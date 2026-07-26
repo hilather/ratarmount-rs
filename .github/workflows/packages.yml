@@ -1,9 +1,14 @@
-# Build distributable packages for Ubuntu (.deb) and Rocky Linux (.rpm).
+# Build distributable packages for Ubuntu (.deb), Rocky (.rpm), portable tarballs,
+# and cosign keyless signatures for release artifacts.
 #
-# Triggers:
-#   - push tags v*  → attach packages to a GitHub Release
-#   - workflow_dispatch → manual downloadable artifacts
-#   - pull_request (optional path) → validate packaging only when packaging/ changes
+# Matrix:
+#   - Ubuntu 20.04 (container), 22.04, 24.04 — amd64
+#   - Ubuntu 24.04 — arm64 (ubuntu-24.04-arm)
+#   - Rocky Linux 8 & 9 — amd64 (containers)
+#   - Rocky Linux 9 — arm64 (container on arm runner)
+#   - Portable “oldest glibc” tarball — Debian bullseye (glibc 2.31) amd64 + arm64
+#
+# Triggers: tag v*, workflow_dispatch, packaging PR paths
 name: Packages
 
 on:
@@ -19,52 +24,87 @@ on:
 
 permissions:
   contents: write
+  id-token: write   # cosign keyless (OIDC)
+  attestations: write
 
 env:
   CARGO_TERM_COLOR: always
+  NFPM_VERSION: v2.41.3
 
 jobs:
-  # -------------------------------------------------------------------------
-  # Ubuntu: native .deb on ubuntu-22.04 and ubuntu-24.04 (x86_64)
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # Ubuntu / Debian packages (.deb)
+  # =========================================================================
   deb:
-    name: deb (${{ matrix.os }})
-    runs-on: ${{ matrix.os }}
+    name: deb (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-22.04, ubuntu-24.04]
+        include:
+          # GitHub no longer ships ubuntu-20.04 runners — build in a 20.04 container.
+          - label: ubuntu-20.04-amd64
+            runner: ubuntu-latest
+            container: ubuntu:20.04
+            distro_label: ubuntu-20.04
+          - label: ubuntu-22.04-amd64
+            runner: ubuntu-22.04
+            container: null
+            distro_label: ubuntu-22.04
+          - label: ubuntu-24.04-amd64
+            runner: ubuntu-24.04
+            container: null
+            distro_label: ubuntu-24.04
+          - label: ubuntu-24.04-arm64
+            runner: ubuntu-24.04-arm
+            container: null
+            distro_label: ubuntu-24.04
+    container: ${{ matrix.container || null }}
     steps:
+      - name: Install checkout tools (container)
+        if: matrix.container != ''
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y ca-certificates curl git sudo
+
       - uses: actions/checkout@v4
 
       - name: Install build deps
         run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            build-essential pkg-config curl \
-            libfuse3-dev fuse3 libarchive-dev zlib1g-dev \
-            libssl-dev
+          export DEBIAN_FRONTEND=noninteractive
+          if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
+          $SUDO apt-get update
+          $SUDO apt-get install -y \
+            build-essential pkg-config curl ca-certificates git \
+            libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust
+        run: |
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
       - uses: Swatinem/rust-cache@v2
+        if: matrix.container == ''
         with:
-          key: packages-${{ matrix.os }}
+          key: packages-deb-${{ matrix.label }}
 
       - name: Version
         id: ver
         run: |
           V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          # Tag push: prefer git tag without leading v
           if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
             V="${GITHUB_REF_NAME#v}"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
-          echo "Building version $V on ${{ matrix.os }}"
 
-      - name: Build packages
+      - name: Build .deb + tarball
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           PACKAGE_FAMILY: deb
+          DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
         run: |
           chmod +x packaging/build-native-packages.sh
@@ -73,40 +113,51 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: deb-${{ matrix.os }}-${{ runner.arch }}
+          name: deb-${{ matrix.label }}
           path: |
             dist/*.deb
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
 
-  # -------------------------------------------------------------------------
-  # Rocky Linux 8 & 9 via containers (RPM)
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # Rocky Linux packages (.rpm)
+  # =========================================================================
   rpm:
-    name: rpm (rocky ${{ matrix.rocky }})
-    runs-on: ubuntu-latest
+    name: rpm (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
     strategy:
       fail-fast: false
       matrix:
-        rocky: ["8", "9"]
+        include:
+          - label: rocky8-amd64
+            runner: ubuntu-latest
+            image: rockylinux/rockylinux:8
+            distro_label: rocky-8
+          - label: rocky9-amd64
+            runner: ubuntu-latest
+            image: rockylinux/rockylinux:9
+            distro_label: rocky-9
+          - label: rocky9-arm64
+            runner: ubuntu-24.04-arm
+            image: rockylinux/rockylinux:9
+            distro_label: rocky-9
     container:
-      image: rockylinux/rockylinux:${{ matrix.rocky }}
+      image: ${{ matrix.image }}
     steps:
       - uses: actions/checkout@v4
 
       - name: Install build deps (dnf)
         run: |
           dnf -y install epel-release || true
-          dnf -y install \
-            gcc gcc-c++ make pkgconf-pkg-config curl git \
-            fuse3-devel fuse3 libarchive-devel zlib-devel \
-            openssl-devel
-          # Rocky 8 may need powertools/CRB for some -devel packages
           dnf -y install 'dnf-command(config-manager)' || true
           dnf config-manager --set-enabled powertools 2>/dev/null \
             || dnf config-manager --set-enabled crb 2>/dev/null \
             || true
+          dnf -y install \
+            gcc gcc-c++ make pkgconf-pkg-config curl git \
+            fuse3-devel fuse3 libarchive-devel zlib-devel \
+            openssl-devel
 
       - name: Install Rust
         run: |
@@ -122,10 +173,11 @@ jobs:
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
 
-      - name: Build packages
+      - name: Build .rpm + tarball
         env:
           VERSION: ${{ steps.ver.outputs.version }}
           PACKAGE_FAMILY: rpm
+          DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
         run: |
           chmod +x packaging/build-native-packages.sh
@@ -134,20 +186,98 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: rpm-rocky${{ matrix.rocky }}-${{ runner.arch }}
+          name: rpm-${{ matrix.label }}
           path: |
             dist/*.rpm
             dist/*.tar.gz
             dist/*.sha256
           if-no-files-found: error
 
-  # -------------------------------------------------------------------------
-  # Optional: attach all packages to the GitHub Release on tag push
-  # -------------------------------------------------------------------------
+  # =========================================================================
+  # Portable tarball on old glibc (Debian bullseye = glibc 2.31)
+  # Prefer this binary when you need one artifact for many distros.
+  # =========================================================================
+  portable:
+    name: portable (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: bullseye-amd64
+            runner: ubuntu-latest
+            image: debian:bullseye
+            distro_label: portable-glibc2.31
+          - label: bullseye-arm64
+            runner: ubuntu-24.04-arm
+            image: debian:bullseye
+            distro_label: portable-glibc2.31
+    container:
+      image: ${{ matrix.image }}
+    steps:
+      - name: Bootstrap
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y ca-certificates curl git
+
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y \
+            build-essential pkg-config curl ca-certificates git \
+            libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build portable tarball only
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PACKAGE_FAMILY: none
+          TARBALL_ONLY: "1"
+          DISTRO_LABEL: ${{ matrix.distro_label }}
+          OUT_DIR: dist
+        run: |
+          chmod +x packaging/build-native-packages.sh
+          ./packaging/build-native-packages.sh
+          # Record glibc requirement for consumers
+          ldd --version | head -1 | tee dist/glibc-version.txt || true
+          file target/release/ratarmount | tee dist/file-info.txt || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: portable-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/glibc-version.txt
+            dist/file-info.txt
+          if-no-files-found: error
+
+  # =========================================================================
+  # Collect, sign (cosign keyless), release
+  # =========================================================================
   release:
-    name: GitHub Release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-    needs: [deb, rpm]
+    name: Sign & release
+    # Always collect on tag; on workflow_dispatch just assemble + sign artifacts
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    needs: [deb, rpm, portable]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -158,14 +288,72 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' -o -name '*.sha256' \) \
-            -exec cp -v {} release/ \;
-          ls -la release/
+          find artifacts -type f \( \
+              -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \
+              -o -name '*.sha256' -o -name 'glibc-version.txt' -o -name 'file-info.txt' \
+            \) -exec cp -v {} release/ \;
+          # Unique names: if collisions, prefix with parent dir
+          cd release
+          ls -la
+          # Combined SHA256SUMS
+          : > SHA256SUMS
+          for f in *.deb *.rpm *.tar.gz; do
+            [[ -f "$f" ]] || continue
+            sha256sum "$f" >> SHA256SUMS
+          done
+          cat SHA256SUMS
 
-      - name: Create / update release
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Cosign keyless sign (OIDC)
+        # Signs each package blob; verification: cosign verify-blob --certificate-identity-regexp ...
+        env:
+          COSIGN_EXPERIMENTAL: "1"
+          COSIGN_YES: "true"
+        run: |
+          cd release
+          for f in *.deb *.rpm *.tar.gz SHA256SUMS; do
+            [[ -f "$f" ]] || continue
+            echo "Signing $f"
+            cosign sign-blob --yes \
+              --bundle "${f}.cosign.bundle" \
+              "$f"
+          done
+          ls -la
+
+      - name: Upload signed bundle (workflow_dispatch / PR path)
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@v4
+        with:
+          name: signed-release-bundle
+          path: release/
+
+      - name: Create / update GitHub Release (tags only)
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: release/*
           generate_release_notes: true
+          body: |
+            ## Packages
+
+            | Kind | Platforms |
+            |------|-----------|
+            | `.deb` | Ubuntu 20.04 / 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
+            | `.rpm` | Rocky 8/9 (amd64), Rocky 9 (arm64) |
+            | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) — broadest glibc compatibility |
+
+            ### Verify cosign signatures (keyless)
+
+            ```bash
+            cosign verify-blob \
+              --bundle ratarmount_….deb.cosign.bundle \
+              --certificate-identity-regexp 'https://github.com/.+/.+/.github/workflows/packages.yml@.*' \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+              ratarmount_….deb
+            ```
+
+            Runtime depends: **fuse3**, **libarchive** (plus optional e2fsprogs / squashfs-tools).
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

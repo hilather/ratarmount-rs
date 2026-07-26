@@ -6,9 +6,11 @@
 #   OUT_DIR=dist VERSION=0.1.0 ./packaging/build-native-packages.sh
 #
 # Env:
-#   PACKAGE_FAMILY=deb|rpm|auto   (default auto: detect from /etc/os-release)
-#   SKIP_BUILD=1                  skip cargo build
+#   PACKAGE_FAMILY=deb|rpm|auto|none   (default auto; none = tarball only)
+#   SKIP_BUILD=1                       skip cargo build
 #   OUT_DIR=dist
+#   DISTRO_LABEL=ubuntu-22.04          tag tarball/package filenames for multi-job CI
+#   TARBALL_ONLY=1                     only emit the binary tarball (+ checksums)
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -26,6 +28,19 @@ if [[ -z "$VERSION" ]]; then
 fi
 # nfpm wants semver without leading v
 VERSION="${VERSION#v}"
+
+# Human-readable distro tag for artifact names (avoid collisions across CI matrix jobs).
+if [[ -z "${DISTRO_LABEL:-}" ]]; then
+    if [[ -f /etc/os-release ]]; then
+        # shellcheck source=/dev/null
+        . /etc/os-release
+        DISTRO_LABEL="${ID:-linux}${VERSION_ID:-}"
+    else
+        DISTRO_LABEL=linux
+    fi
+fi
+# sanitize for filenames (strip newline from echo so tr does not append a trailing '-')
+DISTRO_LABEL="$(printf '%s' "$DISTRO_LABEL" | tr '[:upper:]' '[:lower:]' | tr -c 'a-z0-9._-' '-' | sed 's/-\+/-/g; s/^-//; s/-$//')"
 
 ARCH_UNAME="$(uname -m)"
 case "$ARCH_UNAME" in
@@ -67,12 +82,32 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
 fi
 test -x target/release/ratarmount
 
-# Always ship a portable tarball of the binary (works on any glibc-compatible peer).
-TARBALL="$OUT_DIR/${NAME}-${VERSION}-linux-${ARCH_UNAME}.tar.gz"
-tar -C target/release -czf "$TARBALL" ratarmount
+# Always ship a tarball of the binary (glibc-linked; run on peers with equal-or-newer glibc).
+TARBALL_BASE="${NAME}-${VERSION}-${DISTRO_LABEL}-${ARCH_UNAME}"
+TARBALL="$OUT_DIR/${TARBALL_BASE}.tar.gz"
+# Include a small README in the tarball
+STAGE="$OUT_DIR/.tarball-stage-$$"
+mkdir -p "$STAGE"
+cp -a target/release/ratarmount "$STAGE/"
+cat >"$STAGE/README.txt" <<EOF
+${NAME} ${VERSION}
+Built on: ${DISTRO_LABEL} (${ARCH_UNAME})
+Install:  install -m 755 ratarmount /usr/local/bin/
+Runtime:  fuse3, libarchive (and optional e2fsprogs, squashfs-tools)
+EOF
+tar -C "$STAGE" -czf "$TARBALL" ratarmount README.txt
+rm -rf "$STAGE"
 echo "Wrote $TARBALL"
-# Optional checksum
-( cd "$OUT_DIR" && sha256sum "$(basename "$TARBALL")" > "$(basename "$TARBALL").sha256" )
+(
+    cd "$OUT_DIR"
+    sha256sum "$(basename "$TARBALL")" | tee "$(basename "$TARBALL").sha256"
+)
+
+if [[ "${TARBALL_ONLY:-0}" == "1" || "${PACKAGE_FAMILY:-}" == "none" ]]; then
+    echo "==> TARBALL_ONLY/PACKAGE_FAMILY=none — skipping .deb/.rpm"
+    ls -la "$OUT_DIR"
+    exit 0
+fi
 
 install_nfpm() {
     if command -v nfpm >/dev/null 2>&1; then
