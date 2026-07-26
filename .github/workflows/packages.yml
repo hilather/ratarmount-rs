@@ -106,6 +106,7 @@ jobs:
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
+          OPENSSL_NO_VENDOR: "1"
         run: |
           chmod +x packaging/build-native-packages.sh
           ./packaging/build-native-packages.sh
@@ -149,15 +150,20 @@ jobs:
 
       - name: Install build deps (dnf)
         run: |
+          # Rocky images ship curl-minimal; installing curl conflicts unless we allow erasing.
           dnf -y install epel-release || true
           dnf -y install 'dnf-command(config-manager)' || true
           dnf config-manager --set-enabled powertools 2>/dev/null \
             || dnf config-manager --set-enabled crb 2>/dev/null \
             || true
-          dnf -y install \
-            gcc gcc-c++ make pkgconf-pkg-config curl git \
+          # Prefer /usr/bin/crb when present (Rocky 9 EPEL hint).
+          command -v crb >/dev/null 2>&1 && crb enable || true
+          dnf -y install --allowerasing \
+            gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
             fuse3-devel fuse3 libarchive-devel zlib-devel \
-            openssl-devel
+            openssl-devel perl-IPC-Cmd
+          # Ensure a curl binary exists (curl-minimal or full curl after allowerasing).
+          command -v curl >/dev/null || dnf -y install --allowerasing curl
 
       - name: Install Rust
         run: |
@@ -179,6 +185,8 @@ jobs:
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
+          # Link system OpenSSL (distro packages); avoid vendored openssl-src perl deps.
+          OPENSSL_NO_VENDOR: "1"
         run: |
           chmod +x packaging/build-native-packages.sh
           ./packaging/build-native-packages.sh
@@ -252,6 +260,7 @@ jobs:
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
+          OPENSSL_NO_VENDOR: "1"
         run: |
           chmod +x packaging/build-native-packages.sh
           ./packaging/build-native-packages.sh
@@ -275,8 +284,11 @@ jobs:
   # =========================================================================
   release:
     name: Sign & release
-    # Always collect on tag; on workflow_dispatch just assemble + sign artifacts
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    # Collect on tag / manual dispatch even if some matrix legs failed (partial packages).
+    if: |
+      always() &&
+      (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
+      (needs.deb.result == 'success' || needs.rpm.result == 'success' || needs.portable.result == 'success')
     needs: [deb, rpm, portable]
     runs-on: ubuntu-latest
     steps:
@@ -284,6 +296,8 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: artifacts
+          merge-multiple: false
+        continue-on-error: true
 
       - name: Flatten artifacts
         run: |

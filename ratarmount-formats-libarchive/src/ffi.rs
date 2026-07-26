@@ -31,6 +31,7 @@ extern "C" {
     pub fn archive_read_support_format_iso9660(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_lha(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_rar(a: *mut archive) -> c_int;
+    #[cfg(libarchive_has_rar5)]
     pub fn archive_read_support_format_rar5(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_tar(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_warc(a: *mut archive) -> c_int;

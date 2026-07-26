@@ -21,6 +21,8 @@ use ratarmount_core::{
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
 
+#[cfg(libarchive_has_rar5)]
+use crate::ffi::archive_read_support_format_rar5;
 use crate::ffi::{
     archive_entry_filetype, archive_entry_gid, archive_entry_mode, archive_entry_mtime,
     archive_entry_mtime_is_set, archive_entry_pathname, archive_entry_size,
@@ -30,10 +32,9 @@ use crate::ffi::{
     archive_read_support_format_ar, archive_read_support_format_cab,
     archive_read_support_format_cpio, archive_read_support_format_iso9660,
     archive_read_support_format_lha, archive_read_support_format_rar,
-    archive_read_support_format_rar5, archive_read_support_format_tar,
-    archive_read_support_format_warc, archive_read_support_format_xar,
-    archive_read_support_format_zip, cstr_to_string, error_string, AE_IFDIR, AE_IFLNK, AE_IFMT,
-    ARCHIVE_EOF, ARCHIVE_OK, ARCHIVE_WARN,
+    archive_read_support_format_tar, archive_read_support_format_warc,
+    archive_read_support_format_xar, archive_read_support_format_zip, cstr_to_string, error_string,
+    AE_IFDIR, AE_IFLNK, AE_IFMT, ARCHIVE_EOF, ARCHIVE_OK, ARCHIVE_WARN,
 };
 
 /// Exact Python interop string.
@@ -108,6 +109,8 @@ unsafe fn support_formats(a: *mut ffi::archive) -> Result<()> {
     let _ = archive_read_support_format_iso9660(a);
     let _ = archive_read_support_format_lha(a);
     let _ = archive_read_support_format_rar(a);
+    // RAR5 requires libarchive ≥ 3.4; older EL/Rocky 8 only have classic RAR.
+    #[cfg(libarchive_has_rar5)]
     let _ = archive_read_support_format_rar5(a);
     let _ = archive_read_support_format_tar(a);
     let _ = archive_read_support_format_warc(a);
