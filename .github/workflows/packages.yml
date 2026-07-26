@@ -322,39 +322,29 @@ jobs:
 
       - name: Create / update GitHub Release (tags only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: ratarmount-rs ${{ github.ref_name }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: false
+          generate_release_notes: true
+          files: release/**
+          body: |
+            ## Packages
+
+            | Kind | Platforms |
+            |------|-----------|
+            | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
+            | `.rpm` | Rocky 8 (amd64) |
+            | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
+
+            Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
+
+            Runtime depends: **fuse3**, **libarchive** (optional: e2fsprogs, squashfs-tools).
+
+            If the Release asset list is empty, download the **signed-release-bundle**
+            workflow artifact from the Packages run.
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          cd release
-          ls -la
-          test -s SHA256SUMS
-          shopt -s nullglob
-          mapfile -t FILES < <(find . -maxdepth 1 -type f ! -name '.*' | sed 's|^\./||' | sort)
-          echo "Uploading ${#FILES[@]} files: ${FILES[*]}"
-          test "${#FILES[@]}" -gt 0
-
-          NOTES=$(mktemp)
-          cat >"$NOTES" <<'EOF'
-          ## Packages
-
-          | Kind | Platforms |
-          |------|-----------|
-          | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
-          | `.rpm` | Rocky 8 (amd64) |
-          | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
-
-          Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
-
-          Runtime depends: **fuse3**, **libarchive** (optional: e2fsprogs, squashfs-tools).
-          EOF
-
-          # Replace any prior broken release for this tag.
-          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
-            gh release delete "${GITHUB_REF_NAME}" --yes
-          fi
-          gh release create "${GITHUB_REF_NAME}" \
-            --title "ratarmount-rs ${GITHUB_REF_NAME}" \
-            --notes-file "$NOTES" \
-            --verify-tag \
-            "${FILES[@]}"
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
