@@ -41,7 +41,7 @@ jobs:
     # Containers default to `sh`; force bash for all run steps.
     defaults:
       run:
-        shell: /bin/bash --noprofile --norc -eo pipefail {0}
+        shell: bash
     strategy:
       fail-fast: false
       matrix:
@@ -97,14 +97,18 @@ jobs:
 
       - name: Version
         id: ver
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
-          if [ -z "$V" ]; then
-            echo "Could not parse version from Cargo.toml" >&2
-            exit 1
+          if [ "$REF_TYPE" = tag ]; then
+            V="${REF_NAME#v}"
+          else
+            V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
           fi
-          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
-            V="${GITHUB_REF_NAME#v}"
+          if [ -z "$V" ]; then
+            echo "Could not resolve version" >&2
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved package version: $V"
@@ -138,9 +142,10 @@ jobs:
     name: rpm (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
     # Container jobs default to `sh`; force absolute bash for all run steps.
+    # Avoid `set -u` — GITHUB_* vars can be unset on some container images/runners.
     defaults:
       run:
-        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -195,15 +200,19 @@ jobs:
 
       - name: Version
         id: ver
+        env:
+          # Prefer tag name; fall back to Cargo workspace version via expression-safe default.
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          # POSIX-friendly parse (avoid bashisms that fail under `sh`).
-          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
-          if [ -z "$V" ]; then
-            echo "Could not parse version from Cargo.toml" >&2
-            exit 1
+          if [ "$REF_TYPE" = tag ]; then
+            V="${REF_NAME#v}"
+          else
+            V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
           fi
-          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
-            V="${GITHUB_REF_NAME#v}"
+          if [ -z "$V" ]; then
+            echo "Could not resolve version" >&2
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved package version: $V"
@@ -240,7 +249,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
-        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -279,14 +288,18 @@ jobs:
 
       - name: Version
         id: ver
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
-          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
-          if [ -z "$V" ]; then
-            echo "Could not parse version from Cargo.toml" >&2
-            exit 1
+          if [ "$REF_TYPE" = tag ]; then
+            V="${REF_NAME#v}"
+          else
+            V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n 1)
           fi
-          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
-            V="${GITHUB_REF_NAME#v}"
+          if [ -z "$V" ]; then
+            echo "Could not resolve version" >&2
+            exit 1
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Resolved package version: $V"
