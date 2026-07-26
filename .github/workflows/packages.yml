@@ -46,40 +46,25 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # GitHub no longer ships ubuntu-20.04 runners — build in a 20.04 container.
-          - label: ubuntu-20.04-amd64
-            runner: ubuntu-latest
-            container: ubuntu:20.04
-            distro_label: ubuntu-20.04
+          # Note: Ubuntu 20.04 container builds hang on apt in GHA; use 22.04+ for v0.1.0.
+          # Portable bullseye tarball covers older glibc hosts.
           - label: ubuntu-22.04-amd64
             runner: ubuntu-22.04
-            container: null
             distro_label: ubuntu-22.04
           - label: ubuntu-24.04-amd64
             runner: ubuntu-24.04
-            container: null
             distro_label: ubuntu-24.04
           - label: ubuntu-24.04-arm64
             runner: ubuntu-24.04-arm
-            container: null
             distro_label: ubuntu-24.04
-    container: ${{ matrix.container || null }}
     steps:
-      - name: Install checkout tools (container)
-        if: matrix.container != ''
-        run: |
-          export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y ca-certificates curl git sudo
-
       - uses: actions/checkout@v4
 
       - name: Install build deps
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          if command -v sudo >/dev/null; then SUDO=sudo; else SUDO=; fi
-          $SUDO apt-get update
-          $SUDO apt-get install -y \
+          sudo apt-get update
+          sudo apt-get install -y \
             build-essential pkg-config curl ca-certificates git \
             libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 
@@ -91,7 +76,6 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: Swatinem/rust-cache@v2
-        if: matrix.container == ''
         with:
           key: packages-deb-${{ matrix.label }}
 
@@ -132,18 +116,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # Rocky 9 GHA containers still exit 127 during the build step; ship Rocky 8 for v0.1.0.
+          # Portable glibc2.31 tarball is the recommended cross-distro binary.
           - label: rocky8-amd64
             runner: ubuntu-latest
             image: rockylinux/rockylinux:8
             distro_label: rocky-8
-          - label: rocky9-amd64
-            runner: ubuntu-latest
-            image: rockylinux/rockylinux:9
-            distro_label: rocky-9
-          - label: rocky9-arm64
-            runner: ubuntu-24.04-arm
-            image: rockylinux/rockylinux:9
-            distro_label: rocky-9
     container:
       image: ${{ matrix.image }}
     steps:
@@ -159,14 +137,12 @@ jobs:
           dnf config-manager --set-enabled powertools 2>/dev/null \
             || dnf config-manager --set-enabled crb 2>/dev/null \
             || true
-          # Prefer /usr/bin/crb when present (Rocky 9 EPEL hint).
           if command -v crb >/dev/null 2>&1; then crb enable || true; fi
           dnf -y install --allowerasing \
             gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
             which findutils tar gzip \
             fuse3-devel fuse3 libarchive-devel zlib-devel \
             openssl-devel perl-IPC-Cmd
-          # Ensure a curl binary exists (curl-minimal or full curl after allowerasing).
           if ! command -v curl >/dev/null 2>&1; then
             dnf -y install --allowerasing curl
           fi
@@ -174,8 +150,6 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
-          # Prefer GITHUB_PATH (prepends); do NOT rewrite PATH via GITHUB_ENV
-          # (that can drop /usr/bin and make `bash`/`cc` vanish → exit 127).
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           # shellcheck disable=SC1091
@@ -189,14 +163,12 @@ jobs:
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
-          # Link system OpenSSL (distro packages); avoid vendored openssl-src perl deps.
           OPENSSL_NO_VENDOR: "1"
         run: |
           # shellcheck disable=SC1091
           [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
           command -v cargo
-          command -v bash
           cargo --version
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh

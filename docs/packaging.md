@@ -15,12 +15,14 @@ CI workflow: [`.github/workflows/packages.yml`](../.github/workflows/packages.ym
 
 | Target | Job | Arch | Artifact |
 |--------|-----|------|----------|
-| Ubuntu 20.04 | `deb` (container) | amd64 | `.deb` + tarball |
 | Ubuntu 22.04 | `deb` | amd64 | `.deb` + tarball |
 | Ubuntu 24.04 | `deb` | amd64 + **arm64** | `.deb` + tarball |
 | Rocky Linux 8 | `rpm` (container) | amd64 | `.rpm` + tarball |
-| Rocky Linux 9 | `rpm` (container) | amd64 + **arm64** | `.rpm` + tarball |
 | Portable (Debian bullseye, **glibc 2.31**) | `portable` | amd64 + **arm64** | tarball only |
+
+> **v0.1.0 note:** Ubuntu 20.04 container and Rocky 9 matrix legs are temporarily disabled in CI
+> (apt hang / exit 127). Use the portable glibc 2.31 tarball on older hosts; Rocky 9 packages
+> can be built locally with `PACKAGE_FAMILY=rpm ./packaging/build-native-packages.sh`.
 
 Each native package is built **on** that distro (matching glibc / libfuse). The **portable** job uses Debian bullseye so one tarball runs on most modern Ubuntu/Rocky hosts with glibc ≥ 2.31.
 
