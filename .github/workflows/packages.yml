@@ -95,15 +95,10 @@ jobs:
         with:
           key: packages-deb-${{ matrix.label }}
 
-      - name: Version
-        id: ver
-        run: |
-          echo "version=0.1.0" >> "$GITHUB_OUTPUT"
-          echo "Resolved package version: 0.1.0"
 
       - name: Build .deb + tarball
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: "0.1.0"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -185,16 +180,10 @@ jobs:
           rustc --version
           cargo --version
 
-      - name: Version
-        id: ver
-        run: |
-          # Hardcode for tags/releases; keep deterministic in CI containers.
-          echo "version=0.1.0" >> "$GITHUB_OUTPUT"
-          echo "Resolved package version: 0.1.0"
 
       - name: Build .rpm + tarball
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: "0.1.0"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -261,15 +250,10 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Version
-        id: ver
-        run: |
-          echo "version=0.1.0" >> "$GITHUB_OUTPUT"
-          echo "Resolved package version: 0.1.0"
 
       - name: Build portable tarball only
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: "0.1.0"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
