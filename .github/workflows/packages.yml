@@ -104,7 +104,7 @@ jobs:
           OUT_DIR: dist
           OPENSSL_NO_VENDOR: "1"
         run: |
-          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
 
@@ -174,9 +174,10 @@ jobs:
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          # Prefer GITHUB_PATH (prepends); do NOT rewrite PATH via GITHUB_ENV
+          # (that can drop /usr/bin and make `bash`/`cc` vanish → exit 127).
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          echo "PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
           # shellcheck disable=SC1091
           . "$HOME/.cargo/env"
           rustc --version
@@ -193,8 +194,9 @@ jobs:
         run: |
           # shellcheck disable=SC1091
           [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
-          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
           command -v cargo
+          command -v bash
           cargo --version
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
@@ -265,7 +267,7 @@ jobs:
           OUT_DIR: dist
           OPENSSL_NO_VENDOR: "1"
         run: |
-          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
           # Record glibc requirement for consumers
