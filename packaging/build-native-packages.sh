@@ -120,9 +120,16 @@ install_nfpm() {
         url="https://github.com/goreleaser/nfpm/releases/download/${ver}/nfpm_${ver#v}_Linux_arm64.tar.gz"
     fi
     curl -fsSL "$url" | tar -xz -C /tmp nfpm
-    install -m 755 /tmp/nfpm "$HOME/.local/bin/nfpm" 2>/dev/null \
-        || sudo install -m 755 /tmp/nfpm /usr/local/bin/nfpm
-    export PATH="${HOME}/.local/bin:${PATH}"
+    mkdir -p "${HOME}/.local/bin"
+    if install -m 755 /tmp/nfpm "${HOME}/.local/bin/nfpm" 2>/dev/null; then
+        :
+    elif command -v sudo >/dev/null 2>&1 && sudo install -m 755 /tmp/nfpm /usr/local/bin/nfpm; then
+        :
+    else
+        install -m 755 /tmp/nfpm /usr/local/bin/nfpm
+    fi
+    export PATH="${HOME}/.local/bin:/usr/local/bin:${PATH}"
+    command -v nfpm >/dev/null
 }
 
 write_nfpm_config() {
