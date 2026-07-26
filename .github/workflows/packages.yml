@@ -176,10 +176,11 @@ jobs:
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+          echo "PATH=$HOME/.cargo/bin:$HOME/.local/bin:$PATH" >> "$GITHUB_ENV"
+          # shellcheck disable=SC1091
+          . "$HOME/.cargo/env"
           rustc --version
           cargo --version
-
 
       - name: Build .rpm + tarball
         env:
@@ -190,7 +191,11 @@ jobs:
           # Link system OpenSSL (distro packages); avoid vendored openssl-src perl deps.
           OPENSSL_NO_VENDOR: "1"
         run: |
+          # shellcheck disable=SC1091
+          [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
+          command -v cargo
+          cargo --version
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
 
