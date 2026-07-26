@@ -82,7 +82,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.0"
+          VERSION: "0.1.1"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -159,7 +159,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.0"
+          VERSION: "0.1.1"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -232,7 +232,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.0"
+          VERSION: "0.1.1"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}

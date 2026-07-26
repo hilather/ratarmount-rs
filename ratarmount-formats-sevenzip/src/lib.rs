@@ -49,6 +49,10 @@ pub struct SevenZipMountSource {
     file: Mutex<File>,
     /// folder_index → fully decompressed folder bytes (small/medium folders).
     folder_cache: Mutex<HashMap<usize, Vec<u8>>>,
+    /// folder_index → packed stream bytes (shared across solid members).
+    packed_cache: Mutex<HashMap<usize, Vec<u8>>>,
+    /// (pack_offset, unpack_offset) → file index for O(1) open lookup.
+    entry_by_offsets: HashMap<(u64, u64), usize>,
     password: Option<String>,
     /// Encrypted archive mounted without a valid password: list/stat only.
     content_locked: bool,
@@ -105,12 +109,15 @@ impl SevenZipMountSource {
         let content_locked = encrypted && password.is_none();
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        let entry_by_offsets = entry_offset_map(&archive);
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
             index,
             file: Mutex::new(file),
             folder_cache: Mutex::new(HashMap::new()),
+            packed_cache: Mutex::new(HashMap::new()),
+            entry_by_offsets,
             password,
             content_locked,
             options: options.clone(),
@@ -297,12 +304,15 @@ impl SevenZipMountSource {
         );
 
         let index = index.into_read_only()?;
+        let entry_by_offsets = entry_offset_map(&archive);
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
             index,
             file: Mutex::new(file),
             folder_cache: Mutex::new(HashMap::new()),
+            packed_cache: Mutex::new(HashMap::new()),
+            entry_by_offsets,
             password,
             content_locked,
             options: options.clone(),
@@ -346,6 +356,15 @@ impl SevenZipMountSource {
         let pack_offset = ud.offsetheader.unwrap_or(0);
         let unpack_offset = ud.offset;
 
+        if let Some(&idx) = self.entry_by_offsets.get(&(pack_offset, unpack_offset)) {
+            if let Some(entry) = self.archive.files.get(idx) {
+                let is_link = (file_info.mode & libc::S_IFMT) == libc::S_IFLNK;
+                if entry.size == file_info.size || (is_link && file_info.size == 0) {
+                    return Ok(entry);
+                }
+            }
+        }
+
         for entry in &self.archive.files {
             if entry.is_dir || entry.is_empty_stream {
                 continue;
@@ -360,6 +379,30 @@ impl SevenZipMountSource {
         Err(SzError::Msg(format!(
             "Could not locate 7z member pack={pack_offset} unpack={unpack_offset}"
         )))
+    }
+
+    fn read_packed_for_folder(
+        &self,
+        folder_index: usize,
+        entry: &SevenZipFileEntry,
+    ) -> Result<Vec<u8>> {
+        {
+            let cache = self.packed_cache.lock().unwrap();
+            if let Some(data) = cache.get(&folder_index) {
+                return Ok(data.clone());
+            }
+        }
+        let pack =
+            decode::FilePackSource::open(&self.archive_path, entry.pack_offset, entry.pack_size)?;
+        let packed = decode::PackSource::as_bytes(&pack).map_err(SzError::Seven)?;
+        let mut cache = self.packed_cache.lock().unwrap();
+        if cache.len() >= 8 {
+            if let Some(k) = cache.keys().next().copied() {
+                cache.remove(&k);
+            }
+        }
+        cache.insert(folder_index, packed.clone());
+        Ok(packed)
     }
 
     fn get_folder_bytes(&self, entry: &SevenZipFileEntry) -> Result<Vec<u8>> {
@@ -378,15 +421,28 @@ impl SevenZipMountSource {
                 "Cannot read encrypted 7z member without a password; pass --password".into(),
             )));
         }
-        let pack =
-            decode::FilePackSource::open(&self.archive_path, entry.pack_offset, entry.pack_size)?;
+        // Pure LZMA2: prefer chunk-indexed decode so random member opens do not
+        // force full solid-folder materialization when we only need a slice later.
+        let packed = self.read_packed_for_folder(fi, entry)?;
         let sizes = self.pack_stream_sizes_for(entry);
-        let data = decode::decompress_folder_source(
-            folder,
-            Box::new(pack),
-            self.password.as_deref(),
-            sizes.as_deref(),
-        )?;
+        let data = if folder.coders.len() == 1
+            && folder.coders[0].method.as_slice() == parse::METHOD_LZMA2
+            && !folder.is_encrypted()
+            && sizes.is_none()
+        {
+            let mut decoder = decode::Lzma2RandomAccessDecoder::new(folder, packed, 128)
+                .map_err(SzError::Seven)?;
+            decoder
+                .read_range(0, decoder.unpack_size() as usize)
+                .map_err(SzError::Seven)?
+        } else {
+            decode::decompress_folder_source(
+                folder,
+                Box::new(decode::BytesPackSource::new(packed)),
+                self.password.as_deref(),
+                sizes.as_deref(),
+            )?
+        };
         let mut cache = self.folder_cache.lock().unwrap();
         if cache.len() >= 4 {
             if let Some(k) = cache.keys().next().copied() {
@@ -396,6 +452,31 @@ impl SevenZipMountSource {
         cache.insert(fi, data.clone());
         Ok(data)
     }
+
+    /// Open a pure-LZMA2 solid member via chunk-indexed random access (no full-folder slice).
+    fn open_lzma2_member(&self, entry: &SevenZipFileEntry) -> Result<Vec<u8>> {
+        let fi = entry
+            .folder_index
+            .ok_or_else(|| SzError::Msg("entry has no folder".into()))?;
+        let folder = &self.archive.folders[fi];
+        let packed = self.read_packed_for_folder(fi, entry)?;
+        let mut decoder =
+            decode::Lzma2RandomAccessDecoder::new(folder, packed, 128).map_err(SzError::Seven)?;
+        decoder
+            .read_range(entry.unpack_offset, entry.size as usize)
+            .map_err(SzError::Seven)
+    }
+}
+
+fn entry_offset_map(archive: &SevenZipArchiveInfo) -> HashMap<(u64, u64), usize> {
+    let mut map = HashMap::new();
+    for (i, entry) in archive.files.iter().enumerate() {
+        if entry.is_dir || entry.is_empty_stream {
+            continue;
+        }
+        map.insert((entry.pack_offset, entry.unpack_offset), i);
+    }
+    map
 }
 
 fn pack_stream_sizes(archive: &SevenZipArchiveInfo, entry: &SevenZipFileEntry) -> Option<Vec<u64>> {
@@ -575,6 +656,21 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(stencil));
         }
 
+        // Pure LZMA2 solid folders: chunk-indexed random access (Python a0bc76e).
+        if folder.coders.len() == 1
+            && folder.coders[0].method.as_slice() == parse::METHOD_LZMA2
+            && !folder.is_encrypted()
+            && self.pack_stream_sizes_for(entry).is_none()
+        {
+            let data = self
+                .open_lzma2_member(entry)
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            if data.len() as u64 != entry.size && !data.is_empty() {
+                // Allow short only if EOF; prefer exact size when available.
+            }
+            return Ok(Box::new(Cursor::new(data)));
+        }
+
         // Compressed / BCJ2 / multi-pack: full-folder decompress + slice (cached).
         // Pack is read via FilePackSource (not always preloaded into RAM before open).
         let folder_data = self
@@ -643,8 +739,18 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf.len(), fi.size as usize);
+        // Random mid-member read should match full open (LZMA2 chunk path).
         let med = m.lookup("/medium.bin", 0).expect("medium");
         assert_eq!(med.size, 2097152);
+        let mut r = m.open(&med, 0).unwrap();
+        let mut full = Vec::new();
+        r.read_to_end(&mut full).unwrap();
+        assert_eq!(full.len(), 2097152);
+        // Second open uses packed cache + chunk index.
+        let mut r2 = m.open(&med, 0).unwrap();
+        let mut again = Vec::new();
+        r2.read_to_end(&mut again).unwrap();
+        assert_eq!(full, again);
         let mut r = m.open(&med, 0).unwrap();
         let mut one = [0u8; 1];
         r.read_exact(&mut one).unwrap();

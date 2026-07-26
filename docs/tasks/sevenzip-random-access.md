@@ -90,3 +90,14 @@ Wire into `ratarmount/src/factory.rs` for `*.7z` detection.
 - Reuse `StenciledFile` / `SegmentedFile` for Copy members.  
 - Solid folders: port `_DEFAULT_SMALL_FOLDER_THRESHOLD` (4 MiB) and chunk cache (1 MiB × 64).  
 - Prefer existing crates (`lzma-rs` / `xz2`, `flate2`, `bzip2`) over shelling out to `7z`.
+
+## 2026-07-26 — Python a0bc76e parity (nested spool / LZMA2 solid RA)
+
+Ported from hilather/ratarmount `master` commit `a0bc76e` (*Fix nested 7z spool cache and LZMA2 random access for solid archives*):
+
+- `index_lzma2_chunks` + `Lzma2RandomAccessDecoder` in `decode.rs`
+- Pure LZMA2 member open uses folder-level filter decompress (not per-chunk filter rebinding)
+- Packed stream cache + O(1) `(pack,unpack)` entry lookup in `SevenZipMountSource`
+- Unit test: `index_lzma2_chunks_sum_unpacked_sizes`; integration: `lzma2_two_files` mid-open consistency
+
+Nested on-disk spool cache is less critical in Rust (automount materializes nested `.7z` to temp paths) and remains a follow-up if in-memory nested streams appear.

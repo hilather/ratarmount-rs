@@ -897,6 +897,219 @@ fn lzma_stream_decode_chain(
 }
 
 // ---------------------------------------------------------------------------
+// LZMA2 chunk-indexed random access (Python Lzma2RandomAccessDecoder parity)
+// ---------------------------------------------------------------------------
+
+/// One LZMA2 chunk in a folder's packed stream.
+#[derive(Debug, Clone)]
+pub struct Lzma2ChunkIndex {
+    pub index: usize,
+    pub packed_offset: usize,
+    pub packed_size: usize,
+    pub unpacked_offset: u64,
+    pub unpacked_size: usize,
+    pub control: u8,
+    pub is_lzma: bool,
+    /// Dictionary reset: may be decoded independently.
+    pub independent: bool,
+}
+
+// Fields are populated by the indexer and used by progressive decode paths / tests.
+#[allow(dead_code)]
+fn _lzma2_chunk_index_allow_dead_fields(c: &Lzma2ChunkIndex) {
+    let _ = (
+        c.index,
+        c.packed_offset,
+        c.packed_size,
+        c.unpacked_offset,
+        c.unpacked_size,
+        c.control,
+        c.is_lzma,
+        c.independent,
+    );
+}
+
+/// Walk an LZMA2 packed stream and record chunk boundaries without decompressing.
+pub fn index_lzma2_chunks(packed: &[u8]) -> Result<Vec<Lzma2ChunkIndex>> {
+    let mut pos = 0usize;
+    let mut unpacked_pos = 0u64;
+    let mut chunks = Vec::new();
+    let mut need_dict_reset = true;
+    let mut chunk_index = 0usize;
+
+    while pos < packed.len() {
+        let chunk_start = pos;
+        let control = packed[pos];
+        pos += 1;
+        if control == 0 {
+            break;
+        }
+
+        let dict_reset = control >= 0xe0 || control == 0x01;
+        if !dict_reset && need_dict_reset {
+            return Err(SevenZipError::Msg(format!(
+                "LZMA2 stream missing dictionary reset at offset {chunk_start}"
+            )));
+        }
+        if dict_reset {
+            need_dict_reset = false;
+        }
+
+        if control >= 0x80 {
+            if pos + 4 > packed.len() {
+                return Err(SevenZipError::Msg("Truncated LZMA2 chunk header".into()));
+            }
+            let unpacked_size = (((control & 0x1f) as usize) << 16)
+                + ((packed[pos] as usize) << 8)
+                + packed[pos + 1] as usize
+                + 1;
+            pos += 2;
+            let compressed_size = ((packed[pos] as usize) << 8) + packed[pos + 1] as usize + 1;
+            pos += 2;
+            if control >= 0xc0 {
+                pos += 1; // properties byte
+            }
+            if pos + compressed_size > packed.len() {
+                return Err(SevenZipError::Msg("Truncated LZMA2 compressed data".into()));
+            }
+            pos += compressed_size;
+            let independent = control >= 0xe0 || control == 0x01;
+            chunks.push(Lzma2ChunkIndex {
+                index: chunk_index,
+                packed_offset: chunk_start,
+                packed_size: pos - chunk_start,
+                unpacked_offset: unpacked_pos,
+                unpacked_size,
+                control,
+                is_lzma: true,
+                independent,
+            });
+            unpacked_pos += unpacked_size as u64;
+        } else if control == 1 || control == 2 {
+            if pos + 2 > packed.len() {
+                return Err(SevenZipError::Msg(
+                    "Truncated LZMA2 uncompressed chunk header".into(),
+                ));
+            }
+            let copy_size = ((packed[pos] as usize) << 8) + packed[pos + 1] as usize + 1;
+            pos += 2;
+            if pos + copy_size > packed.len() {
+                return Err(SevenZipError::Msg(
+                    "Truncated LZMA2 uncompressed data".into(),
+                ));
+            }
+            pos += copy_size;
+            chunks.push(Lzma2ChunkIndex {
+                index: chunk_index,
+                packed_offset: chunk_start,
+                packed_size: pos - chunk_start,
+                unpacked_offset: unpacked_pos,
+                unpacked_size: copy_size,
+                control,
+                is_lzma: false,
+                independent: control == 1,
+            });
+            unpacked_pos += copy_size as u64;
+        } else {
+            return Err(SevenZipError::Msg(format!(
+                "Invalid LZMA2 control byte 0x{control:02x} at offset {chunk_start}"
+            )));
+        }
+        chunk_index += 1;
+    }
+    Ok(chunks)
+}
+
+/// Serve random unpacked ranges from an LZMA2 folder.
+///
+/// Port of Python `Lzma2RandomAccessDecoder` (hilather a0bc76e):
+/// always decode with the **folder-level** LZMA2 filter (never re-bind
+/// per-chunk property filters for multi-chunk solid chains). Chunk boundaries
+/// are indexed for validation and future progressive decode; ranges are served
+/// from a single full decompress cached in this decoder instance.
+pub struct Lzma2RandomAccessDecoder {
+    packed: Vec<u8>,
+    folder_props: Option<Vec<u8>>,
+    /// Indexed chunk map (used for validation / progressive paths / tests).
+    #[allow(dead_code)]
+    chunks: Vec<Lzma2ChunkIndex>,
+    unpack_size: u64,
+    full: Option<Vec<u8>>,
+}
+
+impl Lzma2RandomAccessDecoder {
+    pub fn new(folder: &Folder, packed: Vec<u8>, _max_cached_chunks: usize) -> Result<Self> {
+        if folder.coders.is_empty() || folder.coders[0].method.as_slice() != METHOD_LZMA2 {
+            return Err(SevenZipError::Msg(
+                "Lzma2RandomAccessDecoder requires an LZMA2 folder".into(),
+            ));
+        }
+        let chunks = index_lzma2_chunks(&packed)?;
+        Ok(Self {
+            packed,
+            folder_props: folder.coders[0].properties.clone(),
+            chunks,
+            unpack_size: folder.get_unpack_size(),
+            full: None,
+        })
+    }
+
+    fn ensure_full(&mut self) -> Result<()> {
+        if self.full.is_some() {
+            return Ok(());
+        }
+        // Folder-level filter only — critical for solid multi-chunk streams (a0bc76e).
+        let coder = Coder {
+            method: METHOD_LZMA2.to_vec(),
+            num_in_streams: 1,
+            num_out_streams: 1,
+            properties: self.folder_props.clone(),
+        };
+        let out = lzma_decompress_chain(&[coder], &self.packed, self.unpack_size.max(1) as usize)?;
+        self.full = Some(out);
+        Ok(())
+    }
+
+    pub fn read_range(&mut self, start: u64, length: usize) -> Result<Vec<u8>> {
+        if length == 0 || start >= self.unpack_size {
+            return Ok(vec![]);
+        }
+        self.ensure_full()?;
+        let full = self.full.as_ref().unwrap();
+        let s = start as usize;
+        if s >= full.len() {
+            return Ok(vec![]);
+        }
+        let e = (s + length).min(full.len());
+        Ok(full[s..e].to_vec())
+    }
+
+    pub fn unpack_size(&self) -> u64 {
+        self.unpack_size
+    }
+
+    #[allow(dead_code)]
+    pub fn chunk_count(&self) -> usize {
+        self.chunks.len()
+    }
+}
+
+/// Best random-access decoder for a folder's primary codec (Python `create_folder_decoder`).
+#[allow(dead_code)]
+pub fn create_folder_decoder(
+    folder: &Folder,
+    packed: Vec<u8>,
+    max_cached_chunks: usize,
+) -> Result<Lzma2RandomAccessDecoder> {
+    if folder.coders.first().map(|c| c.method.as_slice()) == Some(METHOD_LZMA2) {
+        return Lzma2RandomAccessDecoder::new(folder, packed, max_cached_chunks.max(64));
+    }
+    Err(SevenZipError::Msg(
+        "create_folder_decoder currently only supports pure LZMA2 folders".into(),
+    ))
+}
+
+// ---------------------------------------------------------------------------
 // Streaming folder decoder (single-stream codecs; BCJ2 uses full decompress)
 // ---------------------------------------------------------------------------
 
@@ -1076,5 +1289,54 @@ fn aes_decrypt_7z(packed: &[u8], properties: Option<&[u8]>, password: &str) -> R
 mod hex {
     pub fn encode_simple(bytes: &[u8]) -> String {
         bytes.iter().map(|b| format!("{b:02x}")).collect()
+    }
+}
+
+#[cfg(test)]
+mod lzma2_random_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn py_lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
+        let status = Command::new("python3")
+            .args([
+                "-c",
+                r#"
+import lzma, sys
+data = sys.stdin.buffer.read()
+packed = lzma.compress(data, format=lzma.FORMAT_RAW, filters=[{"id": lzma.FILTER_LZMA2, "preset": 1}])
+sys.stdout.buffer.write(packed)
+"#,
+            ])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .spawn()
+            .ok()?;
+        use std::io::Write;
+        let mut child = status;
+        child.stdin.as_mut()?.write_all(data).ok()?;
+        let out = child.wait_with_output().ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(out.stdout)
+    }
+
+    #[test]
+    fn index_lzma2_chunks_sum_unpacked_sizes() {
+        // Port of Python test_index_lzma2_chunks_matches_full_decompress (structure only).
+        let data: Vec<u8> = (0u8..=255).cycle().take(256 * 2000).collect();
+        let Some(packed) = py_lzma2_compress(&data) else {
+            eprintln!("skip: python3/lzma compress unavailable");
+            return;
+        };
+        let chunks = index_lzma2_chunks(&packed).expect("index chunks");
+        assert!(!chunks.is_empty());
+        let sum: u64 = chunks.iter().map(|c| c.unpacked_size as u64).sum();
+        assert_eq!(sum, data.len() as u64);
+        assert!(
+            chunks.iter().any(|c| c.independent),
+            "need at least one reset chunk"
+        );
     }
 }
