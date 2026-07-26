@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use ratarmount_compress::SharedArchiveFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -88,9 +88,7 @@ impl ZipMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -108,7 +106,11 @@ impl ZipMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         let file = File::open(archive_path)?;
@@ -191,11 +193,11 @@ impl ZipMountSource {
             }
 
             let mode = if is_dir {
-                (unix_mode & 0o7777) | libc::S_IFDIR as u32
+                (unix_mode & 0o7777) | libc::S_IFDIR
             } else if is_symlink {
-                (unix_mode & 0o7777) | libc::S_IFLNK as u32
+                (unix_mode & 0o7777) | libc::S_IFLNK
             } else {
-                (unix_mode & 0o7777) | libc::S_IFREG as u32
+                (unix_mode & 0o7777) | libc::S_IFREG
             };
 
             let full = name.trim_end_matches('/');
@@ -268,11 +270,7 @@ impl ZipMountSource {
 
 impl MountSource for ZipMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -307,9 +305,10 @@ impl MountSource for ZipMountSource {
                 io::Error::new(io::ErrorKind::InvalidInput, "missing zip header offset")
             })?;
 
-        let meta = self.members.get(&header).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "zip member meta not found")
-        })?;
+        let meta = self
+            .members
+            .get(&header)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "zip member meta not found"))?;
 
         // Prefer data_start from index userdata.offset when present (new indexes).
         let data_start = userdata(file_info)
@@ -318,7 +317,9 @@ impl MountSource for ZipMountSource {
             .unwrap_or(meta.data_start);
 
         match meta.method {
-            METHOD_STORED => Ok(Box::new(self.archive_file.region(data_start, file_info.size))),
+            METHOD_STORED => Ok(Box::new(
+                self.archive_file.region(data_start, file_info.size),
+            )),
             METHOD_DEFLATE => {
                 {
                     let cache = self.inflate_cache.lock().expect("zip cache");
@@ -399,7 +400,10 @@ impl Seek for ArcBytes {
             SeekFrom::Current(o) => self.pos as i64 + o,
         };
         if new < 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "seek before start"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
         self.pos = new as u64;
         Ok(self.pos)
@@ -445,19 +449,18 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
 pub fn looks_like_zip(path: &Path) -> bool {
     if let Ok(mut f) = File::open(path) {
         let mut magic = [0u8; 4];
-        if std::io::Read::read(&mut f, &mut magic).ok() == Some(4) {
-            if magic[0] == b'P' && magic[1] == b'K' {
-                return true;
-            }
+        if std::io::Read::read(&mut f, &mut magic).ok() == Some(4)
+            && magic[0] == b'P'
+            && magic[1] == b'K'
+        {
+            return true;
         }
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            e.eq_ignore_ascii_case("zip")
-                || e.eq_ignore_ascii_case("jar")
-                || e.eq_ignore_ascii_case("war")
-        })
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("zip")
+            || e.eq_ignore_ascii_case("jar")
+            || e.eq_ignore_ascii_case("war")
+    })
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
@@ -489,11 +492,7 @@ fn ensure_parent_dirs(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -505,21 +504,7 @@ fn ensure_parent_dirs(
         generated.insert(cur.clone());
         let mode = (libc::S_IFDIR | 0o755) as i64;
         index.insert_file(
-            &parent,
-            part,
-            0,
-            0,
-            0,
-            mtime,
-            mode,
-            0,
-            "",
-            0,
-            0,
-            false,
-            false,
-            true,
-            0,
+            &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
         )?;
     }
     Ok(())

@@ -101,11 +101,17 @@ impl Folder {
     }
 
     pub fn is_encrypted(&self) -> bool {
-        self.coders.iter().any(|c| c.method.as_slice() == METHOD_AES)
+        self.coders
+            .iter()
+            .any(|c| c.method.as_slice() == METHOD_AES)
     }
 
     pub fn content_coders(&self) -> &[Coder] {
-        if self.coders.first().is_some_and(|c| c.method.as_slice() == METHOD_AES) {
+        if self
+            .coders
+            .first()
+            .is_some_and(|c| c.method.as_slice() == METHOD_AES)
+        {
             &self.coders[1..]
         } else {
             &self.coders
@@ -407,7 +413,9 @@ fn parse_pack_info(c: &mut Cursor<'_>) -> Result<PackInfo> {
         info.crcs = vec![None; num_streams as usize];
     }
     if prop != PROP_END {
-        return Err(err(format!("Expected END after PackInfo, got 0x{prop:02x}")));
+        return Err(err(format!(
+            "Expected END after PackInfo, got 0x{prop:02x}"
+        )));
     }
     Ok(info)
 }
@@ -525,7 +533,9 @@ fn parse_unpack_info(c: &mut Cursor<'_>) -> Result<Vec<Folder>> {
         prop = c.read_byte()?;
     }
     if prop != PROP_END {
-        return Err(err(format!("Expected END after UnpackInfo, got 0x{prop:02x}")));
+        return Err(err(format!(
+            "Expected END after UnpackInfo, got 0x{prop:02x}"
+        )));
     }
     Ok(folders)
 }
@@ -551,7 +561,11 @@ fn parse_substreams_info(c: &mut Cursor<'_>, folders: &[Folder]) -> Result<Subst
                 sizes.push(size);
                 total += size;
             }
-            sizes.push(folders[folder_index].get_unpack_size().saturating_sub(total));
+            sizes.push(
+                folders[folder_index]
+                    .get_unpack_size()
+                    .saturating_sub(total),
+            );
             info.unpack_sizes.extend(sizes);
         }
         prop = c.read_byte()?;
@@ -623,7 +637,11 @@ fn parse_streams_info(c: &mut Cursor<'_>) -> Result<StreamsInfo> {
     } else if !streams.folders.is_empty() {
         streams.substreams = Some(SubstreamsInfo {
             num_unpack_streams: vec![1; streams.folders.len()],
-            unpack_sizes: streams.folders.iter().map(|f| f.get_unpack_size()).collect(),
+            unpack_sizes: streams
+                .folders
+                .iter()
+                .map(|f| f.get_unpack_size())
+                .collect(),
             digests: streams
                 .folders
                 .iter()
@@ -632,7 +650,9 @@ fn parse_streams_info(c: &mut Cursor<'_>) -> Result<StreamsInfo> {
         });
     }
     if prop != PROP_END {
-        return Err(err(format!("Expected END after StreamsInfo, got 0x{prop:02x}")));
+        return Err(err(format!(
+            "Expected END after StreamsInfo, got 0x{prop:02x}"
+        )));
     }
     Ok(streams)
 }
@@ -719,8 +739,7 @@ fn parse_files_info(c: &mut Cursor<'_>) -> Result<(Vec<RawFile>, Vec<bool>, Vec<
                 for (i, is_defined) in defined.into_iter().enumerate() {
                     if is_defined {
                         let b = p.read_exact(4)?;
-                        files[i].attributes =
-                            Some(u32::from_le_bytes(b.try_into().unwrap()));
+                        files[i].attributes = Some(u32::from_le_bytes(b.try_into().unwrap()));
                     }
                 }
             }
@@ -748,22 +767,18 @@ fn attributes_to_mode(attributes: Option<u32>, is_dir: bool) -> u32 {
             let unix_full = (attrs >> 16) & 0o7777;
             let file_type = (attrs >> 16) & 0o170000;
             if file_type == 0o120000 {
-                return ((attrs >> 16) & 0o777) | libc::S_IFLNK as u32;
+                return ((attrs >> 16) & 0o777) | libc::S_IFLNK;
             }
             if unix_full != 0 {
-                let ft = if is_dir {
-                    libc::S_IFDIR as u32
-                } else {
-                    libc::S_IFREG as u32
-                };
+                let ft = if is_dir { libc::S_IFDIR } else { libc::S_IFREG };
                 return (unix_full & 0o7777) | ft;
             }
         }
     }
     if is_dir {
-        (libc::S_IFDIR | 0o755) as u32
+        libc::S_IFDIR | 0o755
     } else {
-        (libc::S_IFREG | 0o644) as u32
+        libc::S_IFREG | 0o644
     }
 }
 
@@ -803,8 +818,12 @@ fn build_file_entries(
             } else {
                 false
             };
-            let is_dir =
-                is_directory_entry(&raw.filename, raw.attributes, is_empty_stream, is_empty_file);
+            let is_dir = is_directory_entry(
+                &raw.filename,
+                raw.attributes,
+                is_empty_stream,
+                is_empty_file,
+            );
             entries.push(SevenZipFileEntry {
                 path: raw.filename.trim_end_matches('/').to_string(),
                 size: 0,
@@ -875,8 +894,12 @@ fn build_file_entries(
         } else {
             (false, false)
         };
-        let is_dir =
-            is_directory_entry(&raw.filename, raw.attributes, is_empty_stream, is_empty_file);
+        let is_dir = is_directory_entry(
+            &raw.filename,
+            raw.attributes,
+            is_empty_stream,
+            is_empty_file,
+        );
         let mtime = filetime_to_unix(raw.mtime);
 
         if is_empty_stream || is_dir {
@@ -934,9 +957,9 @@ fn build_file_entries(
     Ok((entries, solid))
 }
 
-fn parse_unpacked_header(
-    c: &mut Cursor<'_>,
-) -> Result<(Option<StreamsInfo>, Vec<RawFile>, Vec<bool>, Vec<bool>)> {
+type UnpackedHeader = (Option<StreamsInfo>, Vec<RawFile>, Vec<bool>, Vec<bool>);
+
+fn parse_unpacked_header(c: &mut Cursor<'_>) -> Result<UnpackedHeader> {
     let mut streams = None;
     let mut raw_files = Vec::new();
     let mut empty_files = Vec::new();
@@ -955,17 +978,16 @@ fn parse_unpacked_header(
         prop = c.read_byte()?;
     }
     if prop != PROP_END {
-        return Err(err(format!("Expected END at end of Header, got 0x{prop:02x}")));
+        return Err(err(format!(
+            "Expected END at end of Header, got 0x{prop:02x}"
+        )));
     }
     Ok((streams, raw_files, empty_files, anti_files))
 }
 
 /// Parse a 7z archive from a seekable reader. `decompress_folder` is injected
 /// to avoid a circular module dependency for encoded headers.
-pub fn parse_7z_archive<R, F>(
-    file: &mut R,
-    mut decompress_folder: F,
-) -> Result<SevenZipArchiveInfo>
+pub fn parse_7z_archive<R, F>(file: &mut R, mut decompress_folder: F) -> Result<SevenZipArchiveInfo>
 where
     R: Read + Seek,
     F: FnMut(&Folder, &[u8]) -> Result<Vec<u8>>,
@@ -1055,7 +1077,7 @@ fn parse_header_buffer<R, F>(
     archive_file: &mut R,
     after_header: u64,
     decompress_folder: &mut F,
-) -> Result<(Option<StreamsInfo>, Vec<RawFile>, Vec<bool>, Vec<bool>)>
+) -> Result<UnpackedHeader>
 where
     R: Read + Seek,
     F: FnMut(&Folder, &[u8]) -> Result<Vec<u8>>,

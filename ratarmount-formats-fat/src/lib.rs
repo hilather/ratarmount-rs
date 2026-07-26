@@ -9,9 +9,7 @@ use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use fatfs::{Dir, FileSystem, FsOptions};
-use ratarmount_core::{
-    FileInfo, ListModeResult, ListResult, MountSource, UserData,
-};
+use ratarmount_core::{FileInfo, ListModeResult, ListResult, MountSource, UserData};
 use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "FATMountSource";
@@ -85,11 +83,7 @@ fn dos_datetime_to_unix(dt: fatfs::DateTime) -> f64 {
     let doy = (153 * mp + 2) / 5 + day - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy as u64;
     let days = (era * 146097 + doe as i64 - 719468) as f64;
-    let secs = days * 86400.0
-        + f64::from(t.hour) * 3600.0
-        + f64::from(t.min) * 60.0
-        + f64::from(t.sec);
-    secs
+    days * 86400.0 + f64::from(t.hour) * 3600.0 + f64::from(t.min) * 60.0 + f64::from(t.sec)
 }
 
 fn entry_to_file_info(name_path: &str, is_dir: bool, size: u64, mtime: f64) -> FileInfo {
@@ -282,10 +276,7 @@ impl MountSource for FatMountSource {
 pub fn looks_like_fat(path: &Path) -> bool {
     if let Ok(mut f) = File::open(path) {
         let mut boot = [0u8; 512];
-        if f.read_exact(&mut boot).is_ok()
-            && boot[510] == 0x55
-            && boot[511] == 0xAA
-        {
+        if f.read_exact(&mut boot).is_ok() && boot[510] == 0x55 && boot[511] == 0xAA {
             // FAT12/16 type string at 54, FAT32 at 82
             let s16 = &boot[54..62];
             let s32 = &boot[82..90];
@@ -300,12 +291,10 @@ pub fn looks_like_fat(path: &Path) -> bool {
             }
         }
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            let e = e.to_ascii_lowercase();
-            e == "fat" || e == "fat12" || e == "fat16" || e == "fat32" || e == "vfat"
-        })
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        let e = e.to_ascii_lowercase();
+        e == "fat" || e == "fat12" || e == "fat16" || e == "fat32" || e == "vfat"
+    })
 }
 
 #[cfg(test)]
@@ -344,7 +333,10 @@ mod tests {
         let list = m.list("/foo").expect("list foo");
         match list {
             ListResult::Infos(map) => {
-                assert!(map.contains_key("fighter") || map.keys().any(|k| k.eq_ignore_ascii_case("fighter")));
+                assert!(
+                    map.contains_key("fighter")
+                        || map.keys().any(|k| k.eq_ignore_ascii_case("fighter"))
+                );
             }
             _ => panic!("expected infos"),
         }

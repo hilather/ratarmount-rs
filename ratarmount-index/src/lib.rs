@@ -173,10 +173,7 @@ impl SqliteIndex {
                     .entry(path.clone())
                     .or_default()
                     .insert(name.clone(), fi.clone());
-                modes
-                    .entry(path)
-                    .or_default()
-                    .insert(name, fi.mode);
+                modes.entry(path).or_default().insert(name, fi.mode);
             }
             Ok(MemIndex {
                 by_key,
@@ -290,7 +287,10 @@ impl SqliteIndex {
         if !tables.iter().any(|t| t == "files") {
             return Err(IndexError::Invalid("SQLite index is empty".into()));
         }
-        if tables.iter().any(|t| t == "filestmp" || t == "parentfolders") {
+        if tables
+            .iter()
+            .any(|t| t == "filestmp" || t == "parentfolders")
+        {
             let has_rows = |name: &str| -> Result<bool> {
                 if !tables.iter().any(|t| t == name) {
                     return Ok(false);
@@ -310,9 +310,8 @@ impl SqliteIndex {
 
     fn table_names(&self) -> Result<Vec<String>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT name FROM sqlite_master WHERE type='table' OR type='view'",
-            )?;
+            let mut stmt =
+                conn.prepare("SELECT name FROM sqlite_master WHERE type='table' OR type='view'")?;
             let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
             for r in rows {
@@ -511,10 +510,7 @@ impl SqliteIndex {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
         }
-        let versions = [
-            ("ratarmount", ratarmount_version),
-            ("index", INDEX_VERSION),
-        ];
+        let versions = [("ratarmount", ratarmount_version), ("index", INDEX_VERSION)];
         self.with_conn(|conn| {
             for (name, ver) in versions {
                 let parts: Vec<&str> = ver.split('.').collect();
@@ -788,9 +784,8 @@ mod tests {
     use super::*;
 
     fn py_fixture(rel: &str) -> PathBuf {
-        let root = std::env::var("RATARMOUNT_PY_ROOT").unwrap_or_else(|_| {
-            "/home/mbrewer/projects/ratarmount".into()
-        });
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join(rel)
     }
 

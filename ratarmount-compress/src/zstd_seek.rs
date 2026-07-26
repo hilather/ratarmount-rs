@@ -41,14 +41,12 @@ impl SeekableZstd {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
         match build_frame_map(path) {
-            Ok((frames, uncomp_size)) if frames.len() > 1 => {
-                Ok(Arc::new(Self {
-                    path: path.to_path_buf(),
-                    frames,
-                    uncompressed_size: uncomp_size,
-                    fallback: None,
-                }))
-            }
+            Ok((frames, uncomp_size)) if frames.len() > 1 => Ok(Arc::new(Self {
+                path: path.to_path_buf(),
+                frames,
+                uncompressed_size: uncomp_size,
+                fallback: None,
+            })),
             Ok((frames, uncomp_size)) if frames.len() == 1 => {
                 // Single frame: if small content size known, decode that frame only once into memory.
                 // Otherwise full decode (same cost as materialize, but unified SeekableBody).
@@ -69,8 +67,8 @@ impl SeekableZstd {
 
 fn decode_full(path: &Path) -> Result<Arc<dyn SeekableBody>> {
     let file = File::open(path)?;
-    let dec = zstd::stream::read::Decoder::new(file)
-        .map_err(|e| CompressError::Msg(e.to_string()))?;
+    let dec =
+        zstd::stream::read::Decoder::new(file).map_err(|e| CompressError::Msg(e.to_string()))?;
     let body = DecodedBody::from_decoder(path, "zstd", dec, DEFAULT_MEMORY_CAP)?;
     Ok(body)
 }
@@ -239,8 +237,7 @@ fn build_frame_map(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
         let (header_size, content_size) = parse_frame_header(&mut file, pos)?;
         // Determine compressed frame size by decompressing (reliable) when content size unknown,
         // or by scanning: use decoder to measure compressed consumed.
-        let (comp_size, frame_uncomp) =
-            measure_frame(&mut file, frame_start, content_size)?;
+        let (comp_size, frame_uncomp) = measure_frame(&mut file, frame_start, content_size)?;
 
         frames.push(FrameInfo {
             compressed_offset: frame_start,

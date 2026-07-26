@@ -21,7 +21,11 @@ pub struct TransformMountSource {
 }
 
 impl TransformMountSource {
-    pub fn new(pattern: &str, replacement: &str, inner: Arc<dyn MountSource>) -> Result<Self, String> {
+    pub fn new(
+        pattern: &str,
+        replacement: &str,
+        inner: Arc<dyn MountSource>,
+    ) -> Result<Self, String> {
         let re = Regex::new(pattern).map_err(|e| format!("--transform regex: {e}"))?;
         Ok(Self {
             inner,
@@ -122,7 +126,10 @@ impl MountSource for TransformMountSource {
                 .and_then(|int| self.inner.lookup(int, 0))
             {
                 out.insert(name, fi);
-            } else if map.keys().any(|e| e.starts_with(&(child_ext.clone() + "/"))) {
+            } else if map
+                .keys()
+                .any(|e| e.starts_with(&(child_ext.clone() + "/")))
+            {
                 // directory synthesized
                 out.insert(
                     name,
@@ -170,7 +177,10 @@ impl MountSource for TransformMountSource {
                 .map
                 .lock()
                 .ok()
-                .and_then(|g| g.as_ref().map(|m| m.keys().any(|e| e.starts_with(&(path.clone() + "/")))))
+                .and_then(|g| {
+                    g.as_ref()
+                        .map(|m| m.keys().any(|e| e.starts_with(&(path.clone() + "/"))))
+                })
                 .unwrap_or(false)
             {
                 Some(FileInfo {

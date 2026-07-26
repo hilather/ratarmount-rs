@@ -43,15 +43,10 @@ struct AwsCreds {
 }
 
 fn load_credentials() -> Result<AwsCreds> {
-    let access_key = std::env::var("AWS_ACCESS_KEY_ID").map_err(|_| {
-        RemoteError::S3(
-            "AWS_ACCESS_KEY_ID not set (needed for s3:// URLs)".into(),
-        )
-    })?;
+    let access_key = std::env::var("AWS_ACCESS_KEY_ID")
+        .map_err(|_| RemoteError::S3("AWS_ACCESS_KEY_ID not set (needed for s3:// URLs)".into()))?;
     let secret_key = std::env::var("AWS_SECRET_ACCESS_KEY").map_err(|_| {
-        RemoteError::S3(
-            "AWS_SECRET_ACCESS_KEY not set (needed for s3:// URLs)".into(),
-        )
+        RemoteError::S3("AWS_SECRET_ACCESS_KEY not set (needed for s3:// URLs)".into())
     })?;
     let session_token = std::env::var("AWS_SESSION_TOKEN").ok();
     Ok(AwsCreds {
@@ -171,9 +166,8 @@ pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64
         .map(|(k, v)| format!("{k}:{}\n", v.trim()))
         .collect::<String>();
 
-    let canonical_request = format!(
-        "GET\n{uri_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-    );
+    let canonical_request =
+        format!("GET\n{uri_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
     let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
     let string_to_sign = format!(
         "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",

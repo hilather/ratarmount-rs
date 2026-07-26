@@ -89,7 +89,7 @@ fn gather_attachments(doc: &Document) -> Vec<(String, ObjectId, Vec<u8>)> {
     }
 
     // 2) Walk all objects for Filespec with EF, and FileAttachment annotations.
-    for (_id, obj) in doc.objects.iter() {
+    for obj in doc.objects.values() {
         let Object::Dictionary(dict) = obj else {
             continue;
         };
@@ -325,11 +325,7 @@ impl PdfMountSource {
 
 impl MountSource for PdfMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -404,11 +400,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {

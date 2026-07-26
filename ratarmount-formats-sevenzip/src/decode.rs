@@ -14,10 +14,10 @@ use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
 use sha2::{Digest, Sha256};
 
 use crate::parse::{
-    coders_are_native_lzma_chain, Coder, Folder, SevenZipError, METHOD_AES, METHOD_BCJ,
+    coders_are_native_lzma_chain, Coder, Folder, Result, SevenZipError, METHOD_AES, METHOD_BCJ,
     METHOD_BCJ2, METHOD_BCJ_ARM, METHOD_BCJ_ARMT, METHOD_BCJ_IA64, METHOD_BCJ_PPC,
     METHOD_BCJ_SPARC, METHOD_BCJ_X86, METHOD_BZIP2, METHOD_COPY, METHOD_DEFLATE, METHOD_DELTA,
-    METHOD_LZMA, METHOD_LZMA2, Result,
+    METHOD_LZMA, METHOD_LZMA2,
 };
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
@@ -148,7 +148,7 @@ impl PackSource for AesPackSource {
         let block = 16u64;
         let start_block = offset / block;
         let end = offset + size as u64;
-        let end_block = (end + block - 1) / block;
+        let end_block = end.div_ceil(block);
         let ct_start = if start_block == 0 {
             0
         } else {
@@ -201,9 +201,7 @@ pub fn make_pack_source(
         return Ok((folder.clone(), packed));
     }
     let password = password.ok_or_else(|| {
-        SevenZipError::Msg(
-            "7z archive contents are encrypted; pass --password".into(),
-        )
+        SevenZipError::Msg("7z archive contents are encrypted; pass --password".into())
     })?;
     let intermediate = folder
         .unpack_sizes
@@ -323,7 +321,9 @@ pub fn decompress_folder_source(
         for &sz in &sizes {
             let end = off + sz as usize;
             if end > blob.len() {
-                return Err(SevenZipError::Msg("pack stream sizes exceed packed data".into()));
+                return Err(SevenZipError::Msg(
+                    "pack stream sizes exceed packed data".into(),
+                ));
             }
             streams.push(blob[off..end].to_vec());
             off = end;
@@ -385,6 +385,7 @@ pub fn decompress_folder_source(
 }
 
 /// Legacy AES strip used by header decoding.
+#[allow(dead_code)]
 pub fn prepare_folder_packed(
     folder: &Folder,
     packed: &[u8],
@@ -429,10 +430,12 @@ pub fn bcj2_decode(
     let mut code: u32 = 0;
     let mut probs = vec![BCJ2_BIT_MODEL_TOTAL >> 1; 2 + 256];
 
-    let mut read_be32 = |stream: usize, pos: &mut [usize; 4]| -> Result<u32> {
+    let read_be32 = |stream: usize, pos: &mut [usize; 4]| -> Result<u32> {
         let i = pos[stream];
         if i + 4 > lims[stream] {
-            return Err(SevenZipError::Msg(format!("BCJ2 stream {stream} truncated")));
+            return Err(SevenZipError::Msg(format!(
+                "BCJ2 stream {stream} truncated"
+            )));
         }
         pos[stream] = i + 4;
         Ok(u32::from_be_bytes([
@@ -446,17 +449,12 @@ pub fn bcj2_decode(
     // Init range coder from first 5 RC bytes.
     while range != 5 {
         if range == 1 && code != 0 {
-            return Err(SevenZipError::Msg(
-                "BCJ2 RC data error during init".into(),
-            ));
+            return Err(SevenZipError::Msg("BCJ2 RC data error during init".into()));
         }
         if pos[BCJ2_STREAM_RC] >= lims[BCJ2_STREAM_RC] {
-            return Err(SevenZipError::Msg(
-                "BCJ2 RC truncated during init".into(),
-            ));
+            return Err(SevenZipError::Msg("BCJ2 RC truncated during init".into()));
         }
-        code = ((code << 8) | u32::from(streams[BCJ2_STREAM_RC][pos[BCJ2_STREAM_RC]]))
-            & 0xFFFF_FFFF;
+        code = (code << 8) | u32::from(streams[BCJ2_STREAM_RC][pos[BCJ2_STREAM_RC]]);
         pos[BCJ2_STREAM_RC] += 1;
         range += 1;
     }
@@ -470,9 +468,8 @@ pub fn bcj2_decode(
             if pos[BCJ2_STREAM_RC] >= lims[BCJ2_STREAM_RC] {
                 break;
             }
-            range = (range << 8) & 0xFFFF_FFFF;
-            code = ((code << 8) | u32::from(streams[BCJ2_STREAM_RC][pos[BCJ2_STREAM_RC]]))
-                & 0xFFFF_FFFF;
+            range <<= 8;
+            code = (code << 8) | u32::from(streams[BCJ2_STREAM_RC][pos[BCJ2_STREAM_RC]]);
             pos[BCJ2_STREAM_RC] += 1;
         }
         if pos[BCJ2_STREAM_MAIN] >= lims[BCJ2_STREAM_MAIN] {
@@ -482,34 +479,33 @@ pub fn bcj2_decode(
         pos[BCJ2_STREAM_MAIN] += 1;
         dest.push(b);
         ip = ip.wrapping_add(1);
-        let v = ((temp << 24) | u32::from(b)) & 0xFFFF_FFFF;
+        let v = (temp << 24) | u32::from(b);
         temp = v;
 
-        if ((b as u32).wrapping_add(0x100 - 0xE8) & 0xFE) != 0 {
-            if (v.wrapping_sub((0x0F << 24) + 0x80) & ((((1u32 << 28) - 0x1) << 4))) != 0 {
-                continue;
-            }
+        if ((b as u32).wrapping_add(0x100 - 0xE8) & 0xFE) != 0
+            && (v.wrapping_sub((0x0F << 24) + 0x80) & (((1u32 << 28) - 0x1) << 4)) != 0
+        {
+            continue;
         }
 
         let c_bit = ((v.wrapping_add(0x17) >> 6) & 1) as usize;
-        let prob_idx =
-            (((0u32.wrapping_sub(c_bit as u32)) & ((v >> 24) & 0xFF)) + c_bit as u32 + ((v >> 5) & 1))
-                as usize;
+        let prob_idx = (((0u32.wrapping_sub(c_bit as u32)) & ((v >> 24) & 0xFF))
+            + c_bit as u32
+            + ((v >> 5) & 1)) as usize;
         let ttt = probs[prob_idx];
         let bound = (range >> BCJ2_NUM_BIT_MODEL_TOTAL_BITS) * ttt;
         if code < bound {
             range = bound;
-            probs[prob_idx] =
-                (ttt + ((BCJ2_BIT_MODEL_TOTAL - ttt) >> BCJ2_NUM_MOVE_BITS)) & 0xFFFF;
+            probs[prob_idx] = (ttt + ((BCJ2_BIT_MODEL_TOTAL - ttt) >> BCJ2_NUM_MOVE_BITS)) & 0xFFFF;
             continue;
         }
         range -= bound;
-        code = (code - bound) & 0xFFFF_FFFF;
+        code -= bound;
         probs[prob_idx] = (ttt - (ttt >> BCJ2_NUM_MOVE_BITS)) & 0xFFFF;
 
         let cj = (((v.wrapping_add(0x57) >> 6) & 1) as usize) + BCJ2_STREAM_CALL;
         let mut val = read_be32(cj, &mut pos)?;
-        val = val.wrapping_sub(ip.wrapping_add(4)) & 0xFFFF_FFFF;
+        val = val.wrapping_sub(ip.wrapping_add(4));
         ip = ip.wrapping_add(4);
         dest.push((val & 0xFF) as u8);
         dest.push(((val >> 8) & 0xFF) as u8);
@@ -606,8 +602,7 @@ pub fn decompress_complex_folder(folder: &Folder, pack_streams: &[Vec<u8>]) -> R
         in_data[glob_in as usize] = Some(pack_streams[pack_i].clone());
     }
 
-    let mut remaining: std::collections::HashSet<usize> =
-        (0..folder.coders.len()).collect();
+    let mut remaining: std::collections::HashSet<usize> = (0..folder.coders.len()).collect();
     let mut progress = true;
     while !remaining.is_empty() && progress {
         progress = false;
@@ -662,8 +657,7 @@ pub fn decompress_complex_folder(folder: &Folder, pack_streams: &[Vec<u8>]) -> R
                     )));
                 }
                 let out_sz = folder.unpack_sizes[out_base[ci]] as usize;
-                out_data[out_base[ci]] =
-                    Some(decompress_single_coder(coder, &inputs[0], out_sz)?);
+                out_data[out_base[ci]] = Some(decompress_single_coder(coder, &inputs[0], out_sz)?);
             }
             remaining.remove(&ci);
             progress = true;
@@ -677,9 +671,8 @@ pub fn decompress_complex_folder(folder: &Folder, pack_streams: &[Vec<u8>]) -> R
     let used_outs: std::collections::HashSet<usize> =
         folder.bind_pairs.iter().map(|(_, o)| *o as usize).collect();
     let primary = (0..total_out).find(|i| !used_outs.contains(i));
-    let primary = primary.ok_or_else(|| {
-        SevenZipError::Msg("No primary output stream in complex folder".into())
-    })?;
+    let primary = primary
+        .ok_or_else(|| SevenZipError::Msg("No primary output stream in complex folder".into()))?;
     out_data[primary]
         .take()
         .ok_or_else(|| SevenZipError::Msg("Primary output missing".into()))
@@ -824,7 +817,10 @@ fn lzma_stream_decode_chain(
         let mut opts_ptrs: Vec<*mut c_void> = Vec::new();
         for coder in &filter_coders {
             let filter_id = method_to_lzma_filter_id(coder.method.as_slice()).ok_or_else(|| {
-                SevenZipError::Msg(format!("Not a native lzma-chain coder: {:02x?}", coder.method))
+                SevenZipError::Msg(format!(
+                    "Not a native lzma-chain coder: {:02x?}",
+                    coder.method
+                ))
             })?;
             let props = coder.properties.as_deref().unwrap_or(&[]);
             let mut filter = lzma_sys::lzma_filter {
@@ -924,6 +920,7 @@ pub struct StreamingFolderDecoder {
     full: Option<Vec<u8>>,
 }
 
+#[allow(dead_code)]
 impl StreamingFolderDecoder {
     pub fn new(
         folder: &Folder,
@@ -954,10 +951,15 @@ impl StreamingFolderDecoder {
                 crc: 0,
             };
             // For streaming path, pack is already AES-stripped content pack.
-            let data = decompress_folder_source(&content, {
-                // re-wrap pack via as_bytes once — still avoids keeping pack+plain both if small
-                Box::new(BytesPackSource::new(self.pack.as_bytes()?))
-            }, None, None)?;
+            let data = decompress_folder_source(
+                &content,
+                {
+                    // re-wrap pack via as_bytes once — still avoids keeping pack+plain both if small
+                    Box::new(BytesPackSource::new(self.pack.as_bytes()?))
+                },
+                None,
+                None,
+            )?;
             self.full = Some(data);
         }
         Ok(())

@@ -111,12 +111,11 @@ impl WriteOverlay {
     pub fn list_deleted(&self, path: &str) -> Vec<String> {
         let path = normpath(path).trim_end_matches('/').to_string();
         let db = self.db.lock().expect("overlay db");
-        let mut stmt = match db.prepare(
-            r#"SELECT name FROM "files" WHERE path = ?1 AND deleted = 1"#,
-        ) {
-            Ok(s) => s,
-            Err(_) => return vec![HIDDEN_DB.to_string()],
-        };
+        let mut stmt =
+            match db.prepare(r#"SELECT name FROM "files" WHERE path = ?1 AND deleted = 1"#) {
+                Ok(s) => s,
+                Err(_) => return vec![HIDDEN_DB.to_string()],
+            };
         let rows = stmt
             .query_map(params![path], |r| r.get::<_, String>(0))
             .into_iter()
@@ -475,12 +474,8 @@ pub fn commit_overlay(
             &db_path,
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
         )?;
-        let mut stmt = conn.prepare(
-            r#"SELECT path, name FROM "files" WHERE deleted = 1"#,
-        )?;
-        let rows = stmt.query_map([], |r| {
-            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
-        })?;
+        let mut stmt = conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#)?;
+        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
             let (path, name) = row?;
             let rel = join_rel(&path, &name);
@@ -490,10 +485,7 @@ pub fn commit_overlay(
 
     // Overlay walk: files to append (and replace = delete + append)
     let suffixes = ["", "-journal", "-shm", "-wal"];
-    let ignored: Vec<String> = suffixes
-        .iter()
-        .map(|s| format!("{HIDDEN_DB}{s}"))
-        .collect();
+    let ignored: Vec<String> = suffixes.iter().map(|s| format!("{HIDDEN_DB}{s}")).collect();
 
     let overlay_str = write_overlay.to_string_lossy();
     let overlay_prefix = if overlay_str.ends_with('/') {
@@ -547,7 +539,9 @@ pub fn commit_overlay(
     }
 
     if opts.debug >= 1 {
-        println!("To commit the overlay folder to the archive, these commands have to be executed:");
+        println!(
+            "To commit the overlay folder to the archive, these commands have to be executed:"
+        );
         println!();
         if !deletions.is_empty() {
             println!(
@@ -620,10 +614,7 @@ pub fn commit_overlay(
 
     if !appends.is_empty() {
         let status = tar_env_command()
-            .args([
-                "--append",
-                "-C",
-            ])
+            .args(["--append", "-C"])
             .arg(write_overlay)
             .args([
                 "--null",
@@ -763,7 +754,11 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
             // Only when this dir has no filenames (even if it has subdirs that had content)
             let has_file = fs::read_dir(dir)?.any(|e| {
                 e.ok()
-                    .map(|e| e.file_type().map(|t| t.is_file() || t.is_symlink()).unwrap_or(false))
+                    .map(|e| {
+                        e.file_type()
+                            .map(|t| t.is_file() || t.is_symlink())
+                            .unwrap_or(false)
+                    })
                     .unwrap_or(false)
             });
             if !has_file && dir != root {
@@ -841,11 +836,7 @@ mod tests {
                 None
             }
         }
-        fn open(
-            &self,
-            _: &FileInfo,
-            _: i32,
-        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
             Err(io::Error::new(io::ErrorKind::NotFound, "null base"))
         }
         fn is_immutable(&self) -> bool {

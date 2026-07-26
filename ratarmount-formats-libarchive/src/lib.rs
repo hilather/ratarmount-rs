@@ -15,24 +15,25 @@ use std::time::Instant;
 
 use log::info;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
 
 use crate::ffi::{
     archive_entry_filetype, archive_entry_gid, archive_entry_mode, archive_entry_mtime,
-    archive_entry_mtime_is_set, archive_entry_pathname, archive_entry_size, archive_entry_size_is_set,
-    archive_entry_symlink, archive_entry_uid, archive_format_name, archive_read_data,
-    archive_read_free, archive_read_new, archive_read_next_header, archive_read_open_filename,
-    archive_read_support_filter_all, archive_read_support_format_7zip,
-    archive_read_support_format_ar, archive_read_support_format_cab, archive_read_support_format_cpio,
-    archive_read_support_format_iso9660, archive_read_support_format_lha,
-    archive_read_support_format_rar, archive_read_support_format_rar5,
-    archive_read_support_format_tar, archive_read_support_format_warc,
-    archive_read_support_format_xar, archive_read_support_format_zip, cstr_to_string, error_string,
-    AE_IFDIR, AE_IFLNK, AE_IFMT, ARCHIVE_EOF, ARCHIVE_OK, ARCHIVE_WARN,
+    archive_entry_mtime_is_set, archive_entry_pathname, archive_entry_size,
+    archive_entry_size_is_set, archive_entry_symlink, archive_entry_uid, archive_format_name,
+    archive_read_data, archive_read_free, archive_read_new, archive_read_next_header,
+    archive_read_open_filename, archive_read_support_filter_all, archive_read_support_format_7zip,
+    archive_read_support_format_ar, archive_read_support_format_cab,
+    archive_read_support_format_cpio, archive_read_support_format_iso9660,
+    archive_read_support_format_lha, archive_read_support_format_rar,
+    archive_read_support_format_rar5, archive_read_support_format_tar,
+    archive_read_support_format_warc, archive_read_support_format_xar,
+    archive_read_support_format_zip, cstr_to_string, error_string, AE_IFDIR, AE_IFLNK, AE_IFMT,
+    ARCHIVE_EOF, ARCHIVE_OK, ARCHIVE_WARN,
 };
 
 /// Exact Python interop string.
@@ -166,9 +167,7 @@ impl LibarchiveMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -187,7 +186,11 @@ impl LibarchiveMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -350,6 +353,7 @@ impl LibarchiveMountSource {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_entry(
     index: &SqliteIndex,
     raw_path: &str,
@@ -382,7 +386,7 @@ fn insert_entry(
     } else {
         libc::S_IFREG
     };
-    let mode = (mode_bits & 0o7777) | ifmt as u32;
+    let mode = (mode_bits & 0o7777) | ifmt;
 
     index.insert_file(
         &path,
@@ -420,11 +424,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -436,7 +436,21 @@ fn ensure_parents(
         generated.insert(cur.clone());
         let mode = (libc::S_IFDIR | 0o755) as i64;
         index.insert_file(
-            &parent, part, -1 - i as i64, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
+            &parent,
+            part,
+            -1 - i as i64,
+            0,
+            0,
+            mtime,
+            mode,
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            true,
+            0,
         )?;
     }
     Ok(())
@@ -444,11 +458,7 @@ fn ensure_parents(
 
 impl MountSource for LibarchiveMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -589,14 +599,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("c.index.sqlite");
-        let m = LibarchiveMountSource::open(
-            &path,
-            Some(&idx),
-            &OpenOptions::default(),
-            "0.1.0",
-            true,
-        )
-        .expect("open cab");
+        let m =
+            LibarchiveMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .expect("open cab");
         let fi = m.lookup("/bar", 0).expect("bar");
         let mut r = m.open(&fi, 0).unwrap();
         let mut buf = Vec::new();

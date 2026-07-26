@@ -6,9 +6,7 @@
 use std::io;
 use std::sync::Arc;
 
-use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
-};
+use ratarmount_core::{normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData};
 
 const VERSIONS_SUFFIX: &str = ".versions";
 const TAG_FILE: &str = "versionlayer:file";
@@ -179,5 +177,3 @@ impl MountSource for FileVersionLayer {
         self.inner.statfs()
     }
 }
-
-

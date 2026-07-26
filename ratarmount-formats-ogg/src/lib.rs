@@ -119,21 +119,18 @@ pub fn parse_ogg<R: Read + Seek>(file: &mut R) -> Result<HashMap<u32, OggStream>
             ));
         }
 
-        if !streams.contains_key(&stream_id) {
+        if let std::collections::hash_map::Entry::Vacant(e) = streams.entry(stream_id) {
             let mut stream_data = vec![0u8; data_size as usize];
             if data_size > 0 {
                 file.read_exact(&mut stream_data)?;
             }
             let (media_type, subtype) = detect_media_type(&stream_data);
-            streams.insert(
-                stream_id,
-                OggStream {
-                    media_type: media_type.into(),
-                    subtype: subtype.into(),
-                    pages: Vec::new(),
-                    last_sequence: -1,
-                },
-            );
+            e.insert(OggStream {
+                media_type: media_type.into(),
+                subtype: subtype.into(),
+                pages: Vec::new(),
+                last_sequence: -1,
+            });
             // data already consumed
         } else {
             file.seek(SeekFrom::Start(data_offset + data_size))?;
@@ -176,12 +173,10 @@ pub fn looks_like_ogg(path: &Path) -> bool {
             return true;
         }
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            let e = e.to_ascii_lowercase();
-            matches!(e.as_str(), "ogg" | "ogm" | "ogv" | "oga" | "opus" | "spx")
-        })
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        let e = e.to_ascii_lowercase();
+        matches!(e.as_str(), "ogg" | "ogm" | "ogv" | "oga" | "opus" | "spx")
+    })
 }
 
 pub struct OggMountSource {
@@ -222,9 +217,7 @@ impl OggMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -241,7 +234,11 @@ impl OggMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -305,8 +302,8 @@ impl OggMountSource {
                 })
                 .collect();
             let size: u64 = stencils.iter().map(|(_, s)| s).sum();
-            let ranges = serde_json::to_string(&stencils)
-                .map_err(|e| OggError::Msg(e.to_string()))?;
+            let ranges =
+                serde_json::to_string(&stencils).map_err(|e| OggError::Msg(e.to_string()))?;
             let page0 = &stream.pages[0];
             let mode = (libc::S_IFREG | 0o644) as i64;
             index.insert_file(
@@ -350,11 +347,7 @@ impl OggMountSource {
 
 impl MountSource for OggMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -459,7 +452,7 @@ mod tests {
         page2.extend_from_slice(&0u32.to_le_bytes());
         page2.push(1);
         page2.push(0); // empty segment
-        // data size 0
+                       // data size 0
 
         let mut out = page;
         out.extend_from_slice(&page2);

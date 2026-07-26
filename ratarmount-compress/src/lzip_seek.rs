@@ -102,10 +102,8 @@ fn index_lzip_file(path: &Path) -> Result<Vec<Member>> {
         // Try candidate member ends: after payload + trailer. Use progressive approach:
         // decompress with optional sizes from scanning trailers every 8-byte aligned end.
         // Fast path: for single-member files, entire file is one member.
-        let (end, data_size, plain_len) =
-            find_member_end(&rest, dict_code, max_payload).map_err(|e| {
-                CompressError::Msg(format!("LZIP member at {pos}: {e}"))
-            })?;
+        let (end, data_size, plain_len) = find_member_end(&rest, dict_code, max_payload)
+            .map_err(|e| CompressError::Msg(format!("LZIP member at {pos}: {e}")))?;
 
         let member_blob_len = HEADER_SIZE + end; // end is relative to payload_start including trailer
         let end_offset = pos + member_blob_len;
@@ -162,7 +160,11 @@ fn find_member_end(rest: &[u8], dict_code: u8, _max_payload: u64) -> Result<(u64
         header_blob.push(dict_code);
         header_blob.extend_from_slice(payload);
         header_blob.extend_from_slice(trailer);
-        match decompress_member(&header_blob, dict_code, if data_size > 0 { Some(data_size) } else { None }) {
+        match decompress_member(
+            &header_blob,
+            dict_code,
+            if data_size > 0 { Some(data_size) } else { None },
+        ) {
             Ok(plain) => {
                 let plain_len = plain.len() as u64;
                 let ds = if data_size > 0 && data_size == plain_len {
@@ -195,7 +197,9 @@ fn find_member_end(rest: &[u8], dict_code: u8, _max_payload: u64) -> Result<(u64
             continue;
         }
     }
-    Err(CompressError::Msg("could not locate LZIP member end".into()))
+    Err(CompressError::Msg(
+        "could not locate LZIP member end".into(),
+    ))
 }
 
 /// Shared seekable LZIP body with on-demand member cache.

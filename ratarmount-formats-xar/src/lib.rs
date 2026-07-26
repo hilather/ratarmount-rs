@@ -10,8 +10,8 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -58,9 +58,7 @@ impl XarMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -77,7 +75,11 @@ impl XarMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -222,8 +224,7 @@ fn parse_toc_xml(toc_xml: &[u8], heap_offset: u64) -> Result<Vec<XarRow>> {
                             for a in e.attributes().flatten() {
                                 let key = local_name(a.key.as_ref());
                                 if key == "style" || key == "name" {
-                                    st.encoding =
-                                        String::from_utf8_lossy(&a.value).into_owned();
+                                    st.encoding = String::from_utf8_lossy(&a.value).into_owned();
                                 }
                             }
                         }
@@ -322,8 +323,7 @@ fn parse_toc_xml(toc_xml: &[u8], heap_offset: u64) -> Result<Vec<XarRow>> {
                             let size = if st.size != 0 { st.size } else { st.length };
                             let nfull = normpath(&full);
                             let (path, base) = split_name(&nfull);
-                            let linkname =
-                                format!("xar-enc:{}|packed:{}", st.encoding, st.length);
+                            let linkname = format!("xar-enc:{}|packed:{}", st.encoding, st.length);
                             rows.push(XarRow {
                                 path,
                                 name: base,
@@ -376,11 +376,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -400,11 +396,7 @@ fn ensure_parents(
 
 impl MountSource for XarMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -430,9 +422,8 @@ impl MountSource for XarMountSource {
                 "is a directory",
             ));
         }
-        let ud = userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing xar userdata")
-        })?;
+        let ud = userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing xar userdata"))?;
         let link = file_info.linkname.as_str();
         if !link.starts_with("xar-enc:") {
             let file = File::open(&self.archive_path)?;

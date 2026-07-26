@@ -37,9 +37,7 @@ pub fn looks_like_git(path: &Path) -> bool {
         return true;
     }
     // Bare repo heuristics: HEAD + objects/ + refs/
-    path.join("HEAD").is_file()
-        && path.join("objects").is_dir()
-        && path.join("refs").is_dir()
+    path.join("HEAD").is_file() && path.join("objects").is_dir() && path.join("refs").is_dir()
 }
 
 fn git_path_userdata(path: &str) -> UserData {
@@ -305,7 +303,9 @@ impl MountSource for GitMountSource {
             } else {
                 format!("/{path_n}")
             };
-            Ok(Some(self.object_to_file_info(repo, &obj, &vpath, filemode)?))
+            Ok(Some(
+                self.object_to_file_info(repo, &obj, &vpath, filemode)?,
+            ))
         })
         .ok()
         .flatten()

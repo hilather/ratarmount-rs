@@ -22,12 +22,8 @@ const F_CRC32_C: u32 = 0x0000_0200;
 const F_H_EXTRA_FIELD: u32 = 0x0000_0040;
 const F_H_FILTER: u32 = 0x0000_0800;
 
-type LzoDecompressFn = unsafe fn(
-    src: *const u8,
-    src_len: u32,
-    dst: *mut u8,
-    dst_len: *mut u32,
-) -> i32;
+type LzoDecompressFn =
+    unsafe fn(src: *const u8, src_len: u32, dst: *mut u8, dst_len: *mut u32) -> i32;
 
 struct LzoLib {
     _lib: Library,
@@ -37,12 +33,7 @@ struct LzoLib {
 fn load_lzo() -> Result<&'static LzoLib> {
     static LIB: OnceLock<std::result::Result<LzoLib, String>> = OnceLock::new();
     let res = LIB.get_or_init(|| {
-        for name in [
-            "liblzo2.so.2",
-            "liblzo2.so",
-            "liblzo2.dylib",
-            "lzo2.dll",
-        ] {
+        for name in ["liblzo2.so.2", "liblzo2.so", "liblzo2.dylib", "lzo2.dll"] {
             // SAFETY: loading a well-known system compression library.
             let lib = match unsafe { Library::new(name) } {
                 Ok(l) => l,

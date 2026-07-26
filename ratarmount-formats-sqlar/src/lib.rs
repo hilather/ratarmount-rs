@@ -19,8 +19,8 @@ use std::sync::Mutex;
 
 use flate2::read::ZlibDecoder;
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
-    UserData,
+    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, UserData,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
@@ -105,13 +105,7 @@ impl SqlarMountSource {
         p.to_string()
     }
 
-    fn row_to_file_info(
-        rowid: i64,
-        mode: i64,
-        mtime: i64,
-        sz: i64,
-        linkname: String,
-    ) -> FileInfo {
+    fn row_to_file_info(rowid: i64, mode: i64, mtime: i64, sz: i64, linkname: String) -> FileInfo {
         FileInfo {
             size: sz.max(0) as u64,
             mtime: mtime as f64,
@@ -301,9 +295,8 @@ impl MountSource for SqlarMountSource {
                     None
                 };
                 if let Some((cname, rowid, mode, mtime, sz, link)) = child {
-                    map.entry(cname).or_insert_with(|| {
-                        Self::row_to_file_info(rowid, mode, mtime, sz, link)
-                    });
+                    map.entry(cname)
+                        .or_insert_with(|| Self::row_to_file_info(rowid, mode, mtime, sz, link));
                 }
             }
             Ok(Some(ListResult::Infos(map)))

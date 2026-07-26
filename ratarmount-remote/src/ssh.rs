@@ -82,9 +82,8 @@ pub fn fetch_ssh_location_to_temp(loc: &SshLocation) -> Result<(NamedTempFile, u
     let addr = format!("{}:{}", loc.host, loc.port);
     debug!("ssh connect {addr} path={}", loc.path);
 
-    let tcp = TcpStream::connect(&addr).map_err(|e| {
-        RemoteError::Ssh(format!("connect {addr}: {e}"))
-    })?;
+    let tcp =
+        TcpStream::connect(&addr).map_err(|e| RemoteError::Ssh(format!("connect {addr}: {e}")))?;
     let mut sess = Session::new().map_err(|e| RemoteError::Ssh(e.to_string()))?;
     sess.set_tcp_stream(tcp);
     sess.handshake()
@@ -144,11 +143,7 @@ fn authenticate(sess: &mut Session, user: &str, password: Option<&str>) -> Resul
                 continue;
             }
             // Try without passphrase first.
-            if sess
-                .userauth_pubkey_file(user, None, &key, None)
-                .is_ok()
-                && sess.authenticated()
-            {
+            if sess.userauth_pubkey_file(user, None, &key, None).is_ok() && sess.authenticated() {
                 return Ok(());
             }
         }

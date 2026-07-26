@@ -111,7 +111,11 @@ impl RatarmountFs {
     }
 
     fn path_for_ino(&self, ino: u64) -> Option<String> {
-        self.inodes.lock().unwrap().get(&ino).map(|e| e.path.clone())
+        self.inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map(|e| e.path.clone())
     }
 
     fn cached_fi(&self, ino: u64) -> Option<FileInfo> {
@@ -140,7 +144,7 @@ impl RatarmountFs {
         let listing = self.source.list_mode(path)?;
         let entries: Vec<(String, u32)> = match listing {
             ListModeResult::Modes(m) => m.into_iter().collect(),
-            ListModeResult::Names(names) => names.into_iter().map(|n| (n, libc::S_IFREG as u32)).collect(),
+            ListModeResult::Names(names) => names.into_iter().map(|n| (n, libc::S_IFREG)).collect(),
         };
         self.dir_cache.lock().unwrap().insert(
             path.to_string(),
@@ -363,7 +367,11 @@ impl Filesystem for RatarmountFs {
                 })
                 .unwrap_or(FUSE_ROOT_ID)
         };
-        full.push((parent_ino, "..".into(), Self::file_attr(parent_ino, &self_fi)));
+        full.push((
+            parent_ino,
+            "..".into(),
+            Self::file_attr(parent_ino, &self_fi),
+        ));
         for (name, fi) in map {
             let child = join_path(&path, &name);
             let cino = self.ino_for_path_with_fi(&child, Some(fi.clone()));
@@ -480,14 +488,14 @@ impl Filesystem for RatarmountFs {
                 }
             }
             OpenBackend::Source { reader, .. } => {
-                let mut r = reader.lock().unwrap();
+                let r = reader.get_mut().unwrap();
                 if let Err(e) = r.seek(std::io::SeekFrom::Start(offset.max(0) as u64)) {
                     debug!("seek error: {e}");
                     reply.error(EIO);
                     return;
                 }
                 let mut buf = vec![0u8; size as usize];
-                match std::io::Read::read(&mut *r, &mut buf) {
+                match std::io::Read::read(r, &mut buf) {
                     Ok(n) => {
                         buf.truncate(n);
                         reply.data(&buf);
@@ -523,14 +531,7 @@ impl Filesystem for RatarmountFs {
                 }
             }
         };
-        let n = unsafe {
-            libc::pwrite(
-                fd,
-                data.as_ptr() as *const _,
-                data.len(),
-                offset.max(0),
-            )
-        };
+        let n = unsafe { libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset.max(0)) };
         if n < 0 {
             reply.error(EIO);
         } else {
@@ -561,18 +562,15 @@ impl Filesystem for RatarmountFs {
         match ov.create_file(&path, mode) {
             Ok(fd) => {
                 let ino = self.ino_for_path(&path);
-                let fi = self
-                    .source
-                    .lookup(&path, 0)
-                    .unwrap_or_else(|| FileInfo {
-                        size: 0,
-                        mtime: 0.0,
-                        mode: mode | libc::S_IFREG as u32,
-                        linkname: String::new(),
-                        uid: unsafe { libc::geteuid() },
-                        gid: unsafe { libc::getegid() },
-                        userdata: vec![],
-                    });
+                let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
+                    size: 0,
+                    mtime: 0.0,
+                    mode: mode | libc::S_IFREG,
+                    linkname: String::new(),
+                    uid: unsafe { libc::geteuid() },
+                    gid: unsafe { libc::getegid() },
+                    userdata: vec![],
+                });
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 self.handles
                     .lock()
@@ -612,7 +610,7 @@ impl Filesystem for RatarmountFs {
                 let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
                     size: 0,
                     mtime: 0.0,
-                    mode: mode | libc::S_IFDIR as u32,
+                    mode: mode | libc::S_IFDIR,
                     linkname: String::new(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },

@@ -35,13 +35,10 @@ pub type Result<T> = std::result::Result<T, HtmlError>;
 
 /// Loose HTML detection (Python `is_html_file`).
 pub fn looks_like_html(path: &Path) -> bool {
-    let ext_ok = path
-        .extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| {
-            let e = e.to_ascii_lowercase();
-            e == "html" || e == "htm"
-        });
+    let ext_ok = path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        let e = e.to_ascii_lowercase();
+        e == "html" || e == "htm"
+    });
     let Ok(mut f) = File::open(path) else {
         return false;
     };
@@ -64,17 +61,13 @@ pub fn looks_like_html(path: &Path) -> bool {
     let tags: &[&[u8]] = &[
         b"<html", b"<head", b"<title", b"<script", b"<style", b"<table", b"<a href",
     ];
-    let content = tags.iter().any(|t| {
-        lower
-            .windows(t.len())
-            .any(|w| w == *t)
-    });
+    let content = tags.iter().any(|t| lower.windows(t.len()).any(|w| w == *t));
     if content {
         return true;
     }
     // Extension alone is insufficient without content; require content match
     // unless extension + starts with `<`.
-    ext_ok && chunk[..n].iter().any(|&b| b == b'<')
+    ext_ok && chunk[..n].contains(&b'<')
 }
 
 fn unescape_html_entities(s: &str) -> String {
@@ -154,13 +147,9 @@ fn decode_data_url(raw: &str) -> Option<(String, Vec<u8>)> {
         // Strip whitespace sometimes present in HTML.
         let cleaned: String = unquoted.chars().filter(|c| !c.is_whitespace()).collect();
         B64.decode(cleaned.as_bytes()).ok()?
-    } else if encoding.eq_ignore_ascii_case("utf-8")
-        || encoding.eq_ignore_ascii_case("utf8")
-        || encoding.eq_ignore_ascii_case("ascii")
-        || encoding.eq_ignore_ascii_case("us-ascii")
-    {
-        unquoted.into_bytes()
     } else {
+        // utf-8 / ascii / other: keep raw bytes of the unquoted payload.
+        let _ = encoding;
         unquoted.into_bytes()
     };
 
@@ -374,11 +363,7 @@ impl HtmlMountSource {
 
 impl MountSource for HtmlMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -413,9 +398,10 @@ impl MountSource for HtmlMountSource {
                 _ => None,
             })
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing html userdata"))?;
-        let map = self.payloads.lock().map_err(|_| {
-            io::Error::other("html payload lock poisoned")
-        })?;
+        let map = self
+            .payloads
+            .lock()
+            .map_err(|_| io::Error::other("html payload lock poisoned"))?;
         let data = map
             .get(&key)
             .cloned()
@@ -452,11 +438,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {

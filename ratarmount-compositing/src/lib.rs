@@ -18,6 +18,4 @@ pub use prefix::PrefixMountSource;
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
-pub use write_overlay::{
-    commit_overlay, CommitOverlayOptions, WriteOverlay, HIDDEN_DB,
-};
+pub use write_overlay::{commit_overlay, CommitOverlayOptions, WriteOverlay, HIDDEN_DB};

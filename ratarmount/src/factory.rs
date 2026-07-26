@@ -3,17 +3,17 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compress::{
-    body_looks_like_tar, detect_compression, looks_like_tar, materialize,
-    name_suggests_compressed_tar, open_seekable_bzip2, open_seekable_compress_z,
-    open_seekable_lz4, open_seekable_lzip, open_seekable_lzma, open_seekable_lzo,
-    open_seekable_xz, open_seekable_zlib, strip_compression_suffix, CompressionFormat,
-    SeekableBody, SeekableZstd, SharedSeekableGzip,
-};
 use ratarmount_compositing::{
     parse_recursive_extensions, AutoMountLayer, AutoMountOptions, FileVersionLayer,
     FolderMountSource, OpenNestedFn, PrefixMountSource, RecursiveExtSet, TransformMountSource,
     UnionMountOptions, UnionMountSource,
+};
+use ratarmount_compress::{
+    body_looks_like_tar, detect_compression, looks_like_tar, materialize,
+    name_suggests_compressed_tar, open_seekable_bzip2, open_seekable_compress_z, open_seekable_lz4,
+    open_seekable_lzip, open_seekable_lzma, open_seekable_lzo, open_seekable_xz,
+    open_seekable_zlib, strip_compression_suffix, CompressionFormat, SeekableBody, SeekableZstd,
+    SharedSeekableGzip,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -159,21 +159,13 @@ pub fn open_path(
                 match CabMountSource::open(path, index_path, &options, VERSION, recreate) {
                     Ok(s) => Arc::new(s),
                     Err(CabError::UnsupportedCompression(_)) => Arc::new(
-                        LibarchiveMountSource::open(
-                            path,
-                            index_path,
-                            &options,
-                            VERSION,
-                            recreate,
-                        )
-                        .map_err(|e| e.to_string())?,
+                        LibarchiveMountSource::open(path, index_path, &options, VERSION, recreate)
+                            .map_err(|e| e.to_string())?,
                     ),
                     Err(e) => return Err(e.to_string()),
                 }
             } else if looks_like_sqlar(path) {
-                Arc::new(
-                    SqlarMountSource::open(path, &options).map_err(|e| e.to_string())?,
-                )
+                Arc::new(SqlarMountSource::open(path, &options).map_err(|e| e.to_string())?)
             } else if looks_like_squashfs(path) {
                 Arc::new(SquashFsMountSource::open(path).map_err(|e| e.to_string())?)
             } else if looks_like_ext4(path) {
@@ -208,12 +200,7 @@ pub fn open_path(
             {
                 let mut mat = None;
                 Arc::new(open_tar(
-                    path,
-                    path,
-                    index_path,
-                    &options,
-                    recreate,
-                    &mut mat,
+                    path, path, index_path, &options, recreate, &mut mat,
                 )?)
             } else {
                 let name = path
@@ -228,9 +215,7 @@ pub fn open_path(
                 )
             }
         }
-        CompressionFormat::Gzip => {
-            open_gzip(path, index_path, &options, recreate)?
-        }
+        CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
         CompressionFormat::Bzip2 => {
             open_seekable_codec(path, index_path, &options, recreate, "bzip2", || {
                 open_seekable_bzip2(path)
@@ -291,9 +276,7 @@ fn open_tar(
 ) -> Result<SqliteIndexedTar, String> {
     if let Some(ip) = index_path {
         if !recreate && !options.index_in_memory && ip.exists() {
-            let meta_ok = std::fs::metadata(ip)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
+            let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
             if meta_ok {
                 match SqliteIndexedTar::open_with_existing_index(
                     archive_path,
@@ -342,11 +325,7 @@ fn open_gzip(
             gzip.checkpoint_count()
         );
         return Ok(Arc::new(open_tar_gzip(
-            path,
-            gzip,
-            index_path,
-            options,
-            recreate,
+            path, gzip, index_path, options, recreate,
         )?));
     }
 
@@ -386,20 +365,13 @@ fn open_gzip(
             FatMountSource::open(&keep).map_err(|e| e.to_string())?,
         ));
     }
-    if let Some(src) = try_stencil_archives_on_path(
-        &data_path,
-        index_path,
-        options,
-        recreate,
-        &mut materialised,
-    )? {
+    if let Some(src) =
+        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
+    {
         return Ok(src);
     }
-    let stripped = strip_compression_suffix(
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file"),
-    );
+    let stripped =
+        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
     Ok(Arc::new(
         SingleFileMountSource::new(stripped, data_path, size, materialised.take())
             .map_err(|e| e.to_string())?,
@@ -414,16 +386,14 @@ fn try_stencil_archives_on_path(
     recreate: bool,
     materialised: &mut Option<tempfile::NamedTempFile>,
 ) -> Result<Option<Arc<dyn MountSource>>, String> {
-    let keep_path = |materialised: &mut Option<tempfile::NamedTempFile>| -> Result<PathBuf, String> {
-        if let Some(tmp) = materialised.take() {
-            tmp.into_temp_path()
-                .keep()
-                .map_err(|e| e.error.to_string())
-                .map(PathBuf::from)
-        } else {
-            Ok(data_path.to_path_buf())
-        }
-    };
+    let keep_path =
+        |materialised: &mut Option<tempfile::NamedTempFile>| -> Result<PathBuf, String> {
+            if let Some(tmp) = materialised.take() {
+                tmp.into_temp_path().keep().map_err(|e| e.error.to_string())
+            } else {
+                Ok(data_path.to_path_buf())
+            }
+        };
 
     if looks_like_iso(data_path) {
         let keep = keep_path(materialised)?;
@@ -471,9 +441,7 @@ fn open_tar_gzip(
 ) -> Result<SqliteIndexedTar, String> {
     if let Some(ip) = index_path {
         if !recreate && !options.index_in_memory && ip.exists() {
-            let meta_ok = std::fs::metadata(ip)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
+            let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
             if meta_ok {
                 match SqliteIndexedTar::open_with_existing_index_gzip(
                     archive_path,
@@ -509,8 +477,7 @@ fn open_seekable_codec(
         body.kind()
     );
 
-    let is_tar =
-        name_suggests_compressed_tar(path) || body_looks_like_tar(&body).unwrap_or(false);
+    let is_tar = name_suggests_compressed_tar(path) || body_looks_like_tar(&body).unwrap_or(false);
 
     if is_tar {
         return Ok(Arc::new(open_tar_body(
@@ -554,13 +521,9 @@ fn open_seekable_codec(
         ));
     }
     let mut materialised = Some(tmp);
-    if let Some(src) = try_stencil_archives_on_path(
-        &data_path,
-        index_path,
-        options,
-        recreate,
-        &mut materialised,
-    )? {
+    if let Some(src) =
+        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
+    {
         return Ok(src);
     }
     if looks_like_libarchive(&data_path) {
@@ -575,11 +538,8 @@ fn open_seekable_codec(
                 .map_err(|e| e.to_string())?,
         ));
     }
-    let stripped = strip_compression_suffix(
-        path.file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or("file"),
-    );
+    let stripped =
+        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
     Ok(Arc::new(
         SingleFileMountSource::new(stripped, data_path, size, materialised.take())
             .map_err(|e| e.to_string())?,
@@ -595,9 +555,7 @@ fn open_tar_body(
 ) -> Result<SqliteIndexedTar, String> {
     if let Some(ip) = index_path {
         if !recreate && !options.index_in_memory && ip.exists() {
-            let meta_ok = std::fs::metadata(ip)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
+            let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
             if meta_ok {
                 match SqliteIndexedTar::open_with_existing_index_body(
                     archive_path,
@@ -707,10 +665,7 @@ pub fn build_mount_source_ex(
         }
         let mut src = open_path(&local_path, &opts, recreate && !opts.read_only_index)?;
         if let Some((ref pat, ref rep)) = comp.transform {
-            src = Arc::new(
-                TransformMountSource::new(pat, rep, src)
-                    .map_err(|e| e)?,
-            );
+            src = Arc::new(TransformMountSource::new(pat, rep, src)?);
         }
         if comp.recursive {
             let opener = open_nested_fn(opts.clone());
@@ -766,7 +721,9 @@ pub fn build_mount_source_ex(
 
 fn strip_source_name(name: &str) -> String {
     let lower = name.to_ascii_lowercase();
-    for suf in [".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar", ".tgz", ".zip", ".7z", ".rar"] {
+    for suf in [
+        ".tar.gz", ".tar.bz2", ".tar.xz", ".tar.zst", ".tar", ".tgz", ".zip", ".7z", ".rar",
+    ] {
         if lower.ends_with(suf) && name.len() > suf.len() {
             return name[..name.len() - suf.len()].to_string();
         }

@@ -8,13 +8,13 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
-use ratarmount_compress::strip_compression_suffix;
 use ratarmount_compositing::{commit_overlay, CommitOverlayOptions, WriteOverlay};
-use std::os::unix::net::UnixListener;
-use std::sync::atomic::{AtomicBool, Ordering};
+use ratarmount_compress::strip_compression_suffix;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_fuse::{mount_blocking, unmount};
 use ratarmount_index::{default_index_folders, parse_index_folders, MEMORY_INDEX};
+use std::os::unix::net::UnixListener;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 mod factory;
 
@@ -111,7 +111,12 @@ struct Args {
     verify_mtime: bool,
 
     /// Gzip seek point spacing in MiB (Python `-gs`; converted to bytes internally)
-    #[arg(short = 'g', long = "gzip-seek-point-spacing", default_value_t = 16.0, visible_alias = "gs")]
+    #[arg(
+        short = 'g',
+        long = "gzip-seek-point-spacing",
+        default_value_t = 16.0,
+        visible_alias = "gs"
+    )]
     gzip_seek_point_spacing_mib: f64,
 
     /// Recursion depth for --recursive (0 = deep default when combined with -r)
@@ -119,7 +124,10 @@ struct Args {
     recursion_depth: i32,
 
     /// Comma-separated recursive extension sets (e.g. `/archive,/compressed` or `/all`)
-    #[arg(long = "recursive-extensions", default_value = "/archive,/compressed,/disk,/split")]
+    #[arg(
+        long = "recursive-extensions",
+        default_value = "/archive,/compressed,/disk,/split"
+    )]
     recursive_extensions: String,
 
     /// Transform all member paths: `--transform REGEX REPLACEMENT`
@@ -228,13 +236,7 @@ fn main() {
         return;
     }
 
-    let use_color = if args.no_color {
-        false
-    } else if args.color {
-        true
-    } else {
-        true // default on
-    };
+    let use_color = !args.no_color; // default on; --no-color disables
     init_logger(args.debug, args.log_file.as_deref(), use_color);
 
     if args.unmount {
@@ -375,18 +377,13 @@ fn main() {
             .filter(|s| !s.is_empty())
             .collect(),
         force_folder_index: args.force_folder_index,
-        ..OpenOptions::default()
     };
 
     if args.force_folder_index {
         eprintln!("info: --force-folder-index accepted; folders still bind-mount without SQLite");
     }
 
-    let file_versions = if args.no_file_versions {
-        false
-    } else {
-        true // default on; --file-versions is explicit enable (same)
-    };
+    let file_versions = !args.no_file_versions;
 
     let mut bundle = match factory::build_mount_source_ex(
         &inputs,
@@ -437,8 +434,8 @@ fn main() {
 
     if let Some(w) = &args.write_overlay {
         let overlay_path = if w.as_os_str() == ":temp:" {
-            let td = tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
-                .expect("temp overlay");
+            let td =
+                tempfile::TempDir::with_prefix("ratarmount-write-overlay.").expect("temp overlay");
             let p = td.path().to_path_buf();
             eprintln!("Created temporary overlay directory: {}", p.display());
             _temp_overlay = Some(td);
@@ -553,9 +550,8 @@ fn init_logger(debug: u8, log_file: Option<&Path>, use_color: bool) {
         _ => log::LevelFilter::Debug,
     };
     // RUST_LOG still wins if set (env_logger convention via filter_or).
-    let mut builder = env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(level.as_str()),
-    );
+    let mut builder =
+        env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
     builder.filter_level(level);
     builder.write_style(if use_color {
         env_logger::WriteStyle::Auto
@@ -602,9 +598,7 @@ fn print_features() {
     println!(
         "  formats: tar,zip,ar,cpio,iso9660,warc,xar,cab,sevenzip,sqlar,squashfs,ext4,fat,asar,ogg,html,pdf,git,libarchive"
     );
-    println!(
-        "  compositing: automount,union,folder,write-overlay,file-versions,prefix,transform"
-    );
+    println!("  compositing: automount,union,folder,write-overlay,file-versions,prefix,transform");
     println!("  remote: http,https,file,s3,ssh,sftp");
     println!("  index: --index-file, --index-folders, :memory:");
     println!("  control: --control-interface (unix socket)");
@@ -632,17 +626,16 @@ fn print_oss_attributions(full: bool) {
     }
     if full {
         println!();
-        println!("Full license texts ship with the respective crates on crates.io / system packages.");
+        println!(
+            "Full license texts ship with the respective crates on crates.io / system packages."
+        );
         println!("This binary is MIT-licensed; see LICENSE in the source tree.");
     }
 }
 
 /// Listen for line-based control commands on a Unix socket.
 fn start_control_interface(mountpoint: &Path, stop: Arc<AtomicBool>) -> Option<PathBuf> {
-    let sock = std::env::temp_dir().join(format!(
-        "ratarmount-control-{}.sock",
-        std::process::id()
-    ));
+    let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
         Ok(l) => l,
@@ -746,7 +739,10 @@ fn path_is_fuse(path: &Path) -> bool {
 fn redirect_stdio_to_null() -> std::io::Result<()> {
     use std::fs::OpenOptions;
     use std::os::unix::io::AsRawFd;
-    let devnull = OpenOptions::new().read(true).write(true).open("/dev/null")?;
+    let devnull = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/null")?;
     let fd = devnull.as_raw_fd();
     unsafe {
         libc::dup2(fd, 0);

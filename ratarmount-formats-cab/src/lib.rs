@@ -14,8 +14,8 @@ use std::time::Instant;
 use flate2::{Decompress, FlushDecompress, Status};
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -105,17 +105,14 @@ impl CabMountSource {
         let mut file = File::open(&archive_path)?;
         let (folders, files) = parse_cab_archive(&mut file)?;
         for folder in &folders {
-            if folder.type_compress != TCOMP_TYPE_NONE && folder.type_compress != TCOMP_TYPE_MSZIP
-            {
+            if folder.type_compress != TCOMP_TYPE_NONE && folder.type_compress != TCOMP_TYPE_MSZIP {
                 return Err(CabError::UnsupportedCompression(folder.type_compress));
             }
         }
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options, folders.clone()) {
                         Ok(s) => return Ok(s),
@@ -322,11 +319,7 @@ impl CabMountSource {
 
 impl MountSource for CabMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -355,14 +348,14 @@ impl MountSource for CabMountSource {
         if file_info.size == 0 {
             return Ok(Box::new(Cursor::new(Vec::new())));
         }
-        let ud = userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing cab userdata")
-        })?;
+        let ud = userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing cab userdata"))?;
         let folder_index = ud.offsetheader.unwrap_or(0) as usize;
         let folder_offset = ud.offset;
-        let folder = self.folders.get(folder_index).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "invalid cab folder")
-        })?;
+        let folder = self
+            .folders
+            .get(folder_index)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid cab folder"))?;
         if folder.type_compress == TCOMP_TYPE_NONE {
             return self.open_store_file(folder_index, folder_offset, file_info.size);
         }
@@ -569,7 +562,14 @@ fn inflate_all(
     payload: &[u8],
     max_out: usize,
 ) -> std::result::Result<Vec<u8>, String> {
-    let mut out = vec![0u8; if max_out == 0 { payload.len() * 4 + 64 } else { max_out }];
+    let mut out = vec![
+        0u8;
+        if max_out == 0 {
+            payload.len() * 4 + 64
+        } else {
+            max_out
+        }
+    ];
     loop {
         let in_off = d.total_in() as usize;
         let out_off = d.total_out() as usize;
@@ -625,11 +625,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {

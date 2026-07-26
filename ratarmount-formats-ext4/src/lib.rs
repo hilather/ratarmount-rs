@@ -79,8 +79,7 @@ impl Ext4MountSource {
             }
         }
 
-        let inner = FolderMountSource::new(&out)
-            .map_err(|e| Ext4Error::Msg(e.to_string()))?;
+        let inner = FolderMountSource::new(&out).map_err(|e| Ext4Error::Msg(e.to_string()))?;
         Ok(Self {
             inner,
             _extract: extract,
@@ -131,14 +130,11 @@ pub fn looks_like_ext4(path: &Path) -> bool {
         return false;
     }
     u16::from_le_bytes(buf) == EXT_MAGIC
-        || path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| {
-                e.eq_ignore_ascii_case("ext4")
-                    || e.eq_ignore_ascii_case("ext3")
-                    || e.eq_ignore_ascii_case("ext2")
-            })
+        || path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+            e.eq_ignore_ascii_case("ext4")
+                || e.eq_ignore_ascii_case("ext3")
+                || e.eq_ignore_ascii_case("ext2")
+        })
 }
 
 fn which_debugfs() -> Option<PathBuf> {

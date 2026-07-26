@@ -7,8 +7,8 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -57,9 +57,7 @@ impl ArMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -76,7 +74,11 @@ impl ArMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -137,15 +139,13 @@ impl ArMountSource {
             let data_offset = file.stream_position()?;
 
             // Skip special GNU/BSD tables for index of regular files only
-            let is_special = name.is_empty()
-                || name == "/"
-                || name == "//"
-                || name.starts_with("#1/");
+            let is_special =
+                name.is_empty() || name == "/" || name == "//" || name.starts_with("#1/");
 
             if !is_special && !name.is_empty() {
                 let full = normpath(&name);
                 let (path, base) = split_name(&full);
-                let mode = (mode_bits & 0o7777) | libc::S_IFREG as u32;
+                let mode = (mode_bits & 0o7777) | libc::S_IFREG;
                 index.insert_file(
                     &path,
                     &base,
@@ -195,11 +195,7 @@ impl ArMountSource {
 
 impl MountSource for ArMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -219,9 +215,8 @@ impl MountSource for ArMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        let ud = userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing AR userdata")
-        })?;
+        let ud = userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing AR userdata"))?;
         let file = File::open(&self.archive_path)?;
         Ok(Box::new(StenciledFile::new(
             file,
@@ -248,9 +243,9 @@ pub fn looks_like_ar(path: &Path) -> bool {
             return true;
         }
     }
-    path.extension()
-        .and_then(|e| e.to_str())
-        .is_some_and(|e| e.eq_ignore_ascii_case("ar") || e.eq_ignore_ascii_case("a") || e.eq_ignore_ascii_case("deb"))
+    path.extension().and_then(|e| e.to_str()).is_some_and(|e| {
+        e.eq_ignore_ascii_case("ar") || e.eq_ignore_ascii_case("a") || e.eq_ignore_ascii_case("deb")
+    })
 }
 
 pub fn default_index_path(archive: &Path) -> PathBuf {
@@ -310,8 +305,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("a.index.sqlite");
-        let ar = ArMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
-            .unwrap();
+        let ar =
+            ArMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true).unwrap();
         let fi = ar.lookup("/bar", 0).expect("bar");
         assert_eq!(fi.size, 4);
         let mut r = ar.open(&fi, 0).unwrap();

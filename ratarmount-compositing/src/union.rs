@@ -83,9 +83,7 @@ impl UnionMountSource {
         max_seconds: f64,
     ) {
         let t0 = Instant::now();
-        warn!(
-            "Building cache for union mount (timeout after {max_seconds}s)..."
-        );
+        warn!("Building cache for union mount (timeout after {max_seconds}s)...");
 
         // Root: only immutable sources (mutable always consulted at runtime).
         let mut entries_left = max_cache_entries;

@@ -196,10 +196,7 @@ fn path_can_create_index(path: &Path) -> bool {
 }
 
 fn test_writable_dir(dir: &Path) -> bool {
-    let probe = dir.join(format!(
-        ".ratarmount-write-test-{}",
-        std::process::id()
-    ));
+    let probe = dir.join(format!(".ratarmount-write-test-{}", std::process::id()));
     match std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)

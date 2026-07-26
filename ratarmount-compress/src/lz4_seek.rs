@@ -62,7 +62,9 @@ impl SeekableLz4 {
             Ok(frames) if !frames.is_empty() => {
                 let size: u64 = frames.iter().map(|f| f.total_uncompressed).sum();
                 // Prefer block index when at least one frame has real multi-block independence.
-                let has_indexed_blocks = frames.iter().any(|f| f.block_independence && f.blocks.len() > 1);
+                let has_indexed_blocks = frames
+                    .iter()
+                    .any(|f| f.block_independence && f.blocks.len() > 1);
                 let only_synthetic = frames.iter().all(|f| !f.block_independence);
                 if only_synthetic && size > DEFAULT_MEMORY_CAP {
                     // Large dependent-only: still expose frame-level restarts if multi-frame;
@@ -202,7 +204,11 @@ impl Lz4BlockReader {
     fn find(&self, pos: u64) -> io::Result<(usize, usize, u64)> {
         if pos >= self.size {
             let fi = self.frames.len().saturating_sub(1);
-            let bi = self.frames.get(fi).map(|f| f.blocks.len().saturating_sub(1)).unwrap_or(0);
+            let bi = self
+                .frames
+                .get(fi)
+                .map(|f| f.blocks.len().saturating_sub(1))
+                .unwrap_or(0);
             return Ok((fi, bi, 0));
         }
         for (fi, frame) in self.frames.iter().enumerate() {
@@ -216,11 +222,7 @@ impl Lz4BlockReader {
                     }
                 }
                 if let Some(last) = frame.blocks.last() {
-                    return Ok((
-                        fi,
-                        frame.blocks.len() - 1,
-                        last.uncompressed_size as u64,
-                    ));
+                    return Ok((fi, frame.blocks.len() - 1, last.uncompressed_size as u64));
                 }
             }
         }

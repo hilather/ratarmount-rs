@@ -10,7 +10,7 @@ use std::time::Instant;
 use std::sync::Arc;
 
 use ratarmount_compress::{
-    FileSegment, SegmentedFile, SeekRead, SeekableBody, SharedSeekableGzip, StenciledFile,
+    FileSegment, SeekRead, SeekableBody, SegmentedFile, SharedSeekableGzip, StenciledFile,
 };
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
@@ -230,9 +230,7 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = body.path().to_path_buf();
-        let mut reader = body
-            .open_reader()
-            .map_err(|e| TarError::Io(e))?;
+        let mut reader = body.open_reader().map_err(TarError::Io)?;
         let backend = ContentBackend::Body(body);
         Self::create_index_from_reader(
             archive_path,
@@ -297,11 +295,7 @@ impl SqliteIndexedTar {
 
 impl MountSource for SqliteIndexedTar {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -325,9 +319,8 @@ impl MountSource for SqliteIndexedTar {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        let ud = tar_userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing TAR userdata")
-        })?;
+        let ud = tar_userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing TAR userdata"))?;
         if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
@@ -339,7 +332,9 @@ impl MountSource for SqliteIndexedTar {
         }
         let reader = self.backend.open_reader()?;
         if ud.issparse {
-            let header_off = ud.offsetheader.unwrap_or(ud.offset.saturating_sub(BLOCK_SIZE));
+            let header_off = ud
+                .offsetheader
+                .unwrap_or(ud.offset.saturating_sub(BLOCK_SIZE));
             return open_sparse_member(reader, header_off, ud.offset, file_info.size);
         }
         Ok(Box::new(StenciledFile::new(
@@ -402,7 +397,7 @@ fn store_arguments(index: &SqliteIndex, options: &OpenOptions) -> Result<()> {
 const BATCH_FLUSH: usize = 512;
 
 fn pad512(n: u64) -> u64 {
-    ((n + BLOCK_SIZE - 1) / BLOCK_SIZE) * BLOCK_SIZE
+    n.div_ceil(BLOCK_SIZE) * BLOCK_SIZE
 }
 
 /// Parsed pax records plus accumulated GNU sparse 0.0 offset/numbytes pairs.
@@ -462,7 +457,10 @@ fn parse_pax_records(data: &[u8]) -> PaxParsed {
 
 /// GNU sparse 1.0 map at the start of the data blocks: `N\noff\nlen\n…` then 512-pad.
 /// Returns `(map pairs, absolute offset of first content byte)`.
-fn parse_sparse_1_0_map<R: Read + Seek>(reader: &mut R, data_start: u64) -> Result<(Vec<(u64, u64)>, u64)> {
+fn parse_sparse_1_0_map<R: Read + Seek>(
+    reader: &mut R,
+    data_start: u64,
+) -> Result<(Vec<(u64, u64)>, u64)> {
     reader.seek(SeekFrom::Start(data_start))?;
     let mut buf = vec![0u8; 512 * 64];
     let n = reader.read(&mut buf)?;
@@ -502,10 +500,7 @@ fn parse_sparse_1_0_map<R: Read + Seek>(reader: &mut R, data_start: u64) -> Resu
 fn sparse_map_from_pax(pax: &PaxParsed) -> Vec<(u64, u64)> {
     // 0.1: GNU.sparse.map = "off,len,off,len,..."
     if let Some(m) = pax.map.get("GNU.sparse.map") {
-        let nums: Vec<u64> = m
-            .split(',')
-            .filter_map(|s| s.trim().parse().ok())
-            .collect();
+        let nums: Vec<u64> = m.split(',').filter_map(|s| s.trim().parse().ok()).collect();
         let mut out = Vec::new();
         let mut i = 0;
         while i + 1 < nums.len() {
@@ -534,7 +529,8 @@ fn parse_tar_into_index<R: Read + Seek>(
     let mut header = [0u8; 512];
     let mut generated_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
-    let mut pax_global: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut pax_global: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
     let mut pax_pending: PaxParsed = PaxParsed {
         map: std::collections::HashMap::new(),
         sparse_pairs: Vec::new(),
@@ -645,10 +641,7 @@ fn parse_tar_into_index<R: Read + Seek>(
         } else {
             parse_name(&header, &options.encoding)
         };
-        let linkname = pax_map
-            .get("linkpath")
-            .cloned()
-            .unwrap_or(linkname);
+        let linkname = pax_map.get("linkpath").cloned().unwrap_or(linkname);
         let mtime = pax_map
             .get("mtime")
             .and_then(|s| s.parse::<f64>().ok())
@@ -747,6 +740,7 @@ fn parse_tar_into_index<R: Read + Seek>(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_entry(
     batch: &mut Vec<FileRow>,
     full_name: &str,
@@ -786,7 +780,7 @@ fn push_entry(
     } else {
         libc::S_IFREG
     };
-    let mode = (mode_bits & 0o7777) | ifmt as u32;
+    let mode = (mode_bits & 0o7777) | ifmt;
 
     // typeflag 'S' is not a digit — store as 0 like Python/sqlite silent conversion, or as byte value.
     // Keep raw byte for diagnostics; Python notes it becomes 0 for non-digit typeflags in some paths.
@@ -834,11 +828,7 @@ fn ensure_parent_dirs(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -1241,9 +1231,8 @@ mod tests {
 
     #[test]
     fn sparse_fixtures_pax_and_gnu() {
-        let root = std::env::var("RATARMOUNT_PY_ROOT").unwrap_or_else(|_| {
-            "/home/mbrewer/projects/ratarmount".into()
-        });
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         for name in [
             "sparse.gnu.tar",
             "sparse.pax.sparse-0.0.tar",

@@ -40,15 +40,12 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 
 /// True if `s` looks like a URL with a scheme (not a bare Windows path).
 pub fn is_remote_url(s: &str) -> bool {
-    if let Ok(u) = Url::parse(s) {
-        match u.scheme() {
-            "http" | "https" | "file" | "ftp" | "s3" | "ssh" | "sftp" | "scp" | "smb"
-            | "webdav" => true,
-            _ => false,
-        }
-    } else {
-        false
-    }
+    Url::parse(s).is_ok_and(|u| {
+        matches!(
+            u.scheme(),
+            "http" | "https" | "file" | "ftp" | "s3" | "ssh" | "sftp" | "scp" | "smb" | "webdav"
+        )
+    })
 }
 
 /// Resolve a path or URL to a local filesystem path suitable for openers.
@@ -95,7 +92,10 @@ fn keep_fetched(input: &str, tmp: NamedTempFile, size: u64) -> Result<RemoteLoca
 pub enum RemoteLocal {
     Local(PathBuf),
     /// Downloaded remote object; path is deleted when dropped unless `persist`.
-    Fetched { path: PathBuf, size: u64 },
+    Fetched {
+        path: PathBuf,
+        size: u64,
+    },
 }
 
 impl RemoteLocal {

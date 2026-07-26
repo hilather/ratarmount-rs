@@ -71,9 +71,7 @@ mod tests {
         if !path.exists() {
             return;
         }
-        assert!(looks_like_zlib_header(
-            &std::fs::read(&path).unwrap()[..2]
-        ));
+        assert!(looks_like_zlib_header(&std::fs::read(&path).unwrap()[..2]));
         let body = open_seekable_zlib(&path).unwrap();
         assert_eq!(body.size(), 12);
         let mut r = body.open_reader().unwrap();

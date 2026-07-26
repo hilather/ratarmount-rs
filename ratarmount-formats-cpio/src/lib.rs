@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -68,9 +68,7 @@ impl CpioMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -87,7 +85,11 @@ impl CpioMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -147,11 +149,7 @@ impl CpioMountSource {
 
 impl MountSource for CpioMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -177,9 +175,8 @@ impl MountSource for CpioMountSource {
                 "is a directory",
             ));
         }
-        let ud = userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing cpio userdata")
-        })?;
+        let ud = userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing cpio userdata"))?;
         let file = File::open(&self.archive_path)?;
         Ok(Box::new(StenciledFile::new(
             file,
@@ -425,6 +422,7 @@ fn parse_bin(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn insert_entry(
     index: &SqliteIndex,
     generated: &mut std::collections::BTreeSet<String>,
@@ -488,7 +486,7 @@ fn insert_entry(
     } else {
         libc::S_IFREG
     };
-    let fmode = (mode & 0o7777) | ifmt as u32;
+    let fmode = (mode & 0o7777) | ifmt;
 
     index.insert_file(
         &path,
@@ -522,11 +520,7 @@ pub fn looks_like_cpio(path: &Path) -> bool {
     if let Ok(mut f) = File::open(path) {
         let mut magic = [0u8; 6];
         if let Ok(n) = f.read(&mut magic) {
-            if n >= 6
-                && (&magic == NEWC_MAGIC
-                    || &magic == CRC_MAGIC
-                    || &magic == ODC_MAGIC)
-            {
+            if n >= 6 && (&magic == NEWC_MAGIC || &magic == CRC_MAGIC || &magic == ODC_MAGIC) {
                 return true;
             }
             if n >= 2 && (&magic[..2] == BIN_MAGIC_LE || &magic[..2] == BIN_MAGIC_BE) {
@@ -579,11 +573,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {

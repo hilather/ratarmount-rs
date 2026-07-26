@@ -110,25 +110,51 @@ pub fn parse_recursive_extensions(spec: &str) -> RecursiveExtSet {
 
 fn set_archive() -> Vec<String> {
     [
-        ".tar", ".tar.gz", ".tgz", ".tar.bz2", ".tbz2", ".tbz", ".tar.xz", ".txz",
-        ".tar.zst", ".tar.zstd", ".tzst", ".zip", ".jar", ".7z", ".rar", ".cab", ".ar",
-        ".a", ".cpio", ".sqlar", ".squashfs", ".asar", ".xar", ".warc",
+        ".tar",
+        ".tar.gz",
+        ".tgz",
+        ".tar.bz2",
+        ".tbz2",
+        ".tbz",
+        ".tar.xz",
+        ".txz",
+        ".tar.zst",
+        ".tar.zstd",
+        ".tzst",
+        ".zip",
+        ".jar",
+        ".7z",
+        ".rar",
+        ".cab",
+        ".ar",
+        ".a",
+        ".cpio",
+        ".sqlar",
+        ".squashfs",
+        ".asar",
+        ".xar",
+        ".warc",
     ]
     .into_iter()
     .map(str::to_string)
     .collect()
 }
 fn set_compressed() -> Vec<String> {
-    [".gz", ".bz2", ".xz", ".zst", ".zstd", ".lz4", ".lzip", ".lz", ".lzo", ".z", ".lzma", ".zlib"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    [
+        ".gz", ".bz2", ".xz", ".zst", ".zstd", ".lz4", ".lzip", ".lz", ".lzo", ".z", ".lzma",
+        ".zlib",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 fn set_disk() -> Vec<String> {
-    [".iso", ".img", ".ext4", ".ext3", ".ext2", ".fat", ".fat12", ".fat16", ".fat32", ".vfat"]
-        .into_iter()
-        .map(str::to_string)
-        .collect()
+    [
+        ".iso", ".img", ".ext4", ".ext3", ".ext2", ".fat", ".fat12", ".fat16", ".fat32", ".vfat",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
 }
 fn set_document() -> Vec<String> {
     [".pdf", ".html", ".htm"]
@@ -150,9 +176,7 @@ fn set_binary() -> Vec<String> {
 }
 fn set_split() -> Vec<String> {
     // common split suffixes 001..099
-    (1..100)
-        .map(|i| format!(".{i:03}"))
-        .collect()
+    (1..100).map(|i| format!(".{i:03}")).collect()
 }
 
 /// Returns true if `name` looks like a mountable nested archive (default extension set).
@@ -255,11 +279,9 @@ impl AutoMountLayer {
         open_nested: OpenNestedFn,
         opts: AutoMountOptions,
     ) -> Self {
-        let transform = opts.transform.and_then(|(pat, rep)| {
-            Regex::new(&pat)
-                .ok()
-                .map(|re| (re, rep))
-        });
+        let transform = opts
+            .transform
+            .and_then(|(pat, rep)| Regex::new(&pat).ok().map(|re| (re, rep)));
         let layer = Self {
             root,
             mounted: Mutex::new(HashMap::new()),
@@ -735,7 +757,9 @@ impl MountSource for AutoMountLayer {
         self.ensure_lazy_mount(&path);
         // Strip-ext: user may look up /foo for archive /foo.tar
         if self.strip_ext || self.lazy {
-            for suf in [".tar", ".tar.gz", ".tgz", ".zip", ".7z", ".tar.bz2", ".tar.xz"] {
+            for suf in [
+                ".tar", ".tar.gz", ".tgz", ".zip", ".7z", ".tar.bz2", ".tar.xz",
+            ] {
                 let candidate = format!("{path}{suf}");
                 self.ensure_lazy_mount(&candidate);
             }
@@ -743,14 +767,18 @@ impl MountSource for AutoMountLayer {
 
         let mounted = self.mounted.lock().expect("automount mutex");
         if let Some(m) = mounted.get(&path) {
-            let mut fi = m.source.lookup("/", 0).unwrap_or_else(create_root_file_info);
+            let mut fi = m
+                .source
+                .lookup("/", 0)
+                .unwrap_or_else(create_root_file_info);
             fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
             fi.size = 0;
             return Some(Self::tag(fi, &path));
         }
         let (mp, rest) = Self::find_mounted_in(&mounted, &path);
         if mp != "/" {
-            let fi = Self::source_at_locked(&self.root, &mounted, mp).lookup(&rest, file_version)?;
+            let fi =
+                Self::source_at_locked(&self.root, &mounted, mp).lookup(&rest, file_version)?;
             return Some(Self::tag(fi, mp));
         }
         let mut fi = self.root.lookup(&path, file_version)?;

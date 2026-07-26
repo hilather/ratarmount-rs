@@ -85,8 +85,8 @@ impl SquashFsMountSource {
             out.clone()
         };
 
-        let inner = FolderMountSource::new(&serve)
-            .map_err(|e| SquashFsError::Msg(e.to_string()))?;
+        let inner =
+            FolderMountSource::new(&serve).map_err(|e| SquashFsError::Msg(e.to_string()))?;
         Ok(Self {
             inner,
             _extract: extract,
@@ -149,10 +149,7 @@ pub fn find_squashfs_offset(path: &Path) -> Result<Option<u64>> {
 }
 
 pub fn looks_like_squashfs(path: &Path) -> bool {
-    find_squashfs_offset(path)
-        .ok()
-        .flatten()
-        .is_some()
+    find_squashfs_offset(path).ok().flatten().is_some()
 }
 
 fn which_unsquashfs() -> Option<PathBuf> {

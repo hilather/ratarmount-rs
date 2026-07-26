@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -57,9 +57,7 @@ impl WarcMountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -76,7 +74,11 @@ impl WarcMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -132,17 +134,18 @@ impl WarcMountSource {
             }
 
             let header_start = pos;
-            let (header_blob, payload_offset) = if let Some(rel) = find_subslice(&data[pos..], b"\r\n\r\n") {
-                let sep = pos + rel;
-                (&data[pos..sep], sep + 4)
-            } else if let Some(rel) = find_subslice(&data[pos..], b"\n\n") {
-                let sep = pos + rel;
-                (&data[pos..sep], sep + 2)
-            } else {
-                return Err(WarcError::Msg(format!(
-                    "WARC record at {pos} missing header terminator"
-                )));
-            };
+            let (header_blob, payload_offset) =
+                if let Some(rel) = find_subslice(&data[pos..], b"\r\n\r\n") {
+                    let sep = pos + rel;
+                    (&data[pos..sep], sep + 4)
+                } else if let Some(rel) = find_subslice(&data[pos..], b"\n\n") {
+                    let sep = pos + rel;
+                    (&data[pos..sep], sep + 2)
+                } else {
+                    return Err(WarcError::Msg(format!(
+                        "WARC record at {pos} missing header terminator"
+                    )));
+                };
 
             let content_length = header_field(header_blob, b"Content-Length")
                 .and_then(|v| std::str::from_utf8(v).ok())
@@ -236,11 +239,7 @@ impl WarcMountSource {
 
 impl MountSource for WarcMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -266,9 +265,8 @@ impl MountSource for WarcMountSource {
                 "is a directory",
             ));
         }
-        let ud = userdata(file_info).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::InvalidInput, "missing warc userdata")
-        })?;
+        let ud = userdata(file_info)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing warc userdata"))?;
         let file = File::open(&self.archive_path)?;
         Ok(Box::new(StenciledFile::new(
             file,
@@ -325,9 +323,7 @@ fn uri_to_path(uri: &str) -> String {
             if let Some(q) = parsed.query() {
                 path = format!("{path}?{q}");
             }
-            return format!("{host}{path}")
-                .trim_start_matches('/')
-                .to_string();
+            return format!("{host}{path}").trim_start_matches('/').to_string();
         }
     }
     let s = uri.trim_start_matches('/');
@@ -341,7 +337,10 @@ fn uri_to_path(uri: &str) -> String {
 fn sanitize_name(name: &str, used: &mut HashMap<String, u32>) -> String {
     let mut name = uri_to_path(name);
     if name.is_empty() || name.ends_with('/') {
-        name = format!("{}index.html", if name.is_empty() { "record" } else { &name });
+        name = format!(
+            "{}index.html",
+            if name.is_empty() { "record" } else { &name }
+        );
     }
     let key = name.clone();
     if let Some(n) = used.get_mut(&key) {
@@ -383,11 +382,7 @@ fn ensure_parents(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -457,9 +452,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("w.index.sqlite");
-        let m =
-            WarcMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
-                .unwrap();
+        let m = WarcMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+            .unwrap();
         let fi = m
             .lookup(
                 "/iipc.github.io/warc-specifications/primers/web-archive-formats/hello-world.txt",
@@ -482,9 +476,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("w.index.sqlite");
-        let m =
-            WarcMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
-                .unwrap();
+        let m = WarcMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+            .unwrap();
         let fi = m.lookup("/example.com/hello.txt", 0).expect("hello");
         let mut r = m.open(&fi, 0).unwrap();
         let mut buf = Vec::new();

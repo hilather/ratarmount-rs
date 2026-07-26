@@ -8,8 +8,8 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
-    SQLiteIndexedTarUserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -58,9 +58,7 @@ impl Iso9660MountSource {
 
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() {
-                let meta_ok = std::fs::metadata(ip)
-                    .map(|m| m.len() > 0)
-                    .unwrap_or(false);
+                let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
                     match Self::open_existing(&archive_path, ip, options) {
                         Ok(s) => return Ok(s),
@@ -77,7 +75,11 @@ impl Iso9660MountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -104,7 +106,7 @@ impl Iso9660MountSource {
         file.seek(SeekFrom::Start(PVD_OFFSET))?;
         let mut pvd = vec![0u8; SECTOR as usize];
         file.read_exact(&mut pvd)?;
-        if pvd.get(0) != Some(&1) || pvd.get(1..6) != Some(b"CD001") {
+        if pvd.first() != Some(&1) || pvd.get(1..6) != Some(b"CD001") {
             return Err(IsoError::Msg(
                 "Not a valid ISO 9660 image (missing primary volume descriptor)".into(),
             ));
@@ -116,14 +118,7 @@ impl Iso9660MountSource {
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         let mut seen = HashSet::new();
-        walk_directory(
-            &mut file,
-            root.extent,
-            root.size,
-            "",
-            &index,
-            &mut seen,
-        )?;
+        walk_directory(&mut file, root.extent, root.size, "", &index, &mut seen)?;
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
@@ -147,11 +142,7 @@ impl Iso9660MountSource {
 
 impl MountSource for Iso9660MountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -290,8 +281,21 @@ fn walk_directory(
             if rec.is_dir {
                 let mode = (libc::S_IFDIR | 0o755) as i64;
                 index.insert_file(
-                    &path, &base, data_off as i64, data_off as i64, 0, 0.0, mode, 0, "", 0, 0,
-                    false, false, false, 0,
+                    &path,
+                    &base,
+                    data_off as i64,
+                    data_off as i64,
+                    0,
+                    0.0,
+                    mode,
+                    0,
+                    "",
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    0,
                 )?;
                 walk_directory(file, rec.extent, rec.size, &full, index, seen)?;
             } else {
@@ -398,9 +402,8 @@ mod tests {
             .unwrap();
         assert!(looks_like_iso(&iso));
         let idx = dir.path().join("i.index.sqlite");
-        let m =
-            Iso9660MountSource::open(&iso, Some(&idx), &OpenOptions::default(), "0.1.0", true)
-                .unwrap();
+        let m = Iso9660MountSource::open(&iso, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+            .unwrap();
         // ISO Level 1 names are uppercase
         let fi = m
             .lookup("/BAR", 0)

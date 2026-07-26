@@ -183,7 +183,11 @@ pub trait SeekableDecoder: Read + Seek + Send {
     fn format(&self) -> CompressionFormat;
 }
 
-fn materialize_from_reader(mut decoder: impl Read, label: &str, path: &Path) -> Result<(NamedTempFile, u64)> {
+fn materialize_from_reader(
+    mut decoder: impl Read,
+    label: &str,
+    path: &Path,
+) -> Result<(NamedTempFile, u64)> {
     let mut tmp = NamedTempFile::new()?;
     let n = copy(&mut decoder, &mut tmp)?;
     tmp.flush()?;
@@ -226,7 +230,11 @@ pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
     materialize_from_reader(decoder, "zstd", path)
 }
 
-fn materialize_from_body(path: &Path, body: Arc<dyn SeekableBody>, label: &str) -> Result<(NamedTempFile, u64)> {
+fn materialize_from_body(
+    path: &Path,
+    body: Arc<dyn SeekableBody>,
+    label: &str,
+) -> Result<(NamedTempFile, u64)> {
     let mut reader = body.open_reader().map_err(CompressError::from)?;
     materialize_from_reader(&mut reader, label, path)
 }
@@ -239,24 +247,14 @@ pub fn materialize(path: &Path, format: CompressionFormat) -> Result<(NamedTempF
         CompressionFormat::Bzip2 => materialize_bzip2(path),
         CompressionFormat::Xz => materialize_xz(path),
         CompressionFormat::Zstd => materialize_zstd(path),
-        CompressionFormat::Lz4 => {
-            materialize_from_body(path, open_seekable_lz4(path)?, "lz4")
-        }
-        CompressionFormat::Lzip => {
-            materialize_from_body(path, open_seekable_lzip(path)?, "lzip")
-        }
-        CompressionFormat::Lzo => {
-            materialize_from_body(path, open_seekable_lzo(path)?, "lzo")
-        }
+        CompressionFormat::Lz4 => materialize_from_body(path, open_seekable_lz4(path)?, "lz4"),
+        CompressionFormat::Lzip => materialize_from_body(path, open_seekable_lzip(path)?, "lzip"),
+        CompressionFormat::Lzo => materialize_from_body(path, open_seekable_lzo(path)?, "lzo"),
         CompressionFormat::CompressZ => {
             materialize_from_body(path, open_seekable_compress_z(path)?, "compress-z")
         }
-        CompressionFormat::Lzma => {
-            materialize_from_body(path, open_seekable_lzma(path)?, "lzma")
-        }
-        CompressionFormat::Zlib => {
-            materialize_from_body(path, open_seekable_zlib(path)?, "zlib")
-        }
+        CompressionFormat::Lzma => materialize_from_body(path, open_seekable_lzma(path)?, "lzma"),
+        CompressionFormat::Zlib => materialize_from_body(path, open_seekable_zlib(path)?, "zlib"),
     }
 }
 

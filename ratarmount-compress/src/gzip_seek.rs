@@ -305,7 +305,11 @@ fn inflate_more(
             state,
             input,
             &mut out[total_written..],
-            if n_in == 0 { MZFlush::Finish } else { MZFlush::None },
+            if n_in == 0 {
+                MZFlush::Finish
+            } else {
+                MZFlush::None
+            },
         );
         match res.status {
             Ok(MZStatus::Ok) | Ok(MZStatus::StreamEnd) | Ok(MZStatus::NeedDict) => {}
@@ -600,7 +604,10 @@ mod tests {
             enc.finish().unwrap();
         }
         let g = SeekableGzip::open(&gz, 16 * 1024).unwrap();
-        assert!(g.checkpoint_count() >= 2, "expected intermediate checkpoints");
+        assert!(
+            g.checkpoint_count() >= 2,
+            "expected intermediate checkpoints"
+        );
         assert_eq!(g.uncompressed_size(), raw.len() as u64);
         let mut r = g.reader().unwrap();
         // Seek near end

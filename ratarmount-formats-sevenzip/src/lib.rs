@@ -15,8 +15,7 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
-    UserData,
+    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{FileRow, IndexError, SqliteIndex};
 use thiserror::Error;
@@ -46,6 +45,7 @@ pub struct SevenZipMountSource {
     archive_path: PathBuf,
     archive: SevenZipArchiveInfo,
     index: SqliteIndex,
+    #[allow(dead_code)] // reserved for shared archive fd / pack streaming
     file: Mutex<File>,
     /// folder_index → fully decompressed folder bytes (small/medium folders).
     folder_cache: Mutex<HashMap<usize, Vec<u8>>>,
@@ -171,13 +171,7 @@ impl SevenZipMountSource {
                     {
                         let fi = entry.folder_index.unwrap();
                         let folder = &archive.folders[fi];
-                        match Self::try_decrypt_entry(
-                            archive_path,
-                            &archive,
-                            entry,
-                            folder,
-                            pw,
-                        ) {
+                        match Self::try_decrypt_entry(archive_path, &archive, entry, folder, pw) {
                             Ok(()) => {
                                 chosen = Some(pw.clone());
                                 break;
@@ -231,17 +225,16 @@ impl SevenZipMountSource {
             ensure_parent_dirs(&mut batch, &path, &mut generated, entry.mtime);
 
             let mut mode = entry.mode;
-            let ifmt = mode & libc::S_IFMT as u32;
-            if entry.is_dir && ifmt != libc::S_IFDIR as u32 {
-                mode = (mode & 0o777) | libc::S_IFDIR as u32;
+            let ifmt = mode & libc::S_IFMT;
+            if entry.is_dir && ifmt != libc::S_IFDIR {
+                mode = (mode & 0o777) | libc::S_IFDIR;
             } else if !entry.is_dir && ifmt == 0 {
-                mode = (mode & 0o777) | libc::S_IFREG as u32;
+                mode = (mode & 0o777) | libc::S_IFREG;
             }
 
             let mut linkname = String::new();
             let mut size = entry.size as i64;
-            if ifmt == libc::S_IFLNK as u32 || (mode & libc::S_IFMT as u32) == libc::S_IFLNK as u32
-            {
+            if ifmt == libc::S_IFLNK || (mode & libc::S_IFMT) == libc::S_IFLNK {
                 // Read symlink target at index time (skip when content-locked).
                 if !content_locked {
                     if let Some(fi) = entry.folder_index {
@@ -334,7 +327,9 @@ impl SevenZipMountSource {
         if (data.len() as u64) >= folder.get_unpack_size() || data.len() >= entry.size as usize {
             Ok(())
         } else {
-            Err(SevenZipError::Msg("password trial produced short data".into()))
+            Err(SevenZipError::Msg(
+                "password trial produced short data".into(),
+            ))
         }
     }
 
@@ -356,7 +351,7 @@ impl SevenZipMountSource {
                 continue;
             }
             if entry.pack_offset == pack_offset && entry.unpack_offset == unpack_offset {
-                let is_link = (file_info.mode & libc::S_IFMT) == libc::S_IFLNK as u32;
+                let is_link = (file_info.mode & libc::S_IFMT) == libc::S_IFLNK;
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
                     return Ok(entry);
                 }
@@ -383,11 +378,8 @@ impl SevenZipMountSource {
                 "Cannot read encrypted 7z member without a password; pass --password".into(),
             )));
         }
-        let pack = decode::FilePackSource::open(
-            &self.archive_path,
-            entry.pack_offset,
-            entry.pack_size,
-        )?;
+        let pack =
+            decode::FilePackSource::open(&self.archive_path, entry.pack_offset, entry.pack_size)?;
         let sizes = self.pack_stream_sizes_for(entry);
         let data = decode::decompress_folder_source(
             folder,
@@ -473,11 +465,7 @@ fn ensure_parent_dirs(
         .collect();
     let mut cur = String::new();
     for (i, part) in parts.iter().enumerate() {
-        let parent = if i == 0 {
-            String::new()
-        } else {
-            cur.clone()
-        };
+        let parent = if i == 0 { String::new() } else { cur.clone() };
         cur = if parent.is_empty() {
             format!("/{part}")
         } else {
@@ -521,11 +509,7 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 
 impl MountSource for SevenZipMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -618,9 +602,8 @@ mod tests {
     use super::*;
 
     fn py_fixture(name: &str) -> PathBuf {
-        let root = std::env::var("RATARMOUNT_PY_ROOT").unwrap_or_else(|_| {
-            "/home/mbrewer/projects/ratarmount".into()
-        });
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join("tests").join(name)
     }
 
@@ -652,14 +635,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("i.sqlite");
-        let m = SevenZipMountSource::open(
-            &path,
-            Some(&idx),
-            &OpenOptions::default(),
-            "0.1.0",
-            true,
-        )
-        .unwrap();
+        let m =
+            SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .unwrap();
         let fi = m.lookup("/a.txt", 0).expect("a.txt");
         let mut r = m.open(&fi, 0).unwrap();
         let mut buf = Vec::new();
@@ -700,14 +678,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("i.sqlite");
-        let m = SevenZipMountSource::open(
-            &path,
-            Some(&idx),
-            &OpenOptions::default(),
-            "0.1.0",
-            true,
-        )
-        .expect("metadata-only mount");
+        let m =
+            SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .expect("metadata-only mount");
         let fi = m.lookup("/secret.txt", 0).expect("list/stat works");
         assert!(fi.size > 0);
         assert!(m.open(&fi, 0).is_err());
@@ -721,14 +694,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("i.sqlite");
-        let m = SevenZipMountSource::open(
-            &path,
-            Some(&idx),
-            &OpenOptions::default(),
-            "0.1.0",
-            true,
-        )
-        .expect("open bcj2");
+        let m =
+            SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .expect("open bcj2");
         // bcj2-x.bin is the typical payload name in the fixture set.
         let fi = m
             .lookup("/bcj2-x.bin", 0)
@@ -754,14 +722,9 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("i.sqlite");
-        let m = SevenZipMountSource::open(
-            &path,
-            Some(&idx),
-            &OpenOptions::default(),
-            "0.1.0",
-            true,
-        )
-        .expect("open bcj+lzma2");
+        let m =
+            SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .expect("open bcj+lzma2");
         if let Some(ListResult::Infos(infos)) = m.list("/") {
             if let Some((_, fi)) = infos.into_iter().find(|(_, i)| i.size > 0) {
                 let mut r = m.open(&fi, 0).unwrap();

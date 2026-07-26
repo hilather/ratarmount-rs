@@ -36,7 +36,8 @@ pub fn find_asar_header(file: &mut File) -> Result<(u64, u64, u64)> {
     let mut magic = [0u8; 16];
     file.read_exact(&mut magic)?;
     let size_of_pickled_size = u32::from_le_bytes(magic[0..4].try_into().unwrap());
-    let size_of_pickled_pickled_pickled_header = u32::from_le_bytes(magic[4..8].try_into().unwrap());
+    let size_of_pickled_pickled_pickled_header =
+        u32::from_le_bytes(magic[4..8].try_into().unwrap());
     let size_of_pickled_pickled_header = u32::from_le_bytes(magic[8..12].try_into().unwrap());
     let size_of_pickled_header = u32::from_le_bytes(magic[12..16].try_into().unwrap());
 
@@ -117,7 +118,11 @@ impl AsarMountSource {
         )
     }
 
-    fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
+    fn open_existing(
+        archive_path: &Path,
+        index_path: &Path,
+        options: &OpenOptions,
+    ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -240,7 +245,10 @@ fn entry_to_row(full_path: &str, entry: &Value, data_offset: u64) -> Option<File
     let size = if is_file {
         entry
             .get("size")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0) as i64
     } else {
         0
@@ -248,7 +256,10 @@ fn entry_to_row(full_path: &str, entry: &Value, data_offset: u64) -> Option<File
     let offset = if is_file {
         let off: u64 = entry
             .get("offset")
-            .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
+            .and_then(|v| {
+                v.as_u64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
             .unwrap_or(0);
         (data_offset + off) as i64
     } else {
@@ -256,31 +267,13 @@ fn entry_to_row(full_path: &str, entry: &Value, data_offset: u64) -> Option<File
     };
 
     Some(FileRow::new(
-        path,
-        name,
-        0,
-        offset,
-        size,
-        0.0,
-        mode,
-        0,
-        "",
-        0,
-        0,
-        false,
-        false,
-        false,
-        0,
+        path, name, 0, offset, size, 0.0, mode, 0, "", 0, 0, false, false, false, 0,
     ))
 }
 
 impl MountSource for AsarMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index
-            .list(path)
-            .ok()
-            .flatten()
-            .map(ListResult::Infos)
+        self.index.list(path).ok().flatten().map(ListResult::Infos)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
