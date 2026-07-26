@@ -1,7 +1,8 @@
-# Phase 9 libarchive-backed formats
-# Note: WARC payload from libarchive includes HTTP response headers (differs from some Python paths).
+# Phase 9 long-tail formats formerly/also covered by libarchive.
+# CAB/XAR/WARC/ISO prefer pure stencil backends when available (same factory path).
 tests/single-file.cab	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.xar	bar	d3b07384d113edec49eaa6238ad5ff00
-tests/hello-world.warc	warc-specifications/primers/web-archive-formats/hello-world.txt	f75a12de31db9d1cbe2b927a0778dbb1
-# .iso.bz2 materializes then libarchive; ISO root exposes bar (not single-file.iso/ prefix)
-tests/single-file.iso.bz2	bar	d3b07384d113edec49eaa6238ad5ff00
+# Pure WARCMountSource layout includes host; payload includes HTTP response headers.
+tests/hello-world.warc	iipc.github.io/warc-specifications/primers/web-archive-formats/hello-world.txt	4aecced75ff52fdd39bb52dae192258f
+# ISO Level-1 names are uppercase via ISO9660MountSource after materialize.
+tests/single-file.iso.bz2	BAR	d3b07384d113edec49eaa6238ad5ff00

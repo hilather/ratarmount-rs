@@ -18,25 +18,28 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | GNU incremental TAR | yes | detect flag only | `[ ]` full semantics |
 | ZIP (store/deflate, symlink, password) | yes | store/deflate; `--password` | `~` encrypted ZIP, multi-disk |
 | Custom SevenZip random-access | yes (fork PR) | yes | `[x]` |
-| AR / CPIO newc | yes | yes | `[x]` |
-| libarchive long-tail (CAB/XAR/WARC/ISO/RAR/…) | yes | yes (sequential open) | `~` random-access quality |
-| SquashFS | yes | no | `[ ]` |
-| EXT4 / FAT images | yes | no (libarchive/ISO only) | `[ ]` |
-| SQLAR | yes | no | `[ ]` |
-| ASAR | yes | no | `[ ]` |
-| PDF / OGG / HTML | yes | no | `[ ]` |
-| Git tree mount | yes | no | `[ ]` |
+| AR / CPIO newc/crc/odc/binary | yes | yes | `[x]` |
+| libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |
+| Stencil CAB / ISO / WARC / XAR (fork RA) | yes (custom) | yes (store/MSZIP CAB; LZX→libarchive) | `[x]` |
+| SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
+| SquashFS | yes | yes (MVP: `unsquashfs` materialize) | `~` in-process reader deferred |
+| EXT4 / FAT images | yes | EXT4 MVP (`debugfs`); FAT pure (`fatfs`) | `~` in-process EXT4 deferred |
+| SQLAR | yes | yes (unencrypted) | `~` sqlcipher encrypted |
+| ASAR | yes | yes (stencil) | `[x]` |
+| PDF / OGG / HTML | yes | PDF attachments (lopdf); OGG demux; HTML data-URLs | `~` PDF images deferred |
+| Git tree mount | yes | yes (`git2`; worktree needs `RATARMOUNT_FORCE_GIT=1`) | `~` |
 | RAR pure / best-effort (beyond libarchive) | yes | libarchive only | `~` |
 
 ### Compression (seekable / outer codecs)
 
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
-| gzip (rapidgzip / seek index) | yes | **materialize (G3)** | `[ ]` seekable / Tier C index import |
-| bzip2 block-parallel | yes | materialize | `[ ]` block map + `-P` |
-| xz multi-block seek | yes | materialize | `[ ]` |
-| zstd multi-frame / seek table | yes | materialize | `[ ]` |
-| lz4 / lzip / lzo / lrz / Z / zlib | yes | no | `[ ]` |
+| gzip (rapidgzip / seek index) | yes | **G3 Tier B seekable** for `.tar.gz`; materialize for plain `.gz` | `~` Tier C blob import still open |
+| bzip2 block-parallel | yes | **Tier B lite** (decode → RAM/temp via `SeekableBody`) | `~` true bit-block map + `-P` |
+| xz multi-block seek | yes | **Tier B lite** (decode → RAM/temp) | `~` liblzma stream index |
+| zstd multi-frame / seek table | yes | **multi-frame map** + single-frame decode | `~` seek-table / `zstdblocks` import |
+| lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
+| lrz | yes | no | `[ ]` |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
 | Split files (`.001`/`.002`) | yes | no | `[ ]` |
 
@@ -45,18 +48,23 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
-| Union of multiple sources | yes | yes | `~` cache knobs incomplete |
-| AutoMount recursive (`-r`) | yes | yes | `~` extension list; strip-ext options |
+| Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
+| AutoMount recursive (`-r`) | yes | yes | `~` |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
-| `--commit-overlay` into archive | yes | no | `[ ]` |
-| File version paths (`.versions/`) | yes | no | `[ ]` |
-| Control interface socket | yes | no | `[ ]` |
-| Lazy mount (`-l`) | yes | no | `[ ]` |
-| Path transform / strip recursive extension | yes | no | `[ ]` |
-| Prefix (`-p`) | yes | no | `[ ]` |
-| FUSE extra options (`-o`) | yes | minimal | `[ ]` |
+| `--commit-overlay` into archive | yes | yes (uncompressed TAR + GNU tar; `--yes`) | `~` compressed TAR |
+| File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
+| Control interface socket | yes | yes (Unix socket: ping/status/unmount) | `~` not in-FS Python control |
+| Lazy mount (`-l`) | yes | yes (mount on first access) | `[x]` |
+| Path transform / strip recursive extension | yes | yes (`-s`, `--transform`, `--transform-recursive-mount-point`) | `[x]` |
+| Recursive extension sets | yes | yes (`--recursive-extensions`) | `[x]` |
+| Prefix (`-p`) | yes | yes | `[x]` |
+| Disable union mount (subfolders) | yes | yes (`--disable-union-mount`) | `[x]` |
+| Password file | yes | yes (`--password-file`) | `[x]` |
+| `--use-backend` | yes | accepted (priority list stored) | `~` |
+| FUSE extra options (`-o`) | yes | yes | `[x]` |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
+| Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |
 
 ### Remote I/O
 
@@ -76,15 +84,15 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | SQLite index 0.7.x schema | yes | yes | `[x]` |
 | Cross-open Py↔Rust index (TAR core) | yes | yes | `~` compression side tables |
-| `--index-file` / `:memory:` | yes | path only | `~` `:memory:` |
-| `--index-folders` / XDG cache | yes | no | `[ ]` |
+| `--index-file` / `:memory:` | yes | yes | `[x]` |
+| `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
 | Index file hashes / xattrs | yes | no | `[ ]` |
 | `--use-backend` selection | yes | fixed factory order | `[ ]` |
-| Encoding (`-e`) | yes | hard-coded utf-8 | `[ ]` |
-| Debug / log-file / color | yes | env_logger only | `[ ]` |
+| Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
+| Debug / log-file / color | yes | `-d` + `--log-file`; no color | `~` |
 | OSS attributions | yes | no | `[ ]` |
 | Parallelization matrix (`-P backend:n`) | yes | flag reserved | `[ ]` |
-| Default mountpoint (strip extension) | yes | requires explicit mp | `[ ]` |
+| Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)
 
@@ -96,7 +104,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | ZIP store stencil + deflate cache | `[x]` |
 | SevenZip solid streaming (large folders) | `[ ]` progressive decoder |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
-| Seekable codecs (drop materialize for gzip+) | `[ ]` |
+| Seekable codecs (drop materialize for gzip+) | `~` all four via SeekableBody; true block maps still partial |
 | Benchmark gates in CI (`rust-gates.json`) | `[ ]` |
 
 ---
@@ -105,19 +113,20 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 ### Current Rust harness (allowlists)
 
-~40 fixture lines across phases 2–11 + sevenzip/http/remote.  
-Python has **100+** fixed archives and three large shells: fixed-archive, complex-usage, remote-backend.
+~90+ fixture lines across phases 2–11 + sevenzip/sqlar/squashfs/ext4/http/remote + index interop.  
+Python has **100+** fixed archives and three large shells: fixed-archive, complex-usage, remote-backend.  
+Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔Rust SQLite).
 
 ### Harness expansion TODO
 
 | Priority | Work | Exit criteria |
 |----------|------|----------------|
-| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | No silent skips for supported formats |
-| P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | Documented wrapper; CI job |
-| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | store, lzma2, nested `-r`, encrypted |
-| P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | Subset of `run-complex-usage-tests.sh` green |
+| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 ~26 TAR; phase6 ZIP; phase9 AR/7z grown |
+| P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | `[x]` `run-fixed-archive-subset.sh` |
+| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large; encrypted/nested still open |
+| P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `~` complex harness + commit-overlay; phase2 versions paths |
 | P1 | Remote: SSH fixture server (`start-asyncssh-server.py`) + optional S3/MinIO | Live optional; unit always |
-| P1 | Index interop golden: Py builds index → Rust mounts; reverse | TAR + ZIP + 7z |
+| P1 | Index interop golden: Py builds index → Rust mounts; reverse | `[x]` TAR+ZIP+7z py→rs; TAR rs→py |
 | P2 | Full fixed-archive (≥90% of ~174 triples) | Gap list in `docs/parity-gaps.md` |
 | P2 | Style/clippy/fmt + `cargo deny` / license attributions | CI |
 | P2 | Perf regression job from `benchmarks/baselines/rust-gates.json` | Fail on >20% regression |
@@ -139,22 +148,34 @@ Python has **100+** fixed archives and three large shells: fixed-archive, comple
 |------|--------|
 | Makefile release/install | `[x]` |
 | Daemonize default | `[x]` |
-| AppImage / distro packages | `[ ]` |
+| AppImage / distro packages | `~` `packaging/build-appimage.sh` + desktop; needs linuxdeploy host |
 | crates.io library publish policy | `[ ]` |
 | Pure FUSE ABI (Annex A) | `[ ]` deferred; fuser stays product path |
-| Phase 12: Python deprecation timeline | `[ ]` after parity gates |
+| GitHub CI (fmt/clippy/test) | `[x]` `.github/workflows/ci.yml` |
+| GitHub CI FUSE allowlist suite | `[x]` (fixtures from mxmlnkn/ratarmount) |
+| Phase 12: Python deprecation timeline | `~` scaffold [`docs/phase12-dual-run.md`](phase12-dual-run.md) |
 
 ---
 
 ## 4. Suggested implementation order
 
-1. **CLI flag parity** for harness-critical options (`--index-folders`, default mountpoint, `-e`, `-d`, `-o` pass-through).  
-2. **Seekable gzip (or import Python gzip index tables)** — closes largest architectural gap vs rapidgzip.  
-3. **Test harness expansion** to full fixed-archive allowlist growth + Py interop goldens.  
-4. **SquashFS / EXT4 / SQLAR** as needed by allowlist failures (libarchive or pure).  
-5. **`--commit-overlay`**, file versions, control interface.  
-6. **Packaging (AppImage)** + CI gates.  
-7. **Phase 12** announce dual-run → Rust primary.
+1. ~~**CLI flag parity**~~ — done: `--index-folders`, `:memory:`, default mountpoint, `-e`, `-d`, `--log-file`, `-o`.  
+2. ~~**Seekable gzip (G3 Tier B)**~~ — done for `.tar.gz`/`.tgz` via `miniz_oxide` checkpoints; plain `.gz` still materializes; Tier C import deferred.  
+3. ~~**Seekable bzip2 / xz / zstd**~~ — done: shared `SeekableBody`; zstd multi-frame map; bz2/xz one-shot decode to RAM/temp (true block-parallel / xz index / zstd seek-table still open).  
+4. ~~**Test harness expansion**~~ — phase2–9 allowlists grown; `run-index-interop.sh` (Py↔Rust); fixed-archive wrapper ready (`RUN=1`). Continue complex-usage subset + full fixed-archive gap list.  
+5. ~~**SquashFS / SQLAR**~~ — SQLAR pure; SquashFS via `unsquashfs` MVP.  
+6. ~~**`--commit-overlay`**~~ — done for uncompressed TAR via GNU tar (`--yes` for non-interactive).  
+7. ~~**File versions + prefix + control**~~ — `.versions/`, `-p`, Unix control socket.  
+8. ~~**Lazy + strip/transform recursive**~~ — `-l`, `-s`, `--transform-recursive-mount-point`.  
+9. ~~**CI gates**~~ — fmt/clippy/test + FUSE allowlist job. Packaging notes in `docs/packaging.md`.  
+10. ~~**EXT4 MVP**~~ — `debugfs` rdump → FolderMountSource; harness `phase9-ext4`.  
+10b. ~~**FAT images**~~ — pure Rust `fatfs` (FAT12/16/32); harness `phase9-fat`.  
+11. ~~**AppImage scaffolding**~~ — `packaging/build-appimage.sh` (linuxdeploy when installed). Full CI AppImage optional.  
+12. ~~**Python fork parity**~~ — done: [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md).  
+13. ~~**ASAR**~~ — stencil `ASARMountSource`; harness `phase9-asar`.  
+14. ~~**OGG / HTML / PDF / Git / zlib**~~ — OGG demux; HTML data-URLs; PDF attachments; Git via git2; zlib seekable.  
+15. ~~**Mount options CLI parity**~~ — high-impact flags: password-file, recursive-extensions, transform, disable-union, no-recreate-index, gnu-incremental, color, oss-attributions; matrix: [`docs/mount-options-parity.md`](mount-options-parity.md).  
+16. **Phase 12** dual-run announce → Rust primary — scaffold: [`docs/phase12-dual-run.md`](phase12-dual-run.md); execute after residual gates.
 
 ---
 
@@ -163,3 +184,5 @@ Python has **100+** fixed archives and three large shells: fixed-archive, comple
 - Design: `../ratarmount/docs/design-rust-rewrite.md` (or copy into this repo later)
 - Benchmarks: `benchmarks/python-vs-rust-results.md`
 - Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
+- **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
+- **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)

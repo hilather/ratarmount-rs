@@ -1,0 +1,6 @@
+# SQLAR + SquashFS (MVP)
+# archive <TAB> path <TAB> md5
+tests/nested-tar.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-tar-denormal.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/folder-symlink.no-compression.squashfs	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/folder-symlink.gzip.squashfs	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc

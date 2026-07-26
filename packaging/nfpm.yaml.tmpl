@@ -1,0 +1,25 @@
+# Generated/filled by packaging/build-native-packages.sh
+name: "@NAME@"
+arch: "@ARCH@"
+platform: linux
+version: "@VERSION@"
+section: utils
+priority: optional
+maintainer: "@MAINTAINER@"
+description: |
+  Random Access To Archived Resources — mount archives via FUSE.
+  Native Rust rewrite of ratarmount with SQLite indexes and multi-format support.
+vendor: ratarmount-rs
+homepage: https://github.com/hilather/ratarmount-rs
+license: MIT
+contents:
+  - src: target/release/ratarmount
+    dst: /usr/bin/ratarmount
+    file_info:
+      mode: 0755
+  - src: packaging/ratarmount.desktop
+    dst: /usr/share/applications/ratarmount.desktop
+    file_info:
+      mode: 0644
+depends:
+@DEPENDS@

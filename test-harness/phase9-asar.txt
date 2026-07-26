@@ -1,0 +1,3 @@
+# Electron ASAR
+# archive <TAB> path <TAB> md5
+tests/nested-tar.asar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc

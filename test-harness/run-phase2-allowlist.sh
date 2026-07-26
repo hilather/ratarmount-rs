@@ -111,7 +111,8 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
             continue
         fi
         target="$mp/$path_in"
-        if [[ ! -e "$target" ]]; then
+        # -L: broken symlinks are still valid archive members (-e is false for dangling links).
+        if [[ ! -e "$target" && ! -L "$target" ]]; then
             echo "  [FAIL] missing mounted path: $path_in"
             ls -laR "$mp" || true
             fusermount3 -u "$mp" 2>/dev/null || true
@@ -119,13 +120,17 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
             failed=1
             continue
         fi
-        if [[ -f "$target" ]]; then
-            got=$(md5sum -- "$target" | awk '{print $1}')
-            if [[ -n "${expected_md5:-}" && "$got" != "$expected_md5" ]]; then
-                echo "  [FAIL] md5 mismatch for $path_in: got $got want $expected_md5"
-                failed=1
+        if [[ -f "$target" || -L "$target" ]]; then
+            if [[ -z "${expected_md5:-}" || "$expected_md5" == "." ]]; then
+                echo "  [ok] path exists $path_in"
             else
-                echo "  [ok] md5 $got"
+                got=$(md5sum -- "$target" | awk '{print $1}')
+                if [[ "$got" != "$expected_md5" ]]; then
+                    echo "  [FAIL] md5 mismatch for $path_in: got $got want $expected_md5"
+                    failed=1
+                else
+                    echo "  [ok] md5 $got"
+                fi
             fi
         else
             echo "  [ok] path exists (dir) $path_in"

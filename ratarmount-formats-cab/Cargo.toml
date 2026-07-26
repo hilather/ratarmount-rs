@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-cab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Microsoft CAB MountSource (store + MSZIP)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

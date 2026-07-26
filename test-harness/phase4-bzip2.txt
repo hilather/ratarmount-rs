@@ -1,2 +1,5 @@
 # Phase 4 bzip2
+# Plain single-file
 tests/simple.bz2	simple	19696f24a91fc4e8950026f9c801a0d0
+# Seekable body path for compressed TAR (no NamedTempFile materialize in factory)
+tests/file-with-attribute.gnu.tar.bz2	foo	c157a79031e1c40f85931829bc5fc552

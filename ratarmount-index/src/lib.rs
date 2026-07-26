@@ -1,5 +1,12 @@
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
 
+mod location;
+
+pub use location::{
+    default_index_folders, default_index_path, expand_user, parse_index_folders,
+    possible_index_paths, resolve_index_location, IndexLocation, MEMORY_INDEX,
+};
+
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -216,6 +223,52 @@ impl SqliteIndex {
         })
     }
 
+    /// Seal a writable build into a read-only mount index (keeps in-memory DBs alive).
+    ///
+    /// Prefer this over `drop` + `open_read_only` so `--index-file :memory:` works and
+    /// we avoid an extra open syscall for on-disk indexes.
+    pub fn into_read_only(mut self) -> Result<Self> {
+        self.finalize_build()?;
+        if !self.read_only {
+            self.with_conn(|conn| {
+                // Drop intermediary tables so Python's completeness check accepts the index.
+                let _ = conn.execute_batch(
+                    r#"
+                    DROP TABLE IF EXISTS "filestmp";
+                    DROP TABLE IF EXISTS "parentfolders";
+                    "#,
+                );
+                conn.execute_batch(
+                    r#"
+                    PRAGMA locking_mode = NORMAL;
+                    PRAGMA query_only = ON;
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA cache_size = -65536;
+                    PRAGMA mmap_size = 268435456;
+                    "#,
+                )?;
+                Ok(())
+            })?;
+            self.read_only = true;
+        }
+        if self.mem.is_none() {
+            if let Ok(n) = self.file_count_db() {
+                if n > 0 && n <= 500_000 {
+                    self.mem = Some(self.load_mem_index()?);
+                }
+            }
+        }
+        if let Some(path) = &self.path {
+            println!(
+                "Successfully loaded offset dictionary from {}",
+                path.display()
+            );
+        } else {
+            println!("Successfully loaded offset dictionary from :memory:");
+        }
+        Ok(self)
+    }
+
     pub fn path(&self) -> Option<&Path> {
         self.path.as_deref()
     }
@@ -309,6 +362,30 @@ impl SqliteIndex {
             return Ok(m.count);
         }
         self.file_count_db()
+    }
+
+    /// Number of distinct index rows (versions) for `path` (0 if missing).
+    pub fn version_count(&self, path: &str) -> Result<u32> {
+        let path = query_normpath(path);
+        if path == "/" {
+            return Ok(1);
+        }
+        let (dir, name) = split_path(&path);
+        if let Some(mem) = &self.mem {
+            return Ok(mem
+                .by_key
+                .get(&(dir, name))
+                .map(|v| v.len() as u32)
+                .unwrap_or(0));
+        }
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                r#"SELECT COUNT(*) FROM "files" WHERE "path" = ?1 AND "name" = ?2"#,
+                params![dir, name],
+                |r| r.get(0),
+            )?;
+            Ok(n as u32)
+        })
     }
 
     pub fn lookup(&self, path: &str, file_version: i32) -> Result<Option<FileInfo>> {

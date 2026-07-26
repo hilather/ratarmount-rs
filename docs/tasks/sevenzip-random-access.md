@@ -1,9 +1,9 @@
 # Task: Port SevenZip random-access backend (from hilather/ratarmount PR #1)
 
-**Status:** **done** (2026-07-25)  
+**Status:** **done** (2026-07-25 baseline; **2026-07-26** BCJ2 / stream pack / metadata-only encrypt)  
 **Priority:** high (parity + performance vs libarchive/py7zr)  
 **Source PR:** https://github.com/hilather/ratarmount/pull/1  
-**Merged commit (Python):** `231147e` on branch `feature/sevenzip-random-access` in `hilather/ratarmount`
+**Merged commit (Python):** tip `35a089b` on branch `feature/sevenzip-random-access` in `hilather/ratarmount`
 
 ## Implementation location
 
@@ -24,7 +24,10 @@
 - [x] Nested: `nested-inner-hello.7z` with `-r` → `inner-hello.7z/hello.txt`
 - [x] Encrypted: `encrypted-hello.7z` with `--password secret`
 - [x] Unit tests + harness allowlist green
-- [ ] Progressive streaming decoder for huge solid folders (currently full-folder cache; fine for fixtures ≤64 MiB unpacked)
+- [x] BCJ / BCJ2 multi-stream (`bcj2-*.7z`, `bcj-lzma2-x86.7z`)
+- [x] Metadata-only encrypted mount (list/stat without password)
+- [x] FilePackSource + AES range decrypt (pack not always fully preloaded)
+- [ ] Progressive streaming decoder that never materializes full unpack for multi-GB solids (folder cache still used; fine for fixtures)
 
 ## Goal
 

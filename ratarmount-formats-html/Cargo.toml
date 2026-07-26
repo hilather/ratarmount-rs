@@ -1,0 +1,20 @@
+[package]
+name = "ratarmount-formats-html"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTML data-URL extract MountSource (backendName=HTMLMountSource)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+base64 = "0.22"
+sha2 = "0.10"
+regex = "1"
+percent-encoding = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

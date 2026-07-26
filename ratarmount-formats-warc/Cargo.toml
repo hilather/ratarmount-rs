@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-warc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "WARC MountSource with random access via record payload offsets"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+url = "2"
+
+[dev-dependencies]
+tempfile.workspace = true

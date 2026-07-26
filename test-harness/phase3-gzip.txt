@@ -1,3 +1,6 @@
 # Phase 3 gzip allowlist
 # archive_relpath <TAB> path_inside <TAB> optional_md5
+# Plain gzip (materialize path)
 tests/simple.gz	simple	19696f24a91fc4e8950026f9c801a0d0
+# Seekable gzip + TAR (.tar.gz — G3 Tier B checkpoints, no full materialize of body)
+tests/packed-5-times.tar.gz	ufo_03.tar	a82c46a7511715386a2aa62c11cf7287

@@ -59,7 +59,13 @@ pub struct StatFs {
 pub struct OpenOptions {
     pub write_index: bool,
     pub clear_index_cache: bool,
+    /// Explicit `--index-file` path, or `None` to resolve via `index_folders`.
+    /// The special value `:memory:` is represented by `index_in_memory = true`.
     pub index_file_path: Option<PathBuf>,
+    /// When true, keep the SQLite index purely in memory (`--index-file :memory:`).
+    pub index_in_memory: bool,
+    /// Folders to try for index storage (empty entry = next to archive).
+    /// Empty vec means use Python-compatible defaults at resolve time.
     pub index_folders: Vec<PathBuf>,
     pub verify_modification_time: bool,
     pub index_minimum_file_count: u64,
@@ -68,10 +74,17 @@ pub struct OpenOptions {
     pub ignore_zeros: bool,
     pub gnu_incremental: Option<bool>,
     pub parallelization: u32,
+    /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
     /// Passwords for encrypted archives (7z AES, ZIP, …). Tried in order.
     pub passwords: Vec<String>,
+    /// Preferred backends (Python `--use-backend`); last has highest priority.
+    pub use_backends: Vec<String>,
+    /// Never create/modify indexes (`--no-recreate-index`).
+    pub read_only_index: bool,
+    /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
+    pub force_folder_index: bool,
 }
 
 impl Default for OpenOptions {
@@ -80,6 +93,7 @@ impl Default for OpenOptions {
             write_index: true,
             clear_index_cache: false,
             index_file_path: None,
+            index_in_memory: false,
             index_folders: Vec::new(),
             verify_modification_time: false,
             // Harness always forces 0 via CLI; default matches common interactive use later.
@@ -92,6 +106,9 @@ impl Default for OpenOptions {
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
+            use_backends: Vec::new(),
+            read_only_index: false,
+            force_folder_index: false,
         }
     }
 }

@@ -739,17 +739,69 @@ impl Filesystem for RatarmountFs {
     }
 }
 
+/// Parse a Python-style `-o` / `--fuse` comma-separated option string into `MountOption`s.
+///
+/// Unknown tokens become `MountOption::CUSTOM` (passed through to libfuse/kernel).
+pub fn parse_fuse_options(s: &str) -> Vec<MountOption> {
+    s.split(',')
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .map(mount_option_from_str)
+        .collect()
+}
+
+fn mount_option_from_str(s: &str) -> MountOption {
+    match s {
+        "auto_unmount" => MountOption::AutoUnmount,
+        "allow_other" => MountOption::AllowOther,
+        "allow_root" => MountOption::AllowRoot,
+        "default_permissions" => MountOption::DefaultPermissions,
+        "dev" => MountOption::Dev,
+        "nodev" => MountOption::NoDev,
+        "suid" => MountOption::Suid,
+        "nosuid" => MountOption::NoSuid,
+        "ro" => MountOption::RO,
+        "rw" => MountOption::RW,
+        "exec" => MountOption::Exec,
+        "noexec" => MountOption::NoExec,
+        "atime" => MountOption::Atime,
+        "noatime" => MountOption::NoAtime,
+        "dirsync" => MountOption::DirSync,
+        "sync" => MountOption::Sync,
+        "async" => MountOption::Async,
+        x if x.starts_with("fsname=") => MountOption::FSName(x[7..].into()),
+        x if x.starts_with("subtype=") => MountOption::Subtype(x[8..].into()),
+        x => MountOption::CUSTOM(x.into()),
+    }
+}
+
 /// Mount `source` at `mountpoint` (blocking).
+///
+/// `extra_fuse_opts` is the `-o` / `--fuse` string (comma-separated).
 pub fn mount_blocking(
     source: Arc<dyn MountSource>,
     mountpoint: impl AsRef<Path>,
     foreground: bool,
     writable: bool,
     overlay: Option<Arc<WriteOverlay>>,
+    extra_fuse_opts: &str,
 ) -> std::io::Result<()> {
     let mut options = vec![MountOption::FSName("ratarmount".into())];
     if !writable {
         options.push(MountOption::RO);
+    }
+    for opt in parse_fuse_options(extra_fuse_opts) {
+        // User `-o rw` can override default RO for writable overlays; for RO mounts keep RO.
+        match &opt {
+            MountOption::RW if !writable => continue,
+            MountOption::RO => {}
+            MountOption::FSName(_) => {
+                // Prefer user-supplied fsname if present.
+                options.retain(|o| !matches!(o, MountOption::FSName(_)));
+            }
+            _ => {}
+        }
+        options.push(opt);
     }
     let _ = foreground;
     let fs = RatarmountFs::new(source, overlay);

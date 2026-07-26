@@ -1,0 +1,3 @@
+# HTML / PDF / zlib (OGG covered by unit tests; no .ogg fixture in ratarmount)
+tests/simple.zlib	simple	19696f24a91fc4e8950026f9c801a0d0
+tests/pypdf-minimal-single-attachment.pdf	test.bin	079c08eedea9b8ef267387cf08df9e10

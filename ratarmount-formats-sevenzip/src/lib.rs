@@ -50,6 +50,8 @@ pub struct SevenZipMountSource {
     /// folder_index → fully decompressed folder bytes (small/medium folders).
     folder_cache: Mutex<HashMap<usize, Vec<u8>>>,
     password: Option<String>,
+    /// Encrypted archive mounted without a valid password: list/stat only.
+    content_locked: bool,
     #[allow(dead_code)]
     options: OpenOptions,
 }
@@ -63,19 +65,29 @@ impl SevenZipMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
-        let default_index = {
-            let mut s = archive_path.as_os_str().to_os_string();
-            s.push(".index.sqlite");
-            PathBuf::from(s)
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            Some(index_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
+                let mut s = archive_path.as_os_str().to_os_string();
+                s.push(".index.sqlite");
+                PathBuf::from(s)
+            }))
         };
-        let index_path = index_path.unwrap_or(&default_index);
 
-        if !recreate && index_path.exists() {
-            if let Ok(s) = Self::open_existing(&archive_path, index_path, options) {
-                return Ok(s);
+        if let Some(ref ip) = index_path_buf {
+            if !recreate && ip.exists() {
+                if let Ok(s) = Self::open_existing(&archive_path, ip, options) {
+                    return Ok(s);
+                }
             }
         }
-        Self::create_index(&archive_path, index_path, options, product_version)
+        Self::create_index(
+            &archive_path,
+            index_path_buf.as_deref(),
+            options,
+            product_version,
+        )
     }
 
     fn open_existing(
@@ -89,6 +101,8 @@ impl SevenZipMountSource {
             decode::decompress_folder(folder, packed, password.as_deref())
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+        let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
+        let content_locked = encrypted && password.is_none();
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
@@ -98,13 +112,14 @@ impl SevenZipMountSource {
             file: Mutex::new(file),
             folder_cache: Mutex::new(HashMap::new()),
             password,
+            content_locked,
             options: options.clone(),
         })
     }
 
     fn create_index(
         archive_path: &Path,
-        index_path: &Path,
+        index_path: Option<&Path>,
         options: &OpenOptions,
         product_version: &str,
     ) -> Result<Self> {
@@ -122,54 +137,75 @@ impl SevenZipMountSource {
         })?;
 
         let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
+        let mut content_locked = false;
         let password = if encrypted {
-            let mut chosen = None;
-            let mut last_err = None;
-            for pw in &options.passwords {
-                if let Some(entry) = archive
-                    .files
-                    .iter()
-                    .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
-                {
-                    let fi = entry.folder_index.unwrap();
-                    let folder = &archive.folders[fi];
-                    file.seek(SeekFrom::Start(entry.pack_offset))?;
-                    let mut packed = vec![0u8; entry.pack_size as usize];
-                    if file.read_exact(&mut packed).is_err() {
-                        continue;
-                    }
-                    match decode::decompress_folder(folder, &packed, Some(pw.as_str())) {
-                        Ok(data)
-                            if (data.len() as u64) >= folder.get_unpack_size()
-                                || data.len() >= entry.size as usize =>
-                        {
-                            chosen = Some(pw.clone());
-                            break;
-                        }
-                        Ok(_) => continue,
-                        Err(e) => {
-                            last_err = Some(e);
-                            continue;
-                        }
-                    }
-                } else {
-                    chosen = Some(pw.clone());
-                    break;
+            // Verify codecs are supported when a password would be used.
+            for folder in &archive.folders {
+                if folder.is_encrypted() && !folder.is_supported_for_open(true) {
+                    return Err(SzError::Seven(SevenZipError::Msg(format!(
+                        "Unsupported encrypted 7z coder chain: {:?}",
+                        folder
+                            .coders
+                            .iter()
+                            .map(|c| format!("{:02x?}", c.method))
+                            .collect::<Vec<_>>()
+                    ))));
                 }
             }
-            if chosen.is_none() {
-                return Err(SzError::Seven(last_err.unwrap_or_else(|| {
-                    SevenZipError::Msg(
-                        "7z archive contents are encrypted; pass --password".into(),
-                    )
-                })));
+            if options.passwords.is_empty() {
+                // Metadata-only mount: list/stat work; open requires password.
+                eprintln!(
+                    "warning: 7z archive contents are encrypted; mounting metadata only. \
+                     Pass --password to read file contents."
+                );
+                content_locked = true;
+                None
+            } else {
+                let mut chosen = None;
+                let mut last_err = None;
+                for pw in &options.passwords {
+                    if let Some(entry) = archive
+                        .files
+                        .iter()
+                        .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
+                    {
+                        let fi = entry.folder_index.unwrap();
+                        let folder = &archive.folders[fi];
+                        match Self::try_decrypt_entry(
+                            archive_path,
+                            &archive,
+                            entry,
+                            folder,
+                            pw,
+                        ) {
+                            Ok(()) => {
+                                chosen = Some(pw.clone());
+                                break;
+                            }
+                            Err(e) => {
+                                last_err = Some(e);
+                                continue;
+                            }
+                        }
+                    } else {
+                        chosen = Some(pw.clone());
+                        break;
+                    }
+                }
+                if chosen.is_none() {
+                    return Err(SzError::Seven(last_err.unwrap_or_else(|| {
+                        SevenZipError::Msg(
+                            "Could not decrypt 7z archive with the provided password(s)".into(),
+                        )
+                    })));
+                }
+                chosen
             }
-            chosen
         } else {
             options.passwords.first().cloned()
         };
 
-        let index = SqliteIndex::create_writable(Some(index_path))?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
 
         let mut batch = Vec::new();
@@ -206,16 +242,18 @@ impl SevenZipMountSource {
             let mut size = entry.size as i64;
             if ifmt == libc::S_IFLNK as u32 || (mode & libc::S_IFMT as u32) == libc::S_IFLNK as u32
             {
-                // Read symlink target at index time.
-                if let Some(fi) = entry.folder_index {
-                    if let Ok(bytes) = read_member_bytes_static(
-                        &mut file,
-                        &archive,
-                        entry,
-                        &archive.folders[fi],
-                        password.as_deref(),
-                    ) {
-                        linkname = String::from_utf8_lossy(&bytes).into_owned();
+                // Read symlink target at index time (skip when content-locked).
+                if !content_locked {
+                    if let Some(fi) = entry.folder_index {
+                        if let Ok(bytes) = read_member_bytes_static(
+                            &mut file,
+                            &archive,
+                            entry,
+                            &archive.folders[fi],
+                            password.as_deref(),
+                        ) {
+                            linkname = String::from_utf8_lossy(&bytes).into_owned();
+                        }
                     }
                 }
                 size = 0;
@@ -258,7 +296,6 @@ impl SevenZipMountSource {
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
         store_stats(&index, archive_path)?;
         index.commit_write()?;
-        index.finalize_build()?;
 
         let secs = t0.elapsed().as_secs_f64();
         println!(
@@ -266,8 +303,7 @@ impl SevenZipMountSource {
             archive_path.display()
         );
 
-        drop(index);
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
@@ -275,8 +311,35 @@ impl SevenZipMountSource {
             file: Mutex::new(file),
             folder_cache: Mutex::new(HashMap::new()),
             password,
+            content_locked,
             options: options.clone(),
         })
+    }
+
+    fn try_decrypt_entry(
+        archive_path: &Path,
+        archive: &SevenZipArchiveInfo,
+        entry: &SevenZipFileEntry,
+        folder: &parse::Folder,
+        password: &str,
+    ) -> std::result::Result<(), SevenZipError> {
+        let pack = decode::FilePackSource::open(archive_path, entry.pack_offset, entry.pack_size)?;
+        let sizes = pack_stream_sizes(archive, entry);
+        let data = decode::decompress_folder_source(
+            folder,
+            Box::new(pack),
+            Some(password),
+            sizes.as_deref(),
+        )?;
+        if (data.len() as u64) >= folder.get_unpack_size() || data.len() >= entry.size as usize {
+            Ok(())
+        } else {
+            Err(SevenZipError::Msg("password trial produced short data".into()))
+        }
+    }
+
+    fn pack_stream_sizes_for(&self, entry: &SevenZipFileEntry) -> Option<Vec<u64>> {
+        pack_stream_sizes(&self.archive, entry)
     }
 
     fn find_entry(&self, file_info: &FileInfo) -> Result<&SevenZipFileEntry> {
@@ -304,14 +367,6 @@ impl SevenZipMountSource {
         )))
     }
 
-    fn read_packed(&self, entry: &SevenZipFileEntry) -> Result<Vec<u8>> {
-        let mut f = self.file.lock().expect("file lock");
-        f.seek(SeekFrom::Start(entry.pack_offset))?;
-        let mut packed = vec![0u8; entry.pack_size as usize];
-        f.read_exact(&mut packed)?;
-        Ok(packed)
-    }
-
     fn get_folder_bytes(&self, entry: &SevenZipFileEntry) -> Result<Vec<u8>> {
         let fi = entry
             .folder_index
@@ -323,9 +378,23 @@ impl SevenZipMountSource {
             }
         }
         let folder = &self.archive.folders[fi];
-        let packed = self.read_packed(entry)?;
-        let data =
-            decode::decompress_folder(folder, &packed, self.password.as_deref())?;
+        if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
+            return Err(SzError::Seven(SevenZipError::Msg(
+                "Cannot read encrypted 7z member without a password; pass --password".into(),
+            )));
+        }
+        let pack = decode::FilePackSource::open(
+            &self.archive_path,
+            entry.pack_offset,
+            entry.pack_size,
+        )?;
+        let sizes = self.pack_stream_sizes_for(entry);
+        let data = decode::decompress_folder_source(
+            folder,
+            Box::new(pack),
+            self.password.as_deref(),
+            sizes.as_deref(),
+        )?;
         let mut cache = self.folder_cache.lock().unwrap();
         if cache.len() >= 4 {
             if let Some(k) = cache.keys().next().copied() {
@@ -337,9 +406,29 @@ impl SevenZipMountSource {
     }
 }
 
+fn pack_stream_sizes(archive: &SevenZipArchiveInfo, entry: &SevenZipFileEntry) -> Option<Vec<u64>> {
+    let pack_info = archive.pack_info.as_ref()?;
+    let fi = entry.folder_index?;
+    let folder = archive.folders.get(fi)?;
+    let count = if folder.packed_indices.is_empty() {
+        1
+    } else {
+        folder.packed_indices.len()
+    };
+    if count <= 1 {
+        return None;
+    }
+    let start = entry.pack_stream_index;
+    let end = start + count;
+    if end > pack_info.pack_sizes.len() {
+        return None;
+    }
+    Some(pack_info.pack_sizes[start..end].to_vec())
+}
+
 fn read_member_bytes_static(
     file: &mut File,
-    _archive: &SevenZipArchiveInfo,
+    archive: &SevenZipArchiveInfo,
     entry: &SevenZipFileEntry,
     folder: &parse::Folder,
     password: Option<&str>,
@@ -350,10 +439,17 @@ fn read_member_bytes_static(
         file.read_exact(&mut buf)?;
         return Ok(buf);
     }
+    // Prefer pack path via path on disk when possible (file is already open; re-read region).
     file.seek(SeekFrom::Start(entry.pack_offset))?;
     let mut packed = vec![0u8; entry.pack_size as usize];
     file.read_exact(&mut packed)?;
-    let data = decode::decompress_folder(folder, &packed, password)?;
+    let sizes = pack_stream_sizes(archive, entry);
+    let data = decode::decompress_folder_source(
+        folder,
+        Box::new(decode::BytesPackSource::new(packed)),
+        password,
+        sizes.as_deref(),
+    )?;
     let end = (entry.unpack_offset + entry.size) as usize;
     if end > data.len() {
         return Err(SzError::Msg("member slice exceeds folder".into()));
@@ -472,6 +568,13 @@ impl MountSource for SevenZipMountSource {
             .folder_index
             .ok_or_else(|| io::Error::other("no folder"))?;
         let folder = &self.archive.folders[fi];
+
+        if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
+            return Err(io::Error::other(
+                "password required to open encrypted 7z member; pass --password",
+            ));
+        }
+
         let allow_enc = !folder.is_encrypted() || self.password.is_some();
         if !folder.is_supported_for_open(allow_enc) {
             return Err(io::Error::other(format!(
@@ -488,9 +591,8 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(stencil));
         }
 
-        // Compressed: full-folder decompress + slice (all test fixtures fit; large
-        // solid folders still use a per-folder cache so second opens are free).
-        let folder_size = folder.get_unpack_size();
+        // Compressed / BCJ2 / multi-pack: full-folder decompress + slice (cached).
+        // Pack is read via FilePackSource (not always preloaded into RAM before open).
         let folder_data = self
             .get_folder_bytes(entry)
             .map_err(|e| io::Error::other(e.to_string()))?;
@@ -502,13 +604,8 @@ impl MountSource for SevenZipMountSource {
                 folder_data.len()
             )));
         }
-        // For very large folders only retain the member slice in the handle.
-        let slice = if folder_size > SMALL_FOLDER_THRESHOLD {
-            folder_data[start..end].to_vec()
-        } else {
-            folder_data[start..end].to_vec()
-        };
-        Ok(Box::new(Cursor::new(slice)))
+        let _ = SMALL_FOLDER_THRESHOLD; // reserved for progressive path tuning
+        Ok(Box::new(Cursor::new(folder_data[start..end].to_vec())))
     }
 
     fn is_immutable(&self) -> bool {
@@ -583,13 +680,95 @@ mod tests {
         }
         let dir = tempfile::tempdir().unwrap();
         let idx = dir.path().join("i.sqlite");
-        let mut opts = OpenOptions::default();
-        opts.passwords = vec!["secret".into()];
+        let opts = OpenOptions {
+            passwords: vec!["secret".into()],
+            ..OpenOptions::default()
+        };
         let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true).unwrap();
         let fi = m.lookup("/secret.txt", 0).expect("secret");
         let mut r = m.open(&fi, 0).unwrap();
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert!(s.contains("secret") || !s.is_empty());
+    }
+
+    #[test]
+    fn encrypted_metadata_only_without_password() {
+        let path = py_fixture("encrypted-hello.7z");
+        if !path.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let m = SevenZipMountSource::open(
+            &path,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            true,
+        )
+        .expect("metadata-only mount");
+        let fi = m.lookup("/secret.txt", 0).expect("list/stat works");
+        assert!(fi.size > 0);
+        assert!(m.open(&fi, 0).is_err());
+    }
+
+    #[test]
+    fn bcj2_default_fixture() {
+        let path = py_fixture("bcj2-default.7z");
+        if !path.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let m = SevenZipMountSource::open(
+            &path,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            true,
+        )
+        .expect("open bcj2");
+        // bcj2-x.bin is the typical payload name in the fixture set.
+        let fi = m
+            .lookup("/bcj2-x.bin", 0)
+            .or_else(|| {
+                if let Some(ListResult::Infos(infos)) = m.list("/") {
+                    infos.into_iter().find(|(_, i)| i.size > 0).map(|(_, i)| i)
+                } else {
+                    None
+                }
+            })
+            .expect("bcj2 member");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn bcj_lzma2_fixture() {
+        let path = py_fixture("bcj-lzma2-x86.7z");
+        if !path.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let m = SevenZipMountSource::open(
+            &path,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            true,
+        )
+        .expect("open bcj+lzma2");
+        if let Some(ListResult::Infos(infos)) = m.list("/") {
+            if let Some((_, fi)) = infos.into_iter().find(|(_, i)| i.size > 0) {
+                let mut r = m.open(&fi, 0).unwrap();
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf).unwrap();
+                assert_eq!(buf.len(), fi.size as usize);
+            }
+        }
     }
 }

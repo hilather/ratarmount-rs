@@ -34,9 +34,18 @@ pub const PROP_DUMMY: u8 = 0x19;
 pub const METHOD_COPY: &[u8] = &[0x00];
 pub const METHOD_LZMA: &[u8] = &[0x03, 0x01, 0x01];
 pub const METHOD_LZMA2: &[u8] = &[0x21];
+pub const METHOD_BCJ: &[u8] = &[0x03, 0x03, 0x01, 0x03];
+pub const METHOD_BCJ2: &[u8] = &[0x03, 0x03, 0x01, 0x1b];
+pub const METHOD_DELTA: &[u8] = &[0x03];
 pub const METHOD_AES: &[u8] = &[0x06, 0xf1, 0x07, 0x01];
 pub const METHOD_BZIP2: &[u8] = &[0x04, 0x02, 0x02];
 pub const METHOD_DEFLATE: &[u8] = &[0x04, 0x01, 0x08];
+pub const METHOD_BCJ_X86: &[u8] = &[0x04];
+pub const METHOD_BCJ_PPC: &[u8] = &[0x03, 0x03, 0x02, 0x05];
+pub const METHOD_BCJ_IA64: &[u8] = &[0x03, 0x03, 0x04, 0x01];
+pub const METHOD_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
+pub const METHOD_BCJ_ARMT: &[u8] = &[0x03, 0x03, 0x07, 0x01];
+pub const METHOD_BCJ_SPARC: &[u8] = &[0x03, 0x03, 0x08, 0x05];
 
 const FILETIME_UNIX_DELTA: u64 = 11_644_473_600_000_000_000;
 const WINDOWS_DIRECTORY_ATTR: u32 = 0x10;
@@ -79,6 +88,14 @@ impl Folder {
         self.unpack_sizes.last().copied().unwrap_or(0)
     }
 
+    pub fn total_in_streams(&self) -> u64 {
+        self.coders.iter().map(|c| c.num_in_streams).sum()
+    }
+
+    pub fn total_out_streams(&self) -> u64 {
+        self.coders.iter().map(|c| c.num_out_streams).sum()
+    }
+
     pub fn is_copy_only(&self) -> bool {
         self.coders.len() == 1 && self.coders[0].method.as_slice() == METHOD_COPY
     }
@@ -87,19 +104,30 @@ impl Folder {
         self.coders.iter().any(|c| c.method.as_slice() == METHOD_AES)
     }
 
+    pub fn content_coders(&self) -> &[Coder] {
+        if self.coders.first().is_some_and(|c| c.method.as_slice() == METHOD_AES) {
+            &self.coders[1..]
+        } else {
+            &self.coders
+        }
+    }
+
+    pub fn has_bcj2(&self) -> bool {
+        self.coders
+            .iter()
+            .any(|c| c.method.as_slice() == METHOD_BCJ2)
+    }
+
     pub fn is_supported_for_open(&self, allow_encrypted: bool) -> bool {
         if self.coders.is_empty() {
             return false;
         }
-        let mut coders = self.coders.as_slice();
-        if coders[0].method.as_slice() == METHOD_AES {
-            if !allow_encrypted {
-                return false;
-            }
-            coders = &coders[1..];
-            if coders.is_empty() {
-                return true;
-            }
+        if self.is_encrypted() && !allow_encrypted {
+            return false;
+        }
+        let coders = self.content_coders();
+        if coders.is_empty() {
+            return self.is_encrypted() && allow_encrypted;
         }
         if coders.len() == 1 {
             let m = coders[0].method.as_slice();
@@ -107,10 +135,61 @@ impl Folder {
                 || m == METHOD_LZMA
                 || m == METHOD_LZMA2
                 || m == METHOD_BZIP2
-                || m == METHOD_DEFLATE;
+                || m == METHOD_DEFLATE
+                || is_native_lzma_filter_method(m);
+        }
+        if coders_are_native_lzma_chain(coders) {
+            return true;
+        }
+        if coders.iter().any(|c| c.method.as_slice() == METHOD_BCJ2) {
+            for c in coders {
+                if c.method.as_slice() == METHOD_BCJ2 {
+                    if c.num_in_streams != 4 || c.num_out_streams != 1 {
+                        return false;
+                    }
+                } else {
+                    let m = c.method.as_slice();
+                    let ok = m == METHOD_COPY
+                        || m == METHOD_LZMA
+                        || m == METHOD_LZMA2
+                        || m == METHOD_BZIP2
+                        || m == METHOD_DEFLATE
+                        || is_native_lzma_filter_method(m);
+                    if !ok {
+                        return false;
+                    }
+                }
+            }
+            return true;
         }
         false
     }
+}
+
+pub fn is_native_lzma_filter_method(method: &[u8]) -> bool {
+    method == METHOD_LZMA
+        || method == METHOD_LZMA2
+        || method == METHOD_DELTA
+        || method == METHOD_BCJ
+        || method == METHOD_BCJ_X86
+        || method == METHOD_BCJ_PPC
+        || method == METHOD_BCJ_IA64
+        || method == METHOD_BCJ_ARM
+        || method == METHOD_BCJ_ARMT
+        || method == METHOD_BCJ_SPARC
+}
+
+pub fn coders_are_native_lzma_chain(coders: &[Coder]) -> bool {
+    if coders.is_empty() {
+        return false;
+    }
+    let has_compressor = coders
+        .iter()
+        .any(|c| c.method.as_slice() == METHOD_LZMA || c.method.as_slice() == METHOD_LZMA2);
+    has_compressor
+        && coders
+            .iter()
+            .all(|c| is_native_lzma_filter_method(c.method.as_slice()))
 }
 
 #[derive(Debug, Clone, Default)]
@@ -159,6 +238,8 @@ pub struct SevenZipFileEntry {
     pub unpack_offset: u64,
     pub pack_offset: u64,
     pub pack_size: u64,
+    /// Index of the first pack stream for this folder in PackInfo.
+    pub pack_stream_index: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -736,6 +817,7 @@ fn build_file_entries(
                 unpack_offset: 0,
                 pack_offset: 0,
                 pack_size: 0,
+                pack_stream_index: 0,
             });
         }
         return Ok((entries, false));
@@ -811,6 +893,7 @@ fn build_file_entries(
                 unpack_offset: 0,
                 pack_offset: 0,
                 pack_size: 0,
+                pack_stream_index: 0,
             });
             continue;
         }
@@ -844,6 +927,7 @@ fn build_file_entries(
             unpack_offset,
             pack_offset,
             pack_size,
+            pack_stream_index,
         });
     }
 

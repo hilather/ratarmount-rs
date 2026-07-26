@@ -43,11 +43,21 @@ A pure `/dev/fuse` implementation is optional future work (design Annex A); not 
 
 ## AppImage / distro packages
 
-Not automated in-tree yet. Recommended short term:
+Scaffold: `packaging/build-appimage.sh` (stages AppDir; runs `linuxdeploy` when installed).
+
+```bash
+./packaging/build-appimage.sh
+# → dist/AppDir and optionally dist/*.AppImage
+```
+
+Short term without AppImage:
 
 1. `cargo build --release` on target glibc
 2. Ship binary + dynamic deps (`libfuse3`, `libarchive`, compression libs as linked)
-3. Or static-friendlier builds later with musl (FUSE still needs libfuse at runtime typically)
+3. Optional helpers: `e2fsprogs` (EXT4), `squashfs-tools` (SquashFS)
+4. Or static-friendlier builds later with musl (FUSE still needs libfuse at runtime typically)
+
+See `docs/packaging.md`.
 
 ## Release checklist
 

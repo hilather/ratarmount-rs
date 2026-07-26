@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -Dwarnings
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+  fuse-harness:
+    name: FUSE phase allowlists
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout Python ratarmount (fixtures)
+        uses: actions/checkout@v4
+        with:
+          repository: mxmlnkn/ratarmount
+          path: ratarmount-py
+
+      - name: Install deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libarchive-dev \
+            zlib1g-dev squashfs-tools tar
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Phase allowlist suite
+        env:
+          RATARMOUNT_PY_ROOT: ${{ github.workspace }}/ratarmount-py
+          RATARMOUNT_CMD: ${{ github.workspace }}/target/release/ratarmount
+        run: |
+          # Core formats only (fast, no network secrets)
+          ./test-harness/run-phase2-allowlist.sh
+          ./test-harness/run-phase3-gzip.sh
+          ./test-harness/run-phase4-bzip2.sh
+          ./test-harness/run-phase5-xz-zstd.sh
+          ./test-harness/run-phase6-zip.sh
+          ./test-harness/run-phase7-nested.sh
+          ./test-harness/run-phase8-complex-usage.sh
+          ./test-harness/run-phase9-ar-cpio.sh
+          ./test-harness/run-phase9-sevenzip.sh

@@ -10,8 +10,21 @@ members = [
     "ratarmount-formats-zip",
     "ratarmount-formats-ar",
     "ratarmount-formats-cpio",
+    "ratarmount-formats-iso9660",
+    "ratarmount-formats-warc",
+    "ratarmount-formats-xar",
+    "ratarmount-formats-cab",
     "ratarmount-formats-libarchive",
     "ratarmount-formats-sevenzip",
+    "ratarmount-formats-sqlar",
+    "ratarmount-formats-squashfs",
+    "ratarmount-formats-ext4",
+    "ratarmount-formats-fat",
+    "ratarmount-formats-asar",
+    "ratarmount-formats-ogg",
+    "ratarmount-formats-html",
+    "ratarmount-formats-pdf",
+    "ratarmount-formats-git",
     "ratarmount-remote",
     "ratarmount-compositing",
 ]
@@ -33,8 +46,21 @@ ratarmount-formats-tar = { path = "ratarmount-formats-tar" }
 ratarmount-formats-zip = { path = "ratarmount-formats-zip" }
 ratarmount-formats-ar = { path = "ratarmount-formats-ar" }
 ratarmount-formats-cpio = { path = "ratarmount-formats-cpio" }
+ratarmount-formats-iso9660 = { path = "ratarmount-formats-iso9660" }
+ratarmount-formats-warc = { path = "ratarmount-formats-warc" }
+ratarmount-formats-xar = { path = "ratarmount-formats-xar" }
+ratarmount-formats-cab = { path = "ratarmount-formats-cab" }
 ratarmount-formats-libarchive = { path = "ratarmount-formats-libarchive" }
 ratarmount-formats-sevenzip = { path = "ratarmount-formats-sevenzip" }
+ratarmount-formats-sqlar = { path = "ratarmount-formats-sqlar" }
+ratarmount-formats-squashfs = { path = "ratarmount-formats-squashfs" }
+ratarmount-formats-ext4 = { path = "ratarmount-formats-ext4" }
+ratarmount-formats-fat = { path = "ratarmount-formats-fat" }
+ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
+ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
+ratarmount-formats-html = { path = "ratarmount-formats-html" }
+ratarmount-formats-pdf = { path = "ratarmount-formats-pdf" }
+ratarmount-formats-git = { path = "ratarmount-formats-git" }
 ratarmount-remote = { path = "ratarmount-remote" }
 ratarmount-compositing = { path = "ratarmount-compositing" }
 rusqlite = { version = "0.32", features = ["bundled"] }

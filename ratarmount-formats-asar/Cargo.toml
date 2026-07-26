@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-asar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Electron ASAR MountSource with stencil random access"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+serde_json = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

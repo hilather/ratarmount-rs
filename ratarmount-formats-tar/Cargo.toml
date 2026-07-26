@@ -13,3 +13,4 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 tempfile.workspace = true
+encoding_rs = "0.8"

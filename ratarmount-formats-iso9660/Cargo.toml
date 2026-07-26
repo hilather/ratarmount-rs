@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-iso9660"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ISO 9660 MountSource with random access via extent LBAs"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+bzip2 = { version = "0.5", features = ["static"] }

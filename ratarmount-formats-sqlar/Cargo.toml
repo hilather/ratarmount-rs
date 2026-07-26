@@ -1,0 +1,17 @@
+[package]
+name = "ratarmount-formats-sqlar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLAR (SQLite Archiver) mount source"
+
+[dependencies]
+ratarmount-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+tempfile.workspace = true

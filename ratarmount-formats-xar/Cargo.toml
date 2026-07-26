@@ -1,0 +1,21 @@
+[package]
+name = "ratarmount-formats-xar"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "XAR archive MountSource with TOC heap offsets"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+flate2 = "1"
+bzip2 = { version = "0.5", features = ["static"] }
+xz2 = { version = "0.1", features = ["static"] }
+quick-xml = "0.37"
+
+[dev-dependencies]
+tempfile.workspace = true

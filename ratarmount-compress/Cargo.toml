@@ -9,9 +9,14 @@ description = "Seekable compression backends for ratarmount-rs"
 ratarmount-core.workspace = true
 thiserror.workspace = true
 flate2 = "1"
+miniz_oxide = "0.8"
 # Prefer static/bundled so we do not need system -dev packages.
 bzip2 = { version = "0.5", features = ["static"] }
 xz2 = { version = "0.1", features = ["static"] }
 zstd = "0.13"
 tempfile.workspace = true
 log.workspace = true
+lz4_flex = "0.11"
+lzma-rs = { version = "0.3", features = ["raw_decoder"] }
+newtua-lzw-z = "0.1"
+libloading = "0.8"

@@ -1,0 +1,171 @@
+# Build distributable packages for Ubuntu (.deb) and Rocky Linux (.rpm).
+#
+# Triggers:
+#   - push tags v*  → attach packages to a GitHub Release
+#   - workflow_dispatch → manual downloadable artifacts
+#   - pull_request (optional path) → validate packaging only when packaging/ changes
+name: Packages
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "packaging/**"
+      - ".github/workflows/packages.yml"
+      - "ratarmount/Cargo.toml"
+      - "Cargo.toml"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # -------------------------------------------------------------------------
+  # Ubuntu: native .deb on ubuntu-22.04 and ubuntu-24.04 (x86_64)
+  # -------------------------------------------------------------------------
+  deb:
+    name: deb (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config curl \
+            libfuse3-dev fuse3 libarchive-dev zlib1g-dev \
+            libssl-dev
+
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages-${{ matrix.os }}
+
+      - name: Version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          # Tag push: prefer git tag without leading v
+          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Building version $V on ${{ matrix.os }}"
+
+      - name: Build packages
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PACKAGE_FAMILY: deb
+          OUT_DIR: dist
+        run: |
+          chmod +x packaging/build-native-packages.sh
+          ./packaging/build-native-packages.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-${{ matrix.os }}-${{ runner.arch }}
+          path: |
+            dist/*.deb
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Rocky Linux 8 & 9 via containers (RPM)
+  # -------------------------------------------------------------------------
+  rpm:
+    name: rpm (rocky ${{ matrix.rocky }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rocky: ["8", "9"]
+    container:
+      image: rockylinux/rockylinux:${{ matrix.rocky }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build deps (dnf)
+        run: |
+          dnf -y install epel-release || true
+          dnf -y install \
+            gcc gcc-c++ make pkgconf-pkg-config curl git \
+            fuse3-devel fuse3 libarchive-devel zlib-devel \
+            openssl-devel
+          # Rocky 8 may need powertools/CRB for some -devel packages
+          dnf -y install 'dnf-command(config-manager)' || true
+          dnf config-manager --set-enabled powertools 2>/dev/null \
+            || dnf config-manager --set-enabled crb 2>/dev/null \
+            || true
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Version
+        id: ver
+        run: |
+          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
+          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          fi
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+
+      - name: Build packages
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+          PACKAGE_FAMILY: rpm
+          OUT_DIR: dist
+        run: |
+          chmod +x packaging/build-native-packages.sh
+          ./packaging/build-native-packages.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-rocky${{ matrix.rocky }}-${{ runner.arch }}
+          path: |
+            dist/*.rpm
+            dist/*.tar.gz
+            dist/*.sha256
+          if-no-files-found: error
+
+  # -------------------------------------------------------------------------
+  # Optional: attach all packages to the GitHub Release on tag push
+  # -------------------------------------------------------------------------
+  release:
+    name: GitHub Release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: [deb, rpm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Flatten artifacts
+        run: |
+          mkdir -p release
+          find artifacts -type f \( -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' -o -name '*.sha256' \) \
+            -exec cp -v {} release/ \;
+          ls -la release/
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

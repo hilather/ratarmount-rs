@@ -14,10 +14,21 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) �
 | Area | Status |
 |------|--------|
 | TAR (+ GNU/PAX sparse) + ZIP + AR + CPIO | done |
-| gzip / bzip2 / xz / zstd | done via **materialize-to-temp** (G3) |
+| gzip / bzip2 / xz / zstd | **seekable** compressed TAR path for all four; plain single-file still materializes |
 | Custom **SevenZip** pack-offset backend | done (AES + common codecs) |
-| libarchive long-tail (CAB/XAR/WARC/ISO/RAR/…) | done (sequential member extract) |
+| **SQLAR** (unencrypted) | done |
+| **SquashFS** | MVP via `unsquashfs` extract (needs squashfs-tools) |
+| **EXT4** | MVP via `debugfs rdump` (needs e2fsprogs) |
+| **FAT12/16/32** | pure Rust (`fatfs`) |
+| **ISO / WARC / XAR / CAB / ASAR** | stencil random-access (CAB LZX → libarchive) |
+| **OGG / HTML / PDF / Git** | demux / data-URLs / attachments / git2 tree |
+| **SevenZip** | pack offsets + BCJ/BCJ2 + AES + metadata-only encrypt |
+| gzip/bzip2/xz/zstd/lz4/lzip/lzo/.Z/lzma/**zlib** | seekable outer codecs |
+| libarchive long-tail (RAR/LHA/CAB LZX/…) | done (sequential member extract) |
 | Recursive automount, union, folder, write overlay | done |
+| Lazy `-l`, strip `-s`, transform mount points | done |
+| File versions, `-p` prefix, control socket | done |
+| **`--commit-overlay`** (uncompressed TAR) | done (`--yes` skips prompt) |
 | Remote: `http(s)`, `file`, `s3`, `ssh`/`sftp` | done |
 | Daemonize / `-f` / Makefile / phase harness | done |
 | Head-to-head benchmarks vs Python | done (`benchmarks/`) |
@@ -30,28 +41,28 @@ Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).
 
 ### Feature parity — still open (high level)
 
-1. **Seekable compression** — drop materialize for gzip/bzip2/xz/zstd; import/build compression index tables (rapidgzip-class path).  
-2. **CLI flag parity** — `--index-folders`, default mountpoint, `-e` encoding, `-o` FUSE opts, `-d`/`--log-file`, `--commit-overlay`, control interface, lazy mount, path transforms, file versions.  
-3. **Formats** — SquashFS, EXT4/FAT, SQLAR, ASAR, PDF/OGG/HTML, Git; better RAR; split files (`.001`).  
-4. **Codecs** — lz4/lzip/lzo/lrz/Z/zlib; true `-P` parallel decoders.  
+1. **Seekable compression (remaining)** — true bzip2 bit-block map + `-P`; xz stream index; zstd seek-table / `zstdblocks` import; gzip Tier C; parallel Tier D. (TAR path no longer requires NamedTempFile materialize for gz/bz2/xz/zst.)  
+2. **CLI (remaining)** — colored logs; full in-FS control layer. (Lazy `-l`, strip `-s`, transform, versions, `-p`, control socket, commit-overlay landed.)  
+3. **Formats** — in-process SquashFS/EXT4 (drop helpers); encrypted SQLAR; full PDF images; better RAR; split files (`.001`); GNU incremental TAR.  
+4. **Codecs** — lrz; true `-P` parallel decoders; progressive multi-GB solid 7z without full unpack buffer.  
 5. **Remote** — Range-backed readers (no full download); SMB/WebDAV; remote/compressed indexes.  
-6. **Index** — `:memory:`, compression side-table interop with Python, hashes/xattrs.  
+6. **Index** — compression side-table interop with Python, hashes/xattrs.  
 7. **Perf** — cold `find` / nested automount; SevenZip progressive solid decode; CI gates from `benchmarks/baselines/rust-gates.json`.  
-8. **Packaging** — AppImage/distro; Phase 12 Python deprecation when gates pass.
+8. **Packaging / Phase 12** — polish AppImage CI; dual-run cutover per [`docs/phase12-dual-run.md`](docs/phase12-dual-run.md).
 
 ### Test parity — still open
 
 | Priority | Work |
 |----------|------|
-| **P0** | Grow phase allowlists to all fixtures for formats we already claim |
-| **P0** | Phase-gated wrapper around Python `run-fixed-archive-tests.sh` |
-| **P0** | SevenZip scenarios aligned with `test_sevenzip.py` |
+| **P0** | `~` phase allowlists grown (TAR/ZIP/AR/7z); keep adding fixtures |
+| **P0** | `[x]` `test-harness/run-fixed-archive-subset.sh` (`RUN=1`) |
+| **P0** | `~` SevenZip store/lzma2/large; encrypted/nested still open |
 | **P1** | Complex-usage subset (union, overlay, multi-source) |
-| **P1** | Index interop goldens (Py↔Rust) |
+| **P1** | `[x]` `test-harness/run-index-interop.sh` (TAR+ZIP+7z) |
 | **P1** | Optional live SSH/S3 CI |
 | **P2** | ≥90% fixed-archive triples; clippy/fmt CI; weekly bench gates |
 
-Current harness: ~40 allowlist entries under `test-harness/`. Python: 100+ archives + fixed/complex/remote shells.
+Current harness: 90+ allowlist/interop lines under `test-harness/`. Python: 100+ archives + fixed/complex/remote shells.
 
 ## Requirements
 
@@ -59,6 +70,7 @@ Current harness: ~40 allowlist entries under `test-harness/`. Python: 100+ archi
 - `libfuse3` / `fuse3`
 - `libarchive` (long-tail formats)
 - `zlib` headers (flate2/system zlib)
+- Optional: `e2fsprogs` (`debugfs`) for EXT4, `squashfs-tools` for SquashFS
 - Sibling Python checkout for fixtures (default `../ratarmount`) for the harness
 
 ## Build / install
@@ -115,10 +127,11 @@ ratarmount-core/            # MountSource trait, options
 ratarmount-index/           # SQLite 0.7.x index
 ratarmount-fuse/            # fuser low-level FS
 ratarmount-compress/        # materialize + stencils
-ratarmount-formats-{tar,zip,ar,cpio,sevenzip,libarchive}/
+ratarmount-formats-{tar,zip,ar,cpio,iso9660,warc,xar,cab,asar,ogg,html,pdf,git,sevenzip,sqlar,squashfs,ext4,fat,libarchive}/
 ratarmount-compositing/     # folder, union, automount, overlay
 ratarmount-remote/          # http/s3/ssh
 test-harness/               # phase allowlists + runners
+packaging/                  # desktop entry + AppImage script
 benchmarks/                 # Python vs Rust comparison
 docs/                       # decisions, phase notes, parity TODO
 ```

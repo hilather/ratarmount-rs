@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ratarmount
+Comment=Random Access To Archived Resources (FUSE)
+Exec=ratarmount
+Icon=ratarmount
+Terminal=true
+Categories=Utility;Archiving;
+Keywords=archive;fuse;tar;mount;

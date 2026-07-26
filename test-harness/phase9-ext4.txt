@@ -1,0 +1,4 @@
+# EXT2/3/4 images (MVP via debugfs rdump; needs e2fsprogs)
+# archive <TAB> path <TAB> md5
+tests/nested-tar-1M.ext4.bz2	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-tar-10M.ext4.bz2	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc

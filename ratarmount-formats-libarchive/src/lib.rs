@@ -154,21 +154,37 @@ impl LibarchiveMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
-        let default_index = default_index_path(&archive_path);
-        let index_path = index_path.unwrap_or(&default_index);
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            Some(
+                index_path
+                    .map(|p| p.to_path_buf())
+                    .unwrap_or_else(|| default_index_path(&archive_path)),
+            )
+        };
 
-        if !recreate && index_path.exists() {
-            let meta_ok = std::fs::metadata(index_path)
-                .map(|m| m.len() > 0)
-                .unwrap_or(false);
-            if meta_ok {
-                match Self::open_existing(&archive_path, index_path, options) {
-                    Ok(s) => return Ok(s),
-                    Err(e) => eprintln!("info: could not load libarchive index ({e}); rebuilding"),
+        if let Some(ref ip) = index_path_buf {
+            if !recreate && ip.exists() {
+                let meta_ok = std::fs::metadata(ip)
+                    .map(|m| m.len() > 0)
+                    .unwrap_or(false);
+                if meta_ok {
+                    match Self::open_existing(&archive_path, ip, options) {
+                        Ok(s) => return Ok(s),
+                        Err(e) => {
+                            eprintln!("info: could not load libarchive index ({e}); rebuilding")
+                        }
+                    }
                 }
             }
         }
-        Self::create_index(&archive_path, index_path, options, product_version)
+        Self::create_index(
+            &archive_path,
+            index_path_buf.as_deref(),
+            options,
+            product_version,
+        )
     }
 
     fn open_existing(archive_path: &Path, index_path: &Path, options: &OpenOptions) -> Result<Self> {
@@ -184,7 +200,7 @@ impl LibarchiveMountSource {
 
     fn create_index(
         archive_path: &Path,
-        index_path: &Path,
+        index_path: Option<&Path>,
         options: &OpenOptions,
         product_version: &str,
     ) -> Result<Self> {
@@ -195,7 +211,7 @@ impl LibarchiveMountSource {
         let t0 = Instant::now();
 
         let handle = ArchiveHandle::open_path(archive_path)?;
-        let index = SqliteIndex::create_writable(Some(index_path))?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         let mut generated = BTreeSet::new();
         let mut entry_index: i64 = 0;
@@ -289,7 +305,6 @@ impl LibarchiveMountSource {
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
         store_stats(&index, archive_path)?;
         index.commit_write()?;
-        index.finalize_build()?;
 
         let secs = t0.elapsed().as_secs_f64();
         println!(
@@ -297,8 +312,7 @@ impl LibarchiveMountSource {
             archive_path.display()
         );
 
-        drop(index);
-        let index = SqliteIndex::open_read_only(index_path)?;
+        let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             index,

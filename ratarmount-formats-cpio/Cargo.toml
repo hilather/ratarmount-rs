@@ -3,7 +3,7 @@ name = "ratarmount-formats-cpio"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "CPIO newc mount source (subset of libarchive formats)"
+description = "CPIO newc/odc/binary mount source (subset of libarchive formats)"
 
 [dependencies]
 ratarmount-core.workspace = true

@@ -1,16 +1,17 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
-//! Mirrors Python `WritableFolderMountSource` (subset).
+//! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
 use ratarmount_core::{
     create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
 };
-use rusqlite::{params, Connection};
+use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
 
 pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
@@ -210,7 +211,7 @@ impl WriteOverlay {
             use std::os::unix::io::IntoRawFd;
             f.into_raw_fd()
         };
-        self.mark_present(path, mode | libc::S_IFREG as u32)?;
+        self.mark_present(path, mode | libc::S_IFREG)?;
         Ok(fd)
     }
 
@@ -239,7 +240,7 @@ impl WriteOverlay {
         let real = self.realpath(path);
         fs::create_dir_all(&real)?;
         let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
-        self.mark_present(path, mode | libc::S_IFDIR as u32)?;
+        self.mark_present(path, mode | libc::S_IFDIR)?;
         Ok(())
     }
 
@@ -408,8 +409,447 @@ fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
 }
 
-// Silence unused import if Write not needed elsewhere
-#[allow(dead_code)]
-fn _w() {
-    let _ = std::io::sink().write(&[]);
+/// Options for [`commit_overlay`].
+#[derive(Clone, Debug)]
+pub struct CommitOverlayOptions {
+    /// When true, skip interactive "commit" confirmation (for harness / automation).
+    pub yes: bool,
+    /// Verbosity: 0 = quiet, 1+ = print plan (Python `printDebug`).
+    pub debug: u8,
+}
+
+impl Default for CommitOverlayOptions {
+    fn default() -> Self {
+        Self {
+            yes: false,
+            debug: 1,
+        }
+    }
+}
+
+/// Apply overlay folder modifications to an **uncompressed** TAR using GNU tar.
+///
+/// Mirrors Python `commit_overlay`:
+/// 1. Collect deleted paths from `.ratarmount.overlay.sqlite`
+/// 2. Walk overlay files → delete-then-append list
+/// 3. `tar --delete` then `tar --append -C overlay`
+///
+/// Returns `Ok(true)` if changes were committed, `Ok(false)` if nothing to do or canceled.
+pub fn commit_overlay(
+    write_overlay: impl AsRef<Path>,
+    tar_file: impl AsRef<Path>,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
+    let write_overlay = write_overlay.as_ref();
+    let tar_file = tar_file.as_ref();
+
+    if !write_overlay.is_dir() {
+        return Err(OverlayError::Msg(
+            "Need an existing write overlay folder for committing changes.".into(),
+        ));
+    }
+    if !tar_file.is_file() {
+        return Err(OverlayError::Msg(format!(
+            "Specified TAR '{}' to commit to does not exist or is not a file!",
+            tar_file.display()
+        )));
+    }
+    if !is_uncompressed_tar(tar_file)? {
+        return Err(OverlayError::Msg(
+            "Currently, only modifications to an uncompressed TAR may be committed.".into(),
+        ));
+    }
+    ensure_gnu_tar()?;
+
+    let tmp = tempfile::tempdir()?;
+    let deletion_list = tmp.path().join("deletions.lst");
+    let append_list = tmp.path().join("append.lst");
+
+    let mut deletions: Vec<u8> = Vec::new();
+    let mut appends: Vec<u8> = Vec::new();
+
+    // Deletions from hidden DB
+    let db_path = write_overlay.join(HIDDEN_DB);
+    if db_path.is_file() {
+        let conn = Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?;
+        let mut stmt = conn.prepare(
+            r#"SELECT path, name FROM "files" WHERE deleted = 1"#,
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?))
+        })?;
+        for row in rows {
+            let (path, name) = row?;
+            let rel = join_rel(&path, &name);
+            add_deletion_variants(&mut deletions, &rel);
+        }
+    }
+
+    // Overlay walk: files to append (and replace = delete + append)
+    let suffixes = ["", "-journal", "-shm", "-wal"];
+    let ignored: Vec<String> = suffixes
+        .iter()
+        .map(|s| format!("{HIDDEN_DB}{s}"))
+        .collect();
+
+    let overlay_str = write_overlay.to_string_lossy();
+    let overlay_prefix = if overlay_str.ends_with('/') {
+        overlay_str.to_string()
+    } else {
+        format!("{overlay_str}/")
+    };
+
+    for entry in walkdir_files_and_empty_dirs(write_overlay)? {
+        let full = entry.path;
+        let is_dir = entry.is_dir;
+        let rel = if full == write_overlay {
+            continue;
+        } else if let Ok(r) = full.strip_prefix(write_overlay) {
+            r.to_string_lossy().replace('\\', "/")
+        } else if let Some(rest) = full.to_string_lossy().strip_prefix(&overlay_prefix) {
+            rest.to_string()
+        } else {
+            continue;
+        };
+        let rel = rel.trim_start_matches('/').to_string();
+        if rel.is_empty() {
+            continue;
+        }
+        if ignored.iter().any(|i| rel == *i || rel.ends_with(i)) {
+            continue;
+        }
+        // Only top-level DB name
+        if ignored.contains(&rel) {
+            continue;
+        }
+        if is_dir {
+            // Empty dirs only (walkdir_files_and_empty_dirs already filters)
+            appends.extend(rel.as_bytes());
+            appends.push(0);
+        } else {
+            add_deletion_variants(&mut deletions, &rel);
+            appends.extend(rel.as_bytes());
+            appends.push(0);
+        }
+    }
+
+    fs::write(&deletion_list, &deletions)?;
+    fs::write(&append_list, &appends)?;
+
+    if deletions.is_empty() && appends.is_empty() {
+        if opts.debug >= 1 {
+            println!("Nothing to commit.");
+        }
+        return Ok(false);
+    }
+
+    if opts.debug >= 1 {
+        println!("To commit the overlay folder to the archive, these commands have to be executed:");
+        println!();
+        if !deletions.is_empty() {
+            println!(
+                "    tar --delete --null --files-from='{}' --file '{}' 2>&1 |",
+                deletion_list.display(),
+                tar_file.display()
+            );
+            println!("       sed '/^tar: Exiting with failure/d; /^tar.*Not found in archive/d'");
+        }
+        if !appends.is_empty() {
+            println!(
+                "    tar --append -C '{}' --null --files-from='{}' --file '{}'",
+                write_overlay.display(),
+                append_list.display(),
+                tar_file.display()
+            );
+        }
+        println!();
+        println!("Committing is an experimental feature!");
+    }
+
+    let confirmed = if opts.yes {
+        true
+    } else {
+        print!("Please confirm by entering \"commit\". Any other input will cancel.\n> ");
+        let _ = io::stdout().flush();
+        let mut line = String::new();
+        io::stdin().read_line(&mut line)?;
+        line.trim() == "commit"
+    };
+
+    if !confirmed {
+        if opts.debug >= 1 {
+            println!("Canceled");
+        }
+        return Ok(false);
+    }
+
+    if !deletions.is_empty() {
+        let output = tar_env_command()
+            .args([
+                "--delete",
+                "--null",
+                &format!("--files-from={}", deletion_list.display()),
+                "--file",
+            ])
+            .arg(tar_file)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .output()?;
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let unfiltered: Vec<&str> = stderr
+            .lines()
+            .filter(|line| {
+                let line = line.trim();
+                !line.is_empty()
+                    && !line.contains("tar: Exiting with failure")
+                    && !line.contains("Not found in archive")
+            })
+            .collect();
+        if !unfiltered.is_empty() {
+            for line in &unfiltered {
+                eprintln!("{line}");
+            }
+            return Err(OverlayError::Msg(
+                "There were problems when trying to delete files.".into(),
+            ));
+        }
+    }
+
+    if !appends.is_empty() {
+        let status = tar_env_command()
+            .args([
+                "--append",
+                "-C",
+            ])
+            .arg(write_overlay)
+            .args([
+                "--null",
+                &format!("--files-from={}", append_list.display()),
+                "--file",
+            ])
+            .arg(tar_file)
+            .status()?;
+        if !status.success() {
+            return Err(OverlayError::Msg(format!(
+                "tar --append failed with {status}"
+            )));
+        }
+    }
+
+    if opts.debug >= 1 {
+        println!(
+            "Committed successfully. You can now remove the overlay folder at {}.",
+            write_overlay.display()
+        );
+    }
+    Ok(true)
+}
+
+fn join_rel(path: &str, name: &str) -> String {
+    let path = path.trim_start_matches('/').trim_end_matches('/');
+    if path.is_empty() {
+        name.trim_start_matches('/').to_string()
+    } else {
+        format!("{path}/{}", name.trim_start_matches('/'))
+    }
+}
+
+fn add_deletion_variants(buf: &mut Vec<u8>, path_relative_to_root: &str) {
+    let p = path_relative_to_root.trim_start_matches('/');
+    for variant in [p.to_string(), format!("/{p}"), format!("./{p}")] {
+        buf.extend(variant.as_bytes());
+        buf.push(0);
+    }
+}
+
+fn is_uncompressed_tar(path: &Path) -> Result<bool> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = File::open(path)?;
+    // Reject common compression magics
+    let mut magic = [0u8; 6];
+    let n = f.read(&mut magic)?;
+    if n >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        return Ok(false); // gzip
+    }
+    if n >= 3 && &magic[..3] == b"BZh" {
+        return Ok(false);
+    }
+    if n >= 6 && &magic[..6] == b"\xFD7zXZ\0" {
+        return Ok(false);
+    }
+    if n >= 4 && &magic[..4] == b"\x28\xb5\x2f\xfd" {
+        return Ok(false);
+    }
+    // ustar at 257
+    f.seek(SeekFrom::Start(257))?;
+    let mut ustar = [0u8; 5];
+    let n = f.read(&mut ustar)?;
+    Ok(n == 5 && (&ustar == b"ustar" || ustar.starts_with(b"ustar") || &ustar == b"GNU  "))
+}
+
+fn ensure_gnu_tar() -> Result<()> {
+    let out = Command::new("tar")
+        .arg("--version")
+        .output()
+        .map_err(|e| OverlayError::Msg(format!("Currently, GNU tar must be installed: {e}")))?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    if !text.contains("GNU tar") {
+        return Err(OverlayError::Msg(
+            "Currently, GNU tar is required for --commit-overlay.".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn tar_env_command() -> Command {
+    let mut cmd = Command::new("tar");
+    // Locale C for reproducible/stable messages (Python run_without_locale)
+    cmd.env("LC_ALL", "C");
+    cmd.env("LC_LANG", "C");
+    cmd.env("LANGUAGE", "C");
+    // Clear LC_* that might already be set by clearing via env_clear is too aggressive;
+    // setting LC_ALL=C is enough for most systems.
+    cmd
+}
+
+struct WalkEntry {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+/// Files + empty directories under `root` (topdown=False equivalent for empty dirs).
+fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
+    let mut out = Vec::new();
+    fn walk(dir: &Path, root: &Path, out: &mut Vec<WalkEntry>) -> Result<()> {
+        let mut files = Vec::new();
+        let mut dirs = Vec::new();
+        let rd = match fs::read_dir(dir) {
+            Ok(r) => r,
+            Err(_) => return Ok(()),
+        };
+        for ent in rd.flatten() {
+            let p = ent.path();
+            let ft = ent.file_type()?;
+            if ft.is_dir() {
+                dirs.push(p);
+            } else if ft.is_file() || ft.is_symlink() {
+                files.push(p);
+            }
+        }
+        for d in &dirs {
+            walk(d, root, out)?;
+        }
+        for f in files {
+            out.push(WalkEntry {
+                path: f,
+                is_dir: false,
+            });
+        }
+        // Empty directory (no files; may still have subdirs already walked)
+        if dirs.is_empty() {
+            // re-check: empty of files and dirs
+            let empty = fs::read_dir(dir)?.next().is_none();
+            if empty && dir != root {
+                out.push(WalkEntry {
+                    path: dir.to_path_buf(),
+                    is_dir: true,
+                });
+            }
+        } else {
+            // Python: if not filenames and dirpath: append empty folder
+            // Only when this dir has no filenames (even if it has subdirs that had content)
+            let has_file = fs::read_dir(dir)?.any(|e| {
+                e.ok()
+                    .map(|e| e.file_type().map(|t| t.is_file() || t.is_symlink()).unwrap_or(false))
+                    .unwrap_or(false)
+            });
+            if !has_file && dir != root {
+                // Still append dirpath if no files directly — matches Python "not filenames"
+                out.push(WalkEntry {
+                    path: dir.to_path_buf(),
+                    is_dir: true,
+                });
+            }
+        }
+        Ok(())
+    }
+    walk(root, root, &mut out)?;
+    Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command as StdCommand;
+
+    #[test]
+    fn commit_overlay_add_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("data");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("old.txt"), b"old\n").unwrap();
+        let tar = dir.path().join("a.tar");
+        let st = StdCommand::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&src)
+            .arg("old.txt")
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        // Create hidden DB so schema exists (optional for append-only)
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        {
+            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            fs::write(overlay.join("new.txt"), b"hello commit\n").unwrap();
+            // Drop overlay so exclusive SQLite lock is released before commit.
+        }
+
+        let opts = CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+        };
+        commit_overlay(&overlay, &tar, &opts).unwrap();
+
+        let list = StdCommand::new("tar")
+            .args(["-tf"])
+            .arg(&tar)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(text.contains("new.txt"), "tar listing: {text}");
+        assert!(text.contains("old.txt"), "tar listing: {text}");
+    }
+
+    /// Minimal immutable empty base for WriteOverlay construction in tests.
+    struct NullBase;
+    impl MountSource for NullBase {
+        fn list(&self, _path: &str) -> Option<ListResult> {
+            Some(ListResult::Infos(Default::default()))
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                Some(create_root_file_info())
+            } else {
+                None
+            }
+        }
+        fn open(
+            &self,
+            _: &FileInfo,
+            _: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "null base"))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
 }

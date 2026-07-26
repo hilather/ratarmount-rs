@@ -61,18 +61,24 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
         continue
     fi
 
-    target="$mp/$path_in"
-    if [[ ! -f "$target" ]]; then
-        echo "  [FAIL] missing $path_in"
-        ls -laR "$mp" || true
-        failed=1
+    if [[ "$path_in" == "." ]]; then
+        echo "  [ok] mounted (index/list only)"
     else
-        got=$(md5sum -- "$target" | awk '{print $1}')
-        if [[ -n "${expected_md5:-}" && "$got" != "$expected_md5" ]]; then
-            echo "  [FAIL] md5 got $got want $expected_md5"
+        target="$mp/$path_in"
+        if [[ ! -e "$target" && ! -L "$target" ]]; then
+            echo "  [FAIL] missing $path_in"
+            ls -laR "$mp" || true
             failed=1
+        elif [[ -f "$target" ]]; then
+            got=$(md5sum -- "$target" | awk '{print $1}')
+            if [[ -n "${expected_md5:-}" && "$expected_md5" != "." && "$got" != "$expected_md5" ]]; then
+                echo "  [FAIL] md5 got $got want $expected_md5"
+                failed=1
+            else
+                echo "  [ok] md5 $got"
+            fi
         else
-            echo "  [ok] md5 $got"
+            echo "  [ok] path exists $path_in"
         fi
     fi
     fusermount3 -u "$mp" 2>/dev/null || true

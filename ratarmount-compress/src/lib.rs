@@ -1,11 +1,46 @@
-//! Compression backends (Phases 3–5).
+//! Compression backends (Phases 3–5 + stream codecs).
 //!
-//! Alpha strategy for gzip/bzip2/xz/zstd: materialize decompressed content to a
-//! temp file for random access. Parallel seek indexes / block maps come later.
+//! * **gzip** — G3 Tier B seekable checkpoints (`gzip_seek`).
+//! * **zstd** — multi-frame seek map; single-frame full decode into RAM/temp.
+//! * **lz4** — frame block index (independent blocks; dependent → frame decode).
+//! * **lzip** — multimember walk via trailer `member_size`.
+//! * **lzo** — LZOP block index via liblzo2 (optional at runtime).
+//! * **bzip2 / xz / .Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
+//! * CLI/helpers still expose `materialize_*` for plain single-file mounts.
+
+mod bzip2_seek;
+mod compress_z_seek;
+mod gzip_seek;
+mod lz4_seek;
+mod lzip_seek;
+mod lzma_seek;
+mod lzo_seek;
+mod seekable_body;
+mod xz_seek;
+mod zlib_seek;
+mod zstd_seek;
+
+pub use bzip2_seek::open_seekable_bzip2;
+pub use compress_z_seek::open_seekable_compress_z;
+pub use gzip_seek::{
+    open_seekable_gzip, SeekableGzip, SeekableGzipReader, SharedSeekableGzip,
+    DEFAULT_GZIP_SEEK_SPACING,
+};
+pub use lz4_seek::{open_seekable_lz4, SeekableLz4};
+pub use lzip_seek::{open_seekable_lzip, SeekableLzip};
+pub use lzma_seek::open_seekable_lzma;
+pub use lzo_seek::{lzo_available, open_seekable_lzo, SeekableLzo};
+pub use seekable_body::{
+    body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
+};
+pub use xz_seek::open_seekable_xz;
+pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib};
+pub use zstd_seek::SeekableZstd;
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use bzip2::read::BzDecoder;
 use flate2::read::MultiGzDecoder;
@@ -33,19 +68,34 @@ pub enum CompressionFormat {
     Bzip2,
     Xz,
     Zstd,
+    Lz4,
+    Lzip,
+    Lzo,
+    CompressZ,
+    Lzma,
+    /// RFC 1950 zlib wrapper (e.g. `.zlib`).
+    Zlib,
 }
 
-/// Detect compression from magic bytes (and optionally path).
+/// Detect compression from magic bytes, with extension fallback for ambiguous formats.
 pub fn detect_compression(path: &Path) -> Result<CompressionFormat> {
     let mut f = File::open(path)?;
-    let mut magic = [0u8; 6];
+    let mut magic = [0u8; 16];
     let n = f.read(&mut magic)?;
-    detect_compression_magic(&magic[..n])
+    let by_magic = detect_compression_magic(&magic[..n])?;
+    if by_magic != CompressionFormat::None {
+        return Ok(by_magic);
+    }
+    Ok(detect_compression_extension(path).unwrap_or(CompressionFormat::None))
 }
 
 pub fn detect_compression_magic(magic: &[u8]) -> Result<CompressionFormat> {
     if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         return Ok(CompressionFormat::Gzip);
+    }
+    // Unix compress (.Z): 1f 9d or 1f a0
+    if magic.len() >= 2 && magic[0] == 0x1f && (magic[1] == 0x9d || magic[1] == 0xa0) {
+        return Ok(CompressionFormat::CompressZ);
     }
     if magic.len() >= 3 && magic[0] == b'B' && magic[1] == b'Z' && magic[2] == b'h' {
         return Ok(CompressionFormat::Bzip2);
@@ -56,7 +106,60 @@ pub fn detect_compression_magic(magic: &[u8]) -> Result<CompressionFormat> {
     if magic.len() >= 4 && magic[..4] == *b"\x28\xb5\x2f\xfd" {
         return Ok(CompressionFormat::Zstd);
     }
+    // LZ4 frame magic 0x184D2204 LE, or skippable 0x184D2A5x
+    if magic.len() >= 4 {
+        let m = u32::from_le_bytes([magic[0], magic[1], magic[2], magic[3]]);
+        if m == 0x184D_2204 || (m & 0xFFFF_FFF0) == 0x184D_2A50 {
+            return Ok(CompressionFormat::Lz4);
+        }
+    }
+    if magic.len() >= 4 && &magic[..4] == b"LZIP" {
+        return Ok(CompressionFormat::Lzip);
+    }
+    if magic.len() >= 9 && magic[..9] == *b"\x89LZO\x00\x0d\x0a\x1a\x0a" {
+        return Ok(CompressionFormat::Lzo);
+    }
+    // LZMA Alone often starts with 0x5d 0x00 0x00 (lc/lp/pb + dict); leave to extension if unsure.
+    if magic.len() >= 3 && magic[0] == 0x5d && magic[1] == 0x00 && magic[2] == 0x00 {
+        return Ok(CompressionFormat::Lzma);
+    }
+    // zlib (RFC 1950): CMF/FLG checksum, common magics 78 01 / 78 9c / 78 da / 78 5e …
+    if looks_like_zlib_header(magic) {
+        return Ok(CompressionFormat::Zlib);
+    }
     Ok(CompressionFormat::None)
+}
+
+/// Extension-only detection (used when magic is absent/ambiguous).
+pub fn detect_compression_extension(path: &Path) -> Option<CompressionFormat> {
+    let name = path.file_name()?.to_str()?.to_ascii_lowercase();
+    if name.ends_with(".lz4") {
+        return Some(CompressionFormat::Lz4);
+    }
+    if name.ends_with(".lzip") || name.ends_with(".lz") {
+        return Some(CompressionFormat::Lzip);
+    }
+    if name.ends_with(".lzo") || name.ends_with(".lzop") {
+        return Some(CompressionFormat::Lzo);
+    }
+    if name.ends_with(".lzma") {
+        return Some(CompressionFormat::Lzma);
+    }
+    if name.ends_with(".zlib") || name.ends_with(".zz") {
+        return Some(CompressionFormat::Zlib);
+    }
+    // Bare `.Z` / `.z` — careful: `.gz` already handled by magic; `.tz` etc. rare.
+    if name.ends_with(".z")
+        && !name.ends_with(".gz")
+        && !name.ends_with(".bz")
+        && !name.ends_with(".xz")
+        && !name.ends_with(".lz")
+        && !name.ends_with(".tz")
+        && !name.ends_with(".zlib")
+    {
+        return Some(CompressionFormat::CompressZ);
+    }
+    None
 }
 
 /// TAR magic at offset 257: "ustar" or GNU.
@@ -123,6 +226,11 @@ pub fn materialize_zstd(path: &Path) -> Result<(NamedTempFile, u64)> {
     materialize_from_reader(decoder, "zstd", path)
 }
 
+fn materialize_from_body(path: &Path, body: Arc<dyn SeekableBody>, label: &str) -> Result<(NamedTempFile, u64)> {
+    let mut reader = body.open_reader().map_err(CompressError::from)?;
+    materialize_from_reader(&mut reader, label, path)
+}
+
 /// Materialize any known compressed format (not `None`).
 pub fn materialize(path: &Path, format: CompressionFormat) -> Result<(NamedTempFile, u64)> {
     match format {
@@ -131,6 +239,24 @@ pub fn materialize(path: &Path, format: CompressionFormat) -> Result<(NamedTempF
         CompressionFormat::Bzip2 => materialize_bzip2(path),
         CompressionFormat::Xz => materialize_xz(path),
         CompressionFormat::Zstd => materialize_zstd(path),
+        CompressionFormat::Lz4 => {
+            materialize_from_body(path, open_seekable_lz4(path)?, "lz4")
+        }
+        CompressionFormat::Lzip => {
+            materialize_from_body(path, open_seekable_lzip(path)?, "lzip")
+        }
+        CompressionFormat::Lzo => {
+            materialize_from_body(path, open_seekable_lzo(path)?, "lzo")
+        }
+        CompressionFormat::CompressZ => {
+            materialize_from_body(path, open_seekable_compress_z(path)?, "compress-z")
+        }
+        CompressionFormat::Lzma => {
+            materialize_from_body(path, open_seekable_lzma(path)?, "lzma")
+        }
+        CompressionFormat::Zlib => {
+            materialize_from_body(path, open_seekable_zlib(path)?, "zlib")
+        }
     }
 }
 
@@ -151,6 +277,15 @@ pub fn name_suggests_compressed_tar(path: &Path) -> bool {
         || l.ends_with(".tar.zst")
         || l.ends_with(".tar.zstd")
         || l.ends_with(".tzst")
+        || l.ends_with(".tar.lz4")
+        || l.ends_with(".tlz4")
+        || l.ends_with(".tar.lzip")
+        || l.ends_with(".tar.lz")
+        || l.ends_with(".tar.lzo")
+        || l.ends_with(".tar.lzma")
+        || l.ends_with(".tar.zlib")
+        || l.ends_with(".tar.z")
+        || l.ends_with(".taz")
 }
 
 /// Zero-filled virtual file (sparse holes).
@@ -445,18 +580,34 @@ pub fn strip_compression_suffix(name: &str) -> String {
         (".tar.xz", ".tar"),
         (".tar.zst", ".tar"),
         (".tar.zstd", ".tar"),
+        (".tar.lz4", ".tar"),
+        (".tar.lzip", ".tar"),
+        (".tar.lz", ".tar"),
+        (".tar.lzo", ".tar"),
+        (".tar.lzma", ".tar"),
+        (".tar.zlib", ".tar"),
+        (".tar.z", ".tar"),
         (".tgz", ".tar"),
         (".taz", ".tar"),
         (".tbz2", ".tar"),
         (".tbz", ".tar"),
         (".txz", ".tar"),
         (".tzst", ".tar"),
+        (".tlz4", ".tar"),
         (".gzip", ""),
         (".gz", ""),
         (".bz2", ""),
         (".xz", ""),
         (".zst", ""),
         (".zstd", ""),
+        (".lz4", ""),
+        (".lzip", ""),
+        (".lzop", ""),
+        (".lzo", ""),
+        (".lzma", ""),
+        (".zlib", ""),
+        (".zz", ""),
+        (".lz", ""),
         (".z", ""),
     ] {
         if lower.ends_with(suf) {
@@ -479,7 +630,6 @@ pub fn path_buf(tmp: &NamedTempFile) -> PathBuf {
 mod tests {
     use super::*;
     use std::io::Cursor;
-    use std::process::Command;
 
     #[test]
     fn stencil_concat() {
@@ -521,6 +671,13 @@ mod tests {
         assert_simple_body(&py_test("simple.bz2"), CompressionFormat::Bzip2);
         assert_simple_body(&py_test("simple.xz"), CompressionFormat::Xz);
         assert_simple_body(&py_test("simple.zst"), CompressionFormat::Zstd);
+        assert_simple_body(&py_test("simple.lz4"), CompressionFormat::Lz4);
+        assert_simple_body(&py_test("simple.lzip"), CompressionFormat::Lzip);
+        assert_simple_body(&py_test("simple.Z"), CompressionFormat::CompressZ);
+        assert_simple_body(&py_test("simple.lzma"), CompressionFormat::Lzma);
+        if lzo_available() {
+            assert_simple_body(&py_test("simple.lzo"), CompressionFormat::Lzo);
+        }
     }
 
     #[test]
@@ -541,6 +698,26 @@ mod tests {
             detect_compression_magic(&[0x28, 0xb5, 0x2f, 0xfd]).unwrap(),
             CompressionFormat::Zstd
         );
+        assert_eq!(
+            detect_compression_magic(&[0x04, 0x22, 0x4d, 0x18]).unwrap(),
+            CompressionFormat::Lz4
+        );
+        assert_eq!(
+            detect_compression_magic(b"LZIP\x01").unwrap(),
+            CompressionFormat::Lzip
+        );
+        assert_eq!(
+            detect_compression_magic(&[0x1f, 0x9d, 0x90]).unwrap(),
+            CompressionFormat::CompressZ
+        );
+        assert_eq!(
+            detect_compression_magic(&[0x5d, 0x00, 0x00]).unwrap(),
+            CompressionFormat::Lzma
+        );
+        assert_eq!(
+            detect_compression_magic(b"\x89LZO\x00\x0d\x0a\x1a\x0a").unwrap(),
+            CompressionFormat::Lzo
+        );
     }
 
     #[test]
@@ -548,5 +725,8 @@ mod tests {
         assert_eq!(strip_compression_suffix("a.gz"), "a");
         assert_eq!(strip_compression_suffix("a.tgz"), "a.tar");
         assert_eq!(strip_compression_suffix("a.tar.bz2"), "a.tar");
+        assert_eq!(strip_compression_suffix("a.lz4"), "a");
+        assert_eq!(strip_compression_suffix("a.tar.lz4"), "a.tar");
+        assert_eq!(strip_compression_suffix("a.lzip"), "a");
     }
 }

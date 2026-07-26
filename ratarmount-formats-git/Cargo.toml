@@ -1,0 +1,16 @@
+[package]
+name = "ratarmount-formats-git"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Git repository tree MountSource via libgit2 (backendName=GitMountSource)"
+
+[dependencies]
+ratarmount-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+git2 = { version = "0.19", features = ["vendored-libgit2", "vendored-openssl"] }
+
+[dev-dependencies]
+tempfile.workspace = true

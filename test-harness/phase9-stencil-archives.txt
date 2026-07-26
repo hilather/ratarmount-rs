@@ -1,0 +1,11 @@
+# Phase 9 pure stencil random-access archives (ISO/WARC/XAR/CAB + odc/bin CPIO)
+# Paths match pure backends (not libarchive layout).
+tests/single-file.cab	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.xar	bar	d3b07384d113edec49eaa6238ad5ff00
+# WARC response payload includes HTTP headers (Python WARCMountSource layout includes host)
+tests/hello-world.warc	iipc.github.io/warc-specifications/primers/web-archive-formats/hello-world.txt	4aecced75ff52fdd39bb52dae192258f
+tests/simple-response.warc	example.com/hello.txt	3a33bb4573e0491e5c7537b6f57e3601
+# ISO Level-1 names are uppercase; .iso.bz2 materializes then ISO9660MountSource
+tests/single-file.iso.bz2	BAR	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.odc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.bin.cpio	bar	d3b07384d113edec49eaa6238ad5ff00

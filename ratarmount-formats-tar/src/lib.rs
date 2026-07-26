@@ -7,7 +7,11 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use ratarmount_compress::{FileSegment, SegmentedFile, StenciledFile};
+use std::sync::Arc;
+
+use ratarmount_compress::{
+    FileSegment, SegmentedFile, SeekRead, SeekableBody, SharedSeekableGzip, StenciledFile,
+};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -33,6 +37,56 @@ pub enum TarError {
 
 pub type Result<T> = std::result::Result<T, TarError>;
 
+/// Where uncompressed TAR bytes live for open/read.
+enum ContentBackend {
+    /// Plain file (uncompressed archive or materialised temp body).
+    File {
+        file: File,
+        _keep: Option<NamedTempFile>,
+    },
+    /// Seekable gzip (checkpoint decoder).
+    Gzip(Arc<SharedSeekableGzip>),
+    /// Generic seekable body (bzip2/xz/zstd DecodedBody or multi-frame zstd).
+    Body(Arc<dyn SeekableBody>),
+}
+
+impl ContentBackend {
+    fn open_reader(&self) -> io::Result<ContentReader> {
+        match self {
+            Self::File { file, .. } => Ok(ContentReader::File(file.try_clone()?)),
+            Self::Gzip(g) => Ok(ContentReader::Gzip(g.reader()?)),
+            Self::Body(b) => Ok(ContentReader::Dyn(b.open_reader()?)),
+        }
+    }
+}
+
+/// Concrete reader used by open paths.
+enum ContentReader {
+    File(File),
+    Gzip(ratarmount_compress::SeekableGzipReader),
+    Dyn(Box<dyn SeekRead>),
+}
+
+impl Read for ContentReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(f) => f.read(buf),
+            Self::Gzip(g) => g.read(buf),
+            Self::Dyn(r) => r.read(buf),
+        }
+    }
+}
+
+impl Seek for ContentReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(f) => f.seek(pos),
+            Self::Gzip(g) => g.seek(pos),
+            Self::Dyn(r) => r.seek(pos),
+        }
+    }
+}
+
 /// TAR archive backed by a SQLite index (read path + optional build).
 pub struct SqliteIndexedTar {
     /// Original archive path (for logs / tarstats).
@@ -40,10 +94,7 @@ pub struct SqliteIndexedTar {
     /// Path used for content reads (uncompressed body; may be a temp file).
     #[allow(dead_code)]
     data_path: PathBuf,
-    /// Shared archive fd — `try_clone` per open (independent seeks, page-cache friendly).
-    data_file: File,
-    /// Keeps materialised gzip (etc.) alive for the mount lifetime.
-    _materialised: Option<NamedTempFile>,
+    backend: ContentBackend,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -67,8 +118,30 @@ impl SqliteIndexedTar {
         Ok(Self {
             archive_path,
             data_path,
-            data_file,
-            _materialised: materialised.take(),
+            backend: ContentBackend::File {
+                file: data_file,
+                _keep: materialised.take(),
+            },
+            index,
+            options,
+        })
+    }
+
+    /// Open existing index with a seekable-gzip body (no materialize).
+    pub fn open_with_existing_index_gzip(
+        archive_path: impl AsRef<Path>,
+        gzip: Arc<SharedSeekableGzip>,
+        index_path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let archive_path = archive_path.as_ref().to_path_buf();
+        let data_path = gzip.path().to_path_buf();
+        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        index.check_backend_name(BACKEND_NAME)?;
+        Ok(Self {
+            archive_path,
+            data_path,
+            backend: ContentBackend::Gzip(gzip),
             index,
             options,
         })
@@ -76,6 +149,7 @@ impl SqliteIndexedTar {
 
     /// Build a new index by parsing TAR data at `data_path` (uncompressed).
     /// Logs use `archive_path` (original user-facing path).
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:`.
     /// On success, takes ownership of `materialised` (if any).
     pub fn create_index(
         archive_path: impl AsRef<Path>,
@@ -87,27 +161,114 @@ impl SqliteIndexedTar {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let data_path = data_path.as_ref().to_path_buf();
-        let default_index = default_index_path(&archive_path);
-        let index_path = index_path.unwrap_or(&default_index);
+        let mut file = File::open(&data_path)?;
+        let backend = ContentBackend::File {
+            file: file.try_clone()?,
+            _keep: materialised.take(),
+        };
+        Self::create_index_from_reader(
+            archive_path,
+            data_path,
+            &mut file,
+            index_path,
+            options,
+            product_version,
+            backend,
+        )
+    }
 
+    /// Build index from a seekable-gzip body (G3 Tier B — no materialize).
+    pub fn create_index_gzip(
+        archive_path: impl AsRef<Path>,
+        gzip: Arc<SharedSeekableGzip>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self> {
+        let archive_path = archive_path.as_ref().to_path_buf();
+        let data_path = gzip.path().to_path_buf();
+        let mut reader = gzip.reader()?;
+        let backend = ContentBackend::Gzip(Arc::clone(&gzip));
+        Self::create_index_from_reader(
+            archive_path,
+            data_path,
+            &mut reader,
+            index_path,
+            options,
+            product_version,
+            backend,
+        )
+    }
+
+    /// Open existing index with a generic seekable body (bzip2/xz/zstd).
+    pub fn open_with_existing_index_body(
+        archive_path: impl AsRef<Path>,
+        body: Arc<dyn SeekableBody>,
+        index_path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<Self> {
+        let archive_path = archive_path.as_ref().to_path_buf();
+        let data_path = body.path().to_path_buf();
+        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        index.check_backend_name(BACKEND_NAME)?;
+        Ok(Self {
+            archive_path,
+            data_path,
+            backend: ContentBackend::Body(body),
+            index,
+            options,
+        })
+    }
+
+    /// Build index from a generic seekable body (bzip2/xz/zstd).
+    pub fn create_index_body(
+        archive_path: impl AsRef<Path>,
+        body: Arc<dyn SeekableBody>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self> {
+        let archive_path = archive_path.as_ref().to_path_buf();
+        let data_path = body.path().to_path_buf();
+        let mut reader = body
+            .open_reader()
+            .map_err(|e| TarError::Io(e))?;
+        let backend = ContentBackend::Body(body);
+        Self::create_index_from_reader(
+            archive_path,
+            data_path,
+            &mut reader,
+            index_path,
+            options,
+            product_version,
+            backend,
+        )
+    }
+
+    fn create_index_from_reader<R: Read + Seek>(
+        archive_path: PathBuf,
+        data_path: PathBuf,
+        reader: &mut R,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+        backend: ContentBackend,
+    ) -> Result<Self> {
         println!(
             "Creating offset dictionary for {} ...",
             archive_path.display()
         );
         let t0 = Instant::now();
 
-        let index = SqliteIndex::create_writable(Some(index_path))?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
-        let mut file = File::open(&data_path)?;
-        parse_tar_into_index(&mut file, &index, options)?;
+        parse_tar_into_index(reader, &index, options)?;
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
-        // tarstats of the original archive path (Python stores the outer file stats)
         store_tarstats(&index, &archive_path)?;
         store_arguments(&index, options)?;
         index.commit_write()?;
-        index.finalize_build()?;
 
         let secs = t0.elapsed().as_secs_f64();
         println!(
@@ -115,15 +276,11 @@ impl SqliteIndexedTar {
             archive_path.display()
         );
 
-        drop(index);
-        let index = SqliteIndex::open_read_only(index_path)?;
-        let data_file = File::open(&data_path)?;
-
+        let index = index.into_read_only()?;
         Ok(Self {
             archive_path,
             data_path,
-            data_file,
-            _materialised: materialised.take(),
+            backend,
             index,
             options: options.clone(),
         })
@@ -159,6 +316,10 @@ impl MountSource for SqliteIndexedTar {
         self.index.lookup(path, file_version).ok().flatten()
     }
 
+    fn versions(&self, path: &str) -> u32 {
+        self.index.version_count(path).unwrap_or(0)
+    }
+
     fn open(
         &self,
         file_info: &FileInfo,
@@ -176,13 +337,13 @@ impl MountSource for SqliteIndexedTar {
         if file_info.size == 0 && !ud.issparse {
             return Ok(Box::new(std::io::Cursor::new(Vec::new())));
         }
-        let file = self.data_file.try_clone()?;
+        let reader = self.backend.open_reader()?;
         if ud.issparse {
             let header_off = ud.offsetheader.unwrap_or(ud.offset.saturating_sub(BLOCK_SIZE));
-            return open_sparse_member(file, header_off, ud.offset, file_info.size);
+            return open_sparse_member(reader, header_off, ud.offset, file_info.size);
         }
         Ok(Box::new(StenciledFile::new(
-            file,
+            reader,
             vec![(ud.offset, file_info.size)],
         )))
     }
@@ -419,7 +580,7 @@ fn parse_tar_into_index<R: Read + Seek>(
         let uid = parse_octal(&header[108..116]).unwrap_or(0) as i64;
         let gid = parse_octal(&header[116..124]).unwrap_or(0) as i64;
         let typeflag = header[156];
-        let linkname = cstr_field(&header[157..257]);
+        let linkname = cstr_field_encoded(&header[157..257], &options.encoding);
 
         // PAX extended / global headers — apply to next file (or global).
         if typeflag == b'x' || typeflag == b'g' {
@@ -451,7 +612,7 @@ fn parse_tar_into_index<R: Read + Seek>(
             while long.last() == Some(&0) {
                 long.pop();
             }
-            let long_str = String::from_utf8_lossy(&long).into_owned();
+            let long_str = decode_bytes(&long, &options.encoding);
             pos = data_off_long + pad512(size);
             if typeflag == b'L' {
                 pax_pending.map.insert("path".into(), long_str);
@@ -482,7 +643,7 @@ fn parse_tar_into_index<R: Read + Seek>(
         } else if let Some(p) = pax_map.get("GNU.sparse.name") {
             p.clone()
         } else {
-            parse_name(&header)
+            parse_name(&header, &options.encoding)
         };
         let linkname = pax_map
             .get("linkpath")
@@ -749,8 +910,8 @@ fn segments_from_map(
 }
 
 /// Open a sparse member: re-read map from old GNU `S` or PAX 0.0/0.1/1.0 headers.
-fn open_sparse_member(
-    mut file: File,
+fn open_sparse_member<R: Read + Seek + Send + 'static>(
+    mut file: R,
     header_offset: u64,
     data_offset: u64,
     logical_size: u64,
@@ -845,9 +1006,9 @@ fn open_sparse_member(
     Ok(Box::new(SegmentedFile::new(file, segments)))
 }
 
-fn parse_name(header: &[u8; 512]) -> String {
-    let prefix = cstr_field(&header[345..500]);
-    let name = cstr_field(&header[0..100]);
+fn parse_name(header: &[u8; 512], encoding: &str) -> String {
+    let prefix = cstr_field_encoded(&header[345..500], encoding);
+    let name = cstr_field_encoded(&header[0..100], encoding);
     if prefix.is_empty() {
         name
     } else {
@@ -855,9 +1016,43 @@ fn parse_name(header: &[u8; 512]) -> String {
     }
 }
 
+/// NUL-terminated header field as UTF-8 (for octal / binary-safe numeric fields).
 fn cstr_field(bytes: &[u8]) -> String {
     let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
     String::from_utf8_lossy(&bytes[..end]).into_owned()
+}
+
+/// NUL-terminated field decoded with the configured archive encoding (`-e`).
+fn cstr_field_encoded(bytes: &[u8], encoding: &str) -> String {
+    let end = bytes.iter().position(|&b| b == 0).unwrap_or(bytes.len());
+    decode_bytes(&bytes[..end], encoding)
+}
+
+/// Decode archive path/name bytes using Python-compatible encoding labels.
+fn decode_bytes(bytes: &[u8], encoding: &str) -> String {
+    let enc = encoding.trim();
+    if enc.is_empty()
+        || enc.eq_ignore_ascii_case("utf-8")
+        || enc.eq_ignore_ascii_case("utf8")
+        || enc.eq_ignore_ascii_case("ascii")
+    {
+        return String::from_utf8_lossy(bytes).into_owned();
+    }
+    // Common aliases Python accepts
+    let lowered = enc.to_ascii_lowercase();
+    let label: &str = match lowered.as_str() {
+        "latin1" | "latin-1" | "iso-8859-1" | "iso8859-1" => "iso-8859-1",
+        "cp1252" | "windows-1252" => "windows-1252",
+        "cp437" => "ibm437",
+        other => other,
+    };
+    if let Some(enc) = encoding_rs::Encoding::for_label(label.as_bytes()) {
+        let (cow, _, _) = enc.decode(bytes);
+        cow.into_owned()
+    } else {
+        // Unknown label: fall back to lossy UTF-8 rather than failing the whole archive.
+        String::from_utf8_lossy(bytes).into_owned()
+    }
 }
 
 fn parse_octal(bytes: &[u8]) -> Option<u64> {
@@ -980,6 +1175,32 @@ impl MountSource for SingleFileMountSource {
 mod tests {
     use super::*;
     use std::process::Command;
+
+    #[test]
+    fn multi_version_count_updated_file() {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        let path = Path::new(&root).join("tests/updated-file.tar");
+        if !path.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &path,
+            &path,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .unwrap();
+        assert_eq!(m.versions("/foo/fighter/ufo"), 3);
+        let latest = m.lookup("/foo/fighter/ufo", 0).unwrap();
+        let oldest = m.lookup("/foo/fighter/ufo", 1).unwrap();
+        assert_ne!(latest.size, oldest.size);
+    }
 
     #[test]
     fn index_simple_tar_roundtrip() {
