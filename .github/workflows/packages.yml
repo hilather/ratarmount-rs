@@ -41,7 +41,7 @@ jobs:
     # Containers default to `sh`; force bash for all run steps.
     defaults:
       run:
-        shell: /bin/bash --noprofile --norc -euo pipefail {0}
+        shell: /bin/bash --noprofile --norc -eo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -98,11 +98,16 @@ jobs:
       - name: Version
         id: ver
         run: |
-          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$V" ]; then
+            echo "Could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
             V="${GITHUB_REF_NAME#v}"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved package version: $V"
 
       - name: Build .deb + tarball
         env:
@@ -112,8 +117,9 @@ jobs:
           OUT_DIR: dist
           OPENSSL_NO_VENDOR: "1"
         run: |
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           chmod +x packaging/build-native-packages.sh
-          ./packaging/build-native-packages.sh
+          bash packaging/build-native-packages.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
@@ -234,7 +240,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     defaults:
       run:
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -274,11 +280,16 @@ jobs:
       - name: Version
         id: ver
         run: |
-          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$V" ]; then
+            echo "Could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
             V="${GITHUB_REF_NAME#v}"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved package version: $V"
 
       - name: Build portable tarball only
         env:
@@ -289,8 +300,9 @@ jobs:
           OUT_DIR: dist
           OPENSSL_NO_VENDOR: "1"
         run: |
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           chmod +x packaging/build-native-packages.sh
-          ./packaging/build-native-packages.sh
+          bash packaging/build-native-packages.sh
           # Record glibc requirement for consumers
           ldd --version | head -1 | tee dist/glibc-version.txt || true
           file target/release/ratarmount | tee dist/file-info.txt || true
