@@ -153,12 +153,8 @@ jobs:
     container:
       image: ${{ matrix.image }}
     steps:
-      - name: Bootstrap minimal tools
-        run: |
-          # Container default shell is sh; ensure bash + coreutils for later steps.
-          dnf -y install bash coreutils findutils grep sed which tar gzip ca-certificates \
-            || microdnf -y install bash coreutils findutils grep sed which tar gzip ca-certificates
-
+      # Note: do not install full `coreutils` — Rocky images ship `coreutils-single`
+      # and the two conflict without --allowerasing.
       - uses: actions/checkout@v4
 
       - name: Install build deps (dnf)
@@ -173,6 +169,7 @@ jobs:
           command -v crb >/dev/null 2>&1 && crb enable || true
           dnf -y install --allowerasing \
             gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
+            which findutils tar gzip \
             fuse3-devel fuse3 libarchive-devel zlib-devel \
             openssl-devel perl-IPC-Cmd
           # Ensure a curl binary exists (curl-minimal or full curl after allowerasing).
