@@ -314,8 +314,7 @@ jobs:
           done
           ls -la
 
-      - name: Upload signed bundle (workflow_dispatch / PR path)
-        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
+      - name: Upload signed bundle (always)
         uses: actions/upload-artifact@v4
         with:
           name: signed-release-bundle
@@ -330,9 +329,13 @@ jobs:
           cd release
           ls -la
           test -s SHA256SUMS
-          # Recreate release so re-tags replace empty/failed prior attempts.
-          gh release delete "${GITHUB_REF_NAME}" --yes 2>/dev/null || true
-          cat > /tmp/release-notes.md <<'EOF'
+          shopt -s nullglob
+          mapfile -t FILES < <(find . -maxdepth 1 -type f ! -name '.*' | sed 's|^\./||' | sort)
+          echo "Uploading ${#FILES[@]} files: ${FILES[*]}"
+          test "${#FILES[@]}" -gt 0
+
+          NOTES=$(mktemp)
+          cat >"$NOTES" <<'EOF'
           ## Packages
 
           | Kind | Platforms |
@@ -343,20 +346,15 @@ jobs:
 
           Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
 
-          ### Verify
-
-          ```bash
-          cosign verify-blob \
-            --bundle FILE.cosign.bundle \
-            --certificate-identity-regexp 'https://github.com/hilather/ratarmount-rs/.github/workflows/packages.yml@.*' \
-            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-            FILE
-          ```
-
           Runtime depends: **fuse3**, **libarchive** (optional: e2fsprogs, squashfs-tools).
           EOF
-          # Tag already exists on this push; attach a release and upload artifacts.
+
+          # Replace any prior broken release for this tag.
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release delete "${GITHUB_REF_NAME}" --yes
+          fi
           gh release create "${GITHUB_REF_NAME}" \
             --title "ratarmount-rs ${GITHUB_REF_NAME}" \
-            --notes-file /tmp/release-notes.md \
-            ./*
+            --notes-file "$NOTES" \
+            --verify-tag \
+            "${FILES[@]}"
