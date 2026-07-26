@@ -323,29 +323,40 @@ jobs:
 
       - name: Create / update GitHub Release (tags only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          files: release/*
-          generate_release_notes: true
-          body: |
-            ## Packages
-
-            | Kind | Platforms |
-            |------|-----------|
-            | `.deb` | Ubuntu 20.04 / 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
-            | `.rpm` | Rocky 8/9 (amd64), Rocky 9 (arm64) |
-            | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) — broadest glibc compatibility |
-
-            ### Verify cosign signatures (keyless)
-
-            ```bash
-            cosign verify-blob \
-              --bundle ratarmount_….deb.cosign.bundle \
-              --certificate-identity-regexp 'https://github.com/.+/.+/.github/workflows/packages.yml@.*' \
-              --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-              ratarmount_….deb
-            ```
-
-            Runtime depends: **fuse3**, **libarchive** (plus optional e2fsprogs / squashfs-tools).
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          cd release
+          ls -la
+          test -s SHA256SUMS
+          # Recreate release so re-tags replace empty/failed prior attempts.
+          gh release delete "${GITHUB_REF_NAME}" --yes 2>/dev/null || true
+          cat > /tmp/release-notes.md <<'EOF'
+          ## Packages
+
+          | Kind | Platforms |
+          |------|-----------|
+          | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
+          | `.rpm` | Rocky 8 (amd64) |
+          | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
+
+          Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
+
+          ### Verify
+
+          ```bash
+          cosign verify-blob \
+            --bundle FILE.cosign.bundle \
+            --certificate-identity-regexp 'https://github.com/hilather/ratarmount-rs/.github/workflows/packages.yml@.*' \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            FILE
+          ```
+
+          Runtime depends: **fuse3**, **libarchive** (optional: e2fsprogs, squashfs-tools).
+          EOF
+          # Tag already exists on this push; attach a release and upload artifacts.
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "ratarmount-rs ${GITHUB_REF_NAME}" \
+            --notes-file /tmp/release-notes.md \
+            ./*
