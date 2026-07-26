@@ -38,10 +38,10 @@ jobs:
   deb:
     name: deb (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
-    # Containers default to `sh`; our scripts and `[[` need bash.
+    # Containers default to `sh`; force bash for all run steps.
     defaults:
       run:
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -131,9 +131,10 @@ jobs:
   rpm:
     name: rpm (${{ matrix.label }})
     runs-on: ${{ matrix.runner }}
+    # Container jobs default to `sh`; force absolute bash for all run steps.
     defaults:
       run:
-        shell: bash
+        shell: /bin/bash --noprofile --norc -euo pipefail {0}
     strategy:
       fail-fast: false
       matrix:
@@ -166,29 +167,40 @@ jobs:
             || dnf config-manager --set-enabled crb 2>/dev/null \
             || true
           # Prefer /usr/bin/crb when present (Rocky 9 EPEL hint).
-          command -v crb >/dev/null 2>&1 && crb enable || true
+          if command -v crb >/dev/null 2>&1; then crb enable || true; fi
           dnf -y install --allowerasing \
             gcc gcc-c++ make pkgconf-pkg-config git ca-certificates \
             which findutils tar gzip \
             fuse3-devel fuse3 libarchive-devel zlib-devel \
             openssl-devel perl-IPC-Cmd
           # Ensure a curl binary exists (curl-minimal or full curl after allowerasing).
-          command -v curl >/dev/null || dnf -y install --allowerasing curl
+          if ! command -v curl >/dev/null 2>&1; then
+            dnf -y install --allowerasing curl
+          fi
 
       - name: Install Rust
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:$PATH"
+          rustc --version
+          cargo --version
 
       - name: Version
         id: ver
         run: |
-          V=$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')
-          if [[ "${GITHUB_REF_TYPE:-}" == tag ]]; then
+          # POSIX-friendly parse (avoid bashisms that fail under `sh`).
+          V=$(sed -n 's/^version *= *"\([^"]*\)".*/\1/p' Cargo.toml | head -n1)
+          if [ -z "$V" ]; then
+            echo "Could not parse version from Cargo.toml" >&2
+            exit 1
+          fi
+          if [ "${GITHUB_REF_TYPE:-}" = tag ]; then
             V="${GITHUB_REF_NAME#v}"
           fi
           echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Resolved package version: $V"
 
       - name: Build .rpm + tarball
         env:
@@ -199,8 +211,9 @@ jobs:
           # Link system OpenSSL (distro packages); avoid vendored openssl-src perl deps.
           OPENSSL_NO_VENDOR: "1"
         run: |
+          export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:$PATH"
           chmod +x packaging/build-native-packages.sh
-          ./packaging/build-native-packages.sh
+          bash packaging/build-native-packages.sh
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
