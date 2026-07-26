@@ -1,0 +1,32 @@
+[package]
+name = "ratarmount"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Random Access To Archived Resources (Rust)"
+default-run = "ratarmount"
+
+[[bin]]
+name = "ratarmount"
+path = "src/main.rs"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-formats-tar.workspace = true
+ratarmount-formats-zip.workspace = true
+ratarmount-formats-ar.workspace = true
+ratarmount-formats-cpio.workspace = true
+ratarmount-formats-libarchive.workspace = true
+ratarmount-formats-sevenzip.workspace = true
+ratarmount-remote.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-fuse.workspace = true
+ratarmount-compress.workspace = true
+tempfile.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+log.workspace = true
+url = "2"
+nix = { version = "0.29", features = ["process"] }
+libc.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "ratarmount-formats-sevenzip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Custom 7z MountSource with pack offsets (SevenZipMountSource parity)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+flate2 = "1"
+bzip2 = { version = "0.5", features = ["static"] }
+lzma-sys = "0.1"
+aes = "0.8"
+cbc = "0.1"
+sha2 = "0.10"
+cipher = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true

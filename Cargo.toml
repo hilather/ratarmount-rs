@@ -1,0 +1,46 @@
+[workspace]
+resolver = "2"
+members = [
+    "ratarmount",
+    "ratarmount-core",
+    "ratarmount-index",
+    "ratarmount-fuse",
+    "ratarmount-compress",
+    "ratarmount-formats-tar",
+    "ratarmount-formats-zip",
+    "ratarmount-formats-ar",
+    "ratarmount-formats-cpio",
+    "ratarmount-formats-libarchive",
+    "ratarmount-formats-sevenzip",
+    "ratarmount-remote",
+    "ratarmount-compositing",
+]
+default-members = ["ratarmount"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/mxmlnkn/ratarmount-rs"
+rust-version = "1.74"
+
+[workspace.dependencies]
+ratarmount-core = { path = "ratarmount-core" }
+ratarmount-index = { path = "ratarmount-index" }
+ratarmount-fuse = { path = "ratarmount-fuse" }
+ratarmount-compress = { path = "ratarmount-compress" }
+ratarmount-formats-tar = { path = "ratarmount-formats-tar" }
+ratarmount-formats-zip = { path = "ratarmount-formats-zip" }
+ratarmount-formats-ar = { path = "ratarmount-formats-ar" }
+ratarmount-formats-cpio = { path = "ratarmount-formats-cpio" }
+ratarmount-formats-libarchive = { path = "ratarmount-formats-libarchive" }
+ratarmount-formats-sevenzip = { path = "ratarmount-formats-sevenzip" }
+ratarmount-remote = { path = "ratarmount-remote" }
+ratarmount-compositing = { path = "ratarmount-compositing" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+thiserror = "2"
+clap = { version = "4", features = ["derive", "env"] }
+libc = "0.2"
+log = "0.4"
+env_logger = "0.11"
+tempfile = "3"

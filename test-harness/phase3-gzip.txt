@@ -1,0 +1,3 @@
+# Phase 3 gzip allowlist
+# archive_relpath <TAB> path_inside <TAB> optional_md5
+tests/simple.gz	simple	19696f24a91fc4e8950026f9c801a0d0

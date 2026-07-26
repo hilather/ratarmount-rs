@@ -1,0 +1,2 @@
+# Phase 4 bzip2
+tests/simple.bz2	simple	19696f24a91fc4e8950026f9c801a0d0

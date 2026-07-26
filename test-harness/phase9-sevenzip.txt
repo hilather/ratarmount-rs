@@ -1,0 +1,7 @@
+# Phase 9+ custom SevenZip random-access fixtures (from Python tests/*.7z)
+# format: archive_relpath | member_path | expected_substring_or_md5_hint
+tests/store-copy-two-files.7z|a.txt|AAA
+tests/store-copy-two-files.7z|b.txt|BBB
+tests/lzma2-two-files-and-medium.7z|a.txt|AAA
+tests/lzma2-two-files-and-medium.7z|medium.bin|
+tests/file-in-non-existing-folder.7z|foo2/ufo|

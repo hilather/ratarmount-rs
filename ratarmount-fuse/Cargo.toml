@@ -1,0 +1,14 @@
+[package]
+name = "ratarmount-fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "FUSE layer for ratarmount-rs (fuser low-level)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+fuser = "0.15"
+libc.workspace = true
+log.workspace = true
+thiserror.workspace = true

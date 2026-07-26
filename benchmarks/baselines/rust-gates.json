@@ -1,0 +1,26 @@
+{
+  "_comment": "Soft gates from head-to-head Python vs Rust benchmarks. Fail CI if worse than max_ratio without waiver.",
+  "cold_index_empty_1k_tar_sec": {
+    "max_seconds": 0.5,
+    "notes": "After bulk SQLite PRAGMA+transaction path; was ~5s before fix"
+  },
+  "mount_time_warm_vs_python": {
+    "max_ratio_vs_python": 1.0,
+    "notes": "Rust should stay faster or equal on warm mount (geo-mean ~4×)"
+  },
+  "peak_rss_vs_python": {
+    "max_ratio_vs_python": 0.25,
+    "notes": "Rust peak RSS should stay well under Python (~12× better)"
+  },
+  "find_mounted_vs_python": {
+    "max_ratio_vs_python": 1.5
+  },
+  "sequential_read_uncompressed_tar_vs_python": {
+    "min_ratio_vs_python": 0.8,
+    "notes": "Bandwidth ratio Rust/Python"
+  },
+  "sequential_read_tar_gz_MBps": {
+    "min_ratio_vs_python": 0.5,
+    "notes": "Until seekable gzip lands; materialize path still allowed"
+  }
+}

@@ -1,0 +1,3 @@
+# Phase 6 ZIP (no nested automount paths)
+tests/nested-with-symlink.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/denormal-paths.zip	ufo	2709a3348eb2c52302a7606ecf5860bc

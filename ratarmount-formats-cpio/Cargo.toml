@@ -1,0 +1,17 @@
+[package]
+name = "ratarmount-formats-cpio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CPIO newc mount source (subset of libarchive formats)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+ratarmount-compress.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,7 @@
+# Phase 9 libarchive-backed formats
+# Note: WARC payload from libarchive includes HTTP response headers (differs from some Python paths).
+tests/single-file.cab	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.xar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/hello-world.warc	warc-specifications/primers/web-archive-formats/hello-world.txt	f75a12de31db9d1cbe2b927a0778dbb1
+# .iso.bz2 materializes then libarchive; ISO root exposes bar (not single-file.iso/ prefix)
+tests/single-file.iso.bz2	bar	d3b07384d113edec49eaa6238ad5ff00

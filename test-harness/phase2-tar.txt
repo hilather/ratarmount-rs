@@ -1,0 +1,6 @@
+# Phase 2 allowlist: plain uncompressed TAR fixtures.
+# Format: archive_relpath <TAB> path_inside <TAB> optional_md5
+tests/single-file.tar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-nested-file.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/single-nested-folder.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/empty.tar	.	.

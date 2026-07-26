@@ -1,0 +1,17 @@
+[package]
+name = "ratarmount-index"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SQLite index 0.7.0 read/write for ratarmount-rs"
+
+[dependencies]
+ratarmount-core.workspace = true
+rusqlite.workspace = true
+thiserror.workspace = true
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

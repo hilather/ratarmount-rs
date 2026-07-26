@@ -1,0 +1,3 @@
+# Phase 9 pure AR + CPIO newc
+tests/single-file.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.newc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00

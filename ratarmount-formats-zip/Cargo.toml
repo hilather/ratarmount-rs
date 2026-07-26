@@ -1,0 +1,19 @@
+[package]
+name = "ratarmount-formats-zip"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZIP mount source (ZipMountSource parity)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+zip = { version = "2", default-features = true }
+flate2 = { version = "1", features = ["zlib"] }
+ratarmount-compress.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

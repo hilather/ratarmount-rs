@@ -1,0 +1,10 @@
+[package]
+name = "ratarmount-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "MountSource trait and shared types for ratarmount-rs"
+
+[dependencies]
+libc.workspace = true
+thiserror.workspace = true

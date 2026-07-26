@@ -1,0 +1,19 @@
+[package]
+name = "ratarmount-remote"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Remote URL fetch (HTTP, S3, SSH/SFTP) for ratarmount-rs"
+
+[dependencies]
+ratarmount-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+tempfile.workspace = true
+ureq = { version = "2", default-features = true, features = ["tls"] }
+url = "2"
+ssh2 = { version = "0.9", features = ["vendored-openssl"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

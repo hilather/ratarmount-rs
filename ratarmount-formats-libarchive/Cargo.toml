@@ -1,0 +1,20 @@
+[package]
+name = "ratarmount-formats-libarchive"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "libarchive-backed mount source (LibarchiveMountSource)"
+links = "archive"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+thiserror.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[build-dependencies]
+pkg-config = "0.3"
+
+[dev-dependencies]
+tempfile.workspace = true

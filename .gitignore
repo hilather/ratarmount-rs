@@ -1,0 +1,13 @@
+/target/
+**/*.rs.bk
+.idea/
+.vscode/
+*.swp
+*~
+.DS_Store
+*.index.sqlite
+/tmp/
+benchmarks/.venv-py/
+**/bench-results/
+*.log
+.cargo-cache/
