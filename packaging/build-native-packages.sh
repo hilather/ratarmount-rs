@@ -17,7 +17,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT"
 
-export PATH="${HOME}/.cargo/bin:${PATH}"
+export PATH="${HOME}/.cargo/bin:${HOME}/.local/bin:/usr/local/bin:/usr/bin:/bin:${PATH}"
 
 OUT_DIR="${OUT_DIR:-$ROOT/dist}"
 NAME="${PACKAGE_NAME:-ratarmount}"
