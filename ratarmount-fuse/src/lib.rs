@@ -9,7 +9,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, FUSE_ROOT_ID,
+    ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
+    FUSE_ROOT_ID,
 };
 use libc::{EIO, ENOENT, ENOSYS, EROFS};
 use log::debug;
@@ -184,6 +185,41 @@ impl RatarmountFs {
 
     fn writable(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Resolve `FileInfo` for an inode (cache first, then source lookup).
+    fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
+        if let Some(fi) = self.cached_fi(ino) {
+            return Some(fi);
+        }
+        let path = self.path_for_ino(ino)?;
+        let fi = if path == "/" {
+            ratarmount_core::create_root_file_info()
+        } else {
+            self.source.lookup(&path, 0)?
+        };
+        self.store_fi(ino, fi.clone());
+        Some(fi)
+    }
+}
+
+/// Encode xattr names as concatenated NUL-terminated C strings (FUSE listxattr wire format).
+fn encode_xattr_list(keys: &[String]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for key in keys {
+        bytes.extend_from_slice(key.as_bytes());
+        bytes.push(0);
+    }
+    bytes
+}
+
+fn reply_xattr_bytes(size: u32, data: &[u8], reply: ReplyXattr) {
+    if size == 0 {
+        reply.size(data.len() as u32);
+    } else if data.len() <= size as usize {
+        reply.data(data);
+    } else {
+        reply.error(libc::ERANGE);
     }
 }
 
@@ -738,6 +774,41 @@ impl Filesystem for RatarmountFs {
         };
         reply.data(fi.linkname.as_bytes());
     }
+
+    fn getxattr(
+        &mut self,
+        _req: &Request<'_>,
+        ino: u64,
+        name: &OsStr,
+        size: u32,
+        reply: ReplyXattr,
+    ) {
+        let Some(fi) = self.file_info_for_ino(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let key = name.to_string_lossy();
+        match self.source.get_xattr(&fi, &key) {
+            Some(value) => reply_xattr_bytes(size, &value, reply),
+            None => {
+                // Linux: ENODATA; macOS/BSD: ENOATTR (same numeric value on many systems).
+                #[cfg(target_os = "linux")]
+                reply.error(libc::ENODATA);
+                #[cfg(not(target_os = "linux"))]
+                reply.error(libc::ENOATTR);
+            }
+        }
+    }
+
+    fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
+        let Some(fi) = self.file_info_for_ino(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let keys = self.source.list_xattr(&fi);
+        let bytes = encode_xattr_list(&keys);
+        reply_xattr_bytes(size, &bytes, reply);
+    }
 }
 
 /// Parse a Python-style `-o` / `--fuse` comma-separated option string into `MountOption`s.
@@ -879,4 +950,104 @@ fn unmount_macos(mp: &Path) -> std::io::Result<()> {
 #[allow(dead_code)]
 fn _pb() -> PathBuf {
     PathBuf::new()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratarmount_core::{ListModeResult, ListResult, MountSource, S_IFREG};
+    use std::collections::BTreeMap;
+    use std::io;
+
+    /// Minimal MountSource that only serves synthetic xattrs for unit tests.
+    struct XattrSource {
+        fi: FileInfo,
+        attrs: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl MountSource for XattrSource {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                let mut m = BTreeMap::new();
+                m.insert("f".into(), self.fi.clone());
+                Some(ListResult::Infos(m))
+            } else {
+                None
+            }
+        }
+
+        fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+            if path == "/" {
+                let mut m = BTreeMap::new();
+                m.insert("f".into(), self.fi.mode);
+                Some(ListModeResult::Modes(m))
+            } else {
+                None
+            }
+        }
+
+        fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
+            match path {
+                "/" => Some(ratarmount_core::create_root_file_info()),
+                "/f" => Some(self.fi.clone()),
+                _ => None,
+            }
+        }
+
+        fn open(
+            &self,
+            _file_info: &FileInfo,
+            _buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(Vec::new())))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+
+        fn list_xattr(&self, _file_info: &FileInfo) -> Vec<String> {
+            self.attrs.keys().cloned().collect()
+        }
+
+        fn get_xattr(&self, _file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+            self.attrs.get(key).cloned()
+        }
+    }
+
+    #[test]
+    fn encode_xattr_list_null_terminated() {
+        let keys = vec!["user.hash.sha256".into(), "user.hash.crc32".into()];
+        let bytes = encode_xattr_list(&keys);
+        assert_eq!(bytes, b"user.hash.sha256\0user.hash.crc32\0".as_slice());
+    }
+
+    #[test]
+    fn source_xattr_roundtrip_via_fs_cache() {
+        let digest = b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447".to_vec();
+        let mut attrs = BTreeMap::new();
+        attrs.insert("user.hash.sha256".into(), digest.clone());
+        let fi = FileInfo {
+            size: 12,
+            mtime: 0.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![],
+        };
+        let src = Arc::new(XattrSource { fi, attrs });
+        let fs = RatarmountFs::new(src, None);
+
+        // Prime inode cache as lookup would.
+        let ino = fs.ino_for_path_with_fi("/f", Some(fs.source.lookup("/f", 0).unwrap()));
+        let fi = fs.file_info_for_ino(ino).expect("fi");
+        let keys = fs.source.list_xattr(&fi);
+        assert_eq!(keys, vec!["user.hash.sha256".to_string()]);
+        assert_eq!(
+            fs.source.get_xattr(&fi, "user.hash.sha256").as_deref(),
+            Some(digest.as_slice())
+        );
+        assert!(fs.source.get_xattr(&fi, "user.hash.md5").is_none());
+    }
 }

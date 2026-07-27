@@ -350,6 +350,27 @@ impl MountSource for SqliteIndexedTar {
     fn is_immutable(&self) -> bool {
         true
     }
+
+    /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        let Some(oh) = tar_offsetheader(file_info) else {
+            return Vec::new();
+        };
+        self.index.list_xattr_keys(oh).unwrap_or_default()
+    }
+
+    /// One xattr value from the index (e.g. hex digest for `user.hash.sha256`).
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        let oh = tar_offsetheader(file_info)?;
+        self.index.get_xattr(oh, key).ok().flatten()
+    }
+}
+
+/// `offsetheader` used as the xattrs table key (Python interop).
+fn tar_offsetheader(fi: &FileInfo) -> Option<i64> {
+    tar_userdata(fi)
+        .and_then(|ud| ud.offsetheader)
+        .map(|v| v as i64)
 }
 
 fn tar_userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
@@ -1759,5 +1780,86 @@ mod tests {
             fix_incremental_backup_name_prefixes("14130613451/foo", &empty),
             "14130613451/foo"
         );
+    }
+
+    /// After `--hashes sha256` fill, MountSource xattrs expose `user.hash.sha256` (Python parity).
+    #[test]
+    fn get_xattr_user_hash_after_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("t.tar");
+        let src = dir.path().join("data");
+        std::fs::create_dir_all(&src).unwrap();
+        let content = b"hello world\n";
+        std::fs::write(src.join("hello.txt"), content).unwrap();
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&src)
+            .arg("hello.txt")
+            .status()
+            .expect("tar");
+        assert!(status.success());
+
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        {
+            let opts = OpenOptions::default();
+            let mut mat = None;
+            let _m = SqliteIndexedTar::create_index(
+                &tar_path,
+                &tar_path,
+                Some(&idx_path),
+                &opts,
+                "0.1.0",
+                &mut mat,
+            )
+            .expect("create index");
+        }
+
+        // Same path as CLI `--hashes sha256`: open index writable and fill.
+        {
+            let idx = ratarmount_index::SqliteIndex::open_writable(&idx_path).unwrap();
+            ratarmount_index::fill_content_hashes(
+                &idx,
+                &tar_path,
+                &["sha256".into(), "crc32".into()],
+            )
+            .unwrap();
+        }
+
+        let mut mat = None;
+        let m = SqliteIndexedTar::open_with_existing_index(
+            &tar_path,
+            &tar_path,
+            &idx_path,
+            OpenOptions::default(),
+            &mut mat,
+        )
+        .expect("reopen with index");
+
+        let fi = m.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        let mut keys = m.list_xattr(&fi);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+
+        let sha = m
+            .get_xattr(&fi, "user.hash.sha256")
+            .expect("user.hash.sha256 present");
+        assert_eq!(
+            sha.as_slice(),
+            b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+        let crc = m
+            .get_xattr(&fi, "user.hash.crc32")
+            .expect("user.hash.crc32 present");
+        assert_eq!(crc.as_slice(), b"af083b2d");
+        assert!(m.get_xattr(&fi, "user.hash.md5").is_none());
+        assert!(m.get_xattr(&fi, "missing").is_none());
     }
 }
