@@ -157,8 +157,30 @@ jobs:
           key: macos-14-v2
 
       - name: cargo build (fuse smoke compile)
-        # Surface link/build errors before clippy for clearer logs.
-        run: cargo build -p ratarmount-fuse -p ratarmount --all-targets
+        # Surface link/build errors before clippy. Emit ::error:: annotations so
+        # failure details are visible via the public Checks API without log auth.
+        run: |
+          set +e
+          cargo build -p ratarmount-fuse -p ratarmount --all-targets 2>&1 | tee /tmp/cargo-macos-build.log
+          code=${PIPESTATUS[0]}
+          if [[ "$code" -ne 0 ]]; then
+            echo "::group::cargo build failure (tail)"
+            tail -n 120 /tmp/cargo-macos-build.log
+            echo "::endgroup::"
+            # Annotations (public on public repos)
+            grep -E 'error(\[E[0-9]+\]|:)|\berror: ' /tmp/cargo-macos-build.log \
+              | head -n 40 \
+              | while IFS= read -r line; do
+                  # Truncate extremely long lines for annotation limits
+                  echo "::error::${line:0:300}"
+                done
+            grep -E 'note:|warning:|ld:|Undefined|pkg-config|fuse' /tmp/cargo-macos-build.log \
+              | head -n 30 \
+              | while IFS= read -r line; do
+                  echo "::warning::${line:0:300}"
+                done
+            exit "$code"
+          fi
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
