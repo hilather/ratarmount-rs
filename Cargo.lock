@@ -1499,6 +1499,8 @@ dependencies = [
 name = "ratarmount-compositing"
 version = "0.1.2"
 dependencies = [
+ "bzip2",
+ "flate2",
  "libc",
  "log",
  "ratarmount-compress",
@@ -1508,6 +1510,7 @@ dependencies = [
  "rusqlite",
  "tempfile",
  "thiserror",
+ "xz2",
 ]
 
 [[package]]

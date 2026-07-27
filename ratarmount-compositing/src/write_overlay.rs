@@ -2,17 +2,22 @@
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
-use std::io::{self, Write};
+use std::io::{self, BufReader, BufWriter, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 
+use bzip2::write::BzEncoder;
+use flate2::write::GzEncoder;
+use flate2::Compression as GzCompression;
+use ratarmount_compress::{detect_compression, materialize, CompressionFormat};
 use ratarmount_core::{
     create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
+use xz2::write::XzEncoder;
 
 pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
 
@@ -426,9 +431,16 @@ impl Default for CommitOverlayOptions {
     }
 }
 
-/// Apply overlay folder modifications to an **uncompressed** TAR using GNU tar.
+/// Apply overlay folder modifications to a TAR archive using GNU tar.
 ///
-/// Mirrors Python `commit_overlay`:
+/// Supports **uncompressed** TAR and compressed TAR (gzip / bzip2 / xz).
+/// For compressed archives:
+/// 1. Decompress to a temp uncompressed TAR
+/// 2. Run the usual `tar --delete` / `tar --append` on the temp
+/// 3. Recompress and atomically replace the original
+///
+/// Mirrors Python `commit_overlay` (uncompressed path) plus the typical
+/// decompress → commit → recompress approach for compressed TARs:
 /// 1. Collect deleted paths from `.ratarmount.overlay.sqlite`
 /// 2. Walk overlay files → delete-then-append list
 /// 3. `tar --delete` then `tar --append -C overlay`
@@ -453,12 +465,50 @@ pub fn commit_overlay(
             tar_file.display()
         )));
     }
-    if !is_uncompressed_tar(tar_file)? {
-        return Err(OverlayError::Msg(
-            "Currently, only modifications to an uncompressed TAR may be committed.".into(),
-        ));
-    }
     ensure_gnu_tar()?;
+
+    let format = detect_compression(tar_file).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to detect compression for '{}': {e}",
+            tar_file.display()
+        ))
+    })?;
+
+    // Keep materialized temp alive until recompress finishes.
+    let (work_tar, _materialized): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
+        CompressionFormat::None => {
+            if !is_uncompressed_tar(tar_file)? {
+                return Err(OverlayError::Msg(
+                    "Archive does not look like an uncompressed TAR \
+                     (ustar/GNU magic missing)."
+                        .into(),
+                ));
+            }
+            (tar_file.to_path_buf(), None)
+        }
+        CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
+            let (tmp, _) = materialize(tar_file, format).map_err(|e| {
+                OverlayError::Msg(format!(
+                    "Failed to decompress '{}' for commit: {e}",
+                    tar_file.display()
+                ))
+            })?;
+            if !is_uncompressed_tar(tmp.path())? {
+                return Err(OverlayError::Msg(format!(
+                    "Decompressed content of '{}' does not look like a TAR archive.",
+                    tar_file.display()
+                )));
+            }
+            let path = tmp.path().to_path_buf();
+            (path, Some(tmp))
+        }
+        other => {
+            return Err(OverlayError::Msg(format!(
+                "Currently, commit-overlay supports uncompressed TAR and \
+                 gzip/bzip2/xz compressed TAR (got {other:?})."
+            )));
+        }
+    };
 
     let tmp = tempfile::tempdir()?;
     let deletion_list = tmp.path().join("deletions.lst");
@@ -543,11 +593,17 @@ pub fn commit_overlay(
             "To commit the overlay folder to the archive, these commands have to be executed:"
         );
         println!();
+        if format != CompressionFormat::None {
+            println!(
+                "    # decompress {} -> temp TAR, then:",
+                tar_file.display()
+            );
+        }
         if !deletions.is_empty() {
             println!(
                 "    tar --delete --null --files-from='{}' --file '{}' 2>&1 |",
                 deletion_list.display(),
-                tar_file.display()
+                work_tar.display()
             );
             println!("       sed '/^tar: Exiting with failure/d; /^tar.*Not found in archive/d'");
         }
@@ -556,6 +612,12 @@ pub fn commit_overlay(
                 "    tar --append -C '{}' --null --files-from='{}' --file '{}'",
                 write_overlay.display(),
                 append_list.display(),
+                work_tar.display()
+            );
+        }
+        if format != CompressionFormat::None {
+            println!(
+                "    # recompress temp TAR -> {} ({format:?})",
                 tar_file.display()
             );
         }
@@ -588,7 +650,7 @@ pub fn commit_overlay(
                 &format!("--files-from={}", deletion_list.display()),
                 "--file",
             ])
-            .arg(tar_file)
+            .arg(&work_tar)
             .stdout(Stdio::null())
             .stderr(Stdio::piped())
             .output()?;
@@ -621,13 +683,17 @@ pub fn commit_overlay(
                 &format!("--files-from={}", append_list.display()),
                 "--file",
             ])
-            .arg(tar_file)
+            .arg(&work_tar)
             .status()?;
         if !status.success() {
             return Err(OverlayError::Msg(format!(
                 "tar --append failed with {status}"
             )));
         }
+    }
+
+    if format != CompressionFormat::None {
+        recompress_replace(&work_tar, tar_file, format)?;
     }
 
     if opts.debug >= 1 {
@@ -637,6 +703,54 @@ pub fn commit_overlay(
         );
     }
     Ok(true)
+}
+
+/// Compress `plain` with `format` and atomically replace `dest`.
+fn recompress_replace(plain: &Path, dest: &Path, format: CompressionFormat) -> Result<()> {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match parent {
+        Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+
+    {
+        let mut src = BufReader::new(File::open(plain)?);
+        let mut out = BufWriter::new(tmp.as_file_mut());
+        match format {
+            CompressionFormat::Gzip => {
+                let mut enc = GzEncoder::new(&mut out, GzCompression::default());
+                io::copy(&mut src, &mut enc)?;
+                enc.finish()?;
+            }
+            CompressionFormat::Bzip2 => {
+                let mut enc = BzEncoder::new(&mut out, bzip2::Compression::default());
+                io::copy(&mut src, &mut enc)?;
+                enc.finish()?;
+            }
+            CompressionFormat::Xz => {
+                let mut enc = XzEncoder::new(&mut out, 6);
+                io::copy(&mut src, &mut enc)?;
+                enc.finish()?;
+            }
+            other => {
+                return Err(OverlayError::Msg(format!(
+                    "internal: recompress_replace called with unsupported format {other:?}"
+                )));
+            }
+        }
+        out.flush()?;
+    }
+    tmp.as_file().sync_all()?;
+
+    // Atomic replace on the same filesystem (parent chosen to match dest).
+    tmp.persist(dest).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to replace '{}' with recompressed archive: {}",
+            dest.display(),
+            e.error
+        ))
+    })?;
+    Ok(())
 }
 
 fn join_rel(path: &str, name: &str) -> String {
@@ -840,6 +954,86 @@ mod tests {
         let text = String::from_utf8_lossy(&list.stdout);
         assert!(text.contains("new.txt"), "tar listing: {text}");
         assert!(text.contains("old.txt"), "tar listing: {text}");
+    }
+
+    #[test]
+    fn commit_overlay_add_file_tar_gz() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("data");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("old.txt"), b"old gz\n").unwrap();
+        let tgz = dir.path().join("a.tar.gz");
+        let st = StdCommand::new("tar")
+            .args(["-czf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&src)
+            .arg("old.txt")
+            .status()
+            .unwrap();
+        assert!(st.success());
+
+        // Sanity: starts with gzip magic
+        let magic = fs::read(&tgz).unwrap();
+        assert!(magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b);
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        {
+            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            fs::write(overlay.join("new.txt"), b"hello gzip commit\n").unwrap();
+        }
+
+        let opts = CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+        };
+        match commit_overlay(&overlay, &tgz, &opts) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            Err(e) => panic!("commit_overlay tar.gz: {e}"),
+        }
+
+        // Still gzip-compressed after commit
+        let magic = fs::read(&tgz).unwrap();
+        assert!(
+            magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b,
+            "archive should remain gzip after commit"
+        );
+
+        // List via tar -tzf (or gunzip | tar if needed)
+        let list = StdCommand::new("tar")
+            .args(["-tzf"])
+            .arg(&tgz)
+            .output()
+            .unwrap();
+        assert!(
+            list.status.success(),
+            "tar -tzf failed: {}",
+            String::from_utf8_lossy(&list.stderr)
+        );
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(text.contains("new.txt"), "tar.gz listing: {text}");
+        assert!(text.contains("old.txt"), "tar.gz listing: {text}");
+
+        // Extract new.txt and verify content
+        let extract = dir.path().join("out");
+        fs::create_dir_all(&extract).unwrap();
+        let st = StdCommand::new("tar")
+            .args(["-xzf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&extract)
+            .arg("new.txt")
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let body = fs::read_to_string(extract.join("new.txt")).unwrap();
+        assert_eq!(body, "hello gzip commit\n");
     }
 
     /// Minimal immutable empty base for WriteOverlay construction in tests.
