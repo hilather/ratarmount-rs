@@ -24,7 +24,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
 | SquashFS | yes | yes (backhand in-process; unsquashfs fallback for xz/lzma) | `[x]` / `~` xz fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
-| SQLAR | yes | yes (unencrypted) | `~` sqlcipher encrypted |
+| SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments (lopdf); OGG demux; HTML data-URLs | `~` PDF images deferred |
 | Git tree mount | yes | yes (`git2`; worktree needs `RATARMOUNT_FORCE_GIT=1`) | `~` |
@@ -35,9 +35,9 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | gzip (rapidgzip / seek index) | yes | **G3 Tier B seekable** for `.tar.gz`; materialize for plain `.gz` | `~` Tier C blob import still open |
-| bzip2 block-parallel | yes | **Tier B lite** (decode → RAM/temp via `SeekableBody`) | `~` true bit-block map + `-P` |
+| bzip2 block-parallel | yes | multi-stream parallel via `-P` / `ParallelizationSpec` | `~` true bit-block map still open |
 | xz multi-block seek | yes | **Tier B lite** (decode → RAM/temp) | `~` liblzma stream index |
-| zstd multi-frame / seek table | yes | **multi-frame map** + single-frame decode | `~` seek-table / `zstdblocks` import |
+| zstd multi-frame / seek table | yes | multi-frame map + seek-table footer import | `[x]` / `~` zstdblocks import |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
 | lrz | yes | no | `[ ]` |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
@@ -53,7 +53,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR; GNU tar) | `[x]` common compressions |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
-| Control interface socket | yes | yes (Unix socket: ping/status/unmount) | `~` not in-FS Python control |
+| Control interface socket | yes | Unix socket + in-FS `/.ratarmount-control/` | `[x]` |
 | Lazy mount (`-l`) | yes | yes (mount on first access) | `[x]` |
 | Path transform / strip recursive extension | yes | yes (`-s`, `--transform`, `--transform-recursive-mount-point`) | `[x]` |
 | Recursive extension sets | yes | yes (`--recursive-extensions`) | `[x]` |
@@ -75,7 +75,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | HTTP Range without full download | yes | Range chunk materialize + HttpRangeFile | `~` formats still open local path after fetch |
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
-| SMB / WebDAV / Dropbox | yes | WebDAV file GET (`webdav://`); no SMB/Dropbox | `~` WebDAV MVP |
+| SMB / WebDAV / Dropbox | yes | WebDAV + SMB (`smbclient`); no Dropbox | `~` Dropbox still open |
 | Remote/compressed **index** download | yes | no | `[ ]` |
 
 ### Index / CLI
@@ -91,7 +91,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file`; no color | `~` |
 | OSS attributions | yes | no | `[ ]` |
-| Parallelization matrix (`-P backend:n`) | yes | flag reserved | `[ ]` |
+| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + bzip2 threads | `~` not all codecs use matrix yet |
 | Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)
