@@ -1,12 +1,14 @@
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints (`gzip_seek`).
-//! * **zstd** — multi-frame seek map; single-frame full decode into RAM/temp.
+//! * **zstd** — multi-frame seek map + seekable-format seek table; single-frame full decode.
 //! * **lz4** — frame block index (independent blocks; dependent → frame decode).
 //! * **lzip** — multimember walk via trailer `member_size`.
 //! * **lzo** — LZOP block index via liblzo2 (optional at runtime).
-//! * **bzip2 / xz / .Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
+//! * **bzip2** — one-shot decode into RAM/temp; optional multi-block parallel decode (`-P`).
+//! * **xz / .Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
 //! * CLI/helpers still expose `materialize_*` for plain single-file mounts.
+//! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
 mod bzip2_seek;
 mod compress_z_seek;
@@ -26,7 +28,7 @@ pub use split::{
     joined_base_name, materialize_joined_parts, JoinedFile, SplitFileSet,
 };
 
-pub use bzip2_seek::open_seekable_bzip2;
+pub use bzip2_seek::{open_seekable_bzip2, open_seekable_bzip2_with_threads};
 pub use compress_z_seek::open_seekable_compress_z;
 pub use gzip_seek::{
     open_seekable_gzip, SeekableGzip, SeekableGzipReader, SharedSeekableGzip,
@@ -36,12 +38,14 @@ pub use lz4_seek::{open_seekable_lz4, SeekableLz4};
 pub use lzip_seek::{open_seekable_lzip, SeekableLzip};
 pub use lzma_seek::open_seekable_lzma;
 pub use lzo_seek::{lzo_available, open_seekable_lzo, SeekableLzo};
+/// Re-export for `-P` / backend matrix parsing at the compress boundary.
+pub use ratarmount_core::ParallelizationSpec;
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };
 pub use xz_seek::open_seekable_xz;
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib};
-pub use zstd_seek::SeekableZstd;
+pub use zstd_seek::{build_seek_table_skippable, SeekableZstd};
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};

@@ -1,8 +1,138 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Read, Seek};
 use std::path::PathBuf;
+
+/// Per-backend decompression thread matrix (Python `-P` / `--parallelization`).
+///
+/// Accepts the same string forms as Python `parse_parallelization`:
+/// * `"0"` / `"1"` / `"8"` — default threads for all backends (`0` → CPU count)
+/// * `"bzip2:4,gzip:2"` — per-backend overrides; missing default → CPU count
+/// * `":1,bzip2:0"` — explicit default (`:N`) plus overrides (`0` → CPU count)
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParallelizationSpec {
+    /// Default thread count when a backend is not listed in [`Self::by_backend`].
+    pub default: u32,
+    /// Backend name → thread count (already resolved; never 0).
+    pub by_backend: HashMap<String, u32>,
+}
+
+impl Default for ParallelizationSpec {
+    fn default() -> Self {
+        Self {
+            default: 1,
+            by_backend: HashMap::new(),
+        }
+    }
+}
+
+impl From<u32> for ParallelizationSpec {
+    fn from(n: u32) -> Self {
+        Self {
+            default: Self::resolve_zero(n),
+            by_backend: HashMap::new(),
+        }
+    }
+}
+
+impl ParallelizationSpec {
+    /// Build a matrix with only a default thread count (`0` → CPU count).
+    pub fn new(default: u32) -> Self {
+        Self {
+            default: Self::resolve_zero(default),
+            by_backend: HashMap::new(),
+        }
+    }
+
+    /// Available parallelism (at least 1). Used when a value is `0`.
+    pub fn cpu_count() -> u32 {
+        std::thread::available_parallelism()
+            .map(|n| n.get() as u32)
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Map Python/`0` “use all cores” to a concrete thread count.
+    pub fn resolve_zero(n: u32) -> u32 {
+        if n == 0 {
+            Self::cpu_count()
+        } else {
+            n
+        }
+    }
+
+    /// Parse a Python-style parallelization string.
+    ///
+    /// # Errors
+    /// Returns a message when a token is not `digits` or `backend:digits`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Ok(Self::default());
+        }
+
+        // Whole string is a non-negative integer → default only.
+        if s.bytes().all(|b| b.is_ascii_digit()) {
+            let n: u32 = s
+                .parse()
+                .map_err(|_| format!("invalid parallelization count: {s}"))?;
+            return Ok(Self::new(n));
+        }
+
+        let mut by_backend = HashMap::new();
+        let mut default: Option<u32> = None;
+
+        for token in s.split(',') {
+            let token = token.trim();
+            if token.is_empty() {
+                continue;
+            }
+            let (backend, count_str) = if let Some((b, c)) = token.split_once(':') {
+                (b.trim(), c.trim())
+            } else {
+                return Err(format!(
+                    "parallelization entry must be 'N' or 'backend:N', got '{token}'"
+                ));
+            };
+            if count_str.is_empty() || !count_str.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(format!(
+                    "Parallelization must be non-negative number but got {count_str} for {backend}"
+                ));
+            }
+            let n: u32 = count_str
+                .parse()
+                .map_err(|_| format!("invalid parallelization count '{count_str}' for {backend}"))?;
+            let resolved = Self::resolve_zero(n);
+            if backend.is_empty() {
+                default = Some(resolved);
+            } else {
+                by_backend.insert(backend.to_ascii_lowercase(), resolved);
+            }
+        }
+
+        // Python: if '' not in result, default = CPU count.
+        Ok(Self {
+            default: default.unwrap_or_else(Self::cpu_count),
+            by_backend,
+        })
+    }
+
+    /// Thread count for `backend` (case-insensitive), falling back to [`Self::default`].
+    pub fn threads_for(&self, backend: &str) -> u32 {
+        let key = backend.to_ascii_lowercase();
+        self.by_backend
+            .get(&key)
+            .copied()
+            .unwrap_or(self.default)
+            .max(1)
+    }
+
+    /// Alias for [`Self::default`] (default backend / empty key).
+    pub fn default_threads(&self) -> u32 {
+        self.default.max(1)
+    }
+}
 
 /// Portable `S_IF*` bits for [`FileInfo::mode`] (`u32`).
 ///
@@ -104,7 +234,8 @@ pub struct OpenOptions {
     pub recursion_depth: Option<i32>,
     pub ignore_zeros: bool,
     pub gnu_incremental: Option<bool>,
-    pub parallelization: u32,
+    /// Decompression parallelization matrix (Python `-P backend:n` / integer default).
+    pub parallelization: ParallelizationSpec,
     /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
@@ -136,7 +267,7 @@ impl Default for OpenOptions {
             recursion_depth: None,
             ignore_zeros: false,
             gnu_incremental: None,
-            parallelization: 1,
+            parallelization: ParallelizationSpec::default(),
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
@@ -145,6 +276,13 @@ impl Default for OpenOptions {
             force_folder_index: false,
             hashes: Vec::new(),
         }
+    }
+}
+
+impl OpenOptions {
+    /// Thread count for a compression backend (`bzip2`, `gzip`, `zstd`, …).
+    pub fn threads_for(&self, backend: &str) -> u32 {
+        self.parallelization.threads_for(backend)
     }
 }
 
@@ -308,5 +446,61 @@ mod tests {
         assert_eq!(normpath("/foo/./bar"), "/foo/bar");
         assert_eq!(normpath("/"), "/");
         assert_eq!(normpath(""), "/");
+    }
+
+    #[test]
+    fn parallelization_plain_int() {
+        let p = ParallelizationSpec::parse("8").unwrap();
+        assert_eq!(p.default, 8);
+        assert_eq!(p.threads_for("bzip2"), 8);
+        assert_eq!(p.threads_for("gzip"), 8);
+
+        let z = ParallelizationSpec::parse("0").unwrap();
+        assert_eq!(z.default, ParallelizationSpec::cpu_count());
+        assert!(z.default >= 1);
+
+        let one = ParallelizationSpec::parse("1").unwrap();
+        assert_eq!(one.default, 1);
+    }
+
+    #[test]
+    fn parallelization_backend_matrix() {
+        let p = ParallelizationSpec::parse("bzip2:4,gzip:2").unwrap();
+        assert_eq!(p.threads_for("bzip2"), 4);
+        assert_eq!(p.threads_for("GZIP"), 2); // case-insensitive
+        // No explicit default → CPU count (Python semantics)
+        assert_eq!(p.default, ParallelizationSpec::cpu_count());
+        assert_eq!(p.threads_for("xz"), ParallelizationSpec::cpu_count());
+
+        let p2 = ParallelizationSpec::parse(":1,bzip2:0,rapidgzip-gzip:2").unwrap();
+        assert_eq!(p2.default, 1);
+        assert_eq!(p2.threads_for("bzip2"), ParallelizationSpec::cpu_count());
+        assert_eq!(p2.threads_for("rapidgzip-gzip"), 2);
+        assert_eq!(p2.threads_for("unknown"), 1);
+    }
+
+    #[test]
+    fn parallelization_from_u32() {
+        let p: ParallelizationSpec = 4u32.into();
+        assert_eq!(p.default_threads(), 4);
+        let z: ParallelizationSpec = 0u32.into();
+        assert_eq!(z.default_threads(), ParallelizationSpec::cpu_count());
+    }
+
+    #[test]
+    fn parallelization_invalid() {
+        assert!(ParallelizationSpec::parse("bzip2").is_err());
+        assert!(ParallelizationSpec::parse("bzip2:x").is_err());
+        assert!(ParallelizationSpec::parse("gzip:-1").is_err());
+    }
+
+    #[test]
+    fn open_options_threads_for() {
+        let opts = OpenOptions {
+            parallelization: ParallelizationSpec::parse("bzip2:3,:2").unwrap(),
+            ..OpenOptions::default()
+        };
+        assert_eq!(opts.threads_for("bzip2"), 3);
+        assert_eq!(opts.threads_for("zstd"), 2);
     }
 }
