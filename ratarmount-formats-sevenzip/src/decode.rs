@@ -1026,28 +1026,57 @@ pub fn index_lzma2_chunks(packed: &[u8]) -> Result<Vec<Lzma2ChunkIndex>> {
 /// always decode with the **folder-level** LZMA2 filter (never re-bind
 /// per-chunk property filters for multi-chunk solid chains).
 ///
-/// **Progressive mode (default for large folders):** decompress only up to
-/// `start+length` and discard prefix bytes — peak RAM is O(range end), not
-/// O(full folder), when the full cache is not retained.
 /// **Small folders** (≤ `SMALL_FOLDER_FULL_CACHE`) keep a full unpack cache
 /// after the first decode for repeated random access.
+///
+/// **Large folders** use a bounded LRU cache of fixed-size unpacked windows
+/// (`chunk_size` × `max_cached_chunks`, defaults 1 MiB × 64). On miss, a single
+/// progressive prefix decode fills all needed windows through the range end
+/// (LZMA2 solid streams have no cheap mid-stream resume without a live
+/// decompressor cursor). Subsequent hits in the window cache are O(1).
 pub struct Lzma2RandomAccessDecoder {
     packed: Vec<u8>,
     folder_props: Option<Vec<u8>>,
-    /// Indexed chunk map (validation / tests / future resume points).
+    /// Indexed LZMA2 stream chunk map (validation / tests / future resume points).
     #[allow(dead_code)]
     chunks: Vec<Lzma2ChunkIndex>,
     unpack_size: u64,
     full: Option<Vec<u8>>,
     /// When true, first full decode is retained for subsequent ranges.
     cache_full: bool,
+    /// Unpacked window size for the progressive LRU cache.
+    chunk_size: usize,
+    max_cached_chunks: usize,
+    /// Window index → decoded unpacked bytes for that window.
+    window_cache: HashMap<usize, Vec<u8>>,
+    /// LRU order: oldest window index at the front.
+    window_lru: Vec<usize>,
 }
 
 /// Folders at or below this unpack size keep a full decode cache.
 pub const SMALL_FOLDER_FULL_CACHE: u64 = 4 * 1024 * 1024;
 
+/// Default unpacked window size for progressive solid decode cache (1 MiB).
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+/// Default max windows retained in the progressive LRU cache.
+pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 64;
+
 impl Lzma2RandomAccessDecoder {
-    pub fn new(folder: &Folder, packed: Vec<u8>, _max_cached_chunks: usize) -> Result<Self> {
+    pub fn new(folder: &Folder, packed: Vec<u8>, max_cached_chunks: usize) -> Result<Self> {
+        Self::with_chunk_size(
+            folder,
+            packed,
+            DEFAULT_CHUNK_SIZE,
+            max_cached_chunks.max(1),
+        )
+    }
+
+    pub fn with_chunk_size(
+        folder: &Folder,
+        packed: Vec<u8>,
+        chunk_size: usize,
+        max_cached_chunks: usize,
+    ) -> Result<Self> {
         if folder.coders.is_empty() || folder.coders[0].method.as_slice() != METHOD_LZMA2 {
             return Err(SevenZipError::Msg(
                 "Lzma2RandomAccessDecoder requires an LZMA2 folder".into(),
@@ -1062,6 +1091,10 @@ impl Lzma2RandomAccessDecoder {
             unpack_size,
             full: None,
             cache_full: unpack_size <= SMALL_FOLDER_FULL_CACHE,
+            chunk_size: chunk_size.max(4096),
+            max_cached_chunks: max_cached_chunks.max(1),
+            window_cache: HashMap::new(),
+            window_lru: Vec::new(),
         })
     }
 
@@ -1088,12 +1121,153 @@ impl Lzma2RandomAccessDecoder {
         Ok(())
     }
 
-    /// Progressive: decompress only the prefix needed for `[start, start+length)`.
+    /// Progressive: decompress only the prefix needed for `[0, end)`.
     fn decode_prefix(&self, end: usize) -> Result<Vec<u8>> {
         if end == 0 {
             return Ok(vec![]);
         }
         lzma_decompress_chain(&[self.folder_coder()], &self.packed, end)
+    }
+
+    fn touch_window(&mut self, index: usize) {
+        if let Some(pos) = self.window_lru.iter().position(|&i| i == index) {
+            self.window_lru.remove(pos);
+        }
+        self.window_lru.push(index);
+        while self.window_lru.len() > self.max_cached_chunks {
+            let old = self.window_lru.remove(0);
+            self.window_cache.remove(&old);
+        }
+    }
+
+    fn store_window(&mut self, index: usize, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        self.window_cache.insert(index, data);
+        self.touch_window(index);
+    }
+
+    /// Cache windows covered by `prefix` (unpacked [0, prefix.len())).
+    /// Requested windows `first..=last` are stored first (MRU) so they survive
+    /// eviction when warming earlier windows from the same decode pass.
+    fn cache_prefix_windows(&mut self, prefix: &[u8], first: usize, last: usize) {
+        let n_windows = prefix.len().div_ceil(self.chunk_size);
+        // Ensure requested windows are present and most-recently used.
+        for i in first..=last {
+            if i >= n_windows {
+                break;
+            }
+            let start = i * self.chunk_size;
+            let end = (start + self.chunk_size).min(prefix.len());
+            if start >= end {
+                break;
+            }
+            if !self.window_cache.contains_key(&i) {
+                self.store_window(i, prefix[start..end].to_vec());
+            } else {
+                self.touch_window(i);
+            }
+        }
+        // Opportunistically keep other windows from this decode while capacity remains.
+        for i in 0..n_windows {
+            if i >= first && i <= last {
+                continue;
+            }
+            if self.window_cache.len() >= self.max_cached_chunks {
+                break;
+            }
+            if self.window_cache.contains_key(&i) {
+                continue;
+            }
+            let start = i * self.chunk_size;
+            let end = (start + self.chunk_size).min(prefix.len());
+            if start >= end {
+                break;
+            }
+            // Insert without promoting to MRU ahead of requested windows: put at LRU front.
+            self.window_cache.insert(i, prefix[start..end].to_vec());
+            if !self.window_lru.contains(&i) {
+                self.window_lru.insert(0, i);
+            }
+            while self.window_lru.len() > self.max_cached_chunks {
+                let old = self.window_lru.remove(0);
+                // Never drop a still-needed window from the request range.
+                if old >= first && old <= last && self.window_cache.contains_key(&old) {
+                    self.window_lru.push(old);
+                    break;
+                }
+                self.window_cache.remove(&old);
+            }
+        }
+    }
+
+    fn assemble_from_windows(&mut self, start: usize, end: usize) -> Result<Vec<u8>> {
+        let mut out = Vec::with_capacity(end.saturating_sub(start));
+        let mut offset = start;
+        while offset < end {
+            let index = offset / self.chunk_size;
+            if !self.window_cache.contains_key(&index) {
+                return Err(SevenZipError::Msg(format!(
+                    "LZMA2 window {index} missing after ensure (offset={offset})"
+                )));
+            }
+            self.touch_window(index);
+            let win = self.window_cache.get(&index).unwrap();
+            let chunk_start = index * self.chunk_size;
+            let local = offset - chunk_start;
+            if local >= win.len() {
+                return Err(SevenZipError::Msg(format!(
+                    "Invalid window slice at {index}: local={local} len={}",
+                    win.len()
+                )));
+            }
+            let take = (end - offset).min(win.len() - local);
+            out.extend_from_slice(&win[local..local + take]);
+            offset += take;
+        }
+        Ok(out)
+    }
+
+    /// Ensure windows covering `[start, end)` are cached; one progressive decode on miss.
+    fn ensure_windows(&mut self, start: usize, end: usize) -> Result<()> {
+        if end <= start {
+            return Ok(());
+        }
+        let first = start / self.chunk_size;
+        let last = (end - 1) / self.chunk_size;
+        if (first..=last).all(|i| self.window_cache.contains_key(&i)) {
+            for i in first..=last {
+                self.touch_window(i);
+            }
+            return Ok(());
+        }
+        // Solid LZMA2: decode from folder start through end of last needed window.
+        let need_through = ((last + 1) * self.chunk_size).min(self.unpack_size as usize);
+        let prefix = self.decode_prefix(need_through)?;
+        if prefix.len() < end.min(self.unpack_size as usize) {
+            return Err(SevenZipError::Msg(format!(
+                "LZMA2 progressive decode short: got {} want through {}",
+                prefix.len(),
+                need_through
+            )));
+        }
+        self.cache_prefix_windows(&prefix, first, last);
+        // Verify requested windows landed in cache.
+        for i in first..=last {
+            let win_start = i * self.chunk_size;
+            if win_start >= self.unpack_size as usize {
+                break;
+            }
+            if !self.window_cache.contains_key(&i) {
+                // Range larger than max_cached_chunks: re-store from prefix without LRU eviction mid-way.
+                let win_end = (win_start + self.chunk_size).min(prefix.len());
+                self.window_cache
+                    .insert(i, prefix[win_start..win_end].to_vec());
+                self.touch_window(i);
+            }
+        }
+        Ok(())
     }
 
     pub fn read_range(&mut self, start: u64, length: usize) -> Result<Vec<u8>> {
@@ -1116,22 +1290,44 @@ impl Lzma2RandomAccessDecoder {
             return Ok(full[s..e].to_vec());
         }
 
-        // Progressive path for large solids: only decode through `end`.
-        let prefix = self.decode_prefix(end)?;
-        if s >= prefix.len() {
-            return Ok(vec![]);
+        // Progressive path: fill overlapping windows via one prefix decode per miss batch.
+        let first = s / self.chunk_size;
+        let last = (end - 1) / self.chunk_size;
+        let windows_needed = last - first + 1;
+        // If the request spans more windows than the LRU can hold, decode once and
+        // return the slice directly (still warm the cache for the MRU end of the range).
+        if windows_needed > self.max_cached_chunks {
+            let need_through = ((last + 1) * self.chunk_size).min(self.unpack_size as usize);
+            let prefix = self.decode_prefix(need_through)?;
+            self.cache_prefix_windows(&prefix, first, last);
+            if s >= prefix.len() {
+                return Ok(vec![]);
+            }
+            return Ok(prefix[s..end.min(prefix.len())].to_vec());
         }
-        let e = end.min(prefix.len());
-        Ok(prefix[s..e].to_vec())
+        self.ensure_windows(s, end)?;
+        self.assemble_from_windows(s, end)
     }
 
     pub fn unpack_size(&self) -> u64 {
         self.unpack_size
     }
 
+    #[allow(dead_code)] // used by unit tests / diagnostics
+    pub fn cached_window_count(&self) -> usize {
+        self.window_cache.len()
+    }
+
     #[allow(dead_code)]
     pub fn chunk_count(&self) -> usize {
         self.chunks.len()
+    }
+
+    /// Force progressive window-cache mode even for small folders (tests).
+    #[cfg(test)]
+    fn force_progressive_for_test(&mut self) {
+        self.cache_full = false;
+        self.full = None;
     }
 }
 
@@ -1143,7 +1339,11 @@ pub fn create_folder_decoder(
     max_cached_chunks: usize,
 ) -> Result<Lzma2RandomAccessDecoder> {
     if folder.coders.first().map(|c| c.method.as_slice()) == Some(METHOD_LZMA2) {
-        return Lzma2RandomAccessDecoder::new(folder, packed, max_cached_chunks.max(64));
+        return Lzma2RandomAccessDecoder::new(
+            folder,
+            packed,
+            max_cached_chunks.max(DEFAULT_MAX_CACHED_CHUNKS),
+        );
     }
     Err(SevenZipError::Msg(
         "create_folder_decoder currently only supports pure LZMA2 folders".into(),
@@ -1153,11 +1353,6 @@ pub fn create_folder_decoder(
 // ---------------------------------------------------------------------------
 // Streaming folder decoder (single-stream codecs; BCJ2 uses full decompress)
 // ---------------------------------------------------------------------------
-
-#[allow(dead_code)]
-pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
-#[allow(dead_code)]
-pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 64;
 
 /// Progressive decode with bounded chunk cache for single-stream folders.
 /// Multi-pack/BCJ2 folders should use full `decompress_folder_source` instead.
@@ -1336,6 +1531,8 @@ mod hex {
 #[cfg(test)]
 mod lzma2_random_tests {
     use super::*;
+    use crate::parse::{Folder, METHOD_LZMA2};
+    use std::io::{Read, Seek};
     use std::process::Command;
 
     fn py_lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
@@ -1363,6 +1560,28 @@ sys.stdout.buffer.write(packed)
         Some(out.stdout)
     }
 
+    fn lzma2_folder(unpack_size: u64, props: Option<Vec<u8>>) -> Folder {
+        Folder {
+            coders: vec![Coder {
+                method: METHOD_LZMA2.to_vec(),
+                num_in_streams: 1,
+                num_out_streams: 1,
+                properties: props,
+            }],
+            bind_pairs: vec![],
+            packed_indices: vec![],
+            unpack_sizes: vec![unpack_size],
+            has_crc: false,
+            crc: 0,
+        }
+    }
+
+    fn py_fixture(name: &str) -> std::path::PathBuf {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        std::path::PathBuf::from(root).join("tests").join(name)
+    }
+
     #[test]
     fn index_lzma2_chunks_sum_unpacked_sizes() {
         // Port of Python test_index_lzma2_chunks_matches_full_decompress (structure only).
@@ -1379,5 +1598,96 @@ sys.stdout.buffer.write(packed)
             chunks.iter().any(|c| c.independent),
             "need at least one reset chunk"
         );
+    }
+
+    #[test]
+    fn progressive_window_cache_two_non_overlapping_ranges() {
+        // Patterned data so range equality checks are meaningful.
+        let data: Vec<u8> = (0u8..=255).cycle().take(768 * 1024).collect();
+        let Some(packed) = py_lzma2_compress(&data) else {
+            eprintln!("skip: python3/lzma compress unavailable");
+            return;
+        };
+        // Folder-level LZMA2 dict_size prop (matches typical 7z "LZMA2:22" / 4 MiB-ish).
+        let folder = lzma2_folder(data.len() as u64, Some(vec![22]));
+        let mut decoder =
+            Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, 64 * 1024, 4)
+                .expect("decoder");
+        // Exercise progressive window path even though unpack is under full-cache threshold.
+        decoder.force_progressive_for_test();
+
+        let r1 = decoder.read_range(0, 4096).expect("range1");
+        assert_eq!(r1, data[..4096]);
+        assert!(decoder.cached_window_count() > 0);
+
+        // Non-overlapping mid-stream range (different windows).
+        let mid = 400 * 1024;
+        let r2 = decoder.read_range(mid as u64, 8192).expect("range2");
+        assert_eq!(r2, data[mid..mid + 8192]);
+        assert_ne!(r1, r2);
+
+        // Re-read first range should hit window cache (still correct).
+        let r1b = decoder.read_range(0, 4096).expect("range1b");
+        assert_eq!(r1b, data[..4096]);
+
+        // Cap on cached windows.
+        assert!(decoder.cached_window_count() <= 4);
+    }
+
+    #[test]
+    fn medium_fixture_two_non_overlapping_ranges() {
+        let path = py_fixture("lzma2-two-files-and-medium.7z");
+        if !path.exists() {
+            eprintln!("skip missing {}", path.display());
+            return;
+        }
+        let mut file = std::fs::File::open(&path).expect("open fixture");
+        let archive = crate::parse::parse_7z_archive(&mut file, |folder, packed| {
+            decompress_folder(folder, packed, None)
+        })
+        .expect("parse 7z");
+        let med = archive
+            .files
+            .iter()
+            .find(|f| f.path.ends_with("medium.bin") || f.path == "medium.bin")
+            .expect("medium.bin entry");
+        assert_eq!(med.size, 2 * 1024 * 1024);
+        let fi = med.folder_index.expect("folder");
+        let folder = &archive.folders[fi];
+        assert_eq!(folder.coders[0].method.as_slice(), METHOD_LZMA2);
+
+        file.seek(std::io::SeekFrom::Start(med.pack_offset))
+            .expect("seek pack");
+        let mut packed = vec![0u8; med.pack_size as usize];
+        file.read_exact(&mut packed).expect("read pack");
+
+        let mut decoder = Lzma2RandomAccessDecoder::with_chunk_size(
+            folder,
+            packed.clone(),
+            256 * 1024,
+            DEFAULT_MAX_CACHED_CHUNKS,
+        )
+        .expect("decoder");
+        // Fixture folder is ~2 MiB (< 4 MiB full-cache threshold); force progressive
+        // windows for the non-overlapping range check.
+        decoder.force_progressive_for_test();
+
+        let base = med.unpack_offset;
+        let a = decoder.read_range(base, 4096).expect("medium head");
+        let b = decoder
+            .read_range(base + 1024 * 1024, 4096)
+            .expect("medium mid");
+        assert_eq!(a.len(), 4096);
+        assert_eq!(b.len(), 4096);
+        assert!(decoder.cached_window_count() > 0);
+        assert!(decoder.cached_window_count() <= DEFAULT_MAX_CACHED_CHUNKS);
+
+        // Full-folder decode cross-check on the same slices (default small-folder path).
+        let mut full_dec =
+            Lzma2RandomAccessDecoder::new(folder, packed, 64).expect("full");
+        let full_a = full_dec.read_range(base, 4096).unwrap();
+        let full_b = full_dec.read_range(base + 1024 * 1024, 4096).unwrap();
+        assert_eq!(a, full_a);
+        assert_eq!(b, full_b);
     }
 }
