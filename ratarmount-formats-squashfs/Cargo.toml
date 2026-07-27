@@ -3,7 +3,7 @@ name = "ratarmount-formats-squashfs"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SquashFS mount source (unsquashfs materialize MVP)"
+description = "SquashFS mount source (in-process via backhand, unsquashfs fallback)"
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -12,5 +12,8 @@ thiserror.workspace = true
 log.workspace = true
 tempfile.workspace = true
 libc.workspace = true
+# Pure-Rust SquashFS reader (0.25+). XZ feature uses liblzma and conflicts with
+# workspace xz2/lzma-sys (zip, compress, xar) — leave xz off; XZ/LZMA → unsquashfs.
+backhand = { version = "0.25", default-features = false, features = ["gzip", "zstd", "lz4", "lzo", "parallel"] }
 
 [dev-dependencies]
