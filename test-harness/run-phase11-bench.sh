@@ -19,7 +19,7 @@ MP="$WORKDIR/mnt"
 mkdir -p "$MP"
 
 cleanup() {
-    fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
+    ratar_unmount "$MP"
     [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
     rm -rf "$WORKDIR"
 }

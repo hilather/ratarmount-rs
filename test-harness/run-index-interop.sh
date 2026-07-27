@@ -19,7 +19,7 @@ cleanup() {
     done
     for mp in "$WORKDIR"/mnt-*; do
         if [[ -d "$mp" ]]; then
-            fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+            ratar_unmount "$mp"
         fi
     done
     rm -rf "$WORKDIR"
@@ -148,7 +148,7 @@ run_case() {
             echo "  [FAIL] expected load of python index, saw rebuild only"
             cat "$WORKDIR/mount-$name.log" || true
             failed=1
-            fusermount3 -u "$mp" 2>/dev/null || true
+            ratar_unmount "$mp"
             wait "$mpid" 2>/dev/null || true
             return
         fi
@@ -173,7 +173,7 @@ run_case() {
         echo "  [ok] path exists $member"
     fi
 
-    fusermount3 -u "$mp" 2>/dev/null || true
+    ratar_unmount "$mp"
     wait "$mpid" 2>/dev/null || true
 }
 

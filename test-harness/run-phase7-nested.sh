@@ -14,7 +14,7 @@ MOUNT_PIDS=()
 cleanup() {
     for pid in "${MOUNT_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
     for mp in "$WORKDIR"/mnt-*; do
-        [[ -d "$mp" ]] && fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+        [[ -d "$mp" ]] && ratar_unmount "$mp"
     done
     rm -rf "$WORKDIR"
 }

@@ -15,7 +15,7 @@ cleanup() {
         kill "$pid" 2>/dev/null || true
     done
     for mp in "$WORKDIR"/mnt-*; do
-        [[ -d "$mp" ]] && fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+        [[ -d "$mp" ]] && ratar_unmount "$mp"
     done
     rm -rf "$WORKDIR"
 }
@@ -62,7 +62,7 @@ if [[ -f "$TAR1" && -f "$TAR2" ]]; then
             failed=1
         fi
         # bar from TAR1 may still exist depending on union order
-        fusermount3 -u "$mp" 2>/dev/null || true
+        ratar_unmount "$mp"
         wait "${MOUNT_PIDS[-1]}" 2>/dev/null || true
     fi
 else
@@ -95,7 +95,7 @@ if [[ -f "$TAR1" ]]; then
             cat "$WORKDIR/ov.log" || true
             failed=1
         fi
-        fusermount3 -u "$mp" 2>/dev/null || true
+        ratar_unmount "$mp"
         wait "${MOUNT_PIDS[-1]}" 2>/dev/null || true
     fi
 else
@@ -122,7 +122,7 @@ else
         echo "  [FAIL] folder bind content"
         failed=1
     fi
-    fusermount3 -u "$mp" 2>/dev/null || true
+    ratar_unmount "$mp"
     wait "${MOUNT_PIDS[-1]}" 2>/dev/null || true
 fi
 
@@ -141,7 +141,7 @@ if command -v tar >/dev/null && tar --version 2>/dev/null | grep -q 'GNU tar'; t
         failed=1
     else
         echo "committed-new" >"$tdir/mnt/new.txt"
-        fusermount3 -u "$tdir/mnt" 2>/dev/null || true
+        ratar_unmount "$tdir/mnt"
         wait "${MOUNT_PIDS[-1]}" 2>/dev/null || true
         if "$RATARMOUNT_CMD" --commit-overlay --yes -w "$tdir/ov" "$tdir/a.tar" >"$tdir/c.log" 2>&1; then
             if tar -tf "$tdir/a.tar" | grep -q 'new.txt'; then

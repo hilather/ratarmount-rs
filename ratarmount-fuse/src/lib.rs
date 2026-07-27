@@ -809,6 +809,19 @@ pub fn mount_blocking(
 
 pub fn unmount(mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
     let mp = mountpoint.as_ref();
+    #[cfg(target_os = "macos")]
+    {
+        unmount_macos(mp)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        unmount_linux(mp)
+    }
+}
+
+/// Linux: `fusermount3 -u` then `fusermount -u`.
+#[cfg(not(target_os = "macos"))]
+fn unmount_linux(mp: &Path) -> std::io::Result<()> {
     let status = std::process::Command::new("fusermount3")
         .args(["-u"])
         .arg(mp)
@@ -824,6 +837,37 @@ pub fn unmount(mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::other(format!(
             "fusermount failed for {}",
+            mp.display()
+        )))
+    }
+}
+
+/// macOS: `umount`, then `diskutil unmount` (+ force).
+#[cfg(target_os = "macos")]
+fn unmount_macos(mp: &Path) -> std::io::Result<()> {
+    if let Ok(status) = std::process::Command::new("umount").arg(mp).status() {
+        if status.success() {
+            return Ok(());
+        }
+    }
+    if let Ok(status) = std::process::Command::new("diskutil")
+        .args(["unmount"])
+        .arg(mp)
+        .status()
+    {
+        if status.success() {
+            return Ok(());
+        }
+    }
+    let status = std::process::Command::new("diskutil")
+        .args(["unmount", "force"])
+        .arg(mp)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "umount/diskutil unmount failed for {}",
             mp.display()
         )))
     }

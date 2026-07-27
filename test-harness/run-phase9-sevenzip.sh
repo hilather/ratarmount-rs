@@ -9,7 +9,7 @@ BIN="${RATARMOUNT_CMD:-$ROOT/target/release/ratarmount}"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 ALLOWLIST="${1:-$ROOT/test-harness/phase9-sevenzip.txt}"
 WORKDIR=$(mktemp -d /tmp/ratarmount-rs-7z-XXXXXX)
-trap 'fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true; rm -rf "$WORKDIR"' EXIT
+trap 'ratar_unmount "$WORKDIR/mnt"; rm -rf "$WORKDIR"' EXIT
 
 mkdir -p "$WORKDIR/mnt"
 echo "RATARMOUNT_CMD=$BIN"
@@ -28,7 +28,7 @@ while IFS='|' read -r archive member expect || [[ -n "${archive:-}" ]]; do
     echo "  [run] $archive  (path=$member)"
     idx="$WORKDIR/$(basename "$archive").index.sqlite"
     rm -f "$idx"
-    fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true
+    ratar_unmount "$WORKDIR/mnt"
     "$BIN" -f -c --index-file "$idx" "$src" "$WORKDIR/mnt" &
     pid=$!
     ok=0
@@ -44,7 +44,7 @@ while IFS='|' read -r archive member expect || [[ -n "${archive:-}" ]]; do
     if [[ $ok -ne 1 ]]; then
         echo "  [fail] mount/member not ready: $member"
         kill "$pid" 2>/dev/null || true
-        fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true
+        ratar_unmount "$WORKDIR/mnt"
         exit 1
     fi
     size=$(stat -c%s "$WORKDIR/mnt/$member" 2>/dev/null || echo 0)
@@ -53,7 +53,7 @@ while IFS='|' read -r archive member expect || [[ -n "${archive:-}" ]]; do
         if [[ "$got" != *"$expect"* ]]; then
             echo "  [fail] expected substring '$expect' in head of $member, got: $got"
             kill "$pid" 2>/dev/null || true
-            fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true
+            ratar_unmount "$WORKDIR/mnt"
             exit 1
         fi
         echo "  [ok] content contains '$expect' (size=$size)"
@@ -61,12 +61,12 @@ while IFS='|' read -r archive member expect || [[ -n "${archive:-}" ]]; do
         if [[ "$size" -le 0 ]]; then
             echo "  [fail] empty member $member"
             kill "$pid" 2>/dev/null || true
-            fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true
+            ratar_unmount "$WORKDIR/mnt"
             exit 1
         fi
         echo "  [ok] size=$size"
     fi
-    fusermount3 -u "$WORKDIR/mnt" 2>/dev/null || true
+    ratar_unmount "$WORKDIR/mnt"
     wait "$pid" 2>/dev/null || true
 done < "$ALLOWLIST"
 

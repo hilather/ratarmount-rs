@@ -1,6 +1,6 @@
 # ratarmount-rs development helpers (Phase 11)
 
-.PHONY: build release test suite install clean help check package-notes appimage packages
+.PHONY: build release test suite install clean help check package-notes appimage packages macos-tarball macos-smoke
 
 CARGO ?= cargo
 PREFIX ?= $(HOME)/.local
@@ -16,6 +16,8 @@ help:
 	@echo "  make install       - install release binary to $(BINDIR)"
 	@echo "  make appimage      - stage AppDir / AppImage (packaging/build-appimage.sh)"
 	@echo "  make packages      - .deb/.rpm + tarball (packaging/build-native-packages.sh)"
+	@echo "  make macos-tarball - macOS release tarball (run on Darwin; packaging/build-macos-tarball.sh)"
+	@echo "  make macos-smoke   - portable FUSE smoke (test-harness/run-macos-smoke.sh)"
 	@echo "  make package-notes - print packaging docs path"
 	@echo "  make clean         - cargo clean"
 
@@ -51,6 +53,12 @@ appimage: release
 
 packages: release
 	./packaging/build-native-packages.sh
+
+macos-tarball: release
+	./packaging/build-macos-tarball.sh
+
+macos-smoke: release
+	RATARMOUNT_CMD=$(CURDIR)/target/release/ratarmount ./test-harness/run-macos-smoke.sh
 
 clean:
 	$(CARGO) clean

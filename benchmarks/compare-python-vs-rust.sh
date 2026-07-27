@@ -34,7 +34,7 @@ cleanup() {
     # shellcheck disable=SC2046
     for mp in "$WORKDIR"/mnt-*; do
         [[ -d "$mp" ]] || continue
-        fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+        ratar_unmount "$mp"
     done
     pkill -f "ratarmount.*$WORKDIR" 2>/dev/null || true
     # keep workdir for debugging if COMPARE_KEEP=1
@@ -118,7 +118,7 @@ wait_mount() {
 
 unmount_mp() {
     local mp=$1
-    fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+    ratar_unmount "$mp"
     # wait until gone
     local i
     for i in $(seq 1 50); do
@@ -126,7 +126,7 @@ unmount_mp() {
             break
         fi
         sleep 0.05
-        fusermount3 -u "$mp" 2>/dev/null || true
+        ratar_unmount "$mp"
     done
 }
 

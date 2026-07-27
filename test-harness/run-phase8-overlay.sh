@@ -14,7 +14,7 @@ IDX="$WORKDIR/idx.sqlite"
 mkdir -p "$MP" "$OV"
 
 cleanup() {
-    fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
+    ratar_unmount "$MP"
     [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true
     rm -rf "$WORKDIR"
 }

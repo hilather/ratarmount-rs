@@ -1,12 +1,12 @@
 # Build distributable packages for Ubuntu (.deb), Rocky (.rpm), portable tarballs,
-# and cosign keyless signatures for release artifacts.
+# macOS tarballs, and cosign keyless signatures for release artifacts.
 #
 # Matrix:
-#   - Ubuntu 20.04 (container), 22.04, 24.04 — amd64
+#   - Ubuntu 22.04, 24.04 — amd64
 #   - Ubuntu 24.04 — arm64 (ubuntu-24.04-arm)
-#   - Rocky Linux 8 & 9 — amd64 (containers)
-#   - Rocky Linux 9 — arm64 (container on arm runner)
+#   - Rocky Linux 8 — amd64 (container)
 #   - Portable “oldest glibc” tarball — Debian bullseye (glibc 2.31) amd64 + arm64
+#   - macOS arm64 (macos-14) + x86_64 (macos-13)
 #
 # Triggers: tag v*, workflow_dispatch, packaging PR paths
 name: Packages
@@ -21,6 +21,8 @@ on:
       - ".github/workflows/packages.yml"
       - "ratarmount/Cargo.toml"
       - "Cargo.toml"
+      - "docs/macos.md"
+      - "docs/packaging.md"
 
 permissions:
   contents: write
@@ -258,6 +260,66 @@ jobs:
           if-no-files-found: error
 
   # =========================================================================
+  # macOS release tarballs (Apple Silicon primary; Intel optional)
+  # =========================================================================
+  macos:
+    name: macos (${{ matrix.label }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-arm64
+            runner: macos-14
+            arch_label: arm64
+          # Intel runners are slower/scarcer; keep for release tags when available.
+          - label: macos-x86_64
+            runner: macos-13
+            arch_label: x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Homebrew deps
+        # End users: see docs/macos.md (macFUSE cask or FUSE-T). GHA prefers FUSE-T
+        # because macFUSE kexts cannot load on hosted runners; we only need link libs here.
+        run: |
+          brew update
+          brew install pkgconf libarchive
+          brew install macos-fuse-t/homebrew-cask/fuse-t || brew install --cask macfuse || true
+          echo "PKG_CONFIG_PATH=$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}" >> "$GITHUB_ENV"
+
+      - name: Install Rust
+        run: |
+          if ! command -v rustc >/dev/null 2>&1; then
+            curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable
+          fi
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: packages-macos-${{ matrix.label }}
+
+      - name: Build macOS tarball
+        env:
+          VERSION: "0.1.1"
+          OUT_DIR: dist
+        run: |
+          export PATH="$HOME/.cargo/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+          export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+          chmod +x packaging/build-macos-tarball.sh
+          ./packaging/build-macos-tarball.sh
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-${{ matrix.label }}
+          path: |
+            dist/*.tar.gz
+            dist/*.sha256
+            dist/file-info-macos-*.txt
+          if-no-files-found: error
+
+  # =========================================================================
   # Collect, sign (cosign keyless), release
   # =========================================================================
   release:
@@ -266,8 +328,8 @@ jobs:
     if: |
       always() &&
       (github.event_name == 'push' || github.event_name == 'workflow_dispatch') &&
-      (needs.deb.result == 'success' || needs.rpm.result == 'success' || needs.portable.result == 'success')
-    needs: [deb, rpm, portable]
+      (needs.deb.result == 'success' || needs.rpm.result == 'success' || needs.portable.result == 'success' || needs.macos.result == 'success')
+    needs: [deb, rpm, portable, macos]
     runs-on: ubuntu-latest
     steps:
       - name: Download all artifacts
@@ -282,7 +344,7 @@ jobs:
           mkdir -p release
           find artifacts -type f \( \
               -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \
-              -o -name '*.sha256' -o -name 'glibc-version.txt' -o -name 'file-info.txt' \
+              -o -name '*.sha256' -o -name 'glibc-version.txt' -o -name 'file-info*.txt' \
             \) -exec cp -v {} release/ \;
           # Unique names: if collisions, prefix with parent dir
           cd release
@@ -339,10 +401,12 @@ jobs:
             | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
             | `.rpm` | Rocky 8 (amd64) |
             | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
+            | macOS tarball | Apple Silicon (arm64), Intel (x86_64) |
 
             Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
 
-            Runtime depends: **fuse3**, **libarchive** (optional: e2fsprogs, squashfs-tools).
+            **Linux runtime:** fuse3, libarchive (optional: e2fsprogs, squashfs-tools).  
+            **macOS runtime:** macFUSE or FUSE-T, libarchive — see `docs/macos.md`.
 
             If the Release asset list is empty, download the **signed-release-bundle**
             workflow artifact from the Packages run.

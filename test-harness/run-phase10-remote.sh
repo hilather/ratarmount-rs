@@ -15,7 +15,7 @@ MP="$WORKDIR/mnt"
 cleanup() {
     [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
     [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
-    fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
+    ratar_unmount "$MP"
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -58,7 +58,7 @@ if [[ "$got" != "$want" ]]; then
   exit 1
 fi
 echo "  [ok] HTTP remote bar md5 $got"
-fusermount3 -u "$MP" 2>/dev/null || true
+ratar_unmount "$MP"
 wait "$MNT_PID" 2>/dev/null || true
 MNT_PID=
 

@@ -18,7 +18,7 @@ cleanup() {
     done
     for mp in "$WORKDIR"/mnt-*; do
         if [[ -d "$mp" ]]; then
-            fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+            ratar_unmount "$mp"
         fi
     done
     rm -rf "$WORKDIR"
@@ -26,22 +26,7 @@ cleanup() {
 trap cleanup EXIT
 
 wait_mounted() {
-    local mp=$1
-    local i
-    for i in $(seq 1 50); do
-        if mountpoint -q "$mp" 2>/dev/null || mount 2>/dev/null | grep -F -q "$mp"; then
-            return 0
-        fi
-        # FUSE often makes ls work even before mountpoint is reliable
-        if [[ -n "$(ls -A "$mp" 2>/dev/null || true)" ]] || [[ -e "$mp/." ]]; then
-            # empty tar has no children; check that mount isn't just empty dir via findfs
-            if mount 2>/dev/null | grep -F -q "$mp"; then
-                return 0
-            fi
-        fi
-        sleep 0.1
-    done
-    return 1
+    ratar_wait_mounted "$1" 50
 }
 
 echo "==> Phase 2 allowlist: $ALLOWLIST"
@@ -115,7 +100,7 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
         if [[ ! -e "$target" && ! -L "$target" ]]; then
             echo "  [FAIL] missing mounted path: $path_in"
             ls -laR "$mp" || true
-            fusermount3 -u "$mp" 2>/dev/null || true
+            ratar_unmount "$mp"
             kill "$mpid" 2>/dev/null || true
             failed=1
             continue
@@ -135,7 +120,7 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
         else
             echo "  [ok] path exists (dir) $path_in"
         fi
-        fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+        ratar_unmount "$mp"
         wait "$mpid" 2>/dev/null || true
     fi
 

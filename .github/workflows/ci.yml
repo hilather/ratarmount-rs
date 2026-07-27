@@ -78,3 +78,58 @@ jobs:
           ./test-harness/run-phase8-complex-usage.sh
           ./test-harness/run-phase9-ar-cpio.sh
           ./test-harness/run-phase9-sevenzip.sh
+
+  # -------------------------------------------------------------------------
+  # macOS: compile + unit tests (FUSE mount is best-effort; GHA cannot load
+  # macFUSE kexts — prefer FUSE-T when available).
+  # -------------------------------------------------------------------------
+  macos:
+    name: macOS (build + test)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Homebrew deps
+        run: |
+          brew update
+          brew install pkgconf libarchive
+          # FUSE-T is kext-less and more likely to work on GHA runners.
+          brew install macos-fuse-t/homebrew-cask/fuse-t || true
+          # Fallback headers/libs if FUSE-T formula is unavailable.
+          brew install --cask macfuse || true
+          PCS="$(brew --prefix libarchive)/lib/pkgconfig"
+          for p in \
+            /usr/local/lib/pkgconfig \
+            /opt/homebrew/lib/pkgconfig \
+            /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig; do
+            [[ -d "$p" ]] && PCS="${p}:${PCS}"
+          done
+          echo "PKG_CONFIG_PATH=${PCS}" >> "$GITHUB_ENV"
+          echo "PKG_CONFIG_PATH=${PCS}"
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: macos-14
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace
+
+      - name: Build release
+        run: cargo build --release -p ratarmount
+
+      - name: FUSE smoke (best-effort)
+        continue-on-error: true
+        env:
+          RATARMOUNT_CMD: ${{ github.workspace }}/target/release/ratarmount
+          SKIP_IF_NO_FUSE: "1"
+        run: |
+          chmod +x test-harness/run-macos-smoke.sh
+          ./test-harness/run-macos-smoke.sh

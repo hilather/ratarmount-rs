@@ -19,6 +19,7 @@ CI workflow: [`.github/workflows/packages.yml`](../.github/workflows/packages.ym
 | Ubuntu 24.04 | `deb` | amd64 + **arm64** | `.deb` + tarball |
 | Rocky Linux 8 | `rpm` (container) | amd64 | `.rpm` + tarball |
 | Portable (Debian bullseye, **glibc 2.31**) | `portable` | amd64 + **arm64** | tarball only |
+| **macOS** | `macos` | **arm64** (`macos-14`) + **x86_64** (`macos-13`) | tarball only |
 
 > **v0.1.0 note:** Ubuntu 20.04 container and Rocky 9 matrix legs are temporarily disabled in CI
 > (apt hang / exit 127). Use the portable glibc 2.31 tarball on older hosts; Rocky 9 packages
@@ -47,9 +48,14 @@ PACKAGE_FAMILY=rpm ./packaging/build-native-packages.sh
 
 # Tarball only (any host)
 TARBALL_ONLY=1 DISTRO_LABEL=local ./packaging/build-native-packages.sh
+
+# macOS (run on a Mac)
+export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+./packaging/build-macos-tarball.sh
 ```
 
-Or: `make packages`
+Or: `make packages`  
+macOS guide: [`docs/macos.md`](macos.md)
 
 Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if missing).
 
@@ -94,7 +100,8 @@ If you prefer traditional Debian/RPM signing later:
 
 | Package | Purpose |
 |---------|---------|
-| `fuse3` / `libfuse3` | FUSE mount |
+| `fuse3` / `libfuse3` | FUSE mount (Linux) |
+| macFUSE or FUSE-T | FUSE mount (macOS) — see [`macos.md`](macos.md) |
 | `libarchive` | long-tail formats (CAB/XAR/ISO/RAR/…) |
 | `e2fsprogs` (`debugfs`) | **optional** — EXT2/3/4 image MVP |
 | `squashfs-tools` (`unsquashfs`) | **optional** — SquashFS MVP |
@@ -102,7 +109,26 @@ If you prefer traditional Debian/RPM signing later:
 ```text
 Debian/Ubuntu: fuse3 libarchive13 e2fsprogs squashfs-tools
 Rocky/Fedora:  fuse3 libarchive e2fsprogs squashfs-tools
+macOS (brew):  brew install --cask macfuse   # or FUSE-T; see docs/macos.md
+               brew install libarchive pkgconf
 ```
+
+### macOS FUSE install (summary)
+
+macOS has **no** system FUSE. Users must install a backend before mounting:
+
+| Backend | Install | When |
+|---------|---------|------|
+| **macFUSE** (recommended) | `brew install --cask macfuse` | Most desktops; also DMG from [macfuse.github.io](https://macfuse.github.io/) |
+| **FUSE-T** | `brew install macos-fuse-t/homebrew-cask/fuse-t` | No kext; CI / locked-down Macs |
+
+On **macOS 26 Tahoe**, prefer FSKit if the kernel extension path is blocked:
+
+```bash
+ratarmount -f -o backend=fskit archive.tar.gz mnt/
+```
+
+Full steps (approval dialogs, pkg-config paths, troubleshooting): **[`docs/macos.md`](macos.md)**.
 
 ## AppImage
 
@@ -117,9 +143,10 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 
 ## CI gates
 
-- **Always:** `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (see `ci.yml`)
-- **Packages:** `packages.yml` on tags / manual dispatch
-- **FUSE harness:** optional when Python fixtures are checked out
+- **Always (Linux):** `cargo fmt --check`, `clippy -D warnings`, `cargo test --workspace` (see `ci.yml`)
+- **Always (macOS):** `macos-14` clippy + `cargo test --workspace`; FUSE smoke best-effort
+- **Packages:** `packages.yml` on tags / manual dispatch (includes macOS tarballs)
+- **FUSE harness (Linux):** phase allowlists when Python fixtures are checked out
 
 ## crates.io
 

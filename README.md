@@ -6,7 +6,7 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) �
 |--|--|
 | **Language** | Rust (edition 2021) |
 | **FUSE** | `fuser` low-level (inode API) |
-| **Platforms (1.0)** | Linux first |
+| **Platforms** | Linux (primary) · **macOS** (beta: arm64 + x86_64 tarballs) |
 | **Upstream** | Feature parity tracked vs [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount) |
 | **Living checklist** | [docs/parity-todo.md](docs/parity-todo.md) · [docs/mount-options-parity.md](docs/mount-options-parity.md) |
 
@@ -106,8 +106,8 @@ Still missing or partial relative to upstream Python:
 4. **Remote breadth** — SMB/WebDAV/Dropbox; HTTP Range-backed format readers (no full download); remote/compressed indexes.
 5. **Index extras** — file hashes / xattrs; full compression side-table interop with Python.
 6. **CLI polish** — colored logs; in-FS control folder (Rust uses a Unix socket); full `-P backend:n` matrix; OSS attributions depth.
-7. **Packaging** — PyPI/AppImage ecosystem is mature for Python; Rust has distro package CI (deb/rpm/portable + cosign) and AppImage scaffolding — polish ongoing.
-8. **Platforms** — macOS/FUSE-T not a 1.0 goal yet (Linux first).
+7. **Packaging** — PyPI/AppImage ecosystem is mature for Python; Rust has distro package CI (deb/rpm/portable + cosign, macOS tarballs) and AppImage scaffolding — polish ongoing.
+8. **Platforms** — **macOS is beta** (arm64/x86_64 tarballs + CI); requires [macFUSE or FUSE-T](docs/macos.md). Full harness parity and Homebrew formula still open.
 
 ---
 
@@ -164,12 +164,28 @@ export RATARMOUNT_PY_ROOT=../ratarmount
 
 ## Requirements
 
+**Linux**
+
 - Rust stable (`rustup default stable`)
 - `libfuse3` / `fuse3`
 - `libarchive` (long-tail formats)
 - `zlib` headers (flate2/system zlib)
 - Optional: `e2fsprogs` (`debugfs`) for EXT4, `squashfs-tools` for SquashFS
 - Sibling Python checkout for fixtures (default `../ratarmount`) for the harness
+
+**macOS** — full guide: [`docs/macos.md`](docs/macos.md) (FUSE install, Tahoe/FSKit, build, smoke)
+
+```bash
+# FUSE — pick one (required before mount or build)
+brew install --cask macfuse          # recommended
+# or: brew install macos-fuse-t/homebrew-cask/fuse-t
+
+brew install libarchive pkgconf
+export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+# macOS 26 Tahoe: if mounts fail, use FSKit
+#   ratarmount -f -o backend=fskit archive.tar.gz mnt/
+```
 
 ## Build / install
 
@@ -178,9 +194,10 @@ export PATH="$HOME/.cargo/bin:$PATH"
 make release
 make install          # → ~/.local/bin/ratarmount
 # or: cargo install --path ratarmount
+# macOS package: ./packaging/build-macos-tarball.sh
 ```
 
-**Packages:** GitHub Actions builds `.deb` (Ubuntu 20.04/22.04/24.04 amd64 + 24.04 arm64), Rocky 8/9 RPM, and portable glibc 2.31 tarballs with cosign keyless signatures. See [`docs/packaging.md`](docs/packaging.md).
+**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64/x86_64 tarballs**, with cosign keyless signatures. See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
 
 ## Test
 

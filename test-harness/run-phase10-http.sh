@@ -15,7 +15,7 @@ mkdir -p "$MP"
 cleanup() {
     [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
     [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
-    fusermount3 -u "$MP" 2>/dev/null || fusermount -u "$MP" 2>/dev/null || true
+    ratar_unmount "$MP"
     rm -rf "$WORKDIR"
 }
 trap cleanup EXIT
@@ -64,7 +64,7 @@ fi
 echo "[ok] http:// archive bar md5 $got"
 
 # file:// URL
-fusermount3 -u "$MP" 2>/dev/null || true
+ratar_unmount "$MP"
 wait "$MNT_PID" 2>/dev/null || true
 FILE_URL="file://$RATARMOUNT_PY_ROOT/tests/single-file.tar"
 "$RATARMOUNT_CMD" -f -c --index-file "$WORKDIR/idx2.sqlite" "$FILE_URL" "$MP" \

@@ -693,25 +693,91 @@ fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
     false
 }
 
+/// True when `path` appears to be a live FUSE (or FUSE-T) mount.
 fn is_fuse_mount(path: &Path) -> bool {
-    // Prefer /proc/self/mountinfo when available
-    if let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") {
-        let target = path.to_string_lossy();
-        if text.lines().any(|l| l.contains(&*target)) {
+    if mount_table_lists(path) {
+        return true;
+    }
+    // Linux: FUSE superblock magic via statfs (layout is Linux-specific).
+    #[cfg(target_os = "linux")]
+    {
+        if path_is_fuse_superblock(path) {
             return true;
         }
-    }
-    // Fallback: non-empty readdir often works once FUSE is up
-    if let Ok(mut rd) = std::fs::read_dir(path) {
-        // Mounted empty archives still allow readdir
-        let _ = rd.next();
-        // Check mount source type via statfs if possible
-        return path_is_fuse(path);
     }
     false
 }
 
-fn path_is_fuse(path: &Path) -> bool {
+/// Check kernel/user mount tables for `path` (Linux mountinfo + portable `mount`).
+fn mount_table_lists(path: &Path) -> bool {
+    let candidates = path_mount_candidates(path);
+
+    if let Ok(text) = std::fs::read_to_string("/proc/self/mountinfo") {
+        if text
+            .lines()
+            .any(|l| candidates.iter().any(|c| l.contains(c.as_str())))
+        {
+            return true;
+        }
+    }
+
+    if let Ok(output) = std::process::Command::new("mount").output() {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                if mount_output_lists_path(&text, &candidates) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Paths to match in mount tables (as given + canonical when available).
+fn path_mount_candidates(path: &Path) -> Vec<String> {
+    let mut v = Vec::with_capacity(2);
+    let raw = path.to_string_lossy().into_owned();
+    v.push(raw);
+    if let Ok(c) = path.canonicalize() {
+        let s = c.to_string_lossy().into_owned();
+        if !v.iter().any(|x| x == &s) {
+            v.push(s);
+        }
+    }
+    v
+}
+
+/// Parse `mount` command text for a mountpoint.
+///
+/// Linux: `src on /path type fuse ...`  
+/// Darwin: `src on /path (macfuse, local, ...)` or FUSE-T NFS/SMB lines.
+fn mount_output_lists_path(mount_text: &str, candidates: &[String]) -> bool {
+    for line in mount_text.lines() {
+        let Some(idx) = line.find(" on ") else {
+            continue;
+        };
+        let rest = &line[idx + 4..];
+        for cand in candidates {
+            if !rest.starts_with(cand.as_str()) {
+                continue;
+            }
+            let after = &rest[cand.len()..];
+            // Boundary: end, whitespace, or '(' (Darwin options).
+            if after.is_empty()
+                || after.starts_with(' ')
+                || after.starts_with('(')
+                || after.starts_with('\t')
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+/// Linux-only: `statfs` FUSE_SUPER_MAGIC (`0x65735546`).
+#[cfg(target_os = "linux")]
+fn path_is_fuse_superblock(path: &Path) -> bool {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
     #[repr(C)]
@@ -719,7 +785,6 @@ fn path_is_fuse(path: &Path) -> bool {
         f_type: i64,
         _pad: [u8; 128],
     }
-    // FUSE_SUPER_MAGIC 0x65735546
     const FUSE_SUPER_MAGIC: i64 = 0x6573_5546;
     extern "C" {
         fn statfs(path: *const libc::c_char, buf: *mut Statfs) -> i32;
@@ -777,6 +842,7 @@ fn default_mountpoint(archive: &Path) -> PathBuf {
                 return PathBuf::from(stem);
             }
         }
+        // fall through if URL parse had no usable last segment
         return PathBuf::from("remote");
     }
     let name = archive
@@ -789,4 +855,39 @@ fn default_mountpoint(archive: &Path) -> PathBuf {
         .and_then(|s| s.to_str())
         .unwrap_or(&stripped);
     PathBuf::from(stem)
+}
+
+#[cfg(test)]
+mod mount_probe_tests {
+    use super::{mount_output_lists_path, path_mount_candidates};
+    use std::path::Path;
+
+    #[test]
+    fn mount_output_linux_fuse_line() {
+        let text = "ratarmount on /tmp/mnt type fuse.ratarmount (rw,nosuid,nodev,relatime,user_id=1000,group_id=1000)\n";
+        let cands = path_mount_candidates(Path::new("/tmp/mnt"));
+        assert!(mount_output_lists_path(text, &cands));
+    }
+
+    #[test]
+    fn mount_output_darwin_macfuse_line() {
+        let text =
+            "ratarmount@macfuse0 on /private/tmp/mnt (macfuse, local, nodev, nosuid, synchronous, mounted by user)\n";
+        let cands = vec!["/private/tmp/mnt".to_string()];
+        assert!(mount_output_lists_path(text, &cands));
+    }
+
+    #[test]
+    fn mount_output_prefix_not_matched() {
+        // `/tmp/mnt` must not match `/tmp/mnt-extra`
+        let text = "x on /tmp/mnt-extra type fuse (rw)\n";
+        let cands = vec!["/tmp/mnt".to_string()];
+        assert!(!mount_output_lists_path(text, &cands));
+    }
+
+    #[test]
+    fn path_candidates_include_raw() {
+        let c = path_mount_candidates(Path::new("/nonexistent/ratarmount-test-path"));
+        assert!(c.iter().any(|s| s.contains("ratarmount-test-path")));
+    }
 }

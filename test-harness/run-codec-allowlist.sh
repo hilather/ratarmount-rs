@@ -19,7 +19,7 @@ cleanup() {
     done
     for mp in "$WORKDIR"/mnt-*; do
         if [[ -d "$mp" ]]; then
-            fusermount3 -u "$mp" 2>/dev/null || fusermount -u "$mp" 2>/dev/null || true
+            ratar_unmount "$mp"
         fi
     done
     rm -rf "$WORKDIR"
@@ -78,7 +78,7 @@ while IFS=$'\t' read -r archive_rel path_in expected_md5 || [[ -n "${archive_rel
             echo "  [ok] md5 $got"
         fi
     fi
-    fusermount3 -u "$mp" 2>/dev/null || true
+    ratar_unmount "$mp"
     wait "$mpid" 2>/dev/null || true
 done < "$ALLOWLIST"
 
