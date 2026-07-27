@@ -8,9 +8,12 @@
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file |
 | `s3://bucket/key` | AWS SigV4 GetObject → temp file |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
+| `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
+
+`webdav://` / `webdavs://` use `fetch_webdav_to_temp` (plain file GET is enough for mounting; recursive directory mount is out of scope). Plain `http(s)://` DAV endpoints that need no special scheme continue to use the HTTP path; put credentials in the URL when using the WebDAV schemes.
 
 ### S3 credentials / endpoint
 
@@ -32,7 +35,8 @@ Path rules (fsspec-like):
 
 ## Not yet
 
-- `smb://`, WebDAV, Git
+- `smb://`, Git
+- Recursive WebDAV directory mount as a folder (single-file GET only)
 - Streaming open without full download for multi-GB archives (Range-backed format readers)
 - S3 anonymous / instance-profile auto-refresh beyond static env keys
 
@@ -43,6 +47,8 @@ ratarmount -f http://127.0.0.1:8000/archive.tar mnt/
 ratarmount -f file:///path/to/archive.tar mnt/
 ratarmount -f s3://my-bucket/path/archive.tar mnt/
 ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
+ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
+ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
 ```
 
 ## Tests

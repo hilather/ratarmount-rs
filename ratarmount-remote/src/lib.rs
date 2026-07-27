@@ -4,10 +4,12 @@
 //! - `http(s)://` → fetch to temp (prefer Range when supported) and optional range-capable reader
 //! - `s3://bucket/key` → GetObject to temp (AWS env credentials)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
+//! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - other schemes → clear "not yet" errors
 
 mod s3;
 mod ssh;
+mod webdav;
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
@@ -19,11 +21,15 @@ use url::Url;
 
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
 pub use ssh::{fetch_ssh_to_temp, parse_ssh_url, SshLocation};
+pub use webdav::{
+    fetch_webdav_to_temp, parse_getcontentlength, parse_webdav_url, propfind_content_length,
+    WebDavLocation,
+};
 
 /// Chunk size for sequential Range GET materialization (4 MiB).
 pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 
-const USER_AGENT: &str = "ratarmount-rs/0.1";
+pub(crate) const USER_AGENT: &str = "ratarmount-rs/0.1";
 
 #[derive(Debug, Error)]
 pub enum RemoteError {
@@ -37,6 +43,8 @@ pub enum RemoteError {
     S3(String),
     #[error("ssh: {0}")]
     Ssh(String),
+    #[error("webdav: {0}")]
+    WebDav(String),
     #[error("unsupported remote scheme: {0}")]
     UnsupportedScheme(String),
 }
@@ -48,7 +56,17 @@ pub fn is_remote_url(s: &str) -> bool {
     Url::parse(s).is_ok_and(|u| {
         matches!(
             u.scheme(),
-            "http" | "https" | "file" | "ftp" | "s3" | "ssh" | "sftp" | "scp" | "smb" | "webdav"
+            "http"
+                | "https"
+                | "file"
+                | "ftp"
+                | "s3"
+                | "ssh"
+                | "sftp"
+                | "scp"
+                | "smb"
+                | "webdav"
+                | "webdavs"
         )
     })
 }
@@ -78,6 +96,10 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
         }
         "ssh" | "sftp" | "scp" => {
             let (tmp, size) = fetch_ssh_to_temp(input)?;
+            keep_fetched(input, tmp, size)
+        }
+        "webdav" | "webdavs" => {
+            let (tmp, size) = fetch_webdav_to_temp(input)?;
             keep_fetched(input, tmp, size)
         }
         other => Err(RemoteError::UnsupportedScheme(other.to_string())),
@@ -516,6 +538,8 @@ mod tests {
         assert!(is_remote_url("s3://bucket/key.tar"));
         assert!(is_remote_url("ssh://user@host/path.tar"));
         assert!(is_remote_url("sftp://user@host//abs/path.tar"));
+        assert!(is_remote_url("webdav://host.example/files/a.tar"));
+        assert!(is_remote_url("webdavs://host.example/files/a.tar"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
     }
@@ -850,5 +874,225 @@ mod tests {
         let local = resolve_to_local(&url).unwrap();
         assert_eq!(std::fs::read(local.path()).unwrap(), body);
         assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    /// Minimal WebDAV-capable mock: PROPFIND (207) + GET with optional Basic auth.
+    struct MockWebDav {
+        /// `http://127.0.0.1:port` base (no trailing slash).
+        http_base: String,
+        propfinds: Arc<AtomicUsize>,
+        gets: Arc<AtomicUsize>,
+        log: Arc<Mutex<Vec<String>>>,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    #[derive(Clone)]
+    struct MockWebDavConfig {
+        body: Vec<u8>,
+        /// If set, require `Authorization: Basic …` matching this user:pass.
+        require_basic: Option<(String, String)>,
+        /// Answer PROPFIND with getcontentlength.
+        propfind_size: bool,
+    }
+
+    impl MockWebDav {
+        fn spawn(cfg: MockWebDavConfig) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let http_base = format!("http://{}", listener.local_addr().unwrap());
+            let propfinds = Arc::new(AtomicUsize::new(0));
+            let gets = Arc::new(AtomicUsize::new(0));
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let pf_c = Arc::clone(&propfinds);
+            let get_c = Arc::clone(&gets);
+            let log_c = Arc::clone(&log);
+            let join = thread::spawn(move || {
+                for stream in listener.incoming().take(64) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut content_length: usize = 0;
+                    let mut auth_hdr: Option<String> = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.strip_prefix("Content-Length:") {
+                            content_length = v.trim().parse().unwrap_or(0);
+                        }
+                        if let Some(v) = line.strip_prefix("Authorization:") {
+                            auth_hdr = Some(v.trim().to_string());
+                        }
+                    }
+                    // Drain request body if any (PROPFIND).
+                    if content_length > 0 {
+                        let mut buf = vec![0u8; content_length];
+                        let _ = std::io::Read::read_exact(&mut reader, &mut buf);
+                    }
+
+                    {
+                        let mut lg = log_c.lock().unwrap();
+                        lg.push(request_line.trim().to_string());
+                        if let Some(a) = &auth_hdr {
+                            lg.push(format!("Authorization: {a}"));
+                        }
+                    }
+
+                    if let Some((user, pass)) = &cfg.require_basic {
+                        let expected = webdav::basic_auth_header(user, Some(pass));
+                        if auth_hdr.as_deref() != Some(expected.as_str()) {
+                            let body = b"unauthorized";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"dav\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(body);
+                            continue;
+                        }
+                    }
+
+                    let is_propfind = request_line.starts_with("PROPFIND ");
+                    let is_get = request_line.starts_with("GET ");
+
+                    if is_propfind {
+                        pf_c.fetch_add(1, Ordering::SeqCst);
+                        if !cfg.propfind_size {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            continue;
+                        }
+                        let xml = format!(
+                            r#"<?xml version="1.0" encoding="utf-8"?>
+<D:multistatus xmlns:D="DAV:">
+  <D:response>
+    <D:href>/file.bin</D:href>
+    <D:propstat>
+      <D:prop>
+        <D:getcontentlength>{}</D:getcontentlength>
+        <D:resourcetype/>
+      </D:prop>
+      <D:status>HTTP/1.1 200 OK</D:status>
+    </D:propstat>
+  </D:response>
+</D:multistatus>"#,
+                            cfg.body.len()
+                        );
+                        let hdr = format!(
+                            "HTTP/1.1 207 Multi-Status\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            xml.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(xml.as_bytes());
+                        continue;
+                    }
+
+                    if is_get {
+                        get_c.fetch_add(1, Ordering::SeqCst);
+                        let hdr = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            cfg.body.len()
+                        );
+                        let _ = stream.write_all(hdr.as_bytes());
+                        let _ = stream.write_all(&cfg.body);
+                        continue;
+                    }
+
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            });
+            Self {
+                http_base,
+                propfinds,
+                gets,
+                log,
+                _join: Some(join),
+            }
+        }
+
+        /// `webdav://127.0.0.1:port/path` (maps to this mock's HTTP listener).
+        fn webdav_url(&self, path: &str) -> String {
+            let rest = self.http_base.strip_prefix("http://").unwrap();
+            format!("webdav://{rest}{path}")
+        }
+
+        fn webdav_url_with_auth(&self, user: &str, pass: &str, path: &str) -> String {
+            let rest = self.http_base.strip_prefix("http://").unwrap();
+            format!("webdav://{user}:{pass}@{rest}{path}")
+        }
+    }
+
+    #[test]
+    fn webdav_fetch_with_propfind_and_get() {
+        let body = b"webdav-file-body-content".to_vec();
+        let mock = MockWebDav::spawn(MockWebDavConfig {
+            body: body.clone(),
+            require_basic: None,
+            propfind_size: true,
+        });
+        let url = mock.webdav_url("/files/a.tar");
+        let (mut tmp, size) = fetch_webdav_to_temp(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(
+            mock.propfinds.load(Ordering::SeqCst) >= 1,
+            "expected PROPFIND, log={:?}",
+            mock.log.lock().unwrap()
+        );
+        assert!(mock.gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn webdav_basic_auth_required() {
+        let body = b"secret-dav-payload".to_vec();
+        let mock = MockWebDav::spawn(MockWebDavConfig {
+            body: body.clone(),
+            require_basic: Some(("davuser".into(), "davpass".into())),
+            propfind_size: true,
+        });
+        // Without credentials → failure
+        let bare = mock.webdav_url("/secret.bin");
+        assert!(fetch_webdav_to_temp(&bare).is_err());
+
+        let authed = mock.webdav_url_with_auth("davuser", "davpass", "/secret.bin");
+        let (mut tmp, size) = fetch_webdav_to_temp(&authed).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(mock.gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn resolve_to_local_webdav() {
+        let body = b"resolve-webdav-body".to_vec();
+        let mock = MockWebDav::spawn(MockWebDavConfig {
+            body: body.clone(),
+            require_basic: None,
+            propfind_size: false, // GET still works if PROPFIND 404s
+        });
+        let url = mock.webdav_url("/a.tar");
+        let local = resolve_to_local(&url).unwrap();
+        assert_eq!(std::fs::read(local.path()).unwrap(), body);
+        assert!(mock.gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn webdav_parse_maps_webdavs() {
+        let loc = parse_webdav_url("webdavs://files.example.com/vault/x.tar").unwrap();
+        assert_eq!(loc.http_url, "https://files.example.com/vault/x.tar");
     }
 }
