@@ -104,11 +104,13 @@ jobs:
         run: |
           set -euo pipefail
           brew update
-          brew install pkgconf libarchive
+          brew install pkgconf libarchive gnu-tar
           brew install --cask macfuse
 
           # Optional runtime for smoke mounts (best-effort).
           brew install --cask fuse-t || true
+          # Prefer GNU tar (Homebrew gtar) for --commit-overlay tests.
+          echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
 
           LA="$(brew --prefix libarchive)/lib/pkgconfig"
           PCS="/usr/local/lib/pkgconfig"

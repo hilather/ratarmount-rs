@@ -681,22 +681,34 @@ fn is_uncompressed_tar(path: &Path) -> Result<bool> {
     Ok(n == 5 && (&ustar == b"ustar" || ustar.starts_with(b"ustar") || &ustar == b"GNU  "))
 }
 
-fn ensure_gnu_tar() -> Result<()> {
-    let out = Command::new("tar")
-        .arg("--version")
-        .output()
-        .map_err(|e| OverlayError::Msg(format!("Currently, GNU tar must be installed: {e}")))?;
-    let text = String::from_utf8_lossy(&out.stdout);
-    if !text.contains("GNU tar") {
-        return Err(OverlayError::Msg(
-            "Currently, GNU tar is required for --commit-overlay.".into(),
-        ));
+/// Resolve a GNU tar binary (`tar` on Linux, often `gtar` via Homebrew on macOS).
+fn find_gnu_tar() -> Option<PathBuf> {
+    for name in ["gtar", "gnutar", "tar"] {
+        let Ok(out) = Command::new(name).arg("--version").output() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(&out.stdout);
+        if text.contains("GNU tar") {
+            return Some(PathBuf::from(name));
+        }
     }
-    Ok(())
+    None
+}
+
+fn ensure_gnu_tar() -> Result<()> {
+    if find_gnu_tar().is_some() {
+        return Ok(());
+    }
+    Err(OverlayError::Msg(
+        "Currently, GNU tar is required for --commit-overlay \
+         (install `gtar` via Homebrew on macOS, or use Linux GNU tar)."
+            .into(),
+    ))
 }
 
 fn tar_env_command() -> Command {
-    let mut cmd = Command::new("tar");
+    let bin = find_gnu_tar().unwrap_or_else(|| PathBuf::from("tar"));
+    let mut cmd = Command::new(bin);
     // Locale C for reproducible/stable messages (Python run_without_locale)
     cmd.env("LC_ALL", "C");
     cmd.env("LC_LANG", "C");
@@ -811,7 +823,14 @@ mod tests {
             yes: true,
             debug: 0,
         };
-        commit_overlay(&overlay, &tar, &opts).unwrap();
+        match commit_overlay(&overlay, &tar, &opts) {
+            Ok(_) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            Err(e) => panic!("commit_overlay: {e}"),
+        }
 
         let list = StdCommand::new("tar")
             .args(["-tf"])
