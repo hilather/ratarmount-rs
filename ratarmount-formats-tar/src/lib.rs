@@ -260,10 +260,14 @@ impl SqliteIndexedTar {
 
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
-        parse_tar_into_index(reader, &index, options)?;
+        let is_gnu_incremental = parse_tar_into_index(reader, &index, options)?;
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        index.store_metadata_key_value(
+            "isGnuIncremental",
+            if is_gnu_incremental { "1" } else { "0" },
+        )?;
         store_tarstats(&index, &archive_path)?;
         store_arguments(&index, options)?;
         index.commit_write()?;
@@ -520,11 +524,85 @@ fn sparse_map_from_pax(pax: &PaxParsed) -> Vec<(u64, u64)> {
     Vec::new()
 }
 
+/// Scan headers for GNU dumpdir typeflag `D` (Python `_detect_gnu_incremental`).
+fn detect_gnu_incremental<R: Read + Seek>(reader: &mut R, ignore_zeros: bool) -> Result<bool> {
+    let old_pos = reader.stream_position()?;
+    let result = (|| -> Result<bool> {
+        reader.seek(SeekFrom::Start(0))?;
+        let mut pos: u64 = 0;
+        let mut header = [0u8; 512];
+        let mut remaining: u32 = 10_000;
+        let t0 = Instant::now();
+
+        loop {
+            if remaining == 0 || t0.elapsed().as_secs_f64() > 3.0 {
+                return Ok(false);
+            }
+            reader.seek(SeekFrom::Start(pos))?;
+            let n = reader.read(&mut header)?;
+            if n < 512 {
+                return Ok(false);
+            }
+
+            if header.iter().all(|&b| b == 0) {
+                pos += BLOCK_SIZE;
+                reader.seek(SeekFrom::Start(pos))?;
+                let mut next = [0u8; 512];
+                let n2 = reader.read(&mut next)?;
+                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                    if ignore_zeros {
+                        continue;
+                    }
+                    return Ok(false);
+                }
+                // Zero block then non-zero without ignore_zeros → end of archive.
+                return Ok(false);
+            }
+
+            let typeflag = header[156];
+            if typeflag == b'D' {
+                return Ok(true);
+            }
+            remaining -= 1;
+
+            let size = parse_octal(&header[124..136]).unwrap_or(0);
+            pos = pos + BLOCK_SIZE + pad512(size);
+        }
+    })();
+    reader.seek(SeekFrom::Start(old_pos))?;
+    result
+}
+
+/// Strip GNU incremental octal-timestamp prefix when it matches the raw ustar prefix field.
+///
+/// Python: `_fix_incremental_backup_name_prefixes`. Also requires the first path component
+/// to look like an octal timestamp (digits 0–7 only).
+fn fix_incremental_backup_name_prefixes(name: &str, header: &[u8; 512]) -> String {
+    let Some((prefix, rest)) = name.split_once('/') else {
+        return name.to_string();
+    };
+    if prefix.is_empty() {
+        return name.to_string();
+    }
+    // Incremental timestamp prefixes are octal digit strings.
+    if !prefix.bytes().all(|b| b.is_ascii_digit() && b <= b'7') {
+        return name.to_string();
+    }
+    let encoded = prefix.as_bytes();
+    let raw_prefix = &header[345..500];
+    // Match first C-string in the 155-byte prefix field (may hold two timestamps).
+    if raw_prefix.starts_with(encoded) && raw_prefix.get(encoded.len()) == Some(&0) {
+        return rest.to_string();
+    }
+    name.to_string()
+}
+
+/// Returns whether the archive was treated as GNU incremental (`isGnuIncremental`).
 fn parse_tar_into_index<R: Read + Seek>(
     reader: &mut R,
     index: &SqliteIndex,
     options: &OpenOptions,
-) -> Result<()> {
+) -> Result<bool> {
     let mut pos: u64 = 0;
     let mut header = [0u8; 512];
     let mut generated_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -536,6 +614,11 @@ fn parse_tar_into_index<R: Read + Seek>(
         sparse_pairs: Vec::new(),
     };
     let mut pax_header_start: Option<u64> = None;
+
+    let mut is_gnu_incremental = match options.gnu_incremental {
+        Some(v) => v,
+        None => detect_gnu_incremental(reader, options.ignore_zeros)?,
+    };
 
     let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
         if !batch.is_empty() {
@@ -647,6 +730,15 @@ fn parse_tar_into_index<R: Read + Seek>(
             .and_then(|s| s.parse::<f64>().ok())
             .unwrap_or(mtime);
 
+        // Dumpdir members mark GNU incremental archives (Python `_process_tar_info`).
+        if typeflag == b'D' && !is_gnu_incremental {
+            is_gnu_incremental = true;
+        }
+
+        if is_gnu_incremental {
+            name = fix_incremental_backup_name_prefixes(&name, &header);
+        }
+
         let mut issparse = false;
         let mut logical_size = size;
         let mut data_off = pos + BLOCK_SIZE;
@@ -699,25 +791,42 @@ fn parse_tar_into_index<R: Read + Seek>(
             continue;
         }
 
-        push_entry(
-            &mut batch,
-            &name,
-            member_header_start,
-            data_off,
-            if typeflag == b'5' || name.ends_with('/') {
-                0
-            } else {
-                logical_size
-            },
-            mtime,
-            mode_bits,
-            typeflag,
-            &linkname,
-            uid,
-            gid,
-            issparse,
-            &mut generated_dirs,
-        )?;
+        if typeflag == b'D' {
+            // Dumpdir: regular meta entry (S_IFREG, dumpdir size) + directory entry (size 0).
+            push_dumpdir_entries(
+                &mut batch,
+                &name,
+                member_header_start,
+                data_off,
+                logical_size,
+                mtime,
+                mode_bits,
+                &linkname,
+                uid,
+                gid,
+                &mut generated_dirs,
+            )?;
+        } else {
+            push_entry(
+                &mut batch,
+                &name,
+                member_header_start,
+                data_off,
+                if typeflag == b'5' || name.ends_with('/') {
+                    0
+                } else {
+                    logical_size
+                },
+                mtime,
+                mode_bits,
+                typeflag,
+                &linkname,
+                uid,
+                gid,
+                issparse,
+                &mut generated_dirs,
+            )?;
+        }
         if batch.len() >= BATCH_FLUSH {
             flush(&mut batch)?;
         }
@@ -737,7 +846,7 @@ fn parse_tar_into_index<R: Read + Seek>(
     }
 
     flush(&mut batch)?;
-    Ok(())
+    Ok(is_gnu_incremental)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -807,6 +916,94 @@ fn push_entry(
         false,
         0,
     ));
+    Ok(())
+}
+
+/// GNU dumpdir (typeflag `D`): store as regular-file meta plus a directory entry.
+///
+/// Python `_process_tar_info` adds the dumpdir payload as `S_IFREG` and a second
+/// row with `offsetheader + 1`, size 0, and `mode | S_IFDIR` so the name is listable
+/// as a directory (newest version wins by higher `offsetheader`).
+#[allow(clippy::too_many_arguments)]
+fn push_dumpdir_entries(
+    batch: &mut Vec<FileRow>,
+    full_name: &str,
+    offsetheader: u64,
+    offset: u64,
+    size: u64,
+    mtime: f64,
+    mode_bits: u32,
+    linkname: &str,
+    uid: i64,
+    gid: i64,
+    generated_dirs: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    let mut full = full_name.trim_end_matches('/').to_string();
+    if full.is_empty() {
+        return Ok(());
+    }
+    while full.starts_with("./") {
+        full = full[2..].to_string();
+    }
+    let full_path = normpath(&full);
+    let (path, name) = match full_path.rsplit_once('/') {
+        Some(("", n)) => (String::new(), n.to_string()),
+        Some((p, n)) => (p.to_string(), n.to_string()),
+        None => (String::new(), full_path.clone()),
+    };
+
+    ensure_parent_dirs(batch, &path, generated_dirs, mtime, uid, gid);
+
+    let mode_reg = ((mode_bits & 0o7777) | ratarmount_core::S_IFREG) as i64;
+    let mode_dir = ((mode_bits & 0o7777) | ratarmount_core::S_IFDIR) as i64;
+    let type_store = b'D' as i64;
+
+    // Dumpdir metadata (regular file with dumpdir payload size).
+    batch.push(FileRow::new(
+        path.clone(),
+        name.clone(),
+        offsetheader as i64,
+        offset as i64,
+        size as i64,
+        mtime,
+        mode_reg,
+        type_store,
+        linkname,
+        uid,
+        gid,
+        false,
+        false,
+        false,
+        0,
+    ));
+
+    // Directory side so children can be listed; unique PK via offsetheader+1.
+    batch.push(FileRow::new(
+        path.clone(),
+        name.clone(),
+        offsetheader as i64 + 1,
+        offset as i64,
+        0,
+        mtime,
+        mode_dir,
+        type_store,
+        linkname,
+        uid,
+        gid,
+        false,
+        false,
+        false,
+        0,
+    ));
+
+    // Prevent `ensure_parent_dirs` from synthesizing a generated parent later.
+    let dir_key = if path.is_empty() {
+        format!("/{name}")
+    } else {
+        format!("{path}/{name}")
+    };
+    generated_dirs.insert(dir_key);
+
     Ok(())
 }
 
@@ -1362,5 +1559,205 @@ mod tests {
             r.read_exact(&mut z).unwrap();
             assert!(z.iter().all(|&b| b == 0), "leading hole should be zeros");
         }
+    }
+
+    fn py_test_root() -> PathBuf {
+        PathBuf::from(
+            std::env::var("RATARMOUNT_PY_ROOT")
+                .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into()),
+        )
+    }
+
+    fn open_fixture(name: &str, gnu: Option<bool>) -> Option<SqliteIndexedTar> {
+        let path = py_test_root().join("tests").join(name);
+        if !path.exists() {
+            eprintln!("skip missing fixture {name}");
+            return None;
+        }
+        let opts = OpenOptions {
+            gnu_incremental: gnu,
+            ..OpenOptions::default()
+        };
+        let mut mat = None;
+        Some(
+            SqliteIndexedTar::create_index(&path, &path, None, &opts, "0.1.0", &mut mat)
+                .unwrap_or_else(|e| panic!("{name}: {e}")),
+        )
+    }
+
+    #[test]
+    fn gnu_incremental_detect_dumpdir_strips_prefix() {
+        // incremental-backup.level.0.tar has typeflag 'D' → auto-detect strips octal prefixes.
+        let Some(m) = open_fixture("incremental-backup.level.0.tar", None) else {
+            return;
+        };
+        let meta = m.index().metadata().unwrap();
+        assert_eq!(
+            meta.get("isGnuIncremental").map(String::as_str),
+            Some("1"),
+            "metadata isGnuIncremental"
+        );
+
+        let root = m.list("/").expect("root list");
+        if let ListResult::Infos(map) = root {
+            assert!(map.contains_key("foo"), "dir foo from dumpdir: {:?}", map.keys());
+            assert!(
+                map.contains_key("root-file.txt"),
+                "root-file.txt: {:?}",
+                map.keys()
+            );
+            assert!(
+                !map.keys().any(|k| k.chars().all(|c| c.is_ascii_digit())),
+                "octal timestamp dirs should be stripped: {:?}",
+                map.keys()
+            );
+            let foo = map.get("foo").unwrap();
+            assert_eq!(
+                foo.mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFDIR,
+                "lookup /foo is directory"
+            );
+            assert_eq!(foo.size, 0);
+        } else {
+            panic!("expected Infos");
+        }
+
+        // Dumpdir also creates a regular-file version (size > 0).
+        assert_eq!(m.versions("/foo"), 2);
+        let dump_meta = m.lookup("/foo", 1).expect("older dumpdir version");
+        assert_eq!(
+            dump_meta.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert!(dump_meta.size > 0);
+
+        for child in ["1", "2", "3"] {
+            let fi = m
+                .lookup(&format!("/foo/{child}"), 0)
+                .unwrap_or_else(|| panic!("missing /foo/{child}"));
+            assert!(fi.size > 0);
+        }
+
+        let fi = m.lookup("/root-file.txt", 0).expect("root-file.txt");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+    }
+
+    #[test]
+    fn gnu_incremental_force_strips_single_file() {
+        // No typeflag D — only forced gnu_incremental=Some(true) strips the prefix.
+        let Some(m) = open_fixture("single-file-incremental.tar", Some(true)) else {
+            return;
+        };
+        let meta = m.index().metadata().unwrap();
+        assert_eq!(meta.get("isGnuIncremental").map(String::as_str), Some("1"));
+
+        assert!(m.lookup("/foo", 0).is_some(), "stripped path /foo");
+        assert!(
+            m.lookup("/14130613451/foo", 0).is_none(),
+            "prefixed path should not exist when forced"
+        );
+        let fi = m.lookup("/foo", 0).unwrap();
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"bar\n");
+    }
+
+    #[test]
+    fn gnu_incremental_off_keeps_prefix_without_dumpdir() {
+        let Some(m) = open_fixture("single-file-incremental.tar", Some(false)) else {
+            return;
+        };
+        let meta = m.index().metadata().unwrap();
+        assert_eq!(meta.get("isGnuIncremental").map(String::as_str), Some("0"));
+        assert!(m.lookup("/14130613451/foo", 0).is_some());
+        assert!(m.lookup("/foo", 0).is_none());
+    }
+
+    #[test]
+    fn gnu_incremental_detect_without_dumpdir_keeps_prefix() {
+        // Auto-detect finds no 'D' → leave names as tarfile-joined prefix/name.
+        let Some(m) = open_fixture("single-file-incremental.tar", None) else {
+            return;
+        };
+        let meta = m.index().metadata().unwrap();
+        assert_eq!(meta.get("isGnuIncremental").map(String::as_str), Some("0"));
+        assert!(m.lookup("/14130613451/foo", 0).is_some());
+    }
+
+    #[test]
+    fn gnu_incremental_force_absolute_path() {
+        let Some(m) = open_fixture("absolute-file-incremental.tar", Some(true)) else {
+            return;
+        };
+        assert!(m.lookup("/tmp/foo", 0).is_some());
+        assert!(m.lookup("/14130612002/tmp/foo", 0).is_none());
+    }
+
+    #[test]
+    fn gnu_incremental_mockup_does_not_strip_without_raw_prefix() {
+        // Mockup stores the timestamp in the name field with empty ustar prefix → do not strip.
+        let Some(m) = open_fixture("single-file-incremental-mockup.tar", Some(true)) else {
+            return;
+        };
+        assert!(
+            m.lookup("/14130613451/foo", 0).is_some(),
+            "mockup must keep embedded prefix path"
+        );
+        assert!(m.lookup("/foo", 0).is_none());
+    }
+
+    #[test]
+    fn gnu_incremental_level1_moved_file() {
+        let Some(m) = open_fixture("incremental-backup.level.1.tar", None) else {
+            return;
+        };
+        assert_eq!(
+            m.index()
+                .metadata()
+                .unwrap()
+                .get("isGnuIncremental")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert!(m.lookup("/foo/3", 0).is_some());
+        assert!(m.lookup("/foo/moved", 0).is_some());
+        let fi = m.lookup("/foo", 0).expect("foo dir");
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFDIR);
+    }
+
+    #[test]
+    fn fix_incremental_name_helpers() {
+        let mut header = [0u8; 512];
+        let prefix = b"14130613451";
+        header[345..345 + prefix.len()].copy_from_slice(prefix);
+        // second timestamp + NULs already zero
+        assert_eq!(
+            fix_incremental_backup_name_prefixes("14130613451/foo", &header),
+            "foo"
+        );
+        assert_eq!(
+            fix_incremental_backup_name_prefixes("14130613451//tmp/foo", &header),
+            "/tmp/foo"
+        );
+        // non-octal first component
+        assert_eq!(
+            fix_incremental_backup_name_prefixes("notoctal/foo", &header),
+            "notoctal/foo"
+        );
+        // mismatch vs raw prefix
+        assert_eq!(
+            fix_incremental_backup_name_prefixes("99999999999/foo", &header),
+            "99999999999/foo"
+        );
+        // empty raw prefix (mockup style)
+        let empty = [0u8; 512];
+        assert_eq!(
+            fix_incremental_backup_name_prefixes("14130613451/foo", &empty),
+            "14130613451/foo"
+        );
     }
 }
