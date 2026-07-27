@@ -16,7 +16,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Uncompressed TAR (ustar/pax/gnu) | yes | yes | `[x]` |
 | GNU sparse `S` + PAX sparse 0.0/0.1/1.0 | yes | yes | `[x]` |
 | GNU incremental TAR | yes | detect + prefix strip + dumpdir `D` dual entry + `isGnuIncremental` metadata | `[x]` |
-| ZIP (store/deflate, symlink, password) | yes | store/deflate; `--password` | `~` encrypted ZIP, multi-disk |
+| ZIP (store/deflate, symlink, password) | yes | store/deflate; password + multi-part join | `~` true multi-disk EOCD still limited |
 | Custom SevenZip random-access | yes (fork PR) | yes | `[x]` |
 | AR / CPIO newc/crc/odc/binary | yes | yes | `[x]` |
 | libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |

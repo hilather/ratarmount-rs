@@ -8,9 +8,12 @@ use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
-use ratarmount_compositing::{commit_overlay, CommitOverlayOptions, WriteOverlay};
+use ratarmount_compositing::{
+    commit_overlay, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
+    WriteOverlay,
+};
 use ratarmount_compress::strip_compression_suffix;
-use ratarmount_core::{MountSource, OpenOptions};
+use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{mount_blocking, unmount};
 use ratarmount_index::{
     default_index_folders, fill_content_hashes, parse_index_folders, resolve_index_location,
@@ -331,17 +334,11 @@ fn main() {
         }
     }
 
-    // Parallelization: accept Python-style matrix but only use leading integer for now.
-    let parallelization = args
-        .parallelization
-        .split(',')
-        .next()
-        .and_then(|s| {
-            let s = s.trim();
-            let s = s.strip_prefix(':').unwrap_or(s);
-            s.split(':').next().and_then(|p| p.parse::<u32>().ok())
-        })
-        .unwrap_or(1);
+    // Parallelization: Python-style matrix (`4`, `bzip2:4,gzip:2`, `0` = all cores).
+    let parallelization = ParallelizationSpec::parse(&args.parallelization).unwrap_or_else(|e| {
+        eprintln!("warning: invalid --parallelization: {e}; using default 1");
+        ParallelizationSpec::default()
+    });
 
     let gnu_incremental = if args.gnu_incremental {
         Some(true)
@@ -559,9 +556,20 @@ fn main() {
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
 
-    // Optional control Unix socket (status / unmount).
+    // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
     let _control_sock = if args.control_interface {
+        let stop = Arc::clone(&control_stop);
+        let mp_ctrl = mp.clone();
+        bundle.source = Arc::new(ControlFolderMountSource::new(
+            Arc::clone(&bundle.source),
+            ControlFolderOptions::enabled()
+                .with_label(mp.display().to_string())
+                .with_on_unmount(Arc::new(move || {
+                    stop.store(true, Ordering::SeqCst);
+                    let _ = unmount(&mp_ctrl);
+                })),
+        )) as Arc<dyn MountSource>;
         start_control_interface(&mp, Arc::clone(&control_stop))
     } else {
         None

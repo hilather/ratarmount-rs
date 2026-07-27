@@ -11,7 +11,8 @@ use ratarmount_compositing::{
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
     looks_like_tar, materialize, materialize_joined_parts, name_suggests_compressed_tar,
-    open_seekable_bzip2, open_seekable_compress_z, open_seekable_lz4, open_seekable_lzip,
+    open_seekable_bzip2_with_threads, open_seekable_compress_z, open_seekable_lz4,
+    open_seekable_lzip,
     open_seekable_lzma, open_seekable_lzo, open_seekable_xz, open_seekable_zlib,
     strip_compression_suffix, CompressionFormat, SeekableBody, SeekableZstd, SharedSeekableGzip,
 };
@@ -372,8 +373,9 @@ fn open_path_impl(
         }
         CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
         CompressionFormat::Bzip2 => {
+            let threads = options.threads_for("bzip2");
             open_seekable_codec(path, index_path, &options, recreate, "bzip2", || {
-                open_seekable_bzip2(path)
+                open_seekable_bzip2_with_threads(path, threads)
             })?
         }
         CompressionFormat::Xz => {

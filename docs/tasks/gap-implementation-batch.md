@@ -42,16 +42,26 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | EXT4 | formats-ext4 | `ext4-view` pure + debugfs fallback |
 | WebDAV | remote | `webdav://` / `webdavs://` file materialize |
 
+## Batch 4 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| In-FS control | compositing | `/.ratarmount-control/` layer; main wires with socket |
+| Codec + `-P` | compress + core | `ParallelizationSpec`, bzip2 threads, zstd seek table |
+| Multi-part ZIP | formats-zip | `.z01`+`.zip` / `.zip.001` join + password AES |
+| SQLAR encrypt | formats-sqlar | detect + optional `sqlcipher` feature |
+| SMB | remote | `smb://` via smbclient CLI |
+
 ## Still open (later)
 
 | Gap | Notes |
 |-----|--------|
 | True Range without materialize for format openers | Formats still need local path after fetch |
-| SquashFS xz compressor | backhand xz conflicts with workspace lzma |
-| SMB / Dropbox | not started |
-| Full `-P` backend parallel matrix | reserved flag only |
-| In-FS control folder | Unix socket remains |
-| Codec depth (true block maps) | Tier B lite remains |
+| SquashFS xz in-process | backhand xz conflicts with workspace lzma |
+| Dropbox / full fsspec | not started |
+| Full `-P` for all codecs | bzip2 wired; others default |
+| True bzip2 bit-block map | multi-stream parallel only |
+| lrzip, multi-disk ZIP EOCD | long-tail |
 
 ## Verify
 
