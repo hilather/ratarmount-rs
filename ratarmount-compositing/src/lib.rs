@@ -1,7 +1,8 @@
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
-//! file versions, path prefix, path transform.
+//! file versions, path prefix, path transform, in-FS control folder.
 
 mod automount;
+mod control;
 mod folder;
 mod prefix;
 mod transform;
@@ -12,6 +13,9 @@ mod write_overlay;
 pub use automount::{
     is_archive_filename, is_archive_filename_with, parse_recursive_extensions,
     strip_archive_extension, AutoMountLayer, AutoMountOptions, OpenNestedFn, RecursiveExtSet,
+};
+pub use control::{
+    ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_NAME, CONTROL_DIR_PATH,
 };
 pub use folder::FolderMountSource;
 pub use prefix::PrefixMountSource;
