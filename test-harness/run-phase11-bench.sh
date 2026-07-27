@@ -19,9 +19,10 @@ MP="$WORKDIR/mnt"
 mkdir -p "$MP"
 
 cleanup() {
+    set +e
     ratar_unmount "$MP"
     [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 

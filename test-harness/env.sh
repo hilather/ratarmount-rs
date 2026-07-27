@@ -22,8 +22,12 @@ ratar_unmount() {
                 || true
             ;;
         *)
-            fusermount3 -u "$mp" 2>/dev/null \
+            # Prefer lazy unmount so EXIT traps can remove workdirs while FUSE settles.
+            fusermount3 -uz "$mp" 2>/dev/null \
+                || fusermount3 -u "$mp" 2>/dev/null \
+                || fusermount -uz "$mp" 2>/dev/null \
                 || fusermount -u "$mp" 2>/dev/null \
+                || umount -l "$mp" 2>/dev/null \
                 || umount "$mp" 2>/dev/null \
                 || true
             ;;

@@ -13,10 +13,11 @@ MP="$WORKDIR/mnt"
 mkdir -p "$MP"
 
 cleanup() {
+    set +e
     [[ -n "${SRV_PID:-}" ]] && kill "$SRV_PID" 2>/dev/null || true
     [[ -n "${MNT_PID:-}" ]] && kill "$MNT_PID" 2>/dev/null || true
     ratar_unmount "$MP"
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 

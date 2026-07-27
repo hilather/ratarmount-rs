@@ -36,12 +36,13 @@ mkdir -p "$MP"
 MOUNT_PID=""
 
 cleanup() {
+    set +e
     if [[ -n "${MOUNT_PID:-}" ]]; then
         kill "$MOUNT_PID" 2>/dev/null || true
         wait "$MOUNT_PID" 2>/dev/null || true
     fi
     ratar_unmount "$MP"
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 

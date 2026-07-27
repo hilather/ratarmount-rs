@@ -46,9 +46,10 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Checkout Python ratarmount (fixtures)
+        # hilather fork includes extra 7z fixtures used by phase9-sevenzip.
         uses: actions/checkout@v4
         with:
-          repository: mxmlnkn/ratarmount
+          repository: hilather/ratarmount
           path: ratarmount-py
 
       - name: Install deps
@@ -90,22 +91,44 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Homebrew deps
+        # fuser on Darwin requires pkg-config package "fuse" or "osxfuse"
+        # (macFUSE). FUSE-T alone is not enough to *link*; use it only for
+        # optional runtime smoke (kext-less).
         run: |
+          set -euo pipefail
           brew update
           brew install pkgconf libarchive
-          # FUSE-T is kext-less and more likely to work on GHA runners.
-          brew install macos-fuse-t/homebrew-cask/fuse-t || true
-          # Fallback headers/libs if FUSE-T formula is unavailable.
-          brew install --cask macfuse || true
+
+          # Required for build: macFUSE provides fuse.pc + libfuse.
+          # (Runtime kext load is not available on GHA; linking still works.)
+          brew install --cask macfuse
+
+          # Optional runtime for smoke mounts (best-effort).
+          brew install --cask fuse-t || brew install macos-fuse-t/homebrew-cask/fuse-t || true
+
           PCS="$(brew --prefix libarchive)/lib/pkgconfig"
           for p in \
+            "$(brew --prefix)/lib/pkgconfig" \
             /usr/local/lib/pkgconfig \
             /opt/homebrew/lib/pkgconfig \
-            /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig; do
-            [[ -d "$p" ]] && PCS="${p}:${PCS}"
+            /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig \
+            /usr/local/opt/libfuse/lib/pkgconfig; do
+            [[ -n "$p" && -d "$p" ]] && PCS="${p}:${PCS}"
           done
           echo "PKG_CONFIG_PATH=${PCS}" >> "$GITHUB_ENV"
+          export PKG_CONFIG_PATH="${PCS}"
           echo "PKG_CONFIG_PATH=${PCS}"
+
+          echo "==> fuse pkg-config probe"
+          pkg-config --list-all | grep -iE 'fuse|osx' || true
+          if ! pkg-config --exists fuse && ! pkg-config --exists osxfuse; then
+            echo "ERROR: macFUSE did not install a usable fuse/osxfuse .pc file"
+            ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig 2>/dev/null || true
+            ls -la /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig 2>/dev/null || true
+            exit 1
+          fi
+          pkg-config --modversion fuse 2>/dev/null || pkg-config --modversion osxfuse
+          pkg-config --libs fuse 2>/dev/null || pkg-config --libs osxfuse
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable

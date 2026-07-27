@@ -9,7 +9,7 @@ BIN="${RATARMOUNT_CMD:-$ROOT/target/release/ratarmount}"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 ALLOWLIST="${1:-$ROOT/test-harness/phase9-sevenzip.txt}"
 WORKDIR=$(mktemp -d /tmp/ratarmount-rs-7z-XXXXXX)
-trap 'ratar_unmount "$WORKDIR/mnt"; rm -rf "$WORKDIR"' EXIT
+trap 'ratar_unmount "$WORKDIR/mnt"; rm -rf "$WORKDIR" || true' EXIT
 
 mkdir -p "$WORKDIR/mnt"
 echo "RATARMOUNT_CMD=$BIN"

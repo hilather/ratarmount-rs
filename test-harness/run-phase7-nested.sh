@@ -12,11 +12,23 @@ mkdir -p "$WORKDIR"
 MOUNT_PIDS=()
 
 cleanup() {
-    for pid in "${MOUNT_PIDS[@]:-}"; do kill "$pid" 2>/dev/null || true; done
+    # Never fail the script from the EXIT trap (set -e).
+    set +e
+    # Unmount first (lazy), then stop mount processes.
     for mp in "$WORKDIR"/mnt-*; do
         [[ -d "$mp" ]] && ratar_unmount "$mp"
     done
-    rm -rf "$WORKDIR"
+    for pid in "${MOUNT_PIDS[@]:-}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${MOUNT_PIDS[@]:-}"; do
+        wait "$pid" 2>/dev/null || true
+    done
+    sleep 0.2
+    for mp in "$WORKDIR"/mnt-*; do
+        [[ -d "$mp" ]] && ratar_unmount "$mp"
+    done
+    rm -rf "$WORKDIR" 2>/dev/null || true
 }
 trap cleanup EXIT
 

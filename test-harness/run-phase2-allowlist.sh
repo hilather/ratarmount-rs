@@ -13,15 +13,19 @@ mkdir -p "$WORKDIR"
 MOUNT_PIDS=()
 
 cleanup() {
+    set +e
     for pid in "${MOUNT_PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
+    done
+    for pid in "${MOUNT_PIDS[@]:-}"; do
+        wait "$pid" 2>/dev/null || true
     done
     for mp in "$WORKDIR"/mnt-*; do
         if [[ -d "$mp" ]]; then
             ratar_unmount "$mp"
         fi
     done
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 

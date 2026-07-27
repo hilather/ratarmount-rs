@@ -14,9 +14,10 @@ IDX="$WORKDIR/idx.sqlite"
 mkdir -p "$MP" "$OV"
 
 cleanup() {
+    set +e
     ratar_unmount "$MP"
     [[ -n "${PID:-}" ]] && kill "$PID" 2>/dev/null || true
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 

@@ -14,6 +14,7 @@ mkdir -p "$WORKDIR"
 MOUNT_PIDS=()
 
 cleanup() {
+    set +e
     for pid in "${MOUNT_PIDS[@]:-}"; do
         kill "$pid" 2>/dev/null || true
     done
@@ -22,7 +23,7 @@ cleanup() {
             ratar_unmount "$mp"
         fi
     done
-    rm -rf "$WORKDIR"
+    rm -rf "$WORKDIR" || true
 }
 trap cleanup EXIT
 
