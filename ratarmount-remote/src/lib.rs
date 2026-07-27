@@ -1,7 +1,7 @@
 //! Remote URL access for Phase 10.
 //!
 //! - `file://` → local path
-//! - `http(s)://` → fetch to temp (and optional range-capable reader)
+//! - `http(s)://` → fetch to temp (prefer Range when supported) and optional range-capable reader
 //! - `s3://bucket/key` → GetObject to temp (AWS env credentials)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - other schemes → clear "not yet" errors
@@ -19,6 +19,11 @@ use url::Url;
 
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
 pub use ssh::{fetch_ssh_to_temp, parse_ssh_url, SshLocation};
+
+/// Chunk size for sequential Range GET materialization (4 MiB).
+pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
+
+const USER_AGENT: &str = "ratarmount-rs/0.1";
 
 #[derive(Debug, Error)]
 pub enum RemoteError {
@@ -63,7 +68,8 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
             Ok(RemoteLocal::Local(path))
         }
         "http" | "https" => {
-            let (tmp, size) = fetch_http_to_temp(url.as_str())?;
+            // Prefer Range materialization when the server supports it (fsspec-style path).
+            let (tmp, size) = fetch_http_to_temp_prefer_range(url.as_str())?;
             keep_fetched(input, tmp, size)
         }
         "s3" => {
@@ -114,10 +120,181 @@ impl Drop for RemoteLocal {
     }
 }
 
+/// Metadata from an HTTP probe (HEAD and/or Range GET).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpProbe {
+    pub content_length: Option<u64>,
+    /// True when the server advertises or demonstrates byte-range support.
+    pub accept_ranges: bool,
+}
+
+/// Parse `Content-Range: bytes start-end/total` and return `total` when present.
+pub fn parse_content_range_total(header: Option<&str>) -> Option<u64> {
+    let h = header?;
+    // e.g. "bytes 0-0/12345" or "bytes 0-1023/*"
+    let after_slash = h.rsplit_once('/')?.1.trim();
+    if after_slash == "*" {
+        return None;
+    }
+    after_slash.parse().ok()
+}
+
+/// Whether `Accept-Ranges` (or equivalent) indicates byte ranges are usable.
+pub fn accept_ranges_bytes(header: Option<&str>) -> bool {
+    header
+        .map(|s| {
+            let lower = s.to_ascii_lowercase();
+            lower.contains("bytes") && !lower.contains("none")
+        })
+        .unwrap_or(false)
+}
+
+/// Compute inclusive byte-range windows for sequential chunk download.
+///
+/// Returns `(start, end_inclusive)` pairs covering `0..size` in steps of `chunk`.
+pub fn range_chunk_windows(size: u64, chunk: u64) -> Vec<(u64, u64)> {
+    if size == 0 || chunk == 0 {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut start = 0u64;
+    while start < size {
+        let end = (start + chunk - 1).min(size - 1);
+        out.push((start, end));
+        start = end + 1;
+    }
+    out
+}
+
+/// Probe an HTTP(S) URL for Content-Length and Accept-Ranges support.
+///
+/// Tries HEAD first; on failure or missing length with ranges advertised, probes with
+/// `Range: bytes=0-0` (206 + Content-Range total).
+pub fn probe_http(url: &str) -> Result<HttpProbe> {
+    match ureq::head(url)
+        .set("User-Agent", USER_AGENT)
+        .call()
+    {
+        Ok(resp) if (200..300).contains(&resp.status()) => {
+            let content_length = resp
+                .header("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok());
+            let accept_ranges = accept_ranges_bytes(resp.header("Accept-Ranges"));
+            if accept_ranges && content_length.is_some() {
+                return Ok(HttpProbe {
+                    content_length,
+                    accept_ranges: true,
+                });
+            }
+            if accept_ranges {
+                // Ranges OK but size unknown — try Content-Range probe.
+                if let Some(probe) = probe_range_size(url)? {
+                    return Ok(probe);
+                }
+            }
+            // No usable range path from HEAD alone.
+            if content_length.is_some() && !accept_ranges {
+                return Ok(HttpProbe {
+                    content_length,
+                    accept_ranges: false,
+                });
+            }
+            // Fall through to range probe when length missing or ambiguous.
+            if let Some(probe) = probe_range_size(url)? {
+                return Ok(probe);
+            }
+            return Ok(HttpProbe {
+                content_length,
+                accept_ranges: false,
+            });
+        }
+        Ok(resp) => {
+            debug!("HEAD {url} -> {}, probing with Range GET", resp.status());
+        }
+        Err(e) => {
+            debug!("HEAD {url} failed: {e}, probing with Range GET");
+        }
+    }
+
+    if let Some(probe) = probe_range_size(url)? {
+        return Ok(probe);
+    }
+
+    // Last resort: no size / no ranges from probes; full GET will discover body length.
+    Ok(HttpProbe {
+        content_length: None,
+        accept_ranges: false,
+    })
+}
+
+/// Issue `GET` with `Range: bytes=0-0`. Returns probe meta on 206; `None` if ranges unusable.
+fn probe_range_size(url: &str) -> Result<Option<HttpProbe>> {
+    let resp = match ureq::get(url)
+        .set("User-Agent", USER_AGENT)
+        .set("Range", "bytes=0-0")
+        .call()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            debug!("Range probe {url} failed: {e}");
+            return Ok(None);
+        }
+    };
+    let status = resp.status();
+    if status == 206 {
+        // Prefer Content-Range total (Content-Length on 206 is only the partial length).
+        let total = parse_content_range_total(resp.header("Content-Range"));
+        return Ok(Some(HttpProbe {
+            content_length: total,
+            accept_ranges: true,
+        }));
+    }
+    if (200..300).contains(&status) {
+        // Server ignored Range (full body). Not usable as range-capable.
+        let content_length = resp
+            .header("Content-Length")
+            .and_then(|s| s.parse::<u64>().ok());
+        return Ok(Some(HttpProbe {
+            content_length,
+            accept_ranges: false,
+        }));
+    }
+    debug!("Range probe {url} -> HTTP {status}");
+    Ok(None)
+}
+
 /// Full GET download to a tempfile (works without Range support).
 pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
+    fetch_http_full_get(url)
+}
+
+/// Download via sequential Range GETs when supported; otherwise full GET.
+///
+/// Used by [`resolve_to_local`] so the factory materialization path benefits without
+/// factory changes. Matches the Python fsspec-style prefer-range path.
+pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)> {
+    let probe = probe_http(url)?;
+    if probe.accept_ranges {
+        if let Some(size) = probe.content_length {
+            debug!(
+                "HTTP prefer-range: downloading {url} ({size} bytes) in {}-byte chunks",
+                HTTP_RANGE_CHUNK
+            );
+            match fetch_http_via_ranges(url, size) {
+                Ok(v) => return Ok(v),
+                Err(e) => {
+                    debug!("HTTP range download failed for {url}: {e}; falling back to full GET");
+                }
+            }
+        }
+    }
+    debug!("HTTP full GET for {url} (ranges unavailable or incomplete probe)");
+    fetch_http_full_get(url)
+}
+
+fn fetch_http_full_get(url: &str) -> Result<(NamedTempFile, u64)> {
     let resp = ureq::get(url)
-        .set("User-Agent", "ratarmount-rs/0.1")
+        .set("User-Agent", USER_AGENT)
         .call()
         .map_err(|e| RemoteError::Http(e.to_string()))?;
     if !(200..300).contains(&resp.status()) {
@@ -134,8 +311,57 @@ pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
     Ok((tmp, n))
 }
 
+/// Sequential Range GET materialization into a tempfile.
+fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = NamedTempFile::new()?;
+    if size == 0 {
+        tmp.flush()?;
+        return Ok((tmp, 0));
+    }
+    let mut written = 0u64;
+    for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
+        let range = format!("bytes={start}-{end}");
+        let resp = ureq::get(url)
+            .set("User-Agent", USER_AGENT)
+            .set("Range", &range)
+            .call()
+            .map_err(|e| RemoteError::Http(e.to_string()))?;
+        let status = resp.status();
+        if status == 206 {
+            let mut reader = resp.into_reader();
+            let expected = end - start + 1;
+            let n = io::copy(&mut reader, &mut tmp)?;
+            if n != expected {
+                return Err(RemoteError::Http(format!(
+                    "range {range} returned {n} bytes, expected {expected}"
+                )));
+            }
+            written += n;
+        } else if status == 200 && start == 0 {
+            // Server ignored Range and returned the full body on the first chunk.
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            tmp.flush()?;
+            tmp.as_file().seek(SeekFrom::Start(0))?;
+            return Ok((tmp, n));
+        } else {
+            return Err(RemoteError::Http(format!(
+                "HTTP {status} for range {range} on {url}"
+            )));
+        }
+    }
+    if written != size {
+        return Err(RemoteError::Http(format!(
+            "range download size mismatch: wrote {written}, expected {size}"
+        )));
+    }
+    tmp.flush()?;
+    tmp.as_file().seek(SeekFrom::Start(0))?;
+    Ok((tmp, written))
+}
+
 /// Seekable HTTP reader using Range requests when the server supports them.
-/// Falls back to full download into memory if Content-Length is small or ranges fail.
+/// Falls back to full download into memory if ranges are unavailable.
 pub struct HttpRangeFile {
     url: String,
     size: u64,
@@ -146,25 +372,9 @@ pub struct HttpRangeFile {
 
 impl HttpRangeFile {
     pub fn open(url: &str) -> Result<Self> {
-        let head = ureq::head(url)
-            .set("User-Agent", "ratarmount-rs/0.1")
-            .call()
-            .map_err(|e| RemoteError::Http(e.to_string()))?;
-        let status = head.status();
-        if !(200..300).contains(&status) && status != 405 {
-            // Some servers reject HEAD
-            debug!("HEAD {url} -> {status}, trying GET probe");
-        }
-        let len = head
-            .header("Content-Length")
-            .and_then(|s| s.parse::<u64>().ok());
-        let accept_ranges = head
-            .header("Accept-Ranges")
-            .map(|s| s.to_ascii_lowercase().contains("bytes"))
-            .unwrap_or(false);
-
-        if accept_ranges {
-            if let Some(size) = len {
+        let probe = probe_http(url)?;
+        if probe.accept_ranges {
+            if let Some(size) = probe.content_length {
                 return Ok(Self {
                     url: url.to_string(),
                     size,
@@ -174,8 +384,8 @@ impl HttpRangeFile {
             }
         }
 
-        // Fallback: full download into memory (fine for test fixtures)
-        let (mut tmp, size) = fetch_http_to_temp(url)?;
+        // Fallback: full download into memory (fine for test fixtures / small objects)
+        let (mut tmp, size) = fetch_http_full_get(url)?;
         let mut buf = Vec::with_capacity(size as usize);
         tmp.read_to_end(&mut buf)?;
         Ok(Self {
@@ -192,6 +402,11 @@ impl HttpRangeFile {
 
     pub fn is_empty(&self) -> bool {
         self.size == 0
+    }
+
+    /// True when reads issue live Range GETs (not a fully buffered body).
+    pub fn uses_ranges(&self) -> bool {
+        self.buffered.is_none()
     }
 }
 
@@ -215,24 +430,39 @@ impl Read for HttpRangeFile {
         // Inclusive Range end
         let range = format!("bytes={}-{}", self.pos, end - 1);
         let resp = ureq::get(&self.url)
-            .set("User-Agent", "ratarmount-rs/0.1")
+            .set("User-Agent", USER_AGENT)
             .set("Range", &range)
             .call()
             .map_err(|e| io::Error::other(e.to_string()))?;
         let status = resp.status();
-        if status != 206 && status != 200 {
-            return Err(io::Error::other(format!(
-                "HTTP {status} for range {range} on {}",
-                self.url
-            )));
+        if status == 206 {
+            let mut reader = resp.into_reader();
+            let mut chunk = vec![0u8; (end - self.pos) as usize];
+            reader.read_exact(&mut chunk)?;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.pos += n as u64;
+            return Ok(n);
         }
-        let mut reader = resp.into_reader();
-        let mut chunk = vec![0u8; (end - self.pos) as usize];
-        reader.read_exact(&mut chunk)?;
-        let n = chunk.len().min(buf.len());
-        buf[..n].copy_from_slice(&chunk[..n]);
-        self.pos += n as u64;
-        Ok(n)
+        if status == 200 {
+            // Server ignored Range and returned the full body; skip to pos then read.
+            let mut reader = resp.into_reader();
+            let skip = self.pos;
+            if skip > 0 {
+                io::copy(&mut reader.by_ref().take(skip), &mut io::sink())?;
+            }
+            let need = (end - self.pos) as usize;
+            let mut chunk = vec![0u8; need];
+            reader.read_exact(&mut chunk)?;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        Err(io::Error::other(format!(
+            "HTTP {status} for range {range} on {}",
+            self.url
+        )))
     }
 }
 
@@ -262,6 +492,11 @@ pub fn materialize_input(input: &str) -> Result<RemoteLocal> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use std::thread;
 
     #[test]
     fn file_url_local() {
@@ -289,5 +524,331 @@ mod tests {
     fn unsupported_scheme_message() {
         let err = resolve_to_local("smb://server/share/a.tar").unwrap_err();
         assert!(err.to_string().contains("unsupported") || err.to_string().contains("smb"));
+    }
+
+    #[test]
+    fn parse_content_range_total_ok() {
+        assert_eq!(
+            parse_content_range_total(Some("bytes 0-0/12345")),
+            Some(12345)
+        );
+        assert_eq!(
+            parse_content_range_total(Some("bytes 100-199/1000")),
+            Some(1000)
+        );
+        assert_eq!(parse_content_range_total(Some("bytes 0-0/*")), None);
+        assert_eq!(parse_content_range_total(None), None);
+    }
+
+    #[test]
+    fn accept_ranges_bytes_logic() {
+        assert!(accept_ranges_bytes(Some("bytes")));
+        assert!(accept_ranges_bytes(Some("Bytes")));
+        assert!(!accept_ranges_bytes(Some("none")));
+        assert!(!accept_ranges_bytes(Some("NONE")));
+        assert!(!accept_ranges_bytes(None));
+    }
+
+    #[test]
+    fn range_chunk_windows_basic() {
+        assert_eq!(range_chunk_windows(0, 4), Vec::<(u64, u64)>::new());
+        assert_eq!(range_chunk_windows(10, 4), vec![(0, 3), (4, 7), (8, 9)]);
+        assert_eq!(range_chunk_windows(4, 4), vec![(0, 3)]);
+        assert_eq!(range_chunk_windows(5, 4), vec![(0, 3), (4, 4)]);
+        // empty body / zero chunk
+        assert!(range_chunk_windows(100, 0).is_empty());
+    }
+
+    /// Minimal HTTP/1.1 mock server for unit tests.
+    struct MockHttp {
+        addr: String,
+        /// Recorded request first-lines / headers of interest.
+        log: Arc<Mutex<Vec<String>>>,
+        range_gets: Arc<AtomicUsize>,
+        full_gets: Arc<AtomicUsize>,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    #[derive(Clone)]
+    struct MockConfig {
+        body: Vec<u8>,
+        /// Advertise Accept-Ranges: bytes on HEAD/GET.
+        accept_ranges: bool,
+        /// Honor Range header with 206.
+        honor_range: bool,
+        /// If true, HEAD returns 405.
+        head_rejects: bool,
+    }
+
+    impl MockHttp {
+        fn spawn(cfg: MockConfig) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = format!("http://{}", listener.local_addr().unwrap());
+            let log = Arc::new(Mutex::new(Vec::new()));
+            let range_gets = Arc::new(AtomicUsize::new(0));
+            let full_gets = Arc::new(AtomicUsize::new(0));
+            let log_c = Arc::clone(&log);
+            let range_c = Arc::clone(&range_gets);
+            let full_c = Arc::clone(&full_gets);
+            let join = thread::spawn(move || {
+                // Serve a handful of requests then exit when listener is dropped / timeout-ish.
+                listener
+                    .set_nonblocking(false)
+                    .ok();
+                for stream in listener.incoming().take(64) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut headers = Vec::new();
+                    let mut range_hdr: Option<String> = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        headers.push(line.clone());
+                        if let Some(v) = line.strip_prefix("Range:") {
+                            range_hdr = Some(v.trim().to_string());
+                        }
+                    }
+                    {
+                        let mut lg = log_c.lock().unwrap();
+                        lg.push(request_line.trim().to_string());
+                        if let Some(r) = &range_hdr {
+                            lg.push(format!("Range: {r}"));
+                        }
+                    }
+
+                    let is_head = request_line.starts_with("HEAD ");
+                    let is_get = request_line.starts_with("GET ");
+
+                    if is_head && cfg.head_rejects {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+
+                    if is_head {
+                        let mut resp = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                            cfg.body.len()
+                        );
+                        if cfg.accept_ranges {
+                            resp.push_str("Accept-Ranges: bytes\r\n");
+                        }
+                        resp.push_str("\r\n");
+                        let _ = stream.write_all(resp.as_bytes());
+                        continue;
+                    }
+
+                    if !is_get {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 501 Not Implemented\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+
+                    if cfg.honor_range {
+                        if let Some(r) = range_hdr.as_deref() {
+                            // Parse bytes=start-end
+                            if let Some(spec) = r.strip_prefix("bytes=") {
+                                let parts: Vec<&str> = spec.splitn(2, '-').collect();
+                                if parts.len() == 2 {
+                                    let start: u64 = parts[0].parse().unwrap_or(0);
+                                    let end: u64 = if parts[1].is_empty() {
+                                        (cfg.body.len() as u64).saturating_sub(1)
+                                    } else {
+                                        parts[1].parse().unwrap_or(0)
+                                    };
+                                    let start = start as usize;
+                                    let end = (end as usize).min(cfg.body.len().saturating_sub(1));
+                                    if start < cfg.body.len() && start <= end {
+                                        range_c.fetch_add(1, Ordering::SeqCst);
+                                        let slice = &cfg.body[start..=end];
+                                        let hdr = format!(
+                                            "HTTP/1.1 206 Partial Content\r\n\
+                                             Content-Length: {}\r\n\
+                                             Content-Range: bytes {}-{}/{}\r\n\
+                                             Accept-Ranges: bytes\r\n\
+                                             Connection: close\r\n\r\n",
+                                            slice.len(),
+                                            start,
+                                            end,
+                                            cfg.body.len()
+                                        );
+                                        let _ = stream.write_all(hdr.as_bytes());
+                                        let _ = stream.write_all(slice);
+                                        continue;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Full GET
+                    full_c.fetch_add(1, Ordering::SeqCst);
+                    let mut hdr = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
+                        cfg.body.len()
+                    );
+                    if cfg.accept_ranges {
+                        hdr.push_str("Accept-Ranges: bytes\r\n");
+                    }
+                    hdr.push_str("\r\n");
+                    let _ = stream.write_all(hdr.as_bytes());
+                    let _ = stream.write_all(&cfg.body);
+                }
+            });
+            Self {
+                addr,
+                log,
+                range_gets,
+                full_gets,
+                _join: Some(join),
+            }
+        }
+
+        fn url(&self, path: &str) -> String {
+            format!("{}{}", self.addr, path)
+        }
+    }
+
+    #[test]
+    fn prefer_range_downloads_in_chunks() {
+        // Body larger than a tiny artificial chunk plan: use small body with overridden windows
+        // by setting body size and verifying Range requests were used.
+        let body: Vec<u8> = (0u8..=255).cycle().take(12_000).collect();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/blob.bin");
+        let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(
+            mock.range_gets.load(Ordering::SeqCst) >= 1,
+            "expected Range GETs, log={:?}",
+            mock.log.lock().unwrap()
+        );
+        // Full GET should not be the materialization path when ranges work.
+        // (probe may not full-GET; range path uses only 206s)
+        assert_eq!(mock.full_gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn prefer_range_falls_back_to_full_get() {
+        let body = b"hello-no-ranges-server".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+        });
+        let url = mock.url("/blob.bin");
+        let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert_eq!(mock.range_gets.load(Ordering::SeqCst), 0);
+        assert!(mock.full_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn prefer_range_when_head_rejected_uses_range_probe() {
+        let body: Vec<u8> = (0..5000).map(|i| (i % 256) as u8).collect();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: true,
+        });
+        let url = mock.url("/blob.bin");
+        let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn http_range_file_seek_and_read() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/blob.bin");
+        let mut f = HttpRangeFile::open(&url).unwrap();
+        assert!(f.uses_ranges());
+        assert_eq!(f.len(), body.len() as u64);
+
+        f.seek(SeekFrom::Start(100)).unwrap();
+        let mut buf = [0u8; 16];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &body[100..116]);
+
+        f.seek(SeekFrom::End(-4)).unwrap();
+        let mut tail = [0u8; 4];
+        f.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, &body[body.len() - 4..]);
+
+        f.seek(SeekFrom::Start(0)).unwrap();
+        let mut head = [0u8; 8];
+        f.read_exact(&mut head).unwrap();
+        assert_eq!(&head, &body[..8]);
+
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn http_range_file_fallback_buffer() {
+        let body = b"buffered-fallback-body".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+        });
+        let url = mock.url("/blob.bin");
+        let mut f = HttpRangeFile::open(&url).unwrap();
+        assert!(!f.uses_ranges());
+        assert_eq!(f.len(), body.len() as u64);
+        f.seek(SeekFrom::Start(9)).unwrap();
+        let mut buf = [0u8; 8];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"fallback");
+    }
+
+    #[test]
+    fn resolve_to_local_http_uses_prefer_range() {
+        let body = b"resolve-path-body".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/a.tar");
+        let local = resolve_to_local(&url).unwrap();
+        assert_eq!(std::fs::read(local.path()).unwrap(), body);
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
     }
 }

@@ -5,12 +5,12 @@
 | Scheme | Behavior |
 |--------|----------|
 | `file://` | Map to local path |
-| `http://` / `https://` | Download archive body to a temp file, then open with existing format stack |
+| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file |
 | `s3://bucket/key` | AWS SigV4 GetObject → temp file |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
 | bare local paths | Unchanged |
 
-`HttpRangeFile` is available for Range-based `Read+Seek` when servers advertise `Accept-Ranges: bytes`; the default open path materializes with a full GET so mounts work even when the server lacks ranges (e.g. `python3 -m http.server`).
+`resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
 ### S3 credentials / endpoint
 
