@@ -32,15 +32,26 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 **Merge:** cherry-pick from worktree objects onto `main`; `cargo test --workspace` + `clippy -D warnings` green.
 
+## Batch 3 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| FUSE xattr | fuse + formats-tar | Serve `user.hash.*` via listxattr/getxattr |
+| SquashFS | formats-squashfs | `backhand` in-process; unsquashfs fallback |
+| Commit-overlay | compositing write_overlay | gzip/bzip2/xz recompress commit |
+| EXT4 | formats-ext4 | `ext4-view` pure + debugfs fallback |
+| WebDAV | remote | `webdav://` / `webdavs://` file materialize |
+
 ## Still open (later)
 
 | Gap | Notes |
 |-----|--------|
-| True Range without materialize for format openers | Formats still need local path |
-| FUSE serve of `user.hash.*` | Index filled; MountSource xattr still empty |
-| In-process SquashFS/EXT4 | Helper MVP remains |
-| Commit-overlay compressed TAR | Uncompressed + GNU tar only |
-| SMB/WebDAV, full `-P` matrix | Large |
+| True Range without materialize for format openers | Formats still need local path after fetch |
+| SquashFS xz compressor | backhand xz conflicts with workspace lzma |
+| SMB / Dropbox | not started |
+| Full `-P` backend parallel matrix | reserved flag only |
+| In-FS control folder | Unix socket remains |
+| Codec depth (true block maps) | Tier B lite remains |
 
 ## Verify
 

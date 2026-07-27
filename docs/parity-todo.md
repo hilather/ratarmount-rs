@@ -22,8 +22,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |
 | Stencil CAB / ISO / WARC / XAR (fork RA) | yes (custom) | yes (store/MSZIP CAB; LZX→libarchive) | `[x]` |
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
-| SquashFS | yes | yes (MVP: `unsquashfs` materialize) | `~` in-process reader deferred |
-| EXT4 / FAT images | yes | EXT4 MVP (`debugfs`); FAT pure (`fatfs`) | `~` in-process EXT4 deferred |
+| SquashFS | yes | yes (backhand in-process; unsquashfs fallback for xz/lzma) | `[x]` / `~` xz fallback |
+| EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | SQLAR | yes | yes (unencrypted) | `~` sqlcipher encrypted |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments (lopdf); OGG demux; HTML data-URLs | `~` PDF images deferred |
@@ -51,7 +51,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
 | AutoMount recursive (`-r`) | yes | yes | `~` |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
-| `--commit-overlay` into archive | yes | yes (uncompressed TAR + GNU tar; `--yes`) | `~` compressed TAR |
+| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR; GNU tar) | `[x]` common compressions |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
 | Control interface socket | yes | yes (Unix socket: ping/status/unmount) | `~` not in-FS Python control |
 | Lazy mount (`-l`) | yes | yes (mount on first access) | `[x]` |
@@ -75,7 +75,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | HTTP Range without full download | yes | Range chunk materialize + HttpRangeFile | `~` formats still open local path after fetch |
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
-| SMB / WebDAV / Dropbox | yes | no | `[ ]` |
+| SMB / WebDAV / Dropbox | yes | WebDAV file GET (`webdav://`); no SMB/Dropbox | `~` WebDAV MVP |
 | Remote/compressed **index** download | yes | no | `[ ]` |
 
 ### Index / CLI
@@ -86,7 +86,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Cross-open Py↔Rust index (TAR core) | yes | yes | `~` compression side tables |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
-| Index file hashes / xattrs | yes | `--hashes` + xattr store (crc32/md5/sha1/sha256) | `~` post-build fill; FUSE xattr serve still open |
+| Index file hashes / xattrs | yes | `--hashes` fill + FUSE listxattr/getxattr for TAR | `[x]` / `~` non-TAR sources |
 | `--use-backend` selection | yes | fixed factory order | `[ ]` |
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file`; no color | `~` |
