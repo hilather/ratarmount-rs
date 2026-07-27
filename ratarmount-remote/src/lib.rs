@@ -5,9 +5,11 @@
 //! - `s3://bucket/key` → GetObject to temp (AWS env credentials)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
+//! - `smb://` → download via Samba `smbclient` CLI when present
 //! - other schemes → clear "not yet" errors
 
 mod s3;
+mod smb;
 mod ssh;
 mod webdav;
 
@@ -20,6 +22,9 @@ use thiserror::Error;
 use url::Url;
 
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
+pub use smb::{
+    fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
+};
 pub use ssh::{fetch_ssh_to_temp, parse_ssh_url, SshLocation};
 pub use webdav::{
     fetch_webdav_to_temp, parse_getcontentlength, parse_webdav_url, propfind_content_length,
@@ -45,6 +50,8 @@ pub enum RemoteError {
     Ssh(String),
     #[error("webdav: {0}")]
     WebDav(String),
+    #[error("smb: {0}")]
+    Smb(String),
     #[error("unsupported remote scheme: {0}")]
     UnsupportedScheme(String),
 }
@@ -100,6 +107,10 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
         }
         "webdav" | "webdavs" => {
             let (tmp, size) = fetch_webdav_to_temp(input)?;
+            keep_fetched(input, tmp, size)
+        }
+        "smb" => {
+            let (tmp, size) = fetch_smb_to_temp(input)?;
             keep_fetched(input, tmp, size)
         }
         other => Err(RemoteError::UnsupportedScheme(other.to_string())),
@@ -540,14 +551,43 @@ mod tests {
         assert!(is_remote_url("sftp://user@host//abs/path.tar"));
         assert!(is_remote_url("webdav://host.example/files/a.tar"));
         assert!(is_remote_url("webdavs://host.example/files/a.tar"));
+        assert!(is_remote_url("smb://server/share/a.tar"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
     }
 
     #[test]
     fn unsupported_scheme_message() {
-        let err = resolve_to_local("smb://server/share/a.tar").unwrap_err();
-        assert!(err.to_string().contains("unsupported") || err.to_string().contains("smb"));
+        // `ftp` is recognized as remote but not implemented yet.
+        let err = resolve_to_local("ftp://host.example/a.tar").unwrap_err();
+        assert!(
+            err.to_string().contains("unsupported") || err.to_string().contains("ftp"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn smb_resolve_errors_without_live_server() {
+        // Without a real SMB server this must fail clearly (missing smbclient or
+        // connection/auth error). Must not panic or claim "unsupported scheme".
+        let err = resolve_to_local("smb://127.0.0.1/nosuchshare/a.tar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("smb") || msg.contains("smbclient"),
+            "unexpected: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("unsupported remote scheme"),
+            "smb should be a supported scheme: {msg}"
+        );
+    }
+
+    #[test]
+    fn smb_parse_export() {
+        let loc = parse_smb_url("smb://u:p@host/share/dir/f.tar").unwrap();
+        assert_eq!(loc.share, "share");
+        assert_eq!(loc.path, "dir/f.tar");
+        assert_eq!(loc.user.as_deref(), Some("u"));
     }
 
     #[test]

@@ -9,6 +9,7 @@
 | `s3://bucket/key` | AWS SigV4 GetObject → temp file |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
+| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH` |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
@@ -33,9 +34,25 @@ Path rules (fsspec-like):
 - `ssh://host/rel/path` → relative `rel/path`
 - `ssh://host//abs/path` → absolute `/abs/path`
 
+### SMB (`smbclient`)
+
+Requires the Samba client binary on `PATH` (`apt install smbclient` / `dnf install samba-client`). Without it, `resolve_to_local` returns a clear install hint.
+
+| Env | Purpose |
+|-----|---------|
+| `RATARMOUNT_SMB_PASSWORD` | Password when URL has no userinfo (pairs with `RATARMOUNT_SMB_USER` or `$USER`) |
+| `RATARMOUNT_SMB_USER` | Username when using `RATARMOUNT_SMB_PASSWORD` |
+
+URL path: first segment is the **share**, remainder is the file path inside the share. Domain may appear as `DOMAIN;user` or `DOMAIN%5Cuser` in userinfo.
+
+```bash
+ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
+```
+
 ## Not yet
 
-- `smb://`, Git
+- Pure-Rust SMB (no `smbclient` dependency)
+- Git
 - Recursive WebDAV directory mount as a folder (single-file GET only)
 - Streaming open without full download for multi-GB archives (Range-backed format readers)
 - S3 anonymous / instance-profile auto-refresh beyond static env keys
@@ -49,6 +66,7 @@ ratarmount -f s3://my-bucket/path/archive.tar mnt/
 ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
 ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
+ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
 ```
 
 ## Tests
