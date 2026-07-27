@@ -1,48 +1,52 @@
-# Gap implementation batch (vs Python ratarmount)
+# Gap implementation batches (vs Python ratarmount)
 
 **Date:** 2026-07-27  
-**Python refs:** `core/ratarmountcore/compressions.py`, `mountsource/factory.py`, `automount.py`, `sevenzip` decoder design.
+**Python refs:** `compressions.py`, `automount.py`, `factory.py`, `tar.py`, `hashing.py`, sevenzip decoder.
 
-## Landed this batch
+## Batch 1 — sequential (main session)
 
-### 1. Split multi-volume files (`.001` / `.002` / …)
-
-| Piece | Location |
-|-------|----------|
-| Detection (decimal/hex/alpha, width-fixed, start 0/1) | `ratarmount-compress/src/split.rs` |
-| Lazy join (`JoinedFile`) + materialize for open | same |
-| Top-level factory wire-up | `ratarmount/src/factory.rs` `open_split_set` |
-| Unit tests (Python `test_factory` / compressions parity) | `split::tests`, `factory::split_open_tests` |
-| Fixtures | `tests/simple-file-split.001`, `single-file-split.tar.001` |
-
-**Still open for split:** recursive AutoMount join *inside* a mounted tree (Python lists parent + joins first-part only); materialize-to-temp for multi‑GB volumes (Python keeps lazy FDs only).
-
-### 2. Progressive solid LZMA2 (partial)
+### Split multi-volume (top-level)
 
 | Piece | Location |
 |-------|----------|
-| Large pure LZMA2 folders: decode only prefix through range end | `Lzma2RandomAccessDecoder::read_range` |
-| Small folders (≤4 MiB) still full-cache | `SMALL_FOLDER_FULL_CACHE` |
+| Detection + `JoinedFile` | `ratarmount-compress/src/split.rs` |
+| Factory open | `ratarmount/src/factory.rs` |
 
-**Still open for 7z:** BCJ/AES/multi-pack full-folder path; true chunk-resume cache without re-decoding prefix; nested solid spool.
+### Progressive solid LZMA2 (prefix)
 
-## Not started this batch (next candidates)
+| Piece | Location |
+|-------|----------|
+| Prefix decode for large pure LZMA2 | `ratarmount-formats-sevenzip/src/decode.rs` |
 
-| Gap | Python entry points | Effort |
-|-----|---------------------|--------|
-| GNU incremental TAR semantics | TAR dumpdir / `isGnuIncremental` | M–L |
-| HTTP Range-backed format open | `HttpRangeFile` + factory | M |
-| Index `--hashes` / xattrs | `hashing.py`, SQLite xattrs | M |
-| In-process SquashFS/EXT4 | PySquashfsImage / python-ext4 | L |
-| Commit-overlay compressed TAR | CLI + tar pipeline | M |
-| SMB/WebDAV | fsspec | L |
-| Full `-P` matrix | BlockParallelReaders | L |
+## Batch 2 — five parallel worktree agents (merged)
+
+Non-overlapping crate ownership so agents could not stomp each other:
+
+| Agent | Ownership | Commit (on main) | Result |
+|-------|-----------|------------------|--------|
+| AutoMount split polish | `ratarmount-compositing/**` only | `b6f3819` | Recursive first-part join + tests |
+| HTTP Range | `ratarmount-remote/**` only | `88c62b4` | Prefer Range chunk materialize |
+| GNU incremental TAR | `ratarmount-formats-tar/**` only | `041444a` | Detect, prefix strip, dumpdir `D` |
+| Index hashes/xattrs | `index` + `core` OpenOptions + CLI | `7618724` | `--hashes`, xattr store/fill |
+| 7z LRU windows | `ratarmount-formats-sevenzip/**` only | `9373fbe` | 1 MiB × 64 LRU progressive cache |
+
+**Merge:** cherry-pick from worktree objects onto `main`; `cargo test --workspace` + `clippy -D warnings` green.
+
+## Still open (later)
+
+| Gap | Notes |
+|-----|--------|
+| True Range without materialize for format openers | Formats still need local path |
+| FUSE serve of `user.hash.*` | Index filled; MountSource xattr still empty |
+| In-process SquashFS/EXT4 | Helper MVP remains |
+| Commit-overlay compressed TAR | Uncompressed + GNU tar only |
+| SMB/WebDAV, full `-P` matrix | Large |
 
 ## Verify
 
 ```bash
-cargo test -p ratarmount-compress split
-cargo test -p ratarmount open_
-cargo test -p ratarmount-formats-sevenzip
-# CLI: ratarmount -f tests/simple-file-split.001 mnt/  → cat mnt/simple-file-split
+cargo test --workspace
+cargo clippy --workspace --all-targets -- -D warnings
+# split: ratarmount -f tests/simple-file-split.001 mnt/
+# hashes: ratarmount --hashes sha256,crc32 --no-mount archive.tar
 ```

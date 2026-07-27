@@ -72,7 +72,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | `file://` | yes | yes | `[x]` |
 | `http(s)://` (full GET) | yes | yes | `[x]` |
-| HTTP Range without full download | yes | helper only | `[ ]` format readers on RangeFile |
+| HTTP Range without full download | yes | Range chunk materialize + HttpRangeFile | `~` formats still open local path after fetch |
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
 | SMB / WebDAV / Dropbox | yes | no | `[ ]` |
@@ -86,7 +86,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Cross-open Py↔Rust index (TAR core) | yes | yes | `~` compression side tables |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
-| Index file hashes / xattrs | yes | no | `[ ]` |
+| Index file hashes / xattrs | yes | `--hashes` + xattr store (crc32/md5/sha1/sha256) | `~` post-build fill; FUSE xattr serve still open |
 | `--use-backend` selection | yes | fixed factory order | `[ ]` |
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file`; no color | `~` |
