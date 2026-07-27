@@ -12,7 +12,10 @@ use ratarmount_compositing::{commit_overlay, CommitOverlayOptions, WriteOverlay}
 use ratarmount_compress::strip_compression_suffix;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_fuse::{mount_blocking, unmount};
-use ratarmount_index::{default_index_folders, parse_index_folders, MEMORY_INDEX};
+use ratarmount_index::{
+    default_index_folders, fill_content_hashes, parse_index_folders, resolve_index_location,
+    SqliteIndex, MEMORY_INDEX,
+};
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -153,6 +156,11 @@ struct Args {
     /// Force index usage for folders (accepted; folders still bind-mount live)
     #[arg(long = "force-folder-index", action = ArgAction::SetTrue)]
     force_folder_index: bool,
+
+    /// Comma-separated content hashes to store as index xattrs (e.g. `crc32,sha256,sha1`).
+    /// Stored under `user.hash.<algo>`. Supported: crc32, md5, sha1, sha256.
+    #[arg(long = "hashes", value_name = "ALGO[,ALGO...]")]
+    hashes: Option<String>,
 
     /// Max directory depth for union mount folder cache (Python default 1024)
     #[arg(long = "union-mount-cache-max-depth", default_value_t = 1024)]
@@ -377,6 +385,16 @@ fn main() {
             .filter(|s| !s.is_empty())
             .collect(),
         force_folder_index: args.force_folder_index,
+        hashes: args
+            .hashes
+            .as_deref()
+            .map(|s| {
+                s.split(',')
+                    .map(|p| p.trim().to_string())
+                    .filter(|p| !p.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default(),
     };
 
     if args.force_folder_index {
@@ -428,6 +446,75 @@ fn main() {
             std::process::exit(1);
         }
     };
+
+    // Content-hash xattrs foundation: after a successful mount build, for each
+    // path-backed local archive with an on-disk index, open the index writable and
+    // fill user.hash.* xattrs. Does not go through factory (TODO: hook during index
+    // finalization so compressed/nested sources hash via MountSource::open).
+    if !open_opts.hashes.is_empty() {
+        if open_opts.index_in_memory {
+            log::warn!(
+                "--hashes with --index-file :memory: is not applied after mount build; \
+                 re-open a path-backed index or hook factory finalization"
+            );
+        } else {
+            for input in &inputs {
+                if !input.is_file() {
+                    continue;
+                }
+                // Skip obvious non-local schemes (http(s), sftp, …).
+                if let Some(s) = input.to_str() {
+                    if s.contains("://") {
+                        continue;
+                    }
+                }
+                let explicit = open_opts
+                    .index_file_path
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned());
+                let loc = resolve_index_location(
+                    input,
+                    explicit.as_deref(),
+                    &open_opts.index_folders,
+                    false,
+                );
+                let Some(idx_path) = loc.as_path() else {
+                    continue;
+                };
+                if !idx_path.exists() {
+                    log::debug!(
+                        "skip --hashes for {}: index {} missing",
+                        input.display(),
+                        idx_path.display()
+                    );
+                    continue;
+                }
+                match SqliteIndex::open_writable(idx_path) {
+                    Ok(idx) => {
+                        if let Err(e) = fill_content_hashes(&idx, input, &open_opts.hashes) {
+                            log::warn!(
+                                "failed to fill content hashes for {} (index {}): {e}",
+                                input.display(),
+                                idx_path.display()
+                            );
+                        } else {
+                            log::info!(
+                                "stored content hashes {:?} in {}",
+                                open_opts.hashes,
+                                idx_path.display()
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        log::warn!(
+                            "cannot open index {} for --hashes: {e}",
+                            idx_path.display()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;

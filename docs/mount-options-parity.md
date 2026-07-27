@@ -48,7 +48,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Remote/compressed index URL | yes | no | `[ ]` |
 | `--verify-mtime` | yes | yes | `[x]` |
 | `--force-folder-index` | yes | accepted (folders still live) | `~` |
-| `--hashes` | yes | no | `[ ]` |
+| `--hashes` | yes | **added** (crc32/md5/sha1/sha256 → index xattrs; path-backed post-build) | `~` |
 | `--index-minimum-file-count` | yes | yes | `[x]` |
 | `-gs` / `--gzip-seek-point-spacing` | yes | yes | `[x]` |
 | `-d` / `--debug` | yes | yes | `[x]` |

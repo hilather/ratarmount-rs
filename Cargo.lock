@@ -1667,11 +1667,15 @@ dependencies = [
 name = "ratarmount-index"
 version = "0.1.2"
 dependencies = [
+ "crc32fast",
  "log",
+ "md-5",
  "ratarmount-core",
  "rusqlite",
  "serde",
  "serde_json",
+ "sha1",
+ "sha2",
  "tempfile",
  "thiserror",
 ]

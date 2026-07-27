@@ -116,6 +116,9 @@ pub struct OpenOptions {
     pub read_only_index: bool,
     /// Force folder index usage (`--force-folder-index`); folders still bind-mount live.
     pub force_folder_index: bool,
+    /// Content hash algorithms to compute and store as index xattrs (`--hashes`).
+    /// Values match Python CLI names, e.g. `crc32`, `md5`, `sha1`, `sha256`.
+    pub hashes: Vec<String>,
 }
 
 impl Default for OpenOptions {
@@ -140,6 +143,7 @@ impl Default for OpenOptions {
             use_backends: Vec::new(),
             read_only_index: false,
             force_folder_index: false,
+            hashes: Vec::new(),
         }
     }
 }

@@ -1,7 +1,12 @@
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
 
+mod hashing;
 mod location;
 
+pub use hashing::{
+    compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
+    SUPPORTED_HASH_ALGORITHMS,
+};
 pub use location::{
     default_index_folders, default_index_path, expand_user, parse_index_folders,
     possible_index_paths, resolve_index_location, IndexLocation, MEMORY_INDEX,
@@ -638,6 +643,112 @@ impl SqliteIndex {
             Ok(())
         })
     }
+
+    /// Open an existing on-disk index for read/write (e.g. to fill content-hash xattrs).
+    ///
+    /// Does not truncate or recreate schema. Fails if the file is missing or incomplete.
+    pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref();
+        let conn = Connection::open(path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA temp_store = MEMORY;
+            PRAGMA journal_mode = WAL;
+            PRAGMA synchronous = NORMAL;
+            "#,
+        )?;
+        let idx = Self {
+            path: Some(path.to_path_buf()),
+            conn: Mutex::new(conn),
+            read_only: false,
+            mem: None,
+        };
+        idx.validate_loaded()?;
+        Ok(idx)
+    }
+
+    /// Insert one xattr via the `xattrs` view (Python `setxattrs` / INSERT trigger).
+    ///
+    /// Do not use `INSERT OR REPLACE` — it would bypass the instead-of-insert trigger.
+    pub fn insert_xattr(&self, offsetheader: i64, key: &str, value: &[u8]) -> Result<()> {
+        self.insert_xattrs_batch(&[(offsetheader, key.to_string(), value.to_vec())])
+    }
+
+    /// Bulk insert xattrs (Python `executemany('INSERT INTO "xattrs" VALUES (?,?,?)', …)`).
+    pub fn insert_xattrs_batch(&self, rows: &[(i64, String, Vec<u8>)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            let mut stmt =
+                conn.prepare_cached(r#"INSERT INTO "xattrs" (offsetheader, key, value) VALUES (?1, ?2, ?3)"#)?;
+            for (oh, key, value) in rows {
+                stmt.execute(params![oh, key, value])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// List xattr keys for a file identified by `offsetheader`.
+    pub fn list_xattr_keys(&self, offsetheader: i64) -> Result<Vec<String>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(r#"SELECT key FROM "xattrs" WHERE offsetheader = ?1"#)?;
+            let rows = stmt.query_map(params![offsetheader], |row| row.get::<_, String>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Get one xattr value by `offsetheader` and key.
+    pub fn get_xattr(&self, offsetheader: i64, key: &str) -> Result<Option<Vec<u8>>> {
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                r#"SELECT value FROM "xattrs" WHERE offsetheader = ?1 AND key = ?2"#,
+            )?;
+            let row = stmt
+                .query_row(params![offsetheader, key], |row| row.get::<_, Vec<u8>>(0))
+                .optional()?;
+            Ok(row)
+        })
+    }
+
+    /// Regular-file rows eligible for content hashing: `(offsetheader, offset, size)`.
+    ///
+    /// Matches Python `_compute_and_store_hashes` filters: `S_IFREG`, non-generated,
+    /// non-null offsetheader, `size > 0`.
+    pub(crate) fn regular_file_payloads(&self) -> Result<Vec<(i64, i64, u64)>> {
+        // S_IFREG = 0x8000; S_IFMT = 0xF000
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"
+                SELECT offsetheader, offset, size
+                FROM "files"
+                WHERE size > 0
+                  AND (mode & 0xF000) = 0x8000
+                  AND offsetheader IS NOT NULL
+                  AND NOT isgenerated
+                ORDER BY offsetheader ASC
+                "#,
+            )?;
+            let mut rows = stmt.query([])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let oh: i64 = row.get(0)?;
+                let off: i64 = row.get(1)?;
+                let size: i64 = row.get(2)?;
+                if size > 0 {
+                    out.push((oh, off, size as u64));
+                }
+            }
+            Ok(out)
+        })
+    }
 }
 
 /// One row for the `files` table (bulk or single insert).
@@ -815,6 +926,115 @@ mod tests {
         assert_eq!(
             idx.backend_name().unwrap().as_deref(),
             Some("SQLiteIndexedTar")
+        );
+    }
+
+    #[test]
+    fn xattr_insert_list_get_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.index.sqlite");
+        let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+
+        // Minimal files row so schema is realistic; xattrs only need offsetheader.
+        idx.insert_file(
+            "",
+            "bar",
+            512,
+            1024,
+            4,
+            0.0,
+            0o100644,
+            0,
+            "",
+            1000,
+            1000,
+            true,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+
+        idx.insert_xattr(512, "user.hash.sha256", b"deadbeef").unwrap();
+        idx.insert_xattr(512, "user.hash.crc32", b"7e3265a8").unwrap();
+
+        let mut keys = idx.list_xattr_keys(512).unwrap();
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+        assert_eq!(
+            idx.get_xattr(512, "user.hash.crc32").unwrap().as_deref(),
+            Some(b"7e3265a8".as_slice())
+        );
+        assert_eq!(
+            idx.get_xattr(512, "user.hash.sha256").unwrap().as_deref(),
+            Some(b"deadbeef".as_slice())
+        );
+        assert!(idx.get_xattr(512, "missing").unwrap().is_none());
+        assert!(idx.list_xattr_keys(999).unwrap().is_empty());
+
+        // Reopen writable and ensure persistence.
+        drop(idx);
+        let idx2 = SqliteIndex::open_writable(&path).unwrap();
+        assert_eq!(
+            idx2.get_xattr(512, "user.hash.crc32").unwrap().as_deref(),
+            Some(b"7e3265a8".as_slice())
+        );
+    }
+
+    #[test]
+    fn fill_content_hashes_from_temp_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("payload.bin");
+        // layout: 8 bytes padding, then "foo\n"
+        let mut blob = vec![0u8; 8];
+        blob.extend_from_slice(b"foo\n");
+        std::fs::write(&archive, &blob).unwrap();
+
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.insert_file(
+            "",
+            "bar",
+            0,
+            8, // offset into archive
+            4, // size
+            0.0,
+            0o100644,
+            0,
+            "",
+            0,
+            0,
+            true,
+            false,
+            false,
+            0,
+        )
+        .unwrap();
+
+        fill_content_hashes(
+            &idx,
+            &archive,
+            &["crc32".into(), "sha256".into(), "md5".into(), "sha1".into()],
+        )
+        .unwrap();
+
+        let keys = idx.list_xattr_keys(0).unwrap();
+        assert_eq!(keys.len(), 4);
+        assert_eq!(
+            idx.get_xattr(0, "user.hash.crc32").unwrap().as_deref(),
+            Some(b"7e3265a8".as_slice())
+        );
+        assert_eq!(
+            idx.get_xattr(0, "user.hash.sha256").unwrap().as_deref(),
+            Some(
+                b"b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c".as_slice()
+            )
         );
     }
 }
