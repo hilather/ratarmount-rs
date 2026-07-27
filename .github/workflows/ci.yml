@@ -82,53 +82,70 @@ jobs:
 
   # -------------------------------------------------------------------------
   # macOS: compile + unit tests (FUSE mount is best-effort; GHA cannot load
-  # macFUSE kexts — prefer FUSE-T when available).
+  # macFUSE kexts).
+  # Mirrors fuser upstream mac-ci: macfuse cask + /usr/local/lib/pkgconfig.
   # -------------------------------------------------------------------------
   macos:
     name: macOS (build + test)
     runs-on: macos-14
+    env:
+      # Workflow-level RUSTFLAGS=-Dwarnings also applies to *dependencies*.
+      # On macOS that can fail the fuser/macFUSE build with exit 101. Clippy
+      # still enforces -D warnings on our workspace crates below.
+      RUSTFLAGS: ""
+      # macFUSE installs fuse.pc under /usr/local even on Apple Silicon.
+      PKG_CONFIG_PATH: /usr/local/lib/pkgconfig
     steps:
       - uses: actions/checkout@v4
 
       - name: Homebrew deps
         # fuser on Darwin requires pkg-config package "fuse" or "osxfuse"
-        # (macFUSE). FUSE-T alone is not enough to *link*; use it only for
-        # optional runtime smoke (kext-less).
+        # (macFUSE). FUSE-T alone is not enough to *link*.
         run: |
           set -euo pipefail
           brew update
           brew install pkgconf libarchive
-
-          # Required for build: macFUSE provides fuse.pc + libfuse.
-          # (Runtime kext load is not available on GHA; linking still works.)
           brew install --cask macfuse
 
           # Optional runtime for smoke mounts (best-effort).
-          brew install --cask fuse-t || brew install macos-fuse-t/homebrew-cask/fuse-t || true
+          brew install --cask fuse-t || true
 
-          PCS="$(brew --prefix libarchive)/lib/pkgconfig"
+          LA="$(brew --prefix libarchive)/lib/pkgconfig"
+          PCS="/usr/local/lib/pkgconfig"
           for p in \
+            "$LA" \
             "$(brew --prefix)/lib/pkgconfig" \
-            /usr/local/lib/pkgconfig \
             /opt/homebrew/lib/pkgconfig \
-            /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig \
-            /usr/local/opt/libfuse/lib/pkgconfig; do
-            [[ -n "$p" && -d "$p" ]] && PCS="${p}:${PCS}"
+            /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig; do
+            [[ -n "$p" && -d "$p" ]] && PCS="${PCS}:${p}"
           done
           echo "PKG_CONFIG_PATH=${PCS}" >> "$GITHUB_ENV"
           export PKG_CONFIG_PATH="${PCS}"
-          echo "PKG_CONFIG_PATH=${PCS}"
+
+          # Ensure pkg-config can see fuse (macFUSE may drop files under
+          # /Library/Filesystems/...; symlink into /usr/local if needed).
+          if ! pkg-config --exists fuse && ! pkg-config --exists osxfuse; then
+            sudo mkdir -p /usr/local/lib/pkgconfig
+            for src in \
+              /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig/*.pc \
+              /usr/local/opt/macfuse/lib/pkgconfig/*.pc; do
+              [[ -f "$src" ]] || continue
+              sudo ln -sfn "$src" "/usr/local/lib/pkgconfig/$(basename "$src")"
+            done
+          fi
 
           echo "==> fuse pkg-config probe"
+          echo "PKG_CONFIG_PATH=$PKG_CONFIG_PATH"
           pkg-config --list-all | grep -iE 'fuse|osx' || true
+          ls -la /usr/local/lib/pkgconfig 2>/dev/null || true
+          ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig 2>/dev/null || true
           if ! pkg-config --exists fuse && ! pkg-config --exists osxfuse; then
-            echo "ERROR: macFUSE did not install a usable fuse/osxfuse .pc file"
-            ls -la /Library/Filesystems/macfuse.fs/Contents/Resources/pkgconfig 2>/dev/null || true
-            ls -la /usr/local/lib/pkgconfig /opt/homebrew/lib/pkgconfig 2>/dev/null || true
+            echo "ERROR: no fuse/osxfuse .pc after macFUSE install"
             exit 1
           fi
           pkg-config --modversion fuse 2>/dev/null || pkg-config --modversion osxfuse
           pkg-config --libs fuse 2>/dev/null || pkg-config --libs osxfuse
+          pkg-config --cflags fuse 2>/dev/null || pkg-config --cflags osxfuse
 
       - name: Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -137,7 +154,11 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
         with:
-          key: macos-14
+          key: macos-14-v2
+
+      - name: cargo build (fuse smoke compile)
+        # Surface link/build errors before clippy for clearer logs.
+        run: cargo build -p ratarmount-fuse -p ratarmount --all-targets
 
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
