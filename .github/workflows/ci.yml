@@ -186,7 +186,21 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
 
       - name: cargo test
-        run: cargo test --workspace
+        run: |
+          set +e
+          cargo test --workspace --no-fail-fast 2>&1 | tee /tmp/cargo-macos-test.log
+          code=${PIPESTATUS[0]}
+          if [[ "$code" -ne 0 ]]; then
+            echo "::group::cargo test failure (tail)"
+            tail -n 150 /tmp/cargo-macos-test.log
+            echo "::endgroup::"
+            grep -E 'FAILED|failures:|error\[|panicked at|assertion|test result:' /tmp/cargo-macos-test.log \
+              | head -n 50 \
+              | while IFS= read -r line; do
+                  echo "::error::${line:0:350}"
+                done
+            exit "$code"
+          fi
 
       - name: Build release
         run: cargo build --release -p ratarmount
