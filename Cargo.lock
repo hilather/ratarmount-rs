@@ -586,6 +586,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ext4-view"
+version = "0.9.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecf18f4817ea4baf95d700eb763642e65f77a94e630867028024b6725848a028"
+dependencies = [
+ "bitflags 2.13.1",
+ "crc",
+]
+
+[[package]]
 name = "fallible-iterator"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1585,6 +1595,7 @@ dependencies = [
 name = "ratarmount-formats-ext4"
 version = "0.1.2"
 dependencies = [
+ "ext4-view",
  "libc",
  "log",
  "ratarmount-compositing",

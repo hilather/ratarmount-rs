@@ -3,7 +3,7 @@ name = "ratarmount-formats-ext4"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "EXT2/3/4 image mount source (debugfs materialize MVP)"
+description = "EXT2/3/4 image mount source (pure Rust via ext4-view, debugfs fallback)"
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -12,3 +12,9 @@ thiserror.workspace = true
 log.workspace = true
 tempfile.workspace = true
 libc.workspace = true
+# Read-only in-process ext2/ext4 (parity with Python python-ext4 / `ext4` package).
+# Falls back to e2fsprogs `debugfs rdump` when load fails or features are missing.
+ext4-view = "0.9"
+
+[dev-dependencies]
+tempfile.workspace = true
