@@ -52,7 +52,7 @@ Rust is not a drop-in replacement for every Python workflow yet (see [gaps](#gap
 | SQLAR | yes | yes | Unencrypted; sqlcipher later |
 | PDF / OGG / HTML / Git | yes | yes | PDF images deferred; Git needs `RATARMOUNT_FORCE_GIT=1` for some trees |
 | RAR / LHA / long-tail | yes | yes | via libarchive (sequential member open) |
-| Split files (`.001`) | yes | — | not yet |
+| Split files (`.001`) | yes | yes | decimal/hex/alpha join at open |
 | lrzip | yes | — | not yet |
 
 ### Compression (outer / seekable)
@@ -101,8 +101,8 @@ Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).
 Still missing or partial relative to upstream Python:
 
 1. **Seekable codecs (depth)** — true bzip2 bit-block map + `-P` parallel; xz stream index; zstd seek-table / `zstdblocks` import; gzip Tier C blob import.
-2. **Formats** — in-process SquashFS/EXT4 (drop helpers); encrypted SQLAR; split `.001` volumes; GNU incremental TAR semantics; stronger RAR; PDF embedded images.
-3. **7z solids** — progressive multi-GB solid decode without full unpack buffer.
+2. **Formats** — in-process SquashFS/EXT4 (drop helpers); encrypted SQLAR; GNU incremental TAR semantics; stronger RAR; PDF embedded images.
+3. **7z solids** — large pure LZMA2 uses progressive prefix decode (≤4 MiB still full-cached); BCJ/AES folders still full-folder; chunk resume cache unfinished.
 4. **Remote breadth** — SMB/WebDAV/Dropbox; HTTP Range-backed format readers (no full download); remote/compressed indexes.
 5. **Index extras** — file hashes / xattrs; full compression side-table interop with Python.
 6. **CLI polish** — colored logs; in-FS control folder (Rust uses a Unix socket); full `-P backend:n` matrix; OSS attributions depth.

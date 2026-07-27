@@ -1024,18 +1024,27 @@ pub fn index_lzma2_chunks(packed: &[u8]) -> Result<Vec<Lzma2ChunkIndex>> {
 ///
 /// Port of Python `Lzma2RandomAccessDecoder` (hilather a0bc76e):
 /// always decode with the **folder-level** LZMA2 filter (never re-bind
-/// per-chunk property filters for multi-chunk solid chains). Chunk boundaries
-/// are indexed for validation and future progressive decode; ranges are served
-/// from a single full decompress cached in this decoder instance.
+/// per-chunk property filters for multi-chunk solid chains).
+///
+/// **Progressive mode (default for large folders):** decompress only up to
+/// `start+length` and discard prefix bytes — peak RAM is O(range end), not
+/// O(full folder), when the full cache is not retained.
+/// **Small folders** (≤ `SMALL_FOLDER_FULL_CACHE`) keep a full unpack cache
+/// after the first decode for repeated random access.
 pub struct Lzma2RandomAccessDecoder {
     packed: Vec<u8>,
     folder_props: Option<Vec<u8>>,
-    /// Indexed chunk map (used for validation / progressive paths / tests).
+    /// Indexed chunk map (validation / tests / future resume points).
     #[allow(dead_code)]
     chunks: Vec<Lzma2ChunkIndex>,
     unpack_size: u64,
     full: Option<Vec<u8>>,
+    /// When true, first full decode is retained for subsequent ranges.
+    cache_full: bool,
 }
+
+/// Folders at or below this unpack size keep a full decode cache.
+pub const SMALL_FOLDER_FULL_CACHE: u64 = 4 * 1024 * 1024;
 
 impl Lzma2RandomAccessDecoder {
     pub fn new(folder: &Folder, packed: Vec<u8>, _max_cached_chunks: usize) -> Result<Self> {
@@ -1045,13 +1054,24 @@ impl Lzma2RandomAccessDecoder {
             ));
         }
         let chunks = index_lzma2_chunks(&packed)?;
+        let unpack_size = folder.get_unpack_size();
         Ok(Self {
             packed,
             folder_props: folder.coders[0].properties.clone(),
             chunks,
-            unpack_size: folder.get_unpack_size(),
+            unpack_size,
             full: None,
+            cache_full: unpack_size <= SMALL_FOLDER_FULL_CACHE,
         })
+    }
+
+    fn folder_coder(&self) -> Coder {
+        Coder {
+            method: METHOD_LZMA2.to_vec(),
+            num_in_streams: 1,
+            num_out_streams: 1,
+            properties: self.folder_props.clone(),
+        }
     }
 
     fn ensure_full(&mut self) -> Result<()> {
@@ -1059,29 +1079,50 @@ impl Lzma2RandomAccessDecoder {
             return Ok(());
         }
         // Folder-level filter only — critical for solid multi-chunk streams (a0bc76e).
-        let coder = Coder {
-            method: METHOD_LZMA2.to_vec(),
-            num_in_streams: 1,
-            num_out_streams: 1,
-            properties: self.folder_props.clone(),
-        };
-        let out = lzma_decompress_chain(&[coder], &self.packed, self.unpack_size.max(1) as usize)?;
+        let out = lzma_decompress_chain(
+            &[self.folder_coder()],
+            &self.packed,
+            self.unpack_size.max(1) as usize,
+        )?;
         self.full = Some(out);
         Ok(())
+    }
+
+    /// Progressive: decompress only the prefix needed for `[start, start+length)`.
+    fn decode_prefix(&self, end: usize) -> Result<Vec<u8>> {
+        if end == 0 {
+            return Ok(vec![]);
+        }
+        lzma_decompress_chain(&[self.folder_coder()], &self.packed, end)
     }
 
     pub fn read_range(&mut self, start: u64, length: usize) -> Result<Vec<u8>> {
         if length == 0 || start >= self.unpack_size {
             return Ok(vec![]);
         }
-        self.ensure_full()?;
-        let full = self.full.as_ref().unwrap();
+        let end = (start as usize)
+            .saturating_add(length)
+            .min(self.unpack_size as usize);
         let s = start as usize;
-        if s >= full.len() {
+
+        // Prefer full cache when already populated or folder is small.
+        if self.full.is_some() || self.cache_full {
+            self.ensure_full()?;
+            let full = self.full.as_ref().unwrap();
+            if s >= full.len() {
+                return Ok(vec![]);
+            }
+            let e = end.min(full.len());
+            return Ok(full[s..e].to_vec());
+        }
+
+        // Progressive path for large solids: only decode through `end`.
+        let prefix = self.decode_prefix(end)?;
+        if s >= prefix.len() {
             return Ok(vec![]);
         }
-        let e = (s + length).min(full.len());
-        Ok(full[s..e].to_vec())
+        let e = end.min(prefix.len());
+        Ok(prefix[s..e].to_vec())
     }
 
     pub fn unpack_size(&self) -> u64 {

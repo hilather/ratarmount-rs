@@ -16,9 +16,15 @@ mod lzip_seek;
 mod lzma_seek;
 mod lzo_seek;
 mod seekable_body;
+mod split;
 mod xz_seek;
 mod zlib_seek;
 mod zstd_seek;
+
+pub use split::{
+    check_for_split_file_in, check_for_split_file_in_folder, is_first_split_extension,
+    joined_base_name, materialize_joined_parts, JoinedFile, SplitFileSet,
+};
 
 pub use bzip2_seek::open_seekable_bzip2;
 pub use compress_z_seek::open_seekable_compress_z;

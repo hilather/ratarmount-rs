@@ -9,11 +9,11 @@ use ratarmount_compositing::{
     UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
-    body_looks_like_tar, detect_compression, looks_like_tar, materialize,
-    name_suggests_compressed_tar, open_seekable_bzip2, open_seekable_compress_z, open_seekable_lz4,
-    open_seekable_lzip, open_seekable_lzma, open_seekable_lzo, open_seekable_xz,
-    open_seekable_zlib, strip_compression_suffix, CompressionFormat, SeekableBody, SeekableZstd,
-    SharedSeekableGzip,
+    body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
+    looks_like_tar, materialize, materialize_joined_parts, name_suggests_compressed_tar,
+    open_seekable_bzip2, open_seekable_compress_z, open_seekable_lz4, open_seekable_lzip,
+    open_seekable_lzma, open_seekable_lzo, open_seekable_xz, open_seekable_zlib,
+    strip_compression_suffix, CompressionFormat, SeekableBody, SeekableZstd, SharedSeekableGzip,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -38,6 +38,59 @@ use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
 use ratarmount_index::{resolve_index_location, IndexLocation};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(test)]
+mod split_open_tests {
+    use super::*;
+    use std::io::Read;
+    use std::sync::Arc;
+
+    #[test]
+    fn open_joined_plain_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("foo.001"), b"foo").unwrap();
+        std::fs::write(dir.path().join("foo.002"), b"bar").unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = open_path(&dir.path().join("foo.001"), &opts, true).unwrap();
+        let fi = m.lookup("/foo", 0).expect("joined name foo");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foobar");
+        // Opening .002 also joins the set
+        let m2 = open_path(&dir.path().join("foo.002"), &opts, true).unwrap();
+        let fi2 = m2.lookup("/foo", 0).expect("joined name");
+        let mut r2 = m2.open(&fi2, 0).unwrap();
+        buf.clear();
+        r2.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foobar");
+    }
+
+    #[test]
+    fn open_python_fixture_single_file_split_tar() {
+        let py = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        let p001 = PathBuf::from(&py).join("tests/single-file-split.tar.001");
+        if !p001.exists() {
+            eprintln!("skip: missing fixture {p001:?}");
+            return;
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = open_path(&p001, &opts, true).unwrap();
+        let fi = m.lookup("/bar", 0).expect("bar in joined tar");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+        let _ = Arc::strong_count(&m);
+    }
+}
 
 pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
     Arc::new(move |path: &Path| {
@@ -74,11 +127,106 @@ fn index_arg(loc: &IndexLocation) -> Option<&Path> {
     loc.as_path()
 }
 
+/// Open a multi-volume split set (Python JoinedFileFromFactory → open_mount_source).
+///
+/// Joins parts into a temp file, then reuses the normal open path. Index defaults
+/// next to the first part (`foo.001.index.sqlite`) like Python.
+fn open_split_set(
+    parts: &[PathBuf],
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    if parts.is_empty() {
+        return Err("empty split set".into());
+    }
+    let first = &parts[0];
+    let joined_name = joined_base_name(first);
+    let (tmp, size) = materialize_joined_parts(parts).map_err(|e| e.to_string())?;
+    let tmp_path = tmp.path().to_path_buf();
+
+    let mut opts = options.clone();
+    if opts.index_file_path.is_none() && !opts.index_in_memory {
+        let mut idx = first.as_os_str().to_os_string();
+        idx.push(".index.sqlite");
+        opts.index_file_path = Some(PathBuf::from(idx));
+    }
+
+    let compression = detect_compression(&tmp_path).map_err(|e| e.to_string())?;
+    let looks_archive = compression != CompressionFormat::None
+        || looks_like_tar(&tmp_path).unwrap_or(false)
+        || looks_like_zip(&tmp_path)
+        || looks_like_7z(&tmp_path)
+        || looks_like_ar(&tmp_path)
+        || looks_like_cpio(&tmp_path);
+
+    if !looks_archive {
+        // Plain joined file → virtual name without split suffix (Python SingleFileMountSource).
+        return Ok(Arc::new(
+            SingleFileMountSource::new(joined_name, tmp_path, size, Some(tmp))
+                .map_err(|e| e.to_string())?,
+        ));
+    }
+
+    // Archive/compressed stream: open without re-running split detection; keep temp alive.
+    let inner = open_path_impl(&tmp_path, &opts, recreate, false)?;
+    Ok(Arc::new(KeepAliveMount { inner, _tmp: tmp }))
+}
+
+struct KeepAliveMount {
+    inner: Arc<dyn MountSource>,
+    _tmp: tempfile::NamedTempFile,
+}
+
+impl MountSource for KeepAliveMount {
+    fn list(&self, path: &str) -> Option<ratarmount_core::ListResult> {
+        self.inner.list(path)
+    }
+    fn list_mode(&self, path: &str) -> Option<ratarmount_core::ListModeResult> {
+        self.inner.list_mode(path)
+    }
+    fn lookup(&self, path: &str, file_version: i32) -> Option<ratarmount_core::FileInfo> {
+        self.inner.lookup(path, file_version)
+    }
+    fn open(
+        &self,
+        file_info: &ratarmount_core::FileInfo,
+        buffering: i32,
+    ) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        self.inner.open(file_info, buffering)
+    }
+    fn read(
+        &self,
+        file_info: &ratarmount_core::FileInfo,
+        size: usize,
+        offset: u64,
+    ) -> std::io::Result<Vec<u8>> {
+        self.inner.read(file_info, size, offset)
+    }
+    fn is_immutable(&self) -> bool {
+        self.inner.is_immutable()
+    }
+    fn exists(&self, path: &str) -> bool {
+        self.inner.exists(path)
+    }
+    fn is_dir(&self, path: &str) -> bool {
+        self.inner.is_dir(path)
+    }
+}
+
 /// Open a single path (file archive or directory).
 pub fn open_path(
     path: &Path,
     options: &OpenOptions,
     recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    open_path_impl(path, options, recreate, true)
+}
+
+fn open_path_impl(
+    path: &Path,
+    options: &OpenOptions,
+    recreate: bool,
+    allow_split: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     if path.is_dir() {
         // Git: bare repos / `.git` dirs (HEAD+objects, no nested `.git`), or force via env.
@@ -98,6 +246,13 @@ pub fn open_path(
     }
     if !path.exists() {
         return Err(format!("not found: {}", path.display()));
+    }
+
+    // Multi-volume split files (Python check_for_split_file_in_folder + JoinedFile).
+    if allow_split {
+        if let Some(split) = check_for_split_file_in_folder(path) {
+            return open_split_set(&split.paths, options, recreate);
+        }
     }
 
     let compression = detect_compression(path).map_err(|e| e.to_string())?;

@@ -41,7 +41,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
 | lrz | yes | no | `[ ]` |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
-| Split files (`.001`/`.002`) | yes | no | `[ ]` |
+| Split files (`.001`/`.002`) | yes | yes (decimal/hex/alpha join) | `[x]` top-level open; recursive AutoMount join partial |
 
 ### Compositing & FUSE UX
 
@@ -102,7 +102,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | In-memory index for RO mounts | `[x]` |
 | FUSE open-handle reuse / caches / readdirplus | `[x]` |
 | ZIP store stencil + deflate cache | `[x]` |
-| SevenZip solid streaming (large folders) | `[ ]` progressive decoder |
+| SevenZip solid streaming (large folders) | `~` progressive prefix decode for large pure LZMA2; full cache ≤4 MiB |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
 | Seekable codecs (drop materialize for gzip+) | `~` all four via SeekableBody; true block maps still partial |
 | Benchmark gates in CI (`rust-gates.json`) | `[ ]` |
