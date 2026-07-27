@@ -1,4 +1,4 @@
-//! SQLAR (SQLite Archiver) mount source — Python `SQLARMountSource` parity (unencrypted).
+//! SQLAR (SQLite Archiver) mount source — Python `SQLARMountSource` parity.
 //!
 //! Schema: <https://www.sqlite.org/sqlar.html>
 //! ```text
@@ -10,7 +10,17 @@
 //!   data BLOB               -- NULL=dir; link text if sz=-1; zlib if len<data < sz
 //! );
 //! ```
-//! Encrypted SQLAR (sqlcipher) is not supported yet.
+//!
+//! # Encrypted SQLAR (sqlcipher)
+//!
+//! Encrypted archives do **not** start with the SQLite magic (`SQLite format 3\0`);
+//! the first 16 bytes are the AES salt. Opening them requires SQLCipher.
+//!
+//! * Default build (stock bundled SQLite): encrypted files are **detected** and open
+//!   fails with a clear [`SqlarError`] (`EncryptedRequiresPassword` /
+//!   `EncryptedNotSupported`).
+//! * With `--features sqlcipher`: passwords from [`OpenOptions::passwords`] are tried
+//!   via `PRAGMA key` (passphrase and PBKDF2-HMAC-SHA512 raw key, matching Python).
 
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read};
@@ -27,6 +37,11 @@ use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "SQLARMountSource";
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+const OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
+
+/// SQLCipher default KDF iterations (current); salt is the first 16 file bytes.
+#[cfg(feature = "sqlcipher")]
+const SQLCIPHER_KDF_ITER: u32 = 256_000;
 
 #[derive(Debug, Error)]
 pub enum SqlarError {
@@ -36,6 +51,22 @@ pub enum SqlarError {
     Io(#[from] io::Error),
     #[error("{0}")]
     Msg(String),
+    /// File looks like sqlcipher-encrypted SQLAR but no password was supplied.
+    #[error(
+        "encrypted SQLAR requires a password (sqlcipher); pass --password \
+         (rebuild ratarmount-formats-sqlar with --features sqlcipher for decryption support)"
+    )]
+    EncryptedRequiresPassword,
+    /// Passwords were given but this build was not linked with SQLCipher.
+    #[error(
+        "encrypted SQLAR is not supported in this build (stock SQLite, no sqlcipher). \
+         Rebuild with `--features sqlcipher` on ratarmount-formats-sqlar, or use an unencrypted archive. \
+         Passwords were ignored."
+    )]
+    EncryptedNotSupported,
+    /// SQLCipher is available but none of the provided passwords unlocked the archive.
+    #[error("could not decrypt SQLAR with the provided password(s)")]
+    WrongPassword,
 }
 
 pub type Result<T> = std::result::Result<T, SqlarError>;
@@ -60,23 +91,19 @@ impl SqlarMountSource {
                 path.display()
             )));
         }
-        let conn = Connection::open_with_flags(
-            &path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
-        // Verify sqlar table exists.
-        let ok: Option<String> = conn
-            .query_row(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlar'",
-                [],
-                |r| r.get(0),
-            )
-            .optional()?;
-        if ok.is_none() {
-            return Err(SqlarError::Msg("missing sqlar table".into()));
-        }
-        // Probe one row / empty archive ok.
-        let _ = conn.query_row("SELECT COUNT(*) FROM sqlar", [], |r| r.get::<_, i64>(0))?;
+
+        let header = read_header(&path)?;
+        let conn = match open_plain(&path) {
+            Ok(c) => c,
+            Err(plain_err) => {
+                if header_is_sqlite_magic(&header) {
+                    // Plain SQLite header but not a usable SQLAR (missing table / corrupt).
+                    return Err(plain_err);
+                }
+                // No SQLite magic → treat as sqlcipher-encrypted candidate.
+                open_encrypted(&path, options, &header, plain_err)?
+            }
+        };
 
         let name_map = build_name_map(&conn)?;
         Ok(Self {
@@ -145,6 +172,140 @@ impl SqlarMountSource {
     }
 }
 
+fn read_header(path: &Path) -> Result<Vec<u8>> {
+    let mut f = std::fs::File::open(path)?;
+    let mut buf = [0u8; 16];
+    let n = f.read(&mut buf)?;
+    Ok(buf[..n].to_vec())
+}
+
+fn header_is_sqlite_magic(header: &[u8]) -> bool {
+    header.len() >= SQLITE_MAGIC.len() && &header[..SQLITE_MAGIC.len()] == SQLITE_MAGIC
+}
+
+fn has_sqlar_extension(path: &Path) -> bool {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("sqlar"))
+}
+
+/// Open unencrypted SQLAR and verify the `sqlar` table is readable.
+fn open_plain(path: &Path) -> Result<Connection> {
+    let conn = Connection::open_with_flags(path, OPEN_FLAGS)?;
+    verify_sqlar_readable(&conn)?;
+    Ok(conn)
+}
+
+fn verify_sqlar_readable(conn: &Connection) -> Result<()> {
+    let ok: Option<String> = conn
+        .query_row(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='sqlar'",
+            [],
+            |r| r.get(0),
+        )
+        .optional()?;
+    if ok.is_none() {
+        return Err(SqlarError::Msg("missing sqlar table".into()));
+    }
+    // Touch the table (also fails if still encrypted / wrong key).
+    let _ = conn.query_row("SELECT COUNT(*) FROM sqlar", [], |r| r.get::<_, i64>(0))?;
+    Ok(())
+}
+
+fn open_encrypted(
+    path: &Path,
+    options: &OpenOptions,
+    header: &[u8],
+    plain_err: SqlarError,
+) -> Result<Connection> {
+    // Require at least a 16-byte salt for a plausible sqlcipher file.
+    if header.len() < 16 {
+        return Err(plain_err);
+    }
+
+    if options.passwords.is_empty() {
+        log::debug!(
+            "SQLAR open failed without SQLite magic ({}): {plain_err}; treating as encrypted",
+            path.display()
+        );
+        return Err(SqlarError::EncryptedRequiresPassword);
+    }
+
+    #[cfg(feature = "sqlcipher")]
+    {
+        let salt: [u8; 16] = header[..16].try_into().expect("checked len >= 16");
+        return try_sqlcipher_passwords(path, &options.passwords, &salt);
+    }
+
+    #[cfg(not(feature = "sqlcipher"))]
+    {
+        let _ = (path, plain_err);
+        // Best-effort: stock rusqlite `bundled` has no codec; PRAGMA key is a no-op / unused.
+        // Surface a structured error rather than a cryptic "file is not a database".
+        log::info!(
+            "encrypted SQLAR detected at {}; passwords present but sqlcipher feature disabled",
+            path.display()
+        );
+        Err(SqlarError::EncryptedNotSupported)
+    }
+}
+
+/// Try each password with SQLCipher (passphrase form, then PBKDF2 raw key).
+#[cfg(feature = "sqlcipher")]
+fn try_sqlcipher_passwords(path: &Path, passwords: &[String], salt: &[u8; 16]) -> Result<Connection> {
+    use pbkdf2::pbkdf2_hmac;
+    use sha2::Sha512;
+
+    for password in passwords {
+        // 1) Passphrase mode — SQLCipher derives the key itself.
+        if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
+            if apply_pragma_key_passphrase(&conn, password).is_ok()
+                && verify_sqlar_readable(&conn).is_ok()
+            {
+                return Ok(conn);
+            }
+        }
+
+        // 2) Raw key from PBKDF2-HMAC-SHA512 (Python / sqlcipher3 parity; safe for any password chars).
+        let mut key = [0u8; 32];
+        pbkdf2_hmac::<Sha512>(password.as_bytes(), salt, SQLCIPHER_KDF_ITER, &mut key);
+        if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
+            if apply_pragma_key_raw(&conn, &key).is_ok() && verify_sqlar_readable(&conn).is_ok() {
+                return Ok(conn);
+            }
+        }
+    }
+    Err(SqlarError::WrongPassword)
+}
+
+#[cfg(feature = "sqlcipher")]
+fn apply_pragma_key_passphrase(conn: &Connection, password: &str) -> rusqlite::Result<()> {
+    // Escape single quotes for SQL string literal.
+    let escaped = password.replace('\'', "''");
+    conn.execute_batch(&format!("PRAGMA key = '{escaped}';"))?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlcipher")]
+fn apply_pragma_key_raw(conn: &Connection, key: &[u8; 32]) -> rusqlite::Result<()> {
+    // https://www.zetetic.net/sqlcipher/sqlcipher-api/#PRAGMA_key
+    // Double-quoted x'..' form (Python uses the same).
+    let hex = to_hex(key);
+    conn.execute_batch(&format!("PRAGMA key = \"x'{hex}'\";"))?;
+    Ok(())
+}
+
+#[cfg(feature = "sqlcipher")]
+fn to_hex(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(HEX[(b >> 4) as usize] as char);
+        out.push(HEX[(b & 0xf) as usize] as char);
+    }
+    out
+}
+
 fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>> {
     let mut stmt = conn.prepare("SELECT name FROM sqlar")?;
     let names: Vec<String> = stmt
@@ -191,27 +352,26 @@ fn build_name_map(conn: &Connection) -> Result<Option<BTreeMap<String, String>>>
     Ok(Some(map))
 }
 
-/// True if path starts with SQLite magic and has an `sqlar` table (or at least SQLite header).
+/// True if path is a plausible SQLAR: SQLite magic + `sqlar` table, or `.sqlar` extension
+/// (encrypted sqlcipher archives omit the magic and store salt in the first 16 bytes).
 pub fn looks_like_sqlar(path: &Path) -> bool {
     let Ok(mut f) = std::fs::File::open(path) else {
         return false;
     };
     let mut magic = [0u8; 16];
-    if std::io::Read::read(&mut f, &mut magic).ok() != Some(16) {
+    let Ok(n) = std::io::Read::read(&mut f, &mut magic) else {
+        return false;
+    };
+    if n < 16 {
         return false;
     }
     if magic.as_slice() != SQLITE_MAGIC {
-        // Extension hint for encrypted / non-magic cases later.
-        return path
-            .extension()
-            .and_then(|e| e.to_str())
-            .is_some_and(|e| e.eq_ignore_ascii_case("sqlar"));
+        // Encrypted SQLAR (sqlcipher): no magic; first 16 B are salt.
+        // Require .sqlar extension to avoid claiming every random 16+ byte file.
+        return has_sqlar_extension(path);
     }
     // Prefer verifying table when possible.
-    if let Ok(conn) = Connection::open_with_flags(
-        path,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    ) {
+    if let Ok(conn) = Connection::open_with_flags(path, OPEN_FLAGS) {
         let has: bool = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type='table' AND name='sqlar' LIMIT 1",
@@ -225,6 +385,14 @@ pub fn looks_like_sqlar(path: &Path) -> bool {
         return has;
     }
     false
+}
+
+/// True when the file does not have a SQLite header (likely sqlcipher-encrypted SQLAR).
+pub fn looks_like_encrypted_sqlar(path: &Path) -> bool {
+    let Ok(header) = read_header(path) else {
+        return false;
+    };
+    header.len() >= 16 && !header_is_sqlite_magic(&header) && has_sqlar_extension(path)
 }
 
 impl MountSource for SqlarMountSource {
@@ -403,6 +571,15 @@ mod tests {
         PathBuf::from(root).join("tests").join(name)
     }
 
+    fn assert_ufo(m: &SqlarMountSource) {
+        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo");
+        assert_eq!(fi.size, 6);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
+    }
+
     #[test]
     fn nested_tar_sqlar() {
         let path = py_test("nested-tar.sqlar");
@@ -411,16 +588,145 @@ mod tests {
             return;
         }
         assert!(looks_like_sqlar(&path));
+        assert!(!looks_like_encrypted_sqlar(&path));
         let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
-        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo");
-        assert_eq!(fi.size, 6);
-        let mut r = m.open(&fi, 0).unwrap();
-        let mut s = String::new();
-        r.read_to_string(&mut s).unwrap();
-        assert_eq!(s, "iriya\n");
+        assert_ufo(&m);
         let root = m.list("/").expect("root");
         if let ListResult::Infos(map) = root {
             assert!(map.contains_key("foo"));
         }
+        // nested dirs
+        assert!(m.lookup("/foo", 0).is_some());
+        assert!(m.lookup("/foo/fighter", 0).is_some());
+    }
+
+    #[test]
+    fn nested_tar_denormal_sqlar() {
+        let path = py_test("nested-tar-denormal.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing fixture");
+            return;
+        }
+        assert!(looks_like_sqlar(&path));
+        let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert_ufo(&m);
+    }
+
+    #[test]
+    fn nested_tar_compressed_sqlar() {
+        let path = py_test("nested-tar-compressed.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing fixture");
+            return;
+        }
+        assert!(looks_like_sqlar(&path));
+        let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert_ufo(&m);
+    }
+
+    #[test]
+    fn nested_tar_trailing_slash_sqlar() {
+        let path = py_test("nested-tar-trailing-slash.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing fixture");
+            return;
+        }
+        let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        assert_ufo(&m);
+    }
+
+    #[test]
+    fn encrypted_detection_without_password() {
+        let path = py_test("encrypted-nested-tar.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing encrypted fixture");
+            return;
+        }
+        assert!(looks_like_sqlar(&path));
+        assert!(looks_like_encrypted_sqlar(&path));
+
+        match SqlarMountSource::open(&path, &OpenOptions::default()) {
+            Err(err @ SqlarError::EncryptedRequiresPassword) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("password") || msg.contains("encrypted"),
+                    "message should mention password/encrypted: {msg}"
+                );
+            }
+            Err(other) => panic!("expected EncryptedRequiresPassword, got {other}"),
+            Ok(_) => panic!("expected error for encrypted SQLAR without password"),
+        }
+    }
+
+    #[test]
+    fn encrypted_with_password() {
+        let path = py_test("encrypted-nested-tar.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing encrypted fixture");
+            return;
+        }
+        let opts = OpenOptions {
+            passwords: vec!["foo".into()],
+            ..OpenOptions::default()
+        };
+
+        #[cfg(feature = "sqlcipher")]
+        {
+            let m = SqlarMountSource::open(&path, &opts).expect("decrypt with password foo");
+            assert_ufo(&m);
+        }
+
+        #[cfg(not(feature = "sqlcipher"))]
+        {
+            match SqlarMountSource::open(&path, &opts) {
+                Err(err @ SqlarError::EncryptedNotSupported) => {
+                    let msg = err.to_string();
+                    assert!(
+                        msg.contains("sqlcipher") || msg.contains("not supported"),
+                        "message: {msg}"
+                    );
+                }
+                Err(other) => panic!("expected EncryptedNotSupported, got {other}"),
+                Ok(_) => panic!("expected EncryptedNotSupported without sqlcipher feature"),
+            }
+        }
+    }
+
+    #[test]
+    fn encrypted_wrong_password_or_unsupported() {
+        let path = py_test("encrypted-nested-tar.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing encrypted fixture");
+            return;
+        }
+        let opts = OpenOptions {
+            passwords: vec!["not-the-password".into()],
+            ..OpenOptions::default()
+        };
+
+        match SqlarMountSource::open(&path, &opts) {
+            #[cfg(feature = "sqlcipher")]
+            Err(SqlarError::WrongPassword) => {}
+            #[cfg(not(feature = "sqlcipher"))]
+            Err(SqlarError::EncryptedNotSupported) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("expected decrypt failure"),
+        }
+    }
+
+    /// Unencrypted path still works when unused passwords are supplied.
+    #[test]
+    fn unencrypted_ignores_passwords() {
+        let path = py_test("nested-tar.sqlar");
+        if !path.exists() {
+            eprintln!("skip missing fixture");
+            return;
+        }
+        let opts = OpenOptions {
+            passwords: vec!["irrelevant".into()],
+            ..OpenOptions::default()
+        };
+        let m = SqlarMountSource::open(&path, &opts).unwrap();
+        assert_ufo(&m);
     }
 }

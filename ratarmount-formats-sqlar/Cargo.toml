@@ -5,6 +5,17 @@ edition.workspace = true
 license.workspace = true
 description = "SQLAR (SQLite Archiver) mount source"
 
+[features]
+default = []
+# Open sqlcipher-encrypted SQLAR archives (`PRAGMA key` + PBKDF2).
+# Requires building rusqlite with the SQLCipher amalgamation (vendored OpenSSL).
+# Enable with: cargo test -p ratarmount-formats-sqlar --features sqlcipher
+sqlcipher = [
+    "rusqlite/bundled-sqlcipher-vendored-openssl",
+    "dep:pbkdf2",
+    "dep:sha2",
+]
+
 [dependencies]
 ratarmount-core.workspace = true
 rusqlite.workspace = true
@@ -12,6 +23,8 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 flate2 = "1"
+pbkdf2 = { version = "0.12", optional = true, default-features = false, features = ["hmac"] }
+sha2 = { version = "0.10", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
