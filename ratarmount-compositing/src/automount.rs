@@ -175,8 +175,76 @@ fn set_binary() -> Vec<String> {
         .collect()
 }
 fn set_split() -> Vec<String> {
-    // common split suffixes 001..099
-    (1..100).map(|i| format!(".{i:03}")).collect()
+    // First-part style suffixes only (Python FIRST_SPLIT_EXTENSION_REGEX + common .001).
+    // Full sibling discovery happens at mount time via check_for_split_file_in.
+    let mut v = vec![
+        ".aa".into(),
+        ".a".into(),
+        ".0".into(),
+        ".1".into(),
+        ".00".into(),
+        ".01".into(),
+        ".000".into(),
+        ".001".into(),
+    ];
+    for i in 0..20 {
+        v.push(format!(".{i:02}"));
+        v.push(format!(".{i:03}"));
+    }
+    v.sort();
+    v.dedup();
+    v
+}
+
+/// If `archive_path` is the first part of a multi-volume set inside `parent`, join parts to a temp path.
+fn try_materialize_split_from_parent(
+    parent: &dyn MountSource,
+    archive_path: &str,
+) -> Option<PathBuf> {
+    use ratarmount_compress::{
+        check_for_split_file_in, is_first_split_extension,
+    };
+    let path = normpath(archive_path);
+    let name = Path::new(&path)
+        .file_name()
+        .and_then(|s| s.to_str())?
+        .to_string();
+    let ext = Path::new(&name)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| format!(".{e}"))
+        .unwrap_or_default();
+    if !is_first_split_extension(&ext) {
+        return None;
+    }
+    let parent_dir = Path::new(&path)
+        .parent()
+        .map(|p| p.to_string_lossy().into_owned())
+        .filter(|p| !p.is_empty())
+        .unwrap_or_else(|| "/".into());
+    let list = parent.list(&parent_dir)?;
+    let names: Vec<String> = match list {
+        ListResult::Names(n) => n,
+        ListResult::Infos(m) => m.into_keys().collect(),
+    };
+    let set = check_for_split_file_in(&name, &names)?;
+    // Materialize joined stream by opening each part through the parent mount.
+    let mut tmp = NamedTempFile::new().ok()?;
+    for part_name in &set.paths {
+        // set.paths may be relative basenames with extensions only as full paths from check —
+        // we built them from basename; for in-mount use the name component only.
+        let part_base = part_name
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(part_name.to_str()?);
+        let full = join(&parent_dir, part_base);
+        let fi = parent.lookup(&full, 0)?;
+        let mut reader = parent.open(&fi, 0).ok()?;
+        io::copy(&mut reader, &mut tmp).ok()?;
+    }
+    let _ = tmp.flush();
+    let keep = tmp.into_temp_path().keep().ok()?;
+    Some(keep)
 }
 
 /// Returns true if `name` looks like a mountable nested archive (default extension set).
@@ -466,12 +534,19 @@ impl AutoMountLayer {
             Self::source_at_locked(&self.root, &mounted, &mp)
         };
         let fi = parent.lookup(&rest, 0)?;
-        let mut reader = parent.open(&fi, 0).ok()?;
-        let mut tmp = NamedTempFile::new().ok()?;
-        io::copy(&mut reader, &mut tmp).ok()?;
-        let _ = tmp.flush();
-        let tmp_path = tmp.into_temp_path();
-        let persist = tmp_path.keep().ok()?;
+
+        // Recursive split join (Python AutoMountLayer + check_for_split_file_in).
+        let persist = if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), path)
+        {
+            joined
+        } else {
+            let mut reader = parent.open(&fi, 0).ok()?;
+            let mut tmp = NamedTempFile::new().ok()?;
+            io::copy(&mut reader, &mut tmp).ok()?;
+            let _ = tmp.flush();
+            let tmp_path = tmp.into_temp_path();
+            tmp_path.keep().ok()?
+        };
         let nested = match (self.open_nested)(&persist) {
             Ok(s) => s,
             Err(e) => {
