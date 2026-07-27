@@ -42,6 +42,9 @@ pub struct RecursiveExtSet {
     pub suffixes: Vec<String>,
     /// When true, any non-empty filename is considered (Python `*`).
     pub match_all: bool,
+    /// When true, first multi-volume split parts match (Python `/split` +
+    /// `FIRST_SPLIT_EXTENSION_REGEX`: `.aa`, `.001`, `.0`, `.1`, … of any width).
+    pub match_split_first: bool,
 }
 
 impl Default for RecursiveExtSet {
@@ -57,6 +60,7 @@ impl Default for RecursiveExtSet {
 pub fn parse_recursive_extensions(spec: &str) -> RecursiveExtSet {
     let mut suffixes = Vec::new();
     let mut match_all = false;
+    let mut match_split_first = false;
     for raw in spec.split(',') {
         let tok = raw.trim();
         if tok.is_empty() {
@@ -72,7 +76,7 @@ pub fn parse_recursive_extensions(spec: &str) -> RecursiveExtSet {
                 suffixes.extend(set_document());
                 suffixes.extend(set_multimedia());
                 suffixes.extend(set_binary());
-                suffixes.extend(set_split());
+                match_split_first = true;
             }
             "/archive" => suffixes.extend(set_archive()),
             "/compressed" => suffixes.extend(set_compressed()),
@@ -80,7 +84,8 @@ pub fn parse_recursive_extensions(spec: &str) -> RecursiveExtSet {
             "/document" => suffixes.extend(set_document()),
             "/multimedia" => suffixes.extend(set_multimedia()),
             "/binary" => suffixes.extend(set_binary()),
-            "/split" => suffixes.extend(set_split()),
+            // Python: ExtensionRule with FIRST_SPLIT_EXTENSION_REGEX (any-width first part).
+            "/split" => match_split_first = true,
             s if s.starts_with('.') => {
                 // `.gz*` → treat as prefix of suffix `.gz`
                 let s = s.trim_end_matches('*');
@@ -99,12 +104,13 @@ pub fn parse_recursive_extensions(spec: &str) -> RecursiveExtSet {
     // de-dup
     suffixes.sort();
     suffixes.dedup();
-    if suffixes.is_empty() && !match_all {
+    if suffixes.is_empty() && !match_all && !match_split_first {
         return RecursiveExtSet::default();
     }
     RecursiveExtSet {
         suffixes,
         match_all,
+        match_split_first,
     }
 }
 
@@ -174,37 +180,18 @@ fn set_binary() -> Vec<String> {
         .map(str::to_string)
         .collect()
 }
-fn set_split() -> Vec<String> {
-    // First-part style suffixes only (Python FIRST_SPLIT_EXTENSION_REGEX + common .001).
-    // Full sibling discovery happens at mount time via check_for_split_file_in.
-    let mut v = vec![
-        ".aa".into(),
-        ".a".into(),
-        ".0".into(),
-        ".1".into(),
-        ".00".into(),
-        ".01".into(),
-        ".000".into(),
-        ".001".into(),
-    ];
-    for i in 0..20 {
-        v.push(format!(".{i:02}"));
-        v.push(format!(".{i:03}"));
-    }
-    v.sort();
-    v.dedup();
-    v
-}
-
-/// If `archive_path` is the first part of a multi-volume set inside `parent`, join parts to a temp path.
+/// If `path_in_parent` is the first part of a multi-volume set inside `parent`, join parts to a temp path.
+///
+/// `path_in_parent` is the path relative to `parent`'s root (not the AutoMount virtual path).
+/// Mirrors Python AutoMountLayer: list the parent folder, `check_for_split_file_in`, open each
+/// part via the parent `MountSource`, concatenate into a seekable temp file for `open_nested`.
 fn try_materialize_split_from_parent(
     parent: &dyn MountSource,
-    archive_path: &str,
+    path_in_parent: &str,
 ) -> Option<PathBuf> {
-    use ratarmount_compress::{
-        check_for_split_file_in, is_first_split_extension,
-    };
-    let path = normpath(archive_path);
+    use ratarmount_compress::{check_for_split_file_in, is_first_split_extension};
+
+    let path = normpath(path_in_parent);
     let name = Path::new(&path)
         .file_name()
         .and_then(|s| s.to_str())?
@@ -214,35 +201,45 @@ fn try_materialize_split_from_parent(
         .and_then(|s| s.to_str())
         .map(|e| format!(".{e}"))
         .unwrap_or_default();
+    // Python: only when FIRST_SPLIT_EXTENSION_REGEX matches the last extension.
     if !is_first_split_extension(&ext) {
         return None;
     }
-    let parent_dir = Path::new(&path)
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .filter(|p| !p.is_empty())
-        .unwrap_or_else(|| "/".into());
+    let parent_dir = match Path::new(&path).parent() {
+        Some(p) => {
+            let s = p.to_string_lossy();
+            if s.is_empty() || s == "." {
+                "/".into()
+            } else {
+                s.into_owned()
+            }
+        }
+        None => "/".into(),
+    };
     let list = parent.list(&parent_dir)?;
     let names: Vec<String> = match list {
         ListResult::Names(n) => n,
         ListResult::Infos(m) => m.into_keys().collect(),
     };
     let set = check_for_split_file_in(&name, &names)?;
+    // Need at least two parts (Python check_for_split_file_in requires len > 1).
+    if set.paths.len() < 2 {
+        return None;
+    }
     // Materialize joined stream by opening each part through the parent mount.
     let mut tmp = NamedTempFile::new().ok()?;
-    for part_name in &set.paths {
-        // set.paths may be relative basenames with extensions only as full paths from check —
-        // we built them from basename; for in-mount use the name component only.
-        let part_base = part_name
+    for part_path in &set.paths {
+        // `check_for_split_file_in` may return basenames or dir-prefixed paths; use the name only.
+        let part_base = part_path
             .file_name()
             .and_then(|s| s.to_str())
-            .unwrap_or(part_name.to_str()?);
+            .unwrap_or(part_path.to_str()?);
         let full = join(&parent_dir, part_base);
         let fi = parent.lookup(&full, 0)?;
         let mut reader = parent.open(&fi, 0).ok()?;
         io::copy(&mut reader, &mut tmp).ok()?;
     }
-    let _ = tmp.flush();
+    tmp.flush().ok()?;
     let keep = tmp.into_temp_path().keep().ok()?;
     Some(keep)
 }
@@ -258,7 +255,16 @@ pub fn is_archive_filename_with(name: &str, set: &RecursiveExtSet) -> bool {
         return !name.is_empty() && name != "." && name != "..";
     }
     let l = name.to_ascii_lowercase();
-    set.suffixes.iter().any(|suf| l.ends_with(suf.as_str()))
+    if set.suffixes.iter().any(|suf| l.ends_with(suf.as_str())) {
+        return true;
+    }
+    // Python `/split` uses FIRST_SPLIT_EXTENSION_REGEX (any-width first part only).
+    if set.match_split_first {
+        if let Some(ext) = Path::new(name).extension().and_then(|s| s.to_str()) {
+            return ratarmount_compress::is_first_split_extension(&format!(".{ext}"));
+        }
+    }
+    false
 }
 
 /// Strip a known archive/compression extension for mount-point display.
@@ -536,17 +542,18 @@ impl AutoMountLayer {
         let fi = parent.lookup(&rest, 0)?;
 
         // Recursive split join (Python AutoMountLayer + check_for_split_file_in).
-        let persist = if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), path)
-        {
-            joined
-        } else {
-            let mut reader = parent.open(&fi, 0).ok()?;
-            let mut tmp = NamedTempFile::new().ok()?;
-            io::copy(&mut reader, &mut tmp).ok()?;
-            let _ = tmp.flush();
-            let tmp_path = tmp.into_temp_path();
-            tmp_path.keep().ok()?
-        };
+        // Use `rest` (path inside parent mount), not the AutoMount virtual path.
+        let persist =
+            if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), &rest) {
+                joined
+            } else {
+                let mut reader = parent.open(&fi, 0).ok()?;
+                let mut tmp = NamedTempFile::new().ok()?;
+                io::copy(&mut reader, &mut tmp).ok()?;
+                tmp.flush().ok()?;
+                let tmp_path = tmp.into_temp_path();
+                tmp_path.keep().ok()?
+            };
         let nested = match (self.open_nested)(&persist) {
             Ok(s) => s,
             Err(e) => {
@@ -901,6 +908,9 @@ fn join(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
+    use std::io::Read;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn strip_ext_names() {
@@ -908,5 +918,208 @@ mod tests {
         assert_eq!(strip_archive_extension("foo.tar.gz"), "foo");
         assert_eq!(strip_archive_extension("archive.tgz"), "archive");
         assert_eq!(strip_archive_extension("plain.txt"), "plain.txt");
+    }
+
+    #[test]
+    fn default_set_includes_split_first_parts() {
+        let set = RecursiveExtSet::default();
+        assert!(set.match_split_first);
+        assert!(is_archive_filename_with("foo.001", &set));
+        assert!(is_archive_filename_with("foo.01", &set));
+        assert!(is_archive_filename_with("foo.1", &set));
+        assert!(is_archive_filename_with("foo.0", &set));
+        assert!(is_archive_filename_with("foo.aa", &set));
+        assert!(is_archive_filename_with("foo.aaa", &set));
+        assert!(is_archive_filename_with("foo.0001", &set));
+        assert!(is_archive_filename_with("archive.tar.001", &set));
+        // Non-first parts must not trigger recursive mount on their own.
+        assert!(!is_archive_filename_with("foo.002", &set));
+        assert!(!is_archive_filename_with("foo.ab", &set));
+        assert!(!is_archive_filename_with("plain.txt", &set));
+        // Regular archives still match.
+        assert!(is_archive_filename_with("foo.tar", &set));
+    }
+
+    #[test]
+    fn parse_split_only_extension_set() {
+        let set = parse_recursive_extensions("/split");
+        assert!(set.match_split_first);
+        assert!(set.suffixes.is_empty());
+        assert!(is_archive_filename_with("vol.001", &set));
+        assert!(!is_archive_filename_with("vol.tar", &set));
+        assert!(!is_archive_filename_with("vol.002", &set));
+    }
+
+    #[test]
+    fn try_materialize_joins_parts_from_folder_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("foo.001"), b"hello ").unwrap();
+        fs::write(dir.path().join("foo.002"), b"world").unwrap();
+        fs::write(dir.path().join("unrelated.txt"), b"x").unwrap();
+
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        let joined = try_materialize_split_from_parent(&folder, "/foo.001").expect("join");
+        let data = fs::read(&joined).unwrap();
+        assert_eq!(data, b"hello world");
+        let _ = fs::remove_file(&joined);
+    }
+
+    #[test]
+    fn try_materialize_decimal_and_alpha_in_subdir() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("parts");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("vol.aa"), b"AA").unwrap();
+        fs::write(sub.join("vol.ab"), b"AB").unwrap();
+        fs::write(sub.join("vol.ac"), b"AC").unwrap();
+
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        let joined = try_materialize_split_from_parent(&folder, "/parts/vol.aa").expect("alpha join");
+        assert_eq!(fs::read(&joined).unwrap(), b"AAABAC");
+        let _ = fs::remove_file(&joined);
+
+        // Non-first part must not join.
+        assert!(try_materialize_split_from_parent(&folder, "/parts/vol.ab").is_none());
+    }
+
+    #[test]
+    fn try_materialize_skips_single_lonely_first_part() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("lonely.001"), b"only").unwrap();
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        assert!(try_materialize_split_from_parent(&folder, "/lonely.001").is_none());
+    }
+
+    /// Minimal empty nested mount used when open_nested is only needed for success.
+    struct EmptyNested;
+    impl MountSource for EmptyNested {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if normpath(path) == "/" {
+                Some(ListResult::Names(vec![]))
+            } else {
+                None
+            }
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if normpath(path) == "/" {
+                Some(create_root_file_info())
+            } else {
+                None
+            }
+        }
+        fn open(
+            &self,
+            _: &FileInfo,
+            _: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "empty nested"))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    #[test]
+    fn automount_layer_joins_split_parts_before_open_nested() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("payload.001"), b"PART1").unwrap();
+        fs::write(dir.path().join("payload.002"), b"PART2").unwrap();
+        fs::write(dir.path().join("payload.003"), b"PART3").unwrap();
+
+        let opened = Arc::new(AtomicUsize::new(0));
+        let joined_ok = Arc::new(std::sync::Mutex::new(false));
+        let opened_c = Arc::clone(&opened);
+        let joined_c = Arc::clone(&joined_ok);
+
+        let open_nested: OpenNestedFn = Arc::new(move |path: &Path| {
+            opened_c.fetch_add(1, Ordering::SeqCst);
+            let data = fs::read(path).map_err(|e| {
+                io::Error::new(e.kind(), format!("read joined {}: {e}", path.display()))
+            })?;
+            if data == b"PART1PART2PART3" {
+                *joined_c.lock().unwrap() = true;
+            }
+            Ok(Arc::new(EmptyNested) as Arc<dyn MountSource>)
+        });
+
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new(root, 1, open_nested);
+
+        // Eager scan should have mounted the first part after joining.
+        assert!(
+            *joined_ok.lock().unwrap(),
+            "open_nested must see concatenated split parts"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 1);
+
+        // Mount point is the first-part path (no strip by default).
+        let fi = layer.lookup("/payload.001", 0).expect("mounted as dir");
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFDIR);
+
+        // Listing root should show payload.001 as a directory (mounted).
+        match layer.list("/").unwrap() {
+            ListResult::Infos(map) => {
+                let mode = map.get("payload.001").expect("name present").mode;
+                assert_eq!(mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFDIR);
+            }
+            ListResult::Names(_) => panic!("expected infos"),
+        }
+    }
+
+    #[test]
+    fn automount_split_with_real_tar_payload() {
+        use ratarmount_core::OpenOptions;
+        use ratarmount_formats_tar::SqliteIndexedTar;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Build a small TAR, then split into two volume files.
+        let content_dir = dir.path().join("content");
+        fs::create_dir(&content_dir).unwrap();
+        fs::write(content_dir.join("hello.txt"), b"hello from split tar\n").unwrap();
+        let tar_path = dir.path().join("archive.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&content_dir)
+            .arg("hello.txt")
+            .status()
+            .expect("tar available");
+        assert!(status.success());
+        let tar_bytes = fs::read(&tar_path).unwrap();
+        let mid = tar_bytes.len() / 2;
+        assert!(mid > 0 && mid < tar_bytes.len());
+        fs::write(dir.path().join("archive.tar.001"), &tar_bytes[..mid]).unwrap();
+        fs::write(dir.path().join("archive.tar.002"), &tar_bytes[mid..]).unwrap();
+        let _ = fs::remove_file(&tar_path);
+
+        let open_nested: OpenNestedFn = Arc::new(|path: &Path| {
+            let opts = OpenOptions::default();
+            let ms = SqliteIndexedTar::create_index(
+                path,
+                path,
+                None,
+                &opts,
+                "test",
+                &mut None,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        });
+
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new(root, 1, open_nested);
+
+        let fi = layer
+            .lookup("/archive.tar.001/hello.txt", 0)
+            .expect("file inside joined tar");
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+        let mut reader = layer.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        reader.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello from split tar\n");
     }
 }

@@ -1350,6 +1350,7 @@ version = "0.1.2"
 dependencies = [
  "libc",
  "log",
+ "ratarmount-compress",
  "ratarmount-core",
  "ratarmount-formats-tar",
  "regex",
