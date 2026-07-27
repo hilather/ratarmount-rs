@@ -62,7 +62,7 @@ impl MountSource for PrefixMountSource {
                 FileInfo {
                     size: 0,
                     mtime: 0.0,
-                    mode: libc::S_IFDIR | 0o755,
+                    mode: ratarmount_core::S_IFDIR | 0o755,
                     linkname: String::new(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },
@@ -96,7 +96,7 @@ impl MountSource for PrefixMountSource {
             return Some(FileInfo {
                 size: 0,
                 mtime: 0.0,
-                mode: libc::S_IFDIR | 0o755,
+                mode: ratarmount_core::S_IFDIR | 0o755,
                 linkname: String::new(),
                 uid: unsafe { libc::geteuid() },
                 gid: unsafe { libc::getegid() },

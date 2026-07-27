@@ -169,7 +169,7 @@ impl MountSource for CpioMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
@@ -437,8 +437,8 @@ fn insert_entry(
     file: &mut File,
     data_align: u64,
 ) -> Result<()> {
-    let is_dir = mode & libc::S_IFMT == libc::S_IFDIR;
-    let is_lnk = mode & libc::S_IFMT == libc::S_IFLNK;
+    let is_dir = mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR;
+    let is_lnk = mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK;
     let mut linkname = String::new();
     let mut size = filesize;
 
@@ -480,11 +480,11 @@ fn insert_entry(
     ensure_parents(index, &path, generated, mtime)?;
 
     let ifmt = if is_dir {
-        libc::S_IFDIR
+        ratarmount_core::S_IFDIR
     } else if is_lnk {
-        libc::S_IFLNK
+        ratarmount_core::S_IFLNK
     } else {
-        libc::S_IFREG
+        ratarmount_core::S_IFREG
     };
     let fmode = (mode & 0o7777) | ifmt;
 
@@ -583,7 +583,7 @@ fn ensure_parents(
             continue;
         }
         generated.insert(cur.clone());
-        let mode = (libc::S_IFDIR | 0o755) as i64;
+        let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
         index.insert_file(
             &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
         )?;

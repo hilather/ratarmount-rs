@@ -88,9 +88,9 @@ fn dos_datetime_to_unix(dt: fatfs::DateTime) -> f64 {
 
 fn entry_to_file_info(name_path: &str, is_dir: bool, size: u64, mtime: f64) -> FileInfo {
     let mode = if is_dir {
-        libc::S_IFDIR | 0o777
+        ratarmount_core::S_IFDIR | 0o777
     } else {
-        libc::S_IFREG | 0o777
+        ratarmount_core::S_IFREG | 0o777
     };
     FileInfo {
         size: if is_dir { 0 } else { size },
@@ -254,7 +254,7 @@ impl MountSource for FatMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",

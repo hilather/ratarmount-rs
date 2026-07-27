@@ -312,7 +312,7 @@ fn parse_toc_xml(toc_xml: &[u8], heap_offset: u64) -> Result<Vec<XarRow>> {
                                 data_offset: 0,
                                 size: 0,
                                 mtime: 0.0,
-                                mode: (libc::S_IFDIR | 0o755) as i64,
+                                mode: (ratarmount_core::S_IFDIR | 0o755) as i64,
                                 linkname: String::new(),
                             });
                             if st.pushed_dir {
@@ -331,7 +331,7 @@ fn parse_toc_xml(toc_xml: &[u8], heap_offset: u64) -> Result<Vec<XarRow>> {
                                 data_offset: data_offset as i64,
                                 size: size as i64,
                                 mtime: 0.0,
-                                mode: (libc::S_IFREG | 0o644) as i64,
+                                mode: (ratarmount_core::S_IFREG | 0o644) as i64,
                                 linkname,
                             });
                         }
@@ -386,7 +386,7 @@ fn ensure_parents(
             continue;
         }
         generated.insert(cur.clone());
-        let mode = (libc::S_IFDIR | 0o755) as i64;
+        let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
         index.insert_file(
             &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
         )?;
@@ -416,7 +416,7 @@ impl MountSource for XarMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",

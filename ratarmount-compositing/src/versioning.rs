@@ -84,7 +84,7 @@ impl FileVersionLayer {
         FileInfo {
             size: 0,
             mtime: parent.mtime,
-            mode: libc::S_IFDIR | 0o755,
+            mode: ratarmount_core::S_IFDIR | 0o755,
             linkname: String::new(),
             uid: parent.uid,
             gid: parent.gid,

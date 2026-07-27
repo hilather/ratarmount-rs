@@ -4,6 +4,37 @@ use std::collections::BTreeMap;
 use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 
+/// Portable `S_IF*` bits for [`FileInfo::mode`] (`u32`).
+///
+/// libc `mode_t` is `u32` on Linux but `u16` on macOS; mixing raw `libc::S_IFMT`
+/// with `u32` modes fails to compile on Darwin (`u32 & u16`). Always use these.
+#[allow(clippy::unnecessary_cast)] // mode_t width differs by OS
+pub const S_IFMT: u32 = libc::S_IFMT as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFREG: u32 = libc::S_IFREG as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFIFO: u32 = libc::S_IFIFO as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFCHR: u32 = libc::S_IFCHR as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFBLK: u32 = libc::S_IFBLK as u32;
+#[allow(clippy::unnecessary_cast)]
+pub const S_IFSOCK: u32 = libc::S_IFSOCK as u32;
+
+#[inline]
+pub fn is_dir_mode(mode: u32) -> bool {
+    mode & S_IFMT == S_IFDIR
+}
+
+#[inline]
+pub fn is_lnk_mode(mode: u32) -> bool {
+    mode & S_IFMT == S_IFLNK
+}
+
 /// Mirrors `MountSource.py::FileInfo`.
 #[derive(Clone, Debug)]
 pub struct FileInfo {
@@ -175,7 +206,7 @@ pub trait MountSource: Send + Sync {
 
     fn is_dir(&self, path: &str) -> bool {
         self.lookup(path, 0)
-            .map(|fi| fi.mode & libc::S_IFMT == libc::S_IFDIR)
+            .map(|fi| fi.mode & S_IFMT == S_IFDIR)
             .unwrap_or(false)
     }
 
@@ -201,7 +232,7 @@ pub fn create_root_file_info() -> FileInfo {
     FileInfo {
         size: 0,
         mtime: 0.0,
-        mode: libc::S_IFDIR | 0o777,
+        mode: S_IFDIR | 0o777,
         linkname: String::new(),
         uid: unsafe { libc::geteuid() },
         gid: unsafe { libc::getegid() },

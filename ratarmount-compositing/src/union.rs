@@ -138,7 +138,7 @@ impl UnionMountSource {
                         let Some(fi) = self.sources[si].lookup(&full, 0) else {
                             continue;
                         };
-                        if fi.mode & libc::S_IFMT != libc::S_IFDIR {
+                        if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFDIR {
                             continue;
                         }
                         entries_left = entries_left.saturating_sub(1);

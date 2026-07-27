@@ -144,7 +144,10 @@ impl RatarmountFs {
         let listing = self.source.list_mode(path)?;
         let entries: Vec<(String, u32)> = match listing {
             ListModeResult::Modes(m) => m.into_iter().collect(),
-            ListModeResult::Names(names) => names.into_iter().map(|n| (n, libc::S_IFREG)).collect(),
+            ListModeResult::Names(names) => names
+                .into_iter()
+                .map(|n| (n, ratarmount_core::S_IFREG))
+                .collect(),
         };
         self.dir_cache.lock().unwrap().insert(
             path.to_string(),
@@ -185,13 +188,13 @@ impl RatarmountFs {
 }
 
 fn mode_to_kind(mode: u32) -> FileType {
-    match mode & libc::S_IFMT {
-        x if x == libc::S_IFDIR => FileType::Directory,
-        x if x == libc::S_IFLNK => FileType::Symlink,
-        x if x == libc::S_IFIFO => FileType::NamedPipe,
-        x if x == libc::S_IFCHR => FileType::CharDevice,
-        x if x == libc::S_IFBLK => FileType::BlockDevice,
-        x if x == libc::S_IFSOCK => FileType::Socket,
+    match mode & ratarmount_core::S_IFMT {
+        x if x == ratarmount_core::S_IFDIR => FileType::Directory,
+        x if x == ratarmount_core::S_IFLNK => FileType::Symlink,
+        x if x == ratarmount_core::S_IFIFO => FileType::NamedPipe,
+        x if x == ratarmount_core::S_IFCHR => FileType::CharDevice,
+        x if x == ratarmount_core::S_IFBLK => FileType::BlockDevice,
+        x if x == ratarmount_core::S_IFSOCK => FileType::Socket,
         _ => FileType::RegularFile,
     }
 }
@@ -565,7 +568,7 @@ impl Filesystem for RatarmountFs {
                 let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
                     size: 0,
                     mtime: 0.0,
-                    mode: mode | libc::S_IFREG,
+                    mode: mode | ratarmount_core::S_IFREG,
                     linkname: String::new(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },
@@ -610,7 +613,7 @@ impl Filesystem for RatarmountFs {
                 let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
                     size: 0,
                     mtime: 0.0,
-                    mode: mode | libc::S_IFDIR,
+                    mode: mode | ratarmount_core::S_IFDIR,
                     linkname: String::new(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },

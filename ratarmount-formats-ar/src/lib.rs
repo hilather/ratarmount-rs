@@ -145,7 +145,7 @@ impl ArMountSource {
             if !is_special && !name.is_empty() {
                 let full = normpath(&name);
                 let (path, base) = split_name(&full);
-                let mode = (mode_bits & 0o7777) | libc::S_IFREG;
+                let mode = (mode_bits & 0o7777) | ratarmount_core::S_IFREG;
                 index.insert_file(
                     &path,
                     &base,

@@ -183,7 +183,7 @@ impl WriteOverlay {
             // New file: just ensure parent
             return Ok(());
         };
-        if fi.mode & libc::S_IFMT == libc::S_IFDIR {
+        if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             fs::create_dir_all(&real)?;
             return Ok(());
         }
@@ -210,7 +210,7 @@ impl WriteOverlay {
             use std::os::unix::io::IntoRawFd;
             f.into_raw_fd()
         };
-        self.mark_present(path, mode | libc::S_IFREG)?;
+        self.mark_present(path, mode | ratarmount_core::S_IFREG)?;
         Ok(fd)
     }
 
@@ -239,7 +239,7 @@ impl WriteOverlay {
         let real = self.realpath(path);
         fs::create_dir_all(&real)?;
         let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
-        self.mark_present(path, mode | libc::S_IFDIR)?;
+        self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
         Ok(())
     }
 

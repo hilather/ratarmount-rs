@@ -64,7 +64,7 @@ impl TransformMountSource {
                 let external = self.transform_path(&internal);
                 map.insert(external.clone(), internal.clone());
                 if let Some(fi) = self.inner.lookup(&internal, 0) {
-                    if fi.mode & libc::S_IFMT == libc::S_IFDIR {
+                    if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
                         stack.push(internal);
                     }
                 }
@@ -136,7 +136,7 @@ impl MountSource for TransformMountSource {
                     FileInfo {
                         size: 0,
                         mtime: 0.0,
-                        mode: libc::S_IFDIR | 0o755,
+                        mode: ratarmount_core::S_IFDIR | 0o755,
                         linkname: String::new(),
                         uid: unsafe { libc::geteuid() },
                         gid: unsafe { libc::getegid() },
@@ -186,7 +186,7 @@ impl MountSource for TransformMountSource {
                 Some(FileInfo {
                     size: 0,
                     mtime: 0.0,
-                    mode: libc::S_IFDIR | 0o755,
+                    mode: ratarmount_core::S_IFDIR | 0o755,
                     linkname: String::new(),
                     uid: unsafe { libc::geteuid() },
                     gid: unsafe { libc::getegid() },

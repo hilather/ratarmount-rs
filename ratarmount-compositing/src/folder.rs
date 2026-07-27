@@ -88,7 +88,7 @@ impl MountSource for FolderMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",

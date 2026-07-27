@@ -352,7 +352,7 @@ impl AutoMountLayer {
             }
         }
         self.lookup_raw(path)
-            .map(|fi| fi.mode & libc::S_IFMT == libc::S_IFDIR)
+            .map(|fi| fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR)
             .unwrap_or(false)
     }
 
@@ -452,7 +452,7 @@ impl AutoMountLayer {
         }
 
         let fi = self.lookup_raw(path)?;
-        if fi.mode & libc::S_IFMT == libc::S_IFDIR {
+        if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return None;
         }
 
@@ -642,14 +642,14 @@ impl MountSource for AutoMountLayer {
                     let full = join(&path, &name);
                     let mut key = name;
                     if mounted.contains_key(&full) {
-                        fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+                        fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
                         fi.size = 0;
                     } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
                         let stripped = strip_archive_extension(&key);
                         let alt = join(&path, &stripped);
                         if mounted.contains_key(&alt) {
                             key = stripped;
-                            fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+                            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
                             fi.size = 0;
                         }
                     }
@@ -665,14 +665,14 @@ impl MountSource for AutoMountLayer {
                     if let Some(mut fi) = src.lookup(&child_rest, 0) {
                         let mut key = name;
                         if mounted.contains_key(&full) {
-                            fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+                            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
                             fi.size = 0;
                         } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
                             let stripped = strip_archive_extension(&key);
                             let alt = join(&path, &stripped);
                             if mounted.contains_key(&alt) {
                                 key = stripped;
-                                fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+                                fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
                                 fi.size = 0;
                             }
                         }
@@ -705,13 +705,13 @@ impl MountSource for AutoMountLayer {
                     let full = join(&path, &name);
                     let mut key = name;
                     if mounted.contains_key(&full) {
-                        mode = (mode & 0o7777) | libc::S_IFDIR;
+                        mode = (mode & 0o7777) | ratarmount_core::S_IFDIR;
                     } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
                         let stripped = strip_archive_extension(&key);
                         let alt = join(&path, &stripped);
                         if mounted.contains_key(&alt) {
                             key = stripped;
-                            mode = (mode & 0o7777) | libc::S_IFDIR;
+                            mode = (mode & 0o7777) | ratarmount_core::S_IFDIR;
                         }
                     }
                     remapped.insert(key, mode);
@@ -725,22 +725,22 @@ impl MountSource for AutoMountLayer {
                     let child_rest = join(&rest, &name);
                     let mut key = name.clone();
                     let mode = if mounted.contains_key(&full) {
-                        libc::S_IFDIR | 0o755
+                        ratarmount_core::S_IFDIR | 0o755
                     } else if self.strip_ext && is_archive_filename_with(&name, &self.ext_set) {
                         let stripped = strip_archive_extension(&name);
                         let alt = join(&path, &stripped);
                         if mounted.contains_key(&alt) {
                             key = stripped;
-                            libc::S_IFDIR | 0o755
+                            ratarmount_core::S_IFDIR | 0o755
                         } else if let Some(fi) = src.lookup(&child_rest, 0) {
                             fi.mode
                         } else {
-                            libc::S_IFREG
+                            ratarmount_core::S_IFREG
                         }
                     } else if let Some(fi) = src.lookup(&child_rest, 0) {
                         fi.mode
                     } else {
-                        libc::S_IFREG
+                        ratarmount_core::S_IFREG
                     };
                     modes.insert(key, mode);
                 }
@@ -771,7 +771,7 @@ impl MountSource for AutoMountLayer {
                 .source
                 .lookup("/", 0)
                 .unwrap_or_else(create_root_file_info);
-            fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
             fi.size = 0;
             return Some(Self::tag(fi, &path));
         }
@@ -783,7 +783,7 @@ impl MountSource for AutoMountLayer {
         }
         let mut fi = self.root.lookup(&path, file_version)?;
         if mounted.contains_key(&path) {
-            fi.mode = (fi.mode & 0o7777) | libc::S_IFDIR;
+            fi.mode = (fi.mode & 0o7777) | ratarmount_core::S_IFDIR;
             fi.size = 0;
         }
         Some(Self::tag(fi, "/"))

@@ -305,7 +305,7 @@ impl OggMountSource {
             let ranges =
                 serde_json::to_string(&stencils).map_err(|e| OggError::Msg(e.to_string()))?;
             let page0 = &stream.pages[0];
-            let mode = (libc::S_IFREG | 0o644) as i64;
+            let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
             index.insert_file(
                 &path,
                 &base,
@@ -367,7 +367,7 @@ impl MountSource for OggMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",

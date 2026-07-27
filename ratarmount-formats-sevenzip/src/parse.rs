@@ -767,18 +767,22 @@ fn attributes_to_mode(attributes: Option<u32>, is_dir: bool) -> u32 {
             let unix_full = (attrs >> 16) & 0o7777;
             let file_type = (attrs >> 16) & 0o170000;
             if file_type == 0o120000 {
-                return ((attrs >> 16) & 0o777) | libc::S_IFLNK;
+                return ((attrs >> 16) & 0o777) | ratarmount_core::S_IFLNK;
             }
             if unix_full != 0 {
-                let ft = if is_dir { libc::S_IFDIR } else { libc::S_IFREG };
+                let ft = if is_dir {
+                    ratarmount_core::S_IFDIR
+                } else {
+                    ratarmount_core::S_IFREG
+                };
                 return (unix_full & 0o7777) | ft;
             }
         }
     }
     if is_dir {
-        libc::S_IFDIR | 0o755
+        ratarmount_core::S_IFDIR | 0o755
     } else {
-        libc::S_IFREG | 0o644
+        ratarmount_core::S_IFREG | 0o644
     }
 }
 

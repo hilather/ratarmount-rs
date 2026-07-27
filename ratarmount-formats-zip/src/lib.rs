@@ -179,7 +179,7 @@ impl ZipMountSource {
                 .unwrap_or(0.0);
 
             let unix_mode = zf.unix_mode().unwrap_or(if is_dir { 0o755 } else { 0o644 });
-            let is_symlink = (unix_mode & libc::S_IFMT) == libc::S_IFLNK;
+            let is_symlink = (unix_mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
             drop(zf);
 
             let mut linkname = String::new();
@@ -193,11 +193,11 @@ impl ZipMountSource {
             }
 
             let mode = if is_dir {
-                (unix_mode & 0o7777) | libc::S_IFDIR
+                (unix_mode & 0o7777) | ratarmount_core::S_IFDIR
             } else if is_symlink {
-                (unix_mode & 0o7777) | libc::S_IFLNK
+                (unix_mode & 0o7777) | ratarmount_core::S_IFLNK
             } else {
-                (unix_mode & 0o7777) | libc::S_IFREG
+                (unix_mode & 0o7777) | ratarmount_core::S_IFREG
             };
 
             let full = name.trim_end_matches('/');
@@ -290,7 +290,7 @@ impl MountSource for ZipMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
@@ -502,7 +502,7 @@ fn ensure_parent_dirs(
             continue;
         }
         generated.insert(cur.clone());
-        let mode = (libc::S_IFDIR | 0o755) as i64;
+        let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
         index.insert_file(
             &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
         )?;

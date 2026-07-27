@@ -190,7 +190,7 @@ impl WarcMountSource {
             let nfull = normpath(&display);
             let (path, base) = split_name(&nfull);
             ensure_parents(&index, &path, &mut generated, 0.0)?;
-            let mode = (libc::S_IFREG | 0o644) as i64;
+            let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
             index.insert_file(
                 &path,
                 &base,
@@ -259,7 +259,7 @@ impl MountSource for WarcMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
@@ -392,7 +392,7 @@ fn ensure_parents(
             continue;
         }
         generated.insert(cur.clone());
-        let mode = (libc::S_IFDIR | 0o755) as i64;
+        let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
         index.insert_file(
             &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
         )?;

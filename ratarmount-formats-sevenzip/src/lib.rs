@@ -232,16 +232,18 @@ impl SevenZipMountSource {
             ensure_parent_dirs(&mut batch, &path, &mut generated, entry.mtime);
 
             let mut mode = entry.mode;
-            let ifmt = mode & libc::S_IFMT;
-            if entry.is_dir && ifmt != libc::S_IFDIR {
-                mode = (mode & 0o777) | libc::S_IFDIR;
+            let ifmt = mode & ratarmount_core::S_IFMT;
+            if entry.is_dir && ifmt != ratarmount_core::S_IFDIR {
+                mode = (mode & 0o777) | ratarmount_core::S_IFDIR;
             } else if !entry.is_dir && ifmt == 0 {
-                mode = (mode & 0o777) | libc::S_IFREG;
+                mode = (mode & 0o777) | ratarmount_core::S_IFREG;
             }
 
             let mut linkname = String::new();
             let mut size = entry.size as i64;
-            if ifmt == libc::S_IFLNK || (mode & libc::S_IFMT) == libc::S_IFLNK {
+            if ifmt == ratarmount_core::S_IFLNK
+                || (mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK
+            {
                 // Read symlink target at index time (skip when content-locked).
                 if !content_locked {
                     if let Some(fi) = entry.folder_index {
@@ -358,7 +360,8 @@ impl SevenZipMountSource {
 
         if let Some(&idx) = self.entry_by_offsets.get(&(pack_offset, unpack_offset)) {
             if let Some(entry) = self.archive.files.get(idx) {
-                let is_link = (file_info.mode & libc::S_IFMT) == libc::S_IFLNK;
+                let is_link =
+                    (file_info.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
                     return Ok(entry);
                 }
@@ -370,7 +373,8 @@ impl SevenZipMountSource {
                 continue;
             }
             if entry.pack_offset == pack_offset && entry.unpack_offset == unpack_offset {
-                let is_link = (file_info.mode & libc::S_IFMT) == libc::S_IFLNK;
+                let is_link =
+                    (file_info.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
                     return Ok(entry);
                 }
@@ -563,7 +567,7 @@ fn ensure_parent_dirs(
             0,
             0,
             mtime,
-            (libc::S_IFDIR | 0o755) as i64,
+            (ratarmount_core::S_IFDIR | 0o755) as i64,
             0,
             "",
             0,
@@ -610,13 +614,13 @@ impl MountSource for SevenZipMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
             ));
         }
-        if file_info.mode & libc::S_IFMT == libc::S_IFLNK {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "cannot read symlink contents",

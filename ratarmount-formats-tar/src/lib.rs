@@ -321,7 +321,7 @@ impl MountSource for SqliteIndexedTar {
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         let ud = tar_userdata(file_info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing TAR userdata"))?;
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
@@ -774,11 +774,11 @@ fn push_entry(
     ensure_parent_dirs(batch, &path, generated_dirs, mtime, uid, gid);
 
     let ifmt = if is_dir {
-        libc::S_IFDIR
+        ratarmount_core::S_IFDIR
     } else if typeflag == b'2' {
-        libc::S_IFLNK
+        ratarmount_core::S_IFLNK
     } else {
-        libc::S_IFREG
+        ratarmount_core::S_IFREG
     };
     let mode = (mode_bits & 0o7777) | ifmt;
 
@@ -838,7 +838,7 @@ fn ensure_parent_dirs(
             continue;
         }
         generated.insert(cur.clone());
-        let mode = (libc::S_IFDIR | 0o755) as i64;
+        let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
         batch.push(FileRow::new(
             parent,
             (*part).to_string(),
@@ -1093,7 +1093,7 @@ impl SingleFileMountSource {
             data_path,
             _materialised: materialised,
             mtime: meta.mtime() as f64,
-            mode: libc::S_IFREG | 0o644,
+            mode: ratarmount_core::S_IFREG | 0o644,
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
         })
@@ -1146,7 +1146,7 @@ impl MountSource for SingleFileMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        if file_info.mode & libc::S_IFMT == libc::S_IFDIR {
+        if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
                 "is a directory",
