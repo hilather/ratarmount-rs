@@ -1,12 +1,16 @@
 //! CPIO archive support: newc/crc (070701/070702), portable ASCII odc (070707),
 //! and old binary (0x71c7 LE/BE). Random access via [`StenciledFile`].
+//!
+//! Nested archives can open from any seekable stream via
+//! [`CpioMountSource::open_from_reader`] (no temp spool).
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -40,8 +44,117 @@ enum CpioKind {
     BinBe,
 }
 
+/// Mutex-backed `Read + Seek` for concurrent stencil opens (Cursor / nested stream).
+struct SharedSeekReader {
+    inner: Mutex<Box<dyn SeekRead>>,
+}
+
+impl SharedSeekReader {
+    fn new<R: SeekRead + 'static>(reader: R) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Box::new(reader)),
+        })
+    }
+
+    fn open_reader(self: &Arc<Self>) -> PositionedSeekReader {
+        PositionedSeekReader {
+            shared: Arc::clone(self),
+            pos: 0,
+        }
+    }
+}
+
+/// Independent logical cursor over a [`SharedSeekReader`].
+struct PositionedSeekReader {
+    shared: Arc<SharedSeekReader>,
+    pos: u64,
+}
+
+impl Read for PositionedSeekReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared cpio reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionedSeekReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .inner
+                    .lock()
+                    .map_err(|_| io::Error::other("shared cpio reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Where CPIO archive bytes live for open/read.
+enum ContentBackend {
+    /// On-disk path: `File::open` per member open (current path-based behavior).
+    Path(PathBuf),
+    /// Any `Read + Seek` shared under a mutex (nested / in-memory / remote).
+    Shared(Arc<SharedSeekReader>),
+}
+
+impl ContentBackend {
+    fn open_reader(&self) -> io::Result<ContentReader> {
+        match self {
+            Self::Path(p) => Ok(ContentReader::File(File::open(p)?)),
+            Self::Shared(s) => Ok(ContentReader::Shared(s.open_reader())),
+        }
+    }
+}
+
+enum ContentReader {
+    File(File),
+    Shared(PositionedSeekReader),
+}
+
+impl Read for ContentReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            Self::File(f) => f.read(buf),
+            Self::Shared(r) => r.read(buf),
+        }
+    }
+}
+
+impl Seek for ContentReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            Self::File(f) => f.seek(pos),
+            Self::Shared(r) => r.seek(pos),
+        }
+    }
+}
+
 pub struct CpioMountSource {
+    /// User-facing path or virtual label (logs / tarstats).
+    #[allow(dead_code)]
     archive_path: PathBuf,
+    backend: ContentBackend,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -85,6 +198,75 @@ impl CpioMountSource {
         )
     }
 
+    /// Index and open a CPIO archive from any `Read + Seek` source.
+    ///
+    /// Intended for nested AutoMount / in-memory archives: no on-disk archive path is
+    /// required. `archive_label` is used for logs and index metadata (may be a virtual
+    /// name). The reader is retained under a mutex for concurrent stencil opens.
+    ///
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
+    /// `options.index_in_memory` is set).
+    pub fn open_from_reader<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            index_path.map(|p| p.to_path_buf())
+        };
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+
+        let kind = detect_kind(&mut reader)?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        index.begin_write()?;
+        let mut generated = std::collections::BTreeSet::new();
+
+        match kind {
+            CpioKind::Newc => parse_newc(&mut reader, &index, &mut generated)?,
+            CpioKind::Odc => parse_odc(&mut reader, &index, &mut generated)?,
+            CpioKind::BinLe => parse_bin(&mut reader, &index, &mut generated, true)?,
+            CpioKind::BinBe => parse_bin(&mut reader, &index, &mut generated, false)?,
+        }
+
+        index.store_versions(product_version)?;
+        index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        store_stats_for_label(&index, &archive_path, size)?;
+        index.commit_write()?;
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        reader.seek(SeekFrom::Start(0))?;
+        let index = index.into_read_only()?;
+        Ok(Self {
+            archive_path,
+            backend: ContentBackend::Shared(SharedSeekReader::new(reader)),
+            index,
+            options: options.clone(),
+        })
+    }
+
     fn open_existing(
         archive_path: &Path,
         index_path: &Path,
@@ -94,6 +276,7 @@ impl CpioMountSource {
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: ContentBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
@@ -141,6 +324,7 @@ impl CpioMountSource {
         let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: ContentBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
@@ -177,9 +361,9 @@ impl MountSource for CpioMountSource {
         }
         let ud = userdata(file_info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing cpio userdata"))?;
-        let file = File::open(&self.archive_path)?;
+        let reader = self.backend.open_reader()?;
         Ok(Box::new(StenciledFile::new(
-            file,
+            reader,
             vec![(ud.offset, file_info.size)],
         )))
     }
@@ -189,7 +373,7 @@ impl MountSource for CpioMountSource {
     }
 }
 
-fn detect_kind(file: &mut File) -> Result<CpioKind> {
+fn detect_kind<R: Read + Seek>(file: &mut R) -> Result<CpioKind> {
     let mut magic = [0u8; 6];
     let n = file.read(&mut magic)?;
     if n >= 6 {
@@ -211,8 +395,8 @@ fn detect_kind(file: &mut File) -> Result<CpioKind> {
     Err(CpioError::Msg(format!("unrecognized cpio magic {magic:?}")))
 }
 
-fn parse_newc(
-    file: &mut File,
+fn parse_newc<R: Read + Seek>(
+    file: &mut R,
     index: &SqliteIndex,
     generated: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
@@ -276,8 +460,8 @@ fn parse_newc(
     Ok(())
 }
 
-fn parse_odc(
-    file: &mut File,
+fn parse_odc<R: Read + Seek>(
+    file: &mut R,
     index: &SqliteIndex,
     generated: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
@@ -338,8 +522,8 @@ fn parse_odc(
     Ok(())
 }
 
-fn parse_bin(
-    file: &mut File,
+fn parse_bin<R: Read + Seek>(
+    file: &mut R,
     index: &SqliteIndex,
     generated: &mut std::collections::BTreeSet<String>,
     little_endian: bool,
@@ -423,7 +607,7 @@ fn parse_bin(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn insert_entry(
+fn insert_entry<R: Read + Seek>(
     index: &SqliteIndex,
     generated: &mut std::collections::BTreeSet<String>,
     name: &str,
@@ -434,7 +618,7 @@ fn insert_entry(
     data_offset: u64,
     uid: u32,
     gid: u32,
-    file: &mut File,
+    file: &mut R,
     data_align: u64,
 ) -> Result<()> {
     let is_dir = mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR;
@@ -604,9 +788,20 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Store tarstats for a path label; if not a real file, use synthetic stats from `size`.
+fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
+    if path.exists() && store_stats(index, path).is_ok() {
+        return Ok(());
+    }
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn py_root() -> PathBuf {
         PathBuf::from(
@@ -628,6 +823,45 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"foo\n");
+    }
+
+    /// Build a minimal newc CPIO with one regular file and TRAILER.
+    fn build_newc_cpio(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+        fn push_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
+            let namesize = name.len() + 1;
+            let filesize = data.len() as u32;
+            out.extend_from_slice(b"070701");
+            for val in [
+                1u32, // ino
+                mode,
+                0, // uid
+                0, // gid
+                1, // nlink
+                0, // mtime
+                filesize,
+                0, // devmajor
+                0, // devminor
+                0, // rdevmajor
+                0, // rdevminor
+                namesize as u32,
+                0, // check
+            ] {
+                out.extend_from_slice(format!("{val:08X}").as_bytes());
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            let header_and_name = 110 + namesize;
+            let name_pad = (4 - (header_and_name % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, name_pad));
+            out.extend_from_slice(data);
+            let data_pad = (4 - (data.len() % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, data_pad));
+        }
+
+        let mut out = Vec::new();
+        push_entry(&mut out, name, data, mode);
+        push_entry(&mut out, "TRAILER!!!", &[], 0);
+        out
     }
 
     #[test]
@@ -659,5 +893,65 @@ mod tests {
                 assert!(looks_like_cpio(&p), "{name}");
             }
         }
+    }
+
+    #[test]
+    fn open_from_reader_newc_list_lookup_seek() {
+        // S_IFREG | 0644
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let payload = b"hello-cpio-world";
+        let bytes = build_newc_cpio("nested/hello.txt", payload, mode);
+        let size = bytes.len() as u64;
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = CpioMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "virtual://nested.cpio",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        // list root / nested
+        let root = src.list("/").expect("list /");
+        match root {
+            ListResult::Infos(infos) => {
+                assert!(
+                    infos.contains_key("nested"),
+                    "root should contain nested dir: {:?}",
+                    infos.keys().collect::<Vec<_>>()
+                );
+            }
+            other => panic!("unexpected list result: {other:?}"),
+        }
+
+        let fi = src.lookup("/nested/hello.txt", 0).expect("lookup hello");
+        assert_eq!(fi.size, payload.len() as u64);
+
+        // full read
+        let mut r = src.open(&fi, 0).expect("open member");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+
+        // mid-seek read (no temp files — pure Cursor backend)
+        let mut r2 = src.open(&fi, 0).expect("reopen");
+        r2.seek(SeekFrom::Start(6)).unwrap();
+        let mut mid = [0u8; 4];
+        r2.read_exact(&mut mid).unwrap();
+        assert_eq!(&mid, b"cpio");
+
+        // seek to end then back
+        r2.seek(SeekFrom::End(-5)).unwrap();
+        let mut tail = [0u8; 5];
+        r2.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"world");
+
+        // synthetic label is not a real path; size was recorded for indexing
+        let _ = size;
     }
 }
