@@ -40,11 +40,395 @@ use ratarmount_index::{resolve_index_location, IndexLocation};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Archive format backends probed for uncompressed inputs.
+///
+/// Order of [`DEFAULT_FORMAT_PROBE_ORDER`] matches the historical fixed chain
+/// (7z → zip → … → tar). [`ordered_format_backends`] prepends names from
+/// [`OpenOptions::use_backends`] (Python `prioritizedBackends`: last flag wins).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum FormatBackend {
+    SevenZip,
+    Zip,
+    Asar,
+    Ar,
+    Cpio,
+    Iso,
+    Warc,
+    Xar,
+    Cab,
+    Sqlar,
+    SquashFs,
+    Ext4,
+    Fat,
+    Ogg,
+    Pdf,
+    Html,
+    Libarchive,
+    Tar,
+}
+
+/// Default probe order when `--use-backend` is empty (historical fixed chain).
+const DEFAULT_FORMAT_PROBE_ORDER: &[FormatBackend] = &[
+    FormatBackend::SevenZip,
+    FormatBackend::Zip,
+    FormatBackend::Asar,
+    FormatBackend::Ar,
+    FormatBackend::Cpio,
+    FormatBackend::Iso,
+    FormatBackend::Warc,
+    FormatBackend::Xar,
+    FormatBackend::Cab,
+    FormatBackend::Sqlar,
+    FormatBackend::SquashFs,
+    FormatBackend::Ext4,
+    FormatBackend::Fat,
+    FormatBackend::Ogg,
+    FormatBackend::Pdf,
+    FormatBackend::Html,
+    FormatBackend::Libarchive,
+    FormatBackend::Tar,
+];
+
+/// Map a user/Python backend name to a format backend.
+///
+/// Unknown names return `None` (skipped with no error, like Python's warning path).
+/// Compression-only names (`rapidgzip`, `indexed_bzip2`, …) map to `Tar`, matching
+/// Python `mapToArchiveBackend` → `tarfile`.
+fn parse_format_backend(name: &str) -> Option<FormatBackend> {
+    let n = name.trim().to_ascii_lowercase();
+    if n.is_empty() {
+        return None;
+    }
+    Some(match n.as_str() {
+        "tar" | "tarfile" | "sqliteindexedtar" => FormatBackend::Tar,
+        // Compression backends that Python delegates to tarfile.
+        "rapidgzip"
+        | "indexed_gzip"
+        | "indexed_bzip2"
+        | "xz"
+        | "lzma"
+        | "zstd"
+        | "lz4"
+        | "lzip"
+        | "lzo"
+        | "lzop"
+        | "zlib"
+        | "deflate"
+        | "compress"
+        | "compress-z"
+        | "gzip"
+        | "bzip2" => FormatBackend::Tar,
+        "zip" | "zipfile" => FormatBackend::Zip,
+        "7z" | "sevenzip" | "py7zr" => FormatBackend::SevenZip,
+        "libarchive" => FormatBackend::Libarchive,
+        "squashfs" | "pysquashfsimage" => FormatBackend::SquashFs,
+        "ext4" | "ext" => FormatBackend::Ext4,
+        "fat" | "fatfs" | "vfat" => FormatBackend::Fat,
+        "ar" => FormatBackend::Ar,
+        "cpio" => FormatBackend::Cpio,
+        "iso" | "iso9660" => FormatBackend::Iso,
+        "warc" => FormatBackend::Warc,
+        "xar" => FormatBackend::Xar,
+        "cab" => FormatBackend::Cab,
+        "asar" => FormatBackend::Asar,
+        "sqlar" => FormatBackend::Sqlar,
+        "ogg" | "ogv" | "oga" => FormatBackend::Ogg,
+        "pdf" => FormatBackend::Pdf,
+        "html" | "htm" => FormatBackend::Html,
+        // RAR/RPM have no dedicated Rust backend; prefer libarchive when requested.
+        "rar" | "rarfile" | "rpm" => FormatBackend::Libarchive,
+        _ => return None,
+    })
+}
+
+/// Build format probe order from `--use-backend` / `OpenOptions.use_backends`.
+///
+/// Matches Python `CLIHelpers`: flatten comma-separated values, then reverse so
+/// the **last** name has highest priority (tried first). Unknown names are
+/// ignored. Remaining defaults follow without duplicates.
+fn ordered_format_backends(use_backends: &[String]) -> Vec<FormatBackend> {
+    let mut ordered = Vec::with_capacity(DEFAULT_FORMAT_PROBE_ORDER.len() + use_backends.len());
+    let mut seen = std::collections::HashSet::new();
+
+    // Python: [b for s in use_backend for b in s.split(',')][::-1]
+    let flattened: Vec<&str> = use_backends
+        .iter()
+        .flat_map(|s| s.split(','))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
+    for name in flattened.into_iter().rev() {
+        if let Some(backend) = parse_format_backend(name) {
+            if seen.insert(backend) {
+                ordered.push(backend);
+            }
+        }
+    }
+    for &backend in DEFAULT_FORMAT_PROBE_ORDER {
+        if seen.insert(backend) {
+            ordered.push(backend);
+        }
+    }
+    ordered
+}
+
+/// Try one format backend; `Ok(None)` means magic/extension check failed (try next).
+fn try_open_format_backend(
+    path: &Path,
+    backend: FormatBackend,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Option<Arc<dyn MountSource>>, String> {
+    match backend {
+        FormatBackend::SevenZip => {
+            if !looks_like_7z(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                SevenZipMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Zip => {
+            if !looks_like_zip(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                ZipMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Asar => {
+            if !looks_like_asar(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                AsarMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Ar => {
+            if !looks_like_ar(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                ArMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Cpio => {
+            if !looks_like_cpio(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                CpioMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Iso => {
+            if !looks_like_iso(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                Iso9660MountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Warc => {
+            if !looks_like_warc(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                WarcMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Xar => {
+            if !looks_like_xar(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                XarMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Cab => {
+            if !looks_like_cab(path) {
+                return Ok(None);
+            }
+            match CabMountSource::open(path, index_path, options, VERSION, recreate) {
+                Ok(s) => Ok(Some(Arc::new(s))),
+                Err(CabError::UnsupportedCompression(_)) => Ok(Some(Arc::new(
+                    LibarchiveMountSource::open(path, index_path, options, VERSION, recreate)
+                        .map_err(|e| e.to_string())?,
+                ))),
+                Err(e) => Err(e.to_string()),
+            }
+        }
+        FormatBackend::Sqlar => {
+            if !looks_like_sqlar(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                SqlarMountSource::open(path, options).map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::SquashFs => {
+            if !looks_like_squashfs(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                SquashFsMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Ext4 => {
+            if !looks_like_ext4(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                Ext4MountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Fat => {
+            if !looks_like_fat(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                FatMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Ogg => {
+            if !looks_like_ogg(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                OggMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Pdf => {
+            if !looks_like_pdf(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                PdfMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Html => {
+            if !looks_like_html(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                HtmlMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Libarchive => {
+            if !looks_like_libarchive(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                LibarchiveMountSource::open(path, index_path, options, VERSION, recreate)
+                    .map_err(|e| e.to_string())?,
+            )))
+        }
+        FormatBackend::Tar => {
+            let by_ext = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("tar"));
+            if !looks_like_tar(path).unwrap_or(false) && !by_ext {
+                return Ok(None);
+            }
+            let mut mat = None;
+            Ok(Some(Arc::new(open_tar(
+                path, path, index_path, options, recreate, &mut mat,
+            )?)))
+        }
+    }
+}
+
+/// Open an uncompressed path by probing formats in [`ordered_format_backends`] order.
+fn open_uncompressed_path(
+    path: &Path,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    for backend in ordered_format_backends(&options.use_backends) {
+        if let Some(src) = try_open_format_backend(path, backend, index_path, options, recreate)? {
+            return Ok(src);
+        }
+    }
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("file")
+        .to_string();
+    let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
+    Ok(Arc::new(
+        SingleFileMountSource::new(name, path.to_path_buf(), size, None)
+            .map_err(|e| e.to_string())?,
+    ))
+}
+
 #[cfg(test)]
 mod split_open_tests {
     use super::*;
     use std::io::Read;
     use std::sync::Arc;
+
+    #[test]
+    fn ordered_format_backends_default_matches_historical() {
+        let order = ordered_format_backends(&[]);
+        assert_eq!(order, DEFAULT_FORMAT_PROBE_ORDER.to_vec());
+        assert_eq!(order.first(), Some(&FormatBackend::SevenZip));
+        assert_eq!(order.last(), Some(&FormatBackend::Tar));
+    }
+
+    #[test]
+    fn ordered_format_backends_last_flag_highest_priority() {
+        // Python: use_backend flatten then [::-1] → last wins.
+        let order = ordered_format_backends(&[
+            "zip".into(),
+            "tar".into(),
+        ]);
+        assert_eq!(order[0], FormatBackend::Tar);
+        assert_eq!(order[1], FormatBackend::Zip);
+        // No duplicates; defaults fill the rest.
+        assert_eq!(
+            order.iter().filter(|&&b| b == FormatBackend::Zip).count(),
+            1
+        );
+        assert_eq!(
+            order.iter().filter(|&&b| b == FormatBackend::Tar).count(),
+            1
+        );
+        assert_eq!(order.len(), DEFAULT_FORMAT_PROBE_ORDER.len());
+    }
+
+    #[test]
+    fn ordered_format_backends_comma_and_aliases() {
+        let order = ordered_format_backends(&["zipfile,sevenzip".into()]);
+        // Flatten then reverse: sevenzip first, then zipfile.
+        assert_eq!(order[0], FormatBackend::SevenZip);
+        assert_eq!(order[1], FormatBackend::Zip);
+        // Python aliases
+        assert_eq!(parse_format_backend("py7zr"), Some(FormatBackend::SevenZip));
+        assert_eq!(parse_format_backend("iso9660"), Some(FormatBackend::Iso));
+        assert_eq!(parse_format_backend("rapidgzip"), Some(FormatBackend::Tar));
+        assert_eq!(parse_format_backend("PySquashfsImage"), Some(FormatBackend::SquashFs));
+        assert_eq!(parse_format_backend("unknown-backend-xyz"), None);
+    }
+
+    #[test]
+    fn ordered_format_backends_unknown_skipped() {
+        let order = ordered_format_backends(&["nope".into(), "libarchive".into()]);
+        assert_eq!(order[0], FormatBackend::Libarchive);
+        assert!(!order.is_empty());
+    }
 
     #[test]
     fn open_joined_plain_file() {
@@ -270,107 +654,9 @@ fn open_path_impl(
     let index_path = index_arg(&index_loc);
 
     let source: Arc<dyn MountSource> = match compression {
-        CompressionFormat::None => {
-            if looks_like_7z(path) {
-                Arc::new(
-                    SevenZipMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_zip(path) {
-                Arc::new(
-                    ZipMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_asar(path) {
-                Arc::new(
-                    AsarMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_ar(path) {
-                Arc::new(
-                    ArMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_cpio(path) {
-                Arc::new(
-                    CpioMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_iso(path) {
-                Arc::new(
-                    Iso9660MountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_warc(path) {
-                Arc::new(
-                    WarcMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_xar(path) {
-                Arc::new(
-                    XarMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_cab(path) {
-                match CabMountSource::open(path, index_path, &options, VERSION, recreate) {
-                    Ok(s) => Arc::new(s),
-                    Err(CabError::UnsupportedCompression(_)) => Arc::new(
-                        LibarchiveMountSource::open(path, index_path, &options, VERSION, recreate)
-                            .map_err(|e| e.to_string())?,
-                    ),
-                    Err(e) => return Err(e.to_string()),
-                }
-            } else if looks_like_sqlar(path) {
-                Arc::new(SqlarMountSource::open(path, &options).map_err(|e| e.to_string())?)
-            } else if looks_like_squashfs(path) {
-                Arc::new(SquashFsMountSource::open(path).map_err(|e| e.to_string())?)
-            } else if looks_like_ext4(path) {
-                Arc::new(Ext4MountSource::open(path).map_err(|e| e.to_string())?)
-            } else if looks_like_fat(path) {
-                Arc::new(FatMountSource::open(path).map_err(|e| e.to_string())?)
-            } else if looks_like_ogg(path) {
-                Arc::new(
-                    OggMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_pdf(path) {
-                Arc::new(
-                    PdfMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_html(path) {
-                Arc::new(
-                    HtmlMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_libarchive(path) {
-                Arc::new(
-                    LibarchiveMountSource::open(path, index_path, &options, VERSION, recreate)
-                        .map_err(|e| e.to_string())?,
-                )
-            } else if looks_like_tar(path).unwrap_or(false)
-                || path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .is_some_and(|e| e.eq_ignore_ascii_case("tar"))
-            {
-                let mut mat = None;
-                Arc::new(open_tar(
-                    path, path, index_path, &options, recreate, &mut mat,
-                )?)
-            } else {
-                let name = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("file")
-                    .to_string();
-                let size = std::fs::metadata(path).map_err(|e| e.to_string())?.len();
-                Arc::new(
-                    SingleFileMountSource::new(name, path.to_path_buf(), size, None)
-                        .map_err(|e| e.to_string())?,
-                )
-            }
-        }
+        // Outer compression still wins (detect_compression first). Format
+        // backends are reordered via options.use_backends only for plain files.
+        CompressionFormat::None => open_uncompressed_path(path, index_path, &options, recreate)?,
         CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
         CompressionFormat::Bzip2 => {
             let threads = options.threads_for("bzip2");

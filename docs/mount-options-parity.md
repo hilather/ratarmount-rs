@@ -39,7 +39,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `-P` / `--parallelization` | backend matrix string | single int (reserved) | `~` |
 | `--password` | yes | yes (repeatable) | `[x]` |
 | `--password-file` | yes | **added** | `[x]` |
-| `--use-backend` | yes | **added** | `~` priority only |
+| `--use-backend` | yes | **added** | `[x]` reorders uncompressed format probe (last flag highest priority) |
 | `--disable-union-mount` | yes | **added** | `[x]` |
 | `--union-mount-cache-max-depth` | yes | yes (folder→sources cache) | `[x]` |
 | `--union-mount-cache-max-entries` | yes | yes | `[x]` |
