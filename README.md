@@ -4,7 +4,7 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) �
 
 | | |
 |--|--|
-| **Version** | **0.1.9** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
+| **Version** | **0.1.10** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
 | **Language** | Rust (edition 2021) |
 | **FUSE** | `fuser` low-level (inode API) |
 | **Platforms** | Linux (primary) · **macOS** (beta: arm64 + x86_64 tarballs) |
@@ -23,7 +23,7 @@ ratarmount archive.tar.gz mnt/
 
 Both tools mount archives over FUSE with a **shared SQLite index schema** (0.7.x interop for TAR/ZIP/7z). Python is the mature reference implementation; Rust is a native rewrite optimized for cold mount cost and resident memory.
 
-| Dimension | Python (`mxmlnkn/ratarmount`) | Rust (`ratarmount-rs` 0.1.9) |
+| Dimension | Python (`mxmlnkn/ratarmount`) | Rust (`ratarmount-rs` 0.1.10) |
 |-----------|------------------------------|------------------------------|
 | **Runtime** | CPython + native codec libs | Single static-friendly binary |
 | **FUSE** | mfusepy (fusepy fork) | `fuser` low-level |
@@ -205,7 +205,7 @@ make install          # → ~/.local/bin/ratarmount
 # macOS package: ./packaging/build-macos-tarball.sh
 ```
 
-**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. **v0.1.9**) publishes a GitHub Release. (Intel macOS CI image deferred — scarce GHA runners.) See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
+**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. **v0.1.10**) publishes a GitHub Release. (Intel macOS CI image deferred — scarce GHA runners.) See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
 
 ## Test
 
