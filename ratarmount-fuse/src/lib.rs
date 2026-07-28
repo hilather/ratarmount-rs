@@ -500,7 +500,7 @@ impl Filesystem for RatarmountFs {
                 reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
             }
             Err(e) => {
-                debug!("open error: {e}");
+                debug!("open error path={path} kind={:?}: {e}", e.kind());
                 reply.error(io_to_errno(&e));
             }
         }
@@ -543,10 +543,13 @@ impl Filesystem for RatarmountFs {
                     reply.data(&buf);
                 }
             }
-            OpenBackend::Source { reader, .. } => {
+            OpenBackend::Source { path, reader, .. } => {
                 let r = reader.get_mut().unwrap();
                 if let Err(e) = r.seek(std::io::SeekFrom::Start(offset.max(0) as u64)) {
-                    debug!("seek error: {e}");
+                    debug!(
+                        "seek error path={path} offset={offset} kind={:?}: {e}",
+                        e.kind()
+                    );
                     reply.error(io_to_errno(&e));
                     return;
                 }
@@ -557,7 +560,10 @@ impl Filesystem for RatarmountFs {
                         reply.data(&buf);
                     }
                     Err(e) => {
-                        debug!("read error: {e}");
+                        debug!(
+                            "read error path={path} offset={offset} size={size} kind={:?}: {e}",
+                            e.kind()
+                        );
                         reply.error(io_to_errno(&e));
                     }
                 }

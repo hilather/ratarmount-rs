@@ -32,7 +32,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use log::warn;
+use log::{debug, info, warn};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
@@ -130,6 +130,13 @@ impl SevenZipMountSource {
         R: Read + Seek + Send + 'static,
     {
         let archive_path = archive_label.as_ref().to_path_buf();
+        debug!(
+            "7z open_from_reader: label={} passwords={} index_in_memory={} recreate={}",
+            archive_path.display(),
+            options.passwords.len(),
+            options.index_in_memory,
+            recreate
+        );
         let index_path_buf: Option<PathBuf> = if options.index_in_memory {
             None
         } else {
@@ -148,8 +155,21 @@ impl SevenZipMountSource {
         if let Some(ref ip) = index_path_buf {
             if !recreate && ip.exists() && archive_path.is_file() {
                 // Existing index path only valid when we can re-open by path.
-                if let Ok(s) = Self::open_existing_path(&archive_path, ip, options) {
-                    return Ok(s);
+                match Self::open_existing_path(&archive_path, ip, options) {
+                    Ok(s) => {
+                        debug!(
+                            "7z open_from_reader: reloaded existing index {} content_locked={}",
+                            ip.display(),
+                            s.content_locked
+                        );
+                        return Ok(s);
+                    }
+                    Err(e) => {
+                        debug!(
+                            "7z open_from_reader: existing index {} unusable ({e}); rebuilding",
+                            ip.display()
+                        );
+                    }
                 }
             }
         }
@@ -222,6 +242,12 @@ impl SevenZipMountSource {
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
 
         let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
+        let n_folders = archive.folders.len();
+        let n_files = archive.files.len();
+        debug!(
+            "7z {}: parsed archive folders={n_folders} files={n_files} encrypted={encrypted}",
+            archive_path.display()
+        );
         let mut content_locked = false;
         let password = if encrypted {
             // Verify codecs are supported when a password would be used.
@@ -240,6 +266,14 @@ impl SevenZipMountSource {
             if options.passwords.is_empty() {
                 // Metadata-only mount: list/stat work; open requires password.
                 content_locked = true;
+                warn!(
+                    "7z {}: contents are encrypted; mounting metadata only \
+                     (listing works; reading members fails until --password is provided). \
+                     Nested encrypted archives need the *inner* password \
+                     (e.g. nested-encrypted-inner.7z uses `innerpw`).",
+                    archive_path.display()
+                );
+                // Also print so users without RUST_LOG still see the hint on mount.
                 eprintln!(
                     "warning: 7z archive contents are encrypted; mounting metadata only \
                      (listing works; reading members fails until --password is provided). \
@@ -248,9 +282,14 @@ impl SevenZipMountSource {
                 );
                 None
             } else {
+                debug!(
+                    "7z {}: trying {} password candidate(s) against encrypted archive",
+                    archive_path.display(),
+                    options.passwords.len()
+                );
                 let mut chosen = None;
                 let mut last_err = None;
-                for pw in &options.passwords {
+                for (i, pw) in options.passwords.iter().enumerate() {
                     if let Some(entry) = archive
                         .files
                         .iter()
@@ -260,20 +299,38 @@ impl SevenZipMountSource {
                         let folder = &archive.folders[fi];
                         match Self::try_decrypt_entry_io(&archive_io, &archive, entry, folder, pw) {
                             Ok(()) => {
+                                debug!(
+                                    "7z {}: password candidate #{i} accepted (trial member={})",
+                                    archive_path.display(),
+                                    entry.path
+                                );
                                 chosen = Some(pw.clone());
                                 break;
                             }
                             Err(e) => {
+                                debug!(
+                                    "7z {}: password candidate #{i} rejected for {}: {e}",
+                                    archive_path.display(),
+                                    entry.path
+                                );
                                 last_err = Some(e);
                                 continue;
                             }
                         }
                     } else {
+                        debug!(
+                            "7z {}: no non-empty file to trial; accepting password candidate #{i}",
+                            archive_path.display()
+                        );
                         chosen = Some(pw.clone());
                         break;
                     }
                 }
                 if chosen.is_none() {
+                    warn!(
+                        "7z {}: all password candidates failed",
+                        archive_path.display()
+                    );
                     return Err(SzError::Seven(last_err.unwrap_or_else(|| {
                         SevenZipError::Msg(
                             "Could not decrypt 7z archive with the provided password(s)".into(),
@@ -404,6 +461,12 @@ impl SevenZipMountSource {
             "Creating offset dictionary for {} took {secs:.2}s",
             archive_path.display()
         );
+        info!(
+            "7z {}: index ready in {secs:.2}s files={n_files} folders={n_folders} \
+             encrypted={encrypted} content_locked={content_locked} has_password={}",
+            archive_path.display(),
+            password.is_some()
+        );
 
         let index = index.into_read_only()?;
         let entry_by_offsets = entry_offset_map(&archive);
@@ -455,7 +518,16 @@ impl SevenZipMountSource {
             UserData::Tar(t) => Some(t),
             _ => None,
         });
-        let ud = ud.ok_or_else(|| SzError::Msg("missing userdata".into()))?;
+        let ud = ud.ok_or_else(|| {
+            debug!(
+                "7z {}: find_entry missing Tar userdata (size={} mode={:#x} userdata={:?})",
+                self.archive_path.display(),
+                file_info.size,
+                file_info.mode,
+                file_info.userdata
+            );
+            SzError::Msg("missing userdata".into())
+        })?;
         let pack_offset = ud.offsetheader.unwrap_or(0);
         let unpack_offset = ud.offset;
 
@@ -466,6 +538,13 @@ impl SevenZipMountSource {
                 if entry.size == file_info.size || (is_link && file_info.size == 0) {
                     return Ok(entry);
                 }
+                debug!(
+                    "7z {}: offset map hit idx={idx} but size mismatch entry={} fi={} path={}",
+                    self.archive_path.display(),
+                    entry.size,
+                    file_info.size,
+                    entry.path
+                );
             }
         }
 
@@ -481,8 +560,16 @@ impl SevenZipMountSource {
                 }
             }
         }
+        debug!(
+            "7z {}: find_entry failed pack={pack_offset} unpack={unpack_offset} size={} \
+             (map has {} entries)",
+            self.archive_path.display(),
+            file_info.size,
+            self.entry_by_offsets.len()
+        );
         Err(SzError::Msg(format!(
-            "Could not locate 7z member pack={pack_offset} unpack={unpack_offset}"
+            "Could not locate 7z member pack={pack_offset} unpack={unpack_offset} size={}",
+            file_info.size
         )))
     }
 
@@ -525,6 +612,11 @@ impl SevenZipMountSource {
         }
         let folder = &self.archive.folders[fi];
         if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
+            warn!(
+                "7z {}: get_folder_bytes denied for encrypted folder {fi} (content_locked={})",
+                self.archive_path.display(),
+                self.content_locked
+            );
             return Err(SzError::Msg(
                 "password required to open encrypted 7z member; pass --password / --password-file"
                     .into(),
@@ -865,6 +957,14 @@ impl MountSource for SevenZipMountSource {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        debug!(
+            "7z {}: open request size={} mode={:#x} content_locked={} has_password={}",
+            self.archive_path.display(),
+            file_info.size,
+            file_info.mode,
+            self.content_locked,
+            self.password.is_some()
+        );
         if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             return Err(io::Error::new(
                 io::ErrorKind::IsADirectory,
@@ -878,22 +978,48 @@ impl MountSource for SevenZipMountSource {
             ));
         }
         if file_info.size == 0 {
+            debug!(
+                "7z {}: open empty member (size=0)",
+                self.archive_path.display()
+            );
             return Ok(Box::new(Cursor::new(Vec::new())));
         }
 
-        let entry = self
-            .find_entry(file_info)
-            .map_err(|e| io::Error::other(e.to_string()))?;
-        let fi = entry
-            .folder_index
-            .ok_or_else(|| io::Error::other("no folder"))?;
+        let entry = self.find_entry(file_info).map_err(|e| {
+            warn!(
+                "7z {}: open find_entry failed: {e}",
+                self.archive_path.display()
+            );
+            io::Error::other(e.to_string())
+        })?;
+        let fi = entry.folder_index.ok_or_else(|| {
+            warn!(
+                "7z {}: entry {} has no folder_index",
+                self.archive_path.display(),
+                entry.path
+            );
+            io::Error::other("no folder")
+        })?;
         let folder = &self.archive.folders[fi];
+        debug!(
+            "7z {}: open path={} pack={} unpack={} size={} folder_idx={} copy_only={} encrypted={}",
+            self.archive_path.display(),
+            entry.path,
+            entry.pack_offset,
+            entry.unpack_offset,
+            entry.size,
+            fi,
+            folder.is_copy_only(),
+            folder.is_encrypted()
+        );
 
         if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
             // PermissionDenied → FUSE EACCES (not generic EIO) so users know a password is needed.
-            eprintln!(
-                "error: encrypted 7z content is locked (metadata-only mount); \
-                 pass --password / --password-file (nested archives need the *inner* password)"
+            warn!(
+                "7z {}: open {} denied — encrypted content locked (metadata-only); \
+                 pass --password / --password-file (nested archives need the *inner* password)",
+                self.archive_path.display(),
+                entry.path
             );
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -903,8 +1029,19 @@ impl MountSource for SevenZipMountSource {
 
         let allow_enc = !folder.is_encrypted() || self.password.is_some();
         if !folder.is_supported_for_open(allow_enc) {
+            let methods: Vec<_> = folder
+                .coders
+                .iter()
+                .map(|c| format!("{:02x?}", c.method))
+                .collect();
+            warn!(
+                "7z {}: open {} unsupported codecs {:?}",
+                self.archive_path.display(),
+                entry.path,
+                methods
+            );
             return Err(io::Error::other(format!(
-                "Unsupported 7z codecs for {}",
+                "Unsupported 7z codecs for {} ({methods:?})",
                 entry.path
             )));
         }
@@ -912,6 +1049,12 @@ impl MountSource for SevenZipMountSource {
         // Store / Copy: true random access via shared seekable view (path or nested).
         if folder.is_copy_only() && !folder.is_encrypted() {
             let offset = entry.pack_offset + entry.unpack_offset;
+            debug!(
+                "7z {}: open {} via SharedArchiveView base={offset} len={}",
+                self.archive_path.display(),
+                entry.path,
+                entry.size
+            );
             let view = SharedArchiveView::new(Arc::clone(&self.archive_io), offset, entry.size);
             return Ok(Box::new(view));
         }
@@ -926,25 +1069,60 @@ impl MountSource for SevenZipMountSource {
         {
             let folder_unpack = folder.get_unpack_size();
             if folder_unpack > SMALL_FOLDER_THRESHOLD {
-                let reader = self
-                    .open_lzma2_member_reader(entry)
-                    .map_err(|e| io::Error::other(e.to_string()))?;
+                debug!(
+                    "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack})",
+                    self.archive_path.display(),
+                    entry.path
+                );
+                let reader = self.open_lzma2_member_reader(entry).map_err(|e| {
+                    warn!(
+                        "7z {}: Lzma2MemberReader open failed for {}: {e}",
+                        self.archive_path.display(),
+                        entry.path
+                    );
+                    io::Error::other(e.to_string())
+                })?;
                 return Ok(Box::new(reader));
             }
-            let data = self
-                .open_lzma2_member(entry)
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            debug!(
+                "7z {}: open {} via LZMA2 full-member Cursor (folder_unpack={folder_unpack})",
+                self.archive_path.display(),
+                entry.path
+            );
+            let data = self.open_lzma2_member(entry).map_err(|e| {
+                warn!(
+                    "7z {}: LZMA2 member decode failed for {}: {e}",
+                    self.archive_path.display(),
+                    entry.path
+                );
+                io::Error::other(e.to_string())
+            })?;
             return Ok(Box::new(Cursor::new(data)));
         }
 
         // Compressed / BCJ2 / multi-pack: full-folder decompress + slice (cached).
         // Pack is read via SeekPackSource (shared archive IO — nested-safe).
-        let folder_data = self
-            .get_folder_bytes(entry)
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        debug!(
+            "7z {}: open {} via full-folder decompress + slice",
+            self.archive_path.display(),
+            entry.path
+        );
+        let folder_data = self.get_folder_bytes(entry).map_err(|e| {
+            warn!(
+                "7z {}: get_folder_bytes failed for {}: {e}",
+                self.archive_path.display(),
+                entry.path
+            );
+            io::Error::other(e.to_string())
+        })?;
         let start = entry.unpack_offset as usize;
         let end = start + entry.size as usize;
         if end > folder_data.len() {
+            warn!(
+                "7z {}: member slice [{start}:{end}] exceeds folder len {}",
+                self.archive_path.display(),
+                folder_data.len()
+            );
             return Err(io::Error::other(format!(
                 "Member slice [{start}:{end}] exceeds folder {}",
                 folder_data.len()

@@ -590,55 +590,124 @@ impl AutoMountLayer {
         );
 
         // Prefer no-tmp open from seekable parent member (TAR stencil / 7z store / …).
+        debug!(
+            "automount try_mount: path={path} rest={rest} label={} depth={depth} \
+             has_reader_opener={} size={} mode={:#x}",
+            label.display(),
+            self.open_nested_reader.is_some(),
+            fi.size,
+            fi.mode
+        );
         if self.open_nested_reader.is_some()
             && try_materialize_split_from_parent(parent.as_ref(), &rest).is_none()
         {
-            if let Ok(reader) = parent.open(&fi, 0) {
-                if let Some(ref open_r) = self.open_nested_reader {
-                    match open_r(reader, &label) {
-                        Ok(nested) => {
-                            let mut mounted = self.mounted.lock().expect("automount mutex");
-                            let key = if mounted.contains_key(&mount_point) && mount_point != path {
-                                path.to_string()
-                            } else {
-                                mount_point
-                            };
-                            mounted.insert(
-                                key.clone(),
-                                NestedMount {
-                                    source: nested,
-                                    _persist: None,
-                                    depth,
-                                },
-                            );
-                            return Some(key);
-                        }
-                        Err(e) => {
-                            debug!(
-                                "nested reader open failed for {}: {e}; falling back to temp spool",
-                                label.display()
-                            );
+            match parent.open(&fi, 0) {
+                Ok(reader) => {
+                    if let Some(ref open_r) = self.open_nested_reader {
+                        match open_r(reader, &label) {
+                            Ok(nested) => {
+                                let mut mounted = self.mounted.lock().expect("automount mutex");
+                                let key =
+                                    if mounted.contains_key(&mount_point) && mount_point != path {
+                                        path.to_string()
+                                    } else {
+                                        mount_point
+                                    };
+                                debug!(
+                                    "automount: mounted {} via nested reader at key={key} (no temp spool)",
+                                    label.display()
+                                );
+                                mounted.insert(
+                                    key.clone(),
+                                    NestedMount {
+                                        source: nested,
+                                        _persist: None,
+                                        depth,
+                                    },
+                                );
+                                return Some(key);
+                            }
+                            Err(e) => {
+                                debug!(
+                                    "automount: nested reader open failed for {} (kind={:?}): {e}; \
+                                     falling back to temp spool",
+                                    label.display(),
+                                    e.kind()
+                                );
+                            }
                         }
                     }
+                }
+                Err(e) => {
+                    debug!(
+                        "automount: parent.open failed for {} (kind={:?}): {e}; \
+                         will try temp spool path",
+                        rest,
+                        e.kind()
+                    );
                 }
             }
         }
 
-        let persist =
-            if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), &rest) {
-                joined
-            } else {
-                let mut reader = parent.open(&fi, 0).ok()?;
-                let mut tmp = NamedTempFile::new().ok()?;
-                io::copy(&mut reader, &mut tmp).ok()?;
-                tmp.flush().ok()?;
-                let tmp_path = tmp.into_temp_path();
-                tmp_path.keep().ok()?
+        let persist = if let Some(joined) =
+            try_materialize_split_from_parent(parent.as_ref(), &rest)
+        {
+            debug!(
+                "automount: using split-join materialize for {} -> {}",
+                rest,
+                joined.display()
+            );
+            joined
+        } else {
+            let mut reader = match parent.open(&fi, 0) {
+                Ok(r) => r,
+                Err(e) => {
+                    debug!(
+                        "automount: parent.open for temp spool failed for {rest} (kind={:?}): {e}",
+                        e.kind()
+                    );
+                    return None;
+                }
             };
+            let mut tmp = match NamedTempFile::new() {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("automount: NamedTempFile::new failed for {rest}: {e}");
+                    return None;
+                }
+            };
+            if let Err(e) = io::copy(&mut reader, &mut tmp) {
+                debug!("automount: copy to temp failed for {rest}: {e}");
+                return None;
+            }
+            if let Err(e) = tmp.flush() {
+                debug!("automount: temp flush failed for {rest}: {e}");
+                return None;
+            }
+            let tmp_path = tmp.into_temp_path();
+            match tmp_path.keep() {
+                Ok(p) => {
+                    debug!(
+                        "automount: spooled {} -> {} for path open",
+                        rest,
+                        p.display()
+                    );
+                    p
+                }
+                Err(e) => {
+                    debug!("automount: temp keep failed for {rest}: {e}");
+                    return None;
+                }
+            }
+        };
         let nested = match (self.open_nested)(&persist) {
             Ok(s) => s,
             Err(e) => {
-                debug!("failed to open nested {}: {e}", persist.display());
+                debug!(
+                    "automount: failed to open nested {} via path (kind={:?}): {e}",
+                    persist.display(),
+                    e.kind()
+                );
                 let _ = std::fs::remove_file(&persist);
                 return None;
             }
@@ -651,6 +720,10 @@ impl AutoMountLayer {
         } else {
             mount_point
         };
+        debug!(
+            "automount: mounted {} via temp path at key={key}",
+            label.display()
+        );
         mounted.insert(
             key.clone(),
             NestedMount {

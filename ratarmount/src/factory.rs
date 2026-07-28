@@ -507,30 +507,62 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             .seek(SeekFrom::Start(0))
             .map_err(std::io::Error::other)?;
         let head = &magic[..n];
+        log::debug!(
+            "nested reader open: label={} magic_len={n} passwords={}",
+            label.display(),
+            opts.passwords.len()
+        );
 
         // 7z magic
         if head.len() >= 6 && &head[..6] == b"7z\xBC\xAF'\x1C" {
+            log::debug!(
+                "nested reader open: {} detected as 7z (passwords={})",
+                label.display(),
+                opts.passwords.len()
+            );
             return SevenZipMountSource::open_from_reader(
                 reader, label, None, &opts, VERSION, true,
             )
-            .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-            .map_err(|e| std::io::Error::other(e.to_string()));
+            .map(|s| {
+                log::debug!(
+                    "nested reader open: 7z {} mounted successfully",
+                    label.display()
+                );
+                Arc::new(s) as Arc<dyn MountSource>
+            })
+            .map_err(|e| {
+                log::warn!("nested reader open: 7z {} failed: {e}", label.display());
+                std::io::Error::other(e.to_string())
+            });
         }
         // ZIP local/EOCD
         if head.len() >= 4 && &head[..2] == b"PK" {
+            log::debug!("nested reader open: {} detected as ZIP", label.display());
             return ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
                 .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-                .map_err(|e| std::io::Error::other(e.to_string()));
+                .map_err(|e| {
+                    log::warn!("nested reader open: ZIP {} failed: {e}", label.display());
+                    std::io::Error::other(e.to_string())
+                });
         }
         // Uncompressed TAR (ustar) or name suggests .tar
         let looks_tar =
             (head.len() >= 262 && &head[257..262] == b"ustar") || name_suggests_plain_tar(label);
         if looks_tar {
+            log::debug!("nested reader open: {} detected as TAR", label.display());
             return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
                 .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-                .map_err(|e| std::io::Error::other(e.to_string()));
+                .map_err(|e| {
+                    log::warn!("nested reader open: TAR {} failed: {e}", label.display());
+                    std::io::Error::other(e.to_string())
+                });
         }
 
+        log::debug!(
+            "nested reader open: {} unsupported format (magic={:02x?}); will try temp spool",
+            label.display(),
+            &head[..n.min(16)]
+        );
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,
             format!(

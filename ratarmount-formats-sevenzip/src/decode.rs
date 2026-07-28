@@ -168,14 +168,33 @@ impl Read for SharedArchiveView {
             return Ok(0);
         }
         let max = ((self.len - self.pos) as usize).min(buf.len());
-        let mut g = self
-            .io
-            .lock()
-            .map_err(|_| io::Error::other("7z archive IO lock poisoned"))?;
-        g.seek(SeekFrom::Start(self.base + self.pos))?;
-        let n = g.read(&mut buf[..max])?;
-        self.pos += n as u64;
-        Ok(n)
+        let mut g = self.io.lock().map_err(|_| {
+            log::warn!("7z SharedArchiveView: archive IO lock poisoned");
+            io::Error::other("7z archive IO lock poisoned")
+        })?;
+        let abs = self.base + self.pos;
+        if let Err(e) = g.seek(SeekFrom::Start(abs)) {
+            log::debug!(
+                "7z SharedArchiveView: seek base={} pos={} abs={abs} failed: {e}",
+                self.base,
+                self.pos
+            );
+            return Err(e);
+        }
+        match g.read(&mut buf[..max]) {
+            Ok(n) => {
+                self.pos += n as u64;
+                Ok(n)
+            }
+            Err(e) => {
+                log::debug!(
+                    "7z SharedArchiveView: read base={} pos={} abs={abs} max={max} failed: {e}",
+                    self.base,
+                    self.pos
+                );
+                Err(e)
+            }
+        }
     }
 }
 
