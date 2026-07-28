@@ -1,7 +1,8 @@
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints + Tier C seek-index blob import/export (`gzip_seek`).
-//! * **zstd** — multi-frame seek map + seekable-format seek table; single-frame full decode.
+//! * **zstd** — multi-frame seek map + seekable-format seek table + Python
+//!   `zstdblocks` offset-map import/export; single-frame full decode.
 //! * **lz4** — frame block index (independent blocks; dependent → frame decode);
 //!   `open_seekable_lz4_with_threads` for `-P` (parallel independent-block size discovery).
 //! * **lzip** — multimember walk via trailer `member_size`;
@@ -74,8 +75,10 @@ pub use xz_seek::{
 };
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib, open_seekable_zlib_with_threads};
 pub use zstd_seek::{
-    build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_from_reader,
-    open_seekable_zstd_with_threads, open_seekable_zstd_with_threads_from_reader, SeekableZstd,
+    build_seek_table_skippable, export_zstd_blocks, export_zstd_blocks_from_reader,
+    open_seekable_zstd, open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
+    open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks,
+    open_seekable_zstd_with_zstd_blocks_from_reader, SeekableZstd,
 };
 
 use std::fs::File;

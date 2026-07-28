@@ -1,11 +1,19 @@
-//! Seekable zstd: multi-frame restart points + zstd seekable-format seek table.
+//! Seekable zstd: multi-frame restart points + zstd seekable-format seek table
+//! + Python `zstdblocks` offset-map import.
 //!
-//! Priority when opening:
+//! Priority when opening (without an imported map):
 //! 1. **Seek table** (zstd seekable format skippable footer, magic `0x8F92EAB1`) —
 //!    gives compressed/decompressed sizes without decompressing during map build.
 //! 2. **Multi-frame scan** — walk concatenated zstd frames; random access restores
 //!    only the covering frame (cached per reader), never the full single-frame buffer.
 //! 3. **Full decode** fallback for single large frames without a seek table.
+//!
+//! **Python `zstdblocks` parity** ([`open_seekable_zstd_with_zstd_blocks`] /
+//! [`SeekableZstd::open_with_zstd_blocks`]): pairs are
+//! `(blockoffset, dataoffset) = (compressed_offset, uncompressed_offset)`, matching
+//! `indexed_zstd.IndexedZstdFile.block_offsets()` / SQLite `zstdblocks`. The last
+//! pair is an EOF sentinel (totals). Import skips seek-table / multi-frame rescan.
+//! Export via [`export_zstd_blocks`] / [`SeekableZstd::zstd_blocks`].
 //!
 //! Thread hint (`open_seekable_zstd_with_threads` / Python `-P` zstd backend):
 //! * Multi-frame maps keep **per-frame** random access; frames are independent, so
@@ -75,6 +83,58 @@ where
     SeekableZstd::open_with_threads_from_reader(reader, threads, archive_label)
 }
 
+/// Open seekable zstd using a Python-compatible `zstdblocks` offset map.
+///
+/// `blocks` are `(blockoffset, dataoffset)` = `(compressed_offset, uncompressed_offset)`
+/// pairs (last entry is the EOF sentinel). Skips seek-table / multi-frame rescan.
+pub fn open_seekable_zstd_with_zstd_blocks(
+    path: impl AsRef<Path>,
+    threads: u32,
+    blocks: &[(u64, u64)],
+) -> Result<Arc<dyn SeekableBody>> {
+    let body = SeekableZstd::open_with_zstd_blocks(path, threads, blocks)?;
+    Ok(body as Arc<dyn SeekableBody>)
+}
+
+/// Open seekable zstd from a reader using a Python-compatible `zstdblocks` map.
+///
+/// See [`SeekableZstd::open_with_zstd_blocks_from_reader`].
+pub fn open_seekable_zstd_with_zstd_blocks_from_reader<R>(
+    reader: R,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+    blocks: &[(u64, u64)],
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let body =
+        SeekableZstd::open_with_zstd_blocks_from_reader(reader, threads, archive_label, blocks)?;
+    Ok(body as Arc<dyn SeekableBody>)
+}
+
+/// Scan a multi-frame / seek-table zstd file and export Python `zstdblocks` pairs.
+///
+/// See [`export_zstd_blocks_from_reader`].
+pub fn export_zstd_blocks(path: impl AsRef<Path>) -> Result<Vec<(u64, u64)>> {
+    let mut file = File::open(path)?;
+    export_zstd_blocks_from_reader(&mut file)
+}
+
+/// Build Python `zstdblocks` pairs from a seekable compressed stream.
+///
+/// Prefers an official seek-table footer when present; otherwise multi-frame scan.
+/// Last pair is the EOF sentinel (totals), matching `indexed_zstd`.
+pub fn export_zstd_blocks_from_reader<R: Read + Seek>(reader: &mut R) -> Result<Vec<(u64, u64)>> {
+    if let Ok((frames, uncomp)) = try_load_seek_table_from_reader(reader) {
+        if !frames.is_empty() {
+            return Ok(zstd_blocks_from_frames(&frames, uncomp));
+        }
+    }
+    let (frames, uncomp) = build_frame_map_from_reader(reader)?;
+    Ok(zstd_blocks_from_frames(&frames, uncomp))
+}
+
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const SKIPPABLE_MAGIC_MIN: u32 = 0x184D2A50;
 const SKIPPABLE_MAGIC_MAX: u32 = 0x184D2A5F;
@@ -105,13 +165,24 @@ enum ZstdBackend {
     Shared(Arc<Mutex<Box<dyn SeekRead>>>),
 }
 
+/// Where the per-frame restart map came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameMapSource {
+    /// Concatenated multi-frame walk (`ZSTD_findFrameCompressedSize`).
+    MultiFrameScan,
+    /// Official zstd seekable-format seek table footer.
+    SeekTable,
+    /// Python SQLite `zstdblocks` / `indexed_zstd` offset pairs.
+    ZstdBlocks,
+}
+
 /// Outcome of classifying a zstd stream (seek table / multi-frame map / full decode).
 enum ZstdPlan {
     /// Use per-frame random access.
     Mapped {
         frames: Vec<FrameInfo>,
         uncompressed_size: u64,
-        from_seek_table: bool,
+        source: FrameMapSource,
     },
     /// Materialize the whole uncompressed stream.
     FullDecode,
@@ -126,8 +197,8 @@ pub struct SeekableZstd {
     uncompressed_size: u64,
     /// When only one large frame (or scan failed), fall back to full decode.
     fallback: Option<Arc<DecodedBody>>,
-    /// True when frame map came from a seekable-format seek table.
-    from_seek_table: bool,
+    /// Origin of `frames` (scan / seek table / imported `zstdblocks`).
+    map_source: FrameMapSource,
 }
 
 impl SeekableZstd {
@@ -147,14 +218,14 @@ impl SeekableZstd {
             ZstdPlan::Mapped {
                 frames,
                 uncompressed_size,
-                from_seek_table,
+                source,
             } => Ok(Arc::new(Self {
                 path: path.clone(),
                 backend: ZstdBackend::Path(path),
                 frames,
                 uncompressed_size,
                 fallback: None,
-                from_seek_table,
+                map_source: source,
             })),
             ZstdPlan::FullDecode => decode_full(&path, threads),
         }
@@ -188,7 +259,7 @@ impl SeekableZstd {
             ZstdPlan::Mapped {
                 frames,
                 uncompressed_size,
-                from_seek_table,
+                source,
             } => {
                 let shared: Arc<Mutex<Box<dyn SeekRead>>> =
                     Arc::new(Mutex::new(Box::new(reader)));
@@ -198,16 +269,93 @@ impl SeekableZstd {
                     frames,
                     uncompressed_size,
                     fallback: None,
-                    from_seek_table,
+                    map_source: source,
                 }))
             }
             ZstdPlan::FullDecode => decode_full_from_reader(reader, &path, threads),
         }
     }
 
+    /// Open using a Python-compatible `zstdblocks` map (no stream rescan).
+    ///
+    /// `blocks` are `(blockoffset, dataoffset)` = `(compressed_offset, uncompressed_offset)`
+    /// pairs; the last entry is the EOF sentinel (totals). See module docs.
+    /// `threads` is accepted for API parity with other openers (`0` → CPU count);
+    /// random access remains per-frame.
+    pub fn open_with_zstd_blocks(
+        path: impl AsRef<Path>,
+        threads: u32,
+        blocks: &[(u64, u64)],
+    ) -> Result<Arc<Self>> {
+        let path = path.as_ref().to_path_buf();
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
+        // Best-effort bounds check against file length when available.
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if let Some(last) = frames.last() {
+                let end = last.compressed_offset + last.compressed_size.unwrap_or(0);
+                if end > meta.len() {
+                    return Err(CompressError::Msg(format!(
+                        "zstdblocks compressed end {end} exceeds file size {}",
+                        meta.len()
+                    )));
+                }
+            }
+        }
+        Ok(Arc::new(Self {
+            path: path.clone(),
+            backend: ZstdBackend::Path(path),
+            frames,
+            uncompressed_size,
+            fallback: None,
+            map_source: FrameMapSource::ZstdBlocks,
+        }))
+    }
+
+    /// Open from a seekable stream using a Python-compatible `zstdblocks` map.
+    ///
+    /// See [`Self::open_with_zstd_blocks`].
+    pub fn open_with_zstd_blocks_from_reader<R>(
+        reader: R,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+        blocks: &[(u64, u64)],
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let path = archive_label.as_ref().to_path_buf();
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let (frames, uncompressed_size) = frames_from_zstd_blocks(blocks)?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+        Ok(Arc::new(Self {
+            path,
+            backend: ZstdBackend::Shared(shared),
+            frames,
+            uncompressed_size,
+            fallback: None,
+            map_source: FrameMapSource::ZstdBlocks,
+        }))
+    }
+
     /// Diagnostic: whether the frame map was imported from a seek table.
     pub fn used_seek_table(&self) -> bool {
-        self.from_seek_table
+        self.map_source == FrameMapSource::SeekTable
+    }
+
+    /// Diagnostic: whether the frame map was imported from `zstdblocks` pairs.
+    pub fn used_zstd_blocks(&self) -> bool {
+        self.map_source == FrameMapSource::ZstdBlocks
+    }
+
+    /// Export Python-compatible `zstdblocks` pairs including the EOF sentinel.
+    ///
+    /// Returns `None` when this body fell back to full decode (no frame map).
+    pub fn zstd_blocks(&self) -> Option<Vec<(u64, u64)>> {
+        if self.fallback.is_some() || self.frames.is_empty() {
+            return None;
+        }
+        Some(zstd_blocks_from_frames(&self.frames, self.uncompressed_size))
     }
 }
 
@@ -223,7 +371,7 @@ fn classify_zstd<R: Read + Seek>(reader: &mut R, threads: u32) -> Result<ZstdPla
             return Ok(ZstdPlan::Mapped {
                 frames,
                 uncompressed_size: uncomp_size,
-                from_seek_table: true,
+                source: FrameMapSource::SeekTable,
             });
         }
         if frames.len() == 1 {
@@ -237,7 +385,7 @@ fn classify_zstd<R: Read + Seek>(reader: &mut R, threads: u32) -> Result<ZstdPla
             return Ok(ZstdPlan::Mapped {
                 frames,
                 uncompressed_size: uncomp_size,
-                from_seek_table: true,
+                source: FrameMapSource::SeekTable,
             });
         }
     }
@@ -247,7 +395,7 @@ fn classify_zstd<R: Read + Seek>(reader: &mut R, threads: u32) -> Result<ZstdPla
         Ok((frames, uncomp_size)) if frames.len() > 1 => Ok(ZstdPlan::Mapped {
             frames,
             uncompressed_size: uncomp_size,
-            from_seek_table: false,
+            source: FrameMapSource::MultiFrameScan,
         }),
         Ok((frames, uncomp_size)) if frames.len() == 1 => {
             // Single frame: decode fully (small → RAM; large → temp via DecodedBody).
@@ -451,10 +599,10 @@ impl SeekableBody for SeekableZstd {
     }
 
     fn kind(&self) -> &'static str {
-        if self.from_seek_table {
-            "zstd-seek-table"
-        } else {
-            "zstd-frames"
+        match self.map_source {
+            FrameMapSource::SeekTable => "zstd-seek-table",
+            FrameMapSource::ZstdBlocks => "zstd-blocks",
+            FrameMapSource::MultiFrameScan => "zstd-frames",
         }
     }
 
@@ -725,6 +873,98 @@ fn measure_frame_slice(src: &[u8]) -> Result<(u64, u64)> {
         }
     };
     Ok((comp as u64, frame_uncomp))
+}
+
+/// Convert Python `zstdblocks` pairs into an internal frame map.
+///
+/// Each pair is `(blockoffset, dataoffset)` = `(compressed_offset, uncompressed_offset)`.
+/// Pairs must be sorted with both compressed and uncompressed offsets monotonically
+/// non-decreasing. The last entry is the EOF sentinel (totals), matching
+/// `indexed_zstd.IndexedZstdFile.block_offsets()`.
+///
+/// Frame *i* spans `[blocks[i], blocks[i + 1])` in compressed and uncompressed space.
+///
+/// Returns `(frames, total_uncompressed_size)`.
+fn frames_from_zstd_blocks(blocks: &[(u64, u64)]) -> Result<(Vec<FrameInfo>, u64)> {
+    if blocks.len() < 2 {
+        return Err(CompressError::Msg(
+            "zstdblocks map needs at least one frame start and an EOF sentinel".into(),
+        ));
+    }
+    for window in blocks.windows(2) {
+        let (c0, d0) = window[0];
+        let (c1, d1) = window[1];
+        if c1 < c0 {
+            return Err(CompressError::Msg(format!(
+                "zstdblocks compressed offsets not monotonic: {c0} -> {c1}"
+            )));
+        }
+        if d1 < d0 {
+            return Err(CompressError::Msg(format!(
+                "zstdblocks data offsets not monotonic: {d0} -> {d1}"
+            )));
+        }
+    }
+
+    let mut frames = Vec::with_capacity(blocks.len() - 1);
+    for i in 0..blocks.len() - 1 {
+        let (c0, d0) = blocks[i];
+        let (c1, d1) = blocks[i + 1];
+        let c_size = c1 - c0;
+        let d_size = d1 - d0;
+        if c_size == 0 && d_size == 0 {
+            // Degenerate zero-length span — skip.
+            continue;
+        }
+        if c_size == 0 {
+            return Err(CompressError::Msg(format!(
+                "zstdblocks frame at compressed offset {c0} has zero compressed size but \
+                 uncompressed size {d_size}"
+            )));
+        }
+        frames.push(FrameInfo {
+            compressed_offset: c0,
+            uncompressed_offset: d0,
+            compressed_size: Some(c_size),
+            uncompressed_size: Some(d_size),
+        });
+    }
+    if frames.is_empty() {
+        return Err(CompressError::Msg(
+            "zstdblocks map produced no frames".into(),
+        ));
+    }
+    let total_uncomp = blocks[blocks.len() - 1].1;
+    Ok((frames, total_uncomp))
+}
+
+/// Export a frame map as Python `zstdblocks` pairs (including EOF sentinel).
+///
+/// Pair *i* is the start of frame *i*; the final pair is
+/// `(end_of_last_frame_compressed, total_uncompressed)`.
+fn zstd_blocks_from_frames(frames: &[FrameInfo], uncompressed_size: u64) -> Vec<(u64, u64)> {
+    let mut out = Vec::with_capacity(frames.len() + 1);
+    for f in frames {
+        out.push((f.compressed_offset, f.uncompressed_offset));
+    }
+    let last = match frames.last() {
+        Some(f) => f,
+        None => {
+            out.push((0, uncompressed_size));
+            return out;
+        }
+    };
+    let c_end = last
+        .compressed_size
+        .map(|sz| last.compressed_offset + sz)
+        .unwrap_or(last.compressed_offset);
+    let d_end = last
+        .uncompressed_size
+        .map(|sz| last.uncompressed_offset + sz)
+        .unwrap_or(uncompressed_size)
+        .max(uncompressed_size);
+    out.push((c_end, d_end));
+    out
 }
 
 /// Build a seekable-format seek table skippable frame (no per-frame checksums).
@@ -1068,5 +1308,186 @@ mod tests {
             .unwrap();
         assert_eq!(a, expected);
         assert_eq!(b, expected);
+    }
+
+    #[test]
+    fn zstd_blocks_pair_round_trip_from_pairs() {
+        // (compressed_offset, uncompressed_offset); last is EOF sentinel.
+        let blocks = [(0u64, 0u64), (13, 4), (30, 12), (41, 14)];
+        let (frames, total) = frames_from_zstd_blocks(&blocks).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(total, 14);
+        assert_eq!(frames[0].compressed_offset, 0);
+        assert_eq!(frames[0].uncompressed_offset, 0);
+        assert_eq!(frames[0].compressed_size, Some(13));
+        assert_eq!(frames[0].uncompressed_size, Some(4));
+        assert_eq!(frames[1].compressed_offset, 13);
+        assert_eq!(frames[1].uncompressed_offset, 4);
+        assert_eq!(frames[1].compressed_size, Some(17));
+        assert_eq!(frames[1].uncompressed_size, Some(8));
+        assert_eq!(frames[2].compressed_offset, 30);
+        assert_eq!(frames[2].uncompressed_offset, 12);
+        assert_eq!(frames[2].compressed_size, Some(11));
+        assert_eq!(frames[2].uncompressed_size, Some(2));
+
+        let exported = zstd_blocks_from_frames(&frames, total);
+        assert_eq!(exported, blocks.to_vec());
+    }
+
+    #[test]
+    fn zstd_blocks_rejects_empty_and_non_monotonic() {
+        assert!(frames_from_zstd_blocks(&[]).is_err());
+        assert!(frames_from_zstd_blocks(&[(0, 0)]).is_err());
+        assert!(frames_from_zstd_blocks(&[(10, 0), (5, 4)]).is_err());
+        assert!(frames_from_zstd_blocks(&[(0, 10), (5, 4)]).is_err());
+        assert!(frames_from_zstd_blocks(&[(0, 0), (0, 4)]).is_err()); // zero c_size, nonzero d
+    }
+
+    #[test]
+    fn multi_frame_export_import_zstd_blocks_random_access() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("blocks.zst");
+        let parts: [&[u8]; 3] = [b"AAAA", b"BBBBCCCC", b"DD"];
+        let mut compressed = Vec::new();
+        for part in parts {
+            compressed.extend_from_slice(&encode_frame(part));
+        }
+        std::fs::write(&path, &compressed).unwrap();
+
+        // Export from multi-frame scan (no seek table).
+        let blocks = export_zstd_blocks(&path).unwrap();
+        assert!(
+            blocks.len() >= 4,
+            "expected 3 frame starts + sentinel, got {}",
+            blocks.len()
+        );
+        assert_eq!(blocks[0], (0, 0));
+        assert_eq!(blocks.last().unwrap().1, 14);
+        assert_eq!(blocks.last().unwrap().0, compressed.len() as u64);
+
+        // Round-trip through frames_from_zstd_blocks must preserve pairs.
+        let (frames, total) = frames_from_zstd_blocks(&blocks).unwrap();
+        assert_eq!(frames.len(), 3);
+        assert_eq!(total, 14);
+        assert_eq!(zstd_blocks_from_frames(&frames, total), blocks);
+
+        // Reimport equals multi-frame random access.
+        let scanned = SeekableZstd::open(&path).unwrap();
+        let imported = SeekableZstd::open_with_zstd_blocks(&path, 1, &blocks).unwrap();
+        assert!(imported.used_zstd_blocks());
+        assert!(!imported.used_seek_table());
+        assert_eq!(imported.kind(), "zstd-blocks");
+        assert_eq!(imported.size(), scanned.size());
+        assert_eq!(imported.checkpoint_count(), scanned.checkpoint_count());
+        assert_eq!(imported.zstd_blocks().unwrap(), blocks);
+
+        let mut expected = Vec::new();
+        for p in parts {
+            expected.extend_from_slice(p);
+        }
+
+        let mut s_all = Vec::new();
+        scanned.open_reader().unwrap().read_to_end(&mut s_all).unwrap();
+        let mut i_all = Vec::new();
+        imported
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut i_all)
+            .unwrap();
+        assert_eq!(s_all, expected);
+        assert_eq!(i_all, expected);
+
+        let mut s_r = scanned.open_reader().unwrap();
+        let mut i_r = imported.open_reader().unwrap();
+        let offsets = [0u64, 2, 4, 8, 12];
+        for &off in &offsets {
+            s_r.seek(SeekFrom::Start(off)).unwrap();
+            i_r.seek(SeekFrom::Start(off)).unwrap();
+            let mut sb = [0u8; 4];
+            let mut ib = [0u8; 4];
+            let sn = s_r.read(&mut sb).unwrap();
+            let inn = i_r.read(&mut ib).unwrap();
+            assert_eq!(sn, inn, "offset {off}");
+            assert_eq!(&sb[..sn], &ib[..inn], "offset {off}");
+        }
+
+        // Free-function openers
+        let free = open_seekable_zstd_with_zstd_blocks(&path, 2, &blocks).unwrap();
+        assert_eq!(free.kind(), "zstd-blocks");
+        assert_eq!(free.size(), 14);
+        let mut r = free.open_reader().unwrap();
+        r.seek(SeekFrom::Start(4)).unwrap();
+        let mut mid = [0u8; 4];
+        r.read_exact(&mut mid).unwrap();
+        assert_eq!(&mid, b"BBBB");
+
+        // Reader-based import
+        let mem = open_seekable_zstd_with_zstd_blocks_from_reader(
+            Cursor::new(compressed.clone()),
+            1,
+            Path::new("memory://blocks.zst"),
+            &blocks,
+        )
+        .unwrap();
+        assert_eq!(mem.kind(), "zstd-blocks");
+        assert_eq!(mem.path(), Path::new("memory://blocks.zst"));
+        let mut mem_all = Vec::new();
+        mem.open_reader().unwrap().read_to_end(&mut mem_all).unwrap();
+        assert_eq!(mem_all, expected);
+
+        // export_zstd_blocks_from_reader
+        let mut cur = Cursor::new(compressed);
+        let blocks2 = export_zstd_blocks_from_reader(&mut cur).unwrap();
+        assert_eq!(blocks2, blocks);
+    }
+
+    #[test]
+    fn zstd_blocks_export_import_with_seek_table() {
+        let parts: [&[u8]; 3] = [
+            b"hello world!!!!",
+            b"second frame payload",
+            b"third!",
+        ];
+        let mut frames_bin = Vec::new();
+        let mut table_entries = Vec::new();
+        for part in parts {
+            let f = encode_frame(part);
+            table_entries.push((f.len() as u32, part.len() as u32));
+            frames_bin.extend_from_slice(&f);
+        }
+        let table = build_seek_table_skippable(&table_entries);
+        let mut compressed = frames_bin;
+        compressed.extend_from_slice(&table);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seekable-blocks.zst");
+        std::fs::write(&path, &compressed).unwrap();
+
+        // Export prefers seek table; reimport must still random-access correctly.
+        let blocks = export_zstd_blocks(&path).unwrap();
+        assert_eq!(blocks.len(), 4); // 3 frames + sentinel
+        let total: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        assert_eq!(blocks.last().unwrap().1, total);
+
+        let imported = SeekableZstd::open_with_zstd_blocks(&path, 1, &blocks).unwrap();
+        assert!(imported.used_zstd_blocks());
+        assert_eq!(imported.kind(), "zstd-blocks");
+        assert_eq!(imported.size(), total);
+        assert_eq!(imported.checkpoint_count(), 3);
+
+        let mut expected = Vec::new();
+        for p in parts {
+            expected.extend_from_slice(p);
+        }
+        let mut all = Vec::new();
+        imported.open_reader().unwrap().read_to_end(&mut all).unwrap();
+        assert_eq!(all, expected);
+
+        let off = parts[0].len() as u64 + 7;
+        let mut r = imported.open_reader().unwrap();
+        r.seek(SeekFrom::Start(off)).unwrap();
+        let mut chunk = [0u8; 5];
+        r.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, &parts[1][7..12]);
     }
 }
