@@ -150,4 +150,9 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 
 ## crates.io
 
-Library crates may be published later under a coordinated version policy. The CLI package remains the primary deliverable for 1.0.
+**Policy:** [`docs/crates-io-policy.md`](crates-io-policy.md).
+
+- Primary deliverable is the **CLI binary** (this doc / GitHub Releases / distro packages), not crates.io.
+- Library crates (`ratarmount-core`, `ratarmount-index`, formats, …) may be published later for embedders under workspace lockstep versioning.
+- Do **not** publish the `ratarmount` binary as a library API surface; `ratarmount-fuse` is the optional FUSE **adapter** library, not the CLI.
+- Dual-run and 1.0-class packaging do **not** require any crates.io publish.

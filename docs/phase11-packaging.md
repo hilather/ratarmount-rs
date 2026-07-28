@@ -66,4 +66,4 @@ See `docs/packaging.md`.
 - [ ] Review `bench-results/smoke-*.json` for huge regressions
 - [ ] Tag version in workspace `Cargo.toml`
 - [ ] Update README phase table
-- [ ] (Optional) publish crates.io libraries separately from the binary
+- [ ] (Optional) publish crates.io libraries separately from the binary — see [`docs/crates-io-policy.md`](crates-io-policy.md)

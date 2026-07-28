@@ -9,6 +9,7 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) �
 | **Platforms** | Linux (primary) · **macOS** (beta: arm64 + x86_64 tarballs) |
 | **Upstream** | Feature parity tracked vs [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount) |
 | **Living checklist** | [docs/parity-todo.md](docs/parity-todo.md) · [docs/mount-options-parity.md](docs/mount-options-parity.md) |
+| **Dual-run / crates.io** | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) · [docs/crates-io-policy.md](docs/crates-io-policy.md) |
 
 ```bash
 make release && make install   # → ~/.local/bin/ratarmount
@@ -53,7 +54,7 @@ Rust is not a drop-in replacement for every Python workflow yet (see [gaps](#gap
 | PDF / OGG / HTML / Git | yes | yes | PDF images deferred; Git needs `RATARMOUNT_FORCE_GIT=1` for some trees |
 | RAR / LHA / long-tail | yes | yes | via libarchive (sequential member open) |
 | Split files (`.001`) | yes | yes | decimal/hex/alpha join at open |
-| lrzip | yes | — | not yet |
+| lrzip | yes | yes | CLI materialize + libarchive fallback; pure in-process open |
 
 ### Compression (outer / seekable)
 

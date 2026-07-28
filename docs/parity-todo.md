@@ -39,7 +39,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | xz multi-block seek | yes | Index + multi-stream maps; single-block full decode | `[x]` / `~` exotic filters |
 | zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** import/export | `[x]` |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
-| lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize | `~` CLI required |
+| lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize; **libarchive** raw/filter fallback | `~` pure in-process still open |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
 | Split files (`.001`/`.002`) | yes | yes (decimal/hex/alpha join) | `[x]` top-level + recursive AutoMount |
 
@@ -149,11 +149,11 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 | Makefile release/install | `[x]` |
 | Daemonize default | `[x]` |
 | AppImage / distro packages | `~` `packaging/build-appimage.sh` + desktop; needs linuxdeploy host |
-| crates.io library publish policy | `[ ]` |
+| crates.io library publish policy | `[x]` documented [`docs/crates-io-policy.md`](crates-io-policy.md) (no crates.io publish required for dual-run) |
 | Pure FUSE ABI (Annex A) | `[ ]` deferred; fuser stays product path |
 | GitHub CI (fmt/clippy/test) | `[x]` `.github/workflows/ci.yml` |
 | GitHub CI FUSE allowlist suite | `[x]` (fixtures from mxmlnkn/ratarmount) |
-| Phase 12: Python deprecation timeline | `~` scaffold [`docs/phase12-dual-run.md`](phase12-dual-run.md) |
+| Phase 12: dual-run / Python deprecation timeline | `[x]` docs [`docs/phase12-dual-run.md`](phase12-dual-run.md); announce / cutover still pending gates |
 
 ---
 
@@ -175,7 +175,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 13. ~~**ASAR**~~ — stencil `ASARMountSource`; harness `phase9-asar`.  
 14. ~~**OGG / HTML / PDF / Git / zlib**~~ — OGG demux; HTML data-URLs; PDF attachments; Git via git2; zlib seekable.  
 15. ~~**Mount options CLI parity**~~ — high-impact flags: password-file, recursive-extensions, transform, disable-union, no-recreate-index, gnu-incremental, color, oss-attributions; matrix: [`docs/mount-options-parity.md`](mount-options-parity.md).  
-16. **Phase 12** dual-run announce → Rust primary — scaffold: [`docs/phase12-dual-run.md`](phase12-dual-run.md); execute after residual gates.
+16. **Phase 12** dual-run announce → Rust primary — docs done: [`docs/phase12-dual-run.md`](phase12-dual-run.md); execute announce after residual gates. crates.io: [`docs/crates-io-policy.md`](crates-io-policy.md).
 
 ---
 
@@ -186,3 +186,5 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
 - **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
+- **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
+- **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)

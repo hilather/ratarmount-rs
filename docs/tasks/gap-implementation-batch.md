@@ -157,12 +157,19 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 ## Still open (later / batch 13+)
 
+Productization docs (Phase 12 dual-run + crates.io policy) are **done** — see [`docs/phase12-dual-run.md`](../phase12-dual-run.md) and [`docs/crates-io-policy.md`](../crates-io-policy.md). Residual engineering work below remains for batch 13+.
+
 | Gap | Notes |
 |-----|--------|
-| Pure in-process lrzip | rare; CLI/libarchive cover practical cases |
-| Factory wire zstdblocks from index on open | APIs exist |
-| RAR pure / long-tail | libarchive only |
-| crates.io publish policy / Phase 12 | productization |
+| Pure in-process lrzip | rare; **CLI + libarchive fallback** cover practical cases; no seekable pure decoder |
+| Factory wire zstdblocks from index on open | APIs exist; auto-wire on mount still open |
+| RAR pure / long-tail beyond libarchive | sequential libarchive only |
+| Encrypted ZIP true per-disk offsets | multi-part join + EOCD normalize landed; edge multi-disk residual |
+| Progressive multi-GB solid 7z (BCJ/AES) | progressive LZMA2 + LRU windows; full-folder residual for some filters |
+| PDF Separation/Lab residual | main XObject image paths done |
+| Full fixed-archive ≥90% allowlist | track gaps; not dual-run hard gate |
+| Phase 12 **announce / cutover** (ops) | docs ready; tag + deprecation date after gates in phase12-dual-run.md |
+| crates.io **first publish** (optional) | policy ready; binary remains primary deliverable |
 
 ## Verify
 
