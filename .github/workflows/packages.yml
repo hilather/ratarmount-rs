@@ -84,7 +84,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.3"
+          VERSION: "0.1.4"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.3"
+          VERSION: "0.1.4"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -234,7 +234,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.3"
+          VERSION: "0.1.4"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -260,7 +260,7 @@ jobs:
           if-no-files-found: error
 
   # =========================================================================
-  # macOS release tarballs (Apple Silicon primary; Intel optional)
+  # macOS release tarballs (Apple Silicon; GHA macos-13 Intel is scarce/deprecated)
   # =========================================================================
   macos:
     name: macos (${{ matrix.label }})
@@ -276,10 +276,8 @@ jobs:
           - label: macos-arm64
             runner: macos-14
             arch_label: arm64
-          # Intel runners are slower/scarcer; keep for release tags when available.
-          - label: macos-x86_64
-            runner: macos-13
-            arch_label: x86_64
+          # Note: macos-13 (x86_64) removed — jobs sat "queued" indefinitely on GHA
+          # and blocked Sign & release. Re-add when GitHub offers reliable Intel runners.
     steps:
       - uses: actions/checkout@v4
 
@@ -324,7 +322,7 @@ jobs:
 
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.3"
+          VERSION: "0.1.4"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
