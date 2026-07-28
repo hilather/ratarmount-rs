@@ -124,6 +124,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | Flattened recursive TAR index | later | outer absolute offsets |
 | 7z store-in-solid nested no-tmp | later | progressive outer + inner reader |
 | Tests: nested 7z + nested TAR | **done** | sevenzip + automount unit tests |
+| Nested **compressed** members (7z→`.tar.gz`, …) | **done** (gzip/zstd/bz2/xz→TAR + ZIP) | factory `open_nested_reader_fn`; see [`embedded-nested-random-access.md`](embedded-nested-random-access.md) |
 
 ## Batch 10 — five parallel worktree agents (merged)
 

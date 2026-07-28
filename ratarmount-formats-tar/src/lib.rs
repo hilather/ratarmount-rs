@@ -511,7 +511,13 @@ impl SqliteIndexedTar {
             "isGnuIncremental",
             if is_gnu_incremental { "1" } else { "0" },
         )?;
-        store_tarstats(&index, &archive_path)?;
+        // Nested / virtual labels (e.g. `inner.tar.gz` inside a 7z) are not real
+        // host paths — use label-safe stats (path metadata when present).
+        let size_hint = std::fs::metadata(&archive_path)
+            .or_else(|_| std::fs::metadata(&data_path))
+            .map(|m| m.len())
+            .unwrap_or(0);
+        store_tarstats_for_label(&index, &archive_path, size_hint)?;
         store_arguments(&index, options)?;
         index.commit_write()?;
 
@@ -678,16 +684,9 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn store_tarstats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    let meta = std::fs::metadata(path)?;
-    let json = serde_json_tarstats(&meta);
-    index.store_metadata_key_value("tarstats", &json)?;
-    Ok(())
-}
-
 /// Store tarstats from path metadata when available; otherwise synthetic size-only stats.
 ///
-/// Used for reader-based opens where `archive_label` may be a URL or virtual name.
+/// Used for reader-based / nested opens where `archive_label` may be a URL or virtual name.
 fn store_tarstats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
     if path.exists() {
         if let Ok(meta) = std::fs::metadata(path) {

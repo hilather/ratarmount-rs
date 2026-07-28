@@ -1,0 +1,142 @@
+# Task: Embedded / nested archive random access (no temp spool)
+
+**Goal:** Open nested archives from a parent member `Read+Seek` stream with true random member reads, without materializing to `/tmp` (or only as last resort).
+
+**Baseline (done):**
+
+- AutoMount `OpenNestedReaderFn` + path spool fallback
+- Nested magic open for **7z / ZIP / plain TAR**
+- Outer **`.tar.gz` / `.tar.zst` / `.tar.bz2` / `.tar.xz`** top-level seekable bodies
+- 7z store + pure-LZMA2 progressive member streams
+- TAR nested flatten + `nestedTarMembers` stencil API
+
+**Not yet:** nested **compressed** members (`.tar.gz` inside 7z/TAR/ZIP), stencil formats from reader, image formats from reader.
+
+---
+
+## Capability matrix (only “capable” formats)
+
+| ID | Stack | Random read model | Nested no-tmp today | Target |
+|----|--------|-------------------|---------------------|--------|
+| N0 | Outer 7z store → inner TAR/ZIP/7z | Outer stencil + inner as now | **done** | keep |
+| N1 | Outer 7z solid LZMA2 → inner TAR/ZIP/7z | Progressive outer member + inner | **done** (CPU cost on deep solid) | keep + tests |
+| N2 | Outer 7z → **inner `.tar.gz` / `.tgz`** | Outer member stream + nested gzip seek + TAR | **tmp spool** (gzip not sniffed) | **no-tmp** |
+| N3 | Outer 7z → inner `.tar.zst` / `.tar.bz2` / multi-block `.tar.xz` | Same as N2 with zstd/bzip2/xz from_reader | **tmp** | **no-tmp** |
+| N4 | Outer `.tar.gz` → inner TAR/ZIP/7z | Outer gzip seek + stencil | **done** | keep + large fixtures |
+| N5 | Outer TAR/ZIP → nested gzip/xz/zstd member | Nested compress from_reader | **tmp** | **no-tmp** |
+| N6 | ZIP store nested open | Shared region stencil | **done** (factory) | tests + multi-disk edges |
+| N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
+| N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
+| N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | path / materialize | **no-tmp** when practical |
+| — | Solid RAR / single-stream xz without index / libarchive-only | sequential | n/a | **out of scope** here |
+| — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | separate 7z task |
+
+---
+
+## Phase A — Nested compressed open (highest ROI)
+
+**Owner:** `ratarmount/src/factory.rs` (+ small TAR gzip glue if needed)  
+**Depends on:** existing `SharedSeekableGzip::open_*_from_reader`, zstd/bzip2/xz `*_from_reader`, `SqliteIndexedTar::create_index_gzip` / body open
+
+### A1. Detect nested compression in `open_nested_reader_fn`
+
+- [x] Sniff magic after rewind: gzip `1f 8b`, zstd frame, xz, bzip2 `BZh`
+- [x] Name / body probe for compressed TAR
+- [x] On hit: open seekable body **from the member reader** (no copy to disk)
+- [x] Keep in-memory nested indexes (`index_in_memory = true`)
+- [x] On unsupported inner body: error → existing temp-spool fallback (do not regress)
+
+### A2. Nested `.tar.gz` path (N2 / N4 / N5)
+
+- [x] `SharedSeekableGzip::open_with_threads_from_reader(member, spacing, threads, label)`
+- [x] `body_looks_like_tar_gzip` / name → `SqliteIndexedTar::create_index_gzip`
+- [x] Random `open` of TAR members via existing gzip stencil (no second spool)
+- [x] Log: `nested reader open: {label} gzip→tar checkpoints=N`
+- [x] Fix `store_tarstats` for virtual nested labels (`store_tarstats_for_label`)
+
+### A3. Nested `.tar.zst` / `.tar.bz2` / multi-block `.tar.xz`
+
+- [x] zstd / bzip2 / xz from_reader → TAR when body looks like TAR (same factory path)
+- [ ] Dedicated unit fixtures for zst/bz2/xz nested (optional)
+- [ ] Do **not** claim free random access for single-stream xz/lzma
+
+### A4. Tests (no `/tmp` assertion)
+
+- [x] Unit: outer **store** 7z + `inner.tar.gz` (≥2 files) via `open_nested_reader_fn` + mid-member seek
+- [x] Unit: outer **store** 7z + `inner.zip` random read no-tmp
+- [x] Unit: pure Cursor `.tar.gz` → nested gzip→tar
+- [ ] Unit: outer plain TAR + nested `.tar.gz` no-tmp (covered by cursor + factory path)
+- [ ] Optional harness: `nested-7z-tar-gz` allowlist entry
+
+### A5. Docs / parity
+
+- [ ] Update `docs/parity-todo.md` AutoMount / nested row
+- [ ] Note in sevenzip module docs: nested gzip TAR supported without temp when A1 lands
+- [ ] Cross-link this file from `gap-implementation-batch.md`
+
+---
+
+## Phase B — Stencil archives from reader
+
+**Owners:** per-format crate + factory sniff
+
+### B1. CPIO + AR
+
+- [ ] `open_from_reader` on CPIO / AR mount sources (mirror ZIP/TAR pattern)
+- [ ] Factory nested magic: `07070` newc/crc, `070707` odc, AR `!<arch>\n`
+- [ ] Tests: nested `inner.newc.cpio` in TAR/7z store no-tmp
+
+### B2. ISO 9660 / WARC / XAR / ASAR
+
+- [ ] `open_from_reader` (shared `Read+Seek` backend like ZIP `Shared`)
+- [ ] Factory nested detect (ISO primary volume, WARC/WARC/1, XAR header, ASAR)
+- [ ] Tests: one fixture each nested in store 7z or uncompressed TAR
+
+### B3. ZIP store polish
+
+- [ ] Explicit tests: nested store ZIP in 7z/TAR no-tmp random read
+- [ ] Document deflate members: full-member inflate + cache (not progressive); still no outer temp
+
+---
+
+## Phase C — Disk images from reader (when practical)
+
+### C1. SquashFS / EXT4 / FAT
+
+- [ ] Prefer path/mmap when parent is a real file
+- [ ] `open_from_reader` only if crate can index without `Path` (or spool **only** if library requires path — mark residual)
+- [ ] Nested `disk.img` / `.sqsh` in store 7z: no-tmp if reader API exists
+
+---
+
+## Phase D — Explicit non-goals (this list)
+
+- Pure progressive multi-GB 7z BCJ/AES (separate sevenzip task)
+- Pure RAR solid random access
+- Nested lrzip without materialize
+- Guaranteeing zero CPU for solid outer 7z deep members (no-tmp ≠ free)
+
+---
+
+## Suggested agent batches (non-overlapping)
+
+| Batch | Crates | Tasks |
+|-------|--------|-------|
+| 1 | `ratarmount` factory | A1–A3 nested compress open |
+| 2 | `formats-sevenzip` + `compositing` tests | A4 7z→tar.gz fixtures |
+| 3 | `formats-cpio` + `formats-ar` + factory | B1 |
+| 4 | `formats-iso9660` + warc + xar + asar + factory | B2 |
+| 5 | docs + harness | A5 + allowlist |
+
+Run `cargo fmt --all` before every commit (CI fmt gate).
+
+---
+
+## Acceptance criteria (capable set)
+
+1. **N2:** `outer.7z` (store) + `inner.tar.gz` mounts with `-r` **without** writing nested body to temp; random `cat` of ≥2 inner TAR files succeeds.
+2. **N4:** large-ish outer `.tar.gz` + nested 7z still no-tmp (regression).
+3. Nested plain TAR/ZIP/7z unchanged green.
+4. Unsupported nested formats still fall back to temp spool (no hard fail).
+5. Debug logs show `nested reader open: … gzip→tar` (or zstd/bz2) rather than only temp spool.
+)

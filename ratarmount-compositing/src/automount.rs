@@ -649,57 +649,56 @@ impl AutoMountLayer {
             }
         }
 
-        let persist = if let Some(joined) =
-            try_materialize_split_from_parent(parent.as_ref(), &rest)
-        {
-            debug!(
-                "automount: using split-join materialize for {} -> {}",
-                rest,
-                joined.display()
-            );
-            joined
-        } else {
-            let mut reader = match parent.open(&fi, 0) {
-                Ok(r) => r,
-                Err(e) => {
-                    debug!(
+        let persist =
+            if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), &rest) {
+                debug!(
+                    "automount: using split-join materialize for {} -> {}",
+                    rest,
+                    joined.display()
+                );
+                joined
+            } else {
+                let mut reader = match parent.open(&fi, 0) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        debug!(
                         "automount: parent.open for temp spool failed for {rest} (kind={:?}): {e}",
                         e.kind()
                     );
+                        return None;
+                    }
+                };
+                let mut tmp = match NamedTempFile::new() {
+                    Ok(t) => t,
+                    Err(e) => {
+                        debug!("automount: NamedTempFile::new failed for {rest}: {e}");
+                        return None;
+                    }
+                };
+                if let Err(e) = io::copy(&mut reader, &mut tmp) {
+                    debug!("automount: copy to temp failed for {rest}: {e}");
                     return None;
+                }
+                if let Err(e) = tmp.flush() {
+                    debug!("automount: temp flush failed for {rest}: {e}");
+                    return None;
+                }
+                let tmp_path = tmp.into_temp_path();
+                match tmp_path.keep() {
+                    Ok(p) => {
+                        debug!(
+                            "automount: spooled {} -> {} for path open",
+                            rest,
+                            p.display()
+                        );
+                        p
+                    }
+                    Err(e) => {
+                        debug!("automount: temp keep failed for {rest}: {e}");
+                        return None;
+                    }
                 }
             };
-            let mut tmp = match NamedTempFile::new() {
-                Ok(t) => t,
-                Err(e) => {
-                    debug!("automount: NamedTempFile::new failed for {rest}: {e}");
-                    return None;
-                }
-            };
-            if let Err(e) = io::copy(&mut reader, &mut tmp) {
-                debug!("automount: copy to temp failed for {rest}: {e}");
-                return None;
-            }
-            if let Err(e) = tmp.flush() {
-                debug!("automount: temp flush failed for {rest}: {e}");
-                return None;
-            }
-            let tmp_path = tmp.into_temp_path();
-            match tmp_path.keep() {
-                Ok(p) => {
-                    debug!(
-                        "automount: spooled {} -> {} for path open",
-                        rest,
-                        p.display()
-                    );
-                    p
-                }
-                Err(e) => {
-                    debug!("automount: temp keep failed for {rest}: {e}");
-                    return None;
-                }
-            }
-        };
         let nested = match (self.open_nested)(&persist) {
             Ok(s) => s,
             Err(e) => {

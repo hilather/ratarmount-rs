@@ -489,8 +489,14 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 
 /// Nested open from a seekable parent-member stream (no temp spool).
 ///
-/// Supports uncompressed TAR, 7z, and ZIP. Other formats fail so AutoMount can
-/// fall back to materializing a temp file and [`open_nested_fn`].
+/// Supports:
+/// - **7z**, **ZIP**, uncompressed **TAR**
+/// - **gzip / zstd / bzip2 / xz** when the body is a compressed TAR (e.g. `.tar.gz`
+///   embedded in a store 7z) — seekable decompress + in-memory TAR index, random
+///   member reads without writing the nested body to `/tmp`
+///
+/// Other formats fail so AutoMount can fall back to materializing a temp file
+/// and [`open_nested_fn`].
 pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
     Arc::new(move |mut reader, label| {
         use std::io::{Read, Seek, SeekFrom};
@@ -513,7 +519,7 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             opts.passwords.len()
         );
 
-        // 7z magic
+        // 7z magic (not covered by probe_archive_magic)
         if head.len() >= 6 && &head[..6] == b"7z\xBC\xAF'\x1C" {
             log::debug!(
                 "nested reader open: {} detected as 7z (passwords={})",
@@ -535,21 +541,81 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 std::io::Error::other(e.to_string())
             });
         }
-        // ZIP local/EOCD
-        if head.len() >= 4 && &head[..2] == b"PK" {
-            log::debug!("nested reader open: {} detected as ZIP", label.display());
-            return ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
-                .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-                .map_err(|e| {
-                    log::warn!("nested reader open: ZIP {} failed: {e}", label.display());
-                    std::io::Error::other(e.to_string())
-                });
+
+        match probe_archive_magic(head) {
+            "gzip" => return open_nested_gzip_tar(reader, label, &opts),
+            "zstd" => {
+                return open_nested_seekable_tar(
+                    reader,
+                    label,
+                    &opts,
+                    "zstd",
+                    opts.threads_for("zstd"),
+                    |r, thr, lab| {
+                        open_seekable_zstd_with_threads_from_reader(r, thr, lab)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                )
+            }
+            "bzip2" => {
+                return open_nested_seekable_tar(
+                    reader,
+                    label,
+                    &opts,
+                    "bzip2",
+                    opts.threads_for("bzip2"),
+                    |r, thr, lab| {
+                        open_seekable_bzip2_with_threads_from_reader(r, thr, lab)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                )
+            }
+            "xz" => {
+                return open_nested_seekable_tar(
+                    reader,
+                    label,
+                    &opts,
+                    "xz",
+                    opts.threads_for("xz"),
+                    |r, thr, lab| {
+                        open_seekable_xz_with_threads_from_reader(r, thr, lab)
+                            .map_err(|e| std::io::Error::other(e.to_string()))
+                    },
+                )
+            }
+            "zip" => {
+                log::debug!("nested reader open: {} detected as ZIP", label.display());
+                return ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+                    .map(|s| {
+                        log::debug!(
+                            "nested reader open: ZIP {} mounted successfully",
+                            label.display()
+                        );
+                        Arc::new(s) as Arc<dyn MountSource>
+                    })
+                    .map_err(|e| {
+                        log::warn!("nested reader open: ZIP {} failed: {e}", label.display());
+                        std::io::Error::other(e.to_string())
+                    });
+            }
+            "tar" => {
+                log::debug!("nested reader open: {} detected as TAR", label.display());
+                return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
+                    .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+                    .map_err(|e| {
+                        log::warn!("nested reader open: TAR {} failed: {e}", label.display());
+                        std::io::Error::other(e.to_string())
+                    });
+            }
+            _ => {}
         }
-        // Uncompressed TAR (ustar) or name suggests .tar
-        let looks_tar =
-            (head.len() >= 262 && &head[257..262] == b"ustar") || name_suggests_plain_tar(label);
-        if looks_tar {
-            log::debug!("nested reader open: {} detected as TAR", label.display());
+
+        // Uncompressed TAR by name (no ustar magic in first 512 — rare)
+        if name_suggests_plain_tar(label) {
+            log::debug!(
+                "nested reader open: {} treated as TAR by name",
+                label.display()
+            );
             return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
                 .map(|s| Arc::new(s) as Arc<dyn MountSource>)
                 .map_err(|e| {
@@ -571,6 +637,118 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             ),
         ))
     })
+}
+
+/// Nested gzip body: seekable checkpoints + TAR index (no temp spool of the member).
+fn open_nested_gzip_tar(
+    reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let spacing = if opts.gzip_seek_point_spacing == 0 {
+        ratarmount_compress::DEFAULT_GZIP_SEEK_SPACING
+    } else {
+        opts.gzip_seek_point_spacing
+    };
+    let threads = opts.threads_for("gzip");
+    log::debug!(
+        "nested reader open: {} detected as gzip (spacing={spacing}, -P gzip:{threads})",
+        label.display()
+    );
+    let gzip = SharedSeekableGzip::open_with_threads_from_reader(reader, spacing, threads, label)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    let is_tar =
+        name_suggests_compressed_tar(label) || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
+    if !is_tar {
+        log::debug!(
+            "nested reader open: {} gzip body is not TAR; falling back to temp spool",
+            label.display()
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "nested gzip {} is not a TAR body (will try temp spool)",
+                label.display()
+            ),
+        ));
+    }
+    log::debug!(
+        "nested reader open: {} gzip→tar ({} uncompressed bytes, {} checkpoints)",
+        label.display(),
+        gzip.size(),
+        gzip.checkpoint_count()
+    );
+    // Nested: always rebuild in-memory index (opts already force index_in_memory).
+    SqliteIndexedTar::create_index_gzip(label, gzip, None, opts, VERSION)
+        .map(|s| {
+            log::debug!(
+                "nested reader open: gzip→tar {} mounted successfully",
+                label.display()
+            );
+            Arc::new(s) as Arc<dyn MountSource>
+        })
+        .map_err(|e| {
+            log::warn!(
+                "nested reader open: gzip→tar {} failed: {e}",
+                label.display()
+            );
+            std::io::Error::other(e.to_string())
+        })
+}
+
+/// Nested zstd/bzip2/xz compressed TAR via existing seekable body + TAR index.
+fn open_nested_seekable_tar<R, F>(
+    reader: R,
+    label: &Path,
+    opts: &OpenOptions,
+    codec: &str,
+    threads: u32,
+    open_body: F,
+) -> std::io::Result<Arc<dyn MountSource>>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+    F: FnOnce(R, u32, &Path) -> std::io::Result<Arc<dyn SeekableBody>>,
+{
+    log::debug!(
+        "nested reader open: {} detected as {codec} (-P {codec}:{threads})",
+        label.display()
+    );
+    let body = open_body(reader, threads, label)?;
+    let is_tar = name_suggests_compressed_tar(label) || body_looks_like_tar(&body).unwrap_or(false);
+    if !is_tar {
+        log::debug!(
+            "nested reader open: {} {codec} body is not TAR; falling back to temp spool",
+            label.display()
+        );
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "nested {codec} {} is not a TAR body (will try temp spool)",
+                label.display()
+            ),
+        ));
+    }
+    log::debug!(
+        "nested reader open: {} {codec}→tar ({} uncompressed bytes, {} checkpoints)",
+        label.display(),
+        body.size(),
+        body.checkpoint_count()
+    );
+    open_tar_body(label, body, None, opts, true)
+        .map(|s| {
+            log::debug!(
+                "nested reader open: {codec}→tar {} mounted successfully",
+                label.display()
+            );
+            Arc::new(s) as Arc<dyn MountSource>
+        })
+        .map_err(|e| {
+            log::warn!(
+                "nested reader open: {codec}→tar {} failed: {e}",
+                label.display()
+            );
+            std::io::Error::other(e)
+        })
 }
 
 fn name_suggests_plain_tar(path: &Path) -> bool {
@@ -2514,5 +2692,184 @@ mod tests {
 
         assert!(zstd_blocks_i64_to_u64(&[(-1, 0)]).is_none());
         assert!(zstd_blocks_u64_to_i64(&[(u64::MAX, 0)]).is_none());
+    }
+
+    /// Multi-file `.tar.gz` for nested random-read checks.
+    fn make_multi_tar_gz(dir: &Path) -> PathBuf {
+        let data = dir.join("tg-data");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("alpha.txt"), b"alpha-payload-line\n").expect("write");
+        std::fs::write(
+            data.join("beta.txt"),
+            b"beta-RANDOM-seek-target-0123456789\n",
+        )
+        .expect("write");
+        let tar_gz = dir.join("inner.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&tar_gz)
+            .arg("-C")
+            .arg(&data)
+            .args(["alpha.txt", "beta.txt"])
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -czf multi failed");
+        tar_gz
+    }
+
+    fn make_multi_zip(dir: &Path) -> PathBuf {
+        let data = dir.join("zip-data");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("one.txt"), b"zip-one-contents\n").expect("write");
+        std::fs::write(data.join("two.txt"), b"zip-two-SEEK-ME-abcdef\n").expect("write");
+        let zip_path = dir.join("inner.zip");
+        let status = Command::new("zip")
+            .args(["-q", "-j"])
+            .arg(&zip_path)
+            .arg(data.join("one.txt"))
+            .arg(data.join("two.txt"))
+            .status()
+            .expect("spawn zip");
+        assert!(status.success(), "zip failed");
+        zip_path
+    }
+
+    /// Store/non-solid outer 7z (no solid compression — random outer member open is free).
+    fn make_store_7z_with_member(dir: &Path, member: &Path, outer_name: &str) -> Option<PathBuf> {
+        let outer = dir.join(outer_name);
+        // Prefer 7z; fall back to 7za.
+        for bin in ["7z", "7za"] {
+            let status = Command::new(bin)
+                .args(["a", "-t7z", "-mx0", "-y"])
+                .arg(&outer)
+                .arg(member)
+                .status();
+            match status {
+                Ok(s) if s.success() && outer.exists() => return Some(outer),
+                _ => continue,
+            }
+        }
+        None
+    }
+
+    fn read_all(ms: &dyn MountSource, path: &str) -> Vec<u8> {
+        let fi = ms
+            .lookup(path, 0)
+            .unwrap_or_else(|| panic!("lookup {path}"));
+        let mut r = ms.open(&fi, 0).expect("open");
+        let mut buf = Vec::new();
+        use std::io::Read;
+        r.read_to_end(&mut buf).expect("read");
+        buf
+    }
+
+    fn read_seek_mid(ms: &dyn MountSource, path: &str, start: u64) -> Vec<u8> {
+        use std::io::{Read, Seek, SeekFrom};
+        let fi = ms.lookup(path, 0).expect("lookup");
+        let mut r = ms.open(&fi, 0).expect("open");
+        r.seek(SeekFrom::Start(start)).expect("seek");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).expect("read");
+        buf
+    }
+
+    #[test]
+    fn nested_tar_gz_inside_store_7z_reader_random_read_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_gz = make_multi_tar_gz(dir.path());
+        let Some(outer) = make_store_7z_with_member(dir.path(), &tar_gz, "outer-tgz.7z") else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 64 * 1024,
+            ..Default::default()
+        };
+        let outer_ms = SevenZipMountSource::open(&outer, None, &opts, VERSION, true)
+            .expect("open store 7z outer");
+        let nested_name = tar_gz.file_name().unwrap().to_str().unwrap();
+        let nested_path = format!("/{nested_name}");
+        let nested_fi = outer_ms
+            .lookup(&nested_path, 0)
+            .unwrap_or_else(|| panic!("lookup nested member {nested_path}"));
+        let nested_reader = outer_ms
+            .open(&nested_fi, 0)
+            .expect("open nested member stream (no tmp)");
+
+        let opener = open_nested_reader_fn(opts.clone());
+        let inner = opener(nested_reader, Path::new(nested_name)).expect(
+            "nested open_nested_reader_fn must open .tar.gz from 7z member without temp spool",
+        );
+
+        let alpha = read_all(inner.as_ref(), "/alpha.txt");
+        assert_eq!(alpha, b"alpha-payload-line\n");
+        let beta = read_all(inner.as_ref(), "/beta.txt");
+        assert_eq!(beta, b"beta-RANDOM-seek-target-0123456789\n");
+        // True random read: mid-member seek on gzip-backed TAR.
+        let mid = read_seek_mid(inner.as_ref(), "/beta.txt", 5);
+        assert_eq!(mid.as_slice(), &beta[5..]);
+    }
+
+    #[test]
+    fn nested_zip_inside_store_7z_reader_random_read_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = make_multi_zip(dir.path());
+        let Some(outer) = make_store_7z_with_member(dir.path(), &zip_path, "outer-zip.7z") else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let outer_ms = SevenZipMountSource::open(&outer, None, &opts, VERSION, true)
+            .expect("open store 7z outer");
+        let nested_name = zip_path.file_name().unwrap().to_str().unwrap();
+        let nested_fi = outer_ms
+            .lookup(&format!("/{nested_name}"), 0)
+            .expect("lookup inner.zip");
+        let nested_reader = outer_ms
+            .open(&nested_fi, 0)
+            .expect("open zip member stream");
+
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(nested_reader, Path::new(nested_name))
+            .expect("nested ZIP open_from_reader without temp spool");
+
+        let one = read_all(inner.as_ref(), "/one.txt");
+        assert_eq!(one, b"zip-one-contents\n");
+        let two = read_all(inner.as_ref(), "/two.txt");
+        assert_eq!(two, b"zip-two-SEEK-ME-abcdef\n");
+        let mid = read_seek_mid(inner.as_ref(), "/two.txt", 4);
+        assert_eq!(mid.as_slice(), &two[4..]);
+    }
+
+    #[test]
+    fn nested_tar_gz_from_cursor_direct() {
+        // No outer 7z: pure nested gzip→tar path (what AutoMount feeds after parent.open).
+        let dir = tempfile::tempdir().unwrap();
+        let tar_gz = make_multi_tar_gz(dir.path());
+        let bytes = std::fs::read(&tar_gz).expect("read tar.gz");
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 32 * 1024,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("inner.tar.gz")).expect("gzip→tar nested");
+        assert_eq!(
+            read_all(inner.as_ref(), "/alpha.txt"),
+            b"alpha-payload-line\n"
+        );
+        let beta = read_all(inner.as_ref(), "/beta.txt");
+        assert_eq!(
+            read_seek_mid(inner.as_ref(), "/beta.txt", 10).as_slice(),
+            &beta[10..]
+        );
     }
 }
