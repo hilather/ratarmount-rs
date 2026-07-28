@@ -8,8 +8,9 @@ pub use hashing::{
     SUPPORTED_HASH_ALGORITHMS,
 };
 pub use location::{
-    default_index_folders, default_index_path, expand_user, parse_index_folders,
-    possible_index_paths, resolve_index_location, IndexLocation, MEMORY_INDEX,
+    default_index_folders, default_index_path, expand_user, is_index_url, maybe_fetch_index_url,
+    parse_index_folders, possible_index_paths, resolve_index_location, sibling_index_url,
+    IndexLocation, MEMORY_INDEX,
 };
 
 use std::collections::{BTreeMap, HashMap};
@@ -49,6 +50,8 @@ pub enum IndexError {
     Mismatch(String),
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    #[error("remote index: {0}")]
+    Remote(String),
     #[error("index is not open")]
     NotOpen,
 }

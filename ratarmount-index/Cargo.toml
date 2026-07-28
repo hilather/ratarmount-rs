@@ -16,6 +16,7 @@ sha2 = "0.10"
 sha1 = "0.10"
 md-5 = "0.10"
 crc32fast = "1"
+tempfile.workspace = true
+ureq = { version = "2", default-features = true, features = ["tls"] }
 
 [dev-dependencies]
-tempfile.workspace = true
