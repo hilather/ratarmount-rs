@@ -96,7 +96,10 @@
 - [x] ISO / WARC / ASAR `open_from_reader` (shared `Read+Seek`) — batch 2026-07-28
 - [x] Factory nested detect (ISO PVD/`CD001`, WARC/, `.asar`, …)
 - [x] Unit tests per crate (path + Cursor)
-- [ ] XAR / CAB deferred (compressed members more work)
+- [x] XAR / CAB (store/MSZIP) / SQLAR / FAT `open_from_reader` — wave2 agents
+- [x] Factory wire + e2e nested CPIO/AR/WARC/ASAR tests
+- [ ] CAB LZX residual (spool → libarchive)
+- [ ] SquashFS / EXT4 nested stream (path-oriented residual)
 
 ### B3. ZIP store polish
 

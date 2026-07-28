@@ -265,8 +265,9 @@ Recursive mounts open nested archives from a **seekable parent member stream** w
 | `.tar` inside ZIP / TAR / 7z / `.tar.gz` | **No** | Yes (TAR stencil) |
 | `.tar.gz` inside ZIP / TAR / 7z | **No** | Yes (gzip seek + TAR) |
 | `.zip` / `.7z` inside those parents | **No** | Yes\* |
-| CPIO / AR / ISO / WARC / ASAR nested | **No** | Yes (extent/payload stencil) |
-| XAR / SquashFS / RAR / plain non-TAR `.gz` nested | Often **yes** (fallback) | Path open after spool |
+| CPIO / AR / ISO / WARC / ASAR / XAR / CAB (store/MSZIP) / FAT nested | **No** | Yes (stencil / shared seek) |
+| Unencrypted SQLAR nested | **No** (DB in RAM) | Yes after deserialize |
+| CAB LZX / SquashFS / RAR / plain non-TAR `.gz` nested | Often **yes** (fallback) | Path open after spool |
 
 \* ZIP deflate and solid 7z still decompress (CPU/RAM); they avoid nested **disk** spool when the stream path succeeds.
 

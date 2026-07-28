@@ -28,7 +28,7 @@ use ratarmount_formats_asar::{looks_like_asar, AsarMountSource};
 use ratarmount_formats_cab::{looks_like_cab, CabError, CabMountSource};
 use ratarmount_formats_cpio::{looks_like_cpio, CpioMountSource};
 use ratarmount_formats_ext4::{looks_like_ext4, Ext4MountSource};
-use ratarmount_formats_fat::{looks_like_fat, FatMountSource};
+use ratarmount_formats_fat::{looks_like_fat, looks_like_fat_reader, FatMountSource};
 use ratarmount_formats_git::{looks_like_git, GitMountSource};
 use ratarmount_formats_html::{looks_like_html, HtmlMountSource};
 use ratarmount_formats_iso9660::{looks_like_iso, Iso9660MountSource};
@@ -493,7 +493,8 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 /// - **7z**, **ZIP**, uncompressed **TAR**
 /// - **gzip / zstd / bzip2 / xz** when the body is a compressed TAR (e.g. `.tar.gz`
 ///   embedded in a store 7z) — seekable decompress + in-memory TAR index
-/// - **CPIO**, **AR**, **ISO 9660**, **WARC**, **ASAR** (stencil backends)
+/// - **CPIO**, **AR**, **ISO 9660**, **WARC**, **ASAR**, **XAR**, **CAB** (store/MSZIP),
+///   **SQLAR** (unencrypted, full image in RAM), **FAT** images
 ///
 /// Other formats fail so AutoMount can fall back to materializing a temp file
 /// and [`open_nested_fn`].
@@ -546,6 +547,27 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
             return map_nested_open("AR", label, || {
                 ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // XAR
+        if head.len() >= 4 && &head[..4] == b"xar!" {
+            return map_nested_open("XAR", label, || {
+                XarMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // CAB (MSCF); LZX returns UnsupportedCompression → AutoMount temp spool → libarchive
+        if head.len() >= 4 && &head[..4] == b"MSCF" {
+            return map_nested_open("CAB", label, || {
+                CabMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
+            });
+        }
+
+        // Unencrypted SQLAR / SQLite header
+        if head.len() >= 16 && &head[..16] == b"SQLite format 3\0" {
+            return map_nested_open("SQLAR", label, || {
+                SqlarMountSource::open_from_reader(reader, label, &opts)
             });
         }
 
@@ -657,6 +679,31 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
             });
         }
+        if name_suggests_ext(label, &["xar"]) {
+            return map_nested_open("XAR", label, || {
+                XarMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+        if name_suggests_ext(label, &["cab"]) {
+            return map_nested_open("CAB", label, || {
+                CabMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
+            });
+        }
+        if name_suggests_ext(label, &["sqlar"]) {
+            return map_nested_open("SQLAR", label, || {
+                SqlarMountSource::open_from_reader(reader, label, &opts)
+            });
+        }
+
+        // FAT image: boot-sector probe or name (`.img` only if probe matches — ISO checked above)
+        let looks_fat = name_suggests_ext(label, &["fat", "vfat", "fat12", "fat16", "fat32"])
+            || looks_like_fat_reader(&mut reader);
+        let _ = reader.seek(SeekFrom::Start(0));
+        if looks_fat {
+            return map_nested_open("FAT", label, || {
+                FatMountSource::open_from_reader(reader, label)
+            });
+        }
 
         log::debug!(
             "nested reader open: {} unsupported format (magic={:02x?}); will try temp spool",
@@ -713,7 +760,8 @@ fn head_looks_like_cpio(head: &[u8]) -> bool {
 }
 
 fn name_suggests_iso(path: &Path) -> bool {
-    name_suggests_ext(path, &["iso", "iso9660", "cdr", "img"])
+    // Do not treat bare `.img` as ISO — FAT images often use that suffix too.
+    name_suggests_ext(path, &["iso", "iso9660", "cdr"])
 }
 
 fn name_suggests_asar(path: &Path) -> bool {

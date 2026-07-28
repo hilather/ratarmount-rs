@@ -49,7 +49,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | nested Read+Seek no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR + flattened TAR rows; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` size-gated flatten; XAR/SquashFS/RAR nested still spool |
+| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT + TAR flatten; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, SquashFS, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR; GNU tar) | `[x]` common compressions |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |

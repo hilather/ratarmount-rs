@@ -125,7 +125,8 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | 7z store-in-solid nested no-tmp | later | progressive outer + inner reader |
 | Tests: nested 7z + nested TAR | **done** | sevenzip + automount unit tests |
 | Nested **compressed** members (7z→`.tar.gz`, …) | **done** (gzip/zstd/bz2/xz→TAR + ZIP) | factory `open_nested_reader_fn`; see [`embedded-nested-random-access.md`](embedded-nested-random-access.md) |
-| Nested stencil CPIO/AR/ISO/WARC/ASAR no-tmp | **done** (format APIs + factory wire) | batch 2026-07-28; residual XAR/CAB/SquashFS/RAR |
+| Nested stencil CPIO/AR/ISO/WARC/ASAR no-tmp | **done** (format APIs + factory wire) | batch 2026-07-28 wave1 |
+| Nested XAR/CAB/SQLAR/FAT + factory e2e tests | **done** | wave2 2026-07-28; residual CAB LZX, SquashFS, RAR |
 
 ## Batch 10 — five parallel worktree agents (merged)
 
