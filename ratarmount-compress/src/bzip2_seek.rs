@@ -10,14 +10,23 @@
 //! policy, single block, corrupt), we fall back to a one-shot [`DecodedBody`]
 //! (still multi-stream / multi-block parallel when `threads > 1`).
 //!
+//! # Opening from paths and readers
+//!
+//! Path openers and [`open_seekable_bzip2_from_reader`] share the same pipeline:
+//! the compressed payload is read fully into an `Arc<Vec<u8>>` (within the map
+//! size cap) so remote/HTTP `Read + Seek` sources (Range-capable) work the same
+//! as local files. `archive_label` is stored for diagnostics (`path()`).
+//!
 //! # Size policy
 //!
 //! Bit-block maps are built for compressed inputs up to
 //! [`BIT_BLOCK_SCAN_MAX_BYTES`] (256 MiB, aligned with [`DEFAULT_MEMORY_CAP`]).
 //! Above that cap we skip the bit walk and fall back to full decode so open
-//! stays bounded in RAM and CPU for multi‑GB `.bz2` files. Within the cap the
-//! scanner uses a sliding 48‑bit window (O(n) bit steps, constant work each)
-//! rather than re-reading 48 bits at every offset.
+//! stays bounded in RAM and CPU for multi‑GB `.bz2` files — no mmap dependency;
+//! large inputs stream through the sequential/parallel full-decode path into
+//! RAM or a temp file via [`DecodedBody`]. Within the cap the scanner uses a
+//! sliding 48‑bit window (O(n) bit steps, constant work each) rather than
+//! re-reading 48 bits at every offset.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -53,10 +62,40 @@ pub fn open_seekable_bzip2_with_threads(
     threads: u32,
 ) -> Result<Arc<dyn SeekableBody>> {
     let path = path.as_ref();
+    let file = File::open(path)?;
+    open_seekable_bzip2_with_threads_from_reader(file, threads, path)
+}
+
+/// Open bzip2 from a seekable compressed reader (bit-block map when possible).
+///
+/// `archive_label` is stored for diagnostics ([`SeekableBody::path`] — URL or virtual name).
+/// The compressed payload is read fully into memory for the map path (within
+/// [`BIT_BLOCK_SCAN_MAX_BYTES`]); larger inputs use the full-decode fallback.
+pub fn open_seekable_bzip2_from_reader<R>(
+    reader: R,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek,
+{
+    open_seekable_bzip2_with_threads_from_reader(reader, 1, archive_label)
+}
+
+/// Open bzip2 from a seekable compressed reader with a thread hint.
+///
+/// See [`open_seekable_bzip2_from_reader`]. `threads == 0` means “use CPU count”.
+pub fn open_seekable_bzip2_with_threads_from_reader<R>(
+    mut reader: R,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek,
+{
+    let path = archive_label.as_ref();
     let threads = ParallelizationSpec::resolve_zero(threads).max(1);
-    let mut file = File::open(path)?;
     let mut compressed = Vec::new();
-    file.read_to_end(&mut compressed)?;
+    reader.read_to_end(&mut compressed)?;
     if compressed.len() < 4 || &compressed[..3] != b"BZh" {
         return Err(CompressError::Msg("not a bzip2 stream".into()));
     }
@@ -1006,6 +1045,163 @@ mod tests {
         let mut r = body.open_reader().unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn from_reader_multi_block_equals_path() {
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        let ranges = scan_block_bit_ranges(&compressed).expect("block scan");
+        assert!(ranges.len() >= 2, "fixture must be multi-block");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("from-reader-mb.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let path_body = open_seekable_bzip2(&path).unwrap();
+        let reader_body = open_seekable_bzip2_from_reader(
+            std::io::Cursor::new(compressed.clone()),
+            Path::new("memory://multi-block.bz2"),
+        )
+        .unwrap();
+
+        assert_eq!(path_body.kind(), "bzip2-blocks");
+        assert_eq!(reader_body.kind(), "bzip2-blocks");
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert_eq!(reader_body.path(), Path::new("memory://multi-block.bz2"));
+        assert_eq!(path_body.path(), path.as_path());
+
+        let mut path_all = Vec::new();
+        let mut mem_all = Vec::new();
+        path_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut path_all)
+            .unwrap();
+        reader_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut mem_all)
+            .unwrap();
+        assert_eq!(path_all, data);
+        assert_eq!(mem_all, data);
+
+        // Random seeks match between path and Cursor opens.
+        let mut path_r = path_body.open_reader().unwrap();
+        let mut mem_r = reader_body.open_reader().unwrap();
+        let n = data.len() as u64;
+        for &off in &[0u64, 1, n / 4, n / 2, (3 * n) / 4, n.saturating_sub(1)] {
+            path_r.seek(SeekFrom::Start(off)).unwrap();
+            mem_r.seek(SeekFrom::Start(off)).unwrap();
+            let mut pb = [0u8; 48];
+            let mut mb = [0u8; 48];
+            let pn = path_r.read(&mut pb).unwrap();
+            let mn = mem_r.read(&mut mb).unwrap();
+            assert_eq!(pn, mn, "offset {off}");
+            assert_eq!(&pb[..pn], &mb[..mn], "offset {off}");
+        }
+
+        // Threaded free-function reader path.
+        let body4 = open_seekable_bzip2_with_threads_from_reader(
+            std::io::Cursor::new(compressed),
+            4,
+            "label.bz2",
+        )
+        .unwrap();
+        assert_eq!(body4.size(), data.len() as u64);
+        assert_eq!(body4.checkpoint_count(), path_body.checkpoint_count());
+        let mut got = Vec::new();
+        body4.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn from_reader_multi_stream_equals_path() {
+        let a: Vec<u8> = (0..40_000u32).map(|i| (i % 200) as u8).collect();
+        let b: Vec<u8> = (0..60_000u32).map(|i| ((i * 3) % 200) as u8).collect();
+        let mut compressed = encode_bz2_level(&a, 1);
+        compressed.extend_from_slice(&encode_bz2_level(&b, 1));
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("from-reader-ms.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let path_body = open_seekable_bzip2_with_threads(&path, 2).unwrap();
+        let reader_body = open_seekable_bzip2_with_threads_from_reader(
+            std::io::Cursor::new(compressed.clone()),
+            2,
+            Path::new("memory://multi-stream.bz2"),
+        )
+        .unwrap();
+
+        assert!(path_body.checkpoint_count() >= 2);
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert_eq!(reader_body.path(), Path::new("memory://multi-stream.bz2"));
+
+        let mut path_all = Vec::new();
+        let mut mem_all = Vec::new();
+        path_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut path_all)
+            .unwrap();
+        reader_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut mem_all)
+            .unwrap();
+        assert_eq!(path_all, expected);
+        assert_eq!(mem_all, expected);
+
+        // Seek into second stream region.
+        let mid = a.len() as u64 + 100;
+        let mut path_r = path_body.open_reader().unwrap();
+        let mut mem_r = reader_body.open_reader().unwrap();
+        path_r.seek(SeekFrom::Start(mid)).unwrap();
+        mem_r.seek(SeekFrom::Start(mid)).unwrap();
+        let mut pb = [0u8; 32];
+        let mut mb = [0u8; 32];
+        let pn = path_r.read(&mut pb).unwrap();
+        let mn = mem_r.read(&mut mb).unwrap();
+        assert_eq!(pn, mn);
+        assert_eq!(&pb[..pn], &mb[..mn]);
+    }
+
+    #[test]
+    fn from_reader_threads_zero_ok() {
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        let body = open_seekable_bzip2_with_threads_from_reader(
+            std::io::Cursor::new(compressed),
+            0,
+            "threads-zero.bz2",
+        )
+        .unwrap();
+        assert_eq!(body.size(), data.len() as u64);
+        assert!(body.checkpoint_count() >= 2);
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn from_reader_single_block_fallback() {
+        let data = b"tiny single block from reader";
+        let compressed = encode_bz2(data);
+        let body = open_seekable_bzip2_from_reader(
+            std::io::Cursor::new(compressed),
+            Path::new("virt-single.bz2"),
+        )
+        .unwrap();
+        assert_eq!(body.kind(), "bzip2");
+        assert_eq!(body.path(), Path::new("virt-single.bz2"));
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, data);
     }
 }

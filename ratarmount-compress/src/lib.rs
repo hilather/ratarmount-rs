@@ -38,7 +38,10 @@ pub use split::{
     joined_base_name, materialize_joined_parts, JoinedFile, SplitFileSet,
 };
 
-pub use bzip2_seek::{open_seekable_bzip2, open_seekable_bzip2_with_threads};
+pub use bzip2_seek::{
+    open_seekable_bzip2, open_seekable_bzip2_from_reader, open_seekable_bzip2_with_threads,
+    open_seekable_bzip2_with_threads_from_reader,
+};
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 pub use gzip_seek::{
     open_seekable_gzip, open_seekable_gzip_from_reader, open_seekable_gzip_with_threads,
