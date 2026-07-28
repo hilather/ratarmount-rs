@@ -18,6 +18,32 @@ Do **not** push code that fails `cargo fmt --check`.
 
 Other CI jobs (cold-index benchmark gates, macOS build) can pass while fmt fails — do not treat those alone as “green CI”.
 
+## Tests for every fix (non-negotiable)
+
+**Every bugfix and behavior change must land with automated tests in the same
+commit** (or the same PR). “Manual repro only” is not enough.
+
+| Requirement | Detail |
+|-------------|--------|
+| **Regression test** | Reproduce the failure mode in code; assert the fixed behavior. Name/doc with `Regression:` and a short symptom (e.g. “Dec 31 1969 mtime”). |
+| **Layer** | Prefer the lowest layer that catches the bug (parse unit → mount source → factory nested → FUSE helper). Add a higher-layer test if the bug only appears there. |
+| **No skip without reason** | If a CLI tool is missing (`7z`, `gzip`), `return` early with `eprintln!("skip: …")` — do not silently pass on the happy path without a pure unit test for the core logic. |
+| **Shell/CI** | Workflow-only fixes get a script under `packaging/` or `test-harness/` that CI or agents can run (e.g. empty release asset filter). |
+| **Do not land** | Fix commits without new/updated tests, unless the user explicitly waived tests (rare). |
+
+### Regression catalog (keep these green)
+
+Run filters **separately** (`cargo test` does not treat `|` as OR).
+
+| Symptom / fix | Commands |
+|---------------|----------|
+| Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount nested_large_plain_gzip` |
+| Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
+| 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
+| GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
+
+When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
+
 ## Workspace layout
 
 Rust workspace under `ratarmount-*` crates; binary is `ratarmount/`. Prefer non-overlapping crate ownership when parallelizing. Orchestrator owns `ratarmount/src/factory.rs` glue unless a task explicitly owns factory.

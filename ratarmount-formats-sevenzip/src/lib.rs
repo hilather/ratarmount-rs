@@ -1915,4 +1915,69 @@ sys.stdout.buffer.write(packed)
         );
         assert!(fi.mtime > 0.0, "mtime must be positive (not epoch)");
     }
+
+    /// Embedded / nested path: `open_from_reader` must keep the same mtimes (no-tmp).
+    #[test]
+    fn mtime_open_from_reader_matches_path_open() {
+        use std::io::Cursor;
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("nested.txt");
+        std::fs::write(&plain, b"nested-mtime\n").unwrap();
+        assert!(Command::new("touch")
+            .args(["-d", "2021-03-01 00:00:00 UTC", plain.to_str().unwrap()])
+            .status()
+            .unwrap()
+            .success());
+        let archive = dir.path().join("nested.7z");
+        let status = Command::new("7z")
+            .args([
+                "a",
+                "-t7z",
+                archive.to_str().unwrap(),
+                plain.to_str().unwrap(),
+            ])
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skip: 7z not available");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skip: 7z a failed");
+            return;
+        }
+        let bytes = std::fs::read(&archive).unwrap();
+        let opts = OpenOptions::default();
+        let from_path =
+            SevenZipMountSource::open(&archive, None, &opts, "test", true).expect("path open");
+        let from_reader = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            std::path::Path::new("nested.7z"),
+            None,
+            &opts,
+            "test",
+            true,
+        )
+        .expect("reader open");
+        let a = from_path.lookup("/nested.txt", 0).expect("path lookup");
+        let b = from_reader.lookup("/nested.txt", 0).expect("reader lookup");
+        assert!(
+            a.mtime > 1.0e9 && b.mtime > 1.0e9,
+            "mtimes must be real Unix times, got path={} reader={}",
+            a.mtime,
+            b.mtime
+        );
+        assert!(
+            (a.mtime - b.mtime).abs() < 1.0,
+            "path vs reader mtime mismatch {} vs {}",
+            a.mtime,
+            b.mtime
+        );
+        let expected = 1_614_556_800.0; // 2021-03-01 00:00:00 UTC
+        assert!(
+            (a.mtime - expected).abs() < 86400.0,
+            "mtime {} far from {expected}",
+            a.mtime
+        );
+    }
 }

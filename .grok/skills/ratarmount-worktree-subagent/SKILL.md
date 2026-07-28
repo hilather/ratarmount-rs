@@ -35,9 +35,11 @@ description: >
    cargo test -p <YOUR_CRATE(S)>
 3. CI fails on `cargo fmt --all -- --check` first — unformatted code reds the whole suite
    and skips the FUSE harness (`needs: check`).
-4. One commit on this worktree branch. Do not push.
-5. Report: commit SHA, files changed, residual limits, verify command results.
-6. If you change nested open, materialize, temp spool, or MountSource::open for archives:
+4. **Bug fixes must include regression tests** in the same commit (see root AGENTS.md
+   “Tests for every fix”). Name tests after the symptom; do not ship fix-only commits.
+5. One commit on this worktree branch. Do not push.
+6. Report: commit SHA, files changed, residual limits, verify command results, **new tests**.
+7. If you change nested open, materialize, temp spool, or MountSource::open for archives:
    update docs/embedded-nested-archives.md (and README nested cheat sheet if needed)
    in the same commit, or list an explicit "docs delta" for the orchestrator.
    Skill: format-support-matrices.

@@ -1143,6 +1143,23 @@ mod tests {
         assert_eq!(&buf[..n], payload.as_slice());
     }
 
+    /// Regression: bad archive mtimes (e.g. pre-fix 7z FILETIME) are ≤0 and must
+    /// map to Unix epoch so tools do not panic; after the 7z fix they are positive.
+    #[test]
+    fn unix_float_to_system_time_non_positive_is_epoch() {
+        assert_eq!(unix_float_to_system_time(0.0), UNIX_EPOCH);
+        assert_eq!(unix_float_to_system_time(-1.0), UNIX_EPOCH);
+        // Exact value seen from the wrong FILETIME delta (displayed as Dec 31 1969).
+        assert_eq!(unix_float_to_system_time(-1_151_210_664_000.0), UNIX_EPOCH);
+    }
+
+    #[test]
+    fn unix_float_to_system_time_positive_preserves_seconds() {
+        let t = unix_float_to_system_time(1_592_222_400.0); // 2020-06-15 12:00 UTC
+        let dur = t.duration_since(UNIX_EPOCH).expect("after epoch");
+        assert_eq!(dur.as_secs(), 1_592_222_400);
+    }
+
     #[test]
     fn source_xattr_roundtrip_via_fs_cache() {
         let digest = b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447".to_vec();

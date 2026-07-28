@@ -1210,4 +1210,21 @@ mod filetime_tests {
             "must not be a multi-millennium offset, got {got}"
         );
     }
+
+    /// Document the exact wrong-delta formula that produced Dec 31 1969 on FUSE.
+    #[test]
+    fn historical_wrong_delta_produces_huge_negative() {
+        let unix = 1_592_222_400u64;
+        let ft = unix * 10_000_000 + 116_444_736_000_000_000;
+        // Bug: used 11_644_473_600 * 1_000_000_000 instead of * 10_000_000.
+        let wrong_delta = 11_644_473_600u64.saturating_mul(1_000_000_000);
+        let bad = (ft as f64 - wrong_delta as f64) / 10_000_000.0;
+        assert!(
+            bad < -1.0e9,
+            "wrong delta should yield huge negative (got {bad})"
+        );
+        let good = filetime_to_unix(ft);
+        assert!((good - unix as f64).abs() < 1.0);
+        assert!(good > 0.0);
+    }
 }
