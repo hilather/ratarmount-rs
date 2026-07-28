@@ -44,7 +44,9 @@ use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
 use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
-use ratarmount_index::{resolve_index_location, IndexLocation, SqliteIndex};
+use ratarmount_index::{
+    discard_index_file_if_below_minimum, resolve_index_location, IndexLocation, SqliteIndex,
+};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -933,6 +935,41 @@ fn index_arg(loc: &IndexLocation) -> Option<&Path> {
     loc.as_path()
 }
 
+/// B-119 / `--index-minimum-file-count`: drop a freshly written on-disk SQLite index
+/// when the archive has strictly fewer indexed members than the threshold.
+///
+/// Mount stays live via the open connection (unlinked file). `minimum == 0`,
+/// `:memory:`, read-only index mode, or `write_index = false` leave the file alone.
+fn maybe_discard_index_below_minimum(index_path: Option<&Path>, options: &OpenOptions) {
+    let minimum = options.index_minimum_file_count;
+    if minimum == 0 || options.index_in_memory || options.read_only_index || !options.write_index {
+        return;
+    }
+    let Some(ip) = index_path else {
+        return;
+    };
+    if !ip.exists() {
+        return;
+    }
+    match discard_index_file_if_below_minimum(ip, minimum) {
+        Ok(true) => {
+            // Count is not re-queried here; helper already applied the gate.
+            eprintln!(
+                "info: not keeping on-disk index {} (archive has fewer than \
+                 --index-minimum-file-count {minimum} indexed files)",
+                ip.display()
+            );
+        }
+        Ok(false) => {}
+        Err(e) => {
+            eprintln!(
+                "info: could not apply --index-minimum-file-count gate on {}: {e}",
+                ip.display()
+            );
+        }
+    }
+}
+
 /// Open a multi-volume split set (Python JoinedFileFromFactory → open_mount_source).
 ///
 /// Joins parts into a temp file, then reuses the normal open path. Index defaults
@@ -1125,6 +1162,9 @@ fn open_path_impl(
         }
         CompressionFormat::Lrzip => open_lrzip(path, index_path, &options, recreate)?,
     };
+
+    // After create + optional compression side-table writes: drop small indexes (B-119).
+    maybe_discard_index_below_minimum(index_path, &options);
 
     Ok(source)
 }
@@ -2846,7 +2886,26 @@ fn strip_source_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::process::Command;
+
+    /// Plain 1-file TAR for B-119 index-minimum-file-count regression tests.
+    fn make_tiny_plain_tar(dir: &Path) -> PathBuf {
+        let data = dir.join("data-plain");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("hello.txt"), b"hello world\n").expect("write");
+        let tar_path = dir.join("tiny-plain.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .arg("hello.txt")
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -cf failed");
+        tar_path
+    }
 
     fn make_tiny_tar_gz(dir: &Path) -> PathBuf {
         let data = dir.join("data");
@@ -2863,6 +2922,88 @@ mod tests {
             .expect("spawn tar");
         assert!(status.success(), "tar -czf failed");
         tar_gz
+    }
+
+    /// Regression: B-119 / upstream #119 — small archive must not leave an on-disk index
+    /// when `--index-minimum-file-count` is above the member count (even with explicit
+    /// `--index-file`). Mount still serves content via the live (unlinked) index.
+    #[test]
+    fn index_minimum_file_count_skips_small_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_plain_tar(dir.path());
+        let index = dir.path().join("forced.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            index_minimum_file_count: 1000,
+            ..Default::default()
+        };
+        let src = open_path(&archive, &opts, true).expect("open small tar");
+        // Content readable without FUSE.
+        let info = src.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        let mut r = src.open(&info, 0).expect("open member");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).expect("read member");
+        assert_eq!(buf, b"hello world\n");
+        drop(src);
+        assert!(
+            !index.exists(),
+            "expected no on-disk index for small archive with index_minimum_file_count=1000; \
+             path still present: {}",
+            index.display()
+        );
+    }
+
+    /// Regression: B-119 — minimum 0 (always allow) or 1 (tiny archive meets threshold)
+    /// still writes the index when write_index is true.
+    #[test]
+    fn index_minimum_file_count_zero_or_one_writes_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_plain_tar(dir.path());
+
+        for (min, name) in [(0u64, "min0"), (1u64, "min1")] {
+            let index = dir.path().join(format!("{name}.index.sqlite"));
+            let opts = OpenOptions {
+                index_file_path: Some(index.clone()),
+                write_index: true,
+                index_minimum_file_count: min,
+                ..Default::default()
+            };
+            let src = open_path(&archive, &opts, true).expect("open");
+            drop(src);
+            assert!(
+                index.exists(),
+                "expected on-disk index when index_minimum_file_count={min}"
+            );
+            let meta = std::fs::metadata(&index).expect("stat index");
+            assert!(meta.len() > 0, "index should be non-empty for min={min}");
+        }
+    }
+
+    /// Sibling auto index next to the archive honors the same minimum gate (B-119).
+    #[test]
+    fn index_minimum_file_count_skips_sibling_auto_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_plain_tar(dir.path());
+        // Empty index_folders entry → next to archive.
+        let opts = OpenOptions {
+            index_file_path: None,
+            index_folders: vec![PathBuf::from("")],
+            write_index: true,
+            index_minimum_file_count: 1000,
+            ..Default::default()
+        };
+        let sibling = {
+            let mut p = archive.as_os_str().to_os_string();
+            p.push(".index.sqlite");
+            PathBuf::from(p)
+        };
+        let src = open_path(&archive, &opts, true).expect("open");
+        drop(src);
+        assert!(
+            !sibling.exists(),
+            "sibling auto index should not remain for small archive"
+        );
     }
 
     fn make_tiny_tar_zst(dir: &Path) -> PathBuf {

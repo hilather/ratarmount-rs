@@ -229,6 +229,10 @@ pub struct OpenOptions {
     /// Empty vec means use Python-compatible defaults at resolve time.
     pub index_folders: Vec<PathBuf>,
     pub verify_modification_time: bool,
+    /// When `> 0`, do not keep an on-disk SQLite index if the archive has strictly
+    /// fewer than this many indexed members (`files` rows). `0` always allows
+    /// creating indexes (harness default). Applies even with an explicit `--index-file`
+    /// path (B-119 / upstream #119). In-memory (`:memory:`) is unchanged.
     pub index_minimum_file_count: u64,
     pub recursive: bool,
     pub recursion_depth: Option<i32>,

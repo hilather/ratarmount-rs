@@ -417,6 +417,29 @@ impl SqliteIndex {
         self.file_count_db()
     }
 
+    /// Remove the on-disk index when `file_count() < minimum` (`minimum == 0` → no-op).
+    ///
+    /// Used for B-119 / `--index-minimum-file-count`: small archives keep a live
+    /// SQLite connection (unlinked file still works) but leave no sidecar on disk.
+    /// Returns `true` when the path was removed (or already missing after the check).
+    pub fn discard_on_disk_if_below_minimum(&self, minimum: u64) -> Result<bool> {
+        if minimum == 0 {
+            return Ok(false);
+        }
+        let Some(path) = self.path() else {
+            return Ok(false);
+        };
+        let count = self.file_count_db()?;
+        if count >= minimum {
+            return Ok(false);
+        }
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Number of distinct index rows (versions) for `path` (0 if missing).
     pub fn version_count(&self, path: &str) -> Result<u32> {
         let path = query_normpath(path);
@@ -1204,6 +1227,44 @@ fn file_info_from_named_row(row: &Row<'_>) -> rusqlite::Result<FileInfo> {
     })
 }
 
+/// Count rows in the `files` table of an on-disk index (no mem projection).
+///
+/// Lightweight helper for factory gates that only have a path (B-119).
+pub fn index_file_row_count(path: impl AsRef<Path>) -> Result<u64> {
+    let path = path.as_ref();
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )?;
+    // Favor a quick meta-only open; ignore mmap for a one-shot COUNT.
+    let _ = conn.execute_batch("PRAGMA query_only = ON;");
+    let n: i64 = conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
+    Ok(n as u64)
+}
+
+/// If `minimum > 0` and the on-disk index has strictly fewer than `minimum` `files`
+/// rows, remove the file. Returns `Ok(true)` when removed.
+///
+/// No-op when `minimum == 0`, the path is missing, or the count is at/above the gate.
+pub fn discard_index_file_if_below_minimum(path: impl AsRef<Path>, minimum: u64) -> Result<bool> {
+    if minimum == 0 {
+        return Ok(false);
+    }
+    let path = path.as_ref();
+    if !path.exists() {
+        return Ok(false);
+    }
+    let count = index_file_row_count(path)?;
+    if count >= minimum {
+        return Ok(false);
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1212,6 +1273,71 @@ mod tests {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join(rel)
+    }
+
+    fn one_file_row() -> FileRow {
+        FileRow::new(
+            "/",
+            "only.txt",
+            0,
+            512,
+            4,
+            0.0,
+            0o100644,
+            i64::from(b'0'),
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Regression: B-119 — small indexes are removed when below the minimum.
+    #[test]
+    fn index_minimum_file_count_discards_small_on_disk_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_metadata_key_value("backendName", "SQLiteIndexedTar")
+                .unwrap();
+            // One file row only.
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            let idx = idx.into_read_only().unwrap();
+            assert_eq!(idx.file_count_db().unwrap(), 1);
+            assert!(idx.discard_on_disk_if_below_minimum(1000).unwrap());
+            // Live connection still answers after unlink.
+            assert_eq!(idx.file_count_db().unwrap(), 1);
+        }
+        assert!(
+            !path.exists(),
+            "on-disk index should be removed when count < minimum"
+        );
+    }
+
+    #[test]
+    fn index_minimum_file_count_keeps_index_at_or_above_minimum() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("keep.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_metadata_key_value("backendName", "SQLiteIndexedTar")
+                .unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            let idx = idx.into_read_only().unwrap();
+            assert!(!idx.discard_on_disk_if_below_minimum(1).unwrap());
+            assert!(!idx.discard_on_disk_if_below_minimum(0).unwrap());
+        }
+        assert!(path.exists(), "index should remain when count >= minimum");
+        assert_eq!(index_file_row_count(&path).unwrap(), 1);
+        assert!(!discard_index_file_if_below_minimum(&path, 1).unwrap());
+        assert!(discard_index_file_if_below_minimum(&path, 2).unwrap());
+        assert!(!path.exists());
     }
 
     #[test]

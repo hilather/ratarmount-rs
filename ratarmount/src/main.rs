@@ -105,7 +105,8 @@ struct Args {
     )]
     parallelization: String,
 
-    /// Minimum file count to create an index (harness forces 0)
+    /// Do not keep an on-disk index when the archive has fewer than N indexed files
+    /// (0 = always allow writing indexes; harness forces 0). Applies even with --index-file.
     #[arg(long = "index-minimum-file-count", default_value_t = 0)]
     index_minimum_file_count: u64,
 
