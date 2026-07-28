@@ -224,7 +224,10 @@ impl SeekableLzip {
     /// Open with a thread hint. See [`open_seekable_lzip_with_threads`].
     ///
     /// `threads` is resolved (`0` → CPU count) but indexing/decode stay sequential.
-    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
+    pub fn open_with_threads(
+        path: impl AsRef<Path>,
+        threads: u32,
+    ) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
         // Resolve for -P 0 parity / future multi-member parallel decode; index path
         // does not currently fan out workers.

@@ -1123,10 +1123,7 @@ fn parse_tar_into_index<R: Read + Seek>(
 
         // Nested TAR detection: name ends with `.tar` or ustar/GNU magic at data offset.
         let mut istar = false;
-        if !issparse
-            && is_regular_tar_member(typeflag, &name)
-            && logical_size >= BLOCK_SIZE
-        {
+        if !issparse && is_regular_tar_member(typeflag, &name) && logical_size >= BLOCK_SIZE {
             let by_name = name_looks_like_tar(&name);
             let by_magic = peek_tar_magic_at(reader, data_off)?;
             if by_name || by_magic {
@@ -1261,10 +1258,7 @@ fn flatten_nested_tars<R: Read + Seek>(
         }
         let path_prefix = pending.member.path.clone();
         let region_start = pending.member.offset;
-        let region_end = pending
-            .member
-            .offset
-            .saturating_add(pending.member.size);
+        let region_end = pending.member.offset.saturating_add(pending.member.size);
 
         // Avoid ensure_parent_dirs synthesizing offsetheader=0 for the nest root (would
         // shadow version ordering vs the real file row and the generated directory row).
@@ -1287,10 +1281,7 @@ fn flatten_nested_tars<R: Read + Seek>(
             Ok(()) => {}
             Err(e) => {
                 // Nested content may not be a valid TAR despite magic/name; keep side-list only.
-                log::debug!(
-                    "skip flatten of nested TAR {}: {e}",
-                    pending.member.path
-                );
+                log::debug!("skip flatten of nested TAR {}: {e}", pending.member.path);
                 continue;
             }
         }
@@ -1697,7 +1688,10 @@ fn normalize_member_path(name: &str) -> String {
 
 /// TAR magic at member data offset + 257: `ustar` or GNU.
 fn peek_tar_magic_at<R: Read + Seek>(reader: &mut R, data_off: u64) -> Result<bool> {
-    if reader.seek(SeekFrom::Start(data_off.saturating_add(257))).is_err() {
+    if reader
+        .seek(SeekFrom::Start(data_off.saturating_add(257)))
+        .is_err()
+    {
         return Ok(false);
     }
     let mut magic = [0u8; 5];
@@ -1848,10 +1842,7 @@ fn json_extract_u64_field(obj: &str, key: &str) -> Option<u64> {
     let needle = format!("\"{key}\"");
     let rest = obj.split_once(&needle)?.1.trim_start();
     let rest = rest.strip_prefix(':')?.trim_start();
-    let num: String = rest
-        .chars()
-        .take_while(|c| c.is_ascii_digit())
-        .collect();
+    let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
     num.parse().ok()
 }
 
@@ -2489,7 +2480,9 @@ mod tests {
 
         // After flatten, newest version of /inner.tar is a generated directory (Python parity).
         // File version (raw nested archive bytes) is version 1 (oldest).
-        let fi_dir = outer.lookup("/inner.tar", 0).expect("lookup /inner.tar dir");
+        let fi_dir = outer
+            .lookup("/inner.tar", 0)
+            .expect("lookup /inner.tar dir");
         assert_eq!(
             fi_dir.mode & ratarmount_core::S_IFMT,
             ratarmount_core::S_IFDIR,
@@ -2569,15 +2562,9 @@ mod tests {
             ..OpenOptions::default()
         };
         let mut mat = None;
-        let outer = SqliteIndexedTar::create_index(
-            &outer_tar,
-            &outer_tar,
-            None,
-            &opts,
-            "0.1.0",
-            &mut mat,
-        )
-        .expect("index outer");
+        let outer =
+            SqliteIndexedTar::create_index(&outer_tar, &outer_tar, None, &opts, "0.1.0", &mut mat)
+                .expect("index outer");
 
         // Flattened path exists on the outer mount (no AutoMount).
         let fi = outer
@@ -2665,7 +2652,10 @@ mod tests {
 
     #[test]
     fn join_path_prefix_helpers() {
-        assert_eq!(join_path_prefix("/inner.tar", "payload.txt"), "/inner.tar/payload.txt");
+        assert_eq!(
+            join_path_prefix("/inner.tar", "payload.txt"),
+            "/inner.tar/payload.txt"
+        );
         assert_eq!(join_path_prefix("/inner.tar", "./a/b"), "/inner.tar/a/b");
         assert_eq!(join_path_prefix("", "x"), "x");
     }
@@ -3001,7 +2991,11 @@ mod tests {
 
         let root = m.list("/").expect("root list");
         if let ListResult::Infos(map) = root {
-            assert!(map.contains_key("foo"), "dir foo from dumpdir: {:?}", map.keys());
+            assert!(
+                map.contains_key("foo"),
+                "dir foo from dumpdir: {:?}",
+                map.keys()
+            );
             assert!(
                 map.contains_key("root-file.txt"),
                 "root-file.txt: {:?}",

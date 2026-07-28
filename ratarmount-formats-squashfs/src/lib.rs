@@ -111,15 +111,13 @@ impl CompressionAction for WorkspaceCompressor {
         match compressor {
             Compressor::Xz => {
                 let mut decoder = XzDecoder::new(bytes);
-                decoder.read_to_end(out).map_err(|e| {
-                    BackhandError::CompressionInit(format!("xz2 decompress: {e}"))
-                })?;
+                decoder
+                    .read_to_end(out)
+                    .map_err(|e| BackhandError::CompressionInit(format!("xz2 decompress: {e}")))?;
                 Ok(())
             }
             // Classic LZMA is not implemented by DefaultCompressor either; keep explicit.
-            Compressor::Lzma => Err(BackhandError::UnsupportedCompression(
-                "Lzma".to_string(),
-            )),
+            Compressor::Lzma => Err(BackhandError::UnsupportedCompression("Lzma".to_string())),
             other => DefaultCompressor.decompress(bytes, out, other),
         }
     }
@@ -243,13 +241,14 @@ impl SquashFsMountSource {
         let kind = detect_kind(path, offset)?;
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        let fs = FilesystemReader::from_reader_with_offset_and_kind(reader, offset, kind)
-            .map_err(|e| {
+        let fs = FilesystemReader::from_reader_with_offset_and_kind(reader, offset, kind).map_err(
+            |e| {
                 SquashFsError::Msg(format!(
                     "backhand open failed for {} (offset={offset}): {e}",
                     path.display()
                 ))
-            })?;
+            },
+        )?;
 
         let mut by_path = BTreeMap::new();
         let mut children: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
@@ -407,9 +406,8 @@ impl SquashFsMountSource {
         path: &str,
     ) -> io::Result<Vec<u8>> {
         let abs = norm_abs(path);
-        let node = Self::node_at(fs, by_path, &abs).ok_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, format!("not found: {abs}"))
-        })?;
+        let node = Self::node_at(fs, by_path, &abs)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, format!("not found: {abs}")))?;
         match &node.inner {
             InnerNode::File(f) => {
                 let mut reader = fs.file(f).reader();
@@ -418,7 +416,10 @@ impl SquashFsMountSource {
                 Ok(buf)
             }
             InnerNode::Symlink(s) => Ok(s.link.to_string_lossy().into_owned().into_bytes()),
-            InnerNode::Dir(_) => Err(io::Error::new(io::ErrorKind::IsADirectory, "is a directory")),
+            InnerNode::Dir(_) => Err(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "is a directory",
+            )),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "not a regular file",
@@ -482,7 +483,10 @@ impl MountSource for SquashFsMountSource {
                     ));
                 }
                 let path = path_from_userdata(file_info).ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidInput, "missing squashfs path userdata")
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "missing squashfs path userdata",
+                    )
                 })?;
                 let data = Self::read_file_inprocess(fs, by_path, &path)?;
                 Ok(Box::new(Cursor::new(data)))
@@ -718,10 +722,7 @@ mod tests {
         if !path.exists() {
             return;
         }
-        assert_eq!(
-            read_superblock_compressor(&path, 0).unwrap(),
-            Some(COMP_XZ)
-        );
+        assert_eq!(read_superblock_compressor(&path, 0).unwrap(), Some(COMP_XZ));
         match SquashFsMountSource::open(&path) {
             Ok(m) => {
                 assert!(
@@ -813,10 +814,7 @@ mod tests {
             eprintln!("skip: no mksquashfs or xz compression unavailable");
             return;
         };
-        assert_eq!(
-            read_superblock_compressor(&img, 0).unwrap(),
-            Some(COMP_XZ)
-        );
+        assert_eq!(read_superblock_compressor(&img, 0).unwrap(), Some(COMP_XZ));
         let m = SquashFsMountSource::open(&img).unwrap();
         assert!(
             m.is_inprocess(),

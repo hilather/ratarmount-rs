@@ -616,18 +616,14 @@ fn store_member_content_hashes<R: Read + Seek>(
         let mut zf = match open_member(archive, member_index, password) {
             Ok(z) => z,
             Err(e) => {
-                log::warn!(
-                    "Failed to open ZIP member index={member_index} for content hash: {e}"
-                );
+                log::warn!("Failed to open ZIP member index={member_index} for content hash: {e}");
                 continue;
             }
         };
         let digests = match compute_hashes_limited(&mut zf, size, algorithms) {
             Ok(d) => d,
             Err(e) => {
-                log::warn!(
-                    "Failed to hash ZIP member at offsetheader={offsetheader}: {e}"
-                );
+                log::warn!("Failed to hash ZIP member at offsetheader={offsetheader}: {e}");
                 continue;
             }
         };
@@ -1171,7 +1167,10 @@ fn has_sig_at(file: &mut File, off: u64, sig: &[u8; 4]) -> io::Result<bool> {
 ///
 /// Mutates `path` in place — only call on temp/materialized copies we own.
 fn normalize_multidisk_eocd(path: &Path) -> io::Result<MultidiskNormalize> {
-    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let mut file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)?;
     let file_len = file.seek(SeekFrom::End(0))?;
     if file_len < EOCD_MIN_LEN as u64 {
         return Ok(MultidiskNormalize::Unchanged);
@@ -1357,9 +1356,7 @@ fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
 
 /// If `path` has multi-disk EOCD markers, copy to temp and normalize.
 /// Returns `None` when no rewrite is needed (already single-disk).
-fn normalize_probe_and_copy(
-    path: &Path,
-) -> Result<Option<(NamedTempFile, MultidiskNormalize)>> {
+fn normalize_probe_and_copy(path: &Path) -> Result<Option<(NamedTempFile, MultidiskNormalize)>> {
     // Cheap tail probe: only copy when multi-disk fields are non-zero / multi-disk.
     if !eocd_looks_multidisk(path)? {
         return Ok(None);
@@ -1474,7 +1471,10 @@ fn detect_z_series_parts(path: &Path) -> Option<Vec<PathBuf>> {
     }
 
     // Final volume is base.zip / base.ZIP
-    let zip_candidates = [parent.join(format!("{base}.zip")), parent.join(format!("{base}.ZIP"))];
+    let zip_candidates = [
+        parent.join(format!("{base}.zip")),
+        parent.join(format!("{base}.ZIP")),
+    ];
     if let Some(p) = zip_candidates.into_iter().find(|p| p.is_file()) {
         // Avoid duplicating if the user named something oddly.
         if !parts.iter().any(|x| x == &p) {
@@ -1878,8 +1878,7 @@ mod tests {
         {
             let file = File::create(&path).unwrap();
             let mut zw = ZipWriter::new(file);
-            let opts =
-                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
             zw.start_file("bar.txt", opts).unwrap();
             zw.write_all(content).unwrap();
             zw.finish().unwrap();
@@ -1946,10 +1945,7 @@ mod tests {
         )
         .expect("open_from_reader with hashes");
         let fi = src.lookup("/hello.txt", 0).expect("lookup");
-        assert_eq!(
-            src.list_xattr(&fi),
-            vec!["user.hash.sha256".to_string()]
-        );
+        assert_eq!(src.list_xattr(&fi), vec!["user.hash.sha256".to_string()]);
         let sha = src.get_xattr(&fi, "user.hash.sha256").expect("sha256");
         assert_eq!(
             sha.as_slice(),
@@ -1966,8 +1962,7 @@ mod tests {
 
     #[test]
     fn py_fixture_encrypted_nested_tar() {
-        let root = std::env::var("RATARMOUNT_PY_ROOT")
-            .unwrap_or_else(|_| "../ratarmount".into());
+        let root = std::env::var("RATARMOUNT_PY_ROOT").unwrap_or_else(|_| "../ratarmount".into());
         let path = PathBuf::from(root).join("tests/encrypted-nested-tar.zip");
         if !path.is_file() {
             eprintln!("skip: missing fixture {}", path.display());
@@ -2004,8 +1999,7 @@ mod tests {
             let mut i = data.len() - EOCD_MIN_LEN;
             loop {
                 if data[i..i + 4] == sig {
-                    let comment_len =
-                        u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+                    let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
                     if i + EOCD_MIN_LEN + comment_len == data.len() {
                         eocd = Some(i);
                         break;
@@ -2097,7 +2091,8 @@ mod tests {
             index_in_memory: true,
             ..OpenOptions::default()
         };
-        let src = ZipMountSource::open(&z01, None, &opts, "test", true).expect("open z01 multi-eocd");
+        let src =
+            ZipMountSource::open(&z01, None, &opts, "test", true).expect("open z01 multi-eocd");
         let fi = src.lookup("/hello.txt", 0).expect("lookup");
         let mut r = src.open(&fi, 0).unwrap();
         let mut buf = String::new();
@@ -2114,10 +2109,7 @@ mod tests {
         // Multi-disk markers + corrupt CD offset so absolute CDFH check fails.
         patch_eocd_multidisk(&mut full, 1, 0);
         let sig = [0x50u8, 0x4b, 0x05, 0x06];
-        let eocd = full
-            .windows(4)
-            .rposition(|w| w == sig)
-            .expect("eocd");
+        let eocd = full.windows(4).rposition(|w| w == sig).expect("eocd");
         // Point CD offset at byte 0 (local header PK\x03\x04, not CDFH) → unsafe.
         full[eocd + 16..eocd + 20].copy_from_slice(&0u32.to_le_bytes());
         std::fs::write(&path, &full).unwrap();

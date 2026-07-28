@@ -62,13 +62,12 @@ use ratarmount_core::{
 use tempfile::NamedTempFile;
 
 use crate::{
-    parse_content_range_total, range_chunk_windows, RemoteError, Result, USER_AGENT,
-    HTTP_RANGE_CHUNK,
+    parse_content_range_total, range_chunk_windows, RemoteError, Result, HTTP_RANGE_CHUNK,
+    USER_AGENT,
 };
 
 /// Official Dropbox content-download endpoint.
-pub const DEFAULT_DROPBOX_DOWNLOAD_URL: &str =
-    "https://content.dropboxapi.com/2/files/download";
+pub const DEFAULT_DROPBOX_DOWNLOAD_URL: &str = "https://content.dropboxapi.com/2/files/download";
 
 /// Official Dropbox RPC API base (list_folder, get_metadata).
 pub const DEFAULT_DROPBOX_RPC_BASE: &str = "https://api.dropboxapi.com";
@@ -130,10 +129,7 @@ pub fn parse_dropbox_url_allow_root(url_str: &str) -> Result<DropboxLocation> {
     }
 
     // Strip optional query/fragment if a caller embeds them.
-    let rest = rest
-        .split_once(['?', '#'])
-        .map(|(p, _)| p)
-        .unwrap_or(rest);
+    let rest = rest.split_once(['?', '#']).map(|(p, _)| p).unwrap_or(rest);
 
     let mut path = rest.to_string();
     if !path.is_empty() && !path.starts_with('/') {
@@ -247,9 +243,7 @@ pub fn dropbox_rpc_base() -> String {
 /// back to [`DEFAULT_DROPBOX_LIST_TTL_SECS`].
 pub fn dropbox_list_ttl_secs() -> u64 {
     match std::env::var("RATARMOUNT_DROPBOX_LIST_TTL_SECS") {
-        Ok(s) if !s.is_empty() => s
-            .parse::<u64>()
-            .unwrap_or(DEFAULT_DROPBOX_LIST_TTL_SECS),
+        Ok(s) if !s.is_empty() => s.parse::<u64>().unwrap_or(DEFAULT_DROPBOX_LIST_TTL_SECS),
         _ => DEFAULT_DROPBOX_LIST_TTL_SECS,
     }
 }
@@ -762,16 +756,14 @@ impl DropboxEntry {
 /// Parse Dropbox `server_modified` (`2015-05-12T15:50:38Z`) to unix seconds as f64.
 fn parse_dropbox_mtime(s: &str) -> Option<f64> {
     // Accept trailing Z only (Dropbox API); use chrono when available.
-    let dt = chrono::DateTime::parse_from_rfc3339(s)
-        .ok()
-        .or_else(|| {
-            // Some responses omit fractional seconds; try with Z forced.
-            if s.ends_with('Z') {
-                chrono::DateTime::parse_from_rfc3339(s).ok()
-            } else {
-                chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")).ok()
-            }
-        })?;
+    let dt = chrono::DateTime::parse_from_rfc3339(s).ok().or_else(|| {
+        // Some responses omit fractional seconds; try with Z forced.
+        if s.ends_with('Z') {
+            chrono::DateTime::parse_from_rfc3339(s).ok()
+        } else {
+            chrono::DateTime::parse_from_rfc3339(&format!("{s}Z")).ok()
+        }
+    })?;
     Some(dt.timestamp() as f64)
 }
 
@@ -799,12 +791,7 @@ fn dropbox_rpc_post(url: &str, token: &str, body: &str) -> Result<String> {
         .set("Authorization", &auth)
         .set("Content-Type", "application/json")
         .send_string(body)
-        .map_err(|e| {
-            RemoteError::Dropbox(redact_token(
-                &format!("RPC {url}: {e}"),
-                token,
-            ))
-        })?;
+        .map_err(|e| RemoteError::Dropbox(redact_token(&format!("RPC {url}: {e}"), token)))?;
     let status = resp.status();
     let text = resp.into_string().unwrap_or_else(|_| String::new());
     if !(200..300).contains(&status) {
@@ -820,10 +807,7 @@ fn dropbox_rpc_post(url: &str, token: &str, body: &str) -> Result<String> {
 /// Parse one Dropbox metadata/list entry object.
 fn parse_entry_value(v: &serde_json::Value) -> Option<DropboxEntry> {
     let obj = v.as_object()?;
-    let tag = obj
-        .get(".tag")
-        .and_then(|t| t.as_str())
-        .unwrap_or("");
+    let tag = obj.get(".tag").and_then(|t| t.as_str()).unwrap_or("");
     let kind = match tag {
         "file" => DropboxEntryKind::File,
         "folder" => DropboxEntryKind::Folder,
@@ -865,11 +849,7 @@ fn parse_entry_value(v: &serde_json::Value) -> Option<DropboxEntry> {
 /// List all entries in a Dropbox folder (handles `has_more` / continue).
 ///
 /// `path` is the Dropbox API path (`""` for root, otherwise `/…`).
-pub fn list_dropbox_folder(
-    path: &str,
-    token: &str,
-    rpc_base: &str,
-) -> Result<Vec<DropboxEntry>> {
+pub fn list_dropbox_folder(path: &str, token: &str, rpc_base: &str) -> Result<Vec<DropboxEntry>> {
     if token.is_empty() {
         return Err(RemoteError::Dropbox(
             "DROPBOX_TOKEN is empty; cannot list dropbox:// folders".into(),
@@ -889,9 +869,8 @@ pub fn list_dropbox_folder(
     let mut entries = Vec::new();
 
     loop {
-        let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-            RemoteError::Dropbox(format!("list_folder JSON parse error: {e}"))
-        })?;
+        let v: serde_json::Value = serde_json::from_str(&text)
+            .map_err(|e| RemoteError::Dropbox(format!("list_folder JSON parse error: {e}")))?;
         if let Some(arr) = v.get("entries").and_then(|e| e.as_array()) {
             for item in arr {
                 if let Some(ent) = parse_entry_value(item) {
@@ -899,21 +878,13 @@ pub fn list_dropbox_folder(
                 }
             }
         }
-        let has_more = v
-            .get("has_more")
-            .and_then(|h| h.as_bool())
-            .unwrap_or(false);
+        let has_more = v.get("has_more").and_then(|h| h.as_bool()).unwrap_or(false);
         if !has_more {
             break;
         }
-        let cursor = v
-            .get("cursor")
-            .and_then(|c| c.as_str())
-            .ok_or_else(|| {
-                RemoteError::Dropbox(
-                    "list_folder has_more=true but cursor missing".into(),
-                )
-            })?;
+        let cursor = v.get("cursor").and_then(|c| c.as_str()).ok_or_else(|| {
+            RemoteError::Dropbox("list_folder has_more=true but cursor missing".into())
+        })?;
         let cont_body = format!(r#"{{"cursor":"{}"}}"#, json_escape(cursor));
         text = dropbox_rpc_post(&cont_url, token, &cont_body)?;
     }
@@ -926,11 +897,7 @@ pub fn list_dropbox_folder(
 }
 
 /// Fetch metadata for a single path (`""` / `/…`).
-pub fn get_dropbox_metadata(
-    path: &str,
-    token: &str,
-    rpc_base: &str,
-) -> Result<DropboxEntry> {
+pub fn get_dropbox_metadata(path: &str, token: &str, rpc_base: &str) -> Result<DropboxEntry> {
     if token.is_empty() {
         return Err(RemoteError::Dropbox(
             "DROPBOX_TOKEN is empty; cannot get dropbox metadata".into(),
@@ -945,9 +912,8 @@ pub fn get_dropbox_metadata(
         json_escape(api_path)
     );
     let text = dropbox_rpc_post(&url, token, &body)?;
-    let v: serde_json::Value = serde_json::from_str(&text).map_err(|e| {
-        RemoteError::Dropbox(format!("get_metadata JSON parse error: {e}"))
-    })?;
+    let v: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|e| RemoteError::Dropbox(format!("get_metadata JSON parse error: {e}")))?;
     parse_entry_value(&v).ok_or_else(|| {
         RemoteError::Dropbox(format!(
             "get_metadata for {api_path:?}: missing or unsupported entry (.tag)"
@@ -1037,12 +1003,7 @@ impl DropboxMountSource {
 
     /// Open with an explicit token (still uses env for API URL overrides).
     pub fn open_with_token(url_str: &str, token: &str) -> Result<Self> {
-        Self::open_with_endpoints(
-            url_str,
-            token,
-            &dropbox_download_url(),
-            &dropbox_rpc_base(),
-        )
+        Self::open_with_endpoints(url_str, token, &dropbox_download_url(), &dropbox_rpc_base())
     }
 
     /// Open with explicit token and endpoints (unit tests).
@@ -1101,13 +1062,13 @@ impl DropboxMountSource {
         let v = normpath(virtual_path);
         let now = Instant::now();
         {
-            let cache = self.listing_cache.lock().map_err(|_| {
-                RemoteError::Dropbox("listing cache lock poisoned".into())
-            })?;
+            let cache = self
+                .listing_cache
+                .lock()
+                .map_err(|_| RemoteError::Dropbox("listing cache lock poisoned".into()))?;
             if let Some(cached) = cache.get(&v) {
                 // TTL 0 → never hit; otherwise reuse while age < TTL.
-                if !self.list_ttl.is_zero()
-                    && now.duration_since(cached.fetched_at) < self.list_ttl
+                if !self.list_ttl.is_zero() && now.duration_since(cached.fetched_at) < self.list_ttl
                 {
                     return Ok(cached.entries.clone());
                 }
@@ -1115,9 +1076,10 @@ impl DropboxMountSource {
         }
         let db_path = self.dropbox_path(&v);
         let entries = list_dropbox_folder(&db_path, &self.token, &self.rpc_base)?;
-        let mut cache = self.listing_cache.lock().map_err(|_| {
-            RemoteError::Dropbox("listing cache lock poisoned".into())
-        })?;
+        let mut cache = self
+            .listing_cache
+            .lock()
+            .map_err(|_| RemoteError::Dropbox("listing cache lock poisoned".into()))?;
         cache.insert(
             v,
             ListingCacheEntry {
@@ -1358,10 +1320,7 @@ mod tests {
     #[test]
     fn extract_error_summary_ok() {
         let body = r#"{"error_summary": "path/not_found/...", "error": {".tag": "path"}}"#;
-        assert_eq!(
-            extract_error_summary(body),
-            Some("path/not_found/...")
-        );
+        assert_eq!(extract_error_summary(body), Some("path/not_found/..."));
     }
 
     /// Minimal Dropbox content-API mock: POST + Bearer + Dropbox-API-Arg.

@@ -97,7 +97,12 @@ struct Args {
 
     /// Parallelization matrix for decompressors.
     /// Examples: `1` (default), `0` (all cores), `4`, `bzip2:4,gzip:2`, `:2,bzip2:4`
-    #[arg(short = 'P', long = "parallelization", default_value = "1", value_name = "SPEC")]
+    #[arg(
+        short = 'P',
+        long = "parallelization",
+        default_value = "1",
+        value_name = "SPEC"
+    )]
     parallelization: String,
 
     /// Minimum file count to create an index (harness forces 0)
@@ -505,10 +510,7 @@ fn main() {
                         }
                     }
                     Err(e) => {
-                        log::warn!(
-                            "cannot open index {} for --hashes: {e}",
-                            idx_path.display()
-                        );
+                        log::warn!("cannot open index {} for --hashes: {e}", idx_path.display());
                     }
                 }
             }

@@ -883,7 +883,10 @@ mod tests {
 
     #[test]
     fn raw_entry_name_strips_lrz() {
-        assert_eq!(raw_entry_name_from_path(Path::new("/tmp/simple.lrz")), "simple");
+        assert_eq!(
+            raw_entry_name_from_path(Path::new("/tmp/simple.lrz")),
+            "simple"
+        );
         assert_eq!(
             raw_entry_name_from_path(Path::new("archive.tar.lrzip")),
             "archive.tar"
@@ -912,9 +915,6 @@ mod tests {
             Ok(_) => panic!("expected non-lrzip rejection"),
             Err(e) => e,
         };
-        assert!(
-            err.to_string().contains("not an lrzip"),
-            "got: {err}"
-        );
+        assert!(err.to_string().contains("not an lrzip"), "got: {err}");
     }
 }

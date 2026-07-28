@@ -233,9 +233,11 @@ pub fn parse_gzip_seek_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
     let uncompressed_size = u64::from_le_bytes(blob[20..28].try_into().unwrap());
     let point_count = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
     let need = GZIP_SEEK_INDEX_HEADER_LEN
-        .checked_add(point_count.checked_mul(16).ok_or_else(|| {
-            CompressError::Msg("gzip seek-index point_count overflow".into())
-        })?)
+        .checked_add(
+            point_count
+                .checked_mul(16)
+                .ok_or_else(|| CompressError::Msg("gzip seek-index point_count overflow".into()))?,
+        )
         .ok_or_else(|| CompressError::Msg("gzip seek-index size overflow".into()))?;
     if blob.len() < need {
         return Err(CompressError::Msg(format!(
@@ -429,8 +431,8 @@ impl SeekableGzip {
     ) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         let spacing = spacing.max(64 * 1024); // avoid pathological tiny spacing
-        // Resolve for -P 0 parity / future concurrent index builders; index path
-        // does not currently fan out workers.
+                                              // Resolve for -P 0 parity / future concurrent index builders; index path
+                                              // does not currently fan out workers.
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let mut file = File::open(&path)?;
         let index = build_index(&mut file, spacing)?;
@@ -571,11 +573,7 @@ impl SeekableGzip {
             .iter()
             .map(|c| (c.compressed_offset, c.uncompressed_offset))
             .collect();
-        encode_gzip_seek_index_blob(
-            self.index.spacing,
-            self.index.uncompressed_size,
-            &points,
-        )
+        encode_gzip_seek_index_blob(self.index.spacing, self.index.uncompressed_size, &points)
     }
 
     /// Independent reader (own file fd or shared stream handle + logical position).
@@ -1031,8 +1029,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
     let spacing = spacing.max(64 * 1024);
     if points.is_empty() {
         let index = build_index(file, spacing)?;
-        if expected_uncompressed_size != 0
-            && index.uncompressed_size != expected_uncompressed_size
+        if expected_uncompressed_size != 0 && index.uncompressed_size != expected_uncompressed_size
         {
             return Err(CompressError::Msg(format!(
                 "gzip seek-index size mismatch: blob {} vs decoded {}",
@@ -1170,9 +1167,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
         )));
     }
 
-    if expected_uncompressed_size != 0
-        && uncompressed_total != expected_uncompressed_size
-    {
+    if expected_uncompressed_size != 0 && uncompressed_total != expected_uncompressed_size {
         return Err(CompressError::Msg(format!(
             "gzip seek-index size mismatch: blob {expected_uncompressed_size} vs decoded {uncompressed_total}"
         )));
@@ -1363,7 +1358,9 @@ pub fn try_parallel_multi_member_decode(compressed: &[u8], threads: u32) -> Resu
     let parts = split_gzip_member_slices(compressed)
         .ok_or_else(|| CompressError::Msg("single gzip member; sequential path".into()))?;
     if parts.len() < 2 {
-        return Err(CompressError::Msg("single gzip member; sequential path".into()));
+        return Err(CompressError::Msg(
+            "single gzip member; sequential path".into(),
+        ));
     }
     parallel_map_decode_gzip_members(&parts, threads)
 }
@@ -1450,9 +1447,7 @@ fn parallel_map_decode_gzip_members(parts: &[&[u8]], threads: u32) -> Result<Vec
 
     let mut out = Vec::new();
     for r in results {
-        out.extend(
-            r.ok_or_else(|| CompressError::Msg("gzip parallel worker missing".into()))??,
-        );
+        out.extend(r.ok_or_else(|| CompressError::Msg("gzip parallel worker missing".into()))??);
     }
     Ok(out)
 }
@@ -1813,8 +1808,8 @@ mod tests {
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, payload);
 
-        let mut r2 = open_seekable_gzip_from_reader(Cursor::new(compressed), 1024, "virt.gz")
-            .unwrap();
+        let mut r2 =
+            open_seekable_gzip_from_reader(Cursor::new(compressed), 1024, "virt.gz").unwrap();
         let mut out2 = Vec::new();
         r2.read_to_end(&mut out2).unwrap();
         assert_eq!(out2, payload);
@@ -1928,7 +1923,10 @@ mod tests {
         let err = parse_indexed_gzip_index_blob(&ok[..INDEXED_GZIP_HEADER_LEN + 4])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("truncated") || err.contains("too short"), "{err}");
+        assert!(
+            err.contains("truncated") || err.contains("too short"),
+            "{err}"
+        );
 
         // data_flag=1 but missing window payload
         let mut missing_win = encode_gzidx_v1(10, 100, 32_768, 32_768, &[(10, 0, 0, 1)]);
@@ -1942,7 +1940,9 @@ mod tests {
         let mut tiny = encode_gzidx_v1(10, 100, 100, 100, &[(10, 0, 0, 0)]);
         // rewrite window_size field at offset 27
         tiny[27..31].copy_from_slice(&100u32.to_le_bytes());
-        let err = parse_indexed_gzip_index_blob(&tiny).unwrap_err().to_string();
+        let err = parse_indexed_gzip_index_blob(&tiny)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("window_size"), "{err}");
     }
 
@@ -1978,12 +1978,7 @@ mod tests {
             })
             .collect();
         // zran-style EOF marker (should be dropped by parser).
-        gzidx_points.push((
-            compressed.len() as u64,
-            raw.len() as u64,
-            0,
-            1,
-        ));
+        gzidx_points.push((compressed.len() as u64, raw.len() as u64, 0, 1));
 
         let gzidx = encode_gzidx_v1(
             compressed.len() as u64,
@@ -1996,8 +1991,7 @@ mod tests {
         assert_eq!(parsed.format, GzipSeekBlobFormat::IndexedGzip);
         assert_eq!(parsed.points.len(), parsed_rgzi.points.len());
 
-        let imported =
-            SeekableGzip::open_with_imported_index(&gz, spacing, 1, &gzidx).unwrap();
+        let imported = SeekableGzip::open_with_imported_index(&gz, spacing, 1, &gzidx).unwrap();
         assert_eq!(imported.uncompressed_size(), raw.len() as u64);
         assert_eq!(imported.checkpoint_count(), built.checkpoint_count());
 
@@ -2040,8 +2034,7 @@ mod tests {
         assert_eq!(parsed.points.len(), built.checkpoint_count());
 
         // Path import
-        let imported =
-            SeekableGzip::open_with_imported_index(&gz, spacing, 1, &blob).unwrap();
+        let imported = SeekableGzip::open_with_imported_index(&gz, spacing, 1, &blob).unwrap();
         assert_eq!(imported.uncompressed_size(), built.uncompressed_size());
         assert_eq!(imported.checkpoint_count(), built.checkpoint_count());
         assert_eq!(imported.spacing(), built.spacing());
@@ -2080,8 +2073,7 @@ mod tests {
         }
 
         // Free-function import path
-        let mut free_r =
-            open_seekable_gzip_with_imported_index(&gz, spacing, 2, &blob).unwrap();
+        let mut free_r = open_seekable_gzip_with_imported_index(&gz, spacing, 2, &blob).unwrap();
         free_r.seek(SeekFrom::Start(200)).unwrap();
         let mut chunk = [0u8; 24];
         free_r.read_exact(&mut chunk).unwrap();

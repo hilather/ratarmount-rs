@@ -193,19 +193,14 @@ pub fn fetch_webdav_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
 
 pub fn fetch_webdav_location_to_temp(loc: &WebDavLocation) -> Result<(NamedTempFile, u64)> {
     if let Ok(Some(size)) = propfind_content_length(loc) {
-        debug!(
-            "webdav PROPFIND {} getcontentlength={size}",
-            loc.http_url
-        );
+        debug!("webdav PROPFIND {} getcontentlength={size}", loc.http_url);
     } else {
         debug!("webdav PROPFIND {} skipped or no size", loc.http_url);
     }
 
     let req = ureq::get(&loc.http_url).set("User-Agent", USER_AGENT);
     let req = apply_auth(req, loc);
-    let resp = req
-        .call()
-        .map_err(|e| RemoteError::WebDav(e.to_string()))?;
+    let resp = req.call().map_err(|e| RemoteError::WebDav(e.to_string()))?;
     if !(200..300).contains(&resp.status()) {
         return Err(RemoteError::WebDav(format!(
             "HTTP {} for {}",

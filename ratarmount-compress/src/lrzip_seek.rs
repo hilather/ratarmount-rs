@@ -71,8 +71,7 @@ fn find_lrzip_bin() -> Option<&'static str> {
 /// `lrunzip -f -o <out> <in>`. Does **not** call libarchive — when the CLI is
 /// missing, callers should use the formats-libarchive lrzip open path instead.
 pub fn materialize_lrzip(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let bin = find_lrzip_bin()
-        .ok_or_else(|| CompressError::Msg(LRZIP_CLI_MISSING_MSG.into()))?;
+    let bin = find_lrzip_bin().ok_or_else(|| CompressError::Msg(LRZIP_CLI_MISSING_MSG.into()))?;
 
     let tmp = NamedTempFile::new()?;
     let out_path = tmp.path().to_path_buf();

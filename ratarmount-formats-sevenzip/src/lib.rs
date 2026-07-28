@@ -104,7 +104,14 @@ impl SevenZipMountSource {
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
         let file = File::open(&archive_path)?;
-        Self::open_from_reader(file, &archive_path, index_path, options, product_version, recreate)
+        Self::open_from_reader(
+            file,
+            &archive_path,
+            index_path,
+            options,
+            product_version,
+            recreate,
+        )
     }
 
     /// Open a 7z archive from any seekable reader (nested AutoMount without temp spool).
@@ -249,13 +256,7 @@ impl SevenZipMountSource {
                     {
                         let fi = entry.folder_index.unwrap();
                         let folder = &archive.folders[fi];
-                        match Self::try_decrypt_entry_io(
-                            &archive_io,
-                            &archive,
-                            entry,
-                            folder,
-                            pw,
-                        ) {
+                        match Self::try_decrypt_entry_io(&archive_io, &archive, entry, folder, pw) {
                             Ok(()) => {
                                 chosen = Some(pw.clone());
                                 break;
@@ -426,11 +427,7 @@ impl SevenZipMountSource {
         folder: &parse::Folder,
         password: &str,
     ) -> std::result::Result<(), SevenZipError> {
-        let pack = SeekPackSource::new(
-            Arc::clone(archive_io),
-            entry.pack_offset,
-            entry.pack_size,
-        );
+        let pack = SeekPackSource::new(Arc::clone(archive_io), entry.pack_offset, entry.pack_size);
         let sizes = pack_stream_sizes(archive, entry);
         let data = decode::decompress_folder_source(
             folder,
@@ -585,23 +582,19 @@ impl SevenZipMountSource {
         }
         let folder = &self.archive.folders[fi];
         let packed = self.read_packed_for_folder(fi, entry)?;
-        let decoder = decode::Lzma2RandomAccessDecoder::new(
-            folder,
-            packed,
-            DEFAULT_MAX_CACHED_CHUNKS,
-        )
-        .map_err(SzError::Seven)?;
+        let decoder =
+            decode::Lzma2RandomAccessDecoder::new(folder, packed, DEFAULT_MAX_CACHED_CHUNKS)
+                .map_err(SzError::Seven)?;
         let shared: SharedLzma2Decoder = Arc::new(Mutex::new(decoder));
         let mut cache = self.lzma2_decoders.lock().unwrap();
         // Another open may have won the race; prefer the existing entry.
-        Ok(Arc::clone(cache.entry(fi).or_insert_with(|| Arc::clone(&shared))))
+        Ok(Arc::clone(
+            cache.entry(fi).or_insert_with(|| Arc::clone(&shared)),
+        ))
     }
 
     /// Seekable solid pure-LZMA2 member body for nested AutoMount / random access.
-    fn open_lzma2_member_reader(
-        &self,
-        entry: &SevenZipFileEntry,
-    ) -> Result<Lzma2MemberReader> {
+    fn open_lzma2_member_reader(&self, entry: &SevenZipFileEntry) -> Result<Lzma2MemberReader> {
         let decoder = self.get_lzma2_decoder(entry)?;
         Ok(Lzma2MemberReader::new(
             decoder,
@@ -657,11 +650,7 @@ fn read_member_bytes_io(
         );
         return pack.as_bytes().map_err(SzError::Seven);
     }
-    let pack = SeekPackSource::new(
-        Arc::clone(archive_io),
-        entry.pack_offset,
-        entry.pack_size,
-    );
+    let pack = SeekPackSource::new(Arc::clone(archive_io), entry.pack_offset, entry.pack_size);
     let packed = pack.as_bytes().map_err(SzError::Seven)?;
     let sizes = pack_stream_sizes(archive, entry);
     let data = decode::decompress_folder_source(
@@ -1150,7 +1139,11 @@ mod tests {
         assert_eq!(fi_p.size, fi_r.size);
         let mut bp = Vec::new();
         let mut br = Vec::new();
-        from_path.open(&fi_p, 0).unwrap().read_to_end(&mut bp).unwrap();
+        from_path
+            .open(&fi_p, 0)
+            .unwrap()
+            .read_to_end(&mut bp)
+            .unwrap();
         from_reader
             .open(&fi_r, 0)
             .unwrap()
@@ -1195,7 +1188,9 @@ mod tests {
             })
             .expect("inner 7z member");
         // Parent open returns ArchiveRead (Seek) — no temp spool.
-        let nested_reader = outer.open(&nested_fi, 0).expect("open nested member stream");
+        let nested_reader = outer
+            .open(&nested_fi, 0)
+            .expect("open nested member stream");
         let inner = SevenZipMountSource::open_from_reader(
             nested_reader,
             Path::new("inner-hello.7z"),
@@ -1283,11 +1278,12 @@ mod tests {
         let outer =
             SevenZipMountSource::open(&path, None, &opts, "0.1.0", true).expect("outer solid open");
         assert!(
-            outer.archive.solid || outer.archive.folders.iter().any(|f| {
-                f.coders
-                    .first()
-                    .is_some_and(|c| c.method.as_slice() == parse::METHOD_LZMA2)
-            }),
+            outer.archive.solid
+                || outer.archive.folders.iter().any(|f| {
+                    f.coders
+                        .first()
+                        .is_some_and(|c| c.method.as_slice() == parse::METHOD_LZMA2)
+                }),
             "expected solid/LZMA2 outer"
         );
         let nested_fi = outer
@@ -1311,7 +1307,10 @@ mod tests {
         // Partial read then seek-to-0 must still feed a full nested open.
         let mut head = [0u8; 4];
         nested_reader.read_exact(&mut head).expect("read head");
-        assert_eq!(&head, b"7z\xbc\xaf", "solid outer member starts with 7z magic");
+        assert_eq!(
+            &head, b"7z\xbc\xaf",
+            "solid outer member starts with 7z magic"
+        );
         nested_reader
             .seek(SeekFrom::Start(0))
             .expect("seek solid member to 0");
@@ -1348,7 +1347,9 @@ mod tests {
         );
 
         // Re-open outer solid member after first nested open (independent streams).
-        let mut r2 = outer.open(&nested_fi, 0).expect("re-open solid outer member");
+        let mut r2 = outer
+            .open(&nested_fi, 0)
+            .expect("re-open solid outer member");
         r2.seek(SeekFrom::Start(0)).unwrap();
         let mut again_head = [0u8; 2];
         r2.read_exact(&mut again_head).unwrap();
@@ -1388,7 +1389,7 @@ mod tests {
     fn lzma2_member_reader_progressive_seek_zero() {
         // Unit-level: Lzma2MemberReader over forced progressive decoder.
         use decode::{index_lzma2_chunks, Lzma2MemberReader, Lzma2RandomAccessDecoder};
-        use parse::{Folder, Coder, METHOD_LZMA2};
+        use parse::{Coder, Folder, METHOD_LZMA2};
 
         let data: Vec<u8> = (0u8..=255).cycle().take(128 * 1024).collect();
         let packed = {
@@ -1463,10 +1464,7 @@ sys.stdout.buffer.write(packed)
         r2.seek(SeekFrom::Start(0)).unwrap();
         let mut m2 = Vec::new();
         r2.read_to_end(&mut m2).unwrap();
-        assert_eq!(
-            m2,
-            data[m2_start as usize..(m2_start + m2_size) as usize]
-        );
+        assert_eq!(m2, data[m2_start as usize..(m2_start + m2_size) as usize]);
     }
 
     /// After OpenOptions.hashes fill, list_xattr/get_xattr expose user.hash.* (store-copy fixture).
@@ -1498,16 +1496,10 @@ sys.stdout.buffer.write(packed)
         );
 
         let mut a_bytes = Vec::new();
-        m.open(&fi_a, 0)
-            .unwrap()
-            .read_to_end(&mut a_bytes)
-            .unwrap();
+        m.open(&fi_a, 0).unwrap().read_to_end(&mut a_bytes).unwrap();
         let fi_b = m.lookup("/b.txt", 0).expect("b.txt");
         let mut b_bytes = Vec::new();
-        m.open(&fi_b, 0)
-            .unwrap()
-            .read_to_end(&mut b_bytes)
-            .unwrap();
+        m.open(&fi_b, 0).unwrap().read_to_end(&mut b_bytes).unwrap();
 
         let a_sha = hash_hex("sha256", &a_bytes).unwrap();
         let b_sha = hash_hex("sha256", &b_bytes).unwrap();

@@ -131,9 +131,10 @@ impl PackSource for SeekPackSource {
             return Ok(vec![]);
         }
         let size = size.min((self.length - offset) as usize);
-        let mut g = self.io.lock().map_err(|_| {
-            SevenZipError::Msg("7z archive IO lock poisoned".into())
-        })?;
+        let mut g = self
+            .io
+            .lock()
+            .map_err(|_| SevenZipError::Msg("7z archive IO lock poisoned".into()))?;
         g.seek(SeekFrom::Start(self.offset + offset))
             .map_err(SevenZipError::Io)?;
         let mut buf = vec![0u8; size];
@@ -1155,12 +1156,7 @@ pub const DEFAULT_MAX_CACHED_CHUNKS: usize = 64;
 
 impl Lzma2RandomAccessDecoder {
     pub fn new(folder: &Folder, packed: Vec<u8>, max_cached_chunks: usize) -> Result<Self> {
-        Self::with_chunk_size(
-            folder,
-            packed,
-            DEFAULT_CHUNK_SIZE,
-            max_cached_chunks.max(1),
-        )
+        Self::with_chunk_size(folder, packed, DEFAULT_CHUNK_SIZE, max_cached_chunks.max(1))
     }
 
     pub fn with_chunk_size(
@@ -1778,9 +1774,8 @@ sys.stdout.buffer.write(packed)
         };
         // Folder-level LZMA2 dict_size prop (matches typical 7z "LZMA2:22" / 4 MiB-ish).
         let folder = lzma2_folder(data.len() as u64, Some(vec![22]));
-        let mut decoder =
-            Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, 64 * 1024, 4)
-                .expect("decoder");
+        let mut decoder = Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, 64 * 1024, 4)
+            .expect("decoder");
         // Exercise progressive window path even though unpack is under full-cache threshold.
         decoder.force_progressive_for_test();
 
@@ -1851,8 +1846,7 @@ sys.stdout.buffer.write(packed)
         assert!(decoder.cached_window_count() <= DEFAULT_MAX_CACHED_CHUNKS);
 
         // Full-folder decode cross-check on the same slices (default small-folder path).
-        let mut full_dec =
-            Lzma2RandomAccessDecoder::new(folder, packed, 64).expect("full");
+        let mut full_dec = Lzma2RandomAccessDecoder::new(folder, packed, 64).expect("full");
         let full_a = full_dec.read_range(base, 4096).unwrap();
         let full_b = full_dec.read_range(base + 1024 * 1024, 4096).unwrap();
         assert_eq!(a, full_a);

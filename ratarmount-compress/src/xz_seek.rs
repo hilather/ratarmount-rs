@@ -151,11 +151,7 @@ fn open_with_backend(
     full_decode_body(&path, &compressed, threads)
 }
 
-fn full_decode_body(
-    path: &Path,
-    compressed: &[u8],
-    threads: u32,
-) -> Result<Arc<dyn SeekableBody>> {
+fn full_decode_body(path: &Path, compressed: &[u8], threads: u32) -> Result<Arc<dyn SeekableBody>> {
     let decoded = if threads > 1 {
         match try_parallel_multi_stream(compressed, threads) {
             Ok(data) => data,
@@ -331,8 +327,8 @@ fn read_all_compressed(backend: &XzBackend) -> Result<Vec<u8>> {
 
 /// Read `[offset, offset+len)` from the compressed backend.
 fn read_compressed_range(backend: &XzBackend, offset: u64, len: u64) -> Result<Vec<u8>> {
-    let len_usize = usize::try_from(len)
-        .map_err(|_| CompressError::Msg("xz range size overflow".into()))?;
+    let len_usize =
+        usize::try_from(len).map_err(|_| CompressError::Msg("xz range size overflow".into()))?;
     let mut buf = vec![0u8; len_usize];
     match backend {
         XzBackend::Path(path) => {
@@ -525,11 +521,7 @@ fn parse_index_records(
 /// Try to interpret `data[start..end]` as one complete xz stream (no padding).
 ///
 /// `end` is the exclusive offset of the first byte after Stream Footer.
-fn try_parse_stream(
-    data: &[u8],
-    start: usize,
-    end: usize,
-) -> Option<(Vec<BlockInfo>, u64)> {
+fn try_parse_stream(data: &[u8], start: usize, end: usize) -> Option<(Vec<BlockInfo>, u64)> {
     if end < start + 32 || end > data.len() {
         return None;
     }
@@ -549,9 +541,7 @@ fn try_parse_stream(
         return None;
     }
     let backward_field = u32::from_le_bytes(data[foff + 4..foff + 8].try_into().ok()?);
-    let index_size = (backward_field as usize)
-        .checked_add(1)?
-        .checked_mul(4)?;
+    let index_size = (backward_field as usize).checked_add(1)?.checked_mul(4)?;
     if index_size + 12 > end - start {
         return None;
     }
@@ -626,10 +616,10 @@ fn build_block_map_from_index(data: &[u8]) -> Result<(Vec<BlockInfo>, u64)> {
         let stream_start = pos;
         let (footer_end, mut blocks, stream_uncomp) = locate_and_parse_stream(data, stream_start)
             .ok_or_else(|| {
-                CompressError::Msg(format!(
-                    "xz index/footer parse failed at offset {stream_start}"
-                ))
-            })?;
+            CompressError::Msg(format!(
+                "xz index/footer parse failed at offset {stream_start}"
+            ))
+        })?;
 
         for b in &mut blocks {
             b.uncompressed_offset += total_uncomp;
@@ -645,7 +635,9 @@ fn build_block_map_from_index(data: &[u8]) -> Result<(Vec<BlockInfo>, u64)> {
         }
         // Avoid infinite loop on zero advance.
         if pos <= stream_start {
-            return Err(CompressError::Msg("xz stream parse made no progress".into()));
+            return Err(CompressError::Msg(
+                "xz stream parse made no progress".into(),
+            ));
         }
     }
 
@@ -659,10 +651,7 @@ fn build_block_map_from_index(data: &[u8]) -> Result<(Vec<BlockInfo>, u64)> {
 /// Locate stream end and parse Index for stream starting at `start`.
 ///
 /// Returns `(footer_end_exclusive, blocks_with_local_u_off, stream_uncomp)`.
-fn locate_and_parse_stream(
-    data: &[u8],
-    start: usize,
-) -> Option<(usize, Vec<BlockInfo>, u64)> {
+fn locate_and_parse_stream(data: &[u8], start: usize) -> Option<(usize, Vec<BlockInfo>, u64)> {
     // Candidate upper bounds: next stream magics, then EOF.
     let mut uppers: Vec<usize> = find_xz_magic_offsets(data)
         .into_iter()
@@ -720,10 +709,7 @@ fn locate_and_parse_stream(
 }
 
 /// Multi-stream map by decoding each independent stream for uncompressed size.
-fn build_stream_map_by_decode(
-    compressed: &[u8],
-    threads: u32,
-) -> Result<(Vec<BlockInfo>, u64)> {
+fn build_stream_map_by_decode(compressed: &[u8], threads: u32) -> Result<(Vec<BlockInfo>, u64)> {
     let parts = split_xz_stream_slices(compressed)
         .ok_or_else(|| CompressError::Msg("cannot split xz streams".into()))?;
     if parts.len() < 2 {
@@ -797,9 +783,7 @@ fn parallel_decode_stream_list(parts: &[&[u8]], threads: u32) -> Result<Vec<Vec<
 
     let mut out = Vec::with_capacity(parts.len());
     for r in results {
-        out.push(
-            r.ok_or_else(|| CompressError::Msg("xz parallel worker missing".into()))??,
-        );
+        out.push(r.ok_or_else(|| CompressError::Msg("xz parallel worker missing".into()))??);
     }
     Ok(out)
 }
@@ -876,7 +860,9 @@ fn try_parallel_multi_stream(compressed: &[u8], threads: u32) -> Result<Vec<u8>>
     let parts = split_xz_stream_slices(compressed)
         .ok_or_else(|| CompressError::Msg("single xz stream; sequential path".into()))?;
     if parts.len() < 2 {
-        return Err(CompressError::Msg("single xz stream; sequential path".into()));
+        return Err(CompressError::Msg(
+            "single xz stream; sequential path".into(),
+        ));
     }
     parallel_map_decode_slices(&parts, threads)
 }
@@ -1201,13 +1187,11 @@ mod tests {
         }
 
         // Free-function without threads arg
-        let mut free_r = open_seekable_xz_from_reader(
-            Cursor::new(compressed),
-            Path::new("virt.xz"),
-        )
-        .unwrap()
-        .open_reader()
-        .unwrap();
+        let mut free_r =
+            open_seekable_xz_from_reader(Cursor::new(compressed), Path::new("virt.xz"))
+                .unwrap()
+                .open_reader()
+                .unwrap();
         free_r.seek(SeekFrom::Start(a.len() as u64)).unwrap();
         let mut tail = Vec::new();
         free_r.read_to_end(&mut tail).unwrap();

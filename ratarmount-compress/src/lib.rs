@@ -59,15 +59,13 @@ pub use gzip_seek::{
     INDEXED_GZIP_INDEX_MAGIC, INDEXED_GZIP_INDEX_VERSION,
 };
 pub use lrzip_seek::{
-    looks_like_lrzip, lrzip_available, lrzip_cli_available, materialize_lrzip, LRZIP_CLI_MISSING_MSG,
-    LRZIP_MAGIC,
+    looks_like_lrzip, lrzip_available, lrzip_cli_available, materialize_lrzip,
+    LRZIP_CLI_MISSING_MSG, LRZIP_MAGIC,
 };
 pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};
 pub use lzip_seek::{open_seekable_lzip, open_seekable_lzip_with_threads, SeekableLzip};
 pub use lzma_seek::{open_seekable_lzma, open_seekable_lzma_with_threads};
-pub use lzo_seek::{
-    lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo,
-};
+pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo};
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
 pub use seekable_body::{

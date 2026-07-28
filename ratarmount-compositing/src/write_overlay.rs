@@ -594,10 +594,7 @@ pub fn commit_overlay(
         );
         println!();
         if format != CompressionFormat::None {
-            println!(
-                "    # decompress {} -> temp TAR, then:",
-                tar_file.display()
-            );
+            println!("    # decompress {} -> temp TAR, then:", tar_file.display());
         }
         if !deletions.is_empty() {
             println!(

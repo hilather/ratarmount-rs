@@ -69,7 +69,10 @@ impl SeekableLz4 {
     }
 
     /// Open with a thread hint. See [`open_seekable_lz4_with_threads`].
-    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
+    pub fn open_with_threads(
+        path: impl AsRef<Path>,
+        threads: u32,
+    ) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
         let threads = ParallelizationSpec::resolve_zero(threads).max(1);
         match index_lz4_file(path, threads) {

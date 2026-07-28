@@ -126,11 +126,17 @@ impl MultiHasher {
         let mut out = Vec::with_capacity(self.names.len());
         for name in &self.names {
             let hex = match *name {
-                "crc32" => format!("{:08x}", self.crc32.as_ref().expect("crc32").clone().finalize()),
+                "crc32" => format!(
+                    "{:08x}",
+                    self.crc32.as_ref().expect("crc32").clone().finalize()
+                ),
                 "md5" => format!("{:x}", self.md5.as_ref().expect("md5").clone().finalize()),
                 "sha1" => format!("{:x}", self.sha1.as_ref().expect("sha1").clone().finalize()),
                 "sha256" => {
-                    format!("{:x}", self.sha256.as_ref().expect("sha256").clone().finalize())
+                    format!(
+                        "{:x}",
+                        self.sha256.as_ref().expect("sha256").clone().finalize()
+                    )
                 }
                 _ => continue,
             };
@@ -245,10 +251,7 @@ mod tests {
     #[test]
     fn known_vector_abc() {
         let data = b"abc";
-        assert_eq!(
-            hash_hex("crc32", data).as_deref(),
-            Some("352441c2")
-        );
+        assert_eq!(hash_hex("crc32", data).as_deref(), Some("352441c2"));
         assert_eq!(
             hash_hex("md5", data).as_deref(),
             Some("900150983cd24fb0d6963f7d28e17f72")

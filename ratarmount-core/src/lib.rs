@@ -100,9 +100,9 @@ impl ParallelizationSpec {
                     "Parallelization must be non-negative number but got {count_str} for {backend}"
                 ));
             }
-            let n: u32 = count_str
-                .parse()
-                .map_err(|_| format!("invalid parallelization count '{count_str}' for {backend}"))?;
+            let n: u32 = count_str.parse().map_err(|_| {
+                format!("invalid parallelization count '{count_str}' for {backend}")
+            })?;
             let resolved = Self::resolve_zero(n);
             if backend.is_empty() {
                 default = Some(resolved);
@@ -468,7 +468,7 @@ mod tests {
         let p = ParallelizationSpec::parse("bzip2:4,gzip:2").unwrap();
         assert_eq!(p.threads_for("bzip2"), 4);
         assert_eq!(p.threads_for("GZIP"), 2); // case-insensitive
-        // No explicit default → CPU count (Python semantics)
+                                              // No explicit default → CPU count (Python semantics)
         assert_eq!(p.default, ParallelizationSpec::cpu_count());
         assert_eq!(p.threads_for("xz"), ParallelizationSpec::cpu_count());
 

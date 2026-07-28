@@ -126,9 +126,10 @@ impl ControlFolderMountSource {
 
     fn is_control_path(path: &str) -> bool {
         let path = normpath(path);
-        path == CONTROL_DIR_PATH || path.starts_with(CONTROL_DIR_PATH) && {
-            path.as_bytes().get(CONTROL_DIR_PATH.len()) == Some(&b'/')
-        }
+        path == CONTROL_DIR_PATH
+            || path.starts_with(CONTROL_DIR_PATH) && {
+                path.as_bytes().get(CONTROL_DIR_PATH.len()) == Some(&b'/')
+            }
     }
 
     /// Basename of a direct child of the control dir, if any.
@@ -477,7 +478,10 @@ mod tests {
 
         let status = read_all(&ms, &format!("{CONTROL_DIR_PATH}/status"));
         assert!(status.contains("mounted /mnt/test"), "{status}");
-        assert!(status.contains(&format!("pid {}", std::process::id())), "{status}");
+        assert!(
+            status.contains(&format!("pid {}", std::process::id())),
+            "{status}"
+        );
         assert!(status.contains("hello.txt"), "{status}");
 
         let pid = read_all(&ms, &format!("{CONTROL_DIR_PATH}/pid"));

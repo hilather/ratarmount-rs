@@ -148,9 +148,7 @@ pub fn possible_index_paths(archive: &Path, folders: &[PathBuf]) -> Vec<PathBuf>
 /// True if `s` is an absolute `http(s)://` or `file://` URL suitable as an index path.
 pub fn is_index_url(s: &str) -> bool {
     let s = s.trim();
-    s.starts_with("http://")
-        || s.starts_with("https://")
-        || s.starts_with("file://")
+    s.starts_with("http://") || s.starts_with("https://") || s.starts_with("file://")
 }
 
 /// Sibling index URL convention for a remote archive: `archive_url + ".index.sqlite"`.
@@ -313,7 +311,9 @@ fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBu
     };
 
     let mut builder = tempfile::Builder::new();
-    builder.prefix("ratarmount-index-").suffix(".tmp.sqlite.index");
+    builder
+        .prefix("ratarmount-index-")
+        .suffix(".tmp.sqlite.index");
     let mut tmp = if let Some(dir) = index_temp_dir() {
         std::fs::create_dir_all(&dir)?;
         builder.tempfile_in(&dir)?
@@ -377,7 +377,9 @@ fn fetch_index_http(url: &str) -> Result<PathBuf> {
     }
 
     let mut builder = tempfile::Builder::new();
-    builder.prefix("ratarmount-index-").suffix(".tmp.sqlite.index");
+    builder
+        .prefix("ratarmount-index-")
+        .suffix(".tmp.sqlite.index");
     let mut tmp = if let Some(dir) = index_temp_dir() {
         std::fs::create_dir_all(&dir)?;
         builder.tempfile_in(&dir)?

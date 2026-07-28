@@ -293,10 +293,7 @@ fn split_ssh_kv(line: &str) -> (&str, &str) {
 }
 
 fn parse_ssh_yes(v: &str) -> bool {
-    matches!(
-        v.to_ascii_lowercase().as_str(),
-        "yes" | "true" | "1" | "on"
-    )
+    matches!(v.to_ascii_lowercase().as_str(), "yes" | "true" | "1" | "on")
 }
 
 /// Glob-style match for OpenSSH Host patterns (`*`, `?`). Case-sensitive.
@@ -423,11 +420,7 @@ pub fn resolve_ssh_connect(loc: &SshLocation, config: &SshConfig) -> SshConnectP
     let m = config.match_host(&loc.host);
     let host = m.hostname.unwrap_or_else(|| loc.host.clone());
     let port = loc.port.or(m.port).unwrap_or(22);
-    let user = loc
-        .user
-        .clone()
-        .or(m.user)
-        .unwrap_or_else(default_ssh_user);
+    let user = loc.user.clone().or(m.user).unwrap_or_else(default_ssh_user);
     SshConnectParams {
         host,
         port,
@@ -535,8 +528,7 @@ fn authenticate(sess: &mut Session, params: &SshConnectParams) -> Result<()> {
                 if !key.exists() {
                     continue;
                 }
-                if sess.userauth_pubkey_file(user, None, &key, None).is_ok()
-                    && sess.authenticated()
+                if sess.userauth_pubkey_file(user, None, &key, None).is_ok() && sess.authenticated()
                 {
                     return Ok(());
                 }

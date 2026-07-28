@@ -218,10 +218,9 @@ fn resolve_iccbased_stream(stream: &Stream) -> Option<ImageColorSpace> {
     let alt = stream.dict.get(b"Alternate").ok()?;
     match alt {
         Object::Name(n) => image_color_from_name(&String::from_utf8_lossy(n)),
-        Object::Array(arr) if !arr.is_empty() => arr[0]
-            .as_name_str()
-            .ok()
-            .and_then(image_color_from_name),
+        Object::Array(arr) if !arr.is_empty() => {
+            arr[0].as_name_str().ok().and_then(image_color_from_name)
+        }
         _ => None,
     }
 }
@@ -284,9 +283,7 @@ fn resolve_image_color_space(
             }
         }
         // Bare ICC profile stream (unusual as ColorSpace value, but harmless).
-        Object::Stream(stream) => {
-            resolve_iccbased_stream(stream).map(ResolvedColorSpace::Direct)
-        }
+        Object::Stream(stream) => resolve_iccbased_stream(stream).map(ResolvedColorSpace::Direct),
         _ => None,
     }
 }
@@ -294,12 +291,7 @@ fn resolve_image_color_space(
 /// Unpack tightly packed PDF samples to one `u8` per sample **without** 0..=255 scaling.
 ///
 /// Used for Indexed indices (1/2/4/8 bpc). Values are raw bit-field integers.
-fn unpack_indices_u8(
-    packed: &[u8],
-    width: usize,
-    height: usize,
-    bpc: usize,
-) -> Option<Vec<u8>> {
+fn unpack_indices_u8(packed: &[u8], width: usize, height: usize, bpc: usize) -> Option<Vec<u8>> {
     if width == 0 || height == 0 {
         return None;
     }
@@ -472,8 +464,7 @@ fn decode_png_predictor_rows(
             4 => {
                 // Paeth
                 for i in 0..bpp {
-                    current[i] =
-                        current[i].wrapping_add(paeth_predict(0, previous[i], 0));
+                    current[i] = current[i].wrapping_add(paeth_predict(0, previous[i], 0));
                 }
                 for i in bpp..bytes_per_row {
                     current[i] = current[i].wrapping_add(paeth_predict(
@@ -673,11 +664,7 @@ fn encode_png(width: u32, height: u32, color: PngColor, samples: &[u8]) -> Optio
 ///
 /// Multi-filter chains, non-8-bpc CMYK, unsupported spaces, and failed inflation fall
 /// through to the caller (`.bin`).
-fn try_samples_to_png(
-    doc: Option<&Document>,
-    stream: &Stream,
-    inflate: bool,
-) -> Option<Vec<u8>> {
+fn try_samples_to_png(doc: Option<&Document>, stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
     let width = dict_i64(&stream.dict, b"Width")? as u32;
     let height = dict_i64(&stream.dict, b"Height")? as u32;
     if width == 0 || height == 0 {
@@ -773,16 +760,16 @@ fn image_payload_and_ext(doc: Option<&Document>, stream: &Stream) -> (Vec<u8>, &
 }
 
 /// Resolve a Resources dictionary from a page node or referenced object.
-fn resources_dict<'a>(doc: &'a Document, page: &'a lopdf::Dictionary) -> Option<&'a lopdf::Dictionary> {
+fn resources_dict<'a>(
+    doc: &'a Document,
+    page: &'a lopdf::Dictionary,
+) -> Option<&'a lopdf::Dictionary> {
     match page.get(b"Resources").ok() {
         Some(Object::Dictionary(d)) => Some(d),
         Some(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
         _ => {
             // Inherit from parent Pages nodes.
-            let mut parent = page
-                .get(b"Parent")
-                .ok()
-                .and_then(|o| o.as_reference().ok());
+            let mut parent = page.get(b"Parent").ok().and_then(|o| o.as_reference().ok());
             let mut seen = HashSet::new();
             while let Some(pid) = parent {
                 if !seen.insert(pid) {
@@ -806,7 +793,10 @@ fn resources_dict<'a>(doc: &'a Document, page: &'a lopdf::Dictionary) -> Option<
     }
 }
 
-fn xobject_dict<'a>(doc: &'a Document, resources: &'a lopdf::Dictionary) -> Option<&'a lopdf::Dictionary> {
+fn xobject_dict<'a>(
+    doc: &'a Document,
+    resources: &'a lopdf::Dictionary,
+) -> Option<&'a lopdf::Dictionary> {
     match resources.get(b"XObject").ok() {
         Some(Object::Dictionary(d)) => Some(d),
         Some(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
@@ -835,7 +825,8 @@ fn gather_images(doc: &Document) -> Vec<(String, ObjectId, Vec<u8>)> {
 
         let mut img_idx: u32 = 0;
         // Stable order: iterate by name sorted for determinism.
-        let mut entries: Vec<(Vec<u8>, &Object)> = xobjects.iter().map(|(k, v)| (k.clone(), v)).collect();
+        let mut entries: Vec<(Vec<u8>, &Object)> =
+            xobjects.iter().map(|(k, v)| (k.clone(), v)).collect();
         entries.sort_by(|a, b| a.0.cmp(&b.0));
 
         for (_name, xvalue) in entries {
@@ -1344,8 +1335,8 @@ mod tests {
             0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A,
             0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23,
             0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39,
-            0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32,
-            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, // SOF0
+            0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32, 0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00,
+            0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, // SOF0
             0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, // DHT
             0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -1453,9 +1444,7 @@ mod tests {
             _ => panic!("expected infos"),
         }
 
-        let fi = m
-            .lookup("/images/page1-img0.jpg", 0)
-            .expect("lookup image");
+        let fi = m.lookup("/images/page1-img0.jpg", 0).expect("lookup image");
         let jpeg = tiny_jpeg();
         assert_eq!(fi.size, jpeg.len() as u64);
         let mut r = m.open(&fi, 0).unwrap();
@@ -1939,10 +1928,7 @@ mod tests {
         // ICCBased N=3: ignore profile, treat as RGB sample layout.
         let samples = vec![10u8, 20, 30, 40, 50, 60]; // 2x1 RGB
         let icc = Stream::new(
-            dict(&[
-                ("N", 3.into()),
-                ("Alternate", "DeviceRGB".into()),
-            ]),
+            dict(&[("N", 3.into()), ("Alternate", "DeviceRGB".into())]),
             // Dummy ICC profile payload (ignored).
             b"not-a-real-icc-profile".to_vec(),
         );
@@ -2082,9 +2068,7 @@ mod tests {
             }
             _ => panic!("expected infos"),
         }
-        let fi = m
-            .lookup("/images/page1-img0.png", 0)
-            .expect("lookup png");
+        let fi = m.lookup("/images/page1-img0.png", 0).expect("lookup png");
         let mut r = m.open(&fi, 0).unwrap();
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
@@ -2165,10 +2149,7 @@ mod tests {
         let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut pixels).unwrap();
         // magenta → (255,0,255), yellow → (255,255,0)
-        assert_eq!(
-            &pixels[..info.buffer_size()],
-            &[255, 0, 255, 255, 255, 0]
-        );
+        assert_eq!(&pixels[..info.buffer_size()], &[255, 0, 255, 255, 255, 0]);
         assert_eq!(fi.size, buf.len() as u64);
     }
 

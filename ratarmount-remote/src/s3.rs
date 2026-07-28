@@ -49,8 +49,8 @@ use tempfile::NamedTempFile;
 use url::Url;
 
 use crate::{
-    parse_content_range_total, range_chunk_windows, RemoteError, Result, USER_AGENT,
-    HTTP_RANGE_CHUNK,
+    parse_content_range_total, range_chunk_windows, RemoteError, Result, HTTP_RANGE_CHUNK,
+    USER_AGENT,
 };
 
 /// Objects larger than this prefer chunked Range downloads (1 MiB).
@@ -221,7 +221,9 @@ fn load_env_credentials() -> Result<Option<AwsCreds>> {
 
 fn parse_credential_json(body: &str) -> Result<AwsCreds> {
     let v: serde_json::Value = serde_json::from_str(body).map_err(|e| {
-        RemoteError::S3(format!("failed to parse instance/container credentials JSON: {e}"))
+        RemoteError::S3(format!(
+            "failed to parse instance/container credentials JSON: {e}"
+        ))
     })?;
     let access_key = v
         .get("AccessKeyId")
@@ -605,9 +607,8 @@ fn s3_get_object(
                 .map(|(k, v)| format!("{k}:{}\n", v.trim()))
                 .collect::<String>();
 
-            let canonical_request = format!(
-                "GET\n{uri_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
-            );
+            let canonical_request =
+                format!("GET\n{uri_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}");
             let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
             let string_to_sign = format!(
                 "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
@@ -1119,10 +1120,7 @@ mod tests {
                 saved.push((k.to_string(), std::env::var(k).ok()));
                 std::env::remove_var(k);
             }
-            Self {
-                saved,
-                _lock: lock,
-            }
+            Self { saved, _lock: lock }
         }
 
         fn set(&self, key: &str, val: &str) {
@@ -1260,10 +1258,7 @@ mod tests {
                         .to_string();
 
                     match &mode {
-                        MetaMode::Container {
-                            body,
-                            require_auth,
-                        } => {
+                        MetaMode::Container { body, require_auth } => {
                             if !is_get {
                                 let _ = write!(
                                     stream,
@@ -1314,9 +1309,7 @@ mod tests {
                                 );
                                 continue;
                             }
-                            if *require_token
-                                && imds_token.as_deref() != Some("mock-imds-token")
-                            {
+                            if *require_token && imds_token.as_deref() != Some("mock-imds-token") {
                                 let msg = b"IMDSv2 token required";
                                 let _ = write!(
                                     stream,
@@ -1491,12 +1484,7 @@ mod tests {
                                     continue;
                                 }
                                 let slice = &body[start..=end];
-                                let cr = format!(
-                                    "bytes {}-{}/{}",
-                                    start,
-                                    end,
-                                    body.len()
-                                );
+                                let cr = format!("bytes {}-{}/{}", start, end, body.len());
                                 let _ = write!(
                                     stream,
                                     "HTTP/1.1 206 Partial Content\r\nContent-Range: {cr}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
@@ -1597,10 +1585,7 @@ mod tests {
         let _g = EnvGuard::acquire(AWS_ENV_KEYS);
         _g.set("AWS_ACCESS_KEY_ID", "AKIAONLY");
         let err = resolve_auth().unwrap_err().to_string();
-        assert!(
-            err.contains("AWS_SECRET_ACCESS_KEY"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("AWS_SECRET_ACCESS_KEY"), "unexpected: {err}");
     }
 
     #[test]
@@ -1888,7 +1873,10 @@ mod tests {
         tmp.read_to_end(&mut got).unwrap();
         assert_eq!(got, body);
         let ranges = s3.range_headers.load(Ordering::SeqCst);
-        assert!(ranges >= 2, "expected multi-chunk Range download, ranges={ranges}");
+        assert!(
+            ranges >= 2,
+            "expected multi-chunk Range download, ranges={ranges}"
+        );
         let log = s3.log.lock().unwrap();
         let range_lines: Vec<_> = log
             .iter()
@@ -2004,7 +1992,9 @@ mod tests {
         let _g = EnvGuard::acquire(AWS_ENV_KEYS);
         _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
         _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
-        let err = fetch_s3_range_bytes("s3://b/k", 10, 5).unwrap_err().to_string();
+        let err = fetch_s3_range_bytes("s3://b/k", 10, 5)
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("invalid range"), "got: {err}");
     }
 }

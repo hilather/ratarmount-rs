@@ -61,7 +61,8 @@ use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "SQLARMountSource";
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
-const OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
+const OPEN_FLAGS: OpenFlags =
+    OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::SQLITE_OPEN_NO_MUTEX);
 
 /// SQLCipher default KDF iterations (current); salt is the first 16 file bytes.
 #[cfg(feature = "sqlcipher")]
@@ -307,7 +308,11 @@ fn open_encrypted(
 
 /// Try each password with SQLCipher (passphrase form, then PBKDF2 raw key).
 #[cfg(feature = "sqlcipher")]
-fn try_sqlcipher_passwords(path: &Path, passwords: &[String], salt: &[u8; 16]) -> Result<Connection> {
+fn try_sqlcipher_passwords(
+    path: &Path,
+    passwords: &[String],
+    salt: &[u8; 16],
+) -> Result<Connection> {
     use pbkdf2::pbkdf2_hmac;
     use sha2::Sha512;
 
@@ -681,10 +686,7 @@ mod tests {
         );
 
         let wrong = SqlarError::WrongPassword.to_string();
-        assert!(
-            wrong.contains("password"),
-            "WrongPassword: {wrong}"
-        );
+        assert!(wrong.contains("password"), "WrongPassword: {wrong}");
     }
 
     #[test]
@@ -768,10 +770,7 @@ mod tests {
         }
         // Python fixture password is "foo"; also try a decoy first (multi-password trial).
         let opts = OpenOptions {
-            passwords: vec![
-                r#""; DROP TABLE sqlar;"#.into(),
-                "foo".into(),
-            ],
+            passwords: vec![r#""; DROP TABLE sqlar;"#.into(), "foo".into()],
             ..OpenOptions::default()
         };
 

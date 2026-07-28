@@ -24,10 +24,7 @@ pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + 
 ///
 /// The `label` is a virtual name (e.g. `inner-hello.7z`) for logs/index metadata.
 pub type OpenNestedReaderFn = Arc<
-    dyn Fn(
-            Box<dyn ratarmount_core::ArchiveRead>,
-            &Path,
-        ) -> io::Result<Arc<dyn MountSource>>
+    dyn Fn(Box<dyn ratarmount_core::ArchiveRead>, &Path) -> io::Result<Arc<dyn MountSource>>
         + Send
         + Sync,
 >;
@@ -1058,7 +1055,8 @@ mod tests {
         fs::write(sub.join("vol.ac"), b"AC").unwrap();
 
         let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
-        let joined = try_materialize_split_from_parent(&folder, "/parts/vol.aa").expect("alpha join");
+        let joined =
+            try_materialize_split_from_parent(&folder, "/parts/vol.aa").expect("alpha join");
         assert_eq!(fs::read(&joined).unwrap(), b"AAABAC");
         let _ = fs::remove_file(&joined);
 
@@ -1091,11 +1089,7 @@ mod tests {
                 None
             }
         }
-        fn open(
-            &self,
-            _: &FileInfo,
-            _: i32,
-        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
             Err(io::Error::new(io::ErrorKind::NotFound, "empty nested"))
         }
         fn is_immutable(&self) -> bool {
@@ -1198,15 +1192,8 @@ mod tests {
                 index_in_memory: true,
                 ..OpenOptions::default()
             };
-            let ms = SqliteIndexedTar::create_index(
-                path,
-                path,
-                None,
-                &opts,
-                "test",
-                &mut None,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let ms = SqliteIndexedTar::create_index(path, path, None, &opts, "test", &mut None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(Arc::new(ms) as Arc<dyn MountSource>)
         });
         let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label| {
@@ -1224,15 +1211,9 @@ mod tests {
             index_in_memory: true,
             ..OpenOptions::default()
         };
-        let root = SqliteIndexedTar::create_index(
-            &outer_tar,
-            &outer_tar,
-            None,
-            &opts,
-            "test",
-            &mut None,
-        )
-        .expect("outer tar");
+        let root =
+            SqliteIndexedTar::create_index(&outer_tar, &outer_tar, None, &opts, "test", &mut None)
+                .expect("outer tar");
         let layer = AutoMountLayer::new_with_openers(
             Arc::new(root),
             2,
@@ -1296,8 +1277,9 @@ mod tests {
                 index_in_memory: true,
                 ..OpenOptions::default()
             };
-            let ms = SevenZipMountSource::open_from_reader(reader, label, None, &opts, "test", true)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let ms =
+                SevenZipMountSource::open_from_reader(reader, label, None, &opts, "test", true)
+                    .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(Arc::new(ms) as Arc<dyn MountSource>)
         });
 
@@ -1315,7 +1297,10 @@ mod tests {
         );
 
         assert!(reader_opened.load(AOrd::SeqCst), "inner 7z via reader");
-        assert!(!path_opened.load(AOrd::SeqCst), "no path spool for nested 7z");
+        assert!(
+            !path_opened.load(AOrd::SeqCst),
+            "no path spool for nested 7z"
+        );
 
         // inner-hello.7z/hello.txt (or first file)
         let fi = layer
@@ -1325,8 +1310,7 @@ mod tests {
                 if let Some(ListResult::Infos(map)) = layer.list("/") {
                     for name in map.keys() {
                         if name.ends_with(".7z") {
-                            if let Some(ListResult::Infos(inner)) =
-                                layer.list(&format!("/{name}"))
+                            if let Some(ListResult::Infos(inner)) = layer.list(&format!("/{name}"))
                             {
                                 if let Some(fname) = inner.keys().next() {
                                     return layer.lookup(&format!("/{name}/{fname}"), 0);
@@ -1373,15 +1357,8 @@ mod tests {
 
         let open_nested: OpenNestedFn = Arc::new(|path: &Path| {
             let opts = OpenOptions::default();
-            let ms = SqliteIndexedTar::create_index(
-                path,
-                path,
-                None,
-                &opts,
-                "test",
-                &mut None,
-            )
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            let ms = SqliteIndexedTar::create_index(path, path, None, &opts, "test", &mut None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(Arc::new(ms) as Arc<dyn MountSource>)
         });
 

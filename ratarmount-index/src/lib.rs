@@ -795,9 +795,7 @@ impl SqliteIndex {
                 [],
             )?;
             conn.execute(
-                &format!(
-                    "CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEX}\" ( \"data\" BLOB )"
-                ),
+                &format!("CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEX}\" ( \"data\" BLOB )"),
                 [],
             )?;
             conn.execute(
@@ -821,9 +819,7 @@ impl SqliteIndex {
             let has_index = table_exists(conn, COMPRESSION_TABLE_GZIPINDEX)?;
             if !has_indexes {
                 conn.execute(
-                    &format!(
-                        "CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEXES}\" ( \"data\" BLOB )"
-                    ),
+                    &format!("CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEXES}\" ( \"data\" BLOB )"),
                     [],
                 )?;
                 if has_index {
@@ -868,9 +864,7 @@ impl SqliteIndex {
                 [],
             )?;
             conn.execute(
-                &format!(
-                    "CREATE TABLE \"{COMPRESSION_TABLE_GZTOOLINDEX}\" ( \"data\" BLOB )"
-                ),
+                &format!("CREATE TABLE \"{COMPRESSION_TABLE_GZTOOLINDEX}\" ( \"data\" BLOB )"),
                 [],
             )?;
             conn.execute(
@@ -942,9 +936,8 @@ impl SqliteIndex {
             let mut stmt = conn.prepare(&format!(
                 "SELECT blockoffset, dataoffset FROM \"{table}\" ORDER BY blockoffset"
             ))?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-            })?;
+            let rows =
+                stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
             let mut out = Vec::new();
             for r in rows {
                 out.push(r?);
@@ -968,8 +961,7 @@ impl SqliteIndex {
                 ),
                 [],
             )?;
-            let mut stmt =
-                conn.prepare(&format!("INSERT INTO \"{table}\" VALUES (?1, ?2)"))?;
+            let mut stmt = conn.prepare(&format!("INSERT INTO \"{table}\" VALUES (?1, ?2)"))?;
             for &(blockoffset, dataoffset) in blocks {
                 stmt.execute(params![blockoffset, dataoffset])?;
             }
@@ -993,8 +985,9 @@ impl SqliteIndex {
             return Err(IndexError::Invalid("index is read-only".into()));
         }
         self.with_conn(|conn| {
-            let mut stmt =
-                conn.prepare_cached(r#"INSERT INTO "xattrs" (offsetheader, key, value) VALUES (?1, ?2, ?3)"#)?;
+            let mut stmt = conn.prepare_cached(
+                r#"INSERT INTO "xattrs" (offsetheader, key, value) VALUES (?1, ?2, ?3)"#,
+            )?;
             for (oh, key, value) in rows {
                 stmt.execute(params![oh, key, value])?;
             }
@@ -1005,7 +998,8 @@ impl SqliteIndex {
     /// List xattr keys for a file identified by `offsetheader`.
     pub fn list_xattr_keys(&self, offsetheader: i64) -> Result<Vec<String>> {
         self.with_conn(|conn| {
-            let mut stmt = conn.prepare_cached(r#"SELECT key FROM "xattrs" WHERE offsetheader = ?1"#)?;
+            let mut stmt =
+                conn.prepare_cached(r#"SELECT key FROM "xattrs" WHERE offsetheader = ?1"#)?;
             let rows = stmt.query_map(params![offsetheader], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
             for r in rows {
@@ -1258,26 +1252,14 @@ mod tests {
 
         // Minimal files row so schema is realistic; xattrs only need offsetheader.
         idx.insert_file(
-            "",
-            "bar",
-            512,
-            1024,
-            4,
-            0.0,
-            0o100644,
-            0,
-            "",
-            1000,
-            1000,
-            true,
-            false,
-            false,
-            0,
+            "", "bar", 512, 1024, 4, 0.0, 0o100644, 0, "", 1000, 1000, true, false, false, 0,
         )
         .unwrap();
 
-        idx.insert_xattr(512, "user.hash.sha256", b"deadbeef").unwrap();
-        idx.insert_xattr(512, "user.hash.crc32", b"7e3265a8").unwrap();
+        idx.insert_xattr(512, "user.hash.sha256", b"deadbeef")
+            .unwrap();
+        idx.insert_xattr(512, "user.hash.crc32", b"7e3265a8")
+            .unwrap();
 
         let mut keys = idx.list_xattr_keys(512).unwrap();
         keys.sort();
@@ -1319,21 +1301,9 @@ mod tests {
 
         let idx = SqliteIndex::create_writable(None).unwrap();
         idx.insert_file(
-            "",
-            "bar",
-            0,
-            8, // offset into archive
+            "", "bar", 0, 8, // offset into archive
             4, // size
-            0.0,
-            0o100644,
-            0,
-            "",
-            0,
-            0,
-            true,
-            false,
-            false,
-            0,
+            0.0, 0o100644, 0, "", 0, 0, true, false, false, 0,
         )
         .unwrap();
 
@@ -1352,9 +1322,7 @@ mod tests {
         );
         assert_eq!(
             idx.get_xattr(0, "user.hash.sha256").unwrap().as_deref(),
-            Some(
-                b"b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c".as_slice()
-            )
+            Some(b"b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c".as_slice())
         );
     }
 
@@ -1376,17 +1344,18 @@ mod tests {
 
         let blob = b"indexed-gzip-seek-blob-v1".to_vec();
         idx.set_gzip_index_blob(&blob).unwrap();
-        assert!(idx.has_compression_table(COMPRESSION_TABLE_GZIPINDEX).unwrap());
+        assert!(idx
+            .has_compression_table(COMPRESSION_TABLE_GZIPINDEX)
+            .unwrap());
         assert_eq!(idx.get_gzip_index_blobs().unwrap(), vec![blob.clone()]);
 
         // Append migrates singular → plural and adds second blob.
         let blob2 = b"second-chunk".to_vec();
         idx.append_gzip_index_blob(&blob2).unwrap();
-        assert!(idx.has_compression_table(COMPRESSION_TABLE_GZIPINDEXES).unwrap());
-        assert_eq!(
-            idx.get_gzip_index_blobs().unwrap(),
-            vec![blob, blob2]
-        );
+        assert!(idx
+            .has_compression_table(COMPRESSION_TABLE_GZIPINDEXES)
+            .unwrap());
+        assert_eq!(idx.get_gzip_index_blobs().unwrap(), vec![blob, blob2]);
     }
 
     #[test]
@@ -1421,7 +1390,9 @@ mod tests {
         // Read-only reopen also sees the data (tables already present).
         drop(idx);
         let ro = SqliteIndex::open_read_only(&path).unwrap();
-        assert!(ro.has_compression_table(COMPRESSION_TABLE_GZIPINDEX).unwrap());
+        assert!(ro
+            .has_compression_table(COMPRESSION_TABLE_GZIPINDEX)
+            .unwrap());
         assert_eq!(
             ro.get_gzip_index_blobs().unwrap(),
             vec![b"persist-me".to_vec()]
@@ -1457,7 +1428,9 @@ mod tests {
 
         // ensure recreates empty tables after clear.
         idx.ensure_compression_tables().unwrap();
-        assert!(idx.has_compression_table(COMPRESSION_TABLE_ZSTDBLOCKS).unwrap());
+        assert!(idx
+            .has_compression_table(COMPRESSION_TABLE_ZSTDBLOCKS)
+            .unwrap());
     }
 
     #[test]

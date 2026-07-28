@@ -110,21 +110,8 @@ fn parse_format_backend(name: &str) -> Option<FormatBackend> {
     Some(match n.as_str() {
         "tar" | "tarfile" | "sqliteindexedtar" => FormatBackend::Tar,
         // Compression backends that Python delegates to tarfile.
-        "rapidgzip"
-        | "indexed_gzip"
-        | "indexed_bzip2"
-        | "xz"
-        | "lzma"
-        | "zstd"
-        | "lz4"
-        | "lzip"
-        | "lzo"
-        | "lzop"
-        | "zlib"
-        | "deflate"
-        | "compress"
-        | "compress-z"
-        | "gzip"
+        "rapidgzip" | "indexed_gzip" | "indexed_bzip2" | "xz" | "lzma" | "zstd" | "lz4"
+        | "lzip" | "lzo" | "lzop" | "zlib" | "deflate" | "compress" | "compress-z" | "gzip"
         | "bzip2" => FormatBackend::Tar,
         "zip" | "zipfile" => FormatBackend::Zip,
         "7z" | "sevenzip" | "py7zr" => FormatBackend::SevenZip,
@@ -399,10 +386,7 @@ mod split_open_tests {
     #[test]
     fn ordered_format_backends_last_flag_highest_priority() {
         // Python: use_backend flatten then [::-1] → last wins.
-        let order = ordered_format_backends(&[
-            "zip".into(),
-            "tar".into(),
-        ]);
+        let order = ordered_format_backends(&["zip".into(), "tar".into()]);
         assert_eq!(order[0], FormatBackend::Tar);
         assert_eq!(order[1], FormatBackend::Zip);
         // No duplicates; defaults fill the rest.
@@ -427,7 +411,10 @@ mod split_open_tests {
         assert_eq!(parse_format_backend("py7zr"), Some(FormatBackend::SevenZip));
         assert_eq!(parse_format_backend("iso9660"), Some(FormatBackend::Iso));
         assert_eq!(parse_format_backend("rapidgzip"), Some(FormatBackend::Tar));
-        assert_eq!(parse_format_backend("PySquashfsImage"), Some(FormatBackend::SquashFs));
+        assert_eq!(
+            parse_format_backend("PySquashfsImage"),
+            Some(FormatBackend::SquashFs)
+        );
         assert_eq!(parse_format_backend("unknown-backend-xyz"), None);
     }
 
@@ -516,7 +503,9 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
 
         let mut magic = [0u8; 512];
         let n = reader.read(&mut magic).map_err(std::io::Error::other)?;
-        reader.seek(SeekFrom::Start(0)).map_err(std::io::Error::other)?;
+        reader
+            .seek(SeekFrom::Start(0))
+            .map_err(std::io::Error::other)?;
         let head = &magic[..n];
 
         // 7z magic
@@ -534,8 +523,8 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 .map_err(|e| std::io::Error::other(e.to_string()));
         }
         // Uncompressed TAR (ustar) or name suggests .tar
-        let looks_tar = (head.len() >= 262 && &head[257..262] == b"ustar")
-            || name_suggests_plain_tar(label);
+        let looks_tar =
+            (head.len() >= 262 && &head[257..262] == b"ustar") || name_suggests_plain_tar(label);
         if looks_tar {
             return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
                 .map(|s| Arc::new(s) as Arc<dyn MountSource>)
@@ -987,14 +976,12 @@ fn open_shared_seekable_gzip_path(
                 return Ok(g);
             }
             Err(e) => {
-                eprintln!(
-                    "info: gzip RGZI import failed ({e}); rebuilding seek checkpoints"
-                );
+                eprintln!("info: gzip RGZI import failed ({e}); rebuilding seek checkpoints");
             }
         }
     }
-    let gzip = SharedSeekableGzip::open_with_threads(path, spacing, threads)
-        .map_err(|e| e.to_string())?;
+    let gzip =
+        SharedSeekableGzip::open_with_threads(path, spacing, threads).map_err(|e| e.to_string())?;
     eprintln!(
         "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
         path.display(),
@@ -1051,9 +1038,8 @@ fn open_gzip_rebuilt_from_reader<R>(
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let gzip =
-        SharedSeekableGzip::open_with_threads_from_reader(reader, spacing, threads, label)
-            .map_err(|e| e.to_string())?;
+    let gzip = SharedSeekableGzip::open_with_threads_from_reader(reader, spacing, threads, label)
+        .map_err(|e| e.to_string())?;
     eprintln!(
         "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
         label.display(),
@@ -1083,8 +1069,7 @@ fn open_gzip(
     // Prefer seekable path for names that clearly indicate compressed TAR.
     if name_suggests_compressed_tar(path) {
         let threads = options.threads_for("gzip");
-        let gzip =
-            open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
+        let gzip = open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
         let tar = open_tar_gzip(path, Arc::clone(&gzip), index_path, options, recreate)?;
         // TAR index is now on disk (or memory); side-table write only when path exists.
         persist_gzip_index_blob(&gzip, index_path, options);
@@ -1333,11 +1318,7 @@ fn store_zstd_blocks_in_index(
 }
 
 /// Export frame map from a local path and store as `zstdblocks` when writable.
-fn persist_zstd_blocks_from_path(
-    path: &Path,
-    index_path: Option<&Path>,
-    options: &OpenOptions,
-) {
+fn persist_zstd_blocks_from_path(path: &Path, index_path: Option<&Path>, options: &OpenOptions) {
     if !options.write_index || options.read_only_index || options.index_in_memory {
         return;
     }
@@ -1492,11 +1473,7 @@ fn store_bzip2_blocks_in_index(
     }
 }
 
-fn persist_bzip2_blocks_from_path(
-    path: &Path,
-    index_path: Option<&Path>,
-    options: &OpenOptions,
-) {
+fn persist_bzip2_blocks_from_path(path: &Path, index_path: Option<&Path>, options: &OpenOptions) {
     if !options.write_index || options.read_only_index || options.index_in_memory {
         return;
     }
@@ -1889,9 +1866,7 @@ where
                             match reopen_fn() {
                                 Ok(mut fresh) => {
                                     match export_bzip2_blocks_from_reader(&mut fresh) {
-                                        Ok(blocks) => {
-                                            store_bzip2_blocks_in_index(&blocks, ip, &o)
-                                        }
+                                        Ok(blocks) => store_bzip2_blocks_in_index(&blocks, ip, &o),
                                         Err(e) => {
                                             eprintln!("info: could not export bzip2blocks: {e}")
                                         }
@@ -1994,7 +1969,7 @@ fn open_remote_input(
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
-    use ratarmount_remote::{resolve_access, open_s3_range, RemoteAccess, RemoteHttp};
+    use ratarmount_remote::{open_s3_range, resolve_access, RemoteAccess, RemoteHttp};
 
     // Live S3 Range I/O (parallel to HTTP Range) when GetObject Range works.
     if input.starts_with("s3://") {
@@ -2003,28 +1978,20 @@ fn open_remote_input(
                 let len = range.len();
                 eprintln!("S3 Range: {input} ({len} bytes, live Range GetObject)");
                 let input_owned = input.to_string();
-                match open_from_live_range(
-                    range,
-                    len,
-                    input,
-                    opts,
-                    recreate,
-                    "S3 Range",
-                    || {
-                        open_s3_range(&input_owned).map_err(|e| e.to_string()).and_then(|r| {
+                match open_from_live_range(range, len, input, opts, recreate, "S3 Range", || {
+                    open_s3_range(&input_owned)
+                        .map_err(|e| e.to_string())
+                        .and_then(|r| {
                             if r.uses_ranges() {
                                 Ok(r)
                             } else {
                                 Err("S3 Range reopen lost live Range support".into())
                             }
                         })
-                    },
-                )? {
+                })? {
                     Some(opened) => return Ok(opened),
                     None => {
-                        eprintln!(
-                            "info: S3 Range format unsupported for {input}; materializing"
-                        );
+                        eprintln!("info: S3 Range format unsupported for {input}; materializing");
                         return materialize_remote_input(input, opts, recreate, remotes);
                     }
                 }
@@ -2047,18 +2014,10 @@ fn open_remote_input(
         RemoteAccess::Http(RemoteHttp::Range(range)) => {
             let len = range.len();
             let input_owned = input.to_string();
-            match open_from_live_range(
-                range,
-                len,
-                input,
-                opts,
-                recreate,
-                "HTTP Range",
-                || {
-                    // Buffered fallback is still Read+Seek-usable for rebuild.
-                    ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
-                },
-            )? {
+            match open_from_live_range(range, len, input, opts, recreate, "HTTP Range", || {
+                // Buffered fallback is still Read+Seek-usable for rebuild.
+                ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
+            })? {
                 Some(opened) => Ok(opened),
                 None => materialize_remote_input(input, opts, recreate, remotes),
             }
@@ -2112,7 +2071,9 @@ fn probe_archive_magic(magic: &[u8]) -> &'static str {
     if magic.len() >= 100 {
         // crude: many tars have spaces/nulls in name and octal mode at 100
         let mode = &magic[100..108.min(magic.len())];
-        if mode.iter().all(|b| b.is_ascii_digit() || *b == b' ' || *b == 0)
+        if mode
+            .iter()
+            .all(|b| b.is_ascii_digit() || *b == b' ' || *b == 0)
             && magic.iter().take(20).any(|b| b.is_ascii_graphic())
             && magic.get(257).copied().unwrap_or(0) == 0
         {

@@ -239,10 +239,7 @@ pub fn range_chunk_windows(size: u64, chunk: u64) -> Vec<(u64, u64)> {
 /// Tries HEAD first; on failure or missing length with ranges advertised, probes with
 /// `Range: bytes=0-0` (206 + Content-Range total).
 pub fn probe_http(url: &str) -> Result<HttpProbe> {
-    match ureq::head(url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-    {
+    match ureq::head(url).set("User-Agent", USER_AGENT).call() {
         Ok(resp) if (200..300).contains(&resp.status()) => {
             let content_length = resp
                 .header("Content-Length")
@@ -746,7 +743,8 @@ mod tests {
             "unexpected: {msg}"
         );
         assert!(
-            !msg.to_ascii_lowercase().contains("unsupported remote scheme"),
+            !msg.to_ascii_lowercase()
+                .contains("unsupported remote scheme"),
             "dropbox should be a supported scheme: {msg}"
         );
     }
@@ -778,7 +776,8 @@ mod tests {
             "unexpected: {msg}"
         );
         assert!(
-            !msg.to_ascii_lowercase().contains("unsupported remote scheme"),
+            !msg.to_ascii_lowercase()
+                .contains("unsupported remote scheme"),
             "smb should be a supported scheme: {msg}"
         );
     }
@@ -857,9 +856,7 @@ mod tests {
             let full_c = Arc::clone(&full_gets);
             let join = thread::spawn(move || {
                 // Serve a handful of requests then exit when listener is dropped / timeout-ish.
-                listener
-                    .set_nonblocking(false)
-                    .ok();
+                listener.set_nonblocking(false).ok();
                 for stream in listener.incoming().take(64) {
                     let Ok(mut stream) = stream else { continue };
                     let mut reader = BufReader::new(stream.try_clone().unwrap());

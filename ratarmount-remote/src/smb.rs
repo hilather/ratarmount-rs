@@ -351,8 +351,7 @@ mod tests {
 
     #[test]
     fn parse_auth_port_and_domain_semicolon() {
-        let loc =
-            parse_smb_url("smb://CORP;alice:s3cret@nas.example:1445/data/iso/x.iso").unwrap();
+        let loc = parse_smb_url("smb://CORP;alice:s3cret@nas.example:1445/data/iso/x.iso").unwrap();
         assert_eq!(loc.host, "nas.example");
         assert_eq!(loc.port, 1445);
         assert_eq!(loc.share, "data");
