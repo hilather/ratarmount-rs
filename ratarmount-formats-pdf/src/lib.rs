@@ -8,8 +8,13 @@
 //! Image formats:
 //! - `/Filter /DCTDecode` → `.jpg` (raw JPEG bitstream, no re-encoding)
 //! - `/Filter /JPXDecode` → `.jp2` (raw JPEG 2000 bitstream)
-//! - Other / multi-filter / raw samples → `.bin` (stream bytes as stored; Image streams are
-//!   not fully decoded by lopdf, so non-JPEG payloads are best-effort raw)
+//! - Sole `/Filter /FlateDecode` or no filter, with `/ColorSpace /DeviceGray` or
+//!   `/DeviceRGB` and 8 bits/component → `.png` (inflated samples re-encoded as PNG)
+//! - CMYK, unusual bit depths, multi-filter chains, Indexed/ICCBased, and other cases →
+//!   `.bin` (stream bytes as stored; not reassembled into a displayable image file)
+//!
+//! Note: lopdf refuses to run `decompressed_content` on `/Subtype /Image` streams, so
+//! FlateDecode inflation and PNG reassembly are done here with `flate2` + `png`.
 //!
 //! Text extraction is out of scope.
 
@@ -20,6 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
+use flate2::read::{DeflateDecoder, ZlibDecoder};
 use lopdf::{Document, Object, ObjectId, Stream};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
@@ -82,21 +88,298 @@ fn stream_bytes(doc: &Document, id: ObjectId) -> Option<Vec<u8>> {
     }
 }
 
+/// Supported PNG-encodable color spaces (8 bpc only).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PngColor {
+    Gray,
+    Rgb,
+}
+
+impl PngColor {
+    fn channels(self) -> usize {
+        match self {
+            PngColor::Gray => 1,
+            PngColor::Rgb => 3,
+        }
+    }
+
+    fn png_color_type(self) -> png::ColorType {
+        match self {
+            PngColor::Gray => png::ColorType::Grayscale,
+            PngColor::Rgb => png::ColorType::Rgb,
+        }
+    }
+}
+
+fn dict_i64(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
+    dict.get(key).ok().and_then(|o| o.as_i64().ok())
+}
+
+/// Resolve a simple ColorSpace name (`DeviceGray` / `DeviceRGB` / `DeviceCMYK`, …).
+/// Array forms (`/Indexed`, `/ICCBased`, …) return the first name only for classification.
+fn color_space_name(obj: &Object) -> Option<String> {
+    match obj {
+        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
+        Object::Array(arr) if !arr.is_empty() => arr[0]
+            .as_name_str()
+            .ok()
+            .map(|s| s.to_string()),
+        _ => None,
+    }
+}
+
+fn png_color_from_name(name: &str) -> Option<PngColor> {
+    match name {
+        "DeviceGray" | "CalGray" => Some(PngColor::Gray),
+        "DeviceRGB" | "CalRGB" => Some(PngColor::Rgb),
+        // DeviceCMYK and others are not emitted as PNG.
+        _ => None,
+    }
+}
+
+/// Inflate PDF FlateDecode data (zlib wrapper preferred; raw deflate as fallback).
+fn inflate_flate(data: &[u8]) -> Option<Vec<u8>> {
+    if data.is_empty() {
+        return Some(Vec::new());
+    }
+    let mut out = Vec::with_capacity(data.len().saturating_mul(2));
+    {
+        let mut z = ZlibDecoder::new(data);
+        if z.read_to_end(&mut out).is_ok() {
+            return Some(out);
+        }
+    }
+    out.clear();
+    let mut d = DeflateDecoder::new(data);
+    if d.read_to_end(&mut out).is_ok() {
+        return Some(out);
+    }
+    None
+}
+
+/// Apply PDF `/DecodeParms` predictors after Flate inflation (PNG 10–15 and TIFF 2).
+fn apply_predictor(data: Vec<u8>, params: Option<&lopdf::Dictionary>) -> Option<Vec<u8>> {
+    let Some(params) = params else {
+        return Some(data);
+    };
+    let predictor = dict_i64(params, b"Predictor").unwrap_or(1);
+    if predictor == 1 {
+        return Some(data);
+    }
+
+    let columns = dict_i64(params, b"Columns").unwrap_or(1).max(1) as usize;
+    let colors = dict_i64(params, b"Colors").unwrap_or(1).max(1) as usize;
+    let bits = dict_i64(params, b"BitsPerComponent").unwrap_or(8).max(1) as usize;
+
+    if (10..=15).contains(&predictor) {
+        // PNG filter methods: each row is filter_byte + row_bytes.
+        if !bits.is_multiple_of(8) {
+            return None;
+        }
+        let bytes_per_pixel = colors * (bits / 8);
+        let bytes_per_row = bytes_per_pixel * columns;
+        return decode_png_predictor_rows(&data, bytes_per_pixel, bytes_per_row);
+    }
+
+    if predictor == 2 {
+        // TIFF horizontal differencing (8-bit samples only).
+        if bits != 8 {
+            return None;
+        }
+        return Some(decode_tiff_predictor(&data, columns, colors));
+    }
+
+    // Unknown predictor: leave data unchanged (best-effort).
+    Some(data)
+}
+
+fn decode_png_predictor_rows(
+    content: &[u8],
+    bytes_per_pixel: usize,
+    bytes_per_row: usize,
+) -> Option<Vec<u8>> {
+    if bytes_per_row == 0 {
+        return Some(Vec::new());
+    }
+    let row_stride = bytes_per_row + 1; // filter byte + samples
+    if !content.len().is_multiple_of(row_stride) {
+        return None;
+    }
+    let mut previous = vec![0u8; bytes_per_row];
+    let mut current = vec![0u8; bytes_per_row];
+    let mut decoded = Vec::with_capacity(content.len());
+    let bpp = bytes_per_pixel.min(bytes_per_row);
+
+    for row in content.chunks_exact(row_stride) {
+        let filter = row[0];
+        current.copy_from_slice(&row[1..]);
+        match filter {
+            0 => {} // None
+            1 => {
+                // Sub
+                for i in bpp..bytes_per_row {
+                    current[i] = current[i].wrapping_add(current[i - bpp]);
+                }
+            }
+            2 => {
+                // Up
+                for i in 0..bytes_per_row {
+                    current[i] = current[i].wrapping_add(previous[i]);
+                }
+            }
+            3 => {
+                // Average: floor((left + above) / 2)
+                for i in 0..bpp {
+                    current[i] = current[i].wrapping_add(previous[i] / 2);
+                }
+                for i in bpp..bytes_per_row {
+                    let avg = ((i16::from(current[i - bpp]) + i16::from(previous[i])) / 2) as u8;
+                    current[i] = current[i].wrapping_add(avg);
+                }
+            }
+            4 => {
+                // Paeth
+                for i in 0..bpp {
+                    current[i] =
+                        current[i].wrapping_add(paeth_predict(0, previous[i], 0));
+                }
+                for i in bpp..bytes_per_row {
+                    current[i] = current[i].wrapping_add(paeth_predict(
+                        current[i - bpp],
+                        previous[i],
+                        previous[i - bpp],
+                    ));
+                }
+            }
+            _ => return None,
+        }
+        decoded.extend_from_slice(&current);
+        std::mem::swap(&mut previous, &mut current);
+    }
+    Some(decoded)
+}
+
+fn paeth_predict(left: u8, above: u8, upperleft: u8) -> u8 {
+    let a = i16::from(left);
+    let b = i16::from(above);
+    let c = i16::from(upperleft);
+    let p = a + b - c;
+    let pa = (p - a).abs();
+    let pb = (p - b).abs();
+    let pc = (p - c).abs();
+    if pa <= pb && pa <= pc {
+        left
+    } else if pb <= pc {
+        above
+    } else {
+        upperleft
+    }
+}
+
+fn decode_tiff_predictor(data: &[u8], columns: usize, colors: usize) -> Vec<u8> {
+    let row_len = columns * colors;
+    if row_len == 0 {
+        return data.to_vec();
+    }
+    let mut out = data.to_vec();
+    for row in out.chunks_exact_mut(row_len) {
+        for i in colors..row.len() {
+            row[i] = row[i].wrapping_add(row[i - colors]);
+        }
+    }
+    out
+}
+
+/// Encode raw 8-bpc Gray or RGB samples as a PNG file.
+fn encode_png(width: u32, height: u32, color: PngColor, samples: &[u8]) -> Option<Vec<u8>> {
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(color.channels())?;
+    if samples.len() < expected {
+        return None;
+    }
+    let samples = &samples[..expected];
+
+    let mut buf = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut buf, width, height);
+        encoder.set_color(color.png_color_type());
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().ok()?;
+        writer.write_image_data(samples).ok()?;
+    }
+    Some(buf)
+}
+
+/// Try to reassemble FlateDecode (or raw uncompressed) Image XObject samples as PNG.
+///
+/// Only `/DeviceGray` and `/DeviceRGB` (and CalGray/CalRGB) at 8 bits/component.
+/// CMYK, multi-filter, non-8-bpc, and failed inflation fall through to the caller.
+fn try_samples_to_png(stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
+    let width = dict_i64(&stream.dict, b"Width")? as u32;
+    let height = dict_i64(&stream.dict, b"Height")? as u32;
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let bpc = dict_i64(&stream.dict, b"BitsPerComponent").unwrap_or(8);
+    if bpc != 8 {
+        return None;
+    }
+    let cs_obj = stream.dict.get(b"ColorSpace").ok()?;
+    let cs_name = color_space_name(cs_obj)?;
+    let color = png_color_from_name(&cs_name)?;
+
+    let mut samples = if inflate {
+        let inflated = inflate_flate(&stream.content)?;
+        let params = stream
+            .dict
+            .get(b"DecodeParms")
+            .ok()
+            .and_then(|o| o.as_dict().ok());
+        apply_predictor(inflated, params)?
+    } else {
+        stream.content.clone()
+    };
+
+    // Some producers pad the stream; trim to exact sample count if longer.
+    let expected = (width as usize)
+        .checked_mul(height as usize)?
+        .checked_mul(color.channels())?;
+    if samples.len() < expected {
+        return None;
+    }
+    if samples.len() > expected {
+        samples.truncate(expected);
+    }
+
+    encode_png(width, height, color, &samples)
+}
+
 /// Choose file extension and payload for an Image XObject stream.
 ///
 /// lopdf refuses to run `decompressed_content` on `/Subtype /Image` streams (pixel data is
 /// not general stream content). For sole `/DCTDecode` / `/JPXDecode` the stored bytes are
-/// already a usable file; other cases emit raw stream content as `.bin`.
+/// already a usable file. Sole `/FlateDecode` or no filter with DeviceGray/DeviceRGB 8-bpc
+/// is reassembled into PNG. Other cases emit raw stream content as `.bin`.
 fn image_payload_and_ext(stream: &Stream) -> (Vec<u8>, &'static str) {
     let filters = stream.filters().unwrap_or_default();
     if filters.len() == 1 {
         match filters[0].as_str() {
             "DCTDecode" => return (stream.content.clone(), "jpg"),
             "JPXDecode" => return (stream.content.clone(), "jp2"),
+            "FlateDecode" => {
+                if let Some(png) = try_samples_to_png(stream, true) {
+                    return (png, "png");
+                }
+            }
             _ => {}
         }
+    } else if filters.is_empty() {
+        if let Some(png) = try_samples_to_png(stream, false) {
+            return (png, "png");
+        }
     }
-    // Multi-filter or non-JPEG: keep stored bytes (possibly still filter-encoded).
+    // Multi-filter, CMYK, unusual depths, or failed reassembly: keep stored bytes.
     (stream.content.clone(), "bin")
 }
 
@@ -886,6 +1169,7 @@ mod tests {
         assert_eq!(ext, "jpg");
         assert_eq!(data, jpeg);
 
+        // Incomplete image dict (no ColorSpace): remain .bin
         let raw = Stream::new(
             dict(&[
                 ("Type", "XObject".into()),
@@ -898,5 +1182,243 @@ mod tests {
         let (data, ext) = image_payload_and_ext(&raw);
         assert_eq!(ext, "bin");
         assert_eq!(data, vec![0xAB, 0xCD]);
+    }
+
+    fn zlib_compress(data: &[u8]) -> Vec<u8> {
+        use flate2::write::ZlibEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::fast());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn flate_gray_image_stream(width: i64, height: i64, samples: Vec<u8>) -> Stream {
+        let compressed = zlib_compress(&samples);
+        Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", width.into()),
+                ("Height", height.into()),
+                ("ColorSpace", "DeviceGray".into()),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed,
+        )
+    }
+
+    fn flate_rgb_image_stream(width: i64, height: i64, samples: Vec<u8>) -> Stream {
+        let compressed = zlib_compress(&samples);
+        Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", width.into()),
+                ("Height", height.into()),
+                ("ColorSpace", "DeviceRGB".into()),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed,
+        )
+    }
+
+    fn write_pdf_with_image_stream(path: &Path, image: Stream) {
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let image_id = doc.add_object(image);
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+        let mut xobject = lopdf::Dictionary::new();
+        xobject.set("Im0", Object::Reference(image_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set("XObject", Object::Dictionary(xobject));
+        let page_id = doc.add_object(dict(&[
+            ("Type", "Page".into()),
+            ("Parent", pages_id.into()),
+            (
+                "MediaBox",
+                vec![0.into(), 0.into(), 100.into(), 100.into()].into(),
+            ),
+            ("Contents", content_id.into()),
+            ("Resources", Object::Dictionary(resources)),
+        ]));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dict(&[
+                ("Type", "Pages".into()),
+                ("Kids", vec![page_id.into()].into()),
+                ("Count", 1.into()),
+            ])),
+        );
+        let catalog_id = doc.add_object(dict(&[
+            ("Type", "Catalog".into()),
+            ("Pages", pages_id.into()),
+        ]));
+        doc.trailer.set("Root", catalog_id);
+        doc.save(path).expect("save synthetic pdf");
+    }
+
+    #[test]
+    fn image_payload_flate_devicegray_to_png() {
+        // 2x2 gray: black, white, mid, max
+        let samples = vec![0x00, 0xFF, 0x80, 0x40];
+        let stream = flate_gray_image_stream(2, 2, samples);
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "png");
+        assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
+        // Round-trip decode via png crate
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().expect("png info");
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(info.width, 2);
+        assert_eq!(info.height, 2);
+        assert_eq!(&buf[..info.buffer_size()], &[0x00, 0xFF, 0x80, 0x40]);
+    }
+
+    #[test]
+    fn image_payload_flate_devicergb_to_png() {
+        // 1x2 RGB: red pixel, blue pixel
+        let samples = vec![255, 0, 0, 0, 0, 255];
+        let stream = flate_rgb_image_stream(1, 2, samples);
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "png");
+        assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().expect("png info");
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(info.width, 1);
+        assert_eq!(info.height, 2);
+        assert_eq!(&buf[..info.buffer_size()], &[255, 0, 0, 0, 0, 255]);
+    }
+
+    #[test]
+    fn image_payload_raw_devicergb_to_png() {
+        let samples = vec![1, 2, 3];
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                ("ColorSpace", "DeviceRGB".into()),
+                ("BitsPerComponent", 8.into()),
+            ]),
+            samples.clone(),
+        );
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "png");
+        assert!(data.starts_with(b"\x89PNG"));
+    }
+
+    #[test]
+    fn image_payload_cmyk_flate_stays_bin() {
+        let samples = vec![0u8; 4]; // 1x1 CMYK
+        let compressed = zlib_compress(&samples);
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                ("ColorSpace", "DeviceCMYK".into()),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed.clone(),
+        );
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "bin");
+        assert_eq!(data, compressed);
+    }
+
+    #[test]
+    fn synthetic_pdf_flate_rgb_image_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flate-rgb.pdf");
+        // 2x1: green, white
+        let samples = vec![0, 255, 0, 255, 255, 255];
+        write_pdf_with_image_stream(&path, flate_rgb_image_stream(2, 1, samples));
+
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+        let images = m.list("/images").expect("list images");
+        match &images {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("page1-img0.png"),
+                    "image keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected infos"),
+        }
+        let fi = m
+            .lookup("/images/page1-img0.png", 0)
+            .expect("lookup png");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert!(
+            buf.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "expected PNG signature, got {:?}",
+            &buf[..buf.len().min(16)]
+        );
+        assert_eq!(fi.size, buf.len() as u64);
+    }
+
+    #[test]
+    fn synthetic_pdf_flate_gray_image_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("flate-gray.pdf");
+        let samples = vec![0x11, 0x22, 0x33, 0x44];
+        write_pdf_with_image_stream(&path, flate_gray_image_stream(2, 2, samples));
+
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+        let fi = m
+            .lookup("/images/page1-img0.png", 0)
+            .expect("lookup gray png");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(&buf[..8], b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn image_payload_predictor_png_none() {
+        // Predictor 10–15: each row is filter_byte + samples. Filter 0 (None).
+        // 2x2 DeviceGray: rows [0, a, b] and [0, c, d]
+        let samples = vec![0x10, 0x20, 0x30, 0x40];
+        let mut predicted = Vec::new();
+        predicted.push(0); // filter None
+        predicted.extend_from_slice(&samples[0..2]);
+        predicted.push(0);
+        predicted.extend_from_slice(&samples[2..4]);
+        let compressed = zlib_compress(&predicted);
+        let mut d = dict(&[
+            ("Type", "XObject".into()),
+            ("Subtype", "Image".into()),
+            ("Width", 2.into()),
+            ("Height", 2.into()),
+            ("ColorSpace", "DeviceGray".into()),
+            ("BitsPerComponent", 8.into()),
+            ("Filter", "FlateDecode".into()),
+        ]);
+        let mut parms = lopdf::Dictionary::new();
+        parms.set("Predictor", Object::Integer(15));
+        parms.set("Columns", Object::Integer(2));
+        parms.set("Colors", Object::Integer(1));
+        parms.set("BitsPerComponent", Object::Integer(8));
+        d.set("DecodeParms", Object::Dictionary(parms));
+        let stream = Stream::new(d, compressed);
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "png");
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], samples.as_slice());
     }
 }

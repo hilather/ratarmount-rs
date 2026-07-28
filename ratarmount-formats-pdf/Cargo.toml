@@ -12,6 +12,8 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 lopdf = "0.34"
+flate2 = "1"
+png = "0.18"
 
 [dev-dependencies]
 tempfile.workspace = true
