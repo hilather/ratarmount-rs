@@ -11,10 +11,12 @@ use ratarmount_compositing::{
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
     looks_like_tar, materialize, materialize_joined_parts, name_suggests_compressed_tar,
-    open_seekable_bzip2_with_threads, open_seekable_compress_z, open_seekable_lz4_with_threads,
-    open_seekable_lzip_with_threads, open_seekable_lzma, open_seekable_lzo_with_threads,
-    open_seekable_xz_with_threads, open_seekable_zlib, open_seekable_zstd_with_threads,
-    strip_compression_suffix, CompressionFormat, SeekableBody, SharedSeekableGzip,
+    open_seekable_bzip2_with_threads, open_seekable_compress_z_with_threads,
+    open_seekable_lz4_with_threads, open_seekable_lzip_with_threads,
+    open_seekable_lzma_with_threads, open_seekable_lzo_with_threads,
+    open_seekable_xz_with_threads, open_seekable_zlib_with_threads,
+    open_seekable_zstd_with_threads, strip_compression_suffix, CompressionFormat, SeekableBody,
+    SharedSeekableGzip,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -695,23 +697,88 @@ fn open_path_impl(
             })?
         }
         CompressionFormat::CompressZ => {
+            let threads = options.threads_for("Z");
             open_seekable_codec(path, index_path, &options, recreate, "compress-z", || {
-                open_seekable_compress_z(path)
+                open_seekable_compress_z_with_threads(path, threads)
             })?
         }
         CompressionFormat::Lzma => {
+            let threads = options.threads_for("lzma");
             open_seekable_codec(path, index_path, &options, recreate, "lzma", || {
-                open_seekable_lzma(path)
+                open_seekable_lzma_with_threads(path, threads)
             })?
         }
         CompressionFormat::Zlib => {
+            let threads = options.threads_for("zlib");
             open_seekable_codec(path, index_path, &options, recreate, "zlib", || {
-                open_seekable_zlib(path)
+                open_seekable_zlib_with_threads(path, threads)
             })?
         }
+        CompressionFormat::Lrzip => open_lrzip(path, index_path, &options, recreate)?,
     };
 
     Ok(source)
+}
+
+/// Materialize lrzip (external `lrzip`/`lrunzip`) then open the uncompressed body.
+fn open_lrzip(
+    path: &Path,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    let (tmp, size) = materialize(path, CompressionFormat::Lrzip).map_err(|e| e.to_string())?;
+    eprintln!(
+        "lrzip materialize: {} ({} uncompressed bytes)",
+        path.display(),
+        size
+    );
+    let data_path = tmp.path().to_path_buf();
+    let mut materialised = Some(tmp);
+    if looks_like_tar(&data_path).unwrap_or(false) {
+        return Ok(Arc::new(open_tar(
+            path,
+            &data_path,
+            index_path,
+            options,
+            recreate,
+            &mut materialised,
+        )?));
+    }
+    if looks_like_ext4(&data_path) {
+        let keep = materialised
+            .take()
+            .ok_or_else(|| "materialized lrzip missing".to_string())?
+            .into_temp_path()
+            .keep()
+            .map_err(|e| e.error.to_string())?;
+        return Ok(Arc::new(
+            Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
+        ));
+    }
+    if let Some(src) =
+        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
+    {
+        return Ok(src);
+    }
+    if looks_like_libarchive(&data_path) {
+        let keep = materialised
+            .take()
+            .ok_or_else(|| "materialized lrzip missing".to_string())?
+            .into_temp_path()
+            .keep()
+            .map_err(|e| e.error.to_string())?;
+        return Ok(Arc::new(
+            LibarchiveMountSource::open(&keep, index_path, options, VERSION, recreate)
+                .map_err(|e| e.to_string())?,
+        ));
+    }
+    let stripped =
+        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+    Ok(Arc::new(
+        SingleFileMountSource::new(stripped, data_path, size, materialised.take())
+            .map_err(|e| e.to_string())?,
+    ))
 }
 
 fn open_tar(
@@ -1053,6 +1120,147 @@ pub struct CompositingOptions {
     pub union_cache: UnionMountOptions,
 }
 
+/// Apply transform / recursive AutoMount / disable-union prefix layers.
+fn apply_compositing(
+    mut src: Arc<dyn MountSource>,
+    opts: &OpenOptions,
+    comp: &CompositingOptions,
+    ext_set: &RecursiveExtSet,
+    n_sources: usize,
+    folder_hint: &str,
+) -> Result<Arc<dyn MountSource>, String> {
+    if let Some((ref pat, ref rep)) = comp.transform {
+        src = Arc::new(TransformMountSource::new(pat, rep, src)?);
+    }
+    if comp.recursive {
+        let opener = open_nested_fn(opts.clone());
+        let depth = match opts.recursion_depth.unwrap_or(0) {
+            d if d < 0 => 0,
+            d => d as u32,
+        };
+        src = Arc::new(AutoMountLayer::new_with_options(
+            src,
+            depth,
+            opener,
+            AutoMountOptions {
+                lazy: comp.lazy,
+                strip_recursive_extension: comp.strip_recursive_extension,
+                transform: comp.transform_recursive.clone(),
+                recursive_extensions: ext_set.clone(),
+            },
+        ));
+    }
+    if comp.disable_union_mount && n_sources > 1 {
+        let folder = strip_source_name(folder_hint);
+        src = Arc::new(PrefixMountSource::new(&folder, src));
+    }
+    Ok(src)
+}
+
+/// Open a remote URL: prefer live HTTP Range for uncompressed TAR/ZIP; else materialize.
+fn open_remote_input(
+    input: &str,
+    opts: &OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    use ratarmount_remote::{resolve_access, resolve_to_local, RemoteAccess, RemoteHttp};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let access = resolve_access(input).map_err(|e| e.to_string())?;
+    match access {
+        RemoteAccess::Http(RemoteHttp::Range(mut range)) => {
+            // Probe magic without consuming the eventual open reader.
+            let mut magic = [0u8; 512];
+            let n = range.read(&mut magic).map_err(|e| e.to_string())?;
+            range.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+            let kind = probe_archive_magic(&magic[..n]);
+            let label = PathBuf::from(input);
+            let index_loc = resolved_index(&label, opts, recreate);
+            let mut o = opts.clone();
+            let index_path = if index_loc.is_memory() {
+                o.index_in_memory = true;
+                o.index_file_path = None;
+                None
+            } else if let Some(p) = index_loc.as_path() {
+                o.index_file_path = Some(p.to_path_buf());
+                o.index_in_memory = false;
+                Some(p.to_path_buf())
+            } else {
+                None
+            };
+            let ip = index_path.as_deref();
+
+            match kind {
+                "tar" => {
+                    eprintln!(
+                        "HTTP Range TAR: {} ({} bytes, live Range)",
+                        input,
+                        range.len()
+                    );
+                    let src = SqliteIndexedTar::open_from_reader(range, &label, ip, &o, VERSION)
+                        .map_err(|e| e.to_string())?;
+                    return Ok((label, Arc::new(src)));
+                }
+                "zip" => {
+                    eprintln!(
+                        "HTTP Range ZIP: {} ({} bytes, live Range)",
+                        input,
+                        range.len()
+                    );
+                    let src = ZipMountSource::open_from_reader(range, &label, ip, &o, VERSION)
+                        .map_err(|e| e.to_string())?;
+                    return Ok((label, Arc::new(src)));
+                }
+                _ => {
+                    eprintln!(
+                        "info: HTTP Range for {input} is not uncompressed TAR/ZIP; materializing"
+                    );
+                }
+            }
+            // Fall through: materialize full body for compressed / other formats.
+            let remote = resolve_to_local(input).map_err(|e| e.to_string())?;
+            let path = remote.path().to_path_buf();
+            remotes.push(remote);
+            let src = open_path(&path, opts, recreate)?;
+            Ok((path, src))
+        }
+        RemoteAccess::Http(RemoteHttp::Materialized(remote)) | RemoteAccess::Path(remote) => {
+            let path = remote.path().to_path_buf();
+            remotes.push(remote);
+            let src = open_path(&path, opts, recreate)?;
+            Ok((path, src))
+        }
+    }
+}
+
+fn probe_archive_magic(magic: &[u8]) -> &'static str {
+    // ustar at offset 257
+    if magic.len() >= 262 && &magic[257..262] == b"ustar" {
+        return "tar";
+    }
+    // GNU tar old magic
+    if magic.len() >= 265 && &magic[257..263] == b"ustar " {
+        return "tar";
+    }
+    // Empty / sparse TAR often still has null blocks — check for tar-like name + mode digits
+    if magic.len() >= 100 {
+        // crude: many tars have spaces/nulls in name and octal mode at 100
+        let mode = &magic[100..108.min(magic.len())];
+        if mode.iter().all(|b| b.is_ascii_digit() || *b == b' ' || *b == 0)
+            && magic.iter().take(20).any(|b| b.is_ascii_graphic())
+            && magic.get(257).copied().unwrap_or(0) == 0
+        {
+            // could be pre-POSIX tar without ustar; leave to path open after materialize
+        }
+    }
+    if magic.len() >= 4 && &magic[0..2] == b"PK" {
+        // Local file header / EOCD
+        return "zip";
+    }
+    "other"
+}
+
 /// Build final mount source from one or more inputs (local paths or URLs).
 #[allow(dead_code)]
 pub fn build_mount_source(
@@ -1099,14 +1307,6 @@ pub fn build_mount_source_ex(
     let mut remotes = Vec::new();
     for p in paths {
         let input = p.to_string_lossy();
-        let local_path = if ratarmount_remote::is_remote_url(&input) {
-            let remote = ratarmount_remote::resolve_to_local(&input).map_err(|e| e.to_string())?;
-            let path = remote.path().to_path_buf();
-            remotes.push(remote);
-            path
-        } else {
-            p.clone()
-        };
 
         // Do not force a default index path here — `open_path` resolves via folders / :memory:.
         let mut opts = options.clone();
@@ -1114,38 +1314,40 @@ pub fn build_mount_source_ex(
             opts.write_index = false;
             opts.clear_index_cache = false;
         }
-        let mut src = open_path(&local_path, &opts, recreate && !opts.read_only_index)?;
-        if let Some((ref pat, ref rep)) = comp.transform {
-            src = Arc::new(TransformMountSource::new(pat, rep, src)?);
+        let recreate_src = recreate && !opts.read_only_index;
+
+        // Dropbox folders: browse via API (list + download-on-open). Files fall through.
+        if input.starts_with("dropbox://") || input.starts_with("dropbox:") {
+            match ratarmount_remote::DropboxMountSource::open(input.as_ref()) {
+                Ok(ms) => {
+                    let mut src: Arc<dyn MountSource> = Arc::new(ms);
+                    src = apply_compositing(src, &opts, &comp, &ext_set, paths.len(), "dropbox")?;
+                    sources.push(src);
+                    continue;
+                }
+                Err(e) => {
+                    let msg = e.to_string();
+                    // File paths: materialize via resolve_to_local below.
+                    if !msg.contains("is a file, not a folder") {
+                        return Err(msg);
+                    }
+                }
+            }
         }
-        if comp.recursive {
-            let opener = open_nested_fn(opts.clone());
-            // Negative depth (Python -1) → deep default handled inside AutoMountLayer (0 → 32).
-            let depth = match opts.recursion_depth.unwrap_or(0) {
-                d if d < 0 => 0,
-                d => d as u32,
-            };
-            src = Arc::new(AutoMountLayer::new_with_options(
-                src,
-                depth,
-                opener,
-                AutoMountOptions {
-                    lazy: comp.lazy,
-                    strip_recursive_extension: comp.strip_recursive_extension,
-                    transform: comp.transform_recursive.clone(),
-                    recursive_extensions: ext_set.clone(),
-                },
-            ));
-        }
-        if comp.disable_union_mount && paths.len() > 1 {
-            let name = local_path
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("source");
-            // strip common archive extension for folder name
-            let folder = strip_source_name(name);
-            src = Arc::new(PrefixMountSource::new(&folder, src));
-        }
+
+        let (local_path, mut src) = if ratarmount_remote::is_remote_url(&input) {
+            open_remote_input(input.as_ref(), &opts, recreate_src, &mut remotes)?
+        } else {
+            let local_path = p.clone();
+            let src = open_path(&local_path, &opts, recreate_src)?;
+            (local_path, src)
+        };
+
+        let folder_hint = local_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("source");
+        src = apply_compositing(src, &opts, &comp, &ext_set, paths.len(), folder_hint)?;
         sources.push(src);
     }
     let mut source = if sources.len() == 1 {

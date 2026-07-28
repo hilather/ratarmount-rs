@@ -26,7 +26,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
-| PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2); OGG demux; HTML data-URLs | `[x]` / `~` non-JPEG image reassembly |
+| PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG); OGG demux; HTML data-URLs | `[x]` / `~` CMYK/non-8bpc `.bin` |
 | Git tree mount | yes | yes (`git2`; worktree needs `RATARMOUNT_FORCE_GIT=1`) | `~` |
 | RAR pure / best-effort (beyond libarchive) | yes | libarchive only | `~` |
 
@@ -35,11 +35,11 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | gzip (rapidgzip / seek index) | yes | **G3 Tier B seekable** for `.tar.gz`; materialize for plain `.gz` | `~` Tier C blob import still open |
-| bzip2 block-parallel | yes | multi-stream parallel via `-P` / `ParallelizationSpec` | `~` true bit-block map still open |
+| bzip2 block-parallel | yes | multi-stream + bit-block seek map (≤8 MiB compressed) via `-P` | `[x]` / `~` large-file full decode |
 | xz multi-block seek | yes | **Tier B lite** (decode → RAM/temp) | `~` liblzma stream index |
 | zstd multi-frame / seek table | yes | multi-frame map + seek-table footer import | `[x]` / `~` zstdblocks import |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
-| lrz | yes | no | `[ ]` |
+| lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize | `~` CLI required |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
 | Split files (`.001`/`.002`) | yes | yes (decimal/hex/alpha join) | `[x]` top-level + recursive AutoMount |
 
@@ -72,10 +72,10 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | `file://` | yes | yes | `[x]` |
 | `http(s)://` (full GET) | yes | yes | `[x]` |
-| HTTP Range without full download | yes | Range chunk materialize + HttpRangeFile | `~` formats still open local path after fetch |
+| HTTP Range without full download | yes | live Range for TAR/ZIP + materialize fallback | `[x]` / `~` compressed remotes still materialize |
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
-| SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox (`DROPBOX_TOKEN` file materialize) | `[x]` / `~` Dropbox folder browse |
+| SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox file + folder browse | `[x]` / `~` no listing TTL / content Range |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
 
 ### Index / CLI
@@ -91,7 +91,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
 | OSS attributions | yes | yes (`--oss-attributions` / help) | `[x]` |
-| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + gzip/xz/zstd/bzip2/lz4/lzip/lzo | `~` zlib/lzma/Z still default |
+| Parallelization matrix (`-P backend:n`) | yes | full matrix incl. zlib/lzma/Z; true parallel where codec allows | `[x]` / `~` sequential codecs still API-only |
 | Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)

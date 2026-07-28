@@ -76,24 +76,34 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 **Orchestrator glue:** factory opens lz4/lzip/lzo via `options.threads_for(...)` + `*_with_threads`.
 
-## Still open (later / batch 7+)
+## Batch 7 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| bzip2 bit-block | `bzip2_seek.rs` | retained bit-block map + on-demand block decode |
+| zlib/lzma/Z + lrzip | compress (excl. bzip2) | `-P` APIs; `Lrzip` detect + `lrzip` CLI materialize |
+| remote Range + Dropbox folder | remote | `resolve_http` / `RemoteAccess`; `DropboxMountSource` |
+| PDF Flate PNG | formats-pdf | Flate/raw Gray/RGB → PNG |
+| tar/zip readers | formats-tar + zip | `open_from_reader` for Range |
+
+**Orchestrator glue:** factory wires zlib/lzma/Z threads, Lrzip materialize, HTTP Range TAR/ZIP via `open_from_reader`, Dropbox folder mount.
+
+## Still open (later / batch 8+)
 
 | Gap | Notes |
 |-----|--------|
-| True Range without materialize for format openers | Formats still need local path after fetch |
-| Full fsspec / folder-style Dropbox browse | file materialize only |
-| True bzip2 bit-block map | multi-stream parallel only |
-| lrzip pure (Python stays libarchive) | long-tail |
-| zlib/lzma-alone / compress-z `-P` matrix | still default single-thread openers |
-| PDF non-JPEG image reassembly | `.bin` for Flate/etc. |
+| Range for compressed remote archives | still materialize after probe fails TAR/ZIP magic |
+| Dropbox content Range / listing TTL | full download on file open |
+| bzip2 block map for files > 8 MiB compressed | scan skipped → full decode |
+| PDF CMYK / non-8bpc images | still `.bin` |
+| True in-process lrzip (no CLI) | CLI materialize only |
 
 ## Verify
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-# split: ratarmount -f tests/simple-file-split.001 mnt/
-# hashes: ratarmount --hashes sha256,crc32 --no-mount archive.tar
-# threads: ratarmount -P gzip:4,xz:2,zstd:4,bzip2:4,lz4:4 -f archive.tar.gz mnt/
-# dropbox: DROPBOX_TOKEN=… ratarmount -f dropbox:///path/to/a.tar mnt/
+# threads: ratarmount -P gzip:4,bzip2:4,lz4:4,zlib:2 -f archive.tar.gz mnt/
+# dropbox folder: DROPBOX_TOKEN=… ratarmount -f dropbox:///folder mnt/
+# range TAR: ratarmount -f https://example/a.tar mnt/   # live Range when Accept-Ranges
 ```
