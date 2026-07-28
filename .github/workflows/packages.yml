@@ -6,7 +6,7 @@
 #   - Ubuntu 24.04 — arm64 (ubuntu-24.04-arm)
 #   - Rocky Linux 8 — amd64 (container)
 #   - Portable “oldest glibc” tarball — Debian bullseye (glibc 2.31) amd64 + arm64
-#   - macOS arm64 (macos-14) + x86_64 (macos-13)
+#   - macOS arm64 (macos-14); x86_64 deferred (GHA macos-13 capacity)
 #
 # Triggers: tag v*, workflow_dispatch, packaging PR paths
 name: Packages
@@ -84,7 +84,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.4"
+          VERSION: "0.1.5"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.4"
+          VERSION: "0.1.5"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -234,7 +234,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.4"
+          VERSION: "0.1.5"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -322,7 +322,7 @@ jobs:
 
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.4"
+          VERSION: "0.1.5"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
@@ -408,31 +408,51 @@ jobs:
 
       - name: Create / update GitHub Release (tags only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ github.ref_name }}
-          name: ratarmount-rs ${{ github.ref_name }}
-          draft: false
-          prerelease: false
-          fail_on_unmatched_files: false
-          generate_release_notes: true
-          files: release/**
-          body: |
-            ## Packages
-
-            | Kind | Platforms |
-            |------|-----------|
-            | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
-            | `.rpm` | Rocky 8 (amd64) |
-            | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
-            | macOS tarball | Apple Silicon (arm64), Intel (x86_64) |
-
-            Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
-
-            **Linux runtime:** fuse3, libarchive (optional: e2fsprogs, squashfs-tools).  
-            **macOS runtime:** macFUSE or FUSE-T, libarchive — see `docs/macos.md`.
-
-            If the Release asset list is empty, download the **signed-release-bundle**
-            workflow artifact from the Packages run.
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ github.ref_name }}"
+          cd release
+          shopt -s nullglob
+          files=( *.deb *.rpm *.tar.gz *.sha256 *.cosign.bundle SHA256SUMS file-info*.txt glibc-version.txt )
+          if [[ ${#files[@]} -eq 0 ]]; then
+            echo "No release files found under release/"
+            ls -la
+            exit 1
+          fi
+          echo "Uploading ${#files[@]} assets for $TAG"
+          ls -la "${files[@]}"
+
+          NOTES=$(cat <<'EOF'
+          ## Packages
+
+          | Kind | Platforms |
+          |------|-----------|
+          | `.deb` | Ubuntu 22.04 / 24.04 (amd64), Ubuntu 24.04 (arm64) |
+          | `.rpm` | Rocky 8 (amd64) |
+          | Portable tarball | Debian bullseye / glibc 2.31 (amd64 + arm64) |
+          | macOS tarball | Apple Silicon (arm64) |
+
+          Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
+
+          **Linux runtime:** fuse3, libarchive (optional: e2fsprogs, squashfs-tools).  
+          **macOS runtime:** macFUSE or FUSE-T, libarchive — see `docs/macos.md`.
+
+          If the asset list is incomplete, also check the **signed-release-bundle**
+          workflow artifact on this Packages run.
+          EOF
+          )
+
+          # Create or update the release for this tag, then upload assets.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG already exists; uploading/clobbering assets"
+            gh release upload "$TAG" "${files[@]}" --clobber
+            gh release edit "$TAG" --notes "$NOTES" --title "ratarmount-rs $TAG"
+          else
+            gh release create "$TAG" "${files[@]}" \
+              --title "ratarmount-rs $TAG" \
+              --notes "$NOTES" \
+              --latest
+          fi
+          gh release view "$TAG" --json url,assets --jq '{url, count: (.assets|length), names: [.assets[].name]}'
