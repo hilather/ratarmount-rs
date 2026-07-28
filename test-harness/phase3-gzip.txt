@@ -2,5 +2,8 @@
 # archive_relpath <TAB> path_inside <TAB> optional_md5
 # Plain gzip (materialize path)
 tests/simple.gz	simple	19696f24a91fc4e8950026f9c801a0d0
+tests/base64.gz	base64	c9172d469a8faf82fe598c0ce978fcea
 # Seekable gzip + TAR (.tar.gz — G3 Tier B checkpoints, no full materialize of body)
-tests/packed-5-times.tar.gz	ufo_03.tar	a82c46a7511715386a2aa62c11cf7287
+# Member is the nested .tar blob (not recursive open of ufo_03)
+tests/packed-5-times.tar.gz	ufo_03.tar	3c694018df2bb080859490c92d4259b5
+# Residual skips: compressed-100-times / packed-100-times (slow); zeros.gz (large); nested.pzstd WrongMagicNumber

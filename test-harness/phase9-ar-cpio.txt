@@ -1,7 +1,15 @@
-# Phase 9 pure AR + CPIO newc
+# Phase 9 pure AR + CPIO newc (+ CRC / HP variants)
 tests/single-file.ar	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.newc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.crc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.hpbin.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.hpodc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/ar-bsdtar.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
 tests/ar-GCC-main.a	main.o	9b1c420c2969e36f511eba7695aeccc4
 tests/ar-GNU.ar	0	b4b0d27dcd170a7a75cd494c8d33c5ab
 tests/ar-llvm-19-gnu.ar	0	b4b0d27dcd170a7a75cd494c8d33c5ab
+tests/ar-llvm-19-coff.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-GNU-truncated.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+# Residual skips:
+# - ar-llvm-19-thin.ar — invalid thin AR magic (not supported)
+# - ar-llvm-19-bsd.ar / ar-llvm-19-darwin.ar — mount empty (format variant)

@@ -8,27 +8,68 @@ tests/single-nested-folder.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/empty.tar	.	.
 tests/single-file-with-leading-dot-slash.tar	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/folder-with-leading-dot-slash.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/folder-with-leading-dot-slash.tar	foo/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/hardlink.tar	hardlink/ufo	d41d8cd98f00b204e9800998ecf8427e
+tests/hardlink.tar	hardlink/natsu	2709a3348eb2c52302a7606ecf5860bc
 tests/symlinks.tar	python	.
 tests/concatenated.tar	foo/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/concatenated.tar	foo/bar	2709a3348eb2c52302a7606ecf5860bc
 tests/denormal-paths.tar	foo	c157a79031e1c40f85931829bc5fc552
+tests/denormal-paths.tar	ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/denormal-paths.tar	root/bar	d3b07384d113edec49eaa6238ad5ff00
 tests/updated-file.tar	foo/fighter/ufo	b3de7534cbc8b8a7270c996235d0c2da
 # File versions virtual API (default --file-versions)
 tests/updated-file.tar	foo/fighter/ufo.versions/1	2709a3348eb2c52302a7606ecf5860bc
+tests/updated-file.tar	foo/fighter/ufo.versions/2	9a12be5ebb21d497bd1024d159f2cc5f
 tests/updated-file.tar	foo/fighter/ufo.versions/3	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-folder.tar	foo/fighter	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-file-with-folder.tar	foo/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-file-with-folder.tar	foo/fighter.versions/1	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-file-with-folder.tar	foo.versions/1	9a12be5ebb21d497bd1024d159f2cc5f
 tests/updated-folder-with-file.tar	foo	9a12be5ebb21d497bd1024d159f2cc5f
+tests/updated-folder-with-file.tar	foo.versions/1/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-folder-with-file.tar	foo.versions/3	9a12be5ebb21d497bd1024d159f2cc5f
+# Latest-version paths only (full .versions/* tree partial for this fixture)
+tests/updated-file-implicitly-with-folder.tar	foo/fighter	2709a3348eb2c52302a7606ecf5860bc
+tests/updated-file-implicitly-with-folder.tar	bar/par/sora	cd85c6a5e5053c04f95e1df301c80755
 tests/two-self-links.tar	bar	d41d8cd98f00b204e9800998ecf8427e
 tests/single-self-link.tar	bar	d41d8cd98f00b204e9800998ecf8427e
 tests/file-existing-as-non-link-and-link.tar	foo/fighter/ufo	d41d8cd98f00b204e9800998ecf8427e
 tests/nested-symlinks.tar	foo/foo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-symlinks.tar	foo/fighter/foo	2709a3348eb2c52302a7606ecf5860bc
 tests/truncated.tar	foo/foo	5753d2a2da40d04ad7f3cc7a024b6e90
 tests/nested-tar-with-overlapping-name.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/simple-file-split-in-archive.tar	simple-file-split.001	d3b07384d113edec49eaa6238ad5ff00
-# GNU / PAX sparse
+# GNU / PAX sparse (512B / 513B / 1MiB)
 tests/sparse.gnu.tar	sparse-512B	bf619eac0cdf3f68d496ea9344137e8b
+tests/sparse.gnu.tar	sparse-513B	370a398ecaff897a26df4747c2036ee5
+tests/sparse.gnu.tar	sparse-1MiB	3d8197de2852aebea45828751bac572e
 tests/sparse.pax.sparse-0.0.tar	sparse-512B	bf619eac0cdf3f68d496ea9344137e8b
+tests/sparse.pax.sparse-0.0.tar	sparse-513B	370a398ecaff897a26df4747c2036ee5
+tests/sparse.pax.sparse-0.0.tar	sparse-1MiB	3d8197de2852aebea45828751bac572e
 tests/sparse.pax.sparse-0.1.tar	sparse-512B	bf619eac0cdf3f68d496ea9344137e8b
+tests/sparse.pax.sparse-0.1.tar	sparse-513B	370a398ecaff897a26df4747c2036ee5
+tests/sparse.pax.sparse-0.1.tar	sparse-1MiB	3d8197de2852aebea45828751bac572e
 tests/sparse.pax.sparse-1.0.tar	sparse-512B	bf619eac0cdf3f68d496ea9344137e8b
-tests/gnu-sparse-files.tar	01.sparse1.bin	f0ab723c9d7fcef9ac92bb1098adf4f4
+tests/sparse.pax.sparse-1.0.tar	sparse-513B	370a398ecaff897a26df4747c2036ee5
+tests/sparse.pax.sparse-1.0.tar	sparse-1MiB	3d8197de2852aebea45828751bac572e
+# md5 matches Python fixed-archive list (was wrong f0ab… checksum)
+tests/gnu-sparse-files.tar	01.sparse1.bin	832c78afcb9832e1a21c18212fc6c38b
+tests/gnu-sparse-files.tar	02.normal1.bin	832c78afcb9832e1a21c18212fc6c38b
+tests/gnu-sparse-files.tar	03.sparse1.bin	832c78afcb9832e1a21c18212fc6c38b
+# GNU incremental (needs --detect-gnu-incremental; phase2 runner sets it)
+tests/absolute-file-incremental.tar	14130612002/tmp/foo	c157a79031e1c40f85931829bc5fc552
+tests/incremental-backup.level.0.tar	root-file.txt	8ddd8be4b179a529afa5f2ffae4b9858
+tests/incremental-backup.level.0.tar	foo/1	5bbf5a52328e7439ae6e719dfe712200
+tests/incremental-backup.level.0.tar	foo/2	c193497a1a06b2c72230e6146ff47080
+tests/incremental-backup.level.0.tar	foo/3	febe6995bad457991331348f7b9c85fa
+tests/incremental-backup.level.1.tar	foo/3	3d45efe945446cd53a944972bf60810c
+tests/incremental-backup.level.1.tar	foo/moved	5bbf5a52328e7439ae6e719dfe712200
+tests/single-file-incremental-mockup.tar	14130613451/foo	c157a79031e1c40f85931829bc5fc552
+tests/single-file-incremental.tar	14130613451/foo	c157a79031e1c40f85931829bc5fc552
+tests/single-file-incremental-long-name-mockup.tar	14130613451/000000000100000000020000000003000000000400000000050000000006000000000700000000080000000009000000000A000000000B000000000C	c157a79031e1c40f85931829bc5fc552
+tests/single-file-incremental-long-name.tar	000000000100000000020000000003000000000400000000050000000006000000000700000000080000000009000000000A000000000B000000000C	c157a79031e1c40f85931829bc5fc552
+# Residual skips (do not enable without fix):
+# - two-self-links-to-existing-file.tar bar — hardlink content empty (md5 d41d8…) vs Python d3b0…
+# - special-char.tar — non-UTF8 member name awkward for allowlist encoding
+# - updated-file-implicitly full .versions/* tree — partial (latest paths only above)

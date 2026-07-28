@@ -113,7 +113,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 ### Current Rust harness (allowlists)
 
-~90+ fixture lines across phases 2–11 + sevenzip/sqlar/squashfs/ext4/http/remote + index interop.  
+**~161** fixture lines across phases 2–11 + sevenzip/sqlar/squashfs/ext4/http/remote + index interop
+(phase allowlist `tests/…` rows only; was ~87 before P0 expansion).  
 Python has **100+** fixed archives and three large shells: fixed-archive, complex-usage, remote-backend.  
 Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔Rust SQLite).
 
@@ -121,9 +122,9 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 
 | Priority | Work | Exit criteria |
 |----------|------|----------------|
-| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 ~26 TAR; phase6 ZIP; phase9 AR/7z grown |
+| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **62** TAR rows; phase6 **11** ZIP; phase7 **17** nested; phase9 AR/CPIO **11**, 7z **13**, SQLAR/sqfs **16** |
 | P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | `[x]` `run-fixed-archive-subset.sh` |
-| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large; encrypted/nested still open |
+| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; encrypted still unit-only |
 | P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `~` complex harness + commit-overlay; phase2 versions paths |
 | P1 | Remote: SSH fixture server (`start-asyncssh-server.py`) + optional S3/MinIO | Live optional; unit always |
 | P1 | Index interop golden: Py builds index → Rust mounts; reverse | `[x]` TAR+ZIP+7z py→rs; TAR rs→py |

@@ -1,9 +1,15 @@
-# Phase 6 ZIP (no nested automount paths)
+# Phase 6 ZIP (no nested automount paths — see phase7 for lighter.tar)
 # Format: archive_relpath <TAB> path_inside <TAB> optional_md5
 tests/nested-with-symlink.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-with-symlink.zip	foo/fighter/saucer	2709a3348eb2c52302a7606ecf5860bc
 tests/denormal-paths.zip	ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/denormal-paths.zip	root/bar	d3b07384d113edec49eaa6238ad5ff00
+tests/denormal-paths.zip	foo	c157a79031e1c40f85931829bc5fc552
 tests/folder-symlink.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/folder-symlink.zip	foo/jet/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/file-in-non-existing-folder.zip	foo2/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/mockup-self-extracting.zip	ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-without-execution-flag.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+# rar as zip member file (not recursive rar open — see phase7 for nested content)
 tests/rar.zip	natsu.rar	3b8f48f851f7b0d333787e3629af5e91
+# Residual: encrypted-nested-tar.zip (needs password)
