@@ -70,7 +70,7 @@ Rust is not a drop-in replacement for every Python workflow yet (see [gaps](#gap
 
 | Ability | Python | Rust |
 |---------|:------:|:----:|
-| Recursive automount (`-r`) | yes | yes |
+| Recursive automount (`-r`) | yes | yes | Nested TAR/ZIP/7z/`.tar.gz` prefer **no `/tmp`** stream open — [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) |
 | Lazy mount (`-l`) | yes | yes |
 | Union of multiple sources | yes | yes |
 | Write overlay (`-w` / `:temp:`) | yes | yes |
@@ -256,11 +256,32 @@ benchmarks/                 # Python vs Rust comparison
 docs/                       # decisions, phase notes, parity TODO
 ```
 
+## Embedded / nested archives (`-r`)
+
+Recursive mounts open nested archives from a **seekable parent member stream** when possible — **no copy of the nested body to `/tmp`**.
+
+| Nested member | Temp spool? | Random read of nested contents |
+|---------------|:-----------:|--------------------------------|
+| `.tar` inside ZIP / TAR / 7z / `.tar.gz` | **No** | Yes (TAR stencil) |
+| `.tar.gz` inside ZIP / TAR / 7z | **No** | Yes (gzip seek + TAR) |
+| `.zip` / `.7z` inside those parents | **No** | Yes\* |
+| ISO / SquashFS / RAR / plain non-TAR `.gz` nested | Often **yes** (fallback) | Path open after spool |
+
+\* ZIP deflate and solid 7z still decompress (CPU/RAM); they avoid nested **disk** spool when the stream path succeeds.
+
+Full matrix, parent×nested table, and “when is `/tmp` used?”: **[docs/embedded-nested-archives.md](docs/embedded-nested-archives.md)**.
+
+```bash
+ratarmount -r archive.zip mnt/          # e.g. mnt/inner.tar/file.txt — no /tmp for inner.tar
+RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in logs
+```
+
 ## Docs
 
 | Doc | Topic |
 |-----|--------|
 | [docs/parity-todo.md](docs/parity-todo.md) | **Full feature + test parity checklist** |
+| [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | **Nested/embedded: no-tmp vs temp, random read by format** |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | G3 materialize decision |
 | [docs/phase9-formats.md](docs/phase9-formats.md) | Long-tail formats |
@@ -268,6 +289,7 @@ docs/                       # decisions, phase notes, parity TODO
 | [docs/phase11-packaging.md](docs/phase11-packaging.md) | Packaging notes |
 | [docs/packaging.md](docs/packaging.md) | Install packages + cosign verify |
 | [docs/tasks/sevenzip-random-access.md](docs/tasks/sevenzip-random-access.md) | SevenZip backend |
+| [docs/tasks/embedded-nested-random-access.md](docs/tasks/embedded-nested-random-access.md) | Nested no-tmp implementation tasks |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
 | [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers |
 

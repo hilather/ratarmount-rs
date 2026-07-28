@@ -2872,4 +2872,60 @@ mod tests {
             &beta[10..]
         );
     }
+
+    /// `.tar` embedded in ZIP: parent open + nested TAR from_reader — no temp spool.
+    #[test]
+    fn nested_tar_inside_zip_reader_random_read_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("tar-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("hi.txt"), b"hello from tar in zip\n").unwrap();
+        std::fs::write(data.join("pad.txt"), b"0123456789ABCDEF_mid_seek\n").unwrap();
+        let inner_tar = dir.path().join("inner.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&inner_tar)
+            .arg("-C")
+            .arg(&data)
+            .args(["hi.txt", "pad.txt"])
+            .status()
+            .expect("spawn tar");
+        assert!(status.success());
+        let outer_zip = dir.path().join("outer.zip");
+        // Default zip compresses (deflate); still no /tmp — inflate to RAM then TAR from_reader.
+        let status = Command::new("zip")
+            .args(["-q", "-j"])
+            .arg(&outer_zip)
+            .arg(&inner_tar)
+            .status()
+            .expect("spawn zip");
+        assert!(status.success());
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let outer = ZipMountSource::open(&outer_zip, None, &opts, VERSION, true).expect("zip open");
+        let nested_fi = outer
+            .lookup("/inner.tar", 0)
+            .expect("lookup /inner.tar in zip");
+        let nested_reader = outer
+            .open(&nested_fi, 0)
+            .expect("open tar member from zip (store region or inflated buffer)");
+
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(nested_reader, Path::new("inner.tar"))
+            .expect("nested TAR inside ZIP must open without temp spool");
+
+        assert_eq!(
+            read_all(inner.as_ref(), "/hi.txt"),
+            b"hello from tar in zip\n"
+        );
+        let pad = read_all(inner.as_ref(), "/pad.txt");
+        assert_eq!(pad, b"0123456789ABCDEF_mid_seek\n");
+        assert_eq!(
+            read_seek_mid(inner.as_ref(), "/pad.txt", 10).as_slice(),
+            &pad[10..]
+        );
+    }
 }

@@ -10,7 +10,11 @@
 - 7z store + pure-LZMA2 progressive member streams
 - TAR nested flatten + `nestedTarMembers` stencil API
 
-**Not yet:** nested **compressed** members (`.tar.gz` inside 7z/TAR/ZIP), stencil formats from reader, image formats from reader.
+**User guide:** [`docs/embedded-nested-archives.md`](../embedded-nested-archives.md) (when `/tmp` is used, parent×nested matrix).
+
+**Done (Phase A):** nested compressed TAR (gzip/zstd/bz2/xz) + ZIP/TAR/7z from stream.
+
+**Not yet:** stencil formats (ISO/WARC/…) from reader, image formats from reader.
 
 ---
 
@@ -20,16 +24,17 @@
 |----|--------|-------------------|---------------------|--------|
 | N0 | Outer 7z store → inner TAR/ZIP/7z | Outer stencil + inner as now | **done** | keep |
 | N1 | Outer 7z solid LZMA2 → inner TAR/ZIP/7z | Progressive outer member + inner | **done** (CPU cost on deep solid) | keep + tests |
-| N2 | Outer 7z → **inner `.tar.gz` / `.tgz`** | Outer member stream + nested gzip seek + TAR | **tmp spool** (gzip not sniffed) | **no-tmp** |
-| N3 | Outer 7z → inner `.tar.zst` / `.tar.bz2` / multi-block `.tar.xz` | Same as N2 with zstd/bzip2/xz from_reader | **tmp** | **no-tmp** |
+| N2 | Outer 7z → **inner `.tar.gz` / `.tgz`** | Outer member stream + nested gzip seek + TAR | **done** | keep |
+| N3 | Outer 7z → inner `.tar.zst` / `.tar.bz2` / multi-block `.tar.xz` | zstd/bzip2/xz from_reader | **done** (factory) | optional fixtures |
 | N4 | Outer `.tar.gz` → inner TAR/ZIP/7z | Outer gzip seek + stencil | **done** | keep + large fixtures |
-| N5 | Outer TAR/ZIP → nested gzip/xz/zstd member | Nested compress from_reader | **tmp** | **no-tmp** |
-| N6 | ZIP store nested open | Shared region stencil | **done** (factory) | tests + multi-disk edges |
+| N5 | Outer TAR/ZIP → nested gzip/xz/zstd member | Nested compress from_reader | **done** | keep |
+| N5b | Outer **ZIP → inner `.tar`** | ZIP store region or deflate buffer + TAR from_reader | **done** | tests |
+| N6 | ZIP store nested open | Shared region stencil | **done** (factory) | multi-disk edges |
 | N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
 | N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | path / materialize | **no-tmp** when practical |
 | — | Solid RAR / single-stream xz without index / libarchive-only | sequential | n/a | **out of scope** here |
-| — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | separate 7z task |
+| — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | deferred (low priority) |
 
 ---
 
