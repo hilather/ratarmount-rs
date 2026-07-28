@@ -1,29 +1,33 @@
-//! Seekable bzip2: full decode into RAM/temp (Tier B lite).
+//! Seekable bzip2 via a true bit-block map (indexed_bzip2 class).
 //!
-//! True mid-stream random restart needs an on-disk block index (indexed_bzip2 class).
-//! Until that lands, we decode once into a [`DecodedBody`]. When `threads > 1` and the
-//! file is a concatenation of independent bzip2 *streams* (or multi-block single streams
-//! when a fast bit scan finds ≥2 blocks), streams/blocks are decompressed in parallel
-//! (Python `BlockParallelReaders` / rapidgzip-bzip2 foundation).
+//! At open we:
+//! 1. Walk independent streams (`BZh[1-9]` members) and bit-scan block ranges
+//! 2. Decode each block once (optionally in parallel) to learn uncompressed sizes
+//! 3. Retain `{start_bit, end_bit, uncompressed_offset, uncompressed_size}` per block
+//!
+//! Readers seek by locating the covering block and re-decoding only that block
+//! (last-block cache for sequential reads). When the bit scan fails (large-file
+//! policy, single block, corrupt), we fall back to a one-shot [`DecodedBody`]
+//! (still multi-stream / multi-block parallel when `threads > 1`).
 
 use std::fs::File;
-use std::io::Read;
-use std::path::Path;
+use std::io::{self, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 
 use bzip2::read::BzDecoder;
 use ratarmount_core::ParallelizationSpec;
 
-use crate::seekable_body::{DecodedBody, SeekableBody, DEFAULT_MEMORY_CAP};
+use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
 
-/// Open bzip2 as a seekable body (one-shot decode, memory or temp spill).
+/// Open bzip2 as a seekable body (bit-block map when possible, else full decode).
 pub fn open_seekable_bzip2(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
     open_seekable_bzip2_with_threads(path, 1)
 }
 
-/// Open bzip2 using up to `threads` workers for multi-stream / multi-block parallel decode.
+/// Open bzip2 using up to `threads` workers for block size discovery / fallback decode.
 ///
 /// `threads == 0` means “use CPU count” (Python `-P 0` semantics).
 pub fn open_seekable_bzip2_with_threads(
@@ -39,13 +43,39 @@ pub fn open_seekable_bzip2_with_threads(
         return Err(CompressError::Msg("not a bzip2 stream".into()));
     }
 
+    match try_build_bit_block_map(&compressed, threads) {
+        Ok(blocks) if blocks.len() >= 2 => {
+            let uncompressed_size = blocks
+                .last()
+                .map(|b| b.uncompressed_offset + b.uncompressed_size)
+                .unwrap_or(0);
+            return Ok(Arc::new(SeekableBzip2 {
+                path: path.to_path_buf(),
+                compressed: Arc::new(compressed),
+                blocks: Arc::new(blocks),
+                uncompressed_size,
+            }));
+        }
+        Ok(_) | Err(_) => {
+            // Single block, large-file policy, corrupt scan, etc. → full decode.
+        }
+    }
+
+    full_decode_body(path, &compressed, threads)
+}
+
+fn full_decode_body(
+    path: &Path,
+    compressed: &[u8],
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
     let decoded = if threads > 1 {
-        match try_parallel_decode(&compressed, threads) {
+        match try_parallel_decode(compressed, threads) {
             Ok(data) => data,
-            Err(_) => decode_sequential(&compressed)?,
+            Err(_) => decode_sequential(compressed)?,
         }
     } else {
-        decode_sequential(&compressed)?
+        decode_sequential(compressed)?
     };
 
     if decoded.len() as u64 <= DEFAULT_MEMORY_CAP {
@@ -55,6 +85,255 @@ pub fn open_seekable_bzip2_with_threads(
         let body = DecodedBody::from_decoder(path, "bzip2", cursor, DEFAULT_MEMORY_CAP)?;
         Ok(body)
     }
+}
+
+/// Per-block restart record (absolute bit offsets into the full compressed blob).
+#[derive(Clone, Debug)]
+struct BlockInfo {
+    /// Stream header `BZh[1-9]` for reconstructing a single-block stream.
+    header: [u8; 4],
+    start_bit: u64,
+    end_bit: u64,
+    uncompressed_offset: u64,
+    uncompressed_size: u64,
+}
+
+/// Seekable bzip2 body backed by a retained bit-block map.
+pub struct SeekableBzip2 {
+    path: PathBuf,
+    compressed: Arc<Vec<u8>>,
+    blocks: Arc<Vec<BlockInfo>>,
+    uncompressed_size: u64,
+}
+
+impl SeekableBody for SeekableBzip2 {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn size(&self) -> u64 {
+        self.uncompressed_size
+    }
+
+    fn open_reader(&self) -> io::Result<Box<dyn SeekRead>> {
+        Ok(Box::new(Bzip2BlockReader {
+            compressed: Arc::clone(&self.compressed),
+            blocks: Arc::clone(&self.blocks),
+            size: self.uncompressed_size,
+            pos: 0,
+            cache_idx: None,
+            cache_data: Vec::new(),
+        }))
+    }
+
+    fn kind(&self) -> &'static str {
+        "bzip2-blocks"
+    }
+
+    fn checkpoint_count(&self) -> usize {
+        self.blocks.len().max(1)
+    }
+}
+
+struct Bzip2BlockReader {
+    compressed: Arc<Vec<u8>>,
+    blocks: Arc<Vec<BlockInfo>>,
+    size: u64,
+    pos: u64,
+    cache_idx: Option<usize>,
+    cache_data: Vec<u8>,
+}
+
+impl Bzip2BlockReader {
+    fn find_block(&self, pos: u64) -> (usize, u64) {
+        if self.blocks.is_empty() {
+            return (0, 0);
+        }
+        if pos >= self.size {
+            let last = self.blocks.len() - 1;
+            return (last, self.blocks[last].uncompressed_size);
+        }
+        // First block whose end is strictly past `pos`.
+        let idx = self
+            .blocks
+            .partition_point(|b| b.uncompressed_offset + b.uncompressed_size <= pos);
+        let idx = idx.min(self.blocks.len() - 1);
+        let within = pos.saturating_sub(self.blocks[idx].uncompressed_offset);
+        (idx, within)
+    }
+
+    fn ensure_block(&mut self, idx: usize) -> io::Result<()> {
+        if self.cache_idx == Some(idx) {
+            return Ok(());
+        }
+        let b = &self.blocks[idx];
+        let plain = decode_one_block(b.header, &self.compressed, b.start_bit, b.end_bit)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        self.cache_idx = Some(idx);
+        self.cache_data = plain;
+        Ok(())
+    }
+}
+
+impl Read for Bzip2BlockReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() || self.pos >= self.size {
+            return Ok(0);
+        }
+        let (idx, within) = self.find_block(self.pos);
+        self.ensure_block(idx)?;
+        let into = within as usize;
+        if into >= self.cache_data.len() {
+            return Ok(0);
+        }
+        let n = (self.cache_data.len() - into).min(buf.len());
+        buf[..n].copy_from_slice(&self.cache_data[into..into + n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Bzip2BlockReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.size as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Build a global block map across one or more concatenated bzip2 streams.
+///
+/// Fails (caller falls back to full decode) when:
+/// * the file is larger than the bit-scan cap
+/// * fewer than 2 blocks are found overall
+/// * magic scan / block decode fails
+fn try_build_bit_block_map(compressed: &[u8], threads: u32) -> Result<Vec<BlockInfo>> {
+    // Cap total scan cost for large files (same policy as per-stream scan).
+    if compressed.len() > 8 * 1024 * 1024 {
+        return Err(CompressError::Msg("bzip2 block scan skipped (file large)".into()));
+    }
+
+    let mut all_blocks: Vec<BlockInfo> = Vec::new();
+    let mut u_off = 0u64;
+    let mut byte_pos = 0usize;
+
+    while byte_pos + 4 <= compressed.len() && is_bzh_header(&compressed[byte_pos..]) {
+        let header: [u8; 4] = compressed[byte_pos..byte_pos + 4].try_into().unwrap();
+        let stream = &compressed[byte_pos..];
+        let ranges = scan_block_bit_ranges(stream)?;
+        if ranges.is_empty() {
+            return Err(CompressError::Msg("no bzip2 blocks in stream".into()));
+        }
+
+        let sizes = decode_block_sizes(header, stream, &ranges, threads)?;
+        if sizes.len() != ranges.len() {
+            return Err(CompressError::Msg("bzip2 block size count mismatch".into()));
+        }
+
+        let bit_base = (byte_pos as u64) * 8;
+        for (i, &(start_bit, end_bit)) in ranges.iter().enumerate() {
+            let usize_ = sizes[i];
+            all_blocks.push(BlockInfo {
+                header,
+                start_bit: bit_base + start_bit,
+                end_bit: bit_base + end_bit,
+                uncompressed_offset: u_off,
+                uncompressed_size: usize_,
+            });
+            u_off += usize_;
+        }
+
+        // Last range end is the bit offset of EOS magic within this stream.
+        let eos_bit = ranges.last().unwrap().1;
+        // EOS (48) + CRC (32); then pad to next byte for the next stream member.
+        let after_stream_bits = eos_bit + 48 + 32;
+        let stream_bytes = after_stream_bits.div_ceil(8) as usize;
+        if stream_bytes == 0 {
+            return Err(CompressError::Msg("degenerate bzip2 stream length".into()));
+        }
+        byte_pos += stream_bytes;
+
+        // Skip any zero padding between members (defensive).
+        while byte_pos < compressed.len() && compressed[byte_pos] == 0 {
+            byte_pos += 1;
+        }
+    }
+
+    if all_blocks.is_empty() {
+        return Err(CompressError::Msg("no bzip2 blocks indexed".into()));
+    }
+    // Require multi-block map; single-block falls back to DecodedBody.
+    if all_blocks.len() < 2 {
+        return Err(CompressError::Msg("single bzip2 block; full-decode path".into()));
+    }
+    Ok(all_blocks)
+}
+
+/// Decode each block (optionally in parallel) and return uncompressed sizes.
+fn decode_block_sizes(
+    header: [u8; 4],
+    stream: &[u8],
+    ranges: &[(u64, u64)],
+    threads: u32,
+) -> Result<Vec<u64>> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if threads <= 1 || ranges.len() == 1 {
+        let mut sizes = Vec::with_capacity(ranges.len());
+        for &(start_bit, end_bit) in ranges {
+            let plain = decode_one_block(header, stream, start_bit, end_bit)?;
+            sizes.push(plain.len() as u64);
+        }
+        return Ok(sizes);
+    }
+
+    let n_workers = (threads as usize).min(ranges.len()).max(1);
+    let mut results: Vec<Option<Result<u64>>> = (0..ranges.len()).map(|_| None).collect();
+
+    thread::scope(|scope| {
+        let chunk = ranges.len().div_ceil(n_workers).max(1);
+        let mut handles = Vec::new();
+        for (worker_id, range_chunk) in ranges.chunks(chunk).enumerate() {
+            let base = worker_id * chunk;
+            let owned: Vec<(u64, u64)> = range_chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                let mut outs = Vec::with_capacity(owned.len());
+                for &(start_bit, end_bit) in &owned {
+                    outs.push(
+                        decode_one_block(header, stream, start_bit, end_bit)
+                            .map(|p| p.len() as u64),
+                    );
+                }
+                (base, outs)
+            }));
+        }
+        for h in handles {
+            if let Ok((base, outs)) = h.join() {
+                for (i, r) in outs.into_iter().enumerate() {
+                    results[base + i] = Some(r);
+                }
+            }
+        }
+    });
+
+    let mut sizes = Vec::with_capacity(results.len());
+    for r in results {
+        sizes.push(
+            r.ok_or_else(|| CompressError::Msg("bzip2 size worker missing".into()))??,
+        );
+    }
+    Ok(sizes)
 }
 
 /// Decode one or more concatenated bzip2 streams (libbz2 stops at the first
@@ -176,7 +455,7 @@ const BLOCK_MAGIC: u64 = 0x0000_3141_5926_5359;
 /// 48-bit end-of-stream magic (√π).
 const EOS_MAGIC: u64 = 0x0000_1772_4538_5090;
 
-/// Best-effort multi-block parallel decode via bit-aligned magic scan.
+/// Best-effort multi-block parallel full decode via bit-aligned magic scan (fallback path).
 fn try_parallel_block_decode(compressed: &[u8], threads: u32) -> Result<Vec<u8>> {
     if compressed.len() < 10 || !is_bzh_header(compressed) {
         return Err(CompressError::Msg("bzip2 too short for block scan".into()));
@@ -380,7 +659,7 @@ impl BitWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::path::PathBuf;
 
     use bzip2::write::BzEncoder;
@@ -396,6 +675,22 @@ mod tests {
         let mut enc = BzEncoder::new(Vec::new(), Compression::default());
         enc.write_all(data).unwrap();
         enc.finish().unwrap()
+    }
+
+    fn encode_bz2_level(data: &[u8], level: u32) -> Vec<u8> {
+        let mut enc = BzEncoder::new(Vec::new(), Compression::new(level));
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Build compressible multi-block payload (block size 100 KiB at level 1).
+    fn multi_block_payload() -> Vec<u8> {
+        let mut data = Vec::with_capacity(350_000);
+        for i in 0..350_000u32 {
+            // Repeating pattern keeps compressed size modest while spanning >1 block.
+            data.push(((i / 17) % 251) as u8);
+        }
+        data
     }
 
     #[test]
@@ -440,10 +735,178 @@ mod tests {
         let path = dir.path().join("multi-stream.bz2");
         std::fs::write(&path, &compressed).unwrap();
         let body = open_seekable_bzip2_with_threads(&path, 4).unwrap();
+        assert!(
+            body.checkpoint_count() >= 2,
+            "multi-stream should expose ≥2 checkpoints, got {}",
+            body.checkpoint_count()
+        );
         let mut r = body.open_reader().unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn multi_block_random_seeks_match_sequential() {
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        let ranges = scan_block_bit_ranges(&compressed).expect("block scan");
+        assert!(
+            ranges.len() >= 2,
+            "expected multi-block bz2, got {} blocks (compressed {} bytes)",
+            ranges.len(),
+            compressed.len()
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-block.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let body = open_seekable_bzip2(&path).unwrap();
+        assert_eq!(body.kind(), "bzip2-blocks");
+        assert_eq!(body.checkpoint_count(), ranges.len());
+        assert_eq!(body.size(), data.len() as u64);
+
+        // Full sequential read via block map.
+        let mut r = body.open_reader().unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+
+        // Random seeks: sample offsets across the body.
+        let mut r = body.open_reader().unwrap();
+        let samples: Vec<u64> = {
+            let n = data.len() as u64;
+            let mut v = vec![0, 1, n / 4, n / 2, (3 * n) / 4, n.saturating_sub(1)];
+            // Near block boundaries if we know sizes from a second open path.
+            if let Ok(blocks) = try_build_bit_block_map(&compressed, 1) {
+                for b in &blocks {
+                    if b.uncompressed_offset > 0 {
+                        v.push(b.uncompressed_offset);
+                        v.push(b.uncompressed_offset.saturating_sub(1));
+                    }
+                    v.push(b.uncompressed_offset + b.uncompressed_size / 2);
+                }
+            }
+            v.into_iter().filter(|&o| o < n).collect()
+        };
+        for &off in &samples {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 64];
+            let n = r.read(&mut buf).unwrap();
+            assert!(n > 0, "expected data at offset {off}");
+            assert_eq!(&buf[..n], &data[off as usize..off as usize + n]);
+        }
+
+        // Seek to EOF then backward.
+        assert_eq!(r.seek(SeekFrom::End(0)).unwrap(), data.len() as u64);
+        r.seek(SeekFrom::Start(100)).unwrap();
+        let mut one = [0u8; 1];
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(one[0], data[100]);
+    }
+
+    #[test]
+    fn with_threads_equals_single_thread() {
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let body1 = open_seekable_bzip2_with_threads(&path, 1).unwrap();
+        let body4 = open_seekable_bzip2_with_threads(&path, 4).unwrap();
+        assert_eq!(body1.size(), body4.size());
+        assert_eq!(body1.checkpoint_count(), body4.checkpoint_count());
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, data);
+
+        // Multi-stream: threads vs single-thread.
+        let mut multi = encode_bz2(b"aaa-stream");
+        multi.extend_from_slice(&encode_bz2(b"bbb-stream-extra"));
+        let path2 = dir.path().join("multi-threads.bz2");
+        std::fs::write(&path2, &multi).unwrap();
+        let s1 = open_seekable_bzip2_with_threads(&path2, 1).unwrap();
+        let s4 = open_seekable_bzip2_with_threads(&path2, 4).unwrap();
+        let mut x = Vec::new();
+        let mut y = Vec::new();
+        s1.open_reader().unwrap().read_to_end(&mut x).unwrap();
+        s4.open_reader().unwrap().read_to_end(&mut y).unwrap();
+        assert_eq!(x, y);
+    }
+
+    #[test]
+    fn single_block_falls_back_to_decoded_body() {
+        let data = b"tiny single block payload";
+        let compressed = encode_bz2(data);
+        let ranges = scan_block_bit_ranges(&compressed).unwrap();
+        assert_eq!(ranges.len(), 1, "fixture must be single-block");
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("single.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+        let body = open_seekable_bzip2(&path).unwrap();
+        // DecodedBody uses kind "bzip2"; block map uses "bzip2-blocks".
+        assert_eq!(body.kind(), "bzip2");
+        assert_eq!(body.checkpoint_count(), 1);
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn large_file_scan_policy_rejects() {
+        // Synthetic oversize buffer: scan must refuse without hanging.
+        let mut huge = vec![0u8; 8 * 1024 * 1024 + 16];
+        huge[..4].copy_from_slice(b"BZh9");
+        let err = scan_block_bit_ranges(&huge).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("large") || msg.contains("EOS"),
+            "unexpected error: {msg}"
+        );
+        // try_build must also refuse large inputs before bit-walking.
+        let err = try_build_bit_block_map(&huge, 1).unwrap_err();
+        assert!(
+            err.to_string().contains("large"),
+            "expected large-file skip, got {}",
+            err
+        );
+    }
+
+    #[test]
+    fn multi_stream_random_seeks() {
+        let a: Vec<u8> = (0..50_000u32).map(|i| (i % 200) as u8).collect();
+        let b: Vec<u8> = (0..80_000u32).map(|i| ((i * 3) % 200) as u8).collect();
+        let mut compressed = encode_bz2_level(&a, 1);
+        compressed.extend_from_slice(&encode_bz2_level(&b, 1));
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ms-seek.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+        let body = open_seekable_bzip2_with_threads(&path, 2).unwrap();
+        assert!(body.checkpoint_count() >= 2);
+        assert_eq!(body.size(), expected.len() as u64);
+
+        let mut r = body.open_reader().unwrap();
+        // Seek into second stream region.
+        let mid = a.len() as u64 + 100;
+        r.seek(SeekFrom::Start(mid)).unwrap();
+        let mut buf = [0u8; 32];
+        let n = r.read(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &expected[mid as usize..mid as usize + n]);
+
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, expected);
     }
 
     #[test]
