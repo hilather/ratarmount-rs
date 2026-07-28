@@ -777,7 +777,7 @@ fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
     exts.iter().any(|e| name.ends_with(&format!(".{e}")))
 }
 
-/// Nested gzip body: seekable checkpoints + TAR index (no temp spool of the member).
+/// Nested gzip body: seekable checkpoints + TAR / format / single-file (no temp spool).
 fn open_nested_gzip_tar(
     reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
@@ -797,44 +797,36 @@ fn open_nested_gzip_tar(
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let is_tar =
         name_suggests_compressed_tar(label) || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
-    if !is_tar {
+    if is_tar {
         log::debug!(
-            "nested reader open: {} gzip body is not TAR; falling back to temp spool",
-            label.display()
+            "nested reader open: {} gzip→tar ({} uncompressed bytes, {} checkpoints)",
+            label.display(),
+            gzip.size(),
+            gzip.checkpoint_count()
         );
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "nested gzip {} is not a TAR body (will try temp spool)",
-                label.display()
-            ),
-        ));
+        // Nested: always rebuild in-memory index (opts already force index_in_memory).
+        return SqliteIndexedTar::create_index_gzip(label, gzip, None, opts, VERSION)
+            .map(|s| {
+                log::debug!(
+                    "nested reader open: gzip→tar {} mounted successfully",
+                    label.display()
+                );
+                Arc::new(s) as Arc<dyn MountSource>
+            })
+            .map_err(|e| {
+                log::warn!(
+                    "nested reader open: gzip→tar {} failed: {e}",
+                    label.display()
+                );
+                std::io::Error::other(e.to_string())
+            });
     }
-    log::debug!(
-        "nested reader open: {} gzip→tar ({} uncompressed bytes, {} checkpoints)",
-        label.display(),
-        gzip.size(),
-        gzip.checkpoint_count()
-    );
-    // Nested: always rebuild in-memory index (opts already force index_in_memory).
-    SqliteIndexedTar::create_index_gzip(label, gzip, None, opts, VERSION)
-        .map(|s| {
-            log::debug!(
-                "nested reader open: gzip→tar {} mounted successfully",
-                label.display()
-            );
-            Arc::new(s) as Arc<dyn MountSource>
-        })
-        .map_err(|e| {
-            log::warn!(
-                "nested reader open: gzip→tar {} failed: {e}",
-                label.display()
-            );
-            std::io::Error::other(e.to_string())
-        })
+    // Plain nested .gz (or non-TAR archive body): seekable body, no temp spool.
+    let body: Arc<dyn SeekableBody> = gzip;
+    open_nested_non_tar_seekable_body(label, body, opts, "gzip")
 }
 
-/// Nested zstd/bzip2/xz compressed TAR via existing seekable body + TAR index.
+/// Nested zstd/bzip2/xz: TAR when body matches; else formats / single-file over seekable body.
 fn open_nested_seekable_tar<R, F>(
     reader: R,
     label: &Path,
@@ -853,40 +845,63 @@ where
     );
     let body = open_body(reader, threads, label)?;
     let is_tar = name_suggests_compressed_tar(label) || body_looks_like_tar(&body).unwrap_or(false);
-    if !is_tar {
+    if is_tar {
         log::debug!(
-            "nested reader open: {} {codec} body is not TAR; falling back to temp spool",
+            "nested reader open: {} {codec}→tar ({} uncompressed bytes, {} checkpoints)",
+            label.display(),
+            body.size(),
+            body.checkpoint_count()
+        );
+        return open_tar_body(label, body, None, opts, true)
+            .map(|s| {
+                log::debug!(
+                    "nested reader open: {codec}→tar {} mounted successfully",
+                    label.display()
+                );
+                Arc::new(s) as Arc<dyn MountSource>
+            })
+            .map_err(|e| {
+                log::warn!(
+                    "nested reader open: {codec}→tar {} failed: {e}",
+                    label.display()
+                );
+                std::io::Error::other(e)
+            });
+    }
+    open_nested_non_tar_seekable_body(label, body, opts, codec)
+}
+
+/// Nested non-TAR compressed body: probe archive formats from reader, else single-file.
+fn open_nested_non_tar_seekable_body(
+    label: &Path,
+    body: Arc<dyn SeekableBody>,
+    opts: &OpenOptions,
+    codec: &str,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    log::debug!(
+        "nested reader open: {} {codec} body is not TAR; trying format/single-file (no tmp)",
+        label.display()
+    );
+    if let Some(src) =
+        try_open_formats_from_seekable_body(label, Arc::clone(&body), None, opts, true)
+            .map_err(std::io::Error::other)?
+    {
+        log::debug!(
+            "nested reader open: {codec}→archive {} mounted successfully",
             label.display()
         );
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            format!(
-                "nested {codec} {} is not a TAR body (will try temp spool)",
-                label.display()
-            ),
-        ));
+        return Ok(src);
     }
+    let stripped =
+        strip_compression_suffix(label.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
     log::debug!(
-        "nested reader open: {} {codec}→tar ({} uncompressed bytes, {} checkpoints)",
+        "nested reader open: {codec}→single-file {} as {stripped} ({} bytes, no tmp)",
         label.display(),
-        body.size(),
-        body.checkpoint_count()
+        body.size()
     );
-    open_tar_body(label, body, None, opts, true)
-        .map(|s| {
-            log::debug!(
-                "nested reader open: {codec}→tar {} mounted successfully",
-                label.display()
-            );
-            Arc::new(s) as Arc<dyn MountSource>
-        })
-        .map_err(|e| {
-            log::warn!(
-                "nested reader open: {codec}→tar {} failed: {e}",
-                label.display()
-            );
-            std::io::Error::other(e)
-        })
+    SingleFileMountSource::from_seekable_body(stripped, body)
+        .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+        .map_err(std::io::Error::other)
 }
 
 fn name_suggests_plain_tar(path: &Path) -> bool {
@@ -1398,10 +1413,10 @@ where
     Ok(gzip)
 }
 
-/// Open gzip: G3 Tier B seekable checkpoints for `.tar.gz` / `.tgz`; materialize for plain `.gz`.
+/// Open gzip: always seekable (RGZI import when present); TAR / formats / single-file over body.
 ///
-/// When an on-disk index carries a Tier C RGZI blob, import it before a full checkpoint rebuild.
-/// After a successful TAR index open/create, export and store the blob when the index is writable.
+/// Plain single-file `.gz` uses [`SingleFileMountSource::from_seekable_body`] — **no materialize**.
+/// Path-only residual backends (EXT4 superblock, SquashFS, libarchive-only) may still materialize.
 fn open_gzip(
     path: &Path,
     index_path: Option<&Path>,
@@ -1413,64 +1428,19 @@ fn open_gzip(
     } else {
         options.gzip_seek_point_spacing
     };
+    let threads = options.threads_for("gzip");
+    let gzip = open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
 
-    // Prefer seekable path for names that clearly indicate compressed TAR.
-    if name_suggests_compressed_tar(path) {
-        let threads = options.threads_for("gzip");
-        let gzip = open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
+    let is_tar =
+        name_suggests_compressed_tar(path) || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
+    if is_tar {
         let tar = open_tar_gzip(path, Arc::clone(&gzip), index_path, options, recreate)?;
-        // TAR index is now on disk (or memory); side-table write only when path exists.
         persist_gzip_index_blob(&gzip, index_path, options);
         return Ok(Arc::new(tar));
     }
 
-    // Plain `.gz` (or ambiguous): materialize once; detect secret TAR / EXT4 body if present.
-    let (tmp, size) = materialize(path, CompressionFormat::Gzip).map_err(|e| e.to_string())?;
-    let data_path = tmp.path().to_path_buf();
-    let mut materialised = Some(tmp);
-    if looks_like_tar(&data_path).unwrap_or(false) {
-        return Ok(Arc::new(open_tar(
-            path,
-            &data_path,
-            index_path,
-            options,
-            recreate,
-            &mut materialised,
-        )?));
-    }
-    if looks_like_ext4(&data_path) {
-        let keep = materialised
-            .take()
-            .ok_or_else(|| "materialized gzip missing".to_string())?
-            .into_temp_path()
-            .keep()
-            .map_err(|e| e.error.to_string())?;
-        return Ok(Arc::new(
-            Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
-        ));
-    }
-    if looks_like_fat(&data_path) {
-        let keep = materialised
-            .take()
-            .ok_or_else(|| "materialized gzip missing".to_string())?
-            .into_temp_path()
-            .keep()
-            .map_err(|e| e.error.to_string())?;
-        return Ok(Arc::new(
-            FatMountSource::open(&keep).map_err(|e| e.to_string())?,
-        ));
-    }
-    if let Some(src) =
-        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
-    {
-        return Ok(src);
-    }
-    let stripped =
-        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
-    Ok(Arc::new(
-        SingleFileMountSource::new(stripped, data_path, size, materialised.take())
-            .map_err(|e| e.to_string())?,
-    ))
+    let body: Arc<dyn SeekableBody> = gzip;
+    open_from_seekable_body(path, body, index_path, options, recreate, "gzip")
 }
 
 /// After compression materialize: prefer pure stencil ISO/WARC/XAR/CAB before libarchive.
@@ -1904,6 +1874,10 @@ fn open_bzip2(
 }
 
 /// Mount from an already-opened seekable uncompressed body (path or remote Range codec).
+///
+/// TAR → index over body; other archives → `open_from_reader` when practical;
+/// plain single-file → [`SingleFileMountSource::from_seekable_body`] (**no** full `io::copy`).
+/// Residual path-only backends (EXT4 / SquashFS / libarchive-only) may still materialize.
 fn open_from_seekable_body(
     path: &Path,
     body: Arc<dyn SeekableBody>,
@@ -1928,7 +1902,251 @@ fn open_from_seekable_body(
         )?));
     }
 
-    // Non-TAR: materialize uncompressed body to a temp path for format probe / single-file.
+    if let Some(src) =
+        try_open_formats_from_seekable_body(path, Arc::clone(&body), index_path, options, recreate)?
+    {
+        return Ok(src);
+    }
+
+    // Residual path-only backends that cannot open from a reader yet.
+    if body_needs_path_materialize(&body) {
+        return materialize_seekable_body_for_path_backends(
+            path, body, index_path, options, recreate,
+        );
+    }
+
+    let stripped =
+        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
+    Ok(Arc::new(
+        SingleFileMountSource::from_seekable_body(stripped, body).map_err(|e| e.to_string())?,
+    ))
+}
+
+/// Probe uncompressed archive formats via `open_from_reader` on a seekable body (no `/tmp`).
+///
+/// Returns `Ok(None)` when magic/name does not match a reader-capable backend (caller
+/// may single-file or residual-materialize). Hard open errors propagate as `Err`.
+fn try_open_formats_from_seekable_body(
+    label: &Path,
+    body: Arc<dyn SeekableBody>,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Option<Arc<dyn MountSource>>, String> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut head = [0u8; 512];
+    let n = {
+        let mut r = body.open_reader().map_err(|e| e.to_string())?;
+        r.read(&mut head).map_err(|e| e.to_string())?
+    };
+    let head = &head[..n];
+
+    let open_reader = || body.open_reader().map_err(|e| e.to_string());
+
+    // 7z
+    if head.len() >= 6 && &head[..6] == b"7z\xBC\xAF'\x1C" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            SevenZipMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // Unix ar
+    if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            ArMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // XAR
+    if head.len() >= 4 && &head[..4] == b"xar!" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            XarMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // CAB (store/MSZIP; LZX → residual materialize + libarchive)
+    if head.len() >= 4 && &head[..4] == b"MSCF" {
+        let r = open_reader()?;
+        match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
+            Ok(s) => return Ok(Some(Arc::new(s))),
+            Err(CabError::UnsupportedCompression(_)) => {
+                return Ok(Some(materialize_seekable_body_for_path_backends(
+                    label, body, index_path, options, recreate,
+                )?));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    // SQLAR / SQLite
+    if head.len() >= 16 && &head[..16] == b"SQLite format 3\0" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            SqlarMountSource::open_from_reader(r, label, options).map_err(|e| e.to_string())?,
+        )));
+    }
+    // CPIO
+    if head_looks_like_cpio(head) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            CpioMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // WARC
+    if head.len() >= 5 && &head[..5] == b"WARC/" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            WarcMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // ZIP
+    if head.len() >= 4 && &head[..2] == b"PK" {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            ZipMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // TAR (ustar / name) — normally handled before this helper, but catch edge cases.
+    if (head.len() >= 262 && &head[257..262] == b"ustar")
+        || (head.len() >= 265 && &head[257..263] == b"ustar ")
+        || name_suggests_plain_tar(label)
+    {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            SqliteIndexedTar::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // ISO 9660: PVD at sector 16 or name
+    {
+        let mut r = open_reader()?;
+        let looks_iso = name_suggests_iso(label)
+            || ratarmount_formats_iso9660::looks_like_iso9660_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_iso {
+            return Ok(Some(Arc::new(
+                Iso9660MountSource::open_from_reader(r, label, index_path, options, VERSION)
+                    .map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    // ASAR by name
+    if name_suggests_asar(label) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            AsarMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    // Extension fallbacks (magic missed)
+    if name_suggests_ext(label, &["warc"]) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            WarcMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    if name_suggests_ext(label, &["cpio"]) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            CpioMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    if name_suggests_ext(label, &["ar", "a"]) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            ArMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    if name_suggests_ext(label, &["xar"]) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            XarMountSource::open_from_reader(r, label, index_path, options, VERSION)
+                .map_err(|e| e.to_string())?,
+        )));
+    }
+    if name_suggests_ext(label, &["cab"]) {
+        let r = open_reader()?;
+        match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
+            Ok(s) => return Ok(Some(Arc::new(s))),
+            Err(CabError::UnsupportedCompression(_)) => {
+                return Ok(Some(materialize_seekable_body_for_path_backends(
+                    label, body, index_path, options, recreate,
+                )?));
+            }
+            Err(e) => return Err(e.to_string()),
+        }
+    }
+    if name_suggests_ext(label, &["sqlar"]) {
+        let r = open_reader()?;
+        return Ok(Some(Arc::new(
+            SqlarMountSource::open_from_reader(r, label, options).map_err(|e| e.to_string())?,
+        )));
+    }
+    // FAT image
+    {
+        let mut r = open_reader()?;
+        let looks_fat = name_suggests_ext(label, &["fat", "vfat", "fat12", "fat16", "fat32"])
+            || looks_like_fat_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_fat {
+            return Ok(Some(Arc::new(
+                FatMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+
+    Ok(None)
+}
+
+/// True when the uncompressed body looks like a path-only residual (EXT4 / SquashFS / RAR…).
+fn body_needs_path_materialize(body: &Arc<dyn SeekableBody>) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut r = match body.open_reader() {
+        Ok(r) => r,
+        Err(_) => return false,
+    };
+    // EXT superblock magic 0xEF53 at absolute offset 1024+0x38.
+    if r.seek(SeekFrom::Start(1024 + 0x38)).is_ok() {
+        let mut m = [0u8; 2];
+        if r.read_exact(&mut m).is_ok() && u16::from_le_bytes(m) == 0xEF53 {
+            return true;
+        }
+    }
+    let _ = r.seek(SeekFrom::Start(0));
+    let mut head = [0u8; 16];
+    let n = r.read(&mut head).unwrap_or(0);
+    let head = &head[..n];
+    // SquashFS little/big endian magic
+    if head.len() >= 4 && (&head[..4] == b"hsqs" || &head[..4] == b"sqsh") {
+        return true;
+    }
+    // RAR (libarchive path residual)
+    if (head.len() >= 7 && &head[..7] == b"Rar!\x1a\x07\x00")
+        || (head.len() >= 8 && &head[..8] == b"Rar!\x1a\x07\x01\x00")
+    {
+        return true;
+    }
+    // CAB LZX residual is detected only after Cab open fails; MSCF alone is not enough.
+    false
+}
+
+/// Materialize a seekable body once for residual path-only backends (EXT4 / SquashFS / libarchive).
+fn materialize_seekable_body_for_path_backends(
+    path: &Path,
+    body: Arc<dyn SeekableBody>,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
     let size = body.size();
     let mut reader = body.open_reader().map_err(|e| e.to_string())?;
     drop(body);
@@ -1942,6 +2160,15 @@ fn open_from_seekable_body(
             .map_err(|e| e.error.to_string())?;
         return Ok(Arc::new(
             Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
+        ));
+    }
+    if looks_like_squashfs(&data_path) {
+        let keep = tmp
+            .into_temp_path()
+            .keep()
+            .map_err(|e| e.error.to_string())?;
+        return Ok(Arc::new(
+            SquashFsMountSource::open(&keep).map_err(|e| e.to_string())?,
         ));
     }
     if looks_like_fat(&data_path) {
@@ -1971,6 +2198,7 @@ fn open_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         ));
     }
+    // Fallback: keep temp as single-file (should be rare after body_needs_path_materialize).
     let stripped =
         strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
     Ok(Arc::new(
@@ -2171,18 +2399,10 @@ where
                 persist_gzip_index_blob(&gzip, ip, &o);
                 return Ok(Some((label, Arc::new(src))));
             }
-            // Plain .gz single-file: materialize uncompressed via seekable body.
-            let size = gzip.size();
-            let mut reader = gzip.reader().map_err(|e| e.to_string())?;
-            let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-            std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
-            let data_path = tmp.path().to_path_buf();
-            let stripped = strip_compression_suffix(
-                label.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-            );
-            let src = SingleFileMountSource::new(stripped, data_path, size, Some(tmp))
-                .map_err(|e| e.to_string())?;
-            Ok(Some((label, Arc::new(src))))
+            // Plain .gz: formats / single-file over seekable body (no materialize).
+            let body: Arc<dyn SeekableBody> = gzip;
+            let src = open_from_seekable_body(&label, body, ip, &o, recreate, "gzip")?;
+            Ok(Some((label, src)))
         }
         "bzip2" => {
             let threads = o.threads_for("bzip2");
@@ -3009,6 +3229,66 @@ mod tests {
             read_seek_mid(inner.as_ref(), "/beta.txt", 10).as_slice(),
             &beta[10..]
         );
+    }
+
+    /// Plain (non-TAR) `.gz` via `open_path` / seekable body — no materialize to single-file path.
+    #[test]
+    fn plain_gzip_single_file_open_path_no_materialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"plain-gzip-SEEK-ME-payload-0123456789\n";
+        let plain = dir.path().join("hello.txt");
+        std::fs::write(&plain, payload).expect("write plain");
+        let gz = dir.path().join("hello.txt.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 16 * 1024,
+            ..Default::default()
+        };
+        let src = open_path(&gz, &opts, false).expect("open plain .gz");
+        // Stripped name: hello.txt
+        assert_eq!(read_all(src.as_ref(), "/hello.txt"), payload);
+        let mid = read_seek_mid(src.as_ref(), "/hello.txt", 6);
+        assert_eq!(mid.as_slice(), &payload[6..]);
+    }
+
+    /// Nested plain `.gz` via `open_nested_reader_fn` Cursor — single-file over seekable body (no spool).
+    #[test]
+    fn nested_plain_gzip_from_cursor_single_file_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"nested-plain-gz-RANDOM-seek-abcdef\n";
+        let plain = dir.path().join("data.bin");
+        std::fs::write(&plain, payload).expect("write");
+        let gz = dir.path().join("data.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let bytes = std::fs::read(&gz).expect("read gz");
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 16 * 1024,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("data.bin.gz"))
+            .expect("nested plain gzip must open as single-file without temp spool");
+        assert_eq!(read_all(inner.as_ref(), "/data.bin"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/data.bin", 7);
+        assert_eq!(mid.as_slice(), &payload[7..]);
     }
 
     /// `.tar` embedded in ZIP: parent open + nested TAR from_reader — no temp spool.
