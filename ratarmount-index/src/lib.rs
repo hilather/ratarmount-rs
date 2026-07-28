@@ -37,8 +37,51 @@ struct MemIndex {
 /// Must match Python `SQLiteIndex.__version__`.
 pub const INDEX_VERSION: &str = "0.7.0";
 
-/// Embedded core schema (`create-index-tables.sql`). Compression side tables are runtime-only.
+/// Embedded core schema (`create-index-tables.sql`). Compression side tables are runtime-only
+/// (same as Python: created lazily / on open-write, not in the base SQL script).
 pub const CREATE_TABLES_SQL: &str = include_str!("../create-index-tables.sql");
+
+/// Python `SQLiteIndex` compression side-table names.
+///
+/// Schemas (Python `synchronize_compression_offsets` / `_store_gzip_index`):
+/// - `gzipindex` / `gzipindexes` / `gztoolindex`: `( data BLOB )` — one or more opaque
+///   indexed_gzip / rapidgzip / gztool seek-index blobs.
+/// - `bzip2blocks` / `zstdblocks`: `( blockoffset INTEGER PRIMARY KEY, dataoffset INTEGER )`.
+///
+/// **Note:** Importing these blobs into seekable gzip/zstd/bzip2 decoder backends is a
+/// follow-up (storage + schema parity only in this crate).
+pub const COMPRESSION_TABLE_GZIPINDEX: &str = "gzipindex";
+pub const COMPRESSION_TABLE_GZIPINDEXES: &str = "gzipindexes";
+pub const COMPRESSION_TABLE_GZTOOLINDEX: &str = "gztoolindex";
+pub const COMPRESSION_TABLE_BZIP2BLOCKS: &str = "bzip2blocks";
+pub const COMPRESSION_TABLE_ZSTDBLOCKS: &str = "zstdblocks";
+
+/// All known compression side-table names (Python `clear_compression_offsets` list).
+pub const COMPRESSION_TABLE_NAMES: &[&str] = &[
+    COMPRESSION_TABLE_BZIP2BLOCKS,
+    COMPRESSION_TABLE_GZIPINDEX,
+    COMPRESSION_TABLE_GZIPINDEXES,
+    COMPRESSION_TABLE_GZTOOLINDEX,
+    COMPRESSION_TABLE_ZSTDBLOCKS,
+];
+
+/// CREATE IF NOT EXISTS for compression side tables (Python runtime DDL).
+pub const CREATE_COMPRESSION_TABLES_SQL: &str = r#"
+/* indexed_gzip / rapidgzip multi-blob and single-blob seek indexes */
+CREATE TABLE IF NOT EXISTS "gzipindex" ( "data" BLOB );
+CREATE TABLE IF NOT EXISTS "gzipindexes" ( "data" BLOB );
+/* rapidgzip gztool-format seek index (1+ blobs) */
+CREATE TABLE IF NOT EXISTS "gztoolindex" ( "data" BLOB );
+/* bzip2 / zstd block → data offset maps */
+CREATE TABLE IF NOT EXISTS "bzip2blocks" (
+    "blockoffset" INTEGER PRIMARY KEY,
+    "dataoffset" INTEGER
+);
+CREATE TABLE IF NOT EXISTS "zstdblocks" (
+    "blockoffset" INTEGER PRIMARY KEY,
+    "dataoffset" INTEGER
+);
+"#;
 
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -135,6 +178,9 @@ impl SqliteIndex {
             "#,
         )?;
         conn.execute_batch(CREATE_TABLES_SQL)?;
+        // Python creates compression side tables lazily; we ensure them on build so
+        // writers can store seek indexes without a separate ensure step.
+        conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         Ok(Self {
             path: path_buf,
             conn: Mutex::new(conn),
@@ -649,7 +695,9 @@ impl SqliteIndex {
 
     /// Open an existing on-disk index for read/write (e.g. to fill content-hash xattrs).
     ///
-    /// Does not truncate or recreate schema. Fails if the file is missing or incomplete.
+    /// Does not truncate or recreate the core schema. Ensures compression side tables
+    /// exist (`CREATE IF NOT EXISTS`) for Python parity. Fails if the file is missing
+    /// or incomplete.
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
@@ -660,6 +708,7 @@ impl SqliteIndex {
             PRAGMA synchronous = NORMAL;
             "#,
         )?;
+        conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         let idx = Self {
             path: Some(path.to_path_buf()),
             conn: Mutex::new(conn),
@@ -668,6 +717,264 @@ impl SqliteIndex {
         };
         idx.validate_loaded()?;
         Ok(idx)
+    }
+
+    /// Ensure Python compression side tables exist (`CREATE IF NOT EXISTS`).
+    ///
+    /// Safe to call multiple times. No-op on read-only indexes (returns error).
+    pub fn ensure_compression_tables(&self) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
+            Ok(())
+        })
+    }
+
+    /// Whether a compression side table exists (by name).
+    ///
+    /// Recognized names: `gzipindex`, `gzipindexes`, `gztoolindex`, `bzip2blocks`,
+    /// `zstdblocks` (any other name still checks `sqlite_master`).
+    pub fn has_compression_table(&self, name: &str) -> Result<bool> {
+        self.with_conn(|conn| {
+            let n: i64 = conn.query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master
+                   WHERE (type='table' OR type='view') AND name = ?1"#,
+                params![name],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
+    }
+
+    /// Drop all compression side tables (Python `clear_compression_offsets`).
+    pub fn clear_compression_offsets(&self) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            for table in COMPRESSION_TABLE_NAMES {
+                conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Read gzip seek-index blobs from `gzipindexes` (preferred) or legacy `gzipindex`.
+    ///
+    /// Returns row order as stored (append order). Empty if neither table exists or
+    /// both are empty. Blobs are opaque (indexed_gzip / rapidgzip compatible); decoder
+    /// import is a follow-up outside this crate.
+    pub fn get_gzip_index_blobs(&self) -> Result<Vec<Vec<u8>>> {
+        if self.has_compression_table(COMPRESSION_TABLE_GZIPINDEXES)? {
+            let blobs = self.read_data_blobs(COMPRESSION_TABLE_GZIPINDEXES)?;
+            if !blobs.is_empty() {
+                return Ok(blobs);
+            }
+        }
+        if self.has_compression_table(COMPRESSION_TABLE_GZIPINDEX)? {
+            return self.read_data_blobs(COMPRESSION_TABLE_GZIPINDEX);
+        }
+        Ok(Vec::new())
+    }
+
+    /// Replace gzip seek-index storage with a single blob (Python single-blob path:
+    /// table name `gzipindex` for downward compatibility).
+    pub fn set_gzip_index_blob(&self, blob: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                &format!("DROP TABLE IF EXISTS \"{COMPRESSION_TABLE_GZIPINDEXES}\""),
+                [],
+            )?;
+            conn.execute(
+                &format!("DROP TABLE IF EXISTS \"{COMPRESSION_TABLE_GZIPINDEX}\""),
+                [],
+            )?;
+            conn.execute(
+                &format!(
+                    "CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEX}\" ( \"data\" BLOB )"
+                ),
+                [],
+            )?;
+            conn.execute(
+                &format!("INSERT INTO \"{COMPRESSION_TABLE_GZIPINDEX}\" (data) VALUES (?1)"),
+                params![blob],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Append one gzip seek-index blob to `gzipindexes` (multi-blob path).
+    ///
+    /// If only legacy `gzipindex` exists with rows, migrates those rows into
+    /// `gzipindexes` first (Python stores multi-blob under `gzipindexes`).
+    pub fn append_gzip_index_blob(&self, blob: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            let has_indexes = table_exists(conn, COMPRESSION_TABLE_GZIPINDEXES)?;
+            let has_index = table_exists(conn, COMPRESSION_TABLE_GZIPINDEX)?;
+            if !has_indexes {
+                conn.execute(
+                    &format!(
+                        "CREATE TABLE \"{COMPRESSION_TABLE_GZIPINDEXES}\" ( \"data\" BLOB )"
+                    ),
+                    [],
+                )?;
+                if has_index {
+                    // Migrate legacy single-blob rows, then drop singular table.
+                    conn.execute(
+                        &format!(
+                            "INSERT INTO \"{COMPRESSION_TABLE_GZIPINDEXES}\" (data)
+                             SELECT data FROM \"{COMPRESSION_TABLE_GZIPINDEX}\""
+                        ),
+                        [],
+                    )?;
+                    conn.execute(
+                        &format!("DROP TABLE IF EXISTS \"{COMPRESSION_TABLE_GZIPINDEX}\""),
+                        [],
+                    )?;
+                }
+            }
+            conn.execute(
+                &format!("INSERT INTO \"{COMPRESSION_TABLE_GZIPINDEXES}\" (data) VALUES (?1)"),
+                params![blob],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Read gztool-format seek-index blobs (`gztoolindex` table).
+    pub fn get_gztool_index_blobs(&self) -> Result<Vec<Vec<u8>>> {
+        if !self.has_compression_table(COMPRESSION_TABLE_GZTOOLINDEX)? {
+            return Ok(Vec::new());
+        }
+        self.read_data_blobs(COMPRESSION_TABLE_GZTOOLINDEX)
+    }
+
+    /// Replace `gztoolindex` with a single blob.
+    pub fn set_gztool_index_blob(&self, blob: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                &format!("DROP TABLE IF EXISTS \"{COMPRESSION_TABLE_GZTOOLINDEX}\""),
+                [],
+            )?;
+            conn.execute(
+                &format!(
+                    "CREATE TABLE \"{COMPRESSION_TABLE_GZTOOLINDEX}\" ( \"data\" BLOB )"
+                ),
+                [],
+            )?;
+            conn.execute(
+                &format!("INSERT INTO \"{COMPRESSION_TABLE_GZTOOLINDEX}\" (data) VALUES (?1)"),
+                params![blob],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Append one blob to `gztoolindex`.
+    pub fn append_gztool_index_blob(&self, blob: &[u8]) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            conn.execute(
+                &format!(
+                    "CREATE TABLE IF NOT EXISTS \"{COMPRESSION_TABLE_GZTOOLINDEX}\" ( \"data\" BLOB )"
+                ),
+                [],
+            )?;
+            conn.execute(
+                &format!("INSERT INTO \"{COMPRESSION_TABLE_GZTOOLINDEX}\" (data) VALUES (?1)"),
+                params![blob],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Read bzip2 block map as `(blockoffset, dataoffset)` pairs (opaque to this crate).
+    pub fn get_bzip2_blocks(&self) -> Result<Vec<(i64, i64)>> {
+        self.read_block_offset_table(COMPRESSION_TABLE_BZIP2BLOCKS)
+    }
+
+    /// Replace `bzip2blocks` with the given map (Python `CREATE TABLE` + `executemany`).
+    pub fn set_bzip2_blocks(&self, blocks: &[(i64, i64)]) -> Result<()> {
+        self.write_block_offset_table(COMPRESSION_TABLE_BZIP2BLOCKS, blocks)
+    }
+
+    /// Read zstd block map as `(blockoffset, dataoffset)` pairs (opaque to this crate).
+    pub fn get_zstd_blocks(&self) -> Result<Vec<(i64, i64)>> {
+        self.read_block_offset_table(COMPRESSION_TABLE_ZSTDBLOCKS)
+    }
+
+    /// Replace `zstdblocks` with the given map.
+    pub fn set_zstd_blocks(&self, blocks: &[(i64, i64)]) -> Result<()> {
+        self.write_block_offset_table(COMPRESSION_TABLE_ZSTDBLOCKS, blocks)
+    }
+
+    fn read_data_blobs(&self, table: &str) -> Result<Vec<Vec<u8>>> {
+        // Table names are internal constants only — never user-controlled.
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!("SELECT data FROM \"{table}\" ORDER BY rowid"))?;
+            let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn read_block_offset_table(&self, table: &str) -> Result<Vec<(i64, i64)>> {
+        if !self.has_compression_table(table)? {
+            return Ok(Vec::new());
+        }
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT blockoffset, dataoffset FROM \"{table}\" ORDER BY blockoffset"
+            ))?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+            })?;
+            let mut out = Vec::new();
+            for r in rows {
+                out.push(r?);
+            }
+            Ok(out)
+        })
+    }
+
+    fn write_block_offset_table(&self, table: &str, blocks: &[(i64, i64)]) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.with_conn(|conn| {
+            conn.execute(&format!("DROP TABLE IF EXISTS \"{table}\""), [])?;
+            conn.execute(
+                &format!(
+                    "CREATE TABLE \"{table}\" (
+                        \"blockoffset\" INTEGER PRIMARY KEY,
+                        \"dataoffset\" INTEGER
+                    )"
+                ),
+                [],
+            )?;
+            let mut stmt =
+                conn.prepare(&format!("INSERT INTO \"{table}\" VALUES (?1, ?2)"))?;
+            for &(blockoffset, dataoffset) in blocks {
+                stmt.execute(params![blockoffset, dataoffset])?;
+            }
+            Ok(())
+        })
     }
 
     /// Insert one xattr via the `xattrs` view (Python `setxattrs` / INSERT trigger).
@@ -824,6 +1131,16 @@ fn split_path(path: &str) -> (String, String) {
         Some((dir, name)) => (dir.to_string(), name.to_string()),
         None => (String::new(), path.to_string()),
     }
+}
+
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    let n: i64 = conn.query_row(
+        r#"SELECT COUNT(*) FROM sqlite_master
+           WHERE (type='table' OR type='view') AND name = ?1"#,
+        params![name],
+        |r| r.get(0),
+    )?;
+    Ok(n > 0)
 }
 
 fn row_to_file_info(row: &Row<'_>) -> rusqlite::Result<FileInfo> {
@@ -1039,5 +1356,121 @@ mod tests {
                 b"b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c".as_slice()
             )
         );
+    }
+
+    #[test]
+    fn compression_side_tables_created_on_build() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        for name in COMPRESSION_TABLE_NAMES {
+            assert!(
+                idx.has_compression_table(name).unwrap(),
+                "expected table {name} after create_writable"
+            );
+        }
+    }
+
+    #[test]
+    fn gzip_index_blob_roundtrip_memory() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        assert!(idx.get_gzip_index_blobs().unwrap().is_empty());
+
+        let blob = b"indexed-gzip-seek-blob-v1".to_vec();
+        idx.set_gzip_index_blob(&blob).unwrap();
+        assert!(idx.has_compression_table(COMPRESSION_TABLE_GZIPINDEX).unwrap());
+        assert_eq!(idx.get_gzip_index_blobs().unwrap(), vec![blob.clone()]);
+
+        // Append migrates singular → plural and adds second blob.
+        let blob2 = b"second-chunk".to_vec();
+        idx.append_gzip_index_blob(&blob2).unwrap();
+        assert!(idx.has_compression_table(COMPRESSION_TABLE_GZIPINDEXES).unwrap());
+        assert_eq!(
+            idx.get_gzip_index_blobs().unwrap(),
+            vec![blob, blob2]
+        );
+    }
+
+    #[test]
+    fn gzip_index_blob_roundtrip_reopen_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("comp.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.set_gzip_index_blob(b"persist-me").unwrap();
+            idx.set_bzip2_blocks(&[(0, 0), (100, 50), (200, 120)])
+                .unwrap();
+            idx.set_zstd_blocks(&[(1, 10), (2, 20)]).unwrap();
+            idx.set_gztool_index_blob(b"gztool-blob").unwrap();
+        }
+
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        assert_eq!(
+            idx.get_gzip_index_blobs().unwrap(),
+            vec![b"persist-me".to_vec()]
+        );
+        assert_eq!(
+            idx.get_bzip2_blocks().unwrap(),
+            vec![(0, 0), (100, 50), (200, 120)]
+        );
+        assert_eq!(idx.get_zstd_blocks().unwrap(), vec![(1, 10), (2, 20)]);
+        assert_eq!(
+            idx.get_gztool_index_blobs().unwrap(),
+            vec![b"gztool-blob".to_vec()]
+        );
+
+        // Read-only reopen also sees the data (tables already present).
+        drop(idx);
+        let ro = SqliteIndex::open_read_only(&path).unwrap();
+        assert!(ro.has_compression_table(COMPRESSION_TABLE_GZIPINDEX).unwrap());
+        assert_eq!(
+            ro.get_gzip_index_blobs().unwrap(),
+            vec![b"persist-me".to_vec()]
+        );
+        assert_eq!(
+            ro.get_bzip2_blocks().unwrap(),
+            vec![(0, 0), (100, 50), (200, 120)]
+        );
+    }
+
+    #[test]
+    fn bzip2_zstd_blocks_replace_and_clear() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.set_bzip2_blocks(&[(5, 15)]).unwrap();
+        idx.set_zstd_blocks(&[(7, 17)]).unwrap();
+        assert_eq!(idx.get_bzip2_blocks().unwrap(), vec![(5, 15)]);
+        assert_eq!(idx.get_zstd_blocks().unwrap(), vec![(7, 17)]);
+
+        // Replace overwrites.
+        idx.set_bzip2_blocks(&[(1, 2), (3, 4)]).unwrap();
+        assert_eq!(idx.get_bzip2_blocks().unwrap(), vec![(1, 2), (3, 4)]);
+
+        idx.clear_compression_offsets().unwrap();
+        for name in COMPRESSION_TABLE_NAMES {
+            assert!(
+                !idx.has_compression_table(name).unwrap(),
+                "expected {name} dropped"
+            );
+        }
+        assert!(idx.get_gzip_index_blobs().unwrap().is_empty());
+        assert!(idx.get_bzip2_blocks().unwrap().is_empty());
+        assert!(idx.get_zstd_blocks().unwrap().is_empty());
+
+        // ensure recreates empty tables after clear.
+        idx.ensure_compression_tables().unwrap();
+        assert!(idx.has_compression_table(COMPRESSION_TABLE_ZSTDBLOCKS).unwrap());
+    }
+
+    #[test]
+    fn compression_writes_reject_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ro.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+        }
+        let ro = SqliteIndex::open_read_only(&path).unwrap();
+        assert!(ro.set_gzip_index_blob(b"x").is_err());
+        assert!(ro.set_bzip2_blocks(&[(0, 0)]).is_err());
+        assert!(ro.clear_compression_offsets().is_err());
     }
 }
