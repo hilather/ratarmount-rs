@@ -3,14 +3,22 @@
 //! Independent blocks decompress from their own payload; dependent frames fall
 //! back to a full-frame decode (same strategy as the Python `LZ4File` backend).
 //! Leading skippable frames are skipped when indexing.
+//!
+//! Thread hint ([`open_seekable_lz4_with_threads`] / Python `-P` lz4 backend):
+//! * **Independent blocks** (`block_independence`): during index build, block
+//!   size discovery may fan out across workers when `threads > 1`.
+//! * **Dependent frames**: stay sequential (blocks share history); `threads` is
+//!   accepted for API parity. Parallelism is a **hint** — correctness first.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
 
 use lz4_flex::block as lz4_block;
 use lz4_flex::frame::FrameDecoder;
+use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
@@ -57,8 +65,14 @@ pub struct SeekableLz4 {
 
 impl SeekableLz4 {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
+        Self::open_with_threads(path, 1)
+    }
+
+    /// Open with a thread hint. See [`open_seekable_lz4_with_threads`].
+    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
-        match index_lz4_file(path) {
+        let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        match index_lz4_file(path, threads) {
             Ok(frames) if !frames.is_empty() => {
                 let size: u64 = frames.iter().map(|f| f.total_uncompressed).sum();
                 // Prefer block index when at least one frame has real multi-block independence.
@@ -370,7 +384,7 @@ fn max_block_size_from_bd(bd: u8) -> u32 {
     }
 }
 
-fn index_lz4_file(path: &Path) -> Result<Vec<FrameInfo>> {
+fn index_lz4_file(path: &Path, threads: u32) -> Result<Vec<FrameInfo>> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut frames = Vec::new();
@@ -396,7 +410,7 @@ fn index_lz4_file(path: &Path) -> Result<Vec<FrameInfo>> {
             break;
         }
 
-        let frame = parse_frame(&mut file, pos, stream_u)?;
+        let frame = parse_frame(&mut file, pos, stream_u, threads)?;
         stream_u += frame.total_uncompressed;
         pos = frame.end_offset;
         frames.push(frame);
@@ -408,7 +422,7 @@ fn index_lz4_file(path: &Path) -> Result<Vec<FrameInfo>> {
     Ok(frames)
 }
 
-fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameInfo> {
+fn parse_frame(file: &mut File, start: u64, stream_offset: u64, threads: u32) -> Result<FrameInfo> {
     file.seek(SeekFrom::Start(start + 4))?;
     let mut hdr = [0u8; 2];
     file.read_exact(&mut hdr)?;
@@ -442,7 +456,8 @@ fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameI
 
     let max_block_size = max_block_size_from_bd(bd);
     let mut blocks = Vec::new();
-    let mut u_off = 0u64;
+    // Payloads for independent compressed blocks (for parallel size discovery).
+    let mut independent_payloads: Vec<(usize, Vec<u8>)> = Vec::new();
 
     loop {
         let size_field_offset = file.stream_position()?;
@@ -462,28 +477,25 @@ fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameI
             file.read_exact(&mut c)?;
         }
 
-        let (uncompressed_size, keep_payload_size) = if is_uncompressed {
-            (compressed_size, true)
+        let uncompressed_size = if is_uncompressed {
+            compressed_size
         } else if block_independence {
-            let plain = decompress_block(&payload, 0, max_block_size)
-                .map_err(|e| CompressError::Msg(e.to_string()))?;
-            (plain.len() as u32, true)
+            // Defer size discovery so independent blocks can decode in parallel.
+            independent_payloads.push((blocks.len(), payload));
+            0
         } else {
             // Dependent: sizes filled after full frame decompress.
-            (0, true)
+            0
         };
-        let _ = (size_field_offset, keep_payload_size);
+        let _ = size_field_offset;
 
         blocks.push(BlockInfo {
             data_offset,
             compressed_size,
-            uncompressed_offset: u_off,
+            uncompressed_offset: 0, // filled after sizes are known
             uncompressed_size,
             is_uncompressed,
         });
-        if uncompressed_size > 0 {
-            u_off += uncompressed_size as u64;
-        }
     }
 
     if content_checksum {
@@ -491,6 +503,8 @@ fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameI
         file.read_exact(&mut c)?;
     }
     let end_offset = file.stream_position()?;
+
+    let mut u_off = 0u64;
 
     if !block_independence {
         // Full frame decompress to obtain total size; collapse to one synthetic block.
@@ -512,6 +526,13 @@ fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameI
         }];
         u_off = total;
         file.seek(SeekFrom::Start(end_offset))?;
+    } else {
+        // Independent: discover compressed-block sizes (parallel when threads > 1).
+        fill_independent_block_sizes(&mut blocks, &independent_payloads, max_block_size, threads)?;
+        for b in &mut blocks {
+            b.uncompressed_offset = u_off;
+            u_off += b.uncompressed_size as u64;
+        }
     }
 
     if let Some(cs) = content_size {
@@ -531,9 +552,87 @@ fn parse_frame(file: &mut File, start: u64, stream_offset: u64) -> Result<FrameI
     })
 }
 
-/// Open LZ4 as a seekable body.
+/// Fill `uncompressed_size` for independent compressed blocks.
+///
+/// When `threads > 1` and there are multiple compressed blocks, workers decode
+/// in parallel. Stored (uncompressed) blocks already have their size set.
+fn fill_independent_block_sizes(
+    blocks: &mut [BlockInfo],
+    payloads: &[(usize, Vec<u8>)],
+    max_block_size: u32,
+    threads: u32,
+) -> Result<()> {
+    if payloads.is_empty() {
+        return Ok(());
+    }
+
+    if threads <= 1 || payloads.len() == 1 {
+        for (idx, payload) in payloads {
+            let plain = decompress_block(payload, 0, max_block_size)
+                .map_err(|e| CompressError::Msg(e.to_string()))?;
+            blocks[*idx].uncompressed_size = plain.len() as u32;
+        }
+        return Ok(());
+    }
+
+    let n_workers = (threads as usize).min(payloads.len()).max(1);
+    let mut results: Vec<Option<Result<u32>>> = (0..payloads.len()).map(|_| None).collect();
+
+    thread::scope(|scope| {
+        let chunk = payloads.len().div_ceil(n_workers).max(1);
+        let mut handles = Vec::new();
+        for (worker_id, part_chunk) in payloads.chunks(chunk).enumerate() {
+            let base = worker_id * chunk;
+            let owned: Vec<Vec<u8>> = part_chunk.iter().map(|(_, p)| p.clone()).collect();
+            handles.push(scope.spawn(move || {
+                let mut outs = Vec::with_capacity(owned.len());
+                for p in &owned {
+                    outs.push(
+                        decompress_block(p, 0, max_block_size)
+                            .map(|plain| plain.len() as u32)
+                            .map_err(|e| CompressError::Msg(e.to_string())),
+                    );
+                }
+                (base, outs)
+            }));
+        }
+        for h in handles {
+            if let Ok((base, outs)) = h.join() {
+                for (i, r) in outs.into_iter().enumerate() {
+                    results[base + i] = Some(r);
+                }
+            }
+        }
+    });
+
+    for (i, (idx, _)) in payloads.iter().enumerate() {
+        let size = results[i]
+            .take()
+            .ok_or_else(|| CompressError::Msg("lz4 parallel worker missing".into()))??;
+        blocks[*idx].uncompressed_size = size;
+    }
+    Ok(())
+}
+
+/// Open LZ4 as a seekable body (single-thread open / index).
 pub fn open_seekable_lz4(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
-    SeekableLz4::open(path)
+    open_seekable_lz4_with_threads(path, 1)
+}
+
+/// Open LZ4 using up to `threads` workers for independent-block size discovery.
+///
+/// `threads == 0` means “use CPU count” (Python `-P 0` semantics).
+///
+/// * **Independent blocks**: index build may decompress blocks in parallel when
+///   `threads > 1`.
+/// * **Dependent frames**: decoded sequentially; `threads` is accepted for API
+///   parity. Parallelism is a hint — correctness first.
+pub fn open_seekable_lz4_with_threads(
+    path: impl AsRef<Path>,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    SeekableLz4::open_with_threads(path, threads)
 }
 
 #[cfg(test)]
@@ -626,5 +725,55 @@ mod tests {
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello lz4 seek");
+    }
+
+    #[test]
+    fn open_seekable_lz4_with_threads_equals_single() {
+        let path = py_test("multiblock-independent.lz4");
+        if !path.exists() {
+            // Fallback: small roundtrip frame
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("eq.lz4");
+            {
+                let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                enc.write_all(b"hello lz4 parallelization").unwrap();
+                let data = enc.finish().unwrap();
+                std::fs::write(&path, data).unwrap();
+            }
+            let body1 = open_seekable_lz4_with_threads(&path, 1).unwrap();
+            let body4 = open_seekable_lz4_with_threads(&path, 4).unwrap();
+            let mut a = Vec::new();
+            body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+            let mut b = Vec::new();
+            body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a, b"hello lz4 parallelization");
+            return;
+        }
+        let body1 = open_seekable_lz4_with_threads(&path, 1).unwrap();
+        let body4 = open_seekable_lz4_with_threads(&path, 4).unwrap();
+        assert_eq!(body1.size(), body4.size());
+        let mut a = Vec::new();
+        body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a.len(), 2_000_000);
+    }
+
+    #[test]
+    fn threads_zero_means_cpu_count_lz4() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero.lz4");
+        {
+            let mut enc = lz4_flex::frame::FrameEncoder::new(Vec::new());
+            enc.write_all(b"threads-zero-lz4").unwrap();
+            let data = enc.finish().unwrap();
+            std::fs::write(&path, data).unwrap();
+        }
+        let body = open_seekable_lz4_with_threads(&path, 0).unwrap();
+        let mut s = String::new();
+        body.open_reader().unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "threads-zero-lz4");
     }
 }

@@ -1,4 +1,10 @@
 //! Seekable LZIP (multimember) via trailer `member_size` walk + per-member LZMA1.
+//!
+//! Thread hint ([`open_seekable_lzip_with_threads`] / Python `-P` lzip backend):
+//! members are independent on disk, but open currently builds a sequential member
+//! index and decompresses on demand. The `threads` parameter is clamped
+//! (`0` → CPU count) for API parity with other codecs; decode remains sequential
+//! for now (same as early xz path before multi-stream parallel decode).
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -6,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use lzma_rs::decompress::raw::{LzmaDecoder, LzmaParams, LzmaProperties};
+use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{SeekRead, SeekableBody};
 use crate::{CompressError, Result};
@@ -211,7 +218,17 @@ pub struct SeekableLzip {
 
 impl SeekableLzip {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
+        Self::open_with_threads(path, 1)
+    }
+
+    /// Open with a thread hint. See [`open_seekable_lzip_with_threads`].
+    ///
+    /// `threads` is resolved (`0` → CPU count) but indexing/decode stay sequential.
+    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
+        // Resolve for -P 0 parity / future multi-member parallel decode; index path
+        // does not currently fan out workers.
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let members = index_lzip_file(path)?;
         let uncompressed_size = members.iter().map(|m| m.uncompressed_size).sum();
         Ok(Arc::new(Self {
@@ -329,9 +346,22 @@ impl Seek for LzipReader {
     }
 }
 
-/// Open LZIP as a seekable body.
+/// Open LZIP as a seekable body (single-thread open / index).
 pub fn open_seekable_lzip(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
-    SeekableLzip::open(path)
+    open_seekable_lzip_with_threads(path, 1)
+}
+
+/// Open LZIP with a thread hint (Python `-P` / lzip backend).
+///
+/// `threads == 0` means “use CPU count”. Member indexing and on-demand decode
+/// remain sequential for now; `threads` is accepted so factory code can pass
+/// `options.threads_for("lzip")` without API churn.
+pub fn open_seekable_lzip_with_threads(
+    path: impl AsRef<Path>,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    SeekableLzip::open_with_threads(path, threads)
 }
 
 #[cfg(test)]
@@ -360,5 +390,32 @@ mod tests {
         let mut mid = String::new();
         r.read_to_string(&mut mid).unwrap();
         assert_eq!(mid, "fighter\n");
+    }
+
+    #[test]
+    fn open_seekable_lzip_with_threads_equals_single() {
+        let path = py_test("simple.lzip");
+        if !path.exists() {
+            return;
+        }
+        let body1 = open_seekable_lzip_with_threads(&path, 1).unwrap();
+        let body4 = open_seekable_lzip_with_threads(&path, 4).unwrap();
+        assert_eq!(body1.size(), body4.size());
+        let mut a = Vec::new();
+        body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, b"foo fighter\n");
+    }
+
+    #[test]
+    fn threads_zero_means_cpu_count_lzip() {
+        let path = py_test("simple.lzip");
+        if !path.exists() {
+            return;
+        }
+        let body = open_seekable_lzip_with_threads(&path, 0).unwrap();
+        assert_eq!(body.size(), 12);
     }
 }

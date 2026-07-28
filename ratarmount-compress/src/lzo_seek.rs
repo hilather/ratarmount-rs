@@ -2,6 +2,12 @@
 //!
 //! Decompression uses system `liblzo2` via `libloading`. If the library is
 //! missing, open returns a clear error (Python raises similarly).
+//!
+//! Thread hint ([`open_seekable_lzo_with_threads`] / Python `-P` lzo backend):
+//! LZOP blocks are independent on disk, but open currently builds a sequential
+//! block index and decompresses on demand. The `threads` parameter is clamped
+//! (`0` → CPU count) for API parity with other codecs; decode remains sequential
+//! for now (same as early xz path before multi-stream parallel decode).
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -9,6 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use libloading::{Library, Symbol};
+use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{SeekRead, SeekableBody};
 use crate::{CompressError, Result};
@@ -193,7 +200,17 @@ pub struct SeekableLzo {
 
 impl SeekableLzo {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
+        Self::open_with_threads(path, 1)
+    }
+
+    /// Open with a thread hint. See [`open_seekable_lzo_with_threads`].
+    ///
+    /// `threads` is resolved (`0` → CPU count) but indexing/decode stay sequential.
+    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
+        // Resolve for -P 0 parity / future block-parallel decode; index path
+        // does not currently fan out workers.
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let (blocks, size) = parse_lzop(path)?;
         Ok(Arc::new(Self {
             path: path.to_path_buf(),
@@ -317,9 +334,22 @@ impl Seek for LzoReader {
     }
 }
 
-/// Open LZOP as a seekable body (requires liblzo2).
+/// Open LZOP as a seekable body (requires liblzo2; single-thread open / index).
 pub fn open_seekable_lzo(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
-    SeekableLzo::open(path)
+    open_seekable_lzo_with_threads(path, 1)
+}
+
+/// Open LZOP with a thread hint (Python `-P` / lzo backend).
+///
+/// `threads == 0` means “use CPU count”. Block indexing and on-demand decode
+/// remain sequential for now; `threads` is accepted so factory code can pass
+/// `options.threads_for("lzo")` without API churn. Requires liblzo2.
+pub fn open_seekable_lzo_with_threads(
+    path: impl AsRef<Path>,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    SeekableLzo::open_with_threads(path, threads)
 }
 
 /// Whether liblzo2 can be loaded on this host.
@@ -354,5 +384,40 @@ mod tests {
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert_eq!(s, "foo fighter\n");
+    }
+
+    #[test]
+    fn open_seekable_lzo_with_threads_equals_single() {
+        if !lzo_available() {
+            eprintln!("skip: liblzo2 not available");
+            return;
+        }
+        let path = py_test("simple.lzo");
+        if !path.exists() {
+            return;
+        }
+        let body1 = open_seekable_lzo_with_threads(&path, 1).unwrap();
+        let body4 = open_seekable_lzo_with_threads(&path, 4).unwrap();
+        assert_eq!(body1.size(), body4.size());
+        let mut a = Vec::new();
+        body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, b"foo fighter\n");
+    }
+
+    #[test]
+    fn threads_zero_means_cpu_count_lzo() {
+        if !lzo_available() {
+            eprintln!("skip: liblzo2 not available");
+            return;
+        }
+        let path = py_test("simple.lzo");
+        if !path.exists() {
+            return;
+        }
+        let body = open_seekable_lzo_with_threads(&path, 0).unwrap();
+        assert_eq!(body.size(), 12);
     }
 }

@@ -2,9 +2,12 @@
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints (`gzip_seek`).
 //! * **zstd** — multi-frame seek map + seekable-format seek table; single-frame full decode.
-//! * **lz4** — frame block index (independent blocks; dependent → frame decode).
-//! * **lzip** — multimember walk via trailer `member_size`.
-//! * **lzo** — LZOP block index via liblzo2 (optional at runtime).
+//! * **lz4** — frame block index (independent blocks; dependent → frame decode);
+//!   `open_seekable_lz4_with_threads` for `-P` (parallel independent-block size discovery).
+//! * **lzip** — multimember walk via trailer `member_size`;
+//!   `open_seekable_lzip_with_threads` accepts `-P` (decode sequential for now).
+//! * **lzo** — LZOP block index via liblzo2 (optional at runtime);
+//!   `open_seekable_lzo_with_threads` accepts `-P` (decode sequential for now).
 //! * **bzip2** — one-shot decode into RAM/temp; optional multi-block parallel decode (`-P`).
 //! * **xz** — one-shot decode; multi-stream parallel decode via `open_seekable_xz_with_threads`.
 //! * **zstd** — multi-frame / seek table; `open_seekable_zstd_with_threads` for `-P`.
@@ -37,10 +40,12 @@ pub use gzip_seek::{
     open_seekable_gzip, open_seekable_gzip_with_threads, try_parallel_multi_member_decode,
     SeekableGzip, SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
 };
-pub use lz4_seek::{open_seekable_lz4, SeekableLz4};
-pub use lzip_seek::{open_seekable_lzip, SeekableLzip};
+pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};
+pub use lzip_seek::{open_seekable_lzip, open_seekable_lzip_with_threads, SeekableLzip};
 pub use lzma_seek::open_seekable_lzma;
-pub use lzo_seek::{lzo_available, open_seekable_lzo, SeekableLzo};
+pub use lzo_seek::{
+    lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo,
+};
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
 pub use seekable_body::{
