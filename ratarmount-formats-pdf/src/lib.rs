@@ -13,8 +13,14 @@
 //!   (samples expanded to 8-bpc and re-encoded as PNG)
 //! - Sole `/Filter /FlateDecode` or no filter, `/DeviceCMYK` (and CalCMYK) at 8 bpc →
 //!   `.png` (CMYK→RGB via undercolor-removal photometric formula, then PNG)
-//! - Multi-filter chains, Indexed/ICCBased, non-8-bpc CMYK, exotic spaces, and other
-//!   residual cases → `.bin` (stream bytes as stored; not reassembled)
+//! - `/ColorSpace [/Indexed base hival lookup]` with DeviceGray/RGB/CMYK (or ICCBased
+//!   N=1/3/4) base → expand index samples via lookup table to base samples, then PNG
+//! - `/ColorSpace [/ICCBased …]` with stream `/N` = 1, 3, or 4 → treat sample layout as
+//!   Gray/RGB/CMYK (**ignore ICC profile**; no colorimetric transform) when BPC is
+//!   supported (same as the matching Device* path)
+//! - Multi-filter chains, non-8-bpc CMYK, Separation/DeviceN/Lab, unsupported Indexed
+//!   bases, ICCBased N∉{1,3,4}, and other residual cases → `.bin` (stream bytes as
+//!   stored; not reassembled)
 //!
 //! Note: lopdf refuses to run `decompressed_content` on `/Subtype /Image` streams, so
 //! FlateDecode inflation and PNG reassembly are done here with `flate2` + `png`.
@@ -145,27 +151,222 @@ fn dict_i64(dict: &lopdf::Dictionary, key: &[u8]) -> Option<i64> {
     dict.get(key).ok().and_then(|o| o.as_i64().ok())
 }
 
-/// Resolve a simple ColorSpace name (`DeviceGray` / `DeviceRGB` / `DeviceCMYK`, …).
-/// Array forms (`/Indexed`, `/ICCBased`, …) return the first name only for classification.
-fn color_space_name(obj: &Object) -> Option<String> {
-    match obj {
-        Object::Name(n) => Some(String::from_utf8_lossy(n).into_owned()),
-        Object::Array(arr) if !arr.is_empty() => arr[0]
-            .as_name_str()
-            .ok()
-            .map(|s| s.to_string()),
-        _ => None,
-    }
-}
-
 fn image_color_from_name(name: &str) -> Option<ImageColorSpace> {
     match name {
         "DeviceGray" | "CalGray" => Some(ImageColorSpace::Gray),
         "DeviceRGB" | "CalRGB" => Some(ImageColorSpace::Rgb),
         "DeviceCMYK" | "CalCMYK" => Some(ImageColorSpace::Cmyk),
-        // Indexed / ICCBased / Separation / DeviceN / Lab → residual .bin
+        // Separation / DeviceN / Lab / Pattern → residual .bin
         _ => None,
     }
+}
+
+/// Resolved color interpretation for sample reassembly (before PNG encoding).
+#[derive(Clone, Debug)]
+enum ResolvedColorSpace {
+    /// Direct Device*/Cal* or ICCBased-as-N-channels samples.
+    Direct(ImageColorSpace),
+    /// Indexed: single-channel indices expanded via lookup into `base` samples.
+    Indexed {
+        base: ImageColorSpace,
+        /// `(hival + 1) * base.channels()` bytes; each base component is 8-bit.
+        lookup: Vec<u8>,
+        hival: usize,
+    },
+}
+
+/// Resolve `obj` through an optional document reference chain.
+fn resolve_object<'a>(doc: Option<&'a Document>, obj: &'a Object) -> Option<&'a Object> {
+    match obj {
+        Object::Reference(id) => doc?.get_object(*id).ok(),
+        other => Some(other),
+    }
+}
+
+/// Bytes of an Indexed lookup table (string, stream, or reference thereto).
+fn indexed_lookup_bytes(doc: Option<&Document>, obj: &Object) -> Option<Vec<u8>> {
+    let obj = resolve_object(doc, obj)?;
+    match obj {
+        Object::String(bytes, _) => Some(bytes.clone()),
+        Object::Stream(stream) => {
+            // Lookup streams are not Image subtype; try lopdf inflate then raw/flate.
+            if let Ok(data) = stream.decompressed_content() {
+                return Some(data);
+            }
+            if let Some(data) = inflate_flate(&stream.content) {
+                return Some(data);
+            }
+            Some(stream.content.clone())
+        }
+        _ => None,
+    }
+}
+
+/// ICCBased: ignore the profile; use `/N` (or Alternate device name) for channel layout.
+///
+/// Supported: N=1 → Gray, N=3 → RGB, N=4 → CMYK. Other N values are residual `.bin`.
+fn resolve_iccbased_stream(stream: &Stream) -> Option<ImageColorSpace> {
+    if let Some(n) = dict_i64(&stream.dict, b"N") {
+        return match n {
+            1 => Some(ImageColorSpace::Gray),
+            3 => Some(ImageColorSpace::Rgb),
+            4 => Some(ImageColorSpace::Cmyk),
+            _ => None,
+        };
+    }
+    // Fall back to /Alternate when /N is missing.
+    let alt = stream.dict.get(b"Alternate").ok()?;
+    match alt {
+        Object::Name(n) => image_color_from_name(&String::from_utf8_lossy(n)),
+        Object::Array(arr) if !arr.is_empty() => arr[0]
+            .as_name_str()
+            .ok()
+            .and_then(image_color_from_name),
+        _ => None,
+    }
+}
+
+/// Resolve a ColorSpace object (name, array, or reference) for image sample reassembly.
+///
+/// `doc` is used to follow object references (Indexed lookup streams, ICCBased profile
+/// streams). Inline forms work with `doc = None`.
+fn resolve_image_color_space(
+    doc: Option<&Document>,
+    cs_obj: &Object,
+) -> Option<ResolvedColorSpace> {
+    let obj = resolve_object(doc, cs_obj)?;
+    match obj {
+        Object::Name(n) => {
+            image_color_from_name(&String::from_utf8_lossy(n)).map(ResolvedColorSpace::Direct)
+        }
+        Object::Array(arr) if !arr.is_empty() => {
+            let kind = arr[0].as_name_str().ok()?;
+            match kind {
+                "Indexed" => {
+                    // [/Indexed base hival lookup]
+                    if arr.len() < 4 {
+                        return None;
+                    }
+                    let base = match resolve_image_color_space(doc, &arr[1])? {
+                        ResolvedColorSpace::Direct(cs) => cs,
+                        // Nested Indexed is not supported.
+                        ResolvedColorSpace::Indexed { .. } => return None,
+                    };
+                    let hival = arr[2].as_i64().ok()?;
+                    if hival < 0 {
+                        return None;
+                    }
+                    let hival = hival as usize;
+                    let lookup = indexed_lookup_bytes(doc, &arr[3])?;
+                    let need = (hival + 1).checked_mul(base.channels())?;
+                    if lookup.len() < need {
+                        return None;
+                    }
+                    Some(ResolvedColorSpace::Indexed {
+                        base,
+                        lookup: lookup[..need].to_vec(),
+                        hival,
+                    })
+                }
+                "ICCBased" => {
+                    // [/ICCBased stream] — profile ignored; use N channels.
+                    if arr.len() < 2 {
+                        return None;
+                    }
+                    let profile = resolve_object(doc, &arr[1])?;
+                    let Object::Stream(stream) = profile else {
+                        return None;
+                    };
+                    resolve_iccbased_stream(stream).map(ResolvedColorSpace::Direct)
+                }
+                // CalRGB/Lab etc. may appear as parameter arrays; use the type name.
+                other => image_color_from_name(other).map(ResolvedColorSpace::Direct),
+            }
+        }
+        // Bare ICC profile stream (unusual as ColorSpace value, but harmless).
+        Object::Stream(stream) => {
+            resolve_iccbased_stream(stream).map(ResolvedColorSpace::Direct)
+        }
+        _ => None,
+    }
+}
+
+/// Unpack tightly packed PDF samples to one `u8` per sample **without** 0..=255 scaling.
+///
+/// Used for Indexed indices (1/2/4/8 bpc). Values are raw bit-field integers.
+fn unpack_indices_u8(
+    packed: &[u8],
+    width: usize,
+    height: usize,
+    bpc: usize,
+) -> Option<Vec<u8>> {
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let samples_per_row = width;
+    let out_len = samples_per_row.checked_mul(height)?;
+
+    match bpc {
+        8 => {
+            if packed.len() < out_len {
+                return None;
+            }
+            Some(packed[..out_len].to_vec())
+        }
+        1 | 2 | 4 => {
+            let bytes_per_row = packed_row_bytes(width, 1, bpc)?;
+            let expected = bytes_per_row.checked_mul(height)?;
+            if packed.len() < expected {
+                return None;
+            }
+            let mask = (1u32 << bpc) - 1;
+            let mut out = Vec::with_capacity(out_len);
+            for row in 0..height {
+                let row_data = &packed[row * bytes_per_row..(row + 1) * bytes_per_row];
+                let mut bit_pos = 0usize;
+                for _ in 0..samples_per_row {
+                    let byte_idx = bit_pos / 8;
+                    let bit_offset = bit_pos % 8;
+                    let available = 8 - bit_offset;
+                    let sample = if available >= bpc {
+                        ((row_data[byte_idx] as u32) >> (available - bpc)) & mask
+                    } else {
+                        let hi_bits = available;
+                        let lo_bits = bpc - hi_bits;
+                        let hi = (row_data[byte_idx] as u32) & ((1u32 << hi_bits) - 1);
+                        let lo = (row_data[byte_idx + 1] as u32) >> (8 - lo_bits);
+                        (hi << lo_bits) | lo
+                    };
+                    out.push(sample as u8);
+                    bit_pos += bpc;
+                }
+            }
+            Some(out)
+        }
+        // Indexed images use BPC 1/2/4/8 per PDF; 16-bpc indices are unsupported.
+        _ => None,
+    }
+}
+
+/// Expand Indexed indices through the lookup table into contiguous base-space samples.
+fn expand_indexed_samples(
+    indices: &[u8],
+    base: ImageColorSpace,
+    lookup: &[u8],
+    hival: usize,
+) -> Option<Vec<u8>> {
+    let n = base.channels();
+    let need = (hival + 1).checked_mul(n)?;
+    if lookup.len() < need {
+        return None;
+    }
+    let mut out = Vec::with_capacity(indices.len().checked_mul(n)?);
+    for &idx in indices {
+        let i = (idx as usize).min(hival);
+        let off = i * n;
+        out.extend_from_slice(&lookup[off..off + n]);
+    }
+    Some(out)
 }
 
 /// Inflate PDF FlateDecode data (zlib wrapper preferred; raw deflate as fallback).
@@ -467,10 +668,16 @@ fn encode_png(width: u32, height: u32, color: PngColor, samples: &[u8]) -> Optio
 /// Supported:
 /// - `/DeviceGray` / `/CalGray` and `/DeviceRGB` / `/CalRGB` at 1, 2, 4, 8, or 16 bpc
 /// - `/DeviceCMYK` / `/CalCMYK` at 8 bpc (converted to RGB)
+/// - `/Indexed` with Device*/ICCBased base (lookup expanded to base samples)
+/// - `/ICCBased` with N∈{1,3,4} (profile ignored; channel layout only)
 ///
-/// Multi-filter chains, Indexed/ICCBased, non-8-bpc CMYK, and failed inflation fall
+/// Multi-filter chains, non-8-bpc CMYK, unsupported spaces, and failed inflation fall
 /// through to the caller (`.bin`).
-fn try_samples_to_png(stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
+fn try_samples_to_png(
+    doc: Option<&Document>,
+    stream: &Stream,
+    inflate: bool,
+) -> Option<Vec<u8>> {
     let width = dict_i64(&stream.dict, b"Width")? as u32;
     let height = dict_i64(&stream.dict, b"Height")? as u32;
     if width == 0 || height == 0 {
@@ -482,13 +689,7 @@ fn try_samples_to_png(stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
     }
     let bpc = bpc as usize;
     let cs_obj = stream.dict.get(b"ColorSpace").ok()?;
-    let cs_name = color_space_name(cs_obj)?;
-    let color_space = image_color_from_name(&cs_name)?;
-
-    // CMYK only at 8 bpc (task scope).
-    if color_space == ImageColorSpace::Cmyk && bpc != 8 {
-        return None;
-    }
+    let resolved = resolve_image_color_space(doc, cs_obj)?;
 
     let samples = if inflate {
         let inflated = inflate_flate(&stream.content)?;
@@ -504,8 +705,32 @@ fn try_samples_to_png(stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
 
     let w = width as usize;
     let h = height as usize;
-    let channels = color_space.channels();
-    let expanded = expand_samples_to_8bpc(&samples, w, h, channels, bpc)?;
+
+    let (expanded, color_space) = match resolved {
+        ResolvedColorSpace::Direct(color_space) => {
+            // CMYK only at 8 bpc (task scope).
+            if color_space == ImageColorSpace::Cmyk && bpc != 8 {
+                return None;
+            }
+            let channels = color_space.channels();
+            let expanded = expand_samples_to_8bpc(&samples, w, h, channels, bpc)?;
+            (expanded, color_space)
+        }
+        ResolvedColorSpace::Indexed {
+            base,
+            lookup,
+            hival,
+        } => {
+            // Indexed: BPC applies to the index channel (1/2/4/8); base samples are 8-bit.
+            if !matches!(bpc, 1 | 2 | 4 | 8) {
+                return None;
+            }
+            // CMYK base only when base samples are 8-bpc (always true for lookup tables).
+            let indices = unpack_indices_u8(&samples, w, h, bpc)?;
+            let expanded = expand_indexed_samples(&indices, base, &lookup, hival)?;
+            (expanded, base)
+        }
+    };
 
     let rgb_or_gray = match color_space {
         ImageColorSpace::Cmyk => cmyk_to_rgb(&expanded)?,
@@ -519,27 +744,31 @@ fn try_samples_to_png(stream: &Stream, inflate: bool) -> Option<Vec<u8>> {
 ///
 /// lopdf refuses to run `decompressed_content` on `/Subtype /Image` streams (pixel data is
 /// not general stream content). For sole `/DCTDecode` / `/JPXDecode` the stored bytes are
-/// already a usable file. Sole `/FlateDecode` or no filter with Gray/RGB (1–16 bpc) or
-/// CMYK (8 bpc) is reassembled into PNG. Other cases emit raw stream content as `.bin`.
-fn image_payload_and_ext(stream: &Stream) -> (Vec<u8>, &'static str) {
+/// already a usable file. Sole `/FlateDecode` or no filter with Gray/RGB (1–16 bpc),
+/// CMYK (8 bpc), Indexed (supported bases), or ICCBased N∈{1,3,4} is reassembled into
+/// PNG. Other cases emit raw stream content as `.bin`.
+///
+/// `doc` resolves ColorSpace / lookup object references; pass `None` for fully-inline
+/// synthetic streams.
+fn image_payload_and_ext(doc: Option<&Document>, stream: &Stream) -> (Vec<u8>, &'static str) {
     let filters = stream.filters().unwrap_or_default();
     if filters.len() == 1 {
         match filters[0].as_str() {
             "DCTDecode" => return (stream.content.clone(), "jpg"),
             "JPXDecode" => return (stream.content.clone(), "jp2"),
             "FlateDecode" => {
-                if let Some(png) = try_samples_to_png(stream, true) {
+                if let Some(png) = try_samples_to_png(doc, stream, true) {
                     return (png, "png");
                 }
             }
             _ => {}
         }
     } else if filters.is_empty() {
-        if let Some(png) = try_samples_to_png(stream, false) {
+        if let Some(png) = try_samples_to_png(doc, stream, false) {
             return (png, "png");
         }
     }
-    // Multi-filter, Indexed/ICCBased, exotic depths, or failed reassembly: keep stored bytes.
+    // Multi-filter, exotic depths/spaces, or failed reassembly: keep stored bytes.
     (stream.content.clone(), "bin")
 }
 
@@ -630,7 +859,7 @@ fn gather_images(doc: &Document) -> Vec<(String, ObjectId, Vec<u8>)> {
                 continue;
             }
 
-            let (data, ext) = image_payload_and_ext(stream);
+            let (data, ext) = image_payload_and_ext(Some(doc), stream);
             if data.is_empty() {
                 continue;
             }
@@ -1325,7 +1554,7 @@ mod tests {
             ]),
             jpeg.clone(),
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "jpg");
         assert_eq!(data, jpeg);
 
@@ -1339,7 +1568,7 @@ mod tests {
             ]),
             vec![0xAB, 0xCD],
         );
-        let (data, ext) = image_payload_and_ext(&raw);
+        let (data, ext) = image_payload_and_ext(None, &raw);
         assert_eq!(ext, "bin");
         assert_eq!(data, vec![0xAB, 0xCD]);
     }
@@ -1425,7 +1654,7 @@ mod tests {
         // 2x2 gray: black, white, mid, max
         let samples = vec![0x00, 0xFF, 0x80, 0x40];
         let stream = flate_gray_image_stream(2, 2, samples);
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
         // Round-trip decode via png crate
@@ -1443,7 +1672,7 @@ mod tests {
         // 1x2 RGB: red pixel, blue pixel
         let samples = vec![255, 0, 0, 0, 0, 255];
         let stream = flate_rgb_image_stream(1, 2, samples);
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
         let decoder = png::Decoder::new(Cursor::new(&data));
@@ -1469,7 +1698,7 @@ mod tests {
             ]),
             samples.clone(),
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert!(data.starts_with(b"\x89PNG"));
     }
@@ -1491,7 +1720,7 @@ mod tests {
             ]),
             compressed,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"), "PNG signature");
         let decoder = png::Decoder::new(Cursor::new(&data));
@@ -1518,7 +1747,7 @@ mod tests {
             ]),
             samples,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         let decoder = png::Decoder::new(Cursor::new(&data));
         let mut reader = decoder.read_info().unwrap();
@@ -1547,7 +1776,7 @@ mod tests {
             ]),
             compressed,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert_eq!(&data[..8], b"\x89PNG\r\n\x1a\n");
         let decoder = png::Decoder::new(Cursor::new(&data));
@@ -1574,7 +1803,7 @@ mod tests {
             ]),
             packed,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         assert!(data.starts_with(b"\x89PNG"));
         let decoder = png::Decoder::new(Cursor::new(&data));
@@ -1599,7 +1828,7 @@ mod tests {
             ]),
             packed,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         let decoder = png::Decoder::new(Cursor::new(&data));
         let mut reader = decoder.read_info().unwrap();
@@ -1623,7 +1852,7 @@ mod tests {
             ]),
             packed,
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         let decoder = png::Decoder::new(Cursor::new(&data));
         let mut reader = decoder.read_info().unwrap();
@@ -1634,8 +1863,168 @@ mod tests {
     }
 
     #[test]
-    fn image_payload_indexed_stays_bin() {
-        // Indexed color space remains unsupported → .bin
+    fn image_payload_indexed_devicergb_to_png() {
+        // 2x1 Indexed DeviceRGB: palette black/white/red, indices 0 and 2 → black, red.
+        // hival=2 → 3 entries × 3 bytes.
+        let lookup = vec![
+            0, 0, 0, // 0 black
+            255, 255, 255, // 1 white
+            255, 0, 0, // 2 red
+        ];
+        let indices = vec![0u8, 2u8];
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 2.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec![
+                        "Indexed".into(),
+                        "DeviceRGB".into(),
+                        2.into(),
+                        Object::String(lookup, lopdf::StringFormat::Literal),
+                    ]),
+                ),
+                ("BitsPerComponent", 8.into()),
+            ]),
+            indices,
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "png");
+        assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], &[0, 0, 0, 255, 0, 0]);
+    }
+
+    #[test]
+    fn image_payload_indexed_1bpc_to_png() {
+        // 2x1, 1 bpc indices: 0b1000_0000 → index 1, 0 with hival=1 palette gray/white.
+        let lookup = vec![0x40u8, 0xC0u8]; // DeviceGray
+        let packed = vec![0b1000_0000];
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 2.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec![
+                        "Indexed".into(),
+                        "DeviceGray".into(),
+                        1.into(),
+                        Object::String(lookup, lopdf::StringFormat::Literal),
+                    ]),
+                ),
+                ("BitsPerComponent", 1.into()),
+            ]),
+            packed,
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "png");
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], &[0xC0, 0x40]);
+    }
+
+    #[test]
+    fn image_payload_iccbased_n3_to_png() {
+        // ICCBased N=3: ignore profile, treat as RGB sample layout.
+        let samples = vec![10u8, 20, 30, 40, 50, 60]; // 2x1 RGB
+        let icc = Stream::new(
+            dict(&[
+                ("N", 3.into()),
+                ("Alternate", "DeviceRGB".into()),
+            ]),
+            // Dummy ICC profile payload (ignored).
+            b"not-a-real-icc-profile".to_vec(),
+        );
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 2.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec!["ICCBased".into(), Object::Stream(icc)]),
+                ),
+                ("BitsPerComponent", 8.into()),
+            ]),
+            samples.clone(),
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "png");
+        assert!(data.starts_with(b"\x89PNG\r\n\x1a\n"));
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], samples.as_slice());
+    }
+
+    #[test]
+    fn image_payload_iccbased_n4_cmyk_to_png() {
+        // ICCBased N=4 → CMYK layout → RGB PNG (undercolor removal).
+        let samples = vec![0u8, 0, 0, 0]; // paper white CMYK
+        let icc = Stream::new(dict(&[("N", 4.into())]), vec![0]);
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec!["ICCBased".into(), Object::Stream(icc)]),
+                ),
+                ("BitsPerComponent", 8.into()),
+            ]),
+            samples,
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "png");
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], &[255, 255, 255]);
+    }
+
+    #[test]
+    fn image_payload_iccbased_unsupported_n_stays_bin() {
+        // N=2 (e.g. some spot workflows) remains residual .bin
+        let samples = vec![0u8, 1];
+        let icc = Stream::new(dict(&[("N", 2.into())]), vec![0]);
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec!["ICCBased".into(), Object::Stream(icc)]),
+                ),
+                ("BitsPerComponent", 8.into()),
+            ]),
+            samples.clone(),
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "bin");
+        assert_eq!(data, samples);
+    }
+
+    #[test]
+    fn image_payload_separation_stays_bin() {
+        // Exotic Separation color space remains .bin
         let samples = vec![0u8];
         let stream = Stream::new(
             dict(&[
@@ -1646,17 +2035,17 @@ mod tests {
                 (
                     "ColorSpace",
                     Object::Array(vec![
-                        "Indexed".into(),
-                        "DeviceRGB".into(),
-                        1.into(),
-                        Object::String(vec![0, 0, 0, 255, 255, 255], lopdf::StringFormat::Literal),
+                        "Separation".into(),
+                        "All".into(),
+                        "DeviceGray".into(),
+                        Object::Dictionary(lopdf::Dictionary::new()),
                     ]),
                 ),
                 ("BitsPerComponent", 8.into()),
             ]),
             samples.clone(),
         );
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "bin");
         assert_eq!(data, samples);
     }
@@ -1846,12 +2235,197 @@ mod tests {
         parms.set("BitsPerComponent", Object::Integer(8));
         d.set("DecodeParms", Object::Dictionary(parms));
         let stream = Stream::new(d, compressed);
-        let (data, ext) = image_payload_and_ext(&stream);
+        let (data, ext) = image_payload_and_ext(None, &stream);
         assert_eq!(ext, "png");
         let decoder = png::Decoder::new(Cursor::new(&data));
         let mut reader = decoder.read_info().unwrap();
         let mut buf = vec![0; reader.output_buffer_size().unwrap()];
         let info = reader.next_frame(&mut buf).unwrap();
         assert_eq!(&buf[..info.buffer_size()], samples.as_slice());
+    }
+
+    #[test]
+    fn synthetic_pdf_indexed_rgb_image_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("indexed-rgb.pdf");
+        // 2x1: palette green/blue, indices 0, 1
+        let lookup = vec![0u8, 255, 0, 0, 0, 255];
+        let indices = vec![0u8, 1u8];
+        let compressed = zlib_compress(&indices);
+        let image = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 2.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec![
+                        "Indexed".into(),
+                        "DeviceRGB".into(),
+                        1.into(),
+                        Object::String(lookup, lopdf::StringFormat::Literal),
+                    ]),
+                ),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed,
+        );
+        write_pdf_with_image_stream(&path, image);
+
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+        let images = m.list("/images").expect("list images");
+        match &images {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("page1-img0.png"),
+                    "image keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected infos"),
+        }
+        let fi = m
+            .lookup("/images/page1-img0.png", 0)
+            .expect("lookup indexed png");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert!(
+            buf.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "expected PNG signature, got {:?}",
+            &buf[..buf.len().min(16)]
+        );
+        let decoder = png::Decoder::new(Cursor::new(&buf));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(&pixels[..info.buffer_size()], &[0, 255, 0, 0, 0, 255]);
+        assert_eq!(fi.size, buf.len() as u64);
+    }
+
+    #[test]
+    fn synthetic_pdf_iccbased_n3_image_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("iccbased-n3.pdf");
+        let samples = vec![1u8, 2, 3, 4, 5, 6]; // 2x1 RGB
+        let compressed = zlib_compress(&samples);
+
+        // ICC profile must be an indirect stream object so it round-trips via save/load.
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+        let icc_id = doc.add_object(Stream::new(
+            dict(&[("N", 3.into()), ("Alternate", "DeviceRGB".into())]),
+            b"dummy-icc".to_vec(),
+        ));
+        let image_id = doc.add_object(Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 2.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec!["ICCBased".into(), Object::Reference(icc_id)]),
+                ),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed,
+        ));
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+        let mut xobject = lopdf::Dictionary::new();
+        xobject.set("Im0", Object::Reference(image_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set("XObject", Object::Dictionary(xobject));
+        let page_id = doc.add_object(dict(&[
+            ("Type", "Page".into()),
+            ("Parent", pages_id.into()),
+            (
+                "MediaBox",
+                vec![0.into(), 0.into(), 100.into(), 100.into()].into(),
+            ),
+            ("Contents", content_id.into()),
+            ("Resources", Object::Dictionary(resources)),
+        ]));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dict(&[
+                ("Type", "Pages".into()),
+                ("Kids", vec![page_id.into()].into()),
+                ("Count", 1.into()),
+            ])),
+        );
+        let catalog_id = doc.add_object(dict(&[
+            ("Type", "Catalog".into()),
+            ("Pages", pages_id.into()),
+        ]));
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&path).expect("save synthetic icc pdf");
+
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+        let images = m.list("/images").expect("list images");
+        match &images {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("page1-img0.png"),
+                    "image keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected infos"),
+        }
+        let fi = m
+            .lookup("/images/page1-img0.png", 0)
+            .expect("lookup icc png");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert!(
+            buf.starts_with(b"\x89PNG\r\n\x1a\n"),
+            "expected PNG signature, got {:?}",
+            &buf[..buf.len().min(16)]
+        );
+        let decoder = png::Decoder::new(Cursor::new(&buf));
+        let mut reader = decoder.read_info().unwrap();
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels).unwrap();
+        assert_eq!(&pixels[..info.buffer_size()], samples.as_slice());
+        assert_eq!(fi.size, buf.len() as u64);
+    }
+
+    #[test]
+    fn image_payload_flate_indexed_to_png() {
+        let lookup = vec![255u8, 0, 0, 0, 255, 0]; // red, green
+        let indices = vec![1u8]; // green
+        let compressed = zlib_compress(&indices);
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                (
+                    "ColorSpace",
+                    Object::Array(vec![
+                        "Indexed".into(),
+                        "DeviceRGB".into(),
+                        1.into(),
+                        Object::String(lookup, lopdf::StringFormat::Literal),
+                    ]),
+                ),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "FlateDecode".into()),
+            ]),
+            compressed,
+        );
+        let (data, ext) = image_payload_and_ext(None, &stream);
+        assert_eq!(ext, "png");
+        let decoder = png::Decoder::new(Cursor::new(&data));
+        let mut reader = decoder.read_info().unwrap();
+        let mut buf = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut buf).unwrap();
+        assert_eq!(&buf[..info.buffer_size()], &[0, 255, 0]);
     }
 }
