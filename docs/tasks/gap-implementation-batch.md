@@ -135,16 +135,24 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | S3 Range | `remote/s3.rs` | Range GetObject + prefer-range + `S3RangeFile` |
 | CI gates | benchmarks + ci.yml | cold-index hard gate from `rust-gates.json` |
 
-## Still open (later / batch 11+)
+## Batch 11 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| 7z solid nested | formats-sevenzip | progressive solid member reader for nested open |
+| TAR nested index | formats-tar | `nestedTarMembers` metadata + stencil open API |
+| lrzip libarchive | libarchive + compress + factory | CLI first, libarchive raw/filter fallback |
+| factory glue | factory.rs | gzip RGZI↔index + live S3 Range opens |
+| CI full gates | benchmarks + ci.yml | `benchmark-gates-full` with `ALLOW_RATIO_SKIP` |
+
+## Still open (later / batch 12+)
 
 | Gap | Notes |
 |-----|--------|
-| Wire gzip RGZI blobs ↔ index side tables in factory | storage + codec exist; open path not glued |
-| Factory live `S3RangeFile` like HTTP Range | S3 prefer-range materialize done; no `RemoteAccess::S3` yet |
-| True in-process lrzip (no CLI) | CLI materialize only |
-| Flattened recursive TAR index | open |
-| 7z store-in-solid nested polish | open |
-| Full vs-Python ratio gates in CI | `[x]` `benchmark-gates-full` job (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`); MICRO generate optional |
+| Flattened recursive TAR **path rows** (not only side-list) | foundation done |
+| Pure in-process lrzip (no CLI / no libarchive shellout) | rare |
+| Python indexed_gzip blob interop (not only RGZI) | open |
+| Non-TAR hash xattrs | open |
 
 ## Verify
 
@@ -152,5 +160,6 @@ Non-overlapping crate ownership so agents could not stomp each other:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ./benchmarks/check-rust-gates.sh
-# s3 prefer-range: AWS_* or AWS_ANONYMOUS=1 ratarmount -f s3://bucket/a.tar mnt/
+RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1 ./benchmarks/check-rust-gates.sh
+# s3 live Range: AWS_* ratarmount -f s3://bucket/a.tar mnt/
 ```
