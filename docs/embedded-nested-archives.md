@@ -18,6 +18,27 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 | **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
 | **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (SquashFS tools, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. |
 | **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
+| **Large recursive trees (`-r` on huge `.deb`s)?** | Prefer **`-l` / `--lazy`** (and optional **`--recursion-depth`**). Eager `-r` can use multi‑GB RAM and minutes; not a correctness bug ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)). |
+
+---
+
+## Large recursive trees (RAM / time)
+
+Upstream [#179](https://github.com/mxmlnkn/ratarmount/issues/179): recursive mount of a large package (e.g. `linux-source-*.deb` with many nested `tar.zst` / `tar.bz2`) can cost multi‑GB RAM and minutes when every nested archive is opened up front. Manual nested mounts of only the layers you need stay lighter.
+
+| Flag | Behavior on nested archives |
+|------|-----------------------------|
+| **`-r` / `--recursive`** | Eager automount of nested archives (costly on huge trees). |
+| **`-l` / `--lazy`** | Mount nested archives **on first access** — prefer for large recursive trees. |
+| **`--recursion-depth N`** | Cap how deep automount descends (optional extra control). |
+
+```bash
+# Prefer for large packages / deep nested trees
+ratarmount -r -l package.deb mnt/
+ratarmount -r -l --recursion-depth 2 package.deb mnt/
+```
+
+Light nested fixtures are covered by normal tests. Full `linux-source-*.deb` stress is **optional benchmarking**, not a correctness requirement. Extreme cases can still use multi-step manual mounts (outer first, then individual nested paths).
 
 ---
 

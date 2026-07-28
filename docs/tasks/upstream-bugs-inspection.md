@@ -28,12 +28,12 @@ open **unlabeled** bug-shaped reports and **closed** bugs.
 
 | Status | Count | IDs |
 |--------|------:|-----|
-| **ok** | 13 | B-1, B-3, B-5, B-7, B-9, B-11, B-12, B-13, B-14, B-15, B-17, B-23, B-26 |
-| **partial** (actionable residual) | 5 | **B-2**, **B-4**, **B-8**, **B-10**, **B-119** |
+| **ok** | 14 | B-1, **B-2** (documented), B-3, B-5, B-7, B-9, B-11, B-12, B-13, B-14, B-15, B-17, B-23, B-26 |
+| **partial** (actionable residual) | 4 | **B-4**, **B-8**, **B-10**, **B-119** |
 | **partial** (acceptable / platform) | 2 | B-16, B-24 |
 | **n/a** | 7 | B-6, B-18–B-22, B-25 |
 
-**No hard fails.** Remaining work is residual behavior (union symlinks, incremental TAR delete merge, huge sparse smoke, recursive RAM, small-archive index policy).
+**No hard fails.** Remaining work is residual behavior (union symlinks, incremental TAR delete merge, huge sparse smoke, small-archive index policy).
 
 ---
 
@@ -44,7 +44,7 @@ open **unlabeled** bug-shaped reports and **closed** bugs.
 | ID | Upstream | Summary | Repro result (2026-07-28) | Status |
 |----|----------|---------|---------------------------|--------|
 | **B-1** | [#185](https://github.com/mxmlnkn/ratarmount/issues/185) | Recursive mount of **`.tzst`** fails | Direct `.tzst` + outer `.tzst` with nested `.tzst` under `-r`: `nested.tzst/msg.txt` readable | **ok** |
-| **B-2** | [#179](https://github.com/mxmlnkn/ratarmount/issues/179) | Recursive mount **RAM/time** explosion | Light nested `tar`→`.tar.zst` OK (50 files). Full `linux-source-*.deb` 3 GB RAM case **not** run | **partial** — measure full deb if prioritizing perf |
+| **B-2** | [#179](https://github.com/mxmlnkn/ratarmount/issues/179) | Recursive mount **RAM/time** explosion | Light nested `tar`→`.tar.zst` OK (50 files). Full `linux-source-*.deb` stress optional (not a correctness bug). Guidance: prefer **`-l`/`--lazy`** + **`--recursion-depth`** for large trees; manual multi-step mounts still valid | **ok** (documented) |
 | **B-3** | [#177](https://github.com/mxmlnkn/ratarmount/issues/177) | **7z index always `:memory:`** | `--index-file path` creates ~94 KiB SQLite, reloads without `-c` | **ok** |
 | **B-4** | [#164](https://github.com/mxmlnkn/ratarmount/issues/164) | **Inconsistent symlink handling** in union mounts | **Still order-dependent** (see detail below) | **partial** — **open residual** |
 | **B-5** | [#195](https://github.com/mxmlnkn/ratarmount/issues/195) | **Non-UTF-8** filenames | `-e latin1` shows `Lüneburg.txt` and reads content; UTF-8 default shows replacement char | **ok** |
@@ -105,9 +105,9 @@ Same class of bug as Python [#164](https://github.com/mxmlnkn/ratarmount/issues/
    - level-0/1 mount works; missing multi-volume `.snar` delete-list union.  
    - Track under parity-todo incremental residual.
 
-3. **B-2 / #179 — Recursive resource usage**  
-   - Optional: time/RSS on `linux-source-*.deb` with `-r` vs manual nested mounts.  
-   - Perf only; not a correctness bug.
+3. ~~**B-2 / #179 — Recursive resource usage**~~ — **ok (documented)**  
+   - Documented: `-r` is eager; prefer **`-l`/`--lazy`** and optional **`--recursion-depth`** for huge nested trees; manual multi-step mounts for extremes.  
+   - Optional later: time/RSS on full `linux-source-*.deb` (perf measure only, not correctness).
 
 4. **B-8 / #156 — Sparse > 8 GiB smoke** (optional)  
    - Code path is `u64`; low risk. Optional synthetic fixture if disk allows.

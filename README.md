@@ -84,8 +84,8 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 
 | Ability | Python | Rust | Upstream / notes |
 |---------|:------:|:----:|------------------|
-| Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)) |
-| Lazy mount (`-l`) | yes | **yes** | |
+| Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)); eager on huge trees can be costly — prefer `-l` ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)) |
+| Lazy mount (`-l`) | yes | **yes** | Prefer for large recursive trees (mount nested on first access) |
 | Union of multiple sources | yes | **yes** | + folder cache; symlink-merge option still open ([#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
 | Write overlay (`-w` / `:temp:`) | yes | **yes** | |
 | `--commit-overlay` | yes | **yes** | TAR + gzip/bzip2/xz (GNU tar); **ZIP full rebuild** ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)) — not in-place; residual encrypted/multi-part |
@@ -242,6 +242,9 @@ ratarmount -f archive.tar mnt/
 
 # Recursive, writable, remote, encrypted 7z
 ratarmount -r archive.tar mnt/
+# Large nested trees (e.g. big .deb with many tar.zst): prefer lazy + optional depth cap
+ratarmount -r -l archive.deb mnt/
+ratarmount -r -l --recursion-depth 2 archive.deb mnt/
 ratarmount -w /tmp/ov archive.tar mnt/
 ratarmount http://host/archive.tar mnt/
 ratarmount s3://bucket/key.tar mnt/
@@ -293,8 +296,11 @@ Compared to Python: both support `-r`; Rust’s no-tmp nested path is explicit f
 
 ```bash
 ratarmount -r archive.zip mnt/          # e.g. mnt/inner.tar/file.txt — no /tmp for inner.tar
+ratarmount -r -l big.deb mnt/         # large trees: lazy nested open (see #179)
 RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in logs
 ```
+
+**Large recursive trees:** plain `-r` eagerly automounts nested archives and can use multi‑GB RAM and minutes on huge packages (e.g. `linux-source-*.deb` with many nested `.tar.zst` / `.tar.bz2`). Prefer **`-l` / `--lazy`** so nested archives open on first access; optionally cap with **`--recursion-depth`**. For extreme cases, mount layers manually (outer, then inner paths). Light nested fixtures are fine; full linux-source stress is optional benchmarking, not a correctness bug.
 
 ## Docs
 
