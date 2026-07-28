@@ -66,21 +66,10 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 
 ## Suggested implementation order (agents)
 
-<<<<<<< HEAD
-**Done:** FR-1 (ZIP commit-overlay MVP), FR-3 (TAR PAX xattrs), FR-7 (zstd multi-frame docs).
+**Done:** FR-1 (ZIP commit-overlay MVP), FR-3 (TAR PAX xattrs), FR-4 (ZIP deflate single-flight + parallel multi-member), FR-7 (zstd multi-frame docs).
 
 1. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
-2. **FR-4** Parallel ZIP deflate member decode  
-3. **FR-5** FUSE readahead knobs  
-4. **FR-9** Factory side-table auto-wire  
-=======
-1. **FR-3** TAR SCHILY/LIBARCHIVE xattrs (isolated, tests with Haiku-style fixtures if available)  
-2. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
-3. **FR-1** ZIP commit-overlay MVP (rebuild zip from overlay + base)  
-4. ~~**FR-4** Parallel ZIP deflate member decode~~ **done** (single-flight cache + multi-member parallel open/hash)  
-5. **FR-5** FUSE readahead knobs  
-6. **FR-9** Factory side-table auto-wire  
-7. Docs/examples **FR-7** anytime  
->>>>>>> 1e5c6f7 (Implement FR-4 single-flight ZIP Deflate cache and parallel multi-member decode.)
+2. **FR-5** FUSE readahead knobs  
+3. **FR-9** Factory side-table auto-wire  
 
 Update this file when status changes. Keep README **Upstream** column in sync.
