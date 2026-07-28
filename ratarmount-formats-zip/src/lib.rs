@@ -52,7 +52,7 @@ use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
-use ratarmount_index::{IndexError, SqliteIndex};
+use ratarmount_index::{compute_hashes_limited, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use zip::CompressionMethod;
@@ -366,6 +366,7 @@ impl ZipMountSource {
             product_version,
             None,
             StatsSource::Synthetic(size),
+            &options.hashes,
         )?;
         // Drop ZipArchive before keeping shared for open path.
         drop(archive);
@@ -428,6 +429,7 @@ impl ZipMountSource {
             product_version,
             opened.multipart_parts.as_ref().map(|p| p.len()),
             StatsSource::Path(opened.open_path.as_path()),
+            &options.hashes,
         )?;
         drop(archive);
 
@@ -453,6 +455,10 @@ impl ZipMountSource {
     }
 
     /// Parse ZIP central directory into SQLite + member meta map.
+    ///
+    /// When `hash_algorithms` is non-empty (`OpenOptions.hashes` / `--hashes`), hashes
+    /// each regular-file member's **decompressed** content and stores digests as
+    /// `user.hash.<algo>` index xattrs (Python parity; TAR uses the same xattr keys).
     fn fill_index_from_archive<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
         password: Option<&str>,
@@ -460,12 +466,15 @@ impl ZipMountSource {
         product_version: &str,
         multipart_part_count: Option<usize>,
         stats: StatsSource<'_>,
+        hash_algorithms: &[String],
     ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         let mut members = HashMap::new();
         let mut generated_dirs: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
+        // (offsetheader, central-directory index, uncompressed size) for content hashing.
+        let mut hash_targets: Vec<(i64, usize, u64)> = Vec::new();
 
         for i in 0..archive.len() {
             let zf = open_member(archive, i, password)?;
@@ -551,6 +560,10 @@ impl ZipMountSource {
                 false,
                 0,
             )?;
+            // Regular files with size > 0: same eligibility as index `regular_file_payloads`.
+            if !hash_algorithms.is_empty() && !is_dir && !is_symlink && size > 0 {
+                hash_targets.push((header_offset as i64, i, size));
+            }
             members.insert(
                 header_offset,
                 ZipMemberMeta {
@@ -562,6 +575,10 @@ impl ZipMountSource {
                     index: i,
                 },
             );
+        }
+
+        if !hash_targets.is_empty() {
+            store_member_content_hashes(archive, &index, password, &hash_targets, hash_algorithms)?;
         }
 
         index.store_versions(product_version)?;
@@ -577,6 +594,56 @@ impl ZipMountSource {
         let index = index.into_read_only()?;
         Ok((index, members))
     }
+}
+
+/// Hash decompressed ZIP member payloads and store `user.hash.<algo>` index xattrs.
+///
+/// Unlike TAR's path-backed `fill_content_hashes` (raw archive bytes at `offset`), ZIP
+/// members may be Deflate/AES; we stream through the zip crate so digests match file
+/// contents served by [`MountSource::open`].
+fn store_member_content_hashes<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
+    index: &SqliteIndex,
+    password: Option<&str>,
+    targets: &[(i64, usize, u64)],
+    algorithms: &[String],
+) -> Result<()> {
+    if algorithms.is_empty() || targets.is_empty() {
+        return Ok(());
+    }
+    let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
+    for &(offsetheader, member_index, size) in targets {
+        let mut zf = match open_member(archive, member_index, password) {
+            Ok(z) => z,
+            Err(e) => {
+                log::warn!(
+                    "Failed to open ZIP member index={member_index} for content hash: {e}"
+                );
+                continue;
+            }
+        };
+        let digests = match compute_hashes_limited(&mut zf, size, algorithms) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!(
+                    "Failed to hash ZIP member at offsetheader={offsetheader}: {e}"
+                );
+                continue;
+            }
+        };
+        drop(zf);
+        for (name, hex) in digests {
+            pending.push((offsetheader, format!("user.hash.{name}"), hex.into_bytes()));
+        }
+        if pending.len() >= 256 {
+            index.insert_xattrs_batch(&pending)?;
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        index.insert_xattrs_batch(&pending)?;
+    }
+    Ok(())
 }
 
 /// How to record archive stats in the index.
@@ -647,6 +714,20 @@ impl MountSource for ZipMountSource {
 
     fn is_immutable(&self) -> bool {
         true
+    }
+
+    /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        let Some(oh) = zip_offsetheader(file_info) else {
+            return Vec::new();
+        };
+        self.index.list_xattr_keys(oh).unwrap_or_default()
+    }
+
+    /// One xattr value from the index (e.g. hex digest for `user.hash.sha256`).
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        let oh = zip_offsetheader(file_info)?;
+        self.index.get_xattr(oh, key).ok().flatten()
     }
 }
 
@@ -814,6 +895,13 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
         UserData::Tar(t) => Some(t),
         _ => None,
     })
+}
+
+/// `offsetheader` used as the xattrs table key (Python interop).
+fn zip_offsetheader(fi: &FileInfo) -> Option<i64> {
+    userdata(fi)
+        .and_then(|ud| ud.offsetheader)
+        .map(|v| v as i64)
 }
 
 fn open_member<'a, R: Read + Seek>(
@@ -1736,6 +1824,137 @@ mod tests {
         let mut buf = String::new();
         r.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "aaa");
+    }
+
+    /// When `OpenOptions.hashes` is set during index build, MountSource xattrs expose
+    /// `user.hash.*` digests of decompressed member content (TAR / Python parity).
+    #[test]
+    fn get_xattr_user_hash_after_index_with_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hashed.zip");
+        // Known vectors (same as ratarmount-index hashing tests / TAR parity).
+        let content = b"hello world\n";
+        write_sample_zip(&path, "hello.txt", content);
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            hashes: vec!["sha256".into(), "crc32".into()],
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open with hashes");
+
+        let fi = src.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        let mut keys = src.list_xattr(&fi);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+
+        let sha = src
+            .get_xattr(&fi, "user.hash.sha256")
+            .expect("user.hash.sha256 present");
+        assert_eq!(
+            sha.as_slice(),
+            b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+        let crc = src
+            .get_xattr(&fi, "user.hash.crc32")
+            .expect("user.hash.crc32 present");
+        assert_eq!(crc.as_slice(), b"af083b2d");
+        assert!(src.get_xattr(&fi, "user.hash.md5").is_none());
+        assert!(src.get_xattr(&fi, "missing").is_none());
+    }
+
+    /// Deflate members must hash decompressed content, not compressed bytes.
+    #[test]
+    fn get_xattr_user_hash_deflate_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("deflate-hash.zip");
+        let content = b"foo\n";
+        {
+            let file = File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("bar.txt", opts).unwrap();
+            zw.write_all(content).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            hashes: vec!["crc32".into(), "sha256".into()],
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open deflate");
+        let fi = src.lookup("/bar.txt", 0).expect("lookup");
+        // Content readable
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, content);
+
+        let crc = src
+            .get_xattr(&fi, "user.hash.crc32")
+            .expect("user.hash.crc32");
+        assert_eq!(crc.as_slice(), b"7e3265a8");
+        let sha = src
+            .get_xattr(&fi, "user.hash.sha256")
+            .expect("user.hash.sha256");
+        assert_eq!(
+            sha.as_slice(),
+            b"b5bb9d8014a0f9b1d61e21e796d78dccdf1352f23cd32812f4850b878ae4944c"
+        );
+    }
+
+    /// Without `--hashes`, listxattr is empty for members.
+    #[test]
+    fn list_xattr_empty_without_hashes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nohash.zip");
+        write_sample_zip(&path, "a.txt", b"aaa");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        let fi = src.lookup("/a.txt", 0).unwrap();
+        assert!(src.list_xattr(&fi).is_empty());
+        assert!(src.get_xattr(&fi, "user.hash.sha256").is_none());
+    }
+
+    #[test]
+    fn open_from_reader_hashes_xattrs() {
+        let content = b"hello world\n";
+        let bytes = sample_zip_bytes("hello.txt", content);
+        let cursor = io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            hashes: vec!["sha256".into()],
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open_from_reader(
+            cursor,
+            Path::new("memory://hashed.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("open_from_reader with hashes");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup");
+        assert_eq!(
+            src.list_xattr(&fi),
+            vec!["user.hash.sha256".to_string()]
+        );
+        let sha = src.get_xattr(&fi, "user.hash.sha256").expect("sha256");
+        assert_eq!(
+            sha.as_slice(),
+            b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
     }
 
     #[test]
