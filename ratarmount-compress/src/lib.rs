@@ -41,8 +41,9 @@ pub use split::{
 pub use bzip2_seek::{open_seekable_bzip2, open_seekable_bzip2_with_threads};
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 pub use gzip_seek::{
-    open_seekable_gzip, open_seekable_gzip_with_threads, try_parallel_multi_member_decode,
-    SeekableGzip, SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
+    open_seekable_gzip, open_seekable_gzip_from_reader, open_seekable_gzip_with_threads,
+    open_seekable_gzip_with_threads_from_reader, try_parallel_multi_member_decode, SeekableGzip,
+    SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
 };
 pub use lrzip_seek::{looks_like_lrzip, lrzip_available, materialize_lrzip, LRZIP_MAGIC};
 pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};

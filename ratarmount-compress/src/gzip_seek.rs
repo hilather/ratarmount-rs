@@ -11,6 +11,11 @@
 //!   members**, members can be fully decoded in parallel
 //!   ([`try_parallel_multi_member_decode`]) — best-effort multi-member parallel
 //!   path matching rapidgzip-style member independence.
+//!
+//! Open paths:
+//! * **Path-based** — reopen independent FDs per reader (`File::open`).
+//! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
+//!   `Cursor`); shared under a mutex so random Range reads drive inflate.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -22,6 +27,7 @@ use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use ratarmount_core::ParallelizationSpec;
 
+use crate::seekable_body::SeekRead;
 use crate::{CompressError, Result};
 
 /// Default seek-point spacing (uncompressed), matching Python CLI default (16 MiB).
@@ -43,9 +49,20 @@ pub struct GzipSeekIndex {
     spacing: u64,
 }
 
-/// Shared seekable gzip file (index + path). Readers open independent handles.
+/// How compressed bytes are re-opened for independent inflate cursors.
+enum GzipBackend {
+    /// Local path: each reader opens its own `File`.
+    Path(PathBuf),
+    /// Shared seekable stream (HTTP Range, Cursor, etc.).
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+/// Shared seekable gzip file (index + backend). Readers open independent handles
+/// (path) or share the compressed stream under a mutex (reader backend).
 pub struct SeekableGzip {
+    /// Label for logs / index metadata (filesystem path, URL, or virtual name).
     path: PathBuf,
+    backend: GzipBackend,
     index: GzipSeekIndex,
 }
 
@@ -71,8 +88,52 @@ impl SeekableGzip {
         // Resolve for -P 0 parity / future concurrent index builders; index path
         // does not currently fan out workers.
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
-        let index = build_index(&path, spacing)?;
-        Ok(Arc::new(Self { path, index }))
+        let mut file = File::open(&path)?;
+        let index = build_index(&mut file, spacing)?;
+        Ok(Arc::new(Self {
+            path: path.clone(),
+            backend: GzipBackend::Path(path),
+            index,
+        }))
+    }
+
+    /// Open from an already-seekable compressed stream (HTTP Range, memory, …).
+    ///
+    /// `archive_label` is stored for [`Self::path`] / logs (URL or virtual name).
+    pub fn open_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_threads_from_reader(reader, spacing, 1, archive_label)
+    }
+
+    /// Like [`Self::open_from_reader`] with a thread hint (Python `-P`).
+    ///
+    /// Index construction remains sequential; the thread hint matches path-based
+    /// openers for API parity.
+    pub fn open_with_threads_from_reader<R>(
+        mut reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let path = archive_label.as_ref().to_path_buf();
+        let spacing = spacing.max(64 * 1024);
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let index = build_index(&mut reader, spacing)?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+        Ok(Arc::new(Self {
+            path,
+            backend: GzipBackend::Shared(shared),
+            index,
+        }))
     }
 
     pub fn path(&self) -> &Path {
@@ -91,16 +152,46 @@ impl SeekableGzip {
         self.index.spacing
     }
 
-    /// Independent reader (own file fd + logical position).
+    /// Independent reader (own file fd or shared stream handle + logical position).
     pub fn reader(self: &Arc<Self>) -> io::Result<SeekableGzipReader> {
         SeekableGzipReader::open(Arc::clone(self))
+    }
+}
+
+/// Compressed-stream handle used during inflate (path FD or shared mutex stream).
+enum CompressedHandle {
+    File(File),
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+impl Read for CompressedHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            CompressedHandle::File(f) => f.read(buf),
+            CompressedHandle::Shared(inner) => inner
+                .lock()
+                .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?
+                .read(buf),
+        }
+    }
+}
+
+impl Seek for CompressedHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            CompressedHandle::File(f) => f.seek(pos),
+            CompressedHandle::Shared(inner) => inner
+                .lock()
+                .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?
+                .seek(pos),
+        }
     }
 }
 
 /// Read + Seek view of a [`SeekableGzip`].
 pub struct SeekableGzipReader {
     gzip: Arc<SeekableGzip>,
-    file: File,
+    file: CompressedHandle,
     pos: u64,
     /// Decoded window starting at `buf_start` (absolute uncompressed offset).
     buf: Vec<u8>,
@@ -116,7 +207,10 @@ pub struct SeekableGzipReader {
 
 impl SeekableGzipReader {
     fn open(gzip: Arc<SeekableGzip>) -> io::Result<Self> {
-        let file = File::open(&gzip.path)?;
+        let file = match &gzip.backend {
+            GzipBackend::Path(p) => CompressedHandle::File(File::open(p)?),
+            GzipBackend::Shared(shared) => CompressedHandle::Shared(Arc::clone(shared)),
+        };
         Ok(Self {
             gzip,
             file,
@@ -307,8 +401,8 @@ impl Seek for SeekableGzipReader {
 
 /// Feed inflate from `file` at `compressed_at`, writing into `out`.
 /// Returns bytes written to `out` (0 = EOF of all members).
-fn inflate_more(
-    file: &mut File,
+fn inflate_more<R: Read + Seek>(
+    file: &mut R,
     state: &mut InflateState,
     compressed_at: &mut u64,
     out: &mut [u8],
@@ -373,16 +467,22 @@ fn inflate_more(
     }
 }
 
-fn build_index(path: &Path, spacing: u64) -> Result<GzipSeekIndex> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+fn stream_len<R: Read + Seek>(file: &mut R) -> io::Result<u64> {
+    let cur = file.stream_position()?;
+    let len = file.seek(SeekFrom::End(0))?;
+    file.seek(SeekFrom::Start(cur))?;
+    Ok(len)
+}
+
+fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekIndex> {
+    let file_len = stream_len(file)?;
     let mut checkpoints = Vec::new();
     let mut uncompressed_total = 0u64;
     let mut compressed_at = 0u64;
 
     // Multi-member loop
     while compressed_at < file_len {
-        let header_end = match parse_gzip_header(&mut file, compressed_at)? {
+        let header_end = match parse_gzip_header(file, compressed_at)? {
             Some(h) => h,
             None => break, // padding / EOF
         };
@@ -435,7 +535,7 @@ fn build_index(path: &Path, spacing: u64) -> Result<GzipSeekIndex> {
 
             if matches!(res.status, Ok(MZStatus::StreamEnd)) {
                 // Skip trailer.
-                compressed_at = skip_gzip_trailer(&mut file, compressed_at)?;
+                compressed_at = skip_gzip_trailer(file, compressed_at)?;
                 break;
             }
             if n_in == 0 && res.bytes_consumed == 0 {
@@ -463,7 +563,7 @@ fn build_index(path: &Path, spacing: u64) -> Result<GzipSeekIndex> {
 }
 
 /// Parse gzip member header at `offset`; returns absolute offset of first deflate byte.
-fn parse_gzip_header(file: &mut File, offset: u64) -> Result<Option<u64>> {
+fn parse_gzip_header<R: Read + Seek>(file: &mut R, offset: u64) -> Result<Option<u64>> {
     file.seek(SeekFrom::Start(offset))?;
     let mut fixed = [0u8; 10];
     let n = file.read(&mut fixed)?;
@@ -509,7 +609,7 @@ fn parse_gzip_header(file: &mut File, offset: u64) -> Result<Option<u64>> {
     Ok(Some(pos))
 }
 
-fn skip_c_string(file: &mut File, mut pos: u64) -> Result<u64> {
+fn skip_c_string<R: Read + Seek>(file: &mut R, mut pos: u64) -> Result<u64> {
     file.seek(SeekFrom::Start(pos))?;
     let mut b = [0u8; 1];
     loop {
@@ -522,12 +622,15 @@ fn skip_c_string(file: &mut File, mut pos: u64) -> Result<u64> {
     Ok(pos)
 }
 
-fn skip_gzip_trailer(_file: &mut File, offset: u64) -> Result<u64> {
+fn skip_gzip_trailer<R: Read + Seek>(_file: &mut R, offset: u64) -> Result<u64> {
     // CRC32 + ISIZE
     Ok(offset + 8)
 }
 
-fn skip_trailer_and_next_header(file: &mut File, after_deflate: u64) -> io::Result<Option<u64>> {
+fn skip_trailer_and_next_header<R: Read + Seek>(
+    file: &mut R,
+    after_deflate: u64,
+) -> io::Result<Option<u64>> {
     let after_trailer = after_deflate + 8;
     match parse_gzip_header(file, after_trailer) {
         Ok(Some(h)) => Ok(Some(h)),
@@ -550,6 +653,36 @@ pub fn open_seekable_gzip_with_threads(
     threads: u32,
 ) -> Result<SeekableGzipReader> {
     let g = SeekableGzip::open_with_threads(path, spacing, threads)?;
+    g.reader().map_err(CompressError::from)
+}
+
+/// Open seekable gzip from a seekable compressed reader (builds index).
+///
+/// `archive_label` is used for logs / [`SeekableGzip::path`] (URL or virtual name).
+pub fn open_seekable_gzip_from_reader<R>(
+    reader: R,
+    spacing: u64,
+    archive_label: impl AsRef<Path>,
+) -> Result<SeekableGzipReader>
+where
+    R: Read + Seek + Send + 'static,
+{
+    open_seekable_gzip_with_threads_from_reader(reader, spacing, 1, archive_label)
+}
+
+/// Open seekable gzip from a seekable compressed reader with a thread hint.
+///
+/// See [`SeekableGzip::open_with_threads_from_reader`].
+pub fn open_seekable_gzip_with_threads_from_reader<R>(
+    reader: R,
+    spacing: u64,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+) -> Result<SeekableGzipReader>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let g = SeekableGzip::open_with_threads_from_reader(reader, spacing, threads, archive_label)?;
     g.reader().map_err(CompressError::from)
 }
 
@@ -679,6 +812,38 @@ impl SharedSeekableGzip {
         }))
     }
 
+    /// Open from a seekable compressed reader (HTTP Range, memory, …).
+    ///
+    /// `archive_label` is stored for [`Self::path`] / logs.
+    pub fn open_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_threads_from_reader(reader, spacing, 1, archive_label)
+    }
+
+    /// Like [`Self::open_from_reader`] with a thread hint.
+    pub fn open_with_threads_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let inner =
+            SeekableGzip::open_with_threads_from_reader(reader, spacing, threads, archive_label)?;
+        Ok(Arc::new(Self {
+            inner,
+            _lock: Mutex::new(()),
+        }))
+    }
+
     pub fn size(&self) -> u64 {
         self.inner.uncompressed_size()
     }
@@ -699,7 +864,7 @@ impl SharedSeekableGzip {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{Cursor, Read, Write};
 
     fn py_test(name: &str) -> PathBuf {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
@@ -838,5 +1003,115 @@ mod tests {
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert_eq!(s, "foo fighter\n");
+    }
+
+    #[test]
+    fn from_reader_cursor_random_access_equals_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("cursor.gz");
+        let mut raw = Vec::new();
+        for i in 0..1500 {
+            writeln!(&mut raw, "line {i:05} {}", "y".repeat(64)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        std::fs::write(&gz, &compressed).unwrap();
+
+        let path_g = SeekableGzip::open(&gz, 8 * 1024).unwrap();
+        let reader_g = SeekableGzip::open_with_threads_from_reader(
+            Cursor::new(compressed.clone()),
+            8 * 1024,
+            1,
+            Path::new("memory://cursor.gz"),
+        )
+        .unwrap();
+
+        assert_eq!(path_g.uncompressed_size(), reader_g.uncompressed_size());
+        assert_eq!(path_g.checkpoint_count(), reader_g.checkpoint_count());
+        assert_eq!(reader_g.path(), Path::new("memory://cursor.gz"));
+
+        let mut path_r = path_g.reader().unwrap();
+        let mut mem_r = reader_g.reader().unwrap();
+
+        // Full sequential read
+        let mut path_all = Vec::new();
+        let mut mem_all = Vec::new();
+        path_r.read_to_end(&mut path_all).unwrap();
+        mem_r.read_to_end(&mut mem_all).unwrap();
+        assert_eq!(path_all, raw);
+        assert_eq!(mem_all, raw);
+
+        // Random seeks across the payload
+        let offsets = [
+            0u64,
+            17,
+            raw.len() as u64 / 3,
+            raw.len() as u64 / 2,
+            raw.len() as u64 - 40,
+        ];
+        for &off in &offsets {
+            path_r.seek(SeekFrom::Start(off)).unwrap();
+            mem_r.seek(SeekFrom::Start(off)).unwrap();
+            let mut pb = [0u8; 32];
+            let mut mb = [0u8; 32];
+            let pn = path_r.read(&mut pb).unwrap();
+            let mn = mem_r.read(&mut mb).unwrap();
+            assert_eq!(pn, mn, "offset {off}");
+            assert_eq!(&pb[..pn], &mb[..mn], "offset {off}");
+        }
+
+        // Free-function + SharedSeekableGzip reader path
+        let mut free_r = open_seekable_gzip_with_threads_from_reader(
+            Cursor::new(compressed.clone()),
+            8 * 1024,
+            2,
+            Path::new("label.gz"),
+        )
+        .unwrap();
+        free_r.seek(SeekFrom::Start(100)).unwrap();
+        let mut free_chunk = [0u8; 16];
+        free_r.read_exact(&mut free_chunk).unwrap();
+        assert_eq!(&free_chunk, &raw[100..116]);
+
+        let shared = SharedSeekableGzip::open_with_threads_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            1,
+            Path::new("shared://cursor.gz"),
+        )
+        .unwrap();
+        assert_eq!(shared.size(), raw.len() as u64);
+        assert_eq!(shared.path(), Path::new("shared://cursor.gz"));
+        let mut sr = shared.reader().unwrap();
+        sr.seek(SeekFrom::End(-20)).unwrap();
+        let mut tail = vec![0u8; 20];
+        sr.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, raw[raw.len() - 20..]);
+    }
+
+    #[test]
+    fn from_reader_open_without_threads_api() {
+        let payload = b"hello from reader API\n";
+        let compressed = encode_gz(payload);
+        let g = SeekableGzip::open_from_reader(
+            Cursor::new(compressed.clone()),
+            1024,
+            Path::new("virt.gz"),
+        )
+        .unwrap();
+        let mut r = g.reader().unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+
+        let mut r2 = open_seekable_gzip_from_reader(Cursor::new(compressed), 1024, "virt.gz")
+            .unwrap();
+        let mut out2 = Vec::new();
+        r2.read_to_end(&mut out2).unwrap();
+        assert_eq!(out2, payload);
+
+        let shared =
+            SharedSeekableGzip::open_from_reader(Cursor::new(encode_gz(payload)), 1024, "s.gz")
+                .unwrap();
+        assert_eq!(shared.size(), payload.len() as u64);
     }
 }
