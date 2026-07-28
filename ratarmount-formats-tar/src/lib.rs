@@ -1,6 +1,12 @@
 //! TAR indexing and open-by-offset (Phase 1–3).
 //!
 //! `backendName` must be exactly `SQLiteIndexedTar` for Python interop.
+//!
+//! Nested TAR foundation: while indexing the outer archive, regular members that look
+//! like nested TARs (name ends with `.tar` or ustar/GNU magic at the member data
+//! offset) are recorded in metadata (`nestedTarMembers`) and marked `istar=true`.
+//! Call [`SqliteIndexedTar::list_nested_tar_members`] / [`SqliteIndexedTar::open_nested_tar_from_index`]
+//! to list them or open via stencil without AutoMount.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -22,7 +28,21 @@ use thiserror::Error;
 /// Exact string stored in index metadata (Python `SQLiteIndexedTar`).
 pub const BACKEND_NAME: &str = "SQLiteIndexedTar";
 
+/// Metadata key for the JSON list of nested TAR members `(path, offset, size)`.
+pub const NESTED_TAR_MEMBERS_KEY: &str = "nestedTarMembers";
+
 const BLOCK_SIZE: u64 = 512;
+
+/// A nested TAR member discovered while indexing an outer archive.
+///
+/// `path` is the outer archive member path as stored in the index (leading `/`).
+/// `offset` / `size` are absolute positions in the outer (uncompressed) TAR stream.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NestedTarMember {
+    pub path: String,
+    pub offset: u64,
+    pub size: u64,
+}
 
 #[derive(Debug, Error)]
 pub enum TarError {
@@ -472,6 +492,58 @@ impl SqliteIndexedTar {
     pub fn archive_path(&self) -> &Path {
         &self.archive_path
     }
+
+    /// Nested TAR members recorded during outer-archive indexing (`nestedTarMembers` metadata).
+    ///
+    /// Empty when the index was built without detection, has no nested TARs, or predates this key.
+    pub fn list_nested_tar_members(&self) -> Result<Vec<NestedTarMember>> {
+        let meta = self.index.metadata()?;
+        Ok(match meta.get(NESTED_TAR_MEMBERS_KEY) {
+            Some(json) => parse_nested_tar_members_json(json),
+            None => Vec::new(),
+        })
+    }
+
+    /// Open a nested TAR member by stenciling its outer byte range and indexing in-place.
+    ///
+    /// `member_path` is the outer member path (with or without leading `/`). Does not use
+    /// AutoMount; the returned mount source is a standalone [`SqliteIndexedTar`] over the
+    /// member bytes. Index is in-memory.
+    pub fn open_nested_tar_from_index(&self, member_path: &str) -> Result<Self> {
+        let want = normpath(member_path);
+        let members = self.list_nested_tar_members()?;
+        let nested = members
+            .iter()
+            .find(|m| paths_equal_nested(&m.path, &want))
+            .ok_or_else(|| TarError::Msg(format!("nested TAR member not found: {want}")))?
+            .clone();
+
+        // Prefer MountSource::open (already a stencil of the member data range).
+        let reader: Box<dyn ratarmount_core::ArchiveRead> =
+            if let Some(fi) = self.lookup(&nested.path, 0) {
+                self.open(&fi, 0).map_err(TarError::Io)?
+            } else {
+                let outer = self.backend.open_reader().map_err(TarError::Io)?;
+                Box::new(StenciledFile::new(
+                    outer,
+                    vec![(nested.offset, nested.size)],
+                ))
+            };
+
+        let label = format!("{}{}", self.archive_path.display(), nested.path);
+        // Nested open: do not inherit recursive AutoMount intent; this API is explicit.
+        let opts = OpenOptions {
+            recursive: false,
+            recursion_depth: Some(0),
+            index_in_memory: true,
+            ..self.options.clone()
+        };
+        Self::open_from_reader(reader, PathBuf::from(label), None, &opts, "0.1.0")
+    }
+}
+
+fn paths_equal_nested(a: &str, b: &str) -> bool {
+    normpath(a) == normpath(b)
 }
 
 impl MountSource for SqliteIndexedTar {
@@ -828,6 +900,7 @@ fn parse_tar_into_index<R: Read + Seek>(
         sparse_pairs: Vec::new(),
     };
     let mut pax_header_start: Option<u64> = None;
+    let mut nested_members: Vec<NestedTarMember> = Vec::new();
 
     let mut is_gnu_incremental = match options.gnu_incremental {
         Some(v) => v,
@@ -1005,6 +1078,26 @@ fn parse_tar_into_index<R: Read + Seek>(
             continue;
         }
 
+        // Nested TAR detection: name ends with `.tar` or ustar/GNU magic at data offset.
+        // Lightweight only — does not walk nested headers into the outer index.
+        let mut istar = false;
+        if !issparse
+            && is_regular_tar_member(typeflag, &name)
+            && logical_size >= BLOCK_SIZE
+        {
+            let by_name = name_looks_like_tar(&name);
+            let by_magic = peek_tar_magic_at(reader, data_off)?;
+            if by_name || by_magic {
+                istar = true;
+                let member_path = normalize_member_path(&name);
+                nested_members.push(NestedTarMember {
+                    path: member_path,
+                    offset: data_off,
+                    size: logical_size,
+                });
+            }
+        }
+
         if typeflag == b'D' {
             // Dumpdir: regular meta entry (S_IFREG, dumpdir size) + directory entry (size 0).
             push_dumpdir_entries(
@@ -1038,6 +1131,7 @@ fn parse_tar_into_index<R: Read + Seek>(
                 uid,
                 gid,
                 issparse,
+                istar,
                 &mut generated_dirs,
             )?;
         }
@@ -1060,7 +1154,201 @@ fn parse_tar_into_index<R: Read + Seek>(
     }
 
     flush(&mut batch)?;
+    store_nested_tar_members(index, &nested_members)?;
     Ok(is_gnu_incremental)
+}
+
+/// Regular-file typeflags eligible for nested-TAR detection.
+fn is_regular_tar_member(typeflag: u8, name: &str) -> bool {
+    if name.ends_with('/') {
+        return false;
+    }
+    matches!(typeflag, b'0' | b'\0' | b'7' /* contiguous */)
+        || (typeflag != b'1'
+            && typeflag != b'2'
+            && typeflag != b'3'
+            && typeflag != b'4'
+            && typeflag != b'5'
+            && typeflag != b'6'
+            && typeflag != b'D'
+            && typeflag != b'S'
+            && typeflag != b'L'
+            && typeflag != b'K'
+            && typeflag != b'x'
+            && typeflag != b'g'
+            && typeflag != b'X')
+}
+
+fn name_looks_like_tar(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".tar")
+}
+
+fn normalize_member_path(name: &str) -> String {
+    let mut full = name.trim_end_matches('/').to_string();
+    while full.starts_with("./") {
+        full = full[2..].to_string();
+    }
+    normpath(&full)
+}
+
+/// TAR magic at member data offset + 257: `ustar` or GNU.
+fn peek_tar_magic_at<R: Read + Seek>(reader: &mut R, data_off: u64) -> Result<bool> {
+    if reader.seek(SeekFrom::Start(data_off.saturating_add(257))).is_err() {
+        return Ok(false);
+    }
+    let mut magic = [0u8; 5];
+    let n = match reader.read(&mut magic) {
+        Ok(n) => n,
+        Err(_) => return Ok(false),
+    };
+    Ok(n == 5 && (&magic == b"ustar" || &magic == b"GNU  " || magic.starts_with(b"ustar")))
+}
+
+fn store_nested_tar_members(index: &SqliteIndex, members: &[NestedTarMember]) -> Result<()> {
+    let json = format_nested_tar_members_json(members);
+    index.store_metadata_key_value(NESTED_TAR_MEMBERS_KEY, &json)?;
+    Ok(())
+}
+
+fn format_nested_tar_members_json(members: &[NestedTarMember]) -> String {
+    let mut json = String::from("[");
+    for (i, m) in members.iter().enumerate() {
+        if i > 0 {
+            json.push(',');
+        }
+        json.push('{');
+        json.push_str("\"path\":");
+        json.push_str(&json_escape_string(&m.path));
+        json.push_str(",\"offset\":");
+        json.push_str(&m.offset.to_string());
+        json.push_str(",\"size\":");
+        json.push_str(&m.size.to_string());
+        json.push('}');
+    }
+    json.push(']');
+    json
+}
+
+fn json_escape_string(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if c.is_control() => {
+                use std::fmt::Write;
+                let _ = write!(out, "\\u{:04x}", c as u32);
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Parse the compact JSON written by [`format_nested_tar_members_json`].
+fn parse_nested_tar_members_json(s: &str) -> Vec<NestedTarMember> {
+    let s = s.trim();
+    if s.is_empty() || s == "[]" {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        // Find next object starting with {
+        while i < bytes.len() && bytes[i] != b'{' {
+            i += 1;
+        }
+        if i >= bytes.len() {
+            break;
+        }
+        let obj_start = i;
+        i += 1;
+        let mut depth = 1i32;
+        while i < bytes.len() && depth > 0 {
+            match bytes[i] {
+                b'{' => depth += 1,
+                b'}' => depth -= 1,
+                b'"' => {
+                    i += 1;
+                    while i < bytes.len() {
+                        if bytes[i] == b'\\' {
+                            i += 2;
+                            continue;
+                        }
+                        if bytes[i] == b'"' {
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        let obj = &s[obj_start..i.min(s.len())];
+        if let Some(m) = parse_one_nested_member_object(obj) {
+            out.push(m);
+        }
+    }
+    out
+}
+
+fn parse_one_nested_member_object(obj: &str) -> Option<NestedTarMember> {
+    let path = json_extract_string_field(obj, "path")?;
+    let offset = json_extract_u64_field(obj, "offset")?;
+    let size = json_extract_u64_field(obj, "size")?;
+    Some(NestedTarMember { path, offset, size })
+}
+
+fn json_extract_string_field(obj: &str, key: &str) -> Option<String> {
+    let needle = format!("\"{key}\"");
+    let rest = obj.split_once(&needle)?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    if !rest.starts_with('"') {
+        return None;
+    }
+    let mut out = String::new();
+    let mut chars = rest[1..].chars();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => return Some(out),
+            '\\' => match chars.next()? {
+                '"' => out.push('"'),
+                '\\' => out.push('\\'),
+                'n' => out.push('\n'),
+                'r' => out.push('\r'),
+                't' => out.push('\t'),
+                'u' => {
+                    let h: String = chars.by_ref().take(4).collect();
+                    if h.len() != 4 {
+                        return None;
+                    }
+                    let code = u32::from_str_radix(&h, 16).ok()?;
+                    out.push(char::from_u32(code)?);
+                }
+                other => out.push(other),
+            },
+            c => out.push(c),
+        }
+    }
+    None
+}
+
+fn json_extract_u64_field(obj: &str, key: &str) -> Option<u64> {
+    let needle = format!("\"{key}\"");
+    let rest = obj.split_once(&needle)?.1.trim_start();
+    let rest = rest.strip_prefix(':')?.trim_start();
+    let num: String = rest
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect();
+    num.parse().ok()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1077,6 +1365,7 @@ fn push_entry(
     uid: i64,
     gid: i64,
     issparse: bool,
+    istar: bool,
     generated_dirs: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let is_dir = typeflag == b'5' || full_name.ends_with('/');
@@ -1125,7 +1414,7 @@ fn push_entry(
         linkname,
         uid,
         gid,
-        false,
+        istar,
         issparse,
         false,
         0,
@@ -1638,6 +1927,110 @@ mod tests {
         let mut buf = String::new();
         r.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "hello world\n");
+        // Plain text member is not a nested TAR.
+        assert!(m.list_nested_tar_members().unwrap().is_empty());
+    }
+
+    /// Outer TAR with an inner TAR member: detect via metadata, open nested via stencil.
+    #[test]
+    fn nested_tar_member_index_and_open_via_stencil() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Build inner.tar containing nested-hello.txt
+        let inner_src = dir.path().join("inner_src");
+        std::fs::create_dir_all(&inner_src).unwrap();
+        std::fs::write(inner_src.join("nested-hello.txt"), b"from nested tar\n").unwrap();
+        let inner_tar = dir.path().join("inner.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&inner_tar)
+            .arg("-C")
+            .arg(&inner_src)
+            .arg("nested-hello.txt")
+            .status()
+            .expect("tar inner");
+        assert!(status.success(), "inner tar failed");
+
+        // Build outer.tar containing inner.tar + a plain file
+        let outer_src = dir.path().join("outer_src");
+        std::fs::create_dir_all(&outer_src).unwrap();
+        std::fs::copy(&inner_tar, outer_src.join("inner.tar")).unwrap();
+        std::fs::write(outer_src.join("plain.txt"), b"plain\n").unwrap();
+        let outer_tar = dir.path().join("outer.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&outer_tar)
+            .arg("-C")
+            .arg(&outer_src)
+            .arg("inner.tar")
+            .arg("plain.txt")
+            .status()
+            .expect("tar outer");
+        assert!(status.success(), "outer tar failed");
+
+        let idx_path = dir.path().join("outer.tar.index.sqlite");
+        let opts = OpenOptions::default();
+        let mut mat = None;
+        let outer = SqliteIndexedTar::create_index(
+            &outer_tar,
+            &outer_tar,
+            Some(&idx_path),
+            &opts,
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index outer");
+
+        // Outer listing still shows the nested archive as a regular file member.
+        let fi_inner = outer.lookup("/inner.tar", 0).expect("lookup /inner.tar");
+        assert!(fi_inner.size > 0);
+        let ud = tar_userdata(&fi_inner).expect("tar userdata");
+        assert!(ud.istar, "nested TAR should set istar");
+
+        let nested = outer.list_nested_tar_members().expect("list nested");
+        assert_eq!(nested.len(), 1, "expected one nested tar: {nested:?}");
+        assert_eq!(nested[0].path, "/inner.tar");
+        assert_eq!(nested[0].size, fi_inner.size);
+        assert_eq!(nested[0].offset, ud.offset);
+
+        // Open nested TAR via stencil without AutoMount; read inner content.
+        let nested_ms = outer
+            .open_nested_tar_from_index("inner.tar")
+            .expect("open nested");
+        let nested_fi = nested_ms
+            .lookup("/nested-hello.txt", 0)
+            .expect("lookup nested-hello.txt");
+        assert_eq!(nested_fi.size, b"from nested tar\n".len() as u64);
+        let mut r = nested_ms.open(&nested_fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "from nested tar\n");
+
+        // Metadata key is present on the outer index.
+        let meta = outer.index().metadata().unwrap();
+        assert!(meta.contains_key(NESTED_TAR_MEMBERS_KEY));
+        assert!(meta[NESTED_TAR_MEMBERS_KEY].contains("inner.tar"));
+    }
+
+    #[test]
+    fn nested_tar_members_json_roundtrip() {
+        let members = vec![
+            NestedTarMember {
+                path: "/a/b.tar".into(),
+                offset: 1024,
+                size: 4096,
+            },
+            NestedTarMember {
+                path: r#"/weird"quote.tar"#.into(),
+                offset: 0,
+                size: 512,
+            },
+        ];
+        let json = format_nested_tar_members_json(&members);
+        let parsed = parse_nested_tar_members_json(&json);
+        assert_eq!(parsed, members);
+        assert!(parse_nested_tar_members_json("[]").is_empty());
+        assert!(parse_nested_tar_members_json("").is_empty());
     }
 
     /// Minimal ustar with one regular file (for in-memory reader tests).
