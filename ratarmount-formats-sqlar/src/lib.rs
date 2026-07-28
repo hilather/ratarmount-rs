@@ -11,16 +11,40 @@
 //! );
 //! ```
 //!
-//! # Encrypted SQLAR (sqlcipher)
+//! # Encrypted SQLAR (SQLCipher)
 //!
 //! Encrypted archives do **not** start with the SQLite magic (`SQLite format 3\0`);
 //! the first 16 bytes are the AES salt. Opening them requires SQLCipher.
 //!
-//! * Default build (stock bundled SQLite): encrypted files are **detected** and open
-//!   fails with a clear [`SqlarError`] (`EncryptedRequiresPassword` /
-//!   `EncryptedNotSupported`).
-//! * With `--features sqlcipher`: passwords from [`OpenOptions::passwords`] are tried
-//!   via `PRAGMA key` (passphrase and PBKDF2-HMAC-SHA512 raw key, matching Python).
+//! | Build | Behaviour |
+//! |-------|-----------|
+//! | Default (`bundled` SQLite) | Encrypted files are **detected**; open fails with a clear [`SqlarError`] (`EncryptedRequiresPassword` / `EncryptedNotSupported`). |
+//! | `--features sqlcipher` | Passwords from [`OpenOptions::passwords`] are tried via `PRAGMA key` (passphrase form, then PBKDF2-HMAC-SHA512 raw key — Python / sqlcipher3 parity). |
+//!
+//! ## Building with SQLCipher
+//!
+//! ```bash
+//! # Crate alone
+//! cargo build -p ratarmount-formats-sqlar --features sqlcipher
+//! cargo test  -p ratarmount-formats-sqlar --features sqlcipher --lib
+//!
+//! # Binary (forward the feature from a dependent crate)
+//! cargo build -p ratarmount --features sqlcipher   # if the bin crate exposes it
+//! # or pin the dependency:
+//! # ratarmount-formats-sqlar = { path = "...", features = ["sqlcipher"] }
+//! ```
+//!
+//! Compiling `sqlcipher` vendors OpenSSL and the SQLCipher amalgamation (see
+//! `rusqlite` feature `bundled-sqlcipher-vendored-openssl`). First builds can take a while.
+//!
+//! ## Passwords
+//!
+//! Supply one or more passwords via [`OpenOptions::passwords`] (CLI: `--password` /
+//! password file). Unencrypted archives ignore unused passwords. Encrypted archives
+//! without a password always error; with passwords but no `sqlcipher` feature they
+//! error with [`SqlarError::EncryptedNotSupported`].
+//!
+//! Use [`sqlcipher_enabled`] to probe at runtime whether this build can decrypt.
 
 use std::collections::BTreeMap;
 use std::io::{self, Cursor, Read};
@@ -43,6 +67,14 @@ const OPEN_FLAGS: OpenFlags = OpenFlags::SQLITE_OPEN_READ_ONLY.union(OpenFlags::
 #[cfg(feature = "sqlcipher")]
 const SQLCIPHER_KDF_ITER: u32 = 256_000;
 
+/// Whether this build was compiled with the `sqlcipher` feature (decryption support).
+///
+/// Always `true` when linked with SQLCipher; always `false` in the default stock-SQLite build.
+#[inline]
+pub const fn sqlcipher_enabled() -> bool {
+    cfg!(feature = "sqlcipher")
+}
+
 #[derive(Debug, Error)]
 pub enum SqlarError {
     #[error(transparent)]
@@ -51,16 +83,31 @@ pub enum SqlarError {
     Io(#[from] io::Error),
     #[error("{0}")]
     Msg(String),
-    /// File looks like sqlcipher-encrypted SQLAR but no password was supplied.
-    #[error(
-        "encrypted SQLAR requires a password (sqlcipher); pass --password \
-         (rebuild ratarmount-formats-sqlar with --features sqlcipher for decryption support)"
+    /// File looks like SQLCipher-encrypted SQLAR but no password was supplied.
+    ///
+    /// Message text depends on whether the `sqlcipher` feature is enabled so callers
+    /// get a single actionable hint (provide a password vs rebuild + password).
+    #[cfg_attr(
+        feature = "sqlcipher",
+        error(
+            "encrypted SQLAR requires a password; pass --password \
+             (or set OpenOptions.passwords)"
+        )
+    )]
+    #[cfg_attr(
+        not(feature = "sqlcipher"),
+        error(
+            "encrypted SQLAR requires a password and SQLCipher support; pass --password and \
+             rebuild with `--features sqlcipher` on ratarmount-formats-sqlar \
+             (e.g. `cargo build -p ratarmount-formats-sqlar --features sqlcipher`)"
+        )
     )]
     EncryptedRequiresPassword,
     /// Passwords were given but this build was not linked with SQLCipher.
     #[error(
         "encrypted SQLAR is not supported in this build (stock SQLite, no sqlcipher). \
-         Rebuild with `--features sqlcipher` on ratarmount-formats-sqlar, or use an unencrypted archive. \
+         Rebuild with `cargo build -p ratarmount-formats-sqlar --features sqlcipher` \
+         (or enable the feature on dependents), then pass --password. \
          Passwords were ignored."
     )]
     EncryptedNotSupported,
@@ -83,6 +130,12 @@ pub struct SqlarMountSource {
 }
 
 impl SqlarMountSource {
+    /// Open an SQLAR archive.
+    ///
+    /// Unencrypted archives open with stock SQLite. Encrypted (no SQLite magic) archives:
+    /// * no passwords → [`SqlarError::EncryptedRequiresPassword`]
+    /// * passwords, no `sqlcipher` feature → [`SqlarError::EncryptedNotSupported`]
+    /// * passwords + `sqlcipher` → try each password; fail with [`SqlarError::WrongPassword`]
     pub fn open(path: impl AsRef<Path>, options: &OpenOptions) -> Result<Self> {
         let path = path.as_ref().to_path_buf();
         if !looks_like_sqlar(&path) {
@@ -225,8 +278,10 @@ fn open_encrypted(
 
     if options.passwords.is_empty() {
         log::debug!(
-            "SQLAR open failed without SQLite magic ({}): {plain_err}; treating as encrypted",
-            path.display()
+            "SQLAR open failed without SQLite magic ({}): {plain_err}; treating as encrypted \
+             (sqlcipher_enabled={})",
+            path.display(),
+            sqlcipher_enabled()
         );
         return Err(SqlarError::EncryptedRequiresPassword);
     }
@@ -234,13 +289,13 @@ fn open_encrypted(
     #[cfg(feature = "sqlcipher")]
     {
         let salt: [u8; 16] = header[..16].try_into().expect("checked len >= 16");
-        return try_sqlcipher_passwords(path, &options.passwords, &salt);
+        try_sqlcipher_passwords(path, &options.passwords, &salt)
     }
 
     #[cfg(not(feature = "sqlcipher"))]
     {
         let _ = (path, plain_err);
-        // Best-effort: stock rusqlite `bundled` has no codec; PRAGMA key is a no-op / unused.
+        // Stock rusqlite `bundled` has no codec; PRAGMA key is a no-op / unused.
         // Surface a structured error rather than a cryptic "file is not a database".
         log::info!(
             "encrypted SQLAR detected at {}; passwords present but sqlcipher feature disabled",
@@ -565,10 +620,22 @@ mod tests {
     use super::*;
     use std::io::Read;
 
+    /// Fixture root: `RATARMOUNT_PY_ROOT` (Python ratarmount checkout) or a local default.
     fn py_test(name: &str) -> PathBuf {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join("tests").join(name)
+    }
+
+    fn skip_missing(path: &Path, kind: &str) -> bool {
+        if path.exists() {
+            return false;
+        }
+        eprintln!(
+            "skip missing {kind} fixture {} (set RATARMOUNT_PY_ROOT to the Python ratarmount tree)",
+            path.display()
+        );
+        true
     }
 
     fn assert_ufo(m: &SqlarMountSource) {
@@ -581,10 +648,49 @@ mod tests {
     }
 
     #[test]
+    fn sqlcipher_enabled_matches_cfg() {
+        assert_eq!(sqlcipher_enabled(), cfg!(feature = "sqlcipher"));
+    }
+
+    /// Display text for structured encrypted errors always mentions encryption / sqlcipher path.
+    #[test]
+    fn encrypted_error_messages_are_actionable() {
+        let req = SqlarError::EncryptedRequiresPassword.to_string();
+        assert!(
+            req.contains("password") && req.contains("encrypted"),
+            "EncryptedRequiresPassword: {req}"
+        );
+        if sqlcipher_enabled() {
+            assert!(
+                !req.contains("Rebuild") && !req.contains("rebuild"),
+                "with sqlcipher feature, no rebuild hint expected: {req}"
+            );
+        } else {
+            assert!(
+                req.contains("sqlcipher") || req.contains("SQLCipher"),
+                "without sqlcipher, message should mention the feature: {req}"
+            );
+        }
+
+        let unsupported = SqlarError::EncryptedNotSupported.to_string();
+        assert!(
+            unsupported.contains("sqlcipher")
+                && unsupported.contains("--features")
+                && unsupported.contains("Passwords were ignored"),
+            "EncryptedNotSupported: {unsupported}"
+        );
+
+        let wrong = SqlarError::WrongPassword.to_string();
+        assert!(
+            wrong.contains("password"),
+            "WrongPassword: {wrong}"
+        );
+    }
+
+    #[test]
     fn nested_tar_sqlar() {
         let path = py_test("nested-tar.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing fixture");
+        if skip_missing(&path, "unencrypted") {
             return;
         }
         assert!(looks_like_sqlar(&path));
@@ -603,8 +709,7 @@ mod tests {
     #[test]
     fn nested_tar_denormal_sqlar() {
         let path = py_test("nested-tar-denormal.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing fixture");
+        if skip_missing(&path, "unencrypted") {
             return;
         }
         assert!(looks_like_sqlar(&path));
@@ -615,8 +720,7 @@ mod tests {
     #[test]
     fn nested_tar_compressed_sqlar() {
         let path = py_test("nested-tar-compressed.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing fixture");
+        if skip_missing(&path, "unencrypted") {
             return;
         }
         assert!(looks_like_sqlar(&path));
@@ -627,8 +731,7 @@ mod tests {
     #[test]
     fn nested_tar_trailing_slash_sqlar() {
         let path = py_test("nested-tar-trailing-slash.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing fixture");
+        if skip_missing(&path, "unencrypted") {
             return;
         }
         let m = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
@@ -638,8 +741,7 @@ mod tests {
     #[test]
     fn encrypted_detection_without_password() {
         let path = py_test("encrypted-nested-tar.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing encrypted fixture");
+        if skip_missing(&path, "encrypted") {
             return;
         }
         assert!(looks_like_sqlar(&path));
@@ -649,7 +751,7 @@ mod tests {
             Err(err @ SqlarError::EncryptedRequiresPassword) => {
                 let msg = err.to_string();
                 assert!(
-                    msg.contains("password") || msg.contains("encrypted"),
+                    msg.contains("password") && msg.contains("encrypted"),
                     "message should mention password/encrypted: {msg}"
                 );
             }
@@ -661,28 +763,34 @@ mod tests {
     #[test]
     fn encrypted_with_password() {
         let path = py_test("encrypted-nested-tar.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing encrypted fixture");
+        if skip_missing(&path, "encrypted") {
             return;
         }
+        // Python fixture password is "foo"; also try a decoy first (multi-password trial).
         let opts = OpenOptions {
-            passwords: vec!["foo".into()],
+            passwords: vec![
+                r#""; DROP TABLE sqlar;"#.into(),
+                "foo".into(),
+            ],
             ..OpenOptions::default()
         };
 
         #[cfg(feature = "sqlcipher")]
         {
+            assert!(sqlcipher_enabled());
             let m = SqlarMountSource::open(&path, &opts).expect("decrypt with password foo");
             assert_ufo(&m);
         }
 
         #[cfg(not(feature = "sqlcipher"))]
         {
+            assert!(!sqlcipher_enabled());
             match SqlarMountSource::open(&path, &opts) {
                 Err(err @ SqlarError::EncryptedNotSupported) => {
                     let msg = err.to_string();
                     assert!(
-                        msg.contains("sqlcipher") || msg.contains("not supported"),
+                        msg.contains("sqlcipher")
+                            && (msg.contains("--features") || msg.contains("not supported")),
                         "message: {msg}"
                     );
                 }
@@ -695,8 +803,7 @@ mod tests {
     #[test]
     fn encrypted_wrong_password_or_unsupported() {
         let path = py_test("encrypted-nested-tar.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing encrypted fixture");
+        if skip_missing(&path, "encrypted") {
             return;
         }
         let opts = OpenOptions {
@@ -718,8 +825,7 @@ mod tests {
     #[test]
     fn unencrypted_ignores_passwords() {
         let path = py_test("nested-tar.sqlar");
-        if !path.exists() {
-            eprintln!("skip missing fixture");
+        if skip_missing(&path, "unencrypted") {
             return;
         }
         let opts = OpenOptions {

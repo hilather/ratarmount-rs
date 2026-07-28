@@ -4,12 +4,17 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "SQLAR (SQLite Archiver) mount source"
+readme = "README.md"
 
 [features]
 default = []
-# Open sqlcipher-encrypted SQLAR archives (`PRAGMA key` + PBKDF2).
-# Requires building rusqlite with the SQLCipher amalgamation (vendored OpenSSL).
-# Enable with: cargo test -p ratarmount-formats-sqlar --features sqlcipher
+# Open SQLCipher-encrypted SQLAR archives (`PRAGMA key` + PBKDF2-HMAC-SHA512).
+# Links rusqlite with the SQLCipher amalgamation and vendored OpenSSL.
+#
+#   cargo build -p ratarmount-formats-sqlar --features sqlcipher
+#   cargo test  -p ratarmount-formats-sqlar --features sqlcipher --lib
+#
+# See README.md and the crate-level docs in src/lib.rs.
 sqlcipher = [
     "rusqlite/bundled-sqlcipher-vendored-openssl",
     "dep:pbkdf2",
