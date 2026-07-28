@@ -1,14 +1,21 @@
 //! XAR archive MountSource with TOC heap offsets (`backendName=XARMountSource`).
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! [`XarMountSource::open_from_reader`] indexes any seekable stream without a host path,
+//! so nested XAR can open without a `/tmp` spool when the parent member body is seekable
+//! and the factory sniffs `xar!` magic.
 
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use flate2::read::{GzDecoder, ZlibDecoder};
 use quick_xml::events::Event;
 use quick_xml::Reader;
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -30,8 +37,85 @@ pub enum XarError {
 
 pub type Result<T> = std::result::Result<T, XarError>;
 
+/// Mutex-backed `Read + Seek` for concurrent stencil / heap opens (Cursor / nested / remote).
+struct SharedSeekReader {
+    inner: Mutex<Box<dyn SeekRead>>,
+}
+
+impl SharedSeekReader {
+    fn new<R: SeekRead + 'static>(reader: R) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Box::new(reader)),
+        })
+    }
+
+    fn open_reader(self: &Arc<Self>) -> PositionedSeekReader {
+        PositionedSeekReader {
+            shared: Arc::clone(self),
+            pos: 0,
+        }
+    }
+}
+
+/// Independent logical cursor over a [`SharedSeekReader`].
+struct PositionedSeekReader {
+    shared: Arc<SharedSeekReader>,
+    pos: u64,
+}
+
+impl Read for PositionedSeekReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared XAR reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionedSeekReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .inner
+                    .lock()
+                    .map_err(|_| io::Error::other("shared XAR reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Where XAR bytes live for member open.
+enum XarBackend {
+    /// On-disk archive: open a fresh [`File`] per member.
+    Path(PathBuf),
+    /// Any `Read + Seek` shared under a mutex (nested / in-memory / remote).
+    Shared(Arc<SharedSeekReader>),
+}
+
 pub struct XarMountSource {
+    /// Path or virtual label (logs / index metadata).
+    #[allow(dead_code)]
     archive_path: PathBuf,
+    backend: XarBackend,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -75,6 +159,72 @@ impl XarMountSource {
         )
     }
 
+    /// Index and open a XAR archive from any `Read + Seek` source.
+    ///
+    /// Intended for nested AutoMount / in-memory archives: no on-disk archive path is
+    /// required. `archive_label` is used for logs and index metadata (may be a nested
+    /// member name). The reader is retained under a mutex for concurrent stencil opens
+    /// and compressed heap reads (inflate into RAM; no disk spool).
+    ///
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
+    /// `options.index_in_memory` is set).
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            index_path.map(|p| p.to_path_buf())
+        };
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let mut reader = reader;
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+
+        let (toc_xml, heap_offset) = read_header_and_toc(&mut reader)?;
+        let rows = parse_toc_xml(&toc_xml, heap_offset)?;
+        if rows.is_empty() {
+            return Err(XarError::Msg("XAR archive contains no files".into()));
+        }
+
+        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        index.begin_write()?;
+        insert_rows(&index, &rows)?;
+        index.store_versions(product_version)?;
+        index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        store_stats_for_label(&index, &archive_path, size)?;
+        index.commit_write()?;
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        reader.seek(SeekFrom::Start(0))?;
+        let index = index.into_read_only()?;
+        Ok(Self {
+            archive_path,
+            backend: XarBackend::Shared(SharedSeekReader::new(reader)),
+            index,
+            options: options.clone(),
+        })
+    }
+
     fn open_existing(
         archive_path: &Path,
         index_path: &Path,
@@ -84,6 +234,7 @@ impl XarMountSource {
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: XarBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
@@ -103,25 +254,10 @@ impl XarMountSource {
         let t0 = Instant::now();
 
         let mut file = File::open(archive_path)?;
-        let mut header = [0u8; 28];
-        file.read_exact(&mut header)?;
-        if &header[..4] != b"xar!" {
-            return Err(XarError::Msg("Not a XAR archive".into()));
-        }
-        let header_size = u16::from_be_bytes([header[4], header[5]]) as u64;
-        let toc_comp_len = u64::from_be_bytes(header[8..16].try_into().unwrap());
-        let header_size = if header_size < 28 { 28 } else { header_size };
+        let size = file.seek(SeekFrom::End(0)).unwrap_or(0);
+        file.seek(SeekFrom::Start(0))?;
 
-        file.seek(SeekFrom::Start(header_size))?;
-        let mut toc_compressed = vec![0u8; toc_comp_len as usize];
-        file.read_exact(&mut toc_compressed)?;
-        let mut decoder = ZlibDecoder::new(&toc_compressed[..]);
-        let mut toc_xml = Vec::new();
-        decoder
-            .read_to_end(&mut toc_xml)
-            .map_err(|e| XarError::Msg(format!("Failed to decompress XAR TOC: {e}")))?;
-
-        let heap_offset = header_size + toc_comp_len;
+        let (toc_xml, heap_offset) = read_header_and_toc(&mut file)?;
         let rows = parse_toc_xml(&toc_xml, heap_offset)?;
         if rows.is_empty() {
             return Err(XarError::Msg("XAR archive contains no files".into()));
@@ -129,31 +265,10 @@ impl XarMountSource {
 
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
-        let mut generated = std::collections::BTreeSet::new();
-        for row in rows {
-            ensure_parents(&index, &row.path, &mut generated, row.mtime)?;
-            index.insert_file(
-                &row.path,
-                &row.name,
-                row.header_offset,
-                row.data_offset,
-                row.size,
-                row.mtime,
-                row.mode,
-                0,
-                &row.linkname,
-                0,
-                0,
-                false,
-                false,
-                false,
-                0,
-            )?;
-        }
-
+        insert_rows(&index, &rows)?;
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
-        store_stats(&index, archive_path)?;
+        store_stats_for_label(&index, archive_path, size)?;
         index.commit_write()?;
 
         let secs = t0.elapsed().as_secs_f64();
@@ -165,10 +280,60 @@ impl XarMountSource {
         let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: XarBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
     }
+}
+
+/// Parse XAR header + zlib TOC; return decompressed TOC XML and absolute heap start.
+fn read_header_and_toc<R: Read + Seek>(reader: &mut R) -> Result<(Vec<u8>, u64)> {
+    let mut header = [0u8; 28];
+    reader.read_exact(&mut header)?;
+    if &header[..4] != b"xar!" {
+        return Err(XarError::Msg("Not a XAR archive".into()));
+    }
+    let header_size = u16::from_be_bytes([header[4], header[5]]) as u64;
+    let toc_comp_len = u64::from_be_bytes(header[8..16].try_into().unwrap());
+    let header_size = if header_size < 28 { 28 } else { header_size };
+
+    reader.seek(SeekFrom::Start(header_size))?;
+    let mut toc_compressed = vec![0u8; toc_comp_len as usize];
+    reader.read_exact(&mut toc_compressed)?;
+    let mut decoder = ZlibDecoder::new(&toc_compressed[..]);
+    let mut toc_xml = Vec::new();
+    decoder
+        .read_to_end(&mut toc_xml)
+        .map_err(|e| XarError::Msg(format!("Failed to decompress XAR TOC: {e}")))?;
+
+    let heap_offset = header_size + toc_comp_len;
+    Ok((toc_xml, heap_offset))
+}
+
+fn insert_rows(index: &SqliteIndex, rows: &[XarRow]) -> Result<()> {
+    let mut generated = std::collections::BTreeSet::new();
+    for row in rows {
+        ensure_parents(index, &row.path, &mut generated, row.mtime)?;
+        index.insert_file(
+            &row.path,
+            &row.name,
+            row.header_offset,
+            row.data_offset,
+            row.size,
+            row.mtime,
+            row.mode,
+            0,
+            &row.linkname,
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )?;
+    }
+    Ok(())
 }
 
 struct XarRow {
@@ -424,60 +589,76 @@ impl MountSource for XarMountSource {
         }
         let ud = userdata(file_info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing xar userdata"))?;
+        let offset = ud.offset;
         let link = file_info.linkname.as_str();
-        if !link.starts_with("xar-enc:") {
-            let file = File::open(&self.archive_path)?;
-            return Ok(Box::new(StenciledFile::new(
-                file,
-                vec![(ud.offset, file_info.size)],
-            )));
+
+        match &self.backend {
+            XarBackend::Path(path) => {
+                let file = File::open(path)?;
+                open_member_from_reader(file, offset, file_info.size, link)
+            }
+            XarBackend::Shared(shared) => {
+                let reader = shared.open_reader();
+                open_member_from_reader(reader, offset, file_info.size, link)
+            }
         }
-
-        let rest = &link["xar-enc:".len()..];
-        let (style, packed_meta) = rest.split_once("|packed:").unwrap_or((rest, ""));
-        let packed_size = packed_meta.parse::<u64>().unwrap_or(file_info.size);
-
-        if style == "application/octet-stream" || style.is_empty() {
-            let file = File::open(&self.archive_path)?;
-            return Ok(Box::new(StenciledFile::new(
-                file,
-                vec![(ud.offset, packed_size)],
-            )));
-        }
-
-        let mut file = File::open(&self.archive_path)?;
-        file.seek(SeekFrom::Start(ud.offset))?;
-        let mut packed = vec![0u8; packed_size as usize];
-        file.read_exact(&mut packed)?;
-
-        let data = if style == "application/x-bzip2" {
-            let mut d = bzip2::read::BzDecoder::new(&packed[..]);
-            let mut out = Vec::new();
-            d.read_to_end(&mut out)?;
-            out
-        } else if style == "application/x-xz" || style == "application/xz" {
-            let mut d = xz2::read::XzDecoder::new(&packed[..]);
-            let mut out = Vec::new();
-            d.read_to_end(&mut out)?;
-            out
-        } else if style == "application/x-gzip"
-            || style == "application/gzip"
-            || style.contains("gzip")
-        {
-            decompress_zlib_or_gzip(&packed)?
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                format!("XAR member encoding not supported for random access: {style}"),
-            ));
-        };
-
-        Ok(Box::new(Cursor::new(data)))
     }
 
     fn is_immutable(&self) -> bool {
         true
     }
+}
+
+/// Open a XAR member: store/none → stencil; gzip/zlib/bzip2/xz → inflate into RAM cursor.
+fn open_member_from_reader<R: Read + Seek + Send + 'static>(
+    mut reader: R,
+    offset: u64,
+    logical_size: u64,
+    link: &str,
+) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+    if !link.starts_with("xar-enc:") {
+        return Ok(Box::new(StenciledFile::new(
+            reader,
+            vec![(offset, logical_size)],
+        )));
+    }
+
+    let rest = &link["xar-enc:".len()..];
+    let (style, packed_meta) = rest.split_once("|packed:").unwrap_or((rest, ""));
+    let packed_size = packed_meta.parse::<u64>().unwrap_or(logical_size);
+
+    if style == "application/octet-stream" || style.is_empty() {
+        return Ok(Box::new(StenciledFile::new(
+            reader,
+            vec![(offset, packed_size)],
+        )));
+    }
+
+    reader.seek(SeekFrom::Start(offset))?;
+    let mut packed = vec![0u8; packed_size as usize];
+    reader.read_exact(&mut packed)?;
+
+    let data = if style == "application/x-bzip2" {
+        let mut d = bzip2::read::BzDecoder::new(&packed[..]);
+        let mut out = Vec::new();
+        d.read_to_end(&mut out)?;
+        out
+    } else if style == "application/x-xz" || style == "application/xz" {
+        let mut d = xz2::read::XzDecoder::new(&packed[..]);
+        let mut out = Vec::new();
+        d.read_to_end(&mut out)?;
+        out
+    } else if style == "application/x-gzip" || style == "application/gzip" || style.contains("gzip")
+    {
+        decompress_zlib_or_gzip(&packed)?
+    } else {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("XAR member encoding not supported for random access: {style}"),
+        ));
+    };
+
+    Ok(Box::new(Cursor::new(data)))
 }
 
 fn decompress_zlib_or_gzip(packed: &[u8]) -> io::Result<Vec<u8>> {
@@ -550,15 +731,24 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
+/// Store tarstats from path metadata when available; otherwise synthetic size-only stats.
+///
+/// Used for reader-based / nested opens where `archive_label` may be a virtual name.
+fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
+    if path.exists() {
+        if let Ok(meta) = std::fs::metadata(path) {
+            use std::os::unix::fs::MetadataExt;
+            let json = format!(
+                "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
+                meta.size(),
+                meta.mtime(),
+                meta.mtime_nsec()
+            );
+            index.store_metadata_key_value("tarstats", &json)?;
+            return Ok(());
+        }
+    }
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }
@@ -566,12 +756,138 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::write::ZlibEncoder;
+    use flate2::Compression;
+    use std::io::Write;
+
+    fn py_fixture(name: &str) -> PathBuf {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        PathBuf::from(root).join("tests").join(name)
+    }
+
+    /// Minimal synthetic XAR: one store-encoded member (no disk needed).
+    fn build_store_xar(name: &str, payload: &[u8]) -> Vec<u8> {
+        let toc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xar>
+ <toc>
+  <file id="1">
+   <type>file</type>
+   <name>{name}</name>
+   <data>
+    <length>{len}</length>
+    <offset>0</offset>
+    <size>{len}</size>
+    <encoding style="application/octet-stream"/>
+   </data>
+  </file>
+ </toc>
+</xar>"#,
+            name = name,
+            len = payload.len()
+        );
+        wrap_xar(toc.as_bytes(), payload)
+    }
+
+    /// Minimal synthetic XAR: one gzip/zlib-encoded member.
+    fn build_gzip_xar(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut enc = ZlibEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(payload).unwrap();
+        let packed = enc.finish().unwrap();
+        let toc = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<xar>
+ <toc>
+  <file id="1">
+   <type>file</type>
+   <name>{name}</name>
+   <data>
+    <length>{plen}</length>
+    <offset>0</offset>
+    <size>{ulen}</size>
+    <encoding style="application/x-gzip"/>
+   </data>
+  </file>
+ </toc>
+</xar>"#,
+            name = name,
+            plen = packed.len(),
+            ulen = payload.len()
+        );
+        wrap_xar(toc.as_bytes(), &packed)
+    }
+
+    fn wrap_xar(toc_xml: &[u8], heap: &[u8]) -> Vec<u8> {
+        let mut toc_comp = ZlibEncoder::new(Vec::new(), Compression::default());
+        toc_comp.write_all(toc_xml).unwrap();
+        let toc_comp = toc_comp.finish().unwrap();
+
+        let header_size: u16 = 28;
+        let mut out = Vec::with_capacity(28 + toc_comp.len() + heap.len());
+        out.extend_from_slice(b"xar!");
+        out.extend_from_slice(&header_size.to_be_bytes());
+        out.extend_from_slice(&1u16.to_be_bytes()); // version
+        out.extend_from_slice(&(toc_comp.len() as u64).to_be_bytes());
+        out.extend_from_slice(&(toc_xml.len() as u64).to_be_bytes());
+        out.extend_from_slice(&0u32.to_be_bytes()); // checksum algo none
+        out.extend_from_slice(&toc_comp);
+        out.extend_from_slice(heap);
+        out
+    }
+
+    fn read_member(m: &XarMountSource, path: &str) -> Vec<u8> {
+        let fi = m.lookup(path, 0).unwrap_or_else(|| panic!("lookup {path}"));
+        let mut r = m.open(&fi, 0).expect("open member");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).expect("read member");
+        buf
+    }
+
+    #[test]
+    fn open_from_reader_store_synthetic() {
+        let bytes = build_store_xar("hello.txt", b"hello");
+        let m = XarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested.xar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+        assert_eq!(read_member(&m, "/hello.txt"), b"hello");
+    }
+
+    #[test]
+    fn open_from_reader_gzip_synthetic() {
+        let payload = b"foo\n";
+        let bytes = build_gzip_xar("bar", payload);
+        let m = XarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested-gz.xar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("open_from_reader gzip");
+        assert_eq!(read_member(&m, "/bar"), payload);
+    }
+
+    #[test]
+    fn open_from_reader_rejects_bad_magic() {
+        let err = XarMountSource::open_from_reader(
+            Cursor::new(b"not a xar"),
+            Path::new("bad.xar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        );
+        assert!(err.is_err());
+    }
 
     #[test]
     fn open_single_file_xar() {
-        let root = std::env::var("RATARMOUNT_PY_ROOT")
-            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
-        let path = PathBuf::from(root).join("tests/single-file.xar");
+        let path = py_fixture("single-file.xar");
         if !path.exists() {
             return;
         }
@@ -580,10 +896,33 @@ mod tests {
         let idx = dir.path().join("x.index.sqlite");
         let m = XarMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
             .unwrap();
-        let fi = m.lookup("/bar", 0).expect("bar");
-        let mut r = m.open(&fi, 0).unwrap();
-        let mut buf = Vec::new();
-        r.read_to_end(&mut buf).unwrap();
-        assert_eq!(buf, b"foo\n");
+        assert_eq!(read_member(&m, "/bar"), b"foo\n");
+    }
+
+    #[test]
+    fn open_from_reader_matches_path_open() {
+        let path = py_fixture("single-file.xar");
+        if !path.exists() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("x.index.sqlite");
+        let from_path =
+            XarMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .expect("path open");
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let from_reader = XarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("single-file.xar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+        assert_eq!(
+            read_member(&from_path, "/bar"),
+            read_member(&from_reader, "/bar")
+        );
+        assert_eq!(read_member(&from_reader, "/bar"), b"foo\n");
     }
 }
