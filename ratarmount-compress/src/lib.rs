@@ -6,7 +6,10 @@
 //! * **lzip** — multimember walk via trailer `member_size`.
 //! * **lzo** — LZOP block index via liblzo2 (optional at runtime).
 //! * **bzip2** — one-shot decode into RAM/temp; optional multi-block parallel decode (`-P`).
-//! * **xz / .Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
+//! * **xz** — one-shot decode; multi-stream parallel decode via `open_seekable_xz_with_threads`.
+//! * **zstd** — multi-frame / seek table; `open_seekable_zstd_with_threads` for `-P`.
+//! * **gzip** — seek checkpoints; multi-member parallel decode (best-effort) + `-P` threads.
+//! * **.Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
 //! * CLI/helpers still expose `materialize_*` for plain single-file mounts.
 //! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
@@ -31,8 +34,8 @@ pub use split::{
 pub use bzip2_seek::{open_seekable_bzip2, open_seekable_bzip2_with_threads};
 pub use compress_z_seek::open_seekable_compress_z;
 pub use gzip_seek::{
-    open_seekable_gzip, SeekableGzip, SeekableGzipReader, SharedSeekableGzip,
-    DEFAULT_GZIP_SEEK_SPACING,
+    open_seekable_gzip, open_seekable_gzip_with_threads, try_parallel_multi_member_decode,
+    SeekableGzip, SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
 };
 pub use lz4_seek::{open_seekable_lz4, SeekableLz4};
 pub use lzip_seek::{open_seekable_lzip, SeekableLzip};
@@ -43,9 +46,11 @@ pub use ratarmount_core::ParallelizationSpec;
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };
-pub use xz_seek::open_seekable_xz;
+pub use xz_seek::{open_seekable_xz, open_seekable_xz_with_threads};
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib};
-pub use zstd_seek::{build_seek_table_skippable, SeekableZstd};
+pub use zstd_seek::{
+    build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_with_threads, SeekableZstd,
+};
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};

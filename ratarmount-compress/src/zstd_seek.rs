@@ -6,14 +6,41 @@
 //! 2. **Multi-frame scan** — walk concatenated zstd frames; random access restores
 //!    only the covering frame (cached per reader), never the full single-frame buffer.
 //! 3. **Full decode** fallback for single large frames without a seek table.
+//!
+//! Thread hint (`open_seekable_zstd_with_threads` / Python `-P` zstd backend):
+//! * Multi-frame maps keep **per-frame** random access; frames are independent, so
+//!   concurrent readers already decode different frames without a shared lock.
+//! * When falling back to a full single-buffer decode of multi-frame input and
+//!   `threads > 1`, frames are decompressed in parallel (the public `zstd` crate
+//!   exposes multi-thread **encode** via `zstdmt`/`NbWorkers`; frame-level
+//!   parallel **decode** is implemented here instead).
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::thread;
+
+use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
+
+/// Open zstd as a seekable body (multi-frame map, seek table, or full decode).
+pub fn open_seekable_zstd(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
+    open_seekable_zstd_with_threads(path, 1)
+}
+
+/// Open zstd with a thread hint (Python `-P` / zstd backend).
+///
+/// `threads == 0` means “use CPU count”. See module docs for how threads are used.
+pub fn open_seekable_zstd_with_threads(
+    path: impl AsRef<Path>,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    SeekableZstd::open_with_threads(path, threads)
+}
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
 const SKIPPABLE_MAGIC_MIN: u32 = 0x184D2A50;
@@ -50,7 +77,13 @@ pub struct SeekableZstd {
 
 impl SeekableZstd {
     pub fn open(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
+        Self::open_with_threads(path, 1)
+    }
+
+    /// Open with a thread hint. See [`open_seekable_zstd_with_threads`].
+    pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
         let path = path.as_ref();
+        let threads = ParallelizationSpec::resolve_zero(threads).max(1);
 
         // 1) Prefer official seekable-format seek table when present.
         if let Ok((frames, uncomp_size)) = try_load_seek_table(path) {
@@ -66,7 +99,7 @@ impl SeekableZstd {
             if frames.len() == 1 {
                 if let Some(sz) = frames[0].uncompressed_size {
                     if sz <= DEFAULT_MEMORY_CAP {
-                        return decode_full(path);
+                        return decode_full(path, threads);
                     }
                 }
                 // Single large frame with known compressed bounds: still use frame reader
@@ -94,14 +127,14 @@ impl SeekableZstd {
                 // Single frame: if small content size known, decode that frame only once into memory.
                 if let Some(sz) = frames[0].uncompressed_size {
                     if sz <= DEFAULT_MEMORY_CAP {
-                        return decode_full(path);
+                        return decode_full(path, threads);
                     }
                 }
                 let _ = (frames, uncomp_size);
-                decode_full(path)
+                decode_full(path, threads)
             }
-            Ok(_) => decode_full(path),
-            Err(_) => decode_full(path),
+            Ok(_) => decode_full(path, threads),
+            Err(_) => decode_full(path, threads),
         }
     }
 
@@ -111,12 +144,135 @@ impl SeekableZstd {
     }
 }
 
-fn decode_full(path: &Path) -> Result<Arc<dyn SeekableBody>> {
+fn decode_full(path: &Path, threads: u32) -> Result<Arc<dyn SeekableBody>> {
+    // Best-effort: multi-frame full materialization with parallel frame decode.
+    if threads > 1 {
+        if let Ok(data) = try_parallel_frame_decode(path, threads) {
+            if data.len() as u64 <= DEFAULT_MEMORY_CAP {
+                return Ok(DecodedBody::from_bytes(path, "zstd", data) as Arc<dyn SeekableBody>);
+            }
+            let cursor = std::io::Cursor::new(data);
+            let body = DecodedBody::from_decoder(path, "zstd", cursor, DEFAULT_MEMORY_CAP)?;
+            return Ok(body as Arc<dyn SeekableBody>);
+        }
+    }
     let file = File::open(path)?;
     let dec =
         zstd::stream::read::Decoder::new(file).map_err(|e| CompressError::Msg(e.to_string()))?;
     let body = DecodedBody::from_decoder(path, "zstd", dec, DEFAULT_MEMORY_CAP)?;
     Ok(body)
+}
+
+/// Parallel decompress of independent zstd frames into one contiguous buffer.
+fn try_parallel_frame_decode(path: &Path, threads: u32) -> Result<Vec<u8>> {
+    let data = std::fs::read(path)?;
+    let (frames, _total) = build_frame_map_from_bytes(&data)?;
+    if frames.len() < 2 {
+        return Err(CompressError::Msg("single zstd frame; sequential path".into()));
+    }
+    let mut slices: Vec<&[u8]> = Vec::with_capacity(frames.len());
+    for f in &frames {
+        let start = f.compressed_offset as usize;
+        let len = f
+            .compressed_size
+            .ok_or_else(|| CompressError::Msg("zstd frame size unknown".into()))?
+            as usize;
+        if start + len > data.len() {
+            return Err(CompressError::Msg("zstd frame out of bounds".into()));
+        }
+        slices.push(&data[start..start + len]);
+    }
+    parallel_decode_frame_slices(&slices, threads)
+}
+
+fn parallel_decode_frame_slices(parts: &[&[u8]], threads: u32) -> Result<Vec<u8>> {
+    let n_workers = (threads as usize).min(parts.len()).max(1);
+    let mut results: Vec<Option<Result<Vec<u8>>>> = (0..parts.len()).map(|_| None).collect();
+
+    thread::scope(|scope| {
+        let chunk = parts.len().div_ceil(n_workers).max(1);
+        let mut handles = Vec::new();
+        for (worker_id, part_chunk) in parts.chunks(chunk).enumerate() {
+            let base = worker_id * chunk;
+            let owned: Vec<Vec<u8>> = part_chunk.iter().map(|p| p.to_vec()).collect();
+            handles.push(scope.spawn(move || {
+                let mut outs = Vec::with_capacity(owned.len());
+                for p in &owned {
+                    outs.push(decode_one_zstd_frame(p));
+                }
+                (base, outs)
+            }));
+        }
+        for h in handles {
+            if let Ok((base, outs)) = h.join() {
+                for (i, r) in outs.into_iter().enumerate() {
+                    results[base + i] = Some(r);
+                }
+            }
+        }
+    });
+
+    let mut out = Vec::new();
+    for r in results {
+        out.extend(
+            r.ok_or_else(|| CompressError::Msg("zstd parallel worker missing".into()))??,
+        );
+    }
+    Ok(out)
+}
+
+fn decode_one_zstd_frame(frame: &[u8]) -> Result<Vec<u8>> {
+    let mut decoder = zstd::stream::read::Decoder::new(frame)
+        .map_err(|e| CompressError::Msg(e.to_string()))?
+        .single_frame();
+    let mut out = Vec::new();
+    decoder
+        .read_to_end(&mut out)
+        .map_err(|e| CompressError::Msg(e.to_string()))?;
+    Ok(out)
+}
+
+fn build_frame_map_from_bytes(data: &[u8]) -> Result<(Vec<FrameInfo>, u64)> {
+    let file_len = data.len() as u64;
+    let mut frames = Vec::new();
+    let mut pos = 0usize;
+    let mut uncomp = 0u64;
+
+    while pos + 4 <= data.len() {
+        let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
+
+        if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
+            if pos + 8 > data.len() {
+                break;
+            }
+            let sz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
+            pos += 8 + sz;
+            continue;
+        }
+        if data[pos..pos + 4] != ZSTD_MAGIC {
+            break;
+        }
+
+        let frame_start = pos as u64;
+        let (comp_size, frame_uncomp) = measure_frame_slice(&data[pos..])?;
+
+        frames.push(FrameInfo {
+            compressed_offset: frame_start,
+            uncompressed_offset: uncomp,
+            compressed_size: Some(comp_size),
+            uncompressed_size: Some(frame_uncomp),
+        });
+        uncomp += frame_uncomp;
+        pos += comp_size as usize;
+        if pos as u64 > file_len {
+            break;
+        }
+    }
+
+    if frames.is_empty() {
+        return Err(CompressError::Msg("no zstd frames found".into()));
+    }
+    Ok((frames, uncomp))
 }
 
 impl SeekableBody for SeekableZstd {
@@ -340,47 +496,7 @@ fn try_load_seek_table(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
 /// a streaming decoder would over-read into the next frame.
 fn build_frame_map(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
     let data = std::fs::read(path)?;
-    let file_len = data.len() as u64;
-    let mut frames = Vec::new();
-    let mut pos = 0usize;
-    let mut uncomp = 0u64;
-
-    while pos + 4 <= data.len() {
-        let magic = u32::from_le_bytes(data[pos..pos + 4].try_into().unwrap());
-
-        // Skippable frame (including a trailing seek table — skip while scanning frames)
-        if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
-            if pos + 8 > data.len() {
-                break;
-            }
-            let sz = u32::from_le_bytes(data[pos + 4..pos + 8].try_into().unwrap()) as usize;
-            pos += 8 + sz;
-            continue;
-        }
-        if data[pos..pos + 4] != ZSTD_MAGIC {
-            break;
-        }
-
-        let frame_start = pos as u64;
-        let (comp_size, frame_uncomp) = measure_frame_slice(&data[pos..])?;
-
-        frames.push(FrameInfo {
-            compressed_offset: frame_start,
-            uncompressed_offset: uncomp,
-            compressed_size: Some(comp_size),
-            uncompressed_size: Some(frame_uncomp),
-        });
-        uncomp += frame_uncomp;
-        pos += comp_size as usize;
-        if pos as u64 > file_len {
-            break;
-        }
-    }
-
-    if frames.is_empty() {
-        return Err(CompressError::Msg("no zstd frames found".into()));
-    }
-    Ok((frames, uncomp))
+    build_frame_map_from_bytes(&data)
 }
 
 /// Exact compressed size + uncompressed size for the first zstd frame in `src`.
@@ -569,5 +685,65 @@ mod tests {
         let body = SeekableZstd::open(&path).unwrap();
         assert_eq!(body.kind(), "zstd-frames");
         assert!(body.checkpoint_count() >= 2);
+    }
+
+    #[test]
+    fn open_seekable_zstd_with_threads_equals_single() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("threads.zst");
+        let parts: [&[u8]; 3] = [b"frame-one!!!!", b"frame-two-data", b"f3"];
+        let mut out = File::create(&path).unwrap();
+        for p in parts {
+            out.write_all(&encode_frame(p)).unwrap();
+        }
+        drop(out);
+
+        let mut expected = Vec::new();
+        for p in parts {
+            expected.extend_from_slice(p);
+        }
+
+        let body1 = open_seekable_zstd_with_threads(&path, 1).unwrap();
+        let body4 = open_seekable_zstd_with_threads(&path, 4).unwrap();
+        // Multi-frame path keeps frame map (not full parallel materialize).
+        assert!(body1.checkpoint_count() >= 2);
+        assert!(body4.checkpoint_count() >= 2);
+
+        let mut a = Vec::new();
+        body1.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        body4.open_reader().unwrap().read_to_end(&mut b).unwrap();
+        assert_eq!(a, expected);
+        assert_eq!(b, expected);
+    }
+
+    #[test]
+    fn parallel_frame_decode_matches_sequential() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("par.zst");
+        let parts: [&[u8]; 3] = [b"AAAA", b"BBBBCCCC", b"DD"];
+        let mut out = File::create(&path).unwrap();
+        for p in parts {
+            out.write_all(&encode_frame(p)).unwrap();
+        }
+        drop(out);
+
+        let par = try_parallel_frame_decode(&path, 4).unwrap();
+        let mut seq = Vec::new();
+        let file = File::open(&path).unwrap();
+        let mut dec = zstd::stream::read::Decoder::new(file).unwrap();
+        dec.read_to_end(&mut seq).unwrap();
+        assert_eq!(par, seq);
+        assert_eq!(par, b"AAAABBBBCCCCDD");
+    }
+
+    #[test]
+    fn threads_zero_means_cpu_count_zstd() {
+        let path = py_test("simple.zst");
+        if !path.exists() {
+            return;
+        }
+        let body = open_seekable_zstd_with_threads(&path, 0).unwrap();
+        assert_eq!(body.size(), 12);
     }
 }

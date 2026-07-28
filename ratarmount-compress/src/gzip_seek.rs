@@ -4,14 +4,23 @@
 //! `spacing` uncompressed bytes. Random access restores the nearest checkpoint and
 //! decodes forward (at most ~spacing work per seek). Checkpoints live for the mount
 //! lifetime (rebuild-on-load is acceptable; Python-compatible blob import is Tier C).
+//!
+//! Thread hint (`open_seekable_gzip_with_threads` / Python `-P` gzip backend):
+//! * Seek-index construction is inherently sequential (inflate state chain).
+//! * When `threads > 1` and the file is a **concatenation of independent gzip
+//!   members**, members can be fully decoded in parallel
+//!   ([`try_parallel_multi_member_decode`]) — best-effort multi-member parallel
+//!   path matching rapidgzip-style member independence.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::thread;
 
 use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
+use ratarmount_core::ParallelizationSpec;
 
 use crate::{CompressError, Result};
 
@@ -43,8 +52,25 @@ pub struct SeekableGzip {
 impl SeekableGzip {
     /// Open and build (or rebuild) a seek index for `path`.
     pub fn open(path: impl AsRef<Path>, spacing: u64) -> Result<Arc<Self>> {
+        Self::open_with_threads(path, spacing, 1)
+    }
+
+    /// Open with a thread hint (Python `-P` / gzip backend).
+    ///
+    /// `threads == 0` means “use CPU count”. The seek index is still built
+    /// sequentially (inflate state chain). Independent multi-member parallel
+    /// decode is available via [`try_parallel_multi_member_decode`] when a full
+    /// buffer is preferred over random-access checkpoints.
+    pub fn open_with_threads(
+        path: impl AsRef<Path>,
+        spacing: u64,
+        threads: u32,
+    ) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         let spacing = spacing.max(64 * 1024); // avoid pathological tiny spacing
+        // Resolve for -P 0 parity / future concurrent index builders; index path
+        // does not currently fan out workers.
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
         let index = build_index(&path, spacing)?;
         Ok(Arc::new(Self { path, index }))
     }
@@ -512,8 +538,123 @@ fn skip_trailer_and_next_header(file: &mut File, after_deflate: u64) -> io::Resu
 
 /// Convenience: open gzip as a seekable reader (builds index).
 pub fn open_seekable_gzip(path: &Path, spacing: u64) -> Result<SeekableGzipReader> {
-    let g = SeekableGzip::open(path, spacing)?;
+    open_seekable_gzip_with_threads(path, spacing, 1)
+}
+
+/// Open seekable gzip with a thread hint (Python `-P` / gzip backend).
+///
+/// See [`SeekableGzip::open_with_threads`].
+pub fn open_seekable_gzip_with_threads(
+    path: &Path,
+    spacing: u64,
+    threads: u32,
+) -> Result<SeekableGzipReader> {
+    let g = SeekableGzip::open_with_threads(path, spacing, threads)?;
     g.reader().map_err(CompressError::from)
+}
+
+/// Best-effort parallel decode of independent concatenated gzip members.
+///
+/// Returns concatenated uncompressed bytes when ≥2 members are found and each
+/// segment decodes on its own. Single-member inputs return an error so callers
+/// can fall back to sequential `MultiGzDecoder` / seek-index paths.
+pub fn try_parallel_multi_member_decode(compressed: &[u8], threads: u32) -> Result<Vec<u8>> {
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    let parts = split_gzip_member_slices(compressed)
+        .ok_or_else(|| CompressError::Msg("single gzip member; sequential path".into()))?;
+    if parts.len() < 2 {
+        return Err(CompressError::Msg("single gzip member; sequential path".into()));
+    }
+    parallel_map_decode_gzip_members(&parts, threads)
+}
+
+fn is_gzip_magic(data: &[u8]) -> bool {
+    data.len() >= 2 && data[0] == 0x1f && data[1] == 0x8b
+}
+
+/// Locate gzip member header offsets (`1f 8b`).
+fn find_gzip_magic_offsets(data: &[u8]) -> Vec<usize> {
+    let mut markers = Vec::new();
+    let mut i = 0usize;
+    while i + 2 <= data.len() {
+        if data[i] == 0x1f && data[i + 1] == 0x8b {
+            markers.push(i);
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    markers
+}
+
+/// Split multi-member gzip at header magics. Each slice is one member candidate
+/// (through the next magic or EOF). Callers decode in parallel; false mid-stream
+/// magics cause decode errors and should fall back to sequential.
+fn split_gzip_member_slices(compressed: &[u8]) -> Option<Vec<&[u8]>> {
+    if !is_gzip_magic(compressed) {
+        return None;
+    }
+    let markers = find_gzip_magic_offsets(compressed);
+    if markers.len() < 2 {
+        return None;
+    }
+    let mut ends = markers;
+    ends.push(compressed.len());
+    let mut parts = Vec::with_capacity(ends.len() - 1);
+    for w in ends.windows(2) {
+        let start = w[0];
+        let end = w[1];
+        if end <= start + 10 {
+            return None;
+        }
+        parts.push(&compressed[start..end]);
+    }
+    Some(parts)
+}
+
+fn decode_one_gzip_member(member: &[u8]) -> Result<Vec<u8>> {
+    use flate2::read::GzDecoder;
+    let mut dec = GzDecoder::new(member);
+    let mut out = Vec::new();
+    dec.read_to_end(&mut out)
+        .map_err(|e| CompressError::Msg(format!("gzip member decode: {e}")))?;
+    Ok(out)
+}
+
+fn parallel_map_decode_gzip_members(parts: &[&[u8]], threads: u32) -> Result<Vec<u8>> {
+    let n_workers = (threads as usize).min(parts.len()).max(1);
+    let mut results: Vec<Option<Result<Vec<u8>>>> = (0..parts.len()).map(|_| None).collect();
+
+    thread::scope(|scope| {
+        let chunk = parts.len().div_ceil(n_workers).max(1);
+        let mut handles = Vec::new();
+        for (worker_id, part_chunk) in parts.chunks(chunk).enumerate() {
+            let base = worker_id * chunk;
+            let owned: Vec<Vec<u8>> = part_chunk.iter().map(|p| p.to_vec()).collect();
+            handles.push(scope.spawn(move || {
+                let mut outs = Vec::with_capacity(owned.len());
+                for p in &owned {
+                    outs.push(decode_one_gzip_member(p));
+                }
+                (base, outs)
+            }));
+        }
+        for h in handles {
+            if let Ok((base, outs)) = h.join() {
+                for (i, r) in outs.into_iter().enumerate() {
+                    results[base + i] = Some(r);
+                }
+            }
+        }
+    });
+
+    let mut out = Vec::new();
+    for r in results {
+        out.extend(
+            r.ok_or_else(|| CompressError::Msg("gzip parallel worker missing".into()))??,
+        );
+    }
+    Ok(out)
 }
 
 /// Shared gzip body used by TAR mounts (random access without materialize).
@@ -526,7 +667,12 @@ pub struct SharedSeekableGzip {
 
 impl SharedSeekableGzip {
     pub fn open(path: &Path, spacing: u64) -> Result<Arc<Self>> {
-        let inner = SeekableGzip::open(path, spacing)?;
+        Self::open_with_threads(path, spacing, 1)
+    }
+
+    /// Open with a thread hint (Python `-P` / gzip backend).
+    pub fn open_with_threads(path: &Path, spacing: u64, threads: u32) -> Result<Arc<Self>> {
+        let inner = SeekableGzip::open_with_threads(path, spacing, threads)?;
         Ok(Arc::new(Self {
             inner,
             _lock: Mutex::new(()),
@@ -621,5 +767,76 @@ mod tests {
         let mut all = Vec::new();
         r.read_to_end(&mut all).unwrap();
         assert_eq!(all, raw);
+    }
+
+    fn encode_gz(data: &[u8]) -> Vec<u8> {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap()
+    }
+
+    #[test]
+    fn parallel_multi_member_equals_sequential() {
+        let a = b"member-A-payload-aaaa";
+        let b = b"member-B-payload-bbbb-EXTRA";
+        let mut compressed = encode_gz(a);
+        compressed.extend_from_slice(&encode_gz(b));
+
+        let parts = split_gzip_member_slices(&compressed).expect("split members");
+        assert!(parts.len() >= 2, "expected ≥2 members, got {}", parts.len());
+
+        use flate2::read::MultiGzDecoder;
+        let mut seq = Vec::new();
+        MultiGzDecoder::new(&compressed[..])
+            .read_to_end(&mut seq)
+            .unwrap();
+        let mut expected = Vec::new();
+        expected.extend_from_slice(a);
+        expected.extend_from_slice(b);
+        assert_eq!(seq, expected);
+
+        let par = try_parallel_multi_member_decode(&compressed, 4).unwrap();
+        assert_eq!(par, seq);
+    }
+
+    #[test]
+    fn with_threads_equals_single_thread_gzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("multi.gz");
+        let a = b"alpha-gzip-member";
+        let b = b"beta-gzip-member!!";
+        let mut compressed = encode_gz(a);
+        compressed.extend_from_slice(&encode_gz(b));
+        std::fs::write(&gz, &compressed).unwrap();
+
+        let mut one = Vec::new();
+        open_seekable_gzip_with_threads(&gz, 1024, 1)
+            .unwrap()
+            .read_to_end(&mut one)
+            .unwrap();
+        let mut many = Vec::new();
+        open_seekable_gzip_with_threads(&gz, 1024, 4)
+            .unwrap()
+            .read_to_end(&mut many)
+            .unwrap();
+        assert_eq!(one, many);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(a);
+        expected.extend_from_slice(b);
+        assert_eq!(one, expected);
+    }
+
+    #[test]
+    fn threads_zero_means_cpu_count_gzip() {
+        let path = py_test("simple.gz");
+        if !path.exists() {
+            return;
+        }
+        let mut r = open_seekable_gzip_with_threads(&path, 1024, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "foo fighter\n");
     }
 }
