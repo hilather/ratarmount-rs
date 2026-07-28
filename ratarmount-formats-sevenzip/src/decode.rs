@@ -5,12 +5,13 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use aes::Aes256;
 use cbc::cipher::{block_padding::NoPadding, BlockDecryptMut, KeyIvInit};
+use ratarmount_compress::SeekRead;
 use sha2::{Digest, Sha256};
 
 use crate::parse::{
@@ -19,6 +20,9 @@ use crate::parse::{
     METHOD_BCJ_SPARC, METHOD_BCJ_X86, METHOD_BZIP2, METHOD_COPY, METHOD_DEFLATE, METHOD_DELTA,
     METHOD_LZMA, METHOD_LZMA2,
 };
+
+/// Shared seekable archive body (path-backed `File` or nested `Read+Seek` without temp spool).
+pub type SharedArchiveIo = Arc<Mutex<Box<dyn SeekRead>>>;
 
 type Aes256CbcDec = cbc::Decryptor<Aes256>;
 
@@ -70,6 +74,7 @@ pub struct FilePackSource {
 }
 
 impl FilePackSource {
+    #[allow(dead_code)]
     pub fn open(path: &Path, offset: u64, length: u64) -> Result<Self> {
         let file = File::open(path).map_err(SevenZipError::Io)?;
         Ok(Self {
@@ -101,6 +106,93 @@ impl PackSource for FilePackSource {
         let mut buf = vec![0u8; size];
         f.read_exact(&mut buf).map_err(SevenZipError::Io)?;
         Ok(buf)
+    }
+}
+
+/// Pack region over a shared seekable archive (nested open without materializing to tmp).
+pub struct SeekPackSource {
+    io: SharedArchiveIo,
+    offset: u64,
+    length: u64,
+}
+
+impl SeekPackSource {
+    pub fn new(io: SharedArchiveIo, offset: u64, length: u64) -> Self {
+        Self { io, offset, length }
+    }
+}
+
+impl PackSource for SeekPackSource {
+    fn size(&self) -> u64 {
+        self.length
+    }
+    fn read_at(&self, offset: u64, size: usize) -> Result<Vec<u8>> {
+        if size == 0 || offset >= self.length {
+            return Ok(vec![]);
+        }
+        let size = size.min((self.length - offset) as usize);
+        let mut g = self.io.lock().map_err(|_| {
+            SevenZipError::Msg("7z archive IO lock poisoned".into())
+        })?;
+        g.seek(SeekFrom::Start(self.offset + offset))
+            .map_err(SevenZipError::Io)?;
+        let mut buf = vec![0u8; size];
+        g.read_exact(&mut buf).map_err(SevenZipError::Io)?;
+        Ok(buf)
+    }
+}
+
+/// Independent logical view of `[base, base+len)` over [`SharedArchiveIo`].
+pub struct SharedArchiveView {
+    io: SharedArchiveIo,
+    base: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl SharedArchiveView {
+    pub fn new(io: SharedArchiveIo, base: u64, len: u64) -> Self {
+        Self {
+            io,
+            base,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for SharedArchiveView {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = ((self.len - self.pos) as usize).min(buf.len());
+        let mut g = self
+            .io
+            .lock()
+            .map_err(|_| io::Error::other("7z archive IO lock poisoned"))?;
+        g.seek(SeekFrom::Start(self.base + self.pos))?;
+        let n = g.read(&mut buf[..max])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedArchiveView {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.len as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
     }
 }
 

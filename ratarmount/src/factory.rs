@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{
     parse_recursive_extensions, AutoMountLayer, AutoMountOptions, FileVersionLayer,
-    FolderMountSource, OpenNestedFn, PrefixMountSource, RecursiveExtSet, TransformMountSource,
-    UnionMountOptions, UnionMountSource,
+    FolderMountSource, OpenNestedFn, OpenNestedReaderFn, PrefixMountSource, RecursiveExtSet,
+    TransformMountSource, UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
@@ -493,6 +493,67 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
         opts.index_file_path = Some(PathBuf::from(idx));
         open_path(path, &opts, true).map_err(std::io::Error::other)
     })
+}
+
+/// Nested open from a seekable parent-member stream (no temp spool).
+///
+/// Supports uncompressed TAR, 7z, and ZIP. Other formats fail so AutoMount can
+/// fall back to materializing a temp file and [`open_nested_fn`].
+pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
+    Arc::new(move |mut reader, label| {
+        use std::io::{Read, Seek, SeekFrom};
+
+        let mut opts = options.clone();
+        // Nested indexes cannot live next to a virtual label; keep them in memory.
+        opts.index_file_path = None;
+        opts.index_in_memory = true;
+        opts.clear_index_cache = true;
+
+        let mut magic = [0u8; 512];
+        let n = reader.read(&mut magic).map_err(std::io::Error::other)?;
+        reader.seek(SeekFrom::Start(0)).map_err(std::io::Error::other)?;
+        let head = &magic[..n];
+
+        // 7z magic
+        if head.len() >= 6 && &head[..6] == b"7z\xBC\xAF'\x1C" {
+            return SevenZipMountSource::open_from_reader(
+                reader, label, None, &opts, VERSION, true,
+            )
+            .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+            .map_err(|e| std::io::Error::other(e.to_string()));
+        }
+        // ZIP local/EOCD
+        if head.len() >= 4 && &head[..2] == b"PK" {
+            return ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+                .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+                .map_err(|e| std::io::Error::other(e.to_string()));
+        }
+        // Uncompressed TAR (ustar) or name suggests .tar
+        let looks_tar = (head.len() >= 262 && &head[257..262] == b"ustar")
+            || name_suggests_plain_tar(label);
+        if looks_tar {
+            return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
+                .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+                .map_err(|e| std::io::Error::other(e.to_string()));
+        }
+
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "nested reader open unsupported for {} (will try temp spool)",
+                label.display()
+            ),
+        ))
+    })
+}
+
+fn name_suggests_plain_tar(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    name.ends_with(".tar") || name == "tar"
 }
 
 fn resolved_index(path: &Path, options: &OpenOptions, recreate: bool) -> IndexLocation {
@@ -1137,21 +1198,24 @@ fn apply_compositing(
     }
     if comp.recursive {
         let opener = open_nested_fn(opts.clone());
+        let reader_opener = open_nested_reader_fn(opts.clone());
         let depth = match opts.recursion_depth.unwrap_or(0) {
             d if d < 0 => 0,
             d => d as u32,
         };
-        src = Arc::new(AutoMountLayer::new_with_options(
+        let layer = AutoMountLayer::new_with_openers(
             src,
             depth,
             opener,
+            Some(reader_opener),
             AutoMountOptions {
                 lazy: comp.lazy,
                 strip_recursive_extension: comp.strip_recursive_extension,
                 transform: comp.transform_recursive.clone(),
                 recursive_extensions: ext_set.clone(),
             },
-        ));
+        );
+        src = Arc::new(layer);
     }
     if comp.disable_union_mount && n_sources > 1 {
         let folder = strip_source_name(folder_hint);

@@ -10,15 +10,16 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{FileRow, IndexError, SqliteIndex};
 use thiserror::Error;
+
+use decode::{PackSource, SeekPackSource, SharedArchiveIo, SharedArchiveView};
 
 pub use parse::{looks_like_7z, SevenZipArchiveInfo, SevenZipError, SevenZipFileEntry};
 
@@ -42,11 +43,13 @@ pub type Result<T> = std::result::Result<T, SzError>;
 
 /// Mount source for 7z archives with pack-offset random access.
 pub struct SevenZipMountSource {
+    /// Host path or virtual label (URL / nested name).
+    #[allow(dead_code)]
     archive_path: PathBuf,
     archive: SevenZipArchiveInfo,
     index: SqliteIndex,
-    #[allow(dead_code)] // reserved for shared archive fd / pack streaming
-    file: Mutex<File>,
+    /// Shared seekable archive bytes (file or nested reader — no temp required).
+    archive_io: SharedArchiveIo,
     /// folder_index → fully decompressed folder bytes (small/medium folders).
     folder_cache: Mutex<HashMap<usize, Vec<u8>>>,
     /// folder_index → packed stream bytes (shared across solid members).
@@ -69,24 +72,52 @@ impl SevenZipMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        let file = File::open(&archive_path)?;
+        Self::open_from_reader(file, &archive_path, index_path, options, product_version, recreate)
+    }
+
+    /// Open a 7z archive from any seekable reader (nested AutoMount without temp spool).
+    ///
+    /// `archive_label` is used for logs / index metadata (may be a nested member name).
+    /// Prefer `index_path: None` or `options.index_in_memory` for nested mounts.
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+        recreate: bool,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
         let index_path_buf: Option<PathBuf> = if options.index_in_memory {
             None
         } else {
-            Some(index_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                let mut s = archive_path.as_os_str().to_os_string();
-                s.push(".index.sqlite");
-                PathBuf::from(s)
-            }))
+            index_path.map(|p| p.to_path_buf()).or_else(|| {
+                // Only invent a sibling index path when the label is a real file.
+                if archive_path.is_file() {
+                    let mut s = archive_path.as_os_str().to_os_string();
+                    s.push(".index.sqlite");
+                    Some(PathBuf::from(s))
+                } else {
+                    None
+                }
+            })
         };
 
         if let Some(ref ip) = index_path_buf {
-            if !recreate && ip.exists() {
-                if let Ok(s) = Self::open_existing(&archive_path, ip, options) {
+            if !recreate && ip.exists() && archive_path.is_file() {
+                // Existing index path only valid when we can re-open by path.
+                if let Ok(s) = Self::open_existing_path(&archive_path, ip, options) {
                     return Ok(s);
                 }
             }
         }
-        Self::create_index(
+
+        Self::create_index_from_reader(
+            reader,
             &archive_path,
             index_path_buf.as_deref(),
             options,
@@ -94,7 +125,7 @@ impl SevenZipMountSource {
         )
     }
 
-    fn open_existing(
+    fn open_existing_path(
         archive_path: &Path,
         index_path: &Path,
         options: &OpenOptions,
@@ -110,11 +141,13 @@ impl SevenZipMountSource {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         let entry_by_offsets = entry_offset_map(&archive);
+        file.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
             index,
-            file: Mutex::new(file),
+            archive_io,
             folder_cache: Mutex::new(HashMap::new()),
             packed_cache: Mutex::new(HashMap::new()),
             entry_by_offsets,
@@ -124,24 +157,30 @@ impl SevenZipMountSource {
         })
     }
 
-    fn create_index(
+    fn create_index_from_reader<R>(
+        mut reader: R,
         archive_path: &Path,
         index_path: Option<&Path>,
         options: &OpenOptions,
         product_version: &str,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         println!(
             "Creating offset dictionary for {} ...",
             archive_path.display()
         );
         let t0 = Instant::now();
 
-        let mut file = File::open(archive_path)?;
         // Parse once (encoded-header decompress uses no password typically).
-        let archive = parse::parse_7z_archive(&mut file, |folder, packed| {
+        let archive = parse::parse_7z_archive(&mut reader, |folder, packed| {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
+
+        reader.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
 
         let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
         let mut content_locked = false;
@@ -178,7 +217,13 @@ impl SevenZipMountSource {
                     {
                         let fi = entry.folder_index.unwrap();
                         let folder = &archive.folders[fi];
-                        match Self::try_decrypt_entry(archive_path, &archive, entry, folder, pw) {
+                        match Self::try_decrypt_entry_io(
+                            &archive_io,
+                            &archive,
+                            entry,
+                            folder,
+                            pw,
+                        ) {
                             Ok(()) => {
                                 chosen = Some(pw.clone());
                                 break;
@@ -247,8 +292,8 @@ impl SevenZipMountSource {
                 // Read symlink target at index time (skip when content-locked).
                 if !content_locked {
                     if let Some(fi) = entry.folder_index {
-                        if let Ok(bytes) = read_member_bytes_static(
-                            &mut file,
+                        if let Ok(bytes) = read_member_bytes_io(
+                            &archive_io,
                             &archive,
                             entry,
                             &archive.folders[fi],
@@ -311,7 +356,7 @@ impl SevenZipMountSource {
             archive_path: archive_path.to_path_buf(),
             archive,
             index,
-            file: Mutex::new(file),
+            archive_io,
             folder_cache: Mutex::new(HashMap::new()),
             packed_cache: Mutex::new(HashMap::new()),
             entry_by_offsets,
@@ -321,14 +366,18 @@ impl SevenZipMountSource {
         })
     }
 
-    fn try_decrypt_entry(
-        archive_path: &Path,
+    fn try_decrypt_entry_io(
+        archive_io: &SharedArchiveIo,
         archive: &SevenZipArchiveInfo,
         entry: &SevenZipFileEntry,
         folder: &parse::Folder,
         password: &str,
     ) -> std::result::Result<(), SevenZipError> {
-        let pack = decode::FilePackSource::open(archive_path, entry.pack_offset, entry.pack_size)?;
+        let pack = SeekPackSource::new(
+            Arc::clone(archive_io),
+            entry.pack_offset,
+            entry.pack_size,
+        );
         let sizes = pack_stream_sizes(archive, entry);
         let data = decode::decompress_folder_source(
             folder,
@@ -396,8 +445,11 @@ impl SevenZipMountSource {
                 return Ok(data.clone());
             }
         }
-        let pack =
-            decode::FilePackSource::open(&self.archive_path, entry.pack_offset, entry.pack_size)?;
+        let pack = SeekPackSource::new(
+            Arc::clone(&self.archive_io),
+            entry.pack_offset,
+            entry.pack_size,
+        );
         let packed = decode::PackSource::as_bytes(&pack).map_err(SzError::Seven)?;
         let mut cache = self.packed_cache.lock().unwrap();
         if cache.len() >= 8 {
@@ -503,23 +555,27 @@ fn pack_stream_sizes(archive: &SevenZipArchiveInfo, entry: &SevenZipFileEntry) -
     Some(pack_info.pack_sizes[start..end].to_vec())
 }
 
-fn read_member_bytes_static(
-    file: &mut File,
+fn read_member_bytes_io(
+    archive_io: &SharedArchiveIo,
     archive: &SevenZipArchiveInfo,
     entry: &SevenZipFileEntry,
     folder: &parse::Folder,
     password: Option<&str>,
 ) -> Result<Vec<u8>> {
     if folder.is_copy_only() && !folder.is_encrypted() {
-        file.seek(SeekFrom::Start(entry.pack_offset + entry.unpack_offset))?;
-        let mut buf = vec![0u8; entry.size as usize];
-        file.read_exact(&mut buf)?;
-        return Ok(buf);
+        let pack = SeekPackSource::new(
+            Arc::clone(archive_io),
+            entry.pack_offset + entry.unpack_offset,
+            entry.size,
+        );
+        return pack.as_bytes().map_err(SzError::Seven);
     }
-    // Prefer pack path via path on disk when possible (file is already open; re-read region).
-    file.seek(SeekFrom::Start(entry.pack_offset))?;
-    let mut packed = vec![0u8; entry.pack_size as usize];
-    file.read_exact(&mut packed)?;
+    let pack = SeekPackSource::new(
+        Arc::clone(archive_io),
+        entry.pack_offset,
+        entry.pack_size,
+    );
+    let packed = pack.as_bytes().map_err(SzError::Seven)?;
     let sizes = pack_stream_sizes(archive, entry);
     let data = decode::decompress_folder_source(
         folder,
@@ -581,14 +637,18 @@ fn ensure_parent_dirs(
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    let meta = std::fs::metadata(path)?;
-    use std::os::unix::fs::MetadataExt;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{}}}",
-        meta.size(),
-        meta.mtime()
-    );
-    index.store_metadata_key_value("tarstats", &json)?;
+    if let Ok(meta) = std::fs::metadata(path) {
+        use std::os::unix::fs::MetadataExt;
+        let json = format!(
+            "{{\"st_size\":{},\"st_mtime\":{}}}",
+            meta.size(),
+            meta.mtime()
+        );
+        index.store_metadata_key_value("tarstats", &json)?;
+    } else {
+        // Nested / virtual labels have no host metadata.
+        index.store_metadata_key_value("tarstats", "{\"st_size\":0,\"st_mtime\":0}")?;
+    }
     Ok(())
 }
 
@@ -652,12 +712,11 @@ impl MountSource for SevenZipMountSource {
             )));
         }
 
-        // Store / Copy: true random access via stencil into the archive file.
+        // Store / Copy: true random access via shared seekable view (path or nested).
         if folder.is_copy_only() && !folder.is_encrypted() {
-            let file = File::open(&self.archive_path)?;
             let offset = entry.pack_offset + entry.unpack_offset;
-            let stencil = StenciledFile::new(file, vec![(offset, entry.size)]);
-            return Ok(Box::new(stencil));
+            let view = SharedArchiveView::new(Arc::clone(&self.archive_io), offset, entry.size);
+            return Ok(Box::new(view));
         }
 
         // Pure LZMA2 solid folders: chunk-indexed random access (Python a0bc76e).
@@ -843,5 +902,111 @@ mod tests {
                 assert_eq!(buf.len(), fi.size as usize);
             }
         }
+    }
+
+    #[test]
+    fn open_from_reader_cursor_equals_path() {
+        let path = py_fixture("store-copy-two-files.7z");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let from_path =
+            SevenZipMountSource::open(&path, None, &opts, "0.1.0", true).expect("path open");
+        let from_reader = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/store.7z"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("reader open");
+        let fi_p = from_path.lookup("/a.txt", 0).expect("path a.txt");
+        let fi_r = from_reader.lookup("/a.txt", 0).expect("reader a.txt");
+        assert_eq!(fi_p.size, fi_r.size);
+        let mut bp = Vec::new();
+        let mut br = Vec::new();
+        from_path.open(&fi_p, 0).unwrap().read_to_end(&mut bp).unwrap();
+        from_reader
+            .open(&fi_r, 0)
+            .unwrap()
+            .read_to_end(&mut br)
+            .unwrap();
+        assert_eq!(bp, br);
+        // Mid-member seek on reader-backed store.
+        let mut r = from_reader.open(&fi_r, 0).unwrap();
+        r.seek(SeekFrom::Start(1)).unwrap();
+        let mut mid = Vec::new();
+        r.read_to_end(&mut mid).unwrap();
+        assert_eq!(mid.as_slice(), &bp[1..]);
+    }
+
+    #[test]
+    fn nested_inner_hello_via_outer_member_reader() {
+        // Outer archive holds an inner 7z; open the member as a seekable stream
+        // without writing it to a temp file, then open the nested 7z from that stream.
+        let path = py_fixture("nested-inner-hello.7z");
+        if !path.exists() {
+            return;
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let outer =
+            SevenZipMountSource::open(&path, None, &opts, "0.1.0", true).expect("outer open");
+        // Find the nested .7z member (typically /inner-hello.7z).
+        let nested_fi = outer
+            .lookup("/inner-hello.7z", 0)
+            .or_else(|| {
+                if let Some(ListResult::Infos(infos)) = outer.list("/") {
+                    infos
+                        .into_iter()
+                        .find(|(n, _)| n.ends_with(".7z"))
+                        .map(|(_, i)| i)
+                } else {
+                    None
+                }
+            })
+            .expect("inner 7z member");
+        // Parent open returns ArchiveRead (Seek) — no temp spool.
+        let nested_reader = outer.open(&nested_fi, 0).expect("open nested member stream");
+        let inner = SevenZipMountSource::open_from_reader(
+            nested_reader,
+            Path::new("inner-hello.7z"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("inner open_from_reader");
+        let hello = inner
+            .lookup("/hello.txt", 0)
+            .or_else(|| {
+                if let Some(ListResult::Infos(infos)) = inner.list("/") {
+                    infos.into_iter().find(|(_, i)| i.size > 0).map(|(_, i)| i)
+                } else {
+                    None
+                }
+            })
+            .expect("hello in inner");
+        let mut data = Vec::new();
+        inner
+            .open(&hello, 0)
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        assert!(!data.is_empty(), "inner payload non-empty");
+        // Random access still works on nested store members.
+        let mut r = inner.open(&hello, 0).unwrap();
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let mut again = Vec::new();
+        r.read_to_end(&mut again).unwrap();
+        assert_eq!(data, again);
     }
 }

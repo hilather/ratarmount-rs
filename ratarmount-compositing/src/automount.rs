@@ -20,6 +20,18 @@ use tempfile::NamedTempFile;
 /// Open a nested archive from a filesystem path into a MountSource.
 pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + Send + Sync>;
 
+/// Open a nested archive from a seekable member stream (no temp spool).
+///
+/// The `label` is a virtual name (e.g. `inner-hello.7z`) for logs/index metadata.
+pub type OpenNestedReaderFn = Arc<
+    dyn Fn(
+            Box<dyn ratarmount_core::ArchiveRead>,
+            &Path,
+        ) -> io::Result<Arc<dyn MountSource>>
+        + Send
+        + Sync,
+>;
+
 const TAG_PREFIX: &str = "automount:";
 
 /// Options controlling nested mount point naming and eagerness.
@@ -307,7 +319,8 @@ pub fn strip_archive_extension(name: &str) -> String {
 
 struct NestedMount {
     source: Arc<dyn MountSource>,
-    _persist: PathBuf,
+    /// Temp path when nested was materialized; `None` when opened from a seekable reader.
+    _persist: Option<PathBuf>,
     depth: u32,
 }
 
@@ -317,6 +330,8 @@ pub struct AutoMountLayer {
     mounted: Mutex<HashMap<String, NestedMount>>,
     max_depth: u32,
     open_nested: OpenNestedFn,
+    /// Optional no-tmp nested open (TAR/7z/ZIP from parent member stream).
+    open_nested_reader: Option<OpenNestedReaderFn>,
     lazy: bool,
     strip_ext: bool,
     ext_set: RecursiveExtSet,
@@ -353,6 +368,21 @@ impl AutoMountLayer {
         open_nested: OpenNestedFn,
         opts: AutoMountOptions,
     ) -> Self {
+        Self::new_with_openers(root, max_depth, open_nested, None, opts)
+    }
+
+    /// Construct with both path-based and optional seekable-reader nested openers.
+    ///
+    /// When `open_nested_reader` is set, nested archives are opened from the parent
+    /// member stream without copying to a temp file (TAR / 7z / ZIP supported by the
+    /// factory). Path spool remains the fallback.
+    pub fn new_with_openers(
+        root: Arc<dyn MountSource>,
+        max_depth: u32,
+        open_nested: OpenNestedFn,
+        open_nested_reader: Option<OpenNestedReaderFn>,
+        opts: AutoMountOptions,
+    ) -> Self {
         let transform = opts
             .transform
             .and_then(|(pat, rep)| Regex::new(&pat).ok().map(|re| (re, rep)));
@@ -361,6 +391,7 @@ impl AutoMountLayer {
             mounted: Mutex::new(HashMap::new()),
             max_depth: if max_depth == 0 { 32 } else { max_depth },
             open_nested,
+            open_nested_reader,
             lazy: opts.lazy,
             strip_ext: opts.strip_recursive_extension,
             ext_set: opts.recursive_extensions,
@@ -370,6 +401,17 @@ impl AutoMountLayer {
             layer.scan_and_mount();
         }
         layer
+    }
+
+    /// Prefer opening nested archives from a seekable parent-member stream (no temp file).
+    pub fn with_reader_opener(mut self, open_nested_reader: OpenNestedReaderFn) -> Self {
+        self.open_nested_reader = Some(open_nested_reader);
+        // Re-scan so eager mounts use the reader path when available.
+        if !self.lazy {
+            self.mounted.lock().expect("automount mutex").clear();
+            self.scan_and_mount();
+        }
+        self
     }
 
     fn scan_and_mount(&self) {
@@ -543,6 +585,48 @@ impl AutoMountLayer {
 
         // Recursive split join (Python AutoMountLayer + check_for_split_file_in).
         // Use `rest` (path inside parent mount), not the AutoMount virtual path.
+        let label = PathBuf::from(
+            rest.rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("nested"),
+        );
+
+        // Prefer no-tmp open from seekable parent member (TAR stencil / 7z store / …).
+        if self.open_nested_reader.is_some()
+            && try_materialize_split_from_parent(parent.as_ref(), &rest).is_none()
+        {
+            if let Ok(reader) = parent.open(&fi, 0) {
+                if let Some(ref open_r) = self.open_nested_reader {
+                    match open_r(reader, &label) {
+                        Ok(nested) => {
+                            let mut mounted = self.mounted.lock().expect("automount mutex");
+                            let key = if mounted.contains_key(&mount_point) && mount_point != path {
+                                path.to_string()
+                            } else {
+                                mount_point
+                            };
+                            mounted.insert(
+                                key.clone(),
+                                NestedMount {
+                                    source: nested,
+                                    _persist: None,
+                                    depth,
+                                },
+                            );
+                            return Some(key);
+                        }
+                        Err(e) => {
+                            debug!(
+                                "nested reader open failed for {}: {e}; falling back to temp spool",
+                                label.display()
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         let persist =
             if let Some(joined) = try_materialize_split_from_parent(parent.as_ref(), &rest) {
                 joined
@@ -574,7 +658,7 @@ impl AutoMountLayer {
             key.clone(),
             NestedMount {
                 source: nested,
-                _persist: persist,
+                _persist: Some(persist),
                 depth,
             },
         );
@@ -1065,6 +1149,195 @@ mod tests {
             }
             ListResult::Names(_) => panic!("expected infos"),
         }
+    }
+
+    #[test]
+    fn automount_nested_tar_via_reader_no_tmp() {
+        use ratarmount_core::OpenOptions;
+        use ratarmount_formats_tar::SqliteIndexedTar;
+        use std::process::Command;
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+        let dir = tempfile::tempdir().unwrap();
+        // Outer TAR contains an inner TAR as a regular file member.
+        let inner_dir = dir.path().join("inner_content");
+        fs::create_dir(&inner_dir).unwrap();
+        fs::write(inner_dir.join("payload.txt"), b"nested tar payload\n").unwrap();
+        let inner_tar = dir.path().join("inner.tar");
+        assert!(Command::new("tar")
+            .args(["-cf"])
+            .arg(&inner_tar)
+            .arg("-C")
+            .arg(&inner_dir)
+            .arg("payload.txt")
+            .status()
+            .unwrap()
+            .success());
+        let outer_dir = dir.path().join("outer_content");
+        fs::create_dir(&outer_dir).unwrap();
+        fs::copy(&inner_tar, outer_dir.join("inner.tar")).unwrap();
+        let outer_tar = dir.path().join("outer.tar");
+        assert!(Command::new("tar")
+            .args(["-cf"])
+            .arg(&outer_tar)
+            .arg("-C")
+            .arg(&outer_dir)
+            .arg("inner.tar")
+            .status()
+            .unwrap()
+            .success());
+
+        let path_opened = Arc::new(AtomicBool::new(false));
+        let reader_opened = Arc::new(AtomicBool::new(false));
+        let path_c = Arc::clone(&path_opened);
+        let reader_c = Arc::clone(&reader_opened);
+
+        let open_nested: OpenNestedFn = Arc::new(move |path: &Path| {
+            path_c.store(true, AOrd::SeqCst);
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let ms = SqliteIndexedTar::create_index(
+                path,
+                path,
+                None,
+                &opts,
+                "test",
+                &mut None,
+            )
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        });
+        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label| {
+            reader_c.store(true, AOrd::SeqCst);
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let ms = SqliteIndexedTar::open_from_reader(reader, label, None, &opts, "test")
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        });
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let root = SqliteIndexedTar::create_index(
+            &outer_tar,
+            &outer_tar,
+            None,
+            &opts,
+            "test",
+            &mut None,
+        )
+        .expect("outer tar");
+        let layer = AutoMountLayer::new_with_openers(
+            Arc::new(root),
+            2,
+            open_nested,
+            Some(open_reader),
+            AutoMountOptions::default(),
+        );
+
+        assert!(
+            reader_opened.load(AOrd::SeqCst),
+            "nested TAR must open via Read+Seek reader path"
+        );
+        assert!(
+            !path_opened.load(AOrd::SeqCst),
+            "nested TAR must not fall back to path/temp spool"
+        );
+
+        let fi = layer
+            .lookup("/inner.tar/payload.txt", 0)
+            .expect("nested payload");
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+        let mut r = layer.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "nested tar payload\n");
+    }
+
+    #[test]
+    fn automount_nested_7z_via_reader_no_tmp() {
+        use ratarmount_core::OpenOptions;
+        use ratarmount_formats_sevenzip::SevenZipMountSource;
+        use std::sync::atomic::{AtomicBool, Ordering as AOrd};
+
+        let path = PathBuf::from(
+            std::env::var("RATARMOUNT_PY_ROOT")
+                .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into()),
+        )
+        .join("tests/nested-inner-hello.7z");
+        if !path.exists() {
+            eprintln!("skip missing {}", path.display());
+            return;
+        }
+
+        let path_opened = Arc::new(AtomicBool::new(false));
+        let reader_opened = Arc::new(AtomicBool::new(false));
+        let path_c = Arc::clone(&path_opened);
+        let reader_c = Arc::clone(&reader_opened);
+
+        let open_nested: OpenNestedFn = Arc::new(move |_path: &Path| {
+            path_c.store(true, AOrd::SeqCst);
+            Err(io::Error::other(
+                "path spool should not be used for nested 7z store",
+            ))
+        });
+        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label| {
+            reader_c.store(true, AOrd::SeqCst);
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let ms = SevenZipMountSource::open_from_reader(reader, label, None, &opts, "test", true)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        });
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let root = SevenZipMountSource::open(&path, None, &opts, "test", true).expect("outer 7z");
+        let layer = AutoMountLayer::new_with_openers(
+            Arc::new(root),
+            2,
+            open_nested,
+            Some(open_reader),
+            AutoMountOptions::default(),
+        );
+
+        assert!(reader_opened.load(AOrd::SeqCst), "inner 7z via reader");
+        assert!(!path_opened.load(AOrd::SeqCst), "no path spool for nested 7z");
+
+        // inner-hello.7z/hello.txt (or first file)
+        let fi = layer
+            .lookup("/inner-hello.7z/hello.txt", 0)
+            .or_else(|| {
+                // discover mount + first file
+                if let Some(ListResult::Infos(map)) = layer.list("/") {
+                    for name in map.keys() {
+                        if name.ends_with(".7z") {
+                            if let Some(ListResult::Infos(inner)) =
+                                layer.list(&format!("/{name}"))
+                            {
+                                if let Some(fname) = inner.keys().next() {
+                                    return layer.lookup(&format!("/{name}/{fname}"), 0);
+                                }
+                            }
+                        }
+                    }
+                }
+                None
+            })
+            .expect("file inside nested 7z");
+        let mut data = Vec::new();
+        layer.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+        assert!(!data.is_empty());
     }
 
     #[test]

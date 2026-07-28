@@ -12,7 +12,8 @@ mod write_overlay;
 
 pub use automount::{
     is_archive_filename, is_archive_filename_with, parse_recursive_extensions,
-    strip_archive_extension, AutoMountLayer, AutoMountOptions, OpenNestedFn, RecursiveExtSet,
+    strip_archive_extension, AutoMountLayer, AutoMountOptions, OpenNestedFn, OpenNestedReaderFn,
+    RecursiveExtSet,
 };
 pub use control::{
     ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_NAME, CONTROL_DIR_PATH,

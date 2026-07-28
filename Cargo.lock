@@ -1528,6 +1528,7 @@ dependencies = [
  "log",
  "ratarmount-compress",
  "ratarmount-core",
+ "ratarmount-formats-sevenzip",
  "ratarmount-formats-tar",
  "regex",
  "rusqlite",

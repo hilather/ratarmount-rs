@@ -21,4 +21,5 @@ xz2 = { version = "0.1", features = ["static"] }
 
 [dev-dependencies]
 ratarmount-formats-tar.workspace = true
+ratarmount-formats-sevenzip.workspace = true
 tempfile.workspace = true
