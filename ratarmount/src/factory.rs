@@ -1212,9 +1212,47 @@ fn open_remote_input(
                         .map_err(|e| e.to_string())?;
                     return Ok((label, Arc::new(src)));
                 }
+                "gzip" => {
+                    // Seekable gzip over live Range (checkpoints + inflate via Range seeks).
+                    let spacing = if o.gzip_seek_point_spacing == 0 {
+                        ratarmount_compress::DEFAULT_GZIP_SEEK_SPACING
+                    } else {
+                        o.gzip_seek_point_spacing
+                    };
+                    let threads = o.threads_for("gzip");
+                    eprintln!(
+                        "HTTP Range gzip: {} ({} compressed bytes, live Range, -P gzip:{})",
+                        input,
+                        range.len(),
+                        threads
+                    );
+                    let gzip = SharedSeekableGzip::open_with_threads_from_reader(
+                        range, spacing, threads, &label,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    // Prefer TAR path when URL/name suggests tar.gz / body looks like TAR.
+                    let is_tar = name_suggests_compressed_tar(&label)
+                        || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
+                    if is_tar {
+                        let src = open_tar_gzip(&label, gzip, ip, &o, recreate)?;
+                        return Ok((label, Arc::new(src)));
+                    }
+                    // Plain .gz single-file: materialize uncompressed via seekable body.
+                    let size = gzip.size();
+                    let mut reader = gzip.reader().map_err(|e| e.to_string())?;
+                    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+                    std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
+                    let data_path = tmp.path().to_path_buf();
+                    let stripped = strip_compression_suffix(
+                        label.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+                    );
+                    let src = SingleFileMountSource::new(stripped, data_path, size, Some(tmp))
+                        .map_err(|e| e.to_string())?;
+                    return Ok((label, Arc::new(src)));
+                }
                 _ => {
                     eprintln!(
-                        "info: HTTP Range for {input} is not uncompressed TAR/ZIP; materializing"
+                        "info: HTTP Range for {input} is not TAR/ZIP/gzip; materializing"
                     );
                 }
             }
@@ -1235,6 +1273,10 @@ fn open_remote_input(
 }
 
 fn probe_archive_magic(magic: &[u8]) -> &'static str {
+    // gzip first (outer compression for remote .tar.gz)
+    if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+        return "gzip";
+    }
     // ustar at offset 257
     if magic.len() >= 262 && &magic[257..262] == b"ustar" {
         return "tar";
@@ -1259,6 +1301,18 @@ fn probe_archive_magic(magic: &[u8]) -> &'static str {
         return "zip";
     }
     "other"
+}
+
+/// Peek whether a seekable gzip body starts with a TAR stream.
+fn body_looks_like_tar_gzip(gzip: &SharedSeekableGzip) -> Result<bool, String> {
+    let mut r = gzip.reader().map_err(|e| e.to_string())?;
+    use std::io::Read;
+    let mut hdr = [0u8; 512];
+    let n = r.read(&mut hdr).map_err(|e| e.to_string())?;
+    if n < 262 {
+        return Ok(false);
+    }
+    Ok(&hdr[257..262] == b"ustar" || (n >= 265 && &hdr[257..263] == b"ustar "))
 }
 
 /// Build final mount source from one or more inputs (local paths or URLs).

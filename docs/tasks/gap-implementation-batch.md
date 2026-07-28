@@ -88,22 +88,35 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 **Orchestrator glue:** factory wires zlib/lzma/Z threads, Lrzip materialize, HTTP Range TAR/ZIP via `open_from_reader`, Dropbox folder mount.
 
-## Still open (later / batch 8+)
+## Batch 8 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| bzip2 large maps | `bzip2_seek.rs` | bit-block map cap 8 MiB → **256 MiB** + faster scan |
+| gzip from reader | `gzip_seek.rs` | `open_*_from_reader` for Range / Cursor |
+| xz stream/block map | `xz_seek.rs` | Index + multi-stream seek maps |
+| Dropbox TTL/Range | `remote/dropbox` | 30s list TTL; chunked content Range |
+| PDF CMYK/bpc | `formats-pdf` | CMYK + 1/2/4/16-bpc → PNG |
+
+**Orchestrator glue:** factory HTTP Range path opens **gzip** (incl. `.tar.gz`) via live Range + `SharedSeekableGzip::open_with_threads_from_reader`.
+
+## Still open (later / batch 9+)
 
 | Gap | Notes |
 |-----|--------|
-| Range for compressed remote archives | still materialize after probe fails TAR/ZIP magic |
-| Dropbox content Range / listing TTL | full download on file open |
-| bzip2 block map for files > 8 MiB compressed | scan skipped → full decode |
-| PDF CMYK / non-8bpc images | still `.bin` |
+| Range for remote **xz/zstd/bzip2** | gzip wired; others still materialize |
+| bzip2 map for **>256 MiB** compressed | full decode; no mmap file-backed map yet |
 | True in-process lrzip (no CLI) | CLI materialize only |
+| PDF Indexed/ICCBased images | still `.bin` |
+| S3 instance-role / anonymous | partial |
+| gzip Tier C index blob import | open |
+| Benchmark gates in CI | open |
 
 ## Verify
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-# threads: ratarmount -P gzip:4,bzip2:4,lz4:4,zlib:2 -f archive.tar.gz mnt/
-# dropbox folder: DROPBOX_TOKEN=… ratarmount -f dropbox:///folder mnt/
-# range TAR: ratarmount -f https://example/a.tar mnt/   # live Range when Accept-Ranges
+# range gzip: ratarmount -f https://example/a.tar.gz mnt/  # live Range seekable gzip
+# dropbox: RATARMOUNT_DROPBOX_LIST_TTL_SECS=10 DROPBOX_TOKEN=… ratarmount -f dropbox:///folder mnt/
 ```
