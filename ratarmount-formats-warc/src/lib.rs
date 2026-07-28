@@ -1,12 +1,20 @@
 //! WARC MountSource with random access via record payload offsets (`backendName=WARCMountSource`).
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! Path-based mounts reopen the archive file per member open. Nested / remote /
+//! in-memory WARC is opened via [`WarcMountSource::open_from_reader`], which keeps a
+//! mutex-shared `Read + Seek` backend and serves payloads as stenciled regions —
+//! no host temp spool.
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read};
+use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -29,8 +37,83 @@ pub enum WarcError {
 
 pub type Result<T> = std::result::Result<T, WarcError>;
 
+/// Mutex-backed `Read + Seek` for concurrent stencil opens (Cursor / nested stream).
+struct SharedSeekReader {
+    inner: Mutex<Box<dyn SeekRead>>,
+}
+
+impl SharedSeekReader {
+    fn new<R: SeekRead + 'static>(reader: R) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Box::new(reader)),
+        })
+    }
+
+    fn open_reader(self: &Arc<Self>) -> PositionedSeekReader {
+        PositionedSeekReader {
+            shared: Arc::clone(self),
+            pos: 0,
+        }
+    }
+}
+
+/// Independent logical cursor over a [`SharedSeekReader`].
+struct PositionedSeekReader {
+    shared: Arc<SharedSeekReader>,
+    pos: u64,
+}
+
+impl Read for PositionedSeekReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared warc reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionedSeekReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .inner
+                    .lock()
+                    .map_err(|_| io::Error::other("shared warc reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Where WARC bytes live for member open / stencil.
+enum WarcBackend {
+    /// Path-based: reopen [`WarcMountSource::archive_path`] on each open.
+    Path,
+    /// Shared `Read + Seek` (nested no-tmp / Cursor / remote).
+    Shared(Arc<SharedSeekReader>),
+}
+
 pub struct WarcMountSource {
     archive_path: PathBuf,
+    backend: WarcBackend,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -74,6 +157,73 @@ impl WarcMountSource {
         )
     }
 
+    /// Index and open a WARC from any `Read + Seek` source.
+    ///
+    /// For nested AutoMount / in-memory archives without a host path. Content is served
+    /// via stenciled regions over a shared reader — no temp spool.
+    ///
+    /// `archive_label` is used for logs and index metadata (may be a virtual name).
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
+    /// `options.index_in_memory` is set).
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            index_path.map(|p| p.to_path_buf())
+        };
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let mut reader = reader;
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+        let mut data = Vec::new();
+        reader.read_to_end(&mut data)?;
+        if !data.starts_with(b"WARC/") {
+            return Err(WarcError::Msg(
+                "Not a WARC file (missing WARC/ version line)".into(),
+            ));
+        }
+
+        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        index.begin_write()?;
+        fill_index_from_data(&index, &data)?;
+        index.store_versions(product_version)?;
+        index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        store_stats_synthetic(&index, size)?;
+        index.commit_write()?;
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        // Rewind and retain for member open (shared stencil backend).
+        reader.seek(SeekFrom::Start(0))?;
+        let index = index.into_read_only()?;
+        Ok(Self {
+            archive_path,
+            backend: WarcBackend::Shared(SharedSeekReader::new(reader)),
+            index,
+            options: options.clone(),
+        })
+    }
+
     fn open_existing(
         archive_path: &Path,
         index_path: &Path,
@@ -83,6 +233,7 @@ impl WarcMountSource {
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: WarcBackend::Path,
             index,
             options: options.clone(),
         })
@@ -112,111 +263,7 @@ impl WarcMountSource {
 
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
-        let mut generated = std::collections::BTreeSet::new();
-        let mut used_names: HashMap<String, u32> = HashMap::new();
-        let mut pos = 0usize;
-        let mut record_index = 0usize;
-
-        while pos < data.len() {
-            // Skip blank lines between records.
-            while pos < data.len() && (data[pos] == b'\r' || data[pos] == b'\n') {
-                if data[pos..].starts_with(b"\r\n") {
-                    pos += 2;
-                } else {
-                    pos += 1;
-                }
-            }
-            if pos >= data.len() {
-                break;
-            }
-            if !data[pos..].starts_with(b"WARC/") {
-                break;
-            }
-
-            let header_start = pos;
-            let (header_blob, payload_offset) =
-                if let Some(rel) = find_subslice(&data[pos..], b"\r\n\r\n") {
-                    let sep = pos + rel;
-                    (&data[pos..sep], sep + 4)
-                } else if let Some(rel) = find_subslice(&data[pos..], b"\n\n") {
-                    let sep = pos + rel;
-                    (&data[pos..sep], sep + 2)
-                } else {
-                    return Err(WarcError::Msg(format!(
-                        "WARC record at {pos} missing header terminator"
-                    )));
-                };
-
-            let content_length = header_field(header_blob, b"Content-Length")
-                .and_then(|v| std::str::from_utf8(v).ok())
-                .and_then(|s| s.trim().parse::<usize>().ok())
-                .ok_or_else(|| {
-                    WarcError::Msg(format!(
-                        "WARC record at {header_start} missing Content-Length"
-                    ))
-                })?;
-
-            let warc_type = header_field(header_blob, b"WARC-Type")
-                .map(|v| String::from_utf8_lossy(v).trim().to_ascii_lowercase())
-                .unwrap_or_else(|| "unknown".into());
-
-            let mut display = if let Some(uri) = header_field(header_blob, b"WARC-Target-URI") {
-                uri_to_path(&String::from_utf8_lossy(uri))
-            } else if let Some(rid) = header_field(header_blob, b"WARC-Record-ID") {
-                let s = String::from_utf8_lossy(rid)
-                    .trim()
-                    .trim_start_matches('<')
-                    .trim_end_matches('>')
-                    .replace(':', "_");
-                s
-            } else {
-                format!("record-{record_index}")
-            };
-
-            if matches!(
-                warc_type.as_str(),
-                "warcinfo" | "request" | "metadata" | "revisit" | "conversion"
-            ) {
-                display = format!("_warc/{warc_type}/{display}");
-            }
-            display = sanitize_name(&display, &mut used_names);
-
-            if payload_offset + content_length > data.len() {
-                return Err(WarcError::Msg(format!(
-                    "WARC record at {header_start} truncated payload"
-                )));
-            }
-
-            let nfull = normpath(&display);
-            let (path, base) = split_name(&nfull);
-            ensure_parents(&index, &path, &mut generated, 0.0)?;
-            let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
-            index.insert_file(
-                &path,
-                &base,
-                header_start as i64,
-                payload_offset as i64,
-                content_length as i64,
-                0.0,
-                mode,
-                0,
-                "",
-                0,
-                0,
-                false,
-                false,
-                false,
-                0,
-            )?;
-
-            pos = payload_offset + content_length;
-            record_index += 1;
-        }
-
-        if record_index == 0 {
-            return Err(WarcError::Msg("WARC file contains no records".into()));
-        }
-
+        fill_index_from_data(&index, &data)?;
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
         store_stats(&index, archive_path)?;
@@ -231,6 +278,7 @@ impl WarcMountSource {
         let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: WarcBackend::Path,
             index,
             options: options.clone(),
         })
@@ -267,16 +315,131 @@ impl MountSource for WarcMountSource {
         }
         let ud = userdata(file_info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing warc userdata"))?;
-        let file = File::open(&self.archive_path)?;
-        Ok(Box::new(StenciledFile::new(
-            file,
-            vec![(ud.offset, file_info.size)],
-        )))
+        let regions = vec![(ud.offset, file_info.size)];
+        match &self.backend {
+            WarcBackend::Path => {
+                let file = File::open(&self.archive_path)?;
+                Ok(Box::new(StenciledFile::new(file, regions)))
+            }
+            WarcBackend::Shared(shared) => {
+                let reader = shared.open_reader();
+                Ok(Box::new(StenciledFile::new(reader, regions)))
+            }
+        }
     }
 
     fn is_immutable(&self) -> bool {
         true
     }
+}
+
+/// Parse WARC records from an in-memory buffer and insert file rows into `index`.
+fn fill_index_from_data(index: &SqliteIndex, data: &[u8]) -> Result<()> {
+    let mut generated = std::collections::BTreeSet::new();
+    let mut used_names: HashMap<String, u32> = HashMap::new();
+    let mut pos = 0usize;
+    let mut record_index = 0usize;
+
+    while pos < data.len() {
+        // Skip blank lines between records.
+        while pos < data.len() && (data[pos] == b'\r' || data[pos] == b'\n') {
+            if data[pos..].starts_with(b"\r\n") {
+                pos += 2;
+            } else {
+                pos += 1;
+            }
+        }
+        if pos >= data.len() {
+            break;
+        }
+        if !data[pos..].starts_with(b"WARC/") {
+            break;
+        }
+
+        let header_start = pos;
+        let (header_blob, payload_offset) =
+            if let Some(rel) = find_subslice(&data[pos..], b"\r\n\r\n") {
+                let sep = pos + rel;
+                (&data[pos..sep], sep + 4)
+            } else if let Some(rel) = find_subslice(&data[pos..], b"\n\n") {
+                let sep = pos + rel;
+                (&data[pos..sep], sep + 2)
+            } else {
+                return Err(WarcError::Msg(format!(
+                    "WARC record at {pos} missing header terminator"
+                )));
+            };
+
+        let content_length = header_field(header_blob, b"Content-Length")
+            .and_then(|v| std::str::from_utf8(v).ok())
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .ok_or_else(|| {
+                WarcError::Msg(format!(
+                    "WARC record at {header_start} missing Content-Length"
+                ))
+            })?;
+
+        let warc_type = header_field(header_blob, b"WARC-Type")
+            .map(|v| String::from_utf8_lossy(v).trim().to_ascii_lowercase())
+            .unwrap_or_else(|| "unknown".into());
+
+        let mut display = if let Some(uri) = header_field(header_blob, b"WARC-Target-URI") {
+            uri_to_path(&String::from_utf8_lossy(uri))
+        } else if let Some(rid) = header_field(header_blob, b"WARC-Record-ID") {
+            let s = String::from_utf8_lossy(rid)
+                .trim()
+                .trim_start_matches('<')
+                .trim_end_matches('>')
+                .replace(':', "_");
+            s
+        } else {
+            format!("record-{record_index}")
+        };
+
+        if matches!(
+            warc_type.as_str(),
+            "warcinfo" | "request" | "metadata" | "revisit" | "conversion"
+        ) {
+            display = format!("_warc/{warc_type}/{display}");
+        }
+        display = sanitize_name(&display, &mut used_names);
+
+        if payload_offset + content_length > data.len() {
+            return Err(WarcError::Msg(format!(
+                "WARC record at {header_start} truncated payload"
+            )));
+        }
+
+        let nfull = normpath(&display);
+        let (path, base) = split_name(&nfull);
+        ensure_parents(index, &path, &mut generated, 0.0)?;
+        let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
+        index.insert_file(
+            &path,
+            &base,
+            header_start as i64,
+            payload_offset as i64,
+            content_length as i64,
+            0.0,
+            mode,
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )?;
+
+        pos = payload_offset + content_length;
+        record_index += 1;
+    }
+
+    if record_index == 0 {
+        return Err(WarcError::Msg("WARC file contains no records".into()));
+    }
+    Ok(())
 }
 
 fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
@@ -438,9 +601,31 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn store_stats_synthetic(index: &SqliteIndex, size: u64) -> Result<()> {
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
+/// Build a minimal WARC/1.0 with one `response` record (synthetic unit-test fixture).
+#[cfg(test)]
+fn synthetic_response_warc(uri: &str, payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(b"WARC/1.0\r\n");
+    out.extend_from_slice(b"WARC-Type: response\r\n");
+    out.extend_from_slice(format!("WARC-Target-URI: {uri}\r\n").as_bytes());
+    out.extend_from_slice(b"WARC-Date: 2020-01-01T00:00:00Z\r\n");
+    out.extend_from_slice(b"WARC-Record-ID: <urn:uuid:00000000-0000-0000-0000-000000000001>\r\n");
+    out.extend_from_slice(format!("Content-Length: {}\r\n", payload.len()).as_bytes());
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(payload);
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     #[test]
     fn open_hello_world_warc() {
@@ -483,5 +668,84 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert!(buf.ends_with(b"hello warc\n"), "{buf:?}");
+    }
+
+    #[test]
+    fn open_from_reader_synthetic_response() {
+        let payload = b"Hello World";
+        let warc = synthetic_response_warc("http://example.com/hello.txt", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = WarcMountSource::open_from_reader(
+            Cursor::new(warc),
+            "nested.warc",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        let fi = m
+            .lookup("/example.com/hello.txt", 0)
+            .expect("response path");
+        assert_eq!(fi.size, payload.len() as u64);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, payload);
+
+        // Random access: seek into stencil mid-payload.
+        r.seek(SeekFrom::Start(6)).unwrap();
+        let mut tail = Vec::new();
+        r.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail, b"World");
+    }
+
+    #[test]
+    fn open_from_reader_matches_path_open() {
+        let payload = b"path-vs-reader";
+        let warc = synthetic_response_warc("http://example.org/a.txt", payload);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sample.warc");
+        std::fs::write(&path, &warc).unwrap();
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+
+        let from_path =
+            WarcMountSource::open(&path, None, &opts, "0.1.0", true).expect("path open");
+        let from_reader = WarcMountSource::open_from_reader(
+            Cursor::new(warc.clone()),
+            "sample.warc",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        let fi_p = from_path.lookup("/example.org/a.txt", 0).expect("path fi");
+        let fi_r = from_reader
+            .lookup("/example.org/a.txt", 0)
+            .expect("reader fi");
+        assert_eq!(fi_p.size, fi_r.size);
+
+        let mut bp = Vec::new();
+        from_path
+            .open(&fi_p, 0)
+            .unwrap()
+            .read_to_end(&mut bp)
+            .unwrap();
+        let mut br = Vec::new();
+        from_reader
+            .open(&fi_r, 0)
+            .unwrap()
+            .read_to_end(&mut br)
+            .unwrap();
+        assert_eq!(bp, payload);
+        assert_eq!(br, payload);
     }
 }
