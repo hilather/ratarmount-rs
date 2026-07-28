@@ -12,3 +12,6 @@ fuser = "0.15"
 libc.workspace = true
 log.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

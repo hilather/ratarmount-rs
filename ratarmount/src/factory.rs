@@ -3259,6 +3259,61 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[6..]);
     }
 
+    /// Plain `.zst` / `.bz2` via seekable body (same no-materialize path as gzip).
+    #[test]
+    fn plain_zstd_and_bzip2_open_path_no_materialize() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"plain-zstd-bz2-SEEK-payload-zzzz\n";
+        let plain = dir.path().join("data.bin");
+        std::fs::write(&plain, payload).unwrap();
+
+        let zst = dir.path().join("data.bin.zst");
+        let st = Command::new("zstd")
+            .args(["-q", "-f", "-o"])
+            .arg(&zst)
+            .arg(&plain)
+            .status();
+        if let Ok(st) = st {
+            if st.success() {
+                let opts = OpenOptions {
+                    index_in_memory: true,
+                    ..Default::default()
+                };
+                let src = open_path(&zst, &opts, false).expect("open plain .zst");
+                assert_eq!(read_all(src.as_ref(), "/data.bin"), payload);
+                let mid = read_seek_mid(src.as_ref(), "/data.bin", 6);
+                assert_eq!(mid.as_slice(), &payload[6..]);
+            } else {
+                eprintln!("skip: zstd CLI failed");
+            }
+        } else {
+            eprintln!("skip: zstd not available");
+        }
+
+        let bz2 = dir.path().join("data.bin.bz2");
+        let st = Command::new("bzip2")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&bz2).unwrap())
+            .status();
+        if let Ok(st) = st {
+            if st.success() {
+                let opts = OpenOptions {
+                    index_in_memory: true,
+                    ..Default::default()
+                };
+                let src = open_path(&bz2, &opts, false).expect("open plain .bz2");
+                assert_eq!(read_all(src.as_ref(), "/data.bin"), payload);
+                let mid = read_seek_mid(src.as_ref(), "/data.bin", 6);
+                assert_eq!(mid.as_slice(), &payload[6..]);
+            } else {
+                eprintln!("skip: bzip2 CLI failed");
+            }
+        } else {
+            eprintln!("skip: bzip2 not available");
+        }
+    }
+
     /// Nested plain `.gz` via `open_nested_reader_fn` Cursor — single-file over seekable body (no spool).
     #[test]
     fn nested_plain_gzip_from_cursor_single_file_no_tmp() {
@@ -3602,6 +3657,64 @@ mod tests {
         assert_eq!(read_all(inner.as_ref(), "/pad.txt"), pad);
         let mid = read_seek_mid(inner.as_ref(), "/pad.txt", 5);
         assert_eq!(mid.as_slice(), &pad[5..]);
+    }
+
+    /// Minimal store (uncompressed) CAB for factory magic detection (`MSCF`).
+    fn synthetic_store_cab(name: &str, payload: &[u8]) -> Vec<u8> {
+        let name_bytes = name.as_bytes();
+        let coff_files = 36u32 + 8;
+        let coff_cab_start = coff_files + 16 + name_bytes.len() as u32 + 1;
+        let total = coff_cab_start as usize + 8 + payload.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"MSCF");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&coff_files.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(3);
+        out.push(1);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&coff_cab_start.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes()); // TCOMP_TYPE_NONE
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x20u16.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Factory nested CAB (MSCF magic) — no-tmp open_from_reader wiring.
+    #[test]
+    fn nested_cab_from_cursor_via_opener() {
+        let payload = b"cab-store-SEEK-payload-xyz";
+        let bytes = synthetic_store_cab("member.txt", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.cab"),
+        )
+        .expect("nested CAB open without temp spool");
+        assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/member.txt", 4);
+        assert_eq!(mid.as_slice(), &payload[4..]);
     }
 
     /// CPIO embedded in store 7z: parent open + nested CPIO from_reader — no temp spool.

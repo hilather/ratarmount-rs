@@ -1088,6 +1088,27 @@ mod tests {
         assert_eq!(bytes, b"user.hash.sha256\0user.hash.crc32\0".as_slice());
     }
 
+    /// Regression: encrypted nested 7z without password must surface as EACCES, not EIO.
+    #[test]
+    fn io_to_errno_maps_permission_denied_to_eacces() {
+        assert_eq!(
+            io_to_errno(&io::Error::new(
+                ErrorKind::PermissionDenied,
+                "need password"
+            )),
+            EACCES
+        );
+        assert_eq!(
+            io_to_errno(&io::Error::new(ErrorKind::NotFound, "missing")),
+            ENOENT
+        );
+        assert_eq!(
+            io_to_errno(&io::Error::new(ErrorKind::IsADirectory, "dir")),
+            EISDIR
+        );
+        assert_eq!(io_to_errno(&io::Error::other("generic")), EIO);
+    }
+
     /// Reader that yields at most `chunk` bytes per `read` (mimics seekable gzip windows).
     struct ShortReadCursor {
         data: Vec<u8>,
@@ -1158,6 +1179,83 @@ mod tests {
         let t = unix_float_to_system_time(1_592_222_400.0); // 2020-06-15 12:00 UTC
         let dur = t.duration_since(UNIX_EPOCH).expect("after epoch");
         assert_eq!(dur.as_secs(), 1_592_222_400);
+    }
+
+    /// Regression: with a write overlay, getattr/open must not keep create-time size 0
+    /// from the inode cache (write-then-cat returned empty).
+    #[test]
+    fn overlay_file_info_for_ino_refreshes_size_after_write() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        struct EmptyBase;
+        impl MountSource for EmptyBase {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path == "/" {
+                    Some(ListResult::Infos(BTreeMap::new()))
+                } else {
+                    None
+                }
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                if path == "/" {
+                    Some(ratarmount_core::create_root_file_info())
+                } else {
+                    None
+                }
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Err(io::Error::new(ErrorKind::NotFound, "empty base"))
+            }
+            fn is_immutable(&self) -> bool {
+                false
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        // Create empty file (size 0) then write payload — same sequence as FUSE create+write.
+        let fd = ov.create_file("/new.txt", 0o644).expect("create");
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.write_all(b"hello-overlay-payload").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let stale = FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![],
+        };
+        let ino = fs.ino_for_path_with_fi("/new.txt", Some(stale));
+        // Without overlay re-lookup this would stay 0.
+        let fi = fs.file_info_for_ino(ino).expect("fi");
+        assert_eq!(
+            fi.size,
+            b"hello-overlay-payload".len() as u64,
+            "overlay must re-lookup size after write (was create-time 0)"
+        );
+        assert!(ov.has_file("/new.txt"));
+        let rfd = ov
+            .open_overlay_fd("/new.txt", libc::O_RDONLY)
+            .expect("overlay open");
+        let mut rf = unsafe { std::fs::File::from_raw_fd(rfd) };
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut rf, &mut buf).unwrap();
+        assert_eq!(buf, b"hello-overlay-payload");
     }
 
     #[test]
