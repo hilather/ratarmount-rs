@@ -35,9 +35,9 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | gzip (rapidgzip / seek index) | yes | Tier B + RGZI Tier C + best-effort **GZIDX** (indexed_gzip) | `[x]` / `~` window-dict full interop |
-| bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps (any size on path) | `[x]` / `~` open-time size discovery |
+| bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps + **bzip2blocks** factory auto-import | `[x]` / `~` open-time size discovery |
 | xz multi-block seek | yes | Index + multi-stream maps; single-block full decode | `[x]` / `~` exotic filters |
-| zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** import/export ([guide](zstd-random-access.md)) | `[x]` |
+| zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** factory auto-import ([guide](zstd-random-access.md)) | `[x]` |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
 | lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize; **libarchive** raw/filter fallback | `~` pure in-process still open |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
@@ -83,7 +83,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | SQLite index 0.7.x schema | yes | yes | `[x]` |
-| Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables | `[x]` / `~` decoder import of Python blobs |
+| Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables; factory auto-imports on open (FR-9) | `[x]` / `~` decoder import of Python blobs |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
 | Index file hashes / xattrs | yes | `--hashes` + FUSE xattrs for TAR/ZIP/7z; TAR PAX LIBARCHIVE/SCHILY FS xattrs | `[x]` / `~` solid 7z shared key; other formats |

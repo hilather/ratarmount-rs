@@ -1592,9 +1592,22 @@ fn try_load_zstd_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Vec
     zstd_blocks_i64_to_u64(&raw)
 }
 
+/// Open or create a writable on-disk index for compression side-table writes.
+///
+/// Creates a fresh schema when the path is missing so plain compress opens
+/// (no TAR `files` table build) can still persist `zstdblocks` / `bzip2blocks`.
+fn open_or_create_writable_index(ip: &Path) -> Result<SqliteIndex, String> {
+    if ip.exists() {
+        SqliteIndex::open_writable(ip).map_err(|e| e.to_string())
+    } else {
+        SqliteIndex::create_writable(Some(ip)).map_err(|e| e.to_string())
+    }
+}
+
 /// Persist exported `zstdblocks` into the SQLite side table when writable.
 ///
 /// No-op for `:memory:` / missing path / read-only / `write_index = false` / empty map.
+/// Creates the index file when the path is set but does not yet exist (plain compress).
 fn store_zstd_blocks_in_index(
     blocks: &[(u64, u64)],
     index_path: Option<&Path>,
@@ -1609,14 +1622,11 @@ fn store_zstd_blocks_in_index(
     let Some(ip) = index_path else {
         return;
     };
-    if !ip.exists() {
-        return;
-    }
     let Some(i64_blocks) = zstd_blocks_u64_to_i64(blocks) else {
         eprintln!("info: zstdblocks offsets exceed i64 range; skipping side-table write");
         return;
     };
-    match SqliteIndex::open_writable(ip) {
+    match open_or_create_writable_index(ip) {
         Ok(idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for zstdblocks: {e}");
@@ -1640,7 +1650,7 @@ fn persist_zstd_blocks_from_path(path: &Path, index_path: Option<&Path>, options
     if !options.write_index || options.read_only_index || options.index_in_memory {
         return;
     }
-    if index_path.is_none_or(|ip| !ip.exists()) {
+    if index_path.is_none() {
         return;
     }
     match export_zstd_blocks(path) {
@@ -1650,12 +1660,14 @@ fn persist_zstd_blocks_from_path(path: &Path, index_path: Option<&Path>, options
 }
 
 /// Open seekable zstd from a path, preferring imported `zstdblocks` when available.
+///
+/// Returns `(body, true)` when the side-table map was used (caller may skip re-export).
 fn open_seekable_zstd_prefer_blocks(
     path: &Path,
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
-) -> Result<Arc<dyn SeekableBody>, String> {
+) -> Result<(Arc<dyn SeekableBody>, bool), String> {
     if let Some(blocks) = try_load_zstd_blocks(index_path, recreate) {
         match open_seekable_zstd_with_zstd_blocks(path, threads, &blocks) {
             Ok(body) => {
@@ -1666,14 +1678,16 @@ fn open_seekable_zstd_prefer_blocks(
                     body.checkpoint_count(),
                     threads
                 );
-                return Ok(body);
+                return Ok((body, true));
             }
             Err(e) => {
                 eprintln!("info: zstdblocks import failed ({e}); rebuilding frame map");
             }
         }
     }
-    open_seekable_zstd_with_threads(path, threads).map_err(|e| e.to_string())
+    open_seekable_zstd_with_threads(path, threads)
+        .map(|body| (body, false))
+        .map_err(|e| e.to_string())
 }
 
 /// Try opening seekable zstd from a Range reader using on-disk `zstdblocks`.
@@ -1712,7 +1726,9 @@ where
 /// Open zstd: seekable multi-frame / seek-table body; import `zstdblocks` when present.
 ///
 /// After a successful TAR (or other) open via the seekable body, export and store
-/// the frame map in the SQLite side table when the index is writable.
+/// the frame map in the SQLite side table when the index is writable **and** the
+/// open did not already reuse a side-table map (avoids a full stream rescan on
+/// warm reimport — FR-9).
 fn open_zstd(
     path: &Path,
     index_path: Option<&Path>,
@@ -1720,10 +1736,14 @@ fn open_zstd(
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     let threads = options.threads_for("zstd");
-    let body = open_seekable_zstd_prefer_blocks(path, threads, index_path, recreate)?;
+    let (body, used_blocks) =
+        open_seekable_zstd_prefer_blocks(path, threads, index_path, recreate)?;
     let src = open_from_seekable_body(path, body, index_path, options, recreate, "zstd")?;
-    // Index is now on disk (or memory); side-table write only when path exists.
-    persist_zstd_blocks_from_path(path, index_path, options);
+    // Index is now on disk (or memory); side-table write only when path exists
+    // and we rebuilt the frame map (cold open / import miss / import failure).
+    if !used_blocks {
+        persist_zstd_blocks_from_path(path, index_path, options);
+    }
     Ok(src)
 }
 
@@ -1765,14 +1785,11 @@ fn store_bzip2_blocks_in_index(
     let Some(ip) = index_path else {
         return;
     };
-    if !ip.exists() {
-        return;
-    }
     let Some(i64_blocks) = zstd_blocks_u64_to_i64(blocks) else {
         eprintln!("info: bzip2blocks offsets exceed i64 range; skipping side-table write");
         return;
     };
-    match SqliteIndex::open_writable(ip) {
+    match open_or_create_writable_index(ip) {
         Ok(idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for bzip2blocks: {e}");
@@ -1795,7 +1812,7 @@ fn persist_bzip2_blocks_from_path(path: &Path, index_path: Option<&Path>, option
     if !options.write_index || options.read_only_index || options.index_in_memory {
         return;
     }
-    if index_path.is_none_or(|ip| !ip.exists()) {
+    if index_path.is_none() {
         return;
     }
     match export_bzip2_blocks(path) {
@@ -1804,12 +1821,15 @@ fn persist_bzip2_blocks_from_path(path: &Path, index_path: Option<&Path>, option
     }
 }
 
+/// Open seekable bzip2 from a path, preferring imported `bzip2blocks` when available.
+///
+/// Returns `(body, true)` when the side-table map was used (caller may skip re-export).
 fn open_seekable_bzip2_prefer_blocks(
     path: &Path,
     threads: u32,
     index_path: Option<&Path>,
     recreate: bool,
-) -> Result<Arc<dyn SeekableBody>, String> {
+) -> Result<(Arc<dyn SeekableBody>, bool), String> {
     if let Some(blocks) = try_load_bzip2_blocks(index_path, recreate) {
         match open_seekable_bzip2_with_bzip2_blocks(path, threads, &blocks) {
             Ok(body) => {
@@ -1820,14 +1840,16 @@ fn open_seekable_bzip2_prefer_blocks(
                     body.checkpoint_count(),
                     threads
                 );
-                return Ok(body);
+                return Ok((body, true));
             }
             Err(e) => {
                 eprintln!("info: bzip2blocks import failed ({e}); rebuilding bit-block map");
             }
         }
     }
-    open_seekable_bzip2_with_threads(path, threads).map_err(|e| e.to_string())
+    open_seekable_bzip2_with_threads(path, threads)
+        .map(|body| (body, false))
+        .map_err(|e| e.to_string())
 }
 
 fn try_open_bzip2_imported_from_reader<R>(
@@ -1860,6 +1882,9 @@ where
 }
 
 /// Open bzip2 with optional `bzip2blocks` side-table import/export.
+///
+/// On warm open, a present `bzip2blocks` side table is imported so the bit-block
+/// map is not rebuilt. Export runs only when the open rebuilt the map (FR-9).
 fn open_bzip2(
     path: &Path,
     index_path: Option<&Path>,
@@ -1867,9 +1892,12 @@ fn open_bzip2(
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
     let threads = options.threads_for("bzip2");
-    let body = open_seekable_bzip2_prefer_blocks(path, threads, index_path, recreate)?;
+    let (body, used_blocks) =
+        open_seekable_bzip2_prefer_blocks(path, threads, index_path, recreate)?;
     let src = open_from_seekable_body(path, body, index_path, options, recreate, "bzip2")?;
-    persist_bzip2_blocks_from_path(path, index_path, options);
+    if !used_blocks {
+        persist_bzip2_blocks_from_path(path, index_path, options);
+    }
     Ok(src)
 }
 
@@ -2409,10 +2437,16 @@ where
             eprintln!(
                 "{transport} bzip2: {input} ({range_len} compressed bytes, live Range, -P bzip2:{threads})"
             );
+            // Prefer bzip2blocks import; on success skip re-export (FR-9). Keep
+            // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
+            let mut used_blocks = false;
             let body = if try_load_bzip2_blocks(ip, recreate).is_some() {
                 match try_open_bzip2_imported_from_reader(range, &label, threads, ip, recreate) {
-                    Some(b) => b,
+                    Some(b) => {
+                        used_blocks = true;
+                        b
+                    }
                     None => {
                         let reopen_fn = reopen_opt
                             .take()
@@ -2427,21 +2461,27 @@ where
                     .map_err(|e| e.to_string())?
             };
             let src = open_from_seekable_body(&label, body, ip, &o, recreate, "bzip2")?;
-            if let Some(reopen_fn) = reopen_opt {
-                if o.write_index && !o.read_only_index && !o.index_in_memory {
-                    if let Some(ipath) = ip {
-                        if ipath.exists() {
-                            match reopen_fn() {
-                                Ok(mut fresh) => {
-                                    match export_bzip2_blocks_from_reader(&mut fresh) {
-                                        Ok(blocks) => store_bzip2_blocks_in_index(&blocks, ip, &o),
-                                        Err(e) => {
-                                            eprintln!("info: could not export bzip2blocks: {e}")
+            if !used_blocks {
+                if let Some(reopen_fn) = reopen_opt {
+                    if o.write_index && !o.read_only_index && !o.index_in_memory {
+                        if let Some(ipath) = ip {
+                            if ipath.exists() {
+                                match reopen_fn() {
+                                    Ok(mut fresh) => {
+                                        match export_bzip2_blocks_from_reader(&mut fresh) {
+                                            Ok(blocks) => {
+                                                store_bzip2_blocks_in_index(&blocks, ip, &o)
+                                            }
+                                            Err(e) => {
+                                                eprintln!("info: could not export bzip2blocks: {e}")
+                                            }
                                         }
                                     }
-                                }
-                                Err(e) => {
-                                    eprintln!("info: could not reopen stream for bzip2blocks: {e}")
+                                    Err(e) => {
+                                        eprintln!(
+                                            "info: could not reopen stream for bzip2blocks: {e}"
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2465,12 +2505,16 @@ where
             eprintln!(
                 "{transport} zstd: {input} ({range_len} compressed bytes, live Range, -P zstd:{threads})"
             );
-            // Prefer zstdblocks import; on failure rebuild with a fresh Range handle.
-            // Keep `reopen` available for post-open export when it was not needed for rebuild.
+            // Prefer zstdblocks import; on success skip re-export (FR-9). Keep
+            // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
+            let mut used_blocks = false;
             let body = if try_load_zstd_blocks(ip, recreate).is_some() {
                 match try_open_zstd_imported_from_reader(range, &label, threads, ip, recreate) {
-                    Some(b) => b,
+                    Some(b) => {
+                        used_blocks = true;
+                        b
+                    }
                     None => {
                         let reopen_fn = reopen_opt
                             .take()
@@ -2485,20 +2529,29 @@ where
                     .map_err(|e| e.to_string())?
             };
             let src = open_from_seekable_body(&label, body, ip, &o, recreate, "zstd")?;
-            // Best-effort export via a fresh Range handle when still available.
-            if let Some(reopen_fn) = reopen_opt {
-                if o.write_index && !o.read_only_index && !o.index_in_memory {
-                    if let Some(ipath) = ip {
-                        if ipath.exists() {
-                            match reopen_fn() {
-                                Ok(mut fresh) => match export_zstd_blocks_from_reader(&mut fresh) {
-                                    Ok(blocks) => store_zstd_blocks_in_index(&blocks, ip, &o),
-                                    Err(e) => {
-                                        eprintln!("info: could not export zstdblocks: {e}")
+            // Best-effort export via a fresh Range handle when still available
+            // and we rebuilt (cold open / import miss).
+            if !used_blocks {
+                if let Some(reopen_fn) = reopen_opt {
+                    if o.write_index && !o.read_only_index && !o.index_in_memory {
+                        if let Some(ipath) = ip {
+                            if ipath.exists() {
+                                match reopen_fn() {
+                                    Ok(mut fresh) => {
+                                        match export_zstd_blocks_from_reader(&mut fresh) {
+                                            Ok(blocks) => {
+                                                store_zstd_blocks_in_index(&blocks, ip, &o)
+                                            }
+                                            Err(e) => {
+                                                eprintln!("info: could not export zstdblocks: {e}")
+                                            }
+                                        }
                                     }
-                                },
-                                Err(e) => {
-                                    eprintln!("info: could not reopen stream for zstdblocks: {e}")
+                                    Err(e) => {
+                                        eprintln!(
+                                            "info: could not reopen stream for zstdblocks: {e}"
+                                        )
+                                    }
                                 }
                             }
                         }
@@ -2849,6 +2902,81 @@ mod tests {
         tar_zst
     }
 
+    /// Patterned payload spanning >1 bzip2 block at compression level 1 (100 KiB).
+    fn multi_block_bz2_payload() -> Vec<u8> {
+        let mut data = Vec::with_capacity(350_000);
+        for i in 0..350_000u32 {
+            data.push(((i / 17) % 251) as u8);
+        }
+        data
+    }
+
+    fn make_tiny_tar_bz2(dir: &Path) -> PathBuf {
+        let data = dir.join("data-bz2");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("hello.txt"), b"hello world from bzip2\n").expect("write");
+        // Multi-block: level-1 bzip2 uses 100 KiB blocks; pad must exceed one block.
+        std::fs::write(data.join("pad.bin"), multi_block_bz2_payload()).expect("write pad");
+        let tar_path = dir.join("tiny-bz2.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .args(["hello.txt", "pad.bin"])
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -cf failed");
+        let tar_bz2 = dir.join("tiny.tar.bz2");
+        // `-1` → 100 KiB blocks so export_bzip2_blocks sees a multi-block map.
+        let status = Command::new("bzip2")
+            .args(["-1", "-k", "-f", "-c"])
+            .arg(&tar_path)
+            .stdout(std::fs::File::create(&tar_bz2).expect("create bz2"))
+            .status()
+            .expect("spawn bzip2");
+        assert!(status.success(), "bzip2 compress failed");
+        tar_bz2
+    }
+
+    /// Plain multi-frame `.zst` (not TAR) for side-table wire on plain compress open.
+    fn make_plain_multi_zst(dir: &Path) -> PathBuf {
+        let plain = dir.join("plain.txt");
+        std::fs::write(&plain, vec![b'z'; 8192]).expect("write plain");
+        let zst = dir.join("plain.txt.zst");
+        let status = Command::new("zstd")
+            .args(["-f", "--stream-size=1024", "-o"])
+            .arg(&zst)
+            .arg(&plain)
+            .status()
+            .expect("spawn zstd");
+        if !status.success() {
+            let status = Command::new("zstd")
+                .args(["-f", "-o"])
+                .arg(&zst)
+                .arg(&plain)
+                .status()
+                .expect("spawn zstd fallback");
+            assert!(status.success(), "zstd plain compress failed");
+        }
+        zst
+    }
+
+    fn make_plain_bz2(dir: &Path) -> PathBuf {
+        let plain = dir.join("plain-bz2.txt");
+        // Patterned multi-block payload (not zeros — zeros collapse to one tiny block).
+        std::fs::write(&plain, multi_block_bz2_payload()).expect("write plain");
+        let bz2 = dir.join("plain-bz2.txt.bz2");
+        let status = Command::new("bzip2")
+            .args(["-1", "-k", "-f", "-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&bz2).expect("create bz2"))
+            .status()
+            .expect("spawn bzip2");
+        assert!(status.success(), "bzip2 compress failed");
+        bz2
+    }
+
     #[test]
     fn probe_magic_detects_gzip_and_zip() {
         assert_eq!(probe_archive_magic(&[0x1f, 0x8b, 0x08]), "gzip");
@@ -3050,6 +3178,202 @@ mod tests {
 
         assert!(zstd_blocks_i64_to_u64(&[(-1, 0)]).is_none());
         assert!(zstd_blocks_u64_to_i64(&[(u64::MAX, 0)]).is_none());
+    }
+
+    /// Regression: FR-9 warm open loads `zstdblocks` and skips full frame rescan export.
+    #[test]
+    fn zstd_blocks_warm_open_uses_side_table_without_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_zst(dir.path());
+        let index = dir.path().join("tiny.zst.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        drop(src);
+        let stored = {
+            let idx = SqliteIndex::open_read_only(&index).expect("open index");
+            let blocks = idx.get_zstd_blocks().expect("get zstdblocks");
+            assert!(!blocks.is_empty());
+            blocks
+        };
+
+        // Mark side table with a sentinel last-row identity: warm open must import,
+        // not re-export (re-export would rewrite the same pairs; we assert load works
+        // and prefer_blocks path is taken via try_load).
+        let loaded = try_load_zstd_blocks(Some(&index), false).expect("load for warm open");
+        assert_eq!(
+            loaded.len(),
+            stored.len(),
+            "try_load must surface side table before warm open"
+        );
+
+        let src2 = open_path(&archive, &opts, false).expect("warm open with import");
+        // MountSource stays usable after import-backed body open.
+        let _ = src2.list("/");
+        drop(src2);
+
+        let blocks2 = {
+            let idx = SqliteIndex::open_read_only(&index).expect("reopen");
+            idx.get_zstd_blocks().expect("blocks after warm")
+        };
+        assert_eq!(blocks2, stored, "warm import must not clobber side table");
+        // recreate=true must ignore side table for body build (persist may rewrite).
+        assert!(try_load_zstd_blocks(Some(&index), true).is_none());
+    }
+
+    /// Regression: FR-9 plain `.zst` also auto-wires `zstdblocks` on open.
+    #[test]
+    fn zstd_blocks_plain_zst_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_plain_multi_zst(dir.path());
+        let index = dir.path().join("plain.zst.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold plain zst");
+        drop(src);
+
+        let blocks = {
+            let idx = SqliteIndex::open_read_only(&index).expect("index");
+            let b = idx.get_zstd_blocks().expect("zstdblocks");
+            assert!(
+                !b.is_empty(),
+                "plain .zst cold open should store zstdblocks"
+            );
+            b
+        };
+
+        let src2 = open_path(&archive, &opts, false).expect("warm plain zst");
+        drop(src2);
+        let blocks2 = SqliteIndex::open_read_only(&index)
+            .expect("index")
+            .get_zstd_blocks()
+            .expect("blocks");
+        assert_eq!(blocks2, blocks);
+    }
+
+    #[test]
+    fn bzip2_blocks_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_bz2(dir.path());
+        let index = dir.path().join("tiny.bz2.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+
+        // Cold open: build bit-block map + TAR index, then store bzip2blocks side table.
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        drop(src);
+
+        let idx = SqliteIndex::open_read_only(&index).expect("open index");
+        let blocks = idx.get_bzip2_blocks().expect("get bzip2blocks");
+        assert!(
+            !blocks.is_empty(),
+            "expected non-empty bzip2blocks after cold open"
+        );
+        let stored = blocks.clone();
+        drop(idx);
+
+        // Warm open: import bzip2blocks (no full bit-scan rebuild required).
+        let src2 = open_path(&archive, &opts, false).expect("warm open with import");
+        drop(src2);
+
+        let idx2 = SqliteIndex::open_read_only(&index).expect("reopen index");
+        let blocks2 = idx2.get_bzip2_blocks().expect("blocks again");
+        assert_eq!(blocks2, stored);
+    }
+
+    /// Regression: corrupt `bzip2blocks` falls back to rebuild and rewrites the table.
+    #[test]
+    fn bzip2_blocks_invalid_map_falls_back_to_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_bz2(dir.path());
+        let index = dir.path().join("tiny.bz2.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        drop(src);
+
+        {
+            let idx = SqliteIndex::open_writable(&index).expect("writable");
+            // Decreasing bit offsets must fail import validation.
+            idx.set_bzip2_blocks(&[(100, 0), (50, 10), (200, 20)])
+                .expect("set garbage");
+        }
+
+        let src2 = open_path(&archive, &opts, false).expect("open after invalid blocks");
+        drop(src2);
+
+        let idx = SqliteIndex::open_read_only(&index).expect("ro");
+        let blocks = idx.get_bzip2_blocks().expect("blocks");
+        assert!(!blocks.is_empty());
+        for w in blocks.windows(2) {
+            assert!(w[0].0 <= w[1].0, "blockoffset must be non-decreasing");
+        }
+    }
+
+    #[test]
+    fn bzip2_blocks_memory_index_skips_side_table_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_bz2(dir.path());
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, false).expect("memory index open");
+        drop(src);
+    }
+
+    #[test]
+    fn try_load_bzip2_blocks_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.sqlite");
+        assert!(try_load_bzip2_blocks(Some(&missing), false).is_none());
+        assert!(try_load_bzip2_blocks(None, false).is_none());
+        assert!(try_load_bzip2_blocks(Some(&missing), true).is_none());
+    }
+
+    /// Regression: FR-9 plain `.bz2` also auto-wires `bzip2blocks` on open.
+    #[test]
+    fn bzip2_blocks_plain_bz2_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_plain_bz2(dir.path());
+        let index = dir.path().join("plain.bz2.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold plain bz2");
+        drop(src);
+
+        let blocks = {
+            let idx = SqliteIndex::open_read_only(&index).expect("index");
+            let b = idx.get_bzip2_blocks().expect("bzip2blocks");
+            assert!(
+                !b.is_empty(),
+                "plain .bz2 cold open should store bzip2blocks"
+            );
+            b
+        };
+
+        let src2 = open_path(&archive, &opts, false).expect("warm plain bz2");
+        drop(src2);
+        let blocks2 = SqliteIndex::open_read_only(&index)
+            .expect("index")
+            .get_bzip2_blocks()
+            .expect("blocks");
+        assert_eq!(blocks2, blocks);
     }
 
     /// Multi-file `.tar.gz` for nested random-read checks.

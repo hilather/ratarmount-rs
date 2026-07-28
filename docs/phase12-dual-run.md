@@ -134,7 +134,7 @@ Track detail in [`parity-todo.md`](parity-todo.md) and [`tasks/gap-implementatio
 | SquashFS classic lzma | `unsquashfs` fallback | Install `squashfs-tools` |
 | PDF Separation/Lab (and some color spaces) | XObject JPEG/JP2/Flate path strong | Rare documents |
 | Progressive multi-GB solid 7z (BCJ/AES full-folder) | progressive LZMA2 + LRU windows | Large exotic solids may use more RAM/time |
-| Factory auto-wire zstdblocks from index on open | APIs exist | Manual/index path partial |
+| Factory auto-wire zstdblocks/bzip2blocks from index on open | **done** | Warm open imports side tables; skips re-export when map reused |
 | HTTP Range on every format | TAR/ZIP + main codecs | Others materialize |
 | Full `--use-backend` / Python backend matrix | probe reorder | Priority list accepted |
 | Full fixed-archive ≥90% | allowlist expanding | Track gaps; not cutover-hard |

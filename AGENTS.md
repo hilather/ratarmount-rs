@@ -46,6 +46,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
+| Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.

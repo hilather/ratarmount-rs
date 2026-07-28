@@ -44,7 +44,7 @@ issue from the README feature tables.
 |----|----------|------|---------------------|---------------------|
 | FR-6 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **Parallel index nested archives** | Nested index work can fan out | factory / automount / index |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | Use libarchive path; document | formats-cab / factory |
-| FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | APIs exist; wire factory fully | `ratarmount/src/factory.rs` |
+| FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | **done** — path + Range open import side tables; skip re-export on warm hit | `ratarmount/src/factory.rs` |
 
 ### P2 — design-heavy or partial acceptance
 
@@ -62,10 +62,9 @@ issue from the README feature tables.
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-7.
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
 
 1. **FR-5** FUSE readahead knobs  
-2. **FR-9** Factory side-table auto-wire  
-3. **FR-6** Parallel nested indexing (when needed)
+2. **FR-6** Parallel nested indexing (when needed)  
 
 Update this file when status changes. Keep README **Upstream** column in sync.
