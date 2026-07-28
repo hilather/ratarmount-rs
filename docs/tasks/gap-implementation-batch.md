@@ -100,23 +100,33 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 **Orchestrator glue:** factory HTTP Range path opens **gzip** (incl. `.tar.gz`) via live Range + `SharedSeekableGzip::open_with_threads_from_reader`.
 
-## Still open (later / batch 9+)
+## Batch 9 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| xz from reader | `xz_seek.rs` | `open_seekable_xz_*_from_reader` |
+| zstd from reader | `zstd_seek.rs` | `open_seekable_zstd_*_from_reader` |
+| bzip2 from reader | `bzip2_seek.rs` | `open_seekable_bzip2_*_from_reader` |
+| S3 creds | `remote/s3.rs` | IMDS/ECS role + anonymous GET |
+| PDF Indexed/ICC | `formats-pdf` | Indexed + ICCBased N=1/3/4 → PNG |
+
+**Orchestrator glue:** factory HTTP Range opens gzip/bzip2/xz/zstd (+ TAR/ZIP) via live Range + from_reader APIs.
+
+## Still open (later / batch 10+)
 
 | Gap | Notes |
 |-----|--------|
-| Range for remote **xz/zstd/bzip2** | gzip wired; others still materialize |
 | bzip2 map for **>256 MiB** compressed | full decode; no mmap file-backed map yet |
 | True in-process lrzip (no CLI) | CLI materialize only |
-| PDF Indexed/ICCBased images | still `.bin` |
-| S3 instance-role / anonymous | partial |
 | gzip Tier C index blob import | open |
 | Benchmark gates in CI | open |
+| S3 live Range (not just materialize) | path still materializes after creds |
 
 ## Verify
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-# range gzip: ratarmount -f https://example/a.tar.gz mnt/  # live Range seekable gzip
-# dropbox: RATARMOUNT_DROPBOX_LIST_TTL_SECS=10 DROPBOX_TOKEN=… ratarmount -f dropbox:///folder mnt/
+# range codecs: ratarmount -f https://example/a.tar.{gz,bz2,xz,zst} mnt/
+# s3: AWS_ANONYMOUS=1 ratarmount -f s3://public-bucket/a.tar mnt/
 ```

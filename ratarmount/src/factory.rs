@@ -11,12 +11,13 @@ use ratarmount_compositing::{
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
     looks_like_tar, materialize, materialize_joined_parts, name_suggests_compressed_tar,
-    open_seekable_bzip2_with_threads, open_seekable_compress_z_with_threads,
-    open_seekable_lz4_with_threads, open_seekable_lzip_with_threads,
-    open_seekable_lzma_with_threads, open_seekable_lzo_with_threads,
-    open_seekable_xz_with_threads, open_seekable_zlib_with_threads,
-    open_seekable_zstd_with_threads, strip_compression_suffix, CompressionFormat, SeekableBody,
-    SharedSeekableGzip,
+    open_seekable_bzip2_with_threads, open_seekable_bzip2_with_threads_from_reader,
+    open_seekable_compress_z_with_threads, open_seekable_lz4_with_threads,
+    open_seekable_lzip_with_threads, open_seekable_lzma_with_threads,
+    open_seekable_lzo_with_threads, open_seekable_xz_with_threads,
+    open_seekable_xz_with_threads_from_reader, open_seekable_zlib_with_threads,
+    open_seekable_zstd_with_threads, open_seekable_zstd_with_threads_from_reader,
+    strip_compression_suffix, CompressionFormat, SeekableBody, SharedSeekableGzip,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -987,6 +988,18 @@ fn open_seekable_codec(
     open_body: impl FnOnce() -> Result<Arc<dyn SeekableBody>, ratarmount_compress::CompressError>,
 ) -> Result<Arc<dyn MountSource>, String> {
     let body = open_body().map_err(|e| e.to_string())?;
+    open_from_seekable_body(path, body, index_path, options, recreate, label)
+}
+
+/// Mount from an already-opened seekable uncompressed body (path or remote Range codec).
+fn open_from_seekable_body(
+    path: &Path,
+    body: Arc<dyn SeekableBody>,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+    label: &str,
+) -> Result<Arc<dyn MountSource>, String> {
     eprintln!(
         "seekable {label}: {} ({} uncompressed bytes, {} checkpoints, kind={})",
         path.display(),
@@ -1003,22 +1016,12 @@ fn open_seekable_codec(
         )?));
     }
 
-    // Non-TAR: prefer detecting EXT4 / libarchive on a materialized body.
-    // Drop seekable body first so we don't hold two full copies.
-    let format = match label {
-        "bzip2" => CompressionFormat::Bzip2,
-        "xz" => CompressionFormat::Xz,
-        "zstd" => CompressionFormat::Zstd,
-        "lz4" => CompressionFormat::Lz4,
-        "lzip" => CompressionFormat::Lzip,
-        "lzo" => CompressionFormat::Lzo,
-        "compress-z" => CompressionFormat::CompressZ,
-        "lzma" => CompressionFormat::Lzma,
-        "zlib" => CompressionFormat::Zlib,
-        _ => CompressionFormat::Zstd,
-    };
+    // Non-TAR: materialize uncompressed body to a temp path for format probe / single-file.
+    let size = body.size();
+    let mut reader = body.open_reader().map_err(|e| e.to_string())?;
     drop(body);
-    let (tmp, size) = materialize(path, format).map_err(|e| e.to_string())?;
+    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+    std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
     let data_path = tmp.path().to_path_buf();
     if looks_like_ext4(&data_path) {
         let keep = tmp
@@ -1250,9 +1253,48 @@ fn open_remote_input(
                         .map_err(|e| e.to_string())?;
                     return Ok((label, Arc::new(src)));
                 }
+                "bzip2" => {
+                    let threads = o.threads_for("bzip2");
+                    eprintln!(
+                        "HTTP Range bzip2: {} ({} compressed bytes, live Range, -P bzip2:{})",
+                        input,
+                        range.len(),
+                        threads
+                    );
+                    let body = open_seekable_bzip2_with_threads_from_reader(range, threads, &label)
+                        .map_err(|e| e.to_string())?;
+                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "bzip2")?;
+                    return Ok((label, src));
+                }
+                "xz" => {
+                    let threads = o.threads_for("xz");
+                    eprintln!(
+                        "HTTP Range xz: {} ({} compressed bytes, live Range, -P xz:{})",
+                        input,
+                        range.len(),
+                        threads
+                    );
+                    let body = open_seekable_xz_with_threads_from_reader(range, threads, &label)
+                        .map_err(|e| e.to_string())?;
+                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "xz")?;
+                    return Ok((label, src));
+                }
+                "zstd" => {
+                    let threads = o.threads_for("zstd");
+                    eprintln!(
+                        "HTTP Range zstd: {} ({} compressed bytes, live Range, -P zstd:{})",
+                        input,
+                        range.len(),
+                        threads
+                    );
+                    let body = open_seekable_zstd_with_threads_from_reader(range, threads, &label)
+                        .map_err(|e| e.to_string())?;
+                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "zstd")?;
+                    return Ok((label, src));
+                }
                 _ => {
                     eprintln!(
-                        "info: HTTP Range for {input} is not TAR/ZIP/gzip; materializing"
+                        "info: HTTP Range for {input} is not TAR/ZIP/gzip/bzip2/xz/zstd; materializing"
                     );
                 }
             }
@@ -1273,9 +1315,32 @@ fn open_remote_input(
 }
 
 fn probe_archive_magic(magic: &[u8]) -> &'static str {
-    // gzip first (outer compression for remote .tar.gz)
+    // Outer compression first (remote .tar.gz / .bz2 / .xz / .zst)
     if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
         return "gzip";
+    }
+    if magic.len() >= 3 && &magic[..3] == b"BZh" {
+        return "bzip2";
+    }
+    // xz: FD 37 7A 58 5A 00
+    if magic.len() >= 6
+        && magic[0] == 0xfd
+        && magic[1] == 0x37
+        && magic[2] == 0x7a
+        && magic[3] == 0x58
+        && magic[4] == 0x5a
+        && magic[5] == 0x00
+    {
+        return "xz";
+    }
+    // zstd frame magic
+    if magic.len() >= 4
+        && magic[0] == 0x28
+        && magic[1] == 0xb5
+        && magic[2] == 0x2f
+        && magic[3] == 0xfd
+    {
+        return "zstd";
     }
     // ustar at offset 257
     if magic.len() >= 262 && &magic[257..262] == b"ustar" {

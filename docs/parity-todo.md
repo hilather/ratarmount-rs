@@ -26,7 +26,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
-| PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG incl. CMYK/low-bpc); OGG; HTML | `[x]` / `~` Indexed/ICCBased `.bin` |
+| PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG, CMYK, Indexed, ICCBased); OGG; HTML | `[x]` / `~` Separation/Lab residual |
 | Git tree mount | yes | yes (`git2`; worktree needs `RATARMOUNT_FORCE_GIT=1`) | `~` |
 | RAR pure / best-effort (beyond libarchive) | yes | libarchive only | `~` |
 
@@ -72,8 +72,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | `file://` | yes | yes | `[x]` |
 | `http(s)://` (full GET) | yes | yes | `[x]` |
-| HTTP Range without full download | yes | live Range for TAR/ZIP/**gzip** + materialize fallback | `[x]` / `~` remote xz/zstd/bz2 still materialize |
-| `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
+| HTTP Range without full download | yes | live Range for TAR/ZIP/gzip/**bzip2/xz/zstd** + materialize fallback | `[x]` |
+| `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS role + anonymous | `[x]` / `~` no live S3 Range |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
 | SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox folder (list TTL) + ranged content download | `[x]` |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
