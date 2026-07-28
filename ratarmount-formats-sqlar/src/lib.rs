@@ -11,6 +11,19 @@
 //! );
 //! ```
 //!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! Unencrypted SQLAR can open from any [`Read`] stream without a host path or
+//! `/tmp` spool: [`SqlarMountSource::open_from_reader`] loads the full image into
+//! RAM and attaches it with SQLite `sqlite3_deserialize` (read-only in-memory DB).
+//!
+//! | Concern | Behaviour |
+//! |---------|-----------|
+//! | Host temp file | **Never** for the nested no-tmp path |
+//! | Memory | Full SQLAR image retained for the mount lifetime |
+//! | Encrypted SQLAR | **Not** opened from a stream — detect-only residual (use path [`open`] + `sqlcipher`) |
+//! | Member random read | Yes — file payloads live in the `sqlar` table blobs (zlib as needed) |
+//!
 //! # Encrypted SQLAR (SQLCipher)
 //!
 //! Encrypted archives do **not** start with the SQLite magic (`SQLite format 3\0`);
@@ -123,7 +136,13 @@ pub type Result<T> = std::result::Result<T, SqlarError>;
 pub struct SqlarMountSource {
     #[allow(dead_code)]
     path: PathBuf,
+    /// Dropped before [`Self::mem_image`] (declaration order) so deserialize
+    /// disconnects before the backing buffer is freed.
     conn: Mutex<Connection>,
+    /// Full DB image when opened via [`Self::open_from_reader`]; referenced by
+    /// `sqlite3_deserialize` (must outlive `conn`).
+    #[allow(dead_code)]
+    mem_image: Option<Box<[u8]>>,
     /// When paths are denormal, map normalized path → original `name` key.
     name_map: Option<BTreeMap<String, String>>,
     #[allow(dead_code)]
@@ -163,6 +182,75 @@ impl SqlarMountSource {
         Ok(Self {
             path,
             conn: Mutex::new(conn),
+            mem_image: None,
+            name_map,
+            options: options.clone(),
+        })
+    }
+
+    /// Open an **unencrypted** SQLAR from any readable stream (nested AutoMount without `/tmp`).
+    ///
+    /// Reads the entire archive into memory and attaches it with SQLite
+    /// `sqlite3_deserialize` (read-only). No host temp file is created.
+    ///
+    /// `archive_label` is used for logs / path metadata (may be a nested member name).
+    ///
+    /// # Limitations
+    /// - **Memory**: the full SQLAR image is retained for the lifetime of this mount.
+    /// - **Encrypted SQLAR**: stream open does **not** decrypt. If the stream lacks
+    ///   the SQLite magic (and the label looks like `.sqlar`), returns the same
+    ///   structured encrypted errors as path open; actual decrypt remains path-based
+    ///   [`open`] with the `sqlcipher` feature.
+    pub fn open_from_reader<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        options: &OpenOptions,
+    ) -> Result<Self>
+    where
+        R: Read,
+    {
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        Self::open_from_bytes(bytes, archive_label, options)
+    }
+
+    /// Open an **unencrypted** SQLAR already loaded as bytes (no host temp file).
+    ///
+    /// See [`Self::open_from_reader`] for memory and encryption limitations.
+    pub fn open_from_bytes(
+        bytes: impl Into<Vec<u8>>,
+        archive_label: impl AsRef<Path>,
+        options: &OpenOptions,
+    ) -> Result<Self> {
+        let path = archive_label.as_ref().to_path_buf();
+        let bytes = bytes.into();
+        if bytes.len() < 16 {
+            return Err(SqlarError::Msg(format!(
+                "{} is not an SQLAR/SQLite stream (too short)",
+                path.display()
+            )));
+        }
+
+        let header = &bytes[..16.min(bytes.len())];
+        if !header_is_sqlite_magic(header) {
+            // Same structured residual as path open for encrypted candidates.
+            let plain_err = SqlarError::Msg(format!(
+                "{} is not a plain SQLite/SQLAR stream (missing SQLite magic)",
+                path.display()
+            ));
+            if header.len() >= 16 && has_sqlar_extension(&path) {
+                return encrypted_from_stream_residual(&path, options, header, plain_err);
+            }
+            return Err(plain_err);
+        }
+
+        let image: Box<[u8]> = bytes.into_boxed_slice();
+        let conn = open_plain_from_mem_image(&image)?;
+        let name_map = build_name_map(&conn)?;
+        Ok(Self {
+            path,
+            conn: Mutex::new(conn),
+            mem_image: Some(image),
             name_map,
             options: options.clone(),
         })
@@ -250,6 +338,41 @@ fn open_plain(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
+/// Attach a pre-loaded plain SQLite image as the main DB via `sqlite3_deserialize`.
+///
+/// `image` must remain alive for the lifetime of the returned connection (READONLY,
+/// no FREEONCLOSE). Callers store the buffer on [`SqlarMountSource::mem_image`].
+fn open_plain_from_mem_image(image: &[u8]) -> Result<Connection> {
+    let conn = Connection::open_in_memory()?;
+    let sz = i64::try_from(image.len()).map_err(|_| {
+        SqlarError::Msg(format!(
+            "SQLAR image too large for sqlite3_deserialize ({} bytes)",
+            image.len()
+        ))
+    })?;
+    // SAFETY: buffer is valid for the connection lifetime (held in mem_image);
+    // READONLY without FREEONCLOSE / RESIZEABLE so SQLite does not free or resize it.
+    let rc = unsafe {
+        let handle = conn.handle();
+        let ptr = image.as_ptr().cast_mut();
+        rusqlite::ffi::sqlite3_deserialize(
+            handle,
+            c"main".as_ptr(),
+            ptr,
+            sz,
+            sz,
+            rusqlite::ffi::SQLITE_DESERIALIZE_READONLY,
+        )
+    };
+    if rc != rusqlite::ffi::SQLITE_OK {
+        return Err(SqlarError::Msg(format!(
+            "sqlite3_deserialize failed (rc={rc}); not a usable SQLite database image"
+        )));
+    }
+    verify_sqlar_readable(&conn)?;
+    Ok(conn)
+}
+
 fn verify_sqlar_readable(conn: &Connection) -> Result<()> {
     let ok: Option<String> = conn
         .query_row(
@@ -300,6 +423,55 @@ fn open_encrypted(
         // Surface a structured error rather than a cryptic "file is not a database".
         log::info!(
             "encrypted SQLAR detected at {}; passwords present but sqlcipher feature disabled",
+            path.display()
+        );
+        Err(SqlarError::EncryptedNotSupported)
+    }
+}
+
+/// Encrypted SQLAR residual for stream open: detect and return structured errors only.
+///
+/// SQLCipher page codec needs a path-backed open; in-memory deserialize of ciphertext
+/// is not supported. Callers must materialize a path (or use top-level [`SqlarMountSource::open`]).
+fn encrypted_from_stream_residual(
+    path: &Path,
+    options: &OpenOptions,
+    header: &[u8],
+    plain_err: SqlarError,
+) -> Result<SqlarMountSource> {
+    if header.len() < 16 {
+        return Err(plain_err);
+    }
+    if options.passwords.is_empty() {
+        log::debug!(
+            "SQLAR stream open without SQLite magic ({}): treating as encrypted \
+             (sqlcipher_enabled={}); stream decrypt not supported",
+            path.display(),
+            sqlcipher_enabled()
+        );
+        return Err(SqlarError::EncryptedRequiresPassword);
+    }
+    #[cfg(feature = "sqlcipher")]
+    {
+        let _ = plain_err;
+        // Passwords present and SQLCipher linked, but we still cannot decrypt a pure
+        // stream without a path/VFS. Surface a clear residual rather than WrongPassword.
+        log::info!(
+            "encrypted SQLAR stream at {}; sqlcipher is enabled but open_from_reader \
+             does not decrypt — use path-based open (or AutoMount temp spool)",
+            path.display()
+        );
+        Err(SqlarError::Msg(format!(
+            "encrypted SQLAR cannot be opened from a nested stream without a host path; \
+             use path open with --password (label={})",
+            path.display()
+        )))
+    }
+    #[cfg(not(feature = "sqlcipher"))]
+    {
+        let _ = plain_err;
+        log::info!(
+            "encrypted SQLAR stream at {}; passwords present but sqlcipher feature disabled",
             path.display()
         );
         Err(SqlarError::EncryptedNotSupported)
@@ -833,5 +1005,115 @@ mod tests {
         };
         let m = SqlarMountSource::open(&path, &opts).unwrap();
         assert_ufo(&m);
+    }
+
+    /// Nested no-tmp path: fixture bytes via Cursor → open_from_reader (no host file).
+    #[test]
+    fn open_from_reader_cursor_equals_path() {
+        let path = py_test("nested-tar.sqlar");
+        if skip_missing(&path, "unencrypted") {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let from_path = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        let from_reader = SqlarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "nested-tar.sqlar",
+            &OpenOptions::default(),
+        )
+        .expect("open_from_reader");
+        assert_ufo(&from_path);
+        assert_ufo(&from_reader);
+        // list root names should match
+        let path_root = from_path.list("/").expect("path root");
+        let reader_root = from_reader.list("/").expect("reader root");
+        match (path_root, reader_root) {
+            (ListResult::Infos(a), ListResult::Infos(b)) => {
+                assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+            }
+            _ => panic!("expected Infos lists"),
+        }
+    }
+
+    #[test]
+    fn open_from_reader_compressed_fixture() {
+        let path = py_test("nested-tar-compressed.sqlar");
+        if skip_missing(&path, "unencrypted") {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read fixture");
+        let m = SqlarMountSource::open_from_bytes(
+            bytes,
+            "nested-tar-compressed.sqlar",
+            &OpenOptions::default(),
+        )
+        .expect("open_from_bytes");
+        assert_ufo(&m);
+    }
+
+    #[test]
+    fn open_from_reader_rejects_non_sqlite() {
+        let result = SqlarMountSource::open_from_reader(
+            Cursor::new(b"not a database at all!!!!"),
+            "fake.sqlar",
+            &OpenOptions::default(),
+        );
+        // .sqlar label + no magic → encrypted residual without password
+        match result {
+            Err(err @ SqlarError::EncryptedRequiresPassword) => {
+                assert!(err.to_string().contains("password"));
+            }
+            Err(err) if err.to_string().contains("not a plain SQLite") => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("non-sqlite should fail"),
+        }
+    }
+
+    #[test]
+    fn open_from_reader_encrypted_residual() {
+        let path = py_test("encrypted-nested-tar.sqlar");
+        if skip_missing(&path, "encrypted") {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read encrypted fixture");
+        match SqlarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "encrypted-nested-tar.sqlar",
+            &OpenOptions::default(),
+        ) {
+            Err(SqlarError::EncryptedRequiresPassword) => {}
+            Err(other) => panic!("expected EncryptedRequiresPassword, got {other}"),
+            Ok(_) => panic!("encrypted stream must not open without password/path"),
+        }
+    }
+
+    #[test]
+    fn open_from_reader_encrypted_with_password_still_residual() {
+        let path = py_test("encrypted-nested-tar.sqlar");
+        if skip_missing(&path, "encrypted") {
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read encrypted fixture");
+        let opts = OpenOptions {
+            passwords: vec!["foo".into()],
+            ..OpenOptions::default()
+        };
+        match SqlarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "encrypted-nested-tar.sqlar",
+            &opts,
+        ) {
+            #[cfg(feature = "sqlcipher")]
+            Err(SqlarError::Msg(msg)) => {
+                assert!(
+                    msg.contains("encrypted") && msg.contains("stream"),
+                    "expected stream residual: {msg}"
+                );
+            }
+            #[cfg(not(feature = "sqlcipher"))]
+            Err(SqlarError::EncryptedNotSupported) => {}
+            Err(other) => panic!("unexpected error: {other}"),
+            Ok(_) => panic!("encrypted stream decrypt is residual"),
+        }
     }
 }

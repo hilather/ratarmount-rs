@@ -9,6 +9,21 @@ SQLAR ([SQLite Archiver](https://www.sqlite.org/sqlar.html)) mount source for th
 | *(none)* | yes | Unencrypted SQLAR via stock bundled SQLite |
 | `sqlcipher` | no | Open SQLCipher-encrypted `.sqlar` archives |
 
+## Nested / `open_from_reader` (no host temp)
+
+Unencrypted SQLAR opens from any `Read` stream via `SqlarMountSource::open_from_reader` (or `open_from_bytes`):
+
+1. Read the full image into RAM
+2. Attach with SQLite `sqlite3_deserialize` (read-only in-memory DB)
+
+**No `/tmp` / `NamedTempFile` for this path.** Residuals:
+
+| Case | Behaviour |
+|------|-----------|
+| Unencrypted nested | No host temp; full image in RAM for mount lifetime |
+| Encrypted nested stream | Detect-only structured errors; decrypt remains path-based `open` + `sqlcipher` |
+| Factory wiring | Orchestrator must call `open_from_reader` from nested AutoMount (not this crate) |
+
 ## Encrypted SQLAR
 
 Encrypted archives **omit** the `SQLite format 3\0` magic; the first 16 bytes are the AES salt. Detection still works on `*.sqlar` files without the magic.
