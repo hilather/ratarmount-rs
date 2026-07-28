@@ -47,6 +47,13 @@ pub const NESTED_FLATTEN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
 const BLOCK_SIZE: u64 = 512;
 
+/// `linkname` marker for GNU dumpdir whiteout rows (name deleted in a later dumpdir).
+///
+/// Stored so list/lookup can hide the name when the newest version is this tombstone.
+/// Not a valid path component; the leading NUL makes accidental collisions with real
+/// link targets extremely unlikely.
+const DUMPDIR_DELETE_LINKNAME: &str = "\0GNU.dumpdir.delete";
+
 /// A nested TAR member discovered while indexing an outer archive.
 ///
 /// `path` is the outer archive member path as stored in the index (leading `/`).
@@ -597,22 +604,37 @@ fn paths_equal_nested(a: &str, b: &str) -> bool {
 
 impl MountSource for SqliteIndexedTar {
     fn list(&self, path: &str) -> Option<ListResult> {
-        self.index.list(path).ok().flatten().map(ListResult::Infos)
+        let mut map = self.index.list(path).ok().flatten()?;
+        // Newest row wins in the index map; drop dumpdir whiteouts so deleted names vanish.
+        map.retain(|_, fi| !is_dumpdir_tombstone(fi));
+        Some(ListResult::Infos(map))
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        self.index
-            .list_mode(path)
-            .ok()
-            .flatten()
-            .map(ListModeResult::Modes)
+        // Prefer list() so tombstones are filtered consistently with Infos.
+        let ListResult::Infos(infos) = self.list(path)? else {
+            return None;
+        };
+        let modes = infos.into_iter().map(|(n, fi)| (n, fi.mode)).collect();
+        Some(ListModeResult::Modes(modes))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
-        self.index.lookup(path, file_version).ok().flatten()
+        let fi = self.index.lookup(path, file_version).ok().flatten()?;
+        // Version 0 (newest): hide dumpdir-deleted names. Older versions remain queryable.
+        if is_dumpdir_tombstone(&fi) {
+            return None;
+        }
+        Some(fi)
     }
 
     fn versions(&self, path: &str) -> u32 {
+        // If the newest version is a dumpdir whiteout, treat the path as absent.
+        if let Ok(Some(fi)) = self.index.lookup(path, 0) {
+            if is_dumpdir_tombstone(&fi) {
+                return 0;
+            }
+        }
         self.index.version_count(path).unwrap_or(0)
     }
 
@@ -621,6 +643,12 @@ impl MountSource for SqliteIndexedTar {
         file_info: &FileInfo,
         _buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        if is_dumpdir_tombstone(file_info) {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "dumpdir-deleted member",
+            ));
+        }
         let ud = tar_userdata(file_info)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing TAR userdata"))?;
         if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
@@ -677,6 +705,118 @@ fn tar_userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
         UserData::Tar(t) => Some(t),
         _ => None,
     })
+}
+
+/// True when this index row is a GNU dumpdir whiteout (deleted name).
+fn is_dumpdir_tombstone(fi: &FileInfo) -> bool {
+    fi.linkname == DUMPDIR_DELETE_LINKNAME
+}
+
+/// Parse GNU dumpdir payload: `Cfilename\0…\0` (trailing lone NUL ends the dumpdir).
+///
+/// Control codes (GNU tar manual): `Y` present+dumped, `N` present+not dumped,
+/// `D` subdirectory, plus rename `R`/`T`/`X` (ignored for presence tracking).
+fn parse_dumpdir_entries(payload: &[u8]) -> Vec<(u8, String)> {
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i < payload.len() {
+        if payload[i] == 0 {
+            break;
+        }
+        let status = payload[i];
+        i += 1;
+        let start = i;
+        while i < payload.len() && payload[i] != 0 {
+            i += 1;
+        }
+        let name = String::from_utf8_lossy(&payload[start..i]).into_owned();
+        if i < payload.len() {
+            i += 1; // skip trailing NUL of this record
+        }
+        if !name.is_empty() {
+            out.push((status, name));
+        }
+    }
+    out
+}
+
+/// Names that still exist in the directory according to dumpdir (`Y`/`N`/`D`).
+fn dumpdir_present_names(entries: &[(u8, String)]) -> std::collections::HashSet<String> {
+    entries
+        .iter()
+        .filter_map(|(c, n)| match *c {
+            b'Y' | b'N' | b'D' => Some(n.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Normalize dumpdir member path to a directory full path (`/foo`).
+fn dumpdir_dir_full_path(full_name: &str) -> String {
+    let mut full = full_name.trim_end_matches('/').to_string();
+    while full.starts_with("./") {
+        full = full[2..].to_string();
+    }
+    if full.is_empty() || full == "." {
+        return String::from("/");
+    }
+    normpath(&full)
+}
+
+/// SQL `path` column for direct children of a dumpdir directory.
+fn dumpdir_children_sql_path(dir_full: &str) -> String {
+    if dir_full == "/" {
+        String::new()
+    } else {
+        dir_full.to_string()
+    }
+}
+
+/// When a later dumpdir omits names that a prior dumpdir listed, insert whiteout rows.
+///
+/// Single-archive multi-snapshot MVP (concatenated incremental levels): names present in
+/// an earlier dumpdir for the same directory but absent from the current one are
+/// tombstoned so list/lookup hide them. Multi-archive union / `.snar` merge is residual.
+#[allow(clippy::too_many_arguments)]
+fn apply_dumpdir_deletes(
+    batch: &mut Vec<FileRow>,
+    full_name: &str,
+    offsetheader: u64,
+    payload: &[u8],
+    mtime: f64,
+    uid: i64,
+    gid: i64,
+    recursiondepth: i64,
+    dumpdir_state: &mut std::collections::HashMap<String, std::collections::HashSet<String>>,
+) {
+    let dir_full = dumpdir_dir_full_path(full_name);
+    let entries = parse_dumpdir_entries(payload);
+    let present = dumpdir_present_names(&entries);
+    if let Some(prev) = dumpdir_state.get(&dir_full) {
+        let child_path = dumpdir_children_sql_path(&dir_full);
+        for (tomb_i, name) in (0_i64..).zip(prev.difference(&present)) {
+            // Unique PK: dumpdir already uses offsetheader and +1 for reg/dir dual entry.
+            let oh = offsetheader as i64 + 2 + tomb_i;
+            batch.push(FileRow::new(
+                child_path.clone(),
+                name.clone(),
+                oh,
+                0,
+                0,
+                mtime,
+                0, // mode 0: not a live file/dir
+                b'D' as i64,
+                DUMPDIR_DELETE_LINKNAME,
+                uid,
+                gid,
+                false,
+                false,
+                true, // isgenerated
+                recursiondepth,
+            ));
+        }
+    }
+    dumpdir_state.insert(dir_full, present);
 }
 
 pub fn default_index_path(archive: &Path) -> PathBuf {
@@ -1087,6 +1227,9 @@ fn parse_tar_into_index<R: Read + Seek>(
     let mut pax_header_start: Option<u64> = None;
     let mut nested_pending: Vec<NestedPending> = Vec::new();
     let mut xattr_batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH_FLUSH);
+    // Prior dumpdir present-name sets per directory (for delete whiteouts).
+    let mut dumpdir_state: std::collections::HashMap<String, std::collections::HashSet<String>> =
+        std::collections::HashMap::new();
 
     let mut is_gnu_incremental = match options.gnu_incremental {
         Some(v) => v,
@@ -1293,6 +1436,23 @@ fn parse_tar_into_index<R: Read + Seek>(
         }
 
         if typeflag == b'D' {
+            // Parse dumpdir payload for multi-snapshot delete whiteouts (B-10 MVP).
+            let mut payload = vec![0u8; logical_size as usize];
+            if logical_size > 0 {
+                reader.seek(SeekFrom::Start(data_off))?;
+                reader.read_exact(&mut payload)?;
+            }
+            apply_dumpdir_deletes(
+                &mut batch,
+                &name,
+                member_header_start,
+                &payload,
+                mtime,
+                uid,
+                gid,
+                0,
+                &mut dumpdir_state,
+            );
             // Dumpdir: regular meta entry (S_IFREG, dumpdir size) + directory entry (size 0).
             push_dumpdir_entries(
                 &mut batch,
@@ -3362,6 +3522,193 @@ mod tests {
             fix_incremental_backup_name_prefixes("14130613451/foo", &empty),
             "14130613451/foo"
         );
+    }
+
+    #[test]
+    fn parse_dumpdir_entries_y_n_d() {
+        // Fixture-style: Y1\0Y2\0Y3\0\0 and mixed status codes.
+        let payload = b"Y1\0Nunchanged\0Dsubdir\0Y3\0\0";
+        let entries = parse_dumpdir_entries(payload);
+        assert_eq!(
+            entries,
+            vec![
+                (b'Y', "1".into()),
+                (b'N', "unchanged".into()),
+                (b'D', "subdir".into()),
+                (b'Y', "3".into()),
+            ]
+        );
+        let present = dumpdir_present_names(&entries);
+        assert!(present.contains("1"));
+        assert!(present.contains("unchanged"));
+        assert!(present.contains("subdir"));
+        assert!(present.contains("3"));
+        assert!(!present.contains("missing"));
+    }
+
+    /// Regression: sparse map offsets / realsize above 8 GiB must stay u64 and must not
+    /// materialize an 8+ GiB buffer (holes are Zero segments; data is seeked).
+    #[test]
+    fn sparse_map_offset_above_8gib() {
+        const NINE_GIB: u64 = 9 * 1024 * 1024 * 1024;
+        let map = vec![(NINE_GIB, 4u64)];
+        let logical = NINE_GIB + 4;
+        let segments = segments_from_map(&map, /*tar_cursor=*/ 0, logical).expect("segments");
+        assert_eq!(segments.len(), 2);
+        match &segments[0] {
+            FileSegment::Zero { len } => assert_eq!(*len, NINE_GIB, "leading hole"),
+            other => panic!("expected Zero hole, got {other:?}"),
+        }
+        match &segments[1] {
+            FileSegment::Data { file_offset, len } => {
+                assert_eq!(*file_offset, 0);
+                assert_eq!(*len, 4);
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+
+        // Pax 0.1 map string with large offsets parses as u64 pairs.
+        let mut pax = PaxParsed::empty();
+        pax.map.insert(
+            "GNU.sparse.map".into(),
+            format!("{NINE_GIB},4,{},8", NINE_GIB + 100),
+        );
+        let from_pax = sparse_map_from_pax(&pax);
+        assert_eq!(from_pax, vec![(NINE_GIB, 4), (NINE_GIB + 100, 8)]);
+
+        // Sparse 1.0 textual map with large offsets.
+        let map_text = format!("1\n{NINE_GIB}\n4\n");
+        let map_text_len = map_text.len() as u64;
+        let mut map_buf = map_text.into_bytes();
+        let pad = (512 - (map_buf.len() % 512)) % 512;
+        map_buf.extend(std::iter::repeat_n(0u8, pad));
+        map_buf.extend_from_slice(b"DATA");
+        let (m1, content_off) =
+            parse_sparse_1_0_map(&mut std::io::Cursor::new(map_buf), 0).expect("1.0 map");
+        assert_eq!(m1, vec![(NINE_GIB, 4)]);
+        assert_eq!(content_off, pad512(map_text_len));
+
+        // Read far extent via SegmentedFile without allocating 9 GiB.
+        let backing = b"ABCD";
+        let segs = segments_from_map(&map, 0, logical).unwrap();
+        let mut r = SegmentedFile::new(std::io::Cursor::new(backing.to_vec()), segs);
+        r.seek(SeekFrom::Start(NINE_GIB)).unwrap();
+        let mut buf = [0u8; 4];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"ABCD");
+        // Hole byte at start is zero without materializing the hole.
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let mut z = [0u8; 1];
+        r.read_exact(&mut z).unwrap();
+        assert_eq!(z[0], 0);
+    }
+
+    /// Handcrafted dual dumpdir: first lists 1,2,3; second lists 3,moved → 1 and 2 deleted.
+    ///
+    /// Regression: GNU incremental dumpdir delete residual (B-10 / #73 MVP — single archive).
+    #[test]
+    fn gnu_incremental_dumpdir_deletes_omitted_names() {
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn gnu_header(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            assert!(nb.len() < 100, "name too long for ustar name field");
+            h[..nb.len()].copy_from_slice(nb);
+            h[100..108].copy_from_slice(&oct_field(0o700, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            // GNU tar magic
+            h[257..265].copy_from_slice(b"ustar  \0");
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+        fn pad_payload(p: &[u8]) -> Vec<u8> {
+            let mut v = p.to_vec();
+            let n = (512 - (v.len() % 512)) % 512;
+            v.extend(std::iter::repeat_n(0u8, n));
+            v
+        }
+        fn append_member(out: &mut Vec<u8>, name: &str, typeflag: u8, payload: &[u8]) {
+            out.extend_from_slice(&gnu_header(name, payload.len() as u64, typeflag));
+            out.extend(pad_payload(payload));
+        }
+
+        let mut tar = Vec::new();
+        // Snapshot A
+        append_member(&mut tar, "foo/", b'D', b"Y1\0Y2\0Y3\0\0");
+        append_member(&mut tar, "foo/1", b'0', b"one\n");
+        append_member(&mut tar, "foo/2", b'0', b"two\n");
+        append_member(&mut tar, "foo/3", b'0', b"three\n");
+        // Snapshot B — 1 and 2 gone from dumpdir; 3 updated; moved added
+        append_member(&mut tar, "foo/", b'D', b"Y3\0Ymoved\0\0");
+        append_member(&mut tar, "foo/3", b'0', b"THREE\n");
+        append_member(&mut tar, "foo/moved", b'0', b"mv\n");
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("incremental-deletes.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index dual-dumpdir tar");
+
+        assert_eq!(
+            m.index()
+                .metadata()
+                .unwrap()
+                .get("isGnuIncremental")
+                .map(String::as_str),
+            Some("1")
+        );
+
+        // Deleted names must not appear as live children.
+        assert!(
+            m.lookup("/foo/1", 0).is_none(),
+            "foo/1 should be dumpdir-deleted"
+        );
+        assert!(
+            m.lookup("/foo/2", 0).is_none(),
+            "foo/2 should be dumpdir-deleted"
+        );
+        assert_eq!(m.versions("/foo/1"), 0);
+        assert_eq!(m.versions("/foo/2"), 0);
+
+        let fi3 = m.lookup("/foo/3", 0).expect("foo/3 still live");
+        let mut r = m.open(&fi3, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "THREE\n");
+
+        let fim = m.lookup("/foo/moved", 0).expect("foo/moved");
+        let mut r = m.open(&fim, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "mv\n");
+
+        let ListResult::Infos(map) = m.list("/foo").expect("list /foo") else {
+            panic!("expected Infos");
+        };
+        assert!(
+            !map.contains_key("1") && !map.contains_key("2"),
+            "deleted names must be omitted from list: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(map.contains_key("3"), "3 present: {:?}", map.keys());
+        assert!(map.contains_key("moved"), "moved present: {:?}", map.keys());
     }
 
     /// After `--hashes sha256` fill, MountSource xattrs expose `user.hash.sha256` (Python parity).
