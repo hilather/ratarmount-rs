@@ -41,7 +41,7 @@ use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
 use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
-use ratarmount_index::{resolve_index_location, IndexLocation};
+use ratarmount_index::{resolve_index_location, IndexLocation, SqliteIndex};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -908,7 +908,173 @@ fn open_tar(
     .map_err(|e| e.to_string())
 }
 
+/// Read the first gzip seek-index blob from an on-disk SQLite index, if present.
+///
+/// Used to hydrate Tier C RGZI checkpoints before a full spacing-based rebuild.
+/// Returns `None` when recreate is set, the path is missing, or the table is empty.
+fn try_load_gzip_index_blob(index_path: Option<&Path>, recreate: bool) -> Option<Vec<u8>> {
+    if recreate {
+        return None;
+    }
+    let ip = index_path?;
+    if !ip.exists() {
+        return None;
+    }
+    let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
+    if !meta_ok {
+        return None;
+    }
+    // Prefer open_writable so we do not emit the RO "Successfully loaded…" banner
+    // (TAR will open RO itself). Fall back to open_read_only if the file is not writable.
+    let idx = match SqliteIndex::open_writable(ip) {
+        Ok(i) => i,
+        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
+    };
+    match idx.get_gzip_index_blobs() {
+        Ok(blobs) => blobs.into_iter().next().filter(|b| !b.is_empty()),
+        Err(_) => None,
+    }
+}
+
+/// Persist a Tier C RGZI seek-index blob into the SQLite side table when writable.
+///
+/// No-op for `:memory:` / missing path / read-only / `write_index = false`.
+fn persist_gzip_index_blob(
+    gzip: &SharedSeekableGzip,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+) {
+    if !options.write_index || options.read_only_index || options.index_in_memory {
+        return;
+    }
+    let Some(ip) = index_path else {
+        return;
+    };
+    if !ip.exists() {
+        return;
+    }
+    let blob = gzip.export_seek_index_blob();
+    match SqliteIndex::open_writable(ip) {
+        Ok(idx) => {
+            if let Err(e) = idx.ensure_compression_tables() {
+                eprintln!("info: could not ensure compression tables for gzip blob: {e}");
+                return;
+            }
+            match idx.set_gzip_index_blob(&blob) {
+                Ok(()) => eprintln!(
+                    "gzip RGZI: stored {}-byte seek index in {}",
+                    blob.len(),
+                    ip.display()
+                ),
+                Err(e) => eprintln!("info: could not store gzip seek index blob: {e}"),
+            }
+        }
+        Err(e) => eprintln!("info: could not open index to store gzip seek blob: {e}"),
+    }
+}
+
+/// Open seekable gzip from a path, preferring an imported RGZI blob when available.
+fn open_shared_seekable_gzip_path(
+    path: &Path,
+    spacing: u64,
+    threads: u32,
+    index_path: Option<&Path>,
+    recreate: bool,
+) -> Result<Arc<SharedSeekableGzip>, String> {
+    if let Some(blob) = try_load_gzip_index_blob(index_path, recreate) {
+        match SharedSeekableGzip::open_with_imported_index(path, spacing, threads, &blob) {
+            Ok(g) => {
+                eprintln!(
+                    "seekable gzip (imported RGZI): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+                    path.display(),
+                    g.size(),
+                    g.checkpoint_count(),
+                    threads
+                );
+                return Ok(g);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: gzip RGZI import failed ({e}); rebuilding seek checkpoints"
+                );
+            }
+        }
+    }
+    let gzip = SharedSeekableGzip::open_with_threads(path, spacing, threads)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+        path.display(),
+        gzip.size(),
+        gzip.checkpoint_count(),
+        threads
+    );
+    Ok(gzip)
+}
+
+/// Try opening seekable gzip from a Range reader using an on-disk RGZI blob.
+///
+/// Returns `None` when no blob is available or import fails (caller rebuilds with a
+/// **fresh** reader — the passed reader is consumed on both success and failure).
+fn try_open_gzip_imported_from_reader<R>(
+    reader: R,
+    label: &Path,
+    spacing: u64,
+    threads: u32,
+    index_path: Option<&Path>,
+    recreate: bool,
+) -> Option<Arc<SharedSeekableGzip>>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+{
+    let blob = try_load_gzip_index_blob(index_path, recreate)?;
+    match SharedSeekableGzip::open_with_imported_index_from_reader(
+        reader, spacing, threads, label, &blob,
+    ) {
+        Ok(g) => {
+            eprintln!(
+                "seekable gzip (imported RGZI): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+                label.display(),
+                g.size(),
+                g.checkpoint_count(),
+                threads
+            );
+            Some(g)
+        }
+        Err(e) => {
+            eprintln!("info: gzip RGZI import failed ({e}); rebuilding seek checkpoints");
+            None
+        }
+    }
+}
+
+/// Build seekable gzip from a Range reader, rebuilding checkpoints from scratch.
+fn open_gzip_rebuilt_from_reader<R>(
+    reader: R,
+    label: &Path,
+    spacing: u64,
+    threads: u32,
+) -> Result<Arc<SharedSeekableGzip>, String>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+{
+    let gzip =
+        SharedSeekableGzip::open_with_threads_from_reader(reader, spacing, threads, label)
+            .map_err(|e| e.to_string())?;
+    eprintln!(
+        "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+        label.display(),
+        gzip.size(),
+        gzip.checkpoint_count(),
+        threads
+    );
+    Ok(gzip)
+}
+
 /// Open gzip: G3 Tier B seekable checkpoints for `.tar.gz` / `.tgz`; materialize for plain `.gz`.
+///
+/// When an on-disk index carries a Tier C RGZI blob, import it before a full checkpoint rebuild.
+/// After a successful TAR index open/create, export and store the blob when the index is writable.
 fn open_gzip(
     path: &Path,
     index_path: Option<&Path>,
@@ -924,18 +1090,12 @@ fn open_gzip(
     // Prefer seekable path for names that clearly indicate compressed TAR.
     if name_suggests_compressed_tar(path) {
         let threads = options.threads_for("gzip");
-        let gzip = SharedSeekableGzip::open_with_threads(path, spacing, threads)
-            .map_err(|e| e.to_string())?;
-        eprintln!(
-            "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
-            path.display(),
-            gzip.size(),
-            gzip.checkpoint_count(),
-            threads
-        );
-        return Ok(Arc::new(open_tar_gzip(
-            path, gzip, index_path, options, recreate,
-        )?));
+        let gzip =
+            open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
+        let tar = open_tar_gzip(path, Arc::clone(&gzip), index_path, options, recreate)?;
+        // TAR index is now on disk (or memory); side-table write only when path exists.
+        persist_gzip_index_blob(&gzip, index_path, options);
+        return Ok(Arc::new(tar));
     }
 
     // Plain `.gz` (or ambiguous): materialize once; detect secret TAR / EXT4 body if present.
@@ -1253,150 +1413,243 @@ fn apply_compositing(
     Ok(src)
 }
 
-/// Open a remote URL: prefer live HTTP Range for uncompressed TAR/ZIP; else materialize.
+/// Resolve index options for a remote URL label (same rules as local `open_path`).
+fn remote_index_setup(
+    label: &Path,
+    opts: &OpenOptions,
+    recreate: bool,
+) -> (OpenOptions, Option<PathBuf>) {
+    let index_loc = resolved_index(label, opts, recreate);
+    let mut o = opts.clone();
+    let index_path = if index_loc.is_memory() {
+        o.index_in_memory = true;
+        o.index_file_path = None;
+        None
+    } else if let Some(p) = index_loc.as_path() {
+        o.index_file_path = Some(p.to_path_buf());
+        o.index_in_memory = false;
+        Some(p.to_path_buf())
+    } else {
+        None
+    };
+    (o, index_path)
+}
+
+/// Result of a successful live-Range open (label path + mount source).
+type LiveRangeOpened = (PathBuf, Arc<dyn MountSource>);
+
+/// Open TAR/ZIP/gzip/bzip2/xz/zstd from a live Range-capable `Read+Seek` body.
+///
+/// Returns `Ok(None)` when the probed format is unsupported (caller should materialize).
+/// `transport` is a short label for logs (`HTTP Range`, `S3 Range`).
+///
+/// `reopen` rebuilds a fresh reader after a failed gzip RGZI import (reader was consumed).
+fn open_from_live_range<R, F>(
+    mut range: R,
+    range_len: u64,
+    input: &str,
+    opts: &OpenOptions,
+    recreate: bool,
+    transport: &str,
+    reopen: F,
+) -> Result<Option<LiveRangeOpened>, String>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+    F: FnOnce() -> Result<R, String>,
+{
+    let mut magic = [0u8; 512];
+    let n = std::io::Read::read(&mut range, &mut magic).map_err(|e| e.to_string())?;
+    std::io::Seek::seek(&mut range, std::io::SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+    let kind = probe_archive_magic(&magic[..n]);
+    let label = PathBuf::from(input);
+    let (o, index_path) = remote_index_setup(&label, opts, recreate);
+    let ip = index_path.as_deref();
+
+    match kind {
+        "tar" => {
+            eprintln!("{transport} TAR: {input} ({range_len} bytes, live Range)");
+            let src = SqliteIndexedTar::open_from_reader(range, &label, ip, &o, VERSION)
+                .map_err(|e| e.to_string())?;
+            Ok(Some((label, Arc::new(src))))
+        }
+        "zip" => {
+            eprintln!("{transport} ZIP: {input} ({range_len} bytes, live Range)");
+            let src = ZipMountSource::open_from_reader(range, &label, ip, &o, VERSION)
+                .map_err(|e| e.to_string())?;
+            Ok(Some((label, Arc::new(src))))
+        }
+        "gzip" => {
+            let spacing = if o.gzip_seek_point_spacing == 0 {
+                ratarmount_compress::DEFAULT_GZIP_SEEK_SPACING
+            } else {
+                o.gzip_seek_point_spacing
+            };
+            let threads = o.threads_for("gzip");
+            eprintln!(
+                "{transport} gzip: {input} ({range_len} compressed bytes, live Range, -P gzip:{threads})"
+            );
+            // Prefer RGZI import; on failure rebuild with a fresh Range handle.
+            let gzip = if try_load_gzip_index_blob(ip, recreate).is_some() {
+                match try_open_gzip_imported_from_reader(
+                    range, &label, spacing, threads, ip, recreate,
+                ) {
+                    Some(g) => g,
+                    None => {
+                        let fresh = reopen()?;
+                        open_gzip_rebuilt_from_reader(fresh, &label, spacing, threads)?
+                    }
+                }
+            } else {
+                open_gzip_rebuilt_from_reader(range, &label, spacing, threads)?
+            };
+            let is_tar = name_suggests_compressed_tar(&label)
+                || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
+            if is_tar {
+                let src = open_tar_gzip(&label, Arc::clone(&gzip), ip, &o, recreate)?;
+                persist_gzip_index_blob(&gzip, ip, &o);
+                return Ok(Some((label, Arc::new(src))));
+            }
+            // Plain .gz single-file: materialize uncompressed via seekable body.
+            let size = gzip.size();
+            let mut reader = gzip.reader().map_err(|e| e.to_string())?;
+            let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
+            std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
+            let data_path = tmp.path().to_path_buf();
+            let stripped = strip_compression_suffix(
+                label.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+            );
+            let src = SingleFileMountSource::new(stripped, data_path, size, Some(tmp))
+                .map_err(|e| e.to_string())?;
+            Ok(Some((label, Arc::new(src))))
+        }
+        "bzip2" => {
+            let threads = o.threads_for("bzip2");
+            eprintln!(
+                "{transport} bzip2: {input} ({range_len} compressed bytes, live Range, -P bzip2:{threads})"
+            );
+            let body = open_seekable_bzip2_with_threads_from_reader(range, threads, &label)
+                .map_err(|e| e.to_string())?;
+            let src = open_from_seekable_body(&label, body, ip, &o, recreate, "bzip2")?;
+            Ok(Some((label, src)))
+        }
+        "xz" => {
+            let threads = o.threads_for("xz");
+            eprintln!(
+                "{transport} xz: {input} ({range_len} compressed bytes, live Range, -P xz:{threads})"
+            );
+            let body = open_seekable_xz_with_threads_from_reader(range, threads, &label)
+                .map_err(|e| e.to_string())?;
+            let src = open_from_seekable_body(&label, body, ip, &o, recreate, "xz")?;
+            Ok(Some((label, src)))
+        }
+        "zstd" => {
+            let threads = o.threads_for("zstd");
+            eprintln!(
+                "{transport} zstd: {input} ({range_len} compressed bytes, live Range, -P zstd:{threads})"
+            );
+            let body = open_seekable_zstd_with_threads_from_reader(range, threads, &label)
+                .map_err(|e| e.to_string())?;
+            let src = open_from_seekable_body(&label, body, ip, &o, recreate, "zstd")?;
+            Ok(Some((label, src)))
+        }
+        _ => {
+            eprintln!(
+                "info: {transport} for {input} is not TAR/ZIP/gzip/bzip2/xz/zstd; materializing"
+            );
+            Ok(None)
+        }
+    }
+}
+
+/// Materialize a remote URL to a local path and open it.
+fn materialize_remote_input(
+    input: &str,
+    opts: &OpenOptions,
+    recreate: bool,
+    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
+) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    let remote = ratarmount_remote::resolve_to_local(input).map_err(|e| e.to_string())?;
+    let path = remote.path().to_path_buf();
+    remotes.push(remote);
+    let src = open_path(&path, opts, recreate)?;
+    Ok((path, src))
+}
+
+/// Open a remote URL: prefer live HTTP/S3 Range for TAR/ZIP/codecs; else materialize.
 fn open_remote_input(
     input: &str,
     opts: &OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
-    use ratarmount_remote::{resolve_access, resolve_to_local, RemoteAccess, RemoteHttp};
-    use std::io::{Read, Seek, SeekFrom};
+    use ratarmount_remote::{resolve_access, open_s3_range, RemoteAccess, RemoteHttp};
+
+    // Live S3 Range I/O (parallel to HTTP Range) when GetObject Range works.
+    if input.starts_with("s3://") {
+        match open_s3_range(input) {
+            Ok(range) if range.uses_ranges() => {
+                let len = range.len();
+                eprintln!("S3 Range: {input} ({len} bytes, live Range GetObject)");
+                let input_owned = input.to_string();
+                match open_from_live_range(
+                    range,
+                    len,
+                    input,
+                    opts,
+                    recreate,
+                    "S3 Range",
+                    || {
+                        open_s3_range(&input_owned).map_err(|e| e.to_string()).and_then(|r| {
+                            if r.uses_ranges() {
+                                Ok(r)
+                            } else {
+                                Err("S3 Range reopen lost live Range support".into())
+                            }
+                        })
+                    },
+                )? {
+                    Some(opened) => return Ok(opened),
+                    None => {
+                        eprintln!(
+                            "info: S3 Range format unsupported for {input}; materializing"
+                        );
+                        return materialize_remote_input(input, opts, recreate, remotes);
+                    }
+                }
+            }
+            Ok(_) => {
+                eprintln!(
+                    "info: S3 Range unavailable for {input} (full body buffered); materializing"
+                );
+                return materialize_remote_input(input, opts, recreate, remotes);
+            }
+            Err(e) => {
+                eprintln!("info: S3 Range open failed for {input}: {e}; materializing");
+                return materialize_remote_input(input, opts, recreate, remotes);
+            }
+        }
+    }
 
     let access = resolve_access(input).map_err(|e| e.to_string())?;
     match access {
-        RemoteAccess::Http(RemoteHttp::Range(mut range)) => {
-            // Probe magic without consuming the eventual open reader.
-            let mut magic = [0u8; 512];
-            let n = range.read(&mut magic).map_err(|e| e.to_string())?;
-            range.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
-            let kind = probe_archive_magic(&magic[..n]);
-            let label = PathBuf::from(input);
-            let index_loc = resolved_index(&label, opts, recreate);
-            let mut o = opts.clone();
-            let index_path = if index_loc.is_memory() {
-                o.index_in_memory = true;
-                o.index_file_path = None;
-                None
-            } else if let Some(p) = index_loc.as_path() {
-                o.index_file_path = Some(p.to_path_buf());
-                o.index_in_memory = false;
-                Some(p.to_path_buf())
-            } else {
-                None
-            };
-            let ip = index_path.as_deref();
-
-            match kind {
-                "tar" => {
-                    eprintln!(
-                        "HTTP Range TAR: {} ({} bytes, live Range)",
-                        input,
-                        range.len()
-                    );
-                    let src = SqliteIndexedTar::open_from_reader(range, &label, ip, &o, VERSION)
-                        .map_err(|e| e.to_string())?;
-                    return Ok((label, Arc::new(src)));
-                }
-                "zip" => {
-                    eprintln!(
-                        "HTTP Range ZIP: {} ({} bytes, live Range)",
-                        input,
-                        range.len()
-                    );
-                    let src = ZipMountSource::open_from_reader(range, &label, ip, &o, VERSION)
-                        .map_err(|e| e.to_string())?;
-                    return Ok((label, Arc::new(src)));
-                }
-                "gzip" => {
-                    // Seekable gzip over live Range (checkpoints + inflate via Range seeks).
-                    let spacing = if o.gzip_seek_point_spacing == 0 {
-                        ratarmount_compress::DEFAULT_GZIP_SEEK_SPACING
-                    } else {
-                        o.gzip_seek_point_spacing
-                    };
-                    let threads = o.threads_for("gzip");
-                    eprintln!(
-                        "HTTP Range gzip: {} ({} compressed bytes, live Range, -P gzip:{})",
-                        input,
-                        range.len(),
-                        threads
-                    );
-                    let gzip = SharedSeekableGzip::open_with_threads_from_reader(
-                        range, spacing, threads, &label,
-                    )
-                    .map_err(|e| e.to_string())?;
-                    // Prefer TAR path when URL/name suggests tar.gz / body looks like TAR.
-                    let is_tar = name_suggests_compressed_tar(&label)
-                        || body_looks_like_tar_gzip(&gzip).unwrap_or(false);
-                    if is_tar {
-                        let src = open_tar_gzip(&label, gzip, ip, &o, recreate)?;
-                        return Ok((label, Arc::new(src)));
-                    }
-                    // Plain .gz single-file: materialize uncompressed via seekable body.
-                    let size = gzip.size();
-                    let mut reader = gzip.reader().map_err(|e| e.to_string())?;
-                    let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
-                    std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
-                    let data_path = tmp.path().to_path_buf();
-                    let stripped = strip_compression_suffix(
-                        label.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
-                    );
-                    let src = SingleFileMountSource::new(stripped, data_path, size, Some(tmp))
-                        .map_err(|e| e.to_string())?;
-                    return Ok((label, Arc::new(src)));
-                }
-                "bzip2" => {
-                    let threads = o.threads_for("bzip2");
-                    eprintln!(
-                        "HTTP Range bzip2: {} ({} compressed bytes, live Range, -P bzip2:{})",
-                        input,
-                        range.len(),
-                        threads
-                    );
-                    let body = open_seekable_bzip2_with_threads_from_reader(range, threads, &label)
-                        .map_err(|e| e.to_string())?;
-                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "bzip2")?;
-                    return Ok((label, src));
-                }
-                "xz" => {
-                    let threads = o.threads_for("xz");
-                    eprintln!(
-                        "HTTP Range xz: {} ({} compressed bytes, live Range, -P xz:{})",
-                        input,
-                        range.len(),
-                        threads
-                    );
-                    let body = open_seekable_xz_with_threads_from_reader(range, threads, &label)
-                        .map_err(|e| e.to_string())?;
-                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "xz")?;
-                    return Ok((label, src));
-                }
-                "zstd" => {
-                    let threads = o.threads_for("zstd");
-                    eprintln!(
-                        "HTTP Range zstd: {} ({} compressed bytes, live Range, -P zstd:{})",
-                        input,
-                        range.len(),
-                        threads
-                    );
-                    let body = open_seekable_zstd_with_threads_from_reader(range, threads, &label)
-                        .map_err(|e| e.to_string())?;
-                    let src = open_from_seekable_body(&label, body, ip, &o, recreate, "zstd")?;
-                    return Ok((label, src));
-                }
-                _ => {
-                    eprintln!(
-                        "info: HTTP Range for {input} is not TAR/ZIP/gzip/bzip2/xz/zstd; materializing"
-                    );
-                }
+        RemoteAccess::Http(RemoteHttp::Range(range)) => {
+            let len = range.len();
+            let input_owned = input.to_string();
+            match open_from_live_range(
+                range,
+                len,
+                input,
+                opts,
+                recreate,
+                "HTTP Range",
+                || {
+                    // Buffered fallback is still Read+Seek-usable for rebuild.
+                    ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
+                },
+            )? {
+                Some(opened) => Ok(opened),
+                None => materialize_remote_input(input, opts, recreate, remotes),
             }
-            // Fall through: materialize full body for compressed / other formats.
-            let remote = resolve_to_local(input).map_err(|e| e.to_string())?;
-            let path = remote.path().to_path_buf();
-            remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
         }
         RemoteAccess::Http(RemoteHttp::Materialized(remote)) | RemoteAccess::Path(remote) => {
             let path = remote.path().to_path_buf();
@@ -1594,4 +1847,130 @@ fn strip_source_name(name: &str) -> String {
         }
     }
     name.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::Command;
+
+    fn make_tiny_tar_gz(dir: &Path) -> PathBuf {
+        let data = dir.join("data");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("hello.txt"), b"hello world\n").expect("write");
+        let tar_gz = dir.join("tiny.tar.gz");
+        let status = Command::new("tar")
+            .args(["-czf"])
+            .arg(&tar_gz)
+            .arg("-C")
+            .arg(&data)
+            .arg("hello.txt")
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -czf failed");
+        tar_gz
+    }
+
+    #[test]
+    fn probe_magic_detects_gzip_and_zip() {
+        assert_eq!(probe_archive_magic(&[0x1f, 0x8b, 0x08]), "gzip");
+        assert_eq!(probe_archive_magic(b"BZh91"), "bzip2");
+        assert_eq!(probe_archive_magic(b"PK\x03\x04"), "zip");
+        assert_eq!(probe_archive_magic(b"not-an-archive"), "other");
+    }
+
+    #[test]
+    fn gzip_rgzi_blob_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_gz(dir.path());
+        let index = dir.path().join("tiny.index.sqlite");
+        // Tiny spacing so checkpoints are cheap.
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 64 * 1024,
+            ..Default::default()
+        };
+
+        // Cold open: build seek table + TAR index, then store RGZI side blob.
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        drop(src);
+
+        let idx = SqliteIndex::open_read_only(&index).expect("open index");
+        let blobs = idx.get_gzip_index_blobs().expect("get blobs");
+        assert_eq!(blobs.len(), 1, "expected single gzipindex blob");
+        assert!(
+            blobs[0].starts_with(b"RGZI"),
+            "blob should be Tier C RGZI magic"
+        );
+        let stored = blobs[0].clone();
+        drop(idx);
+
+        // Warm open: import blob (no full spacing rebuild required for offsets).
+        let src2 = open_path(&archive, &opts, false).expect("warm open with import");
+        drop(src2);
+
+        let idx2 = SqliteIndex::open_read_only(&index).expect("reopen index");
+        let blobs2 = idx2.get_gzip_index_blobs().expect("blobs again");
+        assert_eq!(blobs2, vec![stored]);
+    }
+
+    #[test]
+    fn gzip_rgzi_invalid_blob_falls_back_to_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_gz(dir.path());
+        let index = dir.path().join("tiny.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 64 * 1024,
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        drop(src);
+
+        // Poison the side table with a non-RGZI payload.
+        {
+            let idx = SqliteIndex::open_writable(&index).expect("writable");
+            idx.set_gzip_index_blob(b"not-a-valid-rgzi-blob")
+                .expect("set garbage");
+        }
+
+        // Import must fail open; factory falls back to normal checkpoint rebuild.
+        let src2 = open_path(&archive, &opts, false).expect("open after invalid blob");
+        drop(src2);
+
+        // Rebuild should have rewritten a valid RGZI blob.
+        let idx = SqliteIndex::open_read_only(&index).expect("ro");
+        let blobs = idx.get_gzip_index_blobs().expect("blobs");
+        assert!(!blobs.is_empty());
+        assert!(blobs[0].starts_with(b"RGZI"));
+    }
+
+    #[test]
+    fn gzip_rgzi_memory_index_skips_side_table_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_gz(dir.path());
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 64 * 1024,
+            ..Default::default()
+        };
+
+        // No on-disk index path → open works; nothing to assert on side tables.
+        let src = open_path(&archive, &opts, false).expect("memory index open");
+        drop(src);
+        // Sibling default index must not be required / created for :memory: path.
+        let sibling = archive.with_extension("gz.index.sqlite");
+        // default sibling name varies; just ensure open succeeded without panic.
+        let _ = sibling;
+    }
+
+    #[test]
+    fn try_load_gzip_index_blob_none_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("nope.sqlite");
+        assert!(try_load_gzip_index_blob(Some(&missing), false).is_none());
+        assert!(try_load_gzip_index_blob(None, false).is_none());
+        assert!(try_load_gzip_index_blob(Some(&missing), true).is_none());
+    }
 }
