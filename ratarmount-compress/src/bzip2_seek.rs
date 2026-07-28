@@ -9,6 +9,15 @@
 //! (last-block cache for sequential reads). When the bit scan fails (large-file
 //! policy, single block, corrupt), we fall back to a one-shot [`DecodedBody`]
 //! (still multi-stream / multi-block parallel when `threads > 1`).
+//!
+//! # Size policy
+//!
+//! Bit-block maps are built for compressed inputs up to
+//! [`BIT_BLOCK_SCAN_MAX_BYTES`] (256 MiB, aligned with [`DEFAULT_MEMORY_CAP`]).
+//! Above that cap we skip the bit walk and fall back to full decode so open
+//! stays bounded in RAM and CPU for multi‑GB `.bz2` files. Within the cap the
+//! scanner uses a sliding 48‑bit window (O(n) bit steps, constant work each)
+//! rather than re-reading 48 bits at every offset.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -21,6 +30,15 @@ use ratarmount_core::ParallelizationSpec;
 
 use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
+
+/// Maximum compressed size eligible for the true bit-block seek map.
+///
+/// Chosen to match [`DEFAULT_MEMORY_CAP`] (256 MiB): large enough for typical
+/// multi-block `.bz2` / `.tar.bz2` archives, small enough that an in-memory
+/// load + sliding-window bit scan stays practical. Larger files fall back to
+/// full decode (see module docs). Not a hard format limit — residual for
+/// multi‑GB inputs without a file-backed/mmap scanner.
+const BIT_BLOCK_SCAN_MAX_BYTES: usize = DEFAULT_MEMORY_CAP as usize;
 
 /// Open bzip2 as a seekable body (bit-block map when possible, else full decode).
 pub fn open_seekable_bzip2(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
@@ -211,17 +229,30 @@ impl Seek for Bzip2BlockReader {
     }
 }
 
+/// True when `compressed_len` is within the in-memory bit-block scan budget.
+#[inline]
+fn bit_scan_size_ok(compressed_len: usize) -> bool {
+    compressed_len <= BIT_BLOCK_SCAN_MAX_BYTES
+}
+
+fn reject_if_too_large_for_bit_scan(compressed_len: usize) -> Result<()> {
+    if bit_scan_size_ok(compressed_len) {
+        return Ok(());
+    }
+    Err(CompressError::Msg(format!(
+        "bzip2 block scan skipped (file large: {compressed_len} bytes > {BIT_BLOCK_SCAN_MAX_BYTES} byte cap)"
+    )))
+}
+
 /// Build a global block map across one or more concatenated bzip2 streams.
 ///
 /// Fails (caller falls back to full decode) when:
-/// * the file is larger than the bit-scan cap
+/// * the file is larger than [`BIT_BLOCK_SCAN_MAX_BYTES`]
 /// * fewer than 2 blocks are found overall
 /// * magic scan / block decode fails
 fn try_build_bit_block_map(compressed: &[u8], threads: u32) -> Result<Vec<BlockInfo>> {
-    // Cap total scan cost for large files (same policy as per-stream scan).
-    if compressed.len() > 8 * 1024 * 1024 {
-        return Err(CompressError::Msg("bzip2 block scan skipped (file large)".into()));
-    }
+    // Cap total scan cost / RAM for large files (same policy as per-stream scan).
+    reject_if_too_large_for_bit_scan(compressed.len())?;
 
     let mut all_blocks: Vec<BlockInfo> = Vec::new();
     let mut u_off = 0u64;
@@ -502,31 +533,54 @@ fn try_parallel_block_decode(compressed: &[u8], threads: u32) -> Result<Vec<u8>>
 }
 
 /// Returns (start_bit, end_bit) for each block (bits from start of `compressed`, MSB-first).
+///
+/// Uses a sliding 48-bit window so each input bit is examined once (O(n) with
+/// small constants). Suitable up to [`BIT_BLOCK_SCAN_MAX_BYTES`].
 fn scan_block_bit_ranges(compressed: &[u8]) -> Result<Vec<(u64, u64)>> {
+    reject_if_too_large_for_bit_scan(compressed.len())?;
     let total_bits = compressed.len() as u64 * 8;
-    // Cap scan cost for large files: only attempt when compressed size is modest.
-    if total_bits > 8 * 1024 * 1024 * 8 {
-        return Err(CompressError::Msg("bzip2 block scan skipped (file large)".into()));
+    if total_bits < 32 + 48 {
+        return Err(CompressError::Msg("bzip2 too short for block scan".into()));
     }
+
+    // Sliding 48-bit window (MSB-first). After processing bit index `bit`
+    // (0-based), `window` holds bits `[bit-47 ..= bit]` when `bit >= 47`.
+    let mut window = 0u64;
     let mut starts = Vec::new();
     let mut eos_bit: Option<u64> = None;
-    let mut bit = 32u64;
-    while bit + 48 <= total_bits {
-        let mag = match read_bits_msb(compressed, bit, 48) {
-            Some(v) => v,
-            None => break,
-        };
-        if mag == BLOCK_MAGIC {
-            starts.push(bit);
-            bit += 48;
+    // First candidate magic may start at bit 32 (after `BZh[1-9]`).
+    const MAGIC_BITS: u64 = 48;
+    const HEADER_BITS: u64 = 32;
+    let mask48 = (1u64 << MAGIC_BITS) - 1;
+    // After a block magic match, skip candidate starts inside that magic
+    // (matches the previous bit-step scanner's `bit += 48` after a hit).
+    let mut next_allowed_start = HEADER_BITS;
+
+    for bit in 0..total_bits {
+        let byte = compressed[(bit / 8) as usize];
+        let off = 7 - (bit % 8) as u8;
+        let b = u64::from((byte >> off) & 1);
+        window = ((window << 1) | b) & mask48;
+
+        if bit + 1 < HEADER_BITS + MAGIC_BITS {
             continue;
         }
-        if mag == EOS_MAGIC {
-            eos_bit = Some(bit);
+        // Window now equals bits starting at `start`.
+        let start = bit + 1 - MAGIC_BITS;
+        if start < next_allowed_start {
+            continue;
+        }
+        if window == BLOCK_MAGIC {
+            starts.push(start);
+            next_allowed_start = start + MAGIC_BITS;
+            continue;
+        }
+        if window == EOS_MAGIC {
+            eos_bit = Some(start);
             break;
         }
-        bit += 1;
     }
+
     let Some(eos) = eos_bit else {
         return Err(CompressError::Msg("bzip2 EOS magic not found".into()));
     };
@@ -541,7 +595,7 @@ fn scan_block_bit_ranges(compressed: &[u8]) -> Result<Vec<(u64, u64)>> {
         } else {
             eos
         };
-        if end <= start + 48 {
+        if end <= start + MAGIC_BITS {
             return Err(CompressError::Msg("degenerate bzip2 block range".into()));
         }
         ranges.push((start, end));
@@ -860,23 +914,38 @@ mod tests {
     }
 
     #[test]
-    fn large_file_scan_policy_rejects() {
-        // Synthetic oversize buffer: scan must refuse without hanging.
-        let mut huge = vec![0u8; 8 * 1024 * 1024 + 16];
-        huge[..4].copy_from_slice(b"BZh9");
-        let err = scan_block_bit_ranges(&huge).unwrap_err();
+    fn large_file_scan_policy() {
+        // New policy: the old 8 MiB wall is gone — medium buffers may enter the
+        // scanner (and fail for content reasons, not size).
+        assert!(bit_scan_size_ok(8 * 1024 * 1024 + 16));
+        assert!(bit_scan_size_ok(BIT_BLOCK_SCAN_MAX_BYTES));
+        assert!(!bit_scan_size_ok(BIT_BLOCK_SCAN_MAX_BYTES + 1));
+
+        let mut medium = vec![0u8; 8 * 1024 * 1024 + 16];
+        medium[..4].copy_from_slice(b"BZh9");
+        let err = scan_block_bit_ranges(&medium).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("large") || msg.contains("EOS"),
-            "unexpected error: {msg}"
+            !msg.contains("large"),
+            "8 MiB+ must no longer be skipped as large, got: {msg}"
         );
-        // try_build must also refuse large inputs before bit-walking.
-        let err = try_build_bit_block_map(&huge, 1).unwrap_err();
+        assert!(
+            msg.contains("EOS") || msg.contains("block"),
+            "expected content-level scan failure, got: {msg}"
+        );
+
+        // Hard cap still refuses without bit-walking multi-GB inputs.
+        // Gate is size-based; exercise it without allocating 256 MiB+1.
+        let err = reject_if_too_large_for_bit_scan(BIT_BLOCK_SCAN_MAX_BYTES + 1).unwrap_err();
         assert!(
             err.to_string().contains("large"),
             "expected large-file skip, got {}",
             err
         );
+        // try_build uses the same gate (pass a tiny slice only if under cap —
+        // over-cap path is the helper above; also check exact-cap is accepted).
+        assert!(reject_if_too_large_for_bit_scan(BIT_BLOCK_SCAN_MAX_BYTES).is_ok());
+        assert!(reject_if_too_large_for_bit_scan(0).is_ok());
     }
 
     #[test]
