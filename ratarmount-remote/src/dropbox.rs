@@ -28,12 +28,31 @@
 //! - Optional overrides for tests / proxies:
 //!   - download: `RATARMOUNT_DROPBOX_API_URL` or `DROPBOX_API_URL`
 //!   - RPC base (list/metadata): `RATARMOUNT_DROPBOX_RPC_URL` or `DROPBOX_RPC_URL`
+//!
+//! # Listing cache TTL
+//!
+//! [`DropboxMountSource`] caches `list_folder` results per virtual directory.
+//! Cache entries expire after [`DEFAULT_DROPBOX_LIST_TTL_SECS`] (30s), overridable
+//! via env `RATARMOUNT_DROPBOX_LIST_TTL_SECS` (set to `0` to disable caching).
+//! Expired entries are re-fetched on the next list/lookup that needs them.
+//!
+//! # Content download / HTTP Range
+//!
+//! The Dropbox content download endpoint accepts HTTP `Range` on many setups.
+//! - [`fetch_dropbox_range_bytes`] downloads a single inclusive byte window (prefix /
+//!   partial reads for callers that do not need the whole object).
+//! - Full materialize ([`fetch_dropbox_location_to_temp`] /
+//!   [`fetch_dropbox_location_to_temp_prefer_range`]) prefers sequential Range
+//!   chunks ([`crate::HTTP_RANGE_CHUNK`]) when the object size is known and exceeds
+//!   [`DEFAULT_DROPBOX_RANGE_THRESHOLD`]; otherwise falls back to a single full-body
+//!   download. Token redaction on errors is unchanged.
 
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use log::debug;
 use ratarmount_core::{
@@ -42,7 +61,10 @@ use ratarmount_core::{
 };
 use tempfile::NamedTempFile;
 
-use crate::{RemoteError, Result, USER_AGENT};
+use crate::{
+    parse_content_range_total, range_chunk_windows, RemoteError, Result, USER_AGENT,
+    HTTP_RANGE_CHUNK,
+};
 
 /// Official Dropbox content-download endpoint.
 pub const DEFAULT_DROPBOX_DOWNLOAD_URL: &str =
@@ -51,6 +73,11 @@ pub const DEFAULT_DROPBOX_DOWNLOAD_URL: &str =
 /// Official Dropbox RPC API base (list_folder, get_metadata).
 pub const DEFAULT_DROPBOX_RPC_BASE: &str = "https://api.dropboxapi.com";
 
+/// Default TTL for [`DropboxMountSource`] `list_folder` cache entries (seconds).
+pub const DEFAULT_DROPBOX_LIST_TTL_SECS: u64 = 30;
+
+/// Files larger than this prefer chunked Range downloads (1 MiB).
+pub const DEFAULT_DROPBOX_RANGE_THRESHOLD: u64 = 1024 * 1024;
 /// Parsed Dropbox file/folder location (API path only; token is never stored here).
 #[derive(Clone, PartialEq, Eq)]
 pub struct DropboxLocation {
@@ -214,6 +241,18 @@ pub fn dropbox_rpc_base() -> String {
         .unwrap_or_else(|| DEFAULT_DROPBOX_RPC_BASE.to_string())
 }
 
+/// Listing cache TTL in seconds (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30).
+///
+/// `0` disables caching (every list re-fetches). Invalid / non-numeric values fall
+/// back to [`DEFAULT_DROPBOX_LIST_TTL_SECS`].
+pub fn dropbox_list_ttl_secs() -> u64 {
+    match std::env::var("RATARMOUNT_DROPBOX_LIST_TTL_SECS") {
+        Ok(s) if !s.is_empty() => s
+            .parse::<u64>()
+            .unwrap_or(DEFAULT_DROPBOX_LIST_TTL_SECS),
+        _ => DEFAULT_DROPBOX_LIST_TTL_SECS,
+    }
+}
 /// Redact an access token from error / log text.
 pub fn redact_token(msg: &str, token: &str) -> String {
     if token.is_empty() {
@@ -223,6 +262,9 @@ pub fn redact_token(msg: &str, token: &str) -> String {
 }
 
 /// Download `dropbox://…` using `DROPBOX_TOKEN` into a tempfile.
+///
+/// Prefers chunked Range when the API supports it and the object is large; see
+/// [`fetch_dropbox_location_to_temp_prefer_range`].
 pub fn fetch_dropbox_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_dropbox_url(url_str)?;
     let token = load_dropbox_token()?;
@@ -231,10 +273,31 @@ pub fn fetch_dropbox_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
 }
 
 /// Download a parsed location with an explicit token and content API URL.
+///
+/// Equivalent to [`fetch_dropbox_location_to_temp_prefer_range`] with unknown size
+/// (may probe with `Range: bytes=0-0` before falling back to full body).
 pub fn fetch_dropbox_location_to_temp(
     loc: &DropboxLocation,
     token: &str,
     api_url: &str,
+) -> Result<(NamedTempFile, u64)> {
+    fetch_dropbox_location_to_temp_prefer_range(loc, token, api_url, None)
+}
+
+/// Download a Dropbox file, preferring sequential HTTP Range chunks when feasible.
+///
+/// - When `known_size` is `Some(n)` and `n > `[`DEFAULT_DROPBOX_RANGE_THRESHOLD`],
+///   tries chunked Range materialization first.
+/// - When size is unknown, probes with `Range: bytes=0-0`; on 206 + total size above
+///   threshold, uses chunked Range. If the probe returns a full body (Range ignored),
+///   that body is kept (no second download).
+/// - On any Range failure or when the object is small / ranges unsupported, falls
+///   back to a single full-body download.
+pub fn fetch_dropbox_location_to_temp_prefer_range(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+    known_size: Option<u64>,
 ) -> Result<(NamedTempFile, u64)> {
     if token.is_empty() {
         return Err(RemoteError::Dropbox(
@@ -247,33 +310,312 @@ pub fn fetch_dropbox_location_to_temp(
         ));
     }
 
+    let size_for_range = match known_size {
+        Some(n) if n > DEFAULT_DROPBOX_RANGE_THRESHOLD => Some(n),
+        Some(_) => None, // small known size → full body
+        None => match probe_dropbox_download(loc, token, api_url) {
+            Ok(DropboxProbe::RangesOk(n)) if n > DEFAULT_DROPBOX_RANGE_THRESHOLD => Some(n),
+            Ok(DropboxProbe::RangesOk(_)) => None,
+            Ok(DropboxProbe::FullBody(bytes)) => {
+                return bytes_to_tempfile(loc, token, bytes);
+            }
+            Ok(DropboxProbe::Unusable) => None,
+            Err(e) => {
+                debug!(
+                    "dropbox range probe failed for {}: {e}; full download",
+                    loc.path
+                );
+                None
+            }
+        },
+    };
+
+    if let Some(size) = size_for_range {
+        debug!(
+            "dropbox prefer-range: {} ({size} bytes) in {}-byte chunks",
+            loc.path, HTTP_RANGE_CHUNK
+        );
+        match fetch_dropbox_via_ranges(loc, token, api_url, size) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                debug!(
+                    "dropbox range download failed for {}: {e}; falling back to full body",
+                    loc.path
+                );
+            }
+        }
+    }
+
+    fetch_dropbox_full_body(loc, token, api_url)
+}
+
+/// Result of a content-API Range probe (`bytes=0-0`).
+enum DropboxProbe {
+    /// 206 Partial Content with known total size.
+    RangesOk(u64),
+    /// Server ignored Range and returned the full object body.
+    FullBody(Vec<u8>),
+    /// Ranges / size not usable from this probe.
+    Unusable,
+}
+
+fn bytes_to_tempfile(
+    loc: &DropboxLocation,
+    token: &str,
+    bytes: Vec<u8>,
+) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = NamedTempFile::new()?;
+    tmp.write_all(&bytes).map_err(|e| {
+        RemoteError::Dropbox(redact_token(
+            &format!("writing download of {}: {e}", loc.path),
+            token,
+        ))
+    })?;
+    tmp.flush()?;
+    tmp.as_file().seek(SeekFrom::Start(0))?;
+    let n = bytes.len() as u64;
+    debug!("dropbox download {} -> {n} bytes", loc.path);
+    Ok((tmp, n))
+}
+
+/// Download an inclusive byte range (`start..=end`) from a Dropbox file.
+///
+/// Best-effort helper for callers that only need a prefix or window. Expects the
+/// content endpoint to honor `Range` with HTTP 206; returns a clear error on 200
+/// (range ignored) or other status codes. Token is redacted in error messages.
+pub fn fetch_dropbox_range_bytes(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<Vec<u8>> {
+    if token.is_empty() {
+        return Err(RemoteError::Dropbox(
+            "DROPBOX_TOKEN is empty; cannot download dropbox:// URLs".into(),
+        ));
+    }
+    if loc.path.is_empty() {
+        return Err(RemoteError::Dropbox(
+            "dropbox path is empty; expected a file path under the account or app folder".into(),
+        ));
+    }
+    if end_inclusive < start {
+        return Err(RemoteError::Dropbox(format!(
+            "invalid range {start}-{end_inclusive} for {}",
+            loc.path
+        )));
+    }
+    let expected = end_inclusive - start + 1;
+    let (status, _content_range, bytes) =
+        dropbox_download_request(loc, token, api_url, Some((start, end_inclusive)))?;
+    if status == 206 {
+        if bytes.len() as u64 != expected {
+            return Err(RemoteError::Dropbox(format!(
+                "range bytes={start}-{end_inclusive} for {} returned {} bytes, expected {expected}",
+                loc.path,
+                bytes.len()
+            )));
+        }
+        return Ok(bytes);
+    }
+    if status == 200 {
+        return Err(RemoteError::Dropbox(format!(
+            "HTTP 200 (Range ignored) downloading {} bytes={start}-{end_inclusive}; \
+             content endpoint did not return 206 Partial Content",
+            loc.path
+        )));
+    }
+    // Non-success already mapped inside dropbox_download_request for error bodies;
+    // defensive path for unexpected 2xx.
+    Err(RemoteError::Dropbox(format!(
+        "HTTP {status} downloading {} range bytes={start}-{end_inclusive}",
+        loc.path
+    )))
+}
+
+/// Probe via `Range: bytes=0-0` on the content download endpoint.
+fn probe_dropbox_download(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+) -> Result<DropboxProbe> {
+    let api_arg = dropbox_api_arg(&loc.path);
+    let auth = format!("Bearer {token}");
+    debug!(
+        "dropbox probe POST {} Dropbox-API-Arg={} Range=bytes=0-0 (token redacted)",
+        api_url, api_arg
+    );
+    let resp = match ureq::post(api_url)
+        .set("User-Agent", USER_AGENT)
+        .set("Authorization", &auth)
+        .set("Dropbox-API-Arg", &api_arg)
+        .set("Content-Type", "application/octet-stream")
+        .set("Range", "bytes=0-0")
+        .send_bytes(&[])
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, r)) => {
+            let body = r.into_string().unwrap_or_else(|_| String::new());
+            let detail = redact_token(&body, token);
+            let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
+            return Err(RemoteError::Dropbox(format!(
+                "HTTP {status} probing {}: {summary}",
+                loc.path
+            )));
+        }
+        Err(e) => {
+            return Err(RemoteError::Dropbox(redact_token(
+                &format!("probe {} via {api_url}: {e}", loc.path),
+                token,
+            )));
+        }
+    };
+    let status = resp.status();
+    let content_range = resp.header("Content-Range").map(|s| s.to_string());
+    let content_length = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok());
+    if status == 206 {
+        if let Some(total) = parse_content_range_total(content_range.as_deref()) {
+            let _ = resp.into_string();
+            return Ok(DropboxProbe::RangesOk(total));
+        }
+        let _ = resp.into_string();
+        return Ok(DropboxProbe::Unusable);
+    }
+    if (200..300).contains(&status) {
+        // Range ignored. Avoid buffering huge bodies into RAM for reuse.
+        if content_length.is_some_and(|n| n > DEFAULT_DROPBOX_RANGE_THRESHOLD) {
+            let mut reader = resp.into_reader();
+            let _ = io::copy(&mut reader, &mut io::sink());
+            return Ok(DropboxProbe::Unusable);
+        }
+        let mut reader = resp.into_reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes).map_err(|e| {
+            RemoteError::Dropbox(redact_token(
+                &format!("reading probe of {}: {e}", loc.path),
+                token,
+            ))
+        })?;
+        return Ok(DropboxProbe::FullBody(bytes));
+    }
+    let _ = resp.into_string();
+    Ok(DropboxProbe::Unusable)
+}
+
+/// Sequential Range materialization into a tempfile (like HTTP prefer-range).
+fn fetch_dropbox_via_ranges(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+    size: u64,
+) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = NamedTempFile::new()?;
+    if size == 0 {
+        tmp.flush()?;
+        return Ok((tmp, 0));
+    }
+    let mut written = 0u64;
+    for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
+        let range = format!("bytes={start}-{end}");
+        let (status, _cr, chunk) =
+            dropbox_download_request(loc, token, api_url, Some((start, end)))?;
+        if status == 206 {
+            let expected = end - start + 1;
+            if chunk.len() as u64 != expected {
+                return Err(RemoteError::Dropbox(format!(
+                    "range {range} for {} returned {} bytes, expected {expected}",
+                    loc.path,
+                    chunk.len()
+                )));
+            }
+            tmp.write_all(&chunk).map_err(|e| {
+                RemoteError::Dropbox(redact_token(
+                    &format!("writing range {range} of {}: {e}", loc.path),
+                    token,
+                ))
+            })?;
+            written += chunk.len() as u64;
+        } else if status == 200 && start == 0 {
+            // Server ignored Range and returned the full body on the first chunk.
+            tmp.write_all(&chunk).map_err(|e| {
+                RemoteError::Dropbox(redact_token(
+                    &format!("writing download of {}: {e}", loc.path),
+                    token,
+                ))
+            })?;
+            tmp.flush()?;
+            tmp.as_file().seek(SeekFrom::Start(0))?;
+            debug!(
+                "dropbox download {} -> {} bytes (full body; Range ignored)",
+                loc.path,
+                chunk.len()
+            );
+            return Ok((tmp, chunk.len() as u64));
+        } else {
+            return Err(RemoteError::Dropbox(format!(
+                "HTTP {status} for range {range} on {}",
+                loc.path
+            )));
+        }
+    }
+    if written != size {
+        return Err(RemoteError::Dropbox(format!(
+            "range download size mismatch for {}: wrote {written}, expected {size}",
+            loc.path
+        )));
+    }
+    tmp.flush()?;
+    tmp.as_file().seek(SeekFrom::Start(0))?;
+    debug!("dropbox range download {} -> {written} bytes", loc.path);
+    Ok((tmp, written))
+}
+
+/// Single full-body content download (no Range header); streams to tempfile.
+fn fetch_dropbox_full_body(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+) -> Result<(NamedTempFile, u64)> {
     let api_arg = dropbox_api_arg(&loc.path);
     let auth = format!("Bearer {token}");
 
     debug!(
-        "dropbox POST {} Dropbox-API-Arg={} (token redacted)",
+        "dropbox POST {} Dropbox-API-Arg={} (full body, token redacted)",
         api_url, api_arg
     );
 
-    // Official API uses POST with empty body; Dropbox-API-Arg carries the path.
-    let resp = ureq::post(api_url)
+    let resp = match ureq::post(api_url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &auth)
         .set("Dropbox-API-Arg", &api_arg)
         .set("Content-Type", "application/octet-stream")
         .send_bytes(&[])
-        .map_err(|e| {
-            RemoteError::Dropbox(redact_token(
+    {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, r)) => {
+            let body = r.into_string().unwrap_or_else(|_| String::new());
+            let detail = redact_token(&body, token);
+            let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
+            return Err(RemoteError::Dropbox(format!(
+                "HTTP {status} downloading {}: {summary}",
+                loc.path
+            )));
+        }
+        Err(e) => {
+            return Err(RemoteError::Dropbox(redact_token(
                 &format!("download {} via {api_url}: {e}", loc.path),
                 token,
-            ))
-        })?;
+            )));
+        }
+    };
 
     let status = resp.status();
     if !(200..300).contains(&status) {
         let body = resp.into_string().unwrap_or_else(|_| String::new());
         let detail = redact_token(&body, token);
-        // Prefer a short summary when Dropbox returns JSON error_summary.
         let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
         return Err(RemoteError::Dropbox(format!(
             "HTTP {status} downloading {}: {summary}",
@@ -293,6 +635,68 @@ pub fn fetch_dropbox_location_to_temp(
     tmp.as_file().seek(SeekFrom::Start(0))?;
     debug!("dropbox download {} -> {n} bytes", loc.path);
     Ok((tmp, n))
+}
+
+/// POST content download with optional inclusive Range; buffers response body.
+///
+/// Used for Range windows (bounded by [`HTTP_RANGE_CHUNK`]) and prefix helpers.
+/// On error status, returns `RemoteError` with redacted body summary.
+fn dropbox_download_request(
+    loc: &DropboxLocation,
+    token: &str,
+    api_url: &str,
+    range: Option<(u64, u64)>,
+) -> Result<(u16, Option<String>, Vec<u8>)> {
+    let api_arg = dropbox_api_arg(&loc.path);
+    let auth = format!("Bearer {token}");
+
+    debug!(
+        "dropbox POST {} Dropbox-API-Arg={} range={:?} (token redacted)",
+        api_url, api_arg, range
+    );
+
+    let mut req = ureq::post(api_url)
+        .set("User-Agent", USER_AGENT)
+        .set("Authorization", &auth)
+        .set("Dropbox-API-Arg", &api_arg)
+        .set("Content-Type", "application/octet-stream");
+    if let Some((start, end)) = range {
+        req = req.set("Range", &format!("bytes={start}-{end}"));
+    }
+
+    let resp = match req.send_bytes(&[]) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(status, r)) => {
+            let body = r.into_string().unwrap_or_else(|_| String::new());
+            let detail = redact_token(&body, token);
+            let summary = extract_error_summary(&detail).unwrap_or(detail.as_str());
+            let range_note = range
+                .map(|(s, e)| format!(" range bytes={s}-{e}"))
+                .unwrap_or_default();
+            return Err(RemoteError::Dropbox(format!(
+                "HTTP {status} downloading {}{range_note}: {summary}",
+                loc.path
+            )));
+        }
+        Err(e) => {
+            return Err(RemoteError::Dropbox(redact_token(
+                &format!("download {} via {api_url}: {e}", loc.path),
+                token,
+            )));
+        }
+    };
+
+    let status = resp.status();
+    let content_range = resp.header("Content-Range").map(|s| s.to_string());
+    let mut reader = resp.into_reader();
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).map_err(|e| {
+        RemoteError::Dropbox(redact_token(
+            &format!("reading download of {}: {e}", loc.path),
+            token,
+        ))
+    })?;
+    Ok((status, content_range, bytes))
 }
 
 /// Best-effort extract of Dropbox JSON `error_summary` without a full JSON parser.
@@ -575,18 +979,30 @@ pub fn dropbox_path_is_folder(path: &str, token: &str, rpc_base: &str) -> Result
 // DropboxMountSource
 // ---------------------------------------------------------------------------
 
+/// Cached `list_folder` result with fetch timestamp for TTL expiry.
+struct ListingCacheEntry {
+    entries: Vec<DropboxEntry>,
+    fetched_at: Instant,
+}
+
 /// Mount a Dropbox folder as a [`MountSource`] (list + download-on-open).
 ///
 /// Auth: `DROPBOX_TOKEN`. On file open, content is downloaded to a kept temp file
-/// (cleaned up when this source is dropped).
+/// (cleaned up when this source is dropped). Large files use chunked HTTP Range
+/// downloads when the content endpoint supports them (see module docs).
+///
+/// Directory listings are cached with a TTL ([`DEFAULT_DROPBOX_LIST_TTL_SECS`] /
+/// `RATARMOUNT_DROPBOX_LIST_TTL_SECS`); expired entries re-fetch on next use.
 pub struct DropboxMountSource {
     /// Dropbox absolute path of mount root (`""` = account/app root).
     root: String,
     token: String,
     download_url: String,
     rpc_base: String,
-    /// Virtual path → listed entries cache.
-    listing_cache: Mutex<BTreeMap<String, Vec<DropboxEntry>>>,
+    /// Listing cache TTL; `Duration::ZERO` disables caching.
+    list_ttl: Duration,
+    /// Virtual path → listed entries cache (TTL-based).
+    listing_cache: Mutex<BTreeMap<String, ListingCacheEntry>>,
     /// Temp files kept for open handles (deleted on Drop).
     temp_files: Mutex<Vec<PathBuf>>,
 }
@@ -597,6 +1013,7 @@ impl std::fmt::Debug for DropboxMountSource {
             .field("root", &self.root)
             .field("download_url", &self.download_url)
             .field("rpc_base", &self.rpc_base)
+            .field("list_ttl_secs", &self.list_ttl.as_secs())
             .finish_non_exhaustive()
     }
 }
@@ -654,9 +1071,16 @@ impl DropboxMountSource {
             token: token.to_string(),
             download_url: download_url.to_string(),
             rpc_base: rpc_base.trim_end_matches('/').to_string(),
+            list_ttl: Duration::from_secs(dropbox_list_ttl_secs()),
             listing_cache: Mutex::new(BTreeMap::new()),
             temp_files: Mutex::new(Vec::new()),
         })
+    }
+
+    /// Override listing cache TTL (e.g. tests). `0` disables caching.
+    pub fn with_list_ttl_secs(mut self, secs: u64) -> Self {
+        self.list_ttl = Duration::from_secs(secs);
+        self
     }
 
     /// Dropbox API path for a virtual mount path.
@@ -675,12 +1099,18 @@ impl DropboxMountSource {
 
     fn list_dir_entries(&self, virtual_path: &str) -> Result<Vec<DropboxEntry>> {
         let v = normpath(virtual_path);
+        let now = Instant::now();
         {
             let cache = self.listing_cache.lock().map_err(|_| {
                 RemoteError::Dropbox("listing cache lock poisoned".into())
             })?;
             if let Some(cached) = cache.get(&v) {
-                return Ok(cached.clone());
+                // TTL 0 → never hit; otherwise reuse while age < TTL.
+                if !self.list_ttl.is_zero()
+                    && now.duration_since(cached.fetched_at) < self.list_ttl
+                {
+                    return Ok(cached.entries.clone());
+                }
             }
         }
         let db_path = self.dropbox_path(&v);
@@ -688,7 +1118,13 @@ impl DropboxMountSource {
         let mut cache = self.listing_cache.lock().map_err(|_| {
             RemoteError::Dropbox("listing cache lock poisoned".into())
         })?;
-        cache.insert(v, entries.clone());
+        cache.insert(
+            v,
+            ListingCacheEntry {
+                entries: entries.clone(),
+                fetched_at: Instant::now(),
+            },
+        );
         Ok(entries)
     }
 
@@ -778,10 +1214,19 @@ impl MountSource for DropboxMountSource {
         let loc = DropboxLocation {
             path: db_path.to_string(),
         };
-        let (tmp, size) =
-            fetch_dropbox_location_to_temp(&loc, &self.token, &self.download_url).map_err(
-                |e| io::Error::other(format!("dropbox download {db_path}: {e}")),
-            )?;
+        // Prefer chunked Range when size is known (from list/metadata) and large.
+        let known_size = if file_info.size > 0 {
+            Some(file_info.size)
+        } else {
+            None
+        };
+        let (tmp, size) = fetch_dropbox_location_to_temp_prefer_range(
+            &loc,
+            &self.token,
+            &self.download_url,
+            known_size,
+        )
+        .map_err(|e| io::Error::other(format!("dropbox download {db_path}: {e}")))?;
 
         // Small files: buffer in memory for a simple seekable handle.
         // Large files: keep temp path and open File.
@@ -936,6 +1381,14 @@ mod tests {
         require_path: Option<String>,
         /// If true, always 401.
         force_unauthorized: bool,
+        /// If true, honor `Range` with 206 + Content-Range.
+        honor_range: bool,
+    }
+
+    fn parse_bytes_range(h: &str) -> Option<(u64, u64)> {
+        let rest = h.trim().strip_prefix("bytes=")?;
+        let (s, e) = rest.split_once('-')?;
+        Some((s.parse().ok()?, e.parse().ok()?))
     }
 
     impl MockDropbox {
@@ -947,7 +1400,7 @@ mod tests {
             let posts_c = Arc::clone(&posts);
             let log_c = Arc::clone(&log);
             let join = thread::spawn(move || {
-                for stream in listener.incoming().take(32) {
+                for stream in listener.incoming().take(64) {
                     let Ok(mut stream) = stream else { continue };
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut request_line = String::new();
@@ -957,6 +1410,7 @@ mod tests {
                     let mut content_length: usize = 0;
                     let mut auth_hdr: Option<String> = None;
                     let mut api_arg: Option<String> = None;
+                    let mut range_hdr: Option<String> = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -970,6 +1424,9 @@ mod tests {
                         }
                         if let Some(v) = line.strip_prefix("Authorization:") {
                             auth_hdr = Some(v.trim().to_string());
+                        }
+                        if let Some(v) = line.strip_prefix("Range:") {
+                            range_hdr = Some(v.trim().to_string());
                         }
                         // Header name is case-sensitive in our client; accept common variants.
                         let lower = line.to_ascii_lowercase();
@@ -998,6 +1455,9 @@ mod tests {
                         }
                         if let Some(arg) = &api_arg {
                             lg.push(format!("Dropbox-API-Arg: {arg}"));
+                        }
+                        if let Some(r) = &range_hdr {
+                            lg.push(format!("Range: {r}"));
                         }
                     }
 
@@ -1051,6 +1511,28 @@ mod tests {
                         }
                     }
 
+                    if cfg.honor_range {
+                        if let Some(rh) = range_hdr.as_deref().and_then(parse_bytes_range) {
+                            let total = cfg.body.len() as u64;
+                            if total == 0 {
+                                let hdr = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+                                let _ = stream.write_all(hdr.as_bytes());
+                                continue;
+                            }
+                            let start = rh.0.min(total - 1);
+                            let end = rh.1.min(total - 1).max(start);
+                            let slice = &cfg.body[start as usize..=end as usize];
+                            let hdr = format!(
+                                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\n\
+                                 Content-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                                slice.len()
+                            );
+                            let _ = stream.write_all(hdr.as_bytes());
+                            let _ = stream.write_all(slice);
+                            continue;
+                        }
+                    }
+
                     let hdr = format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
                         cfg.body.len()
@@ -1082,6 +1564,7 @@ mod tests {
             require_token: token.into(),
             require_path: Some("/vault/a.tar".into()),
             force_unauthorized: false,
+            honor_range: false,
         });
         let loc = parse_dropbox_url("dropbox:///vault/a.tar").unwrap();
         let (mut tmp, size) =
@@ -1090,7 +1573,8 @@ mod tests {
         let mut got = Vec::new();
         tmp.read_to_end(&mut got).unwrap();
         assert_eq!(got, body);
-        assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+        // Probe (Range ignored → FullBody reuse) or single full GET.
+        assert!(mock.posts.load(Ordering::SeqCst) >= 1);
         let log = mock.log.lock().unwrap();
         assert!(
             log.iter().any(|l| l.contains("Bearer ***")),
@@ -1110,6 +1594,7 @@ mod tests {
             require_token: "correct-token".into(),
             require_path: None,
             force_unauthorized: false,
+            honor_range: false,
         });
         let loc = parse_dropbox_url("dropbox://file.tar").unwrap();
         let err =
@@ -1191,6 +1676,7 @@ mod tests {
                     let mut content_length: usize = 0;
                     let mut auth_hdr: Option<String> = None;
                     let mut api_arg: Option<String> = None;
+                    let mut range_hdr: Option<String> = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -1204,6 +1690,9 @@ mod tests {
                         }
                         if let Some(v) = line.strip_prefix("Authorization:") {
                             auth_hdr = Some(v.trim().to_string());
+                        }
+                        if let Some(v) = line.strip_prefix("Range:") {
+                            range_hdr = Some(v.trim().to_string());
                         }
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("dropbox-api-arg:") {
@@ -1221,6 +1710,9 @@ mod tests {
                         lg.push(request_line.trim().to_string());
                         if !req_body.is_empty() {
                             lg.push(format!("body: {req_body}"));
+                        }
+                        if let Some(r) = &range_hdr {
+                            lg.push(format!("Range: {r}"));
                         }
                     }
 
@@ -1242,7 +1734,7 @@ mod tests {
                         .unwrap_or("")
                         .to_string();
 
-                    // Download: Dropbox-API-Arg header
+                    // Download: Dropbox-API-Arg header (honor Range with 206 when present).
                     if path_part.contains("/files/download") {
                         dc.fetch_add(1, Ordering::SeqCst);
                         let want = api_arg.as_deref().unwrap_or("");
@@ -1260,12 +1752,31 @@ mod tests {
                             }
                         }
                         if let Some(f) = found {
-                            let hdr = format!(
-                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
-                                f.body.len()
-                            );
-                            let _ = stream.write_all(hdr.as_bytes());
-                            let _ = stream.write_all(&f.body);
+                            if let Some(rh) = range_hdr.as_deref().and_then(parse_bytes_range) {
+                                let total = f.body.len() as u64;
+                                if total == 0 {
+                                    let hdr = "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n";
+                                    let _ = stream.write_all(hdr.as_bytes());
+                                    continue;
+                                }
+                                let start = rh.0.min(total - 1);
+                                let end = rh.1.min(total - 1).max(start);
+                                let slice = &f.body[start as usize..=end as usize];
+                                let hdr = format!(
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {start}-{end}/{total}\r\n\
+                                     Content-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                                    slice.len()
+                                );
+                                let _ = stream.write_all(hdr.as_bytes());
+                                let _ = stream.write_all(slice);
+                            } else {
+                                let hdr = format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n",
+                                    f.body.len()
+                                );
+                                let _ = stream.write_all(hdr.as_bytes());
+                                let _ = stream.write_all(&f.body);
+                            }
                         } else {
                             let body = br#"{"error_summary": "path/not_found/..."}"#;
                             let _ = write!(
@@ -1668,5 +2179,232 @@ mod tests {
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"inner-bytes");
+    }
+
+    #[test]
+    fn listing_cache_ttl_revalidates() {
+        let token = "sl.ttl-token";
+        let mock = MockDropboxFs::spawn(
+            token,
+            "/vault",
+            vec![FolderFile {
+                rel: "a.txt".into(),
+                body: b"x".to_vec(),
+            }],
+            vec![],
+        );
+
+        // TTL disabled: every list re-fetches.
+        let ms_no_cache = DropboxMountSource::open_with_endpoints(
+            "dropbox:///vault",
+            token,
+            &mock.download_url(),
+            &mock.rpc_base(),
+        )
+        .unwrap()
+        .with_list_ttl_secs(0);
+        let _ = ms_no_cache.list("/").expect("list 1");
+        let after_first = mock.list_calls.load(Ordering::SeqCst);
+        let _ = ms_no_cache.list("/").expect("list 2");
+        let after_second = mock.list_calls.load(Ordering::SeqCst);
+        assert!(
+            after_second > after_first,
+            "TTL=0 should re-fetch: first={after_first} second={after_second}"
+        );
+
+        // Long TTL: second list hits cache.
+        let before_cached = mock.list_calls.load(Ordering::SeqCst);
+        let ms_cached = DropboxMountSource::open_with_endpoints(
+            "dropbox:///vault",
+            token,
+            &mock.download_url(),
+            &mock.rpc_base(),
+        )
+        .unwrap()
+        .with_list_ttl_secs(3600);
+        let _ = ms_cached.list("/").expect("list warm");
+        let after_warm = mock.list_calls.load(Ordering::SeqCst);
+        assert!(after_warm > before_cached, "warm list should RPC");
+        let _ = ms_cached.list("/").expect("list cached");
+        assert_eq!(
+            mock.list_calls.load(Ordering::SeqCst),
+            after_warm,
+            "long TTL should not re-fetch"
+        );
+    }
+
+    #[test]
+    fn listing_cache_expires_after_ttl() {
+        let token = "sl.ttl-expire";
+        let mock = MockDropboxFs::spawn(
+            token,
+            "/vault",
+            vec![FolderFile {
+                rel: "b.txt".into(),
+                body: b"y".to_vec(),
+            }],
+            vec![],
+        );
+        let ms = DropboxMountSource::open_with_endpoints(
+            "dropbox:///vault",
+            token,
+            &mock.download_url(),
+            &mock.rpc_base(),
+        )
+        .unwrap()
+        .with_list_ttl_secs(1);
+        let _ = ms.list("/").expect("list warm");
+        let after_warm = mock.list_calls.load(Ordering::SeqCst);
+        // Still within TTL.
+        let _ = ms.list("/").expect("list within ttl");
+        assert_eq!(mock.list_calls.load(Ordering::SeqCst), after_warm);
+        // Sleep past TTL.
+        thread::sleep(Duration::from_millis(1100));
+        let _ = ms.list("/").expect("list after ttl");
+        assert!(
+            mock.list_calls.load(Ordering::SeqCst) > after_warm,
+            "expired cache should re-fetch"
+        );
+    }
+
+    #[test]
+    fn range_bytes_prefix_helper() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let token = "sl.range-prefix";
+        let mock = MockDropbox::spawn(MockDropboxConfig {
+            body: body.clone(),
+            require_token: token.into(),
+            require_path: Some("/big.bin".into()),
+            force_unauthorized: false,
+            honor_range: true,
+        });
+        let loc = parse_dropbox_url("dropbox:///big.bin").unwrap();
+        let got = fetch_dropbox_range_bytes(&loc, token, &mock.download_url(), 10, 19).unwrap();
+        assert_eq!(got, &body[10..=19]);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.contains("Range: bytes=10-19")),
+            "log={log:?}"
+        );
+        assert_eq!(mock.posts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn prefer_range_chunked_download() {
+        // > threshold and multi-chunk relative to HTTP_RANGE_CHUNK when large enough.
+        // Use size just above DEFAULT_DROPBOX_RANGE_THRESHOLD so we take the Range path;
+        // with HTTP_RANGE_CHUNK (4 MiB) this is still a single window — assert Range used.
+        let size = (DEFAULT_DROPBOX_RANGE_THRESHOLD + 64 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=251).cycle().take(size).collect();
+        let token = "sl.range-chunk";
+        let mock = MockDropbox::spawn(MockDropboxConfig {
+            body: body.clone(),
+            require_token: token.into(),
+            require_path: Some("/large.bin".into()),
+            force_unauthorized: false,
+            honor_range: true,
+        });
+        let loc = parse_dropbox_url("dropbox:///large.bin").unwrap();
+        let (mut tmp, n) = fetch_dropbox_location_to_temp_prefer_range(
+            &loc,
+            token,
+            &mock.download_url(),
+            Some(body.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("Range: bytes=")),
+            "expected Range GETs, log={log:?}"
+        );
+        // Full-body path would be a single POST without Range after known_size branch.
+        assert!(mock.posts.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn prefer_range_multi_chunk_download() {
+        // Force multiple Range windows: size > HTTP_RANGE_CHUNK.
+        let size = (HTTP_RANGE_CHUNK + 128 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=251).cycle().take(size).collect();
+        let token = "sl.range-multi";
+        let mock = MockDropbox::spawn(MockDropboxConfig {
+            body: body.clone(),
+            require_token: token.into(),
+            require_path: Some("/huge.bin".into()),
+            force_unauthorized: false,
+            honor_range: true,
+        });
+        let loc = parse_dropbox_url("dropbox:///huge.bin").unwrap();
+        let (mut tmp, n) = fetch_dropbox_location_to_temp_prefer_range(
+            &loc,
+            token,
+            &mock.download_url(),
+            Some(body.len() as u64),
+        )
+        .unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let posts = mock.posts.load(Ordering::SeqCst);
+        assert!(
+            posts >= 2,
+            "expected multi-chunk Range download, posts={posts}"
+        );
+        let log = mock.log.lock().unwrap();
+        let range_lines: Vec<_> = log
+            .iter()
+            .filter(|l| l.starts_with("Range: bytes="))
+            .collect();
+        assert!(
+            range_lines.len() >= 2,
+            "expected ≥2 Range headers, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn mount_source_open_large_uses_range() {
+        let size = (DEFAULT_DROPBOX_RANGE_THRESHOLD + 32 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=199).cycle().take(size).collect();
+        let token = "sl.mount-range";
+        let mock = MockDropboxFs::spawn(
+            token,
+            "/vault",
+            vec![FolderFile {
+                rel: "big.bin".into(),
+                body: body.clone(),
+            }],
+            vec![],
+        );
+        let ms = DropboxMountSource::open_with_endpoints(
+            "dropbox:///vault",
+            token,
+            &mock.download_url(),
+            &mock.rpc_base(),
+        )
+        .unwrap();
+        let fi = ms.lookup("/big.bin", 0).expect("lookup");
+        assert_eq!(fi.size, body.len() as u64);
+        let mut r = ms.open(&fi, 0).unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("Range: bytes=")),
+            "mount open of large file should Range, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn dropbox_list_ttl_secs_default() {
+        // Do not mutate env if already set; just sanity-check the constant path.
+        if std::env::var("RATARMOUNT_DROPBOX_LIST_TTL_SECS").is_err() {
+            assert_eq!(dropbox_list_ttl_secs(), DEFAULT_DROPBOX_LIST_TTL_SECS);
+        }
     }
 }

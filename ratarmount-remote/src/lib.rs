@@ -8,7 +8,8 @@
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
-//!   [`DropboxMountSource`] (`files/list_folder` + download on open)
+//!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
+//!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
 //! - other schemes → clear "not yet" errors
 
 mod dropbox;
@@ -26,11 +27,13 @@ use thiserror::Error;
 use url::Url;
 
 pub use dropbox::{
-    dropbox_api_arg, dropbox_download_url, dropbox_path_is_folder, dropbox_rpc_base,
-    fetch_dropbox_location_to_temp, fetch_dropbox_to_temp, get_dropbox_metadata,
-    list_dropbox_folder, load_dropbox_token, parse_dropbox_url, parse_dropbox_url_allow_root,
-    redact_token, DropboxEntry, DropboxEntryKind, DropboxLocation, DropboxMountSource,
-    DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_RPC_BASE,
+    dropbox_api_arg, dropbox_download_url, dropbox_list_ttl_secs, dropbox_path_is_folder,
+    dropbox_rpc_base, fetch_dropbox_location_to_temp, fetch_dropbox_location_to_temp_prefer_range,
+    fetch_dropbox_range_bytes, fetch_dropbox_to_temp, get_dropbox_metadata, list_dropbox_folder,
+    load_dropbox_token, parse_dropbox_url, parse_dropbox_url_allow_root, redact_token,
+    DropboxEntry, DropboxEntryKind, DropboxLocation, DropboxMountSource,
+    DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_LIST_TTL_SECS, DEFAULT_DROPBOX_RANGE_THRESHOLD,
+    DEFAULT_DROPBOX_RPC_BASE,
 };
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
 pub use smb::{
