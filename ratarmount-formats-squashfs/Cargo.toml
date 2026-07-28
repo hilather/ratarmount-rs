@@ -12,8 +12,11 @@ thiserror.workspace = true
 log.workspace = true
 tempfile.workspace = true
 libc.workspace = true
-# Pure-Rust SquashFS reader (0.25+). XZ feature uses liblzma and conflicts with
-# workspace xz2/lzma-sys (zip, compress, xar) — leave xz off; XZ/LZMA → unsquashfs.
+# Pure-Rust SquashFS reader (0.25+). Do not enable backhand's `xz` feature: it pulls
+# `liblzma` (links = "lzma") and conflicts with the workspace `xz2`/`lzma-sys` stack.
+# Instead we inject a custom CompressionAction that decompresses XZ via workspace xz2.
 backhand = { version = "0.25", default-features = false, features = ["gzip", "zstd", "lz4", "lzo", "parallel"] }
+# Same xz2 stack as compress/xar/zip — no second native lzma link.
+xz2 = { version = "0.1", features = ["static"] }
 
 [dev-dependencies]

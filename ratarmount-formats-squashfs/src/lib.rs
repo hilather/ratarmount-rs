@@ -2,12 +2,12 @@
 //!
 //! Prefer **in-process** random access via the pure-Rust [`backhand`] crate (parity with
 //! Python `PySquashfsImage` for list/lookup/open). Supported compressors include
-//! uncompressed, gzip, zstd, lz4, and lzo.
+//! uncompressed, gzip, zstd, lz4, lzo, and **xz** (via workspace `xz2`, not backhand's
+//! `liblzma` feature which conflicts with the rest of the tree).
 //!
-//! When in-process open fails (XZ / classic LZMA — backhand's `xz` feature uses
-//! `liblzma`, which conflicts with the workspace `xz2` stack; corrupt image; exotic
-//! vendor kind), fall back to materializing with `unsquashfs` into a temp dir served by
-//! [`FolderMountSource`].
+//! Classic LZMA (compressor id 2) is not implemented in-process. When in-process open
+//! fails (classic LZMA; corrupt image; exotic vendor kind), fall back to materializing
+//! with `unsquashfs` into a temp dir served by [`FolderMountSource`].
 //!
 //! Detection scans offset 0 and the first 1 MiB at 4 KiB strides (AppImage payloads).
 
@@ -18,16 +18,30 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
+use backhand::compression::{CompressionAction, Compressor, DefaultCompressor};
 use backhand::kind::{self, Kind};
-use backhand::{FilesystemReader, InnerNode, SquashfsFileReader};
+use backhand::{
+    BackhandError, FilesystemCompressor, FilesystemReader, InnerNode, SquashfsFileReader,
+    SuperBlock,
+};
 use ratarmount_compositing::FolderMountSource;
 use ratarmount_core::{
     FileInfo, ListModeResult, ListResult, MountSource, UserData, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
 };
 use tempfile::TempDir;
 use thiserror::Error;
+use xz2::read::XzDecoder;
 
 pub const BACKEND_NAME: &str = "SquashFsMountSource";
+
+/// SquashFS superblock compressor ids (v4).
+const COMP_UNCOMPRESSED: u16 = 0;
+const COMP_GZIP: u16 = 1;
+const COMP_LZMA: u16 = 2;
+const COMP_LZO: u16 = 3;
+const COMP_XZ: u16 = 4;
+const COMP_LZ4: u16 = 5;
+const COMP_ZSTD: u16 = 6;
 
 #[derive(Debug, Error)]
 pub enum SquashFsError {
@@ -76,6 +90,60 @@ fn parent_and_name(abs: &str) -> (String, String) {
     }
 }
 
+/// Custom backhand compressor: same as [`DefaultCompressor`] for enabled pure-Rust codecs,
+/// plus XZ via workspace `xz2` (avoids enabling backhand's `xz` → `liblzma` feature).
+struct WorkspaceCompressor;
+
+static WORKSPACE_COMPRESSOR: WorkspaceCompressor = WorkspaceCompressor;
+
+impl CompressionAction for WorkspaceCompressor {
+    type Error = BackhandError;
+    type Compressor = Compressor;
+    type FilesystemCompressor = FilesystemCompressor;
+    type SuperBlock = SuperBlock;
+
+    fn decompress(
+        &self,
+        bytes: &[u8],
+        out: &mut Vec<u8>,
+        compressor: Self::Compressor,
+    ) -> std::result::Result<(), Self::Error> {
+        match compressor {
+            Compressor::Xz => {
+                let mut decoder = XzDecoder::new(bytes);
+                decoder.read_to_end(out).map_err(|e| {
+                    BackhandError::CompressionInit(format!("xz2 decompress: {e}"))
+                })?;
+                Ok(())
+            }
+            // Classic LZMA is not implemented by DefaultCompressor either; keep explicit.
+            Compressor::Lzma => Err(BackhandError::UnsupportedCompression(
+                "Lzma".to_string(),
+            )),
+            other => DefaultCompressor.decompress(bytes, out, other),
+        }
+    }
+
+    fn compress(
+        &self,
+        bytes: &[u8],
+        fc: Self::FilesystemCompressor,
+        block_size: u32,
+    ) -> std::result::Result<Vec<u8>, Self::Error> {
+        // Read-only mount source; writing is unused. Delegate for completeness.
+        DefaultCompressor.compress(bytes, fc, block_size)
+    }
+
+    fn compression_options(
+        &self,
+        superblock: &mut Self::SuperBlock,
+        kind: &Kind,
+        fs_compressor: Self::FilesystemCompressor,
+    ) -> std::result::Result<Option<Vec<u8>>, Self::Error> {
+        DefaultCompressor.compression_options(superblock, kind, fs_compressor)
+    }
+}
+
 /// Backend storage: in-process reader or materialize fallback.
 enum Backend {
     InProcess {
@@ -108,11 +176,29 @@ impl SquashFsMountSource {
             SquashFsError::Msg(format!("{} is not a SquashFS image", path.display()))
         })?;
 
+        let compressor = read_superblock_compressor(path, offset).ok().flatten();
+
+        // Classic LZMA is never supported in-process (backhand DefaultCompressor and our
+        // xz2 path only cover XZ). Skip straight to unsquashfs with a clear log line.
+        if compressor == Some(COMP_LZMA) {
+            log::info!(
+                "SquashFS {}: in-process lzma unsupported, using unsquashfs",
+                path.display()
+            );
+            let backend = Self::open_unsquashfs(path, offset)?;
+            return Ok(Self {
+                backend,
+                archive_path: path.to_path_buf(),
+                offset,
+            });
+        }
+
         match Self::open_inprocess(path, offset) {
             Ok(backend) => {
                 log::debug!(
-                    "SquashFS in-process open ok for {} (offset={offset})",
-                    path.display()
+                    "SquashFS in-process open ok for {} (offset={offset}, compressor={})",
+                    path.display(),
+                    compressor_name(compressor)
                 );
                 Ok(Self {
                     backend,
@@ -121,11 +207,23 @@ impl SquashFsMountSource {
                 })
             }
             Err(e) => {
+                let reason = match compressor {
+                    Some(COMP_XZ) => "in-process xz unsupported, using unsquashfs",
+                    Some(COMP_LZMA) => "in-process lzma unsupported, using unsquashfs",
+                    _ => "falling back to unsquashfs materialize",
+                };
                 log::warn!(
-                    "SquashFS in-process open failed for {} (offset={offset}): {e}; \
-                     falling back to unsquashfs materialize",
-                    path.display()
+                    "SquashFS in-process open failed for {} (offset={offset}, compressor={}): {e}; {reason}",
+                    path.display(),
+                    compressor_name(compressor)
                 );
+                // Exact message the task/tests look for when XZ cannot be handled pure.
+                if compressor == Some(COMP_XZ) {
+                    log::info!(
+                        "SquashFS {}: in-process xz unsupported, using unsquashfs",
+                        path.display()
+                    );
+                }
                 let backend = Self::open_unsquashfs(path, offset)?;
                 Ok(Self {
                     backend,
@@ -182,7 +280,7 @@ impl SquashFsMountSource {
             return Err(SquashFsError::Msg(
                 "SquashFS in-process reader failed and `unsquashfs` not found on PATH; \
                  install squashfs-tools, or use a compression supported in-process \
-                 (gzip/zstd/lz4/lzo/none). XZ and classic LZMA require unsquashfs fallback"
+                 (gzip/zstd/lz4/lzo/xz/none). Classic LZMA requires unsquashfs fallback"
                     .into(),
             ));
         }
@@ -196,14 +294,20 @@ impl SquashFsMountSource {
             cmd.arg("-o").arg(offset.to_string());
         }
         cmd.arg(path);
-        let status = cmd
-            .status()
+        let output = cmd
+            .output()
             .map_err(|e| SquashFsError::Msg(format!("unsquashfs spawn: {e}")))?;
-        if !status.success() {
-            return Err(SquashFsError::Msg(format!(
-                "unsquashfs failed for {} (offset={offset})",
-                path.display()
-            )));
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr = stderr.trim();
+            return Err(SquashFsError::Msg(if stderr.is_empty() {
+                format!("unsquashfs failed for {} (offset={offset})", path.display())
+            } else {
+                format!(
+                    "unsquashfs failed for {} (offset={offset}): {stderr}",
+                    path.display()
+                )
+            }));
         }
 
         // unsquashfs may create OUT/ or OUT/squashfs-root depending on version/flags.
@@ -397,19 +501,57 @@ fn path_buf_to_abs(p: &Path) -> String {
     norm_abs(&s)
 }
 
-/// Choose LE or BE v4 kind from superblock magic at `offset`.
+fn compressor_name(id: Option<u16>) -> &'static str {
+    match id {
+        Some(COMP_UNCOMPRESSED) => "none",
+        Some(COMP_GZIP) => "gzip",
+        Some(COMP_LZMA) => "lzma",
+        Some(COMP_LZO) => "lzo",
+        Some(COMP_XZ) => "xz",
+        Some(COMP_LZ4) => "lz4",
+        Some(COMP_ZSTD) => "zstd",
+        Some(_) => "unknown",
+        None => "unknown",
+    }
+}
+
+/// Read SquashFS v4 superblock compressor id at `offset` (if magic matches).
+fn read_superblock_compressor(path: &Path, offset: u64) -> Result<Option<u16>> {
+    let mut f = File::open(path)?;
+    f.seek(SeekFrom::Start(offset))?;
+    // magic(4) + inodes(4) + mtime(4) + block_size(4) + fragments(4) + compression(2)
+    let mut hdr = [0u8; 22];
+    f.read_exact(&mut hdr)?;
+    let le = &hdr[0..4] == MAGIC_LE;
+    let be = &hdr[0..4] == MAGIC_BE;
+    if !le && !be {
+        return Ok(None);
+    }
+    let comp = if le {
+        u16::from_le_bytes([hdr[20], hdr[21]])
+    } else {
+        u16::from_be_bytes([hdr[20], hdr[21]])
+    };
+    Ok(Some(comp))
+}
+
+/// Choose LE or BE v4 kind from superblock magic at `offset`, with workspace XZ compressor.
 fn detect_kind(path: &Path, offset: u64) -> Result<Kind> {
     let mut f = File::open(path)?;
     f.seek(SeekFrom::Start(offset))?;
     let mut magic = [0u8; 4];
     f.read_exact(&mut magic)?;
-    if &magic == MAGIC_LE {
-        Kind::from_const(kind::LE_V4_0).map_err(SquashFsError::Msg)
-    } else if &magic == MAGIC_BE {
-        Kind::from_const(kind::BE_V4_0).map_err(SquashFsError::Msg)
+    if &magic == MAGIC_BE {
+        Ok(Kind::new_v4_with_const(
+            &WORKSPACE_COMPRESSOR,
+            kind::BE_V4_0,
+        ))
     } else {
-        // Default LE (AppImage / odd layouts still scanned by find_squashfs_offset).
-        Kind::from_const(kind::LE_V4_0).map_err(SquashFsError::Msg)
+        // LE (default) including AppImage / odd layouts still scanned by find_squashfs_offset.
+        Ok(Kind::new_v4_with_const(
+            &WORKSPACE_COMPRESSOR,
+            kind::LE_V4_0,
+        ))
     }
 }
 
@@ -505,6 +647,30 @@ mod tests {
         }
     }
 
+    fn mksquashfs_ufo_image(comp: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+        which_mksquashfs()?;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("foo/fighter")).unwrap();
+        let mut f = File::create(src.join("foo/fighter/ufo")).unwrap();
+        f.write_all(b"iriya\n").unwrap();
+        let img = dir.path().join(format!("test.{comp}.squashfs"));
+        let status = Command::new("mksquashfs")
+            .args([
+                src.as_os_str(),
+                img.as_os_str(),
+                "-comp".as_ref(),
+                comp.as_ref(),
+                "-noappend".as_ref(),
+            ])
+            .status()
+            .expect("spawn mksquashfs");
+        if !status.success() {
+            return None;
+        }
+        Some((dir, img))
+    }
+
     #[test]
     fn detect_and_mount_fixture_inprocess() {
         let path = py_fixture("folder-symlink.no-compression.squashfs");
@@ -545,24 +711,30 @@ mod tests {
         assert_ufo_content(&m);
     }
 
-    /// XZ needs liblzma in modern backhand (conflicts with workspace xz2) → unsquashfs fallback.
+    /// XZ via workspace xz2 custom compressor (not backhand liblzma) → in-process.
     #[test]
-    fn xz_fixture_fallback_or_inprocess() {
+    fn xz_fixture_inprocess_or_fallback() {
         let path = py_fixture("folder-symlink.xz.squashfs");
         if !path.exists() {
             return;
         }
+        assert_eq!(
+            read_superblock_compressor(&path, 0).unwrap(),
+            Some(COMP_XZ)
+        );
         match SquashFsMountSource::open(&path) {
             Ok(m) => {
-                if !m.is_inprocess() {
-                    assert!(which_unsquashfs().is_some());
-                }
+                assert!(
+                    m.is_inprocess(),
+                    "XZ should open in-process via workspace xz2 custom compressor"
+                );
                 assert_ufo_content(&m);
             }
             Err(e) => {
-                eprintln!("skip/fail soft: {e}");
+                // If pure path somehow fails, unsquashfs fallback should still work.
+                eprintln!("pure xz open failed ({e}); trying fallback expectations");
                 if which_unsquashfs().is_some() {
-                    panic!("expected open (in-process or unsquashfs) to succeed: {e}");
+                    panic!("expected in-process xz2 open to succeed: {e}");
                 }
             }
         }
@@ -590,18 +762,25 @@ mod tests {
         assert_ufo_content(&m);
     }
 
-    /// Classic LZMA (not XZ) is unsupported by backhand → unsquashfs fallback when available.
+    /// Classic LZMA (not XZ) is unsupported in-process → unsquashfs fallback when available.
     #[test]
     fn lzma_fixture_fallback_or_skip() {
         let path = py_fixture("folder-symlink.lzma.squashfs");
         if !path.exists() {
             return;
         }
+        assert_eq!(
+            read_superblock_compressor(&path, 0).unwrap(),
+            Some(COMP_LZMA)
+        );
         match SquashFsMountSource::open(&path) {
             Ok(m) => {
-                // Prefer fallback; if somehow in-process works in future, still check content.
-                if !m.is_inprocess() {
-                    assert!(which_unsquashfs().is_some());
+                // Must materialize (classic lzma has no in-process codec).
+                if which_unsquashfs().is_some() {
+                    assert!(
+                        !m.is_inprocess(),
+                        "classic lzma should use unsquashfs fallback"
+                    );
                 }
                 assert_ufo_content(&m);
             }
@@ -617,33 +796,32 @@ mod tests {
 
     #[test]
     fn mksquashfs_minimal_roundtrip() {
-        if which_mksquashfs().is_none() {
-            eprintln!("skip: no mksquashfs");
+        let Some((_dir, img)) = mksquashfs_ufo_image("gzip") else {
+            eprintln!("skip: no mksquashfs or mksquashfs failed");
             return;
-        }
-        let dir = tempfile::tempdir().unwrap();
-        let src = dir.path().join("src");
-        std::fs::create_dir_all(src.join("foo/fighter")).unwrap();
-        let mut f = File::create(src.join("foo/fighter/ufo")).unwrap();
-        f.write_all(b"iriya\n").unwrap();
-        let img = dir.path().join("test.squashfs");
-        let status = Command::new("mksquashfs")
-            .args([
-                src.as_os_str(),
-                img.as_os_str(),
-                "-comp".as_ref(),
-                "gzip".as_ref(),
-                "-noappend".as_ref(),
-            ])
-            .status()
-            .expect("spawn mksquashfs");
-        if !status.success() {
-            eprintln!("skip: mksquashfs failed");
-            return;
-        }
+        };
         assert!(looks_like_squashfs(&img));
         let m = SquashFsMountSource::open(&img).unwrap();
         assert!(m.is_inprocess());
+        assert_ufo_content(&m);
+    }
+
+    /// mksquashfs -comp xz: open must succeed (pure xz2 path preferred; unsquashfs ok).
+    #[test]
+    fn mksquashfs_xz_roundtrip() {
+        let Some((_dir, img)) = mksquashfs_ufo_image("xz") else {
+            eprintln!("skip: no mksquashfs or xz compression unavailable");
+            return;
+        };
+        assert_eq!(
+            read_superblock_compressor(&img, 0).unwrap(),
+            Some(COMP_XZ)
+        );
+        let m = SquashFsMountSource::open(&img).unwrap();
+        assert!(
+            m.is_inprocess(),
+            "mksquashfs -comp xz should open in-process via workspace xz2"
+        );
         assert_ufo_content(&m);
     }
 

@@ -22,7 +22,7 @@
 
 | Format | Crate | Notes |
 |--------|-------|--------|
-| SquashFS | `ratarmount-formats-squashfs` | In-process via `backhand` (gzip/zstd/lz4/lzo/none); `unsquashfs` fallback for XZ/LZMA (liblzma vs xz2) |
+| SquashFS | `ratarmount-formats-squashfs` | In-process via `backhand` (gzip/zstd/lz4/lzo/xz via workspace `xz2`/none); classic LZMA → `unsquashfs` (backhand `xz`/`liblzma` left off to avoid linking conflict) |
 | EXT2/3/4 | `ratarmount-formats-ext4` | Superblock magic `0xEF53`; `debugfs rdump` → FolderMountSource |
 | FAT12/16/32 | `ratarmount-formats-fat` | Pure Rust via `fatfs` crate (in-process cluster reads) |
 
@@ -39,7 +39,7 @@ Compressed outer streams materialize (or SeekableBody for TAR), then re-detect I
 ## Still open
 
 Pure in-process EXT4, encrypted SQLAR, full PDF page images, GNU incremental TAR.
-(SquashFS: in-process `backhand` with `unsquashfs` fallback for unsupported compressors.)
+(SquashFS: in-process `backhand` + custom xz2 XZ codec; `unsquashfs` for classic LZMA / open failures.)
 
 ## Tests
 

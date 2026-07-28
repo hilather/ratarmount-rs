@@ -1748,6 +1748,7 @@ dependencies = [
  "ratarmount-core",
  "tempfile",
  "thiserror",
+ "xz2",
 ]
 
 [[package]]
