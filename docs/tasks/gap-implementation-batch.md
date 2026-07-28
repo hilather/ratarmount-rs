@@ -144,7 +144,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | True in-process lrzip (no CLI) | CLI materialize only |
 | Flattened recursive TAR index | open |
 | 7z store-in-solid nested polish | open |
-| Full vs-Python ratio gates in CI | optional `RUN_FULL_BENCH=1` only |
+| Full vs-Python ratio gates in CI | `[x]` `benchmark-gates-full` job (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`); MICRO generate optional |
 
 ## Verify
 

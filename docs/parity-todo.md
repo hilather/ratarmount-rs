@@ -105,7 +105,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip solid streaming (large folders) | `~` progressive LZMA2 + 1 MiB LRU windows (≤64); BCJ/AES still full-folder |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
 | Seekable codecs (drop materialize for gzip+) | `~` all four via SeekableBody; true block maps still partial |
-| Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index microbench in CI; ratio gates via `RUN_FULL_BENCH=1` |
+| Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index hard job + optional `benchmark-gates-full` (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`) |
 
 ---
 
@@ -136,7 +136,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 ```text
 [always]  cargo fmt --check && cargo clippy -D warnings && cargo test --workspace
 [fuse]    probe /dev/fuse; run-all-phases.sh (RATARMOUNT_PY_ROOT checkout)
-[bench]   check-rust-gates.sh (cold index always); RUN_FULL_BENCH=1 for ratio CSV; weekly compare optional
+[bench]   check-rust-gates.sh cold always; benchmark-gates-full = RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1
 [optional] SSH/S3 live when secrets present
 ```
 

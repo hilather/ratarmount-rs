@@ -9,11 +9,20 @@
 #
 # Usage:
 #   RATARMOUNT_PY_ROOT=../ratarmount ./benchmarks/compare-python-vs-rust.sh
+#
+# Env:
+#   RATARMOUNT_PY_ROOT  Python ratarmount checkout (default: ../ratarmount)
+#   RUST_BIN            Rust binary (default: target/release/ratarmount)
+#   PY_PYTHON           Python interpreter (default: benchmarks/.venv-py or python3)
+#   CSV_OUT / MD_OUT    result paths under benchmarks/
+#   MICRO=1             minimal fixture set for gate CI (empty-1k + small-100{.tar,.tar.gz})
+#   COMPARE_KEEP=1      keep workdir after run
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 RUST_BIN="${RUST_BIN:-$ROOT/target/release/ratarmount}"
+MICRO="${MICRO:-0}"
 # Prefer local benchmark venv if present
 if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
     PY_PYTHON="${PY_PYTHON:-$ROOT/benchmarks/.venv-py/bin/python}"
@@ -27,8 +36,13 @@ export PATH="${HOME}/.cargo/bin:${PATH}"
 WORKDIR="${TMPDIR:-/tmp}/ratarmount-compare-$$"
 mkdir -p "$WORKDIR/data" "$WORKDIR/mnt" "$WORKDIR/results"
 RESULTS="$WORKDIR/results/results.csv"
-MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results.md}"
-CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results.csv}"
+if [[ "$MICRO" == "1" ]]; then
+    MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results-micro.md}"
+    CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results-micro.csv}"
+else
+    MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results.md}"
+    CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results.csv}"
+fi
 
 cleanup() {
     # shellcheck disable=SC2046
@@ -60,10 +74,7 @@ fi
 # ---- archive construction (mirrors mounting/bandwidth style fixtures) ----
 make_archives() {
     local d="$WORKDIR/data"
-    # A) nested-tar fixture copy
-    cp "$PY_ROOT/tests/nested-tar.tar" "$d/nested-tar.tar"
-
-    # B) many empty files (index-bound), 1k files in 10 folders
+    # B) many empty files (index-bound), 1k files in 10 folders — always
     local empty="$d/empty-1k"
     mkdir -p "$empty"
     for i in $(seq 0 9); do
@@ -81,6 +92,20 @@ make_archives() {
         dd if=/dev/urandom of="$small/f$(printf '%03d' "$i").bin" bs=65536 count=1 status=none 2>/dev/null
     done
     tar -C "$small" -cf "$d/small-100.tar" .
+    gzip -c -1 "$d/small-100.tar" > "$d/small-100.tar.gz"
+
+    if [[ "$MICRO" == "1" ]]; then
+        # Enough for rust-gates.json ratio metrics (warm mount, RSS, find, plain-TAR + tar.gz BW)
+        ls -lah "$d" >&2
+        return 0
+    fi
+
+    # A) nested-tar fixture copy
+    if [[ -f "$PY_ROOT/tests/nested-tar.tar" ]]; then
+        cp "$PY_ROOT/tests/nested-tar.tar" "$d/nested-tar.tar"
+    else
+        echoerr "WARN: nested-tar.tar missing under $PY_ROOT/tests (skipping)"
+    fi
 
     # D) single large file 64 MiB for sequential bandwidth
     local large="$d/large-1"
@@ -89,7 +114,6 @@ make_archives() {
     tar -C "$large" -cf "$d/large-64m.tar" .
 
     # E) compressions of small-100 for codec comparison
-    gzip -c -1 "$d/small-100.tar" > "$d/small-100.tar.gz"
     bzip2 -c -1 "$d/small-100.tar" > "$d/small-100.tar.bz2"
     xz -c -1 -T0 "$d/small-100.tar" > "$d/small-100.tar.xz" 2>/dev/null || xz -c -1 "$d/small-100.tar" > "$d/small-100.tar.xz"
     # multi-frame zstd (seekable) via zstd -T0
@@ -313,18 +337,29 @@ if ! "$WORKDIR/py-ratarmount" --help >/dev/null 2>&1; then
 fi
 
 D="$WORKDIR/data"
-declare -a JOBS=(
-    # archive|extra_flags|bandwidth_relpath
-    "$D/nested-tar.tar||-r|foo/fighter/ufo"
-    "$D/empty-1k.tar|||"
-    "$D/small-100.tar|||f000.bin"
-    "$D/large-64m.tar|||blob.bin"
-    "$D/small-100.tar.gz|||f000.bin"
-    "$D/small-100.tar.bz2|||f000.bin"
-    "$D/small-100.tar.xz|||f000.bin"
-    "$D/small-100.tar.zst|||f000.bin"
-    "$D/small-100.zip|||f000.bin"
-)
+declare -a JOBS=()
+if [[ "$MICRO" == "1" ]]; then
+    echoerr "MICRO=1: minimal fixture set (empty-1k, small-100.tar, small-100.tar.gz)"
+    JOBS=(
+        # archive|extra_flags|bandwidth_relpath
+        "$D/empty-1k.tar|||"
+        "$D/small-100.tar|||f000.bin"
+        "$D/small-100.tar.gz|||f000.bin"
+    )
+else
+    JOBS=(
+        # archive|extra_flags|bandwidth_relpath
+        "$D/nested-tar.tar||-r|foo/fighter/ufo"
+        "$D/empty-1k.tar|||"
+        "$D/small-100.tar|||f000.bin"
+        "$D/large-64m.tar|||blob.bin"
+        "$D/small-100.tar.gz|||f000.bin"
+        "$D/small-100.tar.bz2|||f000.bin"
+        "$D/small-100.tar.xz|||f000.bin"
+        "$D/small-100.tar.zst|||f000.bin"
+        "$D/small-100.zip|||f000.bin"
+    )
+fi
 
 for job in "${JOBS[@]}"; do
     IFS='|' read -r arch extra bwpath <<<"$job"

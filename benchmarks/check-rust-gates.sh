@@ -8,20 +8,29 @@
 #
 # RUN_FULL_BENCH=1:
 #   Also evaluate ratio gates (warm mount, RSS, find, sequential read) from a
-#   results CSV (default: benchmarks/python-vs-rust-results.csv). Soft-skips
-#   individual ratio checks when the CSV or required rows are missing.
+#   results CSV. Prefer an existing RESULTS_CSV; otherwise (or with
+#   GENERATE_RESULTS=1) try MICRO=1 compare-python-vs-rust.sh when Python
+#   ratarmount is available. If ratios cannot be evaluated:
+#     ALLOW_RATIO_SKIP=1 → skip with message, exit 0 (after cold hard gate)
+#     otherwise          → hard-fail (missing CSV / Python / generation)
 #
-# Env:
-#   RUST_BIN           path to ratarmount binary (default: target/release/ratarmount)
-#   GATES_JSON         path to gates file (default: benchmarks/baselines/rust-gates.json)
-#   RESULTS_CSV        CSV for ratio gates (default: benchmarks/python-vs-rust-results.csv)
-#   RUN_FULL_BENCH     set to 1 to evaluate vs-Python ratio gates from CSV
-#   SKIP_BUILD         set to 1 to skip cargo build if binary missing (then fail)
-#   COLD_INDEX_RUNS    number of timed cold-index samples (default: 3; use median)
+# Env knobs:
+#   RUST_BIN             path to ratarmount binary (default: target/release/ratarmount)
+#   GATES_JSON           path to gates file (default: benchmarks/baselines/rust-gates.json)
+#   RESULTS_CSV          CSV for ratio gates (default: post-perf-opt CSV if present,
+#                        else python-vs-rust-results.csv; micro generate writes
+#                        python-vs-rust-results-micro.csv)
+#   RUN_FULL_BENCH       set to 1 to evaluate vs-Python ratio gates from CSV
+#   ALLOW_RATIO_SKIP     set to 1 to soft-skip ratio evaluation when CSV/Python
+#                        unavailable (CI optional full job); cold index still hard
+#   GENERATE_RESULTS     set to 1 to force MICRO compare even if RESULTS_CSV exists
+#   RATARMOUNT_PY_ROOT   Python ratarmount tree for generation (default: ../ratarmount)
+#   SKIP_BUILD           set to 1 to skip cargo build if binary missing (then fail)
+#   COLD_INDEX_RUNS      number of timed cold-index samples (default: 3; use median)
 #
 # Exit codes:
-#   0  all hard gates pass (ratio gates skipped or pass)
-#   1  hard gate failure or missing required tools/binary
+#   0  all hard gates pass (ratio gates skipped with ALLOW_RATIO_SKIP or pass)
+#   1  hard gate failure or missing required tools/binary/CSV (full mode)
 #   2  usage / gates file unreadable
 set -euo pipefail
 
@@ -38,6 +47,9 @@ if [[ -z "${RESULTS_CSV:-}" ]]; then
 fi
 COLD_INDEX_RUNS="${COLD_INDEX_RUNS:-3}"
 RUN_FULL_BENCH="${RUN_FULL_BENCH:-0}"
+ALLOW_RATIO_SKIP="${ALLOW_RATIO_SKIP:-0}"
+GENERATE_RESULTS="${GENERATE_RESULTS:-0}"
+RATARMOUNT_PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 
 echoerr() { echo "$@" >&2; }
 
@@ -118,8 +130,95 @@ for run in $(seq 1 "$COLD_INDEX_RUNS"); do
     fi
 done
 
+# ---- optional: generate / refresh RESULTS_CSV for ratio gates ----
+python_ratarmount_available() {
+    local py_root="${1:-$RATARMOUNT_PY_ROOT}"
+    local py_bin="python3"
+    if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
+        py_bin="$ROOT/benchmarks/.venv-py/bin/python"
+    fi
+    if [[ ! -d "$py_root/ratarmount" && ! -d "$py_root/core" ]]; then
+        return 1
+    fi
+    # Import check (venv preferred; also allow PYTHONPATH install)
+    if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
+        "$ROOT/benchmarks/.venv-py/bin/python" -c "import ratarmount" 2>/dev/null && return 0
+    fi
+    if PYTHONPATH="$py_root${PYTHONPATH:+:$PYTHONPATH}" "$py_bin" -c "import ratarmount" 2>/dev/null; then
+        return 0
+    fi
+    return 1
+}
+
+try_generate_results_csv() {
+    local out_csv="$ROOT/benchmarks/python-vs-rust-results-micro.csv"
+    echoerr "==> Generating minimal vs-Python CSV (MICRO=1 compare)"
+    echoerr "    RATARMOUNT_PY_ROOT=$RATARMOUNT_PY_ROOT"
+    echoerr "    CSV_OUT=$out_csv"
+
+    if ! python_ratarmount_available "$RATARMOUNT_PY_ROOT"; then
+        echoerr "    Python ratarmount not importable at $RATARMOUNT_PY_ROOT"
+        return 1
+    fi
+
+    # Live FUSE micro-compare (requires /dev/fuse + fuse3 userspace).
+    # Cold-index default path never enters here.
+    if [[ ! -e /dev/fuse ]]; then
+        echoerr "    /dev/fuse missing; cannot run mount-based micro compare"
+        return 1
+    fi
+
+    if ! (
+        cd "$ROOT" &&
+            MICRO=1 \
+            RATARMOUNT_PY_ROOT="$RATARMOUNT_PY_ROOT" \
+            RUST_BIN="$RUST_BIN" \
+            CSV_OUT="$out_csv" \
+            MD_OUT="${out_csv%.csv}.md" \
+            bash benchmarks/compare-python-vs-rust.sh
+    ); then
+        echoerr "    micro compare failed"
+        return 1
+    fi
+
+    if [[ ! -s "$out_csv" ]]; then
+        echoerr "    micro compare produced empty/missing CSV: $out_csv"
+        return 1
+    fi
+    RESULTS_CSV="$out_csv"
+    echoerr "    generated: $RESULTS_CSV"
+    return 0
+}
+
+if [[ "$RUN_FULL_BENCH" == "1" ]]; then
+    need_generate=0
+    if [[ "$GENERATE_RESULTS" == "1" ]]; then
+        need_generate=1
+        echoerr "==> GENERATE_RESULTS=1: will refresh ratio CSV via micro compare"
+    elif [[ ! -f "$RESULTS_CSV" ]]; then
+        need_generate=1
+        echoerr "==> RESULTS_CSV missing ($RESULTS_CSV); attempting micro generate"
+    else
+        echoerr "==> Ratio gates: using existing RESULTS_CSV=$RESULTS_CSV"
+    fi
+
+    if [[ "$need_generate" == "1" ]]; then
+        if try_generate_results_csv; then
+            : # RESULTS_CSV updated
+        else
+            if [[ "$ALLOW_RATIO_SKIP" == "1" ]]; then
+                echoerr "    ALLOW_RATIO_SKIP=1: continuing without generated CSV"
+            else
+                echoerr "ERROR: RUN_FULL_BENCH=1 needs RESULTS_CSV or successful micro generate"
+                echoerr "  Provide a results CSV, set RATARMOUNT_PY_ROOT + FUSE, or ALLOW_RATIO_SKIP=1"
+                exit 1
+            fi
+        fi
+    fi
+fi
+
 # Evaluate cold_index + optional CSV ratio gates in one Python pass
-export GATES_JSON RESULTS_CSV RUN_FULL_BENCH
+export GATES_JSON RESULTS_CSV RUN_FULL_BENCH ALLOW_RATIO_SKIP
 # shellcheck disable=SC2124
 export SAMPLES_CSV="${SAMPLES[*]}"
 python3 - <<'PY'
@@ -198,14 +297,20 @@ def ratio_series(data, metric, scenario, higher_better=False, archive_pred=None)
     return ratios
 
 run_full = os.environ.get("RUN_FULL_BENCH", "0") == "1"
+allow_skip = os.environ.get("ALLOW_RATIO_SKIP", "0") == "1"
 if run_full:
     csv_path = Path(os.environ.get("RESULTS_CSV", ""))
     data = load_csv(csv_path)
     if data is None:
-        skips.append(
-            f"ratio gates: RESULTS_CSV missing ({csv_path}); soft-skip "
-            "(generate via benchmarks/compare-python-vs-rust.sh)"
+        msg = (
+            f"ratio gates: RESULTS_CSV missing ({csv_path}); "
+            "generate via MICRO=1 benchmarks/compare-python-vs-rust.sh "
+            "or set GENERATE_RESULTS=1 when Python+FUSE available"
         )
+        if allow_skip:
+            skips.append(msg + " [ALLOW_RATIO_SKIP=1]")
+        else:
+            failures.append(msg)
     else:
         # mount_time_warm_vs_python: geo-mean(rust/python warm mount_s) ≤ max
         g = gates.get("mount_time_warm_vs_python") or {}
@@ -214,7 +319,15 @@ if run_full:
             ratios = ratio_series(data, "mount_s", "warm")
             gm = geomean(ratios)
             if gm is None:
-                skips.append("mount_time_warm_vs_python: no paired warm mount_s rows")
+                if allow_skip:
+                    skips.append(
+                        "mount_time_warm_vs_python: no paired warm mount_s rows "
+                        "[ALLOW_RATIO_SKIP=1]"
+                    )
+                else:
+                    failures.append(
+                        "mount_time_warm_vs_python: no paired warm mount_s rows"
+                    )
             else:
                 print(f"mount_time_warm_vs_python: geo-mean rust/python={gm:.3f}  max={max_r}")
                 if gm > float(max_r):
@@ -233,7 +346,10 @@ if run_full:
                 ratios = ratio_series(data, "mount_rss_kib", "cold")
             gm = geomean(ratios)
             if gm is None:
-                skips.append("peak_rss_vs_python: no paired RSS rows")
+                if allow_skip:
+                    skips.append("peak_rss_vs_python: no paired RSS rows [ALLOW_RATIO_SKIP=1]")
+                else:
+                    failures.append("peak_rss_vs_python: no paired RSS rows")
             else:
                 print(f"peak_rss_vs_python: geo-mean rust/python={gm:.3f}  max={max_r}")
                 if gm > float(max_r):
@@ -250,7 +366,12 @@ if run_full:
             )
             gm = geomean(ratios)
             if gm is None:
-                skips.append("find_mounted_vs_python: no paired find_s rows")
+                if allow_skip:
+                    skips.append(
+                        "find_mounted_vs_python: no paired find_s rows [ALLOW_RATIO_SKIP=1]"
+                    )
+                else:
+                    failures.append("find_mounted_vs_python: no paired find_s rows")
             else:
                 print(f"find_mounted_vs_python: geo-mean rust/python={gm:.3f}  max={max_r}")
                 if gm > float(max_r):
@@ -277,9 +398,16 @@ if run_full:
             )
             gm = geomean(ratios)
             if gm is None:
-                skips.append(
-                    "sequential_read_uncompressed_tar_vs_python: no plain-TAR bandwidth rows"
-                )
+                if allow_skip:
+                    skips.append(
+                        "sequential_read_uncompressed_tar_vs_python: no plain-TAR "
+                        "bandwidth rows [ALLOW_RATIO_SKIP=1]"
+                    )
+                else:
+                    failures.append(
+                        "sequential_read_uncompressed_tar_vs_python: no plain-TAR "
+                        "bandwidth rows"
+                    )
             else:
                 print(
                     f"sequential_read_uncompressed_tar_vs_python: "
@@ -308,9 +436,15 @@ if run_full:
             )
             gm = geomean(ratios)
             if gm is None:
-                skips.append(
-                    "sequential_read_tar_gz_MBps: no .tar.gz bandwidth rows"
-                )
+                if allow_skip:
+                    skips.append(
+                        "sequential_read_tar_gz_MBps: no .tar.gz bandwidth rows "
+                        "[ALLOW_RATIO_SKIP=1]"
+                    )
+                else:
+                    failures.append(
+                        "sequential_read_tar_gz_MBps: no .tar.gz bandwidth rows"
+                    )
             else:
                 print(
                     f"sequential_read_tar_gz_MBps: geo-mean rust/python={gm:.3f}  min={min_r}"

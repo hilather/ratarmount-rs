@@ -71,6 +71,44 @@ jobs:
           chmod +x benchmarks/check-rust-gates.sh
           ./benchmarks/check-rust-gates.sh
 
+  # Optional full vs-Python ratio gates from rust-gates.json.
+  # Uses committed RESULTS_CSV when present; ALLOW_RATIO_SKIP=1 so missing
+  # Python/FUSE/CSV never reds the tree. Cold index still hard-fails.
+  # Also runnable via workflow_dispatch for ad-hoc full checks.
+  benchmark-gates-full:
+    name: benchmark gates (full ratios, soft-skip)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # Always on PR/push like the cold job, but soft on ratio availability.
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-gates
+
+      - name: Build release binary
+        run: cargo build --release -p ratarmount
+
+      - name: Enforce rust-gates.json (full ratios; ALLOW_RATIO_SKIP)
+        env:
+          RUST_BIN: ${{ github.workspace }}/target/release/ratarmount
+          SKIP_BUILD: "1"
+          RUN_FULL_BENCH: "1"
+          ALLOW_RATIO_SKIP: "1"
+        run: |
+          chmod +x benchmarks/check-rust-gates.sh benchmarks/compare-python-vs-rust.sh
+          ./benchmarks/check-rust-gates.sh
+
   fuse-harness:
     name: FUSE phase allowlists
     runs-on: ubuntu-latest
