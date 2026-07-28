@@ -16,7 +16,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Uncompressed TAR (ustar/pax/gnu) | yes | yes | `[x]` |
 | GNU sparse `S` + PAX sparse 0.0/0.1/1.0 | yes | yes | `[x]` |
 | GNU incremental TAR | yes | detect + prefix strip + dumpdir `D` dual entry + `isGnuIncremental` metadata | `[x]` |
-| ZIP (store/deflate, symlink, password) | yes | store/deflate; password + multi-part join | `~` true multi-disk EOCD still limited |
+| ZIP (store/deflate, symlink, password) | yes | store/deflate; password + multi-part join + multi-disk EOCD normalize | `[x]` / `~` true per-disk offsets |
 | Custom SevenZip random-access | yes (fork PR) | yes | `[x]` |
 | AR / CPIO newc/crc/odc/binary | yes | yes | `[x]` |
 | libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |
@@ -26,7 +26,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
-| PDF / OGG / HTML | yes | PDF attachments (lopdf); OGG demux; HTML data-URLs | `~` PDF images deferred |
+| PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2); OGG demux; HTML data-URLs | `[x]` / `~` non-JPEG image reassembly |
 | Git tree mount | yes | yes (`git2`; worktree needs `RATARMOUNT_FORCE_GIT=1`) | `~` |
 | RAR pure / best-effort (beyond libarchive) | yes | libarchive only | `~` |
 
@@ -75,8 +75,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | HTTP Range without full download | yes | Range chunk materialize + HttpRangeFile | `~` formats still open local path after fetch |
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
-| SMB / WebDAV / Dropbox | yes | WebDAV + SMB (`smbclient`); no Dropbox | `~` Dropbox still open |
-| Remote/compressed **index** download | yes | http(s)/file:// materialize into local index path | `[x]` / `~` compressed index blobs |
+| SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox (`DROPBOX_TOKEN` file materialize) | `[x]` / `~` Dropbox folder browse |
+| Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
 
 ### Index / CLI
 
@@ -91,7 +91,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
 | OSS attributions | yes | yes (`--oss-attributions` / help) | `[x]` |
-| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + gzip/xz/zstd/bzip2 threads | `~` long-tail codecs still default |
+| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + gzip/xz/zstd/bzip2/lz4/lzip/lzo | `~` zlib/lzma/Z still default |
 | Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)

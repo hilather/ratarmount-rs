@@ -64,16 +64,28 @@ Non-overlapping crate ownership so agents could not stomp each other:
 
 **Orchestrator glue:** factory opens gzip/xz/zstd/bzip2 via `options.threads_for(...)` + `*_with_threads`.
 
-## Still open (later / batch 6+)
+## Batch 6 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Commit (on main) | Result |
+|-------|-----------|------------------|--------|
+| Long-tail `-P` | `ratarmount-compress` lz4/lzip/lzo | `cd08144` | `open_*_with_threads` for lz4/lzip/lzo |
+| Multi-disk ZIP EOCD | `formats-zip` | `22c7b7b` | normalize multi-disk EOCD after part join |
+| Dropbox | `remote` | `33ceae0` | `dropbox://` via `DROPBOX_TOKEN` |
+| Compressed index | `index` | `6d46047` | gzip/xz/zstd/bz2 index decompress |
+| PDF images | `formats-pdf` | `db9a04b` | XObject images under `images/` |
+
+**Orchestrator glue:** factory opens lz4/lzip/lzo via `options.threads_for(...)` + `*_with_threads`.
+
+## Still open (later / batch 7+)
 
 | Gap | Notes |
 |-----|--------|
 | True Range without materialize for format openers | Formats still need local path after fetch |
-| Dropbox / full fsspec | not started |
-| Full `-P` for remaining long-tail codecs | gzip/xz/zstd/bzip2 wired; lz4/lzip/… still default |
+| Full fsspec / folder-style Dropbox browse | file materialize only |
 | True bzip2 bit-block map | multi-stream parallel only |
-| lrzip | not started |
-| True multi-disk ZIP EOCD | multi-part join exists; EOCD spanning disks limited |
+| lrzip pure (Python stays libarchive) | long-tail |
+| zlib/lzma-alone / compress-z `-P` matrix | still default single-thread openers |
+| PDF non-JPEG image reassembly | `.bin` for Flate/etc. |
 
 ## Verify
 
@@ -82,5 +94,6 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 # split: ratarmount -f tests/simple-file-split.001 mnt/
 # hashes: ratarmount --hashes sha256,crc32 --no-mount archive.tar
-# threads: ratarmount -P gzip:4,xz:2,zstd:4,bzip2:4 -f archive.tar.gz mnt/
+# threads: ratarmount -P gzip:4,xz:2,zstd:4,bzip2:4,lz4:4 -f archive.tar.gz mnt/
+# dropbox: DROPBOX_TOKEN=… ratarmount -f dropbox:///path/to/a.tar mnt/
 ```
