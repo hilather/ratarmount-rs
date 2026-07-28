@@ -104,7 +104,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | ZIP store stencil + deflate cache | `[x]` |
 | SevenZip solid streaming (large folders) | `~` progressive LZMA2 + 1 MiB LRU windows (≤64); BCJ/AES still full-folder |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
-| Seekable codecs (drop materialize for gzip+) | `~` all four via SeekableBody; true block maps still partial |
+| Seekable codecs (drop materialize for gzip+) | `[x]` plain + TAR via SeekableBody / SingleFile; residual SquashFS/lrzip/LZX |
 | Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index hard job + optional `benchmark-gates-full` (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`) |
 
 ---
@@ -160,7 +160,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 ## 4. Suggested implementation order
 
 1. ~~**CLI flag parity**~~ — done: `--index-folders`, `:memory:`, default mountpoint, `-e`, `-d`, `--log-file`, `-o`.  
-2. ~~**Seekable gzip (G3 Tier B)**~~ — done for `.tar.gz`/`.tgz` via `miniz_oxide` checkpoints; plain `.gz` still materializes; Tier C import deferred.  
+2. ~~**Seekable gzip (G3 Tier B)**~~ — `.tar.gz` + plain `.gz` single-file via seekable body; Tier C RGZI import/export done.  
 3. ~~**Seekable bzip2 / xz / zstd**~~ — done: shared `SeekableBody`; zstd multi-frame map; bz2/xz one-shot decode to RAM/temp (true block-parallel / xz index / zstd seek-table still open).  
 4. ~~**Test harness expansion**~~ — phase2–9 allowlists grown; `run-index-interop.sh` (Py↔Rust); fixed-archive wrapper ready (`RUN=1`). Continue complex-usage subset + full fixed-archive gap list.  
 5. ~~**SquashFS / SQLAR**~~ — SQLAR pure; SquashFS via `unsquashfs` MVP.  

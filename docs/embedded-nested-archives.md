@@ -16,7 +16,7 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 |----------|--------|
 | **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR is indexed from that stream in memory. |
 | **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
-| **When *is* `/tmp` used?** | Fallback only: nested format not supported from a stream, or nested open fails — then the member is copied to a temp file and opened by path. Also some **top-level** codecs/images still materialize (see below). |
+| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (SquashFS tools, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. |
 | **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
 
 ---
@@ -72,6 +72,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **ZIP** | `PK` magic | `ZipMountSource::open_from_reader` | Store: true random; deflate: inflate whole member then seek in RAM |
 | **7z** | 7z signature | `SevenZipMountSource::open_from_reader` | Store: true random; pure LZMA2 solid: progressive; other solid: full-folder residual |
 | **`.tar.gz` / `.tgz`** | gzip magic + TAR body/name | Seekable gzip + `create_index_gzip` | **Yes** — gzip checkpoints + TAR stencil |
+| **Plain `.gz` / `.zst` / `.bz2` / `.xz` (non-TAR)** | compress magic | Seekable body + `SingleFileMountSource::from_seekable_body` (or nested archive if payload is ZIP/7z/…) | **Yes** — no nested member spool |
 | **`.tar.zst`** | zstd magic + TAR | Seekable zstd + TAR body | Yes (frame/map dependent) |
 | **`.tar.bz2`** | `BZh` + TAR | Seekable bzip2 + TAR | Yes (block map) |
 | **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Multi-block better; single-stream weaker |
@@ -140,19 +141,17 @@ Same for `outer.zip` → `inner.tar.gz`.
 
 Temp files are held for the life of that nested mount and removed when the nested mount is dropped (best-effort).
 
-### Top-level open (not nested) — may still materialize
-
-These are **host-path** materializations, not the nested-reader path:
+### Top-level open (not nested)
 
 | Case | Temp / materialize? |
 |------|---------------------|
-| Plain single-file `.gz` / `.bz2` / … that is **not** a TAR (or ambiguous) | Often **yes** — decompress to temp, then single-file or format probe |
-| SquashFS classic paths / some EXT4 fallbacks | May use helper tools + disk |
-| lrzip | CLI or libarchive materialize |
-| Remote URL that is not TAR/ZIP/gzip/bzip2/xz/zstd live-Range | Download / materialize |
+| **`.tar.gz` / `.tar.zst` / multi-frame codecs** | **No** — seekable body + TAR/index |
+| **Plain single-file** `.gz` / `.bz2` / `.zst` / `.xz` / lz4 / … | **No** — seekable body + `SingleFileMountSource::from_seekable_body` (or `open_from_reader` if payload is an archive) |
+| Residual: SquashFS tools / some EXT4 / RAR / CAB LZX | May materialize or keep a path |
+| lrzip | CLI or libarchive materialize when needed |
+| Remote URL outside live Range codecs | Download / materialize |
 | Write overlay `:temp:` | Explicit temp overlay root (user-requested) |
-
-Top-level **`.tar.gz`**, **`.tar.zst`**, multi-frame zstd, etc. prefer **seekable in-place** open (no full archive spool).
+| Codec internal `DecodedBody` spill | Bodies larger than ~256 MiB may use an internal temp under the codec (not nested AutoMount spool) |
 
 ---
 
@@ -215,7 +214,8 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
 | Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT | yes | yes\* |
 | Nested unencrypted SQLAR | yes (no `/tmp`) | yes after full DB load in RAM |
-| Nested CAB LZX / SquashFS / RAR / plain `.gz` | usually **tmp** | depends on path open |
+| Nested plain `.gz` / `.zst` / … (single file) | yes | yes (seekable body) |
+| Nested CAB LZX / SquashFS / RAR | usually **tmp** | depends on path open |
 | Solid multi-GB 7z outer | no tmp | often costly |
 
 \* Inner ZIP deflate / solid 7z / single-stream xz have the usual decompress costs; they still avoid nested temp files when the reader path succeeds.

@@ -25,7 +25,8 @@
 5. Checkpoints are **in-memory for the mount lifetime** (rebuild-on-load). Python-compatible `gzipindexes` / `gztoolindex` blob import is **Tier C** (not required for 1.0).
 
 ### Plain `.gz` (non-TAR)
-- Still materialize to a temp file for `SingleFileMountSource` (simple and fast for small files).
+- Seekable gzip body + `SingleFileMountSource::from_seekable_body` — **no full materialize**
+  (same checkpoint random access as TAR path). Residual path-only formats still materialize.
 
 ### CLI
 - `--gzip-seek-point-spacing` controls checkpoint distance (bytes uncompressed).
@@ -50,5 +51,5 @@
 - **Tier C:** import Python `gzipindexes` / `gztoolindex` without rebuild.
 - **Tier D:** parallel decode / rapidgzip-class throughput.
 - Persist Rust checkpoints into SQLite for faster remount without full re-scan.
-- Seekable single-file `.gz` without materialize.
-- True bzip2 bit-block map; xz liblzma stream index; zstd seek-table.
+- ~~Seekable single-file `.gz` without materialize~~ — done (`from_seekable_body`).
+- True bzip2 bit-block map; xz liblzma stream index; zstd seek-table polish.
