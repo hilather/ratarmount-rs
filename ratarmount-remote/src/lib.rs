@@ -2,7 +2,11 @@
 //!
 //! - `file://` → local path
 //! - `http(s)://` → fetch to temp (prefer Range when supported) and live Range I/O via
-//!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`]
+//!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`].
+//!   **HTTP Basic auth** (upstream [#157](https://github.com/mxmlnkn/ratarmount/issues/157) / FR-2):
+//!   credentials from URL userinfo (`https://user:pass@host/path`) and/or env
+//!   [`HTTP_USER_ENV`] / [`HTTP_PASSWORD_ENV`]; sent as `Authorization: Basic …` on HEAD,
+//!   GET, and Range requests. Cookie auth is not implemented.
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp (OpenSSH config subset:
@@ -61,7 +65,126 @@ pub use webdav::{
 /// Chunk size for sequential Range GET materialization (4 MiB).
 pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 
+/// Env: HTTP Basic username when the URL has no userinfo (FR-2 / #157).
+pub const HTTP_USER_ENV: &str = "RATARMOUNT_HTTP_USER";
+/// Env: HTTP Basic password (pairs with [`HTTP_USER_ENV`], or fills missing URL password).
+pub const HTTP_PASSWORD_ENV: &str = "RATARMOUNT_HTTP_PASSWORD";
+
 pub(crate) const USER_AGENT: &str = "ratarmount-rs/0.1";
+
+/// Optional HTTP Basic credentials for `http(s)://` opens.
+#[derive(Clone, PartialEq, Eq)]
+pub struct HttpAuth {
+    pub username: String,
+    /// When `None`, Basic auth uses an empty password (`user:`).
+    pub password: Option<String>,
+}
+
+impl HttpAuth {
+    /// `Authorization` header value: `Basic <base64(user:pass)>`.
+    pub fn authorization_header(&self) -> String {
+        webdav::basic_auth_header(&self.username, self.password.as_deref())
+    }
+}
+
+impl std::fmt::Debug for HttpAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpAuth")
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "***"))
+            .finish()
+    }
+}
+
+/// HTTP(S) request target: clean URL (no userinfo) + optional Basic auth.
+#[derive(Debug, Clone)]
+pub struct HttpLocation {
+    /// `http://` or `https://` URL without userinfo.
+    pub url: String,
+    pub auth: Option<HttpAuth>,
+}
+
+/// Parse an `http://` / `https://` URL for wire requests.
+///
+/// Credentials resolution order:
+/// 1. URL userinfo (`https://user:pass@host/path`) — username required for this branch;
+///    password may fall back to [`HTTP_PASSWORD_ENV`] when the URL has a user but no password.
+/// 2. Else [`HTTP_USER_ENV`] (+ optional [`HTTP_PASSWORD_ENV`]).
+///
+/// Cookie-based auth is not supported.
+pub fn parse_http_url(url_str: &str) -> Result<HttpLocation> {
+    let url = Url::parse(url_str).map_err(|e| RemoteError::Url(e.to_string()))?;
+    match url.scheme() {
+        "http" | "https" => {}
+        other => return Err(RemoteError::UnsupportedScheme(other.to_string())),
+    }
+    if url.host_str().is_none() {
+        return Err(RemoteError::Url("http URL missing host".into()));
+    }
+
+    let url_user = if url.username().is_empty() {
+        None
+    } else {
+        Some(url.username().to_string())
+    };
+    let url_pass = url.password().map(|s| s.to_string());
+
+    let auth = if let Some(username) = url_user {
+        let password = url_pass.or_else(|| non_empty_env(HTTP_PASSWORD_ENV));
+        Some(HttpAuth { username, password })
+    } else {
+        load_http_auth_from_env()
+    };
+
+    let mut clean = url.clone();
+    let _ = clean.set_username("");
+    let _ = clean.set_password(None);
+
+    Ok(HttpLocation {
+        url: clean.to_string(),
+        auth,
+    })
+}
+
+fn non_empty_env(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+fn load_http_auth_from_env() -> Option<HttpAuth> {
+    let username = non_empty_env(HTTP_USER_ENV)?;
+    let password = non_empty_env(HTTP_PASSWORD_ENV);
+    Some(HttpAuth { username, password })
+}
+
+fn apply_http_auth(mut req: ureq::Request, auth: Option<&HttpAuth>) -> ureq::Request {
+    if let Some(a) = auth {
+        req = req.set("Authorization", &a.authorization_header());
+    }
+    req
+}
+
+fn http_unauthorized(url: &str) -> RemoteError {
+    RemoteError::Http(format!(
+        "HTTP 401 Unauthorized for {url}; provide credentials via URL userinfo \
+         (https://user:pass@host/...) or {HTTP_USER_ENV}/{HTTP_PASSWORD_ENV}"
+    ))
+}
+
+fn http_status_err(status: u16, url: &str) -> RemoteError {
+    if status == 401 {
+        http_unauthorized(url)
+    } else {
+        RemoteError::Http(format!("HTTP {status} for {url}"))
+    }
+}
+
+fn map_ureq_http_error(err: ureq::Error, url: &str) -> RemoteError {
+    match err {
+        ureq::Error::Status(401, _) => http_unauthorized(url),
+        ureq::Error::Status(code, _) => RemoteError::Http(format!("HTTP {code} for {url}")),
+        other => RemoteError::Http(other.to_string()),
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum RemoteError {
@@ -237,9 +360,21 @@ pub fn range_chunk_windows(size: u64, chunk: u64) -> Vec<(u64, u64)> {
 /// Probe an HTTP(S) URL for Content-Length and Accept-Ranges support.
 ///
 /// Tries HEAD first; on failure or missing length with ranges advertised, probes with
-/// `Range: bytes=0-0` (206 + Content-Range total).
+/// `Range: bytes=0-0` (206 + Content-Range total). Sends Basic auth when credentials
+/// are present (URL userinfo or env).
 pub fn probe_http(url: &str) -> Result<HttpProbe> {
-    match ureq::head(url).set("User-Agent", USER_AGENT).call() {
+    let loc = parse_http_url(url)?;
+    probe_http_location(&loc)
+}
+
+fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
+    let url = loc.url.as_str();
+    match apply_http_auth(
+        ureq::head(url).set("User-Agent", USER_AGENT),
+        loc.auth.as_ref(),
+    )
+    .call()
+    {
         Ok(resp) if (200..300).contains(&resp.status()) => {
             let content_length = resp
                 .header("Content-Length")
@@ -253,7 +388,7 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
             }
             if accept_ranges {
                 // Ranges OK but size unknown — try Content-Range probe.
-                if let Some(probe) = probe_range_size(url)? {
+                if let Some(probe) = probe_range_size(loc)? {
                     return Ok(probe);
                 }
             }
@@ -265,7 +400,7 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
                 });
             }
             // Fall through to range probe when length missing or ambiguous.
-            if let Some(probe) = probe_range_size(url)? {
+            if let Some(probe) = probe_range_size(loc)? {
                 return Ok(probe);
             }
             return Ok(HttpProbe {
@@ -273,15 +408,21 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
                 accept_ranges: false,
             });
         }
+        Ok(resp) if resp.status() == 401 => {
+            return Err(http_unauthorized(url));
+        }
         Ok(resp) => {
             debug!("HEAD {url} -> {}, probing with Range GET", resp.status());
+        }
+        Err(ureq::Error::Status(401, _)) => {
+            return Err(http_unauthorized(url));
         }
         Err(e) => {
             debug!("HEAD {url} failed: {e}, probing with Range GET");
         }
     }
 
-    if let Some(probe) = probe_range_size(url)? {
+    if let Some(probe) = probe_range_size(loc)? {
         return Ok(probe);
     }
 
@@ -293,13 +434,20 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
 }
 
 /// Issue `GET` with `Range: bytes=0-0`. Returns probe meta on 206; `None` if ranges unusable.
-fn probe_range_size(url: &str) -> Result<Option<HttpProbe>> {
-    let resp = match ureq::get(url)
-        .set("User-Agent", USER_AGENT)
-        .set("Range", "bytes=0-0")
-        .call()
+fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
+    let url = loc.url.as_str();
+    let resp = match apply_http_auth(
+        ureq::get(url)
+            .set("User-Agent", USER_AGENT)
+            .set("Range", "bytes=0-0"),
+        loc.auth.as_ref(),
+    )
+    .call()
     {
         Ok(r) => r,
+        Err(ureq::Error::Status(401, _)) => {
+            return Err(http_unauthorized(url));
+        }
         Err(e) => {
             debug!("Range probe {url} failed: {e}");
             return Ok(None);
@@ -313,6 +461,9 @@ fn probe_range_size(url: &str) -> Result<Option<HttpProbe>> {
             content_length: total,
             accept_ranges: true,
         }));
+    }
+    if status == 401 {
+        return Err(http_unauthorized(url));
     }
     if (200..300).contains(&status) {
         // Server ignored Range (full body). Not usable as range-capable.
@@ -330,7 +481,8 @@ fn probe_range_size(url: &str) -> Result<Option<HttpProbe>> {
 
 /// Full GET download to a tempfile (works without Range support).
 pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
-    fetch_http_full_get(url)
+    let loc = parse_http_url(url)?;
+    fetch_http_full_get(&loc)
 }
 
 /// Download via sequential Range GETs when supported; otherwise full GET.
@@ -338,35 +490,45 @@ pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
 /// Used by [`resolve_to_local`] so the factory materialization path benefits without
 /// factory changes. Matches the Python fsspec-style prefer-range path.
 pub fn fetch_http_to_temp_prefer_range(url: &str) -> Result<(NamedTempFile, u64)> {
-    let probe = probe_http(url)?;
+    let loc = parse_http_url(url)?;
+    let probe = probe_http_location(&loc)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
             debug!(
-                "HTTP prefer-range: downloading {url} ({size} bytes) in {}-byte chunks",
-                HTTP_RANGE_CHUNK
+                "HTTP prefer-range: downloading {} ({size} bytes) in {}-byte chunks",
+                loc.url, HTTP_RANGE_CHUNK
             );
-            match fetch_http_via_ranges(url, size) {
+            match fetch_http_via_ranges(&loc, size) {
                 Ok(v) => return Ok(v),
                 Err(e) => {
-                    debug!("HTTP range download failed for {url}: {e}; falling back to full GET");
+                    // Auth failures must not silently fall back (would 401 again).
+                    if matches!(&e, RemoteError::Http(msg) if msg.contains("401")) {
+                        return Err(e);
+                    }
+                    debug!(
+                        "HTTP range download failed for {}: {e}; falling back to full GET",
+                        loc.url
+                    );
                 }
             }
         }
     }
-    debug!("HTTP full GET for {url} (ranges unavailable or incomplete probe)");
-    fetch_http_full_get(url)
+    debug!(
+        "HTTP full GET for {} (ranges unavailable or incomplete probe)",
+        loc.url
+    );
+    fetch_http_full_get(&loc)
 }
 
-fn fetch_http_full_get(url: &str) -> Result<(NamedTempFile, u64)> {
-    let resp = ureq::get(url)
-        .set("User-Agent", USER_AGENT)
-        .call()
-        .map_err(|e| RemoteError::Http(e.to_string()))?;
+fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
+    let resp = apply_http_auth(
+        ureq::get(&loc.url).set("User-Agent", USER_AGENT),
+        loc.auth.as_ref(),
+    )
+    .call()
+    .map_err(|e| map_ureq_http_error(e, &loc.url))?;
     if !(200..300).contains(&resp.status()) {
-        return Err(RemoteError::Http(format!(
-            "HTTP {} for {url}",
-            resp.status()
-        )));
+        return Err(http_status_err(resp.status(), &loc.url));
     }
     let mut reader = resp.into_reader();
     let mut tmp = NamedTempFile::new()?;
@@ -377,7 +539,7 @@ fn fetch_http_full_get(url: &str) -> Result<(NamedTempFile, u64)> {
 }
 
 /// Sequential Range GET materialization into a tempfile.
-fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
+fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile, u64)> {
     let mut tmp = NamedTempFile::new()?;
     if size == 0 {
         tmp.flush()?;
@@ -386,11 +548,14 @@ fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
     let mut written = 0u64;
     for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
         let range = format!("bytes={start}-{end}");
-        let resp = ureq::get(url)
-            .set("User-Agent", USER_AGENT)
-            .set("Range", &range)
-            .call()
-            .map_err(|e| RemoteError::Http(e.to_string()))?;
+        let resp = apply_http_auth(
+            ureq::get(&loc.url)
+                .set("User-Agent", USER_AGENT)
+                .set("Range", &range),
+            loc.auth.as_ref(),
+        )
+        .call()
+        .map_err(|e| map_ureq_http_error(e, &loc.url))?;
         let status = resp.status();
         if status == 206 {
             let mut reader = resp.into_reader();
@@ -410,9 +575,7 @@ fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
             tmp.as_file().seek(SeekFrom::Start(0))?;
             return Ok((tmp, n));
         } else {
-            return Err(RemoteError::Http(format!(
-                "HTTP {status} for range {range} on {url}"
-            )));
+            return Err(http_status_err(status, &loc.url));
         }
     }
     if written != size {
@@ -430,8 +593,12 @@ fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
 ///
 /// Prefer [`open_http_range`] / [`resolve_http`] for the public entry points.
 /// [`resolve_to_local`] still fully materializes HTTP(S) for path-based openers.
+///
+/// Basic auth from the open URL / env is retained for subsequent Range GETs.
 pub struct HttpRangeFile {
+    /// Wire URL without userinfo.
     url: String,
+    auth: Option<HttpAuth>,
     size: u64,
     pos: u64,
     /// Optional fully buffered body if ranges unavailable
@@ -442,6 +609,7 @@ impl std::fmt::Debug for HttpRangeFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HttpRangeFile")
             .field("url", &self.url)
+            .field("auth", &self.auth)
             .field("size", &self.size)
             .field("pos", &self.pos)
             .field("uses_ranges", &self.uses_ranges())
@@ -454,37 +622,54 @@ impl HttpRangeFile {
     ///
     /// Without usable ranges, buffers the full response body in memory.
     pub fn open(url: &str) -> Result<Self> {
-        let probe = probe_http(url)?;
+        let loc = parse_http_url(url)?;
+        let probe = probe_http_location(&loc)?;
         if probe.accept_ranges {
             if let Some(size) = probe.content_length {
-                return Ok(Self::range_backed(url, size));
+                return Ok(Self::from_location(loc, size, None));
             }
         }
 
         // Fallback: full download into memory (fine for test fixtures / small objects)
-        let (mut tmp, size) = fetch_http_full_get(url)?;
+        let (mut tmp, size) = fetch_http_full_get(&loc)?;
         let mut buf = Vec::with_capacity(size as usize);
         tmp.read_to_end(&mut buf)?;
-        Ok(Self {
-            url: url.to_string(),
-            size: buf.len() as u64,
+        Ok(Self::from_location(loc, buf.len() as u64, Some(buf)))
+    }
+
+    fn from_location(loc: HttpLocation, size: u64, buffered: Option<Vec<u8>>) -> Self {
+        Self {
+            url: loc.url,
+            auth: loc.auth,
+            size,
             pos: 0,
-            buffered: Some(buf),
-        })
+            buffered,
+        }
     }
 
     /// Construct a live Range-backed reader (no probe; caller must know size).
+    ///
+    /// Parses Basic auth from URL userinfo / env the same way as [`open`].
     pub fn range_backed(url: &str, size: u64) -> Self {
-        Self {
-            url: url.to_string(),
-            size,
-            pos: 0,
-            buffered: None,
+        match parse_http_url(url) {
+            Ok(loc) => Self::from_location(loc, size, None),
+            Err(_) => Self {
+                url: url.to_string(),
+                auth: None,
+                size,
+                pos: 0,
+                buffered: None,
+            },
         }
     }
 
     pub fn url(&self) -> &str {
         &self.url
+    }
+
+    /// Basic auth retained for live Range GETs, if any.
+    pub fn auth(&self) -> Option<&HttpAuth> {
+        self.auth.as_ref()
     }
 
     pub fn len(&self) -> u64 {
@@ -559,15 +744,21 @@ impl RemoteHttp {
 ///
 /// [`resolve_to_local`] remains the full-materialize path for path-based openers.
 pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
-    let probe = probe_http(url)?;
+    let loc = parse_http_url(url)?;
+    let probe = probe_http_location(&loc)?;
     if probe.accept_ranges {
         if let Some(size) = probe.content_length {
-            debug!("HTTP live Range for {url} ({size} bytes)");
-            return Ok(RemoteHttp::Range(HttpRangeFile::range_backed(url, size)));
+            debug!("HTTP live Range for {} ({size} bytes)", loc.url);
+            return Ok(RemoteHttp::Range(HttpRangeFile::from_location(
+                loc, size, None,
+            )));
         }
     }
-    debug!("HTTP materialize for {url} (ranges unavailable or size unknown)");
-    let (tmp, size) = fetch_http_full_get(url)?;
+    debug!(
+        "HTTP materialize for {} (ranges unavailable or size unknown)",
+        loc.url
+    );
+    let (tmp, size) = fetch_http_full_get(&loc)?;
     Ok(RemoteHttp::Materialized(keep_fetched(url, tmp, size)?))
 }
 
@@ -634,11 +825,20 @@ impl Read for HttpRangeFile {
         }
         // Inclusive Range end
         let range = format!("bytes={}-{}", self.pos, end - 1);
-        let resp = ureq::get(&self.url)
-            .set("User-Agent", USER_AGENT)
-            .set("Range", &range)
-            .call()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let resp = apply_http_auth(
+            ureq::get(&self.url)
+                .set("User-Agent", USER_AGENT)
+                .set("Range", &range),
+            self.auth.as_ref(),
+        )
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(401, _) => io::Error::other(format!(
+                "HTTP 401 Unauthorized for {}; check URL userinfo or {}/{}",
+                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV
+            )),
+            other => io::Error::other(other.to_string()),
+        })?;
         let status = resp.status();
         if status == 206 {
             let mut reader = resp.into_reader();
@@ -663,6 +863,12 @@ impl Read for HttpRangeFile {
             buf[..n].copy_from_slice(&chunk[..n]);
             self.pos += n as u64;
             return Ok(n);
+        }
+        if status == 401 {
+            return Err(io::Error::other(format!(
+                "HTTP 401 Unauthorized for {}; check URL userinfo or {}/{}",
+                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV
+            )));
         }
         Err(io::Error::other(format!(
             "HTTP {status} for range {range} on {}",
@@ -842,6 +1048,8 @@ mod tests {
         honor_range: bool,
         /// If true, HEAD returns 405.
         head_rejects: bool,
+        /// If set, require `Authorization: Basic …` matching this user:pass.
+        require_basic: Option<(String, String)>,
     }
 
     impl MockHttp {
@@ -866,6 +1074,7 @@ mod tests {
                     }
                     let mut headers = Vec::new();
                     let mut range_hdr: Option<String> = None;
+                    let mut auth_hdr: Option<String> = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -878,12 +1087,32 @@ mod tests {
                         if let Some(v) = line.strip_prefix("Range:") {
                             range_hdr = Some(v.trim().to_string());
                         }
+                        if let Some(v) = line.strip_prefix("Authorization:") {
+                            auth_hdr = Some(v.trim().to_string());
+                        }
                     }
                     {
                         let mut lg = log_c.lock().unwrap();
                         lg.push(request_line.trim().to_string());
                         if let Some(r) = &range_hdr {
                             lg.push(format!("Range: {r}"));
+                        }
+                        if let Some(a) = &auth_hdr {
+                            lg.push(format!("Authorization: {a}"));
+                        }
+                    }
+
+                    if let Some((user, pass)) = &cfg.require_basic {
+                        let expected = webdav::basic_auth_header(user, Some(pass));
+                        if auth_hdr.as_deref() != Some(expected.as_str()) {
+                            let body = b"unauthorized";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"http\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(body);
+                            continue;
                         }
                     }
 
@@ -982,6 +1211,47 @@ mod tests {
         fn url(&self, path: &str) -> String {
             format!("{}{}", self.addr, path)
         }
+
+        /// `http://user:pass@127.0.0.1:port/path`
+        fn url_with_auth(&self, user: &str, pass: &str, path: &str) -> String {
+            let rest = self.addr.strip_prefix("http://").unwrap();
+            format!("http://{user}:{pass}@{rest}{path}")
+        }
+    }
+
+    /// Serialize tests that mutate process environment for HTTP auth.
+    static HTTP_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct HttpEnvGuard {
+        saved: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl HttpEnvGuard {
+        fn acquire(keys: &[&str]) -> Self {
+            let lock = HTTP_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, val: &str) {
+            std::env::set_var(key, val);
+        }
+    }
+
+    impl Drop for HttpEnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
     }
 
     #[test]
@@ -994,6 +1264,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1019,6 +1290,7 @@ mod tests {
             accept_ranges: false,
             honor_range: false,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1038,6 +1310,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: true,
+            require_basic: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1056,6 +1329,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/blob.bin");
         let mut f = HttpRangeFile::open(&url).unwrap();
@@ -1088,6 +1362,7 @@ mod tests {
             accept_ranges: false,
             honor_range: false,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/blob.bin");
         let mut f = HttpRangeFile::open(&url).unwrap();
@@ -1107,6 +1382,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/a.tar");
         let local = resolve_to_local(&url).unwrap();
@@ -1122,6 +1398,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/live.bin");
         let access = resolve_http(&url).unwrap();
@@ -1152,6 +1429,7 @@ mod tests {
             accept_ranges: false,
             honor_range: false,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/full.bin");
         let access = resolve_http(&url).unwrap();
@@ -1171,6 +1449,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/api.bin");
         let mut f = open_http_range(&url).unwrap();
@@ -1189,6 +1468,7 @@ mod tests {
             accept_ranges: true,
             honor_range: true,
             head_rejects: false,
+            require_basic: None,
         });
         let url = mock.url("/acc.bin");
         let acc = resolve_access(&url).unwrap();
@@ -1213,6 +1493,149 @@ mod tests {
         assert!(!acc.uses_ranges());
         assert_eq!(acc.path(), Some(p.as_path()));
         let _ = std::fs::remove_file(p);
+    }
+
+    // --- FR-2 / #157: HTTP Basic authentication ---
+
+    #[test]
+    fn parse_http_url_strips_userinfo() {
+        let loc = parse_http_url("https://alice:s3cret@files.example.com/a.tar").unwrap();
+        assert_eq!(loc.url, "https://files.example.com/a.tar");
+        let auth = loc.auth.expect("auth");
+        assert_eq!(auth.username, "alice");
+        assert_eq!(auth.password.as_deref(), Some("s3cret"));
+        assert_eq!(
+            auth.authorization_header(),
+            webdav::basic_auth_header("alice", Some("s3cret"))
+        );
+    }
+
+    #[test]
+    fn parse_http_url_env_fallback() {
+        let _g = HttpEnvGuard::acquire(&[HTTP_USER_ENV, HTTP_PASSWORD_ENV]);
+        _g.set(HTTP_USER_ENV, "envuser");
+        _g.set(HTTP_PASSWORD_ENV, "envpass");
+        let loc = parse_http_url("http://127.0.0.1:9/blob.bin").unwrap();
+        let auth = loc.auth.expect("env auth");
+        assert_eq!(auth.username, "envuser");
+        assert_eq!(auth.password.as_deref(), Some("envpass"));
+        // URL userinfo wins over env.
+        let loc2 = parse_http_url("http://urluser:urlpass@127.0.0.1:9/x").unwrap();
+        let auth2 = loc2.auth.expect("url auth");
+        assert_eq!(auth2.username, "urluser");
+        assert_eq!(auth2.password.as_deref(), Some("urlpass"));
+    }
+
+    /// Regression: HTTP Basic auth via URL userinfo on GET materialize.
+    #[test]
+    fn http_basic_auth_from_url_userinfo() {
+        let body = b"auth-url-payload".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+            require_basic: Some(("alice".into(), "s3cret".into())),
+        });
+        let bare = mock.url("/secret.bin");
+        let err = fetch_http_to_temp(&bare).unwrap_err().to_string();
+        assert!(
+            err.contains("401"),
+            "expected clear 401 without credentials, got {err}"
+        );
+        assert!(
+            err.contains(HTTP_USER_ENV) || err.contains("userinfo") || err.contains("user:pass"),
+            "401 should mention credential sources, got {err}"
+        );
+
+        let authed = mock.url_with_auth("alice", "s3cret", "/secret.bin");
+        let (mut tmp, size) = fetch_http_to_temp(&authed).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("Authorization: Basic ")),
+            "expected Authorization on GET, log={log:?}"
+        );
+    }
+
+    /// Regression: HTTP Basic auth via RATARMOUNT_HTTP_USER / RATARMOUNT_HTTP_PASSWORD.
+    #[test]
+    fn http_basic_auth_from_env() {
+        let body = b"auth-env-payload".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+            require_basic: Some(("envuser".into(), "envpass".into())),
+        });
+        let _g = HttpEnvGuard::acquire(&[HTTP_USER_ENV, HTTP_PASSWORD_ENV]);
+        _g.set(HTTP_USER_ENV, "envuser");
+        _g.set(HTTP_PASSWORD_ENV, "envpass");
+        let url = mock.url("/env.bin");
+        let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+    }
+
+    /// Regression: Authorization Basic sent on live Range GETs after open.
+    #[test]
+    fn http_basic_auth_on_range_requests() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+            require_basic: Some(("rangeuser".into(), "rangepass".into())),
+        });
+        let url = mock.url_with_auth("rangeuser", "rangepass", "/ranged.bin");
+        let mut f = HttpRangeFile::open(&url).unwrap();
+        assert!(f.uses_ranges());
+        // Credentials stripped from stored URL.
+        assert!(!f.url().contains("rangepass"));
+        assert!(!f.url().contains("rangeuser@"));
+        assert_eq!(f.auth().map(|a| a.username.as_str()), Some("rangeuser"));
+
+        f.seek(SeekFrom::Start(100)).unwrap();
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &body[100..132]);
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+        let log = mock.log.lock().unwrap();
+        let auth_count = log
+            .iter()
+            .filter(|l| l.starts_with("Authorization: Basic "))
+            .count();
+        assert!(
+            auth_count >= 2,
+            "expected Basic auth on probe + Range GET, log={log:?}"
+        );
+    }
+
+    /// Regression: wrong password → clear HTTP 401, not a generic transport error.
+    #[test]
+    fn http_basic_auth_401_clear_error() {
+        let body = b"nope".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body,
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+            require_basic: Some(("good".into(), "pass".into())),
+        });
+        let bad = mock.url_with_auth("good", "wrong", "/x.bin");
+        let err = open_http_range(&bad).unwrap_err().to_string();
+        assert!(err.contains("401"), "got {err}");
+        assert!(
+            err.contains("Unauthorized") || err.contains(HTTP_USER_ENV),
+            "got {err}"
+        );
     }
 
     /// Minimal WebDAV-capable mock: PROPFIND (207) + GET with optional Basic auth.

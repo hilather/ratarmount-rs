@@ -5,7 +5,7 @@
 | Scheme | Behavior |
 |--------|----------|
 | `file://` | Map to local path |
-| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file |
+| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic auth** (URL userinfo and/or env) on HEAD/GET/Range |
 | `s3://bucket/key` | AWS SigV4 GetObject → temp file |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
@@ -13,6 +13,24 @@
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
+
+### HTTP(S) Basic authentication (FR-2 / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
+
+`Authorization: Basic …` is sent on HEAD, full GET, and Range GETs when credentials are available.
+
+| Source | Behavior |
+|--------|----------|
+| URL userinfo | `https://user:pass@host/path` — credentials stripped from the wire URL |
+| Env | `RATARMOUNT_HTTP_USER` + optional `RATARMOUNT_HTTP_PASSWORD` when the URL has no username |
+| URL user + env password | Username in URL, password from `RATARMOUNT_HTTP_PASSWORD` if omitted in the URL |
+
+URL userinfo wins over env username. **401 Unauthorized** returns a clear error naming these credential sources. Cookie-based auth is not supported.
+
+```bash
+ratarmount -f 'https://user:pass@example.com/archives/a.tar' mnt/
+RATARMOUNT_HTTP_USER=user RATARMOUNT_HTTP_PASSWORD=pass \
+  ratarmount -f https://example.com/archives/a.tar mnt/
+```
 
 `webdav://` / `webdavs://` use `fetch_webdav_to_temp` (plain file GET is enough for mounting; recursive directory mount is out of scope). Plain `http(s)://` DAV endpoints that need no special scheme continue to use the HTTP path; put credentials in the URL when using the WebDAV schemes.
 
@@ -61,6 +79,7 @@ ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
 
 ```bash
 ratarmount -f http://127.0.0.1:8000/archive.tar mnt/
+ratarmount -f 'https://user:pass@example.com/archive.tar' mnt/
 ratarmount -f file:///path/to/archive.tar mnt/
 ratarmount -f s3://my-bucket/path/archive.tar mnt/
 ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/

@@ -17,37 +17,32 @@ issue from the README feature tables.
 | [#128](https://github.com/mxmlnkn/ratarmount/issues/128) | Add WARC support | **done** | Stencil `WarcMountSource` + nested `open_from_reader` |
 | [#126](https://github.com/mxmlnkn/ratarmount/issues/126) | Add lzip support | **done** | Seekable lzip body in `ratarmount-compress` |
 | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) | Create index only, do not mount | **done** | `--no-mount` |
-| [#151](https://github.com/mxmlnkn/ratarmount/issues/151) | Mount compression layer only | **done** / **partial** | Plain compress + `--recursion-depth`; no separate “undo TAR” flag beyond depth 0 |
+| [#151](https://github.com/mxmlnkn/ratarmount/issues/151) | Mount compression layer only | **done** / **partial** | Plain compress + `--recursion-depth`; no separate "undo TAR" flag beyond depth 0 |
 | [#109](https://github.com/mxmlnkn/ratarmount/issues/109) | Support more formats | **done** / **partial** | Broad matrix; RAR/LHA still libarchive sequential |
 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | xattrs in TAR | **done** | Content-hash xattrs (`--hashes`) + TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` → index + FUSE (vendor MPE/ZOS pax keys not mapped) |
 | [#100](https://github.com/mxmlnkn/ratarmount/issues/100) | Use pread | **done** | FUSE low-level read path is offset-based (pread-style) |
 | [#79](https://github.com/mxmlnkn/ratarmount/issues/79) | Metadata for recursive compressed TARs in outer index | **partial** | `nestedTarMembers` / flatten paths; not full Python dual-index |
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
-| [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) (seek-table → multi-frame → full decode; producer recipes) |
-| [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `ratarmount-compositing::commit_overlay`; residual encrypted/multi-part |
+| [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) |
+| [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `commit_overlay`; residual encrypted/multi-part |
+| [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic auth (URL userinfo + `RATARMOUNT_HTTP_*`); cookie auth deferred |
+| [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
 
 ---
 
 ## Implementable correctly (todo list)
 
-Prioritized by maintainer clarity + fit for Rust architecture.
-
-### P0 — clear notes, high user value
+### P0 — remaining
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-1 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | **ZIP commit-overlay** | **done** (MVP): full rebuild in `commit_overlay` — raw-copy unchanged store/deflate members; overlay files deflate; atomic replace. Residual: encrypted/multi-part/spanned ZIP, in-place append, jar/war extras | `ratarmount-compositing` |
-| FR-2 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | **HTTP(S) authentication** | Basic auth via URL / headers; cookie auth harder | `ratarmount-remote` |
-| FR-3 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | **TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*`** | **done** — index + `list_xattr`/`get_xattr`; skip vendor MPE/ZOS pax keys | `formats-tar` (fuse already serves index xattrs) |
-| FR-4 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | **Parallel inflate of large ZIP deflate members** | **done** (Rust): single-flight shared Deflate cache (`OnceLock` per header offset) so concurrent `open` of the same large member inflates once; distinct members inflate in parallel via offline flate2; path-backed `--hashes` parallel-decodes plain Stored/Deflate at index time. Store stencil + encrypted paths unchanged. Residual: no true *intra-member* parallel deflate; encrypted multi-open still sequential via zip crate | `formats-zip` |
+| FR-5 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | **Readahead-like option** | Performance for sequential scans | `ratarmount-fuse` + open buffering |
 
 ### P1 — good notes, medium design
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-5 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | **Readahead-like option** | Performance for sequential scans | `ratarmount-fuse` + open buffering |
 | FR-6 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **Parallel index nested archives** | Nested index work can fan out | factory / automount / index |
-| FR-7 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | **Document multi-frame / chunked zstd** | **done** — [`docs/zstd-random-access.md`](../zstd-random-access.md) | docs |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | Use libarchive path; document | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | APIs exist; wire factory fully | `ratarmount/src/factory.rs` |
 
@@ -61,15 +56,16 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 | FR-13 | [#175](https://github.com/mxmlnkn/ratarmount/issues/175) | LD_PRELOAD / syscall wrap FS | Not FUSE; library path exists; out of product scope for now |
 | FR-14 | [#192](https://github.com/mxmlnkn/ratarmount/issues/192) | SQL-free lightweight index | Competing index format; large design |
 | FR-15 | Pure RAR / pure lrzip | Beyond libarchive/CLI | Accepted dual-run residual |
+| FR-2 residual | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | Cookie-based HTTP auth | Maintainer: harder; Basic auth done |
 
 ---
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1 (ZIP commit-overlay MVP), FR-3 (TAR PAX xattrs), FR-4 (ZIP deflate single-flight + parallel multi-member), FR-7 (zstd multi-frame docs).
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-7.
 
-1. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
-2. **FR-5** FUSE readahead knobs  
-3. **FR-9** Factory side-table auto-wire  
+1. **FR-5** FUSE readahead knobs  
+2. **FR-9** Factory side-table auto-wire  
+3. **FR-6** Parallel nested indexing (when needed)
 
 Update this file when status changes. Keep README **Upstream** column in sync.
