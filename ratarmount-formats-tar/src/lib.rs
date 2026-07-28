@@ -649,7 +649,8 @@ impl MountSource for SqliteIndexedTar {
         true
     }
 
-    /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
+    /// Xattr keys from the SQLite index: content hashes (`user.hash.*`) and archive-stored
+    /// filesystem xattrs (`SCHILY.xattr` / `LIBARCHIVE.xattr` → real FS names).
     fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
         let Some(oh) = tar_offsetheader(file_info) else {
             return Vec::new();
@@ -657,7 +658,7 @@ impl MountSource for SqliteIndexedTar {
         self.index.list_xattr_keys(oh).unwrap_or_default()
     }
 
-    /// One xattr value from the index (e.g. hex digest for `user.hash.sha256`).
+    /// One xattr value from the index (hash digests or PAX-stored FS xattr bytes).
     fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
         let oh = tar_offsetheader(file_info)?;
         self.index.get_xattr(oh, key).ok().flatten()
@@ -737,12 +738,144 @@ struct PaxParsed {
     map: std::collections::HashMap<String, String>,
     /// Ordered sparse pairs from repeated `GNU.sparse.offset` / `numbytes` (format 0.0).
     sparse_pairs: Vec<(u64, u64)>,
+    /// Filesystem xattrs from `SCHILY.xattr.*` / `LIBARCHIVE.xattr.*` (FS key → value bytes).
+    /// Vendor pax keywords (MPE/ZOS/…) are intentionally not stored here.
+    fs_xattrs: std::collections::HashMap<String, Vec<u8>>,
+}
+
+impl PaxParsed {
+    fn empty() -> Self {
+        Self {
+            map: std::collections::HashMap::new(),
+            sparse_pairs: Vec::new(),
+            fs_xattrs: std::collections::HashMap::new(),
+        }
+    }
+}
+
+/// PAX prefixes for filesystem extended attributes (Python `SQLiteIndexedTar` / FR-3).
+const SCHILY_XATTR_PREFIX: &str = "SCHILY.xattr.";
+const LIBARCHIVE_XATTR_PREFIX: &str = "LIBARCHIVE.xattr.";
+
+/// urllib.parse.unquote-style percent-decode (does not treat `+` as space).
+fn percent_decode_str(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h1), Some(h2)) =
+                (from_hex_digit(bytes[i + 1]), from_hex_digit(bytes[i + 2]))
+            {
+                out.push((h1 << 4) | h2);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex_digit(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+/// Python `decode_unpadded_base64`: pad to multiple of 4 then standard base64 decode.
+fn decode_unpadded_base64(data: &str) -> Option<Vec<u8>> {
+    let pad = (4 - (data.len() % 4)) % 4;
+    let mut padded = data.as_bytes().to_vec();
+    padded.extend(std::iter::repeat_n(b'=', pad));
+    base64_std_decode(&padded)
+}
+
+/// Minimal standard base64 decoder (no external crate; A–Z a–z 0–9 + /).
+fn base64_std_decode(input: &[u8]) -> Option<Vec<u8>> {
+    fn dec(b: u8) -> Option<u8> {
+        match b {
+            b'A'..=b'Z' => Some(b - b'A'),
+            b'a'..=b'z' => Some(b - b'a' + 26),
+            b'0'..=b'9' => Some(b - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            b'=' => Some(0), // padding handled by length
+            _ => None,
+        }
+    }
+    let filtered: Vec<u8> = input
+        .iter()
+        .copied()
+        .filter(|&b| !b.is_ascii_whitespace())
+        .collect();
+    if !filtered.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
+    for chunk in filtered.chunks_exact(4) {
+        let (a, b, c, d) = (
+            dec(chunk[0])?,
+            dec(chunk[1])?,
+            dec(chunk[2])?,
+            dec(chunk[3])?,
+        );
+        out.push((a << 2) | (b >> 4));
+        if chunk[2] != b'=' {
+            out.push(((b & 0x0f) << 4) | (c >> 2));
+        }
+        if chunk[3] != b'=' {
+            out.push(((c & 0x03) << 6) | d);
+        }
+    }
+    Some(out)
+}
+
+/// Build FS xattr map from pax keys: SCHILY first, then LIBARCHIVE overwrites (Python parity).
+///
+/// - `SCHILY.xattr.<name>` → value is raw bytes from the pax record
+/// - `LIBARCHIVE.xattr.<name>` → key is percent-decoded; value is unpadded base64
+fn fs_xattrs_from_pax_entries(
+    schily: std::collections::HashMap<String, Vec<u8>>,
+    libarchive: std::collections::HashMap<String, Vec<u8>>,
+) -> std::collections::HashMap<String, Vec<u8>> {
+    let mut fs_xattrs = schily;
+    for (enc_key, b64_val) in libarchive {
+        let name = percent_decode_str(&enc_key);
+        let Ok(s) = std::str::from_utf8(&b64_val) else {
+            continue;
+        };
+        if let Some(decoded) = decode_unpadded_base64(s.trim()) {
+            fs_xattrs.insert(name, decoded);
+        }
+    }
+    fs_xattrs
+}
+
+/// Append `(offsetheader, key, value)` rows for index insert.
+fn push_xattr_rows(
+    out: &mut Vec<(i64, String, Vec<u8>)>,
+    offsetheader: u64,
+    fs_xattrs: &std::collections::HashMap<String, Vec<u8>>,
+) {
+    let oh = offsetheader as i64;
+    for (key, value) in fs_xattrs {
+        out.push((oh, key.clone(), value.clone()));
+    }
 }
 
 /// Parse pax extended header records (`LEN key=value\n` …).
 fn parse_pax_records(data: &[u8]) -> PaxParsed {
     let mut map = std::collections::HashMap::new();
     let mut sparse_pairs = Vec::new();
+    let mut schily_xattrs: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut libarchive_xattrs: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
     let mut pending_offset: Option<u64> = None;
     let mut i = 0usize;
     while i < data.len() {
@@ -771,20 +904,31 @@ fn parse_pax_records(data: &[u8]) -> PaxParsed {
                 if val_end > 0 && record[val_end - 1] == b'\n' {
                     val_end -= 1;
                 }
-                let val = String::from_utf8_lossy(&record[eq + 1..val_end]).into_owned();
+                let val_raw = &record[eq + 1..val_end];
+                let val = String::from_utf8_lossy(val_raw).into_owned();
                 if key == "GNU.sparse.offset" {
                     pending_offset = val.parse().ok();
                 } else if key == "GNU.sparse.numbytes" {
                     if let (Some(off), Ok(len)) = (pending_offset.take(), val.parse::<u64>()) {
                         sparse_pairs.push((off, len));
                     }
+                } else if let Some(suffix) = key.strip_prefix(SCHILY_XATTR_PREFIX) {
+                    // Raw value bytes (binary-safe); do not use UTF-8 lossy form.
+                    schily_xattrs.insert(suffix.to_string(), val_raw.to_vec());
+                } else if let Some(suffix) = key.strip_prefix(LIBARCHIVE_XATTR_PREFIX) {
+                    libarchive_xattrs.insert(suffix.to_string(), val_raw.to_vec());
                 }
                 map.insert(key, val);
             }
         }
         i += rec_len;
     }
-    PaxParsed { map, sparse_pairs }
+    let fs_xattrs = fs_xattrs_from_pax_entries(schily_xattrs, libarchive_xattrs);
+    PaxParsed {
+        map,
+        sparse_pairs,
+        fs_xattrs,
+    }
 }
 
 /// GNU sparse 1.0 map at the start of the data blocks: `N\noff\nlen\n…` then 512-pad.
@@ -937,12 +1081,12 @@ fn parse_tar_into_index<R: Read + Seek>(
     let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
     let mut pax_global: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut pax_pending: PaxParsed = PaxParsed {
-        map: std::collections::HashMap::new(),
-        sparse_pairs: Vec::new(),
-    };
+    let mut pax_global_xattrs: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut pax_pending: PaxParsed = PaxParsed::empty();
     let mut pax_header_start: Option<u64> = None;
     let mut nested_pending: Vec<NestedPending> = Vec::new();
+    let mut xattr_batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH_FLUSH);
 
     let mut is_gnu_incremental = match options.gnu_incremental {
         Some(v) => v,
@@ -952,6 +1096,13 @@ fn parse_tar_into_index<R: Read + Seek>(
     let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
         if !batch.is_empty() {
             index.insert_files_batch(batch)?;
+            batch.clear();
+        }
+        Ok(())
+    };
+    let flush_xattrs = |batch: &mut Vec<(i64, String, Vec<u8>)>| -> Result<()> {
+        if !batch.is_empty() {
+            index.insert_xattrs_batch(batch)?;
             batch.clear();
         }
         Ok(())
@@ -1001,6 +1152,7 @@ fn parse_tar_into_index<R: Read + Seek>(
             let recs = parse_pax_records(&body);
             if typeflag == b'g' {
                 pax_global.extend(recs.map);
+                pax_global_xattrs.extend(recs.fs_xattrs);
             } else {
                 pax_pending = recs;
                 pax_header_start = Some(pos);
@@ -1032,18 +1184,15 @@ fn parse_tar_into_index<R: Read + Seek>(
 
         // Merge pax for this member.
         let mut pax_map = pax_global.clone();
-        let pending = std::mem::replace(
-            &mut pax_pending,
-            PaxParsed {
-                map: std::collections::HashMap::new(),
-                sparse_pairs: Vec::new(),
-            },
-        );
+        let pending = std::mem::replace(&mut pax_pending, PaxParsed::empty());
         pax_map.extend(pending.map.iter().map(|(k, v)| (k.clone(), v.clone())));
         let pax_for_sparse = PaxParsed {
             map: pax_map.clone(),
             sparse_pairs: pending.sparse_pairs,
+            fs_xattrs: std::collections::HashMap::new(),
         };
+        let mut member_fs_xattrs = pax_global_xattrs.clone();
+        member_fs_xattrs.extend(pending.fs_xattrs);
         let member_header_start = pax_header_start.take().unwrap_or(pos);
 
         let mut name = if let Some(p) = pax_map.get("path") {
@@ -1182,8 +1331,15 @@ fn parse_tar_into_index<R: Read + Seek>(
                 &mut generated_dirs,
             )?;
         }
+        // Archive-stored FS xattrs (LIBARCHIVE./SCHILY.xattr.*) keyed by offsetheader.
+        if !member_fs_xattrs.is_empty() {
+            push_xattr_rows(&mut xattr_batch, member_header_start, &member_fs_xattrs);
+        }
         if batch.len() >= BATCH_FLUSH {
             flush(&mut batch)?;
+        }
+        if xattr_batch.len() >= BATCH_FLUSH {
+            flush_xattrs(&mut xattr_batch)?;
         }
 
         pos = if typeflag == b'5' || typeflag == b'1' || typeflag == b'2' {
@@ -1201,6 +1357,7 @@ fn parse_tar_into_index<R: Read + Seek>(
     }
 
     flush(&mut batch)?;
+    flush_xattrs(&mut xattr_batch)?;
 
     let nested_members: Vec<NestedTarMember> =
         nested_pending.iter().map(|n| n.member.clone()).collect();
@@ -1241,11 +1398,19 @@ fn flatten_nested_tars<R: Read + Seek>(
     }
 
     let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
+    let mut xattr_batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH_FLUSH);
     let mut deeper: Vec<NestedPending> = Vec::new();
 
     let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
         if !batch.is_empty() {
             index.insert_files_batch(batch)?;
+            batch.clear();
+        }
+        Ok(())
+    };
+    let flush_xattrs = |batch: &mut Vec<(i64, String, Vec<u8>)>| -> Result<()> {
+        if !batch.is_empty() {
+            index.insert_xattrs_batch(batch)?;
             batch.clear();
         }
         Ok(())
@@ -1273,6 +1438,7 @@ fn flatten_nested_tars<R: Read + Seek>(
             content_depth,
             is_gnu_incremental,
             &mut batch,
+            &mut xattr_batch,
             generated_dirs,
             &mut deeper,
             &mut found_any,
@@ -1295,9 +1461,13 @@ fn flatten_nested_tars<R: Read + Seek>(
         if batch.len() >= BATCH_FLUSH {
             flush(&mut batch)?;
         }
+        if xattr_batch.len() >= BATCH_FLUSH {
+            flush_xattrs(&mut xattr_batch)?;
+        }
     }
 
     flush(&mut batch)?;
+    flush_xattrs(&mut xattr_batch)?;
 
     // Depth-first further nesting (Python walks each nested after its parent layer's files).
     if !deeper.is_empty() {
@@ -1381,6 +1551,7 @@ fn walk_tar_region<R: Read + Seek>(
     recursion_depth: i32,
     is_gnu_incremental: &mut bool,
     batch: &mut Vec<FileRow>,
+    xattr_batch: &mut Vec<(i64, String, Vec<u8>)>,
     generated_dirs: &mut std::collections::BTreeSet<String>,
     nested_out: &mut Vec<NestedPending>,
     found_any: &mut bool,
@@ -1393,10 +1564,9 @@ fn walk_tar_region<R: Read + Seek>(
     let mut header = [0u8; 512];
     let mut pax_global: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
-    let mut pax_pending = PaxParsed {
-        map: std::collections::HashMap::new(),
-        sparse_pairs: Vec::new(),
-    };
+    let mut pax_global_xattrs: std::collections::HashMap<String, Vec<u8>> =
+        std::collections::HashMap::new();
+    let mut pax_pending = PaxParsed::empty();
     let mut pax_header_start: Option<u64> = None;
 
     loop {
@@ -1448,6 +1618,7 @@ fn walk_tar_region<R: Read + Seek>(
             let recs = parse_pax_records(&body);
             if typeflag == b'g' {
                 pax_global.extend(recs.map);
+                pax_global_xattrs.extend(recs.fs_xattrs);
             } else {
                 pax_pending = recs;
                 pax_header_start = Some(pos);
@@ -1480,18 +1651,15 @@ fn walk_tar_region<R: Read + Seek>(
         }
 
         let mut pax_map = pax_global.clone();
-        let pending = std::mem::replace(
-            &mut pax_pending,
-            PaxParsed {
-                map: std::collections::HashMap::new(),
-                sparse_pairs: Vec::new(),
-            },
-        );
+        let pending = std::mem::replace(&mut pax_pending, PaxParsed::empty());
         pax_map.extend(pending.map.iter().map(|(k, v)| (k.clone(), v.clone())));
         let pax_for_sparse = PaxParsed {
             map: pax_map.clone(),
             sparse_pairs: pending.sparse_pairs,
+            fs_xattrs: std::collections::HashMap::new(),
         };
+        let mut member_fs_xattrs = pax_global_xattrs.clone();
+        member_fs_xattrs.extend(pending.fs_xattrs);
         let member_header_start = pax_header_start.take().unwrap_or(pos);
 
         let mut name = if let Some(p) = pax_map.get("path") {
@@ -1632,6 +1800,9 @@ fn walk_tar_region<R: Read + Seek>(
                 i64::from(recursion_depth),
                 generated_dirs,
             )?;
+        }
+        if !member_fs_xattrs.is_empty() {
+            push_xattr_rows(xattr_batch, member_header_start, &member_fs_xattrs);
         }
         *found_any = true;
 
@@ -2106,10 +2277,7 @@ fn open_sparse_member<R: Read + Seek + Send + 'static>(
     let mut header = [0u8; 512];
     file.seek(SeekFrom::Start(pos))?;
     file.read_exact(&mut header)?;
-    let mut pax = PaxParsed {
-        map: std::collections::HashMap::new(),
-        sparse_pairs: Vec::new(),
-    };
+    let mut pax = PaxParsed::empty();
 
     // Optional PAX 'x' header before the file header.
     if header[156] == b'x' {
@@ -3275,6 +3443,283 @@ mod tests {
         assert_eq!(crc.as_slice(), b"af083b2d");
         assert!(m.get_xattr(&fi, "user.hash.md5").is_none());
         assert!(m.get_xattr(&fi, "missing").is_none());
+    }
+
+    /// Regression: TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` → index + list_xattr/get_xattr.
+    /// Vendor MPE/ZOS pax keys must not appear as filesystem xattrs (maintainer #145).
+    #[test]
+    fn pax_libarchive_schily_xattrs_synthetic() {
+        // Build a pax-format TAR with both SCHILY (raw) and LIBARCHIVE (base64) xattrs.
+        let tar_bytes = build_pax_xattr_tar(
+            "foo.txt",
+            b"hello\n",
+            &[
+                ("SCHILY.xattr.user.tags", b"mytag".as_slice()),
+                // base64("mytag") without padding = bXl0YWc — overwrites SCHILY for same key
+                ("LIBARCHIVE.xattr.user.tags", b"bXl0YWc"),
+                ("SCHILY.xattr.user.comment", b"hello world"),
+                // binary-ish SCHILY (NUL-terminated Haiku-style string)
+                ("SCHILY.xattr.user.haiku.META:nick", b"Nick\0"),
+                // percent-encoded key in LIBARCHIVE prefix
+                (
+                    "LIBARCHIVE.xattr.user.foo%2Fbar",
+                    // base64("ab") = YWI
+                    b"YWI",
+                ),
+                // Vendor keyword — must NOT become an xattr
+                ("MPE.FILECODE", b"0"),
+                ("ZOS.FILETAG", b"x"),
+            ],
+        );
+
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("xattrs.tar");
+        std::fs::write(&tar_path, &tar_bytes).unwrap();
+
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &tar_path,
+            &tar_path,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index synthetic pax xattr tar");
+
+        let fi = m.lookup("/foo.txt", 0).expect("lookup foo.txt");
+        let mut keys = m.list_xattr(&fi);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.comment".to_string(),
+                "user.foo/bar".to_string(),
+                "user.haiku.META:nick".to_string(),
+                "user.tags".to_string(),
+            ],
+            "FS xattr keys only (no MPE/ZOS); LIBARCHIVE key percent-decoded"
+        );
+
+        // LIBARCHIVE overwrites SCHILY for user.tags → still "mytag"
+        assert_eq!(
+            m.get_xattr(&fi, "user.tags").as_deref(),
+            Some(b"mytag".as_slice())
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.comment").as_deref(),
+            Some(b"hello world".as_slice())
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.haiku.META:nick").as_deref(),
+            Some(b"Nick\0".as_slice()),
+            "SCHILY binary value preserved"
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.foo/bar").as_deref(),
+            Some(b"ab".as_slice())
+        );
+        // Vendor keys must not be exposed under any name
+        assert!(m.get_xattr(&fi, "MPE.FILECODE").is_none());
+        assert!(m.get_xattr(&fi, "FILECODE").is_none());
+        assert!(m.get_xattr(&fi, "user.pax.MPE.FILECODE").is_none());
+    }
+
+    /// Unit helpers: unpadded base64 + percent-decode match Python.
+    #[test]
+    fn pax_xattr_decode_helpers() {
+        assert_eq!(
+            decode_unpadded_base64("bXl0YWc").as_deref(),
+            Some(b"mytag".as_slice())
+        );
+        assert_eq!(
+            decode_unpadded_base64("bXl0YWc=").as_deref(),
+            Some(b"mytag".as_slice())
+        );
+        assert_eq!(
+            decode_unpadded_base64("TmljawA").as_deref(),
+            Some(b"Nick\0".as_slice())
+        );
+        assert_eq!(percent_decode_str("user.foo%2Fbar"), "user.foo/bar");
+        assert_eq!(percent_decode_str("a+b"), "a+b"); // not unquote_plus
+        assert_eq!(percent_decode_str("plain"), "plain");
+
+        // SCHILY then LIBARCHIVE overwrite (same as parse_pax_records order policy)
+        let mut schily = std::collections::HashMap::new();
+        schily.insert("user.tags".into(), b"from-schily".to_vec());
+        let mut liba = std::collections::HashMap::new();
+        liba.insert("user.tags".into(), b"ZnJvbS1saWJh".to_vec()); // base64("from-liba")
+        let merged = fs_xattrs_from_pax_entries(schily, liba);
+        assert_eq!(
+            merged.get("user.tags").map(Vec::as_slice),
+            Some(b"from-liba".as_slice())
+        );
+    }
+
+    /// Optional Python fixture: file-with-attribute.bsd.tar.bz2 (bsdtar dual SCHILY+LIBARCHIVE).
+    #[test]
+    fn pax_xattrs_python_bsd_fixture_if_present() {
+        let root = py_test_root();
+        let bz2_path = root.join("tests/file-with-attribute.bsd.tar.bz2");
+        if !bz2_path.exists() {
+            eprintln!("skip: missing fixture {}", bz2_path.display());
+            return;
+        }
+        // Decompress to plain TAR for create_index (no factory compress path here).
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("file-with-attribute.bsd.tar");
+        let status = Command::new("bunzip2")
+            .args(["-k", "-c"])
+            .arg(&bz2_path)
+            .stdout(std::fs::File::create(&tar_path).unwrap())
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skip: bunzip2 not available");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skip: bunzip2 failed on fixture");
+            return;
+        }
+
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &tar_path,
+            &tar_path,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index bsd xattr fixture");
+
+        let fi = m.lookup("/foo", 0).expect("lookup /foo");
+        let keys = m.list_xattr(&fi);
+        assert!(
+            keys.iter().any(|k| k == "user.tags"),
+            "expected user.tags, got {keys:?}"
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.tags").as_deref(),
+            Some(b"mytag".as_slice())
+        );
+
+        let fi2 = m.lookup("/foo2", 0).expect("lookup /foo2");
+        assert_eq!(
+            m.get_xattr(&fi2, "user.tags").as_deref(),
+            Some(b"mytag2".as_slice())
+        );
+    }
+
+    /// Optional Python fixture: file-with-attribute.gnu.tar.bz2 (SCHILY only).
+    #[test]
+    fn pax_xattrs_python_gnu_fixture_if_present() {
+        let root = py_test_root();
+        let bz2_path = root.join("tests/file-with-attribute.gnu.tar.bz2");
+        if !bz2_path.exists() {
+            eprintln!("skip: missing fixture {}", bz2_path.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("file-with-attribute.gnu.tar");
+        let status = Command::new("bunzip2")
+            .args(["-k", "-c"])
+            .arg(&bz2_path)
+            .stdout(std::fs::File::create(&tar_path).unwrap())
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skip: bunzip2 not available");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skip: bunzip2 failed on fixture");
+            return;
+        }
+
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &tar_path,
+            &tar_path,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index gnu xattr fixture");
+
+        let fi = m.lookup("/foo", 0).expect("lookup /foo");
+        assert_eq!(
+            m.get_xattr(&fi, "user.tags").as_deref(),
+            Some(b"mytag".as_slice())
+        );
+    }
+
+    /// Build a minimal ustar+pax archive with the given extended header records.
+    fn build_pax_xattr_tar(name: &str, payload: &[u8], pax_kvs: &[(&str, &[u8])]) -> Vec<u8> {
+        fn pad512(mut b: Vec<u8>) -> Vec<u8> {
+            let n = (512 - (b.len() % 512)) % 512;
+            b.extend(std::iter::repeat_n(0u8, n));
+            b
+        }
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn ustar_header(name: &str, size: u64, typeflag: u8, mode: u32) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            let nlen = nb.len().min(100);
+            h[..nlen].copy_from_slice(&nb[..nlen]);
+            h[100..108].copy_from_slice(&oct_field(mode as u64, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            // checksum
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+        fn pax_record(key: &str, value: &[u8]) -> Vec<u8> {
+            // LEN includes digits + space + key + '=' + value + '\n'
+            for len_digits in 1..8 {
+                let mut body = Vec::new();
+                body.push(b' ');
+                body.extend_from_slice(key.as_bytes());
+                body.push(b'=');
+                body.extend_from_slice(value);
+                body.push(b'\n');
+                let total = len_digits + body.len();
+                if total.to_string().len() == len_digits {
+                    let mut rec = total.to_string().into_bytes();
+                    rec.extend(body);
+                    return rec;
+                }
+            }
+            panic!("pax record too long for {key}");
+        }
+
+        let mut pax_body = Vec::new();
+        pax_body.extend(pax_record("path", name.as_bytes()));
+        for (k, v) in pax_kvs {
+            pax_body.extend(pax_record(k, v));
+        }
+        let pax_name = format!("PaxHeaders.0/{name}");
+        let mut out = Vec::new();
+        out.extend_from_slice(&ustar_header(&pax_name, pax_body.len() as u64, b'x', 0o644));
+        out.extend(pad512(pax_body));
+        out.extend_from_slice(&ustar_header(name, payload.len() as u64, b'0', 0o644));
+        out.extend(pad512(payload.to_vec()));
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
     }
 
     /// Single-file over `DecodedBody` (no host path): list, full read, mid-seek.

@@ -86,7 +86,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables | `[x]` / `~` decoder import of Python blobs |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
-| Index file hashes / xattrs | yes | `--hashes` + FUSE xattrs for TAR/ZIP/7z | `[x]` / `~` solid 7z shared key; other formats |
+| Index file hashes / xattrs | yes | `--hashes` + FUSE xattrs for TAR/ZIP/7z; TAR PAX LIBARCHIVE/SCHILY FS xattrs | `[x]` / `~` solid 7z shared key; other formats |
 | `--use-backend` selection | yes | reorders format probe (last flag highest) | `[x]` |
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |

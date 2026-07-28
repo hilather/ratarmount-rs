@@ -19,7 +19,7 @@ issue from the README feature tables.
 | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) | Create index only, do not mount | **done** | `--no-mount` |
 | [#151](https://github.com/mxmlnkn/ratarmount/issues/151) | Mount compression layer only | **done** / **partial** | Plain compress + `--recursion-depth`; no separate “undo TAR” flag beyond depth 0 |
 | [#109](https://github.com/mxmlnkn/ratarmount/issues/109) | Support more formats | **done** / **partial** | Broad matrix; RAR/LHA still libarchive sequential |
-| [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | xattrs in TAR | **partial** | Content-hash xattrs (`--hashes`); **LIBARCHIVE./SCHILY.xattr** PAX → FUSE still open |
+| [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | xattrs in TAR | **done** | Content-hash xattrs (`--hashes`) + TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*` → index + FUSE (vendor MPE/ZOS pax keys not mapped) |
 | [#100](https://github.com/mxmlnkn/ratarmount/issues/100) | Use pread | **done** | FUSE low-level read path is offset-based (pread-style) |
 | [#79](https://github.com/mxmlnkn/ratarmount/issues/79) | Metadata for recursive compressed TARs in outer index | **partial** | `nestedTarMembers` / flatten paths; not full Python dual-index |
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
@@ -37,7 +37,7 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 |----|----------|------|---------------------|---------------------|
 | FR-1 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | **ZIP commit-overlay** | Doable; Python zip module can’t in-place rewrite well — scale with size; aim for append/rebuild strategy | `ratarmount-compositing` + `formats-zip` |
 | FR-2 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | **HTTP(S) authentication** | Basic auth via URL / headers; cookie auth harder | `ratarmount-remote` |
-| FR-3 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | **TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*`** | Support FS xattrs; skip vendor MPE/ZOS pax keys | `formats-tar` + fuse xattr path |
+| FR-3 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | **TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*`** | **done** — index + `list_xattr`/`get_xattr`; skip vendor MPE/ZOS pax keys | `formats-tar` (fuse already serves index xattrs) |
 | FR-4 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | **Parallel inflate of large ZIP deflate members** | Multi-threaded access to encrypted zip discussed separately; plain deflate parallel open is in scope | `formats-zip` |
 
 ### P1 — good notes, medium design
@@ -65,11 +65,12 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 
 ## Suggested implementation order (agents)
 
-1. **FR-3** TAR SCHILY/LIBARCHIVE xattrs (isolated, tests with Haiku-style fixtures if available)  
-2. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
-3. **FR-1** ZIP commit-overlay MVP (rebuild zip from overlay + base)  
-4. **FR-4** Parallel ZIP deflate member decode  
-5. **FR-5** FUSE readahead knobs  
-6. **FR-9** Factory side-table auto-wire  
+**Done:** FR-3 (TAR PAX xattrs), FR-7 (zstd multi-frame docs).
+
+1. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
+2. **FR-1** ZIP commit-overlay MVP (rebuild zip from overlay + base)  
+3. **FR-4** Parallel ZIP deflate member decode  
+4. **FR-5** FUSE readahead knobs  
+5. **FR-9** Factory side-table auto-wire  
 
 Update this file when status changes. Keep README **Upstream** column in sync.
