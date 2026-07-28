@@ -50,7 +50,7 @@ issue from the README feature tables.
 
 | ID | Upstream | Work | Why deferred / hard |
 |----|----------|------|---------------------|
-| FR-10 | [#160](https://github.com/mxmlnkn/ratarmount/issues/160) / [#164](https://github.com/mxmlnkn/ratarmount/issues/164) | Union **symlink resolve** option | Maintainer still refining semantics; needs design flag |
+| FR-10 | [#160](https://github.com/mxmlnkn/ratarmount/issues/160) / [#164](https://github.com/mxmlnkn/ratarmount/issues/164) | Union **symlink resolve** option | **#164 dir-over-symlink done** (B-4); optional explicit resolve/follow flag for #160 still open |
 | FR-11 | [#120](https://github.com/mxmlnkn/ratarmount/issues/120) | Writable/rename on compressed TAR | Explicit Python TODO; rename is hard |
 | FR-12 | [#118](https://github.com/mxmlnkn/ratarmount/issues/118) | Multi-volume `tar -M` | Multi-device volume TAR |
 | FR-13 | [#175](https://github.com/mxmlnkn/ratarmount/issues/175) | LD_PRELOAD / syscall wrap FS | Not FUSE; library path exists; out of product scope for now |

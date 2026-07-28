@@ -86,7 +86,7 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 |---------|:------:|:----:|------------------|
 | Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)); eager on huge trees can be costly — prefer `-l` ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)) |
 | Lazy mount (`-l`) | yes | **yes** | Prefer for large recursive trees (mount nested on first access) |
-| Union of multiple sources | yes | **yes** | + folder cache; symlink-merge option still open ([#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
+| Union of multiple sources | yes | **yes** | + folder cache; **directory wins over symlink** ([#164](https://github.com/mxmlnkn/ratarmount/issues/164)); optional deeper symlink-resolve flag still open ([#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
 | Write overlay (`-w` / `:temp:`) | yes | **yes** | |
 | `--commit-overlay` | yes | **yes** | TAR + gzip/bzip2/xz (GNU tar); **ZIP full rebuild** ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)) — not in-place; residual encrypted/multi-part |
 | File versions (`.versions/`) | yes | **yes** | default on; `--no-file-versions` |
