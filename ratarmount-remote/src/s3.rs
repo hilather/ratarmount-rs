@@ -1,4 +1,17 @@
-//! S3 GetObject download-to-temp for `s3://bucket/key` (AWS SigV4 + ureq).
+//! S3 GetObject for `s3://bucket/key` (AWS SigV4 + ureq).
+//!
+//! # Download paths
+//!
+//! - **Full GetObject** — single GET of the whole object (small objects / fallback)
+//! - **Range GetObject** — signed (or anonymous) GET with `Range: bytes=start-end`
+//!   ([`fetch_s3_range_bytes`], inclusive end)
+//! - **Prefer-range materialize** — when object size is known and exceeds
+//!   [`DEFAULT_S3_RANGE_THRESHOLD`], sequential Range GETs in
+//!   [`crate::HTTP_RANGE_CHUNK`] windows into a tempfile; else full GET
+//! - **Live Range I/O** — [`S3RangeFile`] / [`open_s3_range`] issues per-read Range GETs
+//!
+//! Size discovery uses a `Range: bytes=0-0` probe (`Content-Range` total), matching
+//! the HTTP / Dropbox prefer-range patterns in this crate.
 //!
 //! # Credential chain (in order)
 //!
@@ -25,7 +38,7 @@
 //! | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
 //! | `RATARMOUNT_IMDS_BASE` / `AWS_EC2_METADATA_SERVICE_ENDPOINT` | Override IMDS base (tests) |
 
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -35,7 +48,13 @@ use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
 
-use crate::{RemoteError, Result, USER_AGENT};
+use crate::{
+    parse_content_range_total, range_chunk_windows, RemoteError, Result, USER_AGENT,
+    HTTP_RANGE_CHUNK,
+};
+
+/// Objects larger than this prefer chunked Range downloads (1 MiB).
+pub const DEFAULT_S3_RANGE_THRESHOLD: u64 = 1024 * 1024;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -520,16 +539,14 @@ fn s3_request_target(loc: &S3Location, region: &str) -> (String, String, bool) {
     }
 }
 
-/// Download `s3://bucket/key` to a tempfile.
+/// Issue GetObject, optionally with an inclusive `Range: bytes=start-end`.
 ///
-/// Credential chain: env keys → ECS/IMDS role → anonymous (if enabled) → error.
-/// See module docs for env knobs.
-pub fn fetch_s3_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
-    let loc = parse_s3_url(url_str)?;
-    fetch_s3_location_to_temp(&loc)
-}
-
-pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64)> {
+/// SigV4 signs the `Range` header when present (required by AWS). Anonymous mode
+/// sends an unsigned GET with the same optional Range.
+fn s3_get_object(
+    loc: &S3Location,
+    range: Option<(u64, u64)>,
+) -> Result<(CredSource, ureq::Response)> {
     let auth = resolve_auth()?;
     let region = region();
     let (host, uri_path, use_https) = s3_request_target(loc, &region);
@@ -539,20 +556,25 @@ pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64
     } else {
         format!("http://{host}{uri_path}")
     };
-    debug!("s3 GET {url} (auth={:?})", auth.source);
+    let range_value = range.map(|(start, end)| format!("bytes={start}-{end}"));
+    debug!(
+        "s3 GET {url} (auth={:?}, range={:?})",
+        auth.source, range_value
+    );
 
     let resp = match &auth.creds {
         None => {
             // Anonymous: plain GET, no Authorization (public buckets).
-            ureq::get(&url)
-                .set("User-Agent", USER_AGENT)
-                .call()
-                .map_err(|e| {
-                    RemoteError::S3(format!(
-                        "anonymous GetObject s3://{}/{}: {e}",
-                        loc.bucket, loc.key
-                    ))
-                })?
+            let mut req = ureq::get(&url).set("User-Agent", USER_AGENT);
+            if let Some(ref r) = range_value {
+                req = req.set("Range", r);
+            }
+            req.call().map_err(|e| {
+                RemoteError::S3(format!(
+                    "anonymous GetObject s3://{}/{}: {e}",
+                    loc.bucket, loc.key
+                ))
+            })?
         }
         Some(creds) => {
             let now = chrono::Utc::now();
@@ -564,6 +586,10 @@ pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64
                 ("x-amz-content-sha256", payload_hash.clone()),
                 ("x-amz-date", amz_date.clone()),
             ];
+            if let Some(ref r) = range_value {
+                // Range must be included in the SigV4 signed headers for AWS.
+                headers_to_sign.push(("range", r.clone()));
+            }
             if let Some(token) = &creds.session_token {
                 headers_to_sign.push(("x-amz-security-token", token.clone()));
             }
@@ -601,6 +627,9 @@ pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64
                 .set("Authorization", &authorization)
                 .set("x-amz-content-sha256", &payload_hash)
                 .set("x-amz-date", &amz_date);
+            if let Some(ref r) = range_value {
+                req = req.set("Range", r);
+            }
             if let Some(token) = &creds.session_token {
                 req = req.set("x-amz-security-token", token);
             }
@@ -610,26 +639,444 @@ pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64
         }
     };
 
-    let status = resp.status();
-    if !(200..300).contains(&status) {
-        let body = resp.into_string().unwrap_or_default();
-        let kind = if auth.source == CredSource::Anonymous {
-            "anonymous GetObject"
-        } else {
-            "GetObject"
-        };
+    Ok((auth.source, resp))
+}
+
+fn s3_status_error(source: CredSource, status: u16, loc: &S3Location, body: &str) -> RemoteError {
+    let kind = if source == CredSource::Anonymous {
+        "anonymous GetObject"
+    } else {
+        "GetObject"
+    };
+    RemoteError::S3(format!(
+        "{kind} HTTP {status} for s3://{}/{}: {body}",
+        loc.bucket, loc.key
+    ))
+}
+
+/// Download `s3://bucket/key` to a tempfile.
+///
+/// Prefers chunked Range materialization for large objects (see
+/// [`fetch_s3_location_to_temp_prefer_range`]). Credential chain: env keys →
+/// ECS/IMDS role → anonymous (if enabled) → error. See module docs for env knobs.
+pub fn fetch_s3_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
+    let loc = parse_s3_url(url_str)?;
+    fetch_s3_location_to_temp(&loc)
+}
+
+/// Download a parsed location, preferring Range chunks for large objects.
+pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64)> {
+    fetch_s3_location_to_temp_prefer_range(loc, None)
+}
+
+/// Download `s3://…`, preferring sequential Range GETs when feasible.
+///
+/// Convenience wrapper around [`fetch_s3_location_to_temp_prefer_range`].
+pub fn fetch_s3_to_temp_prefer_range(url_str: &str) -> Result<(NamedTempFile, u64)> {
+    let loc = parse_s3_url(url_str)?;
+    fetch_s3_location_to_temp_prefer_range(&loc, None)
+}
+
+/// Download an S3 object, preferring sequential HTTP Range chunks when feasible.
+///
+/// - When `known_size` is `Some(n)` and `n > `[`DEFAULT_S3_RANGE_THRESHOLD`],
+///   tries chunked Range materialization first.
+/// - When size is unknown, probes with `Range: bytes=0-0`; on 206 + total size
+///   above threshold, uses chunked Range. If the probe returns a full body
+///   (Range ignored) that body is kept (no second download).
+/// - On any Range failure or when the object is small / ranges unsupported,
+///   falls back to a single full-body GetObject.
+pub fn fetch_s3_location_to_temp_prefer_range(
+    loc: &S3Location,
+    known_size: Option<u64>,
+) -> Result<(NamedTempFile, u64)> {
+    let size_for_range = match known_size {
+        Some(n) if n > DEFAULT_S3_RANGE_THRESHOLD => Some(n),
+        Some(_) => None, // small known size → full body
+        None => match probe_s3_object(loc) {
+            Ok(S3Probe::RangesOk(n)) if n > DEFAULT_S3_RANGE_THRESHOLD => Some(n),
+            Ok(S3Probe::RangesOk(_)) => None,
+            Ok(S3Probe::FullBody(bytes)) => {
+                return bytes_to_tempfile(&bytes);
+            }
+            Ok(S3Probe::Unusable) => None,
+            Err(e) => {
+                debug!(
+                    "s3 range probe failed for s3://{}/{}: {e}; full download",
+                    loc.bucket, loc.key
+                );
+                None
+            }
+        },
+    };
+
+    if let Some(size) = size_for_range {
+        debug!(
+            "s3 prefer-range: s3://{}/{} ({size} bytes) in {}-byte chunks",
+            loc.bucket, loc.key, HTTP_RANGE_CHUNK
+        );
+        match fetch_s3_via_ranges(loc, size) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                debug!(
+                    "s3 range download failed for s3://{}/{}: {e}; falling back to full GET",
+                    loc.bucket, loc.key
+                );
+            }
+        }
+    }
+
+    fetch_s3_full_get(loc)
+}
+
+/// Download an inclusive byte range (`start..=end`) from an S3 object.
+///
+/// Expects HTTP 206 Partial Content. Returns a clear error on 200 (Range ignored)
+/// or other status codes. `end` is inclusive (HTTP Range semantics).
+pub fn fetch_s3_range_bytes(url_str: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
+    let loc = parse_s3_url(url_str)?;
+    fetch_s3_location_range_bytes(&loc, start, end_inclusive)
+}
+
+/// Inclusive byte range GetObject for a parsed location (`start..=end_inclusive`).
+pub fn fetch_s3_location_range_bytes(
+    loc: &S3Location,
+    start: u64,
+    end_inclusive: u64,
+) -> Result<Vec<u8>> {
+    if end_inclusive < start {
         return Err(RemoteError::S3(format!(
-            "{kind} HTTP {status} for s3://{}/{}: {body}",
+            "invalid range {start}-{end_inclusive} for s3://{}/{}",
             loc.bucket, loc.key
         )));
     }
+    let expected = end_inclusive - start + 1;
+    let (source, resp) = s3_get_object(loc, Some((start, end_inclusive)))?;
+    let status = resp.status();
+    if status == 206 {
+        let mut reader = resp.into_reader();
+        let mut bytes = Vec::with_capacity(expected as usize);
+        reader.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected {
+            return Err(RemoteError::S3(format!(
+                "range bytes={start}-{end_inclusive} for s3://{}/{} returned {} bytes, expected {expected}",
+                loc.bucket,
+                loc.key,
+                bytes.len()
+            )));
+        }
+        return Ok(bytes);
+    }
+    if status == 200 {
+        // Drain body so the connection is not left half-open.
+        let _ = resp.into_string();
+        return Err(RemoteError::S3(format!(
+            "HTTP 200 (Range ignored) GetObject s3://{}/{} bytes={start}-{end_inclusive}; \
+             endpoint did not return 206 Partial Content",
+            loc.bucket, loc.key
+        )));
+    }
+    let body = resp.into_string().unwrap_or_default();
+    Err(s3_status_error(source, status, loc, &body))
+}
 
+/// Result of a GetObject Range probe (`bytes=0-0`).
+enum S3Probe {
+    /// 206 Partial Content with known total size.
+    RangesOk(u64),
+    /// Server ignored Range and returned the full object body (small enough to keep).
+    FullBody(Vec<u8>),
+    /// Ranges / size not usable from this probe.
+    Unusable,
+}
+
+fn bytes_to_tempfile(bytes: &[u8]) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = NamedTempFile::new()?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok((tmp, bytes.len() as u64))
+}
+
+/// Probe via `Range: bytes=0-0` for Content-Range total size.
+fn probe_s3_object(loc: &S3Location) -> Result<S3Probe> {
+    // Empty-object edge: Range 0-0 may 416; treat as unusable and full-GET.
+    let (source, resp) = match s3_get_object(loc, Some((0, 0))) {
+        Ok(v) => v,
+        Err(e) => {
+            debug!("s3 probe request failed: {e}");
+            return Ok(S3Probe::Unusable);
+        }
+    };
+    let status = resp.status();
+    let content_range = resp.header("Content-Range").map(|s| s.to_string());
+    let content_length = resp
+        .header("Content-Length")
+        .and_then(|s| s.parse::<u64>().ok());
+    if status == 206 {
+        if let Some(total) = parse_content_range_total(content_range.as_deref()) {
+            let _ = resp.into_string();
+            return Ok(S3Probe::RangesOk(total));
+        }
+        let _ = resp.into_string();
+        return Ok(S3Probe::Unusable);
+    }
+    if (200..300).contains(&status) {
+        // Range ignored. Avoid buffering huge bodies into RAM for reuse.
+        if content_length.is_some_and(|n| n > DEFAULT_S3_RANGE_THRESHOLD) {
+            let mut reader = resp.into_reader();
+            let _ = io::copy(&mut reader, &mut io::sink());
+            return Ok(S3Probe::Unusable);
+        }
+        let mut reader = resp.into_reader();
+        let mut bytes = Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        return Ok(S3Probe::FullBody(bytes));
+    }
+    // 416 on empty object, 403, etc.
+    debug!(
+        "s3 probe s3://{}/{} -> HTTP {status} (auth={source:?})",
+        loc.bucket, loc.key
+    );
+    let _ = resp.into_string();
+    Ok(S3Probe::Unusable)
+}
+
+/// Sequential Range materialization into a tempfile.
+fn fetch_s3_via_ranges(loc: &S3Location, size: u64) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = NamedTempFile::new()?;
+    if size == 0 {
+        tmp.flush()?;
+        return Ok((tmp, 0));
+    }
+    let mut written = 0u64;
+    for (start, end) in range_chunk_windows(size, HTTP_RANGE_CHUNK) {
+        let range = format!("bytes={start}-{end}");
+        let (source, resp) = s3_get_object(loc, Some((start, end)))?;
+        let status = resp.status();
+        if status == 206 {
+            let expected = end - start + 1;
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            if n != expected {
+                return Err(RemoteError::S3(format!(
+                    "range {range} for s3://{}/{} returned {n} bytes, expected {expected}",
+                    loc.bucket, loc.key
+                )));
+            }
+            written += n;
+        } else if status == 200 && start == 0 {
+            // Server ignored Range and returned the full body on the first chunk.
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            tmp.flush()?;
+            tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+            debug!(
+                "s3 download s3://{}/{} -> {n} bytes (full body; Range ignored)",
+                loc.bucket, loc.key
+            );
+            return Ok((tmp, n));
+        } else {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(s3_status_error(source, status, loc, &body));
+        }
+    }
+    if written != size {
+        return Err(RemoteError::S3(format!(
+            "range download size mismatch for s3://{}/{}: wrote {written}, expected {size}",
+            loc.bucket, loc.key
+        )));
+    }
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    debug!(
+        "s3 range download s3://{}/{} -> {written} bytes",
+        loc.bucket, loc.key
+    );
+    Ok((tmp, written))
+}
+
+/// Single full-body GetObject (no Range header); streams to tempfile.
+fn fetch_s3_full_get(loc: &S3Location) -> Result<(NamedTempFile, u64)> {
+    let (source, resp) = s3_get_object(loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_status_error(source, status, loc, &body));
+    }
     let mut reader = resp.into_reader();
     let mut tmp = NamedTempFile::new()?;
-    let n = std::io::copy(&mut reader, &mut tmp)?;
+    let n = io::copy(&mut reader, &mut tmp)?;
     tmp.flush()?;
     tmp.as_file_mut().seek(SeekFrom::Start(0))?;
     Ok((tmp, n))
+}
+
+/// Seekable S3 reader using live Range GetObject requests.
+///
+/// Falls back to a fully buffered body when size cannot be determined via Range
+/// probe. Prefer [`open_s3_range`] for the public entry point.
+pub struct S3RangeFile {
+    loc: S3Location,
+    size: u64,
+    pos: u64,
+    /// Optional fully buffered body if ranges unavailable.
+    buffered: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for S3RangeFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3RangeFile")
+            .field("bucket", &self.loc.bucket)
+            .field("key", &self.loc.key)
+            .field("size", &self.size)
+            .field("pos", &self.pos)
+            .field("uses_ranges", &self.uses_ranges())
+            .finish()
+    }
+}
+
+impl S3RangeFile {
+    /// Open `s3://…`, using live Range GETs when size is known via probe.
+    ///
+    /// Without a usable size, buffers the full object in memory.
+    pub fn open(url_str: &str) -> Result<Self> {
+        let loc = parse_s3_url(url_str)?;
+        Self::open_location(&loc)
+    }
+
+    /// Open a parsed location (see [`S3RangeFile::open`]).
+    pub fn open_location(loc: &S3Location) -> Result<Self> {
+        match probe_s3_object(loc) {
+            Ok(S3Probe::RangesOk(size)) => Ok(Self::range_backed(loc.clone(), size)),
+            Ok(S3Probe::FullBody(bytes)) => {
+                let size = bytes.len() as u64;
+                Ok(Self {
+                    loc: loc.clone(),
+                    size,
+                    pos: 0,
+                    buffered: Some(bytes),
+                })
+            }
+            Ok(S3Probe::Unusable) | Err(_) => {
+                let (mut tmp, size) = fetch_s3_full_get(loc)?;
+                let mut buf = Vec::with_capacity(size as usize);
+                tmp.read_to_end(&mut buf)?;
+                Ok(Self {
+                    loc: loc.clone(),
+                    size: buf.len() as u64,
+                    pos: 0,
+                    buffered: Some(buf),
+                })
+            }
+        }
+    }
+
+    /// Construct a live Range-backed reader (no probe; caller must know size).
+    pub fn range_backed(loc: S3Location, size: u64) -> Self {
+        Self {
+            loc,
+            size,
+            pos: 0,
+            buffered: None,
+        }
+    }
+
+    pub fn location(&self) -> &S3Location {
+        &self.loc
+    }
+
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// True when reads issue live Range GETs (not a fully buffered body).
+    pub fn uses_ranges(&self) -> bool {
+        self.buffered.is_none()
+    }
+}
+
+/// Open a seekable S3 reader using live Range GetObject when possible.
+///
+/// Equivalent to [`S3RangeFile::open`].
+pub fn open_s3_range(url_str: &str) -> Result<S3RangeFile> {
+    S3RangeFile::open(url_str)
+}
+
+impl Read for S3RangeFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.size || buf.is_empty() {
+            return Ok(0);
+        }
+        if let Some(data) = &self.buffered {
+            let start = self.pos as usize;
+            let end = (self.pos as usize + buf.len()).min(data.len());
+            let n = end - start;
+            buf[..n].copy_from_slice(&data[start..end]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        let end = (self.pos + buf.len() as u64).min(self.size);
+        if end <= self.pos {
+            return Ok(0);
+        }
+        // Inclusive Range end
+        let range_start = self.pos;
+        let range_end = end - 1;
+        let (source, resp) = s3_get_object(&self.loc, Some((range_start, range_end)))
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let status = resp.status();
+        if status == 206 {
+            let mut reader = resp.into_reader();
+            let mut chunk = vec![0u8; (end - self.pos) as usize];
+            reader.read_exact(&mut chunk)?;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        if status == 200 {
+            // Server ignored Range and returned the full body; skip to pos then read.
+            let mut reader = resp.into_reader();
+            let skip = self.pos;
+            if skip > 0 {
+                io::copy(&mut reader.by_ref().take(skip), &mut io::sink())?;
+            }
+            let need = (end - self.pos) as usize;
+            let mut chunk = vec![0u8; need];
+            reader.read_exact(&mut chunk)?;
+            let n = chunk.len().min(buf.len());
+            buf[..n].copy_from_slice(&chunk[..n]);
+            self.pos += n as u64;
+            return Ok(n);
+        }
+        let body = resp.into_string().unwrap_or_default();
+        Err(io::Error::other(
+            s3_status_error(source, status, &self.loc, &body).to_string(),
+        ))
+    }
+}
+
+impl Seek for S3RangeFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.size as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
 }
 
 /// Minimal path-segment encode (RFC 3986 unreserved + leave already-safe chars).
@@ -922,28 +1369,38 @@ mod tests {
         }
     }
 
-    /// Path-style S3 mock: GET /{bucket}/{key} → body; records Authorization presence.
+    /// Path-style S3 mock: GET /{bucket}/{key} → body; honors Range; records Authorization.
     struct MockS3 {
         base_url: String,
         log: Arc<StdMutex<Vec<String>>>,
         gets: Arc<AtomicUsize>,
         auth_headers: Arc<AtomicUsize>,
+        range_headers: Arc<AtomicUsize>,
         _join: Option<thread::JoinHandle<()>>,
     }
 
     impl MockS3 {
         fn spawn(body: Vec<u8>, require_auth: bool) -> Self {
+            Self::spawn_with_options(body, require_auth, true)
+        }
+
+        /// `honor_range`: when false, ignore Range and always return full 200 body.
+        fn spawn_with_options(body: Vec<u8>, require_auth: bool, honor_range: bool) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let local = listener.local_addr().unwrap();
             let base_url = format!("http://{local}");
             let log = Arc::new(StdMutex::new(Vec::new()));
             let gets = Arc::new(AtomicUsize::new(0));
             let auth_headers = Arc::new(AtomicUsize::new(0));
+            let range_headers = Arc::new(AtomicUsize::new(0));
             let log_c = Arc::clone(&log);
             let gets_c = Arc::clone(&gets);
             let auth_c = Arc::clone(&auth_headers);
+            let range_c = Arc::clone(&range_headers);
+            // Enough connections for multi-chunk prefer-range + probes.
+            let max_conns = 64usize;
             let join = thread::spawn(move || {
-                for stream in listener.incoming().take(32) {
+                for stream in listener.incoming().take(max_conns) {
                     let Ok(mut stream) = stream else { continue };
                     let mut reader = BufReader::new(stream.try_clone().unwrap());
                     let mut request_line = String::new();
@@ -951,6 +1408,7 @@ mod tests {
                         continue;
                     }
                     let mut has_auth = false;
+                    let mut range_hdr: Option<String> = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -959,8 +1417,15 @@ mod tests {
                         if line == "\r\n" || line == "\n" || line.is_empty() {
                             break;
                         }
-                        if line.to_ascii_lowercase().starts_with("authorization:") {
+                        let lower = line.to_ascii_lowercase();
+                        if lower.starts_with("authorization:") {
                             has_auth = true;
+                        }
+                        if let Some(rest) = lower.strip_prefix("range:") {
+                            let _ = rest;
+                            if let Some((_, v)) = line.split_once(':') {
+                                range_hdr = Some(v.trim().to_string());
+                            }
                         }
                     }
                     {
@@ -971,9 +1436,15 @@ mod tests {
                         } else {
                             lg.push("Authorization: absent".into());
                         }
+                        if let Some(ref r) = range_hdr {
+                            lg.push(format!("Range: {r}"));
+                        }
                     }
                     if has_auth {
                         auth_c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if range_hdr.is_some() {
+                        range_c.fetch_add(1, Ordering::SeqCst);
                     }
                     if !request_line.starts_with("GET ") {
                         let _ = write!(
@@ -993,9 +1464,53 @@ mod tests {
                         continue;
                     }
                     gets_c.fetch_add(1, Ordering::SeqCst);
+
+                    // Honor Range with 206 when requested and body non-empty.
+                    if honor_range {
+                        if let Some(ref r) = range_hdr {
+                            if let Some((start, end)) = parse_bytes_range(r, body.len()) {
+                                if body.is_empty() {
+                                    let msg = b"InvalidRange";
+                                    let _ = write!(
+                                        stream,
+                                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        msg.len()
+                                    );
+                                    let _ = stream.write_all(msg);
+                                    continue;
+                                }
+                                let end = end.min(body.len().saturating_sub(1));
+                                if start > end || start >= body.len() {
+                                    let msg = b"InvalidRange";
+                                    let _ = write!(
+                                        stream,
+                                        "HTTP/1.1 416 Range Not Satisfiable\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        msg.len()
+                                    );
+                                    let _ = stream.write_all(msg);
+                                    continue;
+                                }
+                                let slice = &body[start..=end];
+                                let cr = format!(
+                                    "bytes {}-{}/{}",
+                                    start,
+                                    end,
+                                    body.len()
+                                );
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 206 Partial Content\r\nContent-Range: {cr}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                    slice.len()
+                                );
+                                let _ = stream.write_all(slice);
+                                continue;
+                            }
+                        }
+                    }
+
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
                         body.len()
                     );
                     let _ = stream.write_all(&body);
@@ -1006,9 +1521,26 @@ mod tests {
                 log,
                 gets,
                 auth_headers,
+                range_headers,
                 _join: Some(join),
             }
         }
+    }
+
+    /// Parse `bytes=start-end` (inclusive). `end` may be omitted (`bytes=start-`).
+    fn parse_bytes_range(header: &str, total: usize) -> Option<(usize, usize)> {
+        let h = header.trim();
+        let rest = h.strip_prefix("bytes=")?;
+        let (a, b) = rest.split_once('-')?;
+        let start: usize = a.parse().ok()?;
+        if b.is_empty() {
+            if total == 0 {
+                return None;
+            }
+            return Some((start, total - 1));
+        }
+        let end: usize = b.parse().ok()?;
+        Some((start, end))
     }
 
     #[test]
@@ -1257,5 +1789,222 @@ mod tests {
         _g.set("RATARMOUNT_IMDS_BASE", "http://mock.local");
         // RATARMOUNT_IMDS_BASE takes precedence
         assert_eq!(imds_base(), "http://mock.local");
+    }
+
+    #[test]
+    fn signed_range_get_asserts_auth_and_range() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(4096).collect();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        let got = fetch_s3_range_bytes("s3://mybucket/obj.bin", 10, 19).unwrap();
+        assert_eq!(got, &body[10..=19]);
+        assert!(s3.auth_headers.load(Ordering::SeqCst) >= 1);
+        assert!(s3.range_headers.load(Ordering::SeqCst) >= 1);
+        let log = s3.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l == "Range: bytes=10-19"),
+            "expected Range header in log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("Authorization: present")),
+            "expected Authorization for signed Range, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn anonymous_range_get_no_authorization() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        let s3 = MockS3::spawn(body.clone(), false);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ANONYMOUS", "1");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+
+        let got = fetch_s3_range_bytes("s3://public/path/obj.bin", 100, 149).unwrap();
+        assert_eq!(got, &body[100..=149]);
+        assert_eq!(
+            s3.auth_headers.load(Ordering::SeqCst),
+            0,
+            "anonymous Range must not send Authorization"
+        );
+        assert!(s3.range_headers.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn prefer_range_chunked_download() {
+        // Just above threshold → Range path; with 4 MiB chunk this is one window.
+        let size = (DEFAULT_S3_RANGE_THRESHOLD + 64 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=251).cycle().take(size).collect();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        let loc = parse_s3_url("s3://b/large.bin").unwrap();
+        let (mut tmp, n) =
+            fetch_s3_location_to_temp_prefer_range(&loc, Some(body.len() as u64)).unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(
+            s3.range_headers.load(Ordering::SeqCst) >= 1,
+            "expected Range GETs"
+        );
+        let log = s3.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("Range: bytes=")),
+            "log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("Authorization: present")),
+            "signed prefer-range must send Authorization, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn prefer_range_multi_chunk_download() {
+        let size = (HTTP_RANGE_CHUNK + 128 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=251).cycle().take(size).collect();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        let loc = parse_s3_url("s3://b/huge.bin").unwrap();
+        let (mut tmp, n) =
+            fetch_s3_location_to_temp_prefer_range(&loc, Some(body.len() as u64)).unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let ranges = s3.range_headers.load(Ordering::SeqCst);
+        assert!(ranges >= 2, "expected multi-chunk Range download, ranges={ranges}");
+        let log = s3.log.lock().unwrap();
+        let range_lines: Vec<_> = log
+            .iter()
+            .filter(|l| l.starts_with("Range: bytes="))
+            .collect();
+        assert!(
+            range_lines.len() >= 2,
+            "expected ≥2 Range headers, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn prefer_range_small_object_uses_full_get() {
+        let body = b"tiny-object".to_vec();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        // known small size → full GET, no Range
+        let loc = parse_s3_url("s3://b/small.bin").unwrap();
+        let (mut tmp, n) =
+            fetch_s3_location_to_temp_prefer_range(&loc, Some(body.len() as u64)).unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert_eq!(
+            s3.range_headers.load(Ordering::SeqCst),
+            0,
+            "small known size must not use Range"
+        );
+        assert!(s3.auth_headers.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn prefer_range_probes_then_downloads() {
+        let size = (DEFAULT_S3_RANGE_THRESHOLD + 32 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=199).cycle().take(size).collect();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        // Unknown size → probe 0-0 then chunked Range.
+        let (mut tmp, n) = fetch_s3_to_temp("s3://b/probed.bin").unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = s3.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l == "Range: bytes=0-0"),
+            "expected size probe, log={log:?}"
+        );
+        assert!(
+            s3.range_headers.load(Ordering::SeqCst) >= 2,
+            "probe + at least one data Range"
+        );
+    }
+
+    #[test]
+    fn prefer_range_falls_back_when_range_ignored() {
+        let size = (DEFAULT_S3_RANGE_THRESHOLD + 64 * 1024) as usize;
+        let body: Vec<u8> = (0u8..=180).cycle().take(size).collect();
+        // honor_range=false → 200 full body even when Range sent
+        let s3 = MockS3::spawn_with_options(body.clone(), true, false);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        let loc = parse_s3_url("s3://b/no-range.bin").unwrap();
+        let (mut tmp, n) =
+            fetch_s3_location_to_temp_prefer_range(&loc, Some(body.len() as u64)).unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn s3_range_file_live_reads() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let s3 = MockS3::spawn(body.clone(), true);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("AWS_REGION", "us-east-1");
+
+        let mut f = open_s3_range("s3://b/live.bin").unwrap();
+        assert!(f.uses_ranges());
+        assert_eq!(f.len(), body.len() as u64);
+        let mut prefix = [0u8; 16];
+        f.read_exact(&mut prefix).unwrap();
+        assert_eq!(&prefix, &body[..16]);
+        f.seek(SeekFrom::Start(1000)).unwrap();
+        let mut mid = [0u8; 32];
+        f.read_exact(&mut mid).unwrap();
+        assert_eq!(&mid, &body[1000..1032]);
+        assert!(s3.range_headers.load(Ordering::SeqCst) >= 2);
+        assert!(s3.auth_headers.load(Ordering::SeqCst) >= 2);
+    }
+
+    #[test]
+    fn range_bytes_invalid_window() {
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        _g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        let err = fetch_s3_range_bytes("s3://b/k", 10, 5).unwrap_err().to_string();
+        assert!(err.contains("invalid range"), "got: {err}");
     }
 }

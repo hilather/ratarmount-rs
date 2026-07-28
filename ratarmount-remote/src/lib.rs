@@ -3,7 +3,8 @@
 //! - `file://` → local path
 //! - `http(s)://` → fetch to temp (prefer Range when supported) and live Range I/O via
 //!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`]
-//! - `s3://bucket/key` → GetObject to temp (env keys → ECS/IMDS role → optional anonymous)
+//! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
+//!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
@@ -35,7 +36,12 @@ pub use dropbox::{
     DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_LIST_TTL_SECS, DEFAULT_DROPBOX_RANGE_THRESHOLD,
     DEFAULT_DROPBOX_RPC_BASE,
 };
-pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
+pub use s3::{
+    fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
+    fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
+    fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, S3Location, S3RangeFile,
+    DEFAULT_S3_RANGE_THRESHOLD,
+};
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
 };
@@ -115,7 +121,8 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
             keep_fetched(input, tmp, size)
         }
         "s3" => {
-            let (tmp, size) = fetch_s3_to_temp(input)?;
+            // Prefer chunked Range materialization for large objects (fsspec-style).
+            let (tmp, size) = fetch_s3_to_temp_prefer_range(input)?;
             keep_fetched(input, tmp, size)
         }
         "ssh" | "sftp" | "scp" => {
