@@ -1,7 +1,14 @@
-//! Union view of multiple mount sources (rightmost wins).
+//! Union view of multiple mount sources (rightmost wins for same type).
 //!
 //! Matches Python `UnionMountSource`: optional folder→sources cache for faster
 //! lookup across many archives (depth / entry count / wall-clock timeout).
+//!
+//! **Directory-over-symlink policy (B-4 / mxmlnkn/ratarmount#164):** when one
+//! source has a real directory at a path and another has a symlink, version-0
+//! `lookup` returns a directory (rightmost directory for metadata). `list`
+//! merges children from every source that contributes a directory or a
+//! followable symlink at that path, and never replaces a listed directory
+//! entry with a symlink.
 
 use std::collections::{BTreeMap, HashMap};
 use std::io;
@@ -10,7 +17,8 @@ use std::time::Instant;
 
 use log::warn;
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    create_root_file_info, is_dir_mode, is_lnk_mode, normpath, FileInfo, ListModeResult,
+    ListResult, MountSource, UserData,
 };
 
 /// Options for building the union folder cache (Python `--union-mount-cache-*`).
@@ -216,6 +224,31 @@ impl UnionMountSource {
             _ => None,
         })
     }
+
+    /// Insert/merge a child into a list map: later sources win, except a directory
+    /// is never replaced by a symlink (B-4 / mxmlnkn/ratarmount#164).
+    fn merge_list_entry(map: &mut BTreeMap<String, FileInfo>, name: String, fi: FileInfo) {
+        if let Some(existing) = map.get(&name) {
+            if is_dir_mode(existing.mode) && is_lnk_mode(fi.mode) {
+                return;
+            }
+        }
+        map.insert(name, fi);
+    }
+
+    /// List a path from one source. If the source has a symlink at `path`, try to
+    /// follow one level within that source so symlink→dir branches still contribute.
+    fn list_from_source(src: &dyn MountSource, path: &str) -> Option<ListResult> {
+        if let Some(listing) = src.list(path) {
+            return Some(listing);
+        }
+        let fi = src.lookup(path, 0)?;
+        if !is_lnk_mode(fi.mode) || fi.linkname.is_empty() {
+            return None;
+        }
+        let target = resolve_symlink_target(path, &fi.linkname);
+        src.list(&target)
+    }
 }
 
 impl MountSource for UnionMountSource {
@@ -224,19 +257,20 @@ impl MountSource for UnionMountSource {
         let mut map: BTreeMap<String, FileInfo> = BTreeMap::new();
         let mut any = false;
         // List merges all sources (cache is for lookup hot path, not listing).
+        // Sources with a real directory *or* a followable symlink at `path` contribute.
         for (si, src) in self.sources.iter().enumerate() {
-            if let Some(listing) = src.list(&path) {
+            if let Some(listing) = Self::list_from_source(src.as_ref(), &path) {
                 any = true;
                 match listing {
                     ListResult::Infos(m) => {
                         for (k, v) in m {
-                            map.insert(k, Self::tag_source(v, si));
+                            Self::merge_list_entry(&mut map, k, Self::tag_source(v, si));
                         }
                     }
                     ListResult::Names(names) => {
                         for name in names {
                             if let Some(fi) = src.lookup(&join(&path, &name), 0) {
-                                map.insert(name, Self::tag_source(fi, si));
+                                Self::merge_list_entry(&mut map, name, Self::tag_source(fi, si));
                             }
                         }
                     }
@@ -267,8 +301,29 @@ impl MountSource for UnionMountSource {
 
         let idxs = self.sources_for_path(&path);
 
-        if file_version <= 0 {
-            // Negative / zero: walk rightmost first; accumulate versions
+        if file_version == 0 {
+            // Version 0: rightmost wins, but a real directory always beats a symlink
+            // so union order cannot hide directory contents (B-4 / #164).
+            let mut rightmost_any: Option<(usize, FileInfo)> = None;
+            let mut rightmost_dir: Option<(usize, FileInfo)> = None;
+            for &si in idxs.iter().rev() {
+                if let Some(fi) = self.sources[si].lookup(&path, 0) {
+                    if rightmost_any.is_none() {
+                        rightmost_any = Some((si, fi.clone()));
+                    }
+                    if is_dir_mode(fi.mode) {
+                        rightmost_dir = Some((si, fi));
+                        break;
+                    }
+                }
+            }
+            return rightmost_dir
+                .or(rightmost_any)
+                .map(|(si, fi)| Self::tag_source(fi, si));
+        }
+
+        if file_version < 0 {
+            // Negative: walk rightmost first; accumulate versions
             let mut ver = file_version;
             for &si in idxs.iter().rev() {
                 let src = &self.sources[si];
@@ -341,6 +396,26 @@ fn join(parent: &str, name: &str) -> String {
         format!("/{name}")
     } else {
         format!("{parent}/{name}")
+    }
+}
+
+/// Resolve a symlink target relative to the directory containing `path` (one hop).
+fn resolve_symlink_target(path: &str, linkname: &str) -> String {
+    if linkname.starts_with('/') {
+        return normpath(linkname);
+    }
+    let parent = if path == "/" {
+        "/".to_string()
+    } else {
+        match path.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(i) => path[..i].to_string(),
+        }
+    };
+    if parent == "/" {
+        normpath(&format!("/{linkname}"))
+    } else {
+        normpath(&format!("{parent}/{linkname}"))
     }
 }
 
@@ -474,5 +549,98 @@ mod tests {
         );
         assert!(u.lookup("/", 0).is_some());
         assert!(u.lookup("/sub", 0).is_some());
+    }
+
+    /// Regression: Dec 31 1969-style order bug for union symlink vs directory.
+    ///
+    /// Upstream mxmlnkn/ratarmount#164 / residual B-4: two folder branches where
+    /// one has `subdir0` → symlink `./subdir1` and the other has a real
+    /// `subdir0/` directory. Lookup type and merged listings must not depend on
+    /// mount order — directory wins over symlink; children from both sides merge.
+    fn build_b4_branches(root: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let branch1 = root.join("branch1");
+        let branch2 = root.join("branch2");
+        // branch1: subdir0 → ./subdir1; subdir1/subdir2/file1
+        fs::create_dir_all(branch1.join("subdir1/subdir2")).unwrap();
+        fs::write(branch1.join("subdir1/subdir2/file1"), b"file1").unwrap();
+        std::os::unix::fs::symlink("./subdir1", branch1.join("subdir0")).unwrap();
+        // branch2: real dir subdir0/subdir2/file2; subdir1/subdir2/file3
+        fs::create_dir_all(branch2.join("subdir0/subdir2")).unwrap();
+        fs::write(branch2.join("subdir0/subdir2/file2"), b"file2").unwrap();
+        fs::create_dir_all(branch2.join("subdir1/subdir2")).unwrap();
+        fs::write(branch2.join("subdir1/subdir2/file3"), b"file3").unwrap();
+        (branch1, branch2)
+    }
+
+    fn assert_b4_union_policy(u: &UnionMountSource, order_label: &str) {
+        let subdir0 = u
+            .lookup("/subdir0", 0)
+            .unwrap_or_else(|| panic!("{order_label}: /subdir0 missing"));
+        assert!(
+            is_dir_mode(subdir0.mode),
+            "{order_label}: /subdir0 must be directory (mode={:#o}), not symlink",
+            subdir0.mode
+        );
+        assert!(
+            !is_lnk_mode(subdir0.mode),
+            "{order_label}: /subdir0 must not be a symlink"
+        );
+
+        // Root listing: subdir0 entry is directory even if a later branch has a symlink.
+        let root_list = u.list("/").expect("list /");
+        let ListResult::Infos(root_map) = root_list else {
+            panic!("{order_label}: expected Infos at /");
+        };
+        let root_s0 = root_map
+            .get("subdir0")
+            .unwrap_or_else(|| panic!("{order_label}: root list missing subdir0"));
+        assert!(
+            is_dir_mode(root_s0.mode),
+            "{order_label}: listed subdir0 must be directory"
+        );
+
+        // subdir0/subdir2 must include file2 from the real-dir branch in both orders.
+        let listing = u
+            .list("/subdir0/subdir2")
+            .unwrap_or_else(|| panic!("{order_label}: list /subdir0/subdir2"));
+        let ListResult::Infos(map) = listing else {
+            panic!("{order_label}: expected Infos for /subdir0/subdir2");
+        };
+        assert!(
+            map.contains_key("file2"),
+            "{order_label}: /subdir0/subdir2 must contain file2; got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        // file1 is reachable via the symlink branch once path is treated as a dir union.
+        assert!(
+            map.contains_key("file1"),
+            "{order_label}: /subdir0/subdir2 should also contain file1; got {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn union_directory_wins_over_symlink_order_independent() {
+        let d = tempfile::tempdir().unwrap();
+        let (branch1, branch2) = build_b4_branches(d.path());
+
+        let s1 = Arc::new(FolderMountSource::new(&branch1).unwrap()) as Arc<dyn MountSource>;
+        let s2 = Arc::new(FolderMountSource::new(&branch2).unwrap()) as Arc<dyn MountSource>;
+
+        // Order A: symlink branch first, real-dir branch rightmost (historically OK).
+        let u_dir_right = UnionMountSource::new(vec![s1.clone(), s2.clone()]);
+        assert_b4_union_policy(&u_dir_right, "branch1 then branch2");
+
+        // Order B: real-dir first, symlink rightmost (historically lost file2 + showed symlink).
+        let u_lnk_right = UnionMountSource::new(vec![s2, s1]);
+        assert_b4_union_policy(&u_lnk_right, "branch2 then branch1");
+    }
+
+    #[test]
+    fn resolve_symlink_target_helpers() {
+        assert_eq!(resolve_symlink_target("/subdir0", "./subdir1"), "/subdir1");
+        assert_eq!(resolve_symlink_target("/a/b", "../c"), "/c");
+        assert_eq!(resolve_symlink_target("/a/b", "/abs"), "/abs");
+        assert_eq!(resolve_symlink_target("/", "x"), "/x");
     }
 }
