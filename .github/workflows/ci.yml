@@ -38,6 +38,39 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  # Pure-Rust cold-index microbench from benchmarks/baselines/rust-gates.json.
+  # No /dev/fuse and no Python required at runtime (--no-mount only).
+  benchmark-gates:
+    name: benchmark gates (cold index)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: bench-gates
+
+      - name: Build release binary
+        run: cargo build --release -p ratarmount
+
+      - name: Enforce rust-gates.json (cold index hard gate)
+        env:
+          RUST_BIN: ${{ github.workspace }}/target/release/ratarmount
+          SKIP_BUILD: "1"
+        run: |
+          chmod +x benchmarks/check-rust-gates.sh
+          ./benchmarks/check-rust-gates.sh
+
   fuse-harness:
     name: FUSE phase allowlists
     runs-on: ubuntu-latest

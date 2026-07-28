@@ -105,7 +105,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip solid streaming (large folders) | `~` progressive LZMA2 + 1 MiB LRU windows (≤64); BCJ/AES still full-folder |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
 | Seekable codecs (drop materialize for gzip+) | `~` all four via SeekableBody; true block maps still partial |
-| Benchmark gates in CI (`rust-gates.json`) | `[ ]` |
+| Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index microbench in CI; ratio gates via `RUN_FULL_BENCH=1` |
 
 ---
 
@@ -129,14 +129,14 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 | P1 | Index interop golden: Py builds index → Rust mounts; reverse | `[x]` TAR+ZIP+7z py→rs; TAR rs→py |
 | P2 | Full fixed-archive (≥90% of ~174 triples) | Gap list in `docs/parity-gaps.md` |
 | P2 | Style/clippy/fmt + `cargo deny` / license attributions | CI |
-| P2 | Perf regression job from `benchmarks/baselines/rust-gates.json` | Fail on >20% regression |
+| P2 | Perf regression job from `benchmarks/baselines/rust-gates.json` | `[x]` `benchmark-gates` CI job + `check-rust-gates.sh` |
 
 ### Suggested CI matrix (ratarmount-rs)
 
 ```text
 [always]  cargo fmt --check && cargo clippy -D warnings && cargo test --workspace
 [fuse]    probe /dev/fuse; run-all-phases.sh (RATARMOUNT_PY_ROOT checkout)
-[bench]   weekly compare-python-vs-rust.sh; check rust-gates.json
+[bench]   check-rust-gates.sh (cold index always); RUN_FULL_BENCH=1 for ratio CSV; weekly compare optional
 [optional] SSH/S3 live when secrets present
 ```
 
