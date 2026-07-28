@@ -3018,4 +3018,232 @@ mod tests {
             &pad[10..]
         );
     }
+
+    /// Minimal newc CPIO with one regular file and TRAILER (mirrors formats-cpio tests).
+    fn build_newc_cpio(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
+        fn push_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
+            let namesize = name.len() + 1;
+            let filesize = data.len() as u32;
+            out.extend_from_slice(b"070701");
+            for val in [
+                1u32, // ino
+                mode,
+                0, // uid
+                0, // gid
+                1, // nlink
+                0, // mtime
+                filesize,
+                0, // devmajor
+                0, // devminor
+                0, // rdevmajor
+                0, // rdevminor
+                namesize as u32,
+                0, // check
+            ] {
+                out.extend_from_slice(format!("{val:08X}").as_bytes());
+            }
+            out.extend_from_slice(name.as_bytes());
+            out.push(0);
+            let header_and_name = 110 + namesize;
+            let name_pad = (4 - (header_and_name % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, name_pad));
+            out.extend_from_slice(data);
+            let data_pad = (4 - (data.len() % 4)) % 4;
+            out.extend(std::iter::repeat_n(0u8, data_pad));
+        }
+
+        let mut out = Vec::new();
+        push_entry(&mut out, name, data, mode);
+        push_entry(&mut out, "TRAILER!!!", &[], 0);
+        out
+    }
+
+    /// Minimal SVR4/GNU `ar` with one regular member (name ends with `/`).
+    fn synthetic_ar(name: &str, payload: &[u8]) -> Vec<u8> {
+        const HEADER_SIZE: usize = 60;
+        let mut out = Vec::new();
+        out.extend_from_slice(b"!<arch>\n");
+        let mut hdr = [b' '; HEADER_SIZE];
+        let name_field = format!("{name}/");
+        let nb = name_field.as_bytes();
+        assert!(nb.len() <= 16, "name too long for short AR header");
+        hdr[..nb.len()].copy_from_slice(nb);
+        hdr[16] = b'0'; // mtime
+        hdr[28] = b'0'; // uid
+        hdr[34] = b'0'; // gid
+        let mode = b"100644";
+        hdr[40..40 + mode.len()].copy_from_slice(mode);
+        let size_s = payload.len().to_string();
+        hdr[48..48 + size_s.len()].copy_from_slice(size_s.as_bytes());
+        hdr[58..60].copy_from_slice(b"`\n");
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// Minimal WARC/1.0 with one `response` record.
+    fn synthetic_response_warc(uri: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(b"WARC/1.0\r\n");
+        out.extend_from_slice(b"WARC-Type: response\r\n");
+        out.extend_from_slice(format!("WARC-Target-URI: {uri}\r\n").as_bytes());
+        out.extend_from_slice(b"WARC-Date: 2020-01-01T00:00:00Z\r\n");
+        out.extend_from_slice(
+            b"WARC-Record-ID: <urn:uuid:00000000-0000-0000-0000-000000000001>\r\n",
+        );
+        out.extend_from_slice(format!("Content-Length: {}\r\n", payload.len()).as_bytes());
+        out.extend_from_slice(b"\r\n");
+        out.extend_from_slice(payload);
+        out
+    }
+
+    /// Minimal Electron ASAR with flat files (concatenated payload; no serde_json dep).
+    fn build_minimal_asar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut entries = Vec::new();
+        let mut offset: u64 = 0;
+        let mut payload = Vec::new();
+        for (name, data) in files {
+            entries.push(format!(
+                r#""{name}":{{"size":{},"offset":"{offset}"}}"#,
+                data.len()
+            ));
+            payload.extend_from_slice(data);
+            offset += data.len() as u64;
+        }
+        let header_bytes = format!(r#"{{"files":{{{}}}}}"#, entries.join(",")).into_bytes();
+        let size_of_pickled_header = header_bytes.len() as u32;
+        let padding = (4 - (size_of_pickled_header % 4)) % 4;
+        let size_of_pickled_pickled_header = size_of_pickled_header + padding + 4;
+        let size_of_pickled_pickled_pickled_header = size_of_pickled_pickled_header + 4;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_header.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend(std::iter::repeat_n(0u8, padding as usize));
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn nested_cpio_from_cursor_via_opener() {
+        // S_IFREG | 0644
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let payload = b"cpio-SEEK-ME-payload-xyz";
+        let bytes = build_newc_cpio("hello.txt", payload, mode);
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("inner.cpio"))
+            .expect("nested CPIO open_from_reader without temp spool");
+
+        assert_eq!(read_all(inner.as_ref(), "/hello.txt"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/hello.txt", 5);
+        assert_eq!(mid.as_slice(), &payload[5..]);
+    }
+
+    #[test]
+    fn nested_ar_from_cursor_via_opener() {
+        let payload = b"ar-RANDOM-seek-target-0123456789";
+        let bytes = synthetic_ar("member.txt", payload);
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("inner.a"))
+            .expect("nested AR open_from_reader without temp spool");
+
+        assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/member.txt", 3);
+        assert_eq!(mid.as_slice(), &payload[3..]);
+    }
+
+    #[test]
+    fn nested_warc_from_cursor_via_opener() {
+        let payload = b"warc-Hello-World-seek-mid";
+        let bytes = synthetic_response_warc("http://example.com/hello.txt", payload);
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("inner.warc"))
+            .expect("nested WARC open_from_reader without temp spool");
+
+        assert_eq!(read_all(inner.as_ref(), "/example.com/hello.txt"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/example.com/hello.txt", 5);
+        assert_eq!(mid.as_slice(), &payload[5..]);
+    }
+
+    #[test]
+    fn nested_asar_from_cursor_via_opener() {
+        // ASAR nested open is name-triggered (no early magic); label must end in .asar.
+        let pad = b"asar-SEEK-ME-abcdef012345";
+        let bytes = build_minimal_asar(&[("hello.txt", b"world\n"), ("pad.txt", pad)]);
+        let reader = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
+        let inner = opener(boxed, Path::new("inner.asar"))
+            .expect("nested ASAR open_from_reader without temp spool");
+
+        assert_eq!(read_all(inner.as_ref(), "/hello.txt"), b"world\n");
+        assert_eq!(read_all(inner.as_ref(), "/pad.txt"), pad);
+        let mid = read_seek_mid(inner.as_ref(), "/pad.txt", 5);
+        assert_eq!(mid.as_slice(), &pad[5..]);
+    }
+
+    /// CPIO embedded in store 7z: parent open + nested CPIO from_reader — no temp spool.
+    #[test]
+    fn nested_cpio_inside_store_7z_reader_random_read_no_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let payload = b"cpio-in-7z-SEEK-payload";
+        let cpio_bytes = build_newc_cpio("nested.txt", payload, mode);
+        let cpio_path = dir.path().join("inner.cpio");
+        std::fs::write(&cpio_path, &cpio_bytes).expect("write cpio");
+        let Some(outer) = make_store_7z_with_member(dir.path(), &cpio_path, "outer-cpio.7z") else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let outer_ms = SevenZipMountSource::open(&outer, None, &opts, VERSION, true)
+            .expect("open store 7z outer");
+        let nested_name = cpio_path.file_name().unwrap().to_str().unwrap();
+        let nested_fi = outer_ms
+            .lookup(&format!("/{nested_name}"), 0)
+            .expect("lookup inner.cpio");
+        let nested_reader = outer_ms
+            .open(&nested_fi, 0)
+            .expect("open cpio member stream");
+
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(nested_reader, Path::new(nested_name))
+            .expect("nested CPIO inside 7z must open without temp spool");
+
+        assert_eq!(read_all(inner.as_ref(), "/nested.txt"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/nested.txt", 5);
+        assert_eq!(mid.as_slice(), &payload[5..]);
+    }
 }
