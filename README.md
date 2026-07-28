@@ -4,7 +4,7 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) â
 
 | | |
 |--|--|
-| **Version** | **0.1.3** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
+| **Version** | **0.1.4** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
 | **Language** | Rust (edition 2021) |
 | **FUSE** | `fuser` low-level (inode API) |
 | **Platforms** | Linux (primary) Â· **macOS** (beta: arm64 + x86_64 tarballs) |
