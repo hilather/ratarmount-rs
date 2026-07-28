@@ -1,7 +1,17 @@
-//! PDF attachment MountSource (`backendName=PDFMountSource`).
+//! PDF MountSource (`backendName=PDFMountSource`).
 //!
-//! MVP: extract embedded file attachments via [`lopdf`] (Names tree + FileAttachment
-//! annotations + Filespec objects). Page images/text extraction is out of scope.
+//! Extracts:
+//! - Embedded file attachments via [`lopdf`] (Names tree + FileAttachment annotations +
+//!   Filespec objects), exposed at their original attachment paths.
+//! - Page XObject images under `images/pageN-imgM.<ext>` (1-based page, 0-based image index).
+//!
+//! Image formats:
+//! - `/Filter /DCTDecode` → `.jpg` (raw JPEG bitstream, no re-encoding)
+//! - `/Filter /JPXDecode` → `.jp2` (raw JPEG 2000 bitstream)
+//! - Other / multi-filter / raw samples → `.bin` (stream bytes as stored; Image streams are
+//!   not fully decoded by lopdf, so non-JPEG payloads are best-effort raw)
+//!
+//! Text extraction is out of scope.
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
@@ -10,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Instant;
 
-use lopdf::{Document, Object, ObjectId};
+use lopdf::{Document, Object, ObjectId, Stream};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
@@ -70,6 +80,137 @@ fn stream_bytes(doc: &Document, id: ObjectId) -> Option<Vec<u8>> {
         }
         _ => None,
     }
+}
+
+/// Choose file extension and payload for an Image XObject stream.
+///
+/// lopdf refuses to run `decompressed_content` on `/Subtype /Image` streams (pixel data is
+/// not general stream content). For sole `/DCTDecode` / `/JPXDecode` the stored bytes are
+/// already a usable file; other cases emit raw stream content as `.bin`.
+fn image_payload_and_ext(stream: &Stream) -> (Vec<u8>, &'static str) {
+    let filters = stream.filters().unwrap_or_default();
+    if filters.len() == 1 {
+        match filters[0].as_str() {
+            "DCTDecode" => return (stream.content.clone(), "jpg"),
+            "JPXDecode" => return (stream.content.clone(), "jp2"),
+            _ => {}
+        }
+    }
+    // Multi-filter or non-JPEG: keep stored bytes (possibly still filter-encoded).
+    (stream.content.clone(), "bin")
+}
+
+/// Resolve a Resources dictionary from a page node or referenced object.
+fn resources_dict<'a>(doc: &'a Document, page: &'a lopdf::Dictionary) -> Option<&'a lopdf::Dictionary> {
+    match page.get(b"Resources").ok() {
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+        _ => {
+            // Inherit from parent Pages nodes.
+            let mut parent = page
+                .get(b"Parent")
+                .ok()
+                .and_then(|o| o.as_reference().ok());
+            let mut seen = HashSet::new();
+            while let Some(pid) = parent {
+                if !seen.insert(pid) {
+                    break;
+                }
+                let Ok(pdict) = doc.get_dictionary(pid) else {
+                    break;
+                };
+                match pdict.get(b"Resources").ok() {
+                    Some(Object::Dictionary(d)) => return Some(d),
+                    Some(Object::Reference(id)) => return doc.get_dictionary(*id).ok(),
+                    _ => {}
+                }
+                parent = pdict
+                    .get(b"Parent")
+                    .ok()
+                    .and_then(|o| o.as_reference().ok());
+            }
+            None
+        }
+    }
+}
+
+fn xobject_dict<'a>(doc: &'a Document, resources: &'a lopdf::Dictionary) -> Option<&'a lopdf::Dictionary> {
+    match resources.get(b"XObject").ok() {
+        Some(Object::Dictionary(d)) => Some(d),
+        Some(Object::Reference(id)) => doc.get_dictionary(*id).ok(),
+        _ => None,
+    }
+}
+
+/// Collect image XObjects from page resources: `(path, stream_id, payload)`.
+///
+/// Paths use `images/page{N}-img{M}.{ext}` with 1-based page and 0-based image index so they
+/// never collide with attachment names at the mount root.
+fn gather_images(doc: &Document) -> Vec<(String, ObjectId, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut used_names: HashMap<String, u32> = HashMap::new();
+
+    for (page_num, page_id) in doc.get_pages() {
+        let Ok(page) = doc.get_dictionary(page_id) else {
+            continue;
+        };
+        let Some(resources) = resources_dict(doc, page) else {
+            continue;
+        };
+        let Some(xobjects) = xobject_dict(doc, resources) else {
+            continue;
+        };
+
+        let mut img_idx: u32 = 0;
+        // Stable order: iterate by name sorted for determinism.
+        let mut entries: Vec<(Vec<u8>, &Object)> = xobjects.iter().map(|(k, v)| (k.clone(), v)).collect();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+
+        for (_name, xvalue) in entries {
+            let stream_id = match xvalue {
+                Object::Reference(id) => *id,
+                _ => continue,
+            };
+            let Ok(obj) = doc.get_object(stream_id) else {
+                continue;
+            };
+            let Object::Stream(stream) = obj else {
+                continue;
+            };
+            let is_image = stream
+                .dict
+                .get(b"Subtype")
+                .ok()
+                .and_then(|s| s.as_name().ok())
+                .is_some_and(|n| n == b"Image");
+            if !is_image {
+                continue;
+            }
+
+            let (data, ext) = image_payload_and_ext(stream);
+            if data.is_empty() {
+                continue;
+            }
+
+            let mut name = format!("images/page{page_num}-img{img_idx}.{ext}");
+            img_idx += 1;
+
+            if let Some(n) = used_names.get_mut(&name) {
+                *n += 1;
+                let count = *n;
+                if let Some((stem, e)) = name.rsplit_once('.') {
+                    name = format!("{stem}-{count}.{e}");
+                } else {
+                    name = format!("{name}-{count}");
+                }
+            } else {
+                used_names.insert(name.clone(), 0);
+            }
+
+            out.push((name, stream_id, data));
+        }
+    }
+    out
 }
 
 /// Collect (display_name, embedded_stream_id, payload).
@@ -263,6 +404,7 @@ impl PdfMountSource {
         let doc = Document::load(archive_path)
             .map_err(|e| PdfError::Msg(format!("failed to load PDF: {e}")))?;
         let attachments = gather_attachments(&doc);
+        let images = gather_images(&doc);
 
         let mtime = std::fs::metadata(archive_path)
             .map(|m| {
@@ -275,6 +417,9 @@ impl PdfMountSource {
         index.begin_write()?;
         let mut payloads = HashMap::new();
         let mut generated = std::collections::BTreeSet::new();
+        // Distinct payload keys for attachments vs images so object-number collisions
+        // (same obj num, different role) cannot overwrite each other.
+        const IMAGE_KEY_BASE: i64 = 1 << 40;
 
         for (name, stream_id, data) in attachments {
             let nfull = normpath(&name);
@@ -300,6 +445,33 @@ impl PdfMountSource {
                 0,
             )?;
             payloads.insert(key, data);
+        }
+
+        for (name, stream_id, data) in images {
+            let nfull = normpath(&name);
+            let (path, base) = split_name(&nfull);
+            ensure_parents(&index, &path, &mut generated, mtime)?;
+            let key = IMAGE_KEY_BASE + stream_id.0 as i64;
+            let mode = (ratarmount_core::S_IFREG | 0o644) as i64;
+            index.insert_file(
+                &path,
+                &base,
+                key,
+                0,
+                data.len() as i64,
+                mtime,
+                mode,
+                0,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            )?;
+            // Prefer first payload if the same image stream appears on multiple pages.
+            payloads.entry(key).or_insert(data);
         }
 
         index.store_versions(product_version)?;
@@ -487,5 +659,244 @@ mod tests {
             }
             _ => panic!("expected infos"),
         }
+    }
+
+    /// Minimal JPEG SOI…EOI used as a DCTDecode Image XObject payload.
+    fn tiny_jpeg() -> Vec<u8> {
+        vec![
+            0xFF, 0xD8, // SOI
+            0xFF, 0xE0, 0x00, 0x10, // APP0
+            b'J', b'F', b'I', b'F', 0x00, 0x01, 0x01, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00,
+            0xFF, 0xDB, 0x00, 0x43, 0x00, // DQT
+            0x08, 0x06, 0x06, 0x07, 0x06, 0x05, 0x08, 0x07, 0x07, 0x07, 0x09, 0x09, 0x08, 0x0A,
+            0x0C, 0x14, 0x0D, 0x0C, 0x0B, 0x0B, 0x0C, 0x19, 0x12, 0x13, 0x0F, 0x14, 0x1D, 0x1A,
+            0x1F, 0x1E, 0x1D, 0x1A, 0x1C, 0x1C, 0x20, 0x24, 0x2E, 0x27, 0x20, 0x22, 0x2C, 0x23,
+            0x1C, 0x1C, 0x28, 0x37, 0x29, 0x2C, 0x30, 0x31, 0x34, 0x34, 0x34, 0x1F, 0x27, 0x39,
+            0x3D, 0x38, 0x32, 0x3C, 0x2E, 0x33, 0x34, 0x32,
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01, 0x01, 0x01, 0x11, 0x00, // SOF0
+            0xFF, 0xC4, 0x00, 0x14, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, // DHT
+            0xFF, 0xC4, 0x00, 0x14, 0x10, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // DHT
+            0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00, 0x7F, // SOS + ECS
+            0xFF, 0xD9, // EOI
+        ]
+    }
+
+    fn dict(entries: &[(&str, Object)]) -> lopdf::Dictionary {
+        let mut d = lopdf::Dictionary::new();
+        for (k, v) in entries {
+            d.set(k.to_string(), v.clone());
+        }
+        d
+    }
+
+    fn jpeg_image_stream(jpeg: Vec<u8>) -> Stream {
+        Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+                ("ColorSpace", "DeviceGray".into()),
+                ("BitsPerComponent", 8.into()),
+                ("Filter", "DCTDecode".into()),
+            ]),
+            jpeg,
+        )
+    }
+
+    fn write_pdf_with_jpeg_image(path: &Path) {
+        let jpeg = tiny_jpeg();
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+
+        let image_id = doc.add_object(jpeg_image_stream(jpeg));
+        // Empty content is enough: we only walk Resources/XObject.
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+
+        let mut xobject = lopdf::Dictionary::new();
+        xobject.set("Im0", Object::Reference(image_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set("XObject", Object::Dictionary(xobject));
+
+        let page_id = doc.add_object(dict(&[
+            ("Type", "Page".into()),
+            ("Parent", pages_id.into()),
+            (
+                "MediaBox",
+                vec![0.into(), 0.into(), 100.into(), 100.into()].into(),
+            ),
+            ("Contents", content_id.into()),
+            ("Resources", Object::Dictionary(resources)),
+        ]));
+
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dict(&[
+                ("Type", "Pages".into()),
+                ("Kids", vec![page_id.into()].into()),
+                ("Count", 1.into()),
+            ])),
+        );
+
+        let catalog_id = doc.add_object(dict(&[
+            ("Type", "Catalog".into()),
+            ("Pages", pages_id.into()),
+        ]));
+        doc.trailer.set("Root", catalog_id);
+        doc.save(path).expect("save synthetic pdf");
+    }
+
+    #[test]
+    fn synthetic_pdf_xobject_image_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with-image.pdf");
+        write_pdf_with_jpeg_image(&path);
+
+        assert!(looks_like_pdf(&path));
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+
+        let root = m.list("/").expect("list root");
+        match &root {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("images"),
+                    "root keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected infos"),
+        }
+
+        let images = m.list("/images").expect("list images");
+        match &images {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("page1-img0.jpg"),
+                    "image keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            _ => panic!("expected infos"),
+        }
+
+        let fi = m
+            .lookup("/images/page1-img0.jpg", 0)
+            .expect("lookup image");
+        let jpeg = tiny_jpeg();
+        assert_eq!(fi.size, jpeg.len() as u64);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, jpeg);
+        assert_eq!(&buf[..2], &[0xFF, 0xD8]);
+    }
+
+    #[test]
+    fn synthetic_pdf_image_and_attachment_no_collision() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("img-and-attach.pdf");
+
+        let jpeg = tiny_jpeg();
+        let mut doc = Document::with_version("1.4");
+        let pages_id = doc.new_object_id();
+
+        let image_id = doc.add_object(jpeg_image_stream(jpeg.clone()));
+
+        let attach_data = b"hello-attachment".to_vec();
+        let embed_id = doc.add_object(Stream::new(
+            dict(&[("Type", "EmbeddedFile".into())]),
+            attach_data,
+        ));
+        let mut ef = lopdf::Dictionary::new();
+        ef.set("F", Object::Reference(embed_id));
+        let filespec_id = doc.add_object(dict(&[
+            ("Type", "Filespec".into()),
+            ("F", Object::string_literal("note.txt")),
+            ("UF", Object::string_literal("note.txt")),
+            ("EF", Object::Dictionary(ef)),
+        ]));
+        // EmbeddedFiles name tree: leaf node with /Names [name filespec …].
+        let ef_tree_id = doc.add_object(dict(&[(
+            "Names",
+            vec![Object::string_literal("note.txt"), filespec_id.into()].into(),
+        )]));
+        let names_root_id =
+            doc.add_object(dict(&[("EmbeddedFiles", Object::Reference(ef_tree_id))]));
+
+        let content_id = doc.add_object(Stream::new(lopdf::Dictionary::new(), Vec::new()));
+        let mut xobject = lopdf::Dictionary::new();
+        xobject.set("Im0", Object::Reference(image_id));
+        let mut resources = lopdf::Dictionary::new();
+        resources.set("XObject", Object::Dictionary(xobject));
+        let page_id = doc.add_object(dict(&[
+            ("Type", "Page".into()),
+            ("Parent", pages_id.into()),
+            (
+                "MediaBox",
+                vec![0.into(), 0.into(), 100.into(), 100.into()].into(),
+            ),
+            ("Contents", content_id.into()),
+            ("Resources", Object::Dictionary(resources)),
+        ]));
+        doc.objects.insert(
+            pages_id,
+            Object::Dictionary(dict(&[
+                ("Type", "Pages".into()),
+                ("Kids", vec![page_id.into()].into()),
+                ("Count", 1.into()),
+            ])),
+        );
+        let catalog_id = doc.add_object(dict(&[
+            ("Type", "Catalog".into()),
+            ("Pages", pages_id.into()),
+            ("Names", names_root_id.into()),
+        ]));
+        doc.trailer.set("Root", catalog_id);
+        doc.save(&path).expect("save");
+
+        let m = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+
+        let attach = m.lookup("/note.txt", 0).expect("attachment");
+        let mut r = m.open(&attach, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello-attachment");
+
+        let img = m.lookup("/images/page1-img0.jpg", 0).expect("image");
+        let mut r = m.open(&img, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, jpeg);
+    }
+
+    #[test]
+    fn image_payload_ext_dct_and_raw() {
+        let jpeg = tiny_jpeg();
+        let stream = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Filter", "DCTDecode".into()),
+            ]),
+            jpeg.clone(),
+        );
+        let (data, ext) = image_payload_and_ext(&stream);
+        assert_eq!(ext, "jpg");
+        assert_eq!(data, jpeg);
+
+        let raw = Stream::new(
+            dict(&[
+                ("Type", "XObject".into()),
+                ("Subtype", "Image".into()),
+                ("Width", 1.into()),
+                ("Height", 1.into()),
+            ]),
+            vec![0xAB, 0xCD],
+        );
+        let (data, ext) = image_payload_and_ext(&raw);
+        assert_eq!(ext, "bin");
+        assert_eq!(data, vec![0xAB, 0xCD]);
     }
 }
