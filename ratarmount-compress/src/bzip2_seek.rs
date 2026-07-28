@@ -6,48 +6,60 @@
 //! 3. Retain `{start_bit, end_bit, uncompressed_offset, uncompressed_size}` per block
 //!
 //! Readers seek by locating the covering block and re-decoding only that block
-//! (last-block cache for sequential reads). When the bit scan fails (large-file
-//! policy, single block, corrupt), we fall back to a one-shot [`DecodedBody`]
-//! (still multi-stream / multi-block parallel when `threads > 1`).
+//! (last-block cache for sequential reads). When the bit scan fails (single
+//! block, corrupt, empty), we fall back to a one-shot [`DecodedBody`] (still
+//! multi-stream / multi-block parallel when `threads > 1` and the compressed
+//! payload is in memory).
 //!
 //! # Opening from paths and readers
 //!
-//! Path openers and [`open_seekable_bzip2_from_reader`] share the same pipeline:
-//! the compressed payload is read fully into an `Arc<Vec<u8>>` (within the map
-//! size cap) so remote/HTTP `Read + Seek` sources (Range-capable) work the same
-//! as local files. `archive_label` is stored for diagnostics (`path()`).
+//! * **Path open**: compressed size ≤ [`IN_MEMORY_COMPRESSED_CAP`] (256 MiB)
+//!   loads into `Arc<Vec<u8>>`; larger files keep an open [`File`] behind a
+//!   mutex and never hold the full compressed blob in a `Vec`.
+//! * **Reader open** (`Read + Seek`): same in-memory threshold; over-cap inputs
+//!   are spooled to a tempfile so the map path can seek compressed ranges
+//!   without an `Arc<Vec<u8>>` of multi‑GB data. Remote/HTTP range sources work
+//!   the same (spool once at open).
 //!
 //! # Size policy
 //!
-//! Bit-block maps are built for compressed inputs up to
-//! [`BIT_BLOCK_SCAN_MAX_BYTES`] (256 MiB, aligned with [`DEFAULT_MEMORY_CAP`]).
-//! Above that cap we skip the bit walk and fall back to full decode so open
-//! stays bounded in RAM and CPU for multi‑GB `.bz2` files — no mmap dependency;
-//! large inputs stream through the sequential/parallel full-decode path into
-//! RAM or a temp file via [`DecodedBody`]. Within the cap the scanner uses a
-//! sliding 48‑bit window (O(n) bit steps, constant work each) rather than
-//! re-reading 48 bits at every offset.
+//! * **In-memory store + slice bit-scan**: capped at [`IN_MEMORY_COMPRESSED_CAP`]
+//!   / [`BIT_BLOCK_SCAN_MAX_BYTES`] (256 MiB).
+//! * **File-backed store**: buffered sliding-window bit scan over the compressed
+//!   stream with **no 256 MiB wall** — only residual limits are open-time CPU
+//!   (one full pass + one decode per block for sizes) and on-demand per-block
+//!   re-decode RAM. No mmap dependency.
+//! * **Fallback**: scan/map failure → full decode via [`DecodedBody`] (memory
+//!   or temp for uncompressed). Large file-backed fallback streams with
+//!   [`bzip2::read::MultiBzDecoder`] (no parallel block path).
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
-use bzip2::read::BzDecoder;
+use bzip2::read::{BzDecoder, MultiBzDecoder};
 use ratarmount_core::ParallelizationSpec;
+use tempfile::NamedTempFile;
 
 use crate::seekable_body::{DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result};
 
-/// Maximum compressed size eligible for the true bit-block seek map.
+/// Prefer an in-memory compressed store at or below this size (256 MiB).
 ///
-/// Chosen to match [`DEFAULT_MEMORY_CAP`] (256 MiB): large enough for typical
-/// multi-block `.bz2` / `.tar.bz2` archives, small enough that an in-memory
-/// load + sliding-window bit scan stays practical. Larger files fall back to
-/// full decode (see module docs). Not a hard format limit — residual for
-/// multi‑GB inputs without a file-backed/mmap scanner.
-const BIT_BLOCK_SCAN_MAX_BYTES: usize = DEFAULT_MEMORY_CAP as usize;
+/// Above this, path opens keep a shared [`File`]; generic readers spool to a
+/// tempfile. Aligns with [`DEFAULT_MEMORY_CAP`].
+const IN_MEMORY_COMPRESSED_CAP: u64 = DEFAULT_MEMORY_CAP;
+
+/// Maximum compressed size for **in-memory** (`&[u8]`) bit-block scanning.
+///
+/// File-backed scans are not subject to this cap. Kept for slice helpers used
+/// by the memory map path and parallel full-decode fallback.
+const BIT_BLOCK_SCAN_MAX_BYTES: usize = IN_MEMORY_COMPRESSED_CAP as usize;
+
+/// Read buffer size for file-backed sliding-window bit scans.
+const BIT_SCAN_READ_BUF: usize = 256 * 1024;
 
 /// Open bzip2 as a seekable body (bit-block map when possible, else full decode).
 pub fn open_seekable_bzip2(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
@@ -63,14 +75,15 @@ pub fn open_seekable_bzip2_with_threads(
 ) -> Result<Arc<dyn SeekableBody>> {
     let path = path.as_ref();
     let file = File::open(path)?;
-    open_seekable_bzip2_with_threads_from_reader(file, threads, path)
+    let len = file.metadata()?.len();
+    open_seekable_bzip2_with_file(file, len, threads, path, IN_MEMORY_COMPRESSED_CAP)
 }
 
 /// Open bzip2 from a seekable compressed reader (bit-block map when possible).
 ///
 /// `archive_label` is stored for diagnostics ([`SeekableBody::path`] — URL or virtual name).
-/// The compressed payload is read fully into memory for the map path (within
-/// [`BIT_BLOCK_SCAN_MAX_BYTES`]); larger inputs use the full-decode fallback.
+/// Compressed payloads ≤ [`IN_MEMORY_COMPRESSED_CAP`] are loaded into memory;
+/// larger inputs are spooled to a tempfile for the file-backed map path.
 pub fn open_seekable_bzip2_from_reader<R>(
     reader: R,
     archive_label: impl AsRef<Path>,
@@ -85,22 +98,94 @@ where
 ///
 /// See [`open_seekable_bzip2_from_reader`]. `threads == 0` means “use CPU count”.
 pub fn open_seekable_bzip2_with_threads_from_reader<R>(
-    mut reader: R,
+    reader: R,
     threads: u32,
     archive_label: impl AsRef<Path>,
 ) -> Result<Arc<dyn SeekableBody>>
 where
     R: Read + Seek,
 {
-    let path = archive_label.as_ref();
+    open_seekable_bzip2_from_reader_with_cap(
+        reader,
+        threads,
+        archive_label.as_ref(),
+        IN_MEMORY_COMPRESSED_CAP,
+    )
+}
+
+/// Path open with an explicit in-memory size threshold (used by tests to force
+/// the file-backed store on small fixtures).
+fn open_seekable_bzip2_with_file(
+    mut file: File,
+    len: u64,
+    threads: u32,
+    path: &Path,
+    memory_cap: u64,
+) -> Result<Arc<dyn SeekableBody>> {
     let threads = ParallelizationSpec::resolve_zero(threads).max(1);
-    let mut compressed = Vec::new();
-    reader.read_to_end(&mut compressed)?;
-    if compressed.len() < 4 || &compressed[..3] != b"BZh" {
+    validate_bzip2_header_reader(&mut file, len)?;
+    let store = if len <= memory_cap {
+        let mut compressed = Vec::with_capacity(len as usize);
+        file.read_to_end(&mut compressed)?;
+        if compressed.len() as u64 != len && len > 0 {
+            // Metadata size can race; trust what we read.
+        }
+        CompressedStore::Memory(Arc::new(compressed))
+    } else {
+        CompressedStore::shared_file(file, len, None)
+    };
+    finish_open(path, store, threads)
+}
+
+fn open_seekable_bzip2_from_reader_with_cap<R>(
+    mut reader: R,
+    threads: u32,
+    path: &Path,
+    memory_cap: u64,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek,
+{
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    let len = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    validate_bzip2_header_reader(&mut reader, len)?;
+
+    let store = if len <= memory_cap {
+        let mut compressed = Vec::with_capacity(len as usize);
+        reader.read_to_end(&mut compressed)?;
+        CompressedStore::Memory(Arc::new(compressed))
+    } else {
+        // Spool once so we retain seekable compressed storage without Arc<Vec>.
+        let mut tmp = NamedTempFile::new()?;
+        io::copy(&mut reader, tmp.as_file_mut())?;
+        tmp.as_file_mut().flush()?;
+        let spool_len = tmp.as_file().metadata()?.len();
+        let reopened = tmp.reopen()?;
+        CompressedStore::shared_file(reopened, spool_len, Some(tmp))
+    };
+    finish_open(path, store, threads)
+}
+
+fn validate_bzip2_header_reader<R: Read + Seek>(reader: &mut R, len: u64) -> Result<()> {
+    if len < 4 {
         return Err(CompressError::Msg("not a bzip2 stream".into()));
     }
+    let mut header = [0u8; 4];
+    reader.read_exact(&mut header)?;
+    reader.seek(SeekFrom::Start(0))?;
+    if !is_bzh_header(&header) {
+        return Err(CompressError::Msg("not a bzip2 stream".into()));
+    }
+    Ok(())
+}
 
-    match try_build_bit_block_map(&compressed, threads) {
+fn finish_open(
+    path: &Path,
+    store: CompressedStore,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    match try_build_bit_block_map_store(&store, threads) {
         Ok(blocks) if blocks.len() >= 2 => {
             let uncompressed_size = blocks
                 .last()
@@ -108,17 +193,17 @@ where
                 .unwrap_or(0);
             return Ok(Arc::new(SeekableBzip2 {
                 path: path.to_path_buf(),
-                compressed: Arc::new(compressed),
+                store,
                 blocks: Arc::new(blocks),
                 uncompressed_size,
             }));
         }
         Ok(_) | Err(_) => {
-            // Single block, large-file policy, corrupt scan, etc. → full decode.
+            // Single block, corrupt scan, etc. → full decode.
         }
     }
 
-    full_decode_body(path, &compressed, threads)
+    full_decode_from_store(path, store, threads)
 }
 
 fn full_decode_body(
@@ -144,6 +229,27 @@ fn full_decode_body(
     }
 }
 
+fn full_decode_from_store(
+    path: &Path,
+    store: CompressedStore,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    match store {
+        CompressedStore::Memory(v) => full_decode_body(path, &v, threads),
+        CompressedStore::Shared(shared) => {
+            // Stream multi-member bzip2 without loading the compressed blob.
+            let mut guard = shared
+                .inner
+                .lock()
+                .map_err(|_| CompressError::Msg("bzip2 compressed store lock poisoned".into()))?;
+            guard.seek(SeekFrom::Start(0))?;
+            let dec = MultiBzDecoder::new(&mut **guard);
+            let body = DecodedBody::from_decoder(path, "bzip2", dec, DEFAULT_MEMORY_CAP)?;
+            Ok(body as Arc<dyn SeekableBody>)
+        }
+    }
+}
+
 /// Per-block restart record (absolute bit offsets into the full compressed blob).
 #[derive(Clone, Debug)]
 struct BlockInfo {
@@ -155,10 +261,84 @@ struct BlockInfo {
     uncompressed_size: u64,
 }
 
+/// Retained compressed payload for the bit-block map path.
+#[derive(Clone)]
+enum CompressedStore {
+    Memory(Arc<Vec<u8>>),
+    Shared(Arc<SharedCompressed>),
+}
+
+/// Shared seekable compressed source (path [`File`] or tempfile spool).
+struct SharedCompressed {
+    inner: Mutex<Box<dyn SeekRead>>,
+    len: u64,
+    /// Keeps a spool tempfile alive for the lifetime of the store.
+    _keep: Option<NamedTempFile>,
+}
+
+impl CompressedStore {
+    fn shared_file(file: File, len: u64, keep: Option<NamedTempFile>) -> Self {
+        CompressedStore::Shared(Arc::new(SharedCompressed {
+            inner: Mutex::new(Box::new(file)),
+            len,
+            _keep: keep,
+        }))
+    }
+
+    fn len(&self) -> u64 {
+        match self {
+            CompressedStore::Memory(v) => v.len() as u64,
+            CompressedStore::Shared(s) => s.len,
+        }
+    }
+
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let end = offset
+            .checked_add(buf.len() as u64)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read range overflow"))?;
+        if end > self.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "read past end of compressed store",
+            ));
+        }
+        match self {
+            CompressedStore::Memory(v) => {
+                let start = offset as usize;
+                buf.copy_from_slice(&v[start..start + buf.len()]);
+                Ok(())
+            }
+            CompressedStore::Shared(s) => {
+                let mut guard = s
+                    .inner
+                    .lock()
+                    .map_err(|_| io::Error::other("bzip2 compressed store lock poisoned"))?;
+                guard.seek(SeekFrom::Start(offset))?;
+                guard.read_exact(buf)
+            }
+        }
+    }
+
+    fn read_range(&self, start: u64, end: u64) -> io::Result<Vec<u8>> {
+        if end < start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid compressed range",
+            ));
+        }
+        let mut buf = vec![0u8; (end - start) as usize];
+        self.read_exact_at(start, &mut buf)?;
+        Ok(buf)
+    }
+}
+
 /// Seekable bzip2 body backed by a retained bit-block map.
 pub struct SeekableBzip2 {
     path: PathBuf,
-    compressed: Arc<Vec<u8>>,
+    store: CompressedStore,
     blocks: Arc<Vec<BlockInfo>>,
     uncompressed_size: u64,
 }
@@ -174,7 +354,7 @@ impl SeekableBody for SeekableBzip2 {
 
     fn open_reader(&self) -> io::Result<Box<dyn SeekRead>> {
         Ok(Box::new(Bzip2BlockReader {
-            compressed: Arc::clone(&self.compressed),
+            store: self.store.clone(),
             blocks: Arc::clone(&self.blocks),
             size: self.uncompressed_size,
             pos: 0,
@@ -193,7 +373,7 @@ impl SeekableBody for SeekableBzip2 {
 }
 
 struct Bzip2BlockReader {
-    compressed: Arc<Vec<u8>>,
+    store: CompressedStore,
     blocks: Arc<Vec<BlockInfo>>,
     size: u64,
     pos: u64,
@@ -224,7 +404,7 @@ impl Bzip2BlockReader {
             return Ok(());
         }
         let b = &self.blocks[idx];
-        let plain = decode_one_block(b.header, &self.compressed, b.start_bit, b.end_bit)
+        let plain = decode_one_block_store(&self.store, b.header, b.start_bit, b.end_bit)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.cache_idx = Some(idx);
         self.cache_data = plain;
@@ -268,7 +448,7 @@ impl Seek for Bzip2BlockReader {
     }
 }
 
-/// True when `compressed_len` is within the in-memory bit-block scan budget.
+/// True when `compressed_len` is within the **in-memory** bit-block scan budget.
 #[inline]
 fn bit_scan_size_ok(compressed_len: usize) -> bool {
     compressed_len <= BIT_BLOCK_SCAN_MAX_BYTES
@@ -279,18 +459,25 @@ fn reject_if_too_large_for_bit_scan(compressed_len: usize) -> Result<()> {
         return Ok(());
     }
     Err(CompressError::Msg(format!(
-        "bzip2 block scan skipped (file large: {compressed_len} bytes > {BIT_BLOCK_SCAN_MAX_BYTES} byte cap)"
+        "bzip2 block scan skipped (in-memory file large: {compressed_len} bytes > {BIT_BLOCK_SCAN_MAX_BYTES} byte cap)"
     )))
 }
 
-/// Build a global block map across one or more concatenated bzip2 streams.
+/// Build a global block map from the retained compressed store.
+fn try_build_bit_block_map_store(store: &CompressedStore, threads: u32) -> Result<Vec<BlockInfo>> {
+    match store {
+        CompressedStore::Memory(v) => try_build_bit_block_map(v, threads),
+        CompressedStore::Shared(_) => try_build_bit_block_map_file(store, threads),
+    }
+}
+
+/// Build a global block map across one or more concatenated bzip2 streams (memory).
 ///
 /// Fails (caller falls back to full decode) when:
-/// * the file is larger than [`BIT_BLOCK_SCAN_MAX_BYTES`]
+/// * the in-memory buffer is larger than [`BIT_BLOCK_SCAN_MAX_BYTES`]
 /// * fewer than 2 blocks are found overall
 /// * magic scan / block decode fails
 fn try_build_bit_block_map(compressed: &[u8], threads: u32) -> Result<Vec<BlockInfo>> {
-    // Cap total scan cost / RAM for large files (same policy as per-stream scan).
     reject_if_too_large_for_bit_scan(compressed.len())?;
 
     let mut all_blocks: Vec<BlockInfo> = Vec::new();
@@ -349,6 +536,81 @@ fn try_build_bit_block_map(compressed: &[u8], threads: u32) -> Result<Vec<BlockI
     Ok(all_blocks)
 }
 
+/// File-backed multi-stream bit-block map (no compressed-size RAM cap).
+fn try_build_bit_block_map_file(store: &CompressedStore, threads: u32) -> Result<Vec<BlockInfo>> {
+    let len = store.len();
+    let mut all_blocks: Vec<BlockInfo> = Vec::new();
+    let mut u_off = 0u64;
+    let mut byte_pos = 0u64;
+
+    while byte_pos + 4 <= len {
+        let mut header = [0u8; 4];
+        store
+            .read_exact_at(byte_pos, &mut header)
+            .map_err(|e| CompressError::Msg(format!("bzip2 header read: {e}")))?;
+        if !is_bzh_header(&header) {
+            break;
+        }
+
+        let remaining = len - byte_pos;
+        let ranges = scan_block_bit_ranges_at(store, byte_pos, remaining)?;
+        if ranges.is_empty() {
+            return Err(CompressError::Msg("no bzip2 blocks in stream".into()));
+        }
+
+        // Absolute bit offsets into the full compressed blob.
+        let bit_base = byte_pos * 8;
+        let abs_ranges: Vec<(u64, u64)> = ranges
+            .iter()
+            .map(|&(s, e)| (bit_base + s, bit_base + e))
+            .collect();
+
+        let sizes = decode_block_sizes_store(header, store, &abs_ranges, threads)?;
+        if sizes.len() != abs_ranges.len() {
+            return Err(CompressError::Msg("bzip2 block size count mismatch".into()));
+        }
+
+        for (i, &(start_bit, end_bit)) in abs_ranges.iter().enumerate() {
+            let usize_ = sizes[i];
+            all_blocks.push(BlockInfo {
+                header,
+                start_bit,
+                end_bit,
+                uncompressed_offset: u_off,
+                uncompressed_size: usize_,
+            });
+            u_off += usize_;
+        }
+
+        let eos_bit = ranges.last().unwrap().1;
+        let after_stream_bits = eos_bit + 48 + 32;
+        let stream_bytes = after_stream_bits.div_ceil(8);
+        if stream_bytes == 0 {
+            return Err(CompressError::Msg("degenerate bzip2 stream length".into()));
+        }
+        byte_pos += stream_bytes;
+
+        while byte_pos < len {
+            let mut b = [0u8; 1];
+            store
+                .read_exact_at(byte_pos, &mut b)
+                .map_err(|e| CompressError::Msg(format!("bzip2 pad read: {e}")))?;
+            if b[0] != 0 {
+                break;
+            }
+            byte_pos += 1;
+        }
+    }
+
+    if all_blocks.is_empty() {
+        return Err(CompressError::Msg("no bzip2 blocks indexed".into()));
+    }
+    if all_blocks.len() < 2 {
+        return Err(CompressError::Msg("single bzip2 block; full-decode path".into()));
+    }
+    Ok(all_blocks)
+}
+
 /// Decode each block (optionally in parallel) and return uncompressed sizes.
 fn decode_block_sizes(
     header: [u8; 4],
@@ -382,6 +644,65 @@ fn decode_block_sizes(
                 for &(start_bit, end_bit) in &owned {
                     outs.push(
                         decode_one_block(header, stream, start_bit, end_bit)
+                            .map(|p| p.len() as u64),
+                    );
+                }
+                (base, outs)
+            }));
+        }
+        for h in handles {
+            if let Ok((base, outs)) = h.join() {
+                for (i, r) in outs.into_iter().enumerate() {
+                    results[base + i] = Some(r);
+                }
+            }
+        }
+    });
+
+    let mut sizes = Vec::with_capacity(results.len());
+    for r in results {
+        sizes.push(
+            r.ok_or_else(|| CompressError::Msg("bzip2 size worker missing".into()))??,
+        );
+    }
+    Ok(sizes)
+}
+
+/// Decode block sizes from absolute bit ranges against a compressed store.
+fn decode_block_sizes_store(
+    header: [u8; 4],
+    store: &CompressedStore,
+    ranges: &[(u64, u64)],
+    threads: u32,
+) -> Result<Vec<u64>> {
+    if ranges.is_empty() {
+        return Ok(Vec::new());
+    }
+    if threads <= 1 || ranges.len() == 1 {
+        let mut sizes = Vec::with_capacity(ranges.len());
+        for &(start_bit, end_bit) in ranges {
+            let plain = decode_one_block_store(store, header, start_bit, end_bit)?;
+            sizes.push(plain.len() as u64);
+        }
+        return Ok(sizes);
+    }
+
+    // Parallel size discovery: each worker loads its own compressed range.
+    let n_workers = (threads as usize).min(ranges.len()).max(1);
+    let mut results: Vec<Option<Result<u64>>> = (0..ranges.len()).map(|_| None).collect();
+    let store_ref = store;
+
+    thread::scope(|scope| {
+        let chunk = ranges.len().div_ceil(n_workers).max(1);
+        let mut handles = Vec::new();
+        for (worker_id, range_chunk) in ranges.chunks(chunk).enumerate() {
+            let base = worker_id * chunk;
+            let owned: Vec<(u64, u64)> = range_chunk.to_vec();
+            handles.push(scope.spawn(move || {
+                let mut outs = Vec::with_capacity(owned.len());
+                for &(start_bit, end_bit) in &owned {
+                    outs.push(
+                        decode_one_block_store(store_ref, header, start_bit, end_bit)
                             .map(|p| p.len() as u64),
                     );
                 }
@@ -574,9 +895,14 @@ fn try_parallel_block_decode(compressed: &[u8], threads: u32) -> Result<Vec<u8>>
 /// Returns (start_bit, end_bit) for each block (bits from start of `compressed`, MSB-first).
 ///
 /// Uses a sliding 48-bit window so each input bit is examined once (O(n) with
-/// small constants). Suitable up to [`BIT_BLOCK_SCAN_MAX_BYTES`].
+/// small constants). Subject to [`BIT_BLOCK_SCAN_MAX_BYTES`] (in-memory only).
 fn scan_block_bit_ranges(compressed: &[u8]) -> Result<Vec<(u64, u64)>> {
     reject_if_too_large_for_bit_scan(compressed.len())?;
+    scan_block_bit_ranges_bytes(compressed)
+}
+
+/// Slice bit-scan without the size gate (caller enforces policy).
+fn scan_block_bit_ranges_bytes(compressed: &[u8]) -> Result<Vec<(u64, u64)>> {
     let total_bits = compressed.len() as u64 * 8;
     if total_bits < 32 + 48 {
         return Err(CompressError::Msg("bzip2 too short for block scan".into()));
@@ -642,6 +968,123 @@ fn scan_block_bit_ranges(compressed: &[u8]) -> Result<Vec<(u64, u64)>> {
     Ok(ranges)
 }
 
+/// Buffered bit-scan of a compressed stream region starting at `byte_offset`.
+///
+/// Reads via the store with a sliding window — does **not** load the whole
+/// region into a `Vec`. Bit offsets in the result are relative to `byte_offset`.
+fn scan_block_bit_ranges_at(
+    store: &CompressedStore,
+    byte_offset: u64,
+    stream_len: u64,
+) -> Result<Vec<(u64, u64)>> {
+    if stream_len < 10 {
+        return Err(CompressError::Msg("bzip2 too short for block scan".into()));
+    }
+
+    match store {
+        CompressedStore::Memory(v) => {
+            let start = byte_offset as usize;
+            let end = (byte_offset + stream_len).min(v.len() as u64) as usize;
+            // Memory store is already size-gated at open; scan the stream slice.
+            scan_block_bit_ranges_bytes(&v[start..end])
+        }
+        CompressedStore::Shared(shared) => {
+            let mut guard = shared.inner.lock().map_err(|_| {
+                CompressError::Msg("bzip2 compressed store lock poisoned".into())
+            })?;
+            guard
+                .seek(SeekFrom::Start(byte_offset))
+                .map_err(|e| CompressError::Msg(format!("bzip2 scan seek: {e}")))?;
+            let take = (&mut **guard).take(stream_len);
+            scan_block_bit_ranges_reader(take, stream_len)
+        }
+    }
+}
+
+/// Sliding-window bit scan over a sequential reader (file-backed path).
+///
+/// `stream_len` is the maximum number of compressed bytes to examine.
+/// No compressed-size RAM cap — only a fixed read buffer is held.
+fn scan_block_bit_ranges_reader<R: Read>(
+    mut reader: R,
+    stream_len: u64,
+) -> Result<Vec<(u64, u64)>> {
+    let total_bits = stream_len.saturating_mul(8);
+    if total_bits < 32 + 48 {
+        return Err(CompressError::Msg("bzip2 too short for block scan".into()));
+    }
+
+    const MAGIC_BITS: u64 = 48;
+    const HEADER_BITS: u64 = 32;
+    let mask48 = (1u64 << MAGIC_BITS) - 1;
+
+    let mut window = 0u64;
+    let mut starts = Vec::new();
+    let mut eos_bit: Option<u64> = None;
+    let mut next_allowed_start = HEADER_BITS;
+    let mut bit: u64 = 0;
+    let mut bytes_seen: u64 = 0;
+    let mut buf = vec![0u8; BIT_SCAN_READ_BUF];
+
+    'read: while bytes_seen < stream_len {
+        let want = ((stream_len - bytes_seen) as usize).min(buf.len());
+        let n = reader
+            .read(&mut buf[..want])
+            .map_err(|e| CompressError::Msg(format!("bzip2 bit scan read: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            for off in (0..8).rev() {
+                if bit >= total_bits {
+                    break 'read;
+                }
+                let b = u64::from((byte >> off) & 1);
+                window = ((window << 1) | b) & mask48;
+
+                if bit + 1 >= HEADER_BITS + MAGIC_BITS {
+                    let start = bit + 1 - MAGIC_BITS;
+                    if start >= next_allowed_start {
+                        if window == BLOCK_MAGIC {
+                            starts.push(start);
+                            next_allowed_start = start + MAGIC_BITS;
+                        } else if window == EOS_MAGIC {
+                            eos_bit = Some(start);
+                            break 'read;
+                        }
+                    }
+                }
+                bit += 1;
+            }
+            bytes_seen += 1;
+            if bytes_seen >= stream_len {
+                break 'read;
+            }
+        }
+    }
+
+    let Some(eos) = eos_bit else {
+        return Err(CompressError::Msg("bzip2 EOS magic not found".into()));
+    };
+    if starts.is_empty() {
+        return Err(CompressError::Msg("no bzip2 blocks found".into()));
+    }
+    let mut ranges = Vec::with_capacity(starts.len());
+    for i in 0..starts.len() {
+        let start = starts[i];
+        let end = if i + 1 < starts.len() {
+            starts[i + 1]
+        } else {
+            eos
+        };
+        if end <= start + MAGIC_BITS {
+            return Err(CompressError::Msg("degenerate bzip2 block range".into()));
+        }
+        ranges.push((start, end));
+    }
+    Ok(ranges)
+}
+
 fn read_bits_msb(data: &[u8], start_bit: u64, n: u32) -> Option<u64> {
     if n == 0 {
         return Some(0);
@@ -681,6 +1124,37 @@ fn decode_one_block(
     dec.read_to_end(&mut out)
         .map_err(|e| CompressError::Msg(format!("bzip2 block decode: {e}")))?;
     Ok(out)
+}
+
+/// Decode one block using absolute bit offsets into a compressed store.
+///
+/// Memory store: zero-copy into the existing `Vec`. File store: seek+read only
+/// the covering compressed byte range into a mini buffer.
+fn decode_one_block_store(
+    store: &CompressedStore,
+    header: [u8; 4],
+    start_bit: u64,
+    end_bit: u64,
+) -> Result<Vec<u8>> {
+    match store {
+        CompressedStore::Memory(v) => decode_one_block(header, v, start_bit, end_bit),
+        CompressedStore::Shared(_) => {
+            if end_bit < start_bit {
+                return Err(CompressError::Msg("degenerate bzip2 block range".into()));
+            }
+            // Cover [start_bit, end_bit) and the 32-bit block CRC at start+48.
+            let crc_end_bit = start_bit.saturating_add(48 + 32);
+            let need_end_bit = end_bit.max(crc_end_bit);
+            let byte_start = start_bit / 8;
+            let byte_end = need_end_bit.div_ceil(8).min(store.len());
+            let data = store
+                .read_range(byte_start, byte_end)
+                .map_err(|e| CompressError::Msg(format!("bzip2 block range read: {e}")))?;
+            let adj_start = start_bit - byte_start * 8;
+            let adj_end = end_bit - byte_start * 8;
+            decode_one_block(header, &data, adj_start, adj_end)
+        }
+    }
 }
 
 struct BitWriter {
@@ -954,8 +1428,7 @@ mod tests {
 
     #[test]
     fn large_file_scan_policy() {
-        // New policy: the old 8 MiB wall is gone — medium buffers may enter the
-        // scanner (and fail for content reasons, not size).
+        // Medium buffers may enter the in-memory scanner (content failures only).
         assert!(bit_scan_size_ok(8 * 1024 * 1024 + 16));
         assert!(bit_scan_size_ok(BIT_BLOCK_SCAN_MAX_BYTES));
         assert!(!bit_scan_size_ok(BIT_BLOCK_SCAN_MAX_BYTES + 1));
@@ -973,18 +1446,85 @@ mod tests {
             "expected content-level scan failure, got: {msg}"
         );
 
-        // Hard cap still refuses without bit-walking multi-GB inputs.
-        // Gate is size-based; exercise it without allocating 256 MiB+1.
+        // In-memory slice scan still refuses multi-GB without allocating.
         let err = reject_if_too_large_for_bit_scan(BIT_BLOCK_SCAN_MAX_BYTES + 1).unwrap_err();
         assert!(
             err.to_string().contains("large"),
             "expected large-file skip, got {}",
             err
         );
-        // try_build uses the same gate (pass a tiny slice only if under cap —
-        // over-cap path is the helper above; also check exact-cap is accepted).
         assert!(reject_if_too_large_for_bit_scan(BIT_BLOCK_SCAN_MAX_BYTES).is_ok());
         assert!(reject_if_too_large_for_bit_scan(0).is_ok());
+    }
+
+    #[test]
+    fn file_backed_reader_scan_matches_slice() {
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        let slice_ranges = scan_block_bit_ranges(&compressed).expect("slice scan");
+        assert!(slice_ranges.len() >= 2);
+
+        let reader_ranges =
+            scan_block_bit_ranges_reader(std::io::Cursor::new(&compressed), compressed.len() as u64)
+                .expect("reader scan");
+        assert_eq!(reader_ranges, slice_ranges);
+    }
+
+    #[test]
+    fn file_backed_map_forced_by_zero_memory_cap() {
+        // Documents the large-file path: memory_cap 0 forces tempfile/file store
+        // + buffered scan + on-demand block reads (no Arc of full compressed Vec
+        // retained on the map body). Synthetic multi-block stays small for CI.
+        let data = multi_block_payload();
+        let compressed = encode_bz2_level(&data, 1);
+        // Ensure >8 KiB uncompressed still maps (goal: no 8 MiB wall regression).
+        assert!(data.len() > 8 * 1024);
+        let slice_ranges = scan_block_bit_ranges(&compressed).expect("multi-block");
+        assert!(slice_ranges.len() >= 2);
+
+        let body = open_seekable_bzip2_from_reader_with_cap(
+            std::io::Cursor::new(compressed.clone()),
+            2,
+            Path::new("forced-file-backed.bz2"),
+            0, // force Shared store
+        )
+        .unwrap();
+        assert_eq!(body.kind(), "bzip2-blocks");
+        assert_eq!(body.checkpoint_count(), slice_ranges.len());
+        assert_eq!(body.size(), data.len() as u64);
+
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
+
+        // Random seeks still work via seek+read block ranges.
+        let mut r = body.open_reader().unwrap();
+        let n = data.len() as u64;
+        for &off in &[0u64, n / 3, n / 2, n.saturating_sub(10)] {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 32];
+            let rn = r.read(&mut buf).unwrap();
+            assert!(rn > 0, "offset {off}");
+            assert_eq!(&buf[..rn], &data[off as usize..off as usize + rn]);
+        }
+
+        // Path open with cap 0 likewise uses the file-backed store.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("path-file-backed.bz2");
+        std::fs::write(&path, &compressed).unwrap();
+        let file = File::open(&path).unwrap();
+        let len = file.metadata().unwrap().len();
+        let path_body =
+            open_seekable_bzip2_with_file(file, len, 1, &path, 0).unwrap();
+        assert_eq!(path_body.kind(), "bzip2-blocks");
+        assert_eq!(path_body.size(), data.len() as u64);
+        let mut path_got = Vec::new();
+        path_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut path_got)
+            .unwrap();
+        assert_eq!(path_got, data);
     }
 
     #[test]
@@ -1203,5 +1743,43 @@ mod tests {
         let mut got = Vec::new();
         body.open_reader().unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, data);
+    }
+
+    #[test]
+    fn file_backed_multi_stream_and_single_fallback() {
+        // Multi-stream over file-backed store.
+        let a: Vec<u8> = (0..40_000u32).map(|i| (i % 200) as u8).collect();
+        let b: Vec<u8> = (0..60_000u32).map(|i| ((i * 3) % 200) as u8).collect();
+        let mut compressed = encode_bz2_level(&a, 1);
+        compressed.extend_from_slice(&encode_bz2_level(&b, 1));
+        let mut expected = a.clone();
+        expected.extend_from_slice(&b);
+
+        let body = open_seekable_bzip2_from_reader_with_cap(
+            std::io::Cursor::new(compressed),
+            2,
+            Path::new("fb-multi.bz2"),
+            0,
+        )
+        .unwrap();
+        assert!(body.checkpoint_count() >= 2);
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, expected);
+
+        // Single-block still falls back when forced file-backed.
+        let tiny = b"tiny fb single";
+        let c = encode_bz2(tiny);
+        let body = open_seekable_bzip2_from_reader_with_cap(
+            std::io::Cursor::new(c),
+            1,
+            Path::new("fb-single.bz2"),
+            0,
+        )
+        .unwrap();
+        assert_eq!(body.kind(), "bzip2");
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, tiny);
     }
 }
