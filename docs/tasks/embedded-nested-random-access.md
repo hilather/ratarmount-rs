@@ -87,20 +87,21 @@
 
 ### B1. CPIO + AR
 
-- [ ] `open_from_reader` on CPIO / AR mount sources (mirror ZIP/TAR pattern)
-- [ ] Factory nested magic: `07070` newc/crc, `070707` odc, AR `!<arch>\n`
-- [ ] Tests: nested `inner.newc.cpio` in TAR/7z store no-tmp
+- [x] `open_from_reader` on CPIO / AR mount sources (batch 2026-07-28 agents)
+- [x] Factory nested magic: CPIO / AR in `open_nested_reader_fn`
+- [ ] Optional: nested `inner.newc.cpio` in store 7z end-to-end harness
 
-### B2. ISO 9660 / WARC / XAR / ASAR
+### B2. ISO 9660 / WARC / ASAR (low-hanging stencil)
 
-- [ ] `open_from_reader` (shared `Read+Seek` backend like ZIP `Shared`)
-- [ ] Factory nested detect (ISO primary volume, WARC/WARC/1, XAR header, ASAR)
-- [ ] Tests: one fixture each nested in store 7z or uncompressed TAR
+- [x] ISO / WARC / ASAR `open_from_reader` (shared `Read+Seek`) — batch 2026-07-28
+- [x] Factory nested detect (ISO PVD/`CD001`, WARC/, `.asar`, …)
+- [x] Unit tests per crate (path + Cursor)
+- [ ] XAR / CAB deferred (compressed members more work)
 
 ### B3. ZIP store polish
 
-- [ ] Explicit tests: nested store ZIP in 7z/TAR no-tmp random read
-- [ ] Document deflate members: full-member inflate + cache (not progressive); still no outer temp
+- [x] Explicit tests: nested store ZIP in 7z + TAR inside ZIP no-tmp (factory tests)
+- [x] Document deflate members: full-member inflate + cache (not progressive); still no outer temp
 
 ---
 

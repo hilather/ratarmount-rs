@@ -75,8 +75,13 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **`.tar.zst`** | zstd magic + TAR | Seekable zstd + TAR body | Yes (frame/map dependent) |
 | **`.tar.bz2`** | `BZh` + TAR | Seekable bzip2 + TAR | Yes (block map) |
 | **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Multi-block better; single-stream weaker |
+| **CPIO** (newc/odc/bin) | `070701` / `070702` / `070707` / binary magic / `.cpio` | `CpioMountSource::open_from_reader` | **Yes** — stencil |
+| **AR** | `!<arch>\n` / `.ar` / `.a` | `ArMountSource::open_from_reader` | **Yes** — stencil |
+| **ISO 9660** | PVD `CD001` @ sector 16 / `.iso` | `Iso9660MountSource::open_from_reader` | **Yes** — extent stencils (no full-image RAM load) |
+| **WARC** | `WARC/` / `.warc` | `WarcMountSource::open_from_reader` | **Yes** — payload stencils |
+| **ASAR** | `.asar` name | `AsarMountSource::open_from_reader` | **Yes** — data-offset stencils |
 
-Anything else (ISO, SquashFS, RAR-only libarchive, plain non-TAR `.gz`, …) **falls back to temp spool** for the nested open today.
+Anything else (XAR, CAB LZX, SquashFS, RAR/libarchive-only, plain non-TAR `.gz`, …) **falls back to temp spool** for the nested open today.
 
 ---
 
@@ -96,7 +101,8 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **7z (store/copy)** | `.tar` / `.tar.gz` / `.zip` / `.7z` | **No** | Preferred outer packing for nested random I/O |
 | **7z (solid LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode; not recommended for large solids |
 | **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for BCJ/AES/etc. |
-| **CPIO / AR / ISO / WARC / …** | nested archive | **Often yes (tmp)** | Nested *inside* these works if parent can open the member; nested open *of* these formats from a stream is still path/temp-oriented |
+| **CPIO / AR / ISO / WARC / ASAR** | nested archive as member of ZIP/TAR/7z | **No** | Stencil `open_from_reader` when magic/name matches |
+| **XAR / CAB / SquashFS / RAR** | nested | **Often yes (tmp)** | Path/spool until stream open is wired |
 
 ### Explicit: ZIP + embedded TAR
 
@@ -177,7 +183,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | List OK, read fails with EACCES | Encrypted 7z metadata-only; need password (inner password for nested encrypted 7z) |
 | Nested `.tar.gz` slow cold open | Building gzip seek checkpoints on the member stream (once per nested mount) |
 | Nested inside solid 7z slow | Solid prefix cost — re-pack outer non-solid if possible |
-| Nested ISO/SquashFS needs tmp | Expected until those backends gain `open_from_reader` |
+| Nested SquashFS/RAR/XAR needs tmp | Expected until those backends gain stream open |
 
 ---
 
@@ -202,7 +208,8 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.tar.gz` in ZIP/TAR/7z | yes | yes (gzip seek) |
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
-| Nested ISO / SquashFS / RAR / plain `.gz` | usually **tmp** | depends on path open |
+| Nested CPIO / AR / ISO / WARC / ASAR | yes | yes (stencil) |
+| Nested XAR / SquashFS / RAR / plain `.gz` | usually **tmp** | depends on path open |
 | Solid multi-GB 7z outer | no tmp | often costly |
 
 \* Inner ZIP deflate / solid 7z / single-stream xz have the usual decompress costs; they still avoid nested temp files when the reader path succeeds.

@@ -492,8 +492,8 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 /// Supports:
 /// - **7z**, **ZIP**, uncompressed **TAR**
 /// - **gzip / zstd / bzip2 / xz** when the body is a compressed TAR (e.g. `.tar.gz`
-///   embedded in a store 7z) — seekable decompress + in-memory TAR index, random
-///   member reads without writing the nested body to `/tmp`
+///   embedded in a store 7z) — seekable decompress + in-memory TAR index
+/// - **CPIO**, **AR**, **ISO 9660**, **WARC**, **ASAR** (stencil backends)
 ///
 /// Other formats fail so AutoMount can fall back to materializing a temp file
 /// and [`open_nested_fn`].
@@ -542,6 +542,27 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             });
         }
 
+        // Unix ar
+        if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
+            return map_nested_open("AR", label, || {
+                ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // CPIO newc/crc/odc (ASCII) or binary magic
+        if head_looks_like_cpio(head) {
+            return map_nested_open("CPIO", label, || {
+                CpioMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // WARC
+        if head.len() >= 5 && &head[..5] == b"WARC/" {
+            return map_nested_open("WARC", label, || {
+                WarcMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
         match probe_archive_magic(head) {
             "gzip" => return open_nested_gzip_tar(reader, label, &opts),
             "zstd" => {
@@ -584,44 +605,57 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 )
             }
             "zip" => {
-                log::debug!("nested reader open: {} detected as ZIP", label.display());
-                return ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
-                    .map(|s| {
-                        log::debug!(
-                            "nested reader open: ZIP {} mounted successfully",
-                            label.display()
-                        );
-                        Arc::new(s) as Arc<dyn MountSource>
-                    })
-                    .map_err(|e| {
-                        log::warn!("nested reader open: ZIP {} failed: {e}", label.display());
-                        std::io::Error::other(e.to_string())
-                    });
+                return map_nested_open("ZIP", label, || {
+                    ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+                });
             }
             "tar" => {
-                log::debug!("nested reader open: {} detected as TAR", label.display());
-                return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
-                    .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-                    .map_err(|e| {
-                        log::warn!("nested reader open: TAR {} failed: {e}", label.display());
-                        std::io::Error::other(e.to_string())
-                    });
+                return map_nested_open("TAR", label, || {
+                    SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
+                });
             }
             _ => {}
         }
 
         // Uncompressed TAR by name (no ustar magic in first 512 — rare)
         if name_suggests_plain_tar(label) {
-            log::debug!(
-                "nested reader open: {} treated as TAR by name",
-                label.display()
-            );
-            return SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
-                .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-                .map_err(|e| {
-                    log::warn!("nested reader open: TAR {} failed: {e}", label.display());
-                    std::io::Error::other(e.to_string())
-                });
+            return map_nested_open("TAR", label, || {
+                SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // ISO 9660: PVD at sector 16 (beyond first 512 bytes) — probe stream or name
+        let looks_iso = name_suggests_iso(label)
+            || ratarmount_formats_iso9660::looks_like_iso9660_reader(&mut reader);
+        let _ = reader.seek(SeekFrom::Start(0));
+        if looks_iso {
+            return map_nested_open("ISO9660", label, || {
+                Iso9660MountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+
+        // ASAR: extension (header sniff needs full parse; name is the nested-open trigger)
+        if name_suggests_asar(label) {
+            return map_nested_open("ASAR", label, || {
+                AsarMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
+            });
+        }
+
+        // WARC / CPIO by extension when magic was missed
+        if name_suggests_ext(label, &["warc"]) {
+            return map_nested_open("WARC", label, || {
+                WarcMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+        if name_suggests_ext(label, &["cpio"]) {
+            return map_nested_open("CPIO", label, || {
+                CpioMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
+        }
+        if name_suggests_ext(label, &["ar", "a"]) {
+            return map_nested_open("AR", label, || {
+                ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
+            });
         }
 
         log::debug!(
@@ -637,6 +671,62 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             ),
         ))
     })
+}
+
+fn map_nested_open<S, E>(
+    kind: &str,
+    label: &Path,
+    f: impl FnOnce() -> std::result::Result<S, E>,
+) -> std::io::Result<Arc<dyn MountSource>>
+where
+    S: MountSource + 'static,
+    E: std::fmt::Display,
+{
+    log::debug!("nested reader open: {} detected as {kind}", label.display());
+    f().map(|s| {
+        log::debug!(
+            "nested reader open: {kind} {} mounted successfully",
+            label.display()
+        );
+        Arc::new(s) as Arc<dyn MountSource>
+    })
+    .map_err(|e| {
+        log::warn!("nested reader open: {kind} {} failed: {e}", label.display());
+        std::io::Error::other(e.to_string())
+    })
+}
+
+fn head_looks_like_cpio(head: &[u8]) -> bool {
+    if head.len() >= 6 {
+        let m6 = &head[..6];
+        if m6 == b"070701" || m6 == b"070702" || m6 == b"070707" {
+            return true;
+        }
+    }
+    if head.len() >= 2 {
+        let m2 = &head[..2];
+        if m2 == b"\xc7\x71" || m2 == b"\x71\xc7" {
+            return true;
+        }
+    }
+    false
+}
+
+fn name_suggests_iso(path: &Path) -> bool {
+    name_suggests_ext(path, &["iso", "iso9660", "cdr", "img"])
+}
+
+fn name_suggests_asar(path: &Path) -> bool {
+    name_suggests_ext(path, &["asar"])
+}
+
+fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    exts.iter().any(|e| name.ends_with(&format!(".{e}")))
 }
 
 /// Nested gzip body: seekable checkpoints + TAR index (no temp spool of the member).
