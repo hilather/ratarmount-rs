@@ -1417,9 +1417,85 @@ impl Lzma2RandomAccessDecoder {
 
     /// Force progressive window-cache mode even for small folders (tests).
     #[cfg(test)]
-    fn force_progressive_for_test(&mut self) {
+    pub fn force_progressive_for_test(&mut self) {
         self.cache_full = false;
         self.full = None;
+    }
+}
+
+/// Shared pure-LZMA2 solid-folder decoder (multiple members / concurrent opens).
+pub type SharedLzma2Decoder = Arc<Mutex<Lzma2RandomAccessDecoder>>;
+
+/// Seekable logical view of one solid-folder member over a shared LZMA2 decoder.
+///
+/// Positions are relative to the member; the decoder addresses absolute offsets
+/// inside the folder unpack stream (`member_start + pos`). Matches Python
+/// `SevenZipStreamingMemberFile` so nested AutoMount can `seek(0)` / re-read
+/// without temp spooling the outer solid member.
+///
+/// **Nested 7z:** outer solid members return this type (or a fully-buffered
+/// `Cursor` for small folders). Either is `Read+Seek` and feeds
+/// `SevenZipMountSource::open_from_reader` without materializing a host temp file.
+pub struct Lzma2MemberReader {
+    decoder: SharedLzma2Decoder,
+    member_start: u64,
+    member_size: u64,
+    pos: u64,
+}
+
+impl Lzma2MemberReader {
+    pub fn new(decoder: SharedLzma2Decoder, member_start: u64, member_size: u64) -> Self {
+        Self {
+            decoder,
+            member_start,
+            member_size,
+            pos: 0,
+        }
+    }
+
+    #[allow(dead_code)] // diagnostics / nested AutoMount sizing
+    pub fn member_size(&self) -> u64 {
+        self.member_size
+    }
+}
+
+impl Read for Lzma2MemberReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.member_size || buf.is_empty() {
+            return Ok(0);
+        }
+        let want = ((self.member_size - self.pos) as usize).min(buf.len());
+        let abs = self.member_start + self.pos;
+        let mut g = self
+            .decoder
+            .lock()
+            .map_err(|_| io::Error::other("7z LZMA2 decoder lock poisoned"))?;
+        let data = g
+            .read_range(abs, want)
+            .map_err(|e| io::Error::other(e.to_string()))?;
+        let n = data.len().min(want);
+        buf[..n].copy_from_slice(&data[..n]);
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for Lzma2MemberReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.member_size as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start of solid 7z member",
+            ));
+        }
+        // Allow seeks past EOF (like Cursor); reads then return 0.
+        self.pos = new as u64;
+        Ok(self.pos)
     }
 }
 
