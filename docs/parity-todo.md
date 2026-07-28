@@ -51,7 +51,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
 | AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT + TAR flatten; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, SquashFS, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
-| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR; GNU tar) | `[x]` common compressions |
+| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild) | `[x]` TAR compressions + ZIP MVP |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
 | Control interface socket | yes | Unix socket + in-FS `/.ratarmount-control/` | `[x]` |
 | Lazy mount (`-l`) | yes | yes (mount on first access) | `[x]` |

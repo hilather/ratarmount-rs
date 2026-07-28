@@ -24,6 +24,7 @@ issue from the README feature tables.
 | [#79](https://github.com/mxmlnkn/ratarmount/issues/79) | Metadata for recursive compressed TARs in outer index | **partial** | `nestedTarMembers` / flatten paths; not full Python dual-index |
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) (seek-table → multi-frame → full decode; producer recipes) |
+| [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `ratarmount-compositing::commit_overlay`; residual encrypted/multi-part |
 
 ---
 
@@ -35,7 +36,7 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-1 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | **ZIP commit-overlay** | Doable; Python zip module can’t in-place rewrite well — scale with size; aim for append/rebuild strategy | `ratarmount-compositing` + `formats-zip` |
+| FR-1 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | **ZIP commit-overlay** | **done** (MVP): full rebuild in `commit_overlay` — raw-copy unchanged store/deflate members; overlay files deflate; atomic replace. Residual: encrypted/multi-part/spanned ZIP, in-place append, jar/war extras | `ratarmount-compositing` |
 | FR-2 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | **HTTP(S) authentication** | Basic auth via URL / headers; cookie auth harder | `ratarmount-remote` |
 | FR-3 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | **TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*`** | **done** — index + `list_xattr`/`get_xattr`; skip vendor MPE/ZOS pax keys | `formats-tar` (fuse already serves index xattrs) |
 | FR-4 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | **Parallel inflate of large ZIP deflate members** | Multi-threaded access to encrypted zip discussed separately; plain deflate parallel open is in scope | `formats-zip` |
@@ -65,6 +66,7 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 
 ## Suggested implementation order (agents)
 
+<<<<<<< HEAD
 **Done:** FR-3 (TAR PAX xattrs), FR-7 (zstd multi-frame docs).
 
 1. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
@@ -72,5 +74,14 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 3. **FR-4** Parallel ZIP deflate member decode  
 4. **FR-5** FUSE readahead knobs  
 5. **FR-9** Factory side-table auto-wire  
+=======
+1. **FR-3** TAR SCHILY/LIBARCHIVE xattrs (isolated, tests with Haiku-style fixtures if available)  
+2. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
+3. ~~**FR-1** ZIP commit-overlay MVP~~ (done: full rebuild)  
+4. **FR-4** Parallel ZIP deflate member decode  
+5. **FR-5** FUSE readahead knobs  
+6. **FR-9** Factory side-table auto-wire  
+7. Docs/examples **FR-7** anytime  
+>>>>>>> a2054f8 (Add ZIP --commit-overlay MVP via full archive rebuild.)
 
 Update this file when status changes. Keep README **Upstream** column in sync.

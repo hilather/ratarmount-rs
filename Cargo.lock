@@ -1535,6 +1535,7 @@ dependencies = [
  "tempfile",
  "thiserror",
  "xz2",
+ "zip",
 ]
 
 [[package]]

@@ -28,7 +28,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--transform-recursive-mount-point` | yes | yes | `[x]` |
 | `--transform` (member path rewrite) | yes | **added** | `[x]` |
 | `-w` / `--write-overlay` / `:temp:` | yes | yes | `[x]` |
-| `--commit-overlay` | yes | yes (uncompressed TAR) | `~` |
+| `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; ZIP full rebuild) | `[x]` / residual encrypted ZIP |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |

@@ -1,8 +1,9 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
-use std::io::{self, BufReader, BufWriter, Write};
+use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -18,6 +19,8 @@ use ratarmount_core::{
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
 use xz2::write::XzEncoder;
+use zip::write::SimpleFileOptions;
+use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
 
@@ -443,91 +446,73 @@ impl Default for CommitOverlayOptions {
     }
 }
 
-/// Apply overlay folder modifications to a TAR archive using GNU tar.
+/// Apply overlay folder modifications to a TAR or ZIP archive.
 ///
-/// Supports **uncompressed** TAR and compressed TAR (gzip / bzip2 / xz).
-/// For compressed archives:
-/// 1. Decompress to a temp uncompressed TAR
-/// 2. Run the usual `tar --delete` / `tar --append` on the temp
-/// 3. Recompress and atomically replace the original
+/// **TAR** (GNU tar): supports uncompressed TAR and gzip / bzip2 / xz compressed TAR
+/// via decompress → `tar --delete` / `tar --append` → recompress.
 ///
-/// Mirrors Python `commit_overlay` (uncompressed path) plus the typical
-/// decompress → commit → recompress approach for compressed TARs:
+/// **ZIP** (full rebuild, not in-place): rebuilds a new ZIP from the base archive plus
+/// overlay adds/deletes. Unchanged members are raw-copied (preserves store/deflate and
+/// other methods). Overlay file bodies are written as **deflate** (directories as empty
+/// directory entries). Atomic replace of the original path. Runtime scales with archive
+/// size (full rewrite). Encrypted / multi-part / spanned ZIPs are not supported for commit.
+///
+/// Shared plan:
 /// 1. Collect deleted paths from `.ratarmount.overlay.sqlite`
 /// 2. Walk overlay files → delete-then-append list
-/// 3. `tar --delete` then `tar --append -C overlay`
+/// 3. Apply format-specific commit
 ///
 /// Returns `Ok(true)` if changes were committed, `Ok(false)` if nothing to do or canceled.
 pub fn commit_overlay(
     write_overlay: impl AsRef<Path>,
-    tar_file: impl AsRef<Path>,
+    archive_file: impl AsRef<Path>,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
     let write_overlay = write_overlay.as_ref();
-    let tar_file = tar_file.as_ref();
+    let archive_file = archive_file.as_ref();
 
     if !write_overlay.is_dir() {
         return Err(OverlayError::Msg(
             "Need an existing write overlay folder for committing changes.".into(),
         ));
     }
-    if !tar_file.is_file() {
+    if !archive_file.is_file() {
         return Err(OverlayError::Msg(format!(
-            "Specified TAR '{}' to commit to does not exist or is not a file!",
-            tar_file.display()
+            "Specified archive '{}' to commit to does not exist or is not a file!",
+            archive_file.display()
         )));
     }
-    ensure_gnu_tar()?;
 
-    let format = detect_compression(tar_file).map_err(|e| {
-        OverlayError::Msg(format!(
-            "Failed to detect compression for '{}': {e}",
-            tar_file.display()
-        ))
-    })?;
+    if is_zip_archive(archive_file)? {
+        return commit_overlay_zip(write_overlay, archive_file, opts);
+    }
 
-    // Keep materialized temp alive until recompress finishes.
-    let (work_tar, _materialized): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
-        CompressionFormat::None => {
-            if !is_uncompressed_tar(tar_file)? {
-                return Err(OverlayError::Msg(
-                    "Archive does not look like an uncompressed TAR \
-                     (ustar/GNU magic missing)."
-                        .into(),
-                ));
-            }
-            (tar_file.to_path_buf(), None)
-        }
-        CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
-            let (tmp, _) = materialize(tar_file, format).map_err(|e| {
-                OverlayError::Msg(format!(
-                    "Failed to decompress '{}' for commit: {e}",
-                    tar_file.display()
-                ))
-            })?;
-            if !is_uncompressed_tar(tmp.path())? {
-                return Err(OverlayError::Msg(format!(
-                    "Decompressed content of '{}' does not look like a TAR archive.",
-                    tar_file.display()
-                )));
-            }
-            let path = tmp.path().to_path_buf();
-            (path, Some(tmp))
-        }
-        other => {
-            return Err(OverlayError::Msg(format!(
-                "Currently, commit-overlay supports uncompressed TAR and \
-                 gzip/bzip2/xz compressed TAR (got {other:?})."
-            )));
-        }
-    };
+    commit_overlay_tar(write_overlay, archive_file, opts)
+}
 
-    let tmp = tempfile::tempdir()?;
-    let deletion_list = tmp.path().join("deletions.lst");
-    let append_list = tmp.path().join("append.lst");
+/// Overlay changes collected for commit (paths relative to archive root, `/`-separated).
+struct OverlayCommitPlan {
+    /// Null-terminated path variants for GNU tar `--files-from`.
+    deletions_nul: Vec<u8>,
+    /// Null-terminated paths for GNU tar `--append --files-from`.
+    appends_nul: Vec<u8>,
+    /// Normalized relative paths marked deleted (DB + files being replaced).
+    deleted_paths: HashSet<String>,
+    /// Overlay entries to add: `(relative path, is_directory)`.
+    append_entries: Vec<(String, bool)>,
+}
 
-    let mut deletions: Vec<u8> = Vec::new();
-    let mut appends: Vec<u8> = Vec::new();
+impl OverlayCommitPlan {
+    fn is_empty(&self) -> bool {
+        self.deleted_paths.is_empty() && self.append_entries.is_empty()
+    }
+}
+
+fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
+    let mut deletions_nul: Vec<u8> = Vec::new();
+    let mut appends_nul: Vec<u8> = Vec::new();
+    let mut deleted_paths: HashSet<String> = HashSet::new();
+    let mut append_entries: Vec<(String, bool)> = Vec::new();
 
     // Deletions from hidden DB
     let db_path = write_overlay.join(HIDDEN_DB);
@@ -541,7 +526,11 @@ pub fn commit_overlay(
         for row in rows {
             let (path, name) = row?;
             let rel = join_rel(&path, &name);
-            add_deletion_variants(&mut deletions, &rel);
+            let norm = normalize_archive_rel_path(&rel);
+            if !norm.is_empty() {
+                deleted_paths.insert(norm);
+            }
+            add_deletion_variants(&mut deletions_nul, &rel);
         }
     }
 
@@ -579,21 +568,316 @@ pub fn commit_overlay(
         if ignored.contains(&rel) {
             continue;
         }
+        let norm = normalize_archive_rel_path(&rel);
         if is_dir {
             // Empty dirs only (walkdir_files_and_empty_dirs already filters)
-            appends.extend(rel.as_bytes());
-            appends.push(0);
+            appends_nul.extend(rel.as_bytes());
+            appends_nul.push(0);
+            append_entries.push((norm, true));
         } else {
-            add_deletion_variants(&mut deletions, &rel);
-            appends.extend(rel.as_bytes());
-            appends.push(0);
+            add_deletion_variants(&mut deletions_nul, &rel);
+            deleted_paths.insert(norm.clone());
+            appends_nul.extend(rel.as_bytes());
+            appends_nul.push(0);
+            append_entries.push((norm, false));
         }
     }
 
-    fs::write(&deletion_list, &deletions)?;
-    fs::write(&append_list, &appends)?;
+    Ok(OverlayCommitPlan {
+        deletions_nul,
+        appends_nul,
+        deleted_paths,
+        append_entries,
+    })
+}
 
-    if deletions.is_empty() && appends.is_empty() {
+fn confirm_commit(opts: &CommitOverlayOptions) -> Result<bool> {
+    if opts.yes {
+        return Ok(true);
+    }
+    print!("Please confirm by entering \"commit\". Any other input will cancel.\n> ");
+    let _ = io::stdout().flush();
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(line.trim() == "commit")
+}
+
+/// Strip leading `./` / `/` and trailing `/` for stable path matching.
+fn normalize_archive_rel_path(path: &str) -> String {
+    let p = path
+        .trim_start_matches('/')
+        .trim_start_matches("./")
+        .trim_end_matches('/');
+    p.to_string()
+}
+
+/// True if path looks like a ZIP local/central/EOCD signature (`PK…`).
+fn is_zip_archive(path: &Path) -> Result<bool> {
+    let mut f = File::open(path)?;
+    let mut magic = [0u8; 4];
+    let n = f.read(&mut magic)?;
+    if n >= 4 && magic[0] == b'P' && magic[1] == b'K' {
+        // Local header, central directory, EOCD, or spanned data descriptor.
+        return Ok(matches!(
+            (magic[2], magic[3]),
+            (0x03, 0x04) | (0x05, 0x06) | (0x07, 0x08) | (0x01, 0x02) | (0x06, 0x06) | (0x06, 0x07)
+        ));
+    }
+    // Extension fallback (empty / exotic zips that don't open as files we can magic).
+    Ok(path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| e.eq_ignore_ascii_case("zip") || e.eq_ignore_ascii_case("jar")))
+}
+
+/// True when a ZIP member should be dropped (explicit delete or replaced by overlay).
+fn zip_member_dropped(member_name: &str, plan: &OverlayCommitPlan) -> bool {
+    let norm = normalize_archive_rel_path(member_name);
+    if norm.is_empty() {
+        return false;
+    }
+    if plan.deleted_paths.contains(&norm) {
+        return true;
+    }
+    // Overlay replace / add with same path (dirs may only be in append_entries).
+    plan.append_entries.iter().any(|(p, _)| p == &norm)
+}
+
+/// Rebuild ZIP from base + overlay (full archive rewrite, atomic replace).
+///
+/// Unchanged members are **raw-copied** (preserves store/deflate/etc.). Overlay files are
+/// written with **deflate**. Not in-place append; cost is O(archive size).
+fn commit_overlay_zip(
+    write_overlay: &Path,
+    zip_file: &Path,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
+    let plan = collect_overlay_commit_plan(write_overlay)?;
+
+    if plan.is_empty() {
+        if opts.debug >= 1 {
+            println!("Nothing to commit.");
+        }
+        return Ok(false);
+    }
+
+    if opts.debug >= 1 {
+        println!(
+            "To commit the overlay folder to the ZIP archive, the archive will be fully rebuilt:"
+        );
+        println!();
+        println!(
+            "    # full rebuild (not in-place) of {}",
+            zip_file.display()
+        );
+        if !plan.deleted_paths.is_empty() {
+            println!(
+                "    # drop {} deleted/replaced path(s)",
+                plan.deleted_paths.len()
+            );
+        }
+        if !plan.append_entries.is_empty() {
+            println!(
+                "    # add/replace {} overlay path(s) from {}",
+                plan.append_entries.len(),
+                write_overlay.display()
+            );
+            for (p, is_dir) in &plan.append_entries {
+                if *is_dir {
+                    println!("    #   dir  {p}/");
+                } else {
+                    println!("    #   file {p}  (deflate)");
+                }
+            }
+        }
+        println!();
+        println!(
+            "ZIP commit-overlay rewrites the entire archive (store/deflate members preserved \
+             via raw copy; overlay files stored with deflate). Performance scales with size."
+        );
+        println!("Committing is an experimental feature!");
+    }
+
+    if !confirm_commit(opts)? {
+        if opts.debug >= 1 {
+            println!("Canceled");
+        }
+        return Ok(false);
+    }
+
+    rebuild_zip_with_overlay(write_overlay, zip_file, &plan)?;
+
+    if opts.debug >= 1 {
+        println!(
+            "Committed successfully. You can now remove the overlay folder at {}.",
+            write_overlay.display()
+        );
+    }
+    Ok(true)
+}
+
+fn rebuild_zip_with_overlay(
+    write_overlay: &Path,
+    zip_file: &Path,
+    plan: &OverlayCommitPlan,
+) -> Result<()> {
+    let src = File::open(zip_file).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to open ZIP '{}' for commit: {e}",
+            zip_file.display()
+        ))
+    })?;
+    let mut archive = ZipArchive::new(src).map_err(|e| {
+        OverlayError::Msg(format!("Failed to read ZIP '{}': {e}", zip_file.display()))
+    })?;
+
+    let parent = zip_file.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match parent {
+        Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
+        None => tempfile::NamedTempFile::new()?,
+    };
+
+    {
+        let mut writer = ZipWriter::new(tmp.as_file_mut());
+
+        // Preserve archive comment when present.
+        let comment = archive.comment().to_vec();
+        if !comment.is_empty() {
+            writer.set_raw_comment(comment.into_boxed_slice());
+        }
+
+        let n = archive.len();
+        for i in 0..n {
+            let name = archive
+                .name_for_index(i)
+                .ok_or_else(|| OverlayError::Msg(format!("ZIP member index {i} has no name")))?
+                .to_string();
+            if zip_member_dropped(&name, plan) {
+                continue;
+            }
+            // Raw copy preserves compression method and encrypted payload bytes without decrypt.
+            let file = archive.by_index_raw(i).map_err(|e| {
+                OverlayError::Msg(format!("Failed to read ZIP member '{name}' for copy: {e}"))
+            })?;
+            writer.raw_copy_file(file).map_err(|e| {
+                OverlayError::Msg(format!("Failed to copy ZIP member '{name}': {e}"))
+            })?;
+        }
+
+        let file_opts =
+            SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        let dir_opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+
+        for (rel, is_dir) in &plan.append_entries {
+            if *is_dir {
+                // ZIP directory entries conventionally end with '/'.
+                let dir_name = if rel.ends_with('/') {
+                    rel.clone()
+                } else {
+                    format!("{rel}/")
+                };
+                writer.add_directory(&dir_name, dir_opts).map_err(|e| {
+                    OverlayError::Msg(format!("Failed to add directory '{dir_name}' to ZIP: {e}"))
+                })?;
+            } else {
+                let src_path = write_overlay.join(rel);
+                let mut src_file = File::open(&src_path).map_err(|e| {
+                    OverlayError::Msg(format!(
+                        "Failed to open overlay file '{}': {e}",
+                        src_path.display()
+                    ))
+                })?;
+                writer.start_file(rel.as_str(), file_opts).map_err(|e| {
+                    OverlayError::Msg(format!("Failed to start ZIP file '{rel}': {e}"))
+                })?;
+                io::copy(&mut src_file, &mut writer).map_err(|e| {
+                    OverlayError::Msg(format!(
+                        "Failed to write overlay file '{rel}' into ZIP: {e}"
+                    ))
+                })?;
+            }
+        }
+
+        writer.finish().map_err(|e| {
+            OverlayError::Msg(format!(
+                "Failed to finalize rebuilt ZIP for '{}': {e}",
+                zip_file.display()
+            ))
+        })?;
+    }
+    tmp.as_file().sync_all()?;
+
+    tmp.persist(zip_file).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to replace '{}' with rebuilt ZIP: {}",
+            zip_file.display(),
+            e.error
+        ))
+    })?;
+    Ok(())
+}
+
+/// Apply overlay to TAR (GNU tar) — uncompressed or gzip/bzip2/xz.
+fn commit_overlay_tar(
+    write_overlay: &Path,
+    tar_file: &Path,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
+    ensure_gnu_tar()?;
+
+    let format = detect_compression(tar_file).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to detect compression for '{}': {e}",
+            tar_file.display()
+        ))
+    })?;
+
+    // Keep materialized temp alive until recompress finishes.
+    let (work_tar, _materialized): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
+        CompressionFormat::None => {
+            if !is_uncompressed_tar(tar_file)? {
+                return Err(OverlayError::Msg(
+                    "Archive does not look like an uncompressed TAR or ZIP \
+                     (ustar/GNU magic missing; ZIP uses PK signature)."
+                        .into(),
+                ));
+            }
+            (tar_file.to_path_buf(), None)
+        }
+        CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
+            let (tmp, _) = materialize(tar_file, format).map_err(|e| {
+                OverlayError::Msg(format!(
+                    "Failed to decompress '{}' for commit: {e}",
+                    tar_file.display()
+                ))
+            })?;
+            if !is_uncompressed_tar(tmp.path())? {
+                return Err(OverlayError::Msg(format!(
+                    "Decompressed content of '{}' does not look like a TAR archive.",
+                    tar_file.display()
+                )));
+            }
+            let path = tmp.path().to_path_buf();
+            (path, Some(tmp))
+        }
+        other => {
+            return Err(OverlayError::Msg(format!(
+                "Currently, commit-overlay supports ZIP, uncompressed TAR, and \
+                 gzip/bzip2/xz compressed TAR (got {other:?})."
+            )));
+        }
+    };
+
+    let plan = collect_overlay_commit_plan(write_overlay)?;
+
+    let tmp = tempfile::tempdir()?;
+    let deletion_list = tmp.path().join("deletions.lst");
+    let append_list = tmp.path().join("append.lst");
+
+    fs::write(&deletion_list, &plan.deletions_nul)?;
+    fs::write(&append_list, &plan.appends_nul)?;
+
+    if plan.is_empty() {
         if opts.debug >= 1 {
             println!("Nothing to commit.");
         }
@@ -608,7 +892,7 @@ pub fn commit_overlay(
         if format != CompressionFormat::None {
             println!("    # decompress {} -> temp TAR, then:", tar_file.display());
         }
-        if !deletions.is_empty() {
+        if !plan.deletions_nul.is_empty() {
             println!(
                 "    tar --delete --null --files-from='{}' --file '{}' 2>&1 |",
                 deletion_list.display(),
@@ -616,7 +900,7 @@ pub fn commit_overlay(
             );
             println!("       sed '/^tar: Exiting with failure/d; /^tar.*Not found in archive/d'");
         }
-        if !appends.is_empty() {
+        if !plan.appends_nul.is_empty() {
             println!(
                 "    tar --append -C '{}' --null --files-from='{}' --file '{}'",
                 write_overlay.display(),
@@ -634,24 +918,14 @@ pub fn commit_overlay(
         println!("Committing is an experimental feature!");
     }
 
-    let confirmed = if opts.yes {
-        true
-    } else {
-        print!("Please confirm by entering \"commit\". Any other input will cancel.\n> ");
-        let _ = io::stdout().flush();
-        let mut line = String::new();
-        io::stdin().read_line(&mut line)?;
-        line.trim() == "commit"
-    };
-
-    if !confirmed {
+    if !confirm_commit(opts)? {
         if opts.debug >= 1 {
             println!("Canceled");
         }
         return Ok(false);
     }
 
-    if !deletions.is_empty() {
+    if !plan.deletions_nul.is_empty() {
         let output = tar_env_command()
             .args([
                 "--delete",
@@ -683,7 +957,7 @@ pub fn commit_overlay(
         }
     }
 
-    if !appends.is_empty() {
+    if !plan.appends_nul.is_empty() {
         let status = tar_env_command()
             .args(["--append", "-C"])
             .arg(write_overlay)
@@ -914,6 +1188,183 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 mod tests {
     use super::*;
     use std::process::Command as StdCommand;
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    fn write_sample_zip(path: &Path, members: &[(&str, &[u8], CompressionMethod)]) {
+        let file = File::create(path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        for (name, data, method) in members {
+            let opts = SimpleFileOptions::default().compression_method(*method);
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    /// Regression: ZIP --commit-overlay add file (full rebuild) → reopen list/read.
+    /// Symptom: commit-overlay rejected non-TAR archives (upstream #154).
+    #[test]
+    fn commit_overlay_zip_add_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("a.zip");
+        write_sample_zip(
+            &zip_path,
+            &[
+                ("old.txt", b"old zip\n", CompressionMethod::Stored),
+                ("nested/keep.txt", b"keep me\n", CompressionMethod::Deflated),
+            ],
+        );
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        {
+            let _ov = WriteOverlay::new(base, &overlay).unwrap();
+            fs::write(overlay.join("new.txt"), b"hello zip commit\n").unwrap();
+        }
+
+        let opts = CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+        };
+        commit_overlay(&overlay, &zip_path, &opts).expect("commit_overlay zip");
+
+        // Still a ZIP after commit
+        let magic = fs::read(&zip_path).unwrap();
+        assert!(
+            magic.len() >= 4 && &magic[..2] == b"PK",
+            "archive should remain ZIP after commit"
+        );
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.name_for_index(i).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "old.txt"),
+            "zip listing: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "nested/keep.txt"),
+            "zip listing: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "new.txt"),
+            "zip listing: {names:?}"
+        );
+
+        // Read overlay-added content
+        {
+            let mut f = archive.by_name("new.txt").unwrap();
+            let mut body = String::new();
+            f.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "hello zip commit\n");
+        }
+        // Unchanged stored member still readable
+        {
+            let mut f = archive.by_name("old.txt").unwrap();
+            let mut body = String::new();
+            f.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "old zip\n");
+        }
+        // Unchanged deflated member still readable
+        {
+            let mut f = archive.by_name("nested/keep.txt").unwrap();
+            let mut body = String::new();
+            f.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "keep me\n");
+        }
+    }
+
+    /// Regression: ZIP commit replaces existing member and honors DB delete.
+    #[test]
+    fn commit_overlay_zip_replace_and_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("b.zip");
+        write_sample_zip(
+            &zip_path,
+            &[
+                ("keep.txt", b"keep\n", CompressionMethod::Stored),
+                ("gone.txt", b"remove me\n", CompressionMethod::Stored),
+                ("mut.txt", b"old mut\n", CompressionMethod::Deflated),
+            ],
+        );
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        {
+            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            // Replace mut.txt via overlay file (also marks delete+append on commit walk)
+            fs::write(overlay.join("mut.txt"), b"new mut\n").unwrap();
+            // Delete gone.txt in overlay DB (base would have had it)
+            // NullBase has no files; insert deleted row directly to simulate unlink of base path.
+            {
+                let db = ov.db.lock().expect("db");
+                db.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES ('','gone.txt',1)"#,
+                    [],
+                )
+                .unwrap();
+            }
+            // Drop overlay so exclusive SQLite lock is released before commit.
+            drop(ov);
+        }
+
+        let opts = CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+        };
+        commit_overlay(&overlay, &zip_path, &opts).expect("commit_overlay zip replace/delete");
+
+        let file = File::open(&zip_path).unwrap();
+        let mut archive = ZipArchive::new(file).unwrap();
+        let names: Vec<String> = (0..archive.len())
+            .filter_map(|i| archive.name_for_index(i).map(|s| s.to_string()))
+            .collect();
+        assert!(
+            names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "keep.txt"),
+            "{names:?}"
+        );
+        assert!(
+            !names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "gone.txt"),
+            "gone.txt should be deleted: {names:?}"
+        );
+        assert!(
+            names
+                .iter()
+                .any(|n| normalize_archive_rel_path(n) == "mut.txt"),
+            "{names:?}"
+        );
+        let mut f = archive.by_name("mut.txt").unwrap();
+        let mut body = String::new();
+        f.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "new mut\n");
+    }
+
+    #[test]
+    fn is_zip_archive_detects_pk_magic() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("c.zip");
+        write_sample_zip(&zip_path, &[("x", b"y", CompressionMethod::Stored)]);
+        assert!(is_zip_archive(&zip_path).unwrap());
+
+        let tarish = dir.path().join("not-a-zip.bin");
+        fs::write(&tarish, b"ustar is not here but also not PK").unwrap();
+        assert!(!is_zip_archive(&tarish).unwrap());
+    }
 
     #[test]
     fn commit_overlay_add_file() {

@@ -203,8 +203,8 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
-    /// Commit write-overlay changes into an uncompressed TAR (GNU tar required).
-    /// Does not mount; requires `--write-overlay` and a single archive path.
+    /// Commit write-overlay changes into a TAR (GNU tar; also gzip/bzip2/xz) or ZIP
+    /// (full rebuild). Does not mount; requires `--write-overlay` and a single archive path.
     #[arg(long = "commit-overlay", action = ArgAction::SetTrue)]
     commit_overlay: bool,
 
@@ -282,12 +282,12 @@ fn main() {
         }
         // Expect: archive [mountpoint-ignored]
         if args.paths.is_empty() {
-            eprintln!("error: --commit-overlay requires <archive.tar>");
+            eprintln!("error: --commit-overlay requires <archive.tar|archive.zip>");
             std::process::exit(2);
         }
         let archive = &args.paths[0];
         if args.paths.len() > 2 {
-            eprintln!("error: currently only modifications to a single TAR may be committed");
+            eprintln!("error: currently only modifications to a single archive may be committed");
             std::process::exit(2);
         }
         let opts = CommitOverlayOptions {
@@ -306,7 +306,7 @@ fn main() {
     if args.paths.is_empty() {
         eprintln!("usage: ratarmount [options] <archive|folder|URL>... [mountpoint]");
         eprintln!("       ratarmount -u <mountpoint>");
-        eprintln!("       ratarmount --commit-overlay -w <overlay> <archive.tar>");
+        eprintln!("       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.zip>");
         std::process::exit(2);
     }
 
