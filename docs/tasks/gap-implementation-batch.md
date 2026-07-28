@@ -155,21 +155,27 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | 7z hashes | formats-sevenzip | `user.hash.*` xattrs (solid shared key caveat) |
 | zstdblocks | zstd_seek | import/export `(cmp,unc)` block maps |
 
-## Still open (later / batch 13+)
+## Batch 13 — five parallel worktree agents (merged)
 
-Productization docs (Phase 12 dual-run + crates.io policy) are **done** — see [`docs/phase12-dual-run.md`](../phase12-dual-run.md) and [`docs/crates-io-policy.md`](../crates-io-policy.md). Residual engineering work below remains for batch 13+.
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| bzip2blocks API | compress | import/export bit-offset maps |
+| factory side tables | factory | zstdblocks + bzip2blocks wire on open |
+| SSH config | remote | HostName/User/Port/IdentityFile |
+| SQLAR sqlcipher | formats-sqlar | clearer encrypt errors + docs |
+| Phase 12 / crates.io | docs | dual-run + publish policy |
+
+## Still open (later / batch 14+)
 
 | Gap | Notes |
 |-----|--------|
-| Pure in-process lrzip | rare; **CLI + libarchive fallback** cover practical cases; no seekable pure decoder |
-| Factory wire zstdblocks from index on open | APIs exist; auto-wire on mount still open |
+| Pure in-process lrzip | rare; CLI + libarchive cover practical cases |
 | RAR pure / long-tail beyond libarchive | sequential libarchive only |
-| Encrypted ZIP true per-disk offsets | multi-part join + EOCD normalize landed; edge multi-disk residual |
-| Progressive multi-GB solid 7z (BCJ/AES) | progressive LZMA2 + LRU windows; full-folder residual for some filters |
-| PDF Separation/Lab residual | main XObject image paths done |
-| Full fixed-archive ≥90% allowlist | track gaps; not dual-run hard gate |
-| Phase 12 **announce / cutover** (ops) | docs ready; tag + deprecation date after gates in phase12-dual-run.md |
-| crates.io **first publish** (optional) | policy ready; binary remains primary deliverable |
+| Encrypted ZIP true per-disk offsets | multi-part join residual |
+| Progressive multi-GB solid 7z (BCJ/AES) | full-folder residual for some filters |
+| Full fixed-archive ≥90% allowlist | harness expansion |
+| Phase 12 **announce / cutover** (ops) | docs ready |
+| crates.io **first publish** (optional) | policy ready |
 
 ## Verify
 

@@ -9,9 +9,11 @@ use ratarmount_compositing::{
     TransformMountSource, UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
-    body_looks_like_tar, check_for_split_file_in_folder, detect_compression, export_zstd_blocks,
-    export_zstd_blocks_from_reader, joined_base_name, looks_like_tar, materialize,
-    materialize_joined_parts, name_suggests_compressed_tar, open_seekable_bzip2_with_threads,
+    body_looks_like_tar, check_for_split_file_in_folder, detect_compression, export_bzip2_blocks,
+    export_bzip2_blocks_from_reader, export_zstd_blocks, export_zstd_blocks_from_reader,
+    joined_base_name, looks_like_tar, materialize, materialize_joined_parts,
+    name_suggests_compressed_tar, open_seekable_bzip2_with_bzip2_blocks,
+    open_seekable_bzip2_with_bzip2_blocks_from_reader, open_seekable_bzip2_with_threads,
     open_seekable_bzip2_with_threads_from_reader, open_seekable_compress_z_with_threads,
     open_seekable_lz4_with_threads, open_seekable_lzip_with_threads,
     open_seekable_lzma_with_threads, open_seekable_lzo_with_threads, open_seekable_xz_with_threads,
@@ -725,12 +727,7 @@ fn open_path_impl(
         // backends are reordered via options.use_backends only for plain files.
         CompressionFormat::None => open_uncompressed_path(path, index_path, &options, recreate)?,
         CompressionFormat::Gzip => open_gzip(path, index_path, &options, recreate)?,
-        CompressionFormat::Bzip2 => {
-            let threads = options.threads_for("bzip2");
-            open_seekable_codec(path, index_path, &options, recreate, "bzip2", || {
-                open_seekable_bzip2_with_threads(path, threads)
-            })?
-        }
+        CompressionFormat::Bzip2 => open_bzip2(path, index_path, &options, recreate)?,
         CompressionFormat::Xz => {
             let threads = options.threads_for("xz");
             open_seekable_codec(path, index_path, &options, recreate, "xz", || {
@@ -1431,6 +1428,156 @@ fn open_zstd(
     Ok(src)
 }
 
+/// Read Python-compatible `bzip2blocks` from an on-disk SQLite index, if present.
+fn try_load_bzip2_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Vec<(u64, u64)>> {
+    if recreate {
+        return None;
+    }
+    let ip = index_path?;
+    if !ip.exists() {
+        return None;
+    }
+    let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
+    if !meta_ok {
+        return None;
+    }
+    let idx = match SqliteIndex::open_writable(ip) {
+        Ok(i) => i,
+        Err(_) => SqliteIndex::open_read_only(ip).ok()?,
+    };
+    let raw = match idx.get_bzip2_blocks() {
+        Ok(b) if !b.is_empty() => b,
+        _ => return None,
+    };
+    zstd_blocks_i64_to_u64(&raw)
+}
+
+fn store_bzip2_blocks_in_index(
+    blocks: &[(u64, u64)],
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+) {
+    if blocks.is_empty() {
+        return;
+    }
+    if !options.write_index || options.read_only_index || options.index_in_memory {
+        return;
+    }
+    let Some(ip) = index_path else {
+        return;
+    };
+    if !ip.exists() {
+        return;
+    }
+    let Some(i64_blocks) = zstd_blocks_u64_to_i64(blocks) else {
+        eprintln!("info: bzip2blocks offsets exceed i64 range; skipping side-table write");
+        return;
+    };
+    match SqliteIndex::open_writable(ip) {
+        Ok(idx) => {
+            if let Err(e) = idx.ensure_compression_tables() {
+                eprintln!("info: could not ensure compression tables for bzip2blocks: {e}");
+                return;
+            }
+            match idx.set_bzip2_blocks(&i64_blocks) {
+                Ok(()) => eprintln!(
+                    "bzip2blocks: stored {} offset pairs in {}",
+                    i64_blocks.len(),
+                    ip.display()
+                ),
+                Err(e) => eprintln!("info: could not store bzip2blocks: {e}"),
+            }
+        }
+        Err(e) => eprintln!("info: could not open index to store bzip2blocks: {e}"),
+    }
+}
+
+fn persist_bzip2_blocks_from_path(
+    path: &Path,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+) {
+    if !options.write_index || options.read_only_index || options.index_in_memory {
+        return;
+    }
+    if index_path.is_none_or(|ip| !ip.exists()) {
+        return;
+    }
+    match export_bzip2_blocks(path) {
+        Ok(blocks) => store_bzip2_blocks_in_index(&blocks, index_path, options),
+        Err(e) => eprintln!("info: could not export bzip2blocks: {e}"),
+    }
+}
+
+fn open_seekable_bzip2_prefer_blocks(
+    path: &Path,
+    threads: u32,
+    index_path: Option<&Path>,
+    recreate: bool,
+) -> Result<Arc<dyn SeekableBody>, String> {
+    if let Some(blocks) = try_load_bzip2_blocks(index_path, recreate) {
+        match open_seekable_bzip2_with_bzip2_blocks(path, threads, &blocks) {
+            Ok(body) => {
+                eprintln!(
+                    "seekable bzip2 (imported bzip2blocks): {} ({} uncompressed bytes, {} checkpoints, -P bzip2:{})",
+                    path.display(),
+                    body.size(),
+                    body.checkpoint_count(),
+                    threads
+                );
+                return Ok(body);
+            }
+            Err(e) => {
+                eprintln!("info: bzip2blocks import failed ({e}); rebuilding bit-block map");
+            }
+        }
+    }
+    open_seekable_bzip2_with_threads(path, threads).map_err(|e| e.to_string())
+}
+
+fn try_open_bzip2_imported_from_reader<R>(
+    reader: R,
+    label: &Path,
+    threads: u32,
+    index_path: Option<&Path>,
+    recreate: bool,
+) -> Option<Arc<dyn SeekableBody>>
+where
+    R: std::io::Read + std::io::Seek + Send + 'static,
+{
+    let blocks = try_load_bzip2_blocks(index_path, recreate)?;
+    match open_seekable_bzip2_with_bzip2_blocks_from_reader(reader, threads, label, &blocks) {
+        Ok(body) => {
+            eprintln!(
+                "seekable bzip2 (imported bzip2blocks): {} ({} uncompressed bytes, {} checkpoints, -P bzip2:{})",
+                label.display(),
+                body.size(),
+                body.checkpoint_count(),
+                threads
+            );
+            Some(body)
+        }
+        Err(e) => {
+            eprintln!("info: bzip2blocks import failed ({e}); rebuilding bit-block map");
+            None
+        }
+    }
+}
+
+/// Open bzip2 with optional `bzip2blocks` side-table import/export.
+fn open_bzip2(
+    path: &Path,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    recreate: bool,
+) -> Result<Arc<dyn MountSource>, String> {
+    let threads = options.threads_for("bzip2");
+    let body = open_seekable_bzip2_prefer_blocks(path, threads, index_path, recreate)?;
+    let src = open_from_seekable_body(path, body, index_path, options, recreate, "bzip2")?;
+    persist_bzip2_blocks_from_path(path, index_path, options);
+    Ok(src)
+}
+
 /// Mount from an already-opened seekable uncompressed body (path or remote Range codec).
 fn open_from_seekable_body(
     path: &Path,
@@ -1717,9 +1864,47 @@ where
             eprintln!(
                 "{transport} bzip2: {input} ({range_len} compressed bytes, live Range, -P bzip2:{threads})"
             );
-            let body = open_seekable_bzip2_with_threads_from_reader(range, threads, &label)
-                .map_err(|e| e.to_string())?;
+            let mut reopen_opt = Some(reopen);
+            let body = if try_load_bzip2_blocks(ip, recreate).is_some() {
+                match try_open_bzip2_imported_from_reader(range, &label, threads, ip, recreate) {
+                    Some(b) => b,
+                    None => {
+                        let reopen_fn = reopen_opt
+                            .take()
+                            .ok_or_else(|| "internal: reopen already consumed".to_string())?;
+                        let fresh = reopen_fn()?;
+                        open_seekable_bzip2_with_threads_from_reader(fresh, threads, &label)
+                            .map_err(|e| e.to_string())?
+                    }
+                }
+            } else {
+                open_seekable_bzip2_with_threads_from_reader(range, threads, &label)
+                    .map_err(|e| e.to_string())?
+            };
             let src = open_from_seekable_body(&label, body, ip, &o, recreate, "bzip2")?;
+            if let Some(reopen_fn) = reopen_opt {
+                if o.write_index && !o.read_only_index && !o.index_in_memory {
+                    if let Some(ipath) = ip {
+                        if ipath.exists() {
+                            match reopen_fn() {
+                                Ok(mut fresh) => {
+                                    match export_bzip2_blocks_from_reader(&mut fresh) {
+                                        Ok(blocks) => {
+                                            store_bzip2_blocks_in_index(&blocks, ip, &o)
+                                        }
+                                        Err(e) => {
+                                            eprintln!("info: could not export bzip2blocks: {e}")
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!("info: could not reopen stream for bzip2blocks: {e}")
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             Ok(Some((label, src)))
         }
         "xz" => {
