@@ -1,14 +1,23 @@
 //! Index path resolution (Python `SQLiteIndex.get_possible_index_file_paths` subset).
 //!
-//! Also materializes remote / URL index paths (`http(s)://`, `file://`) for Python parity
-//! with fsspec-backed index download (`SQLiteIndex._load_index`).
+//! Also materializes remote / URL index paths (`http(s)://`, `file://`) and decompresses
+//! gzip/xz/zstd/bzip2 index blobs for Python parity with `SQLiteIndex._load_index`.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use log::{debug, warn};
 
 use crate::{IndexError, Result};
+
+/// SQLite database header magic (16 bytes including trailing NUL).
+const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
+
+const GZIP_MAGIC: &[u8] = &[0x1f, 0x8b];
+const XZ_MAGIC: &[u8] = &[0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00];
+const ZSTD_MAGIC: &[u8] = &[0x28, 0xb5, 0x2f, 0xfd];
+const BZIP2_MAGIC: &[u8] = b"BZh";
 
 /// Where the SQLite index lives for a mount.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -156,13 +165,12 @@ pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     }
 }
 
-/// Materialize an index path or URL to a local filesystem path.
+/// Materialize an index path or URL to a local filesystem path ready for SQLite open.
 ///
-/// * Local paths and `file://` → expanded local path (no copy).
+/// * Local paths and `file://` → expanded local path (no copy unless compressed).
 /// * `http(s)://` → download into a kept tempfile (dir: `RATARMOUNT_INDEX_TMPDIR` if set).
-///
-/// Matches Python `SQLiteIndex._load_index` URL materialization (without compressed-index
-/// decompression, which remains a follow-up).
+/// * Compressed indexes (gzip/xz/zstd/bzip2) → decompress into a kept tempfile with a real
+///   SQLite header (Python `SQLiteIndex._load_index` / `_undo_compression`).
 pub fn maybe_fetch_index_url(index_spec: &str) -> Result<PathBuf> {
     let s = index_spec.trim();
     if s.is_empty() {
@@ -170,18 +178,185 @@ pub fn maybe_fetch_index_url(index_spec: &str) -> Result<PathBuf> {
     }
 
     // Python strips a single `file://` prefix when `count('://') == 1`.
-    if let Some(rest) = s.strip_prefix("file://") {
+    let local = if let Some(rest) = s.strip_prefix("file://") {
         if !rest.contains("://") {
-            return Ok(expand_user(Path::new(rest)));
+            expand_user(Path::new(rest))
+        } else {
+            // Chained URL not supported without fsspec; treat as opaque local-ish path.
+            expand_user(Path::new(s))
+        }
+    } else if s.starts_with("http://") || s.starts_with("https://") {
+        fetch_index_http(s)?
+    } else {
+        // Non-URL local path (including Windows-ish schemes we do not handle specially).
+        expand_user(Path::new(s))
+    };
+
+    materialize_index_file(&local)
+}
+
+/// Ensure `path` is an on-disk SQLite index file, decompressing if needed.
+///
+/// * Already uncompressed (or non-existent / empty) → returned unchanged.
+/// * gzip (`.gz` / `1f 8b`), xz (`.xz`), zstd (`.zst`/`.zstd`), bzip2 (`.bz2`) → decompressed
+///   into a kept tempfile under `RATARMOUNT_INDEX_TMPDIR` when set.
+///
+/// Errors if compression is detected but decompression fails, or the decompressed payload
+/// does not start with the SQLite magic (`SQLite format 3\0`).
+pub fn materialize_index_file(path: &Path) -> Result<PathBuf> {
+    let meta = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() > 0 => m,
+        // Missing / empty / non-file: pass through (create path or later open will fail).
+        _ => return Ok(path.to_path_buf()),
+    };
+
+    let mut header = [0u8; 16];
+    let n = {
+        let mut f = File::open(path)?;
+        f.read(&mut header)?
+    };
+    let header = &header[..n];
+
+    // Uncompressed SQLite: open as-is.
+    if header.starts_with(SQLITE_MAGIC) {
+        return Ok(path.to_path_buf());
+    }
+
+    let Some(fmt) = detect_index_compression(path, header) else {
+        // Unknown / plain non-SQLite blob — leave validation to SQLite open.
+        return Ok(path.to_path_buf());
+    };
+
+    debug!(
+        "detected {}-compressed index {} ({} bytes); decompressing",
+        fmt.name(),
+        path.display(),
+        meta.len()
+    );
+    decompress_index_to_temp(path, fmt)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IndexCompression {
+    Gzip,
+    Xz,
+    Zstd,
+    Bzip2,
+}
+
+impl IndexCompression {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Gzip => "gzip",
+            Self::Xz => "xz",
+            Self::Zstd => "zstd",
+            Self::Bzip2 => "bzip2",
         }
     }
+}
 
-    if s.starts_with("http://") || s.starts_with("https://") {
-        return fetch_index_http(s);
+/// Detect compressed index by file magic, falling back to well-known suffixes.
+fn detect_index_compression(path: &Path, header: &[u8]) -> Option<IndexCompression> {
+    if header.starts_with(GZIP_MAGIC) {
+        return Some(IndexCompression::Gzip);
+    }
+    if header.len() >= XZ_MAGIC.len() && header.starts_with(XZ_MAGIC) {
+        return Some(IndexCompression::Xz);
+    }
+    if header.len() >= ZSTD_MAGIC.len() && header.starts_with(ZSTD_MAGIC) {
+        return Some(IndexCompression::Zstd);
+    }
+    if header.len() >= BZIP2_MAGIC.len() && header.starts_with(BZIP2_MAGIC) {
+        return Some(IndexCompression::Bzip2);
     }
 
-    // Non-URL local path (including Windows-ish schemes we do not handle specially).
-    Ok(expand_user(Path::new(s)))
+    // Suffix fallback (case-insensitive), for incomplete/odd producers.
+    let name = path.file_name()?.to_string_lossy();
+    let lower = name.to_ascii_lowercase();
+    if lower.ends_with(".gz") {
+        return Some(IndexCompression::Gzip);
+    }
+    if lower.ends_with(".xz") {
+        return Some(IndexCompression::Xz);
+    }
+    if lower.ends_with(".zst") || lower.ends_with(".zstd") {
+        return Some(IndexCompression::Zstd);
+    }
+    if lower.ends_with(".bz2") {
+        return Some(IndexCompression::Bzip2);
+    }
+    None
+}
+
+fn decompress_index_to_temp(path: &Path, fmt: IndexCompression) -> Result<PathBuf> {
+    let input = File::open(path).map_err(|e| {
+        IndexError::Invalid(format!(
+            "cannot open {}-compressed index {}: {e}",
+            fmt.name(),
+            path.display()
+        ))
+    })?;
+
+    let mut reader: Box<dyn Read> = match fmt {
+        IndexCompression::Gzip => Box::new(flate2::read::GzDecoder::new(input)),
+        IndexCompression::Xz => Box::new(xz2::read::XzDecoder::new(input)),
+        IndexCompression::Zstd => {
+            let dec = zstd::stream::read::Decoder::new(input).map_err(|e| {
+                IndexError::Invalid(format!(
+                    "cannot create zstd decoder for {}: {e}",
+                    path.display()
+                ))
+            })?;
+            Box::new(dec)
+        }
+        IndexCompression::Bzip2 => Box::new(bzip2::read::BzDecoder::new(input)),
+    };
+
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ratarmount-index-").suffix(".tmp.sqlite.index");
+    let mut tmp = if let Some(dir) = index_temp_dir() {
+        std::fs::create_dir_all(&dir)?;
+        builder.tempfile_in(&dir)?
+    } else {
+        builder.tempfile()?
+    };
+
+    let n = std::io::copy(&mut reader, &mut tmp).map_err(|e| {
+        IndexError::Invalid(format!(
+            "failed to decompress {}-compressed index {}: {e}",
+            fmt.name(),
+            path.display()
+        ))
+    })?;
+    tmp.flush()?;
+
+    // Verify SQLite magic on the decompressed payload.
+    tmp.seek(SeekFrom::Start(0))?;
+    let mut magic = [0u8; 16];
+    let got = tmp.read(&mut magic).unwrap_or(0);
+    if got < SQLITE_MAGIC.len() || !magic[..SQLITE_MAGIC.len()].starts_with(SQLITE_MAGIC) {
+        // Drop tempfile on scope exit (not kept) so a bad decompress does not litter.
+        return Err(IndexError::Invalid(format!(
+            "decompressed {}-compressed index {} is not a SQLite database (missing '{}…' header, {} bytes)",
+            fmt.name(),
+            path.display(),
+            String::from_utf8_lossy(&SQLITE_MAGIC[..15]),
+            n
+        )));
+    }
+
+    let out = tmp
+        .into_temp_path()
+        .keep()
+        .map_err(|e| IndexError::Io(e.error))?;
+    debug!(
+        "decompressed {}-compressed index {} -> {} ({} bytes)",
+        fmt.name(),
+        path.display(),
+        out.display(),
+        n
+    );
+    Ok(out)
 }
 
 fn index_temp_dir() -> Option<PathBuf> {
@@ -228,8 +403,9 @@ fn fetch_index_http(url: &str) -> Result<PathBuf> {
 /// * `recreate` — skip loading existing; still prefer a writable path for create.
 ///
 /// Absolute `http(s)://` explicit paths are downloaded to a local tempfile and returned as
-/// [`IndexLocation::Path`]. Fetch failures for an explicit remote URL fall through to folder
-/// candidates (Python trial-and-error style) after a warning.
+/// [`IndexLocation::Path`]. Compressed indexes are decompressed to a kept tempfile. Fetch /
+/// decompress failures for an explicit remote URL fall through to folder candidates (Python
+/// trial-and-error style) after a warning.
 pub fn resolve_index_location(
     archive: &Path,
     explicit: Option<&str>,
@@ -252,7 +428,14 @@ pub fn resolve_index_location(
                 }
             }
         } else {
-            return IndexLocation::Path(expand_user(Path::new(e)));
+            let p = expand_user(Path::new(e));
+            match materialize_index_file(&p) {
+                Ok(mp) => return IndexLocation::Path(mp),
+                Err(err) => {
+                    warn!("could not materialize index {}: {err}", p.display());
+                    return IndexLocation::Path(p);
+                }
+            }
         }
     }
 
@@ -266,7 +449,16 @@ pub fn resolve_index_location(
     if !recreate {
         for p in &candidates {
             if path_is_usable_existing_index(p) {
-                return IndexLocation::Path(p.clone());
+                match materialize_index_file(p) {
+                    Ok(mp) => return IndexLocation::Path(mp),
+                    Err(err) => {
+                        warn!(
+                            "could not materialize existing index {}: {err}",
+                            p.display()
+                        );
+                        // try next candidate
+                    }
+                }
             }
         }
     }
@@ -320,7 +512,7 @@ fn test_writable_dir(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
@@ -539,5 +731,208 @@ mod tests {
     fn maybe_fetch_rejects_empty_spec() {
         let err = maybe_fetch_index_url("  ").unwrap_err();
         assert!(matches!(err, IndexError::Invalid(_)));
+    }
+
+    /// Tiny fake SQLite header payload used as compression round-trip body.
+    fn tiny_sqlite_bytes() -> Vec<u8> {
+        let mut v = SQLITE_MAGIC.to_vec();
+        v.extend_from_slice(b"tiny-index-payload-for-tests");
+        v
+    }
+
+    fn write_gzip(path: &Path, data: &[u8]) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        let f = File::create(path).unwrap();
+        let mut enc = GzEncoder::new(f, Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+    }
+
+    fn write_xz(path: &Path, data: &[u8]) {
+        let f = File::create(path).unwrap();
+        let mut enc = xz2::write::XzEncoder::new(f, 6);
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+    }
+
+    fn write_zstd(path: &Path, data: &[u8]) {
+        let f = File::create(path).unwrap();
+        let mut enc = zstd::stream::write::Encoder::new(f, 3).unwrap();
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+    }
+
+    fn write_bzip2(path: &Path, data: &[u8]) {
+        let f = File::create(path).unwrap();
+        let mut enc = bzip2::write::BzEncoder::new(f, bzip2::Compression::default());
+        enc.write_all(data).unwrap();
+        enc.finish().unwrap();
+    }
+
+    fn assert_sqlite_magic(path: &Path) {
+        let mut f = File::open(path).unwrap();
+        let mut magic = [0u8; 16];
+        f.read_exact(&mut magic).unwrap();
+        assert_eq!(&magic, SQLITE_MAGIC, "path={}", path.display());
+    }
+
+    #[test]
+    fn materialize_uncompressed_passthrough() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("plain.index.sqlite");
+        let body = tiny_sqlite_bytes();
+        std::fs::write(&idx, &body).unwrap();
+
+        let out = materialize_index_file(&idx).unwrap();
+        assert_eq!(out, idx);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+    }
+
+    #[test]
+    fn materialize_gzip_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let gz = dir.path().join("t.index.sqlite.gz");
+        write_gzip(&gz, &body);
+
+        let out = materialize_index_file(&gz).unwrap();
+        assert_ne!(out, gz);
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn materialize_xz_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let xz = dir.path().join("t.index.sqlite.xz");
+        write_xz(&xz, &body);
+
+        let out = materialize_index_file(&xz).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn materialize_zstd_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let zst = dir.path().join("t.index.sqlite.zst");
+        write_zstd(&zst, &body);
+
+        let out = materialize_index_file(&zst).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn materialize_zstd_zstd_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let zst = dir.path().join("t.index.sqlite.zstd");
+        write_zstd(&zst, &body);
+
+        let out = materialize_index_file(&zst).unwrap();
+        assert_sqlite_magic(&out);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn materialize_bzip2_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let bz2 = dir.path().join("t.index.sqlite.bz2");
+        write_bzip2(&bz2, &body);
+
+        let out = materialize_index_file(&bz2).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn materialize_gzip_without_sqlite_payload_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("not-sqlite.gz");
+        write_gzip(&gz, b"this is not a sqlite database");
+
+        let err = materialize_index_file(&gz).unwrap_err();
+        match err {
+            IndexError::Invalid(msg) => {
+                assert!(
+                    msg.contains("not a SQLite") || msg.contains("SQLite"),
+                    "unexpected msg: {msg}"
+                );
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn maybe_fetch_decompresses_local_gzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let gz = dir.path().join("idx.sqlite.gz");
+        write_gzip(&gz, &body);
+
+        let out = maybe_fetch_index_url(gz.to_str().unwrap()).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn maybe_fetch_http_gzip_index() {
+        let body = tiny_sqlite_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let gz_path = dir.path().join("remote.gz");
+        write_gzip(&gz_path, &body);
+        let gz_bytes = std::fs::read(&gz_path).unwrap();
+
+        let mock = MockHttp::spawn(gz_bytes);
+        let url = mock.url("/archive.tar.index.sqlite.gz");
+        let out = maybe_fetch_index_url(&url).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn resolve_explicit_gzip_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"x").unwrap();
+        let body = tiny_sqlite_bytes();
+        let gz = dir.path().join("custom.index.sqlite.gz");
+        write_gzip(&gz, &body);
+
+        let loc = resolve_index_location(&archive, Some(gz.to_str().unwrap()), &[], false);
+        match loc {
+            IndexLocation::Path(p) => {
+                assert_sqlite_magic(&p);
+                assert_eq!(std::fs::read(&p).unwrap(), body);
+                if p != gz {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+            IndexLocation::Memory => panic!("expected path"),
+        }
+    }
+
+    #[test]
+    fn detect_compression_by_magic_ignores_wrong_suffix() {
+        // File named .sqlite but gzip-compressed body must still decompress.
+        let dir = tempfile::tempdir().unwrap();
+        let body = tiny_sqlite_bytes();
+        let path = dir.path().join("sneaky.index.sqlite");
+        write_gzip(&path, &body);
+        let out = materialize_index_file(&path).unwrap();
+        assert_sqlite_magic(&out);
+        assert_eq!(std::fs::read(&out).unwrap(), body);
+        let _ = std::fs::remove_file(&out);
     }
 }

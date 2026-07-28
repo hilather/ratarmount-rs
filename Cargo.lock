@@ -1827,7 +1827,9 @@ dependencies = [
 name = "ratarmount-index"
 version = "0.1.2"
 dependencies = [
+ "bzip2",
  "crc32fast",
+ "flate2",
  "log",
  "md-5",
  "ratarmount-core",
@@ -1839,6 +1841,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "ureq",
+ "xz2",
+ "zstd",
 ]
 
 [[package]]

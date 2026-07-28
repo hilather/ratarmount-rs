@@ -8,9 +8,9 @@ pub use hashing::{
     SUPPORTED_HASH_ALGORITHMS,
 };
 pub use location::{
-    default_index_folders, default_index_path, expand_user, is_index_url, maybe_fetch_index_url,
-    parse_index_folders, possible_index_paths, resolve_index_location, sibling_index_url,
-    IndexLocation, MEMORY_INDEX,
+    default_index_folders, default_index_path, expand_user, is_index_url, materialize_index_file,
+    maybe_fetch_index_url, parse_index_folders, possible_index_paths, resolve_index_location,
+    sibling_index_url, IndexLocation, MEMORY_INDEX,
 };
 
 use std::collections::{BTreeMap, HashMap};

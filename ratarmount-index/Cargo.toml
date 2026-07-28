@@ -18,5 +18,10 @@ md-5 = "0.10"
 crc32fast = "1"
 tempfile.workspace = true
 ureq = { version = "2", default-features = true, features = ["tls"] }
+# Compressed SQLite index materialization (Python `_load_index` / `_undo_compression`).
+flate2 = "1"
+xz2 = { version = "0.1", features = ["static"] }
+zstd = "0.13"
+bzip2 = { version = "0.5", features = ["static"] }
 
 [dev-dependencies]
