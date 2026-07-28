@@ -57,7 +57,10 @@ pub use ratarmount_core::ParallelizationSpec;
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };
-pub use xz_seek::{open_seekable_xz, open_seekable_xz_with_threads};
+pub use xz_seek::{
+    open_seekable_xz, open_seekable_xz_from_reader, open_seekable_xz_with_threads,
+    open_seekable_xz_with_threads_from_reader,
+};
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib, open_seekable_zlib_with_threads};
 pub use zstd_seek::{
     build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_with_threads, SeekableZstd,

@@ -16,6 +16,11 @@
 //! unit (last-unit cache). Single-block mini-streams are reconstructed from the
 //! original Stream Header + Block + a one-record Index + Footer.
 //!
+//! Open paths:
+//! * **Path-based** — reopen independent FDs per block read (`File::open`).
+//! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
+//!   `Cursor`); shared under a mutex so random Range reads drive block decode.
+//!
 //! **Limitation:** single-stream multi-block random access needs a valid Index
 //! (always present in well-formed xz). If Index/footer validation fails, we fall
 //! back to full decode rather than partial block isolation.
@@ -23,7 +28,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ratarmount_core::ParallelizationSpec;
@@ -36,6 +41,15 @@ use crate::{CompressError, Result};
 const XZ_MAGIC: [u8; 6] = [0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00];
 /// Stream Footer magic (`YZ`).
 const FOOTER_MAGIC: [u8; 2] = [0x59, 0x5A];
+
+/// How compressed bytes are re-read for on-demand block decode.
+#[derive(Clone)]
+enum XzBackend {
+    /// Local path: each block read opens its own `File`.
+    Path(PathBuf),
+    /// Shared seekable stream (HTTP Range, Cursor, etc.).
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
 
 /// Open xz as a seekable body (block/stream map when possible, else full decode).
 pub fn open_seekable_xz(path: impl AsRef<Path>) -> Result<Arc<dyn SeekableBody>> {
@@ -55,12 +69,53 @@ pub fn open_seekable_xz_with_threads(
     path: impl AsRef<Path>,
     threads: u32,
 ) -> Result<Arc<dyn SeekableBody>> {
-    let path = path.as_ref();
+    let path = path.as_ref().to_path_buf();
     let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    let backend = XzBackend::Path(path.clone());
+    open_with_backend(backend, path, threads)
+}
 
-    let mut file = File::open(path)?;
-    let mut compressed = Vec::new();
-    file.read_to_end(&mut compressed)?;
+/// Open xz from a seekable compressed reader (block/stream map when possible).
+///
+/// `archive_label` is stored for [`SeekableBody::path`] / logs (URL or virtual name).
+pub fn open_seekable_xz_from_reader<R>(
+    reader: R,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    open_seekable_xz_with_threads_from_reader(reader, 1, archive_label)
+}
+
+/// Open xz from a seekable compressed reader with a thread hint (Python `-P`).
+///
+/// Map build is sequential for Index parse; multi-stream size discovery / full
+/// decode may use workers when `threads > 1`. The compressed stream is retained
+/// under a mutex so on-demand block decode can re-seek (HTTP Range, Cursor, …).
+pub fn open_seekable_xz_with_threads_from_reader<R>(
+    reader: R,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let path = archive_label.as_ref().to_path_buf();
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+    let backend = XzBackend::Shared(shared);
+    open_with_backend(backend, path, threads)
+}
+
+fn open_with_backend(
+    backend: XzBackend,
+    path: PathBuf,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    // Index/footer walk and multi-stream size discovery need a full compressed
+    // image once at open; on-demand block decode re-reads ranges via `backend`.
+    let compressed = read_all_compressed(&backend)?;
     if compressed.len() < 12 || compressed[..6] != XZ_MAGIC {
         return Err(CompressError::Msg("not an xz stream".into()));
     }
@@ -69,8 +124,8 @@ pub fn open_seekable_xz_with_threads(
     if let Ok((blocks, uncomp_size)) = build_block_map_from_index(&compressed) {
         if blocks.len() >= 2 {
             return Ok(Arc::new(SeekableXz {
-                path: path.to_path_buf(),
-                compressed: Arc::new(compressed),
+                path,
+                backend,
                 blocks: Arc::new(blocks),
                 uncompressed_size: uncomp_size,
                 kind: "xz-blocks",
@@ -83,8 +138,8 @@ pub fn open_seekable_xz_with_threads(
     if let Ok((blocks, uncomp_size)) = build_stream_map_by_decode(&compressed, threads) {
         if blocks.len() >= 2 {
             return Ok(Arc::new(SeekableXz {
-                path: path.to_path_buf(),
-                compressed: Arc::new(compressed),
+                path,
+                backend,
                 blocks: Arc::new(blocks),
                 uncompressed_size: uncomp_size,
                 kind: "xz-streams",
@@ -93,7 +148,7 @@ pub fn open_seekable_xz_with_threads(
     }
 
     // 3) Full one-shot decode.
-    full_decode_body(path, &compressed, threads)
+    full_decode_body(&path, &compressed, threads)
 }
 
 fn full_decode_body(
@@ -138,10 +193,11 @@ struct BlockInfo {
     whole_stream: bool,
 }
 
-/// Seekable xz body backed by a retained block/stream map.
+/// Seekable xz body backed by a retained block/stream map + compressed backend.
 pub struct SeekableXz {
+    /// Label for logs / index metadata (filesystem path, URL, or virtual name).
     path: PathBuf,
-    compressed: Arc<Vec<u8>>,
+    backend: XzBackend,
     blocks: Arc<Vec<BlockInfo>>,
     uncompressed_size: u64,
     kind: &'static str,
@@ -158,7 +214,7 @@ impl SeekableBody for SeekableXz {
 
     fn open_reader(&self) -> io::Result<Box<dyn SeekRead>> {
         Ok(Box::new(XzBlockReader {
-            compressed: Arc::clone(&self.compressed),
+            backend: self.backend.clone(),
             blocks: Arc::clone(&self.blocks),
             size: self.uncompressed_size,
             pos: 0,
@@ -177,7 +233,7 @@ impl SeekableBody for SeekableXz {
 }
 
 struct XzBlockReader {
-    compressed: Arc<Vec<u8>>,
+    backend: XzBackend,
     blocks: Arc<Vec<BlockInfo>>,
     size: u64,
     pos: u64,
@@ -207,7 +263,7 @@ impl XzBlockReader {
             return Ok(());
         }
         let b = &self.blocks[idx];
-        let plain = decode_block_unit(&self.compressed, b)
+        let plain = decode_block_unit_backend(&self.backend, b)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
         self.cache_idx = Some(idx);
         self.cache_data = plain;
@@ -251,6 +307,64 @@ impl Seek for XzBlockReader {
     }
 }
 
+/// Read the full compressed stream for map build; leave shared backends at offset 0.
+fn read_all_compressed(backend: &XzBackend) -> Result<Vec<u8>> {
+    match backend {
+        XzBackend::Path(path) => {
+            let mut file = File::open(path)?;
+            let mut compressed = Vec::new();
+            file.read_to_end(&mut compressed)?;
+            Ok(compressed)
+        }
+        XzBackend::Shared(shared) => {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| CompressError::Msg("xz backend mutex poisoned".into()))?;
+            guard.seek(SeekFrom::Start(0))?;
+            let mut compressed = Vec::new();
+            guard.read_to_end(&mut compressed)?;
+            guard.seek(SeekFrom::Start(0))?;
+            Ok(compressed)
+        }
+    }
+}
+
+/// Read `[offset, offset+len)` from the compressed backend.
+fn read_compressed_range(backend: &XzBackend, offset: u64, len: u64) -> Result<Vec<u8>> {
+    let len_usize = usize::try_from(len)
+        .map_err(|_| CompressError::Msg("xz range size overflow".into()))?;
+    let mut buf = vec![0u8; len_usize];
+    match backend {
+        XzBackend::Path(path) => {
+            let mut file = File::open(path)?;
+            file.seek(SeekFrom::Start(offset))?;
+            file.read_exact(&mut buf)?;
+        }
+        XzBackend::Shared(shared) => {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| CompressError::Msg("xz backend mutex poisoned".into()))?;
+            guard.seek(SeekFrom::Start(offset))?;
+            guard.read_exact(&mut buf)?;
+        }
+    }
+    Ok(buf)
+}
+
+/// On-demand block decode via seekable compressed backend.
+fn decode_block_unit_backend(backend: &XzBackend, block: &BlockInfo) -> Result<Vec<u8>> {
+    if block.whole_stream {
+        let data = read_compressed_range(backend, block.compressed_offset, block.compressed_size)?;
+        return decode_one_stream(&data);
+    }
+    let header = read_compressed_range(backend, block.stream_header_offset, 12)?;
+    let block_bytes =
+        read_compressed_range(backend, block.compressed_offset, block.compressed_size)?;
+    decode_mini_stream_block(&header, &block_bytes, block)
+}
+
+/// Slice-based block decode (unit tests / in-memory compressed image).
+#[cfg(test)]
 fn decode_block_unit(data: &[u8], block: &BlockInfo) -> Result<Vec<u8>> {
     let start = block.compressed_offset as usize;
     let end = start
@@ -262,14 +376,22 @@ fn decode_block_unit(data: &[u8], block: &BlockInfo) -> Result<Vec<u8>> {
     if block.whole_stream {
         return decode_one_stream(&data[start..end]);
     }
-    // Reconstruct a single-block xz stream: Header + Block + Index(1) + Footer.
     let hs = block.stream_header_offset as usize;
     if hs + 12 > data.len() {
         return Err(CompressError::Msg("xz stream header out of bounds".into()));
     }
-    let header = &data[hs..hs + 12];
-    let block_bytes = &data[start..end];
+    decode_mini_stream_block(&data[hs..hs + 12], &data[start..end], block)
+}
 
+/// Reconstruct a single-block xz stream: Header + Block + Index(1) + Footer.
+fn decode_mini_stream_block(
+    header: &[u8],
+    block_bytes: &[u8],
+    block: &BlockInfo,
+) -> Result<Vec<u8>> {
+    if header.len() < 12 {
+        return Err(CompressError::Msg("xz stream header out of bounds".into()));
+    }
     let mut index = Vec::with_capacity(32);
     index.push(0); // Index Indicator
     index.extend_from_slice(&encode_vli(1));
@@ -292,7 +414,7 @@ fn decode_block_unit(data: &[u8], block: &BlockInfo) -> Result<Vec<u8>> {
     footer.extend_from_slice(&FOOTER_MAGIC);
 
     let mut mini = Vec::with_capacity(12 + block_bytes.len() + index.len() + 12);
-    mini.extend_from_slice(header);
+    mini.extend_from_slice(&header[..12]);
     mini.extend_from_slice(block_bytes);
     mini.extend_from_slice(&index);
     mini.extend_from_slice(&footer);
@@ -1010,5 +1132,169 @@ mod tests {
     fn crc32_ieee_known_vector() {
         // ISO HDLC / gzip/xz CRC32 of "123456789" is 0xCBF43926.
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn from_reader_cursor_random_access_equals_path() {
+        use std::io::Cursor;
+
+        let a = b"alpha-from-reader-1111";
+        let b = b"beta-from-reader-22222222";
+        let c = b"gamma-reader-333";
+        let mut compressed = encode_xz(a);
+        compressed.extend_from_slice(&encode_xz(b));
+        compressed.extend_from_slice(&encode_xz(c));
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.xz");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let path_body = open_seekable_xz(&path).unwrap();
+        let reader_body = open_seekable_xz_with_threads_from_reader(
+            Cursor::new(compressed.clone()),
+            1,
+            Path::new("memory://cursor.xz"),
+        )
+        .unwrap();
+
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert_eq!(reader_body.path(), Path::new("memory://cursor.xz"));
+        assert!(
+            reader_body.kind() == "xz-blocks" || reader_body.kind() == "xz-streams",
+            "kind={}",
+            reader_body.kind()
+        );
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(a);
+        expected.extend_from_slice(b);
+        expected.extend_from_slice(c);
+
+        let mut path_r = path_body.open_reader().unwrap();
+        let mut mem_r = reader_body.open_reader().unwrap();
+
+        let mut path_all = Vec::new();
+        let mut mem_all = Vec::new();
+        path_r.read_to_end(&mut path_all).unwrap();
+        mem_r.read_to_end(&mut mem_all).unwrap();
+        assert_eq!(path_all, expected);
+        assert_eq!(mem_all, expected);
+
+        let offsets = [
+            0u64,
+            3,
+            a.len() as u64,
+            a.len() as u64 + 5,
+            (a.len() + b.len()) as u64,
+            expected.len() as u64 - 4,
+        ];
+        for &off in &offsets {
+            path_r.seek(SeekFrom::Start(off)).unwrap();
+            mem_r.seek(SeekFrom::Start(off)).unwrap();
+            let mut pb = [0u8; 16];
+            let mut mb = [0u8; 16];
+            let pn = path_r.read(&mut pb).unwrap();
+            let mn = mem_r.read(&mut mb).unwrap();
+            assert_eq!(pn, mn, "offset {off}");
+            assert_eq!(&pb[..pn], &mb[..mn], "offset {off}");
+        }
+
+        // Free-function without threads arg
+        let mut free_r = open_seekable_xz_from_reader(
+            Cursor::new(compressed),
+            Path::new("virt.xz"),
+        )
+        .unwrap()
+        .open_reader()
+        .unwrap();
+        free_r.seek(SeekFrom::Start(a.len() as u64)).unwrap();
+        let mut tail = Vec::new();
+        free_r.read_to_end(&mut tail).unwrap();
+        let mut expect_tail = Vec::new();
+        expect_tail.extend_from_slice(b);
+        expect_tail.extend_from_slice(c);
+        assert_eq!(tail, expect_tail);
+    }
+
+    #[test]
+    fn from_reader_multi_block_index_map() {
+        use std::io::Cursor;
+
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("big.bin");
+        let payload = vec![b'Y'; 80_000];
+        std::fs::write(&raw, &payload).unwrap();
+        let status = Command::new("xz")
+            .args(["-T1", "--block-size=16384", "-k", "-f", "-c"])
+            .arg(&raw)
+            .output();
+        let Ok(out) = status else {
+            return;
+        };
+        if !out.status.success() || out.stdout.len() < 32 {
+            return;
+        }
+
+        let path = dir.path().join("multi-block.xz");
+        std::fs::write(&path, &out.stdout).unwrap();
+
+        let path_body = open_seekable_xz(&path).unwrap();
+        let reader_body = open_seekable_xz_from_reader(
+            Cursor::new(out.stdout.clone()),
+            "memory://multi-block.xz",
+        )
+        .unwrap();
+
+        assert_eq!(path_body.kind(), "xz-blocks");
+        assert_eq!(reader_body.kind(), "xz-blocks");
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert!(reader_body.checkpoint_count() >= 2);
+        assert_eq!(reader_body.path(), Path::new("memory://multi-block.xz"));
+
+        let mut path_r = path_body.open_reader().unwrap();
+        let mut mem_r = reader_body.open_reader().unwrap();
+        path_r.seek(SeekFrom::Start(40_000)).unwrap();
+        mem_r.seek(SeekFrom::Start(40_000)).unwrap();
+        let mut pc = [0u8; 48];
+        let mut mc = [0u8; 48];
+        path_r.read_exact(&mut pc).unwrap();
+        mem_r.read_exact(&mut mc).unwrap();
+        assert_eq!(pc, mc);
+        assert_eq!(pc, [b'Y'; 48]);
+    }
+
+    #[test]
+    fn from_reader_with_threads_equals_path() {
+        use std::io::Cursor;
+
+        let a = b"thread-A-payload";
+        let b = b"thread-B-payload!!";
+        let mut compressed = encode_xz(a);
+        compressed.extend_from_slice(&encode_xz(b));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("thr.xz");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let mut from_path = Vec::new();
+        open_seekable_xz_with_threads(&path, 4)
+            .unwrap()
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut from_path)
+            .unwrap();
+        let mut from_reader = Vec::new();
+        open_seekable_xz_with_threads_from_reader(Cursor::new(compressed), 4, "label.xz")
+            .unwrap()
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut from_reader)
+            .unwrap();
+        assert_eq!(from_path, from_reader);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(a);
+        expected.extend_from_slice(b);
+        assert_eq!(from_path, expected);
     }
 }
