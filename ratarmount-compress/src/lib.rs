@@ -63,7 +63,8 @@ pub use xz_seek::{
 };
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib, open_seekable_zlib_with_threads};
 pub use zstd_seek::{
-    build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_with_threads, SeekableZstd,
+    build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_from_reader,
+    open_seekable_zstd_with_threads, open_seekable_zstd_with_threads_from_reader, SeekableZstd,
 };
 
 use std::fs::File;

@@ -14,11 +14,16 @@
 //!   `threads > 1`, frames are decompressed in parallel (the public `zstd` crate
 //!   exposes multi-thread **encode** via `zstdmt`/`NbWorkers`; frame-level
 //!   parallel **decode** is implemented here instead).
+//!
+//! Open paths:
+//! * **Path-based** — reopen independent FDs per reader (`File::open`).
+//! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
+//!   `Cursor`); shared under a mutex so random Range reads drive frame decode.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use ratarmount_core::ParallelizationSpec;
@@ -40,6 +45,34 @@ pub fn open_seekable_zstd_with_threads(
 ) -> Result<Arc<dyn SeekableBody>> {
     let threads = ParallelizationSpec::resolve_zero(threads).max(1);
     SeekableZstd::open_with_threads(path, threads)
+}
+
+/// Open seekable zstd from a seekable compressed reader.
+///
+/// `archive_label` is stored for logs / [`SeekableBody::path`] (URL or virtual name).
+pub fn open_seekable_zstd_from_reader<R>(
+    reader: R,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    open_seekable_zstd_with_threads_from_reader(reader, 1, archive_label)
+}
+
+/// Open seekable zstd from a seekable compressed reader with a thread hint.
+///
+/// See [`SeekableZstd::open_with_threads_from_reader`].
+pub fn open_seekable_zstd_with_threads_from_reader<R>(
+    reader: R,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+    SeekableZstd::open_with_threads_from_reader(reader, threads, archive_label)
 }
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -64,9 +97,31 @@ struct FrameInfo {
     uncompressed_size: Option<u64>,
 }
 
+/// How compressed bytes are re-opened for independent frame readers.
+enum ZstdBackend {
+    /// Local path: each reader opens its own `File`.
+    Path(PathBuf),
+    /// Shared seekable stream (HTTP Range, Cursor, etc.).
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+/// Outcome of classifying a zstd stream (seek table / multi-frame map / full decode).
+enum ZstdPlan {
+    /// Use per-frame random access.
+    Mapped {
+        frames: Vec<FrameInfo>,
+        uncompressed_size: u64,
+        from_seek_table: bool,
+    },
+    /// Materialize the whole uncompressed stream.
+    FullDecode,
+}
+
 /// Shared seekable zstd file.
 pub struct SeekableZstd {
+    /// Label for logs / index metadata (filesystem path, URL, or virtual name).
     path: PathBuf,
+    backend: ZstdBackend,
     frames: Vec<FrameInfo>,
     uncompressed_size: u64,
     /// When only one large frame (or scan failed), fall back to full decode.
@@ -81,66 +136,126 @@ impl SeekableZstd {
     }
 
     /// Open with a thread hint. See [`open_seekable_zstd_with_threads`].
+    ///
+    /// Path openers open a `File` for map/seek-table import, then keep a path
+    /// backend so each reader reopens an independent FD.
     pub fn open_with_threads(path: impl AsRef<Path>, threads: u32) -> Result<Arc<dyn SeekableBody>> {
-        let path = path.as_ref();
+        let path = path.as_ref().to_path_buf();
         let threads = ParallelizationSpec::resolve_zero(threads).max(1);
-
-        // 1) Prefer official seekable-format seek table when present.
-        if let Ok((frames, uncomp_size)) = try_load_seek_table(path) {
-            if frames.len() > 1 {
-                return Ok(Arc::new(Self {
-                    path: path.to_path_buf(),
-                    frames,
-                    uncompressed_size: uncomp_size,
-                    fallback: None,
-                    from_seek_table: true,
-                }));
-            }
-            if frames.len() == 1 {
-                if let Some(sz) = frames[0].uncompressed_size {
-                    if sz <= DEFAULT_MEMORY_CAP {
-                        return decode_full(path, threads);
-                    }
-                }
-                // Single large frame with known compressed bounds: still use frame reader
-                // so we do not force a permanent materialised path.
-                return Ok(Arc::new(Self {
-                    path: path.to_path_buf(),
-                    frames,
-                    uncompressed_size: uncomp_size,
-                    fallback: None,
-                    from_seek_table: true,
-                }));
-            }
-        }
-
-        // 2) Multi-frame (or single-frame) scan without seek table.
-        match build_frame_map(path) {
-            Ok((frames, uncomp_size)) if frames.len() > 1 => Ok(Arc::new(Self {
-                path: path.to_path_buf(),
+        let mut file = File::open(&path)?;
+        match classify_zstd(&mut file, threads)? {
+            ZstdPlan::Mapped {
                 frames,
-                uncompressed_size: uncomp_size,
+                uncompressed_size,
+                from_seek_table,
+            } => Ok(Arc::new(Self {
+                path: path.clone(),
+                backend: ZstdBackend::Path(path),
+                frames,
+                uncompressed_size,
                 fallback: None,
-                from_seek_table: false,
+                from_seek_table,
             })),
-            Ok((frames, uncomp_size)) if frames.len() == 1 => {
-                // Single frame: if small content size known, decode that frame only once into memory.
-                if let Some(sz) = frames[0].uncompressed_size {
-                    if sz <= DEFAULT_MEMORY_CAP {
-                        return decode_full(path, threads);
-                    }
-                }
-                let _ = (frames, uncomp_size);
-                decode_full(path, threads)
+            ZstdPlan::FullDecode => decode_full(&path, threads),
+        }
+    }
+
+    /// Open from an already-seekable compressed stream (HTTP Range, memory, …).
+    ///
+    /// `archive_label` is stored for [`SeekableBody::path`] / logs (URL or virtual name).
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<dyn SeekableBody>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_threads_from_reader(reader, 1, archive_label)
+    }
+
+    /// Like [`Self::open_from_reader`] with a thread hint (Python `-P`).
+    pub fn open_with_threads_from_reader<R>(
+        mut reader: R,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<dyn SeekableBody>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let path = archive_label.as_ref().to_path_buf();
+        let threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        match classify_zstd(&mut reader, threads)? {
+            ZstdPlan::Mapped {
+                frames,
+                uncompressed_size,
+                from_seek_table,
+            } => {
+                let shared: Arc<Mutex<Box<dyn SeekRead>>> =
+                    Arc::new(Mutex::new(Box::new(reader)));
+                Ok(Arc::new(Self {
+                    path,
+                    backend: ZstdBackend::Shared(shared),
+                    frames,
+                    uncompressed_size,
+                    fallback: None,
+                    from_seek_table,
+                }))
             }
-            Ok(_) => decode_full(path, threads),
-            Err(_) => decode_full(path, threads),
+            ZstdPlan::FullDecode => decode_full_from_reader(reader, &path, threads),
         }
     }
 
     /// Diagnostic: whether the frame map was imported from a seek table.
     pub fn used_seek_table(&self) -> bool {
         self.from_seek_table
+    }
+}
+
+/// Classify stream into multi-frame map or full-decode fallback.
+///
+/// Prefer seek-table import; else multi-frame scan. Path and reader openers share
+/// this so HTTP Range / `Cursor` get the same map semantics as local files.
+fn classify_zstd<R: Read + Seek>(reader: &mut R, threads: u32) -> Result<ZstdPlan> {
+    let _ = threads; // reserved for future concurrent map builders
+    // 1) Prefer official seekable-format seek table when present.
+    if let Ok((frames, uncomp_size)) = try_load_seek_table_from_reader(reader) {
+        if frames.len() > 1 {
+            return Ok(ZstdPlan::Mapped {
+                frames,
+                uncompressed_size: uncomp_size,
+                from_seek_table: true,
+            });
+        }
+        if frames.len() == 1 {
+            if let Some(sz) = frames[0].uncompressed_size {
+                if sz <= DEFAULT_MEMORY_CAP {
+                    return Ok(ZstdPlan::FullDecode);
+                }
+            }
+            // Single large frame with known compressed bounds: still use frame reader
+            // so we do not force a permanent materialised path.
+            return Ok(ZstdPlan::Mapped {
+                frames,
+                uncompressed_size: uncomp_size,
+                from_seek_table: true,
+            });
+        }
+    }
+
+    // 2) Multi-frame (or single-frame) scan without seek table.
+    match build_frame_map_from_reader(reader) {
+        Ok((frames, uncomp_size)) if frames.len() > 1 => Ok(ZstdPlan::Mapped {
+            frames,
+            uncompressed_size: uncomp_size,
+            from_seek_table: false,
+        }),
+        Ok((frames, uncomp_size)) if frames.len() == 1 => {
+            // Single frame: decode fully (small → RAM; large → temp via DecodedBody).
+            let _ = (frames, uncomp_size);
+            Ok(ZstdPlan::FullDecode)
+        }
+        Ok(_) => Ok(ZstdPlan::FullDecode),
+        Err(_) => Ok(ZstdPlan::FullDecode),
     }
 }
 
@@ -163,10 +278,51 @@ fn decode_full(path: &Path, threads: u32) -> Result<Arc<dyn SeekableBody>> {
     Ok(body)
 }
 
+fn decode_full_from_reader<R>(
+    mut reader: R,
+    path: &Path,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    if threads > 1 {
+        if let Ok(data) = try_parallel_frame_decode_from_reader(&mut reader, threads) {
+            if data.len() as u64 <= DEFAULT_MEMORY_CAP {
+                return Ok(DecodedBody::from_bytes(path, "zstd", data) as Arc<dyn SeekableBody>);
+            }
+            let cursor = std::io::Cursor::new(data);
+            let body = DecodedBody::from_decoder(path, "zstd", cursor, DEFAULT_MEMORY_CAP)?;
+            return Ok(body as Arc<dyn SeekableBody>);
+        }
+        // Rewind for sequential fallback after a failed parallel attempt.
+        let _ = reader.seek(SeekFrom::Start(0));
+    }
+    reader.seek(SeekFrom::Start(0))?;
+    let dec =
+        zstd::stream::read::Decoder::new(reader).map_err(|e| CompressError::Msg(e.to_string()))?;
+    let body = DecodedBody::from_decoder(path, "zstd", dec, DEFAULT_MEMORY_CAP)?;
+    Ok(body)
+}
+
 /// Parallel decompress of independent zstd frames into one contiguous buffer.
 fn try_parallel_frame_decode(path: &Path, threads: u32) -> Result<Vec<u8>> {
     let data = std::fs::read(path)?;
-    let (frames, _total) = build_frame_map_from_bytes(&data)?;
+    try_parallel_frame_decode_bytes(&data, threads)
+}
+
+fn try_parallel_frame_decode_from_reader<R: Read + Seek>(
+    reader: &mut R,
+    threads: u32,
+) -> Result<Vec<u8>> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
+    try_parallel_frame_decode_bytes(&data, threads)
+}
+
+fn try_parallel_frame_decode_bytes(data: &[u8], threads: u32) -> Result<Vec<u8>> {
+    let (frames, _total) = build_frame_map_from_bytes(data)?;
     if frames.len() < 2 {
         return Err(CompressError::Msg("single zstd frame; sequential path".into()));
     }
@@ -307,8 +463,38 @@ impl SeekableBody for SeekableZstd {
     }
 }
 
+/// Compressed-stream handle used during frame decode (path FD or shared mutex stream).
+enum CompressedHandle {
+    File(File),
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+impl Read for CompressedHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self {
+            CompressedHandle::File(f) => f.read(buf),
+            CompressedHandle::Shared(inner) => inner
+                .lock()
+                .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?
+                .read(buf),
+        }
+    }
+}
+
+impl Seek for CompressedHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        match self {
+            CompressedHandle::File(f) => f.seek(pos),
+            CompressedHandle::Shared(inner) => inner
+                .lock()
+                .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?
+                .seek(pos),
+        }
+    }
+}
+
 struct ZstdFrameReader {
-    path: PathBuf,
+    backend: ZstdBackend,
     frames: Vec<FrameInfo>,
     size: u64,
     pos: u64,
@@ -320,8 +506,12 @@ struct ZstdFrameReader {
 
 impl ZstdFrameReader {
     fn open(z: &SeekableZstd) -> io::Result<Self> {
+        let backend = match &z.backend {
+            ZstdBackend::Path(p) => ZstdBackend::Path(p.clone()),
+            ZstdBackend::Shared(shared) => ZstdBackend::Shared(Arc::clone(shared)),
+        };
         Ok(Self {
-            path: z.path.clone(),
+            backend,
             frames: z.frames.clone(),
             size: z.uncompressed_size,
             pos: 0,
@@ -329,6 +519,13 @@ impl ZstdFrameReader {
             frame_data: Vec::new(),
             frame_start: 0,
         })
+    }
+
+    fn open_compressed(&self) -> io::Result<CompressedHandle> {
+        match &self.backend {
+            ZstdBackend::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
+            ZstdBackend::Shared(shared) => Ok(CompressedHandle::Shared(Arc::clone(shared))),
+        }
     }
 
     fn ensure_frame(&mut self, target: u64) -> io::Result<()> {
@@ -352,13 +549,16 @@ impl ZstdFrameReader {
             }
         }
         let info = &self.frames[best];
-        let mut file = File::open(&self.path)?;
+        let mut file = self.open_compressed()?;
         file.seek(SeekFrom::Start(info.compressed_offset))?;
         // Limit reader to this frame's compressed bytes when known — never decode the whole file.
         let mut data = Vec::new();
         if let Some(csz) = info.compressed_size {
-            let limited = file.take(csz);
-            let mut decoder = zstd::stream::read::Decoder::new(limited)
+            // Copy compressed frame under the (optional) shared lock, then decode.
+            let mut compressed = vec![0u8; csz as usize];
+            file.read_exact(&mut compressed)?;
+            drop(file);
+            let mut decoder = zstd::stream::read::Decoder::new(compressed.as_slice())
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
             decoder.read_to_end(&mut data)?;
         } else {
@@ -415,16 +615,17 @@ impl Seek for ZstdFrameReader {
 /// * Skippable frame magic `0x184D2A5E` + size
 /// * Entries: per frame `cSize:u32le`, `dSize:u32le` [, `checksum:u32le` if flag]
 /// * Footer (9 bytes): `numFrames:u32le`, descriptor byte, magic `0x8F92EAB1`
-fn try_load_seek_table(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
+fn try_load_seek_table_from_reader<R: Read + Seek>(
+    reader: &mut R,
+) -> Result<(Vec<FrameInfo>, u64)> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
     if file_len < SEEK_TABLE_FOOTER_SIZE + SKIPPABLE_HEADER_SIZE {
         return Err(CompressError::Msg("file too small for seek table".into()));
     }
 
-    file.seek(SeekFrom::End(-(SEEK_TABLE_FOOTER_SIZE as i64)))?;
+    reader.seek(SeekFrom::End(-(SEEK_TABLE_FOOTER_SIZE as i64)))?;
     let mut footer = [0u8; 9];
-    file.read_exact(&mut footer)?;
+    reader.read_exact(&mut footer)?;
     let num_frames = u32::from_le_bytes(footer[0..4].try_into().unwrap());
     let descriptor = footer[4];
     let magic = u32::from_le_bytes(footer[5..9].try_into().unwrap());
@@ -443,9 +644,9 @@ fn try_load_seek_table(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
         return Err(CompressError::Msg("seek table larger than file".into()));
     }
 
-    file.seek(SeekFrom::End(-(frame_size as i64)))?;
+    reader.seek(SeekFrom::End(-(frame_size as i64)))?;
     let mut header = [0u8; 8];
-    file.read_exact(&mut header)?;
+    reader.read_exact(&mut header)?;
     let skip_magic = u32::from_le_bytes(header[0..4].try_into().unwrap());
     let skip_size = u32::from_le_bytes(header[4..8].try_into().unwrap()) as u64;
     if skip_magic != SEEK_TABLE_SKIPPABLE_MAGIC {
@@ -456,7 +657,7 @@ fn try_load_seek_table(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
     }
 
     let mut entries = vec![0u8; table_size as usize];
-    file.read_exact(&mut entries)?;
+    reader.read_exact(&mut entries)?;
 
     let mut frames = Vec::with_capacity(num_frames as usize);
     let mut c_off = 0u64;
@@ -490,12 +691,11 @@ fn try_load_seek_table(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
     Ok((frames, d_off))
 }
 
-/// Scan zstd frames; returns (frames, total uncompressed size).
-///
-/// Uses `ZSTD_findFrameCompressedSize` so multi-frame maps are accurate even when
-/// a streaming decoder would over-read into the next frame.
-fn build_frame_map(path: &Path) -> Result<(Vec<FrameInfo>, u64)> {
-    let data = std::fs::read(path)?;
+/// Scan zstd frames from a seekable reader; returns (frames, total uncompressed size).
+fn build_frame_map_from_reader<R: Read + Seek>(reader: &mut R) -> Result<(Vec<FrameInfo>, u64)> {
+    reader.seek(SeekFrom::Start(0))?;
+    let mut data = Vec::new();
+    reader.read_to_end(&mut data)?;
     build_frame_map_from_bytes(&data)
 }
 
@@ -549,7 +749,7 @@ pub fn build_seek_table_skippable(frames: &[(u32, u32)]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
     fn py_test(name: &str) -> PathBuf {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
@@ -645,7 +845,8 @@ mod tests {
         drop(out);
 
         // Seek table import
-        let (map, total) = try_load_seek_table(&path).unwrap();
+        let mut f = File::open(&path).unwrap();
+        let (map, total) = try_load_seek_table_from_reader(&mut f).unwrap();
         assert_eq!(map.len(), 3);
         assert_eq!(total, parts.iter().map(|p| p.len() as u64).sum::<u64>());
         assert_eq!(map[0].compressed_offset, 0);
@@ -681,7 +882,8 @@ mod tests {
         out.write_all(&encode_frame(b"aa")).unwrap();
         out.write_all(&encode_frame(b"bb")).unwrap();
         drop(out);
-        assert!(try_load_seek_table(&path).is_err());
+        let mut f = File::open(&path).unwrap();
+        assert!(try_load_seek_table_from_reader(&mut f).is_err());
         let body = SeekableZstd::open(&path).unwrap();
         assert_eq!(body.kind(), "zstd-frames");
         assert!(body.checkpoint_count() >= 2);
@@ -745,5 +947,126 @@ mod tests {
         }
         let body = open_seekable_zstd_with_threads(&path, 0).unwrap();
         assert_eq!(body.size(), 12);
+    }
+
+    #[test]
+    fn multi_frame_zstd_from_reader_equals_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.zst");
+        let parts: [&[u8]; 3] = [b"AAAA", b"BBBBCCCC", b"DD"];
+        let mut compressed = Vec::new();
+        for part in parts {
+            compressed.extend_from_slice(&encode_frame(part));
+        }
+        std::fs::write(&path, &compressed).unwrap();
+
+        let path_body = SeekableZstd::open(&path).unwrap();
+        let reader_body = SeekableZstd::open_with_threads_from_reader(
+            Cursor::new(compressed.clone()),
+            1,
+            Path::new("memory://cursor.zst"),
+        )
+        .unwrap();
+
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.kind(), reader_body.kind());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert!(reader_body.checkpoint_count() >= 2);
+        assert_eq!(reader_body.path(), Path::new("memory://cursor.zst"));
+
+        let mut path_r = path_body.open_reader().unwrap();
+        let mut mem_r = reader_body.open_reader().unwrap();
+
+        let mut path_all = Vec::new();
+        let mut mem_all = Vec::new();
+        path_r.read_to_end(&mut path_all).unwrap();
+        mem_r.read_to_end(&mut mem_all).unwrap();
+        assert_eq!(path_all, b"AAAABBBBCCCCDD");
+        assert_eq!(mem_all, path_all);
+
+        // Random seeks across frames
+        let offsets = [0u64, 2, 4, 8, 12];
+        for &off in &offsets {
+            path_r.seek(SeekFrom::Start(off)).unwrap();
+            mem_r.seek(SeekFrom::Start(off)).unwrap();
+            let mut pb = [0u8; 4];
+            let mut mb = [0u8; 4];
+            let pn = path_r.read(&mut pb).unwrap();
+            let mn = mem_r.read(&mut mb).unwrap();
+            assert_eq!(pn, mn, "offset {off}");
+            assert_eq!(&pb[..pn], &mb[..mn], "offset {off}");
+        }
+
+        // Free-function openers
+        let free_body = open_seekable_zstd_with_threads_from_reader(
+            Cursor::new(compressed.clone()),
+            2,
+            Path::new("label.zst"),
+        )
+        .unwrap();
+        assert_eq!(free_body.path(), Path::new("label.zst"));
+        assert_eq!(free_body.size(), 14);
+        let mut free_r = free_body.open_reader().unwrap();
+        free_r.seek(SeekFrom::Start(4)).unwrap();
+        let mut free_chunk = [0u8; 4];
+        free_r.read_exact(&mut free_chunk).unwrap();
+        assert_eq!(&free_chunk, b"BBBB");
+
+        let free2 = open_seekable_zstd_from_reader(Cursor::new(compressed), "virt.zst").unwrap();
+        assert_eq!(free2.path(), Path::new("virt.zst"));
+        let mut out = Vec::new();
+        free2.open_reader().unwrap().read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"AAAABBBBCCCCDD");
+    }
+
+    #[test]
+    fn seek_table_from_reader_equals_path() {
+        let parts: [&[u8]; 3] = [
+            b"hello world!!!!",
+            b"second frame payload",
+            b"third!",
+        ];
+        let mut frames_bin = Vec::new();
+        let mut table_entries = Vec::new();
+        for part in parts {
+            let f = encode_frame(part);
+            table_entries.push((f.len() as u32, part.len() as u32));
+            frames_bin.extend_from_slice(&f);
+        }
+        let table = build_seek_table_skippable(&table_entries);
+        let mut compressed = frames_bin;
+        compressed.extend_from_slice(&table);
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seekable-cursor.zst");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let path_body = SeekableZstd::open(&path).unwrap();
+        let reader_body = SeekableZstd::open_from_reader(
+            Cursor::new(compressed),
+            Path::new("memory://seekable.zst"),
+        )
+        .unwrap();
+
+        assert_eq!(path_body.kind(), "zstd-seek-table");
+        assert_eq!(reader_body.kind(), "zstd-seek-table");
+        assert_eq!(path_body.size(), reader_body.size());
+        assert_eq!(path_body.checkpoint_count(), reader_body.checkpoint_count());
+        assert_eq!(reader_body.path(), Path::new("memory://seekable.zst"));
+
+        let mut expected = Vec::new();
+        for p in parts {
+            expected.extend_from_slice(p);
+        }
+        let mut a = Vec::new();
+        path_body.open_reader().unwrap().read_to_end(&mut a).unwrap();
+        let mut b = Vec::new();
+        reader_body
+            .open_reader()
+            .unwrap()
+            .read_to_end(&mut b)
+            .unwrap();
+        assert_eq!(a, expected);
+        assert_eq!(b, expected);
     }
 }
