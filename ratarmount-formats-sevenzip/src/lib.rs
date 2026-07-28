@@ -32,10 +32,13 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+use log::warn;
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
-use ratarmount_index::{FileRow, IndexError, SqliteIndex};
+use ratarmount_index::{
+    compute_hashes_limited, normalize_algorithm, FileRow, IndexError, SqliteIndex,
+};
 use thiserror::Error;
 
 use decode::{
@@ -366,6 +369,26 @@ impl SevenZipMountSource {
         }
         if !batch.is_empty() {
             index.insert_files_batch(&batch)?;
+        }
+
+        // Content hashes (`--hashes` / OpenOptions.hashes) → user.hash.* xattrs.
+        // Skip when encrypted content is locked (no password); otherwise best-effort
+        // per member (decompress via pack offsets, store under offsetheader=pack_offset).
+        if !options.hashes.is_empty() {
+            if content_locked {
+                warn!(
+                    "skipping content hashes for encrypted 7z without password ({})",
+                    archive_path.display()
+                );
+            } else {
+                fill_member_content_hashes(
+                    &index,
+                    &archive_io,
+                    &archive,
+                    password.as_deref(),
+                    &options.hashes,
+                )?;
+            }
         }
 
         index.store_versions(product_version)?;
@@ -716,6 +739,118 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Hash regular-file members into index xattrs (`user.hash.<algo>`).
+///
+/// Unlike path-backed TAR `fill_content_hashes`, 7z payloads are not raw at
+/// `offset` — members must be decoded (Copy stencil or folder decompress).
+/// Uses the same `offsetheader` (= pack offset) as the files row / Python.
+fn fill_member_content_hashes(
+    index: &SqliteIndex,
+    archive_io: &SharedArchiveIo,
+    archive: &SevenZipArchiveInfo,
+    password: Option<&str>,
+    algorithms: &[String],
+) -> Result<()> {
+    let mut algos: Vec<String> = Vec::new();
+    for raw in algorithms {
+        let Some(name) = normalize_algorithm(raw) else {
+            if !raw.trim().is_empty() {
+                warn!("Unsupported hash algorithm: {raw}");
+            }
+            continue;
+        };
+        if !algos.iter().any(|a| a == name) {
+            algos.push(name.to_string());
+        }
+    }
+    if algos.is_empty() {
+        return Ok(());
+    }
+
+    let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
+
+    for (entry_index, entry) in archive.files.iter().enumerate() {
+        if entry.is_dir || entry.is_empty_stream || entry.size == 0 {
+            continue;
+        }
+        let mut mode = entry.mode;
+        let ifmt = mode & ratarmount_core::S_IFMT;
+        if ifmt == ratarmount_core::S_IFDIR || ifmt == ratarmount_core::S_IFLNK {
+            continue;
+        }
+        if ifmt == 0 {
+            mode = (mode & 0o777) | ratarmount_core::S_IFREG;
+        }
+        if (mode & ratarmount_core::S_IFMT) != ratarmount_core::S_IFREG {
+            continue;
+        }
+        let Some(fi) = entry.folder_index else {
+            continue;
+        };
+        let folder = match archive.folders.get(fi) {
+            Some(f) => f,
+            None => continue,
+        };
+        if folder.is_encrypted() && password.is_none() {
+            continue;
+        }
+        let allow_enc = !folder.is_encrypted() || password.is_some();
+        if !folder.is_supported_for_open(allow_enc) {
+            warn!(
+                "skipping content hash for unsupported 7z codecs: {}",
+                entry.path
+            );
+            continue;
+        }
+
+        let header_offset = if entry.folder_index.is_some() {
+            entry.pack_offset as i64
+        } else {
+            ((1u64 << 62) + entry_index as u64) as i64
+        };
+
+        let bytes = match read_member_bytes_io(archive_io, archive, entry, folder, password) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    "Failed to read 7z member {} for content hash: {e}",
+                    entry.path
+                );
+                continue;
+            }
+        };
+        let digests = match compute_hashes_limited(&mut Cursor::new(&bytes), entry.size, &algos) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    "Failed to hash 7z member {} (offsetheader={header_offset}): {e}",
+                    entry.path
+                );
+                continue;
+            }
+        };
+        for (name, hex) in digests {
+            pending.push((header_offset, format!("user.hash.{name}"), hex.into_bytes()));
+        }
+        if pending.len() >= 256 {
+            index.insert_xattrs_batch(&pending)?;
+            pending.clear();
+        }
+    }
+    if !pending.is_empty() {
+        index.insert_xattrs_batch(&pending)?;
+    }
+    Ok(())
+}
+
+/// `offsetheader` used as the xattrs table key (Python interop / pack offset).
+fn sz_offsetheader(file_info: &FileInfo) -> Option<i64> {
+    file_info.userdata.iter().rev().find_map(|u| match u {
+        UserData::Tar(t) => t.offsetheader.map(|v| v as i64),
+        _ => None,
+    })
+}
+
 impl MountSource for SevenZipMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
         self.index.list(path).ok().flatten().map(ListResult::Infos)
@@ -823,11 +958,26 @@ impl MountSource for SevenZipMountSource {
     fn is_immutable(&self) -> bool {
         true
     }
+
+    /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        let Some(oh) = sz_offsetheader(file_info) else {
+            return Vec::new();
+        };
+        self.index.list_xattr_keys(oh).unwrap_or_default()
+    }
+
+    /// One xattr value from the index (e.g. hex digest for `user.hash.sha256`).
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        let oh = sz_offsetheader(file_info)?;
+        self.index.get_xattr(oh, key).ok().flatten()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratarmount_index::hash_hex;
 
     fn py_fixture(name: &str) -> PathBuf {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
@@ -1316,6 +1466,216 @@ sys.stdout.buffer.write(packed)
         assert_eq!(
             m2,
             data[m2_start as usize..(m2_start + m2_size) as usize]
+        );
+    }
+
+    /// After OpenOptions.hashes fill, list_xattr/get_xattr expose user.hash.* (store-copy fixture).
+    #[test]
+    fn content_hash_xattrs_store_copy() {
+        let path = py_fixture("store-copy-two-files.7z");
+        if !path.exists() {
+            eprintln!("skip missing {}", path.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let opts = OpenOptions {
+            hashes: vec!["sha256".into(), "crc32".into()],
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true)
+            .expect("open store-copy with hashes");
+
+        let fi_a = m.lookup("/a.txt", 0).expect("a.txt");
+        let mut keys = m.list_xattr(&fi_a);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+
+        let mut a_bytes = Vec::new();
+        m.open(&fi_a, 0)
+            .unwrap()
+            .read_to_end(&mut a_bytes)
+            .unwrap();
+        let fi_b = m.lookup("/b.txt", 0).expect("b.txt");
+        let mut b_bytes = Vec::new();
+        m.open(&fi_b, 0)
+            .unwrap()
+            .read_to_end(&mut b_bytes)
+            .unwrap();
+
+        let a_sha = hash_hex("sha256", &a_bytes).unwrap();
+        let b_sha = hash_hex("sha256", &b_bytes).unwrap();
+        let a_crc = hash_hex("crc32", &a_bytes).unwrap();
+        let b_crc = hash_hex("crc32", &b_bytes).unwrap();
+
+        let sha = m
+            .get_xattr(&fi_a, "user.hash.sha256")
+            .expect("user.hash.sha256 present");
+        let crc = m
+            .get_xattr(&fi_a, "user.hash.crc32")
+            .expect("user.hash.crc32 present");
+        let got_sha = String::from_utf8(sha).unwrap();
+        let got_crc = String::from_utf8(crc).unwrap();
+        // Solid Copy shares pack offsetheader; last INSERT OR REPLACE wins (Python parity).
+        assert!(
+            got_sha == a_sha || got_sha == b_sha,
+            "sha256 xattr should match a member digest, got {got_sha}"
+        );
+        assert!(got_crc == a_crc || got_crc == b_crc);
+        // Both members share offsetheader → same xattr view.
+        assert_eq!(
+            m.get_xattr(&fi_b, "user.hash.sha256").as_deref(),
+            m.get_xattr(&fi_a, "user.hash.sha256").as_deref()
+        );
+        assert!(m.get_xattr(&fi_a, "user.hash.md5").is_none());
+        assert!(m.get_xattr(&fi_a, "missing").is_none());
+    }
+
+    /// Single-file non-solid encrypted fixture: digests match opened content.
+    #[test]
+    fn content_hash_xattrs_encrypted_with_password() {
+        let path = py_fixture("encrypted-hello.7z");
+        if !path.exists() {
+            eprintln!("skip missing {}", path.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let opts = OpenOptions {
+            passwords: vec!["secret".into()],
+            hashes: vec!["sha256".into(), "crc32".into()],
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true)
+            .expect("open encrypted with password+hashes");
+        let fi = m.lookup("/secret.txt", 0).expect("secret.txt");
+        let mut keys = m.list_xattr(&fi);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+        let mut data = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.sha256").as_deref(),
+            Some(hash_hex("sha256", &data).unwrap().as_bytes())
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.crc32").as_deref(),
+            Some(hash_hex("crc32", &data).unwrap().as_bytes())
+        );
+        // Known vector for "secret content\n" if fixture payload is stable.
+        if data.as_slice() == b"secret content\n" {
+            assert_eq!(
+                m.get_xattr(&fi, "user.hash.sha256").as_deref(),
+                Some(
+                    b"45fa64439f984bb596063451c78ffbca38dda79d33ef01dddd7faf62d3a4b9a8".as_slice()
+                )
+            );
+            assert_eq!(
+                m.get_xattr(&fi, "user.hash.crc32").as_deref(),
+                Some(b"17156130".as_slice())
+            );
+        }
+    }
+
+    /// content_locked metadata-only mount skips hash fill (cannot read members).
+    #[test]
+    fn content_hash_skipped_when_content_locked() {
+        let path = py_fixture("encrypted-hello.7z");
+        if !path.exists() {
+            eprintln!("skip missing {}", path.display());
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let opts = OpenOptions {
+            hashes: vec!["sha256".into()],
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true)
+            .expect("metadata-only mount");
+        let fi = m.lookup("/secret.txt", 0).expect("list/stat works");
+        assert!(m.list_xattr(&fi).is_empty());
+        assert!(m.get_xattr(&fi, "user.hash.sha256").is_none());
+    }
+
+    /// Synthetic single-file non-solid 7z (system 7z): exact content-hash parity.
+    #[test]
+    fn content_hash_xattrs_synthetic_single_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let content = b"hello world\n";
+        let payload = dir.path().join("hello.txt");
+        std::fs::write(&payload, content).unwrap();
+        let archive = dir.path().join("one.7z");
+
+        let sevenz = ["7z", "7za"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok());
+        let Some(sevenz) = sevenz else {
+            eprintln!("skip: no 7z/7za for synthetic fixture");
+            return;
+        };
+        // Non-solid so offsetheader is unique per file.
+        let out = std::process::Command::new(sevenz)
+            .args(["a", "-t7z", "-m0=Copy", "-ms=off"])
+            .arg(&archive)
+            .arg(&payload)
+            .current_dir(dir.path())
+            .output()
+            .expect("run 7z");
+        if !out.status.success() {
+            eprintln!(
+                "skip: 7z create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let idx = dir.path().join("i.sqlite");
+        let opts = OpenOptions {
+            hashes: vec!["sha256".into(), "crc32".into()],
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, Some(&idx), &opts, "0.1.0", true)
+            .expect("open synthetic");
+        let fi = m.lookup("/hello.txt", 0).expect("hello.txt");
+        let mut keys = m.list_xattr(&fi);
+        keys.sort();
+        assert_eq!(
+            keys,
+            vec![
+                "user.hash.crc32".to_string(),
+                "user.hash.sha256".to_string()
+            ]
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.sha256").as_deref(),
+            Some(hash_hex("sha256", content).unwrap().as_bytes())
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.crc32").as_deref(),
+            Some(hash_hex("crc32", content).unwrap().as_bytes())
+        );
+        // TAR known vector for "hello world\n"
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.sha256").as_deref(),
+            Some(b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447".as_slice())
+        );
+        assert_eq!(
+            m.get_xattr(&fi, "user.hash.crc32").as_deref(),
+            Some(b"af083b2d".as_slice())
         );
     }
 }
