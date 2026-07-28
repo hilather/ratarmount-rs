@@ -5,7 +5,9 @@
 //!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`]
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
-//! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
+//! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp (OpenSSH config subset:
+//!   `HostName`/`User`/`Port`/`IdentityFile`/`IdentitiesOnly`; URL fields override
+//!   config; path via `RATARMOUNT_SSH_CONFIG` or `~/.ssh/config`)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
@@ -45,7 +47,12 @@ pub use s3::{
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
 };
-pub use ssh::{fetch_ssh_to_temp, parse_ssh_url, SshLocation};
+pub use ssh::{
+    expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
+    parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url, resolve_ssh_connect,
+    resolve_ssh_connect_default, ssh_config_path, SshConfig, SshConfigMatch, SshConnectParams,
+    SshLocation, SSH_CONFIG_ENV,
+};
 pub use webdav::{
     fetch_webdav_to_temp, parse_getcontentlength, parse_webdav_url, propfind_content_length,
     WebDavLocation,
