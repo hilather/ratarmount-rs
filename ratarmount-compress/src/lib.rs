@@ -1,6 +1,6 @@
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
-//! * **gzip** — G3 Tier B seekable checkpoints (`gzip_seek`).
+//! * **gzip** — G3 Tier B seekable checkpoints + Tier C seek-index blob import/export (`gzip_seek`).
 //! * **zstd** — multi-frame seek map + seekable-format seek table; single-frame full decode.
 //! * **lz4** — frame block index (independent blocks; dependent → frame decode);
 //!   `open_seekable_lz4_with_threads` for `-P` (parallel independent-block size discovery).
@@ -44,9 +44,13 @@ pub use bzip2_seek::{
 };
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 pub use gzip_seek::{
-    open_seekable_gzip, open_seekable_gzip_from_reader, open_seekable_gzip_with_threads,
-    open_seekable_gzip_with_threads_from_reader, try_parallel_multi_member_decode, SeekableGzip,
-    SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
+    encode_gzip_seek_index_blob, import_seek_points, open_seekable_gzip,
+    open_seekable_gzip_from_reader, open_seekable_gzip_with_imported_index,
+    open_seekable_gzip_with_imported_index_from_reader, open_seekable_gzip_with_threads,
+    open_seekable_gzip_with_threads_from_reader, parse_gzip_seek_index_blob,
+    try_parallel_multi_member_decode, GzipSeekIndexBlob, SeekableGzip, SeekableGzipReader,
+    SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING, GZIP_SEEK_INDEX_MAGIC,
+    GZIP_SEEK_INDEX_VERSION,
 };
 pub use lrzip_seek::{looks_like_lrzip, lrzip_available, materialize_lrzip, LRZIP_MAGIC};
 pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};

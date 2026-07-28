@@ -1,9 +1,21 @@
-//! Seekable gzip (G3 Tier B): rebuild-only checkpoints via `miniz_oxide` state clones.
+//! Seekable gzip (G3 Tier B + C): checkpoints via `miniz_oxide` state clones.
 //!
+//! ## Tier B — rebuild-on-open
 //! On first open we scan the compressed stream once, cloning inflate state every
 //! `spacing` uncompressed bytes. Random access restores the nearest checkpoint and
-//! decodes forward (at most ~spacing work per seek). Checkpoints live for the mount
-//! lifetime (rebuild-on-load is acceptable; Python-compatible blob import is Tier C).
+//! decodes forward (at most ~spacing work per seek).
+//!
+//! ## Tier C — seek-index blob import/export
+//! A versioned pure-Rust blob (`RGZI`) stores the checkpoint list
+//! `(compressed_offset, uncompressed_offset)` plus spacing / uncompressed size.
+//! The index crate can persist these bytes; this module only understands the blob
+//! layout (no dependency on `ratarmount-index`).
+//!
+//! On import, inflate state is **rehydrated in one forward pass** at the imported
+//! offsets (mid-stream resume needs `miniz_oxide` state that is not itself
+//! serializable). That skips spacing-based point discovery and enables round-trip
+//! remount when a blob is available. Future format flags may embed window bits for
+//! zero-scan import interop with indexed_gzip / rapidgzip.
 //!
 //! Thread hint (`open_seekable_gzip_with_threads` / Python `-P` gzip backend):
 //! * Seek-index construction is inherently sequential (inflate state chain).
@@ -16,6 +28,8 @@
 //! * **Path-based** — reopen independent FDs per reader (`File::open`).
 //! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
 //!   `Cursor`); shared under a mutex so random Range reads drive inflate.
+//! * **Imported index** — [`SeekableGzip::open_with_imported_index`] hydrates from
+//!   an [`export_seek_index_blob`] payload.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -33,6 +47,16 @@ use crate::{CompressError, Result};
 /// Default seek-point spacing (uncompressed), matching Python CLI default (16 MiB).
 pub const DEFAULT_GZIP_SEEK_SPACING: u64 = 16 * 1024 * 1024;
 
+/// Magic for the ratarmount-rs gzip seek-index blob (`RGZI` = Ratarmount GZip Index).
+pub const GZIP_SEEK_INDEX_MAGIC: &[u8; 4] = b"RGZI";
+
+/// Current blob format version (v1 = offset pairs only, no window bits).
+pub const GZIP_SEEK_INDEX_VERSION: u32 = 1;
+
+/// Minimum blob header size: magic(4) + version(4) + flags(4) + spacing(8)
+/// + uncompressed_size(8) + point_count(4).
+const GZIP_SEEK_INDEX_HEADER_LEN: usize = 32;
+
 /// Inflate state snapshot at a known compressed/uncompressed pair.
 struct Checkpoint {
     /// Next compressed byte to feed (absolute file offset).
@@ -47,6 +71,119 @@ pub struct GzipSeekIndex {
     checkpoints: Vec<Checkpoint>,
     uncompressed_size: u64,
     spacing: u64,
+}
+
+/// Parsed Tier C seek-index blob (offset pairs + metadata; no inflate state).
+///
+/// # Binary layout (version 1, little-endian)
+///
+/// | Offset | Type   | Field |
+/// |--------|--------|-------|
+/// | 0      | `[u8;4]` | magic `RGZI` |
+/// | 4      | `u32`  | version (`1`) |
+/// | 8      | `u32`  | flags (reserved, must be `0` for v1) |
+/// | 12     | `u64`  | spacing (uncompressed bytes between build points) |
+/// | 20     | `u64`  | uncompressed_size |
+/// | 28     | `u32`  | point_count |
+/// | 32     | `point_count × 16` | `(compressed_offset u64, uncompressed_offset u64)` pairs |
+///
+/// Points are ordered by non-decreasing `uncompressed_offset`. The index crate
+/// stores these bytes opaquely; only this module interprets them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GzipSeekIndexBlob {
+    pub version: u32,
+    pub flags: u32,
+    pub spacing: u64,
+    pub uncompressed_size: u64,
+    /// `(compressed_offset, uncompressed_offset)` pairs.
+    pub points: Vec<(u64, u64)>,
+}
+
+/// Encode a Tier C seek-index blob from spacing, size, and seek points.
+pub fn encode_gzip_seek_index_blob(
+    spacing: u64,
+    uncompressed_size: u64,
+    points: &[(u64, u64)],
+) -> Vec<u8> {
+    let count = u32::try_from(points.len()).unwrap_or(u32::MAX);
+    let n = count as usize;
+    let mut out = Vec::with_capacity(GZIP_SEEK_INDEX_HEADER_LEN + n * 16);
+    out.extend_from_slice(GZIP_SEEK_INDEX_MAGIC);
+    out.extend_from_slice(&GZIP_SEEK_INDEX_VERSION.to_le_bytes());
+    out.extend_from_slice(&0u32.to_le_bytes()); // flags
+    out.extend_from_slice(&spacing.to_le_bytes());
+    out.extend_from_slice(&uncompressed_size.to_le_bytes());
+    out.extend_from_slice(&count.to_le_bytes());
+    for &(c, u) in points.iter().take(n) {
+        out.extend_from_slice(&c.to_le_bytes());
+        out.extend_from_slice(&u.to_le_bytes());
+    }
+    out
+}
+
+/// Parse a Tier C seek-index blob. Does not touch the compressed stream.
+pub fn parse_gzip_seek_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
+    if blob.len() < GZIP_SEEK_INDEX_HEADER_LEN {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index blob too short ({} < {GZIP_SEEK_INDEX_HEADER_LEN})",
+            blob.len()
+        )));
+    }
+    if &blob[0..4] != GZIP_SEEK_INDEX_MAGIC.as_slice() {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index bad magic: {:02x?}",
+            &blob[0..4]
+        )));
+    }
+    let version = u32::from_le_bytes(blob[4..8].try_into().unwrap());
+    if version == 0 || version > GZIP_SEEK_INDEX_VERSION {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index unsupported version {version} (max {GZIP_SEEK_INDEX_VERSION})"
+        )));
+    }
+    let flags = u32::from_le_bytes(blob[8..12].try_into().unwrap());
+    if flags != 0 {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index unknown flags 0x{flags:x} (v1 requires 0)"
+        )));
+    }
+    let spacing = u64::from_le_bytes(blob[12..20].try_into().unwrap());
+    let uncompressed_size = u64::from_le_bytes(blob[20..28].try_into().unwrap());
+    let point_count = u32::from_le_bytes(blob[28..32].try_into().unwrap()) as usize;
+    let need = GZIP_SEEK_INDEX_HEADER_LEN
+        .checked_add(point_count.checked_mul(16).ok_or_else(|| {
+            CompressError::Msg("gzip seek-index point_count overflow".into())
+        })?)
+        .ok_or_else(|| CompressError::Msg("gzip seek-index size overflow".into()))?;
+    if blob.len() < need {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index truncated: have {} need {need} for {point_count} points",
+            blob.len()
+        )));
+    }
+    let mut points = Vec::with_capacity(point_count);
+    let mut off = GZIP_SEEK_INDEX_HEADER_LEN;
+    for _ in 0..point_count {
+        let c = u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
+        let u = u64::from_le_bytes(blob[off + 8..off + 16].try_into().unwrap());
+        points.push((c, u));
+        off += 16;
+    }
+    // Enforce non-decreasing uncompressed offsets.
+    for w in points.windows(2) {
+        if w[1].1 < w[0].1 {
+            return Err(CompressError::Msg(
+                "gzip seek-index points not sorted by uncompressed_offset".into(),
+            ));
+        }
+    }
+    Ok(GzipSeekIndexBlob {
+        version,
+        flags,
+        spacing,
+        uncompressed_size,
+        points,
+    })
 }
 
 /// How compressed bytes are re-opened for independent inflate cursors.
@@ -97,6 +234,37 @@ impl SeekableGzip {
         }))
     }
 
+    /// Open using a Tier C seek-index blob (skips spacing-based point discovery).
+    ///
+    /// Inflate states are rehydrated in one forward pass at the imported offsets.
+    /// `spacing` is only used if the blob's spacing is zero (clamped to ≥ 64 KiB);
+    /// otherwise the blob's spacing is kept for forward-decode heuristics.
+    /// `threads` matches the path open API (`0` → CPU count); index rehydration
+    /// remains sequential.
+    pub fn open_with_imported_index(
+        path: impl AsRef<Path>,
+        spacing: u64,
+        threads: u32,
+        index_blob: &[u8],
+    ) -> Result<Arc<Self>> {
+        let path = path.as_ref().to_path_buf();
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let parsed = parse_gzip_seek_index_blob(index_blob)?;
+        let spacing = effective_import_spacing(spacing, parsed.spacing);
+        let mut file = File::open(&path)?;
+        let index = import_seek_points(
+            &mut file,
+            &parsed.points,
+            spacing,
+            parsed.uncompressed_size,
+        )?;
+        Ok(Arc::new(Self {
+            path: path.clone(),
+            backend: GzipBackend::Path(path),
+            index,
+        }))
+    }
+
     /// Open from an already-seekable compressed stream (HTTP Range, memory, …).
     ///
     /// `archive_label` is stored for [`Self::path`] / logs (URL or virtual name).
@@ -136,6 +304,37 @@ impl SeekableGzip {
         }))
     }
 
+    /// Open from a seekable stream using a Tier C seek-index blob.
+    ///
+    /// See [`Self::open_with_imported_index`].
+    pub fn open_with_imported_index_from_reader<R>(
+        mut reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+        index_blob: &[u8],
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let path = archive_label.as_ref().to_path_buf();
+        let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
+        let parsed = parse_gzip_seek_index_blob(index_blob)?;
+        let spacing = effective_import_spacing(spacing, parsed.spacing);
+        let index = import_seek_points(
+            &mut reader,
+            &parsed.points,
+            spacing,
+            parsed.uncompressed_size,
+        )?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+        Ok(Arc::new(Self {
+            path,
+            backend: GzipBackend::Shared(shared),
+            index,
+        }))
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -152,10 +351,35 @@ impl SeekableGzip {
         self.index.spacing
     }
 
+    /// Export a Tier C seek-index blob (offset pairs + metadata) for persistence
+    /// or round-trip reopen via [`Self::open_with_imported_index`].
+    pub fn export_seek_index_blob(&self) -> Vec<u8> {
+        let points: Vec<(u64, u64)> = self
+            .index
+            .checkpoints
+            .iter()
+            .map(|c| (c.compressed_offset, c.uncompressed_offset))
+            .collect();
+        encode_gzip_seek_index_blob(
+            self.index.spacing,
+            self.index.uncompressed_size,
+            &points,
+        )
+    }
+
     /// Independent reader (own file fd or shared stream handle + logical position).
     pub fn reader(self: &Arc<Self>) -> io::Result<SeekableGzipReader> {
         SeekableGzipReader::open(Arc::clone(self))
     }
+}
+
+fn effective_import_spacing(api_spacing: u64, blob_spacing: u64) -> u64 {
+    let s = if blob_spacing > 0 {
+        blob_spacing
+    } else {
+        api_spacing
+    };
+    s.max(64 * 1024)
 }
 
 /// Compressed-stream handle used during inflate (path FD or shared mutex stream).
@@ -562,6 +786,166 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
     })
 }
 
+/// Rehydrate inflate state at imported seek points (Tier C).
+///
+/// Walks the compressed stream once and snapshots `miniz_oxide` state when the
+/// uncompressed cursor matches each imported `(compressed_offset, uncompressed_offset)`.
+/// Empty `points` falls back to a full spacing-based [`build_index`].
+///
+/// `expected_uncompressed_size` must match the decoded size (blob metadata check).
+pub fn import_seek_points<R: Read + Seek>(
+    file: &mut R,
+    points: &[(u64, u64)],
+    spacing: u64,
+    expected_uncompressed_size: u64,
+) -> Result<GzipSeekIndex> {
+    let spacing = spacing.max(64 * 1024);
+    if points.is_empty() {
+        let index = build_index(file, spacing)?;
+        if index.uncompressed_size != expected_uncompressed_size {
+            return Err(CompressError::Msg(format!(
+                "gzip seek-index size mismatch: blob {} vs decoded {}",
+                expected_uncompressed_size, index.uncompressed_size
+            )));
+        }
+        return Ok(index);
+    }
+
+    // Snapshot whenever we land on an imported uncompressed offset (post-inflate
+    // cursor). Duplicate (c,u) pairs from dense spacing exports are preserved.
+    let mut targets: Vec<(u64, u64)> = points.to_vec();
+    targets.sort_by_key(|p| (p.1, p.0));
+
+    let file_len = stream_len(file)?;
+    let mut checkpoints = Vec::with_capacity(targets.len().max(1));
+    let mut uncompressed_total = 0u64;
+    let mut compressed_at = 0u64;
+    let mut next_target = 0usize;
+
+    let take_if_due = |compressed_at: u64,
+                       uncompressed_total: u64,
+                       state: &InflateState,
+                       checkpoints: &mut Vec<Checkpoint>,
+                       next_target: &mut usize|
+     -> Result<()> {
+        while *next_target < targets.len() && uncompressed_total >= targets[*next_target].1 {
+            let (want_c, want_u) = targets[*next_target];
+            if uncompressed_total != want_u {
+                return Err(CompressError::Msg(format!(
+                    "gzip seek-index cannot land on uncompressed_offset {want_u} (at {uncompressed_total})"
+                )));
+            }
+            // Compressed cursor must match the export (deterministic inflate).
+            if compressed_at != want_c {
+                return Err(CompressError::Msg(format!(
+                    "gzip seek-index compressed_offset mismatch at uncompressed {want_u}: \
+                     blob {want_c} vs rehydrated {compressed_at}"
+                )));
+            }
+            checkpoints.push(Checkpoint {
+                compressed_offset: compressed_at,
+                uncompressed_offset: uncompressed_total,
+                state: Box::new(state.clone()),
+            });
+            *next_target += 1;
+        }
+        Ok(())
+    };
+
+    while compressed_at < file_len {
+        let header_end = match parse_gzip_header(file, compressed_at)? {
+            Some(h) => h,
+            None => break,
+        };
+        compressed_at = header_end;
+
+        let mut state = Box::new(InflateState::new(DataFormat::Raw));
+        // Member start may be an imported point.
+        take_if_due(
+            compressed_at,
+            uncompressed_total,
+            state.as_ref(),
+            &mut checkpoints,
+            &mut next_target,
+        )?;
+
+        let mut in_buf = [0u8; 64 * 1024];
+        let mut out_buf = vec![0u8; 256 * 1024];
+
+        loop {
+            file.seek(SeekFrom::Start(compressed_at))?;
+            let n_in = file.read(&mut in_buf)?;
+            let input = if n_in == 0 { &[][..] } else { &in_buf[..n_in] };
+            let res = inflate(
+                state.as_mut(),
+                input,
+                &mut out_buf,
+                if n_in == 0 {
+                    MZFlush::Finish
+                } else {
+                    MZFlush::None
+                },
+            );
+            match res.status {
+                Ok(_) => {}
+                Err(e) => {
+                    return Err(CompressError::Msg(format!(
+                        "gzip inflate during seek-index import: {e:?}"
+                    )));
+                }
+            }
+            compressed_at += res.bytes_consumed as u64;
+            uncompressed_total += res.bytes_written as u64;
+
+            take_if_due(
+                compressed_at,
+                uncompressed_total,
+                state.as_ref(),
+                &mut checkpoints,
+                &mut next_target,
+            )?;
+
+            if matches!(res.status, Ok(MZStatus::StreamEnd)) {
+                compressed_at = skip_gzip_trailer(file, compressed_at)?;
+                break;
+            }
+            if n_in == 0 && res.bytes_consumed == 0 {
+                return Err(CompressError::Msg(
+                    "gzip stream ended unexpectedly during seek-index import".into(),
+                ));
+            }
+        }
+    }
+
+    if next_target != targets.len() {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index import missed {} of {} points (decoded {uncompressed_total} bytes)",
+            targets.len() - next_target,
+            targets.len()
+        )));
+    }
+
+    if uncompressed_total != expected_uncompressed_size {
+        return Err(CompressError::Msg(format!(
+            "gzip seek-index size mismatch: blob {expected_uncompressed_size} vs decoded {uncompressed_total}"
+        )));
+    }
+
+    if checkpoints.is_empty() {
+        checkpoints.push(Checkpoint {
+            compressed_offset: 0,
+            uncompressed_offset: 0,
+            state: Box::new(InflateState::new(DataFormat::Raw)),
+        });
+    }
+
+    Ok(GzipSeekIndex {
+        checkpoints,
+        uncompressed_size: uncompressed_total,
+        spacing,
+    })
+}
+
 /// Parse gzip member header at `offset`; returns absolute offset of first deflate byte.
 fn parse_gzip_header<R: Read + Seek>(file: &mut R, offset: u64) -> Result<Option<u64>> {
     file.seek(SeekFrom::Start(offset))?;
@@ -656,6 +1040,19 @@ pub fn open_seekable_gzip_with_threads(
     g.reader().map_err(CompressError::from)
 }
 
+/// Open seekable gzip using a Tier C seek-index blob.
+///
+/// See [`SeekableGzip::open_with_imported_index`].
+pub fn open_seekable_gzip_with_imported_index(
+    path: &Path,
+    spacing: u64,
+    threads: u32,
+    index_blob: &[u8],
+) -> Result<SeekableGzipReader> {
+    let g = SeekableGzip::open_with_imported_index(path, spacing, threads, index_blob)?;
+    g.reader().map_err(CompressError::from)
+}
+
 /// Open seekable gzip from a seekable compressed reader (builds index).
 ///
 /// `archive_label` is used for logs / [`SeekableGzip::path`] (URL or virtual name).
@@ -683,6 +1080,29 @@ where
     R: Read + Seek + Send + 'static,
 {
     let g = SeekableGzip::open_with_threads_from_reader(reader, spacing, threads, archive_label)?;
+    g.reader().map_err(CompressError::from)
+}
+
+/// Open seekable gzip from a seekable reader using a Tier C seek-index blob.
+///
+/// See [`SeekableGzip::open_with_imported_index_from_reader`].
+pub fn open_seekable_gzip_with_imported_index_from_reader<R>(
+    reader: R,
+    spacing: u64,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+    index_blob: &[u8],
+) -> Result<SeekableGzipReader>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let g = SeekableGzip::open_with_imported_index_from_reader(
+        reader,
+        spacing,
+        threads,
+        archive_label,
+        index_blob,
+    )?;
     g.reader().map_err(CompressError::from)
 }
 
@@ -812,6 +1232,20 @@ impl SharedSeekableGzip {
         }))
     }
 
+    /// Open with a Tier C seek-index blob (see [`SeekableGzip::open_with_imported_index`]).
+    pub fn open_with_imported_index(
+        path: &Path,
+        spacing: u64,
+        threads: u32,
+        index_blob: &[u8],
+    ) -> Result<Arc<Self>> {
+        let inner = SeekableGzip::open_with_imported_index(path, spacing, threads, index_blob)?;
+        Ok(Arc::new(Self {
+            inner,
+            _lock: Mutex::new(()),
+        }))
+    }
+
     /// Open from a seekable compressed reader (HTTP Range, memory, …).
     ///
     /// `archive_label` is stored for [`Self::path`] / logs.
@@ -844,6 +1278,30 @@ impl SharedSeekableGzip {
         }))
     }
 
+    /// Open from a seekable reader with a Tier C seek-index blob.
+    pub fn open_with_imported_index_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+        index_blob: &[u8],
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let inner = SeekableGzip::open_with_imported_index_from_reader(
+            reader,
+            spacing,
+            threads,
+            archive_label,
+            index_blob,
+        )?;
+        Ok(Arc::new(Self {
+            inner,
+            _lock: Mutex::new(()),
+        }))
+    }
+
     pub fn size(&self) -> u64 {
         self.inner.uncompressed_size()
     }
@@ -858,6 +1316,11 @@ impl SharedSeekableGzip {
 
     pub fn checkpoint_count(&self) -> usize {
         self.inner.checkpoint_count()
+    }
+
+    /// Export Tier C seek-index blob (see [`SeekableGzip::export_seek_index_blob`]).
+    pub fn export_seek_index_blob(&self) -> Vec<u8> {
+        self.inner.export_seek_index_blob()
     }
 }
 
@@ -1113,5 +1576,183 @@ mod tests {
             SharedSeekableGzip::open_from_reader(Cursor::new(encode_gz(payload)), 1024, "s.gz")
                 .unwrap();
         assert_eq!(shared.size(), payload.len() as u64);
+    }
+
+    #[test]
+    fn seek_index_blob_roundtrip_parse() {
+        let points = vec![(10, 0), (100, 16_384), (200, 32_768)];
+        let blob = encode_gzip_seek_index_blob(16 * 1024, 40_000, &points);
+        assert!(blob.starts_with(GZIP_SEEK_INDEX_MAGIC));
+        let parsed = parse_gzip_seek_index_blob(&blob).unwrap();
+        assert_eq!(parsed.version, GZIP_SEEK_INDEX_VERSION);
+        assert_eq!(parsed.flags, 0);
+        assert_eq!(parsed.spacing, 16 * 1024);
+        assert_eq!(parsed.uncompressed_size, 40_000);
+        assert_eq!(parsed.points, points);
+
+        assert!(parse_gzip_seek_index_blob(b"nope").is_err());
+        assert!(parse_gzip_seek_index_blob(&blob[..10]).is_err());
+        let mut bad_ver = blob.clone();
+        bad_ver[4..8].copy_from_slice(&99u32.to_le_bytes());
+        assert!(parse_gzip_seek_index_blob(&bad_ver).is_err());
+    }
+
+    #[test]
+    fn export_import_blob_random_access_equals_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("tierc.gz");
+        let mut raw = Vec::new();
+        for i in 0..2500 {
+            writeln!(&mut raw, "line {i:05} {}", "z".repeat(72)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        std::fs::write(&gz, &compressed).unwrap();
+
+        let spacing = 8 * 1024u64;
+        let built = SeekableGzip::open(&gz, spacing).unwrap();
+        assert!(built.checkpoint_count() >= 2);
+        let blob = built.export_seek_index_blob();
+        assert!(blob.len() >= GZIP_SEEK_INDEX_HEADER_LEN + 16);
+        let parsed = parse_gzip_seek_index_blob(&blob).unwrap();
+        assert_eq!(parsed.uncompressed_size, raw.len() as u64);
+        assert_eq!(parsed.points.len(), built.checkpoint_count());
+
+        // Path import
+        let imported =
+            SeekableGzip::open_with_imported_index(&gz, spacing, 1, &blob).unwrap();
+        assert_eq!(imported.uncompressed_size(), built.uncompressed_size());
+        assert_eq!(imported.checkpoint_count(), built.checkpoint_count());
+        assert_eq!(imported.spacing(), built.spacing());
+
+        let mut r_built = built.reader().unwrap();
+        let mut r_imp = imported.reader().unwrap();
+
+        // Full sequential
+        let mut all_b = Vec::new();
+        let mut all_i = Vec::new();
+        r_built.read_to_end(&mut all_b).unwrap();
+        r_imp.read_to_end(&mut all_i).unwrap();
+        assert_eq!(all_b, raw);
+        assert_eq!(all_i, raw);
+
+        // Random access across the payload
+        let offsets = [
+            0u64,
+            1,
+            100,
+            raw.len() as u64 / 4,
+            raw.len() as u64 / 2,
+            raw.len() as u64 * 3 / 4,
+            raw.len() as u64 - 64,
+        ];
+        for &off in &offsets {
+            r_built.seek(SeekFrom::Start(off)).unwrap();
+            r_imp.seek(SeekFrom::Start(off)).unwrap();
+            let mut bb = [0u8; 48];
+            let mut ib = [0u8; 48];
+            let bn = r_built.read(&mut bb).unwrap();
+            let inn = r_imp.read(&mut ib).unwrap();
+            assert_eq!(bn, inn, "offset {off}");
+            assert_eq!(&bb[..bn], &ib[..inn], "offset {off}");
+            assert_eq!(&bb[..bn], &raw[off as usize..off as usize + bn]);
+        }
+
+        // Free-function import path
+        let mut free_r =
+            open_seekable_gzip_with_imported_index(&gz, spacing, 2, &blob).unwrap();
+        free_r.seek(SeekFrom::Start(200)).unwrap();
+        let mut chunk = [0u8; 24];
+        free_r.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, &raw[200..224]);
+
+        // SharedSeekableGzip import + export
+        let shared = SharedSeekableGzip::open_with_imported_index(&gz, spacing, 1, &blob).unwrap();
+        assert_eq!(shared.size(), raw.len() as u64);
+        assert_eq!(shared.export_seek_index_blob(), blob);
+        let mut sr = shared.reader().unwrap();
+        sr.seek(SeekFrom::End(-30)).unwrap();
+        let mut tail = vec![0u8; 30];
+        sr.read_exact(&mut tail).unwrap();
+        assert_eq!(tail, raw[raw.len() - 30..]);
+
+        // Reader-backend import (Cursor)
+        let imp_reader = SeekableGzip::open_with_imported_index_from_reader(
+            Cursor::new(compressed.clone()),
+            spacing,
+            1,
+            Path::new("mem://tierc.gz"),
+            &blob,
+        )
+        .unwrap();
+        assert_eq!(imp_reader.checkpoint_count(), built.checkpoint_count());
+        let mut rr = imp_reader.reader().unwrap();
+        rr.seek(SeekFrom::Start(raw.len() as u64 / 3)).unwrap();
+        let mut mid = [0u8; 16];
+        rr.read_exact(&mut mid).unwrap();
+        let off = raw.len() / 3;
+        assert_eq!(&mid, &raw[off..off + 16]);
+
+        let mut free_mem = open_seekable_gzip_with_imported_index_from_reader(
+            Cursor::new(compressed),
+            spacing,
+            1,
+            "virt-tierc.gz",
+            &blob,
+        )
+        .unwrap();
+        let mut full = Vec::new();
+        free_mem.read_to_end(&mut full).unwrap();
+        assert_eq!(full, raw);
+
+        let shared_mem = SharedSeekableGzip::open_with_imported_index_from_reader(
+            Cursor::new(encode_gz(&raw)),
+            spacing,
+            1,
+            "shared-tierc.gz",
+            &blob,
+        )
+        .unwrap();
+        assert_eq!(shared_mem.size(), raw.len() as u64);
+    }
+
+    #[test]
+    fn import_seek_points_rejects_stale_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("stale.gz");
+        let raw = b"hello stale index payload that is long enough for a few points!!!!\n";
+        std::fs::write(&gz, encode_gz(raw)).unwrap();
+        let g = SeekableGzip::open(&gz, 1024).unwrap();
+        let mut blob = g.export_seek_index_blob();
+        // Corrupt first point's compressed offset.
+        if blob.len() >= GZIP_SEEK_INDEX_HEADER_LEN + 8 {
+            blob[GZIP_SEEK_INDEX_HEADER_LEN] ^= 0xff;
+        }
+        let err = match SeekableGzip::open_with_imported_index(&gz, 1024, 1, &blob) {
+            Ok(_) => panic!("expected stale index to fail"),
+            Err(e) => e,
+        };
+        let msg = err.to_string();
+        assert!(
+            msg.contains("mismatch") || msg.contains("seek-index"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn import_seek_points_direct_api() {
+        let payload = b"direct import_seek_points API\n";
+        let compressed = encode_gz(payload);
+        let mut cur = Cursor::new(compressed.clone());
+        let idx = build_index(&mut cur, 64 * 1024).unwrap();
+        let points: Vec<(u64, u64)> = idx
+            .checkpoints
+            .iter()
+            .map(|c| (c.compressed_offset, c.uncompressed_offset))
+            .collect();
+        let mut cur2 = Cursor::new(compressed);
+        let hydrated =
+            import_seek_points(&mut cur2, &points, 64 * 1024, payload.len() as u64).unwrap();
+        assert_eq!(hydrated.uncompressed_size, payload.len() as u64);
+        assert_eq!(hydrated.checkpoints.len(), points.len());
     }
 }
