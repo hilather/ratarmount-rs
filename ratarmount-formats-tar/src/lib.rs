@@ -7,6 +7,13 @@
 //! offset) are recorded in metadata (`nestedTarMembers`) and marked `istar=true`.
 //! Call [`SqliteIndexedTar::list_nested_tar_members`] / [`SqliteIndexedTar::open_nested_tar_from_index`]
 //! to list them or open via stencil without AutoMount.
+//!
+//! Flattened recursive rows: nested TAR headers are also walked (seek on the outer
+//! stream, no temp file) and inserted into the **outer** SQLite index with paths like
+//! `/inner.tar/payload.txt` and **absolute** outer-stream offsets. The nested member
+//! itself gains a generated directory version (Python recursive index parity) so
+//! `list`/`lookup` work without AutoMount. Size gate: when recursion is disabled,
+//! nested members larger than [`NESTED_FLATTEN_MAX_BYTES`] are only side-listed.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -31,6 +38,13 @@ pub const BACKEND_NAME: &str = "SQLiteIndexedTar";
 /// Metadata key for the JSON list of nested TAR members `(path, offset, size)`.
 pub const NESTED_TAR_MEMBERS_KEY: &str = "nestedTarMembers";
 
+/// Max nested TAR size to walk into the outer index when recursion is disabled.
+///
+/// With `OpenOptions::recursive` or a positive `recursion_depth`, nested members are
+/// flattened without this size gate (Python `SQLiteIndexedTar` recursive parity).
+/// Keeps cold index of huge nested TARs fast in the default non-recursive case.
+pub const NESTED_FLATTEN_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
 const BLOCK_SIZE: u64 = 512;
 
 /// A nested TAR member discovered while indexing an outer archive.
@@ -42,6 +56,38 @@ pub struct NestedTarMember {
     pub path: String,
     pub offset: u64,
     pub size: u64,
+}
+
+/// In-progress nested member with header metadata needed to emit a generated directory row.
+#[derive(Clone, Debug)]
+struct NestedPending {
+    member: NestedTarMember,
+    offsetheader: u64,
+    mtime: f64,
+    mode_bits: u32,
+    uid: i64,
+    gid: i64,
+}
+
+/// Python `determine_recursion_depth`: `recursion_depth` wins; else `recursive` → unbounded; else 0.
+fn max_recursion_depth(options: &OpenOptions) -> i32 {
+    match options.recursion_depth {
+        Some(d) => d,
+        None if options.recursive => i32::MAX,
+        None => 0,
+    }
+}
+
+/// Whether to walk nested headers into the outer index at this recursion level.
+fn should_flatten_nested(options: &OpenOptions, nested_size: u64, content_depth: i32) -> bool {
+    let max = max_recursion_depth(options);
+    // content_depth is the recursiondepth stored on nested file rows (1 = first nested layer).
+    // Flatten when the outer recursive budget allows that depth, or (default) one size-limited layer.
+    if content_depth <= max {
+        return true;
+    }
+    // Default non-recursive: still flatten one layer of small nested TARs for lookup without AutoMount.
+    max == 0 && content_depth == 1 && nested_size <= NESTED_FLATTEN_MAX_BYTES
 }
 
 #[derive(Debug, Error)]
@@ -518,17 +564,14 @@ impl SqliteIndexedTar {
             .ok_or_else(|| TarError::Msg(format!("nested TAR member not found: {want}")))?
             .clone();
 
-        // Prefer MountSource::open (already a stencil of the member data range).
-        let reader: Box<dyn ratarmount_core::ArchiveRead> =
-            if let Some(fi) = self.lookup(&nested.path, 0) {
-                self.open(&fi, 0).map_err(TarError::Io)?
-            } else {
-                let outer = self.backend.open_reader().map_err(TarError::Io)?;
-                Box::new(StenciledFile::new(
-                    outer,
-                    vec![(nested.offset, nested.size)],
-                ))
-            };
+        // Always stencil from nestedTarMembers coordinates (absolute outer stream range).
+        // After flattened recursive indexing, lookup(0) is a generated directory version,
+        // so MountSource::open on the member path is not reliable.
+        let outer = self.backend.open_reader().map_err(TarError::Io)?;
+        let reader: Box<dyn ratarmount_core::ArchiveRead> = Box::new(StenciledFile::new(
+            outer,
+            vec![(nested.offset, nested.size)],
+        ));
 
         let label = format!("{}{}", self.archive_path.display(), nested.path);
         // Nested open: do not inherit recursive AutoMount intent; this API is explicit.
@@ -900,7 +943,7 @@ fn parse_tar_into_index<R: Read + Seek>(
         sparse_pairs: Vec::new(),
     };
     let mut pax_header_start: Option<u64> = None;
-    let mut nested_members: Vec<NestedTarMember> = Vec::new();
+    let mut nested_pending: Vec<NestedPending> = Vec::new();
 
     let mut is_gnu_incremental = match options.gnu_incremental {
         Some(v) => v,
@@ -1079,7 +1122,6 @@ fn parse_tar_into_index<R: Read + Seek>(
         }
 
         // Nested TAR detection: name ends with `.tar` or ustar/GNU magic at data offset.
-        // Lightweight only — does not walk nested headers into the outer index.
         let mut istar = false;
         if !issparse
             && is_regular_tar_member(typeflag, &name)
@@ -1090,10 +1132,17 @@ fn parse_tar_into_index<R: Read + Seek>(
             if by_name || by_magic {
                 istar = true;
                 let member_path = normalize_member_path(&name);
-                nested_members.push(NestedTarMember {
-                    path: member_path,
-                    offset: data_off,
-                    size: logical_size,
+                nested_pending.push(NestedPending {
+                    member: NestedTarMember {
+                        path: member_path,
+                        offset: data_off,
+                        size: logical_size,
+                    },
+                    offsetheader: member_header_start,
+                    mtime,
+                    mode_bits,
+                    uid,
+                    gid,
                 });
             }
         }
@@ -1111,6 +1160,7 @@ fn parse_tar_into_index<R: Read + Seek>(
                 &linkname,
                 uid,
                 gid,
+                0,
                 &mut generated_dirs,
             )?;
         } else {
@@ -1132,6 +1182,7 @@ fn parse_tar_into_index<R: Read + Seek>(
                 gid,
                 issparse,
                 istar,
+                0,
                 &mut generated_dirs,
             )?;
         }
@@ -1154,8 +1205,461 @@ fn parse_tar_into_index<R: Read + Seek>(
     }
 
     flush(&mut batch)?;
+
+    let nested_members: Vec<NestedTarMember> =
+        nested_pending.iter().map(|n| n.member.clone()).collect();
     store_nested_tar_members(index, &nested_members)?;
+
+    // Flatten nested TAR headers into outer index paths (absolute offsets).
+    flatten_nested_tars(
+        reader,
+        index,
+        options,
+        &nested_pending,
+        1,
+        &mut is_gnu_incremental,
+        &mut generated_dirs,
+    )?;
+
     Ok(is_gnu_incremental)
+}
+
+/// Walk nested TAR members and insert flattened path rows into the outer index.
+///
+/// `content_depth` is the `recursiondepth` column for rows written at this layer (1 = first nested).
+fn flatten_nested_tars<R: Read + Seek>(
+    reader: &mut R,
+    index: &SqliteIndex,
+    options: &OpenOptions,
+    nested: &[NestedPending],
+    content_depth: i32,
+    is_gnu_incremental: &mut bool,
+    generated_dirs: &mut std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if nested.is_empty() || content_depth < 0 {
+        return Ok(());
+    }
+    // Guard against pathological recursion depth.
+    if content_depth > 64 {
+        return Ok(());
+    }
+
+    let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
+    let mut deeper: Vec<NestedPending> = Vec::new();
+
+    let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
+        if !batch.is_empty() {
+            index.insert_files_batch(batch)?;
+            batch.clear();
+        }
+        Ok(())
+    };
+
+    for pending in nested {
+        if !should_flatten_nested(options, pending.member.size, content_depth) {
+            continue;
+        }
+        let path_prefix = pending.member.path.clone();
+        let region_start = pending.member.offset;
+        let region_end = pending
+            .member
+            .offset
+            .saturating_add(pending.member.size);
+
+        // Avoid ensure_parent_dirs synthesizing offsetheader=0 for the nest root (would
+        // shadow version ordering vs the real file row and the generated directory row).
+        generated_dirs.insert(path_prefix.clone());
+
+        let mut found_any = false;
+        match walk_tar_region(
+            reader,
+            options,
+            &path_prefix,
+            region_start,
+            region_end,
+            content_depth,
+            is_gnu_incremental,
+            &mut batch,
+            generated_dirs,
+            &mut deeper,
+            &mut found_any,
+        ) {
+            Ok(()) => {}
+            Err(e) => {
+                // Nested content may not be a valid TAR despite magic/name; keep side-list only.
+                log::debug!(
+                    "skip flatten of nested TAR {}: {e}",
+                    pending.member.path
+                );
+                continue;
+            }
+        }
+
+        if !found_any {
+            continue;
+        }
+
+        // Python: after recursive index succeeds, add a generated directory version of the
+        // nested archive (higher offsetheader) and keep the original file row with istar.
+        push_nested_member_as_directory(&mut batch, pending, content_depth, generated_dirs);
+        if batch.len() >= BATCH_FLUSH {
+            flush(&mut batch)?;
+        }
+    }
+
+    flush(&mut batch)?;
+
+    // Depth-first further nesting (Python walks each nested after its parent layer's files).
+    if !deeper.is_empty() {
+        flatten_nested_tars(
+            reader,
+            index,
+            options,
+            &deeper,
+            content_depth + 1,
+            is_gnu_incremental,
+            generated_dirs,
+        )?;
+    }
+    Ok(())
+}
+
+/// Emit a generated directory version of a nested TAR member so `lookup` returns a dir
+/// and `list` under that path works (Python recursive index parity).
+fn push_nested_member_as_directory(
+    batch: &mut Vec<FileRow>,
+    pending: &NestedPending,
+    content_depth: i32,
+    generated_dirs: &mut std::collections::BTreeSet<String>,
+) {
+    let full_path = pending.member.path.trim_end_matches('/');
+    let (path, name) = match full_path.rsplit_once('/') {
+        Some(("", n)) => (String::new(), n.to_string()),
+        Some((p, n)) => (p.to_string(), n.to_string()),
+        None => (String::new(), full_path.to_string()),
+    };
+    if name.is_empty() {
+        return;
+    }
+    generated_dirs.insert(full_path.to_string());
+    let mode = ((pending.mode_bits & 0o7777) | ratarmount_core::S_IFDIR) as i64;
+    batch.push(FileRow::new(
+        path,
+        name,
+        pending.offsetheader as i64 + 1,
+        pending.member.offset as i64 + 1,
+        0,
+        pending.mtime,
+        mode,
+        b'5' as i64,
+        "",
+        pending.uid,
+        pending.gid,
+        true,  // istar
+        false, // issparse
+        true,  // isgenerated
+        i64::from(content_depth),
+    ));
+}
+
+/// Join outer path prefix with an inner member name (`/inner.tar` + `a/b` → `/inner.tar/a/b`).
+fn join_path_prefix(prefix: &str, name: &str) -> String {
+    let mut name = name.to_string();
+    while name.starts_with("./") {
+        name = name[2..].to_string();
+    }
+    name = name.trim_start_matches('/').to_string();
+    if prefix.is_empty() {
+        return name;
+    }
+    let prefix = prefix.trim_end_matches('/');
+    if name.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}/{name}")
+    }
+}
+
+/// Parse one nested TAR region in absolute outer-stream coordinates and push rows under `path_prefix`.
+#[allow(clippy::too_many_arguments)]
+fn walk_tar_region<R: Read + Seek>(
+    reader: &mut R,
+    options: &OpenOptions,
+    path_prefix: &str,
+    region_start: u64,
+    region_end: u64,
+    recursion_depth: i32,
+    is_gnu_incremental: &mut bool,
+    batch: &mut Vec<FileRow>,
+    generated_dirs: &mut std::collections::BTreeSet<String>,
+    nested_out: &mut Vec<NestedPending>,
+    found_any: &mut bool,
+) -> Result<()> {
+    if region_end <= region_start + BLOCK_SIZE {
+        return Ok(());
+    }
+
+    let mut pos = region_start;
+    let mut header = [0u8; 512];
+    let mut pax_global: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut pax_pending = PaxParsed {
+        map: std::collections::HashMap::new(),
+        sparse_pairs: Vec::new(),
+    };
+    let mut pax_header_start: Option<u64> = None;
+
+    loop {
+        if pos + BLOCK_SIZE > region_end {
+            break;
+        }
+        reader.seek(SeekFrom::Start(pos))?;
+        let n = reader.read(&mut header)?;
+        if n < 512 {
+            break;
+        }
+
+        if header.iter().all(|&b| b == 0) {
+            if options.ignore_zeros {
+                pos += BLOCK_SIZE;
+                continue;
+            }
+            // Double zero block ends the nested archive.
+            let next_pos = pos + BLOCK_SIZE;
+            if next_pos + BLOCK_SIZE <= region_end {
+                reader.seek(SeekFrom::Start(next_pos))?;
+                let mut next = [0u8; 512];
+                let n2 = reader.read(&mut next)?;
+                if n2 < 512 || next.iter().all(|&b| b == 0) {
+                    break;
+                }
+            }
+            break;
+        }
+
+        let size = parse_octal(&header[124..136]).unwrap_or(0);
+        let mtime = parse_octal(&header[136..148]).unwrap_or(0) as f64;
+        let mode_bits = parse_octal(&header[100..108]).unwrap_or(0o644) as u32;
+        let uid = parse_octal(&header[108..116]).unwrap_or(0) as i64;
+        let gid = parse_octal(&header[116..124]).unwrap_or(0) as i64;
+        let typeflag = header[156];
+        let linkname = cstr_field_encoded(&header[157..257], &options.encoding);
+
+        if typeflag == b'x' || typeflag == b'g' {
+            let body_off = pos + BLOCK_SIZE;
+            if body_off + size > region_end {
+                break;
+            }
+            let mut body = vec![0u8; size as usize];
+            reader.seek(SeekFrom::Start(body_off))?;
+            if size > 0 {
+                reader.read_exact(&mut body)?;
+            }
+            let recs = parse_pax_records(&body);
+            if typeflag == b'g' {
+                pax_global.extend(recs.map);
+            } else {
+                pax_pending = recs;
+                pax_header_start = Some(pos);
+            }
+            pos = body_off + pad512(size);
+            continue;
+        }
+
+        if typeflag == b'L' || typeflag == b'K' {
+            let data_off_long = pos + BLOCK_SIZE;
+            if data_off_long + size > region_end {
+                break;
+            }
+            let mut long = vec![0u8; size as usize];
+            reader.seek(SeekFrom::Start(data_off_long))?;
+            if size > 0 {
+                reader.read_exact(&mut long)?;
+            }
+            while long.last() == Some(&0) {
+                long.pop();
+            }
+            let long_str = decode_bytes(&long, &options.encoding);
+            pos = data_off_long + pad512(size);
+            if typeflag == b'L' {
+                pax_pending.map.insert("path".into(), long_str);
+            } else {
+                pax_pending.map.insert("linkpath".into(), long_str);
+            }
+            continue;
+        }
+
+        let mut pax_map = pax_global.clone();
+        let pending = std::mem::replace(
+            &mut pax_pending,
+            PaxParsed {
+                map: std::collections::HashMap::new(),
+                sparse_pairs: Vec::new(),
+            },
+        );
+        pax_map.extend(pending.map.iter().map(|(k, v)| (k.clone(), v.clone())));
+        let pax_for_sparse = PaxParsed {
+            map: pax_map.clone(),
+            sparse_pairs: pending.sparse_pairs,
+        };
+        let member_header_start = pax_header_start.take().unwrap_or(pos);
+
+        let mut name = if let Some(p) = pax_map.get("path") {
+            p.clone()
+        } else if let Some(p) = pax_map.get("GNU.sparse.name") {
+            p.clone()
+        } else {
+            parse_name(&header, &options.encoding)
+        };
+        let linkname = pax_map.get("linkpath").cloned().unwrap_or(linkname);
+        let mtime = pax_map
+            .get("mtime")
+            .and_then(|s| s.parse::<f64>().ok())
+            .unwrap_or(mtime);
+
+        if typeflag == b'D' && !*is_gnu_incremental {
+            *is_gnu_incremental = true;
+        }
+        if *is_gnu_incremental {
+            name = fix_incremental_backup_name_prefixes(&name, &header);
+        }
+
+        let mut issparse = false;
+        let mut logical_size = size;
+        let mut data_off = pos + BLOCK_SIZE;
+        let mut on_tape = size;
+
+        if typeflag == b'S' {
+            issparse = true;
+            logical_size = parse_octal(&header[483..495]).unwrap_or(size);
+            let mut is_extended = header[482] != 0;
+            while is_extended {
+                if data_off + BLOCK_SIZE > region_end {
+                    break;
+                }
+                let mut ext = [0u8; 512];
+                reader.seek(SeekFrom::Start(data_off))?;
+                reader.read_exact(&mut ext)?;
+                is_extended = ext[504] != 0;
+                data_off += BLOCK_SIZE;
+            }
+            on_tape = size;
+        }
+
+        let is_pax_sparse = pax_map.contains_key("GNU.sparse.size")
+            || pax_map.contains_key("GNU.sparse.realsize")
+            || pax_map.contains_key("GNU.sparse.map")
+            || pax_map.get("GNU.sparse.major").map(|s| s.as_str()) == Some("1")
+            || !pax_for_sparse.sparse_pairs.is_empty();
+        if is_pax_sparse {
+            issparse = true;
+            if let Some(n) = pax_map.get("GNU.sparse.name") {
+                name = n.clone();
+            }
+            logical_size = pax_map
+                .get("GNU.sparse.realsize")
+                .or_else(|| pax_map.get("GNU.sparse.size"))
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(size);
+            if pax_map.get("GNU.sparse.major").map(|s| s.as_str()) == Some("1") {
+                if data_off < region_end {
+                    let (_map, content_off) = parse_sparse_1_0_map(reader, data_off)?;
+                    data_off = content_off.min(region_end);
+                }
+                on_tape = size;
+            } else {
+                let _ = sparse_map_from_pax(&pax_for_sparse);
+                on_tape = size;
+            }
+        }
+
+        if name.contains("PaxHeaders/") || name.starts_with("./PaxHeaders/") {
+            pos = pos + BLOCK_SIZE + pad512(on_tape);
+            continue;
+        }
+
+        let full_name = join_path_prefix(path_prefix, &name);
+
+        let mut istar = false;
+        if !issparse
+            && is_regular_tar_member(typeflag, &name)
+            && logical_size >= BLOCK_SIZE
+            && data_off + logical_size.min(BLOCK_SIZE) <= region_end
+        {
+            let by_name = name_looks_like_tar(&name);
+            let by_magic = peek_tar_magic_at(reader, data_off)?;
+            if by_name || by_magic {
+                istar = true;
+                nested_out.push(NestedPending {
+                    member: NestedTarMember {
+                        path: normalize_member_path(&full_name),
+                        offset: data_off,
+                        size: logical_size,
+                    },
+                    offsetheader: member_header_start,
+                    mtime,
+                    mode_bits,
+                    uid,
+                    gid,
+                });
+            }
+        }
+
+        if typeflag == b'D' {
+            push_dumpdir_entries(
+                batch,
+                &full_name,
+                member_header_start,
+                data_off,
+                logical_size,
+                mtime,
+                mode_bits,
+                &linkname,
+                uid,
+                gid,
+                i64::from(recursion_depth),
+                generated_dirs,
+            )?;
+        } else {
+            push_entry(
+                batch,
+                &full_name,
+                member_header_start,
+                data_off,
+                if typeflag == b'5' || name.ends_with('/') {
+                    0
+                } else {
+                    logical_size
+                },
+                mtime,
+                mode_bits,
+                typeflag,
+                &linkname,
+                uid,
+                gid,
+                issparse,
+                istar,
+                i64::from(recursion_depth),
+                generated_dirs,
+            )?;
+        }
+        *found_any = true;
+
+        pos = if typeflag == b'5' || typeflag == b'1' || typeflag == b'2' {
+            if on_tape == 0 {
+                pos + BLOCK_SIZE
+            } else {
+                pos + BLOCK_SIZE + pad512(on_tape)
+            }
+        } else {
+            pos + BLOCK_SIZE + pad512(on_tape)
+        };
+        if pos > region_end {
+            break;
+        }
+    }
+
+    Ok(())
 }
 
 /// Regular-file typeflags eligible for nested-TAR detection.
@@ -1366,6 +1870,7 @@ fn push_entry(
     gid: i64,
     issparse: bool,
     istar: bool,
+    recursiondepth: i64,
     generated_dirs: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let is_dir = typeflag == b'5' || full_name.ends_with('/');
@@ -1417,7 +1922,7 @@ fn push_entry(
         istar,
         issparse,
         false,
-        0,
+        recursiondepth,
     ));
     Ok(())
 }
@@ -1439,6 +1944,7 @@ fn push_dumpdir_entries(
     linkname: &str,
     uid: i64,
     gid: i64,
+    recursiondepth: i64,
     generated_dirs: &mut std::collections::BTreeSet<String>,
 ) -> Result<()> {
     let mut full = full_name.trim_end_matches('/').to_string();
@@ -1477,7 +1983,7 @@ fn push_dumpdir_entries(
         false,
         false,
         false,
-        0,
+        recursiondepth,
     ));
 
     // Directory side so children can be listed; unique PK via offsetheader+1.
@@ -1496,7 +2002,7 @@ fn push_dumpdir_entries(
         false,
         false,
         false,
-        0,
+        recursiondepth,
     ));
 
     // Prevent `ensure_parent_dirs` from synthesizing a generated parent later.
@@ -1981,16 +2487,25 @@ mod tests {
         )
         .expect("index outer");
 
-        // Outer listing still shows the nested archive as a regular file member.
-        let fi_inner = outer.lookup("/inner.tar", 0).expect("lookup /inner.tar");
-        assert!(fi_inner.size > 0);
-        let ud = tar_userdata(&fi_inner).expect("tar userdata");
+        // After flatten, newest version of /inner.tar is a generated directory (Python parity).
+        // File version (raw nested archive bytes) is version 1 (oldest).
+        let fi_dir = outer.lookup("/inner.tar", 0).expect("lookup /inner.tar dir");
+        assert_eq!(
+            fi_dir.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR,
+            "flattened nested TAR becomes a directory"
+        );
+        let fi_file = outer
+            .lookup("/inner.tar", 1)
+            .expect("lookup /inner.tar file version");
+        assert!(fi_file.size > 0);
+        let ud = tar_userdata(&fi_file).expect("tar userdata");
         assert!(ud.istar, "nested TAR should set istar");
 
         let nested = outer.list_nested_tar_members().expect("list nested");
         assert_eq!(nested.len(), 1, "expected one nested tar: {nested:?}");
         assert_eq!(nested[0].path, "/inner.tar");
-        assert_eq!(nested[0].size, fi_inner.size);
+        assert_eq!(nested[0].size, fi_file.size);
         assert_eq!(nested[0].offset, ud.offset);
 
         // Open nested TAR via stencil without AutoMount; read inner content.
@@ -2010,6 +2525,149 @@ mod tests {
         let meta = outer.index().metadata().unwrap();
         assert!(meta.contains_key(NESTED_TAR_MEMBERS_KEY));
         assert!(meta[NESTED_TAR_MEMBERS_KEY].contains("inner.tar"));
+    }
+
+    /// Flattened recursive rows: outer lookup/list/open of inner paths without AutoMount.
+    #[test]
+    fn nested_tar_flattened_path_rows_lookup_and_open() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let inner_src = dir.path().join("inner_src");
+        std::fs::create_dir_all(inner_src.join("subdir")).unwrap();
+        std::fs::write(inner_src.join("payload.txt"), b"payload-bytes\n").unwrap();
+        std::fs::write(inner_src.join("subdir").join("deep.txt"), b"deep\n").unwrap();
+        let inner_tar = dir.path().join("inner.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&inner_tar)
+            .arg("-C")
+            .arg(&inner_src)
+            .arg("payload.txt")
+            .arg("subdir")
+            .status()
+            .expect("tar inner");
+        assert!(status.success(), "inner tar failed");
+
+        let outer_src = dir.path().join("outer_src");
+        std::fs::create_dir_all(&outer_src).unwrap();
+        std::fs::copy(&inner_tar, outer_src.join("inner.tar")).unwrap();
+        std::fs::write(outer_src.join("plain.txt"), b"plain\n").unwrap();
+        let outer_tar = dir.path().join("outer.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&outer_tar)
+            .arg("-C")
+            .arg(&outer_src)
+            .arg("inner.tar")
+            .arg("plain.txt")
+            .status()
+            .expect("tar outer");
+        assert!(status.success(), "outer tar failed");
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let mut mat = None;
+        let outer = SqliteIndexedTar::create_index(
+            &outer_tar,
+            &outer_tar,
+            None,
+            &opts,
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index outer");
+
+        // Flattened path exists on the outer mount (no AutoMount).
+        let fi = outer
+            .lookup("/inner.tar/payload.txt", 0)
+            .expect("lookup /inner.tar/payload.txt");
+        assert_eq!(fi.size, b"payload-bytes\n".len() as u64);
+        let ud = tar_userdata(&fi).expect("userdata");
+        assert_eq!(ud.recursiondepth, 1);
+        assert!(ud.offset > 0, "absolute outer offset");
+
+        let mut r = outer.open(&fi, 0).expect("open flattened");
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "payload-bytes\n");
+
+        // Nested directory listing under the prefix.
+        let listing = outer.list("/inner.tar").expect("list /inner.tar");
+        match listing {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("payload.txt"),
+                    "keys: {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+                assert!(map.contains_key("subdir"), "keys: {:?}", map.keys());
+            }
+            other => panic!("unexpected list: {other:?}"),
+        }
+
+        let deep = outer
+            .lookup("/inner.tar/subdir/deep.txt", 0)
+            .expect("deep path");
+        assert_eq!(deep.size, b"deep\n".len() as u64);
+        let mut r = outer.open(&deep, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "deep\n");
+
+        // Root still lists plain.txt and inner.tar.
+        let root = outer.list("/").expect("list root");
+        match root {
+            ListResult::Infos(map) => {
+                assert!(map.contains_key("inner.tar"));
+                assert!(map.contains_key("plain.txt"));
+            }
+            other => panic!("unexpected root list: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nested_flatten_respects_size_limit_when_not_recursive() {
+        // Synthetic oversized nested region should not be flattened without recursive.
+        // Build a small real archive but exercise should_flatten_nested directly.
+        assert!(should_flatten_nested(
+            &OpenOptions::default(),
+            NESTED_FLATTEN_MAX_BYTES,
+            1
+        ));
+        assert!(!should_flatten_nested(
+            &OpenOptions::default(),
+            NESTED_FLATTEN_MAX_BYTES + 1,
+            1
+        ));
+        // recursive: no size gate
+        let rec = OpenOptions {
+            recursive: true,
+            ..OpenOptions::default()
+        };
+        assert!(should_flatten_nested(&rec, NESTED_FLATTEN_MAX_BYTES + 1, 1));
+        // Explicit depth 0: still size-limited one layer (our cold-index default enhancement)
+        let d0 = OpenOptions {
+            recursion_depth: Some(0),
+            ..OpenOptions::default()
+        };
+        assert!(should_flatten_nested(&d0, 1024, 1));
+        assert!(!should_flatten_nested(&d0, 1024, 2));
+        // recursion_depth 1 allows depth-1 content always
+        let d1 = OpenOptions {
+            recursion_depth: Some(1),
+            ..OpenOptions::default()
+        };
+        assert!(should_flatten_nested(&d1, NESTED_FLATTEN_MAX_BYTES + 1, 1));
+        assert!(!should_flatten_nested(&d1, 1024, 2));
+    }
+
+    #[test]
+    fn join_path_prefix_helpers() {
+        assert_eq!(join_path_prefix("/inner.tar", "payload.txt"), "/inner.tar/payload.txt");
+        assert_eq!(join_path_prefix("/inner.tar", "./a/b"), "/inner.tar/a/b");
+        assert_eq!(join_path_prefix("", "x"), "x");
     }
 
     #[test]
