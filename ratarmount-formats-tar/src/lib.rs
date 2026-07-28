@@ -2262,12 +2262,26 @@ fn parse_base256(bytes: &[u8]) -> Option<u64> {
     Some(v)
 }
 
+/// Where single-file payload bytes live for [`SingleFileMountSource::open`].
+enum SingleFileBackend {
+    /// Host path (optional NamedTempFile keep-alive for materialised decompress).
+    Path {
+        path: PathBuf,
+        _keep: Option<NamedTempFile>,
+    },
+    /// Seekable uncompressed body (gzip checkpoints, DecodedBody, …) — no host path.
+    Body(Arc<dyn SeekableBody>),
+}
+
 /// Single decompressed file presented as a mount (Python SingleFileMountSource).
+///
+/// Prefer [`Self::from_seekable_body`] when the payload is already a
+/// [`SeekableBody`] so factory can serve plain `.gz`/`.bz2`/… without spooling
+/// to a NamedTempFile.
 pub struct SingleFileMountSource {
     name: String,
     size: u64,
-    data_path: PathBuf,
-    _materialised: Option<NamedTempFile>,
+    backend: SingleFileBackend,
     mtime: f64,
     mode: u32,
     uid: u32,
@@ -2275,6 +2289,7 @@ pub struct SingleFileMountSource {
 }
 
 impl SingleFileMountSource {
+    /// Path-backed single file (existing factory materialize path).
     pub fn new(
         name: String,
         data_path: PathBuf,
@@ -2286,9 +2301,27 @@ impl SingleFileMountSource {
         Ok(Self {
             name,
             size,
-            data_path,
-            _materialised: materialised,
+            backend: SingleFileBackend::Path {
+                path: data_path,
+                _keep: materialised,
+            },
             mtime: meta.mtime() as f64,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+        })
+    }
+
+    /// Single file over a seekable uncompressed body (no host path / temp).
+    ///
+    /// Size comes from [`SeekableBody::size`]; mtime is 0 (virtual label).
+    pub fn from_seekable_body(name: String, body: Arc<dyn SeekableBody>) -> io::Result<Self> {
+        let size = body.size();
+        Ok(Self {
+            name,
+            size,
+            backend: SingleFileBackend::Body(body),
+            mtime: 0.0,
             mode: ratarmount_core::S_IFREG | 0o644,
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
@@ -2348,8 +2381,16 @@ impl MountSource for SingleFileMountSource {
                 "is a directory",
             ));
         }
-        let file = File::open(&self.data_path)?;
-        Ok(Box::new(StenciledFile::new(file, vec![(0, self.size)])))
+        match &self.backend {
+            SingleFileBackend::Path { path, .. } => {
+                let file = File::open(path)?;
+                Ok(Box::new(StenciledFile::new(file, vec![(0, self.size)])))
+            }
+            SingleFileBackend::Body(body) => {
+                let reader = body.open_reader()?;
+                Ok(Box::new(StenciledFile::new(reader, vec![(0, self.size)])))
+            }
+        }
     }
 
     fn is_immutable(&self) -> bool {
@@ -3234,5 +3275,66 @@ mod tests {
         assert_eq!(crc.as_slice(), b"af083b2d");
         assert!(m.get_xattr(&fi, "user.hash.md5").is_none());
         assert!(m.get_xattr(&fi, "missing").is_none());
+    }
+
+    /// Single-file over `DecodedBody` (no host path): list, full read, mid-seek.
+    #[test]
+    fn single_file_from_seekable_body_list_read_seek() {
+        let payload = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let body: Arc<dyn SeekableBody> = ratarmount_compress::DecodedBody::from_bytes(
+            Path::new("virtual.bin"),
+            "test",
+            payload.to_vec(),
+        );
+        let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
+            .expect("from_seekable_body");
+
+        // list root → single name
+        let ListResult::Infos(map) = src.list("/").expect("list /") else {
+            panic!("expected Infos");
+        };
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("payload.bin"));
+        assert_eq!(map["payload.bin"].size, payload.len() as u64);
+
+        let fi = src.lookup("/payload.bin", 0).expect("lookup");
+        assert_eq!(fi.size, payload.len() as u64);
+        assert_eq!(fi.mtime, 0.0);
+
+        // full read
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut full = Vec::new();
+        r.read_to_end(&mut full).unwrap();
+        assert_eq!(full.as_slice(), payload);
+
+        // mid-seek: jump to offset 10, read rest
+        let mut r = src.open(&fi, 0).unwrap();
+        r.seek(SeekFrom::Start(10)).unwrap();
+        let mut mid = Vec::new();
+        r.read_to_end(&mut mid).unwrap();
+        assert_eq!(mid.as_slice(), &payload[10..]);
+
+        // seek-from-end + partial read
+        let mut r = src.open(&fi, 0).unwrap();
+        r.seek(SeekFrom::End(-4)).unwrap();
+        let mut tail = [0u8; 4];
+        r.read_exact(&mut tail).unwrap();
+        assert_eq!(&tail, b"6789");
+    }
+
+    /// Path-backed constructor still works (regression).
+    #[test]
+    fn single_file_from_path_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hello.txt");
+        std::fs::write(&path, b"hello path\n").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        let src = SingleFileMountSource::new("hello.txt".into(), path, size, None).unwrap();
+        let fi = src.lookup("/hello.txt", 0).unwrap();
+        assert_eq!(fi.size, 11);
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello path\n");
     }
 }
