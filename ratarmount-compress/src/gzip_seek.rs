@@ -53,7 +53,7 @@ use miniz_oxide::inflate::stream::{inflate, InflateState};
 use miniz_oxide::{DataFormat, MZFlush, MZStatus};
 use ratarmount_core::ParallelizationSpec;
 
-use crate::seekable_body::SeekRead;
+use crate::seekable_body::{SeekRead, SeekableBody};
 use crate::{CompressError, Result};
 
 /// Default seek-point spacing (uncompressed), matching Python CLI default (16 MiB).
@@ -1566,6 +1566,28 @@ impl SharedSeekableGzip {
     }
 }
 
+impl SeekableBody for SharedSeekableGzip {
+    fn path(&self) -> &Path {
+        self.inner.path()
+    }
+
+    fn size(&self) -> u64 {
+        self.inner.uncompressed_size()
+    }
+
+    fn open_reader(&self) -> io::Result<Box<dyn SeekRead>> {
+        Ok(Box::new(self.reader()?))
+    }
+
+    fn kind(&self) -> &'static str {
+        "gzip"
+    }
+
+    fn checkpoint_count(&self) -> usize {
+        self.inner.checkpoint_count()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1818,6 +1840,39 @@ mod tests {
             SharedSeekableGzip::open_from_reader(Cursor::new(encode_gz(payload)), 1024, "s.gz")
                 .unwrap();
         assert_eq!(shared.size(), payload.len() as u64);
+    }
+
+    #[test]
+    fn shared_seekable_gzip_as_seekable_body_middle_read() {
+        // Tiny gzip payload; open as SharedSeekableGzip → Arc<dyn SeekableBody>,
+        // then seek into the middle and read (factory-style path).
+        let payload = b"abcdefghijklmnopqrstuvwxyz0123456789";
+        let compressed = encode_gz(payload);
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            1024,
+            Path::new("body-test.gz"),
+        )
+        .unwrap();
+        let body: Arc<dyn SeekableBody> = shared;
+        assert_eq!(body.kind(), "gzip");
+        assert_eq!(body.path(), Path::new("body-test.gz"));
+        assert_eq!(body.size(), payload.len() as u64);
+        assert!(body.checkpoint_count() >= 1);
+
+        let mut r = body.open_reader().unwrap();
+        let mid = 10u64;
+        r.seek(SeekFrom::Start(mid)).unwrap();
+        let mut chunk = [0u8; 8];
+        r.read_exact(&mut chunk).unwrap();
+        assert_eq!(&chunk, &payload[mid as usize..mid as usize + 8]);
+
+        // Independent second reader from the same body.
+        let mut r2 = body.open_reader().unwrap();
+        r2.seek(SeekFrom::Start(0)).unwrap();
+        let mut head = [0u8; 4];
+        r2.read_exact(&mut head).unwrap();
+        assert_eq!(&head, b"abcd");
     }
 
     #[test]
