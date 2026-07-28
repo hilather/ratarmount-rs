@@ -47,7 +47,12 @@ pub const METHOD_BCJ_ARM: &[u8] = &[0x03, 0x03, 0x05, 0x01];
 pub const METHOD_BCJ_ARMT: &[u8] = &[0x03, 0x03, 0x07, 0x01];
 pub const METHOD_BCJ_SPARC: &[u8] = &[0x03, 0x03, 0x08, 0x05];
 
-const FILETIME_UNIX_DELTA: u64 = 11_644_473_600_000_000_000;
+/// Windows FILETIME → Unix: seconds between 1601-01-01 and 1970-01-01, in
+/// **100-nanosecond** ticks (`11_644_473_600 * 10_000_000`).
+///
+/// (A previous constant used `* 1_000_000_000` and was 100× too large, so every
+/// 7z mtime became a huge negative and FUSE displayed Dec 31 1969 / epoch.)
+const FILETIME_UNIX_DELTA: u64 = 116_444_736_000_000_000;
 const WINDOWS_DIRECTORY_ATTR: u32 = 0x10;
 const WINDOWS_UNIX_ATTR_MASK: u32 = 0xFFFF_0000;
 
@@ -375,7 +380,12 @@ fn filetime_to_unix(filetime: u64) -> f64 {
     if filetime == 0 {
         return 0.0;
     }
-    (filetime as f64 - FILETIME_UNIX_DELTA as f64) / 10_000_000.0
+    // Subtract in integer space first so we do not depend on f64 precision near 1e17.
+    if filetime >= FILETIME_UNIX_DELTA {
+        (filetime - FILETIME_UNIX_DELTA) as f64 / 10_000_000.0
+    } else {
+        -((FILETIME_UNIX_DELTA - filetime) as f64) / 10_000_000.0
+    }
 }
 
 fn parse_pack_info(c: &mut Cursor<'_>) -> Result<PackInfo> {
@@ -1161,4 +1171,43 @@ pub fn looks_like_7z(path: &std::path::Path) -> bool {
         return false;
     }
     &magic == MAGIC_7Z
+}
+
+#[cfg(test)]
+mod filetime_tests {
+    use super::filetime_to_unix;
+
+    #[test]
+    fn filetime_zero_is_unix_zero() {
+        assert_eq!(filetime_to_unix(0), 0.0);
+    }
+
+    #[test]
+    fn filetime_unix_epoch_is_zero() {
+        // 1970-01-01 00:00:00 UTC in 100ns ticks from 1601
+        let ft = 116_444_736_000_000_000u64;
+        assert!((filetime_to_unix(ft) - 0.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn filetime_2020_06_15_noon_utc() {
+        // 2020-06-15 12:00:00 UTC = 1592222400
+        let unix = 1_592_222_400u64;
+        let ft = unix * 10_000_000 + 116_444_736_000_000_000;
+        let got = filetime_to_unix(ft);
+        assert!((got - unix as f64).abs() < 1.0, "got {got} expected {unix}");
+    }
+
+    #[test]
+    fn wrong_ns_delta_must_not_be_used() {
+        // Guard against reintroducing *1e9 instead of *1e7 on the 1601→1970 gap.
+        let unix = 1_592_222_400u64;
+        let ft = unix * 10_000_000 + 116_444_736_000_000_000;
+        let got = filetime_to_unix(ft);
+        assert!(got > 0.0, "must be after Unix epoch, got {got}");
+        assert!(
+            got < 2.0e9,
+            "must not be a multi-millennium offset, got {got}"
+        );
+    }
 }

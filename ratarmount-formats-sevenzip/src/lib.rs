@@ -1857,4 +1857,62 @@ sys.stdout.buffer.write(packed)
             Some(b"af083b2d".as_slice())
         );
     }
+
+    /// Regression: FILETIME→Unix delta must use 100ns ticks (not ns). Wrong delta
+    /// made every 7z mtime a huge negative; FUSE then showed Dec 31 1969.
+    #[test]
+    fn mtime_from_7z_cli_fixture_is_not_epoch() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let plain = dir.path().join("file.txt");
+        std::fs::write(&plain, b"hello\n").unwrap();
+        let status = Command::new("touch")
+            .args(["-d", "2020-06-15 12:00:00 UTC", plain.to_str().unwrap()])
+            .status()
+            .expect("touch");
+        assert!(status.success());
+        let archive = dir.path().join("t.7z");
+        let status = Command::new("7z")
+            .args([
+                "a",
+                "-t7z",
+                archive.to_str().unwrap(),
+                plain.to_str().unwrap(),
+            ])
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skip: 7z not available");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skip: 7z a failed");
+            return;
+        }
+        // Parse layer
+        let mut f = std::fs::File::open(&archive).unwrap();
+        let info = crate::parse::parse_7z_archive(&mut f, |_, _| Ok(Vec::new())).unwrap();
+        let entry = info
+            .files
+            .iter()
+            .find(|e| e.path.ends_with("file.txt"))
+            .expect("file.txt entry");
+        let expected = 1_592_222_400.0; // 2020-06-15 12:00:00 UTC
+        assert!(
+            (entry.mtime - expected).abs() < 86400.0,
+            "parse mtime {} far from expected {} (FILETIME epoch bug?)",
+            entry.mtime,
+            expected
+        );
+        // MountSource / index path
+        let src = SevenZipMountSource::open(&archive, None, &OpenOptions::default(), "test", true)
+            .expect("open 7z");
+        let fi = src.lookup("/file.txt", 0).expect("lookup");
+        assert!(
+            (fi.mtime - expected).abs() < 86400.0,
+            "index mtime {} far from expected {}",
+            fi.mtime,
+            expected
+        );
+        assert!(fi.mtime > 0.0, "mtime must be positive (not epoch)");
+    }
 }
