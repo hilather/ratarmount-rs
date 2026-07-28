@@ -187,7 +187,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
 - **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
 - **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)
-- **Upstream bugs to inspect:** [`docs/tasks/upstream-bugs-inspection.md`](tasks/upstream-bugs-inspection.md) (open/closed bug-shaped issues not yet verified on Rust)
+- **Upstream bugs inspected (2026-07-28):** [`docs/tasks/upstream-bugs-inspection.md`](tasks/upstream-bugs-inspection.md) — 13 ok; residuals **B-4** union symlink policy, **B-10** GNU incremental delete merge, **B-2** recursive RAM measure, **B-8** optional 8 GiB sparse, **B-119** index-min-count
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
 - **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
