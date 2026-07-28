@@ -6,16 +6,27 @@
 //! decodes forward (at most ~spacing work per seek).
 //!
 //! ## Tier C — seek-index blob import/export
-//! A versioned pure-Rust blob (`RGZI`) stores the checkpoint list
-//! `(compressed_offset, uncompressed_offset)` plus spacing / uncompressed size.
-//! The index crate can persist these bytes; this module only understands the blob
-//! layout (no dependency on `ratarmount-index`).
+//! Two on-disk encodings are recognized on **import** via
+//! [`try_import_gzip_seek_blob`]:
 //!
-//! On import, inflate state is **rehydrated in one forward pass** at the imported
-//! offsets (mid-stream resume needs `miniz_oxide` state that is not itself
-//! serializable). That skips spacing-based point discovery and enables round-trip
-//! remount when a blob is available. Future format flags may embed window bits for
-//! zero-scan import interop with indexed_gzip / rapidgzip.
+//! 1. **`RGZI` v1** (native) — ratarmount-rs checkpoint list
+//!    `(compressed_offset, uncompressed_offset)` plus spacing / size. This is what
+//!    [`SeekableGzip::export_seek_index_blob`] / [`encode_gzip_seek_index_blob`]
+//!    write. Round-trip remount is exact (strict compressed-offset check).
+//! 2. **`GZIDX` v0/v1** (Python `indexed_gzip` / zran) — best-effort subset:
+//!    header + per-point offset/bits/(optional data flag) are parsed; the 32 KiB
+//!    window payloads are **skipped** (not applied as zlib dictionaries). Inflate
+//!    state is rehydrated in one forward pass at the imported uncompressed
+//!    offsets, so mid-stream bit alignment and window data are unnecessary.
+//!    Compressed offsets from zran may differ from `miniz_oxide` cursors; import
+//!    uses soft matching (uncompressed only).
+//!
+//! **Export stays `RGZI`.** Rust→Python consumers that only understand `GZIDX`
+//! would need a separate conversion path later; SQLite side tables store the
+//! opaque blob as-is.
+//!
+//! The index crate persists these bytes opaquely; this module only understands
+//! the blob layouts (no dependency on `ratarmount-index`).
 //!
 //! Thread hint (`open_seekable_gzip_with_threads` / Python `-P` gzip backend):
 //! * Seek-index construction is inherently sequential (inflate state chain).
@@ -29,7 +40,8 @@
 //! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
 //!   `Cursor`); shared under a mutex so random Range reads drive inflate.
 //! * **Imported index** — [`SeekableGzip::open_with_imported_index`] hydrates from
-//!   an [`export_seek_index_blob`] payload.
+//!   an [`export_seek_index_blob`] (`RGZI`) or Python `indexed_gzip` (`GZIDX`)
+//!   payload via [`try_import_gzip_seek_blob`].
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -50,12 +62,36 @@ pub const DEFAULT_GZIP_SEEK_SPACING: u64 = 16 * 1024 * 1024;
 /// Magic for the ratarmount-rs gzip seek-index blob (`RGZI` = Ratarmount GZip Index).
 pub const GZIP_SEEK_INDEX_MAGIC: &[u8; 4] = b"RGZI";
 
-/// Current blob format version (v1 = offset pairs only, no window bits).
+/// Magic for Python `indexed_gzip` / zran index files (`GZIDX`).
+pub const INDEXED_GZIP_INDEX_MAGIC: &[u8; 5] = b"GZIDX";
+
+/// Current RGZI blob format version (v1 = offset pairs only, no window bits).
 pub const GZIP_SEEK_INDEX_VERSION: u32 = 1;
 
-/// Minimum blob header size: magic(4) + version(4) + flags(4) + spacing(8)
+/// Maximum supported `indexed_gzip` / zran file format version.
+pub const INDEXED_GZIP_INDEX_VERSION: u8 = 1;
+
+/// Minimum RGZI header size: magic(4) + version(4) + flags(4) + spacing(8)
 /// + uncompressed_size(8) + point_count(4).
 const GZIP_SEEK_INDEX_HEADER_LEN: usize = 32;
+
+/// `GZIDX` header: magic(5) + version(1) + reserved(1) + cmp_size(8) + uncmp_size(8)
+/// + spacing(4) + window_size(4) + npoints(4).
+const INDEXED_GZIP_HEADER_LEN: usize = 35;
+
+/// Per-point record size in `GZIDX` v0 (no data flag).
+const INDEXED_GZIP_POINT_V0_LEN: usize = 17;
+/// Per-point record size in `GZIDX` v1 (+ data flag).
+const INDEXED_GZIP_POINT_V1_LEN: usize = 18;
+
+/// Which on-disk encoding a parsed seek-index blob used.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GzipSeekBlobFormat {
+    /// Native ratarmount-rs `RGZI` v1.
+    Rgzi,
+    /// Python `indexed_gzip` / zran `GZIDX` v0/v1 (best-effort checkpoint import).
+    IndexedGzip,
+}
 
 /// Inflate state snapshot at a known compressed/uncompressed pair.
 struct Checkpoint {
@@ -75,7 +111,7 @@ pub struct GzipSeekIndex {
 
 /// Parsed Tier C seek-index blob (offset pairs + metadata; no inflate state).
 ///
-/// # Binary layout (version 1, little-endian)
+/// # `RGZI` binary layout (version 1, little-endian)
 ///
 /// | Offset | Type   | Field |
 /// |--------|--------|-------|
@@ -87,19 +123,42 @@ pub struct GzipSeekIndex {
 /// | 28     | `u32`  | point_count |
 /// | 32     | `point_count × 16` | `(compressed_offset u64, uncompressed_offset u64)` pairs |
 ///
+/// # `GZIDX` binary layout (indexed_gzip / zran, little-endian)
+///
+/// | Offset | Type   | Field |
+/// |--------|--------|-------|
+/// | 0      | `[u8;5]` | magic `GZIDX` |
+/// | 5      | `u8`   | version (`0` or `1`) |
+/// | 6      | `u8`   | reserved (must be `0`) |
+/// | 7      | `u64`  | compressed file size |
+/// | 15     | `u64`  | uncompressed file size |
+/// | 23     | `u32`  | point spacing |
+/// | 27     | `u32`  | window size `W` (typically 32768) |
+/// | 31     | `u32`  | number of index points |
+/// | 35     | …      | per-point: `cmp_offset u64`, `uncmp_offset u64`, `bits u8`,
+/// |        |        | and (v1) `data_flag u8`; then `W` bytes window per flagged point |
+///
 /// Points are ordered by non-decreasing `uncompressed_offset`. The index crate
 /// stores these bytes opaquely; only this module interprets them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GzipSeekIndexBlob {
+    /// On-disk encoding this blob was parsed from (export always writes `RGZI`).
+    pub format: GzipSeekBlobFormat,
     pub version: u32,
     pub flags: u32,
     pub spacing: u64,
     pub uncompressed_size: u64,
     /// `(compressed_offset, uncompressed_offset)` pairs.
+    ///
+    /// For `IndexedGzip`, compressed offsets are informational (zran may use a
+    /// non-zero bit residual); rehydration matches on uncompressed offset only.
     pub points: Vec<(u64, u64)>,
 }
 
-/// Encode a Tier C seek-index blob from spacing, size, and seek points.
+/// Encode a Tier C **`RGZI`** seek-index blob from spacing, size, and seek points.
+///
+/// Export is intentionally native-only. Python `indexed_gzip` consumers that only
+/// accept `GZIDX` would need a separate converter (not implemented here).
 pub fn encode_gzip_seek_index_blob(
     spacing: u64,
     uncompressed_size: u64,
@@ -121,7 +180,30 @@ pub fn encode_gzip_seek_index_blob(
     out
 }
 
-/// Parse a Tier C seek-index blob. Does not touch the compressed stream.
+/// Detect seek-index blob magic and parse **`RGZI`** or **`GZIDX`** (indexed_gzip).
+///
+/// Returns a clear error for empty/unknown payloads so callers can fall back to a
+/// full checkpoint rebuild.
+pub fn try_import_gzip_seek_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
+    if blob.is_empty() {
+        return Err(CompressError::Msg(
+            "gzip seek-index blob is empty (expected RGZI or GZIDX)".into(),
+        ));
+    }
+    if blob.len() >= 4 && &blob[0..4] == GZIP_SEEK_INDEX_MAGIC.as_slice() {
+        return parse_gzip_seek_index_blob(blob);
+    }
+    if blob.len() >= 5 && &blob[0..5] == INDEXED_GZIP_INDEX_MAGIC.as_slice() {
+        return parse_indexed_gzip_index_blob(blob);
+    }
+    let preview = blob.len().min(8);
+    Err(CompressError::Msg(format!(
+        "gzip seek-index unknown format (expected RGZI or GZIDX magic, got {:02x?})",
+        &blob[..preview]
+    )))
+}
+
+/// Parse a native **`RGZI`** Tier C seek-index blob. Does not touch the compressed stream.
 pub fn parse_gzip_seek_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
     if blob.len() < GZIP_SEEK_INDEX_HEADER_LEN {
         return Err(CompressError::Msg(format!(
@@ -178,8 +260,133 @@ pub fn parse_gzip_seek_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         }
     }
     Ok(GzipSeekIndexBlob {
+        format: GzipSeekBlobFormat::Rgzi,
         version,
         flags,
+        spacing,
+        uncompressed_size,
+        points,
+    })
+}
+
+/// Parse a Python **`indexed_gzip` / zran `GZIDX`** index (best-effort).
+///
+/// Extracts spacing, uncompressed size, and `(cmp_offset, uncmp_offset)` seek
+/// points. Window payloads and bit residuals are not applied; callers rehydrate
+/// inflate state by decoding forward (see [`import_seek_points`]).
+///
+/// Points at or past `uncompressed_size` (zran often records an EOF marker) are
+/// dropped — they are not useful inflate restart positions for this backend.
+pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
+    if blob.len() < INDEXED_GZIP_HEADER_LEN {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX blob too short ({} < {INDEXED_GZIP_HEADER_LEN})",
+            blob.len()
+        )));
+    }
+    if &blob[0..5] != INDEXED_GZIP_INDEX_MAGIC.as_slice() {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX bad magic: {:02x?}",
+            &blob[0..5.min(blob.len())]
+        )));
+    }
+    let version = blob[5];
+    if version > INDEXED_GZIP_INDEX_VERSION {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX unsupported version {version} (max {INDEXED_GZIP_INDEX_VERSION})"
+        )));
+    }
+    let reserved = blob[6];
+    if reserved != 0 {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX reserved byte must be 0 (got {reserved})"
+        )));
+    }
+    let _compressed_size = u64::from_le_bytes(blob[7..15].try_into().unwrap());
+    let uncompressed_size = u64::from_le_bytes(blob[15..23].try_into().unwrap());
+    let spacing = u32::from_le_bytes(blob[23..27].try_into().unwrap()) as u64;
+    let window_size = u32::from_le_bytes(blob[27..31].try_into().unwrap()) as usize;
+    let point_count = u32::from_le_bytes(blob[31..35].try_into().unwrap()) as usize;
+
+    if window_size < 32_768 {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX window_size {window_size} < 32768"
+        )));
+    }
+    // zran requires spacing >= window_size; be tolerant of odd blobs but reject 0 window.
+    let point_len = if version >= 1 {
+        INDEXED_GZIP_POINT_V1_LEN
+    } else {
+        INDEXED_GZIP_POINT_V0_LEN
+    };
+    let points_bytes = point_count
+        .checked_mul(point_len)
+        .ok_or_else(|| CompressError::Msg("indexed_gzip GZIDX point_count overflow".into()))?;
+    let points_end = INDEXED_GZIP_HEADER_LEN
+        .checked_add(points_bytes)
+        .ok_or_else(|| CompressError::Msg("indexed_gzip GZIDX size overflow".into()))?;
+    if blob.len() < points_end {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX truncated: have {} need ≥ {points_end} for {point_count} points",
+            blob.len()
+        )));
+    }
+
+    let mut points = Vec::with_capacity(point_count);
+    let mut windows_with_data = 0usize;
+    let mut off = INDEXED_GZIP_HEADER_LEN;
+    for i in 0..point_count {
+        let c = u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
+        let u = u64::from_le_bytes(blob[off + 8..off + 16].try_into().unwrap());
+        let _bits = blob[off + 16];
+        let data_flag = if version >= 1 {
+            blob[off + 17]
+        } else {
+            // v0: first point has no window; all others do.
+            if i == 0 {
+                0
+            } else {
+                1
+            }
+        };
+        if data_flag != 0 {
+            windows_with_data += 1;
+        }
+        // Skip EOF / past-end markers — not restart positions for rehydration.
+        if uncompressed_size == 0 || u < uncompressed_size {
+            points.push((c, u));
+        }
+        off += point_len;
+    }
+
+    let windows_bytes = windows_with_data
+        .checked_mul(window_size)
+        .ok_or_else(|| CompressError::Msg("indexed_gzip GZIDX window section overflow".into()))?;
+    let need = points_end
+        .checked_add(windows_bytes)
+        .ok_or_else(|| CompressError::Msg("indexed_gzip GZIDX size overflow".into()))?;
+    // Best-effort: require window payload presence when flags claim data, so we
+    // do not accept truncated Python blobs that look complete in the header.
+    if blob.len() < need {
+        return Err(CompressError::Msg(format!(
+            "indexed_gzip GZIDX truncated window section: have {} need {need} \
+             ({windows_with_data} × {window_size}-byte windows)",
+            blob.len()
+        )));
+    }
+
+    for w in points.windows(2) {
+        if w[1].1 < w[0].1 {
+            return Err(CompressError::Msg(
+                "indexed_gzip GZIDX points not sorted by uncompressed_offset".into(),
+            ));
+        }
+    }
+
+    Ok(GzipSeekIndexBlob {
+        format: GzipSeekBlobFormat::IndexedGzip,
+        version: u32::from(version),
+        flags: 0,
         spacing,
         uncompressed_size,
         points,
@@ -236,7 +443,9 @@ impl SeekableGzip {
 
     /// Open using a Tier C seek-index blob (skips spacing-based point discovery).
     ///
-    /// Inflate states are rehydrated in one forward pass at the imported offsets.
+    /// Accepts native **`RGZI`** or Python **`indexed_gzip` `GZIDX`** via
+    /// [`try_import_gzip_seek_blob`]. Inflate states are rehydrated in one forward
+    /// pass at the imported offsets.
     /// `spacing` is only used if the blob's spacing is zero (clamped to ≥ 64 KiB);
     /// otherwise the blob's spacing is kept for forward-decode heuristics.
     /// `threads` matches the path open API (`0` → CPU count); index rehydration
@@ -249,14 +458,15 @@ impl SeekableGzip {
     ) -> Result<Arc<Self>> {
         let path = path.as_ref().to_path_buf();
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
-        let parsed = parse_gzip_seek_index_blob(index_blob)?;
+        let parsed = try_import_gzip_seek_blob(index_blob)?;
         let spacing = effective_import_spacing(spacing, parsed.spacing);
         let mut file = File::open(&path)?;
-        let index = import_seek_points(
+        let index = import_seek_points_with_mode(
             &mut file,
             &parsed.points,
             spacing,
             parsed.uncompressed_size,
+            parsed.format == GzipSeekBlobFormat::Rgzi,
         )?;
         Ok(Arc::new(Self {
             path: path.clone(),
@@ -319,13 +529,14 @@ impl SeekableGzip {
     {
         let path = archive_label.as_ref().to_path_buf();
         let _threads = ParallelizationSpec::resolve_zero(threads).max(1);
-        let parsed = parse_gzip_seek_index_blob(index_blob)?;
+        let parsed = try_import_gzip_seek_blob(index_blob)?;
         let spacing = effective_import_spacing(spacing, parsed.spacing);
-        let index = import_seek_points(
+        let index = import_seek_points_with_mode(
             &mut reader,
             &parsed.points,
             spacing,
             parsed.uncompressed_size,
+            parsed.format == GzipSeekBlobFormat::Rgzi,
         )?;
         let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
         Ok(Arc::new(Self {
@@ -793,16 +1004,36 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
 /// Empty `points` falls back to a full spacing-based [`build_index`].
 ///
 /// `expected_uncompressed_size` must match the decoded size (blob metadata check).
+/// Uses **strict** compressed-offset matching (native `RGZI` round-trips).
 pub fn import_seek_points<R: Read + Seek>(
     file: &mut R,
     points: &[(u64, u64)],
     spacing: u64,
     expected_uncompressed_size: u64,
 ) -> Result<GzipSeekIndex> {
+    import_seek_points_with_mode(file, points, spacing, expected_uncompressed_size, true)
+}
+
+/// Like [`import_seek_points`], with control over compressed-offset verification.
+///
+/// * `strict_compressed_match == true` (`RGZI`): rehydrated compressed cursor must
+///   equal the blob's `compressed_offset` at each point.
+/// * `false` (`GZIDX` / indexed_gzip): match on uncompressed offset only and keep
+///   the rehydrated compressed cursor (zran bit residuals / zlib vs miniz cursors
+///   often disagree even when the stream is valid).
+pub fn import_seek_points_with_mode<R: Read + Seek>(
+    file: &mut R,
+    points: &[(u64, u64)],
+    spacing: u64,
+    expected_uncompressed_size: u64,
+    strict_compressed_match: bool,
+) -> Result<GzipSeekIndex> {
     let spacing = spacing.max(64 * 1024);
     if points.is_empty() {
         let index = build_index(file, spacing)?;
-        if index.uncompressed_size != expected_uncompressed_size {
+        if expected_uncompressed_size != 0
+            && index.uncompressed_size != expected_uncompressed_size
+        {
             return Err(CompressError::Msg(format!(
                 "gzip seek-index size mismatch: blob {} vs decoded {}",
                 expected_uncompressed_size, index.uncompressed_size
@@ -835,8 +1066,7 @@ pub fn import_seek_points<R: Read + Seek>(
                     "gzip seek-index cannot land on uncompressed_offset {want_u} (at {uncompressed_total})"
                 )));
             }
-            // Compressed cursor must match the export (deterministic inflate).
-            if compressed_at != want_c {
+            if strict_compressed_match && compressed_at != want_c {
                 return Err(CompressError::Msg(format!(
                     "gzip seek-index compressed_offset mismatch at uncompressed {want_u}: \
                      blob {want_c} vs rehydrated {compressed_at}"
@@ -873,13 +1103,28 @@ pub fn import_seek_points<R: Read + Seek>(
         let mut out_buf = vec![0u8; 256 * 1024];
 
         loop {
+            // Cap output so we can land exactly on the next target uncompressed offset
+            // (indexed_gzip points are not aligned to our default out-buffer size).
+            let out_cap = if next_target < targets.len() {
+                let want_u = targets[next_target].1;
+                if want_u > uncompressed_total {
+                    ((want_u - uncompressed_total) as usize)
+                        .min(out_buf.len())
+                        .max(1)
+                } else {
+                    out_buf.len()
+                }
+            } else {
+                out_buf.len()
+            };
+
             file.seek(SeekFrom::Start(compressed_at))?;
             let n_in = file.read(&mut in_buf)?;
             let input = if n_in == 0 { &[][..] } else { &in_buf[..n_in] };
             let res = inflate(
                 state.as_mut(),
                 input,
-                &mut out_buf,
+                &mut out_buf[..out_cap],
                 if n_in == 0 {
                     MZFlush::Finish
                 } else {
@@ -925,7 +1170,9 @@ pub fn import_seek_points<R: Read + Seek>(
         )));
     }
 
-    if uncompressed_total != expected_uncompressed_size {
+    if expected_uncompressed_size != 0
+        && uncompressed_total != expected_uncompressed_size
+    {
         return Err(CompressError::Msg(format!(
             "gzip seek-index size mismatch: blob {expected_uncompressed_size} vs decoded {uncompressed_total}"
         )));
@@ -1584,17 +1831,192 @@ mod tests {
         let blob = encode_gzip_seek_index_blob(16 * 1024, 40_000, &points);
         assert!(blob.starts_with(GZIP_SEEK_INDEX_MAGIC));
         let parsed = parse_gzip_seek_index_blob(&blob).unwrap();
+        assert_eq!(parsed.format, GzipSeekBlobFormat::Rgzi);
         assert_eq!(parsed.version, GZIP_SEEK_INDEX_VERSION);
         assert_eq!(parsed.flags, 0);
         assert_eq!(parsed.spacing, 16 * 1024);
         assert_eq!(parsed.uncompressed_size, 40_000);
         assert_eq!(parsed.points, points);
 
+        // Dispatcher agrees with the dedicated RGZI parser.
+        let via = try_import_gzip_seek_blob(&blob).unwrap();
+        assert_eq!(via, parsed);
+
         assert!(parse_gzip_seek_index_blob(b"nope").is_err());
         assert!(parse_gzip_seek_index_blob(&blob[..10]).is_err());
         let mut bad_ver = blob.clone();
         bad_ver[4..8].copy_from_slice(&99u32.to_le_bytes());
         assert!(parse_gzip_seek_index_blob(&bad_ver).is_err());
+    }
+
+    /// Encode a minimal `GZIDX` v1 blob (indexed_gzip / zran) for pure-Rust tests.
+    ///
+    /// Window payloads are zero-filled when `data_flag` is set; import ignores them.
+    fn encode_gzidx_v1(
+        compressed_size: u64,
+        uncompressed_size: u64,
+        spacing: u32,
+        window_size: u32,
+        points: &[(u64, u64, u8, u8)], // c, u, bits, data_flag
+    ) -> Vec<u8> {
+        let n = points.len() as u32;
+        let n_windows = points.iter().filter(|p| p.3 != 0).count();
+        let mut out = Vec::with_capacity(
+            INDEXED_GZIP_HEADER_LEN
+                + points.len() * INDEXED_GZIP_POINT_V1_LEN
+                + n_windows * window_size as usize,
+        );
+        out.extend_from_slice(INDEXED_GZIP_INDEX_MAGIC);
+        out.push(1); // version
+        out.push(0); // reserved
+        out.extend_from_slice(&compressed_size.to_le_bytes());
+        out.extend_from_slice(&uncompressed_size.to_le_bytes());
+        out.extend_from_slice(&spacing.to_le_bytes());
+        out.extend_from_slice(&window_size.to_le_bytes());
+        out.extend_from_slice(&n.to_le_bytes());
+        for &(c, u, bits, data_flag) in points {
+            out.extend_from_slice(&c.to_le_bytes());
+            out.extend_from_slice(&u.to_le_bytes());
+            out.push(bits);
+            out.push(data_flag);
+        }
+        for &(.., data_flag) in points {
+            if data_flag != 0 {
+                out.resize(out.len() + window_size as usize, 0);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn try_import_dispatches_rgzi_and_gzidx_unknown_errors() {
+        let rgzi = encode_gzip_seek_index_blob(1024, 10, &[(10, 0)]);
+        let r = try_import_gzip_seek_blob(&rgzi).unwrap();
+        assert_eq!(r.format, GzipSeekBlobFormat::Rgzi);
+
+        let gzidx = encode_gzidx_v1(
+            100,
+            50_000,
+            32_768,
+            32_768,
+            &[(10, 0, 0, 0), (50, 16_384, 0, 1), (100, 50_000, 0, 1)],
+        );
+        let g = try_import_gzip_seek_blob(&gzidx).unwrap();
+        assert_eq!(g.format, GzipSeekBlobFormat::IndexedGzip);
+        assert_eq!(g.version, 1);
+        assert_eq!(g.spacing, 32_768);
+        assert_eq!(g.uncompressed_size, 50_000);
+        // EOF marker (u == size) is dropped.
+        assert_eq!(g.points, vec![(10, 0), (50, 16_384)]);
+
+        let err = try_import_gzip_seek_blob(b"XXXX not an index").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown format") && msg.contains("RGZI") && msg.contains("GZIDX"),
+            "unexpected error: {msg}"
+        );
+        let empty = try_import_gzip_seek_blob(b"").unwrap_err().to_string();
+        assert!(empty.contains("empty"), "unexpected: {empty}");
+    }
+
+    #[test]
+    fn parse_indexed_gzip_rejects_truncated_and_bad_window() {
+        let ok = encode_gzidx_v1(10, 100, 32_768, 32_768, &[(10, 0, 0, 0)]);
+        assert!(parse_indexed_gzip_index_blob(&ok).is_ok());
+
+        // Truncate after header + partial point.
+        let err = parse_indexed_gzip_index_blob(&ok[..INDEXED_GZIP_HEADER_LEN + 4])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncated") || err.contains("too short"), "{err}");
+
+        // data_flag=1 but missing window payload
+        let mut missing_win = encode_gzidx_v1(10, 100, 32_768, 32_768, &[(10, 0, 0, 1)]);
+        missing_win.truncate(INDEXED_GZIP_HEADER_LEN + INDEXED_GZIP_POINT_V1_LEN);
+        let err = parse_indexed_gzip_index_blob(&missing_win)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("window"), "{err}");
+
+        // window_size too small
+        let mut tiny = encode_gzidx_v1(10, 100, 100, 100, &[(10, 0, 0, 0)]);
+        // rewrite window_size field at offset 27
+        tiny[27..31].copy_from_slice(&100u32.to_le_bytes());
+        let err = parse_indexed_gzip_index_blob(&tiny).unwrap_err().to_string();
+        assert!(err.contains("window_size"), "{err}");
+    }
+
+    #[test]
+    fn indexed_gzip_gzidx_import_rehydrates_and_seeks() {
+        // Build a real gzip, take RGZI points, re-encode as GZIDX with deliberately
+        // wrong compressed offsets (simulating zran/miniz disagreement). Soft import
+        // must still rehydrate and serve random access.
+        let dir = tempfile::tempdir().unwrap();
+        let gz = dir.path().join("gzidx.gz");
+        let mut raw = Vec::new();
+        for i in 0..3000 {
+            writeln!(&mut raw, "igz {i:05} {}", "y".repeat(80)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        std::fs::write(&gz, &compressed).unwrap();
+
+        let spacing = 8 * 1024u64;
+        let built = SeekableGzip::open(&gz, spacing).unwrap();
+        assert!(built.checkpoint_count() >= 2);
+        let rgzi = built.export_seek_index_blob();
+        let parsed_rgzi = parse_gzip_seek_index_blob(&rgzi).unwrap();
+
+        let mut gzidx_points: Vec<(u64, u64, u8, u8)> = parsed_rgzi
+            .points
+            .iter()
+            .enumerate()
+            .map(|(i, &(c, u))| {
+                // Poison compressed offsets — soft path must ignore them.
+                let fake_c = c.wrapping_add(12345 + i as u64);
+                let data_flag = if i == 0 { 0 } else { 1 };
+                (fake_c, u, 0u8, data_flag)
+            })
+            .collect();
+        // zran-style EOF marker (should be dropped by parser).
+        gzidx_points.push((
+            compressed.len() as u64,
+            raw.len() as u64,
+            0,
+            1,
+        ));
+
+        let gzidx = encode_gzidx_v1(
+            compressed.len() as u64,
+            raw.len() as u64,
+            spacing as u32,
+            32_768,
+            &gzidx_points,
+        );
+        let parsed = try_import_gzip_seek_blob(&gzidx).unwrap();
+        assert_eq!(parsed.format, GzipSeekBlobFormat::IndexedGzip);
+        assert_eq!(parsed.points.len(), parsed_rgzi.points.len());
+
+        let imported =
+            SeekableGzip::open_with_imported_index(&gz, spacing, 1, &gzidx).unwrap();
+        assert_eq!(imported.uncompressed_size(), raw.len() as u64);
+        assert_eq!(imported.checkpoint_count(), built.checkpoint_count());
+
+        let mut r_imp = imported.reader().unwrap();
+        let mut all = Vec::new();
+        r_imp.read_to_end(&mut all).unwrap();
+        assert_eq!(all, raw);
+
+        for &off in &[0u64, 100, raw.len() as u64 / 2, raw.len() as u64 - 40] {
+            r_imp.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 32];
+            let n = r_imp.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &raw[off as usize..off as usize + n], "off {off}");
+        }
+
+        // Export remains RGZI (not GZIDX).
+        let re_export = imported.export_seek_index_blob();
+        assert!(re_export.starts_with(GZIP_SEEK_INDEX_MAGIC));
+        assert!(!re_export.starts_with(INDEXED_GZIP_INDEX_MAGIC));
     }
 
     #[test]
