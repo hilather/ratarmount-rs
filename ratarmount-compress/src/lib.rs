@@ -12,13 +12,17 @@
 //! * **xz** — one-shot decode; multi-stream parallel decode via `open_seekable_xz_with_threads`.
 //! * **zstd** — multi-frame / seek table; `open_seekable_zstd_with_threads` for `-P`.
 //! * **gzip** — seek checkpoints; multi-member parallel decode (best-effort) + `-P` threads.
-//! * **.Z / lzma** — one-shot decode into RAM/temp (`SeekableBody`).
+//! * **.Z / lzma / zlib** — one-shot decode into RAM/temp (`SeekableBody`);
+//!   `open_seekable_*_with_threads` accepts `-P` (decode sequential: single stream).
+//! * **lrzip** — detect magic/extension; materialize via external `lrzip`/`lrunzip` CLI
+//!   (Python leaves pure RA on libarchive; no in-process decoder here).
 //! * CLI/helpers still expose `materialize_*` for plain single-file mounts.
 //! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
 mod bzip2_seek;
 mod compress_z_seek;
 mod gzip_seek;
+mod lrzip_seek;
 mod lz4_seek;
 mod lzip_seek;
 mod lzma_seek;
@@ -35,14 +39,15 @@ pub use split::{
 };
 
 pub use bzip2_seek::{open_seekable_bzip2, open_seekable_bzip2_with_threads};
-pub use compress_z_seek::open_seekable_compress_z;
+pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 pub use gzip_seek::{
     open_seekable_gzip, open_seekable_gzip_with_threads, try_parallel_multi_member_decode,
     SeekableGzip, SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING,
 };
+pub use lrzip_seek::{looks_like_lrzip, lrzip_available, materialize_lrzip, LRZIP_MAGIC};
 pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};
 pub use lzip_seek::{open_seekable_lzip, open_seekable_lzip_with_threads, SeekableLzip};
-pub use lzma_seek::open_seekable_lzma;
+pub use lzma_seek::{open_seekable_lzma, open_seekable_lzma_with_threads};
 pub use lzo_seek::{
     lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo,
 };
@@ -52,7 +57,7 @@ pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };
 pub use xz_seek::{open_seekable_xz, open_seekable_xz_with_threads};
-pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib};
+pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib, open_seekable_zlib_with_threads};
 pub use zstd_seek::{
     build_seek_table_skippable, open_seekable_zstd, open_seekable_zstd_with_threads, SeekableZstd,
 };
@@ -95,6 +100,8 @@ pub enum CompressionFormat {
     Lzma,
     /// RFC 1950 zlib wrapper (e.g. `.zlib`).
     Zlib,
+    /// lrzip (magic `LRZI\x00`; materialize via external CLI only).
+    Lrzip,
 }
 
 /// Detect compression from magic bytes, with extension fallback for ambiguous formats.
@@ -136,6 +143,10 @@ pub fn detect_compression_magic(magic: &[u8]) -> Result<CompressionFormat> {
     if magic.len() >= 4 && &magic[..4] == b"LZIP" {
         return Ok(CompressionFormat::Lzip);
     }
+    // lrzip: LRZI + major version 0 (Python FID.LRZIP)
+    if looks_like_lrzip(magic) {
+        return Ok(CompressionFormat::Lrzip);
+    }
     if magic.len() >= 9 && magic[..9] == *b"\x89LZO\x00\x0d\x0a\x1a\x0a" {
         return Ok(CompressionFormat::Lzo);
     }
@@ -168,6 +179,9 @@ pub fn detect_compression_extension(path: &Path) -> Option<CompressionFormat> {
     if name.ends_with(".zlib") || name.ends_with(".zz") {
         return Some(CompressionFormat::Zlib);
     }
+    if name.ends_with(".lrz") || name.ends_with(".lrzip") {
+        return Some(CompressionFormat::Lrzip);
+    }
     // Bare `.Z` / `.z` — careful: `.gz` already handled by magic; `.tz` etc. rare.
     if name.ends_with(".z")
         && !name.ends_with(".gz")
@@ -176,6 +190,7 @@ pub fn detect_compression_extension(path: &Path) -> Option<CompressionFormat> {
         && !name.ends_with(".lz")
         && !name.ends_with(".tz")
         && !name.ends_with(".zlib")
+        && !name.ends_with(".lrz")
     {
         return Some(CompressionFormat::CompressZ);
     }
@@ -275,6 +290,7 @@ pub fn materialize(path: &Path, format: CompressionFormat) -> Result<(NamedTempF
         }
         CompressionFormat::Lzma => materialize_from_body(path, open_seekable_lzma(path)?, "lzma"),
         CompressionFormat::Zlib => materialize_from_body(path, open_seekable_zlib(path)?, "zlib"),
+        CompressionFormat::Lrzip => materialize_lrzip(path),
     }
 }
 
@@ -302,6 +318,8 @@ pub fn name_suggests_compressed_tar(path: &Path) -> bool {
         || l.ends_with(".tar.lzo")
         || l.ends_with(".tar.lzma")
         || l.ends_with(".tar.zlib")
+        || l.ends_with(".tar.lrz")
+        || l.ends_with(".tar.lrzip")
         || l.ends_with(".tar.z")
         || l.ends_with(".taz")
 }
@@ -604,6 +622,8 @@ pub fn strip_compression_suffix(name: &str) -> String {
         (".tar.lzo", ".tar"),
         (".tar.lzma", ".tar"),
         (".tar.zlib", ".tar"),
+        (".tar.lrzip", ".tar"),
+        (".tar.lrz", ".tar"),
         (".tar.z", ".tar"),
         (".tgz", ".tar"),
         (".taz", ".tar"),
@@ -625,6 +645,8 @@ pub fn strip_compression_suffix(name: &str) -> String {
         (".lzma", ""),
         (".zlib", ""),
         (".zz", ""),
+        (".lrzip", ""),
+        (".lrz", ""),
         (".lz", ""),
         (".z", ""),
     ] {
@@ -736,6 +758,39 @@ mod tests {
             detect_compression_magic(b"\x89LZO\x00\x0d\x0a\x1a\x0a").unwrap(),
             CompressionFormat::Lzo
         );
+        assert_eq!(
+            detect_compression_magic(b"LRZI\x00\x06").unwrap(),
+            CompressionFormat::Lrzip
+        );
+    }
+
+    #[test]
+    fn detect_lrzip_extension() {
+        assert_eq!(
+            detect_compression_extension(Path::new("archive.lrz")),
+            Some(CompressionFormat::Lrzip)
+        );
+        assert_eq!(
+            detect_compression_extension(Path::new("archive.lrzip")),
+            Some(CompressionFormat::Lrzip)
+        );
+    }
+
+    #[test]
+    fn materialize_lrzip_skips_or_runs() {
+        let path = py_test("simple.lrz");
+        if !path.exists() {
+            return;
+        }
+        if !lrzip_available() {
+            let err = materialize(&path, CompressionFormat::Lrzip).unwrap_err();
+            assert!(
+                err.to_string().contains("lrzip not installed"),
+                "got: {err}"
+            );
+            return;
+        }
+        assert_simple_body(&path, CompressionFormat::Lrzip);
     }
 
     #[test]
