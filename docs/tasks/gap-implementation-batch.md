@@ -145,14 +145,24 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | factory glue | factory.rs | gzip RGZI↔index + live S3 Range opens |
 | CI full gates | benchmarks + ci.yml | `benchmark-gates-full` with `ALLOW_RATIO_SKIP` |
 
-## Still open (later / batch 12+)
+## Batch 12 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| TAR recursive rows | formats-tar | flattened `/inner.tar/…` path rows (64 MiB default cap) |
+| indexed_gzip interop | gzip_seek | GZIDX best-effort + RGZI dispatcher |
+| ZIP hashes | formats-zip | `user.hash.*` xattrs on members |
+| 7z hashes | formats-sevenzip | `user.hash.*` xattrs (solid shared key caveat) |
+| zstdblocks | zstd_seek | import/export `(cmp,unc)` block maps |
+
+## Still open (later / batch 13+)
 
 | Gap | Notes |
 |-----|--------|
-| Flattened recursive TAR **path rows** (not only side-list) | foundation done |
-| Pure in-process lrzip (no CLI / no libarchive shellout) | rare |
-| Python indexed_gzip blob interop (not only RGZI) | open |
-| Non-TAR hash xattrs | open |
+| Pure in-process lrzip | rare; CLI/libarchive cover practical cases |
+| Factory wire zstdblocks from index on open | APIs exist |
+| RAR pure / long-tail | libarchive only |
+| crates.io publish policy / Phase 12 | productization |
 
 ## Verify
 
@@ -160,6 +170,4 @@ Non-overlapping crate ownership so agents could not stomp each other:
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 ./benchmarks/check-rust-gates.sh
-RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1 ./benchmarks/check-rust-gates.sh
-# s3 live Range: AWS_* ratarmount -f s3://bucket/a.tar mnt/
 ```

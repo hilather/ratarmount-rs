@@ -34,10 +34,10 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
-| gzip (rapidgzip / seek index) | yes | **G3 Tier B** + **Tier C RGZI blob** import/export | `[x]` / `~` index table glue at open |
+| gzip (rapidgzip / seek index) | yes | Tier B + RGZI Tier C + best-effort **GZIDX** (indexed_gzip) | `[x]` / `~` window-dict full interop |
 | bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps (any size on path) | `[x]` / `~` open-time size discovery |
 | xz multi-block seek | yes | Index + multi-stream maps; single-block full decode | `[x]` / `~` exotic filters |
-| zstd multi-frame / seek table | yes | multi-frame map + seek-table footer import | `[x]` / `~` zstdblocks import |
+| zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** import/export | `[x]` |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
 | lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize | `~` CLI required |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
@@ -49,7 +49,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | yes; nested open prefers `Read+Seek` (no tmp) for TAR/7z | `~` ZIP store / solid outer later |
+| AutoMount recursive (`-r`) | yes | nested Read+Seek + flattened TAR path rows (≤64 MiB default) | `[x]` / `~` size-gated flatten |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR; GNU tar) | `[x]` common compressions |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
@@ -86,7 +86,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables | `[x]` / `~` decoder import of Python blobs |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
-| Index file hashes / xattrs | yes | `--hashes` fill + FUSE listxattr/getxattr for TAR | `[x]` / `~` non-TAR sources |
+| Index file hashes / xattrs | yes | `--hashes` + FUSE xattrs for TAR/ZIP/7z | `[x]` / `~` solid 7z shared key; other formats |
 | `--use-backend` selection | yes | reorders format probe (last flag highest) | `[x]` |
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
