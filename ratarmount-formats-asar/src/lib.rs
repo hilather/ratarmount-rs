@@ -2,13 +2,20 @@
 //!
 //! Format: pickled JSON header + concatenated file payloads. Members open via
 //! absolute data offsets (stencil), matching Python `ASARMountSource`.
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! [`AsarMountSource::open_from_reader`] indexes any seekable stream without a
+//! host path, so nested ASAR can open without a `/tmp` spool when the parent
+//! member body is seekable.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
@@ -17,6 +24,9 @@ use serde_json::Value;
 use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "ASARMountSource";
+
+/// Mutex-shared seekable archive body for concurrent stencil opens.
+type SharedArchiveIo = Arc<Mutex<Box<dyn SeekRead>>>;
 
 #[derive(Debug, Error)]
 pub enum AsarError {
@@ -30,8 +40,58 @@ pub enum AsarError {
 
 pub type Result<T> = std::result::Result<T, AsarError>;
 
+/// Independent logical cursor over a shared `Read + Seek` archive body.
+struct SharedSeekHandle {
+    shared: SharedArchiveIo,
+    pos: u64,
+}
+
+impl SharedSeekHandle {
+    fn new(shared: SharedArchiveIo) -> Self {
+        Self { shared, pos: 0 }
+    }
+}
+
+impl Read for SharedSeekHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared asar reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedSeekHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .lock()
+                    .map_err(|_| io::Error::other("shared asar reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
 /// (json_start, json_size, data_start)
-pub fn find_asar_header(file: &mut File) -> Result<(u64, u64, u64)> {
+pub fn find_asar_header<R: Read + Seek>(file: &mut R) -> Result<(u64, u64, u64)> {
     file.seek(SeekFrom::Start(0))?;
     let mut magic = [0u8; 16];
     file.read_exact(&mut magic)?;
@@ -63,6 +123,28 @@ pub fn find_asar_header(file: &mut File) -> Result<(u64, u64, u64)> {
     Ok((header_start, header_size, data_offset))
 }
 
+/// Walk the ASAR JSON header tree and emit index rows with absolute data offsets.
+fn walk_asar_entries(header: &Value, data_offset: u64) -> Vec<FileRow> {
+    let mut batch = Vec::new();
+    let mut stack: Vec<(String, Value)> = vec![("/".into(), header.clone())];
+    while let Some((full_path, entry)) = stack.pop() {
+        if let Some(row) = entry_to_row(&full_path, &entry, data_offset) {
+            batch.push(row);
+        }
+        if let Some(files) = entry.get("files").and_then(|v| v.as_object()) {
+            for (name, nested) in files {
+                let child = if full_path == "/" {
+                    format!("/{name}")
+                } else {
+                    format!("{full_path}/{name}")
+                };
+                stack.push((child, nested.clone()));
+            }
+        }
+    }
+    batch
+}
+
 pub fn looks_like_asar(path: &Path) -> bool {
     let Ok(mut f) = File::open(path) else {
         return false;
@@ -75,7 +157,10 @@ pub fn looks_like_asar(path: &Path) -> bool {
 }
 
 pub struct AsarMountSource {
+    /// Path or virtual label (logs / index metadata).
+    #[allow(dead_code)]
     archive_path: PathBuf,
+    archive_io: SharedArchiveIo,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -90,27 +175,61 @@ impl AsarMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        let file = File::open(&archive_path)?;
+        Self::open_from_reader(
+            file,
+            &archive_path,
+            index_path,
+            options,
+            product_version,
+            recreate,
+        )
+    }
+
+    /// Open an ASAR archive from any seekable reader (nested AutoMount without temp spool).
+    ///
+    /// `archive_label` is used for logs / index metadata (may be a nested member name).
+    /// Prefer `index_path: None` or `options.index_in_memory` for nested mounts.
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+        recreate: bool,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
         let index_path_buf: Option<PathBuf> = if options.index_in_memory {
             None
         } else {
-            Some(index_path.map(|p| p.to_path_buf()).unwrap_or_else(|| {
-                let mut s = archive_path.as_os_str().to_os_string();
-                s.push(".index.sqlite");
-                PathBuf::from(s)
-            }))
+            index_path.map(|p| p.to_path_buf()).or_else(|| {
+                // Only invent a sibling index path when the label is a real file.
+                if archive_path.is_file() {
+                    let mut s = archive_path.as_os_str().to_os_string();
+                    s.push(".index.sqlite");
+                    Some(PathBuf::from(s))
+                } else {
+                    None
+                }
+            })
         };
 
         if let Some(ref ip) = index_path_buf {
-            if !recreate && ip.exists() {
+            if !recreate && ip.exists() && archive_path.is_file() {
                 let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
-                    if let Ok(s) = Self::open_existing(&archive_path, ip, options) {
+                    if let Ok(s) = Self::open_existing_path(&archive_path, ip, options) {
                         return Ok(s);
                     }
                 }
             }
         }
-        Self::create_index(
+
+        Self::create_index_from_reader(
+            reader,
             &archive_path,
             index_path_buf.as_deref(),
             options,
@@ -118,26 +237,33 @@ impl AsarMountSource {
         )
     }
 
-    fn open_existing(
+    fn open_existing_path(
         archive_path: &Path,
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
+        let file = File::open(archive_path)?;
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            archive_io,
             index,
             options: options.clone(),
         })
     }
 
-    fn create_index(
+    fn create_index_from_reader<R>(
+        mut reader: R,
         archive_path: &Path,
         index_path: Option<&Path>,
         options: &OpenOptions,
         product_version: &str,
-    ) -> Result<Self> {
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         let _ = options;
         println!(
             "Creating offset dictionary for {} ...",
@@ -145,41 +271,19 @@ impl AsarMountSource {
         );
         let t0 = Instant::now();
 
-        let mut file = File::open(archive_path)?;
-        let (header_start, header_size, data_offset) = find_asar_header(&mut file)?;
-        file.seek(SeekFrom::Start(header_start))?;
+        let (header_start, header_size, data_offset) = find_asar_header(&mut reader)?;
+        reader.seek(SeekFrom::Start(header_start))?;
         let mut header_bytes = vec![0u8; header_size as usize];
-        file.read_exact(&mut header_bytes)?;
+        reader.read_exact(&mut header_bytes)?;
         let header: Value = serde_json::from_slice(&header_bytes)
             .map_err(|e| AsarError::Msg(format!("ASAR JSON header: {e}")))?;
 
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
 
-        let mut batch = Vec::new();
-        // BFS/DFS stack of (full_path, entry)
-        let mut stack: Vec<(String, Value)> = vec![("/".into(), header)];
-        while let Some((full_path, entry)) = stack.pop() {
-            if let Some(row) = entry_to_row(&full_path, &entry, data_offset) {
-                batch.push(row);
-            }
-            if let Some(files) = entry.get("files").and_then(|v| v.as_object()) {
-                for (name, nested) in files {
-                    let child = if full_path == "/" {
-                        format!("/{name}")
-                    } else {
-                        format!("{full_path}/{name}")
-                    };
-                    stack.push((child, nested.clone()));
-                }
-            }
-            if batch.len() > 1000 {
-                index.insert_files_batch(&batch)?;
-                batch.clear();
-            }
-        }
-        if !batch.is_empty() {
-            index.insert_files_batch(&batch)?;
+        let rows = walk_asar_entries(&header, data_offset);
+        for chunk in rows.chunks(1000) {
+            index.insert_files_batch(chunk)?;
         }
 
         index.store_versions(product_version)?;
@@ -191,8 +295,11 @@ impl AsarMountSource {
             t0.elapsed().as_secs_f64()
         );
 
+        reader.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            archive_io,
             index: index.into_read_only()?,
             options: options.clone(),
         })
@@ -311,8 +418,8 @@ impl MountSource for AsarMountSource {
                 _ => None,
             })
             .ok_or_else(|| io::Error::other("missing ASAR offset userdata"))?;
-        let file = File::open(&self.archive_path)?;
-        let stencil = StenciledFile::new(file, vec![(offset, file_info.size)]);
+        let handle = SharedSeekHandle::new(Arc::clone(&self.archive_io));
+        let stencil = StenciledFile::new(handle, vec![(offset, file_info.size)]);
         Ok(Box::new(stencil))
     }
 
@@ -327,11 +434,181 @@ impl MountSource for AsarMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
 
     fn py_fixture(name: &str) -> PathBuf {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join("tests").join(name)
+    }
+
+    /// Build a minimal Electron ASAR with flat files (concatenated payload).
+    fn build_minimal_asar(files: &[(&str, &[u8])]) -> Vec<u8> {
+        use serde_json::{json, Map};
+        let mut map = Map::new();
+        let mut offset: u64 = 0;
+        let mut payload = Vec::new();
+        for (name, data) in files {
+            map.insert(
+                (*name).to_string(),
+                json!({
+                    "size": data.len(),
+                    "offset": offset.to_string(),
+                }),
+            );
+            payload.extend_from_slice(data);
+            offset += data.len() as u64;
+        }
+        let header = json!({ "files": map });
+        let header_bytes = serde_json::to_vec(&header).expect("json");
+        let size_of_pickled_header = header_bytes.len() as u32;
+        let padding = (4 - (size_of_pickled_header % 4)) % 4;
+        let size_of_pickled_pickled_header = size_of_pickled_header + padding + 4;
+        let size_of_pickled_pickled_pickled_header = size_of_pickled_pickled_header + 4;
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_header.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend(std::iter::repeat_n(0u8, padding as usize));
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    /// Nested-directory ASAR: `/foo/fighter/ufo` with payload `iriya\n`.
+    fn build_nested_ufo_asar() -> Vec<u8> {
+        let header = serde_json::json!({
+            "files": {
+                "foo": {
+                    "files": {
+                        "fighter": {
+                            "files": {
+                                "ufo": {
+                                    "size": 6,
+                                    "offset": "0",
+                                    "executable": true
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let header_bytes = serde_json::to_vec(&header).expect("json");
+        let size_of_pickled_header = header_bytes.len() as u32;
+        let padding = (4 - (size_of_pickled_header % 4)) % 4;
+        let size_of_pickled_pickled_header = size_of_pickled_header + padding + 4;
+        let size_of_pickled_pickled_pickled_header = size_of_pickled_pickled_header + 4;
+        let mut out = Vec::new();
+        out.extend_from_slice(&4u32.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_pickled_header.to_le_bytes());
+        out.extend_from_slice(&size_of_pickled_header.to_le_bytes());
+        out.extend_from_slice(&header_bytes);
+        out.extend(std::iter::repeat_n(0u8, padding as usize));
+        out.extend_from_slice(b"iriya\n");
+        out
+    }
+
+    #[test]
+    fn find_asar_header_on_cursor() {
+        let bytes = build_minimal_asar(&[("a.txt", b"hello\n")]);
+        let mut cur = Cursor::new(bytes.as_slice());
+        let (hs, hsz, data) = find_asar_header(&mut cur).expect("header");
+        assert_eq!(hs, 16);
+        assert!(hsz > 0);
+        assert_eq!(data, 16 + hsz + ((4 - (hsz % 4)) % 4));
+    }
+
+    #[test]
+    fn open_from_reader_cursor_minimal() {
+        let bytes = build_minimal_asar(&[("hello.txt", b"world\n"), ("b.bin", b"xyz")]);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = AsarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/minimal.asar"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader");
+        let fi = m.lookup("/hello.txt", 0).expect("hello.txt");
+        assert_eq!(fi.size, 6);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "world\n");
+
+        let fi2 = m.lookup("/b.bin", 0).expect("b.bin");
+        let mut r2 = m.open(&fi2, 0).unwrap();
+        let mut buf = Vec::new();
+        r2.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"xyz");
+
+        // Mid-member seek on shared reader backend.
+        let mut r3 = m.open(&fi, 0).unwrap();
+        r3.seek(SeekFrom::Start(1)).unwrap();
+        let mut mid = String::new();
+        r3.read_to_string(&mut mid).unwrap();
+        assert_eq!(mid, "orld\n");
+    }
+
+    #[test]
+    fn open_from_reader_nested_ufo_cursor() {
+        let bytes = build_nested_ufo_asar();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = AsarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/nested-ufo.asar"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader nested");
+        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo");
+        assert_eq!(fi.size, 6);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
+    }
+
+    #[test]
+    fn open_from_reader_fixture_cursor_if_present() {
+        let path = py_fixture("nested-tar.asar");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = AsarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/nested-tar.asar"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("fixture open_from_reader");
+        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo");
+        assert_eq!(fi.size, 6);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
     }
 
     #[test]
@@ -365,5 +642,47 @@ mod tests {
             .unwrap();
         // empty root is fine
         let _ = m.list("/");
+    }
+
+    #[test]
+    fn open_from_reader_equals_path_when_fixture_present() {
+        let path = py_fixture("nested-tar.asar");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let from_path =
+            AsarMountSource::open(&path, None, &opts, "0.1.0", true).expect("path open");
+        let from_reader = AsarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/nested-tar.asar"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("reader open");
+        let fi_p = from_path.lookup("/foo/fighter/ufo", 0).expect("path ufo");
+        let fi_r = from_reader
+            .lookup("/foo/fighter/ufo", 0)
+            .expect("reader ufo");
+        assert_eq!(fi_p.size, fi_r.size);
+        let mut bp = Vec::new();
+        let mut br = Vec::new();
+        from_path
+            .open(&fi_p, 0)
+            .unwrap()
+            .read_to_end(&mut bp)
+            .unwrap();
+        from_reader
+            .open(&fi_r, 0)
+            .unwrap()
+            .read_to_end(&mut br)
+            .unwrap();
+        assert_eq!(bp, br);
     }
 }
