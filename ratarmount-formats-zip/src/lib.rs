@@ -7,17 +7,23 @@
 //! # Multi-disk / multi-part ZIP
 //!
 //! The underlying [`zip`] crate does **not** implement true multi-disk archives
-//! (EOCD `disk_number != disk_with_central_directory` is rejected). This backend
-//! recovers the common practical case by **concatenating consecutive on-disk parts**
-//! before open:
+//! (EOCD `disk_number != disk_with_central_directory` is rejected; ZIP64 locator
+//! `number_of_disks > 1` is also rejected). This backend recovers the common
+//! practical cases by:
 //!
-//! * PKZIP-style volumes: `archive.z01`, `archive.z02`, …, `archive.zip`
-//! * Generic split suffixes: `archive.zip.001` + `archive.zip.002` + … (and other
-//!   patterns handled by [`ratarmount_compress::check_for_split_file_in_folder`])
+//! 1. **Concatenating consecutive on-disk parts** before open:
+//!    * PKZIP-style volumes: `archive.z01`, `archive.z02`, …, `archive.zip`
+//!    * Generic split suffixes: `archive.zip.001` + `archive.zip.002` + … (and other
+//!      patterns handled by [`ratarmount_compress::check_for_split_file_in_folder`])
+//! 2. **Normalizing multi-disk EOCD markers to single-disk** in the materialized
+//!    stream when central-directory offsets already look archive-absolute
+//!    (common when tools spit split slices of one ZIP, or write multi-volume
+//!    markers but keep cumulative offsets).
 //!
-//! Parts must form a single continuous byte stream of a normal (single-disk) ZIP.
-//! Archives whose central-directory / local offsets are **per-disk** (true spanned
-//! multi-disk with non-remapped offsets) remain unsupported even after concatenation.
+//! Normalization rewrites EOCD / ZIP64 EOCD / ZIP64 locator disk fields to disk 0
+//! (and `number_of_disks = 1`) only when the CD offset points at a central-directory
+//! signature inside the concatenated bytes. Archives whose offsets are **per-disk**
+//! (true spanned multi-disk with non-remapped offsets) remain unsupported.
 //!
 //! # Encryption
 //!
@@ -34,7 +40,7 @@
 
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
@@ -96,6 +102,8 @@ struct OpenedArchive {
     _joined: Option<NamedTempFile>,
     /// Ordered part paths when multi-part was joined (for diagnostics / tests).
     multipart_parts: Option<Vec<PathBuf>>,
+    /// True when multi-disk EOCD markers were rewritten to single-disk on `open_path`.
+    multidisk_normalized: bool,
 }
 
 /// ZIP backed by SQLite index for metadata; content open uses direct archive I/O.
@@ -166,7 +174,17 @@ impl ZipMountSource {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         let opened = open_archive_file(archive_path)?;
-        let mut archive = ZipArchive::new(opened.file.try_clone()?)?;
+        let mut archive = match ZipArchive::new(opened.file.try_clone()?) {
+            Ok(a) => a,
+            Err(e) => {
+                return Err(map_zip_open_error(
+                    e,
+                    archive_path,
+                    opened.multipart_parts.as_ref(),
+                    opened.multidisk_normalized,
+                ));
+            }
+        };
         let password = find_password(&mut archive, &options.passwords)?;
         let members = member_meta_map(&mut archive, password.as_deref())?;
         Ok(Self {
@@ -206,7 +224,12 @@ impl ZipMountSource {
         let mut archive = match ZipArchive::new(opened.file.try_clone()?) {
             Ok(a) => a,
             Err(e) => {
-                return Err(map_zip_open_error(e, archive_path, opened.multipart_parts.as_ref()));
+                return Err(map_zip_open_error(
+                    e,
+                    archive_path,
+                    opened.multipart_parts.as_ref(),
+                    opened.multidisk_normalized,
+                ));
             }
         };
         let password = find_password(&mut archive, &options.passwords)?;
@@ -631,20 +654,43 @@ fn member_meta_map(
     Ok(members)
 }
 
+fn is_multidisk_zip_error(e: &zip::result::ZipError) -> bool {
+    let msg = e.to_string();
+    msg.contains("multi-disk")
+        || msg.contains("multi disk")
+        || msg.contains("Multi-disk")
+        || msg.contains("multi-disk files")
+}
+
 fn map_zip_open_error(
     e: zip::result::ZipError,
     path: &Path,
     multipart: Option<&Vec<PathBuf>>,
+    normalized: bool,
 ) -> ZipError {
     let msg = e.to_string();
-    if msg.contains("multi-disk") || msg.contains("multi disk") {
+    if is_multidisk_zip_error(&e)
+        || msg.contains("Multi-disk ZIP")
+        || msg.to_ascii_lowercase().contains("multi-disk")
+    {
         ZipError::Msg(format!(
-            "true multi-disk ZIP is not supported by the zip crate for {}{}",
+            "true multi-disk ZIP is not supported for {}{}",
             path.display(),
             if multipart.is_some() {
-                " (parts were concatenated; archive still has multi-disk EOCD markers / per-disk offsets)"
+                if normalized {
+                    " (parts were concatenated and multi-disk EOCD markers were rewritten to single-disk; \
+                     remaining failure usually means central-directory / local offsets are per-disk, \
+                     not cumulative over the joined stream)"
+                } else {
+                    " (parts were concatenated; archive still has multi-disk EOCD markers or \
+                     per-disk central-directory offsets that cannot be remapped safely)"
+                }
+            } else if normalized {
+                " (multi-disk EOCD markers were rewritten to single-disk; remaining failure usually \
+                 means central-directory / local offsets are per-disk rather than archive-absolute)"
             } else {
-                " (if you have archive.z01+archive.zip or archive.zip.001 parts, place them together)"
+                " (if you have archive.z01+archive.zip or archive.zip.001 parts, place them together; \
+                 after joining, multi-disk EOCD markers are rewritten when offsets look cumulative)"
             }
         ))
     } else {
@@ -652,11 +698,257 @@ fn map_zip_open_error(
     }
 }
 
-/// Open a ZIP path, joining multi-part volumes when present.
+// --- Multi-disk EOCD normalization -----------------------------------------------------------
+
+const EOCD_SIG: [u8; 4] = [0x50, 0x4b, 0x05, 0x06]; // PK\x05\x06
+const EOCD64_LOCATOR_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x07]; // PK\x06\x07
+const EOCD64_SIG: [u8; 4] = [0x50, 0x4b, 0x06, 0x06]; // PK\x06\x06
+const CDFH_SIG: [u8; 4] = [0x50, 0x4b, 0x01, 0x02]; // PK\x01\x02
+
+const EOCD_MIN_LEN: usize = 22;
+const EOCD64_LOCATOR_LEN: usize = 20;
+/// Fixed-size portion of ZIP64 EOCD (signature + size + 44-byte body through CD offset).
+const EOCD64_FIXED_LEN: usize = 56;
+/// Max ZIP comment is u16::MAX; scan that plus EOCD min size from the end.
+const EOCD_SEARCH_MAX: usize = 65_535 + EOCD_MIN_LEN;
+
+/// Result of attempting to rewrite multi-disk end-of-central-directory markers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MultidiskNormalize {
+    /// Already single-disk, or no EOCD located.
+    Unchanged,
+    /// Multi-disk markers rewritten to single-disk; CD offset looked archive-absolute.
+    Rewrote,
+    /// Multi-disk markers present but CD offset does not look safe to treat as cumulative.
+    UnsafePerDiskLayout,
+}
+
+/// Locate the EOCD record offset by scanning backwards from `data`'s end.
+///
+/// `data` is typically a suffix of the file; `file_len` is the full archive length so the
+/// returned offset is absolute within the file. `data_start` is the absolute offset of
+/// `data[0]` in the file.
+fn find_eocd_in_tail(data: &[u8], data_start: u64, file_len: u64) -> Option<u64> {
+    if data.len() < EOCD_MIN_LEN {
+        return None;
+    }
+    // Search from the end for EOCD signature with a consistent comment length.
+    let mut i = data.len() - EOCD_MIN_LEN;
+    loop {
+        if data[i..i + 4] == EOCD_SIG {
+            let comment_len = u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+            let eocd_abs = data_start + i as u64;
+            // EOCD + comment must end exactly at EOF.
+            if eocd_abs
+                .checked_add(EOCD_MIN_LEN as u64)
+                .and_then(|x| x.checked_add(comment_len as u64))
+                == Some(file_len)
+            {
+                return Some(eocd_abs);
+            }
+        }
+        if i == 0 {
+            break;
+        }
+        i -= 1;
+    }
+    None
+}
+
+fn read_u16_le(buf: &[u8], off: usize) -> u16 {
+    u16::from_le_bytes([buf[off], buf[off + 1]])
+}
+
+fn read_u32_le(buf: &[u8], off: usize) -> u32 {
+    u32::from_le_bytes([buf[off], buf[off + 1], buf[off + 2], buf[off + 3]])
+}
+
+fn read_u64_le(buf: &[u8], off: usize) -> u64 {
+    u64::from_le_bytes([
+        buf[off],
+        buf[off + 1],
+        buf[off + 2],
+        buf[off + 3],
+        buf[off + 4],
+        buf[off + 5],
+        buf[off + 6],
+        buf[off + 7],
+    ])
+}
+
+fn write_u16_le(file: &mut File, abs_off: u64, val: u16) -> io::Result<()> {
+    file.seek(SeekFrom::Start(abs_off))?;
+    file.write_all(&val.to_le_bytes())
+}
+
+fn write_u32_le(file: &mut File, abs_off: u64, val: u32) -> io::Result<()> {
+    file.seek(SeekFrom::Start(abs_off))?;
+    file.write_all(&val.to_le_bytes())
+}
+
+fn write_u64_le(file: &mut File, abs_off: u64, val: u64) -> io::Result<()> {
+    file.seek(SeekFrom::Start(abs_off))?;
+    file.write_all(&val.to_le_bytes())
+}
+
+/// Read 4 bytes at `off` and compare to `sig`.
+fn has_sig_at(file: &mut File, off: u64, sig: &[u8; 4]) -> io::Result<bool> {
+    let mut buf = [0u8; 4];
+    file.seek(SeekFrom::Start(off))?;
+    match file.read_exact(&mut buf) {
+        Ok(()) => Ok(&buf == sig),
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// After parts are joined (or for an already-concatenated file), rewrite multi-disk EOCD
+/// fields to single-disk when the central-directory offset looks archive-absolute.
+///
+/// Mutates `path` in place — only call on temp/materialized copies we own.
+fn normalize_multidisk_eocd(path: &Path) -> io::Result<MultidiskNormalize> {
+    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(path)?;
+    let file_len = file.seek(SeekFrom::End(0))?;
+    if file_len < EOCD_MIN_LEN as u64 {
+        return Ok(MultidiskNormalize::Unchanged);
+    }
+
+    let tail_len = (EOCD_SEARCH_MAX as u64).min(file_len) as usize;
+    let data_start = file_len - tail_len as u64;
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::Start(data_start))?;
+    file.read_exact(&mut tail)?;
+
+    let Some(eocd_off) = find_eocd_in_tail(&tail, data_start, file_len) else {
+        return Ok(MultidiskNormalize::Unchanged);
+    };
+
+    // EOCD must fully lie in the tail we loaded (it does by construction of the search).
+    let eocd_in_tail = (eocd_off - data_start) as usize;
+    let eocd = &tail[eocd_in_tail..eocd_in_tail + EOCD_MIN_LEN];
+
+    let disk_number = read_u16_le(eocd, 4);
+    let disk_with_cd = read_u16_le(eocd, 6);
+    let entries_this_disk = read_u16_le(eocd, 8);
+    let entries_total = read_u16_le(eocd, 10);
+    let cd_size32 = read_u32_le(eocd, 12);
+    let cd_offset32 = read_u32_le(eocd, 16);
+
+    // Optional ZIP64 locator sits immediately before EOCD (no padding).
+    let mut zip64_locator_off: Option<u64> = None;
+    let mut zip64_eocd_off: Option<u64> = None;
+    let mut zip64_number_of_disks: u32 = 1;
+    let mut zip64_disk_with_cd: u32 = 0;
+    let mut zip64_disk_number: u32 = 0;
+    let mut zip64_entries_this_disk: u64 = 0;
+    let mut zip64_entries_total: u64 = 0;
+    let mut zip64_cd_offset: u64 = 0;
+    let mut has_zip64 = false;
+
+    if eocd_off >= EOCD64_LOCATOR_LEN as u64 {
+        let loc_off = eocd_off - EOCD64_LOCATOR_LEN as u64;
+        let mut loc = [0u8; EOCD64_LOCATOR_LEN];
+        file.seek(SeekFrom::Start(loc_off))?;
+        if file.read_exact(&mut loc).is_ok() && loc[0..4] == EOCD64_LOCATOR_SIG {
+            zip64_locator_off = Some(loc_off);
+            zip64_disk_with_cd = read_u32_le(&loc, 4);
+            let eocd64_rel = read_u64_le(&loc, 8);
+            zip64_number_of_disks = read_u32_le(&loc, 16);
+            zip64_eocd_off = Some(eocd64_rel);
+
+            // Parse ZIP64 EOCD at the recorded offset (archive-absolute for single-stream).
+            if eocd64_rel.saturating_add(EOCD64_FIXED_LEN as u64) <= file_len {
+                let mut z64 = [0u8; EOCD64_FIXED_LEN];
+                file.seek(SeekFrom::Start(eocd64_rel))?;
+                if file.read_exact(&mut z64).is_ok() && z64[0..4] == EOCD64_SIG {
+                    has_zip64 = true;
+                    zip64_disk_number = read_u32_le(&z64, 16);
+                    zip64_disk_with_cd = read_u32_le(&z64, 20);
+                    zip64_entries_this_disk = read_u64_le(&z64, 24);
+                    zip64_entries_total = read_u64_le(&z64, 32);
+                    zip64_cd_offset = read_u64_le(&z64, 48);
+                }
+            }
+        }
+    }
+
+    let multi = disk_number != 0
+        || disk_with_cd != 0
+        || disk_number != disk_with_cd
+        || (has_zip64
+            && (zip64_number_of_disks > 1
+                || zip64_disk_number != 0
+                || zip64_disk_with_cd != 0
+                || zip64_disk_number != zip64_disk_with_cd));
+
+    if !multi {
+        return Ok(MultidiskNormalize::Unchanged);
+    }
+
+    // Resolve the central-directory offset we would feed the zip crate after rewrite.
+    // Prefer ZIP64 when the classic EOCD fields are saturated.
+    let use_zip64_cd = has_zip64
+        && (cd_offset32 == u32::MAX || entries_total == u16::MAX || cd_size32 == u32::MAX);
+    let cd_offset: u64 = if use_zip64_cd {
+        zip64_cd_offset
+    } else {
+        cd_offset32 as u64
+    };
+
+    // Safety: CD offset must point at a central-directory file header inside this stream.
+    // True per-disk layouts store CD offsets relative to the starting disk, so after
+    // concatenation the absolute offset rarely hosts a CDFH signature.
+    if cd_offset.saturating_add(4) > file_len || !has_sig_at(&mut file, cd_offset, &CDFH_SIG)? {
+        return Ok(MultidiskNormalize::UnsafePerDiskLayout);
+    }
+
+    // Rewrite EOCD disk fields to single-disk.
+    // disk_number, disk_with_cd → 0
+    write_u16_le(&mut file, eocd_off + 4, 0)?;
+    write_u16_le(&mut file, eocd_off + 6, 0)?;
+    // entries_this_disk → entries_total (all entries live on the joined stream).
+    // When ZIP32 entry count is saturated, leave it at u16::MAX; ZIP64 holds the truth.
+    if entries_this_disk != entries_total {
+        write_u16_le(&mut file, eocd_off + 8, entries_total)?;
+    }
+
+    // ZIP64 locator: disk_with_cd → 0, number_of_disks → 1
+    if let Some(loc_off) = zip64_locator_off {
+        write_u32_le(&mut file, loc_off + 4, 0)?;
+        write_u32_le(&mut file, loc_off + 16, 1)?;
+    }
+
+    // ZIP64 EOCD: disk fields → 0, entries_this_disk → entries_total
+    if has_zip64 {
+        if let Some(z64_off) = zip64_eocd_off {
+            write_u32_le(&mut file, z64_off + 16, 0)?; // disk_number
+            write_u32_le(&mut file, z64_off + 20, 0)?; // disk_with_cd
+            if zip64_entries_this_disk != zip64_entries_total {
+                write_u64_le(&mut file, z64_off + 24, zip64_entries_total)?;
+            }
+        }
+    }
+
+    file.flush()?;
+    Ok(MultidiskNormalize::Rewrote)
+}
+
+/// Copy `path` into a new temp file (for safe in-place EOCD rewrite of a user archive).
+fn materialize_archive_copy(path: &Path) -> io::Result<NamedTempFile> {
+    let mut tmp = NamedTempFile::new()?;
+    let mut src = File::open(path)?;
+    io::copy(&mut src, &mut tmp)?;
+    tmp.flush()?;
+    Ok(tmp)
+}
+
+/// Open a ZIP path, joining multi-part volumes when present and normalizing multi-disk EOCD.
 fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
     if let Some(parts) = detect_multipart_zip_parts(path) {
         if parts.len() > 1 {
             let (tmp, _) = materialize_joined_parts(&parts)?;
+            // Rewrite multi-disk markers on the joined stream when CD offsets look cumulative.
+            let outcome = normalize_multidisk_eocd(tmp.path())?;
             let file = File::open(tmp.path())?;
             let open_path = tmp.path().to_path_buf();
             return Ok(OpenedArchive {
@@ -665,17 +957,94 @@ fn open_archive_file(path: &Path) -> Result<OpenedArchive> {
                 file,
                 _joined: Some(tmp),
                 multipart_parts: Some(parts),
+                multidisk_normalized: outcome == MultidiskNormalize::Rewrote,
             });
         }
     }
-    let file = File::open(path)?;
-    Ok(OpenedArchive {
-        user_path: path.to_path_buf(),
-        open_path: path.to_path_buf(),
-        file,
-        _joined: None,
-        multipart_parts: None,
-    })
+
+    // Single file: if multi-disk markers are present and safe to rewrite, materialize a
+    // private copy (never mutate the user archive) and normalize there.
+    match normalize_probe_and_copy(path)? {
+        Some((tmp, outcome)) => {
+            let file = File::open(tmp.path())?;
+            let open_path = tmp.path().to_path_buf();
+            Ok(OpenedArchive {
+                user_path: path.to_path_buf(),
+                open_path,
+                file,
+                _joined: Some(tmp),
+                multipart_parts: None,
+                multidisk_normalized: outcome == MultidiskNormalize::Rewrote,
+            })
+        }
+        None => {
+            let file = File::open(path)?;
+            Ok(OpenedArchive {
+                user_path: path.to_path_buf(),
+                open_path: path.to_path_buf(),
+                file,
+                _joined: None,
+                multipart_parts: None,
+                multidisk_normalized: false,
+            })
+        }
+    }
+}
+
+/// If `path` has multi-disk EOCD markers, copy to temp and normalize.
+/// Returns `None` when no rewrite is needed (already single-disk).
+fn normalize_probe_and_copy(
+    path: &Path,
+) -> Result<Option<(NamedTempFile, MultidiskNormalize)>> {
+    // Cheap tail probe: only copy when multi-disk fields are non-zero / multi-disk.
+    if !eocd_looks_multidisk(path)? {
+        return Ok(None);
+    }
+    let tmp = materialize_archive_copy(path)?;
+    let outcome = normalize_multidisk_eocd(tmp.path())?;
+    match outcome {
+        MultidiskNormalize::Rewrote => Ok(Some((tmp, outcome))),
+        // Unsafe or unchanged after probe race: fall back to original path.
+        MultidiskNormalize::Unchanged | MultidiskNormalize::UnsafePerDiskLayout => Ok(None),
+    }
+}
+
+/// Cheap read-only check: EOCD (and ZIP64 locator if present) indicate multi-disk.
+fn eocd_looks_multidisk(path: &Path) -> io::Result<bool> {
+    let mut file = File::open(path)?;
+    let file_len = file.seek(SeekFrom::End(0))?;
+    if file_len < EOCD_MIN_LEN as u64 {
+        return Ok(false);
+    }
+    let tail_len = (EOCD_SEARCH_MAX as u64).min(file_len) as usize;
+    let data_start = file_len - tail_len as u64;
+    let mut tail = vec![0u8; tail_len];
+    file.seek(SeekFrom::Start(data_start))?;
+    file.read_exact(&mut tail)?;
+    let Some(eocd_off) = find_eocd_in_tail(&tail, data_start, file_len) else {
+        return Ok(false);
+    };
+    let eocd_in_tail = (eocd_off - data_start) as usize;
+    let eocd = &tail[eocd_in_tail..eocd_in_tail + EOCD_MIN_LEN];
+    let disk_number = read_u16_le(eocd, 4);
+    let disk_with_cd = read_u16_le(eocd, 6);
+    if disk_number != 0 || disk_with_cd != 0 || disk_number != disk_with_cd {
+        return Ok(true);
+    }
+    if eocd_off >= EOCD64_LOCATOR_LEN as u64 {
+        let loc_off = eocd_off - EOCD64_LOCATOR_LEN as u64;
+        if loc_off >= data_start {
+            let rel = (loc_off - data_start) as usize;
+            if rel + EOCD64_LOCATOR_LEN <= tail.len() && tail[rel..rel + 4] == EOCD64_LOCATOR_SIG {
+                let number_of_disks = read_u32_le(&tail[rel..], 16);
+                let disk_with = read_u32_le(&tail[rel..], 4);
+                if number_of_disks > 1 || disk_with != 0 {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    Ok(false)
 }
 
 /// Detect consecutive multi-part ZIP volumes on disk.
@@ -1081,5 +1450,139 @@ mod tests {
         assert!(!is_z_volume_ext("zip"));
         assert!(!is_z_volume_ext("001"));
         assert!(!is_z_volume_ext("za1"));
+    }
+
+    /// Patch ZIP32 EOCD disk fields so the zip crate would reject the archive as multi-disk.
+    fn patch_eocd_multidisk(data: &mut [u8], disk_number: u16, disk_with_cd: u16) {
+        let sig = [0x50u8, 0x4b, 0x05, 0x06];
+        let mut eocd = None;
+        if data.len() >= EOCD_MIN_LEN {
+            let mut i = data.len() - EOCD_MIN_LEN;
+            loop {
+                if data[i..i + 4] == sig {
+                    let comment_len =
+                        u16::from_le_bytes([data[i + 20], data[i + 21]]) as usize;
+                    if i + EOCD_MIN_LEN + comment_len == data.len() {
+                        eocd = Some(i);
+                        break;
+                    }
+                }
+                if i == 0 {
+                    break;
+                }
+                i -= 1;
+            }
+        }
+        let i = eocd.expect("EOCD");
+        data[i + 4..i + 6].copy_from_slice(&disk_number.to_le_bytes());
+        data[i + 6..i + 8].copy_from_slice(&disk_with_cd.to_le_bytes());
+    }
+
+    #[test]
+    fn normalize_multidisk_eocd_rewrites_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.zip");
+        write_sample_zip(&path, "hello.txt", b"hello multi-disk\n");
+        let mut full = std::fs::read(&path).unwrap();
+        // disk_number=1, disk_with_cd=0 → zip crate multi-disk reject
+        patch_eocd_multidisk(&mut full, 1, 0);
+        std::fs::write(&path, &full).unwrap();
+
+        assert!(eocd_looks_multidisk(&path).unwrap());
+        // Raw zip crate must reject before normalize (message may be multi-disk or a
+        // follow-on "Could not find EOCD" after it skips the multi-disk candidate).
+        {
+            let f = File::open(&path).unwrap();
+            assert!(
+                ZipArchive::new(f).is_err(),
+                "zip crate should reject multi-disk EOCD before normalize"
+            );
+        }
+
+        assert_eq!(
+            normalize_multidisk_eocd(&path).unwrap(),
+            MultidiskNormalize::Rewrote
+        );
+        assert!(!eocd_looks_multidisk(&path).unwrap());
+        let f = File::open(&path).unwrap();
+        let mut z = ZipArchive::new(f).expect("open after normalize");
+        assert_eq!(z.len(), 1);
+        let mut r = z.by_index(0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello multi-disk\n");
+    }
+
+    #[test]
+    fn open_synthetic_multidisk_eocd_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("synthetic-multi.zip");
+        write_sample_zip(&path, "hello.txt", b"hello multi-disk\n");
+        let mut full = std::fs::read(&path).unwrap();
+        patch_eocd_multidisk(&mut full, 2, 0);
+        std::fs::write(&path, &full).unwrap();
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true)
+            .expect("open synthetic multi-disk EOCD after rewrite");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup");
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello multi-disk\n");
+    }
+
+    #[test]
+    fn open_concatenated_z01_with_multidisk_eocd() {
+        let dir = tempfile::tempdir().unwrap();
+        let complete = dir.path().join("complete.zip");
+        write_sample_zip(&complete, "hello.txt", b"hello multi-part multi-disk\n");
+        let mut full = std::fs::read(&complete).unwrap();
+        // Simulate a multi-volume marker on an otherwise cumulative single stream.
+        patch_eocd_multidisk(&mut full, 1, 0);
+        let mid = full.len() / 2;
+        let z01 = dir.path().join("archive.z01");
+        let zlast = dir.path().join("archive.zip");
+        std::fs::write(&z01, &full[..mid]).unwrap();
+        std::fs::write(&zlast, &full[mid..]).unwrap();
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&z01, None, &opts, "test", true).expect("open z01 multi-eocd");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup");
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello multi-part multi-disk\n");
+    }
+
+    #[test]
+    fn normalize_skips_when_cd_offset_not_absolute() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("perdisk.zip");
+        write_sample_zip(&path, "hello.txt", b"x");
+        let mut full = std::fs::read(&path).unwrap();
+        // Multi-disk markers + corrupt CD offset so absolute CDFH check fails.
+        patch_eocd_multidisk(&mut full, 1, 0);
+        let sig = [0x50u8, 0x4b, 0x05, 0x06];
+        let eocd = full
+            .windows(4)
+            .rposition(|w| w == sig)
+            .expect("eocd");
+        // Point CD offset at byte 0 (local header PK\x03\x04, not CDFH) → unsafe.
+        full[eocd + 16..eocd + 20].copy_from_slice(&0u32.to_le_bytes());
+        std::fs::write(&path, &full).unwrap();
+
+        assert_eq!(
+            normalize_multidisk_eocd(&path).unwrap(),
+            MultidiskNormalize::UnsafePerDiskLayout
+        );
+        // Markers left intact.
+        assert!(eocd_looks_multidisk(&path).unwrap());
     }
 }
