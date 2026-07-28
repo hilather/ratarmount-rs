@@ -20,6 +20,9 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Portable unmount / mount helpers (Linux + macOS)
+# shellcheck source=../test-harness/env.sh
+source "$ROOT/test-harness/env.sh"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 RUST_BIN="${RUST_BIN:-$ROOT/target/release/ratarmount}"
 MICRO="${MICRO:-0}"
@@ -29,7 +32,12 @@ if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
 else
     PY_PYTHON="${PY_PYTHON:-python3}"
 fi
-PY_CMD="${PY_CMD:-$PY_PYTHON -X dev -W ignore::DeprecationWarning:fuse -u -m ratarmount}"
+# Prefer installed CLI if present (venv); else -m ratarmount
+if [[ -x "$(dirname "$PY_PYTHON")/ratarmount" ]]; then
+    PY_CMD="${PY_CMD:-$(dirname "$PY_PYTHON")/ratarmount}"
+else
+    PY_CMD="${PY_CMD:-$PY_PYTHON -X dev -W ignore::DeprecationWarning:fuse -u -m ratarmount}"
+fi
 
 export PATH="${HOME}/.cargo/bin:${PATH}"
 

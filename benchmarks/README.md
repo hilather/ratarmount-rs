@@ -2,9 +2,12 @@
 
 ## Head-to-head (Python vs Rust)
 
+Latest committed numbers: [`python-vs-rust-results.md`](python-vs-rust-results.md) (**2026-07-28**, ratarmount-rs **v0.1.3** area).
+
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount   # sibling checkout with Python package
 cargo build --release
+# Optional: python -m venv benchmarks/.venv-py && pip install -e "$RATARMOUNT_PY_ROOT"
 ./benchmarks/compare-python-vs-rust.sh
 # → benchmarks/python-vs-rust-results.{csv,md}
 
@@ -13,7 +16,7 @@ MICRO=1 ./benchmarks/compare-python-vs-rust.sh
 # → benchmarks/python-vs-rust-results-micro.{csv,md}
 ```
 
-Requires FUSE, a Python ratarmount install (or venv under `benchmarks/.venv-py`), and the usual system deps.
+Requires FUSE, a Python ratarmount install (or venv under `benchmarks/.venv-py`), and the usual system deps. The compare script sources `test-harness/env.sh` for portable unmount helpers.
 
 ## CI gates (`rust-gates.json`)
 

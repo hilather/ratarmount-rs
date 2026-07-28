@@ -4,10 +4,11 @@ Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) �
 
 | | |
 |--|--|
+| **Version** | **0.1.3** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
 | **Language** | Rust (edition 2021) |
 | **FUSE** | `fuser` low-level (inode API) |
 | **Platforms** | Linux (primary) · **macOS** (beta: arm64 + x86_64 tarballs) |
-| **Upstream** | Feature parity tracked vs [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount) |
+| **Upstream** | Feature parity vs [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount) |
 | **Living checklist** | [docs/parity-todo.md](docs/parity-todo.md) · [docs/mount-options-parity.md](docs/mount-options-parity.md) |
 | **Dual-run / crates.io** | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) · [docs/crates-io-policy.md](docs/crates-io-policy.md) |
 
@@ -18,21 +19,28 @@ ratarmount archive.tar.gz mnt/
 
 ---
 
-## Python vs Rust — at a glance
+## Python ratarmount vs ratarmount-rs
 
-| Dimension | Python (`mxmlnkn/ratarmount`) | Rust (`ratarmount-rs`) |
-|-----------|------------------------------|------------------------|
+Both tools mount archives over FUSE with a **shared SQLite index schema** (0.7.x interop for TAR/ZIP/7z). Python is the mature reference implementation; Rust is a native rewrite optimized for cold mount cost and resident memory.
+
+| Dimension | Python (`mxmlnkn/ratarmount`) | Rust (`ratarmount-rs` 0.1.3) |
+|-----------|------------------------------|------------------------------|
 | **Runtime** | CPython + native codec libs | Single static-friendly binary |
 | **FUSE** | mfusepy (fusepy fork) | `fuser` low-level |
 | **Index** | SQLite 0.7.x | Same schema (TAR/ZIP/7z interop) |
-| **Memory (mount)** | ~110–350 MiB typical | **~13–20 MiB** peak RSS (~7–9× lower geo-mean) |
-| **Cold mount (geo-mean)** | baseline | **~4.5× faster** |
-| **Random access / find** | Strong on some nested/ZIP shapes | Geo-mean: cold random ~1.3× Rust; warm random slightly Python; `find` ~1.2× Rust |
-| **Remote** | Broad fsspec (SMB, Dropbox, …) | `http(s)`, `file`, `s3`, `ssh`/`sftp` |
-| **Write overlay** | Full + commit | Full + commit (uncompressed TAR) |
-| **Maturity** | Production / PyPI / AppImage | Feature-rich beta; packaging CI landing |
+| **Memory (mount)** | ~110–350 MiB typical | **~14–28 MiB** peak RSS (geo-mean **~6–8×** lower) |
+| **Cold mount (geo-mean)** | baseline | **~3.6× faster** |
+| **Warm mount (geo-mean)** | baseline | **~3.8× faster** |
+| **Random cat / seq. read** | Often stronger on compressed TAR (rapidgzip / block maps) | Strong on large uncompressed TAR; geo-mean slightly behind Python on this host |
+| **Nested archives (`-r`)** | Recursive automount | Same + **no-tmp** nested open for most stencil formats |
+| **Remote** | Broad fsspec | `file` / `http(s)` / `s3` / `ssh`·`sftp` / WebDAV / SMB / Dropbox |
+| **Write overlay** | Full + commit | Full + commit (TAR + gzip/bzip2/xz via GNU tar) |
+| **Maturity** | Production / PyPI / AppImage | Feature-rich beta; **deb/rpm/portable + macOS** packages on GitHub Releases |
 
-Rust is not a drop-in replacement for every Python workflow yet (see [gaps](#gaps-vs-python-ratarmount)), but for common TAR/ZIP/7z mounts it is substantially leaner and usually faster to mount.
+**When to prefer Rust:** low-memory hosts, many short-lived mounts, large uncompressed TAR sequential I/O, nested archives without `/tmp` spool.  
+**When to prefer Python:** maximum codec maturity (rapidgzip / bit-block bzip2), widest fsspec ecosystem, long-tail workflows already wired to the Python stack.
+
+Rust is not a drop-in for every Python workflow yet (see [gaps](#gaps-vs-python-ratarmount)), but for common TAR/ZIP/7z mounts it is substantially leaner and usually **much faster to mount**.
 
 ---
 
@@ -42,55 +50,56 @@ Rust is not a drop-in replacement for every Python workflow yet (see [gaps](#gap
 
 | Format | Python | Rust | Notes |
 |--------|:------:|:----:|-------|
-| TAR (ustar / PAX / GNU) + sparse | yes | yes | GNU incremental: detect only in Rust |
-| ZIP (store / deflate, password) | yes | yes | Multi-disk / full crypto still limited |
-| 7z custom pack-offset + AES / BCJ2 | yes* | yes | *fork improvements; solid multi-GB progressive still open |
-| AR / CPIO | yes | yes | |
-| ISO 9660 / WARC / XAR / CAB / ASAR | yes | yes | CAB LZX → libarchive fallback |
-| SquashFS | yes | MVP | Rust: `unsquashfs` materialize |
-| EXT4 | yes | MVP | Rust: `debugfs rdump` |
-| FAT12/16/32 | yes | yes | Pure Rust (`fatfs`) |
-| SQLAR | yes | yes | Unencrypted; sqlcipher later |
-| PDF / OGG / HTML / Git | yes | yes | PDF images deferred; Git needs `RATARMOUNT_FORCE_GIT=1` for some trees |
+| TAR (ustar / PAX / GNU) + sparse | yes | yes | GNU incremental: detect + dumpdir / prefix strip |
+| ZIP (store / deflate, password) | yes | yes | Multi-part join; multi-disk EOCD normalize; residual per-disk edges |
+| 7z custom pack-offset + AES / BCJ2 | yes* | yes | *fork RA work; pure LZMA2 progressive; solid BCJ/AES still heavy |
+| AR / CPIO | yes | yes | `open_from_reader` (nested no-tmp) |
+| ISO 9660 / WARC / XAR / CAB / ASAR | yes | yes | CAB LZX → libarchive; others stream-open for nested |
+| SquashFS | yes | yes | backhand in-process; classic lzma → `unsquashfs` |
+| EXT4 | yes | yes | pure `ext4-view` + `debugfs` fallback |
+| FAT12/16/32 | yes | yes | Pure Rust (`fatfs`); nested `open_from_reader` |
+| SQLAR | yes | yes | Unencrypted stream open (RAM deserialize); sqlcipher optional |
+| PDF / OGG / HTML / Git | yes | yes | PDF attachments + common XObjects; Git may need `RATARMOUNT_FORCE_GIT=1` |
 | RAR / LHA / long-tail | yes | yes | via libarchive (sequential member open) |
-| Split files (`.001`) | yes | yes | decimal/hex/alpha join at open |
-| lrzip | yes | yes | CLI materialize + libarchive fallback; pure in-process open |
+| Split files (`.001`) | yes | yes | decimal/hex/alpha join at open + recursive AutoMount |
+| lrzip | yes | yes | CLI materialize + libarchive fallback |
 
 ### Compression (outer / seekable)
 
 | Codec | Python | Rust | Notes |
 |-------|:------:|:----:|-------|
-| gzip | yes (rapidgzip / seek points) | yes | TAR path seekable; plain `.gz` may materialize |
-| bzip2 | yes (block-parallel) | yes | Tier B lite (not true bit-block map / `-P`) |
-| xz | yes (multi-block) | yes | Tier B lite (not full stream index) |
-| zstd | yes (seek table) | yes | Multi-frame map; seek-table import open |
-| lz4 / lzip / lzo / .Z / lzma / zlib | yes | yes | Seekable in both |
+| gzip | yes (rapidgzip / seek points) | yes | TAR **and** plain `.gz` seekable (no full materialize); RGZI Tier C import/export |
+| bzip2 | yes (block-parallel) | yes | Multi-stream + `bzip2blocks` side table; residual true bit-block polish |
+| xz | yes (multi-block) | yes | Index / multi-stream maps; single-block full decode residual |
+| zstd | yes (seek table) | yes | Multi-frame + seek-table + `zstdblocks` import/export |
+| lz4 / lzip / lzo / .Z / lzma / zlib | yes | yes | Seekable bodies in both |
 
 ### Compositing & mount UX
 
 | Ability | Python | Rust |
 |---------|:------:|:----:|
-| Recursive automount (`-r`) | yes | yes | Nested TAR/ZIP/7z/`.tar.gz` prefer **no `/tmp`** stream open — [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) |
+| Recursive automount (`-r`) | yes | yes — **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)) |
 | Lazy mount (`-l`) | yes | yes |
-| Union of multiple sources | yes | yes |
+| Union of multiple sources | yes | yes (+ folder cache knobs) |
 | Write overlay (`-w` / `:temp:`) | yes | yes |
-| `--commit-overlay` | yes | uncompressed TAR (+ GNU tar) |
-| File versions (`.versions/`) | yes | yes |
+| `--commit-overlay` | yes | TAR + gzip/bzip2/xz (GNU tar) |
+| File versions (`.versions/`) | yes | yes (default on; `--no-file-versions`) |
 | Strip / transform recursive paths | yes | yes |
 | Prefix (`-p`) | yes | yes |
-| Control interface | in-FS folder | Unix socket |
+| Control interface | in-FS folder | Unix socket **+** in-FS `/.ratarmount-control/` |
 | Daemonize / foreground (`-f`) | yes | yes |
 | Password / password-file | yes | yes |
+| Content hashes / FUSE xattrs | yes | yes (TAR/ZIP/7z) |
 
 ### Remote
 
 | Protocol | Python | Rust |
 |----------|:------:|:----:|
 | `file://` | yes | yes |
-| `http(s)://` | yes | yes (full GET; Range helper only) |
-| `s3://` | yes | yes (SigV4 env creds) |
+| `http(s)://` | yes | yes (full GET + **live Range** for TAR/ZIP/gzip/bzip2/xz/zstd) |
+| `s3://` | yes | yes (SigV4 env + IMDS/ECS + anonymous; Range prefer) |
 | `ssh://` / `sftp://` | yes | yes |
-| SMB / WebDAV / Dropbox / GitHub fsspec | yes | — |
+| WebDAV / SMB / Dropbox | yes | yes (folder list + ranged content) |
 
 Full option matrix: [`docs/mount-options-parity.md`](docs/mount-options-parity.md).  
 Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).
@@ -101,23 +110,21 @@ Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).
 
 Still missing or partial relative to upstream Python:
 
-1. **Seekable codecs (depth)** — true bzip2 bit-block map + `-P` parallel; xz stream index; zstd seek-table / `zstdblocks` import; gzip Tier C blob import.
-2. **Formats** — in-process SquashFS/EXT4 (drop helpers); encrypted SQLAR; GNU incremental TAR semantics; stronger RAR; PDF embedded images.
-3. **7z solids** — large pure LZMA2 uses progressive prefix decode (≤4 MiB still full-cached); BCJ/AES folders still full-folder; chunk resume cache unfinished.
-4. **Remote breadth** — SMB/WebDAV/Dropbox; HTTP Range-backed format readers (no full download); remote/compressed indexes.
-5. **Index extras** — file hashes / xattrs; full compression side-table interop with Python.
-6. **CLI polish** — colored logs; in-FS control folder (Rust uses a Unix socket); full `-P backend:n` matrix; OSS attributions depth.
-7. **Packaging** — PyPI/AppImage ecosystem is mature for Python; Rust has distro package CI (deb/rpm/portable + cosign, macOS tarballs) and AppImage scaffolding — polish ongoing.
-8. **Platforms** — **macOS is beta** (arm64/x86_64 tarballs + CI); requires [macFUSE or FUSE-T](docs/macos.md). Full harness parity and Homebrew formula still open.
+1. **Codec depth** — true bzip2 bit-block map / `-P` parity; exotic xz filters; rapidgzip-class throughput.
+2. **Formats** — pure in-process classic SquashFS lzma (no `unsquashfs`); pure RAR; encrypted SQLAR decrypt without path/sqlcipher; residual PDF color spaces.
+3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
+4. **Remote** — full `ssh_config` parity; some remote index edge cases.
+5. **CLI polish** — colored logs; full OSS attributions; optional Homebrew formula.
+6. **Platforms** — macOS is **beta** (arm64/x86_64 tarballs + CI); needs [macFUSE or FUSE-T](docs/macos.md). Full harness parity open.
 
 ---
 
 ## Performance vs Python
 
 Head-to-head harness: [`benchmarks/compare-python-vs-rust.sh`](benchmarks/compare-python-vs-rust.sh).  
-Full tables: [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md).
+**Latest tables (2026-07-28 refresh):** [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md).
 
-**Methodology (same as upstream mounting/bandwidth style):**
+**Methodology (same spirit as upstream mounting/bandwidth benches):**
 
 - **Cold mount**: recreate index (`-c`) until FUSE is usable  
 - **Warm mount**: reuse SQLite index  
@@ -127,37 +134,37 @@ Full tables: [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-
 - Peak RSS from `/proc/<pid>/status` `VmHWM`  
 - Both tools run with `-f` for comparable process measurement  
 
-### Geometric-mean summary (2026-07-26 refresh)
+### Geometric-mean summary (2026-07-28)
 
-From [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md).  
-Factor **>1 ⇒ Rust better**.
+Factor **>1 ⇒ Rust better**, **&lt;1 ⇒ Python better**.
 
 | Metric | Cold | Warm | Interpretation |
 |--------|------|------|----------------|
-| Mount time | **4.50×** | **4.00×** | Rust mounts much faster |
-| Peak RSS | **7.53×** | **8.61×** | Rust ~8× leaner on average |
-| Random cat (median) | **1.31×** | **0.89×** | Cold slight Rust edge; warm slight Python |
-| find walk | **1.18×** | **1.31×** | Rust ahead on metadata walks overall |
-| Seq. bandwidth | **1.59×** | **1.38×** | Rust ahead on sequential read overall |
+| Mount time | **3.63×** | **3.84×** | Rust mounts much faster |
+| Peak RSS | **6.47×** | **8.01×** | Rust ~6–8× leaner on average |
+| Random cat (median) | **0.84×** | **0.75×** | Python slightly ahead (esp. compressed TAR) |
+| find walk | **1.21×** | **1.26×** | Rust ahead on metadata walks overall |
+| Seq. bandwidth | **0.88×** | **0.78×** | Python slight geo-mean edge; **large uncompressed TAR strongly favors Rust** |
 
 ### Highlight fixtures (this run)
 
 | Archive | What stands out |
 |---------|-----------------|
-| `empty-1k.tar` | Cold mount **5.53×** faster; RSS ~8× lower; warm `find` **2.20×** faster |
-| `large-64m.tar` | Random cat ~**4×** faster; sequential bandwidth **3.9–4.7×** higher (7+ GiB/s) |
-| `small-100.tar.gz` | Warm mount **8.14×** faster; warm RSS **26.6×** lower (Python ~350 MiB vs Rust ~13 MiB) |
-| `small-100.tar.xz` | Seq. bandwidth **3.6–5.4×** better for Rust on this host |
-| `small-100.zip` / nested | More mixed — Python can win random cat / bandwidth on some shapes |
+| `empty-1k.tar` | Cold mount **5.69×** faster; warm `find` **~4×** faster; RSS ~7× lower |
+| `large-64m.tar` | Random cat **~4×** faster; sequential bandwidth **3–3.7×** higher (multi‑GiB/s) |
+| `small-100.tar.gz` | Warm mount **7.76×** faster; warm RSS **25×** lower (Python ~351 MiB vs Rust ~14 MiB) |
+| `small-100.tar.bz2` | Cold mount still slower on Rust (map build); random cat **~1.8×** faster once mounted |
+| `small-100.zip` | Mount **~4.7×** faster; random cat mixed (Python often wins small deflate reads) |
 
 **Caveats**
 
 - Single-host, single-run wall times — directional, not publication-grade.  
-- Compressed TAR uses seekable outer codecs in Rust (`SeekableBody` / multi-frame maps); plain single-file `.gz` etc. may still materialize. Python may use rapidgzip / block-parallel paths.  
+- Compressed TAR: Python may use rapidgzip / block-parallel paths; Rust uses seekable bodies (checkpoints / frame maps) without full archive spool.  
 - Re-run anytime:
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount
+cargo build --release
 ./benchmarks/compare-python-vs-rust.sh
 ```
 
@@ -171,7 +178,7 @@ export RATARMOUNT_PY_ROOT=../ratarmount
 - `libfuse3` / `fuse3`
 - `libarchive` (long-tail formats)
 - `zlib` headers (flate2/system zlib)
-- Optional: `e2fsprogs` (`debugfs`) for EXT4, `squashfs-tools` for SquashFS
+- Optional: `e2fsprogs` (`debugfs`) for EXT4 fallback, `squashfs-tools` for classic SquashFS lzma
 - Sibling Python checkout for fixtures (default `../ratarmount`) for the harness
 
 **macOS** — full guide: [`docs/macos.md`](docs/macos.md) (FUSE install, Tahoe/FSKit, build, smoke)
@@ -198,7 +205,7 @@ make install          # → ~/.local/bin/ratarmount
 # macOS package: ./packaging/build-macos-tarball.sh
 ```
 
-**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64/x86_64 tarballs**, with cosign keyless signatures. See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
+**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64/x86_64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. **v0.1.3**) publishes a GitHub Release. See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
 
 ## Test
 
@@ -209,7 +216,7 @@ cargo test --workspace
 ./benchmarks/compare-python-vs-rust.sh   # optional head-to-head
 ```
 
-CI (`.github/workflows/ci.yml`): `cargo fmt`, `clippy -D warnings`, `cargo test`, plus FUSE phase allowlists against upstream fixtures.
+CI (`.github/workflows/ci.yml`): `cargo fmt`, `clippy -D warnings`, `cargo test`, FUSE phase allowlists, cold-index gates, macOS build/test.
 
 ## CLI (subset)
 
@@ -249,7 +256,7 @@ ratarmount-fuse/            # fuser low-level FS
 ratarmount-compress/        # seekable codecs + stencils
 ratarmount-formats-{tar,zip,ar,cpio,iso9660,warc,xar,cab,asar,ogg,html,pdf,git,sevenzip,sqlar,squashfs,ext4,fat,libarchive}/
 ratarmount-compositing/     # folder, union, automount, overlay
-ratarmount-remote/          # http/s3/ssh
+ratarmount-remote/          # http/s3/ssh/webdav/smb/dropbox
 test-harness/               # phase allowlists + runners
 packaging/                  # desktop entry + AppImage / nfpm
 benchmarks/                 # Python vs Rust comparison
@@ -272,7 +279,7 @@ Recursive mounts open nested archives from a **seekable parent member stream** w
 
 \* ZIP deflate and solid 7z still decompress (CPU/RAM); they avoid nested **disk** spool when the stream path succeeds.
 
-Full matrix, parent×nested table, and “when is `/tmp` used?”: **[docs/embedded-nested-archives.md](docs/embedded-nested-archives.md)**.
+Compared to Python: both support `-r`; Rust’s no-tmp nested path is explicit for stencil formats and plain seekable compress (see matrix). Full detail: **[docs/embedded-nested-archives.md](docs/embedded-nested-archives.md)**.
 
 ```bash
 ratarmount -r archive.zip mnt/          # e.g. mnt/inner.tar/file.txt — no /tmp for inner.tar
@@ -286,7 +293,7 @@ RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in log
 | [docs/parity-todo.md](docs/parity-todo.md) | **Full feature + test parity checklist** |
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | **Nested/embedded: no-tmp vs temp, random read by format** |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
-| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | G3 materialize decision |
+| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path (TAR + plain) |
 | [docs/phase9-formats.md](docs/phase9-formats.md) | Long-tail formats |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote URL backends |
 | [docs/phase11-packaging.md](docs/phase11-packaging.md) | Packaging notes |
@@ -295,6 +302,7 @@ RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in log
 | [docs/tasks/embedded-nested-random-access.md](docs/tasks/embedded-nested-random-access.md) | Nested no-tmp implementation tasks |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
 | [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers |
+| [benchmarks/README.md](benchmarks/README.md) | How to re-run benches + CI gates |
 
 ## License
 
@@ -303,4 +311,5 @@ MIT (aligned with upstream ratarmount intent; see `Cargo.toml` workspace license
 ## Related
 
 - Upstream Python: [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount)
+- This fork’s releases: [hilather/ratarmount-rs releases](https://github.com/hilather/ratarmount-rs/releases)
 - SevenZip random-access work: [hilather/ratarmount#1](https://github.com/hilather/ratarmount/pull/1)

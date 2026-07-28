@@ -18,150 +18,150 @@ Methodology (aligned with upstream mounting/bandwidth benchmarks):
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 339.6 ms | 61.4 ms | Rust **5.53×** faster |
-| Mount time | warm | 281.4 ms | 63.4 ms | Rust **4.44×** faster |
-| Peak RSS | cold | 116.1 MiB | 14.8 MiB | Rust **7.86×** lower |
-| Peak RSS | warm | 116.1 MiB | 14.4 MiB | Rust **8.05×** lower |
-| Random cat (median) | cold | 2.9 ms | 4.8 ms | Python **1.65×** faster |
-| Random cat (median) | warm | 2.2 ms | 3.4 ms | Python **1.54×** faster |
-| find walk | cold | 15.3 ms | 10.0 ms | Rust **1.53×** faster |
-| find walk | warm | 15.2 ms | 6.9 ms | Rust **2.20×** faster |
+| Mount time | cold | 339.1 ms | 59.6 ms | Rust **5.69×** faster |
+| Mount time | warm | 281.7 ms | 60.7 ms | Rust **4.64×** faster |
+| Peak RSS | cold | 116.6 MiB | 15.9 MiB | Rust **7.35×** lower |
+| Peak RSS | warm | 116.6 MiB | 15.7 MiB | Rust **7.42×** lower |
+| Random cat (median) | cold | 2.2 ms | 1.9 ms | Rust **1.17×** faster |
+| Random cat (median) | warm | 2.3 ms | 1.9 ms | Rust **1.17×** faster |
+| find walk | cold | 17.9 ms | 3.8 ms | Rust **4.71×** faster |
+| find walk | warm | 17.4 ms | 4.4 ms | Rust **3.95×** faster |
 
 ## `large-64m.tar`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 284.4 ms | 61.5 ms | Rust **4.62×** faster |
-| Mount time | warm | 281.5 ms | 61.0 ms | Rust **4.61×** faster |
-| Peak RSS | cold | 116.1 MiB | 13.8 MiB | Rust **8.40×** lower |
-| Peak RSS | warm | 116.1 MiB | 13.8 MiB | Rust **8.41×** lower |
-| Random cat (median) | cold | 34.2 ms | 8.6 ms | Rust **3.96×** faster |
-| Random cat (median) | warm | 33.4 ms | 8.5 ms | Rust **3.93×** faster |
-| find walk | cold | 2.6 ms | 2.4 ms | Rust **1.08×** faster |
-| find walk | warm | 2.5 ms | 2.1 ms | Rust **1.19×** faster |
-| Seq. bandwidth | cold | 1908.6 MiB/s | 7382.6 MiB/s | Rust **3.87×** better |
-| Seq. bandwidth | warm | 1642.7 MiB/s | 7776.4 MiB/s | Rust **4.73×** better |
-| Seq. read time | cold | 33.5 ms | 8.7 ms | Rust **3.87×** faster |
-| Seq. read time | warm | 39.0 ms | 8.2 ms | Rust **4.73×** faster |
+| Mount time | cold | 282.3 ms | 61.2 ms | Rust **4.61×** faster |
+| Mount time | warm | 282.7 ms | 68.3 ms | Rust **4.14×** faster |
+| Peak RSS | cold | 116.3 MiB | 15.2 MiB | Rust **7.64×** lower |
+| Peak RSS | warm | 116.4 MiB | 14.7 MiB | Rust **7.94×** lower |
+| Random cat (median) | cold | 36.8 ms | 8.9 ms | Rust **4.12×** faster |
+| Random cat (median) | warm | 35.2 ms | 9.3 ms | Rust **3.78×** faster |
+| find walk | cold | 2.4 ms | 2.9 ms | Python **1.21×** faster |
+| find walk | warm | 2.3 ms | 2.6 ms | Python **1.13×** faster |
+| Seq. bandwidth | cold | 1565.7 MiB/s | 4656.2 MiB/s | Rust **2.97×** better |
+| Seq. bandwidth | warm | 1904.7 MiB/s | 7013.7 MiB/s | Rust **3.68×** better |
+| Seq. read time | cold | 40.9 ms | 13.7 ms | Rust **2.97×** faster |
+| Seq. read time | warm | 33.6 ms | 9.1 ms | Rust **3.68×** faster |
 
 ## `nested-tar.tar`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 337.4 ms | 61.7 ms | Rust **5.47×** faster |
-| Mount time | warm | 280.9 ms | 66.3 ms | Rust **4.24×** faster |
-| Peak RSS | cold | 116.1 MiB | 13.9 MiB | Rust **8.33×** lower |
-| Peak RSS | warm | 116.1 MiB | 13.7 MiB | Rust **8.45×** lower |
-| Random cat (median) | cold | 8.8 ms | 4.6 ms | Rust **1.91×** faster |
-| Random cat (median) | warm | 2.3 ms | 3.3 ms | Python **1.42×** faster |
-| find walk | cold | 13.0 ms | 5.7 ms | Rust **2.28×** faster |
-| find walk | warm | 5.4 ms | 4.5 ms | Rust **1.20×** faster |
-| Seq. bandwidth | cold | 0.3 MiB/s | 0.5 MiB/s | Rust **1.83×** better |
-| Seq. bandwidth | warm | 0.5 MiB/s | 0.8 MiB/s | Rust **1.47×** better |
-| Seq. read time | cold | 8.4 ms | 4.6 ms | Rust **1.82×** faster |
-| Seq. read time | warm | 4.7 ms | 3.2 ms | Rust **1.46×** faster |
+| Mount time | cold | 295.2 ms | 61.1 ms | Rust **4.83×** faster |
+| Mount time | warm | 281.6 ms | 63.8 ms | Rust **4.41×** faster |
+| Peak RSS | cold | 116.5 MiB | 14.8 MiB | Rust **7.90×** lower |
+| Peak RSS | warm | 116.5 MiB | 14.9 MiB | Rust **7.82×** lower |
+| Random cat (median) | cold | 2.2 ms | 5.6 ms | Python **2.58×** faster |
+| Random cat (median) | warm | 2.3 ms | 3.2 ms | Python **1.43×** faster |
+| find walk | cold | 3.6 ms | 8.0 ms | Python **2.22×** faster |
+| find walk | warm | 5.8 ms | 4.7 ms | Rust **1.23×** faster |
+| Seq. bandwidth | cold | 0.7 MiB/s | 0.0 MiB/s | — |
+| Seq. bandwidth | warm | 0.5 MiB/s | 0.0 MiB/s | — |
+| Seq. read time | cold | 3.5 ms | 5.7 ms | Python **1.66×** faster |
+| Seq. read time | warm | 4.5 ms | 3.2 ms | Rust **1.41×** faster |
 
 ## `small-100.tar`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 341.2 ms | 61.0 ms | Rust **5.59×** faster |
-| Mount time | warm | 281.3 ms | 65.3 ms | Rust **4.31×** faster |
-| Peak RSS | cold | 116.2 MiB | 13.9 MiB | Rust **8.35×** lower |
-| Peak RSS | warm | 116.1 MiB | 13.9 MiB | Rust **8.37×** lower |
-| Random cat (median) | cold | 7.1 ms | 5.1 ms | Rust **1.39×** faster |
-| Random cat (median) | warm | 3.2 ms | 4.9 ms | Python **1.51×** faster |
-| find walk | cold | 8.7 ms | 5.8 ms | Rust **1.50×** faster |
-| find walk | warm | 7.0 ms | 5.7 ms | Rust **1.23×** faster |
-| Seq. bandwidth | cold | 9.0 MiB/s | 11.9 MiB/s | Rust **1.33×** better |
-| Seq. bandwidth | warm | 11.5 MiB/s | 12.8 MiB/s | Rust **1.11×** better |
-| Seq. read time | cold | 7.0 ms | 5.2 ms | Rust **1.33×** faster |
-| Seq. read time | warm | 5.4 ms | 4.9 ms | Rust **1.11×** faster |
+| Mount time | cold | 285.4 ms | 61.6 ms | Rust **4.63×** faster |
+| Mount time | warm | 281.4 ms | 64.8 ms | Rust **4.34×** faster |
+| Peak RSS | cold | 116.5 MiB | 15.0 MiB | Rust **7.74×** lower |
+| Peak RSS | warm | 116.6 MiB | 14.8 MiB | Rust **7.87×** lower |
+| Random cat (median) | cold | 2.3 ms | 4.0 ms | Python **1.72×** faster |
+| Random cat (median) | warm | 2.5 ms | 4.9 ms | Python **1.96×** faster |
+| find walk | cold | 4.9 ms | 4.6 ms | Rust **1.07×** faster |
+| find walk | warm | 3.2 ms | 5.7 ms | Python **1.78×** faster |
+| Seq. bandwidth | cold | 15.9 MiB/s | 15.6 MiB/s | Python **1.02×** better |
+| Seq. bandwidth | warm | 19.4 MiB/s | 13.3 MiB/s | Python **1.46×** better |
+| Seq. read time | cold | 3.9 ms | 4.0 ms | Python **1.02×** faster |
+| Seq. read time | warm | 3.2 ms | 4.7 ms | Python **1.46×** faster |
 
 ## `small-100.tar.bz2`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 399.9 ms | 334.8 ms | Rust **1.19×** faster |
-| Mount time | warm | 337.6 ms | 335.6 ms | Rust **1.01×** faster |
-| Peak RSS | cold | 130.3 MiB | 19.6 MiB | Rust **6.66×** lower |
-| Peak RSS | warm | 126.7 MiB | 19.1 MiB | Rust **6.63×** lower |
-| Random cat (median) | cold | 14.3 ms | 2.3 ms | Rust **6.23×** faster |
-| Random cat (median) | warm | 15.8 ms | 4.0 ms | Rust **3.98×** faster |
-| find walk | cold | 4.2 ms | 2.7 ms | Rust **1.56×** faster |
-| find walk | warm | 6.2 ms | 6.0 ms | Rust **1.03×** faster |
-| Seq. bandwidth | cold | 3.7 MiB/s | 28.6 MiB/s | Rust **7.78×** better |
-| Seq. bandwidth | warm | 6.5 MiB/s | 12.8 MiB/s | Rust **1.96×** better |
-| Seq. read time | cold | 17.0 ms | 2.2 ms | Rust **7.77×** faster |
-| Seq. read time | warm | 9.6 ms | 4.9 ms | Rust **1.96×** faster |
+| Mount time | cold | 404.3 ms | 1.544 s | Python **3.82×** faster |
+| Mount time | warm | 400.2 ms | 559.5 ms | Python **1.40×** faster |
+| Peak RSS | cold | 129.9 MiB | 27.0 MiB | Rust **4.80×** lower |
+| Peak RSS | warm | 120.4 MiB | 26.6 MiB | Rust **4.54×** lower |
+| Random cat (median) | cold | 18.8 ms | 10.6 ms | Rust **1.76×** faster |
+| Random cat (median) | warm | 15.6 ms | 8.8 ms | Rust **1.78×** faster |
+| find walk | cold | 4.5 ms | 2.3 ms | Rust **1.96×** faster |
+| find walk | warm | 5.0 ms | 2.4 ms | Rust **2.08×** faster |
+| Seq. bandwidth | cold | 18.7 MiB/s | 7.2 MiB/s | Python **2.60×** better |
+| Seq. bandwidth | warm | 2.8 MiB/s | 6.9 MiB/s | Rust **2.46×** better |
+| Seq. read time | cold | 3.3 ms | 8.7 ms | Python **2.60×** faster |
+| Seq. read time | warm | 22.4 ms | 9.1 ms | Rust **2.46×** faster |
 
 ## `small-100.tar.gz`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 337.5 ms | 59.8 ms | Rust **5.64×** faster |
-| Mount time | warm | 502.9 ms | 61.8 ms | Rust **8.14×** faster |
-| Peak RSS | cold | 116.1 MiB | 13.8 MiB | Rust **8.43×** lower |
-| Peak RSS | warm | 350.5 MiB | 13.2 MiB | Rust **26.59×** lower |
-| Random cat (median) | cold | 2.3 ms | 7.6 ms | Python **3.30×** faster |
-| Random cat (median) | warm | 2.5 ms | 10.0 ms | Python **3.98×** faster |
-| find walk | cold | 4.7 ms | 2.9 ms | Rust **1.62×** faster |
-| find walk | warm | 5.8 ms | 2.3 ms | Rust **2.52×** faster |
-| Seq. bandwidth | cold | 11.8 MiB/s | 5.9 MiB/s | Python **2.01×** better |
-| Seq. bandwidth | warm | 12.6 MiB/s | 5.5 MiB/s | Python **2.27×** better |
-| Seq. read time | cold | 5.3 ms | 10.6 ms | Python **2.01×** faster |
-| Seq. read time | warm | 5.0 ms | 11.3 ms | Python **2.27×** faster |
+| Mount time | cold | 337.5 ms | 59.6 ms | Rust **5.66×** faster |
+| Mount time | warm | 505.0 ms | 65.1 ms | Rust **7.76×** faster |
+| Peak RSS | cold | 116.5 MiB | 14.5 MiB | Rust **8.05×** lower |
+| Peak RSS | warm | 351.0 MiB | 14.0 MiB | Rust **25.12×** lower |
+| Random cat (median) | cold | 2.2 ms | 8.2 ms | Python **3.70×** faster |
+| Random cat (median) | warm | 2.7 ms | 8.5 ms | Python **3.21×** faster |
+| find walk | cold | 2.7 ms | 2.3 ms | Rust **1.17×** faster |
+| find walk | warm | 4.6 ms | 2.3 ms | Rust **2.00×** faster |
+| Seq. bandwidth | cold | 21.3 MiB/s | 5.5 MiB/s | Python **3.86×** better |
+| Seq. bandwidth | warm | 18.2 MiB/s | 5.8 MiB/s | Python **3.15×** better |
+| Seq. read time | cold | 2.9 ms | 11.3 ms | Python **3.86×** faster |
+| Seq. read time | warm | 3.4 ms | 10.8 ms | Python **3.15×** faster |
 
 ## `small-100.tar.xz`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 340.3 ms | 60.9 ms | Rust **5.59×** faster |
-| Mount time | warm | 280.7 ms | 64.2 ms | Rust **4.37×** faster |
-| Peak RSS | cold | 116.2 MiB | 19.4 MiB | Rust **5.97×** lower |
-| Peak RSS | warm | 116.1 MiB | 19.1 MiB | Rust **6.09×** lower |
-| Random cat (median) | cold | 9.7 ms | 3.9 ms | Rust **2.52×** faster |
-| Random cat (median) | warm | 4.8 ms | 3.5 ms | Rust **1.37×** faster |
-| find walk | cold | 4.9 ms | 5.1 ms | Python **1.04×** faster |
-| find walk | warm | 10.0 ms | 3.9 ms | Rust **2.56×** faster |
-| Seq. bandwidth | cold | 4.2 MiB/s | 15.2 MiB/s | Rust **3.62×** better |
-| Seq. bandwidth | warm | 3.3 MiB/s | 17.9 MiB/s | Rust **5.42×** better |
-| Seq. read time | cold | 14.8 ms | 4.1 ms | Rust **3.62×** faster |
-| Seq. read time | warm | 18.9 ms | 3.5 ms | Rust **5.43×** faster |
+| Mount time | cold | 335.7 ms | 59.9 ms | Rust **5.60×** faster |
+| Mount time | warm | 280.8 ms | 64.4 ms | Rust **4.36×** faster |
+| Peak RSS | cold | 116.5 MiB | 27.3 MiB | Rust **4.27×** lower |
+| Peak RSS | warm | 116.5 MiB | 17.3 MiB | Rust **6.72×** lower |
+| Random cat (median) | cold | 6.9 ms | 10.0 ms | Python **1.45×** faster |
+| Random cat (median) | warm | 4.6 ms | 10.2 ms | Python **2.21×** faster |
+| find walk | cold | 2.9 ms | 3.0 ms | Python **1.03×** faster |
+| find walk | warm | 2.7 ms | 2.2 ms | Rust **1.23×** faster |
+| Seq. bandwidth | cold | 9.5 MiB/s | 6.6 MiB/s | Python **1.44×** better |
+| Seq. bandwidth | warm | 13.1 MiB/s | 6.2 MiB/s | Python **2.11×** better |
+| Seq. read time | cold | 6.6 ms | 9.5 ms | Python **1.44×** faster |
+| Seq. read time | warm | 4.8 ms | 10.0 ms | Python **2.11×** faster |
 
 ## `small-100.tar.zst`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 340.3 ms | 61.0 ms | Rust **5.58×** faster |
-| Mount time | warm | 282.4 ms | 64.2 ms | Rust **4.40×** faster |
-| Peak RSS | cold | 116.2 MiB | 20.1 MiB | Rust **5.77×** lower |
-| Peak RSS | warm | 116.1 MiB | 19.8 MiB | Rust **5.85×** lower |
-| Random cat (median) | cold | 10.7 ms | 8.1 ms | Rust **1.32×** faster |
-| Random cat (median) | warm | 2.8 ms | 6.2 ms | Python **2.20×** faster |
-| find walk | cold | 10.0 ms | 9.8 ms | Rust **1.02×** faster |
-| find walk | warm | 4.0 ms | 7.3 ms | Python **1.82×** faster |
-| Seq. bandwidth | cold | 7.9 MiB/s | 7.6 MiB/s | Python **1.05×** better |
-| Seq. bandwidth | warm | 23.0 MiB/s | 10.4 MiB/s | Python **2.22×** better |
-| Seq. read time | cold | 7.9 ms | 8.2 ms | Python **1.05×** faster |
-| Seq. read time | warm | 2.7 ms | 6.0 ms | Python **2.22×** faster |
+| Mount time | cold | 285.0 ms | 59.8 ms | Rust **4.77×** faster |
+| Mount time | warm | 292.1 ms | 64.9 ms | Rust **4.50×** faster |
+| Peak RSS | cold | 116.4 MiB | 26.9 MiB | Rust **4.33×** lower |
+| Peak RSS | warm | 116.5 MiB | 19.5 MiB | Rust **5.98×** lower |
+| Random cat (median) | cold | 3.2 ms | 4.0 ms | Python **1.24×** faster |
+| Random cat (median) | warm | 4.0 ms | 10.0 ms | Python **2.52×** faster |
+| find walk | cold | 4.2 ms | 4.7 ms | Python **1.12×** faster |
+| find walk | warm | 3.6 ms | 3.1 ms | Rust **1.16×** faster |
+| Seq. bandwidth | cold | 12.5 MiB/s | 16.5 MiB/s | Rust **1.32×** better |
+| Seq. bandwidth | warm | 15.3 MiB/s | 6.5 MiB/s | Python **2.35×** better |
+| Seq. read time | cold | 5.0 ms | 3.8 ms | Rust **1.32×** faster |
+| Seq. read time | warm | 4.1 ms | 9.6 ms | Python **2.35×** faster |
 
 ## `small-100.zip`
 
 | Metric | Scenario | Python | Rust | Relative |
 |--------|----------|--------|------|----------|
-| Mount time | cold | 285.4 ms | 61.6 ms | Rust **4.63×** faster |
-| Mount time | warm | 281.8 ms | 63.7 ms | Rust **4.42×** faster |
-| Peak RSS | cold | 116.1 MiB | 13.2 MiB | Rust **8.79×** lower |
-| Peak RSS | warm | 116.1 MiB | 13.5 MiB | Rust **8.63×** lower |
-| Random cat (median) | cold | 2.4 ms | 8.3 ms | Python **3.44×** faster |
-| Random cat (median) | warm | 3.0 ms | 6.5 ms | Python **2.19×** faster |
-| find walk | cold | 2.9 ms | 9.3 ms | Python **3.21×** faster |
-| find walk | warm | 5.7 ms | 7.3 ms | Python **1.28×** faster |
-| Seq. bandwidth | cold | 21.7 MiB/s | 7.2 MiB/s | Python **3.01×** better |
-| Seq. bandwidth | warm | 13.4 MiB/s | 10.7 MiB/s | Python **1.26×** better |
-| Seq. read time | cold | 2.9 ms | 8.7 ms | Python **3.01×** faster |
-| Seq. read time | warm | 4.7 ms | 5.9 ms | Python **1.26×** faster |
+| Mount time | cold | 283.8 ms | 60.7 ms | Rust **4.68×** faster |
+| Mount time | warm | 293.2 ms | 65.0 ms | Rust **4.51×** faster |
+| Peak RSS | cold | 116.5 MiB | 14.3 MiB | Rust **8.15×** lower |
+| Peak RSS | warm | 116.5 MiB | 14.2 MiB | Rust **8.20×** lower |
+| Random cat (median) | cold | 2.6 ms | 3.7 ms | Python **1.43×** faster |
+| Random cat (median) | warm | 2.5 ms | 5.0 ms | Python **1.99×** faster |
+| find walk | cold | 5.8 ms | 3.8 ms | Rust **1.53×** faster |
+| find walk | warm | 3.1 ms | 5.6 ms | Python **1.81×** faster |
+| Seq. bandwidth | cold | 13.7 MiB/s | 20.2 MiB/s | Rust **1.48×** better |
+| Seq. bandwidth | warm | 27.5 MiB/s | 12.6 MiB/s | Python **2.18×** better |
+| Seq. read time | cold | 4.6 ms | 3.1 ms | Rust **1.48×** faster |
+| Seq. read time | warm | 2.3 ms | 5.0 ms | Python **2.18×** faster |
 
 ## Summary (geometric mean of Rust-advantage factor across archives)
 
@@ -169,23 +169,26 @@ Factor **>1 ⇒ Rust better**, **<1 ⇒ Python better** (same scale as before: P
 
 | Metric | Scenario | Geo-mean factor | Interpretation |
 |--------|----------|-----------------|----------------|
-| Mount time | cold | 4.50× | Rust ahead (~4.50×) |
-| Mount time | warm | 4.00× | Rust ahead (~4.00×) |
-| Peak RSS | cold | 7.53× | Rust ahead (~7.53×) |
-| Peak RSS | warm | 8.61× | Rust ahead (~8.61×) |
-| Random cat (median) | cold | 1.31× | Rust ahead (~1.31×) |
-| Random cat (median) | warm | 0.89× | Python ahead (~1.13×) |
-| find walk | cold | 1.18× | Rust ahead (~1.18×) |
-| find walk | warm | 1.31× | Rust ahead (~1.31×) |
-| Seq. bandwidth | cold | 1.59× | Rust ahead (~1.59×) |
-| Seq. bandwidth | warm | 1.38× | Rust ahead (~1.38×) |
-| Seq. read time | cold | 1.59× | Rust ahead (~1.59×) |
-| Seq. read time | warm | 1.38× | Rust ahead (~1.38×) |
+| Mount time | cold | 3.63× | Rust ahead (~3.63×) |
+| Mount time | warm | 3.84× | Rust ahead (~3.84×) |
+| Peak RSS | cold | 6.47× | Rust ahead (~6.47×) |
+| Peak RSS | warm | 8.01× | Rust ahead (~8.01×) |
+| Random cat (median) | cold | 0.84× | Python ahead (~1.19×) |
+| Random cat (median) | warm | 0.75× | Python ahead (~1.33×) |
+| find walk | cold | 1.21× | Rust ahead (~1.21×) |
+| find walk | warm | 1.26× | Rust ahead (~1.26×) |
+| Seq. bandwidth | cold | 0.88× | Python ahead (~1.14×) |
+| Seq. bandwidth | warm | 0.78× | Python ahead (~1.28×) |
+| Seq. read time | cold | 0.84× | Python ahead (~1.20×) |
+| Seq. read time | warm | 0.84× | Python ahead (~1.19×) |
 
 ## Notes / caveats
 
+- Generated **2026-07-28** with current `main` (ratarmount-rs **v0.1.3** area) vs sibling Python tree.
 - Values **below 1.0×** in the summary mean **Python is faster / better**, not a Rust win.
-- Compressed TAR (`.tar.gz`/`.bz2`/`.xz`/`.zst`): Rust uses seekable outer codecs (`SeekableBody` / multi-frame maps) for indexing+mount; plain single-file `.gz` etc. still materialize. Python uses rapidgzip / indexed codecs / block-parallel paths with true bit-block maps in some cases.
-- Random access and find on uncompressed TAR/ZIP remain the fairest apples-to-apples metrics.
-- Results are single-run wall times on this host; treat as directional, not formal publication numbers.
+- **Where Rust wins hard:** cold/warm mount time and peak RSS on every fixture; large uncompressed sequential reads (`large-64m.tar`); metadata walks on many-file TARs (`empty-1k.tar`).
+- **Where Python often wins:** random `cat` and sequential MiB/s on compressed TAR (rapidgzip / block-parallel codecs) and some small ZIP/TAR shapes — geo-mean random/seq favor Python slightly on this host.
+- Compressed TAR: Rust uses seekable outer codecs (`SeekableBody`, gzip checkpoints, zstd/bzip2 maps). Plain single-file `.gz`/… also use seekable bodies (`SingleFileMountSource::from_seekable_body`) — no full `/tmp` materialize for that path.
+- Nested bandwidth on `nested-tar.tar` can pick different member paths (tiny sizes); treat that fixture’s MiB/s as noisy.
+- Results are single-run wall times on this host; directional, not publication-grade.
 
