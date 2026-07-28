@@ -2,7 +2,17 @@
 //!
 //! Hot path avoids holding a process-wide `ZipArchive` lock and fully decompressing
 //! on every open: **Stored** members use `StenciledFile` random access; **Deflate**
-//! members are decoded once per open into a `Cursor` (no global mutex).
+//! members use a **single-flight shared inflate cache** keyed by central-directory
+//! header offset (FR-4 / [upstream #105](https://github.com/mxmlnkn/ratarmount/issues/105)):
+//!
+//! * Concurrent `open` of the **same** Deflate member runs **one** inflate; waiters
+//!   share the resulting `Arc<Vec<u8>>` (zero-copy `ArcBytes` views).
+//! * Concurrent `open` of **distinct** Deflate members inflates in parallel on the
+//!   path-backed backend (`File::try_clone` + independent `flate2` decoders). On the
+//!   shared-stream backend, compressed bytes are read under the stream mutex then
+//!   inflated offline so decode still overlaps across members.
+//! * Store stencils and encrypted (ZipCrypto/AES) members are unchanged: store stays
+//!   random-access; encrypted always goes through the `zip` crate decrypt path.
 //!
 //! # Multi-disk / multi-part ZIP
 //!
@@ -42,7 +52,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 use ratarmount_compress::{
@@ -63,6 +73,64 @@ pub const BACKEND_NAME: &str = "ZipMountSource";
 
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
+
+/// Soft cap on completed inflate-cache entries (evict completed when exceeded).
+const INFLATE_CACHE_MAX_ENTRIES: usize = 256;
+
+/// Result of a single-flight Deflate inflate (shared across concurrent openers).
+type InflateOnce = OnceLock<std::result::Result<Arc<Vec<u8>>, String>>;
+
+/// Single-flight shared decode cache for ZIP Deflate members (FR-4).
+///
+/// Keyed by local-header / central-directory header offset. Concurrent openers of
+/// the same key share one `OnceLock` so only a single `flate2` inflate runs.
+struct InflateCache {
+    slots: Mutex<HashMap<u64, Arc<InflateOnce>>>,
+}
+
+impl InflateCache {
+    fn new() -> Self {
+        Self {
+            slots: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Return cached inflated bytes, or run `inflate` exactly once for this key.
+    fn get_or_insert_with(
+        &self,
+        header: u64,
+        inflate: impl FnOnce() -> io::Result<Vec<u8>>,
+    ) -> io::Result<Arc<Vec<u8>>> {
+        let slot = {
+            let mut guard = self.slots.lock().expect("zip inflate cache");
+            // Evict completed entries when over cap; keep in-flight slots.
+            if guard.len() > INFLATE_CACHE_MAX_ENTRIES {
+                guard.retain(|_, s| s.get().is_none());
+            }
+            Arc::clone(
+                guard
+                    .entry(header)
+                    .or_insert_with(|| Arc::new(OnceLock::new())),
+            )
+        };
+        let res = slot.get_or_init(|| inflate().map(Arc::new).map_err(|e| e.to_string()));
+        match res {
+            Ok(bytes) => Ok(Arc::clone(bytes)),
+            Err(msg) => Err(io::Error::other(msg.clone())),
+        }
+    }
+
+    /// Number of successfully completed cache entries (tests / diagnostics).
+    #[cfg(test)]
+    fn completed_len(&self) -> usize {
+        self.slots
+            .lock()
+            .expect("zip inflate cache")
+            .values()
+            .filter(|s| s.get().is_some_and(|r| r.is_ok()))
+            .count()
+    }
+}
 
 #[derive(Debug, Error)]
 pub enum ZipError {
@@ -232,8 +300,8 @@ pub struct ZipMountSource {
     index: SqliteIndex,
     /// local header offset → member layout for open
     members: HashMap<u64, ZipMemberMeta>,
-    /// Decompressed member cache (header_offset → bytes). Avoids re-inflate on random cat.
-    inflate_cache: Mutex<HashMap<u64, Arc<Vec<u8>>>>,
+    /// Single-flight Deflate decode cache (header_offset → inflated bytes).
+    inflate_cache: InflateCache,
     /// Working password for encrypted members (`None` if archive is unencrypted).
     password: Option<String>,
     #[allow(dead_code)]
@@ -310,7 +378,7 @@ impl ZipMountSource {
             },
             index,
             members,
-            inflate_cache: Mutex::new(HashMap::new()),
+            inflate_cache: InflateCache::new(),
             password,
             options: options.clone(),
         })
@@ -359,6 +427,7 @@ impl ZipMountSource {
             ))
         })?;
         let password = find_password(&mut archive, &options.passwords)?;
+        // Shared stream: no independent try_clone for parallel hash; sequential via archive.
         let (index, members) = Self::fill_index_from_archive(
             &mut archive,
             password.as_deref(),
@@ -367,6 +436,7 @@ impl ZipMountSource {
             None,
             StatsSource::Synthetic(size),
             &options.hashes,
+            None,
         )?;
         // Drop ZipArchive before keeping shared for open path.
         drop(archive);
@@ -382,7 +452,7 @@ impl ZipMountSource {
             backend: ZipBackend::Shared(shared),
             index,
             members,
-            inflate_cache: Mutex::new(HashMap::new()),
+            inflate_cache: InflateCache::new(),
             password,
             options: options.clone(),
         })
@@ -422,6 +492,7 @@ impl ZipMountSource {
         };
         let password = find_password(&mut archive, &options.passwords)?;
 
+        // Path-backed: parallel inflate+hash of independent plain Deflate/Stored members.
         let (index, members) = Self::fill_index_from_archive(
             &mut archive,
             password.as_deref(),
@@ -430,6 +501,7 @@ impl ZipMountSource {
             opened.multipart_parts.as_ref().map(|p| p.len()),
             StatsSource::Path(opened.open_path.as_path()),
             &options.hashes,
+            Some(&opened.file),
         )?;
         drop(archive);
 
@@ -448,7 +520,7 @@ impl ZipMountSource {
             },
             index,
             members,
-            inflate_cache: Mutex::new(HashMap::new()),
+            inflate_cache: InflateCache::new(),
             password,
             options: options.clone(),
         })
@@ -459,6 +531,12 @@ impl ZipMountSource {
     /// When `hash_algorithms` is non-empty (`OpenOptions.hashes` / `--hashes`), hashes
     /// each regular-file member's **decompressed** content and stores digests as
     /// `user.hash.<algo>` index xattrs (Python parity; TAR uses the same xattr keys).
+    ///
+    /// When `parallel_file` is `Some`, plain (unencrypted) Stored/Deflate members are
+    /// inflated and hashed on worker threads via independent `File::try_clone` reads
+    /// (FR-4 multi-member parallel inflate). Encrypted / other methods stay sequential
+    /// through the `zip` crate.
+    #[allow(clippy::too_many_arguments)]
     fn fill_index_from_archive<R: Read + Seek>(
         archive: &mut ZipArchive<R>,
         password: Option<&str>,
@@ -467,6 +545,7 @@ impl ZipMountSource {
         multipart_part_count: Option<usize>,
         stats: StatsSource<'_>,
         hash_algorithms: &[String],
+        parallel_file: Option<&File>,
     ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
@@ -578,7 +657,15 @@ impl ZipMountSource {
         }
 
         if !hash_targets.is_empty() {
-            store_member_content_hashes(archive, &index, password, &hash_targets, hash_algorithms)?;
+            store_member_content_hashes(
+                archive,
+                &index,
+                password,
+                &members,
+                &hash_targets,
+                hash_algorithms,
+                parallel_file,
+            )?;
         }
 
         index.store_versions(product_version)?;
@@ -599,20 +686,88 @@ impl ZipMountSource {
 /// Hash decompressed ZIP member payloads and store `user.hash.<algo>` index xattrs.
 ///
 /// Unlike TAR's path-backed `fill_content_hashes` (raw archive bytes at `offset`), ZIP
-/// members may be Deflate/AES; we stream through the zip crate so digests match file
-/// contents served by [`MountSource::open`].
+/// members may be Deflate/AES; digests match file contents served by [`MountSource::open`].
+///
+/// With `parallel_file`, unencrypted Stored/Deflate members are decoded in parallel
+/// (independent clones of the archive file). Encrypted and other compression methods
+/// stay sequential via the `zip` crate.
 fn store_member_content_hashes<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     index: &SqliteIndex,
     password: Option<&str>,
+    members: &HashMap<u64, ZipMemberMeta>,
     targets: &[(i64, usize, u64)],
     algorithms: &[String],
+    parallel_file: Option<&File>,
 ) -> Result<()> {
     if algorithms.is_empty() || targets.is_empty() {
         return Ok(());
     }
+
     let mut pending: Vec<(i64, String, Vec<u8>)> = Vec::new();
+
+    let mut sequential: Vec<(i64, usize, u64)> = Vec::new();
+    let mut parallel_plain: Vec<(i64, u64, ZipMemberMeta)> = Vec::new();
+
     for &(offsetheader, member_index, size) in targets {
+        let header = offsetheader as u64;
+        let meta = members.get(&header);
+        let can_parallel = parallel_file.is_some()
+            && meta.is_some_and(|m| {
+                !m.encrypted && (m.method == METHOD_STORED || m.method == METHOD_DEFLATE)
+            });
+        if can_parallel {
+            if let Some(m) = meta {
+                parallel_plain.push((offsetheader, size, m.clone()));
+            }
+        } else {
+            sequential.push((offsetheader, member_index, size));
+        }
+    }
+
+    if !parallel_plain.is_empty() {
+        if let Some(file) = parallel_file {
+            type HashJobResult = (i64, Vec<(String, String)>);
+            let results: Mutex<Vec<HashJobResult>> = Mutex::new(Vec::new());
+            std::thread::scope(|scope| {
+                for (offsetheader, size, meta) in &parallel_plain {
+                    let offsetheader = *offsetheader;
+                    let size = *size;
+                    let results = &results;
+                    scope.spawn(move || match decode_plain_member_from_file(file, meta, size) {
+                        Ok(data) => {
+                            let mut cursor = io::Cursor::new(data);
+                            match compute_hashes_limited(&mut cursor, size, algorithms) {
+                                Ok(digests) => {
+                                    results
+                                        .lock()
+                                        .expect("zip hash results")
+                                        .push((offsetheader, digests));
+                                }
+                                Err(e) => {
+                                    log::warn!(
+                                        "Failed to hash ZIP member at offsetheader={offsetheader}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to decode ZIP member at offsetheader={offsetheader} for content hash: {e}"
+                            );
+                        }
+                    });
+                }
+            });
+            for (offsetheader, digests) in results.into_inner().expect("zip hash results") {
+                for (name, hex) in digests {
+                    pending.push((offsetheader, format!("user.hash.{name}"), hex.into_bytes()));
+                }
+            }
+        }
+    }
+
+    for &(offsetheader, member_index, size) in &sequential {
         let mut zf = match open_member(archive, member_index, password) {
             Ok(z) => z,
             Err(e) => {
@@ -640,6 +795,77 @@ fn store_member_content_hashes<R: Read + Seek>(
         index.insert_xattrs_batch(&pending)?;
     }
     Ok(())
+}
+
+/// Position-independent read of `[offset, offset+len)` from an archive `File`.
+///
+/// Uses `pread`/`seek_read` so concurrent threads do not race on a shared file
+/// offset (`File::try_clone` shares the offset on Unix).
+fn read_file_range_at(file: &File, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut buf = vec![0u8; len as usize];
+    read_file_range_at_into(file, offset, &mut buf)?;
+    Ok(buf)
+}
+
+fn read_file_range_at_into(file: &File, offset: u64, buf: &mut [u8]) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut done = 0usize;
+        while done < buf.len() {
+            let n = file.seek_read(&mut buf[done..], offset + done as u64)?;
+            if n == 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "zip read_file_range_at: unexpected EOF",
+                ));
+            }
+            done += n;
+        }
+        Ok(())
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        let mut f = file.try_clone()?;
+        f.seek(SeekFrom::Start(offset))?;
+        f.read_exact(buf)
+    }
+}
+
+/// Decode an unencrypted Stored/Deflate member via position-independent archive reads.
+///
+/// Used for parallel index-hash and keeps the open path independent of `ZipArchive`.
+fn decode_plain_member_from_file(
+    file: &File,
+    meta: &ZipMemberMeta,
+    size: u64,
+) -> io::Result<Vec<u8>> {
+    match meta.method {
+        METHOD_STORED => read_file_range_at(file, meta.data_start, size),
+        METHOD_DEFLATE => {
+            let compressed = read_file_range_at(file, meta.data_start, meta.compressed_size)?;
+            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+            let mut data = Vec::with_capacity(size as usize);
+            dec.read_to_end(&mut data)
+                .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
+            if data.len() as u64 > size {
+                data.truncate(size as usize);
+            }
+            Ok(data)
+        }
+        other => Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            format!("zip: method {other} not supported for parallel plain decode"),
+        )),
+    }
 }
 
 /// How to record archive stats in the index.
@@ -752,49 +978,35 @@ impl ZipMountSource {
         data_start: u64,
         size: u64,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        {
-            let cache = self.inflate_cache.lock().expect("zip cache");
-            if let Some(bytes) = cache.get(&header) {
-                return Ok(Box::new(ArcBytes::new(Arc::clone(bytes))));
-            }
-        }
-        let mut data = Vec::with_capacity(size as usize);
-        match &self.backend {
-            ZipBackend::File { raw_file, .. } => {
-                let mut file = raw_file.try_clone()?;
-                file.seek(SeekFrom::Start(data_start))?;
-                let limited = file.take(meta.compressed_size);
-                let mut dec = flate2::read::DeflateDecoder::new(limited);
-                dec.read_to_end(&mut data)
-                    .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
-            }
-            ZipBackend::Shared(shared) => {
-                // Read compressed bytes under the mutex, then inflate offline.
-                let compressed = {
+        // Single-flight: concurrent openers of this member share one inflate.
+        let compressed_size = meta.compressed_size;
+        let arc = self.inflate_cache.get_or_insert_with(header, || {
+            let compressed = match &self.backend {
+                // pread-style: concurrent distinct members do not race on file offset.
+                ZipBackend::File { raw_file, .. } => {
+                    read_file_range_at(raw_file, data_start, compressed_size)?
+                }
+                ZipBackend::Shared(shared) => {
+                    // Read compressed bytes under the mutex, then inflate offline so
+                    // distinct members can overlap decode after their compressed reads.
                     let mut guard = shared
                         .lock()
                         .map_err(|_| io::Error::other("shared zip reader poisoned"))?;
                     guard.seek(SeekFrom::Start(data_start))?;
-                    let mut buf = vec![0u8; meta.compressed_size as usize];
+                    let mut buf = vec![0u8; compressed_size as usize];
                     guard.read_exact(&mut buf)?;
                     buf
-                };
-                let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
-                dec.read_to_end(&mut data)
-                    .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
+                }
+            };
+            let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+            let mut data = Vec::with_capacity(size as usize);
+            dec.read_to_end(&mut data)
+                .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
+            if data.len() as u64 > size {
+                data.truncate(size as usize);
             }
-        }
-        if data.len() as u64 > size {
-            data.truncate(size as usize);
-        }
-        let arc = Arc::new(data);
-        {
-            let mut cache = self.inflate_cache.lock().expect("zip cache");
-            if cache.len() > 256 {
-                cache.clear();
-            }
-            cache.insert(header, Arc::clone(&arc));
-        }
+            Ok(data)
+        })?;
         Ok(Box::new(ArcBytes::new(arc)))
     }
 
@@ -1950,6 +2162,224 @@ mod tests {
         assert_eq!(
             sha.as_slice(),
             b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+    }
+
+    fn write_deflate_zip(path: &Path, files: &[(&str, &[u8])]) {
+        let file = File::create(path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+        for (name, data) in files {
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    fn deflate_zip_bytes(files: &[(&str, &[u8])]) -> Vec<u8> {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            for (name, data) in files {
+                zw.start_file(*name, opts).unwrap();
+                zw.write_all(data).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    /// Regression: concurrent opens of one large Deflate member single-flight inflate
+    /// and return identical payload (FR-4 / upstream #105).
+    #[test]
+    fn concurrent_open_same_deflate_member_single_flight() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large-deflate.zip");
+        // ~256 KiB compressible payload — large enough to exercise inflate, small for CI.
+        let payload: Vec<u8> = (0..256 * 1024).map(|i| b"ABCDEFGH"[i % 8]).collect();
+        write_deflate_zip(&path, &[("big.bin", &payload)]);
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = Arc::new(
+            ZipMountSource::open(&path, None, &opts, "test", true).expect("open deflate zip"),
+        );
+        let fi = src.lookup("/big.bin", 0).expect("lookup");
+        assert_eq!(fi.size, payload.len() as u64);
+
+        const N: usize = 8;
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let src = Arc::clone(&src);
+            let fi = fi.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut r = src.open(&fi, 0).expect("open");
+                let mut out = Vec::new();
+                r.read_to_end(&mut out).expect("read");
+                out
+            }));
+        }
+        for h in handles {
+            let out = h.join().expect("thread");
+            assert_eq!(out, payload);
+        }
+        // Single-flight cache: one completed entry for this member after concurrent opens.
+        assert_eq!(src.inflate_cache.completed_len(), 1);
+
+        // Sequential re-open still hits cache and returns the same bytes.
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+        assert_eq!(src.inflate_cache.completed_len(), 1);
+    }
+
+    /// Regression: concurrent opens of distinct Deflate members inflate independently
+    /// and return correct per-member payloads (FR-4 multi-member parallel open).
+    #[test]
+    fn concurrent_open_distinct_deflate_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-deflate.zip");
+        let a: Vec<u8> = vec![b'A'; 64 * 1024];
+        let b: Vec<u8> = vec![b'B'; 64 * 1024];
+        let c: Vec<u8> = (0..64 * 1024).map(|i| (i % 251) as u8).collect();
+        write_deflate_zip(&path, &[("a.bin", &a), ("b.bin", &b), ("c.bin", &c)]);
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = Arc::new(
+            ZipMountSource::open(&path, None, &opts, "test", true).expect("open multi deflate"),
+        );
+        let fi_a = src.lookup("/a.bin", 0).expect("a");
+        let fi_b = src.lookup("/b.bin", 0).expect("b");
+        let fi_c = src.lookup("/c.bin", 0).expect("c");
+
+        let expected = [a, b, c];
+        let infos = [fi_a, fi_b, fi_c];
+        let mut handles = Vec::new();
+        for (i, fi) in infos.into_iter().enumerate() {
+            let src = Arc::clone(&src);
+            // Open each member twice concurrently to mix single-flight + multi-member.
+            for _ in 0..2 {
+                let src = Arc::clone(&src);
+                let fi = fi.clone();
+                let exp = expected[i].clone();
+                handles.push(std::thread::spawn(move || {
+                    let mut r = src.open(&fi, 0).expect("open");
+                    let mut out = Vec::new();
+                    r.read_to_end(&mut out).expect("read");
+                    assert_eq!(out, exp);
+                }));
+            }
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert_eq!(src.inflate_cache.completed_len(), 3);
+    }
+
+    /// Shared-stream backend: concurrent same-member open still single-flights correctly.
+    #[test]
+    fn concurrent_open_deflate_from_reader_single_flight() {
+        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 17) as u8).collect();
+        let bytes = deflate_zip_bytes(&[("x.bin", &payload)]);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = Arc::new(
+            ZipMountSource::open_from_reader(
+                io::Cursor::new(bytes),
+                Path::new("memory://deflate.zip"),
+                None,
+                &opts,
+                "test",
+            )
+            .expect("open_from_reader"),
+        );
+        let fi = src.lookup("/x.bin", 0).expect("lookup");
+        let mut handles = Vec::new();
+        for _ in 0..6 {
+            let src = Arc::clone(&src);
+            let fi = fi.clone();
+            let exp = payload.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut r = src.open(&fi, 0).expect("open");
+                let mut out = Vec::new();
+                r.read_to_end(&mut out).expect("read");
+                assert_eq!(out, exp);
+            }));
+        }
+        for h in handles {
+            h.join().expect("thread");
+        }
+        assert_eq!(src.inflate_cache.completed_len(), 1);
+    }
+
+    /// Path-backed multi-member Deflate + `--hashes`: parallel inflate hash path still
+    /// produces correct digests (does not break store/deflate hash parity).
+    #[test]
+    fn parallel_hash_multi_deflate_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("hash-multi.zip");
+        let a = b"foo\n";
+        let b = b"hello world\n";
+        write_deflate_zip(&path, &[("bar.txt", a), ("hello.txt", b)]);
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            hashes: vec!["crc32".into(), "sha256".into()],
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open");
+
+        let fi_bar = src.lookup("/bar.txt", 0).expect("bar");
+        let fi_hello = src.lookup("/hello.txt", 0).expect("hello");
+        assert_eq!(
+            src.get_xattr(&fi_bar, "user.hash.crc32")
+                .unwrap()
+                .as_slice(),
+            b"7e3265a8"
+        );
+        assert_eq!(
+            src.get_xattr(&fi_hello, "user.hash.sha256")
+                .unwrap()
+                .as_slice(),
+            b"a948904f2f0f479b8f8197694b30184b0d2ed1c1cd2a1ec0fb85d299a192a447"
+        );
+
+        // Content open still works after parallel hash index build.
+        let mut r = src.open(&fi_bar, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, a);
+    }
+
+    /// Store stencil path remains random-access (not forced through inflate cache).
+    #[test]
+    fn store_member_not_via_inflate_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store.zip");
+        write_sample_zip(&path, "plain.txt", b"stored payload\n");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        let fi = src.lookup("/plain.txt", 0).unwrap();
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = String::new();
+        r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "stored payload\n");
+        assert_eq!(
+            src.inflate_cache.completed_len(),
+            0,
+            "Stored members must not enter the Deflate inflate cache"
         );
     }
 

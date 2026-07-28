@@ -39,7 +39,7 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 | FR-1 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | **ZIP commit-overlay** | **done** (MVP): full rebuild in `commit_overlay` — raw-copy unchanged store/deflate members; overlay files deflate; atomic replace. Residual: encrypted/multi-part/spanned ZIP, in-place append, jar/war extras | `ratarmount-compositing` |
 | FR-2 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | **HTTP(S) authentication** | Basic auth via URL / headers; cookie auth harder | `ratarmount-remote` |
 | FR-3 | [#145](https://github.com/mxmlnkn/ratarmount/issues/145) | **TAR PAX `LIBARCHIVE.xattr.*` / `SCHILY.xattr.*`** | **done** — index + `list_xattr`/`get_xattr`; skip vendor MPE/ZOS pax keys | `formats-tar` (fuse already serves index xattrs) |
-| FR-4 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | **Parallel inflate of large ZIP deflate members** | Multi-threaded access to encrypted zip discussed separately; plain deflate parallel open is in scope | `formats-zip` |
+| FR-4 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | **Parallel inflate of large ZIP deflate members** | **done** (Rust): single-flight shared Deflate cache (`OnceLock` per header offset) so concurrent `open` of the same large member inflates once; distinct members inflate in parallel via offline flate2; path-backed `--hashes` parallel-decodes plain Stored/Deflate at index time. Store stencil + encrypted paths unchanged. Residual: no true *intra-member* parallel deflate; encrypted multi-open still sequential via zip crate | `formats-zip` |
 
 ### P1 — good notes, medium design
 
@@ -66,11 +66,21 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 
 ## Suggested implementation order (agents)
 
+<<<<<<< HEAD
 **Done:** FR-1 (ZIP commit-overlay MVP), FR-3 (TAR PAX xattrs), FR-7 (zstd multi-frame docs).
 
 1. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
 2. **FR-4** Parallel ZIP deflate member decode  
 3. **FR-5** FUSE readahead knobs  
 4. **FR-9** Factory side-table auto-wire  
+=======
+1. **FR-3** TAR SCHILY/LIBARCHIVE xattrs (isolated, tests with Haiku-style fixtures if available)  
+2. **FR-2** HTTP basic auth (`user:pass@` / `Authorization` header)  
+3. **FR-1** ZIP commit-overlay MVP (rebuild zip from overlay + base)  
+4. ~~**FR-4** Parallel ZIP deflate member decode~~ **done** (single-flight cache + multi-member parallel open/hash)  
+5. **FR-5** FUSE readahead knobs  
+6. **FR-9** Factory side-table auto-wire  
+7. Docs/examples **FR-7** anytime  
+>>>>>>> 1e5c6f7 (Implement FR-4 single-flight ZIP Deflate cache and parallel multi-member decode.)
 
 Update this file when status changes. Keep README **Upstream** column in sync.
