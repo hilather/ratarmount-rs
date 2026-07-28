@@ -35,3 +35,17 @@ For isolation=`worktree` tasks, follow skill **`ratarmount-worktree-subagent`** 
 ## Docs
 
 Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`.
+
+### Format / nested / temp-file matrices (keep current)
+
+**Code that changes how archives open, nest, or use `/tmp` must update the support matrices in the same change.** Stale tables mislead users about embedded random access and temp spool.
+
+| Doc | Role |
+|-----|------|
+| [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) | **Canonical** nested no-tmp vs temp matrix + parent×nested behavior |
+| [`README.md`](README.md) | Short nested cheat sheet (must match the canonical doc) |
+| [`docs/tasks/embedded-nested-random-access.md`](docs/tasks/embedded-nested-random-access.md) | Implementation checklist |
+
+Triggers: `open_nested_reader_fn`, AutoMount spool, format `MountSource::open`, materialize vs seekable body, TAR flatten limits.
+
+Full procedure: skill **`format-support-matrices`** (`.grok/skills/format-support-matrices/SKILL.md`).

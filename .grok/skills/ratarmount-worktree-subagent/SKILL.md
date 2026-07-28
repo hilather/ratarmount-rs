@@ -37,6 +37,10 @@ description: >
    and skips the FUSE harness (`needs: check`).
 4. One commit on this worktree branch. Do not push.
 5. Report: commit SHA, files changed, residual limits, verify command results.
+6. If you change nested open, materialize, temp spool, or MountSource::open for archives:
+   update docs/embedded-nested-archives.md (and README nested cheat sheet if needed)
+   in the same commit, or list an explicit "docs delta" for the orchestrator.
+   Skill: format-support-matrices.
 ```
 
 ## Verify commands (agent)
@@ -81,5 +85,6 @@ Then push only when the user asked to publish.
 ## Related docs
 
 - Always-on: root `AGENTS.md`
+- Format / temp matrices: skill **`format-support-matrices`**, `docs/embedded-nested-archives.md`
 - Parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`
 - Dual-run / crates.io: `docs/phase12-dual-run.md`, `docs/crates-io-policy.md`

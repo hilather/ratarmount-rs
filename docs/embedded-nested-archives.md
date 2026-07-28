@@ -4,6 +4,10 @@ How **recursive automount** (`-r` / `-l`) opens archives *inside* other archives
 
 This is the user-facing guide. Implementation / remaining work lives in [`tasks/embedded-nested-random-access.md`](tasks/embedded-nested-random-access.md).
 
+> **Maintainers / agents:** This document is the **canonical format × nested × temp matrix**.  
+> Update it in the **same change** as any nested open, materialize, or temp-spool behavior.  
+> See root [`AGENTS.md`](../AGENTS.md) and skill [`.grok/skills/format-support-matrices/SKILL.md`](../.grok/skills/format-support-matrices/SKILL.md).
+
 ---
 
 ## Short answers
