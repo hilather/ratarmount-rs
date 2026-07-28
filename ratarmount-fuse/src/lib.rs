@@ -204,17 +204,27 @@ impl RatarmountFs {
         self.overlay.is_some()
     }
 
-    /// Resolve `FileInfo` for an inode (cache first, then source lookup).
+    /// Resolve `FileInfo` for an inode.
+    ///
+    /// With a write overlay, always re-lookup so size/mtime after create/write
+    /// match the on-disk overlay file (cache may still hold create-time size 0).
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
+        let path = self.path_for_ino(ino)?;
+        if path == "/" {
+            let fi = ratarmount_core::create_root_file_info();
+            self.store_fi(ino, fi.clone());
+            return Some(fi);
+        }
+        if self.overlay.is_some() {
+            if let Some(fi) = self.source.lookup(&path, 0) {
+                self.store_fi(ino, fi.clone());
+                return Some(fi);
+            }
+        }
         if let Some(fi) = self.cached_fi(ino) {
             return Some(fi);
         }
-        let path = self.path_for_ino(ino)?;
-        let fi = if path == "/" {
-            ratarmount_core::create_root_file_info()
-        } else {
-            self.source.lookup(&path, 0)?
-        };
+        let fi = self.source.lookup(&path, 0)?;
         self.store_fi(ino, fi.clone());
         Some(fi)
     }
@@ -447,34 +457,47 @@ impl Filesystem for RatarmountFs {
             return;
         };
         let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-        if write {
-            if let Some(ov) = &self.overlay {
+        // Writes always go to the overlay; reads of files that exist in the overlay
+        // must also use the overlay FD (not the base archive). Previously RO open
+        // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
+        if let Some(ov) = &self.overlay {
+            if write || ov.has_file(&path) {
                 match ov.open_overlay_fd(&path, flags) {
                     Ok(fd) => {
+                        if let Some(fi) = self.source.lookup(&path, 0) {
+                            self.store_fi(ino, fi);
+                        }
                         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                         self.handles
                             .lock()
                             .unwrap()
                             .insert(fh, OpenBackend::OverlayFd(fd));
+                        // Do not KEEP_CACHE: size changes after write.
                         reply.opened(fh, 0);
                         return;
                     }
                     Err(e) => {
-                        debug!("overlay open: {e}");
-                        reply.error(EIO);
-                        return;
+                        if write {
+                            debug!("overlay open: {e}");
+                            reply.error(EIO);
+                            return;
+                        }
+                        // RO open of non-overlay path: fall through to base source.
+                        debug!("overlay open (read fallthrough): {e}");
                     }
                 }
-            } else {
-                reply.error(EROFS);
-                return;
             }
+        } else if write {
+            reply.error(EROFS);
+            return;
         }
-        let fi = if let Some(c) = self.cached_fi(ino) {
-            c
-        } else if let Some(fi) = self.source.lookup(&path, 0) {
+
+        // Fresh lookup so we do not treat post-write size as still 0 from create cache.
+        let fi = if let Some(fi) = self.source.lookup(&path, 0) {
             self.store_fi(ino, fi.clone());
             fi
+        } else if let Some(c) = self.cached_fi(ino) {
+            c
         } else {
             reply.error(ENOENT);
             return;

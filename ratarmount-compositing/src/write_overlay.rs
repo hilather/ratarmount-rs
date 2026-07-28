@@ -198,6 +198,12 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// True when the overlay root has a real file (or symlink) for this path.
+    pub fn has_file(&self, path: &str) -> bool {
+        let real = self.realpath(path);
+        real.is_file() || real.is_symlink()
+    }
+
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
@@ -223,8 +229,14 @@ impl WriteOverlay {
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
         // If still missing and write flags, create empty
-        if !real.exists() && (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
+        if !real.exists() && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0 {
             self.create_file(path, 0o644)?;
+        }
+        if !real.exists() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("no overlay file at {}", real.display()),
+            )));
         }
         let fd = unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) };
         if fd < 0 {
