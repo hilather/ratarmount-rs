@@ -9,7 +9,8 @@
 //!   `open_seekable_lzip_with_threads` accepts `-P` (decode sequential for now).
 //! * **lzo** — LZOP block index via liblzo2 (optional at runtime);
 //!   `open_seekable_lzo_with_threads` accepts `-P` (decode sequential for now).
-//! * **bzip2** — one-shot decode into RAM/temp; optional multi-block parallel decode (`-P`).
+//! * **bzip2** — bit-block map + Python `bzip2blocks` offset-map import/export;
+//!   optional multi-block parallel size discovery (`-P`); full-decode fallback.
 //! * **xz** — one-shot decode; multi-stream parallel decode via `open_seekable_xz_with_threads`.
 //! * **zstd** — multi-frame / seek table; `open_seekable_zstd_with_threads` for `-P`.
 //! * **gzip** — seek checkpoints; multi-member parallel decode (best-effort) + `-P` threads.
@@ -41,8 +42,10 @@ pub use split::{
 };
 
 pub use bzip2_seek::{
-    open_seekable_bzip2, open_seekable_bzip2_from_reader, open_seekable_bzip2_with_threads,
-    open_seekable_bzip2_with_threads_from_reader,
+    export_bzip2_blocks, export_bzip2_blocks_from_reader, open_seekable_bzip2,
+    open_seekable_bzip2_from_reader, open_seekable_bzip2_with_bzip2_blocks,
+    open_seekable_bzip2_with_bzip2_blocks_from_reader, open_seekable_bzip2_with_threads,
+    open_seekable_bzip2_with_threads_from_reader, SeekableBzip2,
 };
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 pub use gzip_seek::{
