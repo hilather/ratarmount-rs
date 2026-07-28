@@ -205,7 +205,7 @@ make install          # → ~/.local/bin/ratarmount
 # macOS package: ./packaging/build-macos-tarball.sh
 ```
 
-**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. ****v0.1.5****) publishes a GitHub Release. (Intel macOS CI image deferred — scarce GHA runners.) See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
+**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. **v0.1.5**) publishes a GitHub Release. (Intel macOS CI image deferred — scarce GHA runners.) See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
 
 ## Test
 
