@@ -39,6 +39,26 @@ fn io_to_errno(err: &std::io::Error) -> i32 {
     }
 }
 
+/// Fill `buf` from `r` by looping `Read::read` until the buffer is full or true EOF.
+///
+/// **FUSE contract:** a short reply means end-of-file. Codecs such as seekable
+/// gzip often return one inflate window (~64 KiB) per `Read::read` while more
+/// data remains. A single short `read` would make the kernel stop and tools
+/// report UnexpectedEof / truncated archives. Always use this helper for
+/// archive-backed FUSE reads.
+fn fill_read_for_fuse(r: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match std::io::Read::read(r, &mut buf[filled..]) {
+            Ok(0) => break,
+            Ok(n) => filled += n,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(filled)
+}
+
 enum OpenBackend {
     /// Keep the archive member reader open for the lifetime of the fh (critical for cat).
     Source {
@@ -577,7 +597,7 @@ impl Filesystem for RatarmountFs {
                     return;
                 }
                 let mut buf = vec![0u8; size as usize];
-                match std::io::Read::read(r, &mut buf) {
+                match fill_read_for_fuse(r, &mut buf) {
                     Ok(n) => {
                         buf.truncate(n);
                         reply.data(&buf);
@@ -1066,6 +1086,61 @@ mod tests {
         let keys = vec!["user.hash.sha256".into(), "user.hash.crc32".into()];
         let bytes = encode_xattr_list(&keys);
         assert_eq!(bytes, b"user.hash.sha256\0user.hash.crc32\0".as_slice());
+    }
+
+    /// Reader that yields at most `chunk` bytes per `read` (mimics seekable gzip windows).
+    struct ShortReadCursor {
+        data: Vec<u8>,
+        pos: usize,
+        chunk: usize,
+    }
+
+    impl std::io::Read for ShortReadCursor {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = (self.data.len() - self.pos)
+                .min(buf.len())
+                .min(self.chunk.max(1));
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            Ok(n)
+        }
+    }
+
+    #[test]
+    fn fill_read_for_fuse_assembles_short_codec_reads() {
+        // Payload larger than one typical gzip inflate window so a single short
+        // `Read::read` would under-fill a FUSE request (kernel treats that as EOF).
+        let payload: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut r = ShortReadCursor {
+            data: payload.clone(),
+            pos: 0,
+            chunk: 64 * 1024 - 10, // ~65526 — same class of short read as inflate
+        };
+        let mut buf = vec![0u8; payload.len()];
+        let n = fill_read_for_fuse(&mut r, &mut buf).expect("fill");
+        assert_eq!(
+            n,
+            payload.len(),
+            "must fill full FUSE request, not stop at first short read"
+        );
+        assert_eq!(buf, payload);
+    }
+
+    #[test]
+    fn fill_read_for_fuse_true_eof_may_be_short() {
+        let payload = b"hello-short-file";
+        let mut r = ShortReadCursor {
+            data: payload.to_vec(),
+            pos: 0,
+            chunk: 4,
+        };
+        let mut buf = vec![0u8; 64]; // request larger than file
+        let n = fill_read_for_fuse(&mut r, &mut buf).expect("fill");
+        assert_eq!(n, payload.len());
+        assert_eq!(&buf[..n], payload.as_slice());
     }
 
     #[test]

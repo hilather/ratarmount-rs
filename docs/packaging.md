@@ -35,6 +35,24 @@ Each native package is built **on** that distro (matching glibc / libfuse). The 
 | **Actions → Packages → Run workflow** | Build all + sign; download `signed-release-bundle` artifact |
 | PR touching `packaging/` | Validate packaging matrix |
 
+### Agent / maintainer release procedure
+
+Use this when cutting a version so GitHub actually has installable packages:
+
+1. Bump root `Cargo.toml` `version`, all `VERSION:` fields in `.github/workflows/packages.yml`, and README version mentions.
+2. Commit on `main`, push, then push an **annotated** tag `vX.Y.Z` (same as Cargo).
+3. Wait for workflow **Packages** on that tag. Confirm under
+   https://github.com/hilather/ratarmount-rs/releases that the tag lists `.deb` /
+   `.rpm` / portable `.tar.gz` (and cosign bundles), not only tiny text sidecars.
+4. If **Sign & release** fails: open job annotations first. Common causes already
+   fixed in-tree: empty asset upload (skip 0-byte files), flaky multi-file
+   `gh release create` (create empty release then upload one-by-one via REST).
+5. Do **not** spam tags to debug. One fix commit + one new patch tag.
+6. macOS matrix may flake on artifact upload; Linux packages can still publish.
+   Prefer fixing macOS separately rather than blocking the whole release.
+
+See also root [`AGENTS.md`](../AGENTS.md) section **Releases / package builds**.
+
 ### Local package build
 
 ```bash

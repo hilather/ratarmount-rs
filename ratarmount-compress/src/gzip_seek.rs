@@ -592,19 +592,36 @@ fn effective_import_spacing(api_spacing: u64, blob_spacing: u64) -> u64 {
 }
 
 /// Compressed-stream handle used during inflate (path FD or shared mutex stream).
+///
+/// **Shared backend:** each handle keeps its own logical compressed offset. Every
+/// `read` re-seeks under the mutex before reading so concurrent
+/// [`SeekableGzipReader`]s (nested AutoMount / multi-file tar.gz under FUSE) do
+/// not interleave `seek` + `read` on the shared cursor. That race previously
+/// produced truncated inflate and `UnexpectedEof` / "gzip stream ended
+/// unexpectedly" only on the embedded (from-reader) path — host files use a
+/// private FD per reader and were fine.
 enum CompressedHandle {
     File(File),
-    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+    Shared {
+        inner: Arc<Mutex<Box<dyn SeekRead>>>,
+        /// Logical position in the compressed stream for *this* reader.
+        pos: u64,
+    },
 }
 
 impl Read for CompressedHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             CompressedHandle::File(f) => f.read(buf),
-            CompressedHandle::Shared(inner) => inner
-                .lock()
-                .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?
-                .read(buf),
+            CompressedHandle::Shared { inner, pos } => {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?;
+                guard.seek(SeekFrom::Start(*pos))?;
+                let n = guard.read(buf)?;
+                *pos += n as u64;
+                Ok(n)
+            }
         }
     }
 }
@@ -613,10 +630,30 @@ impl Seek for CompressedHandle {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             CompressedHandle::File(f) => f.seek(pos),
-            CompressedHandle::Shared(inner) => inner
-                .lock()
-                .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?
-                .seek(pos),
+            CompressedHandle::Shared {
+                inner,
+                pos: logical,
+            } => {
+                let new = match pos {
+                    SeekFrom::Start(o) => o as i64,
+                    SeekFrom::Current(o) => *logical as i64 + o,
+                    SeekFrom::End(o) => {
+                        let mut guard = inner
+                            .lock()
+                            .map_err(|_| io::Error::other("gzip backend mutex poisoned"))?;
+                        let end = guard.seek(SeekFrom::End(0))? as i64;
+                        end + o
+                    }
+                };
+                if new < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek before start of compressed stream",
+                    ));
+                }
+                *logical = new as u64;
+                Ok(*logical)
+            }
         }
     }
 }
@@ -642,7 +679,10 @@ impl SeekableGzipReader {
     fn open(gzip: Arc<SeekableGzip>) -> io::Result<Self> {
         let file = match &gzip.backend {
             GzipBackend::Path(p) => CompressedHandle::File(File::open(p)?),
-            GzipBackend::Shared(shared) => CompressedHandle::Shared(Arc::clone(shared)),
+            GzipBackend::Shared(shared) => CompressedHandle::Shared {
+                inner: Arc::clone(shared),
+                pos: 0,
+            },
         };
         Ok(Self {
             gzip,
@@ -1815,6 +1855,167 @@ mod tests {
         assert_eq!(tail, raw[raw.len() - 20..]);
     }
 
+    /// Nested AutoMount path uses Shared backend; concurrent FUSE opens must not
+    /// race seek+read on the shared compressed cursor (was UnexpectedEof).
+    #[test]
+    fn shared_from_reader_concurrent_readers_full_payload() {
+        use std::io::Write;
+        use std::thread;
+
+        let mut raw = Vec::new();
+        for i in 0..4000 {
+            writeln!(&mut raw, "line {i:05} {}", "y".repeat(64)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            Path::new("nested://concurrent.gz"),
+        )
+        .unwrap();
+        assert_eq!(shared.size(), raw.len() as u64);
+
+        let expected = Arc::new(raw);
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let g = Arc::clone(&shared);
+            let exp = Arc::clone(&expected);
+            handles.push(thread::spawn(move || {
+                // Mix full reads and mid-stream seeks like multi-open FUSE.
+                for pass in 0..4 {
+                    let mut r = g.reader().unwrap();
+                    if pass % 2 == 0 {
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, *exp, "thread {t} pass {pass} full read");
+                    } else {
+                        let mid = exp.len() as u64 / 2;
+                        r.seek(SeekFrom::Start(mid)).unwrap();
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, exp[mid as usize..], "thread {t} pass {pass} mid seek");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked (likely shared gzip race)");
+        }
+    }
+
+    /// FUSE-style pread loop (seek+read per chunk) must deliver the full payload.
+    #[test]
+    fn fuse_style_seek_read_chunks_full_payload() {
+        use std::io::Write;
+        let mut raw = Vec::new();
+        for i in 0..5000 {
+            writeln!(&mut raw, "line {i:05} {}", "z".repeat(40)).unwrap();
+        }
+        assert!(
+            raw.len() > 80_000,
+            "need larger than one 64KiB inflate buffer"
+        );
+        let compressed = encode_gz(&raw);
+        // Path backend
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.gz");
+        std::fs::write(&path, &compressed).unwrap();
+        let g = SeekableGzip::open(&path, 8 * 1024).unwrap();
+        assert_eq!(g.uncompressed_size(), raw.len() as u64);
+        let mut r = g.reader().unwrap();
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        loop {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            off += n as u64;
+            assert!(off <= raw.len() as u64 + 1, "ran past");
+        }
+        assert_eq!(
+            out.len(),
+            raw.len(),
+            "path fuse-style short read: got {} want {}",
+            out.len(),
+            raw.len()
+        );
+        assert_eq!(out, raw);
+
+        // Shared / nested backend
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            Path::new("nested://big.gz"),
+        )
+        .unwrap();
+        let mut r = shared.reader().unwrap();
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        loop {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = r.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            off += n as u64;
+        }
+        assert_eq!(
+            out.len(),
+            raw.len(),
+            "shared fuse-style short read: got {} want {}",
+            out.len(),
+            raw.len()
+        );
+        assert_eq!(out, raw);
+    }
+
+    #[test]
+    fn stenciled_fuse_style_over_seekable_gzip() {
+        use crate::StenciledFile;
+        use std::io::Write;
+        let mut raw = Vec::new();
+        for i in 0..5000 {
+            writeln!(&mut raw, "line {i:05} {}", "w".repeat(40)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            Path::new("s.gz"),
+        )
+        .unwrap();
+        let size = shared.size();
+        assert_eq!(size, raw.len() as u64);
+        let reader = shared.reader().unwrap();
+        let mut stencil = StenciledFile::new(reader, vec![(0, size)]);
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        loop {
+            stencil.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = stencil.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            off += n as u64;
+        }
+        assert_eq!(
+            out.len(),
+            raw.len(),
+            "stenciled short: {} vs {}",
+            out.len(),
+            raw.len()
+        );
+        assert_eq!(out, raw);
+    }
+
     #[test]
     fn from_reader_open_without_threads_api() {
         let payload = b"hello from reader API\n";
@@ -2225,3 +2426,4 @@ mod tests {
         assert_eq!(hydrated.checkpoints.len(), points.len());
     }
 }
+// temp - better use search_replace for a proper test

@@ -3291,6 +3291,72 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[7..]);
     }
 
+    /// Large nested plain `.gz` must deliver the full payload under FUSE-style
+    /// seek+read chunks (short inflate windows must not truncate).
+    #[test]
+    fn nested_large_plain_gzip_fuse_style_full_payload() {
+        use std::io::{Read, Seek, SeekFrom, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let mut payload = Vec::new();
+        for i in 0..4000 {
+            writeln!(&mut payload, "nested-large {i:05} {}", "q".repeat(48)).unwrap();
+        }
+        assert!(
+            payload.len() > 80_000,
+            "need larger than one typical inflate window"
+        );
+        let plain = dir.path().join("blob.bin");
+        std::fs::write(&plain, &payload).unwrap();
+        let gz = dir.path().join("blob.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).unwrap())
+            .status()
+            .expect("gzip");
+        assert!(status.success());
+
+        let bytes = std::fs::read(&gz).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 16 * 1024,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("blob.bin.gz"),
+        )
+        .expect("nested large gzip open");
+        let fi = inner.lookup("/blob.bin", 0).expect("lookup");
+        assert_eq!(fi.size, payload.len() as u64);
+        let mut reader = inner.open(&fi, 0).expect("open");
+        let mut out = Vec::new();
+        let mut off = 0u64;
+        loop {
+            reader.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 4096];
+            let n = reader.read(&mut buf).unwrap();
+            if n == 0 {
+                break;
+            }
+            out.extend_from_slice(&buf[..n]);
+            off += n as u64;
+            assert!(
+                off <= payload.len() as u64 + 1,
+                "read past end (got offset {off})"
+            );
+        }
+        assert_eq!(
+            out.len(),
+            payload.len(),
+            "short read under FUSE-style loop (got {} want {})",
+            out.len(),
+            payload.len()
+        );
+        assert_eq!(out, payload);
+    }
+
     /// `.tar` embedded in ZIP: parent open + nested TAR from_reader — no temp spool.
     #[test]
     fn nested_tar_inside_zip_reader_random_read_no_tmp() {

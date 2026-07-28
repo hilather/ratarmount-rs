@@ -32,6 +32,55 @@ For isolation=`worktree` tasks, follow skill **`ratarmount-worktree-subagent`** 
 - Subagents: **one commit, do not push** unless the user asked to publish.
 - Orchestrator: cherry-pick / merge, re-run full fmt + clippy + test, then push when asked.
 
+## Releases / package builds (do this properly)
+
+Tagging alone is not enough: **`Packages` must publish a GitHub Release with real
+assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
+[`.github/workflows/packages.yml`](`.github/workflows/packages.yml`).
+
+### Version bump checklist
+
+1. Bump **workspace** `version` in root [`Cargo.toml`](Cargo.toml).
+2. Bump every `VERSION: "x.y.z"` env in [`.github/workflows/packages.yml`](.github/workflows/packages.yml)
+   (deb / rpm / portable / macos jobs).
+3. Update README version strings that mention the release tag.
+4. `cargo test -p ratarmount-compress --lib` (and full workspace when touching more).
+5. Commit on `main`, then **annotated tag** `vX.Y.Z` matching Cargo version.
+6. `git push origin main && git push origin vX.Y.Z`.
+
+### What “success” looks like
+
+| Check | Pass criteria |
+|-------|----------------|
+| Matrix jobs (`deb` / `rpm` / `portable` / `macos`) | Build artifacts uploaded |
+| **Sign & release** | Creates/updates GitHub Release for the tag |
+| [github.com/…/releases](https://github.com/hilather/ratarmount-rs/releases) | Tag has **package** assets (not only tiny sidecars) |
+| Workflow overall | Prefer green; macOS-only failure is OK if Linux packages published |
+
+**Workflow “failure” with empty Releases is not a release.** Builds may still
+leave a downloadable **`signed-release-bundle`** Actions artifact (expires).
+
+### Known failure modes (do not thrash tags)
+
+1. **Empty upload files** — GitHub rejects 0-byte assets (e.g. empty `file-info.txt`).
+   Flatten/upload **must skip size 0**. Symptom: release created, few tiny assets, job red.
+2. **Permissions** — job needs `contents: write` (workflow already sets this). If
+   `POST /releases` is 403, check repo **Settings → Actions → Workflow permissions**
+   = Read and write.
+3. **Do not** keep bumping `v0.1.N` to “debug” without reading **annotations** /
+   the Create Release step. Prefer REST create + `::error::` / `::notice::` so
+   failures are visible without private job-log auth.
+4. Stuck legacy runners (e.g. scarce `macos-13`) — drop or pin to available labels;
+   do not block Linux packages on one matrix leg forever.
+
+### After a bad tag
+
+- Prefer a **new patch tag** with the fix (do not rewrite published tags).
+- Incomplete releases (e.g. only `SHA256SUMS`) can stay; next tag supersedes.
+- Optional: edit notes on the incomplete release pointing at the next tag.
+
+Full packaging user docs: [`docs/packaging.md`](docs/packaging.md).
+
 ## Docs
 
 Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`.
