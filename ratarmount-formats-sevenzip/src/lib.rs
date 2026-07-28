@@ -239,11 +239,13 @@ impl SevenZipMountSource {
             }
             if options.passwords.is_empty() {
                 // Metadata-only mount: list/stat work; open requires password.
-                eprintln!(
-                    "warning: 7z archive contents are encrypted; mounting metadata only. \
-                     Pass --password to read file contents."
-                );
                 content_locked = true;
+                eprintln!(
+                    "warning: 7z archive contents are encrypted; mounting metadata only \
+                     (listing works; reading members fails until --password is provided). \
+                     Nested encrypted archives need the *inner* password \
+                     (e.g. nested-encrypted-inner.7z uses `innerpw`)."
+                );
                 None
             } else {
                 let mut chosen = None;
@@ -523,9 +525,10 @@ impl SevenZipMountSource {
         }
         let folder = &self.archive.folders[fi];
         if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
-            return Err(SzError::Seven(SevenZipError::Msg(
-                "Cannot read encrypted 7z member without a password; pass --password".into(),
-            )));
+            return Err(SzError::Msg(
+                "password required to open encrypted 7z member; pass --password / --password-file"
+                    .into(),
+            ));
         }
         // Pure LZMA2: prefer chunk-indexed decode so random member opens do not
         // force full solid-folder materialization when we only need a slice later.
@@ -887,8 +890,14 @@ impl MountSource for SevenZipMountSource {
         let folder = &self.archive.folders[fi];
 
         if folder.is_encrypted() && (self.content_locked || self.password.is_none()) {
-            return Err(io::Error::other(
-                "password required to open encrypted 7z member; pass --password",
+            // PermissionDenied → FUSE EACCES (not generic EIO) so users know a password is needed.
+            eprintln!(
+                "error: encrypted 7z content is locked (metadata-only mount); \
+                 pass --password / --password-file (nested archives need the *inner* password)"
+            );
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "password required to open encrypted 7z member; pass --password / --password-file",
             ));
         }
 

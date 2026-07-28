@@ -12,15 +12,32 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
     FUSE_ROOT_ID,
 };
-use libc::{EIO, ENOENT, ENOSYS, EROFS};
+use libc::{EACCES, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::debug;
 use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{FileInfo, ListModeResult, ListResult, MountSource};
+use std::io::ErrorKind;
 
 /// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
 const TTL: Duration = Duration::from_secs(60);
 const BLKSIZE: u32 = 256 * 1024;
 const DIR_CACHE_TTL: Duration = Duration::from_secs(30);
+
+/// Map `std::io::Error` to a FUSE/libc errno.
+///
+/// Password / permission failures must not collapse to generic EIO — that is what
+/// users see as "Input/output error" when opening encrypted nested 7z without
+/// `--password`.
+fn io_to_errno(err: &std::io::Error) -> i32 {
+    match err.kind() {
+        ErrorKind::NotFound => ENOENT,
+        ErrorKind::PermissionDenied => EACCES,
+        ErrorKind::IsADirectory => EISDIR,
+        ErrorKind::InvalidInput => EINVAL,
+        ErrorKind::Unsupported => ENOSYS,
+        _ => EIO,
+    }
+}
 
 enum OpenBackend {
     /// Keep the archive member reader open for the lifetime of the fh (critical for cat).
@@ -484,7 +501,7 @@ impl Filesystem for RatarmountFs {
             }
             Err(e) => {
                 debug!("open error: {e}");
-                reply.error(EIO);
+                reply.error(io_to_errno(&e));
             }
         }
     }
@@ -530,7 +547,7 @@ impl Filesystem for RatarmountFs {
                 let r = reader.get_mut().unwrap();
                 if let Err(e) = r.seek(std::io::SeekFrom::Start(offset.max(0) as u64)) {
                     debug!("seek error: {e}");
-                    reply.error(EIO);
+                    reply.error(io_to_errno(&e));
                     return;
                 }
                 let mut buf = vec![0u8; size as usize];
@@ -541,7 +558,7 @@ impl Filesystem for RatarmountFs {
                     }
                     Err(e) => {
                         debug!("read error: {e}");
-                        reply.error(EIO);
+                        reply.error(io_to_errno(&e));
                     }
                 }
             }
