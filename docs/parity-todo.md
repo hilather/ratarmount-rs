@@ -22,7 +22,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | libarchive long-tail (RAR/LHA/…; CAB LZX) | yes | yes (sequential open) | `~` |
 | Stencil CAB / ISO / WARC / XAR (fork RA) | yes (custom) | yes (store/MSZIP CAB; LZX→libarchive) | `[x]` |
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
-| SquashFS | yes | yes (backhand in-process; unsquashfs fallback for xz/lzma) | `[x]` / `~` xz fallback |
+| SquashFS | yes | yes (backhand in-process; xz via xz2; unsquashfs for classic lzma) | `[x]` / `~` classic lzma fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
@@ -76,7 +76,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `s3://` | yes (fsspec) | yes (SigV4 env creds) | `~` instance-role / anonymous |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
 | SMB / WebDAV / Dropbox | yes | WebDAV + SMB (`smbclient`); no Dropbox | `~` Dropbox still open |
-| Remote/compressed **index** download | yes | no | `[ ]` |
+| Remote/compressed **index** download | yes | http(s)/file:// materialize into local index path | `[x]` / `~` compressed index blobs |
 
 ### Index / CLI
 
@@ -87,11 +87,11 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
 | Index file hashes / xattrs | yes | `--hashes` fill + FUSE listxattr/getxattr for TAR | `[x]` / `~` non-TAR sources |
-| `--use-backend` selection | yes | fixed factory order | `[ ]` |
+| `--use-backend` selection | yes | reorders format probe (last flag highest) | `[x]` |
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
-| Debug / log-file / color | yes | `-d` + `--log-file`; no color | `~` |
-| OSS attributions | yes | no | `[ ]` |
-| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + bzip2 threads | `~` not all codecs use matrix yet |
+| Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
+| OSS attributions | yes | yes (`--oss-attributions` / help) | `[x]` |
+| Parallelization matrix (`-P backend:n`) | yes | `ParallelizationSpec` + gzip/xz/zstd/bzip2 threads | `~` long-tail codecs still default |
 | Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)

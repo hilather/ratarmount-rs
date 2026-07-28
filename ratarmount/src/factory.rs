@@ -12,9 +12,9 @@ use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, joined_base_name,
     looks_like_tar, materialize, materialize_joined_parts, name_suggests_compressed_tar,
     open_seekable_bzip2_with_threads, open_seekable_compress_z, open_seekable_lz4,
-    open_seekable_lzip,
-    open_seekable_lzma, open_seekable_lzo, open_seekable_xz, open_seekable_zlib,
-    strip_compression_suffix, CompressionFormat, SeekableBody, SeekableZstd, SharedSeekableGzip,
+    open_seekable_lzip, open_seekable_lzma, open_seekable_lzo, open_seekable_xz_with_threads,
+    open_seekable_zlib, open_seekable_zstd_with_threads, strip_compression_suffix,
+    CompressionFormat, SeekableBody, SharedSeekableGzip,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -665,13 +665,15 @@ fn open_path_impl(
             })?
         }
         CompressionFormat::Xz => {
+            let threads = options.threads_for("xz");
             open_seekable_codec(path, index_path, &options, recreate, "xz", || {
-                open_seekable_xz(path)
+                open_seekable_xz_with_threads(path, threads)
             })?
         }
         CompressionFormat::Zstd => {
+            let threads = options.threads_for("zstd");
             open_seekable_codec(path, index_path, &options, recreate, "zstd", || {
-                SeekableZstd::open(path)
+                open_seekable_zstd_with_threads(path, threads)
             })?
         }
         CompressionFormat::Lz4 => {
@@ -760,12 +762,15 @@ fn open_gzip(
 
     // Prefer seekable path for names that clearly indicate compressed TAR.
     if name_suggests_compressed_tar(path) {
-        let gzip = SharedSeekableGzip::open(path, spacing).map_err(|e| e.to_string())?;
+        let threads = options.threads_for("gzip");
+        let gzip = SharedSeekableGzip::open_with_threads(path, spacing, threads)
+            .map_err(|e| e.to_string())?;
         eprintln!(
-            "seekable gzip: {} ({} uncompressed bytes, {} checkpoints)",
+            "seekable gzip: {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
             path.display(),
             gzip.size(),
-            gzip.checkpoint_count()
+            gzip.checkpoint_count(),
+            threads
         );
         return Ok(Arc::new(open_tar_gzip(
             path, gzip, index_path, options, recreate,

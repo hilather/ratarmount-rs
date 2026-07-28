@@ -52,16 +52,28 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | SQLAR encrypt | formats-sqlar | detect + optional `sqlcipher` feature |
 | SMB | remote | `smb://` via smbclient CLI |
 
-## Still open (later)
+## Batch 5 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Commit (on main) | Result |
+|-------|-----------|------------------|--------|
+| Codec threads | `ratarmount-compress/**` | `12ad752` | `open_*_with_threads` for xz/zstd/gzip |
+| SquashFS xz | `formats-squashfs` | `8024300` | in-process XZ via workspace `xz2` |
+| Remote index | `index` + remote paths | `3e1488e` | materialize http(s)/file:// index |
+| use-backend order | `ratarmount/src/factory.rs` (probe order) | `4a60f36` | `--use-backend` reorders format probe |
+| CLI polish | `ratarmount` main CLI | `8452153` | color env, OSS attributions, `-P` help |
+
+**Orchestrator glue:** factory opens gzip/xz/zstd/bzip2 via `options.threads_for(...)` + `*_with_threads`.
+
+## Still open (later / batch 6+)
 
 | Gap | Notes |
 |-----|--------|
 | True Range without materialize for format openers | Formats still need local path after fetch |
-| SquashFS xz in-process | backhand xz conflicts with workspace lzma |
 | Dropbox / full fsspec | not started |
-| Full `-P` for all codecs | bzip2 wired; others default |
+| Full `-P` for remaining long-tail codecs | gzip/xz/zstd/bzip2 wired; lz4/lzip/… still default |
 | True bzip2 bit-block map | multi-stream parallel only |
-| lrzip, multi-disk ZIP EOCD | long-tail |
+| lrzip | not started |
+| True multi-disk ZIP EOCD | multi-part join exists; EOCD spanning disks limited |
 
 ## Verify
 
@@ -70,4 +82,5 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 # split: ratarmount -f tests/simple-file-split.001 mnt/
 # hashes: ratarmount --hashes sha256,crc32 --no-mount archive.tar
+# threads: ratarmount -P gzip:4,xz:2,zstd:4,bzip2:4 -f archive.tar.gz mnt/
 ```
