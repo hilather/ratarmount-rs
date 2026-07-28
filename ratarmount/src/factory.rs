@@ -29,7 +29,9 @@ use ratarmount_formats_fat::{looks_like_fat, FatMountSource};
 use ratarmount_formats_git::{looks_like_git, GitMountSource};
 use ratarmount_formats_html::{looks_like_html, HtmlMountSource};
 use ratarmount_formats_iso9660::{looks_like_iso, Iso9660MountSource};
-use ratarmount_formats_libarchive::{looks_like_libarchive, LibarchiveMountSource};
+use ratarmount_formats_libarchive::{
+    looks_like_libarchive, try_open_lrzip_via_libarchive, LibarchiveMountSource,
+};
 use ratarmount_formats_ogg::{looks_like_ogg, OggMountSource};
 use ratarmount_formats_pdf::{looks_like_pdf, PdfMountSource};
 use ratarmount_formats_sevenzip::{looks_like_7z, SevenZipMountSource};
@@ -782,65 +784,92 @@ fn open_path_impl(
     Ok(source)
 }
 
-/// Materialize lrzip (external `lrzip`/`lrunzip`) then open the uncompressed body.
+/// Open lrzip: prefer external `lrzip`/`lrunzip` materialize (then format probe);
+/// if the CLI is missing / fails, fall back to libarchive (Python pure-RA path).
 fn open_lrzip(
     path: &Path,
     index_path: Option<&Path>,
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Arc<dyn MountSource>, String> {
-    let (tmp, size) = materialize(path, CompressionFormat::Lrzip).map_err(|e| e.to_string())?;
-    eprintln!(
-        "lrzip materialize: {} ({} uncompressed bytes)",
-        path.display(),
-        size
-    );
-    let data_path = tmp.path().to_path_buf();
-    let mut materialised = Some(tmp);
-    if looks_like_tar(&data_path).unwrap_or(false) {
-        return Ok(Arc::new(open_tar(
-            path,
-            &data_path,
-            index_path,
-            options,
-            recreate,
-            &mut materialised,
-        )?));
+    match materialize(path, CompressionFormat::Lrzip) {
+        Ok((tmp, size)) => {
+            eprintln!(
+                "lrzip materialize: {} ({} uncompressed bytes)",
+                path.display(),
+                size
+            );
+            let data_path = tmp.path().to_path_buf();
+            let mut materialised = Some(tmp);
+            if looks_like_tar(&data_path).unwrap_or(false) {
+                return Ok(Arc::new(open_tar(
+                    path,
+                    &data_path,
+                    index_path,
+                    options,
+                    recreate,
+                    &mut materialised,
+                )?));
+            }
+            if looks_like_ext4(&data_path) {
+                let keep = materialised
+                    .take()
+                    .ok_or_else(|| "materialized lrzip missing".to_string())?
+                    .into_temp_path()
+                    .keep()
+                    .map_err(|e| e.error.to_string())?;
+                return Ok(Arc::new(
+                    Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
+                ));
+            }
+            if let Some(src) = try_stencil_archives_on_path(
+                &data_path,
+                index_path,
+                options,
+                recreate,
+                &mut materialised,
+            )? {
+                return Ok(src);
+            }
+            if looks_like_libarchive(&data_path) {
+                let keep = materialised
+                    .take()
+                    .ok_or_else(|| "materialized lrzip missing".to_string())?
+                    .into_temp_path()
+                    .keep()
+                    .map_err(|e| e.error.to_string())?;
+                return Ok(Arc::new(
+                    LibarchiveMountSource::open(&keep, index_path, options, VERSION, recreate)
+                        .map_err(|e| e.to_string())?,
+                ));
+            }
+            let stripped = strip_compression_suffix(
+                path.file_name().and_then(|s| s.to_str()).unwrap_or("file"),
+            );
+            Ok(Arc::new(
+                SingleFileMountSource::new(stripped, data_path, size, materialised.take())
+                    .map_err(|e| e.to_string())?,
+            ))
+        }
+        Err(cli_err) => {
+            // Python keeps lrzip on libarchive only; filter_all includes lrzip when built-in.
+            match try_open_lrzip_via_libarchive(path, index_path, options, VERSION, recreate) {
+                Ok(src) => {
+                    eprintln!(
+                        "lrzip via libarchive (CLI unavailable): {}",
+                        path.display()
+                    );
+                    Ok(Arc::new(src))
+                }
+                Err(la_err) => Err(format!(
+                    "lrzip open failed for {}: CLI materialize: {cli_err}; libarchive: {la_err}. \
+                     Install `lrzip`/`lrunzip` on PATH, or use a libarchive built with the lrzip filter \
+                     (runtime may still need the external lrzip program).",
+                    path.display()
+                )),
+            }
+        }
     }
-    if looks_like_ext4(&data_path) {
-        let keep = materialised
-            .take()
-            .ok_or_else(|| "materialized lrzip missing".to_string())?
-            .into_temp_path()
-            .keep()
-            .map_err(|e| e.error.to_string())?;
-        return Ok(Arc::new(
-            Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
-        ));
-    }
-    if let Some(src) =
-        try_stencil_archives_on_path(&data_path, index_path, options, recreate, &mut materialised)?
-    {
-        return Ok(src);
-    }
-    if looks_like_libarchive(&data_path) {
-        let keep = materialised
-            .take()
-            .ok_or_else(|| "materialized lrzip missing".to_string())?
-            .into_temp_path()
-            .keep()
-            .map_err(|e| e.error.to_string())?;
-        return Ok(Arc::new(
-            LibarchiveMountSource::open(&keep, index_path, options, VERSION, recreate)
-                .map_err(|e| e.to_string())?,
-        ));
-    }
-    let stripped =
-        strip_compression_suffix(path.file_name().and_then(|s| s.to_str()).unwrap_or("file"));
-    Ok(Arc::new(
-        SingleFileMountSource::new(stripped, data_path, size, materialised.take())
-            .map_err(|e| e.to_string())?,
-    ))
 }
 
 fn open_tar(

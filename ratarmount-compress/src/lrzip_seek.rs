@@ -1,9 +1,13 @@
 //! lrzip outer compression: detect + CLI materialize.
 //!
-//! Python keeps pure random-access on libarchive only for lrzip. This crate
-//! detects magic `LRZI\x00` / extensions `.lrz` / `.lrzip` and materializes via
-//! the external `lrzip` (or `lrunzip`) binary when present on `PATH`. There is
-//! no in-process seekable decoder (no libarchive dependency here).
+//! Python keeps pure random-access on **libarchive only** for lrzip. This crate
+//! detects magic `LRZI\x00` / extensions `.lrz` / `.lrzip` and can materialize via
+//! the external `lrzip` (or `lrunzip`) binary when present on `PATH`.
+//!
+//! There is no in-process seekable decoder and **no libarchive dependency** here.
+//! When the CLI is missing, the factory should fall back to
+//! `ratarmount_formats_libarchive::try_open_lrzip_via_libarchive` (filter_all /
+//! raw stream path). `materialize_lrzip` only shells to the CLI.
 
 use std::io::{self, Seek, SeekFrom};
 use std::path::Path;
@@ -17,13 +21,27 @@ use crate::{CompressError, Result};
 /// lrzip magic: `LRZI` + version major byte `0x00` (see Python `FID.LRZIP`).
 pub const LRZIP_MAGIC: &[u8; 5] = b"LRZI\x00";
 
+/// Clear error when neither CLI nor (caller) libarchive path can decompress.
+pub const LRZIP_CLI_MISSING_MSG: &str = "lrzip not installed: need `lrzip` or `lrunzip` on PATH \
+to decompress .lrz/.lrzip (factory may still open via libarchive lrzip filter)";
+
 /// True if `magic` starts with the lrzip file magic.
 pub fn looks_like_lrzip(magic: &[u8]) -> bool {
     magic.len() >= LRZIP_MAGIC.len() && &magic[..LRZIP_MAGIC.len()] == LRZIP_MAGIC
 }
 
 /// Whether an `lrzip` or `lrunzip` binary is available on `PATH`.
+///
+/// Alias of [`lrzip_cli_available`] — name kept for existing call sites.
 pub fn lrzip_available() -> bool {
+    lrzip_cli_available()
+}
+
+/// Whether the external `lrzip` / `lrunzip` CLI is on `PATH`.
+///
+/// This is independent of libarchive's lrzip filter (which also typically shells
+/// out to `lrzip -d` at runtime). Prefer this name when documenting the CLI path.
+pub fn lrzip_cli_available() -> bool {
     find_lrzip_bin().is_some()
 }
 
@@ -47,17 +65,14 @@ fn find_lrzip_bin() -> Option<&'static str> {
         .find(|&name| which_exists(name))
 }
 
-/// Decompress lrzip into a persistent temp file via external CLI.
+/// Decompress lrzip into a persistent temp file via external CLI only.
 ///
 /// Uses `lrzip -d -f -o <out> <in>` when `lrzip` is available, else
-/// `lrunzip -f -o <out> <in>`. Returns a clear error if neither binary is on PATH.
+/// `lrunzip -f -o <out> <in>`. Does **not** call libarchive — when the CLI is
+/// missing, callers should use the formats-libarchive lrzip open path instead.
 pub fn materialize_lrzip(path: &Path) -> Result<(NamedTempFile, u64)> {
-    let bin = find_lrzip_bin().ok_or_else(|| {
-        CompressError::Msg(
-            "lrzip not installed: need `lrzip` or `lrunzip` on PATH to decompress .lrz/.lrzip"
-                .into(),
-        )
-    })?;
+    let bin = find_lrzip_bin()
+        .ok_or_else(|| CompressError::Msg(LRZIP_CLI_MISSING_MSG.into()))?;
 
     let tmp = NamedTempFile::new()?;
     let out_path = tmp.path().to_path_buf();
@@ -73,10 +88,7 @@ pub fn materialize_lrzip(path: &Path) -> Result<(NamedTempFile, u64)> {
 
     let status = cmd.status().map_err(|e| {
         if e.kind() == io::ErrorKind::NotFound {
-            CompressError::Msg(
-                "lrzip not installed: need `lrzip` or `lrunzip` on PATH to decompress .lrz/.lrzip"
-                    .into(),
-            )
+            CompressError::Msg(LRZIP_CLI_MISSING_MSG.into())
         } else {
             CompressError::Msg(format!("failed to run {bin}: {e}"))
         }
@@ -140,7 +152,7 @@ mod tests {
 
     #[test]
     fn materialize_simple_lrz() {
-        if !lrzip_available() {
+        if !lrzip_cli_available() {
             eprintln!("skip: lrzip/lrunzip not on PATH");
             return;
         }
@@ -157,7 +169,7 @@ mod tests {
 
     #[test]
     fn materialize_missing_binary_errors_clearly() {
-        if lrzip_available() {
+        if lrzip_cli_available() {
             return;
         }
         let path = py_test("simple.lrz");
@@ -167,8 +179,15 @@ mod tests {
         let err = materialize_lrzip(&path).unwrap_err();
         let msg = err.to_string();
         assert!(
-            msg.contains("lrzip not installed") || msg.contains("PATH"),
+            msg.contains("lrzip not installed")
+                || msg.contains("PATH")
+                || msg.contains("libarchive"),
             "unexpected error: {msg}"
         );
+    }
+
+    #[test]
+    fn lrzip_cli_available_matches_available() {
+        assert_eq!(lrzip_available(), lrzip_cli_available());
     }
 }

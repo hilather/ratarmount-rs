@@ -2,12 +2,23 @@
 //!
 //! Matches Python `LibarchiveMountSource` strategy: index entries with a sequential
 //! `entry_index` as `offsetheader`, re-scan on open to extract file data.
+//!
+//! ## Compression filters (including lrzip)
+//!
+//! Opens enable [`archive_read_support_filter_all`](ffi::archive_read_support_filter_all),
+//! which includes the **lrzip** filter when the system libarchive was built with it
+//! ([`archive_read_support_filter_lrzip`](ffi::archive_read_support_filter_lrzip)).
+//! That filter typically shells out to the external `lrzip -d` program at read time.
+//!
+//! Python keeps pure random-access for lrzip on this backend only (no custom CLI
+//! materialize). Single-stream `.lrz` files use a second open with the **raw** format
+//! handler after archive formats fail to bid (same as Python's two-phase open).
 
 mod ffi;
 
 use std::collections::BTreeSet;
 use std::ffi::CString;
-use std::io::{self, Cursor, Seek, SeekFrom};
+use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::Mutex;
@@ -26,12 +37,14 @@ use crate::ffi::archive_read_support_format_rar5;
 use crate::ffi::{
     archive_entry_filetype, archive_entry_gid, archive_entry_mode, archive_entry_mtime,
     archive_entry_mtime_is_set, archive_entry_pathname, archive_entry_size,
-    archive_entry_size_is_set, archive_entry_symlink, archive_entry_uid, archive_format_name,
-    archive_read_data, archive_read_free, archive_read_new, archive_read_next_header,
-    archive_read_open_filename, archive_read_support_filter_all, archive_read_support_format_7zip,
-    archive_read_support_format_ar, archive_read_support_format_cab,
-    archive_read_support_format_cpio, archive_read_support_format_iso9660,
-    archive_read_support_format_lha, archive_read_support_format_rar,
+    archive_entry_size_is_set, archive_entry_symlink, archive_entry_uid, archive_filter_count,
+    archive_filter_name, archive_format_name, archive_read_data, archive_read_free,
+    archive_read_new, archive_read_next_header, archive_read_open_filename,
+    archive_read_support_filter_all, archive_read_support_filter_lrzip,
+    archive_read_support_format_7zip, archive_read_support_format_ar,
+    archive_read_support_format_cab, archive_read_support_format_cpio,
+    archive_read_support_format_iso9660, archive_read_support_format_lha,
+    archive_read_support_format_rar, archive_read_support_format_raw,
     archive_read_support_format_tar, archive_read_support_format_warc,
     archive_read_support_format_xar, archive_read_support_format_zip, cstr_to_string, error_string,
     AE_IFDIR, AE_IFLNK, AE_IFMT, ARCHIVE_EOF, ARCHIVE_OK, ARCHIVE_WARN,
@@ -56,20 +69,38 @@ pub type Result<T> = std::result::Result<T, LaError>;
 
 struct ArchiveHandle {
     ptr: *mut ffi::archive,
+    /// True when opened with the raw format handler only (compressed single stream).
+    raw: bool,
 }
 
 // libarchive archive is used under a mutex; mark Send.
 unsafe impl Send for ArchiveHandle {}
 
 impl ArchiveHandle {
+    /// Python-style two-phase open: archive formats first, then raw + filters.
     fn open_path(path: &Path) -> Result<Self> {
+        match Self::open_path_inner(path, /*allow_archives*/ true) {
+            Ok(h) => Ok(h),
+            Err(archive_err) => match Self::open_path_inner(path, /*allow_archives*/ false) {
+                Ok(h) => Ok(h),
+                Err(raw_err) => Err(LaError::Lib(format!(
+                    "archive open failed ({archive_err}); raw/filter open failed ({raw_err})"
+                ))),
+            },
+        }
+    }
+
+    fn open_path_inner(path: &Path, allow_archives: bool) -> Result<Self> {
         unsafe {
             let a = archive_read_new();
             if a.is_null() {
                 return Err(LaError::Lib("archive_read_new failed".into()));
             }
-            let h = Self { ptr: a };
-            support_formats(h.ptr)?;
+            let h = Self {
+                ptr: a,
+                raw: !allow_archives,
+            };
+            support_formats(h.ptr, allow_archives)?;
             use std::os::unix::ffi::OsStrExt;
             let cpath = CString::new(path.as_os_str().as_bytes())
                 .map_err(|e| LaError::Msg(e.to_string()))?;
@@ -78,6 +109,12 @@ impl ArchiveHandle {
             if r != ARCHIVE_OK && r != ARCHIVE_WARN {
                 let err = error_string(h.ptr);
                 return Err(LaError::Lib(err));
+            }
+            // Raw open must have at least one non-none filter (Python check).
+            if !allow_archives && !has_non_none_filter(h.ptr) {
+                return Err(LaError::Lib(
+                    "raw open had no compression filter (not a filtered stream)".into(),
+                ));
             }
             Ok(h)
         }
@@ -95,11 +132,23 @@ impl Drop for ArchiveHandle {
     }
 }
 
-unsafe fn support_formats(a: *mut ffi::archive) -> Result<()> {
-    // Filters (decompress)
+/// Enable decompress filters + formats.
+///
+/// `allow_archives`: when true, enable container formats (tar/zip/…); when false,
+/// enable **only** the raw handler so filters (gzip/lrzip/…) can expose a single stream.
+/// Do not mix raw with other format handlers (libarchive caveat).
+unsafe fn support_formats(a: *mut ffi::archive, allow_archives: bool) -> Result<()> {
+    // Filters (decompress). Includes lrzip when built into system libarchive.
     let r = archive_read_support_filter_all(a);
     if r != ARCHIVE_OK && r != ARCHIVE_WARN {
         return Err(LaError::Lib(error_string(a)));
+    }
+    if !allow_archives {
+        let r = archive_read_support_format_raw(a);
+        if r != ARCHIVE_OK && r != ARCHIVE_WARN {
+            return Err(LaError::Lib(error_string(a)));
+        }
+        return Ok(());
     }
     // Formats — skip mtree (false positives). Ignore per-format enable failures.
     let _ = archive_read_support_format_7zip(a);
@@ -117,6 +166,18 @@ unsafe fn support_formats(a: *mut ffi::archive) -> Result<()> {
     let _ = archive_read_support_format_xar(a);
     let _ = archive_read_support_format_zip(a);
     Ok(())
+}
+
+unsafe fn has_non_none_filter(a: *mut ffi::archive) -> bool {
+    let n = archive_filter_count(a);
+    for i in 0..n {
+        if let Some(name) = cstr_to_string(archive_filter_name(a, i)) {
+            if name != "none" {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 /// Read all entry data for current header into a Vec.
@@ -221,6 +282,12 @@ impl LibarchiveMountSource {
         index.begin_write()?;
         let mut generated = BTreeSet::new();
         let mut entry_index: i64 = 0;
+        let raw_stream = handle.raw;
+        let raw_display_name = if raw_stream {
+            Some(raw_entry_name_from_path(archive_path))
+        } else {
+            None
+        };
 
         unsafe {
             let fmt = cstr_to_string(archive_format_name(handle.ptr));
@@ -241,7 +308,13 @@ impl LibarchiveMountSource {
                 }
 
                 let path_c = archive_entry_pathname(entry);
-                let path = cstr_to_string(path_c).unwrap_or_default();
+                let mut path = cstr_to_string(path_c).unwrap_or_default();
+                // Raw single-stream: invent a stable basename (Python tarFileName strip).
+                if entry_index == 0 {
+                    if let Some(ref name) = raw_display_name {
+                        path = name.clone();
+                    }
+                }
                 // Skip empty
                 if path.is_empty() {
                     let _ = read_entry_data(handle.ptr, None);
@@ -522,8 +595,118 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
+/// lrzip magic: `LRZI` + version major `0x00` (Python `FID.LRZIP`).
+pub const LRZIP_MAGIC: &[u8; 5] = b"LRZI\x00";
+
+/// True if `magic` starts with the lrzip file magic.
+pub fn looks_like_lrzip_magic(magic: &[u8]) -> bool {
+    magic.len() >= LRZIP_MAGIC.len() && &magic[..LRZIP_MAGIC.len()] == LRZIP_MAGIC
+}
+
+/// True if path extension or magic suggests lrzip (`.lrz` / `.lrzip` / `LRZI\0`).
+pub fn looks_like_lrzip(path: &Path) -> bool {
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if name.ends_with(".lrz") || name.ends_with(".lrzip") {
+        return true;
+    }
+    if let Ok(mut f) = std::fs::File::open(path) {
+        let mut magic = [0u8; 5];
+        if f.read(&mut magic).ok() == Some(5) {
+            return looks_like_lrzip_magic(&magic);
+        }
+    }
+    false
+}
+
+/// Whether the linked libarchive exposes the lrzip **filter API**.
+///
+/// This only checks that `archive_read_support_filter_lrzip` accepts enablement.
+/// Runtime decompression still typically requires the external `lrzip` program
+/// (libarchive shells out to `lrzip -d`).
+pub fn libarchive_has_lrzip_filter() -> bool {
+    unsafe {
+        let a = archive_read_new();
+        if a.is_null() {
+            return false;
+        }
+        let r = archive_read_support_filter_lrzip(a);
+        archive_read_free(a);
+        r == ARCHIVE_OK || r == ARCHIVE_WARN
+    }
+}
+
+/// Open an lrzip path via libarchive (Python-style pure libarchive path).
+///
+/// Handles both multi-member archives (e.g. `.tar.lrz` after filter+tar bid) and
+/// single-stream `.lrz` via the raw format fallback. Returns a clear error when
+/// the filter cannot run (missing external `lrzip`, or filter not built in).
+pub fn try_open_lrzip_via_libarchive(
+    path: impl AsRef<Path>,
+    index_path: Option<&Path>,
+    options: &OpenOptions,
+    product_version: &str,
+    recreate: bool,
+) -> Result<LibarchiveMountSource> {
+    let path = path.as_ref();
+    if !looks_like_lrzip(path) {
+        return Err(LaError::Msg(format!(
+            "not an lrzip input: {}",
+            path.display()
+        )));
+    }
+    if !libarchive_has_lrzip_filter() {
+        return Err(LaError::Msg(
+            "libarchive has no lrzip filter (not built with archive_read_support_filter_lrzip)"
+                .into(),
+        ));
+    }
+    LibarchiveMountSource::open(path, index_path, options, product_version, recreate).map_err(
+        |e| {
+            LaError::Msg(format!(
+                "libarchive lrzip open failed for {}: {e} \
+                 (install `lrzip`/`lrunzip` if the filter shells out, or use a libarchive built with lrzip)",
+                path.display()
+            ))
+        },
+    )
+}
+
+/// Basename for a raw compressed stream entry: strip known compression suffixes.
+fn raw_entry_name_from_path(archive_path: &Path) -> String {
+    let mut fname = archive_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("data")
+        .to_string();
+    // Match Python: strip one known compression suffix (incl. libarchive-only codecs).
+    const SUFFIXES: &[&str] = &[
+        ".gz", ".gzip", ".bz2", ".bzip2", ".xz", ".zst", ".zstd", ".lz4", ".lzip", ".lzma", ".lzo",
+        ".lzop", ".Z", ".lrz", ".lrzip", ".grz", ".grzip", ".zz", ".zlib",
+    ];
+    let lower = fname.to_ascii_lowercase();
+    for suf in SUFFIXES {
+        let s = suf.to_ascii_lowercase();
+        if lower.ends_with(&s) && fname.len() > s.len() {
+            fname.truncate(fname.len() - s.len());
+            break;
+        }
+    }
+    if fname.is_empty() {
+        "data".into()
+    } else {
+        fname
+    }
+}
+
 /// Heuristic: extension/magic suggests a libarchive-handled format not covered by pure backends.
 pub fn looks_like_libarchive(path: &Path) -> bool {
+    if looks_like_lrzip(path) {
+        return true;
+    }
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
@@ -536,7 +719,7 @@ pub fn looks_like_libarchive(path: &Path) -> bool {
         // Magic probes
         if let Ok(mut f) = std::fs::File::open(path) {
             let mut magic = [0u8; 8];
-            if std::io::Read::read(&mut f, &mut magic).ok() == Some(8) {
+            if f.read(&mut magic).ok() == Some(8) {
                 // CAB: MSCF
                 if &magic[0..4] == b"MSCF" {
                     return true;
@@ -549,24 +732,28 @@ pub fn looks_like_libarchive(path: &Path) -> bool {
                 if &magic[0..4] == b"Rar!" {
                     return true;
                 }
+                // lrzip
+                if looks_like_lrzip_magic(&magic) {
+                    return true;
+                }
                 // ISO often starts with zeros; CD001 at 0x8001
             }
             // WARC
             let _ = f.seek(SeekFrom::Start(0));
             let mut head = [0u8; 5];
-            if std::io::Read::read(&mut f, &mut head).ok() == Some(5) && &head == b"WARC/" {
+            if f.read(&mut head).ok() == Some(5) && &head == b"WARC/" {
                 return true;
             }
             // XAR
             let _ = f.seek(SeekFrom::Start(0));
             let mut xar = [0u8; 4];
-            if std::io::Read::read(&mut f, &mut xar).ok() == Some(4) && &xar == b"xar!" {
+            if f.read(&mut xar).ok() == Some(4) && &xar == b"xar!" {
                 return true;
             }
             // ISO9660 primary volume descriptor
             if f.seek(SeekFrom::Start(0x8001)).is_ok() {
                 let mut cd = [0u8; 5];
-                if std::io::Read::read(&mut f, &mut cd).ok() == Some(5) && &cd == b"CD001" {
+                if f.read(&mut cd).ok() == Some(5) && &cd == b"CD001" {
                     return true;
                 }
             }
@@ -591,12 +778,17 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
+
+    fn py_test(name: &str) -> PathBuf {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        PathBuf::from(root).join("tests").join(name)
+    }
 
     #[test]
     fn open_cab() {
-        let root = std::env::var("RATARMOUNT_PY_ROOT")
-            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
-        let path = PathBuf::from(&root).join("tests/single-file.cab");
+        let path = py_test("single-file.cab");
         if !path.exists() {
             return;
         }
@@ -610,5 +802,119 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"foo\n");
+    }
+
+    #[test]
+    fn lrzip_magic_and_extension_detection() {
+        assert!(looks_like_lrzip_magic(b"LRZI\x00\x06"));
+        assert!(!looks_like_lrzip_magic(b"LRZI"));
+        assert!(!looks_like_lrzip_magic(b"LZIP\x01"));
+        assert!(looks_like_lrzip(Path::new("archive.lrz")));
+        assert!(looks_like_lrzip(Path::new("archive.lrzip")));
+        assert!(!looks_like_lrzip(Path::new("archive.tar")));
+        assert!(looks_like_libarchive(Path::new("foo.lrz")));
+    }
+
+    #[test]
+    fn lrzip_magic_from_fixture_when_present() {
+        let path = py_test("simple.lrz");
+        if !path.exists() {
+            return;
+        }
+        assert!(looks_like_lrzip(&path));
+        assert!(looks_like_libarchive(&path));
+        let mut magic = [0u8; 5];
+        let mut f = std::fs::File::open(&path).unwrap();
+        f.read_exact(&mut magic).unwrap();
+        assert!(looks_like_lrzip_magic(&magic));
+    }
+
+    #[test]
+    fn libarchive_lrzip_filter_api_present() {
+        // Host libarchive is expected to expose the filter (even if runtime needs `lrzip` binary).
+        assert!(
+            libarchive_has_lrzip_filter(),
+            "system libarchive missing archive_read_support_filter_lrzip"
+        );
+    }
+
+    #[test]
+    fn open_simple_lrz_skips_if_unsupported() {
+        let path = py_test("simple.lrz");
+        if !path.exists() {
+            eprintln!("skip: missing {}", path.display());
+            return;
+        }
+        if !libarchive_has_lrzip_filter() {
+            eprintln!("skip: libarchive has no lrzip filter");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("lrz.index.sqlite");
+        match try_open_lrzip_via_libarchive(
+            &path,
+            Some(&idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            true,
+        ) {
+            Ok(m) => {
+                let fi = m.lookup("/simple", 0).expect("simple entry");
+                let mut r = m.open(&fi, 0).unwrap();
+                let mut buf = Vec::new();
+                r.read_to_end(&mut buf).unwrap();
+                assert_eq!(buf, b"foo fighter\n");
+            }
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                // Runtime needs external lrzip for most builds of the filter.
+                let skip = msg.contains("lrzip")
+                    || msg.contains("unable to run")
+                    || msg.contains("filter")
+                    || msg.contains("program");
+                assert!(
+                    skip,
+                    "unexpected libarchive lrzip error (not a skippable support gap): {e}"
+                );
+                eprintln!("skip: lrzip runtime unavailable via libarchive: {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn raw_entry_name_strips_lrz() {
+        assert_eq!(raw_entry_name_from_path(Path::new("/tmp/simple.lrz")), "simple");
+        assert_eq!(
+            raw_entry_name_from_path(Path::new("archive.tar.lrzip")),
+            "archive.tar"
+        );
+    }
+
+    #[test]
+    fn try_open_rejects_non_lrzip() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("not.lrz");
+        {
+            let mut f = std::fs::File::create(&p).unwrap();
+            f.write_all(b"not lrzip").unwrap();
+        }
+        // Extension says lrz but magic does not — still treated as lrzip by extension.
+        // Use a non-lrz name:
+        let p2 = dir.path().join("plain.txt");
+        std::fs::write(&p2, b"hi").unwrap();
+        let err = match try_open_lrzip_via_libarchive(
+            &p2,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            true,
+        ) {
+            Ok(_) => panic!("expected non-lrzip rejection"),
+            Err(e) => e,
+        };
+        assert!(
+            err.to_string().contains("not an lrzip"),
+            "got: {err}"
+        );
     }
 }

@@ -15,7 +15,8 @@
 //! * **.Z / lzma / zlib** — one-shot decode into RAM/temp (`SeekableBody`);
 //!   `open_seekable_*_with_threads` accepts `-P` (decode sequential: single stream).
 //! * **lrzip** — detect magic/extension; materialize via external `lrzip`/`lrunzip` CLI
-//!   (Python leaves pure RA on libarchive; no in-process decoder here).
+//!   when present. Python leaves pure RA on libarchive; factory falls back to
+//!   `try_open_lrzip_via_libarchive` when CLI is missing (no in-process decoder here).
 //! * CLI/helpers still expose `materialize_*` for plain single-file mounts.
 //! * [`ParallelizationSpec`] parses Python-style `-P` backend matrices.
 
@@ -52,7 +53,10 @@ pub use gzip_seek::{
     SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING, GZIP_SEEK_INDEX_MAGIC,
     GZIP_SEEK_INDEX_VERSION,
 };
-pub use lrzip_seek::{looks_like_lrzip, lrzip_available, materialize_lrzip, LRZIP_MAGIC};
+pub use lrzip_seek::{
+    looks_like_lrzip, lrzip_available, lrzip_cli_available, materialize_lrzip, LRZIP_CLI_MISSING_MSG,
+    LRZIP_MAGIC,
+};
 pub use lz4_seek::{open_seekable_lz4, open_seekable_lz4_with_threads, SeekableLz4};
 pub use lzip_seek::{open_seekable_lzip, open_seekable_lzip_with_threads, SeekableLzip};
 pub use lzma_seek::{open_seekable_lzma, open_seekable_lzma_with_threads};
@@ -112,7 +116,7 @@ pub enum CompressionFormat {
     Lzma,
     /// RFC 1950 zlib wrapper (e.g. `.zlib`).
     Zlib,
-    /// lrzip (magic `LRZI\x00`; materialize via external CLI only).
+    /// lrzip (magic `LRZI\x00`; CLI materialize; factory may use libarchive fallback).
     Lrzip,
 }
 

@@ -23,7 +23,11 @@ pub enum archive_entry {}
 extern "C" {
     pub fn archive_read_new() -> *mut archive;
     pub fn archive_read_free(a: *mut archive) -> c_int;
+    /// Enables all built-in decompression filters, including **lrzip** when the
+    /// system libarchive was built with that filter (often shells out to `lrzip -d`).
     pub fn archive_read_support_filter_all(a: *mut archive) -> c_int;
+    /// Explicit lrzip filter enable (same filter as included by `filter_all`).
+    pub fn archive_read_support_filter_lrzip(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_7zip(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_ar(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_cab(a: *mut archive) -> c_int;
@@ -37,6 +41,8 @@ extern "C" {
     pub fn archive_read_support_format_warc(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_xar(a: *mut archive) -> c_int;
     pub fn archive_read_support_format_zip(a: *mut archive) -> c_int;
+    /// Single compressed stream (do not combine with other format handlers).
+    pub fn archive_read_support_format_raw(a: *mut archive) -> c_int;
     // Avoid mtree (matches random text)
 
     pub fn archive_read_open_filename(
@@ -49,6 +55,8 @@ extern "C" {
     pub fn archive_read_data(a: *mut archive, buff: *mut c_void, size: usize) -> isize;
     pub fn archive_error_string(a: *mut archive) -> *const c_char;
     pub fn archive_format_name(a: *mut archive) -> *const c_char;
+    pub fn archive_filter_count(a: *mut archive) -> c_int;
+    pub fn archive_filter_name(a: *mut archive, n: c_int) -> *const c_char;
 
     pub fn archive_entry_pathname(entry: *mut archive_entry) -> *const c_char;
     pub fn archive_entry_pathname_w(entry: *mut archive_entry) -> *const libc::wchar_t;
