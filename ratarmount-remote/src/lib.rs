@@ -3,7 +3,7 @@
 //! - `file://` → local path
 //! - `http(s)://` → fetch to temp (prefer Range when supported) and live Range I/O via
 //!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`]
-//! - `s3://bucket/key` → GetObject to temp (AWS env credentials)
+//! - `s3://bucket/key` → GetObject to temp (env keys → ECS/IMDS role → optional anonymous)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
