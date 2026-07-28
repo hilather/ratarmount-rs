@@ -84,7 +84,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.8"
+          VERSION: "0.1.9"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.8"
+          VERSION: "0.1.9"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -234,7 +234,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.8"
+          VERSION: "0.1.9"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -322,7 +322,7 @@ jobs:
 
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.8"
+          VERSION: "0.1.9"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
@@ -370,11 +370,11 @@ jobs:
       - name: Flatten artifacts
         run: |
           mkdir -p release
-          find artifacts -type f \( \
+          # Only copy non-empty files (empty release assets are rejected by GitHub).
+          find artifacts -type f -size +0c \( \
               -name '*.deb' -o -name '*.rpm' -o -name '*.tar.gz' \
               -o -name '*.sha256' -o -name 'glibc-version.txt' -o -name 'file-info*.txt' \
             \) -exec cp -v {} release/ \;
-          # Unique names: if collisions, prefix with parent dir
           cd release
           ls -la
           # Combined SHA256SUMS
@@ -462,10 +462,20 @@ jobs:
 
           cd release
           ls -la
-          mapfile -t files < <(find . -maxdepth 1 -type f ! -name '.*' -printf '%f\n' | sort)
+          # GitHub Releases reject empty blobs (HTTP 422). Skip 0-byte sidecars
+          # like a failed `file ... | tee file-info.txt` from a matrix leg.
+          mapfile -t files < <(
+            find . -maxdepth 1 -type f ! -name '.*' -size +0c -printf '%f\n' | sort
+          )
+          mapfile -t empty_files < <(
+            find . -maxdepth 1 -type f ! -name '.*' -size 0c -printf '%f\n' | sort || true
+          )
+          if [[ ${#empty_files[@]} -gt 0 ]]; then
+            note "Skipping empty files (not uploadable): ${empty_files[*]}"
+          fi
           note "Asset count: ${#files[@]}"
           printf '  %s\n' "${files[@]}"
-          [[ ${#files[@]} -gt 0 ]] || fail "No files under release/"
+          [[ ${#files[@]} -gt 0 ]] || fail "No non-empty files under release/"
 
           NOTES_FILE="$(mktemp)"
           cat >"$NOTES_FILE" <<'MD'
