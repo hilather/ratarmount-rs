@@ -95,8 +95,9 @@ struct Args {
     #[arg(short = 'i', long = "ignore-zeros", action = ArgAction::SetTrue)]
     ignore_zeros: bool,
 
-    /// Parallelization (reserved for parallel decompressors; backend matrix not fully parsed yet)
-    #[arg(short = 'P', long = "parallelization", default_value = "1")]
+    /// Parallelization matrix for decompressors.
+    /// Examples: `1` (default), `0` (all cores), `4`, `bzip2:4,gzip:2`, `:2,bzip2:4`
+    #[arg(short = 'P', long = "parallelization", default_value = "1", value_name = "SPEC")]
     parallelization: String,
 
     /// Minimum file count to create an index (harness forces 0)
@@ -177,10 +178,11 @@ struct Args {
     #[arg(long = "union-mount-cache-timeout", default_value_t = 60.0)]
     union_mount_cache_timeout: f64,
 
-    /// Enable/disable colored log prefixes
+    /// Force colored log prefixes (overrides NO_COLOR / CLICOLOR)
     #[arg(long = "color", action = ArgAction::SetTrue, overrides_with = "no_color")]
     color: bool,
 
+    /// Disable colored log prefixes (overrides auto / CLICOLOR)
     #[arg(long = "no-color", action = ArgAction::SetTrue)]
     no_color: bool,
 
@@ -247,8 +249,8 @@ fn main() {
         return;
     }
 
-    let use_color = !args.no_color; // default on; --no-color disables
-    init_logger(args.debug, args.log_file.as_deref(), use_color);
+    let write_style = resolve_color_style(args.color, args.no_color);
+    init_logger(args.debug, args.log_file.as_deref(), write_style);
 
     if args.unmount {
         if args.paths.is_empty() {
@@ -637,7 +639,40 @@ fn main() {
     }
 }
 
-fn init_logger(debug: u8, log_file: Option<&Path>, use_color: bool) {
+/// Resolve log color style from CLI flags and environment.
+///
+/// Priority: `--no-color` → never; `--color` → always; otherwise auto while
+/// honoring `NO_COLOR` (disable), `CLICOLOR=0` (disable), and `CLICOLOR_FORCE`
+/// (force on when set and not `"0"`).
+fn resolve_color_style(force_color: bool, force_no_color: bool) -> env_logger::WriteStyle {
+    if force_no_color {
+        return env_logger::WriteStyle::Never;
+    }
+    if force_color {
+        return env_logger::WriteStyle::Always;
+    }
+    // Auto: respect NO_COLOR (https://no-color.org/) and CLICOLOR / CLICOLOR_FORCE.
+    if std::env::var_os("NO_COLOR").is_some_and(|v| !v.is_empty()) {
+        return env_logger::WriteStyle::Never;
+    }
+    if std::env::var("CLICOLOR")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| v == "0")
+    {
+        return env_logger::WriteStyle::Never;
+    }
+    if std::env::var("CLICOLOR_FORCE")
+        .ok()
+        .as_deref()
+        .is_some_and(|v| v != "0")
+    {
+        return env_logger::WriteStyle::Always;
+    }
+    env_logger::WriteStyle::Auto
+}
+
+fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::WriteStyle) {
     let level = match debug {
         0 => log::LevelFilter::Error,
         1 => log::LevelFilter::Warn,
@@ -648,11 +683,7 @@ fn init_logger(debug: u8, log_file: Option<&Path>, use_color: bool) {
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
     builder.filter_level(level);
-    builder.write_style(if use_color {
-        env_logger::WriteStyle::Auto
-    } else {
-        env_logger::WriteStyle::Never
-    });
+    builder.write_style(write_style);
     if let Some(path) = log_file {
         match std::fs::OpenOptions::new()
             .create(true)
@@ -701,30 +732,41 @@ fn print_features() {
 
 fn print_oss_attributions(full: bool) {
     println!("ratarmount {VERSION} (Rust) — open source components (non-exhaustive):");
+    // Major direct dependencies used by ratarmount-rs and its workspace crates.
     let short = [
-        "fuser (MIT)",
-        "rusqlite / SQLite (MIT / public domain)",
-        "flate2 / miniz (MIT/Zlib)",
-        "bzip2-rs / libbz2",
-        "xz2 / liblzma",
-        "zstd",
-        "lz4_flex",
-        "aes / sha2",
-        "fatfs",
-        "lopdf",
-        "git2 / libgit2",
-        "libarchive (via FFI)",
-        "clap, regex, thiserror, nix, …",
+        "fuser — FUSE bindings (MIT)",
+        "rusqlite / SQLite — index store (MIT / public domain)",
+        "flate2 / miniz_oxide — gzip/zlib (MIT / Zlib)",
+        "bzip2 (libbz2) — bzip2 decompression (bzip2-rs + libbz2)",
+        "xz2 / liblzma — xz/lzma decompression (MIT)",
+        "zstd — zstd decompression (BSD / dual)",
+        "lz4_flex — lz4 (MIT)",
+        "backhand — SquashFS reader (MIT)",
+        "libarchive — multi-format archives via FFI (BSD-2-Clause)",
+        "git2 / libgit2 — git repositories (MIT / GPL dual for libgit2)",
+        "fatfs — FAT filesystems (MIT)",
+        "lopdf — PDF (MIT)",
+        "aes / sha2 / md-5 / crc32fast — crypto & hashes",
+        "clap — CLI parsing (MIT/Apache-2.0)",
+        "env_logger / log — logging (MIT/Apache-2.0)",
+        "nix / libc — Unix syscalls (MIT)",
+        "regex / thiserror / anyhow / url / tempfile — utilities",
+        "reqwest / ssh2 / … — remote backends (http/s3/ssh)",
     ];
     for s in short {
         println!("  - {s}");
     }
     if full {
         println!();
+        println!("Additional transitive crates (serde, parking_lot, memmap2, byteorder,");
+        println!("smallvec, once_cell, …) are pulled in via Cargo; see `Cargo.lock`.");
+        println!();
         println!(
             "Full license texts ship with the respective crates on crates.io / system packages."
         );
         println!("This binary is MIT-licensed; see LICENSE in the source tree.");
+        println!();
+        println!("Use --oss-attributions-short for the compact list only.");
     }
 }
 
