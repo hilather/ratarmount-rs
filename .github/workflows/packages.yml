@@ -84,7 +84,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.6"
+          VERSION: "0.1.7"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.6"
+          VERSION: "0.1.7"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -234,7 +234,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.6"
+          VERSION: "0.1.7"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -322,7 +322,7 @@ jobs:
 
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.6"
+          VERSION: "0.1.7"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
@@ -414,21 +414,26 @@ jobs:
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
         run: |
-          set -euo pipefail
-          TAG="${{ github.ref_name }}"
+          set -euxo pipefail
+          # Prior failure mode: bash globs kept literal names for missing files
+          # (e.g. glibc-version.txt), so `gh release create` exited 1. Only upload
+          # files that actually exist. Create the release shell first, then attach.
+          command -v gh
+          gh --version
+          test -n "${GH_TOKEN:-}"
+          test -d release
           cd release
-          shopt -s nullglob
-          files=( *.deb *.rpm *.tar.gz *.sha256 *.cosign.bundle SHA256SUMS file-info*.txt glibc-version.txt )
-          if [[ ${#files[@]} -eq 0 ]]; then
-            echo "No release files found under release/"
-            ls -la
-            exit 1
-          fi
-          echo "Uploading ${#files[@]} assets for $TAG"
-          ls -la "${files[@]}"
+          ls -la
+          mapfile -t files < <(find . -maxdepth 1 -type f ! -name '.*' -printf '%f\n' | sort)
+          echo "Asset count: ${#files[@]}"
+          printf '  %s\n' "${files[@]}"
+          test "${#files[@]}" -gt 0
 
-          NOTES=$(cat <<'EOF'
+          NOTES_FILE="$(mktemp)"
+          cat >"$NOTES_FILE" <<'MD'
           ## Packages
 
           | Kind | Platforms |
@@ -440,23 +445,38 @@ jobs:
 
           Cosign keyless signatures (`.cosign.bundle`) and `SHA256SUMS` are included.
 
-          **Linux runtime:** fuse3, libarchive (optional: e2fsprogs, squashfs-tools).  
+          **Linux runtime:** fuse3, libarchive (optional: e2fsprogs, squashfs-tools).
           **macOS runtime:** macFUSE or FUSE-T, libarchive — see `docs/macos.md`.
 
-          If the asset list is incomplete, also check the **signed-release-bundle**
-          workflow artifact on this Packages run.
-          EOF
-          )
+          Workflow artifact fallback: **signed-release-bundle** on the Packages run.
+          MD
+          sed -i 's/^          //' "$NOTES_FILE"
+          echo "----- release notes -----"
+          cat "$NOTES_FILE"
+          echo "----- end notes -----"
 
-          # Create or update the release for this tag, then upload assets.
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Release $TAG already exists; uploading/clobbering assets"
-            gh release upload "$TAG" "${files[@]}" --clobber
-            gh release edit "$TAG" --notes "$NOTES" --title "ratarmount-rs $TAG"
-          else
-            gh release create "$TAG" "${files[@]}" \
+          # Ensure a release exists (no assets yet). Ignore "already exists".
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Creating empty release $TAG"
+            # Do not pass assets here: large multi-file create is flaky; upload next.
+            gh release create "$TAG" \
               --title "ratarmount-rs $TAG" \
-              --notes "$NOTES" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          else
+            echo "Release $TAG already exists; updating title/notes"
+            gh release edit "$TAG" \
+              --title "ratarmount-rs $TAG" \
+              --notes-file "$NOTES_FILE" \
               --latest
           fi
-          gh release view "$TAG" --json url,assets --jq '{url, count: (.assets|length), names: [.assets[].name]}'
+
+          echo "Uploading ${#files[@]} assets to $TAG"
+          # Upload one-by-one so a single bad path does not obscure the rest.
+          for f in "${files[@]}"; do
+            echo ">> upload $f ($(stat -c%s "$f") bytes)"
+            gh release upload "$TAG" "$f" --clobber
+          done
+
+          gh release view "$TAG"
+          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
