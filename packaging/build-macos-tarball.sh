@@ -3,7 +3,7 @@
 #
 # Usage (from repo root, on a Mac with FUSE + libarchive + Rust):
 #   ./packaging/build-macos-tarball.sh
-#   VERSION=0.1.2 OUT_DIR=dist ./packaging/build-macos-tarball.sh
+#   VERSION=0.1.3 OUT_DIR=dist ./packaging/build-macos-tarball.sh
 #
 # Env:
 #   VERSION          default: workspace Cargo.toml version
