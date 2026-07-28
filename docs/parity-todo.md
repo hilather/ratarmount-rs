@@ -34,8 +34,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
-| gzip (rapidgzip / seek index) | yes | **G3 Tier B seekable** for `.tar.gz`; materialize for plain `.gz` | `~` Tier C blob import still open |
-| bzip2 block-parallel | yes | multi-stream + bit-block seek map (≤256 MiB compressed) via `-P` | `[x]` / `~` >256 MiB full decode |
+| gzip (rapidgzip / seek index) | yes | **G3 Tier B** + **Tier C RGZI blob** import/export | `[x]` / `~` index table glue at open |
+| bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps (any size on path) | `[x]` / `~` open-time size discovery |
 | xz multi-block seek | yes | Index + multi-stream maps; single-block full decode | `[x]` / `~` exotic filters |
 | zstd multi-frame / seek table | yes | multi-frame map + seek-table footer import | `[x]` / `~` zstdblocks import |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
@@ -73,7 +73,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `file://` | yes | yes | `[x]` |
 | `http(s)://` (full GET) | yes | yes | `[x]` |
 | HTTP Range without full download | yes | live Range for TAR/ZIP/gzip/**bzip2/xz/zstd** + materialize fallback | `[x]` |
-| `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS role + anonymous | `[x]` / `~` no live S3 Range |
+| `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS + anonymous + Range prefer-range | `[x]` / `~` factory live S3RangeFile |
 | `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
 | SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox folder (list TTL) + ranged content download | `[x]` |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
@@ -83,7 +83,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
 | SQLite index 0.7.x schema | yes | yes | `[x]` |
-| Cross-open Py↔Rust index (TAR core) | yes | yes | `~` compression side tables |
+| Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables | `[x]` / `~` decoder import of Python blobs |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
 | Index file hashes / xattrs | yes | `--hashes` fill + FUSE listxattr/getxattr for TAR | `[x]` / `~` non-TAR sources |

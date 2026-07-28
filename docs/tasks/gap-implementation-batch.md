@@ -125,21 +125,32 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | 7z store-in-solid nested no-tmp | later | progressive outer + inner reader |
 | Tests: nested 7z + nested TAR | **done** | sevenzip + automount unit tests |
 
-## Still open (later / batch 10+)
+## Batch 10 — five parallel worktree agents (merged)
+
+| Agent | Ownership | Result |
+|-------|-----------|--------|
+| bzip2 large maps | `bzip2_seek.rs` | file-backed maps beyond 256 MiB compressed |
+| gzip Tier C | `gzip_seek.rs` | `RGZI` v1 seek-index blob import/export |
+| index side tables | `ratarmount-index` | gzipindexes/zstdblocks/bzip2blocks schema + API |
+| S3 Range | `remote/s3.rs` | Range GetObject + prefer-range + `S3RangeFile` |
+| CI gates | benchmarks + ci.yml | cold-index hard gate from `rust-gates.json` |
+
+## Still open (later / batch 11+)
 
 | Gap | Notes |
 |-----|--------|
-| bzip2 map for **>256 MiB** compressed | full decode; no mmap file-backed map yet |
+| Wire gzip RGZI blobs ↔ index side tables in factory | storage + codec exist; open path not glued |
+| Factory live `S3RangeFile` like HTTP Range | S3 prefer-range materialize done; no `RemoteAccess::S3` yet |
 | True in-process lrzip (no CLI) | CLI materialize only |
-| gzip Tier C index blob import | open |
-| Benchmark gates in CI | open |
-| S3 live Range (not just materialize) | path still materializes after creds |
+| Flattened recursive TAR index | open |
+| 7z store-in-solid nested polish | open |
+| Full vs-Python ratio gates in CI | optional `RUN_FULL_BENCH=1` only |
 
 ## Verify
 
 ```bash
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
-# range codecs: ratarmount -f https://example/a.tar.{gz,bz2,xz,zst} mnt/
-# s3: AWS_ANONYMOUS=1 ratarmount -f s3://public-bucket/a.tar mnt/
+./benchmarks/check-rust-gates.sh
+# s3 prefer-range: AWS_* or AWS_ANONYMOUS=1 ratarmount -f s3://bucket/a.tar mnt/
 ```
