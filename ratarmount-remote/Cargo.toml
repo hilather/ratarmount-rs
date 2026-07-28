@@ -3,7 +3,7 @@ name = "ratarmount-remote"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Remote URL fetch (HTTP, S3, SSH/SFTP, WebDAV, SMB) for ratarmount-rs"
+description = "Remote URL fetch (HTTP, S3, SSH/SFTP, WebDAV, SMB, Dropbox) for ratarmount-rs"
 
 [dependencies]
 ratarmount-core.workspace = true

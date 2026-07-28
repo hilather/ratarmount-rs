@@ -6,8 +6,10 @@
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
+//! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`)
 //! - other schemes → clear "not yet" errors
 
+mod dropbox;
 mod s3;
 mod smb;
 mod ssh;
@@ -21,6 +23,11 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::Url;
 
+pub use dropbox::{
+    dropbox_api_arg, dropbox_download_url, fetch_dropbox_location_to_temp, fetch_dropbox_to_temp,
+    load_dropbox_token, parse_dropbox_url, redact_token, DropboxLocation,
+    DEFAULT_DROPBOX_DOWNLOAD_URL,
+};
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
@@ -52,6 +59,8 @@ pub enum RemoteError {
     WebDav(String),
     #[error("smb: {0}")]
     Smb(String),
+    #[error("dropbox: {0}")]
+    Dropbox(String),
     #[error("unsupported remote scheme: {0}")]
     UnsupportedScheme(String),
 }
@@ -74,6 +83,7 @@ pub fn is_remote_url(s: &str) -> bool {
                 | "smb"
                 | "webdav"
                 | "webdavs"
+                | "dropbox"
         )
     })
 }
@@ -111,6 +121,10 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
         }
         "smb" => {
             let (tmp, size) = fetch_smb_to_temp(input)?;
+            keep_fetched(input, tmp, size)
+        }
+        "dropbox" => {
+            let (tmp, size) = fetch_dropbox_to_temp(input)?;
             keep_fetched(input, tmp, size)
         }
         other => Err(RemoteError::UnsupportedScheme(other.to_string())),
@@ -552,8 +566,34 @@ mod tests {
         assert!(is_remote_url("webdav://host.example/files/a.tar"));
         assert!(is_remote_url("webdavs://host.example/files/a.tar"));
         assert!(is_remote_url("smb://server/share/a.tar"));
+        assert!(is_remote_url("dropbox:///path/to/file.tar"));
+        assert!(is_remote_url("dropbox://path/to/file.tar"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
+    }
+
+    #[test]
+    fn dropbox_resolve_errors_without_token() {
+        // When DROPBOX_TOKEN is unset, resolve must fail clearly — not "unsupported scheme".
+        if std::env::var("DROPBOX_TOKEN").is_ok() {
+            return;
+        }
+        let err = resolve_to_local("dropbox:///some/archive.tar").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DROPBOX_TOKEN") || msg.contains("dropbox"),
+            "unexpected: {msg}"
+        );
+        assert!(
+            !msg.to_ascii_lowercase().contains("unsupported remote scheme"),
+            "dropbox should be a supported scheme: {msg}"
+        );
+    }
+
+    #[test]
+    fn dropbox_parse_export() {
+        let loc = parse_dropbox_url("dropbox://folder/nested/a.tar").unwrap();
+        assert_eq!(loc.path, "/folder/nested/a.tar");
     }
 
     #[test]
