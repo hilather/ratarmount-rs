@@ -1,12 +1,14 @@
 //! Remote URL access for Phase 10.
 //!
 //! - `file://` → local path
-//! - `http(s)://` → fetch to temp (prefer Range when supported) and optional range-capable reader
+//! - `http(s)://` → fetch to temp (prefer Range when supported) and live Range I/O via
+//!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`]
 //! - `s3://bucket/key` → GetObject to temp (AWS env credentials)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
-//! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`)
+//! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
+//!   [`DropboxMountSource`] (`files/list_folder` + download on open)
 //! - other schemes → clear "not yet" errors
 
 mod dropbox;
@@ -24,9 +26,11 @@ use thiserror::Error;
 use url::Url;
 
 pub use dropbox::{
-    dropbox_api_arg, dropbox_download_url, fetch_dropbox_location_to_temp, fetch_dropbox_to_temp,
-    load_dropbox_token, parse_dropbox_url, redact_token, DropboxLocation,
-    DEFAULT_DROPBOX_DOWNLOAD_URL,
+    dropbox_api_arg, dropbox_download_url, dropbox_path_is_folder, dropbox_rpc_base,
+    fetch_dropbox_location_to_temp, fetch_dropbox_to_temp, get_dropbox_metadata,
+    list_dropbox_folder, load_dropbox_token, parse_dropbox_url, parse_dropbox_url_allow_root,
+    redact_token, DropboxEntry, DropboxEntryKind, DropboxLocation, DropboxMountSource,
+    DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_RPC_BASE,
 };
 pub use s3::{fetch_s3_to_temp, parse_s3_url, S3Location};
 pub use smb::{
@@ -409,6 +413,9 @@ fn fetch_http_via_ranges(url: &str, size: u64) -> Result<(NamedTempFile, u64)> {
 
 /// Seekable HTTP reader using Range requests when the server supports them.
 /// Falls back to full download into memory if ranges are unavailable.
+///
+/// Prefer [`open_http_range`] / [`resolve_http`] for the public entry points.
+/// [`resolve_to_local`] still fully materializes HTTP(S) for path-based openers.
 pub struct HttpRangeFile {
     url: String,
     size: u64,
@@ -417,17 +424,26 @@ pub struct HttpRangeFile {
     buffered: Option<Vec<u8>>,
 }
 
+impl std::fmt::Debug for HttpRangeFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpRangeFile")
+            .field("url", &self.url)
+            .field("size", &self.size)
+            .field("pos", &self.pos)
+            .field("uses_ranges", &self.uses_ranges())
+            .finish()
+    }
+}
+
 impl HttpRangeFile {
+    /// Open `url`, using live Range GETs when the server supports ranges and size is known.
+    ///
+    /// Without usable ranges, buffers the full response body in memory.
     pub fn open(url: &str) -> Result<Self> {
         let probe = probe_http(url)?;
         if probe.accept_ranges {
             if let Some(size) = probe.content_length {
-                return Ok(Self {
-                    url: url.to_string(),
-                    size,
-                    pos: 0,
-                    buffered: None,
-                });
+                return Ok(Self::range_backed(url, size));
             }
         }
 
@@ -443,6 +459,20 @@ impl HttpRangeFile {
         })
     }
 
+    /// Construct a live Range-backed reader (no probe; caller must know size).
+    pub fn range_backed(url: &str, size: u64) -> Self {
+        Self {
+            url: url.to_string(),
+            size,
+            pos: 0,
+            buffered: None,
+        }
+    }
+
+    pub fn url(&self) -> &str {
+        &self.url
+    }
+
     pub fn len(&self) -> u64 {
         self.size
     }
@@ -454,6 +484,120 @@ impl HttpRangeFile {
     /// True when reads issue live Range GETs (not a fully buffered body).
     pub fn uses_ranges(&self) -> bool {
         self.buffered.is_none()
+    }
+}
+
+/// Open a seekable HTTP reader using live Range GETs when possible.
+///
+/// Equivalent to [`HttpRangeFile::open`].
+pub fn open_http_range(url: &str) -> Result<HttpRangeFile> {
+    HttpRangeFile::open(url)
+}
+
+/// HTTP access preferring live Range I/O over full materialization.
+///
+/// Unlike [`resolve_to_local`] (which always produces a local path for HTTP), this returns a
+/// live [`HttpRangeFile`] when the server supports byte ranges and the object size is known.
+#[derive(Debug)]
+pub enum RemoteHttp {
+    /// Live Range-backed reader (server supports ranges + known size).
+    Range(HttpRangeFile),
+    /// Full body written to a temp file (ranges unavailable or incomplete probe).
+    Materialized(RemoteLocal),
+}
+
+impl RemoteHttp {
+    /// True when this is a live Range-backed handle (not fully buffered or on-disk).
+    pub fn uses_ranges(&self) -> bool {
+        match self {
+            Self::Range(f) => f.uses_ranges(),
+            Self::Materialized(_) => false,
+        }
+    }
+
+    pub fn len(&self) -> u64 {
+        match self {
+            Self::Range(f) => f.len(),
+            Self::Materialized(RemoteLocal::Fetched { size, .. }) => *size,
+            Self::Materialized(RemoteLocal::Local(p)) => {
+                std::fs::metadata(p).map(|m| m.len()).unwrap_or(0)
+            }
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Local path when materialized; `None` for live Range handles.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Range(_) => None,
+            Self::Materialized(r) => Some(r.path()),
+        }
+    }
+}
+
+/// Resolve an HTTP(S) URL, preferring live Range I/O without full materialize.
+///
+/// - Server advertises ranges **and** size is known → [`RemoteHttp::Range`]
+/// - Otherwise → [`RemoteHttp::Materialized`] (full GET to a kept temp file)
+///
+/// [`resolve_to_local`] remains the full-materialize path for path-based openers.
+pub fn resolve_http(url: &str) -> Result<RemoteHttp> {
+    let probe = probe_http(url)?;
+    if probe.accept_ranges {
+        if let Some(size) = probe.content_length {
+            debug!("HTTP live Range for {url} ({size} bytes)");
+            return Ok(RemoteHttp::Range(HttpRangeFile::range_backed(url, size)));
+        }
+    }
+    debug!("HTTP materialize for {url} (ranges unavailable or size unknown)");
+    let (tmp, size) = fetch_http_full_get(url)?;
+    Ok(RemoteHttp::Materialized(keep_fetched(url, tmp, size)?))
+}
+
+/// Unified access handle: local path materialization **or** live HTTP Range I/O.
+///
+/// Lets the factory choose Range vs path without breaking [`RemoteLocal::path`] users.
+/// Non-HTTP schemes always resolve to [`RemoteAccess::Path`].
+#[derive(Debug)]
+pub enum RemoteAccess {
+    /// Local filesystem path (native or fully fetched remote).
+    Path(RemoteLocal),
+    /// Live HTTP Range (or materialized HTTP when ranges are unusable).
+    Http(RemoteHttp),
+}
+
+impl RemoteAccess {
+    pub fn uses_ranges(&self) -> bool {
+        match self {
+            Self::Path(_) => false,
+            Self::Http(h) => h.uses_ranges(),
+        }
+    }
+
+    /// Path when available (local or materialized); `None` for live Range HTTP.
+    pub fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Path(r) => Some(r.path()),
+            Self::Http(h) => h.path(),
+        }
+    }
+}
+
+/// Resolve a path or URL, preferring live HTTP Range access for `http(s)://`.
+///
+/// Other schemes match [`resolve_to_local`]. For a guaranteed local path, use
+/// [`resolve_to_local`] / [`materialize_input`] instead.
+pub fn resolve_access(input: &str) -> Result<RemoteAccess> {
+    if !is_remote_url(input) {
+        return Ok(RemoteAccess::Path(RemoteLocal::Local(PathBuf::from(input))));
+    }
+    let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
+    match url.scheme() {
+        "http" | "https" => Ok(RemoteAccess::Http(resolve_http(url.as_str())?)),
+        _ => Ok(RemoteAccess::Path(resolve_to_local(input)?)),
     }
 }
 
@@ -954,6 +1098,107 @@ mod tests {
         let local = resolve_to_local(&url).unwrap();
         assert_eq!(std::fs::read(local.path()).unwrap(), body);
         assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn resolve_http_uses_live_range_when_supported() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/live.bin");
+        let access = resolve_http(&url).unwrap();
+        assert!(
+            access.uses_ranges(),
+            "expected live Range path, got {access:?}"
+        );
+        assert!(access.path().is_none());
+        assert_eq!(access.len(), body.len() as u64);
+        // Materialization must not have happened (no full GET after probe HEAD).
+        assert_eq!(mock.full_gets.load(Ordering::SeqCst), 0);
+
+        let RemoteHttp::Range(mut f) = access else {
+            panic!("expected RemoteHttp::Range");
+        };
+        f.seek(SeekFrom::Start(10)).unwrap();
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &body[10..42]);
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn resolve_http_materializes_without_ranges() {
+        let body = b"no-range-server-body".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+        });
+        let url = mock.url("/full.bin");
+        let access = resolve_http(&url).unwrap();
+        assert!(!access.uses_ranges());
+        let path = access.path().expect("materialized path");
+        assert_eq!(std::fs::read(path).unwrap(), body);
+        assert!(matches!(access, RemoteHttp::Materialized(_)));
+        assert!(mock.full_gets.load(Ordering::SeqCst) >= 1);
+        assert_eq!(mock.range_gets.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn open_http_range_public_api() {
+        let body = b"open-http-range-api".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/api.bin");
+        let mut f = open_http_range(&url).unwrap();
+        assert!(f.uses_ranges());
+        assert_eq!(f.url(), url);
+        let mut got = Vec::new();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+    }
+
+    #[test]
+    fn resolve_access_http_prefers_range() {
+        let body = b"access-range".to_vec();
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+        });
+        let url = mock.url("/acc.bin");
+        let acc = resolve_access(&url).unwrap();
+        assert!(acc.uses_ranges());
+        assert!(acc.path().is_none());
+        match acc {
+            RemoteAccess::Http(RemoteHttp::Range(mut f)) => {
+                f.seek(SeekFrom::Start(0)).unwrap();
+                let mut buf = [0u8; 12];
+                f.read_exact(&mut buf).unwrap();
+                assert_eq!(&buf, b"access-range");
+            }
+            other => panic!("expected Http Range, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_access_local_path() {
+        let p = std::env::temp_dir().join("ratarmount-remote-access-local.txt");
+        std::fs::write(&p, b"local").unwrap();
+        let acc = resolve_access(p.to_str().unwrap()).unwrap();
+        assert!(!acc.uses_ranges());
+        assert_eq!(acc.path(), Some(p.as_path()));
+        let _ = std::fs::remove_file(p);
     }
 
     /// Minimal WebDAV-capable mock: PROPFIND (207) + GET with optional Basic auth.

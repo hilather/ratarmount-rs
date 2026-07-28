@@ -1854,6 +1854,7 @@ dependencies = [
  "hmac",
  "log",
  "ratarmount-core",
+ "serde_json",
  "sha2",
  "ssh2",
  "tempfile",
