@@ -46,7 +46,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ratarmount_compress::{
-    check_for_split_file_in_folder, materialize_joined_parts, SharedArchiveFile,
+    check_for_split_file_in_folder, materialize_joined_parts, SeekRead, SharedArchiveFile,
 };
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
@@ -106,15 +106,129 @@ struct OpenedArchive {
     multidisk_normalized: bool,
 }
 
+/// Content backend for ZIP member open (path file vs generic Read+Seek).
+enum ZipBackend {
+    /// Path-based: `try_clone` + [`SharedArchiveFile`] (multi-part join supported).
+    File {
+        archive_file: Arc<SharedArchiveFile>,
+        raw_file: File,
+        /// Keep multi-part join temp file from being deleted.
+        _joined: Option<NamedTempFile>,
+    },
+    /// Single-stream `Read + Seek` shared under a mutex (HTTP Range / Cursor / remote).
+    /// Multi-part join is not applied here — pass an already-joined stream.
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+/// Independent logical cursor over a mutex-shared `Read + Seek`.
+struct SharedSeekHandle {
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    pos: u64,
+}
+
+impl SharedSeekHandle {
+    fn new(shared: Arc<Mutex<Box<dyn SeekRead>>>) -> Self {
+        Self { shared, pos: 0 }
+    }
+}
+
+impl Read for SharedSeekHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared zip reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedSeekHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .lock()
+                    .map_err(|_| io::Error::other("shared zip reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+/// Random-access slice of a shared zip reader (Stored members).
+struct SharedSeekRegion {
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    file_offset: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl SharedSeekRegion {
+    fn new(shared: Arc<Mutex<Box<dyn SeekRead>>>, file_offset: u64, len: u64) -> Self {
+        Self {
+            shared,
+            file_offset,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for SharedSeekRegion {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = ((self.len - self.pos) as usize).min(buf.len());
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared zip reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.file_offset + self.pos))?;
+        let n = guard.read(&mut buf[..max])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedSeekRegion {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.len as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
 /// ZIP backed by SQLite index for metadata; content open uses direct archive I/O.
 pub struct ZipMountSource {
     #[allow(dead_code)]
     archive_path: PathBuf,
-    /// Shared archive fd (region views for Stored; clone for Deflate).
-    archive_file: Arc<SharedArchiveFile>,
-    raw_file: File,
-    /// Keep multi-part join temp file from being deleted.
-    _joined: Option<NamedTempFile>,
+    backend: ZipBackend,
     index: SqliteIndex,
     /// local header offset → member layout for open
     members: HashMap<u64, ZipMemberMeta>,
@@ -189,9 +303,82 @@ impl ZipMountSource {
         let members = member_meta_map(&mut archive, password.as_deref())?;
         Ok(Self {
             archive_path: opened.user_path,
-            archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
-            raw_file: opened.file,
-            _joined: opened._joined,
+            backend: ZipBackend::File {
+                archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
+                raw_file: opened.file,
+                _joined: opened._joined,
+            },
+            index,
+            members,
+            inflate_cache: Mutex::new(HashMap::new()),
+            password,
+            options: options.clone(),
+        })
+    }
+
+    /// Index and open a single-stream ZIP from any `Read + Seek` source.
+    ///
+    /// For HTTP Range / remote / in-memory archives without a real path. Multi-part
+    /// join is **not** performed — pass an already-joined stream. `archive_label` is
+    /// used for logs and index metadata (may be a URL or virtual name).
+    ///
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
+    /// `options.index_in_memory` is set).
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            index_path.map(|p| p.to_path_buf())
+        };
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let mut reader = reader;
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+        let handle = SharedSeekHandle::new(Arc::clone(&shared));
+        let mut archive = ZipArchive::new(handle).map_err(|e| {
+            ZipError::Msg(format!(
+                "failed to open ZIP from reader ({}): {e}",
+                archive_path.display()
+            ))
+        })?;
+        let password = find_password(&mut archive, &options.passwords)?;
+        let (index, members) = Self::fill_index_from_archive(
+            &mut archive,
+            password.as_deref(),
+            index_path_buf.as_deref(),
+            product_version,
+            None,
+            StatsSource::Synthetic(size),
+        )?;
+        // Drop ZipArchive before keeping shared for open path.
+        drop(archive);
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        Ok(Self {
+            archive_path,
+            backend: ZipBackend::Shared(shared),
             index,
             members,
             inflate_cache: Mutex::new(HashMap::new()),
@@ -234,6 +421,46 @@ impl ZipMountSource {
         };
         let password = find_password(&mut archive, &options.passwords)?;
 
+        let (index, members) = Self::fill_index_from_archive(
+            &mut archive,
+            password.as_deref(),
+            index_path,
+            product_version,
+            opened.multipart_parts.as_ref().map(|p| p.len()),
+            StatsSource::Path(opened.open_path.as_path()),
+        )?;
+        drop(archive);
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        Ok(Self {
+            archive_path: opened.user_path,
+            backend: ZipBackend::File {
+                archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
+                raw_file: opened.file,
+                _joined: opened._joined,
+            },
+            index,
+            members,
+            inflate_cache: Mutex::new(HashMap::new()),
+            password,
+            options: options.clone(),
+        })
+    }
+
+    /// Parse ZIP central directory into SQLite + member meta map.
+    fn fill_index_from_archive<R: Read + Seek>(
+        archive: &mut ZipArchive<R>,
+        password: Option<&str>,
+        index_path: Option<&Path>,
+        product_version: &str,
+        multipart_part_count: Option<usize>,
+        stats: StatsSource<'_>,
+    ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
         let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         let mut members = HashMap::new();
@@ -241,7 +468,7 @@ impl ZipMountSource {
             std::collections::BTreeSet::new();
 
         for i in 0..archive.len() {
-            let zf = open_member(&mut archive, i, password.as_deref())?;
+            let zf = open_member(archive, i, password)?;
             let name = zf.name().to_string();
             let header_offset = zf.header_start();
             let data_start = zf.data_start();
@@ -277,7 +504,7 @@ impl ZipMountSource {
 
             let mut linkname = String::new();
             if is_symlink {
-                if let Ok(mut zf) = open_member(&mut archive, i, password.as_deref()) {
+                if let Ok(mut zf) = open_member(archive, i, password) {
                     let mut buf = String::new();
                     if zf.read_to_string(&mut buf).is_ok() {
                         linkname = buf;
@@ -339,32 +566,23 @@ impl ZipMountSource {
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
-        if let Some(ref parts) = opened.multipart_parts {
-            index.store_metadata_key_value("zipMultipartParts", &parts.len().to_string())?;
+        if let Some(n) = multipart_part_count {
+            index.store_metadata_key_value("zipMultipartParts", &n.to_string())?;
         }
-        store_stats(&index, &opened.open_path)?;
+        match stats {
+            StatsSource::Path(path) => store_stats(&index, path)?,
+            StatsSource::Synthetic(size) => store_stats_synthetic(&index, size)?,
+        }
         index.commit_write()?;
-
-        let secs = t0.elapsed().as_secs_f64();
-        println!(
-            "Creating offset dictionary for {} took {secs:.2}s",
-            archive_path.display()
-        );
-
         let index = index.into_read_only()?;
-
-        Ok(Self {
-            archive_path: opened.user_path,
-            archive_file: Arc::new(SharedArchiveFile::new(opened.file.try_clone()?)),
-            raw_file: opened.file,
-            _joined: opened._joined,
-            index,
-            members,
-            inflate_cache: Mutex::new(HashMap::new()),
-            password,
-            options: options.clone(),
-        })
+        Ok((index, members))
     }
+}
+
+/// How to record archive stats in the index.
+enum StatsSource<'a> {
+    Path(&'a Path),
+    Synthetic(u64),
 }
 
 impl MountSource for ZipMountSource {
@@ -421,36 +639,8 @@ impl MountSource for ZipMountSource {
             .unwrap_or(meta.data_start);
 
         match meta.method {
-            METHOD_STORED => Ok(Box::new(
-                self.archive_file.region(data_start, file_info.size),
-            )),
-            METHOD_DEFLATE => {
-                {
-                    let cache = self.inflate_cache.lock().expect("zip cache");
-                    if let Some(bytes) = cache.get(&header) {
-                        return Ok(Box::new(ArcBytes::new(Arc::clone(bytes))));
-                    }
-                }
-                let mut file = self.raw_file.try_clone()?;
-                file.seek(SeekFrom::Start(data_start))?;
-                let limited = file.take(meta.compressed_size);
-                let mut dec = flate2::read::DeflateDecoder::new(limited);
-                let mut data = Vec::with_capacity(file_info.size as usize);
-                dec.read_to_end(&mut data)
-                    .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
-                if data.len() as u64 > file_info.size {
-                    data.truncate(file_info.size as usize);
-                }
-                let arc = Arc::new(data);
-                {
-                    let mut cache = self.inflate_cache.lock().expect("zip cache");
-                    if cache.len() > 256 {
-                        cache.clear();
-                    }
-                    cache.insert(header, Arc::clone(&arc));
-                }
-                Ok(Box::new(ArcBytes::new(arc)))
-            }
+            METHOD_STORED => self.open_stored(data_start, file_info.size),
+            METHOD_DEFLATE => self.open_deflate(header, meta, data_start, file_info.size),
             _ => self.open_via_zip_crate(meta),
         }
     }
@@ -461,14 +651,100 @@ impl MountSource for ZipMountSource {
 }
 
 impl ZipMountSource {
+    fn open_stored(
+        &self,
+        data_start: u64,
+        size: u64,
+    ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        match &self.backend {
+            ZipBackend::File { archive_file, .. } => {
+                Ok(Box::new(archive_file.region(data_start, size)))
+            }
+            ZipBackend::Shared(shared) => Ok(Box::new(SharedSeekRegion::new(
+                Arc::clone(shared),
+                data_start,
+                size,
+            ))),
+        }
+    }
+
+    fn open_deflate(
+        &self,
+        header: u64,
+        meta: &ZipMemberMeta,
+        data_start: u64,
+        size: u64,
+    ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        {
+            let cache = self.inflate_cache.lock().expect("zip cache");
+            if let Some(bytes) = cache.get(&header) {
+                return Ok(Box::new(ArcBytes::new(Arc::clone(bytes))));
+            }
+        }
+        let mut data = Vec::with_capacity(size as usize);
+        match &self.backend {
+            ZipBackend::File { raw_file, .. } => {
+                let mut file = raw_file.try_clone()?;
+                file.seek(SeekFrom::Start(data_start))?;
+                let limited = file.take(meta.compressed_size);
+                let mut dec = flate2::read::DeflateDecoder::new(limited);
+                dec.read_to_end(&mut data)
+                    .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
+            }
+            ZipBackend::Shared(shared) => {
+                // Read compressed bytes under the mutex, then inflate offline.
+                let compressed = {
+                    let mut guard = shared
+                        .lock()
+                        .map_err(|_| io::Error::other("shared zip reader poisoned"))?;
+                    guard.seek(SeekFrom::Start(data_start))?;
+                    let mut buf = vec![0u8; meta.compressed_size as usize];
+                    guard.read_exact(&mut buf)?;
+                    buf
+                };
+                let mut dec = flate2::read::DeflateDecoder::new(compressed.as_slice());
+                dec.read_to_end(&mut data)
+                    .map_err(|e| io::Error::other(format!("zip deflate: {e}")))?;
+            }
+        }
+        if data.len() as u64 > size {
+            data.truncate(size as usize);
+        }
+        let arc = Arc::new(data);
+        {
+            let mut cache = self.inflate_cache.lock().expect("zip cache");
+            if cache.len() > 256 {
+                cache.clear();
+            }
+            cache.insert(header, Arc::clone(&arc));
+        }
+        Ok(Box::new(ArcBytes::new(arc)))
+    }
+
     fn open_via_zip_crate(
         &self,
         meta: &ZipMemberMeta,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        let file = self.raw_file.try_clone()?;
-        let mut archive = ZipArchive::new(file).map_err(io::Error::other)?;
+        match &self.backend {
+            ZipBackend::File { raw_file, .. } => {
+                let file = raw_file.try_clone()?;
+                Self::read_member_via_zip_archive(file, meta, self.password.as_deref())
+            }
+            ZipBackend::Shared(shared) => {
+                let handle = SharedSeekHandle::new(Arc::clone(shared));
+                Self::read_member_via_zip_archive(handle, meta, self.password.as_deref())
+            }
+        }
+    }
+
+    fn read_member_via_zip_archive<R: Read + Seek>(
+        reader: R,
+        meta: &ZipMemberMeta,
+        password: Option<&str>,
+    ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        let mut archive = ZipArchive::new(reader).map_err(io::Error::other)?;
         let mut zf = if meta.encrypted {
-            let pw = self.password.as_deref().ok_or_else(|| {
+            let pw = password.ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::PermissionDenied,
                     "password required to decrypt encrypted ZIP member; pass --password",
@@ -540,8 +816,8 @@ fn userdata(fi: &FileInfo) -> Option<&SQLiteIndexedTarUserData> {
     })
 }
 
-fn open_member<'a>(
-    archive: &'a mut ZipArchive<File>,
+fn open_member<'a, R: Read + Seek>(
+    archive: &'a mut ZipArchive<R>,
     index: usize,
     password: Option<&str>,
 ) -> Result<zip::read::ZipFile<'a>> {
@@ -561,8 +837,8 @@ fn open_member<'a>(
 }
 
 /// Try passwords against the first encrypted non-empty member (Python parity).
-fn find_password(
-    archive: &mut ZipArchive<File>,
+fn find_password<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     passwords: &[String],
 ) -> Result<Option<String>> {
     let mut first_encrypted: Option<usize> = None;
@@ -627,8 +903,8 @@ fn find_password(
     }
 }
 
-fn member_meta_map(
-    archive: &mut ZipArchive<File>,
+fn member_meta_map<R: Read + Seek>(
+    archive: &mut ZipArchive<R>,
     password: Option<&str>,
 ) -> Result<HashMap<u64, ZipMemberMeta>> {
     let mut members = HashMap::new();
@@ -1192,6 +1468,13 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Synthetic stats when there is no on-disk archive path (reader-based open).
+fn store_stats_synthetic(index: &SqliteIndex, size: u64) -> Result<()> {
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
 fn ensure_parent_dirs(
     index: &SqliteIndex,
     path: &str,
@@ -1264,6 +1547,48 @@ mod tests {
         zw.start_file(name, opts).unwrap();
         zw.write_all(data).unwrap();
         zw.finish().unwrap();
+    }
+
+    fn sample_zip_bytes(name: &str, data: &[u8]) -> Vec<u8> {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut buf);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file(name, opts).unwrap();
+            zw.write_all(data).unwrap();
+            zw.finish().unwrap();
+        }
+        buf.into_inner()
+    }
+
+    #[test]
+    fn open_from_cursor_list_and_read_stored() {
+        let bytes = sample_zip_bytes("hello.txt", b"hello from cursor\n");
+        let cursor = io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open_from_reader(
+            cursor,
+            Path::new("memory://sample.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("open_from_reader");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup");
+        assert_eq!(fi.size, b"hello from cursor\n".len() as u64);
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = String::new();
+        r.read_to_string(&mut out).unwrap();
+        assert_eq!(out, "hello from cursor\n");
+        // list root
+        let root = src.list("/").expect("list");
+        match root {
+            ListResult::Infos(map) => assert!(map.contains_key("hello.txt")),
+            other => panic!("unexpected list: {other:?}"),
+        }
     }
 
     fn write_encrypted_zip(path: &Path, name: &str, data: &[u8], password: &str) {

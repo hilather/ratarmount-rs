@@ -5,9 +5,8 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
-
-use std::sync::Arc;
 
 use ratarmount_compress::{
     FileSegment, SeekRead, SeekableBody, SegmentedFile, SharedSeekableGzip, StenciledFile,
@@ -37,6 +36,72 @@ pub enum TarError {
 
 pub type Result<T> = std::result::Result<T, TarError>;
 
+/// Mutex-backed `Read + Seek` for concurrent stencil opens (HTTP Range / Cursor / remote).
+struct SharedSeekReader {
+    inner: Mutex<Box<dyn SeekRead>>,
+}
+
+impl SharedSeekReader {
+    fn new<R: SeekRead + 'static>(reader: R) -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(Box::new(reader)),
+        })
+    }
+
+    fn open_reader(self: &Arc<Self>) -> PositionedSeekReader {
+        PositionedSeekReader {
+            shared: Arc::clone(self),
+            pos: 0,
+        }
+    }
+}
+
+/// Independent logical cursor over a [`SharedSeekReader`].
+struct PositionedSeekReader {
+    shared: Arc<SharedSeekReader>,
+    pos: u64,
+}
+
+impl Read for PositionedSeekReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .inner
+            .lock()
+            .map_err(|_| io::Error::other("shared seek reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for PositionedSeekReader {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .inner
+                    .lock()
+                    .map_err(|_| io::Error::other("shared seek reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
 /// Where uncompressed TAR bytes live for open/read.
 enum ContentBackend {
     /// Plain file (uncompressed archive or materialised temp body).
@@ -48,6 +113,8 @@ enum ContentBackend {
     Gzip(Arc<SharedSeekableGzip>),
     /// Generic seekable body (bzip2/xz/zstd DecodedBody or multi-frame zstd).
     Body(Arc<dyn SeekableBody>),
+    /// Any `Read + Seek` shared under a mutex (remote / in-memory / tempfile reader).
+    Shared(Arc<SharedSeekReader>),
 }
 
 impl ContentBackend {
@@ -56,6 +123,7 @@ impl ContentBackend {
             Self::File { file, .. } => Ok(ContentReader::File(file.try_clone()?)),
             Self::Gzip(g) => Ok(ContentReader::Gzip(g.reader()?)),
             Self::Body(b) => Ok(ContentReader::Dyn(b.open_reader()?)),
+            Self::Shared(s) => Ok(ContentReader::Shared(s.open_reader())),
         }
     }
 }
@@ -65,6 +133,7 @@ enum ContentReader {
     File(File),
     Gzip(ratarmount_compress::SeekableGzipReader),
     Dyn(Box<dyn SeekRead>),
+    Shared(PositionedSeekReader),
 }
 
 impl Read for ContentReader {
@@ -73,6 +142,7 @@ impl Read for ContentReader {
             Self::File(f) => f.read(buf),
             Self::Gzip(g) => g.read(buf),
             Self::Dyn(r) => r.read(buf),
+            Self::Shared(r) => r.read(buf),
         }
     }
 }
@@ -83,6 +153,7 @@ impl Seek for ContentReader {
             Self::File(f) => f.seek(pos),
             Self::Gzip(g) => g.seek(pos),
             Self::Dyn(r) => r.seek(pos),
+            Self::Shared(r) => r.seek(pos),
         }
     }
 }
@@ -166,7 +237,7 @@ impl SqliteIndexedTar {
             file: file.try_clone()?,
             _keep: materialised.take(),
         };
-        Self::create_index_from_reader(
+        Self::build_index_from_reader(
             archive_path,
             data_path,
             &mut file,
@@ -189,7 +260,7 @@ impl SqliteIndexedTar {
         let data_path = gzip.path().to_path_buf();
         let mut reader = gzip.reader()?;
         let backend = ContentBackend::Gzip(Arc::clone(&gzip));
-        Self::create_index_from_reader(
+        Self::build_index_from_reader(
             archive_path,
             data_path,
             &mut reader,
@@ -232,7 +303,7 @@ impl SqliteIndexedTar {
         let data_path = body.path().to_path_buf();
         let mut reader = body.open_reader().map_err(TarError::Io)?;
         let backend = ContentBackend::Body(body);
-        Self::create_index_from_reader(
+        Self::build_index_from_reader(
             archive_path,
             data_path,
             &mut reader,
@@ -243,7 +314,113 @@ impl SqliteIndexedTar {
         )
     }
 
-    fn create_index_from_reader<R: Read + Seek>(
+    /// Index and open an uncompressed TAR from any `Read + Seek` source.
+    ///
+    /// Intended for HTTP Range / remote streams and in-memory archives: no on-disk
+    /// archive path is required. `archive_label` is used for logs and index metadata
+    /// (may be a URL or virtual name). The reader is retained under a mutex for
+    /// concurrent stencil opens.
+    ///
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:`.
+    ///
+    /// Alias of [`Self::create_index_from_reader`].
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::create_index_from_reader(reader, archive_label, index_path, options, product_version)
+    }
+
+    /// Index and open an uncompressed TAR from any `Read + Seek` source.
+    ///
+    /// See [`Self::open_from_reader`].
+    pub fn create_index_from_reader<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let data_path = archive_path.clone();
+        let size = reader.seek(SeekFrom::End(0))?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let index = SqliteIndex::create_writable(index_path)?;
+        index.begin_write()?;
+        let is_gnu_incremental = parse_tar_into_index(&mut reader, &index, options)?;
+
+        index.store_versions(product_version)?;
+        index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        index.store_metadata_key_value(
+            "isGnuIncremental",
+            if is_gnu_incremental { "1" } else { "0" },
+        )?;
+        store_tarstats_for_label(&index, &archive_path, size)?;
+        store_arguments(&index, options)?;
+        index.commit_write()?;
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        // Rewind and retain for member open.
+        reader.seek(SeekFrom::Start(0))?;
+        let backend = ContentBackend::Shared(SharedSeekReader::new(reader));
+        let index = index.into_read_only()?;
+        Ok(Self {
+            archive_path,
+            data_path,
+            backend,
+            index,
+            options: options.clone(),
+        })
+    }
+
+    /// Open an existing index with a `Read + Seek` content source (no re-index).
+    ///
+    /// The reader must match the archive that produced `index_path`. `archive_label`
+    /// is display-only.
+    pub fn open_with_existing_index_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: impl AsRef<Path>,
+        options: OpenOptions,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let data_path = archive_path.clone();
+        let index = SqliteIndex::open_read_only(index_path.as_ref())?;
+        index.check_backend_name(BACKEND_NAME)?;
+        Ok(Self {
+            archive_path,
+            data_path,
+            backend: ContentBackend::Shared(SharedSeekReader::new(reader)),
+            index,
+            options,
+        })
+    }
+
+    fn build_index_from_reader<R: Read + Seek>(
         archive_path: PathBuf,
         data_path: PathBuf,
         reader: &mut R,
@@ -389,6 +566,22 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
 fn store_tarstats(index: &SqliteIndex, path: &Path) -> Result<()> {
     let meta = std::fs::metadata(path)?;
     let json = serde_json_tarstats(&meta);
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
+/// Store tarstats from path metadata when available; otherwise synthetic size-only stats.
+///
+/// Used for reader-based opens where `archive_label` may be a URL or virtual name.
+fn store_tarstats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
+    if path.exists() {
+        if let Ok(meta) = std::fs::metadata(path) {
+            let json = serde_json_tarstats(&meta);
+            index.store_metadata_key_value("tarstats", &json)?;
+            return Ok(());
+        }
+    }
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }
@@ -1445,6 +1638,142 @@ mod tests {
         let mut buf = String::new();
         r.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "hello world\n");
+    }
+
+    /// Minimal ustar with one regular file (for in-memory reader tests).
+    fn synthetic_ustar(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut hdr = [0u8; 512];
+        let name_bytes = name.as_bytes();
+        assert!(name_bytes.len() < 100);
+        hdr[..name_bytes.len()].copy_from_slice(name_bytes);
+        // mode 0644 octal
+        hdr[100..108].copy_from_slice(b"0000644\0");
+        // uid/gid
+        hdr[108..116].copy_from_slice(b"0000000\0");
+        hdr[116..124].copy_from_slice(b"0000000\0");
+        // size octal
+        let size_str = format!("{:011o}", payload.len());
+        hdr[124..135].copy_from_slice(size_str.as_bytes());
+        hdr[135] = 0;
+        // mtime
+        hdr[136..148].copy_from_slice(b"00000000000\0");
+        // checksum placeholder spaces
+        hdr[148..156].copy_from_slice(b"        ");
+        // typeflag regular
+        hdr[156] = b'0';
+        // magic / version
+        hdr[257..265].copy_from_slice(b"ustar\0  ");
+        // checksum
+        let sum: u32 = hdr.iter().map(|&b| b as u32).sum();
+        let cksum = format!("{sum:06o}\0 ");
+        hdr[148..156].copy_from_slice(cksum.as_bytes());
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(payload);
+        // pad payload to 512
+        let pad = (512 - (payload.len() % 512)) % 512;
+        out.extend(std::iter::repeat_n(0u8, pad));
+        // two zero blocks
+        out.extend(std::iter::repeat_n(0u8, 1024));
+        out
+    }
+
+    #[test]
+    fn open_from_cursor_index_list_read() {
+        let bytes = synthetic_ustar("hello.txt", b"hello world\n");
+        let cursor = std::io::Cursor::new(bytes);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SqliteIndexedTar::open_from_reader(
+            cursor,
+            Path::new("memory://synthetic.tar"),
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+        let root = m.list("/").expect("list root");
+        match root {
+            ListResult::Infos(map) => {
+                assert!(map.contains_key("hello.txt"), "keys: {:?}", map.keys());
+            }
+            other => panic!("unexpected list: {other:?}"),
+        }
+        let fi = m.lookup("/hello.txt", 0).expect("lookup");
+        assert_eq!(fi.size, 12);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "hello world\n");
+    }
+
+    #[test]
+    fn open_from_tempfile_reader_roundtrip() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("t.tar");
+        let src = dir.path().join("data");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"from-tempfile\n").unwrap();
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&src)
+            .arg("a.txt")
+            .status()
+            .expect("tar");
+        assert!(status.success());
+
+        let file = File::open(&tar_path).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SqliteIndexedTar::create_index_from_reader(
+            file,
+            Path::new("label-only.tar"),
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("create_index_from_reader");
+        let fi = m.lookup("/a.txt", 0).expect("lookup");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "from-tempfile\n");
+    }
+
+    #[test]
+    fn open_with_existing_index_from_reader() {
+        let bytes = synthetic_ustar("x.bin", b"xyz");
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("i.sqlite");
+        let opts = OpenOptions::default();
+        let m1 = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(bytes.clone()),
+            Path::new("virt.tar"),
+            Some(&idx),
+            &opts,
+            "0.1.0",
+        )
+        .expect("index");
+        drop(m1);
+
+        let m2 = SqliteIndexedTar::open_with_existing_index_from_reader(
+            std::io::Cursor::new(bytes),
+            Path::new("virt.tar"),
+            &idx,
+            opts,
+        )
+        .expect("reopen");
+        let fi = m2.lookup("/x.bin", 0).expect("lookup");
+        let mut r = m2.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"xyz");
     }
 
     #[test]
