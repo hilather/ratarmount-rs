@@ -2,17 +2,25 @@
 //!
 //! - typeCompress 0 (none): stencil open across CFDATA blocks
 //! - typeCompress 1 (MSZIP): decompress CFDATA folders, slice file
-//! - Quantum/LZX: clear error so factory can fall back to libarchive
+//! - Quantum/LZX: [`CabError::UnsupportedCompression`] so factory can fall back to
+//!   libarchive (may temp-spool nested LZX members)
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! [`CabMountSource::open_from_reader`] indexes any seekable stream and retains shared
+//! archive IO for store stencils and MSZIP block reads — nested CAB without `/tmp`
+//! spool when compression is store or MSZIP. LZX/Quantum still return
+//! [`CabError::UnsupportedCompression`].
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use flate2::{Decompress, FlushDecompress, Status};
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -31,6 +39,9 @@ const A_DIRECTORY: u16 = 0x10;
 const A_NAME_IS_UTF: u16 = 0x80;
 const MSZIP_WINDOW: usize = 32768;
 
+/// Mutex-shared seekable archive body for concurrent stencil / block reads.
+type SharedArchiveIo = Arc<Mutex<Box<dyn SeekRead>>>;
+
 #[derive(Debug, Error)]
 pub enum CabError {
     #[error(transparent)]
@@ -44,6 +55,56 @@ pub enum CabError {
 }
 
 pub type Result<T> = std::result::Result<T, CabError>;
+
+/// Independent logical cursor over a shared `Read + Seek` archive body.
+struct SharedSeekHandle {
+    shared: SharedArchiveIo,
+    pos: u64,
+}
+
+impl SharedSeekHandle {
+    fn new(shared: SharedArchiveIo) -> Self {
+        Self { shared, pos: 0 }
+    }
+}
+
+impl Read for SharedSeekHandle {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared CAB reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.pos))?;
+        let n = guard.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedSeekHandle {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let mut guard = self
+                    .shared
+                    .lock()
+                    .map_err(|_| io::Error::other("shared CAB reader poisoned"))?;
+                let end = guard.seek(SeekFrom::End(0))? as i64;
+                end + o
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
 
 #[derive(Clone, Debug)]
 struct CfDataBlock {
@@ -74,7 +135,10 @@ struct CfFile {
 }
 
 pub struct CabMountSource {
+    /// Path or virtual label (logs / index metadata).
+    #[allow(dead_code)]
     archive_path: PathBuf,
+    archive_io: SharedArchiveIo,
     index: SqliteIndex,
     folders: Vec<CfFolder>,
     folder_cache: Mutex<HashMap<usize, Vec<u8>>>,
@@ -91,43 +155,95 @@ impl CabMountSource {
         recreate: bool,
     ) -> Result<Self> {
         let archive_path = archive_path.as_ref().to_path_buf();
+        let file = File::open(&archive_path)?;
+        Self::open_from_reader(
+            file,
+            &archive_path,
+            index_path,
+            options,
+            product_version,
+            recreate,
+        )
+    }
+
+    /// Index and open a CAB from any `Read + Seek` source.
+    ///
+    /// Intended for nested AutoMount / in-memory archives: no on-disk archive path is
+    /// required. `archive_label` is used for logs and index metadata (may be a nested
+    /// member name). The reader is retained under a mutex for concurrent store stencils
+    /// and MSZIP CFDATA block reads.
+    ///
+    /// Supported folder compression: store (0) and MSZIP (1). Quantum/LZX return
+    /// [`CabError::UnsupportedCompression`] so the caller may temp-spool and open via
+    /// libarchive.
+    ///
+    /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
+    /// `options.index_in_memory` is set). Prefer `None` for nested mounts.
+    pub fn open_from_reader<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+        recreate: bool,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
         let index_path_buf: Option<PathBuf> = if options.index_in_memory {
             None
         } else {
-            Some(
-                index_path
-                    .map(|p| p.to_path_buf())
-                    .unwrap_or_else(|| default_index_path(&archive_path)),
-            )
+            index_path.map(|p| p.to_path_buf()).or_else(|| {
+                // Only invent a sibling index path when the label is a real file.
+                if archive_path.is_file() {
+                    Some(default_index_path(&archive_path))
+                } else {
+                    None
+                }
+            })
         };
 
         // Always re-parse folders for open paths; index can be reused.
-        let mut file = File::open(&archive_path)?;
-        let (folders, files) = parse_cab_archive(&mut file)?;
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+        let (folders, files) = parse_cab_archive(&mut reader)?;
         for folder in &folders {
             if folder.type_compress != TCOMP_TYPE_NONE && folder.type_compress != TCOMP_TYPE_MSZIP {
                 return Err(CabError::UnsupportedCompression(folder.type_compress));
             }
         }
 
+        reader.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
+
         if let Some(ref ip) = index_path_buf {
-            if !recreate && ip.exists() {
+            if !recreate && ip.exists() && archive_path.is_file() {
                 let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
-                    match Self::open_existing(&archive_path, ip, options, folders.clone()) {
+                    match Self::open_existing(
+                        &archive_path,
+                        ip,
+                        options,
+                        folders.clone(),
+                        Arc::clone(&archive_io),
+                    ) {
                         Ok(s) => return Ok(s),
                         Err(e) => eprintln!("info: could not load cab index ({e}); rebuilding"),
                     }
                 }
             }
         }
+
         Self::create_index(
-            &archive_path,
+            archive_path,
             index_path_buf.as_deref(),
             options,
             product_version,
             folders,
             files,
+            archive_io,
+            size,
         )
     }
 
@@ -136,11 +252,13 @@ impl CabMountSource {
         index_path: &Path,
         options: &OpenOptions,
         folders: Vec<CfFolder>,
+        archive_io: SharedArchiveIo,
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            archive_io,
             index,
             folders,
             folder_cache: Mutex::new(HashMap::new()),
@@ -148,13 +266,16 @@ impl CabMountSource {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn create_index(
-        archive_path: &Path,
+        archive_path: PathBuf,
         index_path: Option<&Path>,
         options: &OpenOptions,
         product_version: &str,
         folders: Vec<CfFolder>,
         files: Vec<CfFile>,
+        archive_io: SharedArchiveIo,
+        archive_size: u64,
     ) -> Result<Self> {
         let _ = options;
         println!(
@@ -199,7 +320,7 @@ impl CabMountSource {
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
-        store_stats(&index, archive_path)?;
+        store_stats_for_label(&index, &archive_path, archive_size)?;
         index.commit_write()?;
 
         let secs = t0.elapsed().as_secs_f64();
@@ -210,7 +331,8 @@ impl CabMountSource {
 
         let index = index.into_read_only()?;
         Ok(Self {
-            archive_path: archive_path.to_path_buf(),
+            archive_path,
+            archive_io,
             index,
             folders,
             folder_cache: Mutex::new(HashMap::new()),
@@ -229,14 +351,14 @@ impl CabMountSource {
             .folders
             .get(folder_index)
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "bad folder index"))?;
-        let mut file = File::open(&self.archive_path)?;
+        let mut handle = SharedSeekHandle::new(Arc::clone(&self.archive_io));
         let plain = match folder.type_compress {
             TCOMP_TYPE_NONE => {
                 let mut parts = Vec::new();
                 for block in &folder.blocks {
-                    file.seek(SeekFrom::Start(block.offset))?;
+                    handle.seek(SeekFrom::Start(block.offset))?;
                     let mut buf = vec![0u8; block.compressed_size as usize];
-                    file.read_exact(&mut buf)?;
+                    handle.read_exact(&mut buf)?;
                     parts.extend_from_slice(&buf);
                 }
                 parts
@@ -245,9 +367,9 @@ impl CabMountSource {
                 let mut parts = Vec::new();
                 let mut history = Vec::new();
                 for block in &folder.blocks {
-                    file.seek(SeekFrom::Start(block.offset))?;
+                    handle.seek(SeekFrom::Start(block.offset))?;
                     let mut raw = vec![0u8; block.compressed_size as usize];
-                    file.read_exact(&mut raw)?;
+                    handle.read_exact(&mut raw)?;
                     let chunk =
                         mszip_decompress_block(&raw, block.uncompressed_size as usize, &history)?;
                     history.extend_from_slice(&chunk);
@@ -312,8 +434,8 @@ impl CabMountSource {
             let start = (folder_offset as usize).min(end);
             return Ok(Box::new(Cursor::new(plain[start..end].to_vec())));
         }
-        let file = File::open(&self.archive_path)?;
-        Ok(Box::new(StenciledFile::new(file, regions)))
+        let handle = SharedSeekHandle::new(Arc::clone(&self.archive_io));
+        Ok(Box::new(StenciledFile::new(handle, regions)))
     }
 }
 
@@ -370,7 +492,7 @@ impl MountSource for CabMountSource {
     }
 }
 
-fn parse_cab_archive(file: &mut File) -> Result<(Vec<CfFolder>, Vec<CfFile>)> {
+fn parse_cab_archive<R: Read + Seek>(file: &mut R) -> Result<(Vec<CfFolder>, Vec<CfFile>)> {
     let start = file.stream_position()?;
     let mut header = [0u8; 36];
     file.read_exact(&mut header)?;
@@ -492,7 +614,7 @@ fn parse_cab_archive(file: &mut File) -> Result<(Vec<CfFolder>, Vec<CfFile>)> {
     Ok((folders, files))
 }
 
-fn read_cstring(file: &mut File) -> Result<Vec<u8>> {
+fn read_cstring<R: Read>(file: &mut R) -> Result<Vec<u8>> {
     let mut parts = Vec::new();
     loop {
         let mut b = [0u8; 1];
@@ -681,6 +803,16 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Store tarstats for a path label; if not a real file, use synthetic stats from `size`.
+fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
+    if path.exists() && store_stats(index, path).is_ok() {
+        return Ok(());
+    }
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
 // silence unused constants for documentation parity
 const _: u16 = TCOMP_TYPE_QUANTUM;
 const _: u16 = TCOMP_TYPE_LZX;
@@ -688,6 +820,235 @@ const _: u16 = TCOMP_TYPE_LZX;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use flate2::{Compress, Compression, FlushCompress};
+    use std::io::Cursor;
+
+    /// Minimal single-file store CAB: member `bar` → `foo\n`.
+    fn synthetic_store_cab(name: &str, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= u16::MAX as usize);
+        assert!(name.len() < 256);
+        let name_bytes = name.as_bytes();
+        // Layout: CFHEADER(36) + CFFOLDER(8) + CFFILE(16+name+NUL) + CFDATA(8+payload)
+        let coff_files = 36u32 + 8;
+        let coff_cab_start = coff_files + 16 + name_bytes.len() as u32 + 1;
+        let total = coff_cab_start as usize + 8 + payload.len();
+
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"MSCF");
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved1
+        out.extend_from_slice(&(total as u32).to_le_bytes()); // cbCabinet
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved2
+        out.extend_from_slice(&coff_files.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // reserved3
+        out.push(3); // versionMinor
+        out.push(1); // versionMajor
+        out.extend_from_slice(&1u16.to_le_bytes()); // cFolders
+        out.extend_from_slice(&1u16.to_le_bytes()); // cFiles
+        out.extend_from_slice(&0u16.to_le_bytes()); // flags
+        out.extend_from_slice(&1234u16.to_le_bytes()); // setID
+        out.extend_from_slice(&0u16.to_le_bytes()); // iCabinet
+        assert_eq!(out.len(), 36);
+
+        // CFFOLDER
+        out.extend_from_slice(&coff_cab_start.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes()); // cCFData
+        out.extend_from_slice(&TCOMP_TYPE_NONE.to_le_bytes());
+
+        // CFFILE
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes()); // uoffFolderStart
+        out.extend_from_slice(&0u16.to_le_bytes()); // iFolder
+        out.extend_from_slice(&0u16.to_le_bytes()); // date
+        out.extend_from_slice(&0u16.to_le_bytes()); // time
+        out.extend_from_slice(&0x20u16.to_le_bytes()); // attribs (archive)
+        out.extend_from_slice(name_bytes);
+        out.push(0);
+
+        // CFDATA
+        out.extend_from_slice(&0u32.to_le_bytes()); // csum
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(payload);
+        assert_eq!(out.len(), total);
+        out
+    }
+
+    /// Single-file MSZIP CAB: raw deflate + CK signature in one CFDATA block.
+    fn synthetic_mszip_cab(name: &str, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() <= u16::MAX as usize);
+        let mut comp = Compress::new(Compression::default(), false);
+        let mut deflated = vec![0u8; payload.len() + 64];
+        let status = comp
+            .compress(payload, &mut deflated, FlushCompress::Finish)
+            .expect("deflate");
+        assert!(matches!(
+            status,
+            flate2::Status::StreamEnd | flate2::Status::Ok
+        ));
+        deflated.truncate(comp.total_out() as usize);
+        let mut block = Vec::with_capacity(2 + deflated.len());
+        block.extend_from_slice(b"CK");
+        block.extend_from_slice(&deflated);
+        assert!(block.len() <= u16::MAX as usize);
+
+        let name_bytes = name.as_bytes();
+        let coff_files = 36u32 + 8;
+        let coff_cab_start = coff_files + 16 + name_bytes.len() as u32 + 1;
+        let total = coff_cab_start as usize + 8 + block.len();
+
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"MSCF");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&coff_files.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(3);
+        out.push(1);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&1234u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+
+        out.extend_from_slice(&coff_cab_start.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&TCOMP_TYPE_MSZIP.to_le_bytes());
+
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x20u16.to_le_bytes());
+        out.extend_from_slice(name_bytes);
+        out.push(0);
+
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(block.len() as u16).to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u16).to_le_bytes());
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// CAB header claiming LZX compression (typeCompress 3) — open must reject.
+    fn synthetic_lzx_stub_cab() -> Vec<u8> {
+        let payload = b"x";
+        let name = b"x";
+        let coff_files = 36u32 + 8;
+        let coff_cab_start = coff_files + 16 + name.len() as u32 + 1;
+        let total = coff_cab_start as usize + 8 + payload.len();
+        let mut out = Vec::with_capacity(total);
+        out.extend_from_slice(b"MSCF");
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&(total as u32).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&coff_files.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.push(3);
+        out.push(1);
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&coff_cab_start.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&TCOMP_TYPE_LZX.to_le_bytes());
+        out.extend_from_slice(&1u32.to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0u16.to_le_bytes());
+        out.extend_from_slice(&0x20u16.to_le_bytes());
+        out.extend_from_slice(name);
+        out.push(0);
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    #[test]
+    fn open_from_reader_store_list_and_read() {
+        let cab = synthetic_store_cab("bar", b"foo\n");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let m = CabMountSource::open_from_reader(
+            Cursor::new(cab),
+            "nested.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader store");
+        let listed = m.list("/").expect("list root");
+        match listed {
+            ListResult::Infos(infos) => {
+                assert!(infos.contains_key("bar"), "{infos:?}");
+            }
+            other => panic!("unexpected list: {other:?}"),
+        }
+        let fi = m.lookup("/bar", 0).expect("lookup bar");
+        assert_eq!(fi.size, 4);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foo\n");
+        // Random seek via stencil / Cursor
+        r.seek(SeekFrom::Start(1)).unwrap();
+        let mut one = [0u8; 1];
+        r.read_exact(&mut one).unwrap();
+        assert_eq!(&one, b"o");
+    }
+
+    #[test]
+    fn open_from_reader_mszip_list_and_read() {
+        let cab = synthetic_mszip_cab("hello.txt", b"hello mszip cab\n");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let m = CabMountSource::open_from_reader(
+            Cursor::new(cab),
+            "mszip-nested.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader mszip");
+        let fi = m.lookup("/hello.txt", 0).expect("lookup");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"hello mszip cab\n");
+    }
+
+    #[test]
+    fn open_from_reader_rejects_lzx() {
+        let cab = synthetic_lzx_stub_cab();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        match CabMountSource::open_from_reader(
+            Cursor::new(cab),
+            "lzx.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        ) {
+            Err(CabError::UnsupportedCompression(c)) => assert_eq!(c, TCOMP_TYPE_LZX),
+            Ok(_) => panic!("LZX must be UnsupportedCompression"),
+            Err(other) => panic!("unexpected error: {other}"),
+        }
+    }
 
     #[test]
     fn open_single_file_cab() {
@@ -707,5 +1068,51 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"foo\n");
+    }
+
+    #[test]
+    fn open_from_reader_matches_path_fixture() {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        let path = PathBuf::from(root).join("tests/single-file.cab");
+        if !path.exists() {
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let from_reader = CabMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "single-file.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader fixture");
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("c.index.sqlite");
+        let from_path =
+            CabMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
+                .unwrap();
+        let fi_r = from_reader.lookup("/bar", 0).expect("reader bar");
+        let fi_p = from_path.lookup("/bar", 0).expect("path bar");
+        assert_eq!(fi_r.size, fi_p.size);
+        let mut br = Vec::new();
+        let mut bp = Vec::new();
+        from_reader
+            .open(&fi_r, 0)
+            .unwrap()
+            .read_to_end(&mut br)
+            .unwrap();
+        from_path
+            .open(&fi_p, 0)
+            .unwrap()
+            .read_to_end(&mut bp)
+            .unwrap();
+        assert_eq!(br, bp);
+        assert_eq!(br, b"foo\n");
     }
 }
