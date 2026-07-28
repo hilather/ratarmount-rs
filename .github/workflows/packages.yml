@@ -84,7 +84,7 @@ jobs:
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.7"
+          VERSION: "0.1.8"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -161,7 +161,7 @@ jobs:
 
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.7"
+          VERSION: "0.1.8"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -234,7 +234,7 @@ jobs:
 
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.7"
+          VERSION: "0.1.8"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -322,7 +322,7 @@ jobs:
 
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.7"
+          VERSION: "0.1.8"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
@@ -413,24 +413,59 @@ jobs:
       - name: Create / update GitHub Release (tags only)
         if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
         run: |
-          set -euxo pipefail
-          # Prior failure mode: bash globs kept literal names for missing files
-          # (e.g. glibc-version.txt), so `gh release create` exited 1. Only upload
-          # files that actually exist. Create the release shell first, then attach.
-          command -v gh
-          gh --version
-          test -n "${GH_TOKEN:-}"
-          test -d release
+          set -uo pipefail
+          # Pure REST (curl+jq) so we never depend on gh CLI, and every failure
+          # is emitted as a workflow annotation (visible without job-log auth).
+          DEBUG_LOG="${RUNNER_TEMP}/release-debug.log"
+          exec > >(tee -a "$DEBUG_LOG") 2>&1
+          fail() {
+            echo "::error::$1"
+            echo "ERROR: $1"
+            if [[ -f "$DEBUG_LOG" ]]; then
+              echo "::group::release-debug.log"
+              cat "$DEBUG_LOG"
+              echo "::endgroup::"
+            fi
+            exit 1
+          }
+          note() { echo "::notice::$1"; echo "$1"; }
+
+          command -v curl >/dev/null || fail "curl missing"
+          command -v jq >/dev/null || fail "jq missing"
+          [[ -n "${GITHUB_TOKEN:-}" ]] || fail "GITHUB_TOKEN empty"
+          [[ -n "${GITHUB_REPOSITORY:-}" ]] || fail "GITHUB_REPOSITORY empty"
+          [[ -n "${TAG:-}" ]] || fail "TAG empty"
+          [[ -d release ]] || fail "release/ directory missing"
+
+          API="https://api.github.com/repos/${GITHUB_REPOSITORY}"
+          AUTH=( -H "Authorization: Bearer ${GITHUB_TOKEN}"
+                 -H "Accept: application/vnd.github+json"
+                 -H "X-GitHub-Api-Version: 2022-11-28" )
+
+          # Probe token: dump accepted scopes / rate limit headers.
+          note "Probing token against ${API}"
+          probe_headers="$(mktemp)"
+          probe_body="$(mktemp)"
+          probe_code=$(curl -sS -D "$probe_headers" -o "$probe_body" -w "%{http_code}" \
+            "${AUTH[@]}" "$API" || true)
+          echo "probe HTTP $probe_code"
+          grep -iE '^(x-oauth-scopes|x-accepted-oauth-scopes|x-github-request-id|x-ratelimit|HTTP/)' "$probe_headers" || true
+          echo "repo permissions from API:" 
+          jq '{permissions, has_downloads, visibility, default_branch}' "$probe_body" 2>/dev/null || cat "$probe_body"
+          if [[ "$probe_code" != "200" ]]; then
+            fail "Token cannot read repo (HTTP $probe_code)"
+          fi
+
           cd release
           ls -la
           mapfile -t files < <(find . -maxdepth 1 -type f ! -name '.*' -printf '%f\n' | sort)
-          echo "Asset count: ${#files[@]}"
+          note "Asset count: ${#files[@]}"
           printf '  %s\n' "${files[@]}"
-          test "${#files[@]}" -gt 0
+          [[ ${#files[@]} -gt 0 ]] || fail "No files under release/"
 
           NOTES_FILE="$(mktemp)"
           cat >"$NOTES_FILE" <<'MD'
@@ -451,32 +486,83 @@ jobs:
           Workflow artifact fallback: **signed-release-bundle** on the Packages run.
           MD
           sed -i 's/^          //' "$NOTES_FILE"
-          echo "----- release notes -----"
-          cat "$NOTES_FILE"
-          echo "----- end notes -----"
 
-          # Ensure a release exists (no assets yet). Ignore "already exists".
-          if ! gh release view "$TAG" >/dev/null 2>&1; then
-            echo "Creating empty release $TAG"
-            # Do not pass assets here: large multi-file create is flaky; upload next.
-            gh release create "$TAG" \
-              --title "ratarmount-rs $TAG" \
-              --notes-file "$NOTES_FILE" \
-              --latest
+          # Build JSON body with jq so notes are safely escaped.
+          create_payload="$(mktemp)"
+          jq -n \
+            --arg tag "$TAG" \
+            --arg name "ratarmount-rs $TAG" \
+            --rawfile body "$NOTES_FILE" \
+            '{tag_name:$tag, name:$name, body:$body, draft:false, prerelease:false, make_latest:"true", generate_release_notes:false}' \
+            >"$create_payload"
+
+          # GET existing release by tag (404 = create).
+          existing_body="$(mktemp)"
+          existing_code=$(curl -sS -o "$existing_body" -w "%{http_code}" \
+            "${AUTH[@]}" "${API}/releases/tags/${TAG}" || true)
+          echo "GET releases/tags/${TAG} -> HTTP $existing_code"
+          if [[ "$existing_code" == "200" ]]; then
+            RELEASE_ID=$(jq -r '.id' "$existing_body")
+            UPLOAD_URL=$(jq -r '.upload_url' "$existing_body" | sed 's/{?name,label}//')
+            note "Updating existing release id=$RELEASE_ID"
+            edit_code=$(curl -sS -o /tmp/edit-resp.json -w "%{http_code}" \
+              -X PATCH "${AUTH[@]}" \
+              -H "Content-Type: application/json" \
+              "${API}/releases/${RELEASE_ID}" \
+              -d @"$create_payload" || true)
+            echo "PATCH release -> HTTP $edit_code"
+            cat /tmp/edit-resp.json
+            [[ "$edit_code" == "200" ]] || fail "PATCH release failed HTTP $edit_code: $(cat /tmp/edit-resp.json)"
           else
-            echo "Release $TAG already exists; updating title/notes"
-            gh release edit "$TAG" \
-              --title "ratarmount-rs $TAG" \
-              --notes-file "$NOTES_FILE" \
-              --latest
+            note "Creating release for tag $TAG"
+            create_headers="$(mktemp)"
+            create_body="$(mktemp)"
+            create_code=$(curl -sS -D "$create_headers" -o "$create_body" -w "%{http_code}" \
+              -X POST "${AUTH[@]}" \
+              -H "Content-Type: application/json" \
+              "${API}/releases" \
+              -d @"$create_payload" || true)
+            echo "POST /releases -> HTTP $create_code"
+            grep -iE '^(x-oauth-scopes|x-accepted-oauth-scopes|x-github-request-id|HTTP/)' "$create_headers" || true
+            cat "$create_body"
+            if [[ "$create_code" != "201" ]]; then
+              fail "POST /releases failed HTTP $create_code: $(cat "$create_body")"
+            fi
+            RELEASE_ID=$(jq -r '.id' "$create_body")
+            UPLOAD_URL=$(jq -r '.upload_url' "$create_body" | sed 's/{?name,label}//')
+            note "Created release id=$RELEASE_ID"
           fi
 
-          echo "Uploading ${#files[@]} assets to $TAG"
-          # Upload one-by-one so a single bad path does not obscure the rest.
+          [[ -n "$RELEASE_ID" && "$RELEASE_ID" != "null" ]] || fail "No release id"
+          [[ -n "$UPLOAD_URL" && "$UPLOAD_URL" != "null" ]] || fail "No upload_url"
+
           for f in "${files[@]}"; do
-            echo ">> upload $f ($(stat -c%s "$f") bytes)"
-            gh release upload "$TAG" "$f" --clobber
+            size=$(stat -c%s "$f")
+            note "Uploading $f ($size bytes)"
+            # Delete existing asset with same name (clobber).
+            assets_json=$(curl -sS "${AUTH[@]}" "${API}/releases/${RELEASE_ID}/assets?per_page=100")
+            old_id=$(echo "$assets_json" | jq -r --arg n "$f" '.[] | select(.name==$n) | .id' | head -1)
+            if [[ -n "${old_id:-}" && "$old_id" != "null" ]]; then
+              echo "Deleting existing asset id=$old_id name=$f"
+              curl -sS -X DELETE "${AUTH[@]}" "${API}/releases/assets/${old_id}" >/dev/null || true
+            fi
+            # Content-Type: application/octet-stream for all package blobs.
+            up_body="$(mktemp)"
+            up_code=$(curl -sS -o "$up_body" -w "%{http_code}" \
+              -X POST "${AUTH[@]}" \
+              -H "Content-Type: application/octet-stream" \
+              --data-binary @"$f" \
+              "${UPLOAD_URL}?name=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$f")" \
+              || true)
+            echo "upload $f -> HTTP $up_code"
+            if [[ "$up_code" != "201" ]]; then
+              cat "$up_body"
+              fail "Upload $f failed HTTP $up_code: $(head -c 500 "$up_body")"
+            fi
           done
 
-          gh release view "$TAG"
-          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${TAG}"
+          final=$(curl -sS "${AUTH[@]}" "${API}/releases/${RELEASE_ID}")
+          count=$(echo "$final" | jq '.assets | length')
+          url=$(echo "$final" | jq -r '.html_url')
+          note "Release published: $url ($count assets)"
+          echo "$final" | jq '{tag_name, html_url, assets: [.assets[].name]}'
