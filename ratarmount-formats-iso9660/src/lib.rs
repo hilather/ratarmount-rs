@@ -1,12 +1,20 @@
 //! ISO 9660 MountSource with random access via extent LBAs (`backendName=ISO9660MountSource`).
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! Nested ISO members can be opened without `/tmp` when the outer archive yields a
+//! seekable stream: [`Iso9660MountSource::open_from_reader`] indexes from any
+//! `Read + Seek` and retains a mutex-shared handle for extent stencil opens.
+//! Large images are never loaded fully into RAM.
 
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use ratarmount_compress::StenciledFile;
+use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
     normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
@@ -30,8 +38,73 @@ pub enum IsoError {
 
 pub type Result<T> = std::result::Result<T, IsoError>;
 
+/// Where ISO bytes live for member open (path re-open vs shared seekable stream).
+enum IsoBackend {
+    /// Path-based: `File::open` + [`StenciledFile`] on extent offsets.
+    Path(PathBuf),
+    /// Nested / stream open: mutex-shared `Read + Seek` (no full-image RAM load).
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+}
+
+/// Random-access slice of a shared ISO reader (one file extent).
+struct SharedSeekRegion {
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    file_offset: u64,
+    len: u64,
+    pos: u64,
+}
+
+impl SharedSeekRegion {
+    fn new(shared: Arc<Mutex<Box<dyn SeekRead>>>, file_offset: u64, len: u64) -> Self {
+        Self {
+            shared,
+            file_offset,
+            len,
+            pos: 0,
+        }
+    }
+}
+
+impl Read for SharedSeekRegion {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.len || buf.is_empty() {
+            return Ok(0);
+        }
+        let max = ((self.len - self.pos) as usize).min(buf.len());
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared iso reader poisoned"))?;
+        guard.seek(SeekFrom::Start(self.file_offset + self.pos))?;
+        let n = guard.read(&mut buf[..max])?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl Seek for SharedSeekRegion {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.len as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
 pub struct Iso9660MountSource {
+    /// Path or virtual label (logs / index metadata).
+    #[allow(dead_code)]
     archive_path: PathBuf,
+    backend: IsoBackend,
     index: SqliteIndex,
     #[allow(dead_code)]
     options: OpenOptions,
@@ -75,6 +148,66 @@ impl Iso9660MountSource {
         )
     }
 
+    /// Index and open an ISO 9660 image from any `Read + Seek` source.
+    ///
+    /// For nested AutoMount / HTTP Range / in-memory images without materializing to
+    /// `/tmp`. The reader is retained under a mutex for extent stencil opens — the
+    /// full image is **not** loaded into RAM.
+    ///
+    /// `archive_label` is used for logs and index metadata (may be a nested member
+    /// name). Prefer `index_path: None` or `options.index_in_memory` for nested mounts.
+    pub fn open_from_reader<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+        product_version: &str,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let index_path_buf: Option<PathBuf> = if options.index_in_memory {
+            None
+        } else {
+            index_path.map(|p| p.to_path_buf())
+        };
+
+        println!(
+            "Creating offset dictionary for {} ...",
+            archive_path.display()
+        );
+        let t0 = Instant::now();
+
+        let mut reader = reader;
+        let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
+        reader.seek(SeekFrom::Start(0))?;
+
+        // Index while owning the reader, then wrap for shared open() I/O.
+        // (Cannot share under mutex during walk without an independent handle.)
+        let index = build_iso_index(
+            &mut reader,
+            index_path_buf.as_deref(),
+            product_version,
+            StatsSource::Synthetic(size),
+        )?;
+        reader.seek(SeekFrom::Start(0))?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+
+        let secs = t0.elapsed().as_secs_f64();
+        println!(
+            "Creating offset dictionary for {} took {secs:.2}s",
+            archive_path.display()
+        );
+
+        Ok(Self {
+            archive_path,
+            backend: IsoBackend::Shared(shared),
+            index,
+            options: options.clone(),
+        })
+    }
+
     fn open_existing(
         archive_path: &Path,
         index_path: &Path,
@@ -84,6 +217,7 @@ impl Iso9660MountSource {
         index.check_backend_name(BACKEND_NAME)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: IsoBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
@@ -103,27 +237,12 @@ impl Iso9660MountSource {
         let t0 = Instant::now();
 
         let mut file = File::open(archive_path)?;
-        file.seek(SeekFrom::Start(PVD_OFFSET))?;
-        let mut pvd = vec![0u8; SECTOR as usize];
-        file.read_exact(&mut pvd)?;
-        if pvd.first() != Some(&1) || pvd.get(1..6) != Some(b"CD001") {
-            return Err(IsoError::Msg(
-                "Not a valid ISO 9660 image (missing primary volume descriptor)".into(),
-            ));
-        }
-
-        let root = parse_directory_record(&pvd, 156)
-            .ok_or_else(|| IsoError::Msg("ISO 9660 PVD has no root directory".into()))?;
-
-        let index = SqliteIndex::create_writable(index_path)?;
-        index.begin_write()?;
-        let mut seen = HashSet::new();
-        walk_directory(&mut file, root.extent, root.size, "", &index, &mut seen)?;
-
-        index.store_versions(product_version)?;
-        index.store_metadata_key_value("backendName", BACKEND_NAME)?;
-        store_stats(&index, archive_path)?;
-        index.commit_write()?;
+        let index = build_iso_index(
+            &mut file,
+            index_path,
+            product_version,
+            StatsSource::Path(archive_path),
+        )?;
 
         let secs = t0.elapsed().as_secs_f64();
         println!(
@@ -131,9 +250,9 @@ impl Iso9660MountSource {
             archive_path.display()
         );
 
-        let index = index.into_read_only()?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
+            backend: IsoBackend::Path(archive_path.to_path_buf()),
             index,
             options: options.clone(),
         })
@@ -171,11 +290,20 @@ impl MountSource for Iso9660MountSource {
         let ud = userdata(file_info).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "missing iso9660 userdata")
         })?;
-        let file = File::open(&self.archive_path)?;
-        Ok(Box::new(StenciledFile::new(
-            file,
-            vec![(ud.offset, file_info.size)],
-        )))
+        match &self.backend {
+            IsoBackend::Path(path) => {
+                let file = File::open(path)?;
+                Ok(Box::new(StenciledFile::new(
+                    file,
+                    vec![(ud.offset, file_info.size)],
+                )))
+            }
+            IsoBackend::Shared(shared) => Ok(Box::new(SharedSeekRegion::new(
+                Arc::clone(shared),
+                ud.offset,
+                file_info.size,
+            ))),
+        }
     }
 
     fn is_immutable(&self) -> bool {
@@ -189,6 +317,45 @@ struct DirRec {
     size: u32,
     is_dir: bool,
     name: Option<String>,
+}
+
+enum StatsSource<'a> {
+    Path(&'a Path),
+    Synthetic(u64),
+}
+
+/// Parse PVD + walk directory tree into a SQLite index (any `Read + Seek`).
+fn build_iso_index<R: Read + Seek>(
+    file: &mut R,
+    index_path: Option<&Path>,
+    product_version: &str,
+    stats: StatsSource<'_>,
+) -> Result<SqliteIndex> {
+    file.seek(SeekFrom::Start(PVD_OFFSET))?;
+    let mut pvd = vec![0u8; SECTOR as usize];
+    file.read_exact(&mut pvd)?;
+    if pvd.first() != Some(&1) || pvd.get(1..6) != Some(b"CD001") {
+        return Err(IsoError::Msg(
+            "Not a valid ISO 9660 image (missing primary volume descriptor)".into(),
+        ));
+    }
+
+    let root = parse_directory_record(&pvd, 156)
+        .ok_or_else(|| IsoError::Msg("ISO 9660 PVD has no root directory".into()))?;
+
+    let index = SqliteIndex::create_writable(index_path)?;
+    index.begin_write()?;
+    let mut seen = HashSet::new();
+    walk_directory(file, root.extent, root.size, "", &index, &mut seen)?;
+
+    index.store_versions(product_version)?;
+    index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+    match stats {
+        StatsSource::Path(path) => store_stats(&index, path)?,
+        StatsSource::Synthetic(size) => store_stats_size(&index, size)?,
+    }
+    index.commit_write()?;
+    Ok(index.into_read_only()?)
 }
 
 fn read_both_endian_u32(data: &[u8], offset: usize) -> u32 {
@@ -234,15 +401,15 @@ fn parse_directory_record(data: &[u8], offset: usize) -> Option<DirRec> {
     })
 }
 
-fn read_sector(file: &mut File, sector: u32) -> Result<Vec<u8>> {
+fn read_sector<R: Read + Seek>(file: &mut R, sector: u32) -> Result<Vec<u8>> {
     file.seek(SeekFrom::Start(u64::from(sector) * SECTOR))?;
     let mut data = vec![0u8; SECTOR as usize];
     file.read_exact(&mut data)?;
     Ok(data)
 }
 
-fn walk_directory(
-    file: &mut File,
+fn walk_directory<R: Read + Seek>(
+    file: &mut R,
     extent: u32,
     size: u32,
     path_prefix: &str,
@@ -354,6 +521,15 @@ pub fn looks_like_iso9660(path: &Path) -> bool {
         .is_some_and(|e| e.eq_ignore_ascii_case("iso"))
 }
 
+/// True when `reader` has a primary volume descriptor at sector 16 (`CD001`).
+pub fn looks_like_iso9660_reader<R: Read + Seek>(reader: &mut R) -> bool {
+    if reader.seek(SeekFrom::Start(0x8001)).is_err() {
+        return false;
+    }
+    let mut cd = [0u8; 5];
+    matches!(reader.read(&mut cd), Ok(5) if &cd == b"CD001")
+}
+
 pub fn looks_like_iso(path: &Path) -> bool {
     looks_like_iso9660(path)
 }
@@ -377,23 +553,40 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     Ok(())
 }
 
+fn store_stats_size(index: &SqliteIndex, size: u64) -> Result<()> {
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
+    index.store_metadata_key_value("tarstats", &json)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Cursor, Write};
 
-    #[test]
-    fn open_single_file_iso_bz2() {
+    fn load_single_file_iso() -> Option<Vec<u8>> {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         let bz = PathBuf::from(&root).join("tests/single-file.iso.bz2");
         if !bz.exists() {
-            return;
+            eprintln!(
+                "skip: missing ISO fixture at {} (set RATARMOUNT_PY_ROOT)",
+                bz.display()
+            );
+            return None;
         }
-        let compressed = std::fs::read(&bz).unwrap();
+        let compressed = std::fs::read(&bz).ok()?;
         let mut decoder = bzip2::read::BzDecoder::new(&compressed[..]);
         let mut plain = Vec::new();
-        decoder.read_to_end(&mut plain).unwrap();
+        decoder.read_to_end(&mut plain).ok()?;
+        Some(plain)
+    }
+
+    #[test]
+    fn open_single_file_iso_bz2() {
+        let Some(plain) = load_single_file_iso() else {
+            return;
+        };
         let dir = tempfile::tempdir().unwrap();
         let iso = dir.path().join("single-file.iso");
         std::fs::File::create(&iso)
@@ -413,5 +606,86 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"foo\n");
+    }
+
+    #[test]
+    fn open_from_reader_single_file_iso() {
+        let Some(plain) = load_single_file_iso() else {
+            return;
+        };
+        assert!(looks_like_iso9660_reader(&mut Cursor::new(&plain)));
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = Iso9660MountSource::open_from_reader(
+            Cursor::new(plain),
+            "single-file.iso",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+        let fi = m
+            .lookup("/BAR", 0)
+            .or_else(|| m.lookup("/bar", 0))
+            .expect("BAR");
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foo\n");
+    }
+
+    #[test]
+    fn open_from_reader_matches_path_open() {
+        let Some(plain) = load_single_file_iso() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let iso = dir.path().join("single-file.iso");
+        std::fs::File::create(&iso)
+            .unwrap()
+            .write_all(&plain)
+            .unwrap();
+
+        let path_src =
+            Iso9660MountSource::open(&iso, None, &OpenOptions::default(), "0.1.0", true).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let reader_src = Iso9660MountSource::open_from_reader(
+            Cursor::new(plain),
+            "single-file.iso",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .unwrap();
+
+        let path_fi = path_src
+            .lookup("/BAR", 0)
+            .or_else(|| path_src.lookup("/bar", 0))
+            .expect("path BAR");
+        let reader_fi = reader_src
+            .lookup("/BAR", 0)
+            .or_else(|| reader_src.lookup("/bar", 0))
+            .expect("reader BAR");
+        assert_eq!(path_fi.size, reader_fi.size);
+
+        let mut a = Vec::new();
+        let mut b = Vec::new();
+        path_src
+            .open(&path_fi, 0)
+            .unwrap()
+            .read_to_end(&mut a)
+            .unwrap();
+        reader_src
+            .open(&reader_fi, 0)
+            .unwrap()
+            .read_to_end(&mut b)
+            .unwrap();
+        assert_eq!(a, b);
+        assert_eq!(a, b"foo\n");
     }
 }
