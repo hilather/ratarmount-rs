@@ -1,6 +1,8 @@
 //! Seekable zstd: multi-frame restart points + zstd seekable-format seek table
 //! + Python `zstdblocks` offset-map import.
 //!
+//! User-facing guide (producer recipes, open priority): `docs/zstd-random-access.md`.
+//!
 //! Priority when opening (without an imported map):
 //! 1. **Seek table** (zstd seekable format skippable footer, magic `0x8F92EAB1`) —
 //!    gives compressed/decompressed sizes without decompressing during map build.

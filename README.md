@@ -77,7 +77,7 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 | gzip | yes | **yes** | TAR **and** plain `.gz` seekable; RGZI Tier C; residual GZIDX window-dict |
 | bzip2 | yes | **yes** | Multi-stream + `bzip2blocks`; residual bit-block polish |
 | xz | yes | **yes** | Index / multi-stream; single-block full decode residual |
-| zstd | yes | **yes** | Multi-frame + seek-table + `zstdblocks` ([#196](https://github.com/mxmlnkn/ratarmount/issues/196) docs) |
+| zstd | yes | **yes** | Multi-frame + seek-table + `zstdblocks` — [guide](docs/zstd-random-access.md) ([#196](https://github.com/mxmlnkn/ratarmount/issues/196)) |
 | lz4 / lzip / lzo / .Z / lzma / zlib | yes | **yes** | [#126](https://github.com/mxmlnkn/ratarmount/issues/126) lzip; all seekable bodies |
 
 ### Compositing & mount UX
@@ -119,7 +119,7 @@ Upstream FR tracker: [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upst
 
 Still missing or partial relative to upstream Python (and open upstream issues we can implement):
 
-1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable).
+1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher feature; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
@@ -305,6 +305,7 @@ RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in log
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | **Nested/embedded: no-tmp vs temp, random read by format** |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path (TAR + plain) |
+| [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table / multi-frame / full-decode + producer recipes |
 | [docs/phase9-formats.md](docs/phase9-formats.md) | Long-tail formats |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote URL backends |
 | [docs/phase11-packaging.md](docs/phase11-packaging.md) | Packaging notes |

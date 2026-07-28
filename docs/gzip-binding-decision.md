@@ -44,7 +44,7 @@
 |-------|------|
 | bzip2 | `SeekableBody` via one-shot decode → RAM (≤256 MiB) or temp |
 | xz | same (multi-decoder for concatenated streams) |
-| zstd | multi-frame restart map; single-frame same as bzip2/xz |
+| zstd | multi-frame + seek-table + `zstdblocks`; single-frame full decode — [guide](zstd-random-access.md) |
 
 ## Post-1.0
 
@@ -52,4 +52,4 @@
 - **Tier D:** parallel decode / rapidgzip-class throughput.
 - Persist Rust checkpoints into SQLite for faster remount without full re-scan.
 - ~~Seekable single-file `.gz` without materialize~~ — done (`from_seekable_body`).
-- True bzip2 bit-block map; xz liblzma stream index; zstd seek-table polish.
+- True bzip2 bit-block map; xz liblzma stream index. (Zstd seek-table / multi-frame: see [zstd-random-access.md](zstd-random-access.md).)

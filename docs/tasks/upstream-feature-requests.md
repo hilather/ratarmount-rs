@@ -23,6 +23,7 @@ issue from the README feature tables.
 | [#100](https://github.com/mxmlnkn/ratarmount/issues/100) | Use pread | **done** | FUSE low-level read path is offset-based (pread-style) |
 | [#79](https://github.com/mxmlnkn/ratarmount/issues/79) | Metadata for recursive compressed TARs in outer index | **partial** | `nestedTarMembers` / flatten paths; not full Python dual-index |
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
+| [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) (seek-table → multi-frame → full decode; producer recipes) |
 
 ---
 
@@ -45,7 +46,7 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 |----|----------|------|---------------------|---------------------|
 | FR-5 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | **Readahead-like option** | Performance for sequential scans | `ratarmount-fuse` + open buffering |
 | FR-6 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **Parallel index nested archives** | Nested index work can fan out | factory / automount / index |
-| FR-7 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | **Document multi-frame / chunked zstd** | Examples + recommend seekable/multi-frame | docs + optional CLI tip |
+| FR-7 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | **Document multi-frame / chunked zstd** | **done** — [`docs/zstd-random-access.md`](../zstd-random-access.md) | docs |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | Use libarchive path; document | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | APIs exist; wire factory fully | `ratarmount/src/factory.rs` |
 
@@ -70,6 +71,5 @@ Prioritized by maintainer clarity + fit for Rust architecture.
 4. **FR-4** Parallel ZIP deflate member decode  
 5. **FR-5** FUSE readahead knobs  
 6. **FR-9** Factory side-table auto-wire  
-7. Docs/examples **FR-7** anytime  
 
 Update this file when status changes. Keep README **Upstream** column in sync.
