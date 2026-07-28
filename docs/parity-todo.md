@@ -185,6 +185,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - Benchmarks: `benchmarks/python-vs-rust-results.md`
 - Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
 - **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
+- **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
 - **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)

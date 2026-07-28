@@ -63,6 +63,25 @@ For isolation=`worktree` tasks, follow skill **`ratarmount-worktree-subagent`** 
 - Subagents: **one commit, do not push** unless the user asked to publish.
 - Orchestrator: cherry-pick / merge, re-run full fmt + clippy + test, then push when asked.
 
+## Feature comparisons & README (every relevant commit)
+
+**When a commit changes user-visible capability, update living docs in the same
+commit** (or list an explicit “docs delta” for the orchestrator). Do not leave
+README / parity tables stale.
+
+| Trigger | Update |
+|---------|--------|
+| New/removed/changed format, codec, remote, CLI flag, nested/tmp behavior | [`README.md`](README.md) feature tables + Gaps section if needed |
+| Parity status flip (`[x]` / `~` / residual) | [`docs/parity-todo.md`](docs/parity-todo.md) |
+| Mount option added/changed | [`docs/mount-options-parity.md`](docs/mount-options-parity.md) |
+| Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ README cheat sheet) |
+| Dual-run / packaging product status | [`docs/phase12-dual-run.md`](docs/phase12-dual-run.md) / packaging notes |
+| Upstream-inspired feature (from mxmlnkn/ratarmount issues) | [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md) status row + README **Upstream** link |
+
+If the change is pure refactor/tests with **no** user-facing behavior change, skip
+doc updates (still add regression tests per above).
+
+Skill for nested/tmp matrices: **`format-support-matrices`**.
 ## Releases / package builds (do this properly)
 
 Tagging alone is not enough: **`Packages` must publish a GitHub Release with real

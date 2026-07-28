@@ -46,76 +46,87 @@ Rust is not a drop-in for every Python workflow yet (see [gaps](#gaps-vs-python-
 
 ## Features (parity with original ratarmount)
 
+Upstream issue links point at [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount/issues) when a feature
+was requested or designed there. Living backlog of open upstream-inspired work:
+[`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md).
+
 ### Archives & images
 
-| Format | Python | Rust | Notes |
-|--------|:------:|:----:|-------|
-| TAR (ustar / PAX / GNU) + sparse | yes | yes | GNU incremental: detect + dumpdir / prefix strip |
-| ZIP (store / deflate, password) | yes | yes | Multi-part join; multi-disk EOCD normalize; residual per-disk edges |
-| 7z custom pack-offset + AES / BCJ2 | yes* | yes | *fork RA work; pure LZMA2 progressive; solid BCJ/AES still heavy |
-| AR / CPIO | yes | yes | `open_from_reader` (nested no-tmp) |
-| ISO 9660 / WARC / XAR / CAB / ASAR | yes | yes | CAB LZX → libarchive; others stream-open for nested |
-| SquashFS | yes | yes | backhand in-process; classic lzma → `unsquashfs` |
-| EXT4 | yes | yes | pure `ext4-view` + `debugfs` fallback |
-| FAT12/16/32 | yes | yes | Pure Rust (`fatfs`); nested `open_from_reader` |
-| SQLAR | yes | yes | Unencrypted stream open (RAM deserialize); sqlcipher optional |
-| PDF / OGG / HTML / Git | yes | yes | PDF attachments + common XObjects; Git may need `RATARMOUNT_FORCE_GIT=1` |
-| RAR / LHA / long-tail | yes | yes | via libarchive (sequential member open) |
-| Split files (`.001`) | yes | yes | decimal/hex/alpha join at open + recursive AutoMount |
-| lrzip | yes | yes | CLI materialize + libarchive fallback |
+| Format | Python | Rust | Upstream / notes |
+|--------|:------:|:----:|------------------|
+| TAR (ustar / PAX / GNU) + sparse | yes | **yes** | GNU incremental: detect + dumpdir / prefix strip |
+| ZIP (store / deflate, password) | yes | **yes** | Multi-part join; multi-disk EOCD normalize; residual per-disk edges |
+| 7z custom pack-offset + AES / BCJ2 | yes* | **yes** | [#123](https://github.com/mxmlnkn/ratarmount/issues/123) — *fork RA + progressive pure LZMA2; solid BCJ/AES still heavy |
+| AR / CPIO | yes | **yes** | Nested `open_from_reader` (no-tmp) |
+| ISO 9660 | yes | **yes** | Nested stream open |
+| WARC | yes | **yes** | [#128](https://github.com/mxmlnkn/ratarmount/issues/128) — stencil + nested no-tmp |
+| XAR / CAB / ASAR | yes | **yes** | CAB LZX → libarchive; store/MSZIP nested no-tmp |
+| SquashFS | yes | **yes** | backhand in-process; classic lzma → `unsquashfs` |
+| EXT4 | yes | **yes** | pure `ext4-view` + `debugfs` fallback |
+| FAT12/16/32 | yes | **yes** | Pure Rust (`fatfs`); nested `open_from_reader` |
+| SQLAR | yes | **yes** | Unencrypted stream open; sqlcipher optional |
+| PDF / OGG / HTML / Git | yes | **yes** | PDF attachments + common XObjects; Git may need `RATARMOUNT_FORCE_GIT=1` |
+| RAR / LHA / long-tail | yes | **yes** | via libarchive (sequential); no pure RAR |
+| Split files (`.001`) | yes | **yes** | decimal/hex/alpha join + recursive AutoMount |
+| lrzip | yes | **yes** | CLI materialize + libarchive fallback |
 
 ### Compression (outer / seekable)
 
-| Codec | Python | Rust | Notes |
-|-------|:------:|:----:|-------|
-| gzip | yes (rapidgzip / seek points) | yes | TAR **and** plain `.gz` seekable (no full materialize); RGZI Tier C import/export |
-| bzip2 | yes (block-parallel) | yes | Multi-stream + `bzip2blocks` side table; residual true bit-block polish |
-| xz | yes (multi-block) | yes | Index / multi-stream maps; single-block full decode residual |
-| zstd | yes (seek table) | yes | Multi-frame + seek-table + `zstdblocks` import/export |
-| lz4 / lzip / lzo / .Z / lzma / zlib | yes | yes | Seekable bodies in both |
+| Codec | Python | Rust | Upstream / notes |
+|-------|:------:|:----:|------------------|
+| gzip | yes | **yes** | TAR **and** plain `.gz` seekable; RGZI Tier C; residual GZIDX window-dict |
+| bzip2 | yes | **yes** | Multi-stream + `bzip2blocks`; residual bit-block polish |
+| xz | yes | **yes** | Index / multi-stream; single-block full decode residual |
+| zstd | yes | **yes** | Multi-frame + seek-table + `zstdblocks` ([#196](https://github.com/mxmlnkn/ratarmount/issues/196) docs) |
+| lz4 / lzip / lzo / .Z / lzma / zlib | yes | **yes** | [#126](https://github.com/mxmlnkn/ratarmount/issues/126) lzip; all seekable bodies |
 
 ### Compositing & mount UX
 
-| Ability | Python | Rust |
-|---------|:------:|:----:|
-| Recursive automount (`-r`) | yes | yes — **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)) |
-| Lazy mount (`-l`) | yes | yes |
-| Union of multiple sources | yes | yes (+ folder cache knobs) |
-| Write overlay (`-w` / `:temp:`) | yes | yes |
-| `--commit-overlay` | yes | TAR + gzip/bzip2/xz (GNU tar) |
-| File versions (`.versions/`) | yes | yes (default on; `--no-file-versions`) |
-| Strip / transform recursive paths | yes | yes |
-| Prefix (`-p`) | yes | yes |
-| Control interface | in-FS folder | Unix socket **+** in-FS `/.ratarmount-control/` |
-| Daemonize / foreground (`-f`) | yes | yes |
-| Password / password-file | yes | yes |
-| Content hashes / FUSE xattrs | yes | yes (TAR/ZIP/7z) |
+| Ability | Python | Rust | Upstream / notes |
+|---------|:------:|:----:|------------------|
+| Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)) |
+| Lazy mount (`-l`) | yes | **yes** | |
+| Union of multiple sources | yes | **yes** | + folder cache; symlink-merge option still open ([#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
+| Write overlay (`-w` / `:temp:`) | yes | **yes** | |
+| `--commit-overlay` | yes | **yes** | TAR + gzip/bzip2/xz (GNU tar); ZIP commit still open ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)) |
+| File versions (`.versions/`) | yes | **yes** | default on; `--no-file-versions` |
+| Strip / transform recursive paths | yes | **yes** | |
+| Prefix (`-p`) | yes | **yes** | |
+| Control interface | yes | **yes** | Unix socket **+** in-FS `/.ratarmount-control/` |
+| Index only / no mount | yes | **yes** | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) `--no-mount` |
+| Recursion depth control | yes | **yes** | [#151](https://github.com/mxmlnkn/ratarmount/issues/151) `--recursion-depth` (plain compress layer) |
+| Daemonize / foreground (`-f`) | yes | **yes** | |
+| Password / password-file | yes | **yes** | |
+| Content hashes / FUSE xattrs | yes | **yes** | TAR/ZIP/7z hashes; archive **LIBARCHIVE/SCHILY xattrs** partial ([#145](https://github.com/mxmlnkn/ratarmount/issues/145)) |
 
 ### Remote
 
-| Protocol | Python | Rust |
-|----------|:------:|:----:|
-| `file://` | yes | yes |
-| `http(s)://` | yes | yes (full GET + **live Range** for TAR/ZIP/gzip/bzip2/xz/zstd) |
-| `s3://` | yes | yes (SigV4 env + IMDS/ECS + anonymous; Range prefer) |
-| `ssh://` / `sftp://` | yes | yes |
-| WebDAV / SMB / Dropbox | yes | yes (folder list + ranged content) |
+| Protocol | Python | Rust | Upstream / notes |
+|----------|:------:|:----:|------------------|
+| `file://` | yes | **yes** | |
+| `http(s)://` | yes | **yes** | GET + **live Range** (TAR/ZIP/main codecs); **HTTP auth** open ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)) |
+| `s3://` | yes | **yes** | SigV4 env + IMDS/ECS + anonymous; Range prefer |
+| `ssh://` / `sftp://` | yes | **yes** | residual full `ssh_config` |
+| WebDAV / SMB / Dropbox | yes | **yes** | folder list + ranged content |
 
 Full option matrix: [`docs/mount-options-parity.md`](docs/mount-options-parity.md).  
-Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).
+Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).  
+Upstream FR tracker: [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md).
 
 ---
 
 ## Gaps vs Python ratarmount
 
-Still missing or partial relative to upstream Python:
+Still missing or partial relative to upstream Python (and open upstream issues we can implement):
 
-1. **Codec depth** — true bzip2 bit-block map / `-P` parity; exotic xz filters; rapidgzip-class throughput.
-2. **Formats** — pure in-process classic SquashFS lzma (no `unsquashfs`); pure RAR; encrypted SQLAR decrypt without path/sqlcipher; residual PDF color spaces.
+1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable).
+2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher feature; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
-4. **Remote** — full `ssh_config` parity; some remote index edge cases.
-5. **CLI polish** — colored logs; full OSS attributions; optional Homebrew formula.
-6. **Platforms** — macOS is **beta** (arm64/x86_64 tarballs + CI); needs [macFUSE or FUSE-T](docs/macos.md). Full harness parity open.
+4. **Write paths** — ZIP `--commit-overlay` ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
+5. **Remote** — HTTP basic/cookie auth ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); full `ssh_config`.
+6. **xattrs** — TAR PAX `LIBARCHIVE.xattr` / `SCHILY.xattr` ([#145](https://github.com/mxmlnkn/ratarmount/issues/145)) beyond content hashes.
+7. **Perf options** — readahead ([#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel large ZIP deflate ([#105](https://github.com/mxmlnkn/ratarmount/issues/105)); parallel nested indexing ([#80](https://github.com/mxmlnkn/ratarmount/issues/80)).
+8. **Platforms** — macOS **beta** ([docs/macos.md](docs/macos.md)); harness allowlist expansion toward Python fixed-archive set.
 
 ---
 

@@ -37,14 +37,17 @@ description: >
    and skips the FUSE harness (`needs: check`).
 4. **Bug fixes must include regression tests** in the same commit (see root AGENTS.md
    “Tests for every fix”). Name tests after the symptom; do not ship fix-only commits.
-5. One commit on this worktree branch. Do not push.
-6. Report: commit SHA, files changed, residual limits, verify command results, **new tests**.
-7. If you change nested open, materialize, temp spool, or MountSource::open for archives:
+5. **User-visible changes must update feature comparisons / README** when appropriate
+   (see root AGENTS.md “Feature comparisons & README”). At minimum: README tables
+   and/or docs/parity-todo.md; nested/tmp → embedded-nested-archives.md.
+6. One commit on this worktree branch. Do not push.
+7. Report: commit SHA, files changed, residual limits, verify results, **new tests**,
+   **docs touched** (or “docs delta: none — no user-visible change”).
+8. If you change nested open, materialize, temp spool, or MountSource::open for archives:
    update docs/embedded-nested-archives.md (and README nested cheat sheet if needed)
    in the same commit, or list an explicit "docs delta" for the orchestrator.
    Skill: format-support-matrices.
 ```
-
 ## Verify commands (agent)
 
 Scoped (preferred):
