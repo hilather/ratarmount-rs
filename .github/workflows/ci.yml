@@ -175,13 +175,19 @@ jobs:
         run: |
           set -euo pipefail
           brew update
-          brew install pkgconf libarchive gnu-tar
+          # Core link deps + CLIs used by unit tests (zstd/bzip2/p7zip/gzip).
+          # Without zstd/bzip2, factory side-table tests used to panic on spawn.
+          brew install pkgconf libarchive gnu-tar zstd bzip2 p7zip
           brew install --cask macfuse
 
           # Optional runtime for smoke mounts (best-effort).
           brew install --cask fuse-t || true
           # Prefer GNU tar (Homebrew gtar) for --commit-overlay tests.
           echo "$(brew --prefix gnu-tar)/libexec/gnubin" >> "$GITHUB_PATH"
+          # Ensure Homebrew zstd/bzip2/7z are on PATH (Apple Silicon prefixes).
+          echo "$(brew --prefix)/bin" >> "$GITHUB_PATH"
+          echo "$(brew --prefix zstd)/bin" >> "$GITHUB_PATH" || true
+          echo "$(brew --prefix bzip2)/bin" >> "$GITHUB_PATH" || true
 
           LA="$(brew --prefix libarchive)/lib/pkgconfig"
           PCS="/usr/local/lib/pkgconfig"
@@ -265,13 +271,22 @@ jobs:
           code=${PIPESTATUS[0]}
           if [[ "$code" -ne 0 ]]; then
             echo "::group::cargo test failure (tail)"
-            tail -n 150 /tmp/cargo-macos-test.log
+            tail -n 200 /tmp/cargo-macos-test.log
             echo "::endgroup::"
-            grep -E 'FAILED|failures:|error\[|panicked at|assertion|test result:' /tmp/cargo-macos-test.log \
-              | head -n 50 \
-              | while IFS= read -r line; do
-                  echo "::error::${line:0:350}"
-                done
+            # Prefer real failure lines. Do NOT annotate every "test result: ok"
+            # (that flooded the Checks API and hid the actual FAILED tests).
+            {
+              grep -E 'FAILED|failures:|error\[E[0-9]+\]|panicked at|assertion failed|thread .+ panicked' /tmp/cargo-macos-test.log || true
+              grep -E 'test result: FAILED' /tmp/cargo-macos-test.log || true
+              # Package-level summary lines that indicate failure
+              grep -E 'error: test failed|error: could not compile' /tmp/cargo-macos-test.log || true
+            } | head -n 40 | while IFS= read -r line; do
+              echo "::error::${line:0:350}"
+            done
+            # Also print a compact failures section to the job log
+            echo "::group::extracted failures"
+            grep -nE 'FAILED|failures:|panicked at|error\[E|test result: FAILED|could not compile' /tmp/cargo-macos-test.log | head -n 80 || true
+            echo "::endgroup::"
             exit "$code"
           fi
 

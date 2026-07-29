@@ -3024,21 +3024,29 @@ mod tests {
         assert!(status.success(), "tar -cf failed");
         let tar_zst = dir.join("tiny.tar.zst");
         // Compress as multi-frame when possible (frame size small → multiple frames).
-        let status = Command::new("zstd")
+        // Skip when `zstd` is not on PATH (e.g. stock macOS CI without brew zstd).
+        let Ok(status) = Command::new("zstd")
             .args(["-f", "-19", "--stream-size=1024", "-o"])
             .arg(&tar_zst)
             .arg(&tar_path)
             .status()
-            .expect("spawn zstd");
+        else {
+            // Caller tests that need this fixture should skip when missing.
+            return PathBuf::new();
+        };
         if !status.success() {
             // Older zstd without --stream-size: plain compress still yields exportable map.
-            let status = Command::new("zstd")
+            let Ok(status) = Command::new("zstd")
                 .args(["-f", "-o"])
                 .arg(&tar_zst)
                 .arg(&tar_path)
                 .status()
-                .expect("spawn zstd fallback");
-            assert!(status.success(), "zstd compress failed");
+            else {
+                return PathBuf::new();
+            };
+            if !status.success() {
+                return PathBuf::new();
+            }
         }
         tar_zst
     }
@@ -3070,13 +3078,20 @@ mod tests {
         assert!(status.success(), "tar -cf failed");
         let tar_bz2 = dir.join("tiny.tar.bz2");
         // `-1` → 100 KiB blocks so export_bzip2_blocks sees a multi-block map.
-        let status = Command::new("bzip2")
+        let Ok(out) = std::fs::File::create(&tar_bz2) else {
+            return PathBuf::new();
+        };
+        let Ok(status) = Command::new("bzip2")
             .args(["-1", "-k", "-f", "-c"])
             .arg(&tar_path)
-            .stdout(std::fs::File::create(&tar_bz2).expect("create bz2"))
+            .stdout(out)
             .status()
-            .expect("spawn bzip2");
-        assert!(status.success(), "bzip2 compress failed");
+        else {
+            return PathBuf::new();
+        };
+        if !status.success() {
+            return PathBuf::new();
+        }
         tar_bz2
     }
 
@@ -3085,20 +3100,26 @@ mod tests {
         let plain = dir.join("plain.txt");
         std::fs::write(&plain, vec![b'z'; 8192]).expect("write plain");
         let zst = dir.join("plain.txt.zst");
-        let status = Command::new("zstd")
+        let Ok(status) = Command::new("zstd")
             .args(["-f", "--stream-size=1024", "-o"])
             .arg(&zst)
             .arg(&plain)
             .status()
-            .expect("spawn zstd");
+        else {
+            return PathBuf::new();
+        };
         if !status.success() {
-            let status = Command::new("zstd")
+            let Ok(status) = Command::new("zstd")
                 .args(["-f", "-o"])
                 .arg(&zst)
                 .arg(&plain)
                 .status()
-                .expect("spawn zstd fallback");
-            assert!(status.success(), "zstd plain compress failed");
+            else {
+                return PathBuf::new();
+            };
+            if !status.success() {
+                return PathBuf::new();
+            }
         }
         zst
     }
@@ -3108,13 +3129,20 @@ mod tests {
         // Patterned multi-block payload (not zeros — zeros collapse to one tiny block).
         std::fs::write(&plain, multi_block_bz2_payload()).expect("write plain");
         let bz2 = dir.join("plain-bz2.txt.bz2");
-        let status = Command::new("bzip2")
+        let Ok(out) = std::fs::File::create(&bz2) else {
+            return PathBuf::new();
+        };
+        let Ok(status) = Command::new("bzip2")
             .args(["-1", "-k", "-f", "-c"])
             .arg(&plain)
-            .stdout(std::fs::File::create(&bz2).expect("create bz2"))
+            .stdout(out)
             .status()
-            .expect("spawn bzip2");
-        assert!(status.success(), "bzip2 compress failed");
+        else {
+            return PathBuf::new();
+        };
+        if !status.success() {
+            return PathBuf::new();
+        }
         bz2
     }
 
@@ -3225,6 +3253,10 @@ mod tests {
     fn zstd_blocks_persisted_and_reimported() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
         let index = dir.path().join("tiny.zst.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3257,6 +3289,10 @@ mod tests {
     fn zstd_blocks_invalid_map_falls_back_to_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
         let index = dir.path().join("tiny.zst.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3291,6 +3327,10 @@ mod tests {
     fn zstd_blocks_memory_index_skips_side_table_path() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
         let opts = OpenOptions {
             index_in_memory: true,
             ..Default::default()
@@ -3326,6 +3366,10 @@ mod tests {
     fn zstd_blocks_warm_open_uses_side_table_without_rewrite() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
         let index = dir.path().join("tiny.zst.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3370,6 +3414,10 @@ mod tests {
     fn zstd_blocks_plain_zst_persisted_and_reimported() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_plain_multi_zst(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: zstd CLI unavailable");
+            return;
+        }
         let index = dir.path().join("plain.zst.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3402,6 +3450,10 @@ mod tests {
     fn bzip2_blocks_persisted_and_reimported() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_bz2(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: bzip2 CLI unavailable");
+            return;
+        }
         let index = dir.path().join("tiny.bz2.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3435,6 +3487,10 @@ mod tests {
     fn bzip2_blocks_invalid_map_falls_back_to_rebuild() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_bz2(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: bzip2 CLI unavailable");
+            return;
+        }
         let index = dir.path().join("tiny.bz2.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
@@ -3466,6 +3522,10 @@ mod tests {
     fn bzip2_blocks_memory_index_skips_side_table_path() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_tiny_tar_bz2(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: bzip2 CLI unavailable");
+            return;
+        }
         let opts = OpenOptions {
             index_in_memory: true,
             ..Default::default()
@@ -3489,6 +3549,10 @@ mod tests {
     fn bzip2_blocks_plain_bz2_persisted_and_reimported() {
         let dir = tempfile::tempdir().unwrap();
         let archive = make_plain_bz2(dir.path());
+        if archive.as_os_str().is_empty() {
+            eprintln!("skip: bzip2 CLI unavailable");
+            return;
+        }
         let index = dir.path().join("plain.bz2.index.sqlite");
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),

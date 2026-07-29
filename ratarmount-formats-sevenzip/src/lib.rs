@@ -1858,6 +1858,26 @@ sys.stdout.buffer.write(packed)
         );
     }
 
+    /// Set file mtime portably (GNU `touch -d` is not available on BSD/macOS).
+    #[cfg(unix)]
+    fn set_mtime_unix(path: &std::path::Path, secs: i64) {
+        use std::os::unix::ffi::OsStrExt;
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).expect("path cstring");
+        let ts = libc::timespec {
+            tv_sec: secs,
+            tv_nsec: 0,
+        };
+        let times = [ts, ts];
+        let rc = unsafe { libc::utimensat(libc::AT_FDCWD, c.as_ptr(), times.as_ptr(), 0) };
+        assert_eq!(
+            rc,
+            0,
+            "utimensat failed for {}: {}",
+            path.display(),
+            std::io::Error::last_os_error()
+        );
+    }
+
     /// Regression: FILETIME→Unix delta must use 100ns ticks (not ns). Wrong delta
     /// made every 7z mtime a huge negative; FUSE then showed Dec 31 1969.
     #[test]
@@ -1866,11 +1886,8 @@ sys.stdout.buffer.write(packed)
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("file.txt");
         std::fs::write(&plain, b"hello\n").unwrap();
-        let status = Command::new("touch")
-            .args(["-d", "2020-06-15 12:00:00 UTC", plain.to_str().unwrap()])
-            .status()
-            .expect("touch");
-        assert!(status.success());
+        // 2020-06-15 12:00:00 UTC — do not use GNU-only `touch -d` (breaks macOS CI).
+        set_mtime_unix(&plain, 1_592_222_400);
         let archive = dir.path().join("t.7z");
         let status = Command::new("7z")
             .args([
@@ -1924,11 +1941,8 @@ sys.stdout.buffer.write(packed)
         let dir = tempfile::tempdir().unwrap();
         let plain = dir.path().join("nested.txt");
         std::fs::write(&plain, b"nested-mtime\n").unwrap();
-        assert!(Command::new("touch")
-            .args(["-d", "2021-03-01 00:00:00 UTC", plain.to_str().unwrap()])
-            .status()
-            .unwrap()
-            .success());
+        // 2021-03-01 00:00:00 UTC — portable utimensat (not GNU touch -d).
+        set_mtime_unix(&plain, 1_614_556_800);
         let archive = dir.path().join("nested.7z");
         let status = Command::new("7z")
             .args([
