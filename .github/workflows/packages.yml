@@ -32,6 +32,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   NFPM_VERSION: v2.41.3
+  # Do not hardcode package version — set per-job from tag or Cargo.toml (see resolve-version step).
 
 jobs:
   # =========================================================================
@@ -81,16 +82,26 @@ jobs:
         with:
           key: packages-deb-${{ matrix.label }}
 
+      - name: Resolve package version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "VERSION=${V}" >> "$GITHUB_ENV"
+          echo "Package VERSION=${V}"
 
       - name: Build .deb + tarball
         env:
-          VERSION: "0.1.10"
           PACKAGE_FAMILY: deb
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
           OPENSSL_NO_VENDOR: "1"
         run: |
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+          test -n "${VERSION:-}"
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
 
@@ -159,9 +170,19 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Resolve package version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "VERSION=${V}" >> "$GITHUB_ENV"
+          echo "Package VERSION=${V}"
+
       - name: Build .rpm + tarball
         env:
-          VERSION: "0.1.10"
           PACKAGE_FAMILY: rpm
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
@@ -170,6 +191,7 @@ jobs:
           # shellcheck disable=SC1091
           [ -f "$HOME/.cargo/env" ] && . "$HOME/.cargo/env"
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+          test -n "${VERSION:-}"
           command -v cargo
           cargo --version
           chmod +x packaging/build-native-packages.sh
@@ -232,9 +254,19 @@ jobs:
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
 
+      - name: Resolve package version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "VERSION=${V}" >> "$GITHUB_ENV"
+          echo "Package VERSION=${V}"
+
       - name: Build portable tarball only
         env:
-          VERSION: "0.1.10"
           PACKAGE_FAMILY: none
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
@@ -242,6 +274,7 @@ jobs:
           OPENSSL_NO_VENDOR: "1"
         run: |
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
+          test -n "${VERSION:-}"
           chmod +x packaging/build-native-packages.sh
           bash packaging/build-native-packages.sh
           # Record glibc requirement for consumers
@@ -320,9 +353,19 @@ jobs:
         with:
           key: packages-macos-${{ matrix.label }}-v2
 
+      - name: Resolve package version
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
+            V="${GITHUB_REF_NAME#v}"
+          else
+            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
+          fi
+          echo "VERSION=${V}" >> "$GITHUB_ENV"
+          echo "Package VERSION=${V}"
+
       - name: Build macOS tarball
         env:
-          VERSION: "0.1.10"
           OUT_DIR: dist
           RUSTFLAGS: ""
         run: |
@@ -330,6 +373,7 @@ jobs:
           export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-/usr/local/lib/pkgconfig}"
           LA="$(brew --prefix libarchive)/lib/pkgconfig"
           export PKG_CONFIG_PATH="${PKG_CONFIG_PATH}:${LA}"
+          test -n "${VERSION:-}"
           chmod +x packaging/build-macos-tarball.sh
           ./packaging/build-macos-tarball.sh
 
