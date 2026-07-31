@@ -20,6 +20,9 @@ use std::io::ErrorKind;
 
 /// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
 const TTL: Duration = Duration::from_secs(60);
+/// With a write overlay, sizes change after create/write — do not let the kernel
+/// cache attrs for long (or getattr would keep serving create-time size 0).
+const OVERLAY_ATTR_TTL: Duration = Duration::from_secs(0);
 const BLKSIZE: u32 = 256 * 1024;
 const DIR_CACHE_TTL: Duration = Duration::from_secs(30);
 
@@ -127,11 +130,11 @@ impl RatarmountFs {
     fn ino_for_path_with_fi(&self, path: &str, fi: Option<FileInfo>) -> u64 {
         let mut p2i = self.path_to_ino.lock().unwrap();
         if let Some(&ino) = p2i.get(path) {
-            if fi.is_some() {
+            // Always refresh when the caller provides FileInfo (lookup/list may
+            // carry a fresher size after overlay create/write).
+            if let Some(fi) = fi {
                 if let Some(ent) = self.inodes.lock().unwrap().get_mut(&ino) {
-                    if ent.file_info.is_none() {
-                        ent.file_info = fi;
-                    }
+                    ent.file_info = Some(fi);
                 }
             }
             return ino;
@@ -195,6 +198,21 @@ impl RatarmountFs {
             },
         );
         Some(entries)
+    }
+
+    /// Drop a parent directory listing so create/unlink/mkdir/rmdir are visible
+    /// to readdir before the 30s TTL expires.
+    fn invalidate_dir_cache(&self, parent: &str) {
+        self.dir_cache.lock().unwrap().remove(parent);
+    }
+
+    /// Kernel attr/entry TTL: zero when a write overlay can change size/names.
+    fn attr_ttl(&self) -> Duration {
+        if self.overlay.is_some() {
+            OVERLAY_ATTR_TTL
+        } else {
+            TTL
+        }
     }
 
     fn file_attr(ino: u64, fi: &FileInfo) -> FileAttr {
@@ -312,29 +330,17 @@ impl Filesystem for RatarmountFs {
             return;
         };
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        reply.entry(&TTL, &Self::file_attr(ino, &fi), 0);
+        reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if let Some(fi) = self.cached_fi(ino) {
-            reply.attr(&TTL, &Self::file_attr(ino, &fi));
-            return;
-        }
-        let Some(path) = self.path_for_ino(ino) else {
+        // Always go through file_info_for_ino: with a write overlay it re-lookups
+        // so create (size 0) → write → stat/ls sees the real size.
+        let Some(fi) = self.file_info_for_ino(ino) else {
             reply.error(ENOENT);
             return;
         };
-        let Some(fi) = self.source.lookup(&path, 0) else {
-            if path == "/" {
-                let fi = ratarmount_core::create_root_file_info();
-                reply.attr(&TTL, &Self::file_attr(ino, &fi));
-                return;
-            }
-            reply.error(ENOENT);
-            return;
-        };
-        self.store_fi(ino, fi.clone());
-        reply.attr(&TTL, &Self::file_attr(ino, &fi));
+        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
     }
 
     fn readdir(
@@ -666,7 +672,6 @@ impl Filesystem for RatarmountFs {
         let path = join_path(&parent_path, &name);
         match ov.create_file(&path, mode) {
             Ok(fd) => {
-                let ino = self.ino_for_path(&path);
                 let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
                     size: 0,
                     mtime: 0.0,
@@ -676,12 +681,14 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
+                let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+                self.invalidate_dir_cache(&parent_path);
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
                 self.handles
                     .lock()
                     .unwrap()
                     .insert(fh, OpenBackend::OverlayFd(fd));
-                reply.created(&TTL, &Self::file_attr(ino, &fi), 0, fh, 0);
+                reply.created(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0, fh, 0);
             }
             Err(e) => {
                 debug!("create: {e}");
@@ -711,7 +718,6 @@ impl Filesystem for RatarmountFs {
         let path = join_path(&parent_path, &name);
         match ov.mkdir(&path, mode) {
             Ok(()) => {
-                let ino = self.ino_for_path(&path);
                 let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
                     size: 0,
                     mtime: 0.0,
@@ -721,7 +727,9 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
-                reply.entry(&TTL, &Self::file_attr(ino, &fi), 0);
+                let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+                self.invalidate_dir_cache(&parent_path);
+                reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
             }
             Err(e) => {
                 debug!("mkdir: {e}");
@@ -741,7 +749,10 @@ impl Filesystem for RatarmountFs {
         };
         let path = join_path(&parent_path, &name.to_string_lossy());
         match ov.unlink(&path) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_dir_cache(&parent_path);
+                reply.ok();
+            }
             Err(e) => {
                 debug!("unlink: {e}");
                 reply.error(EIO);
@@ -760,7 +771,10 @@ impl Filesystem for RatarmountFs {
         };
         let path = join_path(&parent_path, &name.to_string_lossy());
         match ov.rmdir(&path) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                self.invalidate_dir_cache(&parent_path);
+                reply.ok();
+            }
             Err(e) => {
                 debug!("rmdir: {e}");
                 reply.error(EIO);
@@ -805,10 +819,10 @@ impl Filesystem for RatarmountFs {
             return;
         }
         let fi = self
-            .source
-            .lookup(&path, 0)
+            .file_info_for_ino(ino)
+            .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
-        reply.attr(&TTL, &Self::file_attr(ino, &fi));
+        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
     }
 
     fn release(
@@ -1181,41 +1195,38 @@ mod tests {
         assert_eq!(dur.as_secs(), 1_592_222_400);
     }
 
+    /// Empty base archive for overlay unit tests (no members).
+    struct EmptyBase;
+    impl MountSource for EmptyBase {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                Some(ListResult::Infos(BTreeMap::new()))
+            } else {
+                None
+            }
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                Some(ratarmount_core::create_root_file_info())
+            } else {
+                None
+            }
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(ErrorKind::NotFound, "empty base"))
+        }
+        fn is_immutable(&self) -> bool {
+            false
+        }
+    }
+
     /// Regression: with a write overlay, getattr/open must not keep create-time size 0
-    /// from the inode cache (write-then-cat returned empty).
+    /// from the inode cache (write-then-cat / stat returned empty size).
     #[test]
     fn overlay_file_info_for_ino_refreshes_size_after_write() {
         use ratarmount_compositing::WriteOverlay;
         use std::io::Write;
         use std::os::unix::io::FromRawFd;
-
-        struct EmptyBase;
-        impl MountSource for EmptyBase {
-            fn list(&self, path: &str) -> Option<ListResult> {
-                if path == "/" {
-                    Some(ListResult::Infos(BTreeMap::new()))
-                } else {
-                    None
-                }
-            }
-            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
-                if path == "/" {
-                    Some(ratarmount_core::create_root_file_info())
-                } else {
-                    None
-                }
-            }
-            fn open(
-                &self,
-                _: &FileInfo,
-                _: i32,
-            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-                Err(io::Error::new(ErrorKind::NotFound, "empty base"))
-            }
-            fn is_immutable(&self) -> bool {
-                false
-            }
-        }
 
         let dir = tempfile::tempdir().unwrap();
         let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
@@ -1248,6 +1259,21 @@ mod tests {
             b"hello-overlay-payload".len() as u64,
             "overlay must re-lookup size after write (was create-time 0)"
         );
+        // getattr path uses file_info_for_ino + file_attr (not cached_fi short-circuit).
+        let attr = RatarmountFs::file_attr(ino, &fi);
+        assert_eq!(
+            attr.size,
+            b"hello-overlay-payload".len() as u64,
+            "getattr-equivalent attr must reflect post-write size"
+        );
+        assert_eq!(
+            fs.attr_ttl(),
+            OVERLAY_ATTR_TTL,
+            "writable overlay must not pin long kernel attr TTL"
+        );
+        // After refresh, inode cache must hold the fresh size (not stuck at create-time 0).
+        let cached = fs.cached_fi(ino).expect("cached after refresh");
+        assert_eq!(cached.size, b"hello-overlay-payload".len() as u64);
         assert!(ov.has_file("/new.txt"));
         let rfd = ov
             .open_overlay_fd("/new.txt", libc::O_RDONLY)
@@ -1256,6 +1282,102 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut rf, &mut buf).unwrap();
         assert_eq!(buf, b"hello-overlay-payload");
+    }
+
+    /// Regression: dir_cache 30s TTL must not hide overlay creates from readdir.
+    /// Symptom: create file under parent, then ls misses the new name until TTL expires.
+    #[test]
+    fn overlay_create_invalidates_dir_cache_so_list_shows_new_name() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+
+        // Prime dir_cache for "/" while empty (same as first readdir).
+        let before = fs.list_mode_cached("/").expect("list root");
+        assert!(
+            !before.iter().any(|(n, _)| n == "created.txt"),
+            "precondition: new name not listed yet"
+        );
+        assert!(
+            fs.dir_cache.lock().unwrap().contains_key("/"),
+            "dir_cache must be primed for the invalidation regression"
+        );
+
+        // Overlay create + the same invalidate_dir_cache(parent) create() performs.
+        ov.create_file("/created.txt", 0o644).expect("create");
+        // Without invalidation, list_mode_cached would keep serving the empty listing.
+        fs.invalidate_dir_cache("/");
+        let after = fs.list_mode_cached("/").expect("list after create");
+        assert!(
+            after.iter().any(|(n, _)| n == "created.txt"),
+            "after invalidate, readdir path must list the newly created name"
+        );
+    }
+
+    /// Regression: unlink must drop parent dir_cache so readdir does not ghost-delete.
+    #[test]
+    fn overlay_unlink_invalidates_dir_cache_so_list_drops_name() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+
+        ov.create_file("/gone.txt", 0o644).expect("create");
+        let listed = fs.list_mode_cached("/").expect("list with file");
+        assert!(listed.iter().any(|(n, _)| n == "gone.txt"));
+
+        ov.unlink("/gone.txt").expect("unlink");
+        fs.invalidate_dir_cache("/");
+        let after = fs.list_mode_cached("/").expect("list after unlink");
+        assert!(
+            !after.iter().any(|(n, _)| n == "gone.txt"),
+            "after invalidate, readdir path must not ghost the deleted name"
+        );
+    }
+
+    /// ino_for_path_with_fi must overwrite stale size-0 FileInfo when lookup provides fresher.
+    #[test]
+    fn ino_for_path_with_fi_updates_stale_cached_size() {
+        let src = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let fs = RatarmountFs::new(src, None);
+        let stale = FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![],
+        };
+        let ino = fs.ino_for_path_with_fi("/f", Some(stale));
+        assert_eq!(fs.cached_fi(ino).unwrap().size, 0);
+        let fresh = FileInfo {
+            size: 42,
+            mtime: 1.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![],
+        };
+        let ino2 = fs.ino_for_path_with_fi("/f", Some(fresh));
+        assert_eq!(ino, ino2);
+        assert_eq!(
+            fs.cached_fi(ino).unwrap().size,
+            42,
+            "must replace create-time size 0 with fresher FileInfo"
+        );
     }
 
     #[test]
