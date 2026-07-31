@@ -275,6 +275,8 @@ impl SqliteIndexedTar {
         let data_path = data_path.as_ref().to_path_buf();
         let index = SqliteIndex::open_read_only(index_path.as_ref())?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
+        index.check_tarstats_matches_archive(&archive_path)?;
         let data_file = File::open(&data_path)?;
         Ok(Self {
             archive_path,
@@ -299,6 +301,7 @@ impl SqliteIndexedTar {
         let data_path = gzip.path().to_path_buf();
         let index = SqliteIndex::open_read_only(index_path.as_ref())?;
         index.check_backend_name(BACKEND_NAME)?;
+        index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
             archive_path,
             data_path,
@@ -372,6 +375,7 @@ impl SqliteIndexedTar {
         let data_path = body.path().to_path_buf();
         let index = SqliteIndex::open_read_only(index_path.as_ref())?;
         index.check_backend_name(BACKEND_NAME)?;
+        index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
             archive_path,
             data_path,
@@ -501,6 +505,8 @@ impl SqliteIndexedTar {
         let data_path = archive_path.clone();
         let index = SqliteIndex::open_read_only(index_path.as_ref())?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Virtual labels that are not real paths skip the fingerprint (no host file).
+        index.check_tarstats_matches_archive(&archive_path)?;
         Ok(Self {
             archive_path,
             data_path,
@@ -850,30 +856,19 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Store tarstats from path metadata when available; otherwise synthetic size-only stats.
+/// Store tarstats from path metadata + edge hashes when available; otherwise synthetic size-only stats.
 ///
 /// Used for reader-based / nested opens where `archive_label` may be a URL or virtual name.
 fn store_tarstats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
     if path.exists() {
-        if let Ok(meta) = std::fs::metadata(path) {
-            let json = serde_json_tarstats(&meta);
-            index.store_metadata_key_value("tarstats", &json)?;
+        // Prefer shared helper (size/mtime + first/last 512 SHA-256 for warm-open gate).
+        if index.store_tarstats_for_path(path).is_ok() {
             return Ok(());
         }
     }
     let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
-}
-
-fn serde_json_tarstats(meta: &std::fs::Metadata) -> String {
-    use std::os::unix::fs::MetadataExt;
-    format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    )
 }
 
 fn store_arguments(index: &SqliteIndex, options: &OpenOptions) -> Result<()> {
@@ -2845,6 +2840,76 @@ mod tests {
         assert_eq!(buf, "hello world\n");
         // Plain text member is not a nested TAR.
         assert!(m.list_nested_tar_members().unwrap().is_empty());
+    }
+
+    /// Regression: open_with_existing_index rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("data");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("hello.txt"), b"v1\n").unwrap();
+        let tar_path = dir.path().join("t.tar");
+        assert!(Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&src)
+            .arg("hello.txt")
+            .status()
+            .unwrap()
+            .success());
+
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        let opts = OpenOptions::default();
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &tar_path,
+            &tar_path,
+            Some(&idx_path),
+            &opts,
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("create");
+        drop(m);
+
+        // Matching archive still opens warm.
+        let mut mat = None;
+        SqliteIndexedTar::open_with_existing_index(
+            &tar_path,
+            &tar_path,
+            &idx_path,
+            opts.clone(),
+            &mut mat,
+        )
+        .expect("warm match");
+
+        // Replace archive content (size change).
+        std::fs::write(src.join("hello.txt"), b"v2-longer\n").unwrap();
+        assert!(Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&src)
+            .arg("hello.txt")
+            .status()
+            .unwrap()
+            .success());
+
+        let mut mat = None;
+        match SqliteIndexedTar::open_with_existing_index(
+            &tar_path, &tar_path, &idx_path, opts, &mut mat,
+        ) {
+            Ok(_) => panic!("stale index must fail open_with_existing_index"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size") || msg.contains("mtime") || msg.contains("mismatch"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
     }
 
     /// Outer TAR with an inner TAR member: detect via metadata, open nested via stencil.

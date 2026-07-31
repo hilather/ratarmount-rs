@@ -1296,8 +1296,13 @@ fn open_tar(
 /// Read the first gzip seek-index blob from an on-disk SQLite index, if present.
 ///
 /// Used to hydrate Tier C RGZI checkpoints before a full spacing-based rebuild.
-/// Returns `None` when recreate is set, the path is missing, or the table is empty.
-fn try_load_gzip_index_blob(index_path: Option<&Path>, recreate: bool) -> Option<Vec<u8>> {
+/// Returns `None` when recreate is set, the path is missing, the table is empty,
+/// or stored `tarstats` does not match `archive_path` (stale index after in-place replace).
+fn try_load_gzip_index_blob(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+) -> Option<Vec<u8>> {
     if recreate {
         return None;
     }
@@ -1315,6 +1320,12 @@ fn try_load_gzip_index_blob(index_path: Option<&Path>, recreate: bool) -> Option
         Ok(i) => i,
         Err(_) => SqliteIndex::open_read_only(ip).ok()?,
     };
+    if let Some(ap) = archive_path {
+        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
+            eprintln!("info: gzip RGZI skipped (index fingerprint: {e})");
+            return None;
+        }
+    }
     match idx.get_gzip_index_blobs() {
         Ok(blobs) => blobs.into_iter().next().filter(|b| !b.is_empty()),
         Err(_) => None,
@@ -1324,6 +1335,7 @@ fn try_load_gzip_index_blob(index_path: Option<&Path>, recreate: bool) -> Option
 /// Persist a Tier C RGZI seek-index blob into the SQLite side table when writable.
 ///
 /// No-op for `:memory:` / missing path / read-only / `write_index = false`.
+/// Also refreshes `tarstats` from the archive path so warm reimport can fingerprint.
 fn persist_gzip_index_blob(
     gzip: &SharedSeekableGzip,
     index_path: Option<&Path>,
@@ -1353,6 +1365,9 @@ fn persist_gzip_index_blob(
                 ),
                 Err(e) => eprintln!("info: could not store gzip seek index blob: {e}"),
             }
+            if let Err(e) = idx.store_tarstats_for_path(gzip.path()) {
+                eprintln!("info: could not store tarstats for gzip index: {e}");
+            }
         }
         Err(e) => eprintln!("info: could not open index to store gzip seek blob: {e}"),
     }
@@ -1366,7 +1381,7 @@ fn open_shared_seekable_gzip_path(
     index_path: Option<&Path>,
     recreate: bool,
 ) -> Result<Arc<SharedSeekableGzip>, String> {
-    if let Some(blob) = try_load_gzip_index_blob(index_path, recreate) {
+    if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
         match SharedSeekableGzip::open_with_imported_index(path, spacing, threads, &blob) {
             Ok(g) => {
                 eprintln!(
@@ -1410,7 +1425,8 @@ fn try_open_gzip_imported_from_reader<R>(
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let blob = try_load_gzip_index_blob(index_path, recreate)?;
+    // Label may be virtual (HTTP); fingerprint only when it resolves to a real path.
+    let blob = try_load_gzip_index_blob(index_path, Some(label), recreate)?;
     match SharedSeekableGzip::open_with_imported_index_from_reader(
         reader, spacing, threads, label, &blob,
     ) {
@@ -1608,8 +1624,12 @@ fn zstd_blocks_u64_to_i64(blocks: &[(u64, u64)]) -> Option<Vec<(i64, i64)>> {
 /// Read Python-compatible `zstdblocks` from an on-disk SQLite index, if present.
 ///
 /// Returns `None` when recreate is set, the path is missing, the table is empty,
-/// or offsets cannot be converted to `u64`.
-fn try_load_zstd_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Vec<(u64, u64)>> {
+/// offsets cannot be converted to `u64`, or `tarstats` mismatches `archive_path`.
+fn try_load_zstd_blocks(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+) -> Option<Vec<(u64, u64)>> {
     if recreate {
         return None;
     }
@@ -1625,6 +1645,12 @@ fn try_load_zstd_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Vec
         Ok(i) => i,
         Err(_) => SqliteIndex::open_read_only(ip).ok()?,
     };
+    if let Some(ap) = archive_path {
+        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
+            eprintln!("info: zstdblocks skipped (index fingerprint: {e})");
+            return None;
+        }
+    }
     let raw = match idx.get_zstd_blocks() {
         Ok(b) if !b.is_empty() => b,
         _ => return None,
@@ -1648,9 +1674,11 @@ fn open_or_create_writable_index(ip: &Path) -> Result<SqliteIndex, String> {
 ///
 /// No-op for `:memory:` / missing path / read-only / `write_index = false` / empty map.
 /// Creates the index file when the path is set but does not yet exist (plain compress).
+/// When `archive_path` is set, also stores `tarstats` for warm-open fingerprinting.
 fn store_zstd_blocks_in_index(
     blocks: &[(u64, u64)],
     index_path: Option<&Path>,
+    archive_path: Option<&Path>,
     options: &OpenOptions,
 ) {
     if blocks.is_empty() {
@@ -1680,6 +1708,11 @@ fn store_zstd_blocks_in_index(
                 ),
                 Err(e) => eprintln!("info: could not store zstdblocks: {e}"),
             }
+            if let Some(ap) = archive_path {
+                if let Err(e) = idx.store_tarstats_for_path(ap) {
+                    eprintln!("info: could not store tarstats for zstdblocks index: {e}");
+                }
+            }
         }
         Err(e) => eprintln!("info: could not open index to store zstdblocks: {e}"),
     }
@@ -1694,7 +1727,7 @@ fn persist_zstd_blocks_from_path(path: &Path, index_path: Option<&Path>, options
         return;
     }
     match export_zstd_blocks(path) {
-        Ok(blocks) => store_zstd_blocks_in_index(&blocks, index_path, options),
+        Ok(blocks) => store_zstd_blocks_in_index(&blocks, index_path, Some(path), options),
         Err(e) => eprintln!("info: could not export zstdblocks: {e}"),
     }
 }
@@ -1708,7 +1741,7 @@ fn open_seekable_zstd_prefer_blocks(
     index_path: Option<&Path>,
     recreate: bool,
 ) -> Result<(Arc<dyn SeekableBody>, bool), String> {
-    if let Some(blocks) = try_load_zstd_blocks(index_path, recreate) {
+    if let Some(blocks) = try_load_zstd_blocks(index_path, Some(path), recreate) {
         match open_seekable_zstd_with_zstd_blocks(path, threads, &blocks) {
             Ok(body) => {
                 eprintln!(
@@ -1744,7 +1777,7 @@ fn try_open_zstd_imported_from_reader<R>(
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let blocks = try_load_zstd_blocks(index_path, recreate)?;
+    let blocks = try_load_zstd_blocks(index_path, Some(label), recreate)?;
     match open_seekable_zstd_with_zstd_blocks_from_reader(reader, threads, label, &blocks) {
         Ok(body) => {
             eprintln!(
@@ -1788,7 +1821,13 @@ fn open_zstd(
 }
 
 /// Read Python-compatible `bzip2blocks` from an on-disk SQLite index, if present.
-fn try_load_bzip2_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Vec<(u64, u64)>> {
+///
+/// Returns `None` when `tarstats` mismatches `archive_path` (stale after in-place replace).
+fn try_load_bzip2_blocks(
+    index_path: Option<&Path>,
+    archive_path: Option<&Path>,
+    recreate: bool,
+) -> Option<Vec<(u64, u64)>> {
     if recreate {
         return None;
     }
@@ -1804,6 +1843,12 @@ fn try_load_bzip2_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Ve
         Ok(i) => i,
         Err(_) => SqliteIndex::open_read_only(ip).ok()?,
     };
+    if let Some(ap) = archive_path {
+        if let Err(e) = idx.check_tarstats_matches_archive(ap) {
+            eprintln!("info: bzip2blocks skipped (index fingerprint: {e})");
+            return None;
+        }
+    }
     let raw = match idx.get_bzip2_blocks() {
         Ok(b) if !b.is_empty() => b,
         _ => return None,
@@ -1814,6 +1859,7 @@ fn try_load_bzip2_blocks(index_path: Option<&Path>, recreate: bool) -> Option<Ve
 fn store_bzip2_blocks_in_index(
     blocks: &[(u64, u64)],
     index_path: Option<&Path>,
+    archive_path: Option<&Path>,
     options: &OpenOptions,
 ) {
     if blocks.is_empty() {
@@ -1843,6 +1889,11 @@ fn store_bzip2_blocks_in_index(
                 ),
                 Err(e) => eprintln!("info: could not store bzip2blocks: {e}"),
             }
+            if let Some(ap) = archive_path {
+                if let Err(e) = idx.store_tarstats_for_path(ap) {
+                    eprintln!("info: could not store tarstats for bzip2blocks index: {e}");
+                }
+            }
         }
         Err(e) => eprintln!("info: could not open index to store bzip2blocks: {e}"),
     }
@@ -1856,7 +1907,7 @@ fn persist_bzip2_blocks_from_path(path: &Path, index_path: Option<&Path>, option
         return;
     }
     match export_bzip2_blocks(path) {
-        Ok(blocks) => store_bzip2_blocks_in_index(&blocks, index_path, options),
+        Ok(blocks) => store_bzip2_blocks_in_index(&blocks, index_path, Some(path), options),
         Err(e) => eprintln!("info: could not export bzip2blocks: {e}"),
     }
 }
@@ -1870,7 +1921,7 @@ fn open_seekable_bzip2_prefer_blocks(
     index_path: Option<&Path>,
     recreate: bool,
 ) -> Result<(Arc<dyn SeekableBody>, bool), String> {
-    if let Some(blocks) = try_load_bzip2_blocks(index_path, recreate) {
+    if let Some(blocks) = try_load_bzip2_blocks(index_path, Some(path), recreate) {
         match open_seekable_bzip2_with_bzip2_blocks(path, threads, &blocks) {
             Ok(body) => {
                 eprintln!(
@@ -1902,7 +1953,7 @@ fn try_open_bzip2_imported_from_reader<R>(
 where
     R: std::io::Read + std::io::Seek + Send + 'static,
 {
-    let blocks = try_load_bzip2_blocks(index_path, recreate)?;
+    let blocks = try_load_bzip2_blocks(index_path, Some(label), recreate)?;
     match open_seekable_bzip2_with_bzip2_blocks_from_reader(reader, threads, label, &blocks) {
         Ok(body) => {
             eprintln!(
@@ -2447,7 +2498,7 @@ where
                 "{transport} gzip: {input} ({range_len} compressed bytes, live Range, -P gzip:{threads})"
             );
             // Prefer RGZI import; on failure rebuild with a fresh Range handle.
-            let gzip = if try_load_gzip_index_blob(ip, recreate).is_some() {
+            let gzip = if try_load_gzip_index_blob(ip, Some(&label), recreate).is_some() {
                 match try_open_gzip_imported_from_reader(
                     range, &label, spacing, threads, ip, recreate,
                 ) {
@@ -2481,7 +2532,7 @@ where
             // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
             let mut used_blocks = false;
-            let body = if try_load_bzip2_blocks(ip, recreate).is_some() {
+            let body = if try_load_bzip2_blocks(ip, Some(&label), recreate).is_some() {
                 match try_open_bzip2_imported_from_reader(range, &label, threads, ip, recreate) {
                     Some(b) => {
                         used_blocks = true;
@@ -2509,9 +2560,12 @@ where
                                 match reopen_fn() {
                                     Ok(mut fresh) => {
                                         match export_bzip2_blocks_from_reader(&mut fresh) {
-                                            Ok(blocks) => {
-                                                store_bzip2_blocks_in_index(&blocks, ip, &o)
-                                            }
+                                            Ok(blocks) => store_bzip2_blocks_in_index(
+                                                &blocks,
+                                                ip,
+                                                Some(&label),
+                                                &o,
+                                            ),
                                             Err(e) => {
                                                 eprintln!("info: could not export bzip2blocks: {e}")
                                             }
@@ -2549,7 +2603,7 @@ where
             // `reopen` for post-open export only when the map was rebuilt.
             let mut reopen_opt = Some(reopen);
             let mut used_blocks = false;
-            let body = if try_load_zstd_blocks(ip, recreate).is_some() {
+            let body = if try_load_zstd_blocks(ip, Some(&label), recreate).is_some() {
                 match try_open_zstd_imported_from_reader(range, &label, threads, ip, recreate) {
                     Some(b) => {
                         used_blocks = true;
@@ -2579,9 +2633,12 @@ where
                                 match reopen_fn() {
                                     Ok(mut fresh) => {
                                         match export_zstd_blocks_from_reader(&mut fresh) {
-                                            Ok(blocks) => {
-                                                store_zstd_blocks_in_index(&blocks, ip, &o)
-                                            }
+                                            Ok(blocks) => store_zstd_blocks_in_index(
+                                                &blocks,
+                                                ip,
+                                                Some(&label),
+                                                &o,
+                                            ),
                                             Err(e) => {
                                                 eprintln!("info: could not export zstdblocks: {e}")
                                             }
@@ -2924,6 +2981,73 @@ mod tests {
         tar_gz
     }
 
+    /// Regression: Dec 31 1969-style silent wrong data class — warm `*.index.sqlite` reuse
+    /// without archive fingerprint. After replacing the archive in place (size/mtime
+    /// change), remount with the existing index path must rebuild and serve **new** bytes.
+    #[test]
+    fn warm_index_rebuilds_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data-swap");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("hello.txt"), b"content-v1\n").expect("write v1");
+        let archive = dir.path().join("swap.tar");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&data)
+            .arg("hello.txt")
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -cf v1 failed");
+
+        let index = dir.path().join("swap.tar.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            index_minimum_file_count: 0,
+            ..Default::default()
+        };
+
+        let src = open_path(&archive, &opts, true).expect("cold open");
+        let info = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = Vec::new();
+        src.open(&info, 0)
+            .expect("open v1")
+            .read_to_end(&mut buf)
+            .expect("read v1");
+        assert_eq!(buf, b"content-v1\n");
+        drop(src);
+        assert!(index.exists() && std::fs::metadata(&index).unwrap().len() > 0);
+
+        // Overwrite archive at the same path with different content (size changes).
+        std::fs::write(data.join("hello.txt"), b"content-v2-longer\n").expect("write v2");
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(&data)
+            .arg("hello.txt")
+            .status()
+            .expect("spawn tar rewrite");
+        assert!(status.success(), "tar -cf v2 failed");
+
+        // Warm open: no force-recreate; tarstats mismatch must rebuild the index.
+        let src2 = open_path(&archive, &opts, false).expect("warm open after replace");
+        let info2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = Vec::new();
+        src2.open(&info2, 0)
+            .expect("open v2")
+            .read_to_end(&mut buf2)
+            .expect("read v2");
+        assert_eq!(
+            buf2,
+            b"content-v2-longer\n",
+            "must serve new archive data after tarstats mismatch rebuild, got {:?}",
+            String::from_utf8_lossy(&buf2)
+        );
+    }
+
     /// Regression: B-119 / upstream #119 — small archive must not leave an on-disk index
     /// when `--index-minimum-file-count` is above the member count (even with explicit
     /// `--index-file`). Mount still serves content via the live (unlinked) index.
@@ -3244,9 +3368,9 @@ mod tests {
     fn try_load_gzip_index_blob_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.sqlite");
-        assert!(try_load_gzip_index_blob(Some(&missing), false).is_none());
-        assert!(try_load_gzip_index_blob(None, false).is_none());
-        assert!(try_load_gzip_index_blob(Some(&missing), true).is_none());
+        assert!(try_load_gzip_index_blob(Some(&missing), None, false).is_none());
+        assert!(try_load_gzip_index_blob(None, None, false).is_none());
+        assert!(try_load_gzip_index_blob(Some(&missing), None, true).is_none());
     }
 
     #[test]
@@ -3344,9 +3468,9 @@ mod tests {
     fn try_load_zstd_blocks_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.sqlite");
-        assert!(try_load_zstd_blocks(Some(&missing), false).is_none());
-        assert!(try_load_zstd_blocks(None, false).is_none());
-        assert!(try_load_zstd_blocks(Some(&missing), true).is_none());
+        assert!(try_load_zstd_blocks(Some(&missing), None, false).is_none());
+        assert!(try_load_zstd_blocks(None, None, false).is_none());
+        assert!(try_load_zstd_blocks(Some(&missing), None, true).is_none());
     }
 
     #[test]
@@ -3388,7 +3512,8 @@ mod tests {
         // Mark side table with a sentinel last-row identity: warm open must import,
         // not re-export (re-export would rewrite the same pairs; we assert load works
         // and prefer_blocks path is taken via try_load).
-        let loaded = try_load_zstd_blocks(Some(&index), false).expect("load for warm open");
+        let loaded =
+            try_load_zstd_blocks(Some(&index), Some(&archive), false).expect("load for warm open");
         assert_eq!(
             loaded.len(),
             stored.len(),
@@ -3406,7 +3531,7 @@ mod tests {
         };
         assert_eq!(blocks2, stored, "warm import must not clobber side table");
         // recreate=true must ignore side table for body build (persist may rewrite).
-        assert!(try_load_zstd_blocks(Some(&index), true).is_none());
+        assert!(try_load_zstd_blocks(Some(&index), Some(&archive), true).is_none());
     }
 
     /// Regression: FR-9 plain `.zst` also auto-wires `zstdblocks` on open.
@@ -3539,9 +3664,9 @@ mod tests {
     fn try_load_bzip2_blocks_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("nope.sqlite");
-        assert!(try_load_bzip2_blocks(Some(&missing), false).is_none());
-        assert!(try_load_bzip2_blocks(None, false).is_none());
-        assert!(try_load_bzip2_blocks(Some(&missing), true).is_none());
+        assert!(try_load_bzip2_blocks(Some(&missing), None, false).is_none());
+        assert!(try_load_bzip2_blocks(None, None, false).is_none());
+        assert!(try_load_bzip2_blocks(Some(&missing), None, true).is_none());
     }
 
     /// Regression: FR-9 plain `.bz2` also auto-wires `bzip2blocks` on open.

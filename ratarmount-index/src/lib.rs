@@ -101,6 +101,187 @@ pub enum IndexError {
 
 pub type Result<T> = std::result::Result<T, IndexError>;
 
+/// Archive fingerprint stored under the `tarstats` metadata key (Python parity + extension).
+///
+/// Written when an on-disk index is built so warm reopen can reject a sibling
+/// `*.index.sqlite` that no longer matches the archive file (size/mtime/content samples).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TarStats {
+    pub st_size: u64,
+    /// Whole-second mtime (`MetadataExt::mtime` / Python `st_mtime` truncated).
+    pub st_mtime: i64,
+    /// Nanosecond component when present in the stored JSON.
+    pub st_mtime_ns: Option<i64>,
+    /// Hex SHA-256 of the first up-to-512 bytes of the archive (Rust extension).
+    pub prefix512_sha256: Option<String>,
+    /// Hex SHA-256 of the last up-to-512 bytes of the archive (Rust extension).
+    pub suffix512_sha256: Option<String>,
+    /// Hex SHA-256 of the entire archive when `st_size <= TARSTATS_FULL_HASH_MAX` (Rust extension).
+    ///
+    /// Catches same-size in-place replaces where only a middle member payload changes
+    /// (TAR headers at 0..512 stay identical).
+    pub full_sha256: Option<String>,
+}
+
+/// Max sample size for archive content fingerprint (first/last of file).
+pub const TARSTATS_SAMPLE_BYTES: usize = 512;
+
+/// Archives at or below this size store a full-file SHA-256 in `tarstats` (cheap).
+pub const TARSTATS_FULL_HASH_MAX: u64 = 256 * 1024;
+
+/// Parse Python/Rust `tarstats` JSON (`st_size`, `st_mtime`, optional samples).
+pub fn parse_tarstats_json(json: &str) -> Result<TarStats> {
+    let v: serde_json::Value = serde_json::from_str(json)
+        .map_err(|e| IndexError::Invalid(format!("tarstats JSON parse failed: {e}")))?;
+    let st_size = v
+        .get("st_size")
+        .and_then(|x| x.as_u64().or_else(|| x.as_i64().map(|i| i as u64)))
+        .ok_or_else(|| IndexError::Invalid("tarstats missing st_size".into()))?;
+    // Python may store st_mtime as float; accept number and truncate toward zero.
+    let st_mtime = match v.get("st_mtime") {
+        Some(serde_json::Value::Number(n)) => {
+            if let Some(i) = n.as_i64() {
+                i
+            } else if let Some(f) = n.as_f64() {
+                f as i64
+            } else {
+                return Err(IndexError::Invalid("tarstats st_mtime not a number".into()));
+            }
+        }
+        Some(_) => {
+            return Err(IndexError::Invalid("tarstats st_mtime not a number".into()));
+        }
+        None => {
+            return Err(IndexError::Invalid("tarstats missing st_mtime".into()));
+        }
+    };
+    let st_mtime_ns = v.get("st_mtime_ns").and_then(|x| {
+        x.as_i64()
+            .or_else(|| x.as_u64().map(|u| u as i64))
+            .or_else(|| x.as_f64().map(|f| f as i64))
+    });
+    let prefix512_sha256 = v
+        .get("prefix512_sha256")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let suffix512_sha256 = v
+        .get("suffix512_sha256")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    let full_sha256 = v
+        .get("full_sha256")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string());
+    Ok(TarStats {
+        st_size,
+        st_mtime,
+        st_mtime_ns,
+        prefix512_sha256,
+        suffix512_sha256,
+        full_sha256,
+    })
+}
+
+/// Build [`TarStats`] from filesystem metadata (Unix `st_size` / `st_mtime`), without content samples.
+pub fn tar_stats_from_metadata(meta: &std::fs::Metadata) -> TarStats {
+    use std::os::unix::fs::MetadataExt;
+    TarStats {
+        st_size: meta.size(),
+        st_mtime: meta.mtime(),
+        st_mtime_ns: Some(meta.mtime_nsec()),
+        prefix512_sha256: None,
+        suffix512_sha256: None,
+        full_sha256: None,
+    }
+}
+
+/// SHA-256 hex of the first and last up-to-[`TARSTATS_SAMPLE_BYTES`] of `path`.
+pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
+    use sha2::{Digest, Sha256};
+    use std::io::{Read, Seek, SeekFrom};
+
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+
+    let mut prefix = vec![0u8; TARSTATS_SAMPLE_BYTES.min(len as usize)];
+    if !prefix.is_empty() {
+        f.read_exact(&mut prefix)?;
+    }
+    let prefix_hex = format!("{:x}", Sha256::digest(&prefix));
+
+    let suffix_hex = if len == 0 {
+        prefix_hex.clone()
+    } else if len as usize <= TARSTATS_SAMPLE_BYTES {
+        // Entire file already in prefix.
+        prefix_hex.clone()
+    } else {
+        let mut suffix = vec![0u8; TARSTATS_SAMPLE_BYTES];
+        f.seek(SeekFrom::End(-(TARSTATS_SAMPLE_BYTES as i64)))?;
+        f.read_exact(&mut suffix)?;
+        format!("{:x}", Sha256::digest(&suffix))
+    };
+    Ok((prefix_hex, suffix_hex))
+}
+
+/// Full-file SHA-256 when `path` is at most [`TARSTATS_FULL_HASH_MAX`] bytes.
+pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+
+    let mut f = std::fs::File::open(path)?;
+    let len = f.metadata()?.len();
+    if len > TARSTATS_FULL_HASH_MAX {
+        return Ok(None);
+    }
+    let mut buf = Vec::with_capacity(len as usize);
+    f.read_to_end(&mut buf)?;
+    Ok(Some(format!("{:x}", Sha256::digest(&buf))))
+}
+
+/// Full fingerprint: metadata + content samples (edges; full hash when small).
+pub fn tar_stats_from_path(path: &Path) -> Result<TarStats> {
+    let meta = std::fs::metadata(path)?;
+    let mut stats = tar_stats_from_metadata(&meta);
+    match archive_edge_hashes(path) {
+        Ok((p, s)) => {
+            stats.prefix512_sha256 = Some(p);
+            stats.suffix512_sha256 = Some(s);
+        }
+        Err(e) => {
+            // Still store size/mtime; warm open may only get partial protection.
+            log::warn!("tarstats: could not hash edges of {}: {e}", path.display());
+        }
+    }
+    match archive_full_hash(path) {
+        Ok(h) => stats.full_sha256 = h,
+        Err(e) => {
+            log::warn!("tarstats: could not full-hash {}: {e}", path.display());
+        }
+    }
+    Ok(stats)
+}
+
+/// Serialize [`TarStats`] to the compact JSON form used by format builders.
+pub fn serialize_tarstats(stats: &TarStats) -> String {
+    let mut obj = serde_json::json!({
+        "st_size": stats.st_size,
+        "st_mtime": stats.st_mtime,
+    });
+    if let Some(ns) = stats.st_mtime_ns {
+        obj["st_mtime_ns"] = serde_json::json!(ns);
+    }
+    if let Some(ref p) = stats.prefix512_sha256 {
+        obj["prefix512_sha256"] = serde_json::json!(p);
+    }
+    if let Some(ref s) = stats.suffix512_sha256 {
+        obj["suffix512_sha256"] = serde_json::json!(s);
+    }
+    if let Some(ref f) = stats.full_sha256 {
+        obj["full_sha256"] = serde_json::json!(f);
+    }
+    obj.to_string()
+}
+
 /// Open and query an existing ratarmount SQLite index.
 ///
 /// Connection is behind a `Mutex` so the type is `Sync` for FUSE multi-threaded callbacks.
@@ -405,6 +586,106 @@ impl SqliteIndex {
                 return Err(IndexError::Mismatch(format!(
                     "backendName mismatch: index has {name:?}, expected {expected:?}"
                 )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Read stored `tarstats` fingerprint, if present.
+    pub fn tarstats(&self) -> Result<Option<TarStats>> {
+        match self.metadata()?.get("tarstats") {
+            Some(json) => Ok(Some(parse_tarstats_json(json)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Write `tarstats` from live path metadata + edge hashes (no-op when not a real file).
+    ///
+    /// Used by format builders and compression side-table writers so warm reopen can
+    /// reject a stale sibling index after the archive is replaced in place.
+    pub fn store_tarstats_for_path(&self, path: &Path) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if !path.exists() {
+            return Ok(());
+        }
+        let stats = tar_stats_from_path(path)?;
+        let json = serialize_tarstats(&stats);
+        self.store_metadata_key_value("tarstats", &json)
+    }
+
+    /// Validate stored `tarstats` against the live archive file (Python `check_archive_stats`).
+    ///
+    /// Policy (stricter than Python's optional mtime flag; fail closed for silent wrong data):
+    /// - No `tarstats` key → `Ok` (legacy indexes / synthetic nested labels without stats).
+    /// - `archive_path` does not exist → `Ok` (virtual labels; cannot fingerprint).
+    /// - Size or whole-second mtime mismatch → [`IndexError::Mismatch`] (caller rebuilds).
+    /// - When edge SHA-256 samples are stored, they must match (catches same-size/same-second replaces).
+    ///
+    /// Call **before** trusting `files` rows or compression side tables (RGZI / zstdblocks /
+    /// bzip2blocks) from an on-disk warm index.
+    pub fn check_tarstats_matches_archive(&self, archive_path: &Path) -> Result<()> {
+        let Some(stored) = self.tarstats()? else {
+            return Ok(());
+        };
+        if !archive_path.exists() {
+            return Ok(());
+        }
+        let meta = std::fs::metadata(archive_path)?;
+        let actual_meta = tar_stats_from_metadata(&meta);
+        if stored.st_size != actual_meta.st_size {
+            return Err(IndexError::Mismatch(format!(
+                "archive size mismatch for {}: index tarstats st_size={} current={}",
+                archive_path.display(),
+                stored.st_size,
+                actual_meta.st_size
+            )));
+        }
+        if stored.st_mtime != actual_meta.st_mtime {
+            return Err(IndexError::Mismatch(format!(
+                "archive mtime mismatch for {}: index tarstats st_mtime={} current={}",
+                archive_path.display(),
+                stored.st_mtime,
+                actual_meta.st_mtime
+            )));
+        }
+        // Content samples: only when present in the index (Python indexes omit them).
+        if let Some(ref want_full) = stored.full_sha256 {
+            match archive_full_hash(archive_path)? {
+                Some(got) if got == *want_full => {}
+                Some(_) => {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive full content fingerprint mismatch for {}",
+                        archive_path.display()
+                    )));
+                }
+                None => {
+                    // File grew past full-hash threshold while size field still matched
+                    // (should not happen if st_size matched); treat as mismatch.
+                    return Err(IndexError::Mismatch(format!(
+                        "archive full content fingerprint unavailable for {}",
+                        archive_path.display()
+                    )));
+                }
+            }
+        } else if stored.prefix512_sha256.is_some() || stored.suffix512_sha256.is_some() {
+            let (prefix, suffix) = archive_edge_hashes(archive_path)?;
+            if let Some(ref want) = stored.prefix512_sha256 {
+                if want != &prefix {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive prefix fingerprint mismatch for {}",
+                        archive_path.display()
+                    )));
+                }
+            }
+            if let Some(ref want) = stored.suffix512_sha256 {
+                if want != &suffix {
+                    return Err(IndexError::Mismatch(format!(
+                        "archive suffix fingerprint mismatch for {}",
+                        archive_path.display()
+                    )));
+                }
             }
         }
         Ok(())
@@ -1367,6 +1648,89 @@ mod tests {
             idx.backend_name().unwrap().as_deref(),
             Some("SQLiteIndexedTar")
         );
+    }
+
+    #[test]
+    fn parse_tarstats_json_size_mtime_and_float_mtime() {
+        let s = parse_tarstats_json(r#"{"st_size":1024,"st_mtime":1700000000,"st_mtime_ns":123}"#)
+            .unwrap();
+        assert_eq!(s.st_size, 1024);
+        assert_eq!(s.st_mtime, 1_700_000_000);
+        assert_eq!(s.st_mtime_ns, Some(123));
+        assert!(s.prefix512_sha256.is_none());
+
+        let f = parse_tarstats_json(r#"{"st_size":10,"st_mtime":1.9}"#).unwrap();
+        assert_eq!(f.st_size, 10);
+        assert_eq!(f.st_mtime, 1);
+        assert_eq!(f.st_mtime_ns, None);
+    }
+
+    /// Regression: warm index must not be trusted when archive size/mtime/content no longer match tarstats.
+    #[test]
+    fn check_tarstats_matches_archive_rejects_size_or_mtime_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"old-content").unwrap();
+        let idx_path = dir.path().join("a.tar.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_tarstats_for_path(&archive).unwrap();
+            let ts = idx.tarstats().unwrap().unwrap();
+            assert!(ts.prefix512_sha256.is_some());
+            assert!(ts.suffix512_sha256.is_some());
+            assert!(
+                ts.full_sha256.is_some(),
+                "tiny archive should store full_sha256"
+            );
+        }
+
+        let idx = SqliteIndex::open_read_only(&idx_path).unwrap();
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("matching archive should pass");
+
+        // Size change.
+        std::fs::write(&archive, b"new-content-longer").unwrap();
+        let err = idx
+            .check_tarstats_matches_archive(&archive)
+            .expect_err("size mismatch");
+        assert!(
+            matches!(err, IndexError::Mismatch(_)),
+            "expected Mismatch, got {err:?}"
+        );
+
+        // Same size, different content (tar block-padding class) → edge hash mismatch.
+        // Pad to same length as original "old-content" (11 bytes).
+        std::fs::write(&archive, b"Xld-content").unwrap();
+        assert_eq!(
+            std::fs::metadata(&archive).unwrap().len(),
+            b"old-content".len() as u64
+        );
+        // Force same mtime as stored so only content samples fire.
+        {
+            let stored = idx.tarstats().unwrap().unwrap();
+            let when = std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(stored.st_mtime.max(0) as u64);
+            let times = std::fs::FileTimes::new().set_modified(when);
+            std::fs::File::options()
+                .write(true)
+                .open(&archive)
+                .unwrap()
+                .set_times(times)
+                .unwrap();
+        }
+        let err = idx
+            .check_tarstats_matches_archive(&archive)
+            .expect_err("content fingerprint mismatch");
+        assert!(
+            matches!(err, IndexError::Mismatch(_)),
+            "expected Mismatch for content sample, got {err:?}"
+        );
+
+        // Missing tarstats is allowed (legacy).
+        let idx2 = SqliteIndex::create_writable(None).unwrap();
+        idx2.check_tarstats_matches_archive(&archive)
+            .expect("no tarstats → Ok");
     }
 
     #[test]

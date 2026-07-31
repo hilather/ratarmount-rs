@@ -388,6 +388,8 @@ impl ZipMountSource {
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime fingerprint).
+        index.check_tarstats_matches_archive(archive_path)?;
         let opened = open_archive_file(archive_path)?;
         let mut archive = match ZipArchive::new(opened.file.try_clone()?) {
             Ok(a) => a,
@@ -1789,15 +1791,8 @@ pub fn looks_like_zip(path: &Path) -> bool {
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
-    index.store_metadata_key_value("tarstats", &json)?;
+    // Shared helper: size/mtime + first/last 512 SHA-256 for warm-open fingerprint.
+    index.store_tarstats_for_path(path)?;
     Ok(())
 }
 
@@ -2679,5 +2674,42 @@ mod tests {
         );
         // Markers left intact.
         assert!(eocd_looks_multidisk(&path).unwrap());
+    }
+
+    /// Regression: warm ZIP index rebuilds when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.zip");
+        write_sample_zip(&archive, "hello.txt", b"zip-v1\n");
+        let index = dir.path().join("swap.zip.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = ZipMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "zip-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        write_sample_zip(&archive, "hello.txt", b"zip-v2-longer\n");
+
+        let src2 =
+            ZipMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "zip-v2-longer\n",
+            "must serve new ZIP data after tarstats mismatch rebuild"
+        );
     }
 }
