@@ -155,7 +155,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 | Pure FUSE ABI (Annex A) | `[ ]` deferred; fuser stays product path |
 | GitHub CI (fmt/clippy/test) | `[x]` `.github/workflows/ci.yml` |
 | GitHub CI FUSE allowlist suite | `[x]` (fixtures from mxmlnkn/ratarmount) |
-| Phase 12: dual-run / Python deprecation timeline | `[x]` docs [`docs/phase12-dual-run.md`](phase12-dual-run.md); announce / cutover still pending gates |
+| Phase 12: dual-run / Python deprecation timeline | `[x]` docs ready for announce [`docs/phase12-dual-run.md`](phase12-dual-run.md) (residual table + release-notes stub + how-to-announce); **not announced** — tag / deprecation date / CI-on-tag still **ops-pending** |
 
 ---
 
@@ -177,7 +177,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 13. ~~**ASAR**~~ — stencil `ASARMountSource`; harness `phase9-asar`.  
 14. ~~**OGG / HTML / PDF / Git / zlib**~~ — OGG demux; HTML data-URLs; PDF attachments; Git via git2; zlib seekable.  
 15. ~~**Mount options CLI parity**~~ — high-impact flags: password-file, recursive-extensions, transform, disable-union, no-recreate-index, gnu-incremental, color, oss-attributions; matrix: [`docs/mount-options-parity.md`](mount-options-parity.md).  
-16. **Phase 12** dual-run announce → Rust primary — docs done: [`docs/phase12-dual-run.md`](phase12-dual-run.md); execute announce after residual gates. crates.io: [`docs/crates-io-policy.md`](crates-io-policy.md).
+16. **Phase 12** dual-run announce → Rust primary — **docs ready** (not announced): [`docs/phase12-dual-run.md`](phase12-dual-run.md) runbook + paste-ready notes; maintainer still must tag, publish packages, set deprecation date. crates.io not required: [`docs/crates-io-policy.md`](crates-io-policy.md).
 
 ---
 

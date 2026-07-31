@@ -2,7 +2,7 @@
 
 Status: **policy documented** (2026-07-28). No coordinated crates.io publish is required for dual-run or 1.0-class **binary** distribution.
 
-Related: [`docs/packaging.md`](packaging.md) (binary/deb/rpm/AppImage), [`docs/phase12-dual-run.md`](phase12-dual-run.md).
+Related: [`docs/packaging.md`](packaging.md) (binary/deb/rpm/AppImage), [`docs/phase12-dual-run.md`](phase12-dual-run.md) (dual-run announce runbook; crates.io not required).
 
 ---
 

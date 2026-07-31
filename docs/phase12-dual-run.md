@@ -1,14 +1,16 @@
 # Phase 12 — Dual-run and Python deprecation timeline
 
-Status: **docs complete / not announced** (2026-07-28).  
-Announce only after cutover gates below are green and residual gaps are accepted.
+Status: **docs ready for announce / not announced** (updated 2026-07-31).  
+**Dual-run has not been published** as a GitHub Release or packaging default yet.
+Announce only after cutover gates below are green and residual gaps are accepted by a human maintainer.
 
 Related:
 
 - Living parity matrix: [`docs/parity-todo.md`](parity-todo.md)
 - Gap batches / residual queue: [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
-- Packaging install paths: [`docs/packaging.md`](packaging.md)
-- crates.io policy: [`docs/crates-io-policy.md`](crates-io-policy.md)
+- Upstream FRs (readahead done, parallel nested open): [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md)
+- Packaging install paths & release procedure: [`docs/packaging.md`](packaging.md)
+- crates.io policy (no publish required for dual-run): [`docs/crates-io-policy.md`](crates-io-policy.md)
 
 ---
 
@@ -20,9 +22,9 @@ Dual-run is a **distribution and UX** phase, not a claim of 100% Python parity. 
 
 ---
 
-## Current parity snapshot (as of dual-run docs)
+## Current parity snapshot (as of 2026-07-31)
 
-Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–12. Prefer those files for line-item truth.
+Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–13. Prefer those files for line-item truth.
 
 | Area | State | Notes |
 |------|--------|--------|
@@ -32,13 +34,16 @@ Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–12. Prefe
 | Codecs | **good** | gzip (Tier B + RGZI + best-effort GZIDX), bzip2 maps, xz index/multi-stream, zstd multi-frame + zstdblocks, lz4/lzip/lzo/Z/lzma/zlib |
 | lrzip (`.lrz`) | **practical** | detect + `lrzip`/`lrunzip` materialize; **libarchive raw/filter fallback** when CLI missing; no pure in-process decoder |
 | RAR / LHA / long-tail | **libarchive only** | sequential member open; no pure RAR backend |
-| Compositing / UX | **strong** | union, automount, overlay + commit (common TAR compressions), versions, control socket + in-FS control, lazy/transform/prefix |
+| Compositing / UX | **strong** | union, automount, overlay + commit (common TAR compressions + ZIP rebuild), versions, control socket + in-FS control, lazy/transform/prefix |
+| FUSE readahead | **done** | `--readahead` sequential window (FR-5 / upstream #180); not a dual-run residual |
+| Nested / no-tmp | **strong** | Factory nested `open_from_reader` paths for common formats; residual path spool for some long-tail |
+| Parallel nested index | **open (perf)** | FR-6 / upstream #80 — nested index work not fanned out; functional dual-run OK without it |
 | Remote | **broad** | http(s) Range for TAR/ZIP/gzip/bzip2/xz/zstd; S3/SSH; WebDAV/SMB/Dropbox; remote + compressed index download |
-| Index interop | **good** | SQLite 0.7.x; Py↔Rust TAR (+ ZIP/7z); side tables partial for some codec blobs |
+| Index interop | **good** | SQLite 0.7.x; Py↔Rust TAR (+ ZIP/7z); side tables partial for some codec blobs; warm reimport for zstdblocks/bzip2blocks |
 | Perf / CI | **gated** | cold-index hard gate + optional full bench; fmt/clippy/test + FUSE allowlist CI |
 | Packaging | **shippable** | Makefile install, deb/rpm/portable/macOS tarballs, AppImage scaffold, cosign |
 
-**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred).
+**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred), FR-6 parallel nested indexing (perf).
 
 ---
 
@@ -56,7 +61,7 @@ Realistic criteria for declaring Rust the **default** install name `ratarmount` 
 | Packaging | Documented install: `make install`, portable tarball, and/or distro package | [`docs/packaging.md`](packaging.md) |
 | Residual acceptance | Residual gaps listed below accepted in release notes / dual-run README | This doc + parity-todo `~` / `[ ]` rows |
 
-**Cutover is OK without:** pure RAR, pure lrzip, full PDF color spaces, progressive multi-GB solid 7z for every filter stack, SMB CLI-less pure implementation, or 100% fixed-archive parity.
+**Cutover is OK without:** pure RAR, pure lrzip, full PDF color spaces, progressive multi-GB solid 7z for every filter stack, SMB CLI-less pure implementation, FR-6 parallel nested indexing, or 100% fixed-archive parity.
 
 ---
 
@@ -122,7 +127,7 @@ make release && make install          # Rust → ~/.local/bin/ratarmount
 
 ## Residual known gaps (not blocking dual-run for common paths)
 
-Track detail in [`parity-todo.md`](parity-todo.md) and [`tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md). Dual-run announce may proceed with these open:
+Track detail in [`parity-todo.md`](parity-todo.md), [`tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md), and [`tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md). Dual-run announce may proceed with these open:
 
 | Residual | Status | Mitigation |
 |----------|--------|------------|
@@ -134,40 +139,208 @@ Track detail in [`parity-todo.md`](parity-todo.md) and [`tasks/gap-implementatio
 | SquashFS classic lzma | `unsquashfs` fallback | Install `squashfs-tools` |
 | PDF Separation/Lab (and some color spaces) | XObject JPEG/JP2/Flate path strong | Rare documents |
 | Progressive multi-GB solid 7z (BCJ/AES full-folder) | progressive LZMA2 + LRU windows | Large exotic solids may use more RAM/time |
-| Factory auto-wire zstdblocks/bzip2blocks from index on open | **done** | Warm open imports side tables; skips re-export when map reused |
+| Factory auto-wire zstdblocks/bzip2blocks from index on open | **done** (FR-9) | Warm open imports side tables; skips re-export when map reused |
+| Sequential FUSE readahead (`--readahead`) | **done** (FR-5 / #180) | Shipped; not a residual — listed so announce notes do not re-open it |
+| **Parallel nested archive indexing** (FR-6 / #80) | **open (perf)** | Nested mounts/index still sequential; functional dual-run OK; optional later speed-up |
 | HTTP Range on every format | TAR/ZIP + main codecs | Others materialize |
 | Full `--use-backend` / Python backend matrix | probe reorder | Priority list accepted |
 | Full fixed-archive ≥90% | allowlist expanding | Track gaps; not cutover-hard |
 | Pure `/dev/fuse` ABI (Annex A) | deferred | `fuser` remains product path |
 | macOS harness depth / Homebrew formula | beta tarballs + CI | See [`macos.md`](macos.md) |
+| Cookie HTTP auth (FR-2 residual) | Basic auth done | Use URL userinfo / env Basic; cookies deferred |
+| Writable/rename on compressed TAR (FR-11) | Python residual too | Use overlay + commit where supported |
 
 ---
 
 ## Announcement checklist
 
-- [ ] Publish comparison table from [`docs/parity-todo.md`](parity-todo.md) (or README gaps section) in release notes
-- [ ] Tag ratarmount-rs `v0.x` / `v1.0-rc` with dual-run section linking this doc
-- [ ] Update upstream / packaging README dual-run section (Rust default, `ratarmount-py` fallback)
-- [ ] Set deprecation date for Python-as-primary (suggested: **+2 releases** after first dual-run tag)
-- [ ] Open tracking issues for residual `~` / `[ ]` items that will not ship in the cutover tag
-- [ ] Confirm FUSE harness + cold-index gate green on the tag commit
-- [ ] Document install paths (binary, portable, deb/rpm, optional AppImage)
+Honest status: **nothing below is “announced” until a human tags a release and publishes notes.**
+Docs can prepare text and mark readiness; ops actions stay open.
+
+| # | Item | Readiness | Owner |
+|---|------|-----------|--------|
+| 1 | Residual gaps table current in this doc (incl. FR-5 done, FR-6 open) | **docs-ready** `[x]` | docs |
+| 2 | Comparison / gaps summary for release notes (paste stub below + parity-todo) | **docs-ready** `[x]` | docs |
+| 3 | Install paths documented (binary, portable, deb/rpm, optional AppImage) | **docs-ready** `[x]` | [`packaging.md`](packaging.md) |
+| 4 | crates.io not required for dual-run binary ship | **docs-ready** `[x]` | [`crates-io-policy.md`](crates-io-policy.md) |
+| 5 | Dual-run model + binary naming (`ratarmount` / `ratarmount-py`) | **docs-ready** `[x]` | this doc |
+| 6 | Release notes body stub (operator message) paste-ready | **docs-ready** `[x]` | this doc § below |
+| 7 | Tag ratarmount-rs `v0.x` / dual-run section linking this doc | **ops-pending** `[ ]` | maintainer |
+| 8 | Push tag + confirm **Packages** workflow assets on GitHub Release | **ops-pending** `[ ]` | maintainer |
+| 9 | Confirm FUSE harness + cold-index gate green on the **tag commit** | **ops-pending** `[ ]` | maintainer / CI |
+| 10 | Set deprecation date for Python-as-primary (suggested: **+2 releases** after first dual-run tag) | **ops-pending** `[ ]` | maintainer |
+| 11 | Update packaging / product README dual-run section when cutover is real | **ops-pending** `[ ]` | maintainer (orchestrator owns large README tables) |
+| 12 | Open tracking issues for residual `~` / `[ ]` items that will not ship in the cutover tag | **ops-pending** `[ ]` | maintainer |
+
+Checklist shorthand (same items):
+
+- [x] **docs-ready** — residual table current; comparison + install + crates.io policy; operator message stub
+- [ ] **ops-pending** — tag dual-run release with notes linking this doc
+- [ ] **ops-pending** — push; Packages workflow assets on the release
+- [ ] **ops-pending** — FUSE + cold-index green on tag commit
+- [ ] **ops-pending** — set Python-as-primary deprecation date (+2 releases after first dual-run tag)
+- [ ] **ops-pending** — product README dual-run cutover wording when announce lands
+- [ ] **ops-pending** — tracking issues for accepted residuals
+
+---
+
+## How to announce (maintainer runbook)
+
+Ordered steps for humans. **Do not treat this section as completed work** — no tag or public announce has been made by this docs update alone.
+
+### 0. Preconditions (same day as tag)
+
+1. Main is green: `cargo fmt --all -- --check`, clippy `-D warnings`, `cargo test --workspace`, FUSE allowlist job, cold-index gate (`./benchmarks/check-rust-gates.sh` or CI equivalent).
+2. Residual table above still matches parity-todo / FR list (especially: readahead **done**, parallel nested **open but accepted**).
+3. Decide the first dual-run tag version (workspace version today is independent of “announce ready”; bump per packaging checklist when cutting).
+
+### 1. Version bump and tag
+
+Follow the full packaging procedure — do not invent a second process:
+
+- Root [`AGENTS.md`](../AGENTS.md) § **Releases / package builds**
+- [`docs/packaging.md`](packaging.md) § **Agent / maintainer release procedure**
+- crates.io: **not required** for dual-run binary distribution — [`docs/crates-io-policy.md`](crates-io-policy.md)
+
+Minimum:
+
+1. Bump workspace `version` in root `Cargo.toml`.
+2. Align package workflow `VERSION` (or tag-derived VERSION — follow current `packages.yml` / packaging notes).
+3. Update any README version strings that pin the release tag.
+4. Commit on `main`, push, then push an **annotated** tag `vX.Y.Z` matching Cargo.
+
+### 2. GitHub Release body
+
+When **Sign & release** / GitHub Release is created (or when editing the release notes for the tag):
+
+1. Paste the **Operator message / release notes stub** below (fill `vX.Y.Z` and deprecation placeholder).
+2. Link this file: `docs/phase12-dual-run.md`.
+3. Link install docs: `docs/packaging.md`.
+4. Optionally link parity: `docs/parity-todo.md` Gaps / residual rows.
+
+Confirm under https://github.com/hilather/ratarmount-rs/releases that the tag has **real package assets** (`.deb` / `.rpm` / portable tarballs), not only tiny sidecars. See packaging known failure modes if assets are empty.
+
+### 3. Deprecation date
+
+1. On the first dual-run tag notes, state: *“Python as primary install name will be deprecated after **N** further releases (target: +2 releases). Exact calendar date: **TBD** when the second post-cutover release ships.”*
+2. Record the chosen date (or “after vA.B.C”) in a follow-up edit to this file and in the product README dual-run blurb.
+3. Until that date: packages and docs should keep describing `ratarmount-py` / Python as supported fallback.
+
+### 4. Post-tag verification
+
+| Check | Pass criteria |
+|-------|----------------|
+| CI on tag commit | fmt/clippy/test + FUSE allowlist green |
+| Cold-index | hard gate green (or documented waiver) |
+| GitHub Release assets | Linux packages present; macOS optional if Linux published |
+| Dual-run wording | Release notes say Rust recommended + Python fallback; **do not** claim 100% parity |
+| crates.io | No publish required ([`crates-io-policy.md`](crates-io-policy.md)) |
+
+### 5. After announce
+
+1. Flip any “not announced” status lines in this doc to the dual-run tag id and date.
+2. Open tracking issues for residuals you explicitly accept (RAR pure, lrzip pure, FR-6, etc.).
+3. Orchestrator may add a short README dual-run cutover blurb; large feature tables stay orchestrator-owned.
 
 ---
 
 ## Exit criteria for Phase 12 complete
 
-1. Dual-run docs published (this file + packaging / crates.io policy); **default install name is Rust**.  
+1. Dual-run docs published (this file + packaging / crates.io policy); **default install name is Rust** after ops announce.  
 2. CI matrix enforces fmt/clippy/test + FUSE harness (and cold-index gate).  
 3. Python package marked **maintenance / fallback only** after the stated deprecation date.  
 4. Residual gaps above remain explicitly listed so dual-run is not mistaken for full parity.
+5. A human has executed the **How to announce** runbook (tag + release notes + asset check) — **docs alone do not complete Phase 12.**
 
 ---
 
-## Suggested operator message (release notes stub)
+## Operator message / release notes stub
+
+Paste into the GitHub Release for the first dual-run tag. Replace placeholders in `«…»`.
+
+### Short (summary blurb)
 
 ```text
-ratarmount-rs is now the recommended `ratarmount` binary for Linux (and beta macOS).
-Keep the Python package as `ratarmount-py` during the transition for residual formats
-(e.g. pure RAR edge cases, pure lrzip without CLI/libarchive). See docs/phase12-dual-run.md.
+ratarmount-rs «vX.Y.Z» — dual-run: Rust is the recommended `ratarmount` binary
+for Linux (macOS beta). Keep the Python package as `ratarmount-py` (or
+`python -m ratarmount`) for residual formats during the transition.
+
+This is not 100% Python parity. See docs/phase12-dual-run.md for the dual-run
+model, residual gaps, and deprecation timeline.
+```
+
+### Full release notes body
+
+```text
+## Dual-run: Rust primary, Python fallback
+
+**Status:** First dual-run announcement for ratarmount-rs «vX.Y.Z».
+
+### What changed for operators
+
+- Install the Rust binary as `ratarmount` (deb/rpm/portable tarball, `make install`,
+  or cargo path install). See docs/packaging.md.
+- Keep Python ratarmount available as **`ratarmount-py`** (or `python -m ratarmount`)
+  when you need a residual format or behavior not covered by Rust.
+- Optional wrapper env (distro scripts only): `RATARMOUNT_IMPL=rust|python`.
+
+### Supported well enough for default use
+
+- TAR (incl. sparse / common GNU incremental paths), ZIP (store/deflate, password,
+  multi-part join), custom 7z random access
+- Common outer codecs: gzip, bzip2, xz, zstd (incl. multi-frame / block maps)
+- Nested / automount paths for common parent×child formats without /tmp spool when
+  the seekable reader path succeeds
+- FUSE sequential readahead: `--readahead` (shipped; upstream-inspired #180)
+- Union, write overlay + commit for common TAR compressions and ZIP rebuild, remote
+  Range for main formats
+
+### Known residuals (use Python or accept limits)
+
+- Pure RAR / pure in-process lrzip (libarchive and/or CLI fallbacks only)
+- Parallel nested archive indexing (perf; sequential nested index still works)
+- Progressive multi-GB solid 7z with exotic filters (BCJ/AES full-folder residual)
+- Encrypted ZIP true per-disk offset edges; SQLAR without sqlcipher feature
+- SquashFS classic lzma via `unsquashfs`; some PDF color spaces
+- Cookie-based HTTP auth; pure `/dev/fuse` ABI (fuser remains the product path)
+- Full fixed-archive ≥90% Python triple parity (tracked, not cutover-hard)
+
+Details and mitigations: docs/phase12-dual-run.md
+Living matrix: docs/parity-todo.md
+
+### Install sketch
+
+  # Rust (after this release)
+  # … install .deb / .rpm / portable tarball → ratarmount on PATH
+
+  # Python fallback (example)
+  pip install ratarmount
+  # ensure the Python entry point is available as ratarmount-py if the
+  # package and Rust binary would otherwise collide on the name `ratarmount`
+
+### Deprecation timeline
+
+- **Python as the primary install name** is still supported during dual-run.
+- Target: deprecate Python-as-primary after **+2 releases** following «vX.Y.Z».
+- Calendar date: «TBD — set when announce lands / when the +2nd release is cut».
+- After that date, docs and packages treat Rust as the only default; Python may
+  remain as maintenance-mode fallback for long-tail formats.
+
+### crates.io
+
+Library crates.io publish is **not** required to use this dual-run binary release.
+Policy: docs/crates-io-policy.md
+
+### Links
+
+- Dual-run / cutover: docs/phase12-dual-run.md
+- Packaging: docs/packaging.md
+- Parity: docs/parity-todo.md
+```
+
+### One-line chat / social
+
+```text
+ratarmount-rs «vX.Y.Z»: Rust is now the recommended `ratarmount`; keep Python as
+ratarmount-py for residuals. Dual-run details: docs/phase12-dual-run.md
 ```
