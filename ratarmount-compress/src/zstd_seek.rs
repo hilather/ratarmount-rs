@@ -619,19 +619,34 @@ impl SeekableBody for SeekableZstd {
 }
 
 /// Compressed-stream handle used during frame decode (path FD or shared mutex stream).
+///
+/// Shared holds a private compressed offset so concurrent [`ZstdFrameReader`]s
+/// (nested AutoMount / multi-open FUSE) do not interleave `seek` + `read` on the
+/// shared cursor. That race previously produced truncated / wrong frame data only
+/// on the embedded (from-reader) path — host files use a private FD per open and
+/// were fine.
 enum CompressedHandle {
     File(File),
-    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+    Shared {
+        inner: Arc<Mutex<Box<dyn SeekRead>>>,
+        /// Logical position in the compressed stream for *this* handle.
+        pos: u64,
+    },
 }
 
 impl Read for CompressedHandle {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match self {
             CompressedHandle::File(f) => f.read(buf),
-            CompressedHandle::Shared(inner) => inner
-                .lock()
-                .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?
-                .read(buf),
+            CompressedHandle::Shared { inner, pos } => {
+                let mut guard = inner
+                    .lock()
+                    .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?;
+                guard.seek(SeekFrom::Start(*pos))?;
+                let n = guard.read(buf)?;
+                *pos += n as u64;
+                Ok(n)
+            }
         }
     }
 }
@@ -640,10 +655,30 @@ impl Seek for CompressedHandle {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match self {
             CompressedHandle::File(f) => f.seek(pos),
-            CompressedHandle::Shared(inner) => inner
-                .lock()
-                .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?
-                .seek(pos),
+            CompressedHandle::Shared {
+                inner,
+                pos: logical,
+            } => {
+                let new = match pos {
+                    SeekFrom::Start(o) => o as i64,
+                    SeekFrom::Current(o) => *logical as i64 + o,
+                    SeekFrom::End(o) => {
+                        let mut guard = inner
+                            .lock()
+                            .map_err(|_| io::Error::other("zstd backend mutex poisoned"))?;
+                        let end = guard.seek(SeekFrom::End(0))? as i64;
+                        end + o
+                    }
+                };
+                if new < 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "seek before start of compressed stream",
+                    ));
+                }
+                *logical = new as u64;
+                Ok(*logical)
+            }
         }
     }
 }
@@ -679,7 +714,10 @@ impl ZstdFrameReader {
     fn open_compressed(&self) -> io::Result<CompressedHandle> {
         match &self.backend {
             ZstdBackend::Path(p) => Ok(CompressedHandle::File(File::open(p)?)),
-            ZstdBackend::Shared(shared) => Ok(CompressedHandle::Shared(Arc::clone(shared))),
+            ZstdBackend::Shared(shared) => Ok(CompressedHandle::Shared {
+                inner: Arc::clone(shared),
+                pos: 0,
+            }),
         }
     }
 
@@ -1263,6 +1301,74 @@ mod tests {
         let mut out = Vec::new();
         free2.open_reader().unwrap().read_to_end(&mut out).unwrap();
         assert_eq!(out, b"AAAABBBBCCCCDD");
+    }
+
+    /// Nested AutoMount path uses Shared backend; concurrent FUSE opens must not
+    /// race seek+read on the shared compressed cursor (was truncated / wrong frame data).
+    ///
+    /// Regression: interleaved seek+read under mutex without private compressed offset.
+    #[test]
+    fn shared_zstd_from_reader_concurrent_readers_full_payload() {
+        use std::thread;
+
+        // Multi-frame body so frame decode re-seeks the shared compressed cursor.
+        let mut raw = Vec::new();
+        for i in 0..4000 {
+            writeln!(&mut raw, "line {i:05} {}", "y".repeat(64)).unwrap();
+        }
+        // Chunk into many independent frames (like producer recipes / zstd --rsyncable style).
+        const FRAME_BYTES: usize = 2048;
+        let mut compressed = Vec::new();
+        let mut off = 0usize;
+        while off < raw.len() {
+            let end = (off + FRAME_BYTES).min(raw.len());
+            compressed.extend_from_slice(&encode_frame(&raw[off..end]));
+            off = end;
+        }
+        assert!(
+            compressed.len() > FRAME_BYTES,
+            "expected multi-frame compressed body"
+        );
+
+        let body = SeekableZstd::open_from_reader(
+            Cursor::new(compressed),
+            Path::new("nested://concurrent.zst"),
+        )
+        .unwrap();
+        assert!(
+            body.checkpoint_count() >= 2,
+            "need multi-frame map for concurrent frame decode race, checkpoints={}",
+            body.checkpoint_count()
+        );
+        assert_eq!(body.size(), raw.len() as u64);
+
+        let expected = Arc::new(raw);
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let b = Arc::clone(&body);
+            let exp = Arc::clone(&expected);
+            handles.push(thread::spawn(move || {
+                // Mix full reads and mid-stream seeks like multi-open FUSE.
+                for pass in 0..4 {
+                    let mut r = b.open_reader().unwrap();
+                    if pass % 2 == 0 {
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, *exp, "thread {t} pass {pass} full read");
+                    } else {
+                        let mid = exp.len() as u64 / 2;
+                        r.seek(SeekFrom::Start(mid)).unwrap();
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, exp[mid as usize..], "thread {t} pass {pass} mid seek");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("worker panicked (likely shared zstd seek+read race)");
+        }
     }
 
     #[test]
