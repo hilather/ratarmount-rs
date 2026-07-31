@@ -5,9 +5,28 @@
 //! uncompressed, gzip, zstd, lz4, lzo, and **xz** (via workspace `xz2`, not backhand's
 //! `liblzma` feature which conflicts with the rest of the tree).
 //!
-//! Classic LZMA (compressor id 2) is not implemented in-process. When in-process open
-//! fails (classic LZMA; corrupt image; exotic vendor kind), fall back to materializing
-//! with `unsquashfs` into a temp dir served by [`FolderMountSource`].
+//! Classic LZMA (compressor id 2) is not implemented in-process. When path-based
+//! [`SquashFsMountSource::open`] cannot use backhand (classic LZMA; corrupt image;
+//! exotic vendor kind), it falls back to materializing with `unsquashfs` into a temp
+//! dir served by [`FolderMountSource`].
+//!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! Nested SquashFS members can open without `/tmp` when the outer archive yields a
+//! seekable stream and the compressor is supported in-process:
+//! [`SquashFsMountSource::open_from_reader`] feeds the reader to backhand (optionally
+//! after buffering into a `Cursor<Vec<u8>>` for small images). **No** `NamedTempFile`
+//! is created on the success path.
+//!
+//! | Concern | Behaviour |
+//! |---------|-----------|
+//! | Host temp file | **Never** on the nested no-tmp success path |
+//! | In-process codecs | none / gzip / zstd / lz4 / lzo / xz (workspace `xz2`) |
+//! | Classic LZMA | **Error** — factory/AutoMount may temp-spool and path-`open` |
+//! | `unsquashfs` fallback | **Not** used inside `open_from_reader` (path `open` only) |
+//! | Memory | Seekable body retained by backhand; full RAM buffer is OK |
+//!
+//! Residual: when `open_from_reader` fails → factory/AutoMount temp spool + path open.
 //!
 //! Detection scans offset 0 and the first 1 MiB at 4 KiB strides (AppImage payloads).
 
@@ -237,19 +256,118 @@ impl SquashFsMountSource {
         matches!(self.backend, Backend::InProcess { .. })
     }
 
+    /// Open a SquashFS image from any `Read + Seek + Send + 'static` source without `/tmp`.
+    ///
+    /// Detects SquashFS magic (and optional AppImage-style offset), reads the superblock
+    /// compressor, and opens with in-process **backhand** when practical. The seekable
+    /// reader is wrapped in a [`BufReader`] and handed to backhand directly.
+    ///
+    /// # Residuals (clear errors — never silent `/tmp`)
+    ///
+    /// * **Classic LZMA** (compressor id 2): not supported in-process; returns
+    ///   [`SquashFsError`] so AutoMount / factory can fall back to temp spool + path
+    ///   [`open`](Self::open) (which may use `unsquashfs`).
+    /// * Corrupt / exotic images: backhand open failure is returned the same way.
+    ///
+    /// `archive_label` is diagnostics-only (nested member name / URL).
+    ///
+    /// # Factory wiring
+    ///
+    /// Prefer [`looks_like_squashfs_reader`] or name (`.squashfs` / `.sqfs` / `.snap`)
+    /// before calling this from `open_nested_reader_fn`.
+    pub fn open_from_reader<R>(reader: R, archive_label: impl AsRef<Path>) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let mut reader = reader;
+        reader.seek(SeekFrom::Start(0))?;
+
+        let offset = find_squashfs_offset_reader(&mut reader)?.ok_or_else(|| {
+            SquashFsError::Msg(format!(
+                "{} is not a SquashFS image (stream)",
+                archive_path.display()
+            ))
+        })?;
+
+        let compressor = read_superblock_compressor_reader(&mut reader, offset)
+            .ok()
+            .flatten();
+
+        if compressor == Some(COMP_LZMA) {
+            return Err(SquashFsError::Msg(format!(
+                "SquashFS classic LZMA (compressor id 2) cannot open from a nested stream \
+                 without a host path; use path open / AutoMount temp spool (label={})",
+                archive_path.display()
+            )));
+        }
+
+        let kind = detect_kind_reader(&mut reader, offset)?;
+        reader.seek(SeekFrom::Start(0))?;
+
+        let backend = Self::open_inprocess_from_reader(reader, offset, kind, &archive_path)?;
+        log::debug!(
+            "SquashFS open_from_reader in-process ok for {} (offset={offset}, compressor={})",
+            archive_path.display(),
+            compressor_name(compressor)
+        );
+        Ok(Self {
+            backend,
+            archive_path,
+            offset,
+        })
+    }
+
+    /// Like [`open_from_reader`](Self::open_from_reader) but loads the full image into RAM
+    /// first (`Cursor<Vec<u8>>`). Useful when the source is non-seekable or when the caller
+    /// already has bytes. Still **never** writes `/tmp`.
+    pub fn open_from_bytes(
+        bytes: impl Into<Vec<u8>>,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Self> {
+        Self::open_from_reader(Cursor::new(bytes.into()), archive_label)
+    }
+
     fn open_inprocess(path: &Path, offset: u64) -> Result<Backend> {
         let kind = detect_kind(path, offset)?;
         let file = File::open(path)?;
         let reader = BufReader::new(file);
+        Self::open_inprocess_from_bufread(reader, offset, kind, path)
+    }
+
+    fn open_inprocess_from_reader<R>(
+        reader: R,
+        offset: u64,
+        kind: Kind,
+        label: &Path,
+    ) -> Result<Backend>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_inprocess_from_bufread(BufReader::new(reader), offset, kind, label)
+    }
+
+    fn open_inprocess_from_bufread<R>(
+        reader: R,
+        offset: u64,
+        kind: Kind,
+        label: &Path,
+    ) -> Result<Backend>
+    where
+        R: io::BufRead + Seek + Send + 'static,
+    {
         let fs = FilesystemReader::from_reader_with_offset_and_kind(reader, offset, kind).map_err(
             |e| {
                 SquashFsError::Msg(format!(
                     "backhand open failed for {} (offset={offset}): {e}",
-                    path.display()
+                    label.display()
                 ))
             },
         )?;
+        Ok(Self::backend_from_fs(fs))
+    }
 
+    fn backend_from_fs(fs: FilesystemReader<'static>) -> Backend {
         let mut by_path = BTreeMap::new();
         let mut children: BTreeMap<String, BTreeMap<String, String>> = BTreeMap::new();
 
@@ -267,11 +385,11 @@ impl SquashFsMountSource {
         // Ensure root exists in children map even for empty images.
         children.entry("/".into()).or_default();
 
-        Ok(Backend::InProcess {
+        Backend::InProcess {
             fs,
             by_path,
             children,
-        })
+        }
     }
 
     fn open_unsquashfs(path: &Path, offset: u64) -> Result<Backend> {
@@ -522,10 +640,18 @@ fn compressor_name(id: Option<u16>) -> &'static str {
 /// Read SquashFS v4 superblock compressor id at `offset` (if magic matches).
 fn read_superblock_compressor(path: &Path, offset: u64) -> Result<Option<u16>> {
     let mut f = File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
+    read_superblock_compressor_reader(&mut f, offset)
+}
+
+/// Superblock compressor id from a seekable reader (nested / stream open).
+fn read_superblock_compressor_reader<R: Read + Seek>(
+    reader: &mut R,
+    offset: u64,
+) -> Result<Option<u16>> {
+    reader.seek(SeekFrom::Start(offset))?;
     // magic(4) + inodes(4) + mtime(4) + block_size(4) + fragments(4) + compression(2)
     let mut hdr = [0u8; 22];
-    f.read_exact(&mut hdr)?;
+    reader.read_exact(&mut hdr)?;
     let le = &hdr[0..4] == MAGIC_LE;
     let be = &hdr[0..4] == MAGIC_BE;
     if !le && !be {
@@ -542,9 +668,13 @@ fn read_superblock_compressor(path: &Path, offset: u64) -> Result<Option<u16>> {
 /// Choose LE or BE v4 kind from superblock magic at `offset`, with workspace XZ compressor.
 fn detect_kind(path: &Path, offset: u64) -> Result<Kind> {
     let mut f = File::open(path)?;
-    f.seek(SeekFrom::Start(offset))?;
+    detect_kind_reader(&mut f, offset)
+}
+
+fn detect_kind_reader<R: Read + Seek>(reader: &mut R, offset: u64) -> Result<Kind> {
+    reader.seek(SeekFrom::Start(offset))?;
     let mut magic = [0u8; 4];
-    f.read_exact(&mut magic)?;
+    reader.read_exact(&mut magic)?;
     if &magic == MAGIC_BE {
         Ok(Kind::new_v4_with_const(
             &WORKSPACE_COMPRESSOR,
@@ -562,9 +692,19 @@ fn detect_kind(path: &Path, offset: u64) -> Result<Kind> {
 /// Detect SquashFS; returns superblock offset if found (0..1 MiB scan for AppImage).
 pub fn find_squashfs_offset(path: &Path) -> Result<Option<u64>> {
     let mut f = File::open(path)?;
+    find_squashfs_offset_reader(&mut f)
+}
+
+/// Same as [`find_squashfs_offset`] for an already-open seekable reader (nested probe).
+pub fn find_squashfs_offset_reader<R: Read + Seek>(reader: &mut R) -> Result<Option<u64>> {
     let mut buf = [0u8; 4];
     // Check offset 0 first.
-    f.read_exact(&mut buf)?;
+    reader.seek(SeekFrom::Start(0))?;
+    match reader.read_exact(&mut buf) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e.into()),
+    }
     if &buf == MAGIC_LE || &buf == MAGIC_BE {
         return Ok(Some(0));
     }
@@ -573,8 +713,8 @@ pub fn find_squashfs_offset(path: &Path) -> Result<Option<u64>> {
     const STRIDE: u64 = 4096;
     let mut off = STRIDE;
     while off < MAX {
-        f.seek(SeekFrom::Start(off))?;
-        if f.read(&mut buf)? < 4 {
+        reader.seek(SeekFrom::Start(off))?;
+        if reader.read(&mut buf)? < 4 {
             break;
         }
         if &buf == MAGIC_LE || &buf == MAGIC_BE {
@@ -587,6 +727,16 @@ pub fn find_squashfs_offset(path: &Path) -> Result<Option<u64>> {
 
 pub fn looks_like_squashfs(path: &Path) -> bool {
     find_squashfs_offset(path).ok().flatten().is_some()
+}
+
+/// Probe a seekable stream for SquashFS magic (offset 0 or AppImage-style scan).
+///
+/// Restores the reader position to start on return when the seek succeeds.
+pub fn looks_like_squashfs_reader<R: Read + Seek>(reader: &mut R) -> bool {
+    let start = reader.stream_position().unwrap_or(0);
+    let found = find_squashfs_offset_reader(reader).ok().flatten().is_some();
+    let _ = reader.seek(SeekFrom::Start(start));
+    found
 }
 
 fn which_on_path(bin: &str) -> Option<PathBuf> {
@@ -868,5 +1018,149 @@ mod tests {
         std::fs::write(&p, b"not a squashfs").unwrap();
         assert!(!looks_like_squashfs(&p));
         assert!(SquashFsMountSource::open(&p).is_err());
+    }
+
+    /// Nested no-tmp: fixture bytes via `Cursor` → `open_from_reader` (no host path).
+    #[test]
+    fn open_from_reader_cursor_list_and_read() {
+        let path = py_fixture("folder-symlink.gzip.squashfs");
+        let bytes = if path.exists() {
+            std::fs::read(&path).expect("read fixture")
+        } else {
+            let Some((_dir, img)) = mksquashfs_ufo_image("gzip") else {
+                eprintln!("skip: no fixture and no mksquashfs for open_from_reader");
+                return;
+            };
+            std::fs::read(&img).expect("read mksquashfs image")
+        };
+
+        assert!(looks_like_squashfs_reader(&mut Cursor::new(&bytes)));
+
+        let m = SquashFsMountSource::open_from_reader(Cursor::new(bytes), "nested.squashfs")
+            .expect("open_from_reader");
+        assert!(
+            m.is_inprocess(),
+            "open_from_reader success path must be in-process (no unsquashfs /tmp)"
+        );
+        assert_ufo_content(&m);
+    }
+
+    /// Reader path matches path open for list/content (when both available).
+    #[test]
+    fn open_from_reader_matches_path_open() {
+        let path = py_fixture("folder-symlink.no-compression.squashfs");
+        let (bytes, path_src) = if path.exists() {
+            let bytes = std::fs::read(&path).expect("read fixture");
+            let path_src = SquashFsMountSource::open(&path).expect("path open");
+            (bytes, path_src)
+        } else {
+            let Some((_dir, img)) = mksquashfs_ufo_image("gzip") else {
+                eprintln!("skip: no fixture and no mksquashfs for match test");
+                return;
+            };
+            let bytes = std::fs::read(&img).expect("read image");
+            let path_src = SquashFsMountSource::open(&img).expect("path open");
+            (bytes, path_src)
+        };
+
+        let reader_src = SquashFsMountSource::open_from_reader(Cursor::new(bytes), "match.sqfs")
+            .expect("open_from_reader");
+        assert!(path_src.is_inprocess());
+        assert!(reader_src.is_inprocess());
+        assert_ufo_content(&path_src);
+        assert_ufo_content(&reader_src);
+
+        let path_root = path_src.list("/").expect("path root");
+        let reader_root = reader_src.list("/").expect("reader root");
+        match (path_root, reader_root) {
+            (ListResult::Infos(a), ListResult::Infos(b)) => {
+                assert_eq!(a.keys().collect::<Vec<_>>(), b.keys().collect::<Vec<_>>());
+            }
+            _ => panic!("expected Infos lists"),
+        }
+    }
+
+    #[test]
+    fn open_from_reader_rejects_bad_magic() {
+        match SquashFsMountSource::open_from_reader(
+            Cursor::new(b"not-a-squashfs-image!!!!"),
+            "bad.squashfs",
+        ) {
+            Ok(_) => panic!("expected bad magic to fail"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(msg.contains("not a SquashFS"), "unexpected error: {msg}");
+            }
+        }
+    }
+
+    /// AppImage-style embedded offset via reader (no host path).
+    #[test]
+    fn open_from_reader_offset_scan() {
+        let raw_bytes = if which_mksquashfs().is_some() {
+            let Some((_dir, img)) = mksquashfs_ufo_image("gzip") else {
+                eprintln!("skip: mksquashfs failed for offset reader test");
+                return;
+            };
+            std::fs::read(&img).expect("read raw")
+        } else {
+            let path = py_fixture("folder-symlink.gzip.squashfs");
+            if !path.exists() {
+                eprintln!("skip: no mksquashfs and no fixture for offset reader");
+                return;
+            }
+            std::fs::read(&path).expect("read fixture")
+        };
+
+        let mut combined = vec![0u8; 8192];
+        combined.extend_from_slice(&raw_bytes);
+        assert_eq!(
+            find_squashfs_offset_reader(&mut Cursor::new(&combined)).unwrap(),
+            Some(8192)
+        );
+        let m = SquashFsMountSource::open_from_reader(Cursor::new(combined), "embedded.sqfs")
+            .expect("open_from_reader with offset");
+        assert!(m.is_inprocess());
+        assert_ufo_content(&m);
+    }
+
+    /// Classic LZMA: open_from_reader must error (not materialize to /tmp).
+    #[test]
+    fn open_from_reader_lzma_errors_without_tmp() {
+        let path = py_fixture("folder-symlink.lzma.squashfs");
+        if !path.exists() {
+            eprintln!("skip: no classic lzma fixture");
+            return;
+        }
+        let bytes = std::fs::read(&path).expect("read lzma fixture");
+        match SquashFsMountSource::open_from_reader(Cursor::new(bytes), "nested.lzma.sqfs") {
+            Ok(_) => panic!("classic lzma must not open_from_reader successfully"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.to_ascii_lowercase().contains("lzma")
+                        || msg.contains("temp spool")
+                        || msg.contains("host path"),
+                    "expected clear lzma/spool residual: {msg}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn open_from_bytes_gzip() {
+        let path = py_fixture("folder-symlink.gzip.squashfs");
+        let bytes = if path.exists() {
+            std::fs::read(&path).expect("read")
+        } else {
+            let Some((_dir, img)) = mksquashfs_ufo_image("gzip") else {
+                eprintln!("skip: no fixture/mksquashfs for open_from_bytes");
+                return;
+            };
+            std::fs::read(&img).expect("read")
+        };
+        let m = SquashFsMountSource::open_from_bytes(bytes, "bytes.squashfs").expect("from_bytes");
+        assert!(m.is_inprocess());
+        assert_ufo_content(&m);
     }
 }
