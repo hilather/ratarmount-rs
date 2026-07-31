@@ -62,6 +62,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Password file | yes | yes (`--password-file`) | `[x]` |
 | `--use-backend` | yes | accepted (priority list stored) | `~` |
 | FUSE extra options (`-o`) | yes | yes | `[x]` |
+| Sequential readahead (`--readahead`) | no (issue #180) | yes (`0` off; K/M/G; max 64 MiB) | `[x]` |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
 | Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |

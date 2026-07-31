@@ -42,6 +42,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
 | Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
+| Sequential FUSE readahead window (`--readahead`, #180) | `cargo test -p ratarmount-fuse --lib readahead` |
 | Plain compress no `/tmp` spool (gz/zstd/bz2) | `cargo test -p ratarmount plain_gzip` · `cargo test -p ratarmount plain_zstd` · nested: `nested_plain_gzip` |
 | Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |

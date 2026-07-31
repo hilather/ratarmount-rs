@@ -14,7 +14,7 @@ use ratarmount_compositing::{
 };
 use ratarmount_compress::strip_compression_suffix;
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
-use ratarmount_fuse::{mount_blocking, unmount};
+use ratarmount_fuse::{clamp_readahead, mount_blocking, parse_byte_size, unmount};
 use ratarmount_index::{
     default_index_folders, fill_content_hashes, parse_index_folders, resolve_index_location,
     SqliteIndex, MEMORY_INDEX,
@@ -131,6 +131,14 @@ struct Args {
         visible_alias = "gs"
     )]
     gzip_seek_point_spacing_mib: f64,
+
+    /// Per open-file sequential read window for archive members (`0` = off,
+    /// default). On a miss, fill at least BYTES from the request offset so later
+    /// sequential FUSE reads hit the window (stop-and-go scanners / compressed
+    /// remote images; upstream #180). Accepts `K`/`M`/`G` (1024-based), e.g.
+    /// `1M`, `256K`. Capped at 64 MiB per handle.
+    #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
+    readahead: String,
 
     /// Recursion depth for --recursive (0 = deep default when combined with -r)
     #[arg(long = "recursion-depth", default_value_t = 0)]
@@ -560,6 +568,26 @@ fn main() {
     std::fs::create_dir_all(&mp).ok();
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
+    let readahead = match parse_byte_size(&args.readahead) {
+        Ok(n) => {
+            let clamped = clamp_readahead(n);
+            if clamped < n {
+                eprintln!(
+                    "warning: --readahead {n} exceeds max {}; using {}",
+                    ratarmount_fuse::MAX_READAHEAD_BYTES,
+                    clamped
+                );
+            }
+            if clamped > 0 {
+                log::info!("FUSE readahead enabled: {clamped} bytes per sequential window");
+            }
+            clamped
+        }
+        Err(e) => {
+            eprintln!("error: invalid --readahead: {e}");
+            std::process::exit(2);
+        }
+    };
 
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
@@ -588,6 +616,7 @@ fn main() {
             writable,
             overlay_arc,
             &fuse_opts,
+            readahead,
         ) {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
@@ -624,6 +653,7 @@ fn main() {
                 writable,
                 overlay_arc,
                 &fuse_opts,
+                readahead,
             ) {
                 // Best-effort: write to /tmp if possible
                 let _ = std::fs::write(

@@ -96,6 +96,7 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 | Index only / no mount | yes | **yes** | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) `--no-mount` |
 | Recursion depth control | yes | **yes** | [#151](https://github.com/mxmlnkn/ratarmount/issues/151) `--recursion-depth` (plain compress layer) |
 | Daemonize / foreground (`-f`) | yes | **yes** | |
+| Sequential readahead | no | **yes** | [`#180`](https://github.com/mxmlnkn/ratarmount/issues/180) — `--readahead BYTES` (`0` off; `1M` typical; max 64 MiB per open) |
 | Password / password-file | yes | **yes** | |
 | Content hashes / FUSE xattrs | yes | **yes** | TAR/ZIP/7z hashes; TAR PAX **LIBARCHIVE./SCHILY.xattr** → FUSE ([#145](https://github.com/mxmlnkn/ratarmount/issues/145)) |
 
@@ -124,7 +125,7 @@ Still missing or partial relative to upstream Python (and open upstream issues w
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` MVP done (full rebuild; residual encrypted/multi-part); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
 5. **Remote** — HTTP **Basic auth done** ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); cookie auth residual; full `ssh_config`.
-6. **Perf options** — readahead ([#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing ([#80](https://github.com/mxmlnkn/ratarmount/issues/80)) (ZIP deflate multi-open: done).
+6. **Perf options** — readahead **done** (`--readahead BYTES`, [#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing ([#80](https://github.com/mxmlnkn/ratarmount/issues/80)) still open (ZIP deflate multi-open: done).
 7. **Platforms** — macOS **beta** ([docs/macos.md](docs/macos.md)); harness allowlist expansion toward Python fixed-archive set.
 
 ---

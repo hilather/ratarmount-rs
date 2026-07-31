@@ -27,6 +27,7 @@ issue from the README feature tables.
 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `commit_overlay`; residual encrypted/multi-part |
 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic auth (URL userinfo + `RATARMOUNT_HTTP_*`); cookie auth deferred |
 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
+| [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB |
 
 ---
 
@@ -34,9 +35,7 @@ issue from the README feature tables.
 
 ### P0 — remaining
 
-| ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
-|----|----------|------|---------------------|---------------------|
-| FR-5 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | **Readahead-like option** | Performance for sequential scans | `ratarmount-fuse` + open buffering |
+*(none — FR-5 readahead shipped)*
 
 ### P1 — good notes, medium design
 
@@ -62,9 +61,8 @@ issue from the README feature tables.
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
 
-1. **FR-5** FUSE readahead knobs  
-2. **FR-6** Parallel nested indexing (when needed)  
+1. **FR-6** Parallel nested indexing (when needed)  
 
 Update this file when status changes. Keep README **Upstream** column in sync.

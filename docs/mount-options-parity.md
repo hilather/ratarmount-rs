@@ -51,6 +51,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--hashes` | yes | **added** (crc32/md5/sha1/sha256 → index xattrs; path-backed post-build) | `~` |
 | `--index-minimum-file-count` | yes | yes | `[x]` |
 | `-gs` / `--gzip-seek-point-spacing` | yes | yes | `[x]` |
+| `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle) |
 | `-d` / `--debug` | yes | yes | `[x]` |
 | `--log-file` | yes | yes | `[x]` |
 | `--color` / `--no-color` | yes | **added** (logging style) | `~` |

@@ -62,6 +62,147 @@ fn fill_read_for_fuse(r: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Res
     Ok(filled)
 }
 
+/// Hard cap for `--readahead` (64 MiB) so a typo cannot pin multi‑GiB RAM per open.
+pub const MAX_READAHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Parse a human byte size for CLI / config: bare integer or `K`/`M`/`G` (1024-based).
+///
+/// Accepts `KiB`/`MiB`/`GiB` and mixed case. Examples: `0`, `4096`, `256K`, `1M`, `2MiB`.
+pub fn parse_byte_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return Err("empty size".into());
+    }
+    let lower = s.to_ascii_lowercase();
+    let (num_str, mult) = if let Some(rest) = lower.strip_suffix("kib") {
+        (rest.trim(), 1024u64)
+    } else if let Some(rest) = lower.strip_suffix("mib") {
+        (rest.trim(), 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix("gib") {
+        (rest.trim(), 1024 * 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix('k') {
+        (rest.trim(), 1024)
+    } else if let Some(rest) = lower.strip_suffix('m') {
+        (rest.trim(), 1024 * 1024)
+    } else if let Some(rest) = lower.strip_suffix('g') {
+        (rest.trim(), 1024 * 1024 * 1024)
+    } else {
+        (lower.as_str(), 1)
+    };
+    if num_str.is_empty() {
+        return Err(format!("invalid size: {s}"));
+    }
+    let num: u64 = num_str.parse().map_err(|_| format!("invalid size: {s}"))?;
+    num.checked_mul(mult)
+        .ok_or_else(|| format!("size overflow: {s}"))
+}
+
+/// Clamp readahead to [`MAX_READAHEAD_BYTES`].
+pub fn clamp_readahead(bytes: u64) -> u64 {
+    bytes.min(MAX_READAHEAD_BYTES)
+}
+
+/// Per-open window of decoded/source bytes retained for sequential FUSE reads.
+#[derive(Clone, Debug, Default)]
+struct ReadAheadWindow {
+    /// Absolute file offset of `data[0]`.
+    start: u64,
+    data: Vec<u8>,
+    /// Last fill was short ⇒ true EOF at `start + data.len()`.
+    hit_eof: bool,
+}
+
+impl ReadAheadWindow {
+    fn end_offset(&self) -> u64 {
+        self.start.saturating_add(self.data.len() as u64)
+    }
+
+    /// Return bytes for `[offset, offset+size)` when fully covered, or a short
+    /// EOF slice when the window ends at EOF. `None` means refill required.
+    fn try_serve(&self, offset: u64, size: usize) -> Option<Vec<u8>> {
+        if size == 0 {
+            return Some(Vec::new());
+        }
+        // Past true EOF: empty without another underlying seek/fill.
+        if self.hit_eof && offset >= self.end_offset() {
+            return Some(Vec::new());
+        }
+        if offset < self.start {
+            return None;
+        }
+        let i = match usize::try_from(offset - self.start) {
+            Ok(i) => i,
+            Err(_) => return None,
+        };
+        if i >= self.data.len() {
+            return None;
+        }
+        let end = i.saturating_add(size).min(self.data.len());
+        let slice = &self.data[i..end];
+        if slice.len() == size {
+            return Some(slice.to_vec());
+        }
+        // Partial cover: valid only when the window ends at true EOF.
+        if self.hit_eof && end == self.data.len() {
+            return Some(slice.to_vec());
+        }
+        None
+    }
+}
+
+/// Serve a FUSE read, optionally retaining a sequential readahead window.
+///
+/// * `readahead_bytes == 0` — exact-size read (legacy); `window` is cleared.
+/// * `readahead_bytes > 0` — on miss, fill `max(size, readahead_bytes)` from
+///   `offset` so subsequent sequential kernel reads hit the window without
+///   another seek/decompress (upstream #180 / FR-5).
+fn readahead_fill(
+    reader: &mut dyn ratarmount_core::ArchiveRead,
+    window: &mut Option<ReadAheadWindow>,
+    readahead_bytes: usize,
+    offset: u64,
+    size: usize,
+) -> std::io::Result<Vec<u8>> {
+    if readahead_bytes == 0 {
+        *window = None;
+        reader.seek(std::io::SeekFrom::Start(offset))?;
+        let mut buf = vec![0u8; size];
+        let n = fill_read_for_fuse(reader, &mut buf)?;
+        buf.truncate(n);
+        return Ok(buf);
+    }
+
+    if let Some(w) = window.as_ref() {
+        if let Some(out) = w.try_serve(offset, size) {
+            return Ok(out);
+        }
+    }
+
+    let want = size.max(readahead_bytes);
+    reader.seek(std::io::SeekFrom::Start(offset))?;
+    let mut data = vec![0u8; want];
+    let n = fill_read_for_fuse(reader, &mut data)?;
+    data.truncate(n);
+    let hit_eof = n < want;
+    let out_len = n.min(size);
+    let out = data[..out_len].to_vec();
+    *window = Some(ReadAheadWindow {
+        start: offset,
+        data,
+        hit_eof,
+    });
+    Ok(out)
+}
+
+/// Per-open archive reader + optional sequential readahead window.
+///
+/// Held under its own `Mutex` (behind `Arc`) so FUSE `read` can release the
+/// process-wide handle map while decompressing a large readahead fill.
+struct SourceReadState {
+    reader: Box<dyn ratarmount_core::ArchiveRead>,
+    readahead_window: Option<ReadAheadWindow>,
+}
+
 enum OpenBackend {
     /// Keep the archive member reader open for the lifetime of the fh (critical for cat).
     Source {
@@ -69,7 +210,7 @@ enum OpenBackend {
         path: String,
         #[allow(dead_code)]
         file_info: FileInfo,
-        reader: Mutex<Box<dyn ratarmount_core::ArchiveRead>>,
+        state: Arc<Mutex<SourceReadState>>,
     },
     /// Empty file — no underlying open.
     Empty,
@@ -91,6 +232,8 @@ struct DirCacheEntry {
 pub struct RatarmountFs {
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
+    /// Per-handle sequential readahead size in bytes (`0` = disabled).
+    readahead_bytes: usize,
     inodes: Mutex<HashMap<u64, InodeEntry>>,
     path_to_ino: Mutex<HashMap<String, u64>>,
     next_ino: AtomicU64,
@@ -101,6 +244,17 @@ pub struct RatarmountFs {
 
 impl RatarmountFs {
     pub fn new(source: Arc<dyn MountSource>, overlay: Option<Arc<WriteOverlay>>) -> Self {
+        Self::with_readahead(source, overlay, 0)
+    }
+
+    /// Like [`Self::new`], with application-level sequential readahead (bytes; `0` off).
+    ///
+    /// Values above [`MAX_READAHEAD_BYTES`] are clamped.
+    pub fn with_readahead(
+        source: Arc<dyn MountSource>,
+        overlay: Option<Arc<WriteOverlay>>,
+        readahead: u64,
+    ) -> Self {
         let mut inodes = HashMap::new();
         let mut path_to_ino = HashMap::new();
         inodes.insert(
@@ -111,9 +265,11 @@ impl RatarmountFs {
             },
         );
         path_to_ino.insert("/".into(), FUSE_ROOT_ID);
+        let readahead_bytes = usize::try_from(clamp_readahead(readahead)).unwrap_or(usize::MAX);
         Self {
             source,
             overlay,
+            readahead_bytes,
             inodes: Mutex::new(inodes),
             path_to_ino: Mutex::new(path_to_ino),
             next_ino: AtomicU64::new(FUSE_ROOT_ID + 1),
@@ -542,7 +698,10 @@ impl Filesystem for RatarmountFs {
                     OpenBackend::Source {
                         path,
                         file_info: fi,
-                        reader: Mutex::new(reader),
+                        state: Arc::new(Mutex::new(SourceReadState {
+                            reader,
+                            readahead_window: None,
+                        })),
                     },
                 );
                 // Allow kernel page cache of archive member data.
@@ -566,24 +725,39 @@ impl Filesystem for RatarmountFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let mut handles = self.handles.lock().unwrap();
-        let Some(backend) = handles.get_mut(&fh) else {
-            reply.error(ENOENT);
-            return;
+        // Resolve backend under the map lock, then drop it before I/O so a large
+        // readahead fill does not stall every other FUSE op on this process.
+        enum ReadTarget {
+            Empty,
+            OverlayFd(i32),
+            Source {
+                path: String,
+                state: Arc<Mutex<SourceReadState>>,
+            },
+        }
+        let target = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh) {
+                None => {
+                    reply.error(ENOENT);
+                    return;
+                }
+                Some(OpenBackend::Empty) => ReadTarget::Empty,
+                Some(OpenBackend::OverlayFd(fd)) => ReadTarget::OverlayFd(*fd),
+                Some(OpenBackend::Source { path, state, .. }) => ReadTarget::Source {
+                    path: path.clone(),
+                    state: Arc::clone(state),
+                },
+            }
         };
-        match backend {
-            OpenBackend::Empty => {
+        match target {
+            ReadTarget::Empty => {
                 reply.data(&[]);
             }
-            OpenBackend::OverlayFd(fd) => {
+            ReadTarget::OverlayFd(fd) => {
                 let mut buf = vec![0u8; size as usize];
                 let n = unsafe {
-                    libc::pread(
-                        *fd,
-                        buf.as_mut_ptr() as *mut _,
-                        size as usize,
-                        offset.max(0),
-                    )
+                    libc::pread(fd, buf.as_mut_ptr() as *mut _, size as usize, offset.max(0))
                 };
                 if n < 0 {
                     reply.error(EIO);
@@ -592,22 +766,21 @@ impl Filesystem for RatarmountFs {
                     reply.data(&buf);
                 }
             }
-            OpenBackend::Source { path, reader, .. } => {
-                let r = reader.get_mut().unwrap();
-                if let Err(e) = r.seek(std::io::SeekFrom::Start(offset.max(0) as u64)) {
-                    debug!(
-                        "seek error path={path} offset={offset} kind={:?}: {e}",
-                        e.kind()
-                    );
-                    reply.error(io_to_errno(&e));
-                    return;
-                }
-                let mut buf = vec![0u8; size as usize];
-                match fill_read_for_fuse(r, &mut buf) {
-                    Ok(n) => {
-                        buf.truncate(n);
-                        reply.data(&buf);
-                    }
+            ReadTarget::Source { path, state } => {
+                let mut g = state.lock().unwrap();
+                let SourceReadState {
+                    reader,
+                    readahead_window,
+                } = &mut *g;
+                let off = offset.max(0) as u64;
+                match readahead_fill(
+                    reader.as_mut(),
+                    readahead_window,
+                    self.readahead_bytes,
+                    off,
+                    size as usize,
+                ) {
+                    Ok(buf) => reply.data(&buf),
                     Err(e) => {
                         debug!(
                             "read error path={path} offset={offset} size={size} kind={:?}: {e}",
@@ -930,6 +1103,8 @@ fn mount_option_from_str(s: &str) -> MountOption {
 /// Mount `source` at `mountpoint` (blocking).
 ///
 /// `extra_fuse_opts` is the `-o` / `--fuse` string (comma-separated).
+/// `readahead` is application-level sequential prefetch in bytes (`0` = off);
+/// see [`RatarmountFs::with_readahead`] and CLI `--readahead` (upstream #180).
 pub fn mount_blocking(
     source: Arc<dyn MountSource>,
     mountpoint: impl AsRef<Path>,
@@ -937,6 +1112,7 @@ pub fn mount_blocking(
     writable: bool,
     overlay: Option<Arc<WriteOverlay>>,
     extra_fuse_opts: &str,
+    readahead: u64,
 ) -> std::io::Result<()> {
     let mut options = vec![MountOption::FSName("ratarmount".into())];
     if !writable {
@@ -956,7 +1132,7 @@ pub fn mount_blocking(
         options.push(opt);
     }
     let _ = foreground;
-    let fs = RatarmountFs::new(source, overlay);
+    let fs = RatarmountFs::with_readahead(source, overlay, readahead);
     fuser::mount2(fs, mountpoint, &options)?;
     Ok(())
 }
@@ -1037,7 +1213,7 @@ mod tests {
     use super::*;
     use ratarmount_core::{ListModeResult, ListResult, MountSource, S_IFREG};
     use std::collections::BTreeMap;
-    use std::io;
+    use std::io::{self, Seek};
 
     /// Minimal MountSource that only serves synthetic xattrs for unit tests.
     struct XattrSource {
@@ -1407,5 +1583,185 @@ mod tests {
             Some(digest.as_slice())
         );
         assert!(fs.source.get_xattr(&fi, "user.hash.md5").is_none());
+    }
+
+    #[test]
+    fn parse_byte_size_plain_and_suffixes() {
+        assert_eq!(parse_byte_size("0").unwrap(), 0);
+        assert_eq!(parse_byte_size("4096").unwrap(), 4096);
+        assert_eq!(parse_byte_size("256K").unwrap(), 256 * 1024);
+        assert_eq!(parse_byte_size("1m").unwrap(), 1024 * 1024);
+        assert_eq!(parse_byte_size("2MiB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_byte_size("1G").unwrap(), 1024 * 1024 * 1024);
+        assert!(parse_byte_size("").is_err());
+        assert!(parse_byte_size("xyz").is_err());
+    }
+
+    #[test]
+    fn clamp_readahead_caps_at_max() {
+        assert_eq!(clamp_readahead(0), 0);
+        assert_eq!(clamp_readahead(1024), 1024);
+        assert_eq!(
+            clamp_readahead(MAX_READAHEAD_BYTES + 1),
+            MAX_READAHEAD_BYTES
+        );
+    }
+
+    /// Seekable in-memory member used to unit-test `readahead_fill`.
+    struct SpyReader {
+        data: Vec<u8>,
+        pos: u64,
+        seeks: u32,
+        /// Sum of successful `read` byte counts (proxy for underlying fills).
+        bytes_read: usize,
+    }
+
+    impl SpyReader {
+        fn new(data: Vec<u8>) -> Self {
+            Self {
+                data,
+                pos: 0,
+                seeks: 0,
+                bytes_read: 0,
+            }
+        }
+    }
+
+    impl std::io::Read for SpyReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let pos = self.pos as usize;
+            if pos >= self.data.len() || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = (self.data.len() - pos).min(buf.len());
+            buf[..n].copy_from_slice(&self.data[pos..pos + n]);
+            self.pos += n as u64;
+            self.bytes_read += n;
+            Ok(n)
+        }
+    }
+
+    impl Seek for SpyReader {
+        fn seek(&mut self, pos: io::SeekFrom) -> io::Result<u64> {
+            self.seeks += 1;
+            let new = match pos {
+                io::SeekFrom::Start(o) => o as i64,
+                io::SeekFrom::End(o) => self.data.len() as i64 + o,
+                io::SeekFrom::Current(o) => self.pos as i64 + o,
+            };
+            if new < 0 {
+                return Err(io::Error::new(ErrorKind::InvalidInput, "seek before 0"));
+            }
+            self.pos = new as u64;
+            Ok(self.pos)
+        }
+    }
+
+    /// Regression: sequential small FUSE reads with readahead should pull a large
+    /// window once, then serve later reads from the window (no extra seeks/reads).
+    #[test]
+    fn readahead_sequential_small_reads_hit_window() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut window = None;
+        let readahead = 4096usize;
+        let chunk = 512usize;
+
+        for i in 0..8 {
+            let off = (i * chunk) as u64;
+            let got = readahead_fill(&mut spy, &mut window, readahead, off, chunk).expect("read");
+            assert_eq!(got, payload[off as usize..off as usize + chunk]);
+        }
+        // One seek + one fill of 4096 for the first miss; next 7 chunks hit window.
+        assert_eq!(spy.seeks, 1, "sequential hits must not re-seek the member");
+        assert_eq!(
+            spy.bytes_read, readahead,
+            "one readahead-sized underlying fill expected"
+        );
+        assert_eq!(
+            spy.pos, readahead as u64,
+            "cursor should rest at end of first window after fill"
+        );
+        // Mid-window re-read (not only forward) still hits.
+        let seeks_before = spy.seeks;
+        let got = readahead_fill(&mut spy, &mut window, readahead, 0, chunk).expect("rewind hit");
+        assert_eq!(got, payload[..chunk]);
+        assert_eq!(spy.seeks, seeks_before, "in-window re-read must not seek");
+
+        // Random seek outside window must refill.
+        let off = 8000u64;
+        let got = readahead_fill(&mut spy, &mut window, readahead, off, chunk).expect("seek read");
+        assert_eq!(got, payload[off as usize..off as usize + chunk]);
+        assert!(spy.seeks >= 2, "miss outside window must seek again");
+    }
+
+    #[test]
+    fn readahead_disabled_reads_exact_size_only() {
+        let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut window = None;
+        let got = readahead_fill(&mut spy, &mut window, 0, 100, 64).expect("read");
+        assert_eq!(got, payload[100..164]);
+        assert!(window.is_none(), "readahead 0 must not retain a window");
+        assert_eq!(spy.pos, 164);
+        assert_eq!(spy.bytes_read, 64);
+    }
+
+    #[test]
+    fn readahead_eof_short_read() {
+        let payload = b"short-file-payload".to_vec();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut window = None;
+        let got = readahead_fill(&mut spy, &mut window, 1024, 0, 64).expect("read");
+        assert_eq!(got, payload);
+        let seeks_after_first = spy.seeks;
+        // Second read past EOF is empty without another underlying seek.
+        let got2 =
+            readahead_fill(&mut spy, &mut window, 1024, payload.len() as u64, 16).expect("eof");
+        assert!(got2.is_empty());
+        assert_eq!(
+            spy.seeks, seeks_after_first,
+            "post-EOF must serve empty from hit_eof window"
+        );
+    }
+
+    /// Partial serve near true EOF when request size exceeds remaining bytes.
+    #[test]
+    fn readahead_partial_eof_from_window() {
+        let payload: Vec<u8> = (0..100u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut window = None;
+        let _ = readahead_fill(&mut spy, &mut window, 256, 0, 10).expect("prime");
+        let seeks = spy.seeks;
+        let got = readahead_fill(&mut spy, &mut window, 256, 80, 50).expect("partial");
+        assert_eq!(got, payload[80..]);
+        assert_eq!(spy.seeks, seeks, "partial EOF must hit window");
+    }
+
+    /// Request that straddles the end of a non-EOF window must refill (not short-read).
+    #[test]
+    fn readahead_straddle_non_eof_window_refills() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut window = None;
+        let _ = readahead_fill(&mut spy, &mut window, 1000, 0, 100).expect("prime");
+        assert!(!window.as_ref().unwrap().hit_eof);
+        let seeks = spy.seeks;
+        let got = readahead_fill(&mut spy, &mut window, 1000, 900, 200).expect("straddle");
+        assert_eq!(got, payload[900..1100]);
+        assert!(
+            spy.seeks > seeks,
+            "straddle of non-EOF window must refill, not return false short read"
+        );
+    }
+
+    #[test]
+    fn with_readahead_clamps_and_stores() {
+        let src = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let fs = RatarmountFs::with_readahead(src, None, MAX_READAHEAD_BYTES * 2);
+        assert_eq!(
+            fs.readahead_bytes, MAX_READAHEAD_BYTES as usize,
+            "constructor must clamp oversized readahead"
+        );
     }
 }
