@@ -123,7 +123,10 @@ impl UnionMountSource {
                         );
                         return;
                     }
-                    let Some(listing) = self.sources[si].list(folder) else {
+                    // List via the same one-hop symlink follow as B-4 `list`, so
+                    // walk continues into symlink→dir branches (immutable archives).
+                    let Some(listing) = Self::list_from_source(self.sources[si].as_ref(), folder)
+                    else {
                         continue;
                     };
                     let names: Vec<String> = match listing {
@@ -143,10 +146,11 @@ impl UnionMountSource {
                             return;
                         }
                         let full = join(folder, &name);
-                        let Some(fi) = self.sources[si].lookup(&full, 0) else {
-                            continue;
-                        };
-                        if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFDIR {
+                        // Cache real directories *and* followable symlink→dir paths.
+                        // Previously only S_IFDIR was recorded, so immutable sources
+                        // with a symlink branch were dropped from sources_for_path
+                        // → lookup/open ENOENT after list still showed their children.
+                        if Self::list_from_source(self.sources[si].as_ref(), &full).is_none() {
                             continue;
                         }
                         entries_left = entries_left.saturating_sub(1);
@@ -634,6 +638,63 @@ mod tests {
         // Order B: real-dir first, symlink rightmost (historically lost file2 + showed symlink).
         let u_lnk_right = UnionMountSource::new(vec![s2, s1]);
         assert_b4_union_policy(&u_lnk_right, "branch2 then branch1");
+    }
+
+    /// Regression: union folder cache + immutable sources dropped symlink branches.
+    ///
+    /// Symptom: `list` of `/subdir0/subdir2` shows `file1` (via one-hop symlink
+    /// follow) but `lookup`/`open` return ENOENT because `build_folder_cache`
+    /// only recorded real `S_IFDIR` and `sources_for_path` filtered the
+    /// symlink-only immutable source out. Mutable FolderMountSource always
+    /// consults every source, so this only reproduces with `is_immutable()`.
+    #[test]
+    fn union_immutable_symlink_branch_lookup_not_enont() {
+        let d = tempfile::tempdir().unwrap();
+        let (branch1, branch2) = build_b4_branches(d.path());
+
+        let s1 =
+            Arc::new(ImmFolder(FolderMountSource::new(&branch1).unwrap())) as Arc<dyn MountSource>;
+        let s2 =
+            Arc::new(ImmFolder(FolderMountSource::new(&branch2).unwrap())) as Arc<dyn MountSource>;
+
+        let opts = UnionMountOptions {
+            max_cache_depth: 8,
+            max_cache_entries: 1000,
+            max_seconds_to_cache: 10.0,
+        };
+
+        for (sources, order_label) in [
+            (vec![s1.clone(), s2.clone()], "branch1 then branch2"),
+            (vec![s2.clone(), s1.clone()], "branch2 then branch1"),
+        ] {
+            let u = UnionMountSource::new_with_options(sources, opts.clone());
+            assert!(
+                u.folder_cache_len() >= 2,
+                "{order_label}: expected folder cache to be populated"
+            );
+            assert_b4_union_policy(&u, order_label);
+
+            // file1 lives only on the symlink branch; file2 only on the real-dir branch.
+            let fi1 = u
+                .lookup("/subdir0/subdir2/file1", 0)
+                .unwrap_or_else(|| panic!("{order_label}: file1 lookup must not ENOENT"));
+            let mut r = u.open(&fi1, 0).unwrap_or_else(|e| {
+                panic!("{order_label}: open file1: {e}");
+            });
+            let mut body = String::new();
+            r.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "file1", "{order_label}: file1 content");
+
+            let fi2 = u
+                .lookup("/subdir0/subdir2/file2", 0)
+                .unwrap_or_else(|| panic!("{order_label}: file2 lookup must not ENOENT"));
+            let mut r = u.open(&fi2, 0).unwrap_or_else(|e| {
+                panic!("{order_label}: open file2: {e}");
+            });
+            let mut body = String::new();
+            r.read_to_string(&mut body).unwrap();
+            assert_eq!(body, "file2", "{order_label}: file2 content");
+        }
     }
 
     #[test]

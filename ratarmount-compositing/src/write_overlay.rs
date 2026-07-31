@@ -69,6 +69,8 @@ impl WriteOverlay {
         } else {
             fs::create_dir_all(&root)?;
         }
+        // Canonical root so confinement checks use a stable absolute prefix.
+        let root = root.canonicalize().map_err(OverlayError::Io)?;
         let db_path = root.join(HIDDEN_DB);
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
@@ -90,6 +92,102 @@ impl WriteOverlay {
             return self.root.clone();
         }
         self.root.join(path.trim_start_matches('/'))
+    }
+
+    /// Ensure a host path under the overlay cannot escape the overlay root via
+    /// intermediate or final-component symlinks (`libc::open` follows by default).
+    ///
+    /// - Final component that is a symlink → PermissionDenied (O_NOFOLLOW policy).
+    /// - Resolved parent/path must stay under the canonical overlay root.
+    fn ensure_under_root(&self, host_path: &Path) -> io::Result<()> {
+        let root = &self.root;
+
+        match fs::symlink_metadata(host_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "overlay refuses to follow symlink at {}",
+                        host_path.display()
+                    ),
+                ));
+            }
+            Ok(_) => {
+                let canon = fs::canonicalize(host_path)?;
+                if !path_is_under(root, &canon) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "overlay path escapes overlay root: {} not under {}",
+                            canon.display(),
+                            root.display()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(_) => {
+                // Path missing: walk up to an existing ancestor and verify it.
+            }
+        }
+
+        let mut ancestor = host_path.to_path_buf();
+        while ancestor.pop() {
+            match fs::symlink_metadata(&ancestor) {
+                Ok(meta) if meta.file_type().is_symlink() => {
+                    // Intermediate symlink: resolve and require confinement.
+                    let canon = fs::canonicalize(&ancestor).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "overlay parent symlink not confinable ({}): {e}",
+                                ancestor.display()
+                            ),
+                        )
+                    })?;
+                    if !path_is_under(root, &canon) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "overlay parent symlink escapes overlay root: {} → {}",
+                                ancestor.display(),
+                                canon.display()
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Ok(_) => {
+                    let canon = fs::canonicalize(&ancestor)?;
+                    if !path_is_under(root, &canon) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            format!(
+                                "overlay path escapes overlay root: {} not under {}",
+                                canon.display(),
+                                root.display()
+                            ),
+                        ));
+                    }
+                    return Ok(());
+                }
+                Err(_) => continue,
+            }
+        }
+
+        // No existing ancestor found — joined path must still be under root by construction.
+        if path_is_under(root, host_path) {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "overlay path escapes overlay root: {} not under {}",
+                    host_path.display(),
+                    root.display()
+                ),
+            ))
+        }
     }
 
     fn split(path: &str) -> (String, String) {
@@ -174,6 +272,7 @@ impl WriteOverlay {
             return Ok(());
         }
         let real_parent = self.realpath(&parent);
+        self.ensure_under_root(&real_parent)?;
         if !real_parent.exists() && self.base.is_dir(&parent) {
             fs::create_dir_all(&real_parent)?;
         }
@@ -184,7 +283,10 @@ impl WriteOverlay {
     pub fn ensure_modifiable(&self, path: &str) -> Result<()> {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
-        if real.exists() {
+        self.ensure_under_root(&real)?;
+        // Use symlink_metadata so a planted escape symlink is not treated as "present".
+        if fs::symlink_metadata(&real).is_ok() {
+            // Existing entry must stay under root (final symlink already rejected).
             return Ok(());
         }
         let Some(fi) = self.base.lookup(path, 0) else {
@@ -196,7 +298,11 @@ impl WriteOverlay {
             return Ok(());
         }
         let mut src = self.base.open(&fi, 0)?;
-        let mut dst = File::create(&real)?;
+        let mut dst = FsOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&real)?;
         io::copy(&mut src, &mut dst)?;
         Ok(())
     }
@@ -210,7 +316,9 @@ impl WriteOverlay {
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
+        self.ensure_under_root(&real)?;
         if let Some(parent) = real.parent() {
+            self.ensure_under_root(parent)?;
             fs::create_dir_all(parent)?;
         }
         let f = FsOpenOptions::new()
@@ -219,6 +327,7 @@ impl WriteOverlay {
             .create(true)
             .truncate(true)
             .mode(mode & 0o7777)
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&real)?;
         let fd = {
             use std::os::unix::io::IntoRawFd;
@@ -231,19 +340,34 @@ impl WriteOverlay {
     pub fn open_overlay_fd(&self, path: &str, flags: i32) -> Result<i32> {
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
+        self.ensure_under_root(&real)?;
         // If still missing and write flags, create empty
-        if !real.exists() && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0 {
+        if fs::symlink_metadata(&real).is_err()
+            && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
+        {
             self.create_file(path, 0o644)?;
         }
-        if !real.exists() {
+        if fs::symlink_metadata(&real).is_err() {
             return Err(OverlayError::Io(io::Error::new(
                 io::ErrorKind::NotFound,
                 format!("no overlay file at {}", real.display()),
             )));
         }
+        // Never follow host symlinks out of the overlay folder.
+        let flags = flags | libc::O_NOFOLLOW;
         let fd = unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) };
         if fd < 0 {
             return Err(OverlayError::Io(io::Error::last_os_error()));
+        }
+        // Double-check the opened path still resolves under the overlay root.
+        if let Ok(canon) = fs::canonicalize(&real) {
+            if !path_is_under(&self.root, &canon) {
+                let _ = unsafe { libc::close(fd) };
+                return Err(OverlayError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "overlay open resolved outside overlay root",
+                )));
+            }
         }
         let (folder, name) = Self::split(path);
         let db = self.db.lock().expect("overlay db");
@@ -257,6 +381,7 @@ impl WriteOverlay {
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
+        self.ensure_under_root(&real)?;
         fs::create_dir_all(&real)?;
         let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
         self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
@@ -265,7 +390,16 @@ impl WriteOverlay {
 
     pub fn unlink(&self, path: &str) -> Result<()> {
         let real = self.realpath(path);
-        if real.exists() {
+        // unlink of a symlink removes the link itself (safe); refuse only when the
+        // joined path is not under the overlay root by construction.
+        if !path_is_under(&self.root, &real) {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "overlay unlink path escapes overlay root",
+            )));
+        }
+        // remove_file unlinks symlinks without following them.
+        if fs::symlink_metadata(&real).is_ok() {
             fs::remove_file(&real)?;
         }
         self.mark_deleted(path)?;
@@ -274,6 +408,7 @@ impl WriteOverlay {
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
         let real = self.realpath(path);
+        self.ensure_under_root(&real)?;
         if real.exists() {
             fs::remove_dir(&real)?;
         }
@@ -284,7 +419,11 @@ impl WriteOverlay {
     pub fn truncate(&self, path: &str, size: u64) -> Result<()> {
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
-        let f = FsOpenOptions::new().write(true).open(&real)?;
+        self.ensure_under_root(&real)?;
+        let f = FsOpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&real)?;
         f.set_len(size)?;
         Ok(())
     }
@@ -402,7 +541,12 @@ impl MountSource for WriteOverlay {
         if let Some(UserData::Other(s)) = file_info.userdata.last() {
             if let Some(path) = s.strip_prefix("overlay:") {
                 let real = self.realpath(path);
-                return Ok(Box::new(File::open(real)?));
+                self.ensure_under_root(&real)?;
+                let f = FsOpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_NOFOLLOW)
+                    .open(&real)?;
+                return Ok(Box::new(f));
             }
         }
         // If real overlay file exists for a path we cannot recover, fall back to base.
@@ -420,6 +564,11 @@ fn join(parent: &str, name: &str) -> String {
     } else {
         format!("{parent}/{name}")
     }
+}
+
+/// Component-wise path prefix check (safe vs string prefix `/tmp/ov` vs `/tmp/ov-evil`).
+fn path_is_under(root: &Path, candidate: &Path) -> bool {
+    candidate.starts_with(root)
 }
 
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
@@ -1515,5 +1664,79 @@ mod tests {
         fn is_immutable(&self) -> bool {
             true
         }
+    }
+
+    /// Regression: overlay open/create must not follow host symlinks outside root.
+    ///
+    /// Symptom: `realpath` is join+normpath only; `libc::open` / `File::create`
+    /// follow symlinks, so a pre-seeded symlink under the overlay folder can
+    /// redirect writes to arbitrary host paths.
+    #[test]
+    fn overlay_rejects_symlink_escape_outside_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        let outside_file = outside.join("secret.txt");
+        fs::write(&outside_file, b"secret-data").unwrap();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        // Plant a file symlink and a directory symlink pointing outside the overlay.
+        std::os::unix::fs::symlink(&outside_file, overlay.join("escape")).unwrap();
+        std::os::unix::fs::symlink(&outside, overlay.join("outdir")).unwrap();
+
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+
+        // create_file through file symlink must fail and not clobber outside content.
+        let err = ov.create_file("/escape", 0o644);
+        assert!(
+            err.is_err(),
+            "create_file through escape symlink must fail, got Ok"
+        );
+        assert_eq!(
+            fs::read(&outside_file).unwrap(),
+            b"secret-data",
+            "outside file must remain untouched after create_file"
+        );
+
+        // open_overlay_fd must not follow the escape symlink either.
+        let err = ov.open_overlay_fd("/escape", libc::O_RDWR | libc::O_CREAT);
+        assert!(
+            err.is_err(),
+            "open_overlay_fd through escape symlink must fail, got Ok"
+        );
+        assert_eq!(
+            fs::read(&outside_file).unwrap(),
+            b"secret-data",
+            "outside file must remain untouched after open_overlay_fd"
+        );
+
+        // create under a directory symlink must not write outside the overlay.
+        let err = ov.create_file("/outdir/pwned.txt", 0o644);
+        assert!(
+            err.is_err(),
+            "create_file under dir symlink must fail, got Ok"
+        );
+        assert!(
+            !outside.join("pwned.txt").exists(),
+            "must not create files outside overlay via dir symlink"
+        );
+
+        // mkdir via escape dir symlink must fail.
+        let err = ov.mkdir("/outdir/evil-dir", 0o755);
+        assert!(err.is_err(), "mkdir under dir symlink must fail, got Ok");
+        assert!(
+            !outside.join("evil-dir").exists(),
+            "must not mkdir outside overlay via dir symlink"
+        );
+
+        // Normal create inside overlay still works.
+        let fd = ov.create_file("/safe.txt", 0o644).expect("safe create");
+        assert!(fd >= 0);
+        unsafe {
+            libc::close(fd);
+        }
+        assert!(overlay.join("safe.txt").exists() || ov.root().join("safe.txt").exists());
     }
 }
