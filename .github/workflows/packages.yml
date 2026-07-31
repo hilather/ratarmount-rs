@@ -85,13 +85,13 @@ jobs:
       - name: Resolve package version
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            V="${GITHUB_REF_NAME#v}"
-          else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          fi
-          echo "VERSION=${V}" >> "$GITHUB_ENV"
-          echo "Package VERSION=${V}"
+          # Tag builds must match workspace Cargo.toml (avoids misnamed assets
+          # e.g. tag v0.1.11 vs Cargo 0.1.10). Unit tests:
+          #   ./packaging/test-version-resolve.sh
+          chmod +x packaging/test-version-resolve.sh
+          bash packaging/test-version-resolve.sh --resolve | tee -a "$GITHUB_ENV"
+          # shellcheck: VERSION landed in GITHUB_ENV for later steps
+          echo "Package VERSION resolved (see VERSION= above)"
 
       - name: Build .deb + tarball
         env:
@@ -173,13 +173,13 @@ jobs:
       - name: Resolve package version
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            V="${GITHUB_REF_NAME#v}"
-          else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          fi
-          echo "VERSION=${V}" >> "$GITHUB_ENV"
-          echo "Package VERSION=${V}"
+          # Tag builds must match workspace Cargo.toml (avoids misnamed assets
+          # e.g. tag v0.1.11 vs Cargo 0.1.10). Unit tests:
+          #   ./packaging/test-version-resolve.sh
+          chmod +x packaging/test-version-resolve.sh
+          bash packaging/test-version-resolve.sh --resolve | tee -a "$GITHUB_ENV"
+          # shellcheck: VERSION landed in GITHUB_ENV for later steps
+          echo "Package VERSION resolved (see VERSION= above)"
 
       - name: Build .rpm + tarball
         env:
@@ -257,13 +257,13 @@ jobs:
       - name: Resolve package version
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            V="${GITHUB_REF_NAME#v}"
-          else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          fi
-          echo "VERSION=${V}" >> "$GITHUB_ENV"
-          echo "Package VERSION=${V}"
+          # Tag builds must match workspace Cargo.toml (avoids misnamed assets
+          # e.g. tag v0.1.11 vs Cargo 0.1.10). Unit tests:
+          #   ./packaging/test-version-resolve.sh
+          chmod +x packaging/test-version-resolve.sh
+          bash packaging/test-version-resolve.sh --resolve | tee -a "$GITHUB_ENV"
+          # shellcheck: VERSION landed in GITHUB_ENV for later steps
+          echo "Package VERSION resolved (see VERSION= above)"
 
       - name: Build portable tarball only
         env:
@@ -356,13 +356,13 @@ jobs:
       - name: Resolve package version
         run: |
           set -euo pipefail
-          if [[ "${GITHUB_REF_TYPE:-}" == "tag" ]]; then
-            V="${GITHUB_REF_NAME#v}"
-          else
-            V="$(grep -m1 '^version' Cargo.toml | sed -E 's/.*"([^"]+)".*/\1/')"
-          fi
-          echo "VERSION=${V}" >> "$GITHUB_ENV"
-          echo "Package VERSION=${V}"
+          # Tag builds must match workspace Cargo.toml (avoids misnamed assets
+          # e.g. tag v0.1.11 vs Cargo 0.1.10). Unit tests:
+          #   ./packaging/test-version-resolve.sh
+          chmod +x packaging/test-version-resolve.sh
+          bash packaging/test-version-resolve.sh --resolve | tee -a "$GITHUB_ENV"
+          # shellcheck: VERSION landed in GITHUB_ENV for later steps
+          echo "Package VERSION resolved (see VERSION= above)"
 
       - name: Build macOS tarball
         env:
