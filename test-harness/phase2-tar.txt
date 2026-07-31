@@ -26,8 +26,15 @@ tests/updated-folder.tar	foo/fighter	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-file-with-folder.tar	foo/fighter	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-file-with-folder.tar	foo/fighter.versions/1	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-file-with-folder.tar	foo.versions/1	9a12be5ebb21d497bd1024d159f2cc5f
+tests/updated-file-with-folder.tar	foo.versions/2/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-file-with-folder.tar	foo.versions/2/fighter.versions/1	b3de7534cbc8b8a7270c996235d0c2da
 tests/updated-folder-with-file.tar	foo	9a12be5ebb21d497bd1024d159f2cc5f
 tests/updated-folder-with-file.tar	foo.versions/1/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-folder-with-file.tar	foo.versions/1/fighter.versions/2	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-folder-with-file.tar	foo.versions/1/fighter.versions/1	2709a3348eb2c52302a7606ecf5860bc
+tests/updated-folder-with-file.tar	foo.versions/2/fighter	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-folder-with-file.tar	foo.versions/2/fighter.versions/2	b3de7534cbc8b8a7270c996235d0c2da
+tests/updated-folder-with-file.tar	foo.versions/2/fighter.versions/1	2709a3348eb2c52302a7606ecf5860bc
 tests/updated-folder-with-file.tar	foo.versions/3	9a12be5ebb21d497bd1024d159f2cc5f
 # Latest-version paths only (full .versions/* tree partial for this fixture)
 tests/updated-file-implicitly-with-folder.tar	foo/fighter	2709a3348eb2c52302a7606ecf5860bc
@@ -71,5 +78,7 @@ tests/single-file-incremental-long-name-mockup.tar	14130613451/00000000010000000
 tests/single-file-incremental-long-name.tar	000000000100000000020000000003000000000400000000050000000006000000000700000000080000000009000000000A000000000B000000000C	c157a79031e1c40f85931829bc5fc552
 # Residual skips (do not enable without fix):
 # - two-self-links-to-existing-file.tar bar — hardlink content empty (md5 d41d8…) vs Python d3b0…
-# - special-char.tar — non-UTF8 member name awkward for allowlist encoding
-# - updated-file-implicitly full .versions/* tree — partial (latest paths only above)
+# - special-char.tar / nested-special-char.tar — non-UTF8 member names awkward for allowlist encoding
+# - updated-file-implicitly-with-folder full .versions/* — partial (latest paths only above;
+#   foo.versions/2/fighter and bar/par/sora/natsu missing vs Python)
+# - hardlink.tar hardlink/ufo — empty content (d41d8…) vs Python 2709… (allowlist keeps observed empty)

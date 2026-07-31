@@ -1,6 +1,7 @@
 # Phase 7 recursive automount (-r)
 # archive <TAB> path <TAB> md5
 # Default: mount nested at foo/lighter.tar/
+# Double-compressed outer paths use Rust mount names (e.g. nested-tar.tar.gz not .tgz).
 tests/nested-tar.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.tar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/directly-nested-tar.tar	fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
@@ -8,18 +9,39 @@ tests/directly-nested-tar.tar	lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb
 tests/nested-tar-with-overlapping-name.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar-with-overlapping-name.tar	foo/fighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/nested-with-symlink.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-with-symlink.zip	foo/fighter/saucer	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-with-symlink.zip	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-without-execution-flag.zip	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-without-execution-flag.zip	foo/fighter/saucer	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-without-execution-flag.zip	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/nested-with-symlink.7z	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-with-symlink.7z	foo/fighter/saucer	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-with-symlink.7z	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/zip.7z	natsu.zip/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/zip.7z	natsu.zip/foo	10d6977ec2ab378e60339323c24f9308
+tests/rar.zip	natsu.rar/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/rar.zip	natsu.rar/foo	10d6977ec2ab378e60339323c24f9308
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.bz2/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.gz/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.xz/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-tar.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.sqlar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-tar-compressed.sqlar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-tar.asar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.asar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+# Double-compressed nest (outer strip names as .tar.gz / .tar.bz2 / .tar.7z)
+tests/double-compressed-nested-tar.tgz.tgz	nested-tar.tar.gz/foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/double-compressed-nested-tar.tgz.tgz	nested-tar.tar.gz/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/double-compressed-nested-tar.tbz2.tbz2	nested-tar.tar.bz2/foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/double-compressed-nested-tar.tbz2.tbz2	nested-tar.tar.bz2/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/double-compressed-nested-tar.tar.7z.7z	nested-tar.tar.7z/nested-tar.tar/foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/double-compressed-nested-tar.tar.7z.7z	nested-tar.tar.7z/nested-tar.tar/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+# CPIO with nested TAR member (fixture layout: nested/inner.tar, not nested-tar.tar)
+tests/nested-tar-in-cpio.newc.cpio	nested/inner.tar/inner.txt	6adea3ceca4d0da696e60581ba39c778
+tests/nested-tar-in-cpio.newc.cpio	readme.txt	614c22982b489667d878611e15276c51
 # Residual skips:
 # - nested-tar.tar.pzstd — WrongMagicNumber (pzstd frame)
-# - nested-tar-trailing-slash.sqlar / nested-tar-denormal.sqlar nested lighter path missing
-# - double-compressed-nested-tar.tar.7z.7z — deep 7z nest (optional later)
-# - rar.zip natsu.rar/* — RAR nested open not claimed
+# - nested-tar-trailing-slash.sqlar / nested-tar-denormal.sqlar — nested lighter.tar path missing
+# - 2k-recursive-tars.tar.bz2 — heavy (~800 nested opens); only low-numbered .tar/foo present;
+#   Python high indices (01234/01333/02000) missing under Rust auto-mount caps
+# - triple-compressed-nested-tar.tgz.tgz.gz — outer strip incomplete (stops at compressed member file)
