@@ -1,16 +1,38 @@
 //! Microsoft CAB MountSource (`backendName=CABMountSource`).
 //!
-//! - typeCompress 0 (none): stencil open across CFDATA blocks
-//! - typeCompress 1 (MSZIP): decompress CFDATA folders, slice file
-//! - Quantum/LZX: [`CabError::UnsupportedCompression`] so factory can fall back to
-//!   libarchive (may temp-spool nested LZX members)
+//! | `typeCompress` | Name | Native open |
+//! |----------------|------|-------------|
+//! | 0 | store / none | yes — stencil across CFDATA blocks |
+//! | 1 | MSZIP | yes — folder decompress in RAM, slice file |
+//! | 2 | Quantum | **no** — [`CabError::UnsupportedCompression`] |
+//! | 3 | LZX | **no** — [`CabError::UnsupportedCompression`] |
 //!
 //! # Nested archives (AutoMount / `open_from_reader`)
 //!
 //! [`CabMountSource::open_from_reader`] indexes any seekable stream and retains shared
-//! archive IO for store stencils and MSZIP block reads — nested CAB without `/tmp`
-//! spool when compression is store or MSZIP. LZX/Quantum still return
-//! [`CabError::UnsupportedCompression`].
+//! archive IO for store stencils and MSZIP block reads — **nested CAB without `/tmp`
+//! spool** when every CFFOLDER uses store or MSZIP.
+//!
+//! # Residual: LZX / Quantum (FR-8)
+//!
+//! This crate **does not** implement Microsoft LZX or Quantum decompressors (large
+//! codecs; matches Python ratarmount leaving them on libarchive). When any folder
+//! uses those types, open returns [`CabError::UnsupportedCompression`] with a clear
+//! message and logs the residual path.
+//!
+//! **Caller contract** (factory / AutoMount — not implemented here):
+//!
+//! 1. **Top-level path open:** match `UnsupportedCompression` → open the same path
+//!    with the libarchive backend (sequential member extract).
+//! 2. **Nested stream open:** match `UnsupportedCompression` → **temp-spool** the
+//!    member to a path, then open via libarchive. Nested LZX CAB is **not** no-tmp.
+//!
+//! Helpers for wiring without re-encoding the policy:
+//! - [`compression_requires_libarchive`] — true for Quantum, LZX, and unknown types
+//! - [`compression_type_name`] — human-readable name (`"LZX"`, `"MSZIP"`, …)
+//! - [`TCOMP_TYPE_*`] constants — raw CAB `typeCompress` values (low nibble)
+//!
+//! Do **not** claim no-tmp nested LZX while this residual stands.
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -30,11 +52,16 @@ use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "CABMountSource";
 
-const TCOMP_MASK_TYPE: u16 = 0x000F;
-const TCOMP_TYPE_NONE: u16 = 0x0000;
-const TCOMP_TYPE_MSZIP: u16 = 0x0001;
-const TCOMP_TYPE_QUANTUM: u16 = 0x0002;
-const TCOMP_TYPE_LZX: u16 = 0x0003;
+/// Mask for the compression type nibble in CFFOLDER `typeCompress`.
+pub const TCOMP_MASK_TYPE: u16 = 0x000F;
+/// Uncompressed store (native stencil open).
+pub const TCOMP_TYPE_NONE: u16 = 0x0000;
+/// MSZIP / Deflate (native folder decompress).
+pub const TCOMP_TYPE_MSZIP: u16 = 0x0001;
+/// Quantum — **not** decoded here; requires libarchive fallback.
+pub const TCOMP_TYPE_QUANTUM: u16 = 0x0002;
+/// LZX — **not** decoded here; requires libarchive fallback (nested → temp spool).
+pub const TCOMP_TYPE_LZX: u16 = 0x0003;
 const A_DIRECTORY: u16 = 0x10;
 const A_NAME_IS_UTF: u16 = 0x80;
 const MSZIP_WINDOW: usize = 32768;
@@ -42,13 +69,55 @@ const MSZIP_WINDOW: usize = 32768;
 /// Mutex-shared seekable archive body for concurrent stencil / block reads.
 type SharedArchiveIo = Arc<Mutex<Box<dyn SeekRead>>>;
 
+/// Human-readable name for a CAB folder `typeCompress` value (masked to low nibble).
+///
+/// Unknown values return `"unknown"`.
+pub fn compression_type_name(type_compress: u16) -> &'static str {
+    match type_compress & TCOMP_MASK_TYPE {
+        TCOMP_TYPE_NONE => "store",
+        TCOMP_TYPE_MSZIP => "MSZIP",
+        TCOMP_TYPE_QUANTUM => "Quantum",
+        TCOMP_TYPE_LZX => "LZX",
+        _ => "unknown",
+    }
+}
+
+/// Returns `true` when this crate cannot open the folder natively and the caller
+/// should fall through to libarchive (and nested temp-spool when applicable).
+///
+/// Store (0) and MSZIP (1) return `false`. Quantum (2), LZX (3), and any other type
+/// return `true`.
+///
+/// Intended for factory / AutoMount residual wiring without duplicating CAB policy.
+pub fn compression_requires_libarchive(type_compress: u16) -> bool {
+    !matches!(
+        type_compress & TCOMP_MASK_TYPE,
+        TCOMP_TYPE_NONE | TCOMP_TYPE_MSZIP
+    )
+}
+
+fn unsupported_compression_message(type_compress: u16) -> String {
+    let masked = type_compress & TCOMP_MASK_TYPE;
+    let name = compression_type_name(masked);
+    format!(
+        "unsupported cab compression: {name} (typeCompress={masked}); \
+         CABMountSource supports store/MSZIP only — fall back to libarchive \
+         (nested members may temp-spool under /tmp)"
+    )
+}
+
 #[derive(Debug, Error)]
 pub enum CabError {
     #[error(transparent)]
     Index(#[from] IndexError),
     #[error(transparent)]
     Io(#[from] io::Error),
-    #[error("unsupported cab compression: {0}")]
+    /// Folder compression not handled natively (LZX / Quantum / unknown).
+    ///
+    /// Display includes codec name and residual guidance. Match on this variant
+    /// (ignore the `u16`) to fall back to libarchive / temp spool. The payload is
+    /// the masked `typeCompress` nibble.
+    #[error("{}", unsupported_compression_message(*.0))]
     UnsupportedCompression(u16),
     #[error("{0}")]
     Msg(String),
@@ -173,9 +242,10 @@ impl CabMountSource {
     /// member name). The reader is retained under a mutex for concurrent store stencils
     /// and MSZIP CFDATA block reads.
     ///
-    /// Supported folder compression: store (0) and MSZIP (1). Quantum/LZX return
-    /// [`CabError::UnsupportedCompression`] so the caller may temp-spool and open via
-    /// libarchive.
+    /// Supported folder compression: store ([`TCOMP_TYPE_NONE`]) and MSZIP
+    /// ([`TCOMP_TYPE_MSZIP`]) — **no `/tmp` spool**. Quantum/LZX (and unknown types)
+    /// return [`CabError::UnsupportedCompression`] so the caller may temp-spool and
+    /// open via libarchive. See module-level residual docs.
     ///
     /// `index_path`: `Some(path)` for on-disk index, `None` for `:memory:` (also when
     /// `options.index_in_memory` is set). Prefer `None` for nested mounts.
@@ -209,8 +279,15 @@ impl CabMountSource {
         reader.seek(SeekFrom::Start(0))?;
         let (folders, files) = parse_cab_archive(&mut reader)?;
         for folder in &folders {
-            if folder.type_compress != TCOMP_TYPE_NONE && folder.type_compress != TCOMP_TYPE_MSZIP {
-                return Err(CabError::UnsupportedCompression(folder.type_compress));
+            if compression_requires_libarchive(folder.type_compress) {
+                let tc = folder.type_compress & TCOMP_MASK_TYPE;
+                log::info!(
+                    "CAB {}: folder compression {} (typeCompress={tc}) not handled natively; \
+                     returning UnsupportedCompression for libarchive / nested temp-spool fallback",
+                    archive_path.display(),
+                    compression_type_name(tc),
+                );
+                return Err(CabError::UnsupportedCompression(tc));
             }
         }
 
@@ -381,9 +458,10 @@ impl CabMountSource {
                 parts
             }
             other => {
+                // Open-time guard should have rejected these; keep a clear residual message.
                 return Err(io::Error::new(
                     io::ErrorKind::Unsupported,
-                    format!("Unsupported CAB compression {other}"),
+                    unsupported_compression_message(other),
                 ));
             }
         };
@@ -813,10 +891,6 @@ fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<
     Ok(())
 }
 
-// silence unused constants for documentation parity
-const _: u16 = TCOMP_TYPE_QUANTUM;
-const _: u16 = TCOMP_TYPE_LZX;
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -931,8 +1005,8 @@ mod tests {
         out
     }
 
-    /// CAB header claiming LZX compression (typeCompress 3) — open must reject.
-    fn synthetic_lzx_stub_cab() -> Vec<u8> {
+    /// CAB header claiming a given folder compression — open must reject LZX/Quantum.
+    fn synthetic_stub_cab_with_compress(type_compress: u16) -> Vec<u8> {
         let payload = b"x";
         let name = b"x";
         let coff_files = 36u32 + 8;
@@ -954,7 +1028,7 @@ mod tests {
         out.extend_from_slice(&0u16.to_le_bytes());
         out.extend_from_slice(&coff_cab_start.to_le_bytes());
         out.extend_from_slice(&1u16.to_le_bytes());
-        out.extend_from_slice(&TCOMP_TYPE_LZX.to_le_bytes());
+        out.extend_from_slice(&type_compress.to_le_bytes());
         out.extend_from_slice(&1u32.to_le_bytes());
         out.extend_from_slice(&0u32.to_le_bytes());
         out.extend_from_slice(&0u16.to_le_bytes());
@@ -968,6 +1042,50 @@ mod tests {
         out.extend_from_slice(&1u16.to_le_bytes());
         out.extend_from_slice(payload);
         out
+    }
+
+    fn synthetic_lzx_stub_cab() -> Vec<u8> {
+        synthetic_stub_cab_with_compress(TCOMP_TYPE_LZX)
+    }
+
+    fn synthetic_quantum_stub_cab() -> Vec<u8> {
+        synthetic_stub_cab_with_compress(TCOMP_TYPE_QUANTUM)
+    }
+
+    fn assert_unsupported_open(cab: Vec<u8>, expect: u16) {
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        match CabMountSource::open_from_reader(
+            Cursor::new(cab),
+            "unsupported.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        ) {
+            Err(e @ CabError::UnsupportedCompression(c)) => {
+                assert_eq!(c, expect);
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("libarchive"),
+                    "error must mention libarchive residual: {msg}"
+                );
+                assert!(
+                    msg.contains("temp-spool") || msg.contains("temp"),
+                    "error must mention nested temp-spool residual: {msg}"
+                );
+                assert!(
+                    msg.contains(compression_type_name(expect)),
+                    "error must name codec: {msg}"
+                );
+                // Factory matches this variant for residual path.
+                assert!(compression_requires_libarchive(c));
+            }
+            Ok(_) => panic!("typeCompress {expect} must be UnsupportedCompression"),
+            Err(other) => panic!("unexpected error for typeCompress {expect}: {other}"),
+        }
     }
 
     #[test]
@@ -1030,24 +1148,39 @@ mod tests {
     }
 
     #[test]
+    fn compression_policy_helpers() {
+        assert!(!compression_requires_libarchive(TCOMP_TYPE_NONE));
+        assert!(!compression_requires_libarchive(TCOMP_TYPE_MSZIP));
+        assert!(compression_requires_libarchive(TCOMP_TYPE_QUANTUM));
+        assert!(compression_requires_libarchive(TCOMP_TYPE_LZX));
+        assert!(compression_requires_libarchive(0x000F)); // unknown
+                                                          // High nibble (window bits etc.) must not change the type decision.
+        assert!(!compression_requires_libarchive(TCOMP_TYPE_MSZIP | 0x1F00));
+        assert!(compression_requires_libarchive(TCOMP_TYPE_LZX | 0x1500));
+        assert_eq!(compression_type_name(TCOMP_TYPE_NONE), "store");
+        assert_eq!(compression_type_name(TCOMP_TYPE_MSZIP), "MSZIP");
+        assert_eq!(compression_type_name(TCOMP_TYPE_QUANTUM), "Quantum");
+        assert_eq!(compression_type_name(TCOMP_TYPE_LZX), "LZX");
+        assert_eq!(compression_type_name(TCOMP_TYPE_LZX | 0x1500), "LZX");
+        assert_eq!(compression_type_name(0x000E), "unknown");
+    }
+
+    /// Regression: LZX header rejection stays clear for factory residual (spool → libarchive).
+    #[test]
     fn open_from_reader_rejects_lzx() {
-        let cab = synthetic_lzx_stub_cab();
-        let opts = OpenOptions {
-            index_in_memory: true,
-            ..Default::default()
-        };
-        match CabMountSource::open_from_reader(
-            Cursor::new(cab),
-            "lzx.cab",
-            None,
-            &opts,
-            "0.1.0",
-            true,
-        ) {
-            Err(CabError::UnsupportedCompression(c)) => assert_eq!(c, TCOMP_TYPE_LZX),
-            Ok(_) => panic!("LZX must be UnsupportedCompression"),
-            Err(other) => panic!("unexpected error: {other}"),
-        }
+        assert_unsupported_open(synthetic_lzx_stub_cab(), TCOMP_TYPE_LZX);
+    }
+
+    /// Regression: Quantum same residual path as LZX (no native decoder).
+    #[test]
+    fn open_from_reader_rejects_quantum() {
+        assert_unsupported_open(synthetic_quantum_stub_cab(), TCOMP_TYPE_QUANTUM);
+    }
+
+    /// Regression: unknown typeCompress also requires libarchive residual.
+    #[test]
+    fn open_from_reader_rejects_unknown_compression() {
+        assert_unsupported_open(synthetic_stub_cab_with_compress(0x0007), 0x0007);
     }
 
     #[test]

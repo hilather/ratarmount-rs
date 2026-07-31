@@ -3,7 +3,7 @@ name = "ratarmount-formats-cab"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Microsoft CAB MountSource (store + MSZIP)"
+description = "Microsoft CAB MountSource (store + MSZIP; LZX/Quantum → libarchive residual)"
 
 [dependencies]
 ratarmount-core.workspace = true
