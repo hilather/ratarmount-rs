@@ -45,7 +45,24 @@ pub const NESTED_TAR_MEMBERS_KEY: &str = "nestedTarMembers";
 /// Keeps cold index of huge nested TARs fast in the default non-recursive case.
 pub const NESTED_FLATTEN_MAX_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Max bytes allocated for auxiliary TAR header payloads (PAX, GNU long name / long link).
+///
+/// The 12-byte octal size field can claim multi-GiB payloads. Hostile archives would
+/// OOM the indexer via `vec![0u8; size]` before any bound check. 16 MiB is far above
+/// any legitimate path, link target, or pax xattr block we support.
+pub const MAX_HEADER_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+
 const BLOCK_SIZE: u64 = 512;
+
+/// Reject PAX / GNU long-name header payload sizes above [`MAX_HEADER_PAYLOAD_BYTES`].
+fn check_header_payload_size(size: u64, kind: &str) -> Result<()> {
+    if size > MAX_HEADER_PAYLOAD_BYTES {
+        return Err(TarError::Msg(format!(
+            "{kind} header payload size {size} exceeds cap of {MAX_HEADER_PAYLOAD_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
 
 /// `linkname` marker for GNU dumpdir whiteout rows (name deleted in a later dumpdir).
 ///
@@ -620,8 +637,15 @@ impl MountSource for SqliteIndexedTar {
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+        // Dumpdir delete hides the path entirely for this archive: if the newest row is a
+        // tombstone, no version (0, positive, or negative) is queryable via mount APIs.
+        // Older live rows remain in the index for tooling but must not surface as version N.
+        if let Ok(Some(newest)) = self.index.lookup(path, 0) {
+            if is_dumpdir_tombstone(&newest) {
+                return None;
+            }
+        }
         let fi = self.index.lookup(path, file_version).ok().flatten()?;
-        // Version 0 (newest): hide dumpdir-deleted names. Older versions remain queryable.
         if is_dumpdir_tombstone(&fi) {
             return None;
         }
@@ -629,7 +653,8 @@ impl MountSource for SqliteIndexedTar {
     }
 
     fn versions(&self, path: &str) -> u32 {
-        // If the newest version is a dumpdir whiteout, treat the path as absent.
+        // If the newest version is a dumpdir whiteout, treat the path as deleted for all
+        // version queries (consistent with lookup returning None for every version).
         if let Ok(Some(fi)) = self.index.lookup(path, 0) {
             if is_dumpdir_tombstone(&fi) {
                 return 0;
@@ -1286,6 +1311,7 @@ fn parse_tar_into_index<R: Read + Seek>(
 
         // PAX extended / global headers — apply to next file (or global).
         if typeflag == b'x' || typeflag == b'g' {
+            check_header_payload_size(size, "PAX")?;
             let body_off = pos + BLOCK_SIZE;
             let mut body = vec![0u8; size as usize];
             reader.seek(SeekFrom::Start(body_off))?;
@@ -1306,6 +1332,14 @@ fn parse_tar_into_index<R: Read + Seek>(
 
         // GNU long name / long link
         if typeflag == b'L' || typeflag == b'K' {
+            check_header_payload_size(
+                size,
+                if typeflag == b'L' {
+                    "GNU long name"
+                } else {
+                    "GNU long link"
+                },
+            )?;
             let data_off_long = pos + BLOCK_SIZE;
             let mut long = vec![0u8; size as usize];
             reader.seek(SeekFrom::Start(data_off_long))?;
@@ -1766,6 +1800,7 @@ fn walk_tar_region<R: Read + Seek>(
         let linkname = cstr_field_encoded(&header[157..257], &options.encoding);
 
         if typeflag == b'x' || typeflag == b'g' {
+            check_header_payload_size(size, "PAX")?;
             let body_off = pos + BLOCK_SIZE;
             if body_off + size > region_end {
                 break;
@@ -1788,6 +1823,14 @@ fn walk_tar_region<R: Read + Seek>(
         }
 
         if typeflag == b'L' || typeflag == b'K' {
+            check_header_payload_size(
+                size,
+                if typeflag == b'L' {
+                    "GNU long name"
+                } else {
+                    "GNU long link"
+                },
+            )?;
             let data_off_long = pos + BLOCK_SIZE;
             if data_off_long + size > region_end {
                 break;
@@ -2442,6 +2485,14 @@ fn open_sparse_member<R: Read + Seek + Send + 'static>(
     // Optional PAX 'x' header before the file header.
     if header[156] == b'x' {
         let size = parse_octal(&header[124..136]).unwrap_or(0);
+        if size > MAX_HEADER_PAYLOAD_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "PAX header payload size {size} exceeds cap of {MAX_HEADER_PAYLOAD_BYTES} bytes"
+                ),
+            ));
+        }
         let body_off = pos + BLOCK_SIZE;
         let mut body = vec![0u8; size as usize];
         file.seek(SeekFrom::Start(body_off))?;
@@ -3709,6 +3760,194 @@ mod tests {
         );
         assert!(map.contains_key("3"), "3 present: {:?}", map.keys());
         assert!(map.contains_key("moved"), "moved present: {:?}", map.keys());
+    }
+
+    /// Regression: dumpdir tombstone must hide *all* versions for mount APIs.
+    ///
+    /// Symptom: `versions` returned 0 (absent) while `lookup(path, 1)` still returned
+    /// the pre-delete live row — inconsistent versioning for FUSE/versioning clients.
+    #[test]
+    fn dumpdir_tombstone_hides_all_versions() {
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn gnu_header(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            assert!(nb.len() < 100, "name too long for ustar name field");
+            h[..nb.len()].copy_from_slice(nb);
+            h[100..108].copy_from_slice(&oct_field(0o700, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            h[257..265].copy_from_slice(b"ustar  \0");
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+        fn pad_payload(p: &[u8]) -> Vec<u8> {
+            let mut v = p.to_vec();
+            let n = (512 - (v.len() % 512)) % 512;
+            v.extend(std::iter::repeat_n(0u8, n));
+            v
+        }
+        fn append_member(out: &mut Vec<u8>, name: &str, typeflag: u8, payload: &[u8]) {
+            out.extend_from_slice(&gnu_header(name, payload.len() as u64, typeflag));
+            out.extend(pad_payload(payload));
+        }
+
+        let mut tar = Vec::new();
+        // Snapshot A: foo/gone present
+        append_member(&mut tar, "foo/", b'D', b"Ygone\0Ykeep\0\0");
+        append_member(&mut tar, "foo/gone", b'0', b"old-data\n");
+        append_member(&mut tar, "foo/keep", b'0', b"keep-v1\n");
+        // Snapshot B: gone omitted (tombstone), keep updated
+        append_member(&mut tar, "foo/", b'D', b"Ykeep\0\0");
+        append_member(&mut tar, "foo/keep", b'0', b"keep-v2\n");
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("dumpdir-tombstone-all-versions.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index dual-dumpdir tar");
+
+        // Index still holds older rows + tombstone, but mount API hides the path entirely.
+        let raw_count = m.index().version_count("/foo/gone").unwrap_or(0);
+        assert!(
+            raw_count >= 2,
+            "fixture should leave tombstone + older live row in index, got {raw_count}"
+        );
+
+        assert_eq!(m.versions("/foo/gone"), 0);
+        assert!(m.lookup("/foo/gone", 0).is_none(), "version 0 (newest)");
+        assert!(
+            m.lookup("/foo/gone", 1).is_none(),
+            "version 1 (oldest-first)"
+        );
+        assert!(m.lookup("/foo/gone", 2).is_none(), "version 2");
+        assert!(m.lookup("/foo/gone", -1).is_none(), "negative version");
+
+        // Non-deleted path still versioned.
+        assert!(m.versions("/foo/keep") >= 1);
+        let keep = m.lookup("/foo/keep", 0).expect("keep still live");
+        let mut r = m.open(&keep, 0).unwrap();
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "keep-v2\n");
+    }
+
+    /// Regression: absurd PAX / GNU long-name size must error without huge allocation.
+    ///
+    /// Symptom: hostile tar with `size` near octal field max caused OOM via
+    /// `vec![0u8; size as usize]` while reading PAX / long-name headers during index.
+    #[test]
+    fn pax_or_longname_rejects_oversized_payload() {
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn gnu_header(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            assert!(nb.len() < 100);
+            h[..nb.len()].copy_from_slice(nb);
+            h[100..108].copy_from_slice(&oct_field(0o644, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            h[257..265].copy_from_slice(b"ustar  \0");
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+
+        // Claim a long-name payload just over the cap; body intentionally absent/short
+        // so a missing cap would either OOM or fail late on read_exact.
+        let absurd = MAX_HEADER_PAYLOAD_BYTES + 1;
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&gnu_header("././@LongLink", absurd, b'L'));
+        // No payload body — reject must happen before allocation/read.
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        match SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("hostile-longname.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        ) {
+            Ok(_) => panic!("oversized GNU long name must be rejected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("exceeds cap") || msg.contains("long name"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+
+        // Same for PAX extended header.
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&gnu_header("PaxHeaders.0/x", absurd, b'x'));
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        match SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("hostile-pax.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        ) {
+            Ok(_) => panic!("oversized PAX must be rejected"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("exceeds cap") || msg.contains("PAX"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+
+        // Sanity: payload at the cap with empty body of that length is accepted (no OOM path).
+        // Use a tiny valid long-name below the cap to confirm normal path still works.
+        let mut ok = Vec::new();
+        let long_name = b"ok-name\0";
+        ok.extend_from_slice(&gnu_header("././@LongLink", long_name.len() as u64, b'L'));
+        let mut body = long_name.to_vec();
+        let pad = (512 - (body.len() % 512)) % 512;
+        body.extend(std::iter::repeat_n(0u8, pad));
+        ok.extend(body);
+        ok.extend_from_slice(&gnu_header("short", 4, b'0'));
+        ok.extend(b"data");
+        ok.extend(std::iter::repeat_n(0u8, 512 - 4)); // pad file payload to 512
+        ok.extend(std::iter::repeat_n(0u8, 1024));
+        SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(ok),
+            Path::new("ok-longname.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("normal long-name tar must still index");
     }
 
     /// After `--hashes sha256` fill, MountSource xattrs expose `user.hash.sha256` (Python parity).
