@@ -96,7 +96,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **Plain `.gz` / `.zst` / `.bz2` / `.xz` (non-TAR)** | compress magic | Seekable body + `SingleFileMountSource::from_seekable_body` (or nested archive if payload is ZIP/7z/…) | **Yes** — no nested member spool |
 | **`.tar.zst`** | zstd magic + TAR | Seekable zstd + TAR body | Yes (frame/map dependent) |
 | **`.tar.bz2`** | `BZh` + TAR | Seekable bzip2 + TAR | Yes (block map) |
-| **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Multi-block better; single-stream weaker |
+| **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Index map (multi-block / multi-stream preferred); large single-block spills |
 | **CPIO** (newc/odc/bin) | `070701` / `070702` / `070707` / binary magic / `.cpio` | `CpioMountSource::open_from_reader` | **Yes** — stencil |
 | **AR** | `!<arch>\n` / `.ar` / `.a` | `ArMountSource::open_from_reader` | **Yes** — stencil |
 | **ISO 9660** | PVD `CD001` @ sector 16 / `.iso` | `Iso9660MountSource::open_from_reader` | **Yes** — extent stencils (no full-image RAM load) |
@@ -239,4 +239,4 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | Nested CAB LZX / SquashFS / RAR | usually **tmp** | depends on path open |
 | Solid multi-GB 7z outer | no tmp | often costly |
 
-\* Inner ZIP deflate / solid 7z / single-stream xz have the usual decompress costs; they still avoid nested temp files when the reader path succeeds.
+\* Inner ZIP deflate / solid 7z have the usual decompress costs. **xz residual:** open/size is cheap with a Stream Index (footer-first range reads); any byte access still decompresses the covering **block**. Prefer `xz --block-size=…` / pixz for multi‑GiB random access. Default single-block maps stay seekable only when the unit is ≤ the ~256 MiB RAM cap; larger single-block falls through to full decode + temp spill (same cap as other codecs). Nested temp files are still avoided when the reader path succeeds.

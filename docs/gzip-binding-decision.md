@@ -38,13 +38,19 @@
 - [x] `.tar.gz` mounts via seekable path (`packed-5-times.tar.gz` harness).
 - [x] No dependency on rapidgzip C ABI.
 
-## Related codecs (2026-07-26)
+## Related codecs (2026-07-31)
 
 | Codec | Path |
 |-------|------|
-| bzip2 | `SeekableBody` via one-shot decode → RAM (≤256 MiB) or temp |
-| xz | same (multi-decoder for concatenated streams) |
+| bzip2 | multi-stream + file-backed bit-block maps + `bzip2blocks`; full decode fallback |
+| xz | Stream Footer + Index **footer-first** range map (multi-stream / multi-block / pixz; small single-block Index); units &gt; ~256 MiB fall through to full decode + temp spill; multi-stream decode-map fallback (`xz_seek.rs`) |
 | zstd | multi-frame + seek-table + `zstdblocks`; single-frame full decode — [guide](zstd-random-access.md) |
+
+Shared (from-reader / nested) gzip, zstd, and xz hold compressed **seek+read** under one mutex per range (zstd/gzip also track a private compressed offset per open; xz locks header+block pairs together) so concurrent FUSE opens do not interleave cursors.
+
+### xz single-block residual
+
+Default `xz -c` emits **one block**. Open can still parse Index with a few range reads, but random access decodes that whole block. Maps with any unit larger than `DEFAULT_MEMORY_CAP` (~256 MiB) use full decode + temp spill instead of an unbounded per-reader `Vec` cache. For multi‑GiB mounts, compress with `--block-size` / pixz (or multiple streams).
 
 ## Post-1.0
 
@@ -52,4 +58,5 @@
 - **Tier D:** parallel decode / rapidgzip-class throughput.
 - Persist Rust checkpoints into SQLite for faster remount without full re-scan.
 - ~~Seekable single-file `.gz` without materialize~~ — done (`from_seekable_body`).
-- True bzip2 bit-block map; xz liblzma stream index. (Zstd seek-table / multi-frame: see [zstd-random-access.md](zstd-random-access.md).)
+- ~~xz Stream Index maps without full compressed load~~ — done (range reads for header/Index/footer + magic windows).
+- True bzip2 open-time size discovery polish. (Zstd seek-table / multi-frame: see [zstd-random-access.md](zstd-random-access.md).)

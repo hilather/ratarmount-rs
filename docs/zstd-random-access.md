@@ -121,9 +121,17 @@ Plain multi-frame without a footer still works well (`kind`: multi-frame scan).
 | **Full decode** | Stream-decompress once into RAM or temp; then seek in the decoded body |
 | **Threads (`-P` / backend hint)** | Multi-frame maps already isolate frames; full multi-frame materialization can decode frames in parallel when threads > 1 |
 | **Index side tables** | Python-compatible `zstdblocks` import/export for cross-tool maps |
+| **Nested / Shared** | From-reader path shares the compressed stream under a mutex; each open tracks a **private compressed offset** so concurrent FUSE readers cannot interleave `seek`+`read` |
 
 Plain `.zst` (non-TAR payload) uses the same seekable body under a single-file
 mount — no full payload spool just to present one file.
+
+### Single-frame residual
+
+Default `zstd -o big.zst` emits **one frame**. That path still works (full decode
+to RAM ≤ ~256 MiB or a temp spool) but cold open and random access cost scale with
+the whole uncompressed size. Prefer a seek table or multi-frame producers (above)
+for multi‑GiB mounts.
 
 ---
 

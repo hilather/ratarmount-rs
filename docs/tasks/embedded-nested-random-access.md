@@ -33,7 +33,7 @@
 | N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
 | N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | path / materialize | **no-tmp** when practical |
-| — | Solid RAR / single-stream xz without index / libarchive-only | sequential | n/a | **out of scope** here |
+| — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
 | — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | deferred (low priority) |
 
 ---
@@ -63,7 +63,7 @@
 
 - [x] zstd / bzip2 / xz from_reader → TAR when body looks like TAR (same factory path)
 - [ ] Dedicated unit fixtures for zst/bz2/xz nested (optional)
-- [ ] Do **not** claim free random access for single-stream xz/lzma
+- [x] xz single-block Index maps retained (range decode); no free random access claim for lzma-alone / Index-less corrupt xz
 
 ### A4. Tests (no `/tmp` assertion)
 

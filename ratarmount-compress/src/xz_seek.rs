@@ -5,25 +5,37 @@
 //!    stream's Index records, and build a block map
 //!    `{compressed_offset, compressed_size, uncompressed_offset, uncompressed_size}`.
 //!    Covers multi-stream concatenation **and** single-stream multi-block (e.g. pixz /
-//!    `xz --block-size=…`) without decoding payload during map build.
+//!    `xz --block-size=…`). Map build prefers **EOF / footer-first** range reads
+//!    (header + Index + footer only); a full-file magic scan is a fallback for
+//!    exotic layouts. The compressed payload is never loaded into a single buffer
+//!    for classification.
 //! 2. **Multi-stream decode map** — if Index parse fails but independent stream
-//!    magics split cleanly, decode each stream (optionally in parallel) only to
-//!    learn uncompressed sizes and keep a stream-level restart map.
-//! 3. **Full decode** fallback into [`DecodedBody`] (single-block small files, corrupt
-//!    / exotic layouts). Parallel multi-stream full decode when `threads > 1`.
+//!    magics split cleanly, load the compressed image once and decode each stream
+//!    (optionally in parallel) only to learn uncompressed sizes and keep a
+//!    stream-level restart map.
+//! 3. **Full decode** fallback into [`DecodedBody`] (corrupt / exotic layouts, or
+//!    any map unit larger than [`DEFAULT_MEMORY_CAP`] so uncompressed data can
+//!    spill to a temp file). Parallel multi-stream full decode when `threads > 1`.
 //!
 //! Readers seek by locating the covering block/stream and re-decoding only that
 //! unit (last-unit cache). Single-block mini-streams are reconstructed from the
-//! original Stream Header + Block + a one-record Index + Footer.
+//! original Stream Header + Block + a one-record Index + Footer. **Small**
+//! single-block Index maps are retained (on-demand range decode). **Large**
+//! single-block / large-unit maps fall back to full decode + memory-cap spill
+//! so multi‑GiB default `xz` does not pin the whole plain payload in a
+//! per-reader `Vec`.
 //!
 //! Open paths:
 //! * **Path-based** — reopen independent FDs per block read (`File::open`).
 //! * **Reader-based** — any `Read + Seek + Send` (e.g. HTTP Range / in-memory
 //!   `Cursor`); shared under a mutex so random Range reads drive block decode.
+//!   Each range (and header+block pairs) is seek+read under one lock hold
+//!   (atomic w.r.t. concurrent FUSE opens).
 //!
 //! **Limitation:** single-stream multi-block random access needs a valid Index
 //! (always present in well-formed xz). If Index/footer validation fails, we fall
-//! back to full decode rather than partial block isolation.
+//! back to full decode rather than partial block isolation. Prefer
+//! `xz --block-size=…` / pixz for multi‑GiB random access.
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -113,16 +125,18 @@ fn open_with_backend(
     path: PathBuf,
     threads: u32,
 ) -> Result<Arc<dyn SeekableBody>> {
-    // Index/footer walk and multi-stream size discovery need a full compressed
-    // image once at open; on-demand block decode re-reads ranges via `backend`.
-    let compressed = read_all_compressed(&backend)?;
-    if compressed.len() < 12 || compressed[..6] != XZ_MAGIC {
+    // Cheap magic probe (12 bytes) before any full load or Index walk.
+    let probe = read_compressed_range(&backend, 0, 12)
+        .map_err(|e| CompressError::Msg(format!("xz header read failed: {e}")))?;
+    if probe.len() < 12 || probe[..6] != XZ_MAGIC {
         return Err(CompressError::Msg("not an xz stream".into()));
     }
 
-    // 1) Footer + Index → block map (multi-stream and multi-block).
-    if let Ok((blocks, uncomp_size)) = build_block_map_from_index(&compressed) {
-        if blocks.len() >= 2 {
+    // 1) Footer + Index → block map via range reads (no full compressed image).
+    //    Small single-block maps stay on SeekableXz; any unit larger than the
+    //    memory cap falls through so DecodedBody can temp-spill uncompressed data.
+    if let Ok((blocks, uncomp_size)) = build_block_map_from_backend(&backend) {
+        if index_map_suitable_for_seekable(&blocks) {
             return Ok(Arc::new(SeekableXz {
                 path,
                 backend,
@@ -131,12 +145,17 @@ fn open_with_backend(
                 kind: "xz-blocks",
             }));
         }
-        // Single block: full decode is fine (small files; same content either way).
+    }
+
+    // Fallbacks need a full compressed image once at open.
+    let compressed = read_all_compressed(&backend)?;
+    if compressed.len() < 12 || compressed[..6] != XZ_MAGIC {
+        return Err(CompressError::Msg("not an xz stream".into()));
     }
 
     // 2) Multi-stream map via per-stream decode (sizes only; keep restart points).
     if let Ok((blocks, uncomp_size)) = build_stream_map_by_decode(&compressed, threads) {
-        if blocks.len() >= 2 {
+        if index_map_suitable_for_seekable(&blocks) && blocks.len() >= 2 {
             return Ok(Arc::new(SeekableXz {
                 path,
                 backend,
@@ -147,8 +166,19 @@ fn open_with_backend(
         }
     }
 
-    // 3) Full one-shot decode.
+    // 3) Full one-shot decode (spills above DEFAULT_MEMORY_CAP).
     full_decode_body(&path, &compressed, threads)
+}
+
+/// Whether an Index / stream map can back [`SeekableXz`] without unbounded RAM.
+///
+/// Each restart unit is fully decoded into a per-reader `Vec` cache. Units larger
+/// than [`DEFAULT_MEMORY_CAP`] must use [`DecodedBody`] (temp spill) instead.
+fn index_map_suitable_for_seekable(blocks: &[BlockInfo]) -> bool {
+    !blocks.is_empty()
+        && blocks
+            .iter()
+            .all(|b| b.uncompressed_size <= DEFAULT_MEMORY_CAP)
 }
 
 fn full_decode_body(path: &Path, compressed: &[u8], threads: u32) -> Result<Arc<dyn SeekableBody>> {
@@ -326,6 +356,9 @@ fn read_all_compressed(backend: &XzBackend) -> Result<Vec<u8>> {
 }
 
 /// Read `[offset, offset+len)` from the compressed backend.
+///
+/// For [`XzBackend::Shared`], seek + read are held under one mutex so concurrent
+/// FUSE opens cannot interleave cursor movement mid-range.
 fn read_compressed_range(backend: &XzBackend, offset: u64, len: u64) -> Result<Vec<u8>> {
     let len_usize =
         usize::try_from(len).map_err(|_| CompressError::Msg("xz range size overflow".into()))?;
@@ -347,16 +380,414 @@ fn read_compressed_range(backend: &XzBackend, offset: u64, len: u64) -> Result<V
     Ok(buf)
 }
 
+/// Compressed length via metadata (path) or seek-to-end (shared).
+fn backend_len(backend: &XzBackend) -> Result<u64> {
+    match backend {
+        XzBackend::Path(path) => {
+            let meta = std::fs::metadata(path)?;
+            Ok(meta.len())
+        }
+        XzBackend::Shared(shared) => {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| CompressError::Msg("xz backend mutex poisoned".into()))?;
+            let len = guard.seek(SeekFrom::End(0))?;
+            guard.seek(SeekFrom::Start(0))?;
+            Ok(len)
+        }
+    }
+}
+
+/// Chunked scan for Stream Header magics (overlapping windows so markers never straddle).
+fn find_xz_magic_offsets_backend(backend: &XzBackend, len: u64) -> Result<Vec<u64>> {
+    const WINDOW: u64 = 64 * 1024;
+    let mut markers = Vec::new();
+    if len < 6 {
+        return Ok(markers);
+    }
+    let mut offset = 0u64;
+    while offset < len {
+        let take = (len - offset).min(WINDOW);
+        let buf = read_compressed_range(backend, offset, take)?;
+        let mut i = 0usize;
+        while i + 6 <= buf.len() {
+            if is_xz_magic(&buf[i..]) {
+                markers.push(offset + i as u64);
+                i += 6;
+            } else {
+                i += 1;
+            }
+        }
+        if take < WINDOW {
+            break;
+        }
+        // 5-byte overlap so a magic cannot straddle window boundaries unseen.
+        offset = offset.saturating_add(take.saturating_sub(5));
+        if offset == 0 {
+            // Extremely small WINDOW edge case; force progress.
+            offset = take;
+        }
+    }
+    markers.dedup();
+    Ok(markers)
+}
+
+/// Strip trailing Stream Padding (NULs) and 4-byte-align `upper` as a stream end candidate.
+fn trim_stream_end_backend(backend: &XzBackend, start: u64, upper: u64) -> Option<u64> {
+    if upper <= start + 12 {
+        return None;
+    }
+    const CHUNK: u64 = 4096;
+    let mut end = upper;
+    while end > start + 12 {
+        let chunk_start = end.saturating_sub(CHUNK).max(start);
+        let len = end - chunk_start;
+        let buf = read_compressed_range(backend, chunk_start, len).ok()?;
+        let mut i = buf.len();
+        while i > 0 && buf[i - 1] == 0 {
+            i -= 1;
+        }
+        if i > 0 {
+            end = chunk_start + i as u64;
+            break;
+        }
+        end = chunk_start;
+    }
+    end -= end % 4;
+    if end <= start + 12 {
+        return None;
+    }
+    Some(end)
+}
+
+/// Parse Index records from a standalone Index field buffer (incl. CRC).
+fn parse_index_records_buf(index: &[u8]) -> Option<Vec<(u64, u64)>> {
+    parse_index_records(index, 0, index.len())
+}
+
+/// Try to interpret `[start, end)` as one complete xz stream via range reads only.
+///
+/// Only Stream Header, Index, and Footer are fetched — block payload is not read.
+fn try_parse_stream_backend(
+    backend: &XzBackend,
+    start: u64,
+    end: u64,
+) -> Option<(Vec<BlockInfo>, u64)> {
+    if end < start + 32 || !(end - start).is_multiple_of(4) {
+        return None;
+    }
+    let header = read_compressed_range(backend, start, 12).ok()?;
+    if !is_xz_magic(&header) {
+        return None;
+    }
+    let stream_flags = [header[6], header[7]];
+    let foff = end - 12;
+    let footer = read_compressed_range(backend, foff, 12).ok()?;
+    if footer[10..12] != FOOTER_MAGIC {
+        return None;
+    }
+    if footer[8] != stream_flags[0] || footer[9] != stream_flags[1] {
+        return None;
+    }
+    let backward_field = u32::from_le_bytes(footer[4..8].try_into().ok()?);
+    let index_size = (u64::from(backward_field)).checked_add(1)?.checked_mul(4)?;
+    if index_size + 12 > end - start {
+        return None;
+    }
+    let index_start = end - 12 - index_size;
+    if index_start < start + 12 {
+        return None;
+    }
+    let foot_crc = u32::from_le_bytes(footer[0..4].try_into().ok()?);
+    if crc32_ieee(&footer[4..10]) != foot_crc {
+        return None;
+    }
+
+    let index = read_compressed_range(backend, index_start, index_size).ok()?;
+    let records = parse_index_records_buf(&index)?;
+    let blocks_region = index_start - start - 12;
+    let sum: u64 = records.iter().map(|(up, _)| ceil4(*up)).sum();
+    if sum != blocks_region {
+        return None;
+    }
+
+    let mut blocks = Vec::with_capacity(records.len());
+    let mut bpos = start + 12;
+    let mut u_off = 0u64;
+    for (unpadded, uncomp) in records {
+        let on_disk = ceil4(unpadded);
+        blocks.push(BlockInfo {
+            compressed_offset: bpos,
+            compressed_size: on_disk,
+            unpadded_size: unpadded,
+            uncompressed_offset: u_off,
+            uncompressed_size: uncomp,
+            stream_header_offset: start,
+            stream_flags,
+            whole_stream: false,
+        });
+        bpos += on_disk;
+        u_off += uncomp;
+    }
+    Some((blocks, u_off))
+}
+
+/// Locate stream end and parse Index for a stream starting at `start` (range reads).
+///
+/// `next_magics` are absolute offsets of Stream Headers after `start` (may be empty);
+/// `file_len` is always tried as an upper bound.
+fn locate_and_parse_stream_backend(
+    backend: &XzBackend,
+    start: u64,
+    file_len: u64,
+    next_magics: &[u64],
+) -> Option<(u64, Vec<BlockInfo>, u64)> {
+    let mut uppers: Vec<u64> = next_magics
+        .iter()
+        .copied()
+        .filter(|&m| m > start && m <= file_len)
+        .collect();
+    if !uppers.contains(&file_len) {
+        uppers.push(file_len);
+    }
+    uppers.sort_unstable();
+    uppers.dedup();
+
+    for &upper in &uppers {
+        if let Some(end) = trim_stream_end_backend(backend, start, upper) {
+            if let Some((blocks, uncomp)) = try_parse_stream_backend(backend, start, end) {
+                return Some((end, blocks, uncomp));
+            }
+        }
+        // Also try without aggressive strip — footer may sit at upper if no padding.
+        let end2 = upper - (upper % 4);
+        if end2 > start + 12 {
+            if let Some((blocks, uncomp)) = try_parse_stream_backend(backend, start, end2) {
+                return Some((end2, blocks, uncomp));
+            }
+        }
+    }
+
+    // Slow path: scan for Footer Magic with matching stream flags (4-byte steps).
+    let header = read_compressed_range(backend, start, 12).ok()?;
+    if header.len() < 8 {
+        return None;
+    }
+    let flags = [header[6], header[7]];
+    // Cap slow scan window: prefer next magic or file end.
+    let scan_limit = next_magics
+        .iter()
+        .copied()
+        .find(|&m| m > start)
+        .unwrap_or(file_len)
+        .min(file_len);
+    let mut end = start + 32;
+    end += (4 - end % 4) % 4;
+    // Read footer candidates in windows rather than one byte at a time.
+    const SCAN_CHUNK: u64 = 64 * 1024;
+    while end <= scan_limit {
+        let window_end = (end + SCAN_CHUNK).min(scan_limit);
+        // Ensure we can form 12-byte footers ending at aligned positions.
+        if window_end < start + 32 {
+            break;
+        }
+        let read_start = end.saturating_sub(12).max(start);
+        let buf = read_compressed_range(backend, read_start, window_end - read_start).ok()?;
+        let mut cand = end;
+        while cand <= window_end {
+            if cand >= start + 32 && cand.is_multiple_of(4) {
+                let rel = (cand - 12).saturating_sub(read_start) as usize;
+                if rel + 12 <= buf.len()
+                    && buf[rel + 10] == FOOTER_MAGIC[0]
+                    && buf[rel + 11] == FOOTER_MAGIC[1]
+                    && buf[rel + 8] == flags[0]
+                    && buf[rel + 9] == flags[1]
+                {
+                    if let Some((blocks, uncomp)) = try_parse_stream_backend(backend, start, cand) {
+                        return Some((cand, blocks, uncomp));
+                    }
+                }
+            }
+            cand += 4;
+        }
+        end = window_end + 4;
+        end += (4 - end % 4) % 4;
+    }
+    None
+}
+
+/// Skip Stream Padding NUL bytes starting at `pos` (alignment checked by caller).
+///
+/// Starts with a small probe so non-padding stream headers (the common case) do
+/// not pay a full 4 KiB range read just to discover the first byte is non-zero.
+fn skip_stream_padding_backend(backend: &XzBackend, pos: u64, file_len: u64) -> Result<u64> {
+    if pos >= file_len {
+        return Ok(pos);
+    }
+    const PROBE: u64 = 64;
+    const CHUNK: u64 = 4096;
+    let mut cur = pos;
+    let mut chunk = PROBE;
+    while cur < file_len {
+        let take = (file_len - cur).min(chunk);
+        let buf = read_compressed_range(backend, cur, take)?;
+        let mut i = 0usize;
+        while i < buf.len() && buf[i] == 0 {
+            i += 1;
+        }
+        cur += i as u64;
+        if i < buf.len() {
+            break;
+        }
+        // Still in padding — grow the window for long zero runs.
+        chunk = CHUNK;
+    }
+    Ok(cur)
+}
+
+/// Walk streams from offset 0, parsing each Footer+Index without a magic pre-scan.
+///
+/// For the common single-stream case this only touches header / Index / footer
+/// (plus a short padding strip at EOF). Multi-stream continues after each footer;
+/// when the first footer is not at EOF, [`locate_and_parse_stream_backend`] walks
+/// footer candidates forward (still no full-file magic index).
+fn build_block_map_forward(
+    backend: &XzBackend,
+    file_len: u64,
+    next_magics: &[u64],
+) -> Result<(Vec<BlockInfo>, u64)> {
+    let mut pos = 0u64;
+    let mut all_blocks = Vec::new();
+    let mut total_uncomp = 0u64;
+
+    while pos + 12 <= file_len {
+        let pad_start = pos;
+        pos = skip_stream_padding_backend(backend, pos, file_len)?;
+        if pos >= file_len {
+            break;
+        }
+        let pad_len = pos - pad_start;
+        if pad_len > 0 && !pad_len.is_multiple_of(4) {
+            if all_blocks.is_empty() {
+                return Err(CompressError::Msg("xz stream padding misaligned".into()));
+            }
+            break;
+        }
+
+        let hdr = read_compressed_range(backend, pos, 6)?;
+        if !is_xz_magic(&hdr) {
+            if all_blocks.is_empty() {
+                return Err(CompressError::Msg("xz stream magic missing".into()));
+            }
+            break;
+        }
+
+        let stream_start = pos;
+        let next: Vec<u64> = next_magics
+            .iter()
+            .copied()
+            .filter(|&m| m > stream_start)
+            .collect();
+        let (footer_end, mut blocks, stream_uncomp) =
+            locate_and_parse_stream_backend(backend, stream_start, file_len, &next).ok_or_else(
+                || {
+                    CompressError::Msg(format!(
+                        "xz index/footer parse failed at offset {stream_start}"
+                    ))
+                },
+            )?;
+
+        for b in &mut blocks {
+            b.uncompressed_offset += total_uncomp;
+        }
+        total_uncomp += stream_uncomp;
+        all_blocks.append(&mut blocks);
+
+        pos = footer_end;
+        if pos > file_len {
+            break;
+        }
+        if pos <= stream_start {
+            return Err(CompressError::Msg(
+                "xz stream parse made no progress".into(),
+            ));
+        }
+    }
+
+    if all_blocks.is_empty() {
+        return Err(CompressError::Msg("no xz blocks found".into()));
+    }
+    Ok((all_blocks, total_uncomp))
+}
+
+/// Build a block map by parsing every stream's Footer + Index via range reads.
+///
+/// Prefers footer-first walking (no full-file magic scan). Falls back to a
+/// chunked magic pre-scan only when the forward walk fails.
+fn build_block_map_from_backend(backend: &XzBackend) -> Result<(Vec<BlockInfo>, u64)> {
+    let file_len = backend_len(backend)?;
+    if file_len < 32 {
+        return Err(CompressError::Msg("xz stream too short".into()));
+    }
+
+    // Fast path: no magic pre-scan. Single-stream files only need EOF footer+Index.
+    match build_block_map_forward(backend, file_len, &[]) {
+        Ok(map) => Ok(map),
+        Err(fast_err) => {
+            // Fallback: full-file magic markers help exotic multi-stream layouts.
+            let magics = match find_xz_magic_offsets_backend(backend, file_len) {
+                Ok(m) if !m.is_empty() => m,
+                _ => return Err(fast_err),
+            };
+            match build_block_map_forward(backend, file_len, &magics) {
+                Ok(map) => Ok(map),
+                Err(_) => Err(fast_err),
+            }
+        }
+    }
+}
+
 /// On-demand block decode via seekable compressed backend.
 fn decode_block_unit_backend(backend: &XzBackend, block: &BlockInfo) -> Result<Vec<u8>> {
     if block.whole_stream {
         let data = read_compressed_range(backend, block.compressed_offset, block.compressed_size)?;
         return decode_one_stream(&data);
     }
-    let header = read_compressed_range(backend, block.stream_header_offset, 12)?;
-    let block_bytes =
-        read_compressed_range(backend, block.compressed_offset, block.compressed_size)?;
+    let (header, block_bytes) = read_header_and_block_bytes(backend, block)?;
     decode_mini_stream_block(&header, &block_bytes, block)
+}
+
+/// Fetch Stream Header (12) + Block payload. Shared backends hold one lock for both.
+fn read_header_and_block_bytes(
+    backend: &XzBackend,
+    block: &BlockInfo,
+) -> Result<(Vec<u8>, Vec<u8>)> {
+    let block_len = usize::try_from(block.compressed_size)
+        .map_err(|_| CompressError::Msg("xz block size overflow".into()))?;
+    match backend {
+        XzBackend::Path(path) => {
+            let mut file = File::open(path)?;
+            let mut header = vec![0u8; 12];
+            file.seek(SeekFrom::Start(block.stream_header_offset))?;
+            file.read_exact(&mut header)?;
+            let mut block_bytes = vec![0u8; block_len];
+            file.seek(SeekFrom::Start(block.compressed_offset))?;
+            file.read_exact(&mut block_bytes)?;
+            Ok((header, block_bytes))
+        }
+        XzBackend::Shared(shared) => {
+            let mut guard = shared
+                .lock()
+                .map_err(|_| CompressError::Msg("xz backend mutex poisoned".into()))?;
+            let mut header = vec![0u8; 12];
+            guard.seek(SeekFrom::Start(block.stream_header_offset))?;
+            guard.read_exact(&mut header)?;
+            let mut block_bytes = vec![0u8; block_len];
+            guard.seek(SeekFrom::Start(block.compressed_offset))?;
+            guard.read_exact(&mut block_bytes)?;
+            Ok((header, block_bytes))
+        }
+    }
 }
 
 /// Slice-based block decode (unit tests / in-memory compressed image).
@@ -521,6 +952,8 @@ fn parse_index_records(
 /// Try to interpret `data[start..end]` as one complete xz stream (no padding).
 ///
 /// `end` is the exclusive offset of the first byte after Stream Footer.
+/// Kept for in-memory unit tests; production open uses [`try_parse_stream_backend`].
+#[cfg(test)]
 fn try_parse_stream(data: &[u8], start: usize, end: usize) -> Option<(Vec<BlockInfo>, u64)> {
     if end < start + 32 || end > data.len() {
         return None;
@@ -583,7 +1016,10 @@ fn try_parse_stream(data: &[u8], start: usize, end: usize) -> Option<(Vec<BlockI
     Some((blocks, u_off))
 }
 
-/// Build a block map by parsing every stream's Footer + Index.
+/// Build a block map by parsing every stream's Footer + Index (in-memory image).
+///
+/// Production open uses [`build_block_map_from_backend`]; this slice path is for tests.
+#[cfg(test)]
 fn build_block_map_from_index(data: &[u8]) -> Result<(Vec<BlockInfo>, u64)> {
     let mut pos = 0usize;
     let mut all_blocks = Vec::new();
@@ -651,6 +1087,7 @@ fn build_block_map_from_index(data: &[u8]) -> Result<(Vec<BlockInfo>, u64)> {
 /// Locate stream end and parse Index for stream starting at `start`.
 ///
 /// Returns `(footer_end_exclusive, blocks_with_local_u_off, stream_uncomp)`.
+#[cfg(test)]
 fn locate_and_parse_stream(data: &[u8], start: usize) -> Option<(usize, Vec<BlockInfo>, u64)> {
     // Candidate upper bounds: next stream magics, then EOF.
     let mut uppers: Vec<usize> = find_xz_magic_offsets(data)
@@ -1280,5 +1717,288 @@ mod tests {
         expected.extend_from_slice(a);
         expected.extend_from_slice(b);
         assert_eq!(from_path, expected);
+    }
+
+    /// Nested AutoMount / multi-open FUSE uses Shared backend; concurrent readers
+    /// must not race compressed seek+read (range reads are atomic under the mutex).
+    #[test]
+    fn shared_xz_from_reader_concurrent_readers_full_payload() {
+        use std::io::Cursor;
+        use std::thread;
+
+        // Multi-stream so each unit re-seeks the shared compressed cursor.
+        let mut expected = Vec::new();
+        let mut compressed = Vec::new();
+        for i in 0..6 {
+            let mut chunk = Vec::new();
+            for j in 0..800 {
+                writeln!(&mut chunk, "xz-stream{i}-line{j:04} {}", "z".repeat(32)).unwrap();
+            }
+            compressed.extend_from_slice(&encode_xz(&chunk));
+            expected.extend_from_slice(&chunk);
+        }
+
+        let body = open_seekable_xz_from_reader(
+            Cursor::new(compressed),
+            Path::new("nested://concurrent.xz"),
+        )
+        .unwrap();
+        assert!(
+            body.checkpoint_count() >= 2,
+            "need multi-unit map for concurrent decode race, kind={}, checkpoints={}",
+            body.kind(),
+            body.checkpoint_count()
+        );
+        assert_eq!(body.size(), expected.len() as u64);
+
+        let expected = Arc::new(expected);
+        let mut handles = Vec::new();
+        for t in 0..8 {
+            let b = Arc::clone(&body);
+            let exp = Arc::clone(&expected);
+            handles.push(thread::spawn(move || {
+                for pass in 0..4 {
+                    let mut r = b.open_reader().unwrap();
+                    if pass % 2 == 0 {
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, *exp, "thread {t} pass {pass} full read");
+                    } else {
+                        let mid = exp.len() as u64 / 2;
+                        r.seek(SeekFrom::Start(mid)).unwrap();
+                        let mut out = Vec::new();
+                        r.read_to_end(&mut out).unwrap();
+                        assert_eq!(out, exp[mid as usize..], "thread {t} pass {pass} mid seek");
+                    }
+                }
+            }));
+        }
+        for h in handles {
+            h.join()
+                .expect("worker panicked (likely shared xz seek+read race)");
+        }
+    }
+
+    /// Footer-first Index map must not stream the whole compressed payload at open.
+    /// Snapshot read counters immediately after open (before content verify).
+    #[test]
+    fn index_map_from_backend_avoids_full_payload_load() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingReader {
+            inner: Cursor<Vec<u8>>,
+            max_read: Arc<AtomicU64>,
+            total_read: Arc<AtomicU64>,
+        }
+
+        impl Read for CountingReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let n = self.inner.read(buf)?;
+                self.max_read.fetch_max(n as u64, Ordering::Relaxed);
+                self.total_read.fetch_add(n as u64, Ordering::Relaxed);
+                Ok(n)
+            }
+        }
+
+        impl Seek for CountingReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.inner.seek(pos)
+            }
+        }
+
+        // Prefer multi-block single stream when system xz is available; else multi-stream.
+        // Low-compressibility payload so the .xz is large enough to distinguish
+        // footer-first map I/O from a full compressed load.
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("big.bin");
+        let mut payload = vec![0u8; 200_000];
+        for (i, b) in payload.iter_mut().enumerate() {
+            *b = (i.wrapping_mul(17) ^ (i >> 3)) as u8;
+        }
+        std::fs::write(&raw, &payload).unwrap();
+        let (compressed, expect_payload, multi_block) = match Command::new("xz")
+            .args(["-T1", "--block-size=16384", "-k", "-f", "-c"])
+            .arg(&raw)
+            .output()
+        {
+            Ok(out) if out.status.success() && out.stdout.len() > 8 * 1024 => {
+                (out.stdout, Some(payload), true)
+            }
+            _ => {
+                // Multi-stream fallback: many independent streams → large enough image.
+                let mut c = Vec::new();
+                let mut plain = Vec::new();
+                for i in 0..12 {
+                    let mut chunk = vec![0u8; 8_000];
+                    for (j, b) in chunk.iter_mut().enumerate() {
+                        *b = ((i * 31 + j) ^ 0xA5) as u8;
+                    }
+                    c.extend_from_slice(&encode_xz(&chunk));
+                    plain.extend_from_slice(&chunk);
+                }
+                (c, Some(plain), false)
+            }
+        };
+        let file_len = compressed.len() as u64;
+        assert!(
+            file_len > 4 * 1024,
+            "fixture compressed size {file_len} too small to exercise range-only map"
+        );
+
+        let max_read = Arc::new(AtomicU64::new(0));
+        let total_read = Arc::new(AtomicU64::new(0));
+        let reader = CountingReader {
+            inner: Cursor::new(compressed.clone()),
+            max_read: Arc::clone(&max_read),
+            total_read: Arc::clone(&total_read),
+        };
+
+        let body = open_seekable_xz_from_reader(reader, Path::new("count://map-only.xz")).unwrap();
+        assert_eq!(body.kind(), "xz-blocks");
+        assert!(body.checkpoint_count() >= 1);
+
+        // Snapshot map-build I/O only (before content reads touch payload blocks).
+        let max = max_read.load(Ordering::Relaxed);
+        let total = total_read.load(Ordering::Relaxed);
+        assert!(
+            max < file_len,
+            "map build issued a full-file read (max={max} of {file_len}, total={total})"
+        );
+        // Footer-first multi-block single-stream: open should stay well under the
+        // compressed size (header/index/footer + short padding strip only — not a
+        // full sequential magic scan, which would approach file_len).
+        if multi_block && file_len > 16 * 1024 {
+            assert!(
+                total < file_len / 2,
+                "footer-first multi-block open still read most of the file \
+                 (total={total} of {file_len}); expected sparse Index I/O"
+            );
+            // Padding strip at EOF is typically ≤ 4 KiB; Index is small.
+            assert!(
+                max <= 4 * 1024 + 64,
+                "unexpected large single range during map open (max={max})"
+            );
+            assert!(
+                body.checkpoint_count() >= 2,
+                "expected multi-block map, checkpoints={}",
+                body.checkpoint_count()
+            );
+        }
+
+        // Content still correct via on-demand range decode.
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        if let Some(exp) = expect_payload {
+            assert_eq!(got, exp);
+        }
+    }
+
+    #[test]
+    fn index_map_suitable_rejects_oversized_units() {
+        let small = BlockInfo {
+            compressed_offset: 12,
+            compressed_size: 64,
+            unpadded_size: 60,
+            uncompressed_offset: 0,
+            uncompressed_size: 1024,
+            stream_header_offset: 0,
+            stream_flags: [0, 0],
+            whole_stream: false,
+        };
+        assert!(index_map_suitable_for_seekable(std::slice::from_ref(&small)));
+        assert!(index_map_suitable_for_seekable(&[
+            small.clone(),
+            small.clone()
+        ]));
+        assert!(!index_map_suitable_for_seekable(&[]));
+
+        let huge = BlockInfo {
+            uncompressed_size: DEFAULT_MEMORY_CAP + 1,
+            ..small
+        };
+        assert!(!index_map_suitable_for_seekable(std::slice::from_ref(&huge)));
+        // One large unit among small ones still rejects (cache would pin it).
+        assert!(!index_map_suitable_for_seekable(&[small, huge]));
+    }
+
+    /// Large single-block Index maps must not stay on SeekableXz (unbounded
+    /// per-reader RAM). Full decode + DecodedBody spill is required.
+    ///
+    /// We simulate the gate with synthetic sizes (creating multi‑GiB xz in CI
+    /// is impractical); open path uses the same helper.
+    #[test]
+    fn large_single_block_map_falls_through_to_spill_path() {
+        let huge_unit = BlockInfo {
+            compressed_offset: 12,
+            compressed_size: 1024,
+            unpadded_size: 1000,
+            uncompressed_offset: 0,
+            uncompressed_size: DEFAULT_MEMORY_CAP + 64 * 1024 * 1024,
+            stream_header_offset: 0,
+            stream_flags: [0, 0],
+            whole_stream: false,
+        };
+        assert!(
+            !index_map_suitable_for_seekable(&[huge_unit]),
+            "units above DEFAULT_MEMORY_CAP must not use SeekableXz block cache"
+        );
+
+        // Small default single-block still uses xz-blocks (open integration).
+        let data = b"still-small-single-block";
+        let compressed = encode_xz(data);
+        let body = open_seekable_xz_from_reader(
+            std::io::Cursor::new(compressed),
+            Path::new("small-single.xz"),
+        )
+        .unwrap();
+        assert_eq!(body.kind(), "xz-blocks");
+        assert_eq!(body.size(), data.len() as u64);
+    }
+
+    #[test]
+    fn backend_index_map_matches_slice_index_map() {
+        let a = b"stream-A-backend-map";
+        let b = b"stream-B-backend-map!!";
+        let mut compressed = encode_xz(a);
+        compressed.extend_from_slice(&encode_xz(b));
+
+        let (slice_blocks, slice_total) = build_block_map_from_index(&compressed).unwrap();
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> =
+            Arc::new(Mutex::new(Box::new(std::io::Cursor::new(compressed))));
+        let backend = XzBackend::Shared(shared);
+        let (be_blocks, be_total) = build_block_map_from_backend(&backend).unwrap();
+
+        assert_eq!(slice_total, be_total);
+        assert_eq!(slice_blocks.len(), be_blocks.len());
+        for (s, b) in slice_blocks.iter().zip(be_blocks.iter()) {
+            assert_eq!(s.compressed_offset, b.compressed_offset);
+            assert_eq!(s.compressed_size, b.compressed_size);
+            assert_eq!(s.unpadded_size, b.unpadded_size);
+            assert_eq!(s.uncompressed_offset, b.uncompressed_offset);
+            assert_eq!(s.uncompressed_size, b.uncompressed_size);
+            assert_eq!(s.stream_header_offset, b.stream_header_offset);
+            assert_eq!(s.stream_flags, b.stream_flags);
+            assert_eq!(s.whole_stream, b.whole_stream);
+        }
+    }
+
+    #[test]
+    fn single_block_index_map_is_seekable_not_full_decode() {
+        // Well-formed single-stream single-block xz should keep an Index map
+        // (xz-blocks) rather than forcing DecodedBody at open.
+        let data = b"single-block-keeps-index-map";
+        let compressed = encode_xz(data);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("one-block.xz");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let body = open_seekable_xz(&path).unwrap();
+        assert_eq!(body.kind(), "xz-blocks");
+        assert_eq!(body.checkpoint_count(), 1);
+        assert_eq!(body.size(), data.len() as u64);
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, data);
     }
 }

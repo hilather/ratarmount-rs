@@ -36,8 +36,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | gzip (rapidgzip / seek index) | yes | Tier B + RGZI Tier C + best-effort **GZIDX** (indexed_gzip) | `[x]` / `~` window-dict full interop |
 | bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps + **bzip2blocks** factory auto-import | `[x]` / `~` open-time size discovery |
-| xz multi-block seek | yes | Index + multi-stream maps; single-block full decode | `[x]` / `~` exotic filters |
-| zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** factory auto-import ([guide](zstd-random-access.md)) | `[x]` |
+| xz multi-block seek | yes | Stream Footer+Index **footer-first** range map (multi-stream + multi-block / pixz); small single-block Index; large units → full decode + temp spill | `[x]` / `~` exotic filters |
+| zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** factory auto-import; Shared concurrent-safe ([guide](zstd-random-access.md)) | `[x]` |
 | lz4 / lzip / lzo / Z / lzma-alone / zlib | yes | yes (seekable) | `[x]` |
 | lrz | yes (libarchive) | detect + `lrzip`/`lrunzip` materialize; **libarchive** raw/filter fallback | `~` pure in-process still open |
 | Concatenated / multi-frame outer streams | yes | partial (`--ignore-zeros`) | `~` |
@@ -162,7 +162,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 
 1. ~~**CLI flag parity**~~ — done: `--index-folders`, `:memory:`, default mountpoint, `-e`, `-d`, `--log-file`, `-o`.  
 2. ~~**Seekable gzip (G3 Tier B)**~~ — `.tar.gz` + plain `.gz` single-file via seekable body; Tier C RGZI import/export done.  
-3. ~~**Seekable bzip2 / xz / zstd**~~ — done: shared `SeekableBody`; zstd multi-frame map; bz2/xz one-shot decode to RAM/temp (true block-parallel / xz index / zstd seek-table still open).  
+3. ~~**Seekable bzip2 / xz / zstd**~~ — done: shared `SeekableBody`; zstd multi-frame + seek-table + zstdblocks; xz Footer/Index range-only maps + multi-stream; bzip2 multi-stream + bit-block maps. Residual: exotic xz filters; true bzip2 bit-parallel open-time size discovery polish.  
 4. ~~**Test harness expansion**~~ — phase2–9 allowlists grown; `run-index-interop.sh` (Py↔Rust); fixed-archive wrapper ready (`RUN=1`). Continue complex-usage subset + full fixed-archive gap list.  
 5. ~~**SquashFS / SQLAR**~~ — SQLAR pure; SquashFS via `unsquashfs` MVP.  
 6. ~~**`--commit-overlay`**~~ — done for uncompressed TAR via GNU tar (`--yes` for non-interactive).  
