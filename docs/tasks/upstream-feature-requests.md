@@ -28,6 +28,7 @@ issue from the README feature tables.
 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic auth (URL userinfo + `RATARMOUNT_HTTP_*`); cookie auth deferred |
 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB |
+| [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | Parallel index nested archives | **done** / **partial** | Eager AutoMount same-dir fan-out (`AutoMountOptions::parallel_nested_threads`, default auto); lazy still sequential; CLI/`-P` wire residual |
 
 ---
 
@@ -35,13 +36,13 @@ issue from the README feature tables.
 
 ### P0 — remaining
 
-*(none — FR-5 readahead shipped)*
+*(none — FR-5 readahead + FR-6 compositing parallel eager nested shipped)*
 
 ### P1 — good notes, medium design
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-6 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **Parallel index nested archives** | Nested index work can fan out | factory / automount / index |
+| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI / factory wire for parallel nested** | Options field lives in compositing; default auto | `ratarmount/src/factory.rs` + CLI |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | Use libarchive path; document | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | **done** — path + Range open import side tables; skip re-export on warm hit | `ratarmount/src/factory.rs` |
 
@@ -61,8 +62,8 @@ issue from the README feature tables.
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
 
-1. **FR-6** Parallel nested indexing (when needed)  
+1. **FR-6 residual** Wire factory/`--parallel-nested` (or `-P`) if operators need an explicit cap; compositing default is already auto-parallel for eager same-dir archives.
 
 Update this file when status changes. Keep README **Upstream** column in sync.

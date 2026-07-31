@@ -32,6 +32,9 @@ pub type OpenNestedReaderFn = Arc<
 const TAG_PREFIX: &str = "automount:";
 
 /// Options controlling nested mount point naming and eagerness.
+///
+/// Default enables parallel eager nested opens when a folder has ≥2 archives
+/// (`parallel_nested_threads = 0` → auto via [`std::thread::available_parallelism`]).
 #[derive(Clone, Debug, Default)]
 pub struct AutoMountOptions {
     /// Mount on first access instead of scanning the whole tree up front.
@@ -42,6 +45,16 @@ pub struct AutoMountOptions {
     pub transform: Option<(String, String)>,
     /// Which suffixes trigger recursive mounting (Python `--recursive-extensions`).
     pub recursive_extensions: RecursiveExtSet,
+    /// Worker threads for parallel nested opens during eager `scan_and_mount`
+    /// (upstream [#80](https://github.com/mxmlnkn/ratarmount/issues/80) / FR-6).
+    ///
+    /// * `0` (default): auto — use [`std::thread::available_parallelism`] (min 1).
+    ///   Parallel path is used only when a folder has ≥2 archive children.
+    /// * `1`: force sequential (pre-FR-6 behaviour).
+    /// * `N ≥ 2`: cap concurrency at `N` workers.
+    ///
+    /// Lazy mode always mounts on access single-threaded; this field is ignored.
+    pub parallel_nested_threads: u32,
 }
 
 /// Configured set of filename suffixes for recursive automount.
@@ -333,6 +346,8 @@ pub struct AutoMountLayer {
     strip_ext: bool,
     ext_set: RecursiveExtSet,
     transform: Option<(Regex, String)>,
+    /// Cap for parallel eager nested opens (`0` = auto). See [`AutoMountOptions`].
+    parallel_nested_threads: u32,
 }
 
 impl AutoMountLayer {
@@ -393,6 +408,7 @@ impl AutoMountLayer {
             strip_ext: opts.strip_recursive_extension,
             ext_set: opts.recursive_extensions,
             transform,
+            parallel_nested_threads: opts.parallel_nested_threads,
         };
         if !opts.lazy {
             layer.scan_and_mount();
@@ -411,6 +427,18 @@ impl AutoMountLayer {
         self
     }
 
+    /// Resolve worker count for eager parallel nested opens.
+    fn parallel_worker_count(&self) -> usize {
+        match self.parallel_nested_threads {
+            0 => std::thread::available_parallelism()
+                .map(|n| n.get())
+                .unwrap_or(1),
+            n => n as usize,
+        }
+    }
+
+    /// Eager scan: list each folder, fan out same-directory nested opens, then
+    /// recurse into subdirs and successfully mounted points (depth-by-depth).
     fn scan_and_mount(&self) {
         let mut folders = vec!["/".to_string()];
         while let Some(folder) = folders.pop() {
@@ -421,20 +449,68 @@ impl AutoMountLayer {
             let Some(names) = self.list_names_no_lazy(&folder) else {
                 continue;
             };
+            let mut subdirs = Vec::new();
+            let mut archives = Vec::new();
             for name in names {
                 let full = join(&folder, &name);
                 if self.is_dir_raw(&full) {
-                    folders.push(full);
+                    subdirs.push(full);
                     continue;
                 }
                 if is_archive_filename_with(&name, &self.ext_set) {
-                    if let Some(mp) = self.try_mount_file(&full, depth + 1) {
-                        debug!("automounted {full} -> {mp}");
-                        folders.push(mp);
-                    }
+                    archives.push(full);
                 }
             }
+            let mounted_mps = self.mount_archives_batch(&archives, depth + 1);
+            folders.extend(subdirs);
+            folders.extend(mounted_mps);
         }
+    }
+
+    /// Mount all archive files at one directory level.
+    ///
+    /// When there are ≥2 archives and worker count > 1, opens fan out via
+    /// [`std::thread::scope`]. Otherwise sequential (also used for lazy mode callers
+    /// that invoke [`Self::try_mount_file`] directly).
+    fn mount_archives_batch(&self, archives: &[String], depth: u32) -> Vec<String> {
+        if archives.is_empty() {
+            return Vec::new();
+        }
+        let workers = self.parallel_worker_count();
+        if workers <= 1 || archives.len() < 2 {
+            let mut out = Vec::with_capacity(archives.len());
+            for full in archives {
+                if let Some(mp) = self.try_mount_file(full, depth) {
+                    debug!("automounted {full} -> {mp}");
+                    out.push(mp);
+                }
+            }
+            return out;
+        }
+
+        let n_workers = workers.min(archives.len());
+        let work = Mutex::new(archives.to_vec());
+        let results = Mutex::new(Vec::with_capacity(archives.len()));
+
+        std::thread::scope(|scope| {
+            for _ in 0..n_workers {
+                scope.spawn(|| loop {
+                    let full = {
+                        let mut q = work.lock().expect("automount work queue");
+                        q.pop()
+                    };
+                    let Some(full) = full else {
+                        break;
+                    };
+                    if let Some(mp) = self.try_mount_file(&full, depth) {
+                        debug!("automounted {full} -> {mp}");
+                        results.lock().expect("automount results").push(mp);
+                    }
+                });
+            }
+        });
+
+        results.into_inner().expect("automount results")
     }
 
     fn depth_at(&self, path: &str) -> u32 {
@@ -1446,5 +1522,233 @@ mod tests {
         let mut buf = String::new();
         reader.read_to_string(&mut buf).unwrap();
         assert_eq!(buf, "hello from split tar\n");
+    }
+
+    /// Regression: FR-6 parallel eager mount of multiple same-directory nested archives.
+    ///
+    /// Symptom (upstream #80): outer tree with many nested archives indexes them one-by-one.
+    /// With `parallel_nested_threads ≥ 2` and ≥2 archive children, opens fan out and all
+    /// mounts succeed.
+    #[test]
+    fn parallel_eager_mounts_multiple_archives_same_level() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.tar", "b.tar", "c.tar"] {
+            fs::write(dir.path().join(name), b"dummy-archive").unwrap();
+        }
+        fs::write(dir.path().join("readme.txt"), b"not an archive").unwrap();
+
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_c = Arc::clone(&opened);
+        let open_nested: OpenNestedFn = Arc::new(move |path: &Path| {
+            opened_c.fetch_add(1, Ordering::SeqCst);
+            assert!(path.exists(), "nested path must exist: {}", path.display());
+            Ok(Arc::new(EmptyNested) as Arc<dyn MountSource>)
+        });
+
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new_with_options(
+            root,
+            1,
+            open_nested,
+            AutoMountOptions {
+                // Force parallel path (≥2 workers + ≥2 archives at one level).
+                parallel_nested_threads: 4,
+                ..Default::default()
+            },
+        );
+
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            3,
+            "all three nested archives must be opened"
+        );
+        for name in ["a.tar", "b.tar", "c.tar"] {
+            let fi = layer
+                .lookup(&format!("/{name}"), 0)
+                .unwrap_or_else(|| panic!("expected mount for {name}"));
+            assert_eq!(
+                fi.mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFDIR,
+                "{name} should appear as a directory"
+            );
+        }
+        // Non-archive stays a regular file.
+        let fi = layer.lookup("/readme.txt", 0).expect("readme");
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+    }
+
+    /// Regression: FR-6 concurrent open_nested calls when parallel path is forced.
+    #[test]
+    fn parallel_eager_open_nested_overlaps_with_multiple_archives() {
+        use std::time::Duration;
+
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["x.tar", "y.tar", "z.tar", "w.tar"] {
+            fs::write(dir.path().join(name), b"dummy").unwrap();
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let in_c = Arc::clone(&in_flight);
+        let max_c = Arc::clone(&max_in_flight);
+
+        let open_nested: OpenNestedFn = Arc::new(move |_path: &Path| {
+            let cur = in_c.fetch_add(1, Ordering::SeqCst) + 1;
+            max_c.fetch_max(cur, Ordering::SeqCst);
+            // Hold the slot so sibling workers can overlap.
+            std::thread::sleep(Duration::from_millis(80));
+            in_c.fetch_sub(1, Ordering::SeqCst);
+            Ok(Arc::new(EmptyNested) as Arc<dyn MountSource>)
+        });
+
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let _layer = AutoMountLayer::new_with_options(
+            root,
+            1,
+            open_nested,
+            AutoMountOptions {
+                parallel_nested_threads: 4,
+                ..Default::default()
+            },
+        );
+
+        let peak = max_in_flight.load(Ordering::SeqCst);
+        assert!(
+            peak >= 2,
+            "expected concurrent open_nested (peak in-flight={peak}); parallel path not taken?"
+        );
+    }
+
+    /// Sequential forced (`parallel_nested_threads = 1`) still mounts every archive.
+    #[test]
+    fn sequential_eager_still_mounts_all_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["one.tar", "two.tar"] {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_c = Arc::clone(&opened);
+        let open_nested: OpenNestedFn = Arc::new(move |_path: &Path| {
+            opened_c.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(EmptyNested) as Arc<dyn MountSource>)
+        });
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new_with_options(
+            root,
+            1,
+            open_nested,
+            AutoMountOptions {
+                parallel_nested_threads: 1,
+                ..Default::default()
+            },
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+        assert!(layer.lookup("/one.tar", 0).is_some());
+        assert!(layer.lookup("/two.tar", 0).is_some());
+    }
+
+    /// Lazy mode must not run eager scan (parallel or otherwise); mount on first access.
+    #[test]
+    fn lazy_mode_does_not_eager_parallel_mount() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("late.tar"), b"x").unwrap();
+        fs::write(dir.path().join("also.tar"), b"y").unwrap();
+
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opened_c = Arc::clone(&opened);
+        let open_nested: OpenNestedFn = Arc::new(move |_path: &Path| {
+            opened_c.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(EmptyNested) as Arc<dyn MountSource>)
+        });
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new_with_options(
+            root,
+            2,
+            open_nested,
+            AutoMountOptions {
+                lazy: true,
+                parallel_nested_threads: 8,
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            0,
+            "lazy must not eager-scan even when parallel threads configured"
+        );
+        // First list triggers sequential lazy children mount.
+        let _ = layer.list("/");
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+        assert!(layer.lookup("/late.tar", 0).is_some());
+        assert!(layer.lookup("/also.tar", 0).is_some());
+    }
+
+    /// Nested content under parallel-mounted archives is still reachable.
+    #[test]
+    fn parallel_eager_recurses_into_mounted_archives() {
+        use ratarmount_core::OpenOptions;
+        use ratarmount_formats_tar::SqliteIndexedTar;
+        use std::process::Command;
+
+        let dir = tempfile::tempdir().unwrap();
+        // Build two outer TARs each with one file member.
+        for (archive, payload_name, payload) in [
+            ("left.tar", "left.txt", b"L" as &[u8]),
+            ("right.tar", "right.txt", b"R" as &[u8]),
+        ] {
+            let content = dir.path().join(format!("{archive}.content"));
+            fs::create_dir(&content).unwrap();
+            fs::write(content.join(payload_name), payload).unwrap();
+            let tar_path = dir.path().join(archive);
+            assert!(Command::new("tar")
+                .args(["-cf"])
+                .arg(&tar_path)
+                .arg("-C")
+                .arg(&content)
+                .arg(payload_name)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        let open_nested: OpenNestedFn = Arc::new(|path: &Path| {
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let ms = SqliteIndexedTar::create_index(path, path, None, &opts, "test", &mut None)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        });
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new_with_options(
+            root,
+            2,
+            open_nested,
+            AutoMountOptions {
+                parallel_nested_threads: 4,
+                ..Default::default()
+            },
+        );
+
+        let mut left = String::new();
+        layer
+            .open(&layer.lookup("/left.tar/left.txt", 0).expect("left"), 0)
+            .unwrap()
+            .read_to_string(&mut left)
+            .unwrap();
+        assert_eq!(left, "L");
+        let mut right = String::new();
+        layer
+            .open(&layer.lookup("/right.tar/right.txt", 0).expect("right"), 0)
+            .unwrap()
+            .read_to_string(&mut right)
+            .unwrap();
+        assert_eq!(right, "R");
     }
 }
