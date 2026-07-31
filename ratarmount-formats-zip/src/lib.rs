@@ -77,13 +77,16 @@ const METHOD_DEFLATE: u16 = 8;
 /// Soft cap on completed inflate-cache entries (evict completed when exceeded).
 const INFLATE_CACHE_MAX_ENTRIES: usize = 256;
 
-/// Result of a single-flight Deflate inflate (shared across concurrent openers).
+/// Single-flight Deflate inflate slot. Only **successful** results are retained
+/// permanently; on failure the slot is removed from the map so the next open can
+/// retry (transient I/O must not poison a member for the mount lifetime).
 type InflateOnce = OnceLock<std::result::Result<Arc<Vec<u8>>, String>>;
 
 /// Single-flight shared decode cache for ZIP Deflate members (FR-4).
 ///
 /// Keyed by local-header / central-directory header offset. Concurrent openers of
 /// the same key share one `OnceLock` so only a single `flate2` inflate runs.
+/// Failed inflates are not sticky: the map entry is dropped so a later open retries.
 struct InflateCache {
     slots: Mutex<HashMap<u64, Arc<InflateOnce>>>,
 }
@@ -95,7 +98,10 @@ impl InflateCache {
         }
     }
 
-    /// Return cached inflated bytes, or run `inflate` exactly once for this key.
+    /// Return cached inflated bytes, or run `inflate` once for this key (single-flight).
+    ///
+    /// On error the slot is removed so the next call re-runs `inflate` instead of
+    /// returning a permanently cached failure.
     fn get_or_insert_with(
         &self,
         header: u64,
@@ -107,16 +113,37 @@ impl InflateCache {
             if guard.len() > INFLATE_CACHE_MAX_ENTRIES {
                 guard.retain(|_, s| s.get().is_none());
             }
+            // Drop any prior failed slot that raced before removal (should be rare).
+            if let Some(existing) = guard.get(&header) {
+                if existing.get().is_some_and(|r| r.is_err()) {
+                    guard.remove(&header);
+                }
+            }
             Arc::clone(
                 guard
                     .entry(header)
                     .or_insert_with(|| Arc::new(OnceLock::new())),
             )
         };
+        // Single-flight: concurrent waiters share one inflate invocation.
         let res = slot.get_or_init(|| inflate().map(Arc::new).map_err(|e| e.to_string()));
         match res {
             Ok(bytes) => Ok(Arc::clone(bytes)),
-            Err(msg) => Err(io::Error::other(msg.clone())),
+            Err(msg) => {
+                // Do not permanently poison this member: remove our failed slot so
+                // the next open can retry (e.g. transient remote / Shared I/O).
+                {
+                    let mut guard = self.slots.lock().expect("zip inflate cache");
+                    if let Some(current) = guard.get(&header) {
+                        // Only remove if this is still our slot (a concurrent retry
+                        // may already have installed a fresh OnceLock).
+                        if Arc::ptr_eq(current, &slot) {
+                            guard.remove(&header);
+                        }
+                    }
+                }
+                Err(io::Error::other(msg.clone()))
+            }
         }
     }
 
@@ -129,6 +156,12 @@ impl InflateCache {
             .values()
             .filter(|s| s.get().is_some_and(|r| r.is_ok()))
             .count()
+    }
+
+    /// Total map slots including in-flight / not-yet-removed (tests).
+    #[cfg(test)]
+    fn slot_count(&self) -> usize {
+        self.slots.lock().expect("zip inflate cache").len()
     }
 }
 
@@ -2358,6 +2391,102 @@ mod tests {
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, a);
+    }
+
+    /// Regression: InflateCache must not permanently cache failed inflates.
+    /// Transient I/O (e.g. Shared/remote read) must be retryable on the next open.
+    #[test]
+    fn inflate_cache_does_not_sticky_cache_errors() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = InflateCache::new();
+        let calls = AtomicUsize::new(0);
+        let header = 0x_dead_beef_u64;
+
+        let err = cache.get_or_insert_with(header, || {
+            calls.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::new(io::ErrorKind::Interrupted, "transient I/O"))
+        });
+        assert!(err.is_err(), "first inflate should fail");
+        assert_eq!(
+            err.unwrap_err().to_string(),
+            "transient I/O",
+            "error message should surface"
+        );
+        assert_eq!(
+            cache.completed_len(),
+            0,
+            "failed inflate must not count as completed"
+        );
+        assert_eq!(
+            cache.slot_count(),
+            0,
+            "failed slot must be removed so the key is not poisoned"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        // Retry succeeds and re-invokes the inflate closure (not sticky Err).
+        let ok = cache
+            .get_or_insert_with(header, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                Ok(vec![9, 8, 7])
+            })
+            .expect("retry after failure");
+        assert_eq!(ok.as_slice(), &[9, 8, 7]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.completed_len(), 1);
+        assert_eq!(cache.slot_count(), 1);
+
+        // Subsequent hit uses the success cache without re-inflating.
+        let cached = cache
+            .get_or_insert_with(header, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("must not re-inflate after successful cache fill");
+            })
+            .expect("cached success");
+        assert_eq!(cached.as_slice(), &[9, 8, 7]);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(cache.completed_len(), 1);
+    }
+
+    /// Regression: multiple consecutive failures remain retryable; first success sticks.
+    #[test]
+    fn inflate_cache_retries_after_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let cache = InflateCache::new();
+        let calls = AtomicUsize::new(0);
+        let header = 7u64;
+
+        for attempt in 1..=3 {
+            let r = cache.get_or_insert_with(header, || {
+                let n = calls.fetch_add(1, Ordering::SeqCst) + 1;
+                if n < 3 {
+                    Err(io::Error::other(format!("fail #{attempt}")))
+                } else {
+                    Ok(b"ok".to_vec())
+                }
+            });
+            if attempt < 3 {
+                assert!(r.is_err(), "attempt {attempt} should fail");
+                assert_eq!(cache.completed_len(), 0);
+                assert_eq!(cache.slot_count(), 0);
+            } else {
+                assert_eq!(r.expect("third attempt").as_slice(), b"ok");
+                assert_eq!(cache.completed_len(), 1);
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
+
+        // Cached success: no fourth inflate.
+        let again = cache
+            .get_or_insert_with(header, || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                panic!("must use cached success");
+            })
+            .unwrap();
+        assert_eq!(again.as_slice(), b"ok");
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     /// Store stencil path remains random-access (not forced through inflate cache).
