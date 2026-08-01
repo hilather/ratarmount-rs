@@ -21,6 +21,8 @@ tests/zip.7z	natsu.zip/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/zip.7z	natsu.zip/foo	10d6977ec2ab378e60339323c24f9308
 tests/rar.zip	natsu.rar/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/rar.zip	natsu.rar/foo	10d6977ec2ab378e60339323c24f9308
+# Nested store-method (Copy) 7z containing another 7z
+tests/nested-inner-hello.7z	inner-hello.7z/hello.txt	b96fce030fad4a580a9fa12bd3cac829
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.bz2/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.gz/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.xz/ufo	2709a3348eb2c52302a7606ecf5860bc
@@ -36,6 +38,8 @@ tests/double-compressed-nested-tar.tbz2.tbz2	nested-tar.tar.bz2/foo/fighter/ufo	
 tests/double-compressed-nested-tar.tbz2.tbz2	nested-tar.tar.bz2/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 tests/double-compressed-nested-tar.tar.7z.7z	nested-tar.tar.7z/nested-tar.tar/foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/double-compressed-nested-tar.tar.7z.7z	nested-tar.tar.7z/nested-tar.tar/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+# Nested packed TAR inside .tar.gz (5 levels)
+tests/packed-5-times.tar.gz	ufo_03.tar/ufo_02.tar/ufo_01.tar/ufo_00.tar/ufo	2709a3348eb2c52302a7606ecf5860bc
 # CPIO with nested TAR member (fixture layout: nested/inner.tar, not nested-tar.tar)
 tests/nested-tar-in-cpio.newc.cpio	nested/inner.tar/inner.txt	6adea3ceca4d0da696e60581ba39c778
 tests/nested-tar-in-cpio.newc.cpio	readme.txt	614c22982b489667d878611e15276c51
