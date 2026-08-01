@@ -1,8 +1,74 @@
 # Benchmarks
 
+## Fair rapidgzip A/B (zlib-rs vs ISA-L)
+
+**Use this for inflate-backend comparisons.** ISA-L vs zlib-rs is a **compile-time**
+choice (`gzip-rapidgzip` vs `gzip-rapidgzip-isal`). Timing the same binary twice is
+not a fair A/B — this harness builds **two** release binaries and labels them
+`rust-rgz-zlib` / `rust-rgz-isal` (plus optional `rust-g3` and `python`).
+
+```bash
+# Full A/B (default CORPUS_MIB=256 — can take a while)
+# Needs: rustc ≥ 1.87, libisal (or ISAL_INSTALL_PREFIX), optional FUSE + Python
+./benchmarks/compare-gzip-isal-ab.sh
+# → benchmarks/gzip-backend-results/{results-isal-ab.csv,results-isal-ab.md}
+#    + bin/ratarmount-rgz-{zlib,isal}
+
+# Decode-only (cold index + warm open; no FUSE) and skip Python/G3 baselines:
+SKIP_FUSE=1 SKIP_PYTHON=1 SKIP_G3=1 CORPUS_MIB=64 RUNS=1 ./benchmarks/compare-gzip-isal-ab.sh
+
+# Prebuilt binaries (no cargo) — both paths must already exist and be executable:
+SKIP_BUILD=1 \
+  RUST_BIN_ZLIB=benchmarks/gzip-backend-results/bin/ratarmount-rgz-zlib \
+  RUST_BIN_ISAL=benchmarks/gzip-backend-results/bin/ratarmount-rgz-isal \
+  SKIP_FUSE=1 SKIP_PYTHON=1 \
+  ./benchmarks/compare-gzip-isal-ab.sh
+```
+
+`SKIP_BUILD=1` **requires** both prebuilt binaries (script exits with install hints if missing).
+Python baseline is optional (`SKIP_PYTHON=1`); the script sets `RATARMOUNT_ALLOW_NO_PY=1` by default
+so a sibling Python checkout is not required for Rust-only A/B.
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `CORPUS_MIB` | `256` | Uncompressed large-blob size for generated corpora |
+| `THREADS` | `8` | `-P gzip:N` |
+| `RUNS` | `3` | Cold-index / warm-open samples (median) |
+| `SKIP_BUILD` | `0` | `1` = require `RUST_BIN_ZLIB` + `RUST_BIN_ISAL` |
+| `RUST_BIN_ZLIB` | `…/bin/ratarmount-rgz-zlib` | Binary built with `gzip-rapidgzip` |
+| `RUST_BIN_ISAL` | `…/bin/ratarmount-rgz-isal` | Binary built with `gzip-rapidgzip-isal` |
+| `ISAL_INSTALL_PREFIX` | auto sibling `../rapidgzip-rust/.isal-prefix` if present | Prefix with `lib/libisal.so` + headers |
+| `SKIP_FUSE` | `0` | `1` = decode-only (no mount / seq cat) |
+| `SKIP_PYTHON` / `SKIP_G3` | `0` | Drop baselines |
+| `OUT_DIR` | `benchmarks/gzip-backend-results` | Gitignored output dir |
+
+### What is measured
+
+| Section | How | FUSE? |
+|---------|-----|-------|
+| **Cold index** | `ratarmount -c --no-mount` (full inflate while indexing) | No |
+| **Warm open** | Reuse SQLite index with `--no-mount` (open cost) | No |
+| **FUSE cold/warm** | Mount + sequential `cat` bandwidth after warm | Yes |
+
+`results-isal-ab.md` includes a **zlib vs isal delta** table (time ratio zlib/isal and % wall change; throughput ratio isal/zlib).
+
+### ISA-L install
+
+```bash
+# Distro package, e.g.:
+#   sudo apt install libisal-dev
+# Or a custom prefix:
+export ISAL_INSTALL_PREFIX=/path/to/prefix   # lib/libisal.so + include/
+export LD_LIBRARY_PATH="$ISAL_INSTALL_PREFIX/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+./benchmarks/compare-gzip-isal-ab.sh
+```
+
+Results under `benchmarks/gzip-backend-results/` are **gitignored** — re-run the script to regenerate; do not commit large blobs.
+
 ## Gzip backends (G3 vs rapidgzip POC vs Python)
 
-Focused codec compare for the Tier D rapidgzip feature:
+Multi-tool compare with a **single** Rust build (not a fair zlib↔ISA-L A/B — use
+[`compare-gzip-isal-ab.sh`](compare-gzip-isal-ab.sh) for that):
 
 ```bash
 # Default harness builds with gzip-rapidgzip-isal (needs libisal or ISAL_INSTALL_PREFIX).

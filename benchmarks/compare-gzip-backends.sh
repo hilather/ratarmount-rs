@@ -1,6 +1,12 @@
 #!/usr/bin/env bash
 # Compare gzip backends: Rust G3 vs Rust rapidgzip (POC) vs Python rapidgzip.
 #
+# NOTE: This script builds ONE Rust binary (RUST_FEATURES). It cannot fairly A/B
+# zlib-rs vs ISA-L — those are compile-time inflate backends. For a dual-build
+# A/B with labels rust-rgz-zlib / rust-rgz-isal, use:
+#   ./benchmarks/compare-gzip-isal-ab.sh
+#   → benchmarks/gzip-backend-results/results-isal-ab.md
+#
 # Usage:
 #   ./benchmarks/compare-gzip-backends.sh
 #
