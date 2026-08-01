@@ -21,6 +21,7 @@ use ratarmount_compress::{
     open_seekable_zstd_with_threads, open_seekable_zstd_with_threads_from_reader,
     open_seekable_zstd_with_zstd_blocks, open_seekable_zstd_with_zstd_blocks_from_reader,
     strip_compression_suffix, CompressionFormat, SeekableBody, SharedSeekableGzip,
+    GZIP_SEEK_INDEX_MAGIC, INDEXED_GZIP_INDEX_MAGIC,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
@@ -1497,6 +1498,20 @@ fn try_load_gzip_index_blob(
     }
 }
 
+/// Short format label for gzip seek-index side-table blobs (import / fail logs).
+///
+/// Distinguishes native Tier C **`RGZI`** from Python `indexed_gzip` **`GZIDX`**
+/// via magic prefix so logs do not claim RGZI when the blob is GZIDX (or vice versa).
+fn gzip_seek_index_format_label(blob: &[u8]) -> &'static str {
+    if blob.starts_with(GZIP_SEEK_INDEX_MAGIC) {
+        "RGZI"
+    } else if blob.starts_with(INDEXED_GZIP_INDEX_MAGIC) {
+        "GZIDX"
+    } else {
+        "seek-index"
+    }
+}
+
 /// Persist a Tier C RGZI seek-index blob into the SQLite side table when writable.
 ///
 /// No-op for `:memory:` / missing path / read-only / `write_index = false`.
@@ -1537,7 +1552,7 @@ fn persist_gzip_index_blob(
     }
 }
 
-/// Open seekable gzip from a path, preferring an imported RGZI blob when available.
+/// Open seekable gzip from a path, preferring an imported RGZI/GZIDX blob when available.
 fn open_shared_seekable_gzip_path(
     path: &Path,
     spacing: u64,
@@ -1546,10 +1561,11 @@ fn open_shared_seekable_gzip_path(
     recreate: bool,
 ) -> Result<Arc<SharedSeekableGzip>, String> {
     if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
+        let fmt = gzip_seek_index_format_label(&blob);
         match SharedSeekableGzip::open_with_imported_index(path, spacing, threads, &blob) {
             Ok(g) => {
                 eprintln!(
-                    "seekable gzip (imported RGZI): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+                    "seekable gzip (imported {fmt}): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
                     path.display(),
                     g.size(),
                     g.checkpoint_count(),
@@ -1558,7 +1574,7 @@ fn open_shared_seekable_gzip_path(
                 return Ok(g);
             }
             Err(e) => {
-                eprintln!("info: gzip RGZI import failed ({e}); rebuilding seek checkpoints");
+                eprintln!("info: gzip {fmt} import failed ({e}); rebuilding seek checkpoints");
             }
         }
     }
@@ -1574,7 +1590,7 @@ fn open_shared_seekable_gzip_path(
     Ok(gzip)
 }
 
-/// Try opening seekable gzip from a Range reader using an on-disk RGZI blob.
+/// Try opening seekable gzip from a Range reader using an on-disk RGZI/GZIDX blob.
 ///
 /// Returns `None` when no blob is available or import fails (caller rebuilds with a
 /// **fresh** reader — the passed reader is consumed on both success and failure).
@@ -1591,12 +1607,13 @@ where
 {
     // Label may be virtual (HTTP); fingerprint only when it resolves to a real path.
     let blob = try_load_gzip_index_blob(index_path, Some(label), recreate)?;
+    let fmt = gzip_seek_index_format_label(&blob);
     match SharedSeekableGzip::open_with_imported_index_from_reader(
         reader, spacing, threads, label, &blob,
     ) {
         Ok(g) => {
             eprintln!(
-                "seekable gzip (imported RGZI): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
+                "seekable gzip (imported {fmt}): {} ({} uncompressed bytes, {} checkpoints, -P gzip:{})",
                 label.display(),
                 g.size(),
                 g.checkpoint_count(),
@@ -1605,7 +1622,7 @@ where
             Some(g)
         }
         Err(e) => {
-            eprintln!("info: gzip RGZI import failed ({e}); rebuilding seek checkpoints");
+            eprintln!("info: gzip {fmt} import failed ({e}); rebuilding seek checkpoints");
             None
         }
     }
@@ -1668,12 +1685,13 @@ fn open_shared_rapidgzip_path(
     recreate: bool,
 ) -> Result<Arc<ratarmount_compress::SharedRapidgzip>, String> {
     if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
+        let fmt = gzip_seek_index_format_label(&blob);
         match ratarmount_compress::SharedRapidgzip::open_with_imported_index(
             path, spacing, threads, &blob,
         ) {
             Ok(shared) => {
                 eprintln!(
-                    "seekable gzip-rapidgzip (imported GZIDX): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
+                    "seekable gzip-rapidgzip (imported {fmt}): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
                     path.display(),
                     shared.size(),
                     shared.checkpoint_count(),
@@ -1682,7 +1700,7 @@ fn open_shared_rapidgzip_path(
                 return Ok(shared);
             }
             Err(e) => {
-                eprintln!("info: rapidgzip GZIDX import failed ({e}); rebuilding seek index");
+                eprintln!("info: rapidgzip {fmt} import failed ({e}); rebuilding seek index");
             }
         }
     }
@@ -1700,8 +1718,10 @@ fn open_shared_rapidgzip_path(
 
 /// Persist rapidgzip GZIDX into the SQLite side table when writable.
 ///
-/// Mirrors [`persist_gzip_index_blob`] control flow (`write_index`, not RO / `:memory:`,
-/// index path exists). Stores Python `indexed_gzip` (`GZIDX`) bytes via
+/// Mirrors [`persist_gzip_index_blob`] control flow (`write_index`, not RO / `:memory:`).
+/// Creates the index file when the path is set but does not yet exist (plain `.gz`
+/// has no TAR `files` build — same shell path as G3 RGZI / zstdblocks).
+/// Stores Python `indexed_gzip` (`GZIDX`) bytes via
 /// [`SharedRapidgzip::export_gzidx_blob`](ratarmount_compress::SharedRapidgzip::export_gzidx_blob).
 #[cfg(feature = "gzip-rapidgzip")]
 fn persist_rapidgzip_index_blob(
@@ -1715,9 +1735,6 @@ fn persist_rapidgzip_index_blob(
     let Some(ip) = index_path else {
         return;
     };
-    if !ip.exists() {
-        return;
-    }
     let blob = match shared.export_gzidx_blob() {
         Ok(b) => b,
         Err(e) => {
@@ -1725,7 +1742,7 @@ fn persist_rapidgzip_index_blob(
             return;
         }
     };
-    match SqliteIndex::open_writable(ip) {
+    match open_or_create_writable_index(ip) {
         Ok(idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for gzip blob: {e}");
@@ -2869,12 +2886,13 @@ where
                 let rg_threads = rapidgzip_threads(&o);
                 let rg_result: Result<Arc<ratarmount_compress::SharedRapidgzip>, String> =
                     if let Some(blob) = try_load_gzip_index_blob(ip, Some(&label), recreate) {
+                        let fmt = gzip_seek_index_format_label(&blob);
                         match ratarmount_compress::SharedRapidgzip::open_with_imported_index_from_reader(
                             range, spacing, rg_threads, &label, &blob,
                         ) {
                             Ok(shared) => {
                                 eprintln!(
-                                    "seekable gzip-rapidgzip (imported GZIDX): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
+                                    "seekable gzip-rapidgzip (imported {fmt}): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
                                     label.display(),
                                     shared.size(),
                                     shared.checkpoint_count(),
@@ -2884,7 +2902,7 @@ where
                             }
                             Err(e) => {
                                 eprintln!(
-                                    "info: rapidgzip GZIDX import failed ({e}); rebuilding seek index"
+                                    "info: rapidgzip {fmt} import failed ({e}); rebuilding seek index"
                                 );
                                 let reopen_fn = reopen_opt.take().ok_or_else(|| {
                                     "internal: reopen already consumed".to_string()
@@ -3970,6 +3988,26 @@ mod tests {
         assert!(try_load_gzip_index_blob(Some(&missing), None, true).is_none());
     }
 
+    /// Regression: import/persist logs must label blob magic (RGZI vs GZIDX), not hardcode one.
+    #[test]
+    fn gzip_seek_index_format_label_distinguishes_rgzi_gzidx() {
+        assert_eq!(
+            gzip_seek_index_format_label(b"RGZI\x01\x00\x00\x00"),
+            "RGZI"
+        );
+        assert_eq!(gzip_seek_index_format_label(b"GZIDX\x01\x00rest"), "GZIDX");
+        assert_eq!(
+            gzip_seek_index_format_label(b"XXXX-not-an-index"),
+            "seek-index"
+        );
+        assert_eq!(gzip_seek_index_format_label(b""), "seek-index");
+        assert_eq!(gzip_seek_index_format_label(GZIP_SEEK_INDEX_MAGIC), "RGZI");
+        assert_eq!(
+            gzip_seek_index_format_label(INDEXED_GZIP_INDEX_MAGIC),
+            "GZIDX"
+        );
+    }
+
     #[test]
     fn zstd_blocks_persisted_and_reimported() {
         let dir = tempfile::tempdir().unwrap();
@@ -4760,6 +4798,7 @@ mod tests {
             gzip_seek_point_spacing: 4 * 1024,
             use_backends: vec!["rapidgzip".into()],
             parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            write_index: true,
             ..Default::default()
         };
 
@@ -4793,6 +4832,189 @@ mod tests {
         let idx2 = SqliteIndex::open_read_only(&index).expect("reopen index");
         let blobs2 = idx2.get_gzip_index_blobs().expect("blobs again");
         assert_eq!(blobs2, vec![stored]);
+    }
+
+    /// Regression: plain (non-TAR) `.gz` + prefer rapidgzip + write_index creates an
+    /// index shell and stores GZIDX even when no TAR `files` table is built; warm open
+    /// imports the blob. Mirrors G3-B plain RGZI shell create.
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn plain_gzip_rapidgzip_plain_gzidx_shell_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large enough for multiple checkpoints at 4 KiB spacing.
+        let mut payload = Vec::new();
+        for i in 0..80u32 {
+            payload.extend(format!("rgz-plain-{i:04}-").repeat(128).into_bytes());
+            payload.push(b'\n');
+        }
+        let plain = dir.path().join("blob.bin");
+        std::fs::write(&plain, &payload).expect("write plain");
+        let gz = dir.path().join("blob.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let index = dir.path().join("plain.rgz.gzidx.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 4 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            write_index: true,
+            ..Default::default()
+        };
+
+        // Cold open: no TAR index — must still create SQLite shell + GZIDX side blob.
+        let src = open_path(&gz, &opts, true).expect("cold plain .gz rapidgzip");
+        assert_eq!(read_all(src.as_ref(), "/blob.bin"), payload);
+        drop(src);
+
+        assert!(
+            index.exists(),
+            "plain .gz rapidgzip cold open with write_index must create index path for GZIDX"
+        );
+        let stored = {
+            let idx = SqliteIndex::open_read_only(&index).expect("open index");
+            let blobs = idx.get_gzip_index_blobs().expect("get blobs");
+            assert_eq!(blobs.len(), 1, "expected single gzipindex blob");
+            assert!(
+                blobs[0].starts_with(b"GZIDX"),
+                "blob should be GZIDX magic, got {:?}",
+                blobs[0].get(..8)
+            );
+            assert!(
+                !blobs[0].is_empty(),
+                "GZIDX blob must be non-empty after cold"
+            );
+            blobs[0].clone()
+        };
+
+        let loaded = try_load_gzip_index_blob(Some(&index), Some(&gz), false)
+            .expect("try_load GZIDX after plain rapidgzip cold open");
+        assert_eq!(loaded, stored);
+        assert_eq!(gzip_seek_index_format_label(&loaded), "GZIDX");
+
+        // Warm open via factory: import + serve full payload + mid seek.
+        let src2 = open_path(&gz, &opts, false).expect("warm plain .gz with GZIDX import");
+        assert_eq!(read_all(src2.as_ref(), "/blob.bin"), payload);
+        let mid = payload.len() / 2;
+        assert_eq!(
+            read_seek_mid(src2.as_ref(), "/blob.bin", mid as u64).as_slice(),
+            &payload[mid..]
+        );
+        drop(src2);
+
+        let blobs2 = SqliteIndex::open_read_only(&index)
+            .expect("reopen")
+            .get_gzip_index_blobs()
+            .expect("blobs");
+        assert_eq!(blobs2, vec![stored], "warm remount must keep GZIDX blob");
+    }
+
+    /// Regression: write_index=false must not leave a rapidgzip GZIDX side table on disk
+    /// for plain `.gz` (no shell create / no side blob).
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn plain_gzip_rapidgzip_gzidx_skipped_when_write_index_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"no-gzidx-when-write-index-false\n";
+        let plain = dir.path().join("n.txt");
+        std::fs::write(&plain, payload).expect("write");
+        let gz = dir.path().join("n.txt.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let index = dir.path().join("n.rgz.gzidx.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 4 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            write_index: false,
+            ..Default::default()
+        };
+        let src = open_path(&gz, &opts, true).expect("open with write_index=false");
+        assert_eq!(read_all(src.as_ref(), "/n.txt"), payload.as_slice());
+        drop(src);
+
+        if index.exists() {
+            let blobs = SqliteIndex::open_read_only(&index)
+                .expect("ro")
+                .get_gzip_index_blobs()
+                .unwrap_or_default();
+            assert!(
+                blobs.is_empty(),
+                "write_index=false must not store GZIDX, got {} blob(s)",
+                blobs.len()
+            );
+        }
+    }
+
+    /// Regression: plain rapidgzip path with poisoned GZIDX blob rebuilds and rewrites
+    /// a valid GZIDX (shell already exists from cold open).
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn plain_gzip_rapidgzip_plain_invalid_blob_falls_back_rewrites_gzidx() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut payload = Vec::new();
+        for i in 0..40u32 {
+            payload.extend(format!("poison-{i:03}-").repeat(64).into_bytes());
+            payload.push(b'\n');
+        }
+        let plain = dir.path().join("blob.bin");
+        std::fs::write(&plain, &payload).expect("write plain");
+        let gz = dir.path().join("blob.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let index = dir.path().join("plain-poison.rgz.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 4 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            write_index: true,
+            ..Default::default()
+        };
+
+        let src = open_path(&gz, &opts, true).expect("cold plain rapidgzip seeds shell+GZIDX");
+        drop(src);
+        assert!(index.exists(), "shell must exist before poison");
+
+        {
+            let idx = SqliteIndex::open_writable(&index).expect("writable");
+            idx.set_gzip_index_blob(b"not-a-valid-gzidx-or-rgzi-blob")
+                .expect("poison");
+        }
+
+        let src2 = open_path(&gz, &opts, false).expect("open after invalid blob");
+        assert_eq!(read_all(src2.as_ref(), "/blob.bin"), payload);
+        drop(src2);
+
+        let blobs = SqliteIndex::open_read_only(&index)
+            .expect("ro")
+            .get_gzip_index_blobs()
+            .expect("blobs");
+        assert!(!blobs.is_empty());
+        assert!(
+            blobs[0].starts_with(b"GZIDX"),
+            "expected GZIDX after rapidgzip plain rebuild, got {:?}",
+            blobs[0].get(..8)
+        );
     }
 
     /// Nested plain `.gz` with prefer_rapidgzip uses rapidgzip `from_reader` (no G3 residual).
