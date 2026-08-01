@@ -125,7 +125,7 @@ Still missing or partial relative to upstream Python (and open upstream issues w
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` MVP done (full rebuild; residual encrypted/multi-part); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
 5. **Remote** — HTTP **Basic auth done** ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); cookie auth residual; full `ssh_config`.
-6. **Perf options** — readahead **done** (`--readahead BYTES`, [#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing ([#80](https://github.com/mxmlnkn/ratarmount/issues/80)) still open (ZIP deflate multi-open: done).
+6. **Perf options** — readahead **done** (`--readahead BYTES`, [#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing **done** ([#80](https://github.com/mxmlnkn/ratarmount/issues/80), `--parallel-nested`; ZIP deflate multi-open: done).
 7. **Platforms** — macOS **beta** ([docs/macos.md](docs/macos.md)); harness allowlist expansion toward Python fixed-archive set.
 
 ---

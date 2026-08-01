@@ -42,7 +42,6 @@ issue from the README feature tables.
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI wire for parallel nested cap** | **done** — `--parallel-nested N` (`0`/`auto` default; `1` sequential; `N≥2` cap) → `CompositingOptions` → `AutoMountOptions::parallel_nested_threads`; lazy ignores | CLI / main |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | **documented** — store/MSZIP no-tmp; LZX/Quantum → libarchive/temp spool (no pure LZX decoder) | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | **done** — path + Range open import side tables; skip re-export on warm hit | `ratarmount/src/factory.rs` |
 
@@ -62,8 +61,9 @@ issue from the README feature tables.
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
 
-1. **FR-6 residual** Wire factory/`--parallel-nested` (or `-P`) if operators need an explicit cap; compositing default is already auto-parallel for eager same-dir archives.
+1. **FR-10 residual** Optional union symlink-resolve/follow flag for upstream #160 (dir-over-symlink #164 already done).
+2. **FR-8 residual** Pure LZX decoder remains out of scope; documented spool path is accepted.
 
 Update this file when status changes. Keep README **Upstream** column in sync.
