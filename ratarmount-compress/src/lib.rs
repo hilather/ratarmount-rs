@@ -1,8 +1,9 @@
 //! Compression backends (Phases 3–5 + stream codecs).
 //!
 //! * **gzip** — G3 Tier B seekable checkpoints + Tier C seek-index blob import/export (`gzip_seek`).
-//! * **gzip (optional `gzip-rapidgzip`)** — path-backed Tier D POC via `rapidgzip-core`
-//!   ([`gzip_rapidgzip`]); opt-in with `RATARMOUNT_GZIP_BACKEND=rapidgzip`.
+//! * **gzip (optional `gzip-rapidgzip`)** — Tier D via `rapidgzip-core`
+//!   ([`gzip_rapidgzip`]): path + nested `from_reader` + GZIDX import/export;
+//!   opt-in with `RATARMOUNT_GZIP_BACKEND=rapidgzip`.
 //! * **zstd** — multi-frame seek map + seekable-format seek table + Python
 //!   `zstdblocks` offset-map import/export; single-frame full decode.
 //! * **lz4** — frame block index (independent blocks; dependent → frame decode);
@@ -54,7 +55,9 @@ pub use bzip2_seek::{
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 #[cfg(feature = "gzip-rapidgzip")]
 pub use gzip_rapidgzip::{
-    open_seekable_gzip_rapidgzip, prefer_rapidgzip_gzip_backend,
+    open_seekable_gzip_rapidgzip, open_seekable_gzip_rapidgzip_from_reader,
+    open_seekable_gzip_rapidgzip_with_imported_index,
+    open_seekable_gzip_rapidgzip_with_imported_index_from_reader, prefer_rapidgzip_gzip_backend,
     prefer_rapidgzip_gzip_backend_with_env, RapidgzipReader, SharedRapidgzip,
     RAPIDGZIP_BACKEND_ENV, RAPIDGZIP_BACKEND_VALUE, RAPIDGZIP_BODY_KIND,
 };
