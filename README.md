@@ -1,177 +1,173 @@
+<div align="center">
+
 # ratarmount-rs
 
-Native **Rust** rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount) — mount archives (and remote objects) as a FUSE filesystem with SQLite indexes for fast random access.
+### Random Access To Archived Resources — in Rust
 
-| | |
-|--|--|
-| **Version** | **0.1.14** ([releases](https://github.com/hilather/ratarmount-rs/releases)) |
-| **Language** | Rust (edition 2021) |
-| **FUSE** | `fuser` low-level (inode API) |
-| **Platforms** | Linux (primary) · **macOS** (beta: arm64 + x86_64 tarballs) |
-| **Upstream** | Feature parity vs [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount) |
-| **Living checklist** | [docs/parity-todo.md](docs/parity-todo.md) · [docs/mount-options-parity.md](docs/mount-options-parity.md) |
-| **Dual-run / crates.io** | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) · [docs/crates-io-policy.md](docs/crates-io-policy.md) |
+**Mount archives as filesystems. Seek instantly. Use almost no RAM.**
+
+A native Rust rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount): FUSE mounts backed by SQLite indexes, built for cold-start speed and a tiny resident set.
+
+<br/>
+
+[![CI](https://github.com/hilather/ratarmount-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/hilather/ratarmount-rs/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/hilather/ratarmount-rs?style=flat-square&label=release&color=0ea5e9)](https://github.com/hilather/ratarmount-rs/releases)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
+[![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg?style=flat-square)](https://www.rust-lang.org)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20β-lightgrey.svg?style=flat-square)](docs/macos.md)
+
+<br/>
 
 ```bash
-make release && make install   # → ~/.local/bin/ratarmount
 ratarmount archive.tar.gz mnt/
+ls mnt/          # browse without extracting
+cat mnt/file     # true random access — even inside compressed streams
+```
+
+</div>
+
+---
+
+## Why ratarmount-rs?
+
+| | What you get |
+|---|---|
+| **~3.6× faster cold mounts** | Index + mount in a fraction of the Python baseline |
+| **~6–8× lower peak RSS** | Typical **14–28 MiB** vs 110–350 MiB for Python ratarmount |
+| **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
+| **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z |
+| **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
+| **Remote-first** | `http(s)`, S3, SSH/SFTP, WebDAV, SMB, Dropbox |
+
+> Prefer Python when you need rapidgzip-class throughput or the widest fsspec surface. Prefer **Rust** when mounts are frequent, memory is tight, or you want a static-friendly binary.
+
+Full methodology and fixtures: [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md) · harness: [`benchmarks/compare-python-vs-rust.sh`](benchmarks/compare-python-vs-rust.sh)
+
+---
+
+## Install
+
+### Prebuilt packages (recommended)
+
+Grab the latest assets from **[Releases](https://github.com/hilather/ratarmount-rs/releases)** — Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs, plus **macOS arm64**, all cosign-signed.
+
+```bash
+# Example: portable Linux tarball
+tar xf ratarmount-*-linux-x86_64.tar.gz
+install -m 755 ratarmount ~/.local/bin/
+```
+
+See [`docs/packaging.md`](docs/packaging.md) for verification and package layout.
+
+### From source
+
+**Linux**
+
+```bash
+# deps: rustup stable, fuse3/libfuse3, libarchive, zlib headers
+export PATH="$HOME/.cargo/bin:$PATH"
+make release && make install   # → ~/.local/bin/ratarmount
+# or: cargo install --path ratarmount
+```
+
+**macOS** (beta) — full guide: [`docs/macos.md`](docs/macos.md)
+
+```bash
+brew install --cask macfuse          # or fuse-t
+brew install libarchive pkgconf
+export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+make release && make install
+# Tahoe / FSKit fallback if needed:
+#   ratarmount -f -o backend=fskit archive.tar.gz mnt/
 ```
 
 ---
 
-## Python ratarmount vs ratarmount-rs
+## Quick start
 
-Both tools mount archives over FUSE with a **shared SQLite index schema** (0.7.x interop for TAR/ZIP/7z). Python is the mature reference implementation; Rust is a native rewrite optimized for cold mount cost and resident memory.
+```bash
+# Mount a compressed archive (daemonizes by default; -f stays in foreground)
+ratarmount archive.tar.gz mnt/
+ratarmount -f archive.tar mnt/
 
-| Dimension | Python (`mxmlnkn/ratarmount`) | Rust (`ratarmount-rs` 0.1.14) |
-|-----------|------------------------------|------------------------------|
-| **Runtime** | CPython + native codec libs | Single static-friendly binary |
-| **FUSE** | mfusepy (fusepy fork) | `fuser` low-level |
-| **Index** | SQLite 0.7.x | Same schema (TAR/ZIP/7z interop) |
-| **Memory (mount)** | ~110–350 MiB typical | **~14–28 MiB** peak RSS (geo-mean **~6–8×** lower) |
-| **Cold mount (geo-mean)** | baseline | **~3.6× faster** |
-| **Warm mount (geo-mean)** | baseline | **~3.8× faster** |
-| **Random cat / seq. read** | Often stronger on compressed TAR (rapidgzip / block maps) | Strong on large uncompressed TAR; geo-mean slightly behind Python on this host |
-| **Nested archives (`-r`)** | Recursive automount | Same + **no-tmp** nested open for most stencil formats |
-| **Remote** | Broad fsspec | `file` / `http(s)` / `s3` / `ssh`·`sftp` / WebDAV / SMB / Dropbox |
-| **Write overlay** | Full + commit | Full + commit (TAR + gzip/bzip2/xz via GNU tar) |
-| **Maturity** | Production / PyPI / AppImage | Feature-rich beta; **deb/rpm/portable + macOS arm64** on GitHub Releases |
+# Recursive nested archives (prefer -l on huge trees)
+ratarmount -r archive.zip mnt/
+ratarmount -r -l --recursion-depth 2 package.deb mnt/
 
-**When to prefer Rust:** low-memory hosts, many short-lived mounts, large uncompressed TAR sequential I/O, nested archives without `/tmp` spool.  
-**When to prefer Python:** maximum codec maturity (rapidgzip / bit-block bzip2), widest fsspec ecosystem, long-tail workflows already wired to the Python stack.
+# Write overlay + commit back
+ratarmount -w /tmp/ov archive.tar mnt/
+# …edit under mnt/…
+ratarmount --commit-overlay …   # TAR + gzip/bzip2/xz; ZIP full rebuild
 
-Rust is not a drop-in for every Python workflow yet (see [gaps](#gaps-vs-python-ratarmount)), but for common TAR/ZIP/7z mounts it is substantially leaner and usually **much faster to mount**.
+# Remote & encrypted
+ratarmount http://host/data.tar mnt/
+ratarmount s3://bucket/key.tar mnt/
+ratarmount 'ssh://user@host//path/a.tar' mnt/
+ratarmount --password secret encrypted.7z mnt/
 
----
+# Index only (no FUSE)
+ratarmount --no-mount -c archive.tar
 
-## Features (parity with original ratarmount)
+# Unmount
+ratarmount -u mnt/
 
-Upstream issue links point at [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount/issues) when a feature
-was requested or designed there. Living backlog of open upstream-inspired work:
-[`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md).
-
-### Archives & images
-
-| Format | Python | Rust | Upstream / notes |
-|--------|:------:|:----:|------------------|
-| TAR (ustar / PAX / GNU) + sparse | yes | **yes** | GNU incremental: detect + dumpdir / prefix strip |
-| ZIP (store / deflate, password) | yes | **yes** | Multi-part join; multi-disk EOCD normalize; residual per-disk edges |
-| 7z custom pack-offset + AES / BCJ2 | yes* | **yes** | [#123](https://github.com/mxmlnkn/ratarmount/issues/123) — *fork RA + progressive pure LZMA2; solid BCJ/AES still heavy |
-| AR / CPIO | yes | **yes** | Nested `open_from_reader` (no-tmp) |
-| ISO 9660 | yes | **yes** | Nested stream open |
-| WARC | yes | **yes** | [#128](https://github.com/mxmlnkn/ratarmount/issues/128) — stencil + nested no-tmp |
-| XAR / CAB / ASAR | yes | **yes** | CAB LZX → libarchive; store/MSZIP nested no-tmp |
-| SquashFS | yes | **yes** | backhand in-process; classic lzma → `unsquashfs` |
-| EXT4 | yes | **yes** | pure `ext4-view` + `debugfs` fallback |
-| FAT12/16/32 | yes | **yes** | Pure Rust (`fatfs`); nested `open_from_reader` |
-| SQLAR | yes | **yes** | Unencrypted stream open; sqlcipher optional |
-| PDF / OGG / HTML / Git | yes | **yes** | PDF attachments + common XObjects; Git may need `RATARMOUNT_FORCE_GIT=1` |
-| RAR / LHA / long-tail | yes | **yes** | via libarchive (sequential); no pure RAR |
-| Split files (`.001`) | yes | **yes** | decimal/hex/alpha join + recursive AutoMount |
-| lrzip | yes | **yes** | CLI materialize + libarchive fallback |
-
-### Compression (outer / seekable)
-
-| Codec | Python | Rust | Upstream / notes |
-|-------|:------:|:----:|------------------|
-| gzip | yes | **yes** | TAR **and** plain `.gz` seekable; RGZI Tier C; residual GZIDX window-dict |
-| bzip2 | yes | **yes** | Multi-stream + `bzip2blocks`; residual bit-block polish |
-| xz | yes | **yes** | Index / multi-stream; single-block full decode residual |
-| zstd | yes | **yes** | Multi-frame + seek-table + `zstdblocks` — [guide](docs/zstd-random-access.md) ([#196](https://github.com/mxmlnkn/ratarmount/issues/196)) |
-| lz4 / lzip / lzo / .Z / lzma / zlib | yes | **yes** | [#126](https://github.com/mxmlnkn/ratarmount/issues/126) lzip; all seekable bodies |
-
-### Compositing & mount UX
-
-| Ability | Python | Rust | Upstream / notes |
-|---------|:------:|:----:|------------------|
-| Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)); eager on huge trees can be costly — prefer `-l` ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)) |
-| Lazy mount (`-l`) | yes | **yes** | Prefer for large recursive trees (mount nested on first access) |
-| Union of multiple sources | yes | **yes** | + folder cache; **directory wins over symlink** ([#164](https://github.com/mxmlnkn/ratarmount/issues/164)); optional multi-hop resolve (`--union-resolve-symlinks`, [#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
-| Write overlay (`-w` / `:temp:`) | yes | **yes** | |
-| `--commit-overlay` | yes | **yes** | TAR + gzip/bzip2/xz (GNU tar); **ZIP full rebuild** ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)) — not in-place; residual encrypted/multi-part |
-| File versions (`.versions/`) | yes | **yes** | default on; `--no-file-versions` |
-| Strip / transform recursive paths | yes | **yes** | |
-| Prefix (`-p`) | yes | **yes** | |
-| Control interface | yes | **yes** | Unix socket **+** in-FS `/.ratarmount-control/` |
-| Index only / no mount | yes | **yes** | [#176](https://github.com/mxmlnkn/ratarmount/issues/176) `--no-mount` |
-| Recursion depth control | yes | **yes** | [#151](https://github.com/mxmlnkn/ratarmount/issues/151) `--recursion-depth` (plain compress layer) |
-| Daemonize / foreground (`-f`) | yes | **yes** | |
-| Sequential readahead | no | **yes** | [`#180`](https://github.com/mxmlnkn/ratarmount/issues/180) — `--readahead BYTES` (`0` off; `1M` typical; max 64 MiB per open) |
-| Password / password-file | yes | **yes** | |
-| Content hashes / FUSE xattrs | yes | **yes** | TAR/ZIP/7z hashes; TAR PAX **LIBARCHIVE./SCHILY.xattr** → FUSE ([#145](https://github.com/mxmlnkn/ratarmount/issues/145)) |
-
-### Remote
-
-| Protocol | Python | Rust | Upstream / notes |
-|----------|:------:|:----:|------------------|
-| `file://` | yes | **yes** | |
-| `http(s)://` | yes | **yes** | GET + **live Range** (TAR/ZIP/main codecs); **HTTP Basic** + **Cookie** auth ([#157](https://github.com/mxmlnkn/ratarmount/issues/157): URL userinfo / `RATARMOUNT_HTTP_USER`+`PASSWORD`; `RATARMOUNT_HTTP_COOKIE` or `RATARMOUNT_HTTP_COOKIE_FILE`; no full browser jar) |
-| `s3://` | yes | **yes** | SigV4 env + IMDS/ECS + anonymous; Range prefer |
-| `ssh://` / `sftp://` | yes | **yes** | residual full `ssh_config` |
-| WebDAV / SMB / Dropbox | yes | **yes** | folder list + ranged content |
-
-Full option matrix: [`docs/mount-options-parity.md`](docs/mount-options-parity.md).  
-Full checklist: [`docs/parity-todo.md`](docs/parity-todo.md).  
-Upstream FR tracker: [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md).
+# What does this build support?
+ratarmount --print-features
+```
 
 ---
 
-## Gaps vs Python ratarmount
+## Features
 
-Still missing or partial relative to upstream Python (and open upstream issues we can implement):
+### Archives & disk images
 
-1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher feature; residual PDF color spaces.
-3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
-4. **Write paths** — ZIP `--commit-overlay` MVP done (full rebuild; residual encrypted/multi-part); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
-5. **Remote** — HTTP Basic + Cookie env auth done ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); residual: full browser cookie jar; full `ssh_config` edges.
-6. **Perf options** — readahead **done** (`--readahead BYTES`, [#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing **done** ([#80](https://github.com/mxmlnkn/ratarmount/issues/80), `--parallel-nested`; ZIP deflate multi-open: done).
-7. **Platforms** — macOS **beta** ([docs/macos.md](docs/macos.md)); harness allowlist expansion toward Python fixed-archive set.
+TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
+
+### Seekable compression
+
+gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · compress (`.Z`) · lzma · zlib
+
+### Compositing & UX
+
+| Capability | Notes |
+|------------|--------|
+| Recursive automount (`-r`) | Nested open **without `/tmp`** for most stencil formats — [guide](docs/embedded-nested-archives.md) |
+| Lazy mount (`-l`) | Open nested archives on first access — preferred for huge trees |
+| Union of sources | Directory wins over symlink; optional multi-hop resolve |
+| Write overlay (`-w`, `:temp:`) | Full overlay + `--commit-overlay` |
+| File versions | `.versions/` by default (`--no-file-versions`) |
+| Strip / transform / prefix | Path rewriting on mount |
+| Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
+| Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
+| Depth control | `--recursion-depth`, `--no-mount` |
+
+### Remote backends
+
+`file://` · `http(s)://` (Range + Basic/Cookie auth) · `s3://` (SigV4 / IMDS / anonymous) · `ssh://` / `sftp://` · WebDAV · SMB · Dropbox
+
+Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) · [`docs/parity-todo.md`](docs/parity-todo.md)
 
 ---
 
-## Performance vs Python
+## Performance at a glance
 
-Head-to-head harness: [`benchmarks/compare-python-vs-rust.sh`](benchmarks/compare-python-vs-rust.sh).  
-**Latest tables (2026-07-28 refresh):** [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md).
+Head-to-head vs Python ratarmount (geo-mean, 2026-07-28). **Factor > 1 ⇒ Rust wins.**
 
-**Methodology (same spirit as upstream mounting/bandwidth benches):**
+| Metric | Cold | Warm |
+|--------|-----:|-----:|
+| Mount time | **3.63×** | **3.84×** |
+| Peak RSS | **6.47×** | **8.01×** |
+| `find` walk | 1.21× | 1.26× |
+| Random `cat` | 0.84× | 0.75× |
+| Sequential bandwidth | 0.88× | 0.78× |
 
-- **Cold mount**: recreate index (`-c`) until FUSE is usable  
-- **Warm mount**: reuse SQLite index  
-- **Random access**: median of 15 `cat`s on random files  
-- **find**: metadata walk wall time  
-- **Bandwidth**: sequential `cat` of a large member (MiB/s)  
-- Peak RSS from `/proc/<pid>/status` `VmHWM`  
-- Both tools run with `-f` for comparable process measurement  
+**Standouts on this host**
 
-### Geometric-mean summary (2026-07-28)
+- `small-100.tar.gz` — warm mount **7.8×** faster; warm RSS **~25×** lower (~14 MiB vs ~351 MiB)
+- `large-64m.tar` — random access **~4×** faster; sequential multi‑GiB/s
+- `empty-1k.tar` — cold mount **5.7×** faster
 
-Factor **>1 ⇒ Rust better**, **&lt;1 ⇒ Python better**.
-
-| Metric | Cold | Warm | Interpretation |
-|--------|------|------|----------------|
-| Mount time | **3.63×** | **3.84×** | Rust mounts much faster |
-| Peak RSS | **6.47×** | **8.01×** | Rust ~6–8× leaner on average |
-| Random cat (median) | **0.84×** | **0.75×** | Python slightly ahead (esp. compressed TAR) |
-| find walk | **1.21×** | **1.26×** | Rust ahead on metadata walks overall |
-| Seq. bandwidth | **0.88×** | **0.78×** | Python slight geo-mean edge; **large uncompressed TAR strongly favors Rust** |
-
-### Highlight fixtures (this run)
-
-| Archive | What stands out |
-|---------|-----------------|
-| `empty-1k.tar` | Cold mount **5.69×** faster; warm `find` **~4×** faster; RSS ~7× lower |
-| `large-64m.tar` | Random cat **~4×** faster; sequential bandwidth **3–3.7×** higher (multi‑GiB/s) |
-| `small-100.tar.gz` | Warm mount **7.76×** faster; warm RSS **25×** lower (Python ~351 MiB vs Rust ~14 MiB) |
-| `small-100.tar.bz2` | Cold mount still slower on Rust (map build); random cat **~1.8×** faster once mounted |
-| `small-100.zip` | Mount **~4.7×** faster; random cat mixed (Python often wins small deflate reads) |
-
-**Caveats**
-
-- Single-host, single-run wall times — directional, not publication-grade.  
-- Compressed TAR: Python may use rapidgzip / block-parallel paths; Rust uses seekable bodies (checkpoints / frame maps) without full archive spool.  
-- Re-run anytime:
+Rust leads hard on **mount cost** and **memory**. Python can still edge compressed random/`cat` paths where rapidgzip / block-parallel decoders apply. Numbers are single-host directional benches — re-run the harness on your hardware.
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount
@@ -181,155 +177,132 @@ cargo build --release
 
 ---
 
-## Requirements
+## Architecture
 
-**Linux**
-
-- Rust stable (`rustup default stable`)
-- `libfuse3` / `fuse3`
-- `libarchive` (long-tail formats)
-- `zlib` headers (flate2/system zlib)
-- Optional: `e2fsprogs` (`debugfs`) for EXT4 fallback, `squashfs-tools` for classic SquashFS lzma
-- Sibling Python checkout for fixtures (default `../ratarmount`) for the harness
-
-**macOS** — full guide: [`docs/macos.md`](docs/macos.md) (FUSE install, Tahoe/FSKit, build, smoke)
-
-```bash
-# FUSE — pick one (required before mount or build)
-brew install --cask macfuse          # recommended
-# or: brew install macos-fuse-t/homebrew-cask/fuse-t
-
-brew install libarchive pkgconf
-export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
-
-# macOS 26 Tahoe: if mounts fail, use FSKit
-#   ratarmount -f -o backend=fskit archive.tar.gz mnt/
+```mermaid
+flowchart LR
+  CLI[ratarmount CLI] --> Factory[Open factory]
+  Factory --> Remote[Remote backends]
+  Factory --> Compress[Seekable codecs]
+  Factory --> Formats[Format MountSources]
+  Factory --> Composite[Union · AutoMount · Overlay]
+  Formats --> Index[(SQLite index 0.7.x)]
+  Composite --> FUSE[fuser low-level FS]
+  Index --> FUSE
+  Compress --> Formats
+  Remote --> Factory
 ```
 
-## Build / install
-
-```bash
-export PATH="$HOME/.cargo/bin:$PATH"
-make release
-make install          # → ~/.local/bin/ratarmount
-# or: cargo install --path ratarmount
-# macOS package: ./packaging/build-macos-tarball.sh
-```
-
-**Packages:** GitHub Actions builds Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs **and macOS arm64 tarballs**, with cosign keyless signatures. Tag `v*` (e.g. **v0.1.14**) publishes a GitHub Release. (Intel macOS CI image deferred — scarce GHA runners.) See [`docs/packaging.md`](docs/packaging.md) and [`docs/macos.md`](docs/macos.md).
-
-## Test
-
-```bash
-export RATARMOUNT_PY_ROOT="$HOME/projects/ratarmount"   # Python tree with tests/
-cargo test --workspace
-./test-harness/run-all-phases.sh    # or: make suite
-./benchmarks/compare-python-vs-rust.sh   # optional head-to-head
-```
-
-CI (`.github/workflows/ci.yml`): `cargo fmt`, `clippy -D warnings`, `cargo test`, FUSE phase allowlists, cold-index gates, macOS build/test.
-
-## CLI (subset)
-
-```bash
-ratarmount --print-features
-
-# Index only
-ratarmount --no-mount -c archive.tar
-
-# Mount (daemonizes by default; -f stays attached)
-ratarmount archive.tar mnt/
-ratarmount -f archive.tar mnt/
-
-# Recursive, writable, remote, encrypted 7z
-ratarmount -r archive.tar mnt/
-# Large nested trees (e.g. big .deb with many tar.zst): prefer lazy + optional depth cap
-ratarmount -r -l archive.deb mnt/
-ratarmount -r -l --recursion-depth 2 archive.deb mnt/
-ratarmount -w /tmp/ov archive.tar mnt/
-ratarmount http://host/archive.tar mnt/
-ratarmount s3://bucket/key.tar mnt/
-ratarmount 'ssh://user@host//path/a.tar' mnt/
-ratarmount --password secret encrypted.7z mnt/
-
-ratarmount -u mnt/
-```
-
-Harness log contract (TAR index):
-
-- `Creating offset dictionary for …`
-- `Successfully loaded offset dictionary from …`
-
-## Layout
+| Crate | Role |
+|-------|------|
+| `ratarmount` | CLI binary |
+| `ratarmount-core` | `MountSource` trait & options |
+| `ratarmount-index` | SQLite 0.7.x index |
+| `ratarmount-fuse` | `fuser` low-level filesystem |
+| `ratarmount-compress` | Seekable codecs + stencils |
+| `ratarmount-formats-*` | TAR, ZIP, 7z, ISO, SquashFS, EXT4, … |
+| `ratarmount-compositing` | Folder, union, automount, overlay |
+| `ratarmount-remote` | HTTP, S3, SSH, WebDAV, SMB, Dropbox |
 
 ```
-ratarmount/                 # CLI binary
+ratarmount/                 # CLI
 ratarmount-core/            # MountSource trait, options
-ratarmount-index/           # SQLite 0.7.x index
+ratarmount-index/           # SQLite 0.7.x
 ratarmount-fuse/            # fuser low-level FS
 ratarmount-compress/        # seekable codecs + stencils
-ratarmount-formats-{tar,zip,ar,cpio,iso9660,warc,xar,cab,asar,ogg,html,pdf,git,sevenzip,sqlar,squashfs,ext4,fat,libarchive}/
+ratarmount-formats-*/       # per-format backends
 ratarmount-compositing/     # folder, union, automount, overlay
-ratarmount-remote/          # http/s3/ssh/webdav/smb/dropbox
+ratarmount-remote/          # remote URL backends
 test-harness/               # phase allowlists + runners
-packaging/                  # desktop entry + AppImage / nfpm
+packaging/                  # deb / rpm / portable / macOS
 benchmarks/                 # Python vs Rust comparison
-docs/                       # decisions, phase notes, parity TODO
+docs/                       # parity, decisions, guides
 ```
 
-## Embedded / nested archives (`-r`)
+---
 
-Recursive mounts open nested archives from a **seekable parent member stream** when possible — **no copy of the nested body to `/tmp`**.
+## Nested archives
 
-| Nested member | Temp spool? | Random read of nested contents |
-|---------------|:-----------:|--------------------------------|
-| `.tar` inside ZIP / TAR / 7z / `.tar.gz` | **No** | Yes (TAR stencil) |
-| `.tar.gz` inside ZIP / TAR / 7z | **No** | Yes (gzip seek + TAR) |
-| `.zip` / `.7z` inside those parents | **No** | Yes\* |
-| CPIO / AR / ISO / WARC / ASAR / XAR / CAB (store/MSZIP) / FAT nested | **No** | Yes (stencil / shared seek) |
-| SquashFS nested (none/gzip/zstd/lz4/lzo/xz) | **No** | Yes (in-process backhand) |
-| EXT2/3/4 nested (pure ext4-view) | **No** | Yes; pure-fail → spool/`debugfs` |
-| Unencrypted SQLAR nested | **No** (DB in RAM) | Yes after deserialize |
-| Plain nested `.gz`/`.zst`/… single-file | **No** | Seekable body single-file |
-| CAB LZX / classic SquashFS LZMA / RAR nested | Often **yes** (fallback) | Path open after spool |
+Recursive mounts (`-r`) open nested members from a **seekable parent stream** when possible — **no copy of the nested body to `/tmp`**.
 
-\* ZIP deflate and solid 7z still decompress (CPU/RAM); they avoid nested **disk** spool when the stream path succeeds.
-
-Compared to Python: both support `-r`; Rust’s no-tmp nested path is explicit for stencil formats and plain seekable compress (see matrix). Full detail: **[docs/embedded-nested-archives.md](docs/embedded-nested-archives.md)**.
+| Nested member | Temp spool? |
+|---------------|:-----------:|
+| `.tar` / `.tar.gz` / `.zip` / `.7z` inside ZIP · TAR · 7z | **No** |
+| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT | **No** |
+| SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
+| Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
+| CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |
 
 ```bash
-ratarmount -r archive.zip mnt/          # e.g. mnt/inner.tar/file.txt — no /tmp for inner.tar
-ratarmount -r -l big.deb mnt/         # large trees: lazy nested open (see #179)
-RUST_LOG=debug ratarmount -r -d 2 …   # "nested reader" vs "temp spool" in logs
+ratarmount -r archive.zip mnt/           # mnt/inner.tar/file.txt — no /tmp for inner.tar
+ratarmount -r -l big.deb mnt/            # large trees: lazy nested open
+RUST_LOG=debug ratarmount -r -d 2 …      # “nested reader” vs “temp spool” in logs
 ```
 
-**Large recursive trees:** plain `-r` eagerly automounts nested archives and can use multi‑GB RAM and minutes on huge packages (e.g. `linux-source-*.deb` with many nested `.tar.zst` / `.tar.bz2`). Prefer **`-l` / `--lazy`** so nested archives open on first access; optionally cap with **`--recursion-depth`**. For extreme cases, mount layers manually (outer, then inner paths). Light nested fixtures are fine; full linux-source stress is optional benchmarking, not a correctness bug.
+On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and optionally **`--recursion-depth`**. Details: [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md).
 
-## Docs
+---
 
-| Doc | Topic |
-|-----|--------|
-| [docs/parity-todo.md](docs/parity-todo.md) | **Full feature + test parity checklist** |
-| [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | **Nested/embedded: no-tmp vs temp, random read by format** |
+## Gaps vs Python ratarmount
+
+Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md):
+
+1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
+2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
+3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
+4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges.
+5. **Remote** — HTTP Basic + Cookie env auth done; residual full browser cookie jar & full `ssh_config` edges.
+6. **Platforms** — macOS is **beta** ([docs/macos.md](docs/macos.md)).
+
+---
+
+## Development
+
+```bash
+export RATARMOUNT_PY_ROOT="$HOME/projects/ratarmount"   # Python tree for fixtures
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+./test-harness/run-all-phases.sh    # or: make suite
+```
+
+CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-index gates, and macOS build/test.
+
+**Release checklist** (version bump + packages): see `AGENTS.md` and [`docs/packaging.md`](docs/packaging.md). Tag `v*` publishes signed deb/rpm/portable/macOS assets.
+
+---
+
+## Documentation
+
+| Document | Topic |
+|----------|--------|
+| [docs/parity-todo.md](docs/parity-todo.md) | Full feature + test parity checklist |
+| [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
-| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path (TAR + plain) |
-| [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table / multi-frame / full-decode + producer recipes |
-| [docs/phase9-formats.md](docs/phase9-formats.md) | Long-tail formats |
-| [docs/phase10-remote.md](docs/phase10-remote.md) | Remote URL backends |
-| [docs/phase11-packaging.md](docs/phase11-packaging.md) | Packaging notes |
-| [docs/packaging.md](docs/packaging.md) | Install packages + cosign verify |
-| [docs/tasks/sevenzip-random-access.md](docs/tasks/sevenzip-random-access.md) | SevenZip backend |
-| [docs/tasks/embedded-nested-random-access.md](docs/tasks/embedded-nested-random-access.md) | Nested no-tmp implementation tasks |
+| [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table & producer recipes |
+| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design |
+| [docs/packaging.md](docs/packaging.md) | Packages + cosign verify |
+| [docs/macos.md](docs/macos.md) | macOS FUSE / FSKit |
+| [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
 | [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers |
-| [benchmarks/README.md](benchmarks/README.md) | How to re-run benches + CI gates |
+| [docs/phase12-dual-run.md](docs/phase12-dual-run.md) | Dual-run / crates.io notes |
 
-## License
-
-MIT (aligned with upstream ratarmount intent; see `Cargo.toml` workspace license).
+---
 
 ## Related
 
 - Upstream Python: [mxmlnkn/ratarmount](https://github.com/mxmlnkn/ratarmount)
-- This fork’s releases: [hilather/ratarmount-rs releases](https://github.com/hilather/ratarmount-rs/releases)
-- SevenZip random-access work: [hilather/ratarmount#1](https://github.com/hilather/ratarmount/pull/1)
+- Releases: [hilather/ratarmount-rs/releases](https://github.com/hilather/ratarmount-rs/releases)
+
+---
+
+## License
+
+[MIT](LICENSE) — aligned with upstream ratarmount intent.
+
+<div align="center">
+
+<sub>Built for people who open multi‑GB archives more often than they extract them.</sub>
+
+</div>
