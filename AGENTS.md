@@ -49,6 +49,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
+| G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount gzip_rgzi` · `cargo test -p ratarmount plain_gzip_rgzi` · `cargo test -p ratarmount plain_gzip` |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount nested_ext4` · `cargo test -p ratarmount nested_squashfs` · crate `open_from_reader` tests |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |

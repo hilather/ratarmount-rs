@@ -881,13 +881,16 @@ fn take_and_rewind_nested_gzip_reader(
 /// rapidgzip error — there is no Range-style reopen for nested bodies.
 /// Without prefer, G3 only (still no temp spool).
 fn open_nested_gzip_tar(
-    // `mut` only needed when rapidgzip prefer may reassign `reader` after G3 rewind.
-    #[cfg_attr(not(feature = "gzip-rapidgzip"), allow(unused_mut))] mut reader: Box<
-        dyn ratarmount_core::ArchiveRead,
-    >,
+    reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
     opts: &OpenOptions,
 ) -> std::io::Result<Arc<dyn MountSource>> {
+    // Only reassigned when rapidgzip prefer fails and we recover the stream for G3.
+    #[cfg(feature = "gzip-rapidgzip")]
+    let mut reader = reader;
+    #[cfg(not(feature = "gzip-rapidgzip"))]
+    let reader = reader;
+
     let spacing = if opts.gzip_seek_point_spacing == 0 {
         ratarmount_compress::DEFAULT_GZIP_SEEK_SPACING
     } else {
@@ -1497,6 +1500,8 @@ fn try_load_gzip_index_blob(
 /// Persist a Tier C RGZI seek-index blob into the SQLite side table when writable.
 ///
 /// No-op for `:memory:` / missing path / read-only / `write_index = false`.
+/// Creates the index file when the path is set but does not yet exist (plain `.gz`
+/// has no TAR `files` build — same shell path as zstdblocks / bzip2blocks).
 /// Also refreshes `tarstats` from the archive path so warm reimport can fingerprint.
 fn persist_gzip_index_blob(
     gzip: &SharedSeekableGzip,
@@ -1509,11 +1514,8 @@ fn persist_gzip_index_blob(
     let Some(ip) = index_path else {
         return;
     };
-    if !ip.exists() {
-        return;
-    }
     let blob = gzip.export_seek_index_blob();
-    match SqliteIndex::open_writable(ip) {
+    match open_or_create_writable_index(ip) {
         Ok(idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for gzip blob: {e}");
@@ -1807,8 +1809,12 @@ fn open_gzip(
         return Ok(Arc::new(tar));
     }
 
-    let body: Arc<dyn SeekableBody> = gzip;
-    open_from_seekable_body(path, body, index_path, options, recreate, "gzip")
+    // Plain `.gz` / non-TAR body: still persist RGZI so warm remount imports
+    // checkpoints (index shell created if missing — no TAR files table required).
+    let body: Arc<dyn SeekableBody> = gzip.clone();
+    let src = open_from_seekable_body(path, body, index_path, options, recreate, "gzip")?;
+    persist_gzip_index_blob(&gzip, index_path, options);
+    Ok(src)
 }
 
 /// After compression materialize: prefer pure stencil ISO/WARC/XAR/CAB before libarchive.
@@ -2950,8 +2956,10 @@ where
                 return Ok(Some((label, Arc::new(src))));
             }
             // Plain .gz: formats / single-file over seekable body (no materialize).
-            let body: Arc<dyn SeekableBody> = gzip;
+            // Persist RGZI so warm Range remount can import (create index shell if needed).
+            let body: Arc<dyn SeekableBody> = gzip.clone();
             let src = open_from_seekable_body(&label, body, ip, &o, recreate, "gzip")?;
+            persist_gzip_index_blob(&gzip, ip, &o);
             Ok(Some((label, src)))
         }
         "bzip2" => {
@@ -3719,11 +3727,16 @@ mod tests {
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
             gzip_seek_point_spacing: 64 * 1024,
+            write_index: true,
             ..Default::default()
         };
 
         // Cold open: build seek table + TAR index, then store RGZI side blob.
         let src = open_path(&archive, &opts, true).expect("cold open");
+        assert_eq!(
+            read_all(src.as_ref(), "/hello.txt"),
+            b"hello world\n".as_slice()
+        );
         drop(src);
 
         let idx = SqliteIndex::open_read_only(&index).expect("open index");
@@ -3733,16 +3746,163 @@ mod tests {
             blobs[0].starts_with(b"RGZI"),
             "blob should be Tier C RGZI magic"
         );
+        assert!(
+            !blobs[0].is_empty(),
+            "RGZI blob must be non-empty after cold"
+        );
         let stored = blobs[0].clone();
         drop(idx);
 
+        // Side table is loadable and importable without a full spacing rebuild.
+        let loaded = try_load_gzip_index_blob(Some(&index), Some(&archive), false)
+            .expect("try_load must surface RGZI before warm open");
+        assert_eq!(loaded, stored);
+        SharedSeekableGzip::open_with_imported_index(&archive, 64 * 1024, 1, &loaded)
+            .expect("stored RGZI must open via import path");
+
         // Warm open: import blob (no full spacing rebuild required for offsets).
         let src2 = open_path(&archive, &opts, false).expect("warm open with import");
+        assert_eq!(
+            read_all(src2.as_ref(), "/hello.txt"),
+            b"hello world\n".as_slice()
+        );
         drop(src2);
 
         let idx2 = SqliteIndex::open_read_only(&index).expect("reopen index");
         let blobs2 = idx2.get_gzip_index_blobs().expect("blobs again");
         assert_eq!(blobs2, vec![stored]);
+        // recreate=true must ignore side table for body build.
+        assert!(try_load_gzip_index_blob(Some(&index), Some(&archive), true).is_none());
+    }
+
+    /// Regression: plain (non-TAR) `.gz` + write_index creates an index shell and
+    /// stores RGZI; second open imports the blob (skips full checkpoint rebuild).
+    #[test]
+    fn plain_gzip_rgzi_blob_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        // SeekableGzip clamps spacing to ≥64 KiB — payload must exceed 2× that for
+        // multiple checkpoints (import path is still meaningful with one, but multi
+        // proves cold build + export encoded more than the member-start point).
+        let mut payload = Vec::new();
+        for i in 0..400u32 {
+            payload.extend(format!("plain-gz-{i:04}-").repeat(64).into_bytes());
+            payload.push(b'\n');
+        }
+        assert!(
+            payload.len() as u64 > 2 * 64 * 1024,
+            "payload must exceed 2× min spacing for multi-checkpoint RGZI"
+        );
+        let plain = dir.path().join("blob.bin");
+        std::fs::write(&plain, &payload).expect("write plain");
+        let gz = dir.path().join("blob.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let index = dir.path().join("plain.gz.index.sqlite");
+        // 64 KiB is the effective floor; passing a smaller value is clamped the same way.
+        let spacing = 64 * 1024u64;
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: spacing,
+            write_index: true,
+            ..Default::default()
+        };
+
+        // Cold open: no TAR index — must still create SQLite shell + RGZI side blob.
+        let src = open_path(&gz, &opts, true).expect("cold plain .gz");
+        assert_eq!(read_all(src.as_ref(), "/blob.bin"), payload);
+        drop(src);
+
+        assert!(
+            index.exists(),
+            "plain .gz cold open with write_index must create index path for RGZI"
+        );
+        let stored = {
+            let idx = SqliteIndex::open_read_only(&index).expect("open index");
+            let blobs = idx.get_gzip_index_blobs().expect("get blobs");
+            assert_eq!(blobs.len(), 1, "expected single gzipindex blob");
+            assert!(
+                blobs[0].starts_with(b"RGZI"),
+                "blob should be Tier C RGZI magic, got {:?}",
+                blobs[0].get(..8)
+            );
+            assert!(!blobs[0].is_empty());
+            blobs[0].clone()
+        };
+
+        // Direct import proves warm path can hydrate without spacing rebuild.
+        let loaded = try_load_gzip_index_blob(Some(&index), Some(&gz), false)
+            .expect("try_load RGZI after plain cold open");
+        assert_eq!(loaded, stored);
+        let imported = SharedSeekableGzip::open_with_imported_index(&gz, spacing, 1, &loaded)
+            .expect("import path must accept stored RGZI");
+        assert!(
+            imported.checkpoint_count() >= 2,
+            "expected multiple checkpoints on multi-block plain .gz, got {}",
+            imported.checkpoint_count()
+        );
+
+        // Warm open via factory: import + serve full payload + mid seek.
+        let src2 = open_path(&gz, &opts, false).expect("warm plain .gz with RGZI import");
+        assert_eq!(read_all(src2.as_ref(), "/blob.bin"), payload);
+        let mid = payload.len() / 2;
+        assert_eq!(
+            read_seek_mid(src2.as_ref(), "/blob.bin", mid as u64).as_slice(),
+            &payload[mid..]
+        );
+        drop(src2);
+
+        let blobs2 = SqliteIndex::open_read_only(&index)
+            .expect("reopen")
+            .get_gzip_index_blobs()
+            .expect("blobs");
+        assert_eq!(blobs2, vec![stored], "warm remount must keep RGZI blob");
+    }
+
+    /// Regression: write_index=false must not leave an RGZI side table on disk.
+    #[test]
+    fn plain_gzip_rgzi_skipped_when_write_index_false() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"no-rgzi-when-write-index-false\n";
+        let plain = dir.path().join("n.txt");
+        std::fs::write(&plain, payload).expect("write");
+        let gz = dir.path().join("n.txt.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        let index = dir.path().join("n.gz.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 16 * 1024,
+            write_index: false,
+            ..Default::default()
+        };
+        let src = open_path(&gz, &opts, true).expect("open with write_index=false");
+        assert_eq!(read_all(src.as_ref(), "/n.txt"), payload.as_slice());
+        drop(src);
+
+        // No shell / no side table: either missing file or empty gzip blobs.
+        if index.exists() {
+            let blobs = SqliteIndex::open_read_only(&index)
+                .expect("ro")
+                .get_gzip_index_blobs()
+                .unwrap_or_default();
+            assert!(
+                blobs.is_empty(),
+                "write_index=false must not store RGZI, got {} blob(s)",
+                blobs.len()
+            );
+        }
     }
 
     #[test]
@@ -3753,6 +3913,7 @@ mod tests {
         let opts = OpenOptions {
             index_file_path: Some(index.clone()),
             gzip_seek_point_spacing: 64 * 1024,
+            write_index: true,
             ..Default::default()
         };
 
@@ -3768,6 +3929,10 @@ mod tests {
 
         // Import must fail open; factory falls back to normal checkpoint rebuild.
         let src2 = open_path(&archive, &opts, false).expect("open after invalid blob");
+        assert_eq!(
+            read_all(src2.as_ref(), "/hello.txt"),
+            b"hello world\n".as_slice()
+        );
         drop(src2);
 
         // Rebuild should have rewritten a valid RGZI blob.
