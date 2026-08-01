@@ -53,7 +53,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--hashes` | yes | **added** (crc32/md5/sha1/sha256 → index xattrs; path-backed post-build) | `~` |
 | `--index-minimum-file-count` | yes | yes | `[x]` |
 | `-g` / `--gs` / `--gzip-seek-point-spacing` (Python `-gs`) | yes | yes | `[x]` MiB uncompressed checkpoint spacing; **default 16**; denser **1–4** for random-heavy mounts (higher open time / RSS) — see note below |
-| `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle; auto 1 MiB when rapidgzip preferred and flag omitted; default **G3** gzip still needs explicit flag until [G3-C](tasks/g3-polish-batch.md)) |
+| `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle; auto 1 MiB when flag omitted and rapidgzip preferred **or** any input looks like gzip `.gz`/`.tgz`/`.tar.gz`/`.gzip`; explicit `--readahead 0`/`N` overrides) |
 | `-d` / `--debug` | yes | yes | `[x]` |
 | `--log-file` | yes | yes | `[x]` |
 | `--color` / `--no-color` | yes | **added** (logging style) | `~` |

@@ -151,10 +151,11 @@ struct Args {
     /// remote images; upstream #180). Accepts `K`/`M`/`G` (1024-based), e.g.
     /// `1M`, `256K`. Capped at 64 MiB per handle.
     ///
-    /// When rapidgzip is preferred (`--use-backend rapidgzip` or
-    /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) and this flag is omitted, the CLI
-    /// auto-enables the recommended 1 MiB window. Pass `--readahead 0` to keep
-    /// readahead off.
+    /// When this flag is omitted, the CLI auto-enables the recommended 1 MiB
+    /// window if rapidgzip is preferred (`--use-backend rapidgzip` or
+    /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) **or** any mount input looks like a
+    /// gzip archive (`.gz` / `.tgz` / `.tar.gz` / `.gzip`). Pass `--readahead 0`
+    /// to keep readahead off.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
@@ -609,6 +610,7 @@ fn main() {
         ratarmount_compress::prefer_rapidgzip_gzip_backend(&open_opts.use_backends);
     #[cfg(not(feature = "gzip-rapidgzip"))]
     let prefer_rapidgzip = false;
+    let gzip_input = inputs.iter().any(|p| path_looks_like_gzip_archive(p));
     let readahead = match parse_byte_size(&args.readahead) {
         Ok(n) => {
             let clamped = clamp_readahead(n);
@@ -619,10 +621,16 @@ fn main() {
                     clamped
                 );
             }
-            let effective = should_auto_readahead(prefer_rapidgzip, readahead_on_argv, clamped);
-            if effective > 0 && clamped == 0 && prefer_rapidgzip && !readahead_on_argv {
+            let effective =
+                should_auto_readahead(prefer_rapidgzip, gzip_input, readahead_on_argv, clamped);
+            if effective > 0 && clamped == 0 && !readahead_on_argv {
+                let reason = if prefer_rapidgzip {
+                    "rapidgzip"
+                } else {
+                    "gzip archive"
+                };
                 log::info!(
-                    "auto-enabling FUSE readahead {effective} bytes for rapidgzip \
+                    "auto-enabling FUSE readahead {effective} bytes for {reason} \
                      (pass --readahead 0 to disable)"
                 );
             } else if effective > 0 {
@@ -1077,8 +1085,8 @@ fn default_mountpoint(archive: &Path) -> PathBuf {
 /// True when the user passed `--readahead` / `--readahead=…` on argv.
 ///
 /// Used to distinguish clap's default `"0"` from an explicit `--readahead 0`
-/// so rapidgzip can auto-enable the recommended window only when the flag is
-/// omitted.
+/// so auto-enable (rapidgzip prefer or gzip-ish input) only applies when the
+/// flag is omitted.
 fn readahead_flag_on_argv<I, S>(args: I) -> bool
 where
     I: IntoIterator<Item = S>,
@@ -1090,14 +1098,53 @@ where
     })
 }
 
+/// True when `name` (basename, URL segment, or full path) looks like a
+/// gzip-compressed archive: `.gz`, `.tgz`, `.tar.gz`, or `.gzip` (case-insensitive).
+fn name_looks_like_gzip(name: &str) -> bool {
+    // Drop query/fragment if a URL-ish string is passed whole.
+    let name = name.split(['?', '#']).next().unwrap_or(name);
+    let l = name.to_ascii_lowercase();
+    l.ends_with(".tar.gz") || l.ends_with(".tgz") || l.ends_with(".gzip") || l.ends_with(".gz")
+}
+
+/// True when a mount input path or URL looks like a gzip-compressed archive.
+///
+/// Checks the full path string, the file name, and the last URL path segment so
+/// nested basenames (`…/inner.tar.gz`) and remote URLs work the same as plain
+/// `.gz` / `.tgz` local paths.
+fn path_looks_like_gzip_archive(path: &Path) -> bool {
+    let s = path.to_string_lossy();
+    if name_looks_like_gzip(&s) {
+        return true;
+    }
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        if name_looks_like_gzip(name) {
+            return true;
+        }
+    }
+    if let Ok(url) = url::Url::parse(&s) {
+        if let Some(seg) = url.path_segments().and_then(|mut p| p.next_back()) {
+            if name_looks_like_gzip(seg) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Effective FUSE readahead after CLI parse.
 ///
-/// When rapidgzip is preferred and the user did **not** pass `--readahead` on
-/// argv, a parsed value of `0` (clap default) becomes
-/// [`RECOMMENDED_READAHEAD_BYTES`]. Explicit `--readahead 0` stays off; any
-/// non-zero parse is left unchanged.
-fn should_auto_readahead(prefer_rgz: bool, readahead_flag_on_argv: bool, parsed: u64) -> u64 {
-    if prefer_rgz && !readahead_flag_on_argv && parsed == 0 {
+/// When rapidgzip is preferred **or** any mount input looks like gzip, and the
+/// user did **not** pass `--readahead` on argv, a parsed value of `0` (clap
+/// default) becomes [`RECOMMENDED_READAHEAD_BYTES`]. Explicit `--readahead 0`
+/// stays off; any non-zero parse is left unchanged.
+fn should_auto_readahead(
+    prefer_rgz: bool,
+    gzip_input: bool,
+    readahead_flag_on_argv: bool,
+    parsed: u64,
+) -> u64 {
+    if (prefer_rgz || gzip_input) && !readahead_flag_on_argv && parsed == 0 {
         RECOMMENDED_READAHEAD_BYTES
     } else {
         parsed
@@ -1141,37 +1188,94 @@ mod mount_probe_tests {
 
 #[cfg(test)]
 mod readahead_auto_cli_tests {
-    use super::{readahead_flag_on_argv, should_auto_readahead, RECOMMENDED_READAHEAD_BYTES};
+    use super::{
+        name_looks_like_gzip, path_looks_like_gzip_archive, readahead_flag_on_argv,
+        should_auto_readahead, RECOMMENDED_READAHEAD_BYTES,
+    };
+    use std::path::Path;
 
     /// Regression: auto-enable 1 MiB readahead when rapidgzip preferred and
     /// `--readahead` omitted; explicit `--readahead 0` stays off.
     #[test]
     fn should_auto_readahead_rapidgzip_default_vs_explicit_zero() {
         assert_eq!(
-            should_auto_readahead(true, false, 0),
+            should_auto_readahead(true, false, false, 0),
             RECOMMENDED_READAHEAD_BYTES,
             "prefer rapidgzip + default 0 → recommended"
         );
         assert_eq!(
-            should_auto_readahead(true, true, 0),
+            should_auto_readahead(true, false, true, 0),
             0,
             "prefer rapidgzip + explicit --readahead 0 → off"
         );
         assert_eq!(
-            should_auto_readahead(false, false, 0),
+            should_auto_readahead(false, false, false, 0),
             0,
-            "no rapidgzip + default 0 → off"
+            "no rapidgzip, no gzip input + default 0 → off"
         );
         assert_eq!(
-            should_auto_readahead(true, false, 256 * 1024),
+            should_auto_readahead(true, false, false, 256 * 1024),
             256 * 1024,
             "non-zero parse is never overridden"
         );
         assert_eq!(
-            should_auto_readahead(true, true, RECOMMENDED_READAHEAD_BYTES),
+            should_auto_readahead(true, false, true, RECOMMENDED_READAHEAD_BYTES),
             RECOMMENDED_READAHEAD_BYTES,
             "explicit non-zero is kept"
         );
+    }
+
+    /// Regression: default G3 gzip mounts auto-enable 1 MiB readahead when
+    /// `--readahead` is omitted; explicit `--readahead 0` / `--readahead=N` stay overrides.
+    #[test]
+    fn should_auto_readahead_gzip_path_without_rapidgzip() {
+        assert_eq!(
+            should_auto_readahead(false, true, false, 0),
+            RECOMMENDED_READAHEAD_BYTES,
+            "gzip input + default 0 (no rapidgzip) → recommended"
+        );
+        assert_eq!(
+            should_auto_readahead(false, true, true, 0),
+            0,
+            "gzip input + explicit --readahead 0 → off"
+        );
+        assert_eq!(
+            should_auto_readahead(false, true, false, 512 * 1024),
+            512 * 1024,
+            "gzip input + non-zero parse is never overridden"
+        );
+        assert_eq!(
+            should_auto_readahead(true, true, false, 0),
+            RECOMMENDED_READAHEAD_BYTES,
+            "both rapidgzip prefer and gzip input → recommended"
+        );
+        assert_eq!(
+            should_auto_readahead(true, true, true, 0),
+            0,
+            "both triggers still yield to explicit --readahead 0"
+        );
+    }
+
+    #[test]
+    fn path_looks_like_gzip_archive_suffixes() {
+        assert!(path_looks_like_gzip_archive(Path::new("a.tar.gz")));
+        assert!(path_looks_like_gzip_archive(Path::new("/data/FOO.TGZ")));
+        assert!(path_looks_like_gzip_archive(Path::new("plain.gz")));
+        assert!(path_looks_like_gzip_archive(Path::new("x.GZIP")));
+        assert!(path_looks_like_gzip_archive(Path::new(
+            "/outer/nested/inner.tar.gz"
+        )));
+        assert!(path_looks_like_gzip_archive(Path::new(
+            "https://example.com/pkg/archive.tar.gz"
+        )));
+        assert!(path_looks_like_gzip_archive(Path::new(
+            "https://example.com/pkg/archive.tgz?token=1"
+        )));
+        assert!(!path_looks_like_gzip_archive(Path::new("a.tar.zst")));
+        assert!(!path_looks_like_gzip_archive(Path::new("a.tar.bz2")));
+        assert!(!path_looks_like_gzip_archive(Path::new("a.zip")));
+        assert!(!path_looks_like_gzip_archive(Path::new("notgz")));
+        assert!(!name_looks_like_gzip("archive.tar.gzz"));
     }
 
     #[test]

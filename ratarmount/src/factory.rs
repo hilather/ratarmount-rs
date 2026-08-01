@@ -809,6 +809,8 @@ fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
 ///
 /// Used after a failed prefer-rapidgzip `from_reader` so
 /// [`SharedSeekableGzip::open_with_threads_from_reader`] can re-scan from the start.
+/// Always compiled so unit tests cover rewind without `gzip-rapidgzip`.
+#[cfg_attr(not(feature = "gzip-rapidgzip"), allow(dead_code))]
 fn rewind_nested_gzip_reader_for_g3(reader: &mut dyn std::io::Seek) -> std::io::Result<()> {
     std::io::Seek::seek(reader, std::io::SeekFrom::Start(0))?;
     Ok(())
@@ -879,7 +881,10 @@ fn take_and_rewind_nested_gzip_reader(
 /// rapidgzip error — there is no Range-style reopen for nested bodies.
 /// Without prefer, G3 only (still no temp spool).
 fn open_nested_gzip_tar(
-    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    // `mut` only needed when rapidgzip prefer may reassign `reader` after G3 rewind.
+    #[cfg_attr(not(feature = "gzip-rapidgzip"), allow(unused_mut))] mut reader: Box<
+        dyn ratarmount_core::ArchiveRead,
+    >,
     label: &Path,
     opts: &OpenOptions,
 ) -> std::io::Result<Arc<dyn MountSource>> {

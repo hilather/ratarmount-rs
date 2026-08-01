@@ -120,7 +120,7 @@ Separate from wiring (path/nested/Range + GZIDX **done**): even on the verified 
 | Open amortisation | Full `keep_index` decode; each FUSE open reopens FD + `IndexedReader` (per-open index clone residual) |
 | Seek-cache / prefetch | **Landed (P2)** — FUSE-oriented seek cache (16 chunks / 64 MiB cap), `seek_readahead`, prefetch windows, optional no-CRC keep_index; thruput impact not re-benched |
 | Fair ISA-L A/B | **Harness landed (P3)** — `compare-gzip-isal-ab.sh`; do not claim ISA-L win without published results ([R3](tasks/rapidgzip-residual-batch.md)) |
-| FUSE readahead fit | **Landed (P4)** — sequential short-read window + random exact-size; `RECOMMENDED_READAHEAD_BYTES` (1 MiB); auto-enable when prefer + default 0 is [R4](tasks/rapidgzip-residual-batch.md) |
+| FUSE readahead fit | **Landed (P4 + G3-C)** — sequential short-read window + random exact-size; `RECOMMENDED_READAHEAD_BYTES` (1 MiB); auto-enable 1 MiB when `--readahead` omitted and (rapidgzip preferred **or** any mount input looks like gzip `.gz`/`.tgz`/`.tar.gz`/`.gzip`); explicit `--readahead 0`/`N` overrides ([R4](tasks/rapidgzip-residual-batch.md)) |
 | Default-on | Flip only after published benches justify it; feature stays opt-in |
 
 **Numbers policy:** ranges above are local spot checks recorded in the [perf batch](tasks/rapidgzip-perf-batch.md) (pre–P2/P4). Prefer `benchmarks/gzip-backend-results/{results.md,results.csv}` when present; do not invent new absolute thruput figures.
