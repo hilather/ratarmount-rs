@@ -45,10 +45,14 @@ fn io_to_errno(err: &std::io::Error) -> i32 {
 /// Fill `buf` from `r` by looping `Read::read` until the buffer is full or true EOF.
 ///
 /// **FUSE contract:** a short reply means end-of-file. Codecs such as seekable
-/// gzip often return one inflate window (~64 KiB) per `Read::read` while more
-/// data remains. A single short `read` would make the kernel stop and tools
-/// report UnexpectedEof / truncated archives. Always use this helper for
-/// archive-backed FUSE reads.
+/// gzip / rapidgzip often return one inflate window (~64 KiB) per `Read::read`
+/// while more data remains. A single short `read` would make the kernel stop
+/// and tools report UnexpectedEof / truncated archives. Always use this helper
+/// for archive-backed FUSE reads (including readahead fills).
+///
+/// Pair with [`readahead_fill`]: the readahead window amortizes many short
+/// underlying `read`s into one large fill so sequential `cat` / scanners do not
+/// pay a seek+decompress per FUSE request.
 fn fill_read_for_fuse(r: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Result<usize> {
     let mut filled = 0usize;
     while filled < buf.len() {
@@ -64,6 +68,15 @@ fn fill_read_for_fuse(r: &mut dyn std::io::Read, buf: &mut [u8]) -> std::io::Res
 
 /// Hard cap for `--readahead` (64 MiB) so a typo cannot pin multi‑GiB RAM per open.
 pub const MAX_READAHEAD_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Recommended sequential readahead for short-read decompressors (gzip /
+/// rapidgzip / multi-frame zstd members): 1 MiB.
+///
+/// Kernel FUSE reads are typically ≤128 KiB; codecs often yield ~64 KiB per
+/// `Read::read`. A 1 MiB window covers many FUSE requests per seek/decompress
+/// without the 64 MiB hard cap. CLI default remains `0` (off); pass this when
+/// tuning for sequential thruput on compressed members.
+pub const RECOMMENDED_READAHEAD_BYTES: u64 = 1024 * 1024;
 
 /// Parse a human byte size for CLI / config: bare integer or `K`/`M`/`G` (1024-based).
 ///
@@ -150,21 +163,68 @@ impl ReadAheadWindow {
     }
 }
 
+/// Per-open readahead bookkeeping (window + sequential/random heuristics).
+///
+/// **Short-read codecs** (gzip/rapidgzip windows, multi-frame zstd):
+/// fills always go through [`fill_read_for_fuse`], which loops until the
+/// requested buffer is full or true EOF — so a single underlying short
+/// `Read::read` never becomes a false FUSE EOF.
+///
+/// **Sequential vs random:** the first miss and any offset that continues
+/// from the previous serve (`last_end`) or from the retained window end use a
+/// large fill (`max(size, readahead_bytes)`). Random seeks fill only the
+/// request size so scattered I/O does not storm the decompressor with
+/// multi‑MiB fills. Sequential continuation after a fill skips a redundant
+/// `Seek` when the underlying cursor is already at the requested offset.
+#[derive(Clone, Debug, Default)]
+struct ReadaheadState {
+    window: Option<ReadAheadWindow>,
+    /// Known absolute position of the underlying reader after last seek/fill.
+    cursor: Option<u64>,
+    /// End offset of the last FUSE response (`offset + returned len`).
+    last_end: Option<u64>,
+}
+
+impl ReadaheadState {
+    fn clear(&mut self) {
+        self.window = None;
+        self.cursor = None;
+        self.last_end = None;
+    }
+
+    /// True when a miss should pull a full readahead window (not exact size).
+    fn is_sequential_miss(&self, offset: u64) -> bool {
+        if self.window.is_none() && self.last_end.is_none() {
+            // First fill on this open: prime a large window (typical `cat`).
+            return true;
+        }
+        if self.last_end == Some(offset) {
+            return true;
+        }
+        if let Some(w) = self.window.as_ref() {
+            if offset == w.end_offset() {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 /// Serve a FUSE read, optionally retaining a sequential readahead window.
 ///
-/// * `readahead_bytes == 0` — exact-size read (legacy); `window` is cleared.
-/// * `readahead_bytes > 0` — on miss, fill `max(size, readahead_bytes)` from
-///   `offset` so subsequent sequential kernel reads hit the window without
-///   another seek/decompress (upstream #180 / FR-5).
+/// * `readahead_bytes == 0` — exact-size read (legacy); state is cleared.
+/// * `readahead_bytes > 0` — sequential misses fill `max(size, readahead_bytes)`
+///   so later kernel reads hit the window without another seek/decompress;
+///   random misses fill only `size` (upstream #180 / FR-5 + short-read coop).
 fn readahead_fill(
     reader: &mut dyn ratarmount_core::ArchiveRead,
-    window: &mut Option<ReadAheadWindow>,
+    state: &mut ReadaheadState,
     readahead_bytes: usize,
     offset: u64,
     size: usize,
 ) -> std::io::Result<Vec<u8>> {
     if readahead_bytes == 0 {
-        *window = None;
+        state.clear();
         reader.seek(std::io::SeekFrom::Start(offset))?;
         let mut buf = vec![0u8; size];
         let n = fill_read_for_fuse(reader, &mut buf)?;
@@ -172,21 +232,41 @@ fn readahead_fill(
         return Ok(buf);
     }
 
-    if let Some(w) = window.as_ref() {
+    if size == 0 {
+        return Ok(Vec::new());
+    }
+
+    if let Some(w) = state.window.as_ref() {
         if let Some(out) = w.try_serve(offset, size) {
+            state.last_end = Some(offset.saturating_add(out.len() as u64));
             return Ok(out);
         }
     }
 
-    let want = size.max(readahead_bytes);
-    reader.seek(std::io::SeekFrom::Start(offset))?;
+    let sequential = state.is_sequential_miss(offset);
+    let want = if sequential {
+        size.max(readahead_bytes)
+    } else {
+        // Random seek: exact request only — avoid multi‑MiB readahead storm.
+        size
+    };
+
+    // Skip seek when the prior fill left the cursor at this offset (sequential
+    // walk past the window end). Random misses and mid-window straddles seek.
+    if state.cursor != Some(offset) {
+        reader.seek(std::io::SeekFrom::Start(offset))?;
+        state.cursor = Some(offset);
+    }
+
     let mut data = vec![0u8; want];
     let n = fill_read_for_fuse(reader, &mut data)?;
     data.truncate(n);
+    state.cursor = Some(offset.saturating_add(n as u64));
     let hit_eof = n < want;
     let out_len = n.min(size);
     let out = data[..out_len].to_vec();
-    *window = Some(ReadAheadWindow {
+    state.last_end = Some(offset.saturating_add(out_len as u64));
+    state.window = Some(ReadAheadWindow {
         start: offset,
         data,
         hit_eof,
@@ -194,13 +274,13 @@ fn readahead_fill(
     Ok(out)
 }
 
-/// Per-open archive reader + optional sequential readahead window.
+/// Per-open archive reader + optional sequential readahead state.
 ///
 /// Held under its own `Mutex` (behind `Arc`) so FUSE `read` can release the
 /// process-wide handle map while decompressing a large readahead fill.
 struct SourceReadState {
     reader: Box<dyn ratarmount_core::ArchiveRead>,
-    readahead_window: Option<ReadAheadWindow>,
+    readahead: ReadaheadState,
 }
 
 enum OpenBackend {
@@ -249,7 +329,8 @@ impl RatarmountFs {
 
     /// Like [`Self::new`], with application-level sequential readahead (bytes; `0` off).
     ///
-    /// Values above [`MAX_READAHEAD_BYTES`] are clamped.
+    /// Values above [`MAX_READAHEAD_BYTES`] are clamped. For short-read
+    /// decompressors prefer [`RECOMMENDED_READAHEAD_BYTES`] (1 MiB).
     pub fn with_readahead(
         source: Arc<dyn MountSource>,
         overlay: Option<Arc<WriteOverlay>>,
@@ -700,7 +781,7 @@ impl Filesystem for RatarmountFs {
                         file_info: fi,
                         state: Arc::new(Mutex::new(SourceReadState {
                             reader,
-                            readahead_window: None,
+                            readahead: ReadaheadState::default(),
                         })),
                     },
                 );
@@ -768,14 +849,11 @@ impl Filesystem for RatarmountFs {
             }
             ReadTarget::Source { path, state } => {
                 let mut g = state.lock().unwrap();
-                let SourceReadState {
-                    reader,
-                    readahead_window,
-                } = &mut *g;
+                let SourceReadState { reader, readahead } = &mut *g;
                 let off = offset.max(0) as u64;
                 match readahead_fill(
                     reader.as_mut(),
-                    readahead_window,
+                    readahead,
                     self.readahead_bytes,
                     off,
                     size as usize,
@@ -1608,12 +1686,19 @@ mod tests {
     }
 
     /// Seekable in-memory member used to unit-test `readahead_fill`.
+    ///
+    /// When `max_read_chunk > 0`, each `Read::read` returns at most that many
+    /// bytes (mimics rapidgzip / inflate window short returns).
     struct SpyReader {
         data: Vec<u8>,
         pos: u64,
         seeks: u32,
         /// Sum of successful `read` byte counts (proxy for underlying fills).
         bytes_read: usize,
+        /// Number of `Read::read` calls (including EOF zeros).
+        read_calls: u32,
+        /// Cap per `read` when non-zero (short-read codec simulation).
+        max_read_chunk: usize,
     }
 
     impl SpyReader {
@@ -1623,17 +1708,29 @@ mod tests {
                 pos: 0,
                 seeks: 0,
                 bytes_read: 0,
+                read_calls: 0,
+                max_read_chunk: 0,
             }
+        }
+
+        fn with_short_reads(data: Vec<u8>, max_read_chunk: usize) -> Self {
+            let mut s = Self::new(data);
+            s.max_read_chunk = max_read_chunk;
+            s
         }
     }
 
     impl std::io::Read for SpyReader {
         fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.read_calls += 1;
             let pos = self.pos as usize;
             if pos >= self.data.len() || buf.is_empty() {
                 return Ok(0);
             }
-            let n = (self.data.len() - pos).min(buf.len());
+            let mut n = (self.data.len() - pos).min(buf.len());
+            if self.max_read_chunk > 0 {
+                n = n.min(self.max_read_chunk);
+            }
             buf[..n].copy_from_slice(&self.data[pos..pos + n]);
             self.pos += n as u64;
             self.bytes_read += n;
@@ -1663,13 +1760,13 @@ mod tests {
     fn readahead_sequential_small_reads_hit_window() {
         let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let mut spy = SpyReader::new(payload.clone());
-        let mut window = None;
+        let mut state = ReadaheadState::default();
         let readahead = 4096usize;
         let chunk = 512usize;
 
         for i in 0..8 {
             let off = (i * chunk) as u64;
-            let got = readahead_fill(&mut spy, &mut window, readahead, off, chunk).expect("read");
+            let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("read");
             assert_eq!(got, payload[off as usize..off as usize + chunk]);
         }
         // One seek + one fill of 4096 for the first miss; next 7 chunks hit window.
@@ -1684,25 +1781,34 @@ mod tests {
         );
         // Mid-window re-read (not only forward) still hits.
         let seeks_before = spy.seeks;
-        let got = readahead_fill(&mut spy, &mut window, readahead, 0, chunk).expect("rewind hit");
+        let got = readahead_fill(&mut spy, &mut state, readahead, 0, chunk).expect("rewind hit");
         assert_eq!(got, payload[..chunk]);
         assert_eq!(spy.seeks, seeks_before, "in-window re-read must not seek");
 
-        // Random seek outside window must refill.
+        // Random seek outside window must refill (exact size only — not full window).
         let off = 8000u64;
-        let got = readahead_fill(&mut spy, &mut window, readahead, off, chunk).expect("seek read");
+        let bytes_before = spy.bytes_read;
+        let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("seek read");
         assert_eq!(got, payload[off as usize..off as usize + chunk]);
         assert!(spy.seeks >= 2, "miss outside window must seek again");
+        assert_eq!(
+            spy.bytes_read - bytes_before,
+            chunk,
+            "random miss must not storm with full readahead fill"
+        );
     }
 
     #[test]
     fn readahead_disabled_reads_exact_size_only() {
         let payload: Vec<u8> = (0..2000u32).map(|i| (i % 251) as u8).collect();
         let mut spy = SpyReader::new(payload.clone());
-        let mut window = None;
-        let got = readahead_fill(&mut spy, &mut window, 0, 100, 64).expect("read");
+        let mut state = ReadaheadState::default();
+        let got = readahead_fill(&mut spy, &mut state, 0, 100, 64).expect("read");
         assert_eq!(got, payload[100..164]);
-        assert!(window.is_none(), "readahead 0 must not retain a window");
+        assert!(
+            state.window.is_none(),
+            "readahead 0 must not retain a window"
+        );
         assert_eq!(spy.pos, 164);
         assert_eq!(spy.bytes_read, 64);
     }
@@ -1711,13 +1817,13 @@ mod tests {
     fn readahead_eof_short_read() {
         let payload = b"short-file-payload".to_vec();
         let mut spy = SpyReader::new(payload.clone());
-        let mut window = None;
-        let got = readahead_fill(&mut spy, &mut window, 1024, 0, 64).expect("read");
+        let mut state = ReadaheadState::default();
+        let got = readahead_fill(&mut spy, &mut state, 1024, 0, 64).expect("read");
         assert_eq!(got, payload);
         let seeks_after_first = spy.seeks;
         // Second read past EOF is empty without another underlying seek.
         let got2 =
-            readahead_fill(&mut spy, &mut window, 1024, payload.len() as u64, 16).expect("eof");
+            readahead_fill(&mut spy, &mut state, 1024, payload.len() as u64, 16).expect("eof");
         assert!(got2.is_empty());
         assert_eq!(
             spy.seeks, seeks_after_first,
@@ -1730,10 +1836,10 @@ mod tests {
     fn readahead_partial_eof_from_window() {
         let payload: Vec<u8> = (0..100u8).collect();
         let mut spy = SpyReader::new(payload.clone());
-        let mut window = None;
-        let _ = readahead_fill(&mut spy, &mut window, 256, 0, 10).expect("prime");
+        let mut state = ReadaheadState::default();
+        let _ = readahead_fill(&mut spy, &mut state, 256, 0, 10).expect("prime");
         let seeks = spy.seeks;
-        let got = readahead_fill(&mut spy, &mut window, 256, 80, 50).expect("partial");
+        let got = readahead_fill(&mut spy, &mut state, 256, 80, 50).expect("partial");
         assert_eq!(got, payload[80..]);
         assert_eq!(spy.seeks, seeks, "partial EOF must hit window");
     }
@@ -1743,16 +1849,157 @@ mod tests {
     fn readahead_straddle_non_eof_window_refills() {
         let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
         let mut spy = SpyReader::new(payload.clone());
-        let mut window = None;
-        let _ = readahead_fill(&mut spy, &mut window, 1000, 0, 100).expect("prime");
-        assert!(!window.as_ref().unwrap().hit_eof);
+        let mut state = ReadaheadState::default();
+        let _ = readahead_fill(&mut spy, &mut state, 1000, 0, 100).expect("prime");
+        assert!(!state.window.as_ref().unwrap().hit_eof);
         let seeks = spy.seeks;
-        let got = readahead_fill(&mut spy, &mut window, 1000, 900, 200).expect("straddle");
+        let got = readahead_fill(&mut spy, &mut state, 1000, 900, 200).expect("straddle");
         assert_eq!(got, payload[900..1100]);
         assert!(
             spy.seeks > seeks,
             "straddle of non-EOF window must refill, not return false short read"
         );
+    }
+
+    /// Regression: sequential cat over a short-read source (gzip/rapidgzip-style
+    /// ~64 KiB windows) must assemble correct bytes and amortize fills via the
+    /// readahead window — not stop at the first short `Read::read`.
+    #[test]
+    fn readahead_sequential_cat_short_read_source_correct() {
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+        // ~inflate window class used by seekable gzip / rapidgzip IndexedReader.
+        let window_chunk = 64 * 1024 - 10;
+        let mut spy = SpyReader::with_short_reads(payload.clone(), window_chunk);
+        let mut state = ReadaheadState::default();
+        let readahead = RECOMMENDED_READAHEAD_BYTES as usize; // 1 MiB
+        let fuse_chunk = 128 * 1024usize; // typical kernel FUSE read size
+        let mut out = Vec::with_capacity(payload.len());
+        let mut off = 0u64;
+        while (off as usize) < payload.len() {
+            let want = fuse_chunk.min(payload.len() - off as usize);
+            let got = readahead_fill(&mut spy, &mut state, readahead, off, want).expect("cat");
+            assert!(
+                !got.is_empty() || want == 0,
+                "false EOF at off={off} want={want}"
+            );
+            out.extend_from_slice(&got);
+            off += got.len() as u64;
+        }
+        assert_eq!(out, payload, "sequential cat must match full member");
+        // First fill is 1 MiB; subsequent sequential past-window fills continue
+        // without seeking when cursor is already at window end.
+        assert!(
+            spy.seeks <= 1 + (payload.len() / readahead) as u32,
+            "sequential short-read cat must not seek every FUSE chunk (seeks={})",
+            spy.seeks
+        );
+        // fill_read_for_fuse must have issued multiple short reads for the 1 MiB fill.
+        assert!(
+            spy.read_calls > (payload.len() / window_chunk) as u32 / 2,
+            "short-read codec should require many underlying read calls (got {})",
+            spy.read_calls
+        );
+    }
+
+    /// Regression: random seeks must not readahead-storm (each miss fills only
+    /// the request size, not the full sequential window).
+    #[test]
+    fn readahead_random_seeks_no_storm() {
+        let payload: Vec<u8> = (0..64_000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut state = ReadaheadState::default();
+        let readahead = 16 * 1024usize;
+        let chunk = 512usize;
+        // Prime sequential window.
+        let _ = readahead_fill(&mut spy, &mut state, readahead, 0, chunk).expect("prime");
+        assert_eq!(spy.bytes_read, readahead);
+
+        let random_offs = [50_000u64, 1_000, 40_000, 20_000, 55_000];
+        let bytes_before = spy.bytes_read;
+        let seeks_before = spy.seeks;
+        for &off in &random_offs {
+            let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("rand");
+            assert_eq!(got, payload[off as usize..off as usize + chunk]);
+        }
+        let bytes_random = spy.bytes_read - bytes_before;
+        let seeks_random = spy.seeks - seeks_before;
+        assert_eq!(
+            seeks_random,
+            random_offs.len() as u32,
+            "each random miss must seek once"
+        );
+        assert_eq!(
+            bytes_random,
+            chunk * random_offs.len(),
+            "random misses must pull exact size only (no {readahead}-byte storm); got {bytes_random}"
+        );
+    }
+
+    /// Regression: after a random miss, sequential continuation from that point
+    /// re-enables the large readahead window (cat after sparse seeks).
+    #[test]
+    fn readahead_sequential_after_random_uses_large_window() {
+        let payload: Vec<u8> = (0..20_000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut state = ReadaheadState::default();
+        let readahead = 4096usize;
+        let chunk = 256usize;
+
+        // First miss is always a large sequential prime (typical open+cat).
+        let _ = readahead_fill(&mut spy, &mut state, readahead, 0, chunk).expect("prime");
+        assert_eq!(spy.bytes_read, readahead);
+
+        // Random jump mid-file (exact fill only — no storm).
+        let start = 10_000u64;
+        let bytes_before_rand = spy.bytes_read;
+        let got = readahead_fill(&mut spy, &mut state, readahead, start, chunk).expect("random");
+        assert_eq!(got, payload[start as usize..start as usize + chunk]);
+        assert_eq!(
+            spy.bytes_read - bytes_before_rand,
+            chunk,
+            "random miss after prime must be exact-size only"
+        );
+
+        // Next contiguous read is sequential → full readahead from that offset.
+        let bytes_before = spy.bytes_read;
+        let off = start + chunk as u64;
+        let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("seq");
+        assert_eq!(got, payload[off as usize..off as usize + chunk]);
+        assert_eq!(
+            spy.bytes_read - bytes_before,
+            readahead,
+            "sequential after random must fill full readahead window"
+        );
+    }
+
+    /// Regression: walking past the end of a sequential window must not re-seek
+    /// when the underlying cursor already sits at that offset (short-read coop).
+    #[test]
+    fn readahead_sequential_past_window_skips_redundant_seek() {
+        let payload: Vec<u8> = (0..10_000u32).map(|i| (i % 251) as u8).collect();
+        let mut spy = SpyReader::new(payload.clone());
+        let mut state = ReadaheadState::default();
+        let readahead = 1024usize;
+        let chunk = 256usize;
+
+        // Drain first window via hits.
+        for i in 0..(readahead / chunk) {
+            let off = (i * chunk) as u64;
+            let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("hit");
+            assert_eq!(got.len(), chunk);
+        }
+        assert_eq!(spy.seeks, 1);
+        assert_eq!(spy.pos, readahead as u64);
+
+        // Next offset == window end; cursor already there → no seek.
+        let off = readahead as u64;
+        let got = readahead_fill(&mut spy, &mut state, readahead, off, chunk).expect("continue");
+        assert_eq!(got, payload[off as usize..off as usize + chunk]);
+        assert_eq!(
+            spy.seeks, 1,
+            "sequential past window end must skip redundant Seek"
+        );
+        assert_eq!(spy.bytes_read, readahead * 2);
     }
 
     #[test]
@@ -1762,6 +2009,27 @@ mod tests {
         assert_eq!(
             fs.readahead_bytes, MAX_READAHEAD_BYTES as usize,
             "constructor must clamp oversized readahead"
+        );
+        let fs2 = RatarmountFs::with_readahead(
+            Arc::new(EmptyBase) as Arc<dyn MountSource>,
+            None,
+            RECOMMENDED_READAHEAD_BYTES,
+        );
+        assert_eq!(
+            fs2.readahead_bytes, RECOMMENDED_READAHEAD_BYTES as usize,
+            "recommended 1 MiB must store unchanged"
+        );
+    }
+
+    #[test]
+    fn recommended_readahead_within_cap() {
+        const {
+            assert!(RECOMMENDED_READAHEAD_BYTES > 0);
+            assert!(RECOMMENDED_READAHEAD_BYTES <= MAX_READAHEAD_BYTES);
+        }
+        assert_eq!(
+            clamp_readahead(RECOMMENDED_READAHEAD_BYTES),
+            RECOMMENDED_READAHEAD_BYTES
         );
     }
 }
