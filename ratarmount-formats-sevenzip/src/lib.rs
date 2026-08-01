@@ -188,6 +188,14 @@ impl SevenZipMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
+        // Index + fingerprint first (same order as TAR/ZIP): reject a sibling
+        // index for a replaced archive before paying for header parse.
+        let index = SqliteIndex::open_read_only(index_path)?;
+        index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
+
         let mut file = File::open(archive_path)?;
         let password = options.passwords.first().cloned();
         let archive = parse::parse_7z_archive(&mut file, |folder, packed| {
@@ -196,8 +204,6 @@ impl SevenZipMountSource {
         })?;
         let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
         let content_locked = encrypted && password.is_none();
-        let index = SqliteIndex::open_read_only(index_path)?;
-        index.check_backend_name(BACKEND_NAME)?;
         let entry_by_offsets = entry_offset_map(&archive);
         file.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
@@ -808,18 +814,13 @@ fn ensure_parent_dirs(
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    if let Ok(meta) = std::fs::metadata(path) {
-        use std::os::unix::fs::MetadataExt;
-        let json = format!(
-            "{{\"st_size\":{},\"st_mtime\":{}}}",
-            meta.size(),
-            meta.mtime()
-        );
-        index.store_metadata_key_value("tarstats", &json)?;
-    } else {
-        // Nested / virtual labels have no host metadata.
-        index.store_metadata_key_value("tarstats", "{\"st_size\":0,\"st_mtime\":0}")?;
+    // Real on-disk archives: full fingerprint (size/mtime + edge/full SHA-256)
+    // via shared index helper so warm reopen fails closed after in-place replace.
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
+        return Ok(());
     }
+    // Nested / virtual labels have no host metadata — synthetic size-only stats.
+    index.store_metadata_key_value("tarstats", "{\"st_size\":0,\"st_mtime\":0}")?;
     Ok(())
 }
 
@@ -1992,6 +1993,136 @@ sys.stdout.buffer.write(packed)
             (a.mtime - expected).abs() < 86400.0,
             "mtime {} far from {expected}",
             a.mtime
+        );
+    }
+
+    /// Build a minimal single-file 7z at `archive` containing `member_name` → `payload`.
+    /// Returns false when the `7z` CLI is missing or fails (caller should skip).
+    fn write_sample_7z(archive: &Path, member_name: &str, payload: &[u8]) -> bool {
+        use std::process::Command;
+        let dir = archive.parent().expect("archive parent");
+        let plain = dir.join(member_name);
+        if let Some(parent) = plain.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&plain, payload) {
+            eprintln!("skip: write payload: {e}");
+            return false;
+        }
+        // Replace any previous archive so size/mtime always change.
+        let _ = std::fs::remove_file(archive);
+        let archive_name = archive.file_name().and_then(|s| s.to_str()).unwrap();
+        let status = Command::new("7z")
+            .args([
+                "a",
+                "-t7z",
+                "-mx=0", // store: small, deterministic size change with payload
+                archive_name,
+                member_name,
+            ])
+            .current_dir(dir)
+            .status();
+        match status {
+            Ok(s) if s.success() => true,
+            Ok(_) => {
+                eprintln!("skip: 7z a failed");
+                false
+            }
+            Err(_) => {
+                eprintln!("skip: 7z not available");
+                false
+            }
+        }
+    }
+
+    /// Regression: open_existing_path rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.7z");
+        if !write_sample_7z(&archive, "hello.txt", b"7z-v1\n") {
+            return;
+        }
+        let index = dir.path().join("swap.7z.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = SevenZipMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "7z-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        SevenZipMountSource::open_existing_path(&archive, &index, &opts)
+            .expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        if !write_sample_7z(&archive, "hello.txt", b"7z-v2-longer\n") {
+            return;
+        }
+
+        match SevenZipMountSource::open_existing_path(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing_path after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm 7z open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.7z");
+        if !write_sample_7z(&archive, "hello.txt", b"7z-v1\n") {
+            return;
+        }
+        let index = dir.path().join("swap.7z.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = SevenZipMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "7z-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        if !write_sample_7z(&archive, "hello.txt", b"7z-v2-longer\n") {
+            return;
+        }
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale member rows.
+        let src2 =
+            SevenZipMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "7z-v2-longer\n",
+            "must serve new 7z data after tarstats mismatch rebuild"
         );
     }
 }
