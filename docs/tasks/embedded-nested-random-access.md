@@ -32,7 +32,7 @@
 | N6 | ZIP store nested open | Shared region stencil | **done** (factory) | multi-disk edges |
 | N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
-| N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | path / materialize | **no-tmp** when practical |
+| N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | **SquashFS+FAT no-tmp**; EXT4 path residual | SquashFS `open_from_reader` (non-LZMA); FAT done; EXT4 residual |
 | — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
 | — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | deferred (low priority) |
 
@@ -98,8 +98,9 @@
 - [x] Unit tests per crate (path + Cursor)
 - [x] XAR / CAB (store/MSZIP) / SQLAR / FAT `open_from_reader` — wave2 agents
 - [x] Factory wire + e2e nested CPIO/AR/WARC/ASAR tests
-- [ ] CAB LZX residual (spool → libarchive)
-- [ ] SquashFS / EXT4 nested stream (path-oriented residual)
+- [x] SquashFS nested `open_from_reader` + factory wire (non-LZMA no-tmp; classic LZMA spool residual)
+- [ ] CAB LZX residual (spool → libarchive; documented FR-8)
+- [ ] EXT4 nested stream (path-oriented residual)
 
 ### B3. ZIP store polish
 
@@ -112,9 +113,11 @@
 
 ### C1. SquashFS / EXT4 / FAT
 
-- [ ] Prefer path/mmap when parent is a real file
-- [ ] `open_from_reader` only if crate can index without `Path` (or spool **only** if library requires path — mark residual)
-- [ ] Nested `disk.img` / `.sqsh` in store 7z: no-tmp if reader API exists
+- [x] SquashFS `open_from_reader` / factory nested probe (gzip/zstd/xz/…); classic LZMA residual
+- [x] FAT `open_from_reader`
+- [ ] Prefer path/mmap when parent is a real file (optional polish)
+- [ ] EXT4 `open_from_reader` if practical (still path residual)
+- [x] Nested `.sqsh`/`.squashfs` via reader API when non-LZMA
 
 ---
 

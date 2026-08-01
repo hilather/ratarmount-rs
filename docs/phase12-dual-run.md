@@ -37,13 +37,13 @@ Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–13. Prefe
 | Compositing / UX | **strong** | union, automount, overlay + commit (common TAR compressions + ZIP rebuild), versions, control socket + in-FS control, lazy/transform/prefix |
 | FUSE readahead | **done** | `--readahead` sequential window (FR-5 / upstream #180); not a dual-run residual |
 | Nested / no-tmp | **strong** | Factory nested `open_from_reader` paths for common formats; residual path spool for some long-tail |
-| Parallel nested index | **open (perf)** | FR-6 / upstream #80 — nested index work not fanned out; functional dual-run OK without it |
+| Parallel nested index | **done** / residual CLI | FR-6 / upstream #80 — eager AutoMount same-dir fan-out (`parallel_nested_threads`, default auto); optional CLI cap still residual |
 | Remote | **broad** | http(s) Range for TAR/ZIP/gzip/bzip2/xz/zstd; S3/SSH; WebDAV/SMB/Dropbox; remote + compressed index download |
 | Index interop | **good** | SQLite 0.7.x; Py↔Rust TAR (+ ZIP/7z); side tables partial for some codec blobs; warm reimport for zstdblocks/bzip2blocks |
 | Perf / CI | **gated** | cold-index hard gate + optional full bench; fmt/clippy/test + FUSE allowlist CI |
 | Packaging | **shippable** | Makefile install, deb/rpm/portable/macOS tarballs, AppImage scaffold, cosign |
 
-**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred), FR-6 parallel nested indexing (perf).
+**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred), FR-6 CLI wire residual (compositing parallel already default).
 
 ---
 
@@ -61,7 +61,7 @@ Realistic criteria for declaring Rust the **default** install name `ratarmount` 
 | Packaging | Documented install: `make install`, portable tarball, and/or distro package | [`docs/packaging.md`](packaging.md) |
 | Residual acceptance | Residual gaps listed below accepted in release notes / dual-run README | This doc + parity-todo `~` / `[ ]` rows |
 
-**Cutover is OK without:** pure RAR, pure lrzip, full PDF color spaces, progressive multi-GB solid 7z for every filter stack, SMB CLI-less pure implementation, FR-6 parallel nested indexing, or 100% fixed-archive parity.
+**Cutover is OK without:** pure RAR, pure lrzip, full PDF color spaces, progressive multi-GB solid 7z for every filter stack, SMB CLI-less pure implementation, FR-6 CLI cap flag, or 100% fixed-archive parity.
 
 ---
 
@@ -141,7 +141,7 @@ Track detail in [`parity-todo.md`](parity-todo.md), [`tasks/gap-implementation-b
 | Progressive multi-GB solid 7z (BCJ/AES full-folder) | progressive LZMA2 + LRU windows | Large exotic solids may use more RAM/time |
 | Factory auto-wire zstdblocks/bzip2blocks from index on open | **done** (FR-9) | Warm open imports side tables; skips re-export when map reused |
 | Sequential FUSE readahead (`--readahead`) | **done** (FR-5 / #180) | Shipped; not a residual — listed so announce notes do not re-open it |
-| **Parallel nested archive indexing** (FR-6 / #80) | **open (perf)** | Nested mounts/index still sequential; functional dual-run OK; optional later speed-up |
+| **Parallel nested archive indexing** (FR-6 / #80) | **done** (eager AutoMount) | Same-dir fan-out default; CLI/`-P` wire residual only |
 | HTTP Range on every format | TAR/ZIP + main codecs | Others materialize |
 | Full `--use-backend` / Python backend matrix | probe reorder | Priority list accepted |
 | Full fixed-archive ≥90% | allowlist expanding | Track gaps; not cutover-hard |
@@ -159,7 +159,7 @@ Docs can prepare text and mark readiness; ops actions stay open.
 
 | # | Item | Readiness | Owner |
 |---|------|-----------|--------|
-| 1 | Residual gaps table current in this doc (incl. FR-5 done, FR-6 open) | **docs-ready** `[x]` | docs |
+| 1 | Residual gaps table current in this doc (incl. FR-5 done, FR-6 compositing done) | **docs-ready** `[x]` | docs |
 | 2 | Comparison / gaps summary for release notes (paste stub below + parity-todo) | **docs-ready** `[x]` | docs |
 | 3 | Install paths documented (binary, portable, deb/rpm, optional AppImage) | **docs-ready** `[x]` | [`packaging.md`](packaging.md) |
 | 4 | crates.io not required for dual-run binary ship | **docs-ready** `[x]` | [`crates-io-policy.md`](crates-io-policy.md) |
@@ -191,7 +191,7 @@ Ordered steps for humans. **Do not treat this section as completed work** — no
 ### 0. Preconditions (same day as tag)
 
 1. Main is green: `cargo fmt --all -- --check`, clippy `-D warnings`, `cargo test --workspace`, FUSE allowlist job, cold-index gate (`./benchmarks/check-rust-gates.sh` or CI equivalent).
-2. Residual table above still matches parity-todo / FR list (especially: readahead **done**, parallel nested **open but accepted**).
+2. Residual table above still matches parity-todo / FR list (especially: readahead **done**, parallel nested compositing **done** / CLI residual).
 3. Decide the first dual-run tag version (workspace version today is independent of “announce ready”; bump per packaging checklist when cutting).
 
 ### 1. Version bump and tag

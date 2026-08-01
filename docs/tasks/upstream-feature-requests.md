@@ -42,8 +42,8 @@ issue from the README feature tables.
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI / factory wire for parallel nested** | Options field lives in compositing; default auto | `ratarmount/src/factory.rs` + CLI |
-| FR-8 | Python residual | **CAB LZX nested no-tmp residual** | Use libarchive path; document | formats-cab / factory |
+| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI wire for parallel nested cap** | Compositing + factory Default auto (`parallel_nested_threads=0`); optional CLI/`-P` still open | CLI / main |
+| FR-8 | Python residual | **CAB LZX nested no-tmp residual** | **documented** — store/MSZIP no-tmp; LZX/Quantum → libarchive/temp spool (no pure LZX decoder) | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | **done** — path + Range open import side tables; skip re-export on warm hit | `ratarmount/src/factory.rs` |
 
 ### P2 — design-heavy or partial acceptance

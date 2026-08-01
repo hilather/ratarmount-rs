@@ -16,7 +16,7 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 |----------|--------|
 | **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR is indexed from that stream in memory. |
 | **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
-| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (SquashFS tools, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. |
+| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without spool. |
 | **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
 | **Large recursive trees (`-r` on huge `.deb`s)?** | Prefer **`-l` / `--lazy`** (and optional **`--recursion-depth`**). Eager `-r` can use multi‑GB RAM and minutes; not a correctness bug ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)). |
 
@@ -106,8 +106,10 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **CAB** (store/MSZIP) | `MSCF` / `.cab` | `CabMountSource::open_from_reader` | Store stencil / MSZIP folder decompress in RAM |
 | **SQLAR** (unencrypted) | SQLite magic / `.sqlar` | `SqlarMountSource::open_from_reader` | Full DB in RAM (`sqlite3_deserialize`); no `/tmp` |
 | **FAT** | boot probe / `.fat*` | `FatMountSource::open_from_reader` | Shared seek body (no full-image copy) |
+| **SquashFS** (none/gzip/zstd/lz4/lzo/xz) | `hsqs`/`sqsh` magic (or AppImage scan) / `.squashfs`/`.sqfs`/`.snap` | `SquashFsMountSource::open_from_reader` | **Yes** — in-process backhand; **no** `/tmp` |
+| **SquashFS classic LZMA** | same magic | open_from_reader **errors** | **Temp spool** → path `open` / `unsquashfs` residual |
 
-Anything else (CAB **LZX**, SquashFS, RAR/libarchive-only, encrypted SQLAR, plain non-TAR `.gz`, …) **falls back to temp spool** for the nested open today.
+Anything else (CAB **LZX**, classic SquashFS **LZMA**, RAR/libarchive-only, encrypted SQLAR, …) **falls back to temp spool** for the nested open today.
 
 ---
 
@@ -127,9 +129,9 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **7z (store/copy)** | `.tar` / `.tar.gz` / `.zip` / `.7z` | **No** | Preferred outer packing for nested random I/O |
 | **7z (solid LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode; not recommended for large solids |
 | **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for BCJ/AES/etc. |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches |
+| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches |
 | **SQLAR** unencrypted nested | nested | **No** (full image RAM) | deserialize; encrypted still path residual |
-| **CAB LZX / SquashFS / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; SquashFS often needs path |
+| **CAB LZX / classic SquashFS LZMA / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; classic LZMA → unsquashfs path |
 
 ### Explicit: ZIP + embedded TAR
 
@@ -155,7 +157,7 @@ Same for `outer.zip` → `inner.tar.gz`.
 
 ### Nested automount fallback
 
-1. Nested magic not in the table above (e.g. nested `.iso`, `.sqfs`, `.rar` via libarchive-only).
+1. Nested magic not in the table above (e.g. nested `.rar` / LHA via libarchive-only; classic SquashFS **LZMA**).
 2. Nested open from stream fails (corrupt, password, unsupported codec).
 3. Split multi-part join that materializes a joined temp file.
 4. Logs: `falling back to temp spool` / `spooled … for path open`.
@@ -168,7 +170,7 @@ Temp files are held for the life of that nested mount and removed when the neste
 |------|---------------------|
 | **`.tar.gz` / `.tar.zst` / multi-frame codecs** | **No** — seekable body + TAR/index |
 | **Plain single-file** `.gz` / `.bz2` / `.zst` / `.xz` / lz4 / … | **No** — seekable body + `SingleFileMountSource::from_seekable_body` (or `open_from_reader` if payload is an archive) |
-| Residual: SquashFS tools / some EXT4 / RAR / CAB LZX | May materialize or keep a path |
+| Residual: classic SquashFS lzma / some EXT4 / RAR / CAB LZX | May materialize or keep a path |
 | lrzip | CLI or libarchive materialize when needed |
 | Remote URL outside live Range codecs | Download / materialize |
 | Write overlay `:temp:` | Explicit temp overlay root (user-requested) |
@@ -208,7 +210,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | List OK, read fails with EACCES | Encrypted 7z metadata-only; need password (inner password for nested encrypted 7z) |
 | Nested `.tar.gz` slow cold open | Building gzip seek checkpoints on the member stream (once per nested mount) |
 | Nested inside solid 7z slow | Solid prefix cost — re-pack outer non-solid if possible |
-| Nested SquashFS/RAR/XAR needs tmp | Expected until those backends gain stream open |
+| Nested classic SquashFS LZMA / RAR needs tmp | Expected residual (in-process SquashFS non-LZMA is no-tmp) |
 
 ---
 
@@ -234,9 +236,10 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
 | Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT | yes | yes\* |
+| Nested SquashFS (none/gzip/zstd/lz4/lzo/xz) | yes | yes (backhand) |
 | Nested unencrypted SQLAR | yes (no `/tmp`) | yes after full DB load in RAM |
 | Nested plain `.gz` / `.zst` / … (single file) | yes | yes (seekable body) |
-| Nested CAB LZX / SquashFS / RAR | usually **tmp** | depends on path open |
+| Nested CAB LZX / classic SquashFS LZMA / RAR | usually **tmp** | depends on path open |
 | Solid multi-GB 7z outer | no tmp | often costly |
 
 \* Inner ZIP deflate / solid 7z have the usual decompress costs. **xz residual:** open/size is cheap with a Stream Index (footer-first range reads); any byte access still decompresses the covering **block**. Prefer `xz --block-size=…` / pixz for multi‑GiB random access. Default single-block maps stay seekable only when the unit is ≤ the ~256 MiB RAM cap; larger single-block falls through to full decode + temp spill (same cap as other codecs). Nested temp files are still avoided when the reader path succeeds.

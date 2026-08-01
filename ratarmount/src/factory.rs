@@ -39,7 +39,9 @@ use ratarmount_formats_ogg::{looks_like_ogg, OggMountSource};
 use ratarmount_formats_pdf::{looks_like_pdf, PdfMountSource};
 use ratarmount_formats_sevenzip::{looks_like_7z, SevenZipMountSource};
 use ratarmount_formats_sqlar::{looks_like_sqlar, SqlarMountSource};
-use ratarmount_formats_squashfs::{looks_like_squashfs, SquashFsMountSource};
+use ratarmount_formats_squashfs::{
+    looks_like_squashfs, looks_like_squashfs_reader, SquashFsMountSource,
+};
 use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
 use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
@@ -497,6 +499,8 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 ///   embedded in a store 7z) — seekable decompress + in-memory TAR index
 /// - **CPIO**, **AR**, **ISO 9660**, **WARC**, **ASAR**, **XAR**, **CAB** (store/MSZIP),
 ///   **SQLAR** (unencrypted, full image in RAM), **FAT** images
+/// - **SquashFS** (none/gzip/zstd/lz4/lzo/xz via in-process backhand); classic **LZMA**
+///   images fail here so AutoMount can temp-spool + path/`unsquashfs`
 ///
 /// Other formats fail so AutoMount can fall back to materializing a temp file
 /// and [`open_nested_fn`].
@@ -704,6 +708,16 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         if looks_fat {
             return map_nested_open("FAT", label, || {
                 FatMountSource::open_from_reader(reader, label)
+            });
+        }
+
+        // SquashFS: magic at 0 (or AppImage-style scan); classic LZMA fails → temp spool
+        let looks_sqfs = name_suggests_ext(label, &["squashfs", "sqfs", "snap"])
+            || looks_like_squashfs_reader(&mut reader);
+        let _ = reader.seek(SeekFrom::Start(0));
+        if looks_sqfs {
+            return map_nested_open("SquashFS", label, || {
+                SquashFsMountSource::open_from_reader(reader, label)
             });
         }
 
@@ -1996,7 +2010,7 @@ fn open_bzip2(
 ///
 /// TAR → index over body; other archives → `open_from_reader` when practical;
 /// plain single-file → [`SingleFileMountSource::from_seekable_body`] (**no** full `io::copy`).
-/// Residual path-only backends (EXT4 / SquashFS / libarchive-only) may still materialize.
+/// Residual path-only backends (EXT4 / classic SquashFS lzma / libarchive-only) may still materialize.
 fn open_from_seekable_body(
     path: &Path,
     body: Arc<dyn SeekableBody>,
@@ -2222,11 +2236,30 @@ fn try_open_formats_from_seekable_body(
             )));
         }
     }
+    // SquashFS (in-process backhand; classic LZMA → Ok(None) → path materialize residual)
+    {
+        let mut r = open_reader()?;
+        let looks_sqfs = name_suggests_ext(label, &["squashfs", "sqfs", "snap"])
+            || looks_like_squashfs_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_sqfs {
+            match SquashFsMountSource::open_from_reader(r, label) {
+                Ok(s) => return Ok(Some(Arc::new(s))),
+                Err(e) => {
+                    log::debug!(
+                        "squashfs open_from_reader failed for {} ({e}); residual path materialize",
+                        label.display()
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
 
     Ok(None)
 }
 
-/// True when the uncompressed body looks like a path-only residual (EXT4 / SquashFS / RAR…).
+/// True when the uncompressed body looks like a path-only residual (EXT4 / classic SquashFS lzma / RAR…).
 fn body_needs_path_materialize(body: &Arc<dyn SeekableBody>) -> bool {
     use std::io::{Read, Seek, SeekFrom};
     let mut r = match body.open_reader() {
@@ -2244,7 +2277,8 @@ fn body_needs_path_materialize(body: &Arc<dyn SeekableBody>) -> bool {
     let mut head = [0u8; 16];
     let n = r.read(&mut head).unwrap_or(0);
     let head = &head[..n];
-    // SquashFS little/big endian magic
+    // SquashFS little/big endian magic — only residual when open_from_reader failed
+    // (classic LZMA / corrupt); in-process codecs open earlier without materialize.
     if head.len() >= 4 && (&head[..4] == b"hsqs" || &head[..4] == b"sqsh") {
         return true;
     }
@@ -2411,6 +2445,9 @@ fn apply_compositing(
                 strip_recursive_extension: comp.strip_recursive_extension,
                 transform: comp.transform_recursive.clone(),
                 recursive_extensions: ext_set.clone(),
+                // FR-6: 0 = auto available_parallelism for eager same-dir nested opens.
+                // CLI cap residual (see docs/tasks/upstream-feature-requests.md).
+                ..Default::default()
             },
         );
         src = Arc::new(layer);
@@ -4368,6 +4405,57 @@ mod tests {
         .expect("nested CAB open without temp spool");
         assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/member.txt", 4);
+        assert_eq!(mid.as_slice(), &payload[4..]);
+    }
+
+    /// Factory nested SquashFS (hsqs magic) — no-tmp open_from_reader wiring (gzip image).
+    #[test]
+    fn nested_squashfs_from_cursor_via_opener() {
+        use std::process::Command;
+        let which = || {
+            std::env::var_os("PATH").and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("mksquashfs"))
+                    .find(|p| p.is_file())
+            })
+        };
+        let Some(mks) = which() else {
+            eprintln!("skip: mksquashfs not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("root");
+        std::fs::create_dir(&root).unwrap();
+        let payload = b"sqfs-nested-SEEK-payload";
+        std::fs::write(root.join("ufo"), payload).unwrap();
+        let img = dir.path().join("inner.squashfs");
+        let status = Command::new(mks)
+            .args([
+                root.to_str().unwrap(),
+                img.to_str().unwrap(),
+                "-comp",
+                "gzip",
+                "-noappend",
+            ])
+            .status()
+            .expect("spawn mksquashfs");
+        if !status.success() {
+            eprintln!("skip: mksquashfs failed");
+            return;
+        }
+        let bytes = std::fs::read(&img).expect("read squashfs image");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.squashfs"),
+        )
+        .expect("nested SquashFS open without temp spool");
+        assert_eq!(read_all(inner.as_ref(), "/ufo"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/ufo", 4);
         assert_eq!(mid.as_slice(), &payload[4..]);
     }
 
