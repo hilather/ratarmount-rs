@@ -62,7 +62,7 @@
 ### A3. Nested `.tar.zst` / `.tar.bz2` / multi-block `.tar.xz`
 
 - [x] zstd / bzip2 / xz from_reader → TAR when body looks like TAR (same factory path)
-- [ ] Dedicated unit fixtures for zst/bz2/xz nested (optional)
+- [x] Dedicated unit fixtures for zst/bz2/xz nested (optional)
 - [x] xz single-block Index maps retained (range decode); no free random access claim for lzma-alone / Index-less corrupt xz
 
 ### A4. Tests (no `/tmp` assertion)

@@ -3801,6 +3801,109 @@ mod tests {
         tar_gz
     }
 
+    /// Shared multi-member plain TAR (alpha/beta) for nested compressed-TAR fixtures.
+    fn make_multi_plain_tar(dir: &Path, data_subdir: &str, tar_name: &str) -> PathBuf {
+        let data = dir.join(data_subdir);
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("alpha.txt"), b"alpha-payload-line\n").expect("write");
+        std::fs::write(
+            data.join("beta.txt"),
+            b"beta-RANDOM-seek-target-0123456789\n",
+        )
+        .expect("write");
+        let tar_path = dir.join(tar_name);
+        let status = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .args(["alpha.txt", "beta.txt"])
+            .status()
+            .expect("spawn tar");
+        assert!(status.success(), "tar -cf multi failed");
+        tar_path
+    }
+
+    /// Multi-file `.tar.zst` for nested no-tmp open via `open_nested_reader_fn`.
+    /// Returns `None` when `zstd` is missing or fails (caller skips).
+    fn make_multi_tar_zst(dir: &Path) -> Option<PathBuf> {
+        let tar_path = make_multi_plain_tar(dir, "tzst-data", "inner-zst.tar");
+        let tar_zst = dir.join("inner.tar.zst");
+        let Ok(status) = Command::new("zstd")
+            .args(["-q", "-f", "-o"])
+            .arg(&tar_zst)
+            .arg(&tar_path)
+            .status()
+        else {
+            return None;
+        };
+        if !status.success() || !tar_zst.exists() {
+            return None;
+        }
+        Some(tar_zst)
+    }
+
+    /// Multi-file `.tar.bz2` for nested no-tmp open via `open_nested_reader_fn`.
+    fn make_multi_tar_bz2(dir: &Path) -> Option<PathBuf> {
+        let tar_path = make_multi_plain_tar(dir, "tbz-data", "inner-bz2.tar");
+        let tar_bz2 = dir.join("inner.tar.bz2");
+        let Ok(out) = std::fs::File::create(&tar_bz2) else {
+            return None;
+        };
+        let Ok(status) = Command::new("bzip2")
+            .args(["-c"])
+            .arg(&tar_path)
+            .stdout(out)
+            .status()
+        else {
+            return None;
+        };
+        if !status.success() || !tar_bz2.exists() {
+            return None;
+        }
+        Some(tar_bz2)
+    }
+
+    /// Multi-file `.tar.xz` for nested no-tmp open via `open_nested_reader_fn`.
+    fn make_multi_tar_xz(dir: &Path) -> Option<PathBuf> {
+        let tar_path = make_multi_plain_tar(dir, "txz-data", "inner-xz.tar");
+        let tar_xz = dir.join("inner.tar.xz");
+        let Ok(status) = Command::new("xz")
+            .args(["-f", "-k", "-T1", "-c"])
+            .arg(&tar_path)
+            .stdout(std::fs::File::create(&tar_xz).ok()?)
+            .status()
+        else {
+            return None;
+        };
+        if !status.success() || !tar_xz.exists() {
+            return None;
+        }
+        Some(tar_xz)
+    }
+
+    /// Shared asserts for nested multi-member compressed TAR opened from Cursor
+    /// (list + full read + mid-member seek; no NamedTempFile in the open path).
+    fn assert_nested_multi_tar_from_cursor(label: &str, bytes: Vec<u8>) {
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(std::io::Cursor::new(bytes));
+        let inner = opener(boxed, Path::new(label)).unwrap_or_else(|e| {
+            panic!("nested {label} open_nested_reader_fn from Cursor must succeed without temp spool: {e}")
+        });
+        assert_eq!(
+            read_all(inner.as_ref(), "/alpha.txt"),
+            b"alpha-payload-line\n"
+        );
+        let beta = read_all(inner.as_ref(), "/beta.txt");
+        assert_eq!(beta, b"beta-RANDOM-seek-target-0123456789\n");
+        let mid = read_seek_mid(inner.as_ref(), "/beta.txt", 5);
+        assert_eq!(mid.as_slice(), &beta[5..]);
+    }
+
     fn make_multi_zip(dir: &Path) -> PathBuf {
         let data = dir.join("zip-data");
         std::fs::create_dir_all(&data).expect("mkdir");
@@ -3955,6 +4058,42 @@ mod tests {
             read_seek_mid(inner.as_ref(), "/beta.txt", 10).as_slice(),
             &beta[10..]
         );
+    }
+
+    /// Nested `.tar.zst` via `open_nested_reader_fn` Cursor — zstd→TAR no-tmp path.
+    #[test]
+    fn nested_tar_zst_from_cursor_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(tar_zst) = make_multi_tar_zst(dir.path()) else {
+            eprintln!("skip: zstd not available or failed to compress multi TAR");
+            return;
+        };
+        let bytes = std::fs::read(&tar_zst).expect("read tar.zst");
+        assert_nested_multi_tar_from_cursor("inner.tar.zst", bytes);
+    }
+
+    /// Nested `.tar.bz2` via `open_nested_reader_fn` Cursor — bzip2→TAR no-tmp path.
+    #[test]
+    fn nested_tar_bz2_from_cursor_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(tar_bz2) = make_multi_tar_bz2(dir.path()) else {
+            eprintln!("skip: bzip2 not available or failed to compress multi TAR");
+            return;
+        };
+        let bytes = std::fs::read(&tar_bz2).expect("read tar.bz2");
+        assert_nested_multi_tar_from_cursor("inner.tar.bz2", bytes);
+    }
+
+    /// Nested `.tar.xz` via `open_nested_reader_fn` Cursor — xz→TAR no-tmp path.
+    #[test]
+    fn nested_tar_xz_from_cursor_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(tar_xz) = make_multi_tar_xz(dir.path()) else {
+            eprintln!("skip: xz not available or failed to compress multi TAR");
+            return;
+        };
+        let bytes = std::fs::read(&tar_xz).expect("read tar.xz");
+        assert_nested_multi_tar_from_cursor("inner.tar.xz", bytes);
     }
 
     /// Plain (non-TAR) `.gz` via `open_path` / seekable body — no materialize to single-file path.
