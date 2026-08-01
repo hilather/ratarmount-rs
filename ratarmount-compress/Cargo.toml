@@ -18,6 +18,9 @@ ratarmount-core.workspace = true
 thiserror.workspace = true
 flate2 = "1"
 miniz_oxide = "0.8"
+# Pure-Rust inflate for GZIDX hard restore (`set_dictionary` + optional bit residual).
+# Cold G3 checkpoint build stays on miniz_oxide (state-clone path); do not switch flate2.
+zlib-rs = "0.6"
 # Prefer static/bundled so we do not need system -dev packages.
 bzip2 = { version = "0.5", features = ["static"] }
 xz2 = { version = "0.1", features = ["static"] }
