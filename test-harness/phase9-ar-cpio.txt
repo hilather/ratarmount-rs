@@ -1,15 +1,37 @@
 # Phase 9 pure AR + CPIO newc (+ CRC / HP variants)
+# archive <TAB> path <TAB> md5
 tests/single-file.ar	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.newc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.crc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.hpbin.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.hpodc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+# ar-bsdtar: multi-member BSD AR
 tests/ar-bsdtar.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
+tests/ar-bsdtar.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-bsdtar.ar	zeros-32KiB	bb7df04e1b0a2570657527a7e108ae23
+tests/ar-bsdtar.ar	nested-file	6983b4cd210aab338877de6d3b33c926
 tests/ar-GCC-main.a	main.o	9b1c420c2969e36f511eba7695aeccc4
+# ar-GNU multi-member (symbol table "0" + payload members)
 tests/ar-GNU.ar	0	b4b0d27dcd170a7a75cd494c8d33c5ab
+tests/ar-GNU.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-GNU.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
+tests/ar-GNU.ar	zeros-32KiB	bb7df04e1b0a2570657527a7e108ae23
+tests/ar-GNU.ar	nested-file	6983b4cd210aab338877de6d3b33c926
 tests/ar-llvm-19-gnu.ar	0	b4b0d27dcd170a7a75cd494c8d33c5ab
+tests/ar-llvm-19-gnu.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-llvm-19-gnu.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
+tests/ar-llvm-19-gnu.ar	nested-file	6983b4cd210aab338877de6d3b33c926
 tests/ar-llvm-19-coff.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-llvm-19-coff.ar	0	b4b0d27dcd170a7a75cd494c8d33c5ab
+tests/ar-llvm-19-coff.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
+tests/ar-llvm-19-coff.ar	nested-file	6983b4cd210aab338877de6d3b33c926
 tests/ar-GNU-truncated.ar	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/ar-GNU-truncated.ar	1bar	97d3e3cde2a84597d0b540e2ccaa32b2
+tests/ar-GNU-truncated.ar	nested-file	6983b4cd210aab338877de6d3b33c926
+# CPIO with nested TAR member as plain file (no -r); recursive → phase7-nested.txt
+tests/nested-tar-in-cpio.newc.cpio	readme.txt	614c22982b489667d878611e15276c51
+tests/nested-tar-in-cpio.newc.cpio	nested/inner.tar	9c60b49cd4fc504e557f2f79ef8f890e
 # Residual skips:
 # - ar-llvm-19-thin.ar — invalid thin AR magic (not supported)
 # - ar-llvm-19-bsd.ar / ar-llvm-19-darwin.ar — mount empty (format variant)
+# - AR members with spaces/$/!? in names (e.g. "Datei enthält $Sonderzeichen") — not listed at FUSE root

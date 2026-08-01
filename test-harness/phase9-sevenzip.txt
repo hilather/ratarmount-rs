@@ -3,17 +3,24 @@
 tests/store-copy-two-files.7z|a.txt|AAA
 tests/store-copy-two-files.7z|b.txt|BBB
 tests/lzma2-two-files-and-medium.7z|a.txt|AAA
+tests/lzma2-two-files-and-medium.7z|b.txt|BBB
 tests/lzma2-two-files-and-medium.7z|medium.bin|
 tests/file-in-non-existing-folder.7z|foo2/ufo|
 tests/two-large-files-32Ki-lines-each-1024B.7z|spaces-32-MiB.txt|
+tests/two-large-files-32Ki-lines-each-1024B.7z|zeros-32-MiB.txt|
 tests/two-large-files-32Ki-lines-each-1023B.7z|spaces-32-MiB.txt|
 # Nested / symlink 7z members (no -r needed for regular + folder-symlink paths)
 tests/nested-with-symlink.7z|foo/fighter/ufo|iriya
+tests/nested-with-symlink.7z|foo/fighter/saucer|iriya
+tests/nested-with-symlink.7z|foo/lighter.tar|
 tests/folder-symlink.7z|foo/fighter/ufo|iriya
 tests/folder-symlink.7z|foo/jet/ufo|iriya
 # BCJ2 / BCJ+LZMA2 (fork tip parity)
 tests/bcj2-default.7z|x.bin|
 tests/bcj2-lzma.7z|x.bin|
 tests/bcj-lzma2-x86.7z|x.bin|
+# Nested archive as plain file member (content is the nested archive bytes; -r → phase7)
+tests/zip.7z|natsu.zip|
+tests/nested-inner-hello.7z|inner-hello.7z|
 # Nested zip-in-7z / lighter.tar require -r → phase7-nested.txt
 # Encrypted with password (CLI harness uses no password by default — covered by unit tests)

@@ -1,8 +1,24 @@
 # Phase 9 long-tail formats formerly/also covered by libarchive.
 # CAB/XAR/WARC/ISO prefer pure stencil backends when available (same factory path).
+# archive <TAB> path <TAB> md5
 tests/single-file.cab	bar	d3b07384d113edec49eaa6238ad5ff00
 tests/single-file.xar	bar	d3b07384d113edec49eaa6238ad5ff00
 # Pure WARCMountSource layout includes host; payload includes HTTP response headers.
 tests/hello-world.warc	iipc.github.io/warc-specifications/primers/web-archive-formats/hello-world.txt	4aecced75ff52fdd39bb52dae192258f
+tests/simple-response.warc	example.com/hello.txt	3a33bb4573e0491e5c7537b6f57e3601
 # ISO Level-1 names are uppercase via ISO9660MountSource after materialize.
 tests/single-file.iso.bz2	BAR	d3b07384d113edec49eaa6238ad5ff00
+# odc/bin CPIO also exercised here (primary list is phase9-stencil-archives)
+tests/single-file.odc.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+tests/single-file.bin.cpio	bar	d3b07384d113edec49eaa6238ad5ff00
+# RAR via libarchive (no password). folder-symlink / nested-with-symlink rar residual:
+# libarchive: "Can't decompress an entry marked as a directory"
+tests/file-in-non-existing-folder.rar	foo2/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/denormal-paths.rar	ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/denormal-paths.rar	root/bar	d3b07384d113edec49eaa6238ad5ff00
+tests/denormal-paths.rar	foo	c157a79031e1c40f85931829bc5fc552
+tests/zip.rar	natsu.zip	de0a16f44d378960ffbf3fa11a5bb635
+tests/rar-misrecognized-as-zip.rar	CHANGELOG.md	49b996b16f59ab6c87dea31e227f8798
+# Residual skips:
+# - folder-symlink.rar / nested-with-symlink.rar — libarchive directory-entry decompress error
+# - encrypted-*.rar — needs password
