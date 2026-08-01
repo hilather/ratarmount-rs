@@ -108,8 +108,9 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **FAT** | boot probe / `.fat*` | `FatMountSource::open_from_reader` | Shared seek body (no full-image copy) |
 | **SquashFS** (none/gzip/zstd/lz4/lzo/xz) | `hsqs`/`sqsh` magic (or AppImage scan) / `.squashfs`/`.sqfs`/`.snap` | `SquashFsMountSource::open_from_reader` | **Yes** — in-process backhand; **no** `/tmp` |
 | **SquashFS classic LZMA** | same magic | open_from_reader **errors** | **Temp spool** → path `open` / `unsquashfs` residual |
+| **EXT2/3/4** | superblock `0xEF53` @ 1024+0x38 / `.ext2`/`.ext3`/`.ext4` | `Ext4MountSource::open_from_reader` | **Yes** — pure ext4-view shared stream; pure fail → temp spool + path/`debugfs` |
 
-Anything else (CAB **LZX**, classic SquashFS **LZMA**, RAR/libarchive-only, encrypted SQLAR, …) **falls back to temp spool** for the nested open today.
+Anything else (CAB **LZX**, classic SquashFS **LZMA**, pure-fail EXT4, RAR/libarchive-only, encrypted SQLAR, …) **falls back to temp spool** for the nested open today.
 
 ---
 
@@ -129,7 +130,7 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **7z (store/copy)** | `.tar` / `.tar.gz` / `.zip` / `.7z` | **No** | Preferred outer packing for nested random I/O |
 | **7z (solid LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode; not recommended for large solids |
 | **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for BCJ/AES/etc. |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches |
+| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches |
 | **SQLAR** unencrypted nested | nested | **No** (full image RAM) | deserialize; encrypted still path residual |
 | **CAB LZX / classic SquashFS LZMA / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; classic LZMA → unsquashfs path |
 
@@ -237,6 +238,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
 | Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT | yes | yes\* |
 | Nested SquashFS (none/gzip/zstd/lz4/lzo/xz) | yes | yes (backhand) |
+| Nested EXT2/3/4 (pure ext4-view) | yes | yes |
 | Nested unencrypted SQLAR | yes (no `/tmp`) | yes after full DB load in RAM |
 | Nested plain `.gz` / `.zst` / … (single file) | yes | yes (seekable body) |
 | Nested CAB LZX / classic SquashFS LZMA / RAR | usually **tmp** | depends on path open |

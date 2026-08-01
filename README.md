@@ -288,6 +288,7 @@ Recursive mounts open nested archives from a **seekable parent member stream** w
 | `.zip` / `.7z` inside those parents | **No** | Yes\* |
 | CPIO / AR / ISO / WARC / ASAR / XAR / CAB (store/MSZIP) / FAT nested | **No** | Yes (stencil / shared seek) |
 | SquashFS nested (none/gzip/zstd/lz4/lzo/xz) | **No** | Yes (in-process backhand) |
+| EXT2/3/4 nested (pure ext4-view) | **No** | Yes; pure-fail → spool/`debugfs` |
 | Unencrypted SQLAR nested | **No** (DB in RAM) | Yes after deserialize |
 | Plain nested `.gz`/`.zst`/… single-file | **No** | Seekable body single-file |
 | CAB LZX / classic SquashFS LZMA / RAR nested | Often **yes** (fallback) | Path open after spool |

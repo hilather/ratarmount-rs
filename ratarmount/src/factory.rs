@@ -27,7 +27,7 @@ use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
 use ratarmount_formats_asar::{looks_like_asar, AsarMountSource};
 use ratarmount_formats_cab::{looks_like_cab, CabError, CabMountSource};
 use ratarmount_formats_cpio::{looks_like_cpio, CpioMountSource};
-use ratarmount_formats_ext4::{looks_like_ext4, Ext4MountSource};
+use ratarmount_formats_ext4::{looks_like_ext4, looks_like_ext4_reader, Ext4MountSource};
 use ratarmount_formats_fat::{looks_like_fat, looks_like_fat_reader, FatMountSource};
 use ratarmount_formats_git::{looks_like_git, GitMountSource};
 use ratarmount_formats_html::{looks_like_html, HtmlMountSource};
@@ -501,6 +501,8 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 ///   **SQLAR** (unencrypted, full image in RAM), **FAT** images
 /// - **SquashFS** (none/gzip/zstd/lz4/lzo/xz via in-process backhand); classic **LZMA**
 ///   images fail here so AutoMount can temp-spool + path/`unsquashfs`
+/// - **EXT2/3/4** via pure ext4-view on a shared stream; pure fail → temp spool + path open
+///   (may use debugfs)
 ///
 /// Other formats fail so AutoMount can fall back to materializing a temp file
 /// and [`open_nested_fn`].
@@ -718,6 +720,16 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         if looks_sqfs {
             return map_nested_open("SquashFS", label, || {
                 SquashFsMountSource::open_from_reader(reader, label)
+            });
+        }
+
+        // EXT2/3/4: superblock magic @ 1024+0x38; pure fail → temp spool / debugfs path
+        let looks_ext4 = name_suggests_ext(label, &["ext2", "ext3", "ext4", "ext4img"])
+            || looks_like_ext4_reader(&mut reader);
+        let _ = reader.seek(SeekFrom::Start(0));
+        if looks_ext4 {
+            return map_nested_open("EXT4", label, || {
+                Ext4MountSource::open_from_reader(reader, label)
             });
         }
 
@@ -2248,6 +2260,25 @@ fn try_open_formats_from_seekable_body(
                 Err(e) => {
                     log::debug!(
                         "squashfs open_from_reader failed for {} ({e}); residual path materialize",
+                        label.display()
+                    );
+                    return Ok(None);
+                }
+            }
+        }
+    }
+    // EXT2/3/4 (pure ext4-view shared stream; pure fail → Ok(None) → path materialize / debugfs)
+    {
+        let mut r = open_reader()?;
+        let looks_ext4 = name_suggests_ext(label, &["ext2", "ext3", "ext4", "ext4img"])
+            || looks_like_ext4_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_ext4 {
+            match Ext4MountSource::open_from_reader(r, label) {
+                Ok(s) => return Ok(Some(Arc::new(s))),
+                Err(e) => {
+                    log::debug!(
+                        "ext4 open_from_reader failed for {} ({e}); residual path materialize",
                         label.display()
                     );
                     return Ok(None);
@@ -4410,6 +4441,77 @@ mod tests {
         assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/member.txt", 4);
         assert_eq!(mid.as_slice(), &payload[4..]);
+    }
+
+    /// Factory nested EXT4 — no-tmp open_from_reader wiring (pure ext4-view).
+    #[test]
+    fn nested_ext4_from_cursor_via_opener() {
+        use std::process::Command;
+        // Prefer Python fixture; else mke2fs -d seed (same as formats-ext4 tests).
+        let bytes = (|| -> Option<Vec<u8>> {
+            let root = std::env::var("RATARMOUNT_PY_ROOT")
+                .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+            let bz2 = PathBuf::from(root).join("tests/nested-tar-1M.ext4.bz2");
+            if bz2.is_file() {
+                let dir = tempfile::tempdir().ok()?;
+                let img = dir.path().join("x.ext4");
+                let status = Command::new("bzip2")
+                    .args(["-dc"])
+                    .arg(&bz2)
+                    .stdout(std::fs::File::create(&img).ok()?)
+                    .status()
+                    .ok()?;
+                if status.success() {
+                    return std::fs::read(&img).ok();
+                }
+            }
+            let mke2fs = std::env::var_os("PATH").and_then(|p| {
+                std::env::split_paths(&p)
+                    .map(|d| d.join("mke2fs"))
+                    .find(|p| p.is_file())
+                    .or_else(|| {
+                        let p = PathBuf::from("/usr/sbin/mke2fs");
+                        p.is_file().then_some(p)
+                    })
+            })?;
+            let dir = tempfile::tempdir().ok()?;
+            let seed = dir.path().join("seed");
+            std::fs::create_dir_all(seed.join("foo/fighter")).ok()?;
+            std::fs::write(seed.join("foo/fighter/ufo"), b"iriya\n").ok()?;
+            let img = dir.path().join("min.ext4");
+            {
+                let f = std::fs::File::create(&img).ok()?;
+                f.set_len(1024 * 1024).ok()?;
+            }
+            let status = Command::new(&mke2fs)
+                .args(["-t", "ext4", "-F", "-q", "-d"])
+                .arg(&seed)
+                .arg(&img)
+                .status()
+                .ok()?;
+            if !status.success() {
+                return None;
+            }
+            std::fs::read(&img).ok()
+        })();
+        let Some(bytes) = bytes else {
+            eprintln!("skip: no EXT4 fixture and mke2fs unavailable");
+            return;
+        };
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.ext4"),
+        )
+        .expect("nested EXT4 open without temp spool");
+        // Fixture / mke2fs seed both place payload at /foo/fighter/ufo.
+        assert_eq!(read_all(inner.as_ref(), "/foo/fighter/ufo"), b"iriya\n");
+        let mid = read_seek_mid(inner.as_ref(), "/foo/fighter/ufo", 2);
+        assert_eq!(mid.as_slice(), b"iya\n");
     }
 
     /// Factory nested SquashFS (hsqs magic) — no-tmp open_from_reader wiring (gzip image).

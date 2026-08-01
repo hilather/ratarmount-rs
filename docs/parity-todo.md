@@ -49,7 +49,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, RAR nested still spool |
+| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA)/EXT4(pure) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild) | `[x]` TAR compressions + ZIP MVP |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
@@ -123,7 +123,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 
 | Priority | Work | Exit criteria |
 |----------|------|----------------|
-| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **69** TAR rows; phase6 **12** ZIP; phase7 **35** nested; phase9 AR/CPIO **11**, 7z **13**, SQLAR/sqfs **16** |
+| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **69** TAR; phase6 **12** ZIP; phase7 **35** nested; phase9 AR/CPIO **28**, 7z **19**, SQLAR/sqfs **20**, libarchive **13** |
 | P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | `[x]` `run-fixed-archive-subset.sh` |
 | P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; encrypted still unit-only |
 | P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `~` complex harness + commit-overlay; phase2 versions paths |
