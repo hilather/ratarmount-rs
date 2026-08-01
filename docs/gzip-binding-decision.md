@@ -51,13 +51,13 @@ Example: `ratarmount -gs 4 archive.tar.gz /mnt` (or `--gzip-seek-point-spacing 4
 
 | Item | Status (see [G3 batch](tasks/g3-polish-batch.md)) |
 |------|-----------------------------------------------------|
-| Decoded-window **LRU** on `SeekableGzipReader` (G3-A) | **open** — single decode buffer today; LRU would cut repeat-read cost without denser spacing |
-| RGZI warm remount on all default path mounts (G3-B) | **partial** — `.tar.gz` persist + import done; plain `.gz` cold path may skip persist |
-| Auto FUSE readahead 1 MiB for default gzip when `--readahead` omitted (G3-C) | **open** — auto window exists for **rapidgzip prefer** only |
-| Full **GZIDX window** apply on import (G3-D) | **open** residual — import soft-rehydrates offsets; window payloads skipped |
-| **Export GZIDX** for Python round-trip (G3-E) | **open** residual — export stays `RGZI`; import already accepts `GZIDX` best-effort |
+| Decoded-window **LRU** on `SeekableGzipReader` (G3-A) | **done** — 8 chunks / 16 MiB per reader; reverse/nearby seeks skip re-inflate |
+| RGZI warm remount on all default path mounts (G3-B) | **done** — plain `.gz` + path/live Range create index shell and persist RGZI |
+| Auto FUSE readahead 1 MiB for default gzip when `--readahead` omitted (G3-C) | **done** — auto when rapidgzip preferred **or** input looks like gzip; `--readahead 0`/`N` overrides |
+| Full **GZIDX window** apply on import (G3-D) | **partial** residual — windows/bits stored for re-export; inflate still soft-rehydrates (miniz has no dict/prime API) |
+| **Export GZIDX** for Python round-trip (G3-E) | **partial** residual — GZIDX export API lands; **RGZI remains primary** warm path; pure zran may need rehydrate (bits=0) |
 
-When G3-A / G3-D / G3-E land, prefer denser spacing only where random-seek cost still dominates open-time/RSS; the LRU and full window-dict path reduce the need for extremely dense checkpoints. Until then, **spacing is the operator-facing control**.
+With G3-A landed, prefer denser `-gs` only where random-seek cost still dominates open-time/RSS. Spacing remains the operator-facing control for cold open cost.
 
 ## Kill criteria
 
