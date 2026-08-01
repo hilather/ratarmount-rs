@@ -1521,7 +1521,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "clap",
  "env_logger",
@@ -1559,7 +1559,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-compositing"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1579,7 +1579,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-compress"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1600,7 +1600,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-core"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "thiserror",
@@ -1608,7 +1608,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ar"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1621,7 +1621,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-asar"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1635,7 +1635,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-cab"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "flate2",
  "libc",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-cpio"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1662,7 +1662,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ext4"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "ext4-view",
  "libc",
@@ -1675,7 +1675,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-fat"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "fatfs",
  "libc",
@@ -1687,7 +1687,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-git"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "git2",
  "libc",
@@ -1699,7 +1699,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-html"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "base64",
  "libc",
@@ -1715,7 +1715,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-iso9660"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bzip2",
  "libc",
@@ -1729,7 +1729,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-libarchive"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1742,7 +1742,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-ogg"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1756,7 +1756,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-pdf"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "flate2",
  "libc",
@@ -1771,7 +1771,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-sevenzip"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "aes",
  "bzip2",
@@ -1791,7 +1791,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-sqlar"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "flate2",
  "libc",
@@ -1806,7 +1806,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-squashfs"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "backhand",
  "libc",
@@ -1820,7 +1820,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-tar"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "encoding_rs",
  "libc",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-warc"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "libc",
  "log",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-xar"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bzip2",
  "flate2",
@@ -1865,7 +1865,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-formats-zip"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "flate2",
  "libc",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-fuse"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "fuser",
  "libc",
@@ -1893,7 +1893,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-index"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "bzip2",
  "crc32fast",
@@ -1915,7 +1915,7 @@ dependencies = [
 
 [[package]]
 name = "ratarmount-remote"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "chrono",
  "hex",
