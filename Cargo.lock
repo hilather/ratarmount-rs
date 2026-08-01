@@ -1510,8 +1510,8 @@ checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 
 [[package]]
 name = "rapidgzip-core"
-version = "0.2.1"
-source = "git+https://github.com/hilather/rapidgzip-rust.git?rev=75c5a24de9b0bc8a2250e312a49daa2e1bf1639a#75c5a24de9b0bc8a2250e312a49daa2e1bf1639a"
+version = "0.2.2"
+source = "git+https://github.com/hilather/rapidgzip-rust.git?rev=cea43efdb4fa8408e764a6b56d4e860f22b84ced#cea43efdb4fa8408e764a6b56d4e860f22b84ced"
 dependencies = [
  "crossbeam-deque",
  "isal-sys",
@@ -2265,7 +2265,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32497e9a4c7b38532efcdebeef879707aa9f794296a4f0244f6f69e9bc8574bd"
 dependencies = [
  "fastrand",
- "getrandom 0.4.3",
+ "getrandom 0.3.4",
  "once_cell",
  "rustix",
  "windows-sys 0.61.2",
@@ -2584,7 +2584,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

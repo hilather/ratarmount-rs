@@ -28,6 +28,6 @@ lz4_flex = "0.11"
 lzma-rs = { version = "0.3", features = ["raw_decoder"] }
 newtua-lzw-z = "0.1"
 libloading = "0.8"
-# Tier D POC: pure-Rust rapidgzip (path-backed IndexedReader). Pin v0.2.1 (ISA-L).
+# Tier D POC: pure-Rust rapidgzip (path-backed IndexedReader). Pin v0.2.2 (ISA-L polish).
 # crates.io 0.1.0 is an incomplete stub — do not use it.
-rapidgzip-core = { git = "https://github.com/hilather/rapidgzip-rust.git", rev = "75c5a24de9b0bc8a2250e312a49daa2e1bf1639a", optional = true }
+rapidgzip-core = { git = "https://github.com/hilather/rapidgzip-rust.git", rev = "cea43efdb4fa8408e764a6b56d4e860f22b84ced", optional = true }
