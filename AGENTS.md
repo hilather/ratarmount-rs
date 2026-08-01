@@ -50,7 +50,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount nested_ext4` · `cargo test -p ratarmount nested_squashfs` · crate `open_from_reader` tests |
-| Warm index tarstats AR/CPIO/ISO/7z | `cargo test -p ratarmount-formats-ar --lib warm_index` · `cargo test -p ratarmount-formats-cpio --lib warm_index` · `cargo test -p ratarmount-formats-iso9660 --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
+| Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
+| Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
 | Union symlink resolve (FR-10) | `cargo test -p ratarmount-compositing --lib fr10_resolve` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |

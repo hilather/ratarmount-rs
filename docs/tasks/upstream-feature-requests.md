@@ -64,6 +64,6 @@ issue from the README feature tables.
 **Done:** FR-1, FR-2 (Basic + Cookie env), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire), FR-10 (`--union-resolve-symlinks` + B-4).
 
 1. **FR-8 residual** Pure LZX decoder remains out of scope; documented spool path is accepted.
-2. **Warm tarstats** remaining formats (WARC/CAB/XAR/ASAR/libarchive/…) after AR/CPIO/ISO/7z/ZIP/TAR.
+2. **Warm tarstats** shipped for TAR/ZIP/7z/AR/CPIO/ISO/WARC/CAB/XAR/ASAR/libarchive/OGG; residual only exotic/path-less backends.
 
 Update this file when status changes. Keep README **Upstream** column in sync.
