@@ -36,12 +36,15 @@
 //!
 //! * **Path** — local file; each reader opens its own FD (`File` implements
 //!   [`ReadAt`] natively). Preferred for concurrent decode thruput.
-//! * **Shared reader** — nested / HTTP Range / in-memory `Cursor` wrapped as
+//! * **Small nested / `from_reader`** — when compressed length is known
+//!   (`Seek` End) and ≤ [`DEFAULT_MEMORY_CAP`] (256 MiB), the entire compressed
+//!   stream is slurped into `Arc<Vec<u8>>` and served via true concurrent
+//!   [`ReadAt`] (no mutex, **no `/tmp`**). The original reader is dropped.
+//! * **Large nested / `from_reader` residual** — oversized streams keep
 //!   [`SeekReadAt`] (`Arc<Mutex<Box<dyn SeekRead>>>` + seek+read under lock).
-//!   Parallel decode workers and concurrent readers **serialize on this mutex**
-//!   (nested thruput residual). Prefer path open (or factory materialize to a
-//!   path FD without `/tmp` when possible) over `from_reader` when the source
-//!   is already a local file.
+//!   Parallel decode workers and concurrent readers **serialize on this mutex**.
+//!   Prefer path open when the source is already a local file. No `/tmp` spool
+//!   is introduced for nested open.
 //!
 //! **GZIDX** — [`SharedRapidgzip::export_gzidx_blob`] writes Python
 //! `indexed_gzip` format; import skips the full keep_index rebuild.
@@ -60,8 +63,13 @@ use rapidgzip_core::{
 };
 use ratarmount_core::ParallelizationSpec;
 
-use crate::seekable_body::{SeekRead, SeekableBody};
+use crate::seekable_body::{SeekRead, SeekableBody, DEFAULT_MEMORY_CAP};
 use crate::{CompressError, Result, DEFAULT_GZIP_SEEK_SPACING};
+
+/// Cap for slurping nested compressed bodies into `Arc<Vec<u8>>` (concurrent
+/// [`ReadAt`], no mutex, no `/tmp`). Aligns with [`DEFAULT_MEMORY_CAP`] (256 MiB).
+/// Larger `from_reader` streams keep the mutex [`SeekReadAt`] residual.
+const FROM_READER_MEMORY_CAP: u64 = DEFAULT_MEMORY_CAP;
 
 /// Env var that selects the rapidgzip path backend when set to [`RAPIDGZIP_BACKEND_VALUE`].
 pub const RAPIDGZIP_BACKEND_ENV: &str = "RATARMOUNT_GZIP_BACKEND";
@@ -192,10 +200,15 @@ impl ReadAt for SeekReadAt {
 enum RapidgzipBackend {
     /// Local path: each reader opens its own `File` (best concurrent thruput).
     Path(PathBuf),
-    /// Shared seekable stream (nested Range, Cursor, …).
+    /// In-memory compressed blob (`from_reader` when length ≤ [`FROM_READER_MEMORY_CAP`]).
+    ///
+    /// True concurrent [`ReadAt`] via `Arc` — no mutex, no `/tmp`.
+    Memory(Arc<Vec<u8>>),
+    /// Shared seekable stream (large nested Range, …).
     ///
     /// Residual: all `ReadAt` traffic serializes on one mutex. Prefer
-    /// [`RapidgzipBackend::Path`] when the compressed source is a local file.
+    /// [`RapidgzipBackend::Path`] when the compressed source is a local file,
+    /// or the memory path for small nested bodies.
     Shared {
         reader: Arc<Mutex<Box<dyn SeekRead>>>,
         compressed_len: u64,
@@ -271,9 +284,14 @@ impl SharedRapidgzip {
 
     /// Build index from a seekable compressed reader (nested / Range / Cursor).
     ///
-    /// The reader is held under a mutex and exposed to rapidgzip as [`SeekReadAt`].
-    /// Parallel workers serialize on that mutex (nested thruput residual — prefer
-    /// path open when the source is a local file).
+    /// **Small body** (compressed length known and ≤ [`DEFAULT_MEMORY_CAP`] /
+    /// 256 MiB): the stream is read fully into `Arc<Vec<u8>>` and served with
+    /// concurrent [`ReadAt`] — no mutex, **no `/tmp`**. The original reader is
+    /// dropped after the slurp.
+    ///
+    /// **Large body residual:** oversized streams keep a mutex [`SeekReadAt`]
+    /// (`Arc<Mutex<Box<dyn SeekRead>>>`); parallel workers serialize on that
+    /// lock. Prefer path open when the source is a local file.
     ///
     /// `archive_label` is stored for logs / [`SeekableBody::path`].
     /// CRC follows [`rapidgzip_no_crc_enabled`] (default: **on**).
@@ -315,7 +333,7 @@ impl SharedRapidgzip {
     }
 
     fn open_with_threads_from_reader_crc<R>(
-        mut reader: R,
+        reader: R,
         spacing: u64,
         threads: u32,
         archive_label: impl AsRef<Path>,
@@ -324,18 +342,65 @@ impl SharedRapidgzip {
     where
         R: Read + Seek + Send + 'static,
     {
+        Self::open_with_threads_from_reader_crc_with_cap(
+            reader,
+            spacing,
+            threads,
+            archive_label,
+            crc32_enabled,
+            FROM_READER_MEMORY_CAP,
+        )
+    }
+
+    /// Same as CRC open with an explicit memory-slurp cap (tests force the
+    /// mutex residual without multi-hundred-MiB fixtures).
+    fn open_with_threads_from_reader_crc_with_cap<R>(
+        mut reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+        crc32_enabled: bool,
+        memory_cap: u64,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         let path = archive_label.as_ref().to_path_buf();
         let compressed_len = reader.seek(SeekFrom::End(0))?;
         reader.seek(SeekFrom::Start(0))?;
 
-        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
-        let source = SeekReadAt::new(Arc::clone(&shared), compressed_len);
         let decoder = make_decoder(spacing, threads, /* keep_index */ true, crc32_enabled)?;
+        let backend = if compressed_len <= memory_cap && usize::try_from(compressed_len).is_ok() {
+            // Concurrent ReadAt via Arc — no mutex, no /tmp. Drop original reader.
+            let mut buf = Vec::with_capacity(compressed_len as usize);
+            reader.read_to_end(&mut buf)?;
+            drop(reader);
+            RapidgzipBackend::Memory(Arc::new(buf))
+        } else {
+            // Large-body residual: serialize ReadAt on a shared mutex.
+            let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+            RapidgzipBackend::Shared {
+                reader: shared,
+                compressed_len,
+            }
+        };
 
         let mut sink = io::sink();
-        let report = decoder
-            .decode(&source, &mut sink)
-            .map_err(|e| CompressError::Msg(format!("rapidgzip index build: {e}")))?;
+        let report = match &backend {
+            RapidgzipBackend::Memory(mem) => decoder
+                .decode(mem, &mut sink)
+                .map_err(|e| CompressError::Msg(format!("rapidgzip index build: {e}")))?,
+            RapidgzipBackend::Shared {
+                reader,
+                compressed_len,
+            } => {
+                let source = SeekReadAt::new(Arc::clone(reader), *compressed_len);
+                decoder
+                    .decode(&source, &mut sink)
+                    .map_err(|e| CompressError::Msg(format!("rapidgzip index build: {e}")))?
+            }
+            RapidgzipBackend::Path(_) => unreachable!("from_reader never builds Path backend"),
+        };
         let index = report
             .index
             .ok_or_else(|| CompressError::Msg("rapidgzip keep_index returned no index".into()))?;
@@ -345,10 +410,7 @@ impl SharedRapidgzip {
 
         Ok(Arc::new(Self {
             path,
-            backend: RapidgzipBackend::Shared {
-                reader: shared,
-                compressed_len,
-            },
+            backend,
             index: Arc::new(index),
             size,
             decoder: reader_decoder,
@@ -383,13 +445,36 @@ impl SharedRapidgzip {
 
     /// Open from a seekable reader using a prebuilt index blob (GZIDX / auto-detect).
     ///
-    /// Skips the full keep_index rebuild.
+    /// Skips the full keep_index rebuild. Same small-body memory slurp /
+    /// large-body mutex residual as [`Self::open_with_threads_from_reader`]
+    /// (no `/tmp`).
     pub fn open_with_imported_index_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+        index_blob: &[u8],
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_imported_index_from_reader_with_cap(
+            reader,
+            spacing,
+            threads,
+            archive_label,
+            index_blob,
+            FROM_READER_MEMORY_CAP,
+        )
+    }
+
+    fn open_with_imported_index_from_reader_with_cap<R>(
         mut reader: R,
         spacing: u64,
         threads: u32,
         archive_label: impl AsRef<Path>,
         index_blob: &[u8],
+        memory_cap: u64,
     ) -> Result<Arc<Self>>
     where
         R: Read + Seek + Send + 'static,
@@ -400,14 +485,23 @@ impl SharedRapidgzip {
         let index = import_index_blob(index_blob, Some(compressed_len))?;
         let size = validate_index(&index)?;
         let decoder = make_decoder(spacing, threads, /* keep_index */ false, true)?;
-        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+
+        let backend = if compressed_len <= memory_cap && usize::try_from(compressed_len).is_ok() {
+            let mut buf = Vec::with_capacity(compressed_len as usize);
+            reader.read_to_end(&mut buf)?;
+            drop(reader);
+            RapidgzipBackend::Memory(Arc::new(buf))
+        } else {
+            let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+            RapidgzipBackend::Shared {
+                reader: shared,
+                compressed_len,
+            }
+        };
 
         Ok(Arc::new(Self {
             path,
-            backend: RapidgzipBackend::Shared {
-                reader: shared,
-                compressed_len,
-            },
+            backend,
             index: Arc::new(index),
             size,
             decoder,
@@ -437,40 +531,67 @@ impl SharedRapidgzip {
         self.index.checkpoint_count()
     }
 
-    /// Independent seekable reader (new FD or shared-stream handle + in-process inflate).
+    /// True when the compressed source is an in-memory buffer (concurrent
+    /// [`ReadAt`], no mutex). Path and large shared-reader backends return false.
+    ///
+    /// Diagnostics / tests only — not a stable public contract.
+    #[doc(hidden)]
+    pub fn backend_is_memory_buffer(&self) -> bool {
+        matches!(self.backend, RapidgzipBackend::Memory(_))
+    }
+
+    /// True when the compressed source is the mutex [`SeekReadAt`] residual.
+    ///
+    /// Diagnostics / tests only — not a stable public contract.
+    #[doc(hidden)]
+    pub fn backend_is_shared_mutex(&self) -> bool {
+        matches!(self.backend, RapidgzipBackend::Shared { .. })
+    }
+
+    /// Independent seekable reader (new FD, memory Arc, or mutex stream + inflate).
     ///
     /// Clones the full [`GzipIndex`] into `reader_with_index` (API requirement;
-    /// see module docs). Path backend opens a fresh FD per call.
+    /// see module docs). Path backend opens a fresh FD per call; memory backend
+    /// clones the `Arc` (cheap concurrent [`ReadAt`]).
     pub fn reader(&self) -> io::Result<RapidgzipReader> {
         // Full clone required: Decoder::reader_with_index takes owned GzipIndex.
         let index = (*self.index).clone();
-        let inner =
-            match &self.backend {
-                RapidgzipBackend::Path(path) => {
-                    let file = File::open(path)?;
-                    let ir = self.decoder.reader_with_index(file, index).map_err(|e| {
-                        io::Error::other(format!("rapidgzip reader_with_index: {e}"))
-                    })?;
-                    RapidgzipReaderInner::Path(ir)
-                }
-                RapidgzipBackend::Shared {
-                    reader,
-                    compressed_len,
-                } => {
-                    let source = SeekReadAt::new(Arc::clone(reader), *compressed_len);
-                    let ir = self.decoder.reader_with_index(source, index).map_err(|e| {
-                        io::Error::other(format!("rapidgzip reader_with_index: {e}"))
-                    })?;
-                    RapidgzipReaderInner::Shared(ir)
-                }
-            };
+        let inner = match &self.backend {
+            RapidgzipBackend::Path(path) => {
+                let file = File::open(path)?;
+                let ir = self
+                    .decoder
+                    .reader_with_index(file, index)
+                    .map_err(|e| io::Error::other(format!("rapidgzip reader_with_index: {e}")))?;
+                RapidgzipReaderInner::Path(ir)
+            }
+            RapidgzipBackend::Memory(mem) => {
+                let ir = self
+                    .decoder
+                    .reader_with_index(Arc::clone(mem), index)
+                    .map_err(|e| io::Error::other(format!("rapidgzip reader_with_index: {e}")))?;
+                RapidgzipReaderInner::Memory(ir)
+            }
+            RapidgzipBackend::Shared {
+                reader,
+                compressed_len,
+            } => {
+                let source = SeekReadAt::new(Arc::clone(reader), *compressed_len);
+                let ir = self
+                    .decoder
+                    .reader_with_index(source, index)
+                    .map_err(|e| io::Error::other(format!("rapidgzip reader_with_index: {e}")))?;
+                RapidgzipReaderInner::Shared(ir)
+            }
+        };
         Ok(RapidgzipReader { inner })
     }
 }
 
-/// Reader backend: path FD or shared mutex stream.
+/// Reader backend: path FD, memory Arc, or shared mutex stream.
 enum RapidgzipReaderInner {
     Path(IndexedReader<File>),
+    Memory(IndexedReader<Arc<Vec<u8>>>),
     Shared(IndexedReader<SeekReadAt>),
 }
 
@@ -489,14 +610,16 @@ pub struct RapidgzipReader {
 // handle concurrently from two threads. Exclusive ownership + no concurrent
 // access makes moving this value across threads sound.
 //
-// Shared-backend variant: the compressed `SeekReadAt` is `Send + Sync`; the
-// inflate session remains exclusive to this handle under the same contract.
+// Shared/memory backends: compressed `SeekReadAt` / `Arc<Vec<u8>>` are
+// `Send + Sync`; the inflate session remains exclusive to this handle under
+// the same contract.
 unsafe impl Send for RapidgzipReader {}
 
 impl Read for RapidgzipReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         match &mut self.inner {
             RapidgzipReaderInner::Path(r) => r.read(buf),
+            RapidgzipReaderInner::Memory(r) => r.read(buf),
             RapidgzipReaderInner::Shared(r) => r.read(buf),
         }
     }
@@ -506,6 +629,7 @@ impl Seek for RapidgzipReader {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
         match &mut self.inner {
             RapidgzipReaderInner::Path(r) => r.seek(pos),
+            RapidgzipReaderInner::Memory(r) => r.seek(pos),
             RapidgzipReaderInner::Shared(r) => r.seek(pos),
         }
     }
@@ -557,7 +681,9 @@ pub fn open_seekable_gzip_rapidgzip_fast(
 
 /// Open rapidgzip seekable body from a seekable compressed reader.
 ///
-/// See [`SharedRapidgzip::open_with_threads_from_reader`].
+/// Small bodies (≤ [`DEFAULT_MEMORY_CAP`]) use in-memory concurrent [`ReadAt`];
+/// large bodies keep the mutex residual. See
+/// [`SharedRapidgzip::open_with_threads_from_reader`].
 pub fn open_seekable_gzip_rapidgzip_from_reader<R>(
     reader: R,
     spacing: u64,
@@ -833,7 +959,7 @@ mod tests {
         assert_eq!(full, payload);
     }
 
-    /// Regression: from_reader fast path matches path open payload.
+    /// Regression: from_reader fast path matches path open payload (memory backend).
     #[test]
     fn open_from_reader_fast_correct_payload() {
         let payload = sample_payload();
@@ -845,6 +971,10 @@ mod tests {
             "fast-mem.gz",
         )
         .expect("from_reader fast");
+        assert!(
+            body.backend_is_memory_buffer(),
+            "small from_reader_fast should use Arc memory backend"
+        );
         let mut r = body.reader().unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
@@ -963,6 +1093,8 @@ mod tests {
     }
 
     /// Regression: from_reader Cursor random seek equals path open payload.
+    ///
+    /// Small compressed body uses the Arc memory backend (no mutex).
     #[test]
     fn from_reader_cursor_random_seek_equals_path() {
         let payload = sample_payload();
@@ -977,6 +1109,13 @@ mod tests {
             "virt.gz",
         )
         .expect("from_reader open");
+
+        assert!(
+            reader_body.backend_is_memory_buffer(),
+            "small from_reader should slurp into Arc memory (no mutex)"
+        );
+        assert!(!reader_body.backend_is_shared_mutex());
+        assert!(!path_body.backend_is_memory_buffer());
 
         assert_eq!(reader_body.size(), path_body.size());
         assert_eq!(reader_body.size(), payload.len() as u64);
@@ -1009,7 +1148,8 @@ mod tests {
         assert_eq!(full, payload);
     }
 
-    /// Regression: concurrent from_reader handles do not interleave on shared mutex.
+    /// Regression: concurrent from_reader handles do not interleave; small body
+    /// uses Arc memory backend (true concurrent ReadAt, no mutex).
     #[test]
     fn concurrent_readers_from_reader() {
         let payload: Vec<u8> = (0..40_000u32).flat_map(|i| i.to_le_bytes()).collect();
@@ -1021,6 +1161,10 @@ mod tests {
             "concurrent.gz",
         )
         .unwrap();
+        assert!(
+            body.backend_is_memory_buffer(),
+            "small concurrent from_reader should use memory backend"
+        );
 
         let body_a = Arc::clone(&body);
         let body_b = Arc::clone(&body);
@@ -1040,6 +1184,87 @@ mod tests {
         });
         assert_eq!(h1.join().unwrap(), expected);
         assert_eq!(&h2.join().unwrap(), &expected[100..164]);
+    }
+
+    /// Regression: oversized from_reader keeps mutex SeekReadAt residual (no /tmp).
+    ///
+    /// Uses a tiny memory_cap so fixtures stay small while still exercising the
+    /// large-body backend path.
+    #[test]
+    fn from_reader_over_cap_uses_shared_mutex_backend() {
+        let payload = sample_payload();
+        let compressed = encode_gz(&payload);
+        assert!(
+            compressed.len() as u64 > 16,
+            "fixture must exceed test memory_cap"
+        );
+        let body = SharedRapidgzip::open_with_threads_from_reader_crc_with_cap(
+            Cursor::new(compressed.clone()),
+            1024,
+            2,
+            "large-residual.gz",
+            /* crc32_enabled */ true,
+            /* memory_cap */ 16,
+        )
+        .expect("from_reader over cap");
+        assert!(
+            body.backend_is_shared_mutex(),
+            "over-cap from_reader must keep mutex residual"
+        );
+        assert!(!body.backend_is_memory_buffer());
+        assert_eq!(body.size(), payload.len() as u64);
+
+        let mut r = body.reader().unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+
+        // Concurrent readers still correct under mutex residual.
+        let body_a = Arc::clone(&body);
+        let body_b = Arc::clone(&body);
+        let expected = payload.clone();
+        let h1 = std::thread::spawn(move || {
+            let mut r = body_a.reader().unwrap();
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).unwrap();
+            out
+        });
+        let h2 = std::thread::spawn(move || {
+            let mut r = body_b.reader().unwrap();
+            r.seek(SeekFrom::Start(0)).unwrap();
+            let mut head = [0u8; 32];
+            r.read_exact(&mut head).unwrap();
+            head
+        });
+        assert_eq!(h1.join().unwrap(), expected);
+        assert_eq!(&h2.join().unwrap(), &expected[..32]);
+    }
+
+    /// Regression: GZIDX import from_reader also uses memory backend when small.
+    #[test]
+    fn from_reader_imported_index_memory_backend() {
+        let payload = sample_payload();
+        let compressed = encode_gz(&payload);
+        let (_dir, path) = write_temp_gz(&payload);
+        let built = SharedRapidgzip::open_with_threads(&path, 1024, 1).unwrap();
+        let blob = built.export_gzidx_blob().unwrap();
+
+        let mem = SharedRapidgzip::open_with_imported_index_from_reader(
+            Cursor::new(compressed),
+            1024,
+            1,
+            "import-mem.gz",
+            &blob,
+        )
+        .unwrap();
+        assert!(
+            mem.backend_is_memory_buffer(),
+            "small imported from_reader should use memory backend"
+        );
+        let mut r = mem.reader().unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
     }
 
     /// Regression: GZIDX export → re-import → seek matches (path + from_reader).
