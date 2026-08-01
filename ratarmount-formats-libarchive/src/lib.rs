@@ -257,6 +257,9 @@ impl LibarchiveMountSource {
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             index,
@@ -762,15 +765,20 @@ pub fn looks_like_libarchive(path: &Path) -> bool {
     }
 }
 
+/// Store tarstats from path metadata + edge hashes when available; otherwise synthetic size-only.
+///
+/// Real on-disk archives use the shared helper so warm reopen fails closed after in-place
+/// replace (size/mtime + first/last 512 SHA-256). Nested / virtual labels get size-only.
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
+        return Ok(());
+    }
     use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
+    let (size, mtime, mtime_ns) = match std::fs::metadata(path) {
+        Ok(meta) => (meta.size(), meta.mtime(), meta.mtime_nsec()),
+        Err(_) => (0, 0, 0),
+    };
+    let json = format!("{{\"st_size\":{size},\"st_mtime\":{mtime},\"st_mtime_ns\":{mtime_ns}}}");
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }
@@ -916,5 +924,115 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.to_string().contains("not an lrzip"), "got: {err}");
+    }
+
+    /// Minimal BSD/GNU AR for libarchive path opens (no external tools).
+    fn synthetic_ar(name: &str, payload: &[u8]) -> Vec<u8> {
+        const MAGIC: &[u8] = b"!<arch>\n";
+        const HEADER_SIZE: usize = 60;
+        let mut out = Vec::new();
+        out.extend_from_slice(MAGIC);
+        let mut hdr = [b' '; HEADER_SIZE];
+        let name_field = format!("{name}/");
+        let nb = name_field.as_bytes();
+        assert!(nb.len() <= 16, "name too long for short AR header");
+        hdr[..nb.len()].copy_from_slice(nb);
+        hdr[16] = b'0'; // mtime
+        hdr[28] = b'0'; // uid
+        hdr[34] = b'0'; // gid
+        let mode = b"100644";
+        hdr[40..40 + mode.len()].copy_from_slice(mode);
+        let size_s = payload.len().to_string();
+        hdr[48..48 + size_s.len()].copy_from_slice(size_s.as_bytes());
+        hdr[58..60].copy_from_slice(b"`\n");
+        out.extend_from_slice(&hdr);
+        out.extend_from_slice(payload);
+        if payload.len() % 2 == 1 {
+            out.push(b'\n');
+        }
+        out
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.a");
+        std::fs::write(&archive, synthetic_ar("hello.txt", b"la-v1\n")).unwrap();
+        let index = dir.path().join("swap.a.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = LibarchiveMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "la-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        LibarchiveMountSource::open_existing(&archive, &index, &opts)
+            .expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        std::fs::write(&archive, synthetic_ar("hello.txt", b"la-v2-longer\n")).unwrap();
+
+        match LibarchiveMountSource::open_existing(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm libarchive open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.a");
+        std::fs::write(&archive, synthetic_ar("hello.txt", b"la-v1\n")).unwrap();
+        let index = dir.path().join("swap.a.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = LibarchiveMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "la-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        std::fs::write(&archive, synthetic_ar("hello.txt", b"la-v2-longer\n")).unwrap();
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale member rows.
+        let src2 = LibarchiveMountSource::open(&archive, Some(&index), &opts, "test", false)
+            .expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "la-v2-longer\n",
+            "must serve new libarchive data after tarstats mismatch rebuild"
+        );
     }
 }
