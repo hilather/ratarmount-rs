@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "Seekable compression backends for ratarmount-rs"
 
+[features]
+default = []
+# Parallel gzip + IndexedReader via hilather/rapidgzip-rust (MSRV 1.87+ / edition 2024).
+# Opt-in at open time: RATARMOUNT_GZIP_BACKEND=rapidgzip or --use-backend rapidgzip.
+gzip-rapidgzip = ["dep:rapidgzip-core"]
+
 [dependencies]
 ratarmount-core.workspace = true
 thiserror.workspace = true
@@ -20,3 +26,6 @@ lz4_flex = "0.11"
 lzma-rs = { version = "0.3", features = ["raw_decoder"] }
 newtua-lzw-z = "0.1"
 libloading = "0.8"
+# Tier D POC: pure-Rust rapidgzip (path-backed IndexedReader). Pin v0.2.0 tip.
+# crates.io 0.1.0 is an incomplete stub — do not use it.
+rapidgzip-core = { git = "https://github.com/hilather/rapidgzip-rust.git", rev = "30012f674cdacc38cbea1615361f82f6aa639e65", optional = true }

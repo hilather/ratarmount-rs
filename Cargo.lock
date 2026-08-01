@@ -1098,6 +1098,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "libz-rs-sys"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "50474818739ccab820cd57bca432d6b02d090b47f9e85501d963cd05851f82eb"
+dependencies = [
+ "zlib-rs",
+]
+
+[[package]]
 name = "libz-sys"
 version = "1.1.29"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1481,6 +1490,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "973443cf09a9c8656b574a866ab68dfa19f0867d0340648c7d2f6a71b8a8ea68"
 
 [[package]]
+name = "rapidgzip-core"
+version = "0.2.0"
+source = "git+https://github.com/hilather/rapidgzip-rust.git?rev=30012f674cdacc38cbea1615361f82f6aa639e65#30012f674cdacc38cbea1615361f82f6aa639e65"
+dependencies = [
+ "crossbeam-deque",
+ "libz-rs-sys",
+ "tempfile",
+]
+
+[[package]]
 name = "ratarmount"
 version = "0.1.14"
 dependencies = [
@@ -1550,6 +1569,7 @@ dependencies = [
  "lzma-rs",
  "miniz_oxide",
  "newtua-lzw-z",
+ "rapidgzip-core",
  "ratarmount-core",
  "tempfile",
  "thiserror",

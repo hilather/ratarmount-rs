@@ -10,5 +10,6 @@
 /tmp/
 benchmarks/.venv-py/
 **/bench-results/
+benchmarks/gzip-backend-results/
 *.log
 .cargo-cache/

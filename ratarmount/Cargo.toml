@@ -10,6 +10,11 @@ default-run = "ratarmount"
 name = "ratarmount"
 path = "src/main.rs"
 
+[features]
+default = []
+# Path-backed rapidgzip gzip backend (requires rustc ≥ 1.87). See docs/gzip-binding-decision.md.
+gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
+
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true

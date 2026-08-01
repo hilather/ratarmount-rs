@@ -1,5 +1,18 @@
 # Benchmarks
 
+## Gzip backends (G3 vs rapidgzip POC vs Python)
+
+Focused codec compare for the Tier D rapidgzip feature:
+
+```bash
+cargo build --release -p ratarmount --features gzip-rapidgzip
+./benchmarks/compare-gzip-backends.sh
+# → benchmarks/gzip-backend-results/{results.csv,results.md}
+# knobs: CORPUS_MIB=64 THREADS=8 RUNS=3 SKIP_BUILD=1
+```
+
+Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary built with `gzip-rapidgzip`.
+
 ## Head-to-head (Python vs Rust)
 
 Latest committed numbers: [`python-vs-rust-results.md`](python-vs-rust-results.md) (**2026-07-28**, ratarmount-rs **v0.1.3** area).

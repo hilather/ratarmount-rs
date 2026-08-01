@@ -60,3 +60,31 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 - ~~Seekable single-file `.gz` without materialize~~ — done (`from_seekable_body`).
 - ~~xz Stream Index maps without full compressed load~~ — done (range reads for header/Index/footer + magic windows).
 - True bzip2 open-time size discovery polish. (Zstd seek-table / multi-frame: see [zstd-random-access.md](zstd-random-access.md).)
+
+## Tier D POC — pure-Rust rapidgzip (`gzip-rapidgzip`)
+
+**Status:** opt-in path-only backend (2026-07-31). Does **not** replace G3 as default.
+
+| Item | Detail |
+|------|--------|
+| Crate | [`hilather/rapidgzip-rust`](https://github.com/hilather/rapidgzip-rust) `rapidgzip-core` **v0.2.0** (git pin; crates.io 0.1.0 is an incomplete stub) |
+| Feature | `gzip-rapidgzip` on `ratarmount-compress` / `ratarmount` (requires **rustc ≥ 1.87**, edition 2024 dep) |
+| Open gate | `RATARMOUNT_GZIP_BACKEND=rapidgzip` or `--use-backend rapidgzip` / `rapidgzip-gzip` |
+| Code | `ratarmount-compress/src/gzip_rapidgzip.rs` → `SharedRapidgzip` + `SeekableBody` |
+| Scope | **Local path** `.gz` / `.tar.gz` only; nested / HTTP Range stay on G3 |
+| Index build | Full decode to sink with `keep_index` (parallel when `-P` allows); each FUSE open reopens FD + `IndexedReader` |
+| Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip |
+| Residual | Nested `from_reader` `ReadAt` adapter; RGZI/GZIDX export into SQLite; default-on after benches; ISA-L not required; per-open `GzipIndex` clone; `IndexedReader` marked `Send` via exclusive-ownership `unsafe` (no concurrent multi-thread use of one handle) |
+| Default CI | Feature **off** (workspace MSRV stays 1.74); enable only when rustc ≥ 1.87 |
+
+```bash
+# Build with the POC backend (rustc ≥ 1.87)
+cargo build -p ratarmount --features gzip-rapidgzip
+
+# Select at mount time
+RATARMOUNT_GZIP_BACKEND=rapidgzip cargo run --features gzip-rapidgzip -- archive.tar.gz /mnt
+# or
+cargo run --features gzip-rapidgzip -- --use-backend rapidgzip -P gzip:8 archive.tar.gz /mnt
+# Explicit rapidgzip worker budget (optional):
+cargo run --features gzip-rapidgzip -- --use-backend rapidgzip -P rapidgzip-gzip:16 archive.tar.gz /mnt
+```

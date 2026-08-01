@@ -1499,6 +1499,10 @@ where
 ///
 /// Plain single-file `.gz` uses [`SingleFileMountSource::from_seekable_body`] — **no materialize**.
 /// Path-only residual backends (EXT4 superblock, SquashFS, libarchive-only) may still materialize.
+///
+/// With feature `gzip-rapidgzip` and `RATARMOUNT_GZIP_BACKEND=rapidgzip` (or
+/// `--use-backend rapidgzip`), path opens try the parallel IndexedReader POC first
+/// and fall back to G3 on failure. Nested / Range paths stay on G3.
 fn open_gzip(
     path: &Path,
     index_path: Option<&Path>,
@@ -1511,6 +1515,40 @@ fn open_gzip(
         options.gzip_seek_point_spacing
     };
     let threads = options.threads_for("gzip");
+
+    #[cfg(feature = "gzip-rapidgzip")]
+    if ratarmount_compress::prefer_rapidgzip_gzip_backend(&options.use_backends) {
+        // Explicit `-P rapidgzip-gzip:N` wins when present; otherwise `-P gzip` / default.
+        // Do not `.max()` the two: unlisted backends fall back to ParallelizationSpec::default
+        // (often CPU count), which would ignore a lower `-P gzip:N`.
+        let rg_threads = if options
+            .parallelization
+            .by_backend
+            .contains_key("rapidgzip-gzip")
+        {
+            options.threads_for("rapidgzip-gzip")
+        } else {
+            options.threads_for("gzip")
+        };
+        match ratarmount_compress::open_seekable_gzip_rapidgzip(path, spacing, rg_threads) {
+            Ok(body) => {
+                return open_from_seekable_body(
+                    path,
+                    body,
+                    index_path,
+                    options,
+                    recreate,
+                    "gzip-rapidgzip",
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: rapidgzip gzip open failed ({e}); falling back to G3 seekable gzip"
+                );
+            }
+        }
+    }
+
     let gzip = open_shared_seekable_gzip_path(path, spacing, threads, index_path, recreate)?;
 
     let is_tar =
@@ -4122,6 +4160,54 @@ mod tests {
         assert_eq!(read_all(src.as_ref(), "/hello.txt"), payload);
         let mid = read_seek_mid(src.as_ref(), "/hello.txt", 6);
         assert_eq!(mid.as_slice(), &payload[6..]);
+    }
+
+    /// Tier D POC: path-backed rapidgzip when feature + `--use-backend rapidgzip`.
+    ///
+    /// Regression: factory must serve full payload and mid-seek without materialize.
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn plain_gzip_rapidgzip_backend_open_path_seek() {
+        let dir = tempfile::tempdir().unwrap();
+        // Large enough for multiple checkpoints at 4 KiB spacing.
+        let mut payload = Vec::new();
+        for i in 0..80u32 {
+            payload.extend(format!("rgz-{i:04}-").repeat(128).into_bytes());
+            payload.push(b'\n');
+        }
+        let plain = dir.path().join("blob.bin");
+        std::fs::write(&plain, &payload).expect("write plain");
+        let gz = dir.path().join("blob.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+
+        // Prove rapidgzip can open this file (factory may fall back to G3 on error).
+        let body = ratarmount_compress::open_seekable_gzip_rapidgzip(&gz, 4 * 1024, 2)
+            .expect("rapidgzip open must succeed for this corpus");
+        assert_eq!(
+            body.kind(),
+            ratarmount_compress::RAPIDGZIP_BODY_KIND,
+            "must take rapidgzip SeekableBody path"
+        );
+        assert!(body.checkpoint_count() >= 2);
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 4 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            ..Default::default()
+        };
+        let src = open_path(&gz, &opts, false).expect("open plain .gz via rapidgzip");
+        assert_eq!(read_all(src.as_ref(), "/blob.bin"), payload);
+        let mid = payload.len() / 2;
+        let mid_bytes = read_seek_mid(src.as_ref(), "/blob.bin", mid as u64);
+        assert_eq!(mid_bytes.as_slice(), &payload[mid..]);
     }
 
     /// Plain `.zst` / `.bz2` via seekable body (same no-materialize path as gzip).
