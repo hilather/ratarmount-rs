@@ -158,7 +158,10 @@ fn set_archive() -> Vec<String> {
         ".a",
         ".cpio",
         ".sqlar",
+        // SquashFS aliases match factory nested probes (`squashfs`/`sqfs`/`snap`).
         ".squashfs",
+        ".sqfs",
+        ".snap",
         ".asar",
         ".xar",
         ".warc",
@@ -315,6 +318,8 @@ pub fn strip_archive_extension(name: &str) -> String {
         ".cpio",
         ".sqlar",
         ".squashfs",
+        ".sqfs",
+        ".snap",
         ".gz",
         ".bz2",
         ".xz",
@@ -1167,6 +1172,41 @@ mod tests {
         assert!(!is_archive_filename_with("plain.txt", &set));
         // Regular archives still match.
         assert!(is_archive_filename_with("foo.tar", &set));
+    }
+
+    /// Regression: factory nested probes recognize squashfs/sqfs/snap, so the
+    /// default recursive set must too (else nested `foo.sqfs` is skipped).
+    #[test]
+    fn default_set_includes_squashfs_aliases() {
+        let set = RecursiveExtSet::default();
+        assert!(is_archive_filename_with("root.squashfs", &set));
+        assert!(is_archive_filename_with("image.sqfs", &set));
+        assert!(is_archive_filename_with("app.snap", &set));
+        assert!(is_archive_filename("image.sqfs"));
+        assert!(is_archive_filename("app.snap"));
+        // Case-insensitive suffix match.
+        assert!(is_archive_filename_with("Image.SQFS", &set));
+        assert!(is_archive_filename_with("App.SNAP", &set));
+        // Strip helpers cover the same aliases when --strip-recursive-extension.
+        assert_eq!(strip_archive_extension("image.sqfs"), "image");
+        assert_eq!(strip_archive_extension("app.snap"), "app");
+        assert_eq!(strip_archive_extension("root.squashfs"), "root");
+    }
+
+    #[test]
+    fn custom_recursive_extensions_still_restrict() {
+        // Explicit custom set without SquashFS aliases must not match them.
+        let set = parse_recursive_extensions(".tar,.zip");
+        assert!(is_archive_filename_with("a.tar", &set));
+        assert!(is_archive_filename_with("b.zip", &set));
+        assert!(!is_archive_filename_with("image.sqfs", &set));
+        assert!(!is_archive_filename_with("app.snap", &set));
+        assert!(!is_archive_filename_with("root.squashfs", &set));
+        assert!(!set.match_split_first);
+        // /archive alone still includes the aliases.
+        let archive = parse_recursive_extensions("/archive");
+        assert!(is_archive_filename_with("image.sqfs", &archive));
+        assert!(is_archive_filename_with("app.snap", &archive));
     }
 
     #[test]
