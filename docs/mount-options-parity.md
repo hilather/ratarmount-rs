@@ -1,6 +1,6 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-07-31.
+Last updated: 2026-08-01.
 
 ## Summary
 
@@ -52,8 +52,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--force-folder-index` | yes | accepted (folders still live) | `~` |
 | `--hashes` | yes | **added** (crc32/md5/sha1/sha256 → index xattrs; path-backed post-build) | `~` |
 | `--index-minimum-file-count` | yes | yes | `[x]` |
-| `-gs` / `--gzip-seek-point-spacing` | yes | yes | `[x]` |
-| `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle; auto 1 MiB when rapidgzip preferred and flag omitted) |
+| `-g` / `--gs` / `--gzip-seek-point-spacing` (Python `-gs`) | yes | yes | `[x]` MiB uncompressed checkpoint spacing; **default 16**; denser **1–4** for random-heavy mounts (higher open time / RSS) — see note below |
+| `--readahead BYTES` | no (issue [#180](https://github.com/mxmlnkn/ratarmount/issues/180)) | **added** | `[x]` sequential FUSE window per open (`0`=off; `K`/`M`/`G`; max 64 MiB/handle; auto 1 MiB when rapidgzip preferred and flag omitted; default **G3** gzip still needs explicit flag until [G3-C](tasks/g3-polish-batch.md)) |
 | `-d` / `--debug` | yes | yes | `[x]` |
 | `--log-file` | yes | yes | `[x]` |
 | `--color` / `--no-color` | yes | **added** (logging style) | `~` |
@@ -87,3 +87,14 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 - Path `--transform` is a `TransformMountSource` layer (regex on full path).
 - `--disable-union-mount` wraps each source in a basename prefix then unions.
 - `--use-backend` reorders factory detection for known backend names (see `--print-features`).
+
+### `-g` / `--gzip-seek-point-spacing` (Python `-gs`)
+
+Clap: short `-g`, long `--gzip-seek-point-spacing`, visible alias `--gs`. Value is **MiB** of **uncompressed** distance between seek checkpoints (default **16.0**); converted to bytes in `OpenOptions.gzip_seek_point_spacing` (factory / compress use 0 → `DEFAULT_GZIP_SEEK_SPACING` = 16 MiB).
+
+| Workload | Suggested value |
+|----------|-----------------|
+| General / sequential | **16** (default) |
+| Random-heavy FUSE | **1–4** — less decode-from-checkpoint work per seek; **higher open time and RSS** (more cloned inflate states) |
+
+Applies to default **G3** seekable gzip (`.gz` / `.tar.gz`) and is also the soft spacing hint for opt-in rapidgzip when preferred. Does not invent thruput; denser spacing is a latency/open-cost tradeoff. Further G3 polish (decoded-window LRU, full GZIDX window apply/export) is tracked in [`tasks/g3-polish-batch.md`](tasks/g3-polish-batch.md) and the [G3 polish](gzip-binding-decision.md#g3-polish) subsection of the binding decision.

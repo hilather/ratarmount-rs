@@ -29,7 +29,35 @@
   (same checkpoint random access as TAR path). Residual path-only formats still materialize.
 
 ### CLI
-- `--gzip-seek-point-spacing` controls checkpoint distance (bytes uncompressed).
+- `--gzip-seek-point-spacing` / `-g` / `--gs` (Python `-gs`) controls checkpoint distance in **MiB** uncompressed (CLI), stored as bytes in `OpenOptions`. **Default: 16 MiB.**
+
+## G3 polish
+
+**Default remains G3.** Tier D rapidgzip stays opt-in (`gzip-rapidgzip` + env / `--use-backend`); polish work below improves the default path rather than replacing it. Task split: [`tasks/g3-polish-batch.md`](tasks/g3-polish-batch.md).
+
+### `--gzip-seek-point-spacing` guidance
+
+Checkpoint spacing is a **latency vs open-cost** knob (no thruput claims here — measure on your corpus if needed):
+
+| Setting | When |
+|---------|------|
+| **16 MiB** (default) | General mounts; sequential-heavy reads; lowest open-time / checkpoint RSS |
+| **1–4 MiB** | Random-heavy FUSE (many small seeks into large `.gz` / `.tar.gz`) — denser restart points, less decode-from-checkpoint work per seek; **trades higher open time and RSS** (more cloned `InflateState`s) |
+| Larger than default | Rare random access / memory-tight; more work per seek |
+
+Example: `ratarmount -gs 4 archive.tar.gz /mnt` (or `--gzip-seek-point-spacing 4`).
+
+### Residual polish (not thruput)
+
+| Item | Status (see [G3 batch](tasks/g3-polish-batch.md)) |
+|------|-----------------------------------------------------|
+| Decoded-window **LRU** on `SeekableGzipReader` (G3-A) | **open** — single decode buffer today; LRU would cut repeat-read cost without denser spacing |
+| RGZI warm remount on all default path mounts (G3-B) | **partial** — `.tar.gz` persist + import done; plain `.gz` cold path may skip persist |
+| Auto FUSE readahead 1 MiB for default gzip when `--readahead` omitted (G3-C) | **open** — auto window exists for **rapidgzip prefer** only |
+| Full **GZIDX window** apply on import (G3-D) | **open** residual — import soft-rehydrates offsets; window payloads skipped |
+| **Export GZIDX** for Python round-trip (G3-E) | **open** residual — export stays `RGZI`; import already accepts `GZIDX` best-effort |
+
+When G3-A / G3-D / G3-E land, prefer denser spacing only where random-seek cost still dominates open-time/RSS; the LRU and full window-dict path reduce the need for extremely dense checkpoints. Until then, **spacing is the operator-facing control**.
 
 ## Kill criteria
 
