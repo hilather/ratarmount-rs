@@ -102,25 +102,25 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Scope | **Path / nested / HTTP·S3 Range** rapidgzip when preferred (`--use-backend rapidgzip` / env); G3 fallback on path open failure and Range reopen when available |
 | Index build | Full decode to sink with `keep_index` (parallel when `-P` allows); warm remount imports SQLite GZIDX and skips keep_index; each FUSE open reopens FD + `IndexedReader` |
 | Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
-| Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip (path; Range when reopen remains). Nested prefer has no reopen — error if rapidgzip fails ([R1](tasks/rapidgzip-residual-batch.md)) |
+| Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip: **path** and **Range** (reopen when available); **nested** prefer recovers Arc-held reader, rewinds when `Seek` works, then opens G3 ([R1](tasks/rapidgzip-residual-batch.md) **done** `00c70a3`) |
 | Factory (done) | Path/nested/Range prefer rapidgzip; typed `Arc<SharedRapidgzip>` + GZIDX import/export; invalid blob rebuild (no panic); TAR/plain via `open_from_seekable_body` |
-| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); thruput vs G3 needs re-bench before product claims; default-on rapidgzip after benches; per-open index clone; large nested `from_reader` still mutex ([R2](tasks/rapidgzip-residual-batch.md) partial); R1/R3/R4 **done** |
+| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); thruput vs G3 needs re-bench before product claims; default-on rapidgzip after benches; per-open index clone; large nested `from_reader` still mutex (small-body slurp [R2](tasks/rapidgzip-residual-batch.md) **done**); R1/R3/R4 **done** |
 | Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
 
 ### Residual — performance (thruput / cost)
 
-Separate from wiring (path/nested/Range + GZIDX **done**): even on the verified path FUSE open, **rapidgzip is not yet claimed G3-competitive** on small single-member corpora without a post-P2/P4 re-bench, and **default remains G3**. Python rapidgzip thruput parity is still open. Integration knobs from [P1–P5](tasks/rapidgzip-perf-batch.md) landed; further residuals are [R1–R5](tasks/rapidgzip-residual-batch.md).
+Separate from wiring (path/nested/Range + GZIDX **done**; nested fail→G3 **R1 done**): even on the verified path FUSE open, **rapidgzip is not yet claimed G3-competitive** on small single-member corpora without a post-P2/P4 re-bench, and **default remains G3**. Python rapidgzip thruput parity is still a thruput residual (not a missing wire). Integration knobs from [P1–P5](tasks/rapidgzip-perf-batch.md) **all done**; batch residuals [R1–R5](tasks/rapidgzip-residual-batch.md) **all done** — remaining product gaps are thruput re-bench, large nested mutex, nested imported-index side table, and default-on policy.
 
 | Residual | Spot range / note |
 |----------|-------------------|
-| Cold index wall vs G3 | Spot ~**0.15 s** rapidgzip+ISA-L vs ~**0.05 s** G3 on **64 MiB** single-member gzip — **re-bench after P2** before updating |
-| Cold sequential MiB/s vs G3 | Spot ~**500** vs ~**1100** MiB/s (same corpus, ISA-L feature) — **open pending re-bench** after P2/P4 |
+| Cold index wall vs G3 | Spot ~**0.15 s** rapidgzip+ISA-L vs ~**0.05 s** G3 on **64 MiB** single-member gzip — thruput residual; **re-bench after P2** before updating figures |
+| Cold sequential MiB/s vs G3 | Spot ~**500** vs ~**1100** MiB/s (same corpus, ISA-L feature) — thruput residual **pending re-bench** after P2/P4 (P2/P4 code landed; figures not refreshed) |
 | Peak RSS vs G3 | Spot ~**52 MiB** vs ~**15 MiB** (P2 compresses index windows — re-measure) |
 | vs **Python** rapidgzip | Head-to-head still favors Python on compressed-TAR random/seq in committed results; same-corpus multi-backend CSV is **`benchmarks/gzip-backend-results/` when generated** (see [`benchmarks/README.md`](../benchmarks/README.md)) |
 | Open amortisation | Full `keep_index` decode; each FUSE open reopens FD + `IndexedReader` (per-open index clone residual) |
 | Seek-cache / prefetch | **Landed (P2)** — FUSE-oriented seek cache (16 chunks / 64 MiB cap), `seek_readahead`, prefetch windows, optional no-CRC keep_index; thruput impact not re-benched |
-| Fair ISA-L A/B | **Harness landed (P3)** — `compare-gzip-isal-ab.sh`; do not claim ISA-L win without published results ([R3](tasks/rapidgzip-residual-batch.md)) |
-| FUSE readahead fit | **Landed (P4 + G3-C)** — sequential short-read window + random exact-size; `RECOMMENDED_READAHEAD_BYTES` (1 MiB); auto-enable 1 MiB when `--readahead` omitted and (rapidgzip preferred **or** any mount input looks like gzip `.gz`/`.tgz`/`.tar.gz`/`.gzip`); explicit `--readahead 0`/`N` overrides ([R4](tasks/rapidgzip-residual-batch.md)) |
+| Fair ISA-L A/B | **Harness + smoke (P3 / R3)** — `compare-gzip-isal-ab.sh`; committed tables [`tasks/rapidgzip-isal-ab-spot.md`](tasks/rapidgzip-isal-ab-spot.md); mixed deltas — no universal ISA-L win |
+| FUSE readahead fit | **Landed (P4 + G3-C / R4)** — sequential short-read window + random exact-size; `RECOMMENDED_READAHEAD_BYTES` (1 MiB); auto-enable 1 MiB when `--readahead` omitted and (rapidgzip preferred **or** any mount input looks like gzip `.gz`/`.tgz`/`.tar.gz`/`.gzip`); explicit `--readahead 0`/`N` overrides |
 | Default-on | Flip only after published benches justify it; feature stays opt-in |
 
 **Numbers policy:** ranges above are local spot checks recorded in the [perf batch](tasks/rapidgzip-perf-batch.md) (pre–P2/P4). Prefer `benchmarks/gzip-backend-results/{results.md,results.csv}` when present; do not invent new absolute thruput figures.

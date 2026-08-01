@@ -9,14 +9,14 @@
 
 | ID | Task | Owner | Status |
 |----|------|--------|--------|
-| **G3-A** | Decoded-window LRU cache on `SeekableGzipReader` | `gzip_seek.rs` | **done** — per-reader LRU (`G3_SEEK_CACHE_CHUNKS`=256 / `G3_SEEK_CACHE_BYTES`=16 MiB at 64 KiB chunks); reverse/nearby seeks hit cache; concurrent `Shared` readers keep private caches |
-| **G3-B** | Ensure RGZI warm remount always on default path mounts | factory | **done** — plain `.gz` + path/live Range persist RGZI via `open_or_create_writable_index` shell; units `plain_gzip_rgzi_*` / `gzip_rgzi_*` |
-| **G3-C** | Auto FUSE readahead (1 MiB) for gzip/`.tar.gz` when `--readahead` omitted | `main.rs` | **done** — auto 1 MiB when flag omitted and rapidgzip preferred **or** input looks like `.gz`/`.tgz`/`.tar.gz`/`.gzip`; explicit `--readahead 0`/`N` overrides |
-| **G3-D** | Full **GZIDX window** apply on import (not soft rehydrate only) | `gzip_seek.rs` | **partial** — 32 KiB windows + bit residuals **parsed and stored** for re-export; inflate still soft-rehydrates (miniz cannot `inflateSetDictionary` / `inflatePrime`) |
-| **G3-E** | **Export GZIDX** for Python round-trip (optional alongside RGZI) | `gzip_seek.rs` | **partial** — `encode_indexed_gzip_index_blob` / `export_indexed_gzip_blob` land; **RGZI remains primary** warm path; bits=0 + mid-block points → best-effort for pure zran without rehydrate |
+| **G3-A** | Decoded-window LRU cache on `SeekableGzipReader` | `gzip_seek.rs` | **done** — per-reader LRU (`G3_SEEK_CACHE_CHUNKS`=256 / `G3_SEEK_CACHE_BYTES`=16 MiB at 64 KiB chunks); reverse/nearby seeks hit cache; concurrent `Shared` readers keep private caches (`adc4b82`, budget fix `71469d5`) |
+| **G3-B** | Ensure RGZI warm remount always on default path mounts | factory | **done** — plain `.gz` + path/live Range persist RGZI via `open_or_create_writable_index` shell; units `plain_gzip_rgzi_*` / `gzip_rgzi_*` (`3ba0c93`) |
+| **G3-C** | Auto FUSE readahead (1 MiB) for gzip/`.tar.gz` when `--readahead` omitted | `main.rs` | **done** — auto 1 MiB when flag omitted and rapidgzip preferred **or** input looks like `.gz`/`.tgz`/`.tar.gz`/`.gzip`; explicit `--readahead 0`/`N` overrides (`76bee8d` / Tier D **R4**) |
+| **G3-D** | Full **GZIDX window** apply on import (not soft rehydrate only) | `gzip_seek.rs` | **partial** — 32 KiB windows + bit residuals **parsed and stored** for re-export; inflate still soft-rehydrates (miniz cannot `inflateSetDictionary` / `inflatePrime`); hard apply needs different inflate backend — **orchestrator / follow-on** |
+| **G3-E** | **Export GZIDX** for Python round-trip (optional alongside RGZI) | `gzip_seek.rs` | **partial** — `encode_indexed_gzip_index_blob` / `export_indexed_gzip_blob` land; **RGZI remains primary** warm path; bits=0 + mid-block points → best-effort for pure zran without rehydrate — **orchestrator / follow-on** |
 | **G3-F** | Docs: denser `--gzip-seek-point-spacing` guidance + G3 polish residual | docs | **done** — this file + binding-decision **G3 polish** + mount-options `-gs` note |
 
-Legend: **done** · **partial** · **open**. Status refreshed after A–C merge (`adc4b82` / `3ba0c93` / `76bee8d`).
+Legend: **done** · **partial** · **open**. Status refreshed at tip (`71469d5` / `4aa17a5` / `adc4b82` / `3ba0c93` / `76bee8d`): **G3-A/B/C/F done**; **G3-D/E partial** (soft rehydrate only in `gzip_seek.rs`).
 
 ## High value (detail)
 
@@ -30,8 +30,8 @@ Legend: **done** · **partial** · **open**. Status refreshed after A–C merge 
 
 | ID | Notes |
 |----|--------|
-| **G3-D** | **Partial.** Windows + bits stored on import; miniz still soft-rehydrates (no public dict/prime). Hard apply needs different inflate backend. |
-| **G3-E** | **Partial.** GZIDX export API + our-parser round-trip tests; RGZI remains primary warm path. Full Python zran without rehydrate is residual. |
+| **G3-D** | **Partial (orchestrator).** Windows + bits stored on import; miniz still soft-rehydrates (no public dict/prime). Hard apply needs different inflate backend — not finished on tip. |
+| **G3-E** | **Partial (orchestrator).** GZIDX export API + our-parser round-trip tests; RGZI remains primary warm path. Full Python zran without rehydrate is residual. |
 | **G3-F** | Spacing guidance only (no thruput claims). See binding decision + mount-options note. |
 
 ## Operator guidance (spacing)
