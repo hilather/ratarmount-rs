@@ -213,8 +213,13 @@ impl Iso9660MountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
+        // Index + fingerprint first (same order as TAR/ZIP/7z): reject a sibling
+        // index for a replaced archive before trusting files rows / extent opens.
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             backend: IsoBackend::Path(archive_path.to_path_buf()),
@@ -541,15 +546,9 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
-    index.store_metadata_key_value("tarstats", &json)?;
+    // Shared helper: size/mtime + first/last 512 SHA-256 for warm-open fingerprint.
+    // Path-backed cold create always has a real archive file (see create_index).
+    index.store_tarstats_for_path(path)?;
     Ok(())
 }
 
@@ -687,5 +686,108 @@ mod tests {
             .unwrap();
         assert_eq!(a, b);
         assert_eq!(a, b"foo\n");
+    }
+
+    /// Write `plain` ISO bytes to `path`, optionally patching the BAR payload
+    /// (`foo\n` at extent 31 in the Python single-file fixture) for a second variant.
+    fn write_iso_variant(path: &Path, plain: &[u8], payload: &[u8; 4]) {
+        let mut bytes = plain.to_vec();
+        // Fixture: BAR.;1 extent=31, size=4, payload "foo\n" at sector 31.
+        let off = 31 * 2048;
+        assert!(
+            plain.len() > off + 4,
+            "fixture too small to patch BAR payload"
+        );
+        assert_eq!(&plain[off..off + 4], b"foo\n", "unexpected fixture payload");
+        bytes[off..off + 4].copy_from_slice(payload);
+        std::fs::write(path, &bytes).unwrap();
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let Some(plain) = load_single_file_iso() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.iso");
+        write_iso_variant(&archive, &plain, b"foo\n");
+        let index = dir.path().join("swap.iso.index.sqlite");
+        let opts = OpenOptions::default();
+
+        let src = Iso9660MountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src
+            .lookup("/BAR", 0)
+            .or_else(|| src.lookup("/bar", 0))
+            .expect("lookup v1");
+        let mut buf = Vec::new();
+        src.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foo\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        Iso9660MountSource::open_existing(&archive, &index, &opts)
+            .expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        std::fs::write(&archive, b"not-an-iso-but-different-size").unwrap();
+
+        match Iso9660MountSource::open_existing(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm ISO open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let Some(plain) = load_single_file_iso() else {
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.iso");
+        write_iso_variant(&archive, &plain, b"foo\n");
+        let index = dir.path().join("swap.iso.index.sqlite");
+        let opts = OpenOptions::default();
+
+        let src = Iso9660MountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src
+            .lookup("/BAR", 0)
+            .or_else(|| src.lookup("/bar", 0))
+            .expect("lookup v1");
+        let mut buf = Vec::new();
+        src.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"foo\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Same-size payload swap (edge/full hash fingerprint catches replace).
+        write_iso_variant(&archive, &plain, b"bar\n");
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale extent rows.
+        let src2 = Iso9660MountSource::open(&archive, Some(&index), &opts, "test", false)
+            .expect("warm rebuild");
+        let fi2 = src2
+            .lookup("/BAR", 0)
+            .or_else(|| src2.lookup("/bar", 0))
+            .expect("lookup v2");
+        let mut buf2 = Vec::new();
+        src2.open(&fi2, 0).unwrap().read_to_end(&mut buf2).unwrap();
+        assert_eq!(
+            buf2, b"bar\n",
+            "must serve new ISO data after tarstats mismatch rebuild"
+        );
     }
 }
