@@ -333,6 +333,9 @@ impl CabMountSource {
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive_io,
@@ -868,22 +871,12 @@ pub fn default_index_path(archive: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
-    index.store_metadata_key_value("tarstats", &json)?;
-    Ok(())
-}
-
-/// Store tarstats for a path label; if not a real file, use synthetic stats from `size`.
+/// Store tarstats from path metadata + edge hashes when available; otherwise synthetic size-only.
+///
+/// Real on-disk archives use the shared helper so warm reopen fails closed after in-place
+/// replace (size/mtime + first/last 512 SHA-256). Nested / virtual labels get size-only.
 fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
-    if path.exists() && store_stats(index, path).is_ok() {
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
         return Ok(());
     }
     let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
@@ -1247,5 +1240,149 @@ mod tests {
             .unwrap();
         assert_eq!(br, bp);
         assert_eq!(br, b"foo\n");
+    }
+
+    /// Open warm index via the same path as `open_from_reader` (parse folders + tarstats gate).
+    fn try_open_existing_cab(
+        archive: &Path,
+        index: &Path,
+        opts: &OpenOptions,
+    ) -> Result<CabMountSource> {
+        let mut file = File::open(archive)?;
+        let (folders, _) = parse_cab_archive(&mut file)?;
+        file.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
+        CabMountSource::open_existing(archive, index, opts, folders, archive_io)
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.cab");
+        std::fs::write(&archive, synthetic_store_cab("hello.txt", b"cab-v1\n")).unwrap();
+        let index = dir.path().join("swap.cab.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src =
+            CabMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "cab-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        try_open_existing_cab(&archive, &index, &opts).expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        std::fs::write(
+            &archive,
+            synthetic_store_cab("hello.txt", b"cab-v2-longer\n"),
+        )
+        .unwrap();
+
+        match try_open_existing_cab(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm CAB open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.cab");
+        std::fs::write(&archive, synthetic_store_cab("hello.txt", b"cab-v1\n")).unwrap();
+        let index = dir.path().join("swap.cab.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src =
+            CabMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "cab-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        std::fs::write(
+            &archive,
+            synthetic_store_cab("hello.txt", b"cab-v2-longer\n"),
+        )
+        .unwrap();
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale member rows.
+        let src2 =
+            CabMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "cab-v2-longer\n",
+            "must serve new CAB data after tarstats mismatch rebuild"
+        );
+    }
+
+    /// Regression: MSZIP cold create also stores tarstats; warm open rebuilds on replace.
+    #[test]
+    fn warm_index_mszip_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap-mszip.cab");
+        std::fs::write(&archive, synthetic_mszip_cab("hello.txt", b"mszip-v1\n")).unwrap();
+        let index = dir.path().join("swap-mszip.cab.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src =
+            CabMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold mszip");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "mszip-v1\n");
+        drop(src);
+
+        std::fs::write(
+            &archive,
+            synthetic_mszip_cab("hello.txt", b"mszip-v2-longer\n"),
+        )
+        .unwrap();
+
+        let src2 =
+            CabMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm mszip");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "mszip-v2-longer\n",
+            "must serve new MSZIP CAB data after tarstats mismatch rebuild"
+        );
     }
 }
