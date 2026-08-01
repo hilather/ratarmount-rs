@@ -10,13 +10,38 @@
 //! contract used by FUSE file handles: each reader is never accessed from more
 //! than one thread at a time (it may be moved between threads between requests).
 //!
-//! **Backends**
+//! # Open / seek thruput knobs (P2)
+//!
+//! | Knob | Default | Rationale |
+//! |------|---------|-----------|
+//! | `checkpoint_spacing` | [`DEFAULT_GZIP_SEEK_SPACING`] (16 MiB) when `spacing == 0` | Aligns with G3 / `gzip_seek_point_spacing` so FUSE random seeks land on comparable restart density. |
+//! | [`RAPIDGZIP_SEEK_CACHE_CHUNKS`] | 16 | Per-open decoded-window LRU; matches `rapidgzip-core` thruput default. |
+//! | [`RAPIDGZIP_SEEK_CACHE_BYTES`] | 64 MiB | Cap per-open cache RSS (library default). Multi-open FUSE multiplies this. |
+//! | `seek_readahead` | `true` | Sequential FUSE cats warm the next window without a re-seek. |
+//! | [`RAPIDGZIP_SEEK_PREFETCH_WINDOWS`] | 4 | Background independent inflates ahead of the active buffer (library default is 2; raised for sequential thruput). |
+//! | `compress_index_windows` | `true` | keep_index stores zlib-compressed predecessor windows when smaller (RSS). |
+//! | CRC verify on index build | **on** by default | Disable only via [`SharedRapidgzip::open_with_threads_fast`] or env [`RAPIDGZIP_NO_CRC_ENV`]. |
+//!
+//! ## Per-open index cost
+//!
+//! The shared body holds [`GzipIndex`] behind an [`Arc`]. Cheap Arc clones share
+//! the index across FUSE handles' **body** references. However,
+//! [`Decoder::reader_with_index`](rapidgzip_core::Decoder::reader_with_index)
+//! takes an owned `GzipIndex`, so each [`SharedRapidgzip::reader`] still
+//! performs a **full index clone** into the IndexedReader (which then wraps
+//! it in its own Arc). There is no public Arc-index open API yet — residual
+//! open cost until upstream accepts `Arc<GzipIndex>`.
+//!
+//! ## Shared-reader mutex residual
+//!
 //! * **Path** — local file; each reader opens its own FD (`File` implements
-//!   [`ReadAt`] natively).
+//!   [`ReadAt`] natively). Preferred for concurrent decode thruput.
 //! * **Shared reader** — nested / HTTP Range / in-memory `Cursor` wrapped as
 //!   [`SeekReadAt`] (`Arc<Mutex<Box<dyn SeekRead>>>` + seek+read under lock).
 //!   Parallel decode workers and concurrent readers **serialize on this mutex**
-//!   (nested thruput residual).
+//!   (nested thruput residual). Prefer path open (or factory materialize to a
+//!   path FD without `/tmp` when possible) over `from_reader` when the source
+//!   is already a local file.
 //!
 //! **GZIDX** — [`SharedRapidgzip::export_gzidx_blob`] writes Python
 //! `indexed_gzip` format; import skips the full keep_index rebuild.
@@ -47,6 +72,34 @@ pub const RAPIDGZIP_BACKEND_VALUE: &str = "rapidgzip";
 /// Kind string reported by [`SeekableBody::kind`].
 pub const RAPIDGZIP_BODY_KIND: &str = "gzip-rapidgzip";
 
+/// Env var: when set to `1` / `true` / `yes` (ASCII case-insensitive), keep_index
+/// builds skip gzip member CRC32 verification (ISIZE still checked).
+///
+/// **Off by default.** Experimental thruput knob only — prefer the default
+/// verified path for production mounts. Equivalent to
+/// [`SharedRapidgzip::open_with_threads_fast`] when set.
+pub const RAPIDGZIP_NO_CRC_ENV: &str = "RATARMOUNT_RAPIDGZIP_NO_CRC";
+
+const MIB: usize = 1024 * 1024;
+
+/// Per-open decoded-window LRU entry count ([`DecoderBuilder::seek_cache_chunks`]).
+///
+/// Matches `rapidgzip-core` default (16). Each entry is roughly
+/// `decoded_chunk_size` (4 MiB) of uncompressed payload when filled.
+pub const RAPIDGZIP_SEEK_CACHE_CHUNKS: usize = 16;
+
+/// Per-open decoded-window LRU byte cap ([`DecoderBuilder::seek_cache_bytes`]).
+///
+/// 64 MiB matches the library thruput default. FUSE multi-open multiplies RSS
+/// by open handles that fill their caches.
+pub const RAPIDGZIP_SEEK_CACHE_BYTES: usize = 64 * MIB;
+
+/// Background prefetch window count for sequential FUSE-style reads.
+///
+/// Library default is 2; 4 warms more ahead of the consumer for sequential
+/// thruput while still bounding random-seek waste (stale prefetches cancel).
+pub const RAPIDGZIP_SEEK_PREFETCH_WINDOWS: usize = 4;
+
 /// Whether open paths should prefer the rapidgzip backend (feature compiled in).
 ///
 /// True when `RATARMOUNT_GZIP_BACKEND=rapidgzip` (ASCII case-insensitive) or when
@@ -74,6 +127,24 @@ pub fn prefer_rapidgzip_gzip_backend_with_env(
         let l = b.to_ascii_lowercase();
         l == RAPIDGZIP_BACKEND_VALUE || l == "rapidgzip-gzip"
     })
+}
+
+/// Whether keep_index CRC should be disabled from the process environment.
+///
+/// Reads [`RAPIDGZIP_NO_CRC_ENV`]. **Default is false** (CRC on).
+pub fn rapidgzip_no_crc_enabled() -> bool {
+    rapidgzip_no_crc_from_env_value(std::env::var(RAPIDGZIP_NO_CRC_ENV).ok().as_deref())
+}
+
+/// Parse [`RAPIDGZIP_NO_CRC_ENV`] values (injectable for tests).
+///
+/// True only for `1`, `true`, or `yes` (ASCII case-insensitive). Empty / other
+/// values leave CRC verification enabled.
+pub fn rapidgzip_no_crc_from_env_value(env_value: Option<&str>) -> bool {
+    match env_value {
+        Some(v) => v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes"),
+        None => false,
+    }
 }
 
 /// Positional [`ReadAt`] adapter over a shared seekable compressed stream.
@@ -119,9 +190,12 @@ impl ReadAt for SeekReadAt {
 
 /// Compressed-source backend for multi-open seekable gzip.
 enum RapidgzipBackend {
-    /// Local path: each reader opens its own `File`.
+    /// Local path: each reader opens its own `File` (best concurrent thruput).
     Path(PathBuf),
     /// Shared seekable stream (nested Range, Cursor, …).
+    ///
+    /// Residual: all `ReadAt` traffic serializes on one mutex. Prefer
+    /// [`RapidgzipBackend::Path`] when the compressed source is a local file.
     Shared {
         reader: Arc<Mutex<Box<dyn SeekRead>>>,
         compressed_len: u64,
@@ -133,7 +207,9 @@ pub struct SharedRapidgzip {
     /// Local path or virtual archive label for logs / [`SeekableBody::path`].
     path: PathBuf,
     backend: RapidgzipBackend,
-    index: GzipIndex,
+    /// Shared index (Arc-cheap to share the body). Full clone still required
+    /// into each [`IndexedReader`] — see module docs.
+    index: Arc<GzipIndex>,
     size: u64,
     /// Decoder configuration (threads, cache, spacing) used for every reader.
     decoder: Decoder,
@@ -142,11 +218,30 @@ pub struct SharedRapidgzip {
 impl SharedRapidgzip {
     /// Build index from `path` and return a shared seekable body.
     ///
-    /// `spacing` is the soft uncompressed checkpoint spacing (0 → default 16 MiB).
+    /// `spacing` is the soft uncompressed checkpoint spacing (0 → default 16 MiB,
+    /// same as G3 / `gzip_seek_point_spacing`).
     /// `threads` is the decoder worker budget (`0` → CPU count), matching `-P`.
+    ///
+    /// CRC verification follows [`rapidgzip_no_crc_enabled`] (default: **on**).
     pub fn open_with_threads(path: &Path, spacing: u64, threads: u32) -> Result<Arc<Self>> {
+        Self::open_with_threads_crc(path, spacing, threads, !rapidgzip_no_crc_enabled())
+    }
+
+    /// Like [`Self::open_with_threads`] but **always** skips gzip CRC32 on the
+    /// keep_index build (ISIZE still verified). Experimental thruput path —
+    /// default open keeps CRC on.
+    pub fn open_with_threads_fast(path: &Path, spacing: u64, threads: u32) -> Result<Arc<Self>> {
+        Self::open_with_threads_crc(path, spacing, threads, /* crc32_enabled */ false)
+    }
+
+    fn open_with_threads_crc(
+        path: &Path,
+        spacing: u64,
+        threads: u32,
+        crc32_enabled: bool,
+    ) -> Result<Arc<Self>> {
         let path = path.to_path_buf();
-        let decoder = make_decoder(spacing, threads, /* keep_index */ true)?;
+        let decoder = make_decoder(spacing, threads, /* keep_index */ true, crc32_enabled)?;
 
         let file = File::open(&path)?;
         // Full decode once to collect the index; payload discarded (same cost class
@@ -161,26 +256,70 @@ impl SharedRapidgzip {
         let size = validate_index(&index)?;
         drop(file);
 
+        // Reader path does not need keep_index; rebuild decoder with FUSE knobs
+        // and keep_index off (slightly leaner config clone into IndexedReader).
+        let reader_decoder = make_decoder(spacing, threads, /* keep_index */ false, true)?;
+
         Ok(Arc::new(Self {
             path: path.clone(),
             backend: RapidgzipBackend::Path(path),
-            index,
+            index: Arc::new(index),
             size,
-            decoder,
+            decoder: reader_decoder,
         }))
     }
 
     /// Build index from a seekable compressed reader (nested / Range / Cursor).
     ///
     /// The reader is held under a mutex and exposed to rapidgzip as [`SeekReadAt`].
-    /// Parallel workers serialize on that mutex (nested thruput residual).
+    /// Parallel workers serialize on that mutex (nested thruput residual — prefer
+    /// path open when the source is a local file).
     ///
     /// `archive_label` is stored for logs / [`SeekableBody::path`].
+    /// CRC follows [`rapidgzip_no_crc_enabled`] (default: **on**).
     pub fn open_with_threads_from_reader<R>(
+        reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_threads_from_reader_crc(
+            reader,
+            spacing,
+            threads,
+            archive_label,
+            !rapidgzip_no_crc_enabled(),
+        )
+    }
+
+    /// Like [`Self::open_with_threads_from_reader`] but skips CRC on index build.
+    pub fn open_with_threads_from_reader_fast<R>(
+        reader: R,
+        spacing: u64,
+        threads: u32,
+        archive_label: impl AsRef<Path>,
+    ) -> Result<Arc<Self>>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_with_threads_from_reader_crc(
+            reader,
+            spacing,
+            threads,
+            archive_label,
+            /* crc32_enabled */ false,
+        )
+    }
+
+    fn open_with_threads_from_reader_crc<R>(
         mut reader: R,
         spacing: u64,
         threads: u32,
         archive_label: impl AsRef<Path>,
+        crc32_enabled: bool,
     ) -> Result<Arc<Self>>
     where
         R: Read + Seek + Send + 'static,
@@ -191,7 +330,7 @@ impl SharedRapidgzip {
 
         let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
         let source = SeekReadAt::new(Arc::clone(&shared), compressed_len);
-        let decoder = make_decoder(spacing, threads, /* keep_index */ true)?;
+        let decoder = make_decoder(spacing, threads, /* keep_index */ true, crc32_enabled)?;
 
         let mut sink = io::sink();
         let report = decoder
@@ -202,15 +341,17 @@ impl SharedRapidgzip {
             .ok_or_else(|| CompressError::Msg("rapidgzip keep_index returned no index".into()))?;
         let size = validate_index(&index)?;
 
+        let reader_decoder = make_decoder(spacing, threads, /* keep_index */ false, true)?;
+
         Ok(Arc::new(Self {
             path,
             backend: RapidgzipBackend::Shared {
                 reader: shared,
                 compressed_len,
             },
-            index,
+            index: Arc::new(index),
             size,
-            decoder,
+            decoder: reader_decoder,
         }))
     }
 
@@ -229,12 +370,12 @@ impl SharedRapidgzip {
         let index = import_index_blob(index_blob, Some(compressed_len))?;
         let size = validate_index(&index)?;
         // No keep_index: index already provided.
-        let decoder = make_decoder(spacing, threads, /* keep_index */ false)?;
+        let decoder = make_decoder(spacing, threads, /* keep_index */ false, true)?;
 
         Ok(Arc::new(Self {
             path: path.clone(),
             backend: RapidgzipBackend::Path(path),
-            index,
+            index: Arc::new(index),
             size,
             decoder,
         }))
@@ -258,7 +399,7 @@ impl SharedRapidgzip {
         reader.seek(SeekFrom::Start(0))?;
         let index = import_index_blob(index_blob, Some(compressed_len))?;
         let size = validate_index(&index)?;
-        let decoder = make_decoder(spacing, threads, /* keep_index */ false)?;
+        let decoder = make_decoder(spacing, threads, /* keep_index */ false, true)?;
         let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
 
         Ok(Arc::new(Self {
@@ -267,7 +408,7 @@ impl SharedRapidgzip {
                 reader: shared,
                 compressed_len,
             },
-            index,
+            index: Arc::new(index),
             size,
             decoder,
         }))
@@ -297,28 +438,32 @@ impl SharedRapidgzip {
     }
 
     /// Independent seekable reader (new FD or shared-stream handle + in-process inflate).
+    ///
+    /// Clones the full [`GzipIndex`] into `reader_with_index` (API requirement;
+    /// see module docs). Path backend opens a fresh FD per call.
     pub fn reader(&self) -> io::Result<RapidgzipReader> {
-        let inner = match &self.backend {
-            RapidgzipBackend::Path(path) => {
-                let file = File::open(path)?;
-                let ir = self
-                    .decoder
-                    .reader_with_index(file, self.index.clone())
-                    .map_err(|e| io::Error::other(format!("rapidgzip reader_with_index: {e}")))?;
-                RapidgzipReaderInner::Path(ir)
-            }
-            RapidgzipBackend::Shared {
-                reader,
-                compressed_len,
-            } => {
-                let source = SeekReadAt::new(Arc::clone(reader), *compressed_len);
-                let ir = self
-                    .decoder
-                    .reader_with_index(source, self.index.clone())
-                    .map_err(|e| io::Error::other(format!("rapidgzip reader_with_index: {e}")))?;
-                RapidgzipReaderInner::Shared(ir)
-            }
-        };
+        // Full clone required: Decoder::reader_with_index takes owned GzipIndex.
+        let index = (*self.index).clone();
+        let inner =
+            match &self.backend {
+                RapidgzipBackend::Path(path) => {
+                    let file = File::open(path)?;
+                    let ir = self.decoder.reader_with_index(file, index).map_err(|e| {
+                        io::Error::other(format!("rapidgzip reader_with_index: {e}"))
+                    })?;
+                    RapidgzipReaderInner::Path(ir)
+                }
+                RapidgzipBackend::Shared {
+                    reader,
+                    compressed_len,
+                } => {
+                    let source = SeekReadAt::new(Arc::clone(reader), *compressed_len);
+                    let ir = self.decoder.reader_with_index(source, index).map_err(|e| {
+                        io::Error::other(format!("rapidgzip reader_with_index: {e}"))
+                    })?;
+                    RapidgzipReaderInner::Shared(ir)
+                }
+            };
         Ok(RapidgzipReader { inner })
     }
 }
@@ -398,6 +543,18 @@ pub fn open_seekable_gzip_rapidgzip(
     Ok(body as Arc<dyn SeekableBody>)
 }
 
+/// Open path-backed rapidgzip with CRC disabled on the keep_index build.
+///
+/// See [`SharedRapidgzip::open_with_threads_fast`].
+pub fn open_seekable_gzip_rapidgzip_fast(
+    path: &Path,
+    spacing: u64,
+    threads: u32,
+) -> Result<Arc<dyn SeekableBody>> {
+    let body = SharedRapidgzip::open_with_threads_fast(path, spacing, threads)?;
+    Ok(body as Arc<dyn SeekableBody>)
+}
+
 /// Open rapidgzip seekable body from a seekable compressed reader.
 ///
 /// See [`SharedRapidgzip::open_with_threads_from_reader`].
@@ -412,6 +569,27 @@ where
 {
     let body =
         SharedRapidgzip::open_with_threads_from_reader(reader, spacing, threads, archive_label)?;
+    Ok(body as Arc<dyn SeekableBody>)
+}
+
+/// Open from a reader with CRC disabled on the keep_index build.
+///
+/// See [`SharedRapidgzip::open_with_threads_from_reader_fast`].
+pub fn open_seekable_gzip_rapidgzip_from_reader_fast<R>(
+    reader: R,
+    spacing: u64,
+    threads: u32,
+    archive_label: impl AsRef<Path>,
+) -> Result<Arc<dyn SeekableBody>>
+where
+    R: Read + Seek + Send + 'static,
+{
+    let body = SharedRapidgzip::open_with_threads_from_reader_fast(
+        reader,
+        spacing,
+        threads,
+        archive_label,
+    )?;
     Ok(body as Arc<dyn SeekableBody>)
 }
 
@@ -451,7 +629,21 @@ where
     Ok(body as Arc<dyn SeekableBody>)
 }
 
-fn make_decoder(spacing: u64, threads: u32, keep_index: bool) -> Result<Decoder> {
+/// Build a [`Decoder`] with FUSE-oriented seek cache / prefetch knobs.
+///
+/// * `spacing == 0` → [`DEFAULT_GZIP_SEEK_SPACING`] (16 MiB), aligned with G3.
+/// * Seek cache / prefetch: see module-level table and
+///   [`RAPIDGZIP_SEEK_CACHE_CHUNKS`] / [`RAPIDGZIP_SEEK_CACHE_BYTES`] /
+///   [`RAPIDGZIP_SEEK_PREFETCH_WINDOWS`].
+/// * `compress_index_windows(true)` when collecting an index (RSS).
+/// * `crc32_enabled` gates gzip member CRC on keep_index builds only; indexed
+///   seek reads never verify member CRC (rapidgzip policy).
+fn make_decoder(
+    spacing: u64,
+    threads: u32,
+    keep_index: bool,
+    crc32_enabled: bool,
+) -> Result<Decoder> {
     let threads = ParallelizationSpec::resolve_zero(threads).max(1) as usize;
     let spacing = if spacing == 0 {
         DEFAULT_GZIP_SEEK_SPACING as usize
@@ -464,9 +656,14 @@ fn make_decoder(spacing: u64, threads: u32, keep_index: bool) -> Result<Decoder>
         .keep_index(keep_index)
         .checkpoint_spacing(spacing)
         .format(Format::Gzip)
+        .crc32_enabled(crc32_enabled)
+        // keep_index RSS: zlib-compress predecessor windows when smaller.
+        .compress_index_windows(true)
+        // Per-open IndexedReader LRU (FUSE sequential + random mix).
+        .seek_cache_chunks(RAPIDGZIP_SEEK_CACHE_CHUNKS)
+        .seek_cache_bytes(RAPIDGZIP_SEEK_CACHE_BYTES)
         .seek_readahead(true)
-        // Warm a couple of windows ahead for sequential FUSE cats.
-        .seek_prefetch_windows(2)
+        .seek_prefetch_windows(RAPIDGZIP_SEEK_PREFETCH_WINDOWS)
         .build()
         .map_err(|e| CompressError::Msg(format!("rapidgzip decoder config: {e}")))
 }
@@ -551,6 +748,32 @@ mod tests {
         ));
     }
 
+    /// Regression: CRC verify path remains default (no-CRC env off).
+    #[test]
+    fn no_crc_env_off_by_default() {
+        assert!(!rapidgzip_no_crc_from_env_value(None));
+        assert!(!rapidgzip_no_crc_from_env_value(Some("")));
+        assert!(!rapidgzip_no_crc_from_env_value(Some("0")));
+        assert!(!rapidgzip_no_crc_from_env_value(Some("false")));
+        assert!(!rapidgzip_no_crc_from_env_value(Some("no")));
+        assert!(rapidgzip_no_crc_from_env_value(Some("1")));
+        assert!(rapidgzip_no_crc_from_env_value(Some("true")));
+        assert!(rapidgzip_no_crc_from_env_value(Some("YES")));
+        assert!(rapidgzip_no_crc_from_env_value(Some("True")));
+    }
+
+    /// Regression: FUSE-oriented cache/prefetch constants stay in documented range.
+    #[test]
+    fn seek_cache_prefetch_knobs_documented() {
+        const {
+            assert!(RAPIDGZIP_SEEK_CACHE_CHUNKS >= 4);
+            assert!(RAPIDGZIP_SEEK_CACHE_BYTES >= 4 * MIB);
+            assert!(RAPIDGZIP_SEEK_PREFETCH_WINDOWS >= 2);
+            // Spacing zero aligns with G3 default.
+            assert!(DEFAULT_GZIP_SEEK_SPACING == 16 * 1024 * 1024);
+        }
+    }
+
     #[test]
     fn open_random_seek_and_full_read() {
         let payload = sample_payload();
@@ -580,6 +803,64 @@ mod tests {
         b.read_exact(&mut tb).unwrap();
         assert_eq!(&ta, &payload[mid..mid + 32]);
         assert_eq!(&tb, &payload[mid / 2..mid / 2 + 32]);
+    }
+
+    /// Regression: open_with_threads_fast (no CRC) still yields correct payload.
+    #[test]
+    fn open_with_threads_fast_correct_payload() {
+        let payload = sample_payload();
+        let (_dir, path) = write_temp_gz(&payload);
+        let body = SharedRapidgzip::open_with_threads_fast(&path, 1024, 2).expect("fast open");
+        assert_eq!(body.size(), payload.len() as u64);
+        assert_eq!(body.kind(), RAPIDGZIP_BODY_KIND);
+
+        let mut r = body.reader().unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+
+        let mid = payload.len() / 3;
+        r.seek(SeekFrom::Start(mid as u64)).unwrap();
+        let mut buf = [0u8; 24];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &payload[mid..mid + 24]);
+
+        // Free-function wrapper.
+        let free = open_seekable_gzip_rapidgzip_fast(&path, 2048, 1).unwrap();
+        let mut fr = free.open_reader().unwrap();
+        let mut full = Vec::new();
+        fr.read_to_end(&mut full).unwrap();
+        assert_eq!(full, payload);
+    }
+
+    /// Regression: from_reader fast path matches path open payload.
+    #[test]
+    fn open_from_reader_fast_correct_payload() {
+        let payload = sample_payload();
+        let compressed = encode_gz(&payload);
+        let body = SharedRapidgzip::open_with_threads_from_reader_fast(
+            Cursor::new(compressed.clone()),
+            1024,
+            2,
+            "fast-mem.gz",
+        )
+        .expect("from_reader fast");
+        let mut r = body.reader().unwrap();
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+
+        let free = open_seekable_gzip_rapidgzip_from_reader_fast(
+            Cursor::new(compressed),
+            1024,
+            1,
+            Path::new("free-fast.gz"),
+        )
+        .unwrap();
+        let mut fr = free.open_reader().unwrap();
+        let mut full = Vec::new();
+        fr.read_to_end(&mut full).unwrap();
+        assert_eq!(full, payload);
     }
 
     #[test]
@@ -620,6 +901,46 @@ mod tests {
         });
         assert_eq!(h1.join().unwrap(), expected);
         assert_eq!(h2.join().unwrap(), expected);
+    }
+
+    /// Regression: cache/prefetch config must not break concurrent multi-open.
+    #[test]
+    fn concurrent_readers_with_prefetch_config() {
+        // Larger payload so multiple decoded windows + prefetch fire.
+        let payload: Vec<u8> = (0..200_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let (_dir, path) = write_temp_gz(&payload);
+        // Small spacing → more checkpoints; threads > 1 exercises prefetch workers.
+        let body = SharedRapidgzip::open_with_threads(&path, 4096, 4).unwrap();
+        assert!(body.checkpoint_count() >= 2);
+
+        let expected = payload.clone();
+        let mut handles = Vec::new();
+        for i in 0..4 {
+            let body = Arc::clone(&body);
+            let exp = expected.clone();
+            handles.push(std::thread::spawn(move || {
+                let mut r = body.reader().unwrap();
+                // Mix sequential full-read with random mid seeks.
+                if i % 2 == 0 {
+                    let mut out = Vec::new();
+                    r.read_to_end(&mut out).unwrap();
+                    assert_eq!(out, exp);
+                } else {
+                    let mid = exp.len() / 2;
+                    r.seek(SeekFrom::Start(mid as u64)).unwrap();
+                    let mut buf = vec![0u8; 256];
+                    r.read_exact(&mut buf).unwrap();
+                    assert_eq!(&buf, &exp[mid..mid + 256]);
+                    r.seek(SeekFrom::Start(0)).unwrap();
+                    let mut head = [0u8; 64];
+                    r.read_exact(&mut head).unwrap();
+                    assert_eq!(&head, &exp[..64]);
+                }
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
     }
 
     /// Regression: reader remains usable after move across threads (Send contract).

@@ -55,11 +55,14 @@ pub use bzip2_seek::{
 pub use compress_z_seek::{open_seekable_compress_z, open_seekable_compress_z_with_threads};
 #[cfg(feature = "gzip-rapidgzip")]
 pub use gzip_rapidgzip::{
-    open_seekable_gzip_rapidgzip, open_seekable_gzip_rapidgzip_from_reader,
+    open_seekable_gzip_rapidgzip, open_seekable_gzip_rapidgzip_fast,
+    open_seekable_gzip_rapidgzip_from_reader, open_seekable_gzip_rapidgzip_from_reader_fast,
     open_seekable_gzip_rapidgzip_with_imported_index,
     open_seekable_gzip_rapidgzip_with_imported_index_from_reader, prefer_rapidgzip_gzip_backend,
-    prefer_rapidgzip_gzip_backend_with_env, RapidgzipReader, SharedRapidgzip,
-    RAPIDGZIP_BACKEND_ENV, RAPIDGZIP_BACKEND_VALUE, RAPIDGZIP_BODY_KIND,
+    prefer_rapidgzip_gzip_backend_with_env, rapidgzip_no_crc_enabled,
+    rapidgzip_no_crc_from_env_value, RapidgzipReader, SharedRapidgzip, RAPIDGZIP_BACKEND_ENV,
+    RAPIDGZIP_BACKEND_VALUE, RAPIDGZIP_BODY_KIND, RAPIDGZIP_NO_CRC_ENV, RAPIDGZIP_SEEK_CACHE_BYTES,
+    RAPIDGZIP_SEEK_CACHE_CHUNKS, RAPIDGZIP_SEEK_PREFETCH_WINDOWS,
 };
 pub use gzip_seek::{
     encode_gzip_seek_index_blob, import_seek_points, import_seek_points_with_mode,
