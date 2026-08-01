@@ -241,6 +241,9 @@ impl OggMountSource {
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             index,
@@ -407,7 +410,14 @@ fn userdata(fi: &FileInfo) -> Option<&ratarmount_core::SQLiteIndexedTarUserData>
     })
 }
 
+/// Store tarstats from path metadata + edge hashes when available.
+///
+/// Real on-disk archives use the shared helper so warm reopen fails closed after in-place
+/// replace (size/mtime + first/last 512 SHA-256).
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
+        return Ok(());
+    }
     use std::os::unix::fs::MetadataExt;
     let meta = std::fs::metadata(path)?;
     let json = format!(
@@ -496,5 +506,125 @@ mod tests {
             }
             _ => panic!("expected infos"),
         }
+    }
+
+    /// Alternate synthetic Ogg with a different serial (and different size payload) so
+    /// warm-index replace tests can distinguish v1 vs v2 content by size and stream id.
+    fn synthetic_ogg_v2() -> Vec<u8> {
+        let payload = b"\x01vorbis\0\0\0\0\0\0\0\0EXTRA";
+        let mut page = Vec::new();
+        page.extend_from_slice(b"OggS");
+        page.push(0);
+        page.push(0x02); // BOS
+        page.extend_from_slice(&0u64.to_le_bytes());
+        page.extend_from_slice(&0xabcd_ef00u32.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.extend_from_slice(&0u32.to_le_bytes());
+        page.push(1);
+        page.push(payload.len() as u8);
+        page.extend_from_slice(payload);
+
+        let mut page2 = Vec::new();
+        page2.extend_from_slice(b"OggS");
+        page2.push(0);
+        page2.push(0x04); // EOS
+        page2.extend_from_slice(&0u64.to_le_bytes());
+        page2.extend_from_slice(&0xabcd_ef00u32.to_le_bytes());
+        page2.extend_from_slice(&1u32.to_le_bytes());
+        page2.extend_from_slice(&0u32.to_le_bytes());
+        page2.push(1);
+        page2.push(0);
+
+        let mut out = page;
+        out.extend_from_slice(&page2);
+        out
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.ogg");
+        std::fs::write(&archive, synthetic_ogg()).unwrap();
+        let index = dir.path().join("swap.ogg.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src =
+            OggMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold create");
+        let list = src.list("/").expect("list v1");
+        let ListResult::Infos(map) = list else {
+            panic!("expected infos");
+        };
+        assert!(!map.is_empty());
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        OggMountSource::open_existing(&archive, &index, &opts).expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        std::fs::write(&archive, synthetic_ogg_v2()).unwrap();
+
+        match OggMountSource::open_existing(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm OGG open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.ogg");
+        std::fs::write(&archive, synthetic_ogg()).unwrap();
+        let index = dir.path().join("swap.ogg.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src =
+            OggMountSource::open(&archive, Some(&index), &opts, "test", true).expect("cold create");
+        let list = src.list("/").expect("list v1");
+        let ListResult::Infos(map) = list else {
+            panic!("expected infos");
+        };
+        let v1_name = map.keys().next().unwrap().clone();
+        assert!(v1_name.contains("12345678"), "v1 serial in name: {v1_name}");
+        drop(src);
+        assert!(index.exists());
+
+        std::fs::write(&archive, synthetic_ogg_v2()).unwrap();
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale stream rows.
+        let src2 =
+            OggMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let list2 = src2.list("/").expect("list v2");
+        let ListResult::Infos(map2) = list2 else {
+            panic!("expected infos");
+        };
+        let v2_name = map2.keys().next().unwrap().clone();
+        assert!(
+            v2_name.contains("abcdef00"),
+            "must serve new OGG stream after tarstats mismatch rebuild: {v2_name}"
+        );
+        assert_ne!(
+            v1_name, v2_name,
+            "stream virtual name must change with content"
+        );
     }
 }
