@@ -274,6 +274,9 @@ impl CpioMountSource {
     ) -> Result<Self> {
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             backend: ContentBackend::Path(archive_path.to_path_buf()),
@@ -776,21 +779,14 @@ fn ensure_parents(
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
-    index.store_metadata_key_value("tarstats", &json)?;
+    // Shared helper: size/mtime + first/last 512 SHA-256 for warm-open fingerprint.
+    index.store_tarstats_for_path(path)?;
     Ok(())
 }
 
 /// Store tarstats for a path label; if not a real file, use synthetic stats from `size`.
 fn store_stats_for_label(index: &SqliteIndex, path: &Path, size: u64) -> Result<()> {
-    if path.exists() && store_stats(index, path).is_ok() {
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
         return Ok(());
     }
     let json = format!("{{\"st_size\":{size},\"st_mtime\":0,\"st_mtime_ns\":0}}");
@@ -953,5 +949,93 @@ mod tests {
 
         // synthetic label is not a real path; size was recorded for indexing
         let _ = size;
+    }
+
+    fn write_sample_cpio(path: &Path, name: &str, data: &[u8]) {
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let bytes = build_newc_cpio(name, data, mode);
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.cpio");
+        write_sample_cpio(&archive, "hello.txt", b"cpio-v1\n");
+        let index = dir.path().join("swap.cpio.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = CpioMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "cpio-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        CpioMountSource::open_existing(&archive, &index, &opts).expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        write_sample_cpio(&archive, "hello.txt", b"cpio-v2-longer\n");
+
+        match CpioMountSource::open_existing(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm CPIO open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.cpio");
+        write_sample_cpio(&archive, "hello.txt", b"cpio-v1\n");
+        let index = dir.path().join("swap.cpio.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            write_index: true,
+            ..OpenOptions::default()
+        };
+
+        let src = CpioMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "cpio-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        write_sample_cpio(&archive, "hello.txt", b"cpio-v2-longer\n");
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale member rows.
+        let src2 =
+            CpioMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "cpio-v2-longer\n",
+            "must serve new CPIO data after tarstats mismatch rebuild"
+        );
     }
 }
