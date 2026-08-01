@@ -63,6 +63,17 @@ struct Args {
     #[arg(short = 'l', long = "lazy", action = ArgAction::SetTrue)]
     lazy: bool,
 
+    /// Cap worker threads for eager AutoMount same-dir nested opens (FR-6 / #80).
+    /// `0` or `auto` = `available_parallelism` (default); `1` = sequential; `N≥2` = cap at N.
+    /// Only applies to eager recursive scan (`-r` without `-l`); lazy mode ignores this.
+    #[arg(
+        long = "parallel-nested",
+        default_value = "0",
+        value_name = "N",
+        value_parser = parse_parallel_nested
+    )]
+    parallel_nested: u32,
+
     /// Mount nested `foo.tar` at `foo/` instead of `foo.tar/`
     #[arg(short = 's', long = "strip-recursive-tar-extension", action = ArgAction::SetTrue)]
     strip_recursive_tar_extension: bool,
@@ -248,6 +259,16 @@ struct Args {
     /// Input archives/folders/URLs and optional mountpoint
     #[arg(required = false)]
     paths: Vec<PathBuf>,
+}
+
+/// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
+fn parse_parallel_nested(s: &str) -> Result<u32, String> {
+    let t = s.trim();
+    if t.eq_ignore_ascii_case("auto") {
+        return Ok(0);
+    }
+    t.parse::<u32>()
+        .map_err(|_| format!("expected non-negative integer or 'auto', got {s:?}"))
 }
 
 fn main() {
@@ -451,6 +472,7 @@ fn main() {
                 max_cache_entries: args.union_mount_cache_max_entries,
                 max_seconds_to_cache: args.union_mount_cache_timeout,
             },
+            parallel_nested_threads: args.parallel_nested,
         },
     ) {
         Ok(b) => b,
@@ -1059,5 +1081,70 @@ mod mount_probe_tests {
     fn path_candidates_include_raw() {
         let c = path_mount_candidates(Path::new("/nonexistent/ratarmount-test-path"));
         assert!(c.iter().any(|s| s.contains("ratarmount-test-path")));
+    }
+}
+
+#[cfg(test)]
+mod parallel_nested_cli_tests {
+    use super::{parse_parallel_nested, Args};
+    use clap::Parser;
+
+    /// Regression: FR-6 residual CLI wire — parse `--parallel-nested` values.
+    #[test]
+    fn parse_parallel_nested_values() {
+        assert_eq!(parse_parallel_nested("0").unwrap(), 0);
+        assert_eq!(parse_parallel_nested("auto").unwrap(), 0);
+        assert_eq!(parse_parallel_nested("AUTO").unwrap(), 0);
+        assert_eq!(parse_parallel_nested("  auto  ").unwrap(), 0);
+        assert_eq!(parse_parallel_nested("1").unwrap(), 1);
+        assert_eq!(parse_parallel_nested("8").unwrap(), 8);
+        assert!(parse_parallel_nested("").is_err());
+        assert!(parse_parallel_nested("nope").is_err());
+        assert!(parse_parallel_nested("-1").is_err());
+    }
+
+    /// Default omit → 0 (auto); numeric / auto flag values reach Args.
+    #[test]
+    fn cli_parallel_nested_flag_defaults_and_sets() {
+        let default = Args::try_parse_from(["ratarmount"]).expect("default parse");
+        assert_eq!(default.parallel_nested, 0);
+
+        let sequential =
+            Args::try_parse_from(["ratarmount", "--parallel-nested", "1"]).expect("seq");
+        assert_eq!(sequential.parallel_nested, 1);
+
+        let cap = Args::try_parse_from(["ratarmount", "--parallel-nested", "8"]).expect("cap");
+        assert_eq!(cap.parallel_nested, 8);
+
+        let auto = Args::try_parse_from(["ratarmount", "--parallel-nested", "auto"]).expect("auto");
+        assert_eq!(auto.parallel_nested, 0);
+
+        let zero = Args::try_parse_from(["ratarmount", "--parallel-nested", "0"]).expect("zero");
+        assert_eq!(zero.parallel_nested, 0);
+    }
+
+    /// CompositingOptions path: CLI value is the field that apply_compositing forwards.
+    #[test]
+    fn compositing_options_receives_parallel_nested() {
+        let args = Args::try_parse_from(["ratarmount", "--parallel-nested", "4"]).expect("parse");
+        let comp = crate::factory::CompositingOptions {
+            recursive: true,
+            lazy: false,
+            file_versions: true,
+            prefix: None,
+            strip_recursive_extension: false,
+            transform_recursive: None,
+            transform: None,
+            disable_union_mount: false,
+            recursive_extensions: None,
+            union_cache: ratarmount_compositing::UnionMountOptions::default(),
+            parallel_nested_threads: args.parallel_nested,
+        };
+        assert_eq!(comp.parallel_nested_threads, 4);
+        // Default CompositingOptions matches AutoMountOptions auto (0).
+        assert_eq!(
+            crate::factory::CompositingOptions::default().parallel_nested_threads,
+            0
+        );
     }
 }

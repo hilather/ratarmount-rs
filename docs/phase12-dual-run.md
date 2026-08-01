@@ -37,13 +37,13 @@ Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–13. Prefe
 | Compositing / UX | **strong** | union, automount, overlay + commit (common TAR compressions + ZIP rebuild), versions, control socket + in-FS control, lazy/transform/prefix |
 | FUSE readahead | **done** | `--readahead` sequential window (FR-5 / upstream #180); not a dual-run residual |
 | Nested / no-tmp | **strong** | Factory nested `open_from_reader` paths for common formats; residual path spool for some long-tail |
-| Parallel nested index | **done** / residual CLI | FR-6 / upstream #80 — eager AutoMount same-dir fan-out (`parallel_nested_threads`, default auto); optional CLI cap still residual |
+| Parallel nested index | **done** | FR-6 / upstream #80 — eager AutoMount same-dir fan-out; CLI `--parallel-nested N` (default auto) |
 | Remote | **broad** | http(s) Range for TAR/ZIP/gzip/bzip2/xz/zstd; S3/SSH; WebDAV/SMB/Dropbox; remote + compressed index download |
 | Index interop | **good** | SQLite 0.7.x; Py↔Rust TAR (+ ZIP/7z); side tables partial for some codec blobs; warm reimport for zstdblocks/bzip2blocks |
 | Perf / CI | **gated** | cold-index hard gate + optional full bench; fmt/clippy/test + FUSE allowlist CI |
 | Packaging | **shippable** | Makefile install, deb/rpm/portable/macOS tarballs, AppImage scaffold, cosign |
 
-**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred), FR-6 CLI wire residual (compositing parallel already default).
+**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred).
 
 ---
 

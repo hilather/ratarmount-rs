@@ -2414,6 +2414,10 @@ pub struct CompositingOptions {
     pub recursive_extensions: Option<String>,
     /// Union folder-cache knobs (Python `--union-mount-cache-*`).
     pub union_cache: UnionMountOptions,
+    /// Cap for eager AutoMount same-dir nested opens (FR-6 / #80).
+    /// `0` = auto `available_parallelism`; `1` = sequential; `N≥2` = cap workers.
+    /// Ignored when `lazy` is true. Default `0` matches [`AutoMountOptions`].
+    pub parallel_nested_threads: u32,
 }
 
 /// Apply transform / recursive AutoMount / disable-union prefix layers.
@@ -2445,9 +2449,8 @@ fn apply_compositing(
                 strip_recursive_extension: comp.strip_recursive_extension,
                 transform: comp.transform_recursive.clone(),
                 recursive_extensions: ext_set.clone(),
-                // FR-6: 0 = auto available_parallelism for eager same-dir nested opens.
-                // CLI cap residual (see docs/tasks/upstream-feature-requests.md).
-                ..Default::default()
+                // FR-6 / #80: CLI `--parallel-nested` (0 = auto available_parallelism).
+                parallel_nested_threads: comp.parallel_nested_threads,
             },
         );
         src = Arc::new(layer);
@@ -2877,6 +2880,7 @@ pub fn build_mount_source(
             disable_union_mount: false,
             recursive_extensions: None,
             union_cache: UnionMountOptions::default(),
+            parallel_nested_threads: 0, // auto
         },
     )
 }

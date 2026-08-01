@@ -1,6 +1,6 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-07-26.
+Last updated: 2026-07-31.
 
 ## Summary
 
@@ -36,7 +36,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `-e` / `--encoding` | yes | yes | `[x]` |
 | `-i` / `--ignore-zeros` | yes | yes (`-i` + long) | `[x]` |
 | `--gnu-incremental` / `--detect-gnu-incremental` | yes | **both** | `[x]` |
-| `-P` / `--parallelization` | backend matrix string | single int (reserved) | `~` |
+| `-P` / `--parallelization` | backend matrix string | matrix string (`1`/`0`/`bzip2:4,…`) | `[x]` / `~` sequential codecs API-only |
+| `--parallel-nested N` | n/a (Python uses process pool elsewhere) | **added** (`0`/`auto` = cores; `1` = sequential; `N≥2` = cap; FR-6 / #80 eager same-dir only; lazy ignores) | `[x]` |
 | `--password` | yes | yes (repeatable) | `[x]` |
 | `--password-file` | yes | **added** | `[x]` |
 | `--use-backend` | yes | **added** | `[x]` reorders uncompressed format probe (last flag highest priority) |

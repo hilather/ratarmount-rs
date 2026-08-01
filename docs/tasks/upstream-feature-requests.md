@@ -28,7 +28,7 @@ issue from the README feature tables.
 | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic auth (URL userinfo + `RATARMOUNT_HTTP_*`); cookie auth deferred |
 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB |
-| [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | Parallel index nested archives | **done** / **partial** | Eager AutoMount same-dir fan-out (`AutoMountOptions::parallel_nested_threads`, default auto); lazy still sequential; CLI/`-P` wire residual |
+| [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | Parallel index nested archives | **done** | Eager AutoMount same-dir fan-out (`AutoMountOptions::parallel_nested_threads`, default auto); lazy still sequential; CLI `--parallel-nested N` wires cap |
 
 ---
 
@@ -42,7 +42,7 @@ issue from the README feature tables.
 
 | ID | Upstream | Work | Maintainer takeaway | Suggested ownership |
 |----|----------|------|---------------------|---------------------|
-| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI wire for parallel nested cap** | Compositing + factory Default auto (`parallel_nested_threads=0`); optional CLI/`-P` still open | CLI / main |
+| FR-6 residual | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | **CLI wire for parallel nested cap** | **done** — `--parallel-nested N` (`0`/`auto` default; `1` sequential; `N≥2` cap) → `CompositingOptions` → `AutoMountOptions::parallel_nested_threads`; lazy ignores | CLI / main |
 | FR-8 | Python residual | **CAB LZX nested no-tmp residual** | **documented** — store/MSZIP no-tmp; LZX/Quantum → libarchive/temp spool (no pure LZX decoder) | formats-cab / factory |
 | FR-9 | Python residual | **Factory auto-wire zstdblocks/bzip2blocks on open** | **done** — path + Range open import side tables; skip re-export on warm hit | `ratarmount/src/factory.rs` |
 

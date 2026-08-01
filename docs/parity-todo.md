@@ -49,7 +49,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `parallel_nested_threads`); see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, RAR nested still spool; CLI wire for nested thread cap residual |
+| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild) | `[x]` TAR compressions + ZIP MVP |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
@@ -92,7 +92,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Encoding (`-e`) | yes | yes (TAR names via encoding_rs) | `[x]` |
 | Debug / log-file / color | yes | `-d` + `--log-file` + color env | `[x]` / `~` full NO_COLOR matrix |
 | OSS attributions | yes | yes (`--oss-attributions` / help) | `[x]` |
-| Parallelization matrix (`-P backend:n`) | yes | full matrix incl. zlib/lzma/Z; true parallel where codec allows; AutoMount eager nested fan-out via `AutoMountOptions::parallel_nested_threads` (default auto) | `[x]` / `~` sequential codecs still API-only; nested CLI flag residual |
+| Parallelization matrix (`-P backend:n`) | yes | full matrix incl. zlib/lzma/Z; true parallel where codec allows; AutoMount eager nested fan-out via `--parallel-nested` / `parallel_nested_threads` (default auto) | `[x]` / `~` sequential codecs still API-only |
 | Default mountpoint (strip extension) | yes | yes | `[x]` |
 
 ### Performance (ongoing)
