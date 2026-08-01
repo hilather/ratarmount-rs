@@ -221,8 +221,11 @@ impl AsarMountSource {
             if !recreate && ip.exists() && archive_path.is_file() {
                 let meta_ok = std::fs::metadata(ip).map(|m| m.len() > 0).unwrap_or(false);
                 if meta_ok {
-                    if let Ok(s) = Self::open_existing_path(&archive_path, ip, options) {
-                        return Ok(s);
+                    match Self::open_existing_path(&archive_path, ip, options) {
+                        Ok(s) => return Ok(s),
+                        Err(e) => {
+                            eprintln!("info: could not load asar index ({e}); rebuilding")
+                        }
                     }
                 }
             }
@@ -242,9 +245,14 @@ impl AsarMountSource {
         index_path: &Path,
         options: &OpenOptions,
     ) -> Result<Self> {
-        let file = File::open(archive_path)?;
+        // Index + fingerprint first: reject a sibling index for a replaced archive
+        // before trusting files rows / stencil opens.
         let index = SqliteIndex::open_read_only(index_path)?;
         index.check_backend_name(BACKEND_NAME)?;
+        // Reject sibling indexes for a replaced archive (size/mtime/edge hash).
+        // Missing tarstats still Ok (legacy indexes).
+        index.check_tarstats_matches_archive(archive_path)?;
+        let file = File::open(archive_path)?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
@@ -288,6 +296,9 @@ impl AsarMountSource {
 
         index.store_versions(product_version)?;
         index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+        // Real on-disk archives: store size/mtime + edge hashes so warm reopen
+        // fails closed after in-place replace. Nested/virtual labels skip.
+        store_stats_for_label(&index, archive_path)?;
         index.commit_write()?;
         println!(
             "Creating offset dictionary for {} took {:.2}s",
@@ -304,6 +315,16 @@ impl AsarMountSource {
             options: options.clone(),
         })
     }
+}
+
+/// Store tarstats from path metadata + edge hashes when the label is a real file.
+///
+/// Nested / virtual labels leave tarstats absent (legacy-compatible warm check allows).
+fn store_stats_for_label(index: &SqliteIndex, path: &Path) -> Result<()> {
+    if path.is_file() {
+        index.store_tarstats_for_path(path)?;
+    }
+    Ok(())
 }
 
 fn entry_to_row(full_path: &str, entry: &Value, data_offset: u64) -> Option<FileRow> {
@@ -684,5 +705,88 @@ mod tests {
             .read_to_end(&mut br)
             .unwrap();
         assert_eq!(bp, br);
+    }
+
+    /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.
+    #[test]
+    fn warm_index_rejects_when_archive_size_or_mtime_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.asar");
+        std::fs::write(&archive, build_minimal_asar(&[("hello.txt", b"asar-v1\n")])).unwrap();
+        let index = dir.path().join("swap.asar.index.sqlite");
+        let opts = OpenOptions::default();
+
+        let src = AsarMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "asar-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        // Matching archive still opens warm.
+        AsarMountSource::open_existing_path(&archive, &index, &opts)
+            .expect("warm match must succeed");
+
+        // Replace archive content (size change) while reusing the sibling index path.
+        std::fs::write(
+            &archive,
+            build_minimal_asar(&[("hello.txt", b"asar-v2-longer\n")]),
+        )
+        .unwrap();
+
+        match AsarMountSource::open_existing_path(&archive, &index, &opts) {
+            Ok(_) => panic!("stale index must fail open_existing after archive replace"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("fingerprint"),
+                    "unexpected error (expected tarstats mismatch): {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: warm ASAR open rebuilds when archive content no longer matches tarstats.
+    #[test]
+    fn warm_index_rebuilds_when_archive_content_replaced() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("swap.asar");
+        std::fs::write(&archive, build_minimal_asar(&[("hello.txt", b"asar-v1\n")])).unwrap();
+        let index = dir.path().join("swap.asar.index.sqlite");
+        let opts = OpenOptions::default();
+
+        let src = AsarMountSource::open(&archive, Some(&index), &opts, "test", true)
+            .expect("cold create");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup v1");
+        let mut buf = String::new();
+        src.open(&fi, 0).unwrap().read_to_string(&mut buf).unwrap();
+        assert_eq!(buf, "asar-v1\n");
+        drop(src);
+        assert!(index.exists());
+
+        std::fs::write(
+            &archive,
+            build_minimal_asar(&[("hello.txt", b"asar-v2-longer\n")]),
+        )
+        .unwrap();
+
+        // recreate=false: tarstats mismatch must rebuild, not serve stale member rows.
+        let src2 =
+            AsarMountSource::open(&archive, Some(&index), &opts, "test", false).expect("warm");
+        let fi2 = src2.lookup("/hello.txt", 0).expect("lookup v2");
+        let mut buf2 = String::new();
+        src2.open(&fi2, 0)
+            .unwrap()
+            .read_to_string(&mut buf2)
+            .unwrap();
+        assert_eq!(
+            buf2, "asar-v2-longer\n",
+            "must serve new ASAR data after tarstats mismatch rebuild"
+        );
     }
 }
