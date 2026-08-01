@@ -106,7 +106,7 @@ Separate from wiring (path/nested/Range + GZIDX **done**): even on the verified 
 | Path prefer + G3 fallback | **Done** | — |
 | Path GZIDX import | **Done** | `SharedRapidgzip::open_with_imported_index` |
 | Path GZIDX persist | **Done** | `SharedRapidgzip::export_gzidx_blob` + `SqliteIndex::set_gzip_index_blob` |
-| Nested `from_reader` | **Done** | `open_seekable_gzip_rapidgzip_from_reader` |
+| Nested `from_reader` | **Done** (fail → rewind G3 when Seek) | `open_seekable_gzip_rapidgzip_from_reader` |
 | Nested imported index | Not wired (no nested side table) | `…_with_imported_index_from_reader` exists in compress |
 | HTTP/S3 Range | **Done** (prefer + import; reopen on fail → rebuild / G3) | same `from_reader` / `…_with_imported_index_from_reader` APIs |
 

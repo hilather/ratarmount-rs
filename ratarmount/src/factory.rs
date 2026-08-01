@@ -805,13 +805,81 @@ fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
     exts.iter().any(|e| name.ends_with(&format!(".{e}")))
 }
 
+/// Seek a nested gzip compressed stream to byte 0 before a G3 open attempt.
+///
+/// Used after a failed prefer-rapidgzip `from_reader` so
+/// [`SharedSeekableGzip::open_with_threads_from_reader`] can re-scan from the start.
+fn rewind_nested_gzip_reader_for_g3(reader: &mut dyn std::io::Seek) -> std::io::Result<()> {
+    std::io::Seek::seek(reader, std::io::SeekFrom::Start(0))?;
+    Ok(())
+}
+
+/// Shared ownership of a nested compressed body so rapidgzip open failure can
+/// recover the stream for G3 (rapidgzip takes `R` by value).
+#[cfg(feature = "gzip-rapidgzip")]
+type NestedGzipReaderHeld = Arc<std::sync::Mutex<Box<dyn ratarmount_core::ArchiveRead>>>;
+
+/// `Read + Seek + Send` facade over [`NestedGzipReaderHeld`] for rapidgzip open.
+#[cfg(feature = "gzip-rapidgzip")]
+struct NestedRecoverableGzipReader {
+    inner: NestedGzipReaderHeld,
+}
+
+#[cfg(feature = "gzip-rapidgzip")]
+impl std::io::Read for NestedRecoverableGzipReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        std::io::Read::read(
+            &mut **self.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            buf,
+        )
+    }
+}
+
+#[cfg(feature = "gzip-rapidgzip")]
+impl std::io::Seek for NestedRecoverableGzipReader {
+    fn seek(&mut self, pos: std::io::SeekFrom) -> std::io::Result<u64> {
+        std::io::Seek::seek(
+            &mut **self.inner.lock().unwrap_or_else(|e| e.into_inner()),
+            pos,
+        )
+    }
+}
+
+/// Recover the nested stream after rapidgzip dropped its `R`, then rewind to 0.
+///
+/// Residual: `Arc` still shared (unexpected holder) or `seek(Start(0))` fails →
+/// G3 fallback is impossible.
+#[cfg(feature = "gzip-rapidgzip")]
+fn take_and_rewind_nested_gzip_reader(
+    held: NestedGzipReaderHeld,
+) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+    let mut reader = Arc::try_unwrap(held)
+        .map_err(|_| {
+            std::io::Error::other(
+                "nested compressed reader still held after rapidgzip failure; cannot rewind for G3",
+            )
+        })?
+        .into_inner()
+        .unwrap_or_else(|e| e.into_inner());
+    rewind_nested_gzip_reader_for_g3(reader.as_mut()).map_err(|e| {
+        std::io::Error::other(format!(
+            "rewind nested gzip reader for G3 fallback failed: {e}"
+        ))
+    })?;
+    Ok(reader)
+}
+
 /// Nested gzip body: seekable checkpoints + TAR / format / single-file (no temp spool).
 ///
 /// With `gzip-rapidgzip` + prefer backend, uses rapidgzip `from_reader` (kind
-/// `gzip-rapidgzip`). On failure the reader is consumed so G3 cannot run — return
-/// the error. Without prefer, G3 [`SharedSeekableGzip`] (still no temp spool).
+/// `gzip-rapidgzip`). On failure, if the held reader can be recovered and
+/// [`rewind_nested_gzip_reader_for_g3`] succeeds, falls through to G3
+/// [`SharedSeekableGzip::open_with_threads_from_reader`]. Residual: if recover
+/// or rewind fails (or another holder still owns the stream), return the
+/// rapidgzip error — there is no Range-style reopen for nested bodies.
+/// Without prefer, G3 only (still no temp spool).
 fn open_nested_gzip_tar(
-    reader: Box<dyn ratarmount_core::ArchiveRead>,
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
     opts: &OpenOptions,
 ) -> std::io::Result<Arc<dyn MountSource>> {
@@ -829,8 +897,16 @@ fn open_nested_gzip_tar(
     #[cfg(feature = "gzip-rapidgzip")]
     if ratarmount_compress::prefer_rapidgzip_gzip_backend(&opts.use_backends) {
         let rg_threads = rapidgzip_threads(opts);
+        // Hold the stream under Arc so a failed rapidgzip open (which takes
+        // ownership of R) does not drop the compressed body — we can rewind
+        // and fall through to G3. ArchiveRead is always Seek; residual is
+        // recover/rewind failure, not a non-Seek trait object.
+        let held: NestedGzipReaderHeld = Arc::new(std::sync::Mutex::new(reader));
+        let attempt = NestedRecoverableGzipReader {
+            inner: Arc::clone(&held),
+        };
         match ratarmount_compress::open_seekable_gzip_rapidgzip_from_reader(
-            reader, spacing, rg_threads, label,
+            attempt, spacing, rg_threads, label,
         ) {
             Ok(body) => {
                 log::debug!(
@@ -850,11 +926,28 @@ fn open_nested_gzip_tar(
                 return open_nested_non_tar_seekable_body(label, body, opts, "gzip-rapidgzip");
             }
             Err(e) => {
-                // Reader was consumed — cannot fall back to G3 without a reopen path.
-                log::warn!("nested rapidgzip open failed for {}: {e}", label.display());
-                return Err(std::io::Error::other(format!(
-                    "nested rapidgzip open failed: {e}"
-                )));
+                match take_and_rewind_nested_gzip_reader(held) {
+                    Ok(recovered) => {
+                        log::info!(
+                            "nested rapidgzip open failed for {}: {e}; falling back to G3 seekable gzip",
+                            label.display()
+                        );
+                        eprintln!(
+                            "info: nested rapidgzip open failed ({e}); falling back to G3 seekable gzip"
+                        );
+                        reader = recovered;
+                        // Fall through to SharedSeekableGzip below.
+                    }
+                    Err(rewind_err) => {
+                        log::warn!(
+                            "nested rapidgzip open failed for {} ({e}); cannot fall back to G3: {rewind_err}",
+                            label.display()
+                        );
+                        return Err(std::io::Error::other(format!(
+                            "nested rapidgzip open failed: {e} (G3 fallback unavailable: {rewind_err})"
+                        )));
+                    }
+                }
             }
         }
     }
@@ -1655,8 +1748,10 @@ fn persist_rapidgzip_index_blob(
 /// With feature `gzip-rapidgzip` and `RATARMOUNT_GZIP_BACKEND=rapidgzip` (or
 /// `--use-backend rapidgzip`), path / nested / Range opens prefer the parallel
 /// IndexedReader backend (typed [`SharedRapidgzip`](ratarmount_compress::SharedRapidgzip)
-/// for GZIDX import/export) and fall back to G3 on path open failure (nested has no
-/// reopen — prefer failure returns error; Range reopens when possible).
+/// for GZIDX import/export) and fall back to G3 on path open failure, nested
+/// prefer failure after rewind when the stream is recoverable, and Range reopen
+/// when a fresh handle remains. Residual: nested recover/rewind failure has no
+/// second handle (unlike path reopen / Range).
 fn open_gzip(
     path: &Path,
     index_path: Option<&Path>,
@@ -4580,6 +4675,148 @@ mod tests {
         assert_eq!(read_all(inner.as_ref(), "/nested.bin"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/nested.bin", 8);
         assert_eq!(mid.as_slice(), &payload[8..]);
+    }
+
+    /// Unit: rewind helper resets cursor to 0 for G3 fall-through.
+    #[test]
+    fn rewind_nested_gzip_reader_for_g3_resets_position() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        let mut cur = Cursor::new(vec![10u8, 20, 30, 40]);
+        cur.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(cur.stream_position().unwrap(), 4);
+        rewind_nested_gzip_reader_for_g3(&mut cur).expect("rewind");
+        assert_eq!(cur.stream_position().unwrap(), 0);
+        let mut b = [0u8; 2];
+        cur.read_exact(&mut b).unwrap();
+        assert_eq!(b, [10, 20]);
+    }
+
+    /// Regression: nested prefer rapidgzip fails → rewind → G3 still opens valid gzip.
+    ///
+    /// `open_nested_reader_fn` sniffs magic with the first `Read`; the second `Read`
+    /// (rapidgzip keep_index / ReadAt) is poisoned once so prefer fails; later reads
+    /// succeed for G3 after factory rewind. Single rapidgzip worker avoids parallel
+    /// ReadAt racing past the one-shot poison.
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn nested_plain_gzip_prefer_rapidgzip_fail_rewinds_to_g3() {
+        use std::io::{Read, Seek, SeekFrom};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct FailSecondReadThenOk {
+            data: Vec<u8>,
+            pos: u64,
+            /// Number of `read` calls so far (magic sniff is #1).
+            read_calls: AtomicUsize,
+        }
+
+        impl Read for FailSecondReadThenOk {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let n = self.read_calls.fetch_add(1, Ordering::SeqCst) + 1;
+                // 1 = nested magic sniff (must succeed for gzip probe).
+                // 2 = first rapidgzip compressed ReadAt (poison → G3 fallback).
+                if n == 2 {
+                    return Err(std::io::Error::other(
+                        "simulated rapidgzip decode failure before factory rewind",
+                    ));
+                }
+                let start = self.pos as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                let nread = buf.len().min(self.data.len() - start);
+                buf[..nread].copy_from_slice(&self.data[start..start + nread]);
+                self.pos += nread as u64;
+                Ok(nread)
+            }
+        }
+
+        impl Seek for FailSecondReadThenOk {
+            fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+                let len = self.data.len() as u64;
+                let next = match pos {
+                    SeekFrom::Start(o) => o,
+                    SeekFrom::End(o) => {
+                        if o >= 0 {
+                            len.saturating_add(o as u64)
+                        } else {
+                            len.saturating_sub((-o) as u64)
+                        }
+                    }
+                    SeekFrom::Current(o) => {
+                        if o >= 0 {
+                            self.pos.saturating_add(o as u64)
+                        } else {
+                            self.pos.saturating_sub((-o) as u64)
+                        }
+                    }
+                };
+                if next > len {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "seek past end",
+                    ));
+                }
+                self.pos = next;
+                Ok(self.pos)
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"nested-rgz-fail-then-G3-payload\n";
+        let plain = dir.path().join("nested.bin");
+        std::fs::write(&plain, payload).expect("write");
+        let gz = dir.path().join("nested.bin.gz");
+        let status = Command::new("gzip")
+            .args(["-c"])
+            .arg(&plain)
+            .stdout(std::fs::File::create(&gz).expect("create gz"))
+            .status()
+            .expect("spawn gzip");
+        assert!(status.success(), "gzip CLI failed");
+        let bytes = std::fs::read(&gz).expect("read gz");
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            gzip_seek_point_spacing: 16 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            // Single worker: one poisoned Read must abort rapidgzip before G3.
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:1,rapidgzip-gzip:1")
+                .unwrap(),
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(FailSecondReadThenOk {
+            data: bytes,
+            pos: 0,
+            read_calls: AtomicUsize::new(0),
+        });
+        let inner = opener(boxed, Path::new("nested.bin.gz")).expect(
+            "nested prefer rapidgzip fail must rewind and open via G3 when stream is recoverable",
+        );
+        assert_eq!(read_all(inner.as_ref(), "/nested.bin"), payload);
+        let mid = read_seek_mid(inner.as_ref(), "/nested.bin", 7);
+        assert_eq!(mid.as_slice(), &payload[7..]);
+    }
+
+    /// Unit: take_and_rewind recovers Arc-held reader and seeks to 0.
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn take_and_rewind_nested_gzip_reader_recovers_cursor() {
+        use std::io::{Cursor, Read, Seek, SeekFrom};
+        let held: NestedGzipReaderHeld =
+            Arc::new(std::sync::Mutex::new(Box::new(Cursor::new(vec![
+                1u8, 2, 3, 4, 5,
+            ]))));
+        {
+            let mut g = held.lock().unwrap();
+            g.seek(SeekFrom::Start(3)).unwrap();
+        }
+        let mut recovered = take_and_rewind_nested_gzip_reader(held).expect("recover+rewind");
+        assert_eq!(recovered.stream_position().unwrap(), 0);
+        let mut b = [0u8; 3];
+        recovered.read_exact(&mut b).unwrap();
+        assert_eq!(b, [1, 2, 3]);
     }
 
     /// Plain `.zst` / `.bz2` via seekable body (same no-materialize path as gzip).
