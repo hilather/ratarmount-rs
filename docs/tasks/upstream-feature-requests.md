@@ -25,7 +25,7 @@ issue from the README feature tables.
 | [#95](https://github.com/mxmlnkn/ratarmount/issues/95) | Indexes from un-seekable fileobj | **partial** | Materialize/spool path for some inputs; true non-seek still limited |
 | [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples | **done** | User guide: [`docs/zstd-random-access.md`](../zstd-random-access.md) |
 | [#154](https://github.com/mxmlnkn/ratarmount/issues/154) | ZIP commit-overlay | **done** (MVP) | Full rebuild in `commit_overlay`; residual encrypted/multi-part |
-| [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic auth (URL userinfo + `RATARMOUNT_HTTP_*`); cookie auth deferred |
+| [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | HTTP(S) authentication | **done** / **partial** | Basic (URL userinfo + `RATARMOUNT_HTTP_USER`/`PASSWORD`) + Cookie (`RATARMOUNT_HTTP_COOKIE` / `COOKIE_FILE`); residual full browser jar / Set-Cookie |
 | [#105](https://github.com/mxmlnkn/ratarmount/issues/105) | Parallel large ZIP deflate members | **done** | Single-flight Deflate cache + parallel multi-member open/hash |
 | [#180](https://github.com/mxmlnkn/ratarmount/issues/180) | Readahead-like option | **done** | `--readahead BYTES` (K/M/G); per-open sequential window up to 64 MiB |
 | [#80](https://github.com/mxmlnkn/ratarmount/issues/80) | Parallel index nested archives | **done** | Eager AutoMount same-dir fan-out (`AutoMountOptions::parallel_nested_threads`, default auto); lazy still sequential; CLI `--parallel-nested N` wires cap |
@@ -55,14 +55,15 @@ issue from the README feature tables.
 | FR-13 | [#175](https://github.com/mxmlnkn/ratarmount/issues/175) | LD_PRELOAD / syscall wrap FS | Not FUSE; library path exists; out of product scope for now |
 | FR-14 | [#192](https://github.com/mxmlnkn/ratarmount/issues/192) | SQL-free lightweight index | Competing index format; large design |
 | FR-15 | Pure RAR / pure lrzip | Beyond libarchive/CLI | Accepted dual-run residual |
-| FR-2 residual | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | Cookie-based HTTP auth | Maintainer: harder; Basic auth done |
+| FR-2 residual | [#157](https://github.com/mxmlnkn/ratarmount/issues/157) | Full browser cookie jar / Set-Cookie | Env Cookie MVP done; no per-domain jar |
 
 ---
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire), FR-10 (`--union-resolve-symlinks` + B-4).
+**Done:** FR-1, FR-2 (Basic + Cookie env), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire), FR-10 (`--union-resolve-symlinks` + B-4).
 
 1. **FR-8 residual** Pure LZX decoder remains out of scope; documented spool path is accepted.
+2. **Warm tarstats** remaining formats (WARC/CAB/XAR/ASAR/libarchive/…) after AR/CPIO/ISO/7z/ZIP/TAR.
 
 Update this file when status changes. Keep README **Upstream** column in sync.

@@ -147,7 +147,7 @@ Track detail in [`parity-todo.md`](parity-todo.md), [`tasks/gap-implementation-b
 | Full fixed-archive ≥90% | allowlist expanding | Track gaps; not cutover-hard |
 | Pure `/dev/fuse` ABI (Annex A) | deferred | `fuser` remains product path |
 | macOS harness depth / Homebrew formula | beta tarballs + CI | See [`macos.md`](macos.md) |
-| Cookie HTTP auth (FR-2 residual) | Basic auth done | Use URL userinfo / env Basic; cookies deferred |
+| Cookie HTTP auth (FR-2 residual) | Env Cookie + Basic done | Full browser jar / Set-Cookie residual only |
 | Writable/rename on compressed TAR (FR-11) | Python residual too | Use overlay + commit where supported |
 
 ---
@@ -302,7 +302,7 @@ model, residual gaps, and deprecation timeline.
 - Progressive multi-GB solid 7z with exotic filters (BCJ/AES full-folder residual)
 - Encrypted ZIP true per-disk offset edges; SQLAR without sqlcipher feature
 - SquashFS classic lzma via `unsquashfs`; some PDF color spaces
-- Cookie-based HTTP auth; pure `/dev/fuse` ABI (fuser remains the product path)
+- Full browser HTTP cookie jar (env Cookie MVP shipped); pure `/dev/fuse` ABI (fuser remains the product path)
 - Full fixed-archive ≥90% Python triple parity (tracked, not cutover-hard)
 
 Details and mitigations: docs/phase12-dual-run.md

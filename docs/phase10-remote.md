@@ -5,7 +5,7 @@
 | Scheme | Behavior |
 |--------|----------|
 | `file://` | Map to local path |
-| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic auth** (URL userinfo and/or env) on HEAD/GET/Range |
+| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range |
 | `s3://bucket/key` | AWS SigV4 GetObject → temp file |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
@@ -24,11 +24,24 @@
 | Env | `RATARMOUNT_HTTP_USER` + optional `RATARMOUNT_HTTP_PASSWORD` when the URL has no username |
 | URL user + env password | Username in URL, password from `RATARMOUNT_HTTP_PASSWORD` if omitted in the URL |
 
-URL userinfo wins over env username. **401 Unauthorized** returns a clear error naming these credential sources. Cookie-based auth is not supported.
+URL userinfo wins over env username. **401 Unauthorized** returns a clear error naming these credential sources.
+
+### HTTP(S) Cookie authentication (FR-2 residual / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
+
+A `Cookie` header is sent on HEAD, full GET, and Range GETs when configured. Combines with Basic when both are set.
+
+| Source | Behavior |
+|--------|----------|
+| `RATARMOUNT_HTTP_COOKIE` | Raw `Cookie` header value (e.g. `session=abc; token=xyz`). Wins over file when both set. |
+| `RATARMOUNT_HTTP_COOKIE_FILE` | Path to Netscape jar lines and/or simple `name=value` lines (joined with `"; "`) |
+
+**Residual:** no browser-style jar, no `Set-Cookie` persistence, no per-domain store. Values are redacted in debug logs.
 
 ```bash
 ratarmount -f 'https://user:pass@example.com/archives/a.tar' mnt/
 RATARMOUNT_HTTP_USER=user RATARMOUNT_HTTP_PASSWORD=pass \
+  ratarmount -f https://example.com/archives/a.tar mnt/
+RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
   ratarmount -f https://example.com/archives/a.tar mnt/
 ```
 

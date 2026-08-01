@@ -86,7 +86,7 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 |---------|:------:|:----:|------------------|
 | Recursive automount (`-r`) | yes | **yes** | **no `/tmp`** for most nested formats ([guide](docs/embedded-nested-archives.md)); eager on huge trees can be costly — prefer `-l` ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)) |
 | Lazy mount (`-l`) | yes | **yes** | Prefer for large recursive trees (mount nested on first access) |
-| Union of multiple sources | yes | **yes** | + folder cache; **directory wins over symlink** ([#164](https://github.com/mxmlnkn/ratarmount/issues/164)); optional deeper symlink-resolve flag still open ([#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
+| Union of multiple sources | yes | **yes** | + folder cache; **directory wins over symlink** ([#164](https://github.com/mxmlnkn/ratarmount/issues/164)); optional multi-hop resolve (`--union-resolve-symlinks`, [#160](https://github.com/mxmlnkn/ratarmount/issues/160)) |
 | Write overlay (`-w` / `:temp:`) | yes | **yes** | |
 | `--commit-overlay` | yes | **yes** | TAR + gzip/bzip2/xz (GNU tar); **ZIP full rebuild** ([#154](https://github.com/mxmlnkn/ratarmount/issues/154)) — not in-place; residual encrypted/multi-part |
 | File versions (`.versions/`) | yes | **yes** | default on; `--no-file-versions` |
@@ -105,7 +105,7 @@ was requested or designed there. Living backlog of open upstream-inspired work:
 | Protocol | Python | Rust | Upstream / notes |
 |----------|:------:|:----:|------------------|
 | `file://` | yes | **yes** | |
-| `http(s)://` | yes | **yes** | GET + **live Range** (TAR/ZIP/main codecs); **HTTP Basic auth** ([#157](https://github.com/mxmlnkn/ratarmount/issues/157): URL `user:pass@` or `RATARMOUNT_HTTP_USER`/`RATARMOUNT_HTTP_PASSWORD`; cookies deferred) |
+| `http(s)://` | yes | **yes** | GET + **live Range** (TAR/ZIP/main codecs); **HTTP Basic** + **Cookie** auth ([#157](https://github.com/mxmlnkn/ratarmount/issues/157): URL userinfo / `RATARMOUNT_HTTP_USER`+`PASSWORD`; `RATARMOUNT_HTTP_COOKIE` or `RATARMOUNT_HTTP_COOKIE_FILE`; no full browser jar) |
 | `s3://` | yes | **yes** | SigV4 env + IMDS/ECS + anonymous; Range prefer |
 | `ssh://` / `sftp://` | yes | **yes** | residual full `ssh_config` |
 | WebDAV / SMB / Dropbox | yes | **yes** | folder list + ranged content |
@@ -124,7 +124,7 @@ Still missing or partial relative to upstream Python (and open upstream issues w
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher feature; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` MVP done (full rebuild; residual encrypted/multi-part); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
-5. **Remote** — HTTP **Basic auth done** ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); cookie auth residual; full `ssh_config`.
+5. **Remote** — HTTP Basic + Cookie env auth done ([#157](https://github.com/mxmlnkn/ratarmount/issues/157)); residual: full browser cookie jar; full `ssh_config` edges.
 6. **Perf options** — readahead **done** (`--readahead BYTES`, [#180](https://github.com/mxmlnkn/ratarmount/issues/180)); parallel nested indexing **done** ([#80](https://github.com/mxmlnkn/ratarmount/issues/80), `--parallel-nested`; ZIP deflate multi-open: done).
 7. **Platforms** — macOS **beta** ([docs/macos.md](docs/macos.md)); harness allowlist expansion toward Python fixed-archive set.
 
