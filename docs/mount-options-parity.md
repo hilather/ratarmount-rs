@@ -45,6 +45,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--union-mount-cache-max-depth` | yes | yes (folder→sources cache) | `[x]` |
 | `--union-mount-cache-max-entries` | yes | yes | `[x]` |
 | `--union-mount-cache-timeout` | yes | yes (seconds) | `[x]` |
+| `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged) | `~` Rust-only FR-10 residual |
 | `--index-file` / `:memory:` / folders | yes | yes | `[x]` |
 | Remote/compressed index URL | yes | no | `[ ]` |
 | `--verify-mtime` | yes | yes | `[x]` |

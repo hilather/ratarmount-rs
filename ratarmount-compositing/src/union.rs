@@ -9,8 +9,14 @@
 //! merges children from every source that contributes a directory or a
 //! followable symlink at that path, and never replaces a listed directory
 //! entry with a symlink.
+//!
+//! **Optional symlink resolve (FR-10 / mxmlnkn/ratarmount#160):** when
+//! [`UnionMountOptions::resolve_symlinks`] is true, after the normal union pick
+//! a winning symlink is followed within its **chosen source** (multi-hop, hop
+//! cap + cycle detection). Real directories still beat symlinks at version 0
+//! (B-4 is not relaxed). Default is false (preserve symlink FileInfo).
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io;
 use std::sync::Arc;
 use std::time::Instant;
@@ -21,7 +27,11 @@ use ratarmount_core::{
     ListResult, MountSource, UserData,
 };
 
-/// Options for building the union folder cache (Python `--union-mount-cache-*`).
+/// Max symlink hops when [`UnionMountOptions::resolve_symlinks`] is enabled.
+const MAX_SYMLINK_RESOLVE_HOPS: usize = 8;
+
+/// Options for building the union folder cache (Python `--union-mount-cache-*`)
+/// and optional symlink resolution (Rust `--union-resolve-symlinks`).
 #[derive(Clone, Debug)]
 pub struct UnionMountOptions {
     /// Maximum directory depth to pre-scan (default 1024).
@@ -30,6 +40,9 @@ pub struct UnionMountOptions {
     pub max_cache_entries: usize,
     /// Wall-clock seconds allowed for cache build (default 60).
     pub max_seconds_to_cache: f64,
+    /// When true, follow symlink winners within their source after the union
+    /// pick (FR-10 / #160). Default false keeps B-4 + one-hop list behavior.
+    pub resolve_symlinks: bool,
 }
 
 impl Default for UnionMountOptions {
@@ -38,6 +51,7 @@ impl Default for UnionMountOptions {
             max_cache_depth: 1024,
             max_cache_entries: 100_000,
             max_seconds_to_cache: 60.0,
+            resolve_symlinks: false,
         }
     }
 }
@@ -49,6 +63,8 @@ pub struct UnionMountSource {
     folder_cache: HashMap<String, Vec<usize>>,
     /// Depth actually cached (0 = only `/` or empty).
     folder_cache_depth: usize,
+    /// When true, resolve winning symlinks within the chosen source (FR-10).
+    resolve_symlinks: bool,
 }
 
 impl UnionMountSource {
@@ -61,6 +77,7 @@ impl UnionMountSource {
             sources,
             folder_cache: HashMap::new(),
             folder_cache_depth: 0,
+            resolve_symlinks: opts.resolve_symlinks,
         };
         if u.sources.len() > 1 {
             u.build_folder_cache(
@@ -70,6 +87,11 @@ impl UnionMountSource {
             );
         }
         u
+    }
+
+    /// Whether this union resolves symlink winners (see [`UnionMountOptions::resolve_symlinks`]).
+    pub fn resolve_symlinks(&self) -> bool {
+        self.resolve_symlinks
     }
 
     pub fn sources(&self) -> &[Arc<dyn MountSource>] {
@@ -123,10 +145,13 @@ impl UnionMountSource {
                         );
                         return;
                     }
-                    // List via the same one-hop symlink follow as B-4 `list`, so
+                    // List via the same symlink follow as B-4 `list`, so
                     // walk continues into symlink→dir branches (immutable archives).
-                    let Some(listing) = Self::list_from_source(self.sources[si].as_ref(), folder)
-                    else {
+                    let Some(listing) = Self::list_from_source(
+                        self.sources[si].as_ref(),
+                        folder,
+                        self.resolve_symlinks,
+                    ) else {
                         continue;
                     };
                     let names: Vec<String> = match listing {
@@ -150,7 +175,13 @@ impl UnionMountSource {
                         // Previously only S_IFDIR was recorded, so immutable sources
                         // with a symlink branch were dropped from sources_for_path
                         // → lookup/open ENOENT after list still showed their children.
-                        if Self::list_from_source(self.sources[si].as_ref(), &full).is_none() {
+                        if Self::list_from_source(
+                            self.sources[si].as_ref(),
+                            &full,
+                            self.resolve_symlinks,
+                        )
+                        .is_none()
+                        {
                             continue;
                         }
                         entries_left = entries_left.saturating_sub(1);
@@ -241,8 +272,13 @@ impl UnionMountSource {
     }
 
     /// List a path from one source. If the source has a symlink at `path`, try to
-    /// follow one level within that source so symlink→dir branches still contribute.
-    fn list_from_source(src: &dyn MountSource, path: &str) -> Option<ListResult> {
+    /// follow within that source so symlink→dir branches still contribute.
+    /// Default: one hop (B-4). With `resolve_symlinks`, multi-hop up to the cap.
+    fn list_from_source(
+        src: &dyn MountSource,
+        path: &str,
+        resolve_symlinks: bool,
+    ) -> Option<ListResult> {
         if let Some(listing) = src.list(path) {
             return Some(listing);
         }
@@ -250,8 +286,80 @@ impl UnionMountSource {
         if !is_lnk_mode(fi.mode) || fi.linkname.is_empty() {
             return None;
         }
-        let target = resolve_symlink_target(path, &fi.linkname);
-        src.list(&target)
+        let max_hops = if resolve_symlinks {
+            MAX_SYMLINK_RESOLVE_HOPS
+        } else {
+            1
+        };
+        let mut current_path = path.to_string();
+        let mut current = fi;
+        let mut seen = HashSet::new();
+        seen.insert(current_path.clone());
+        for _ in 0..max_hops {
+            if !is_lnk_mode(current.mode) || current.linkname.is_empty() {
+                break;
+            }
+            let target = resolve_symlink_target(&current_path, &current.linkname);
+            if !seen.insert(target.clone()) {
+                return None; // cycle
+            }
+            if let Some(listing) = src.list(&target) {
+                return Some(listing);
+            }
+            current = src.lookup(&target, 0)?;
+            current_path = target;
+        }
+        None
+    }
+
+    /// After a union pick, optionally follow a winning symlink within `src`.
+    /// Returns the final non-symlink FileInfo, or None on cycle / hop limit / broken link.
+    fn maybe_resolve_winner(
+        src: &dyn MountSource,
+        path: &str,
+        fi: FileInfo,
+        resolve_symlinks: bool,
+    ) -> Option<FileInfo> {
+        if !resolve_symlinks || !is_lnk_mode(fi.mode) {
+            return Some(fi);
+        }
+        Self::resolve_symlink_chain(src, path, fi)
+    }
+
+    /// Follow symlink hops within one source; stop at first non-symlink.
+    fn resolve_symlink_chain(src: &dyn MountSource, path: &str, fi: FileInfo) -> Option<FileInfo> {
+        let mut current_path = path.to_string();
+        let mut current = fi;
+        let mut seen = HashSet::new();
+        seen.insert(current_path.clone());
+        for _ in 0..MAX_SYMLINK_RESOLVE_HOPS {
+            if !is_lnk_mode(current.mode) {
+                return Some(current);
+            }
+            if current.linkname.is_empty() {
+                return None;
+            }
+            let target = resolve_symlink_target(&current_path, &current.linkname);
+            if !seen.insert(target.clone()) {
+                return None; // cycle
+            }
+            current = src.lookup(&target, 0)?;
+            current_path = target;
+        }
+        // Exceeded hop cap while still a symlink (or last hop still link).
+        if is_lnk_mode(current.mode) {
+            None
+        } else {
+            Some(current)
+        }
+    }
+
+    /// Path userdata from a FileInfo (folder sources store the virtual path).
+    fn path_from_file_info(file_info: &FileInfo) -> Option<&str> {
+        file_info.userdata.iter().rev().find_map(|u| match u {
+            UserData::Other(s) if !s.starts_with("union:") => Some(s.as_str()),
+            _ => None,
+        })
     }
 }
 
@@ -262,8 +370,12 @@ impl MountSource for UnionMountSource {
         let mut any = false;
         // List merges all sources (cache is for lookup hot path, not listing).
         // Sources with a real directory *or* a followable symlink at `path` contribute.
+        // Children are merged first (B-4 dir>symlink), then optionally resolved so a
+        // resolved file cannot clobber a real directory the way a raw symlink cannot.
         for (si, src) in self.sources.iter().enumerate() {
-            if let Some(listing) = Self::list_from_source(src.as_ref(), &path) {
+            if let Some(listing) =
+                Self::list_from_source(src.as_ref(), &path, self.resolve_symlinks)
+            {
                 any = true;
                 match listing {
                     ListResult::Infos(m) => {
@@ -281,11 +393,39 @@ impl MountSource for UnionMountSource {
                 }
             }
         }
-        if any {
-            Some(ListResult::Infos(map))
-        } else {
-            None
+        if !any {
+            return None;
         }
+        if self.resolve_symlinks {
+            let names: Vec<String> = map.keys().cloned().collect();
+            for name in names {
+                let Some(fi) = map.get(&name) else {
+                    continue;
+                };
+                if !is_lnk_mode(fi.mode) {
+                    continue;
+                }
+                let Some(si) = self.source_from_info(fi) else {
+                    continue;
+                };
+                let Some(src) = self.sources.get(si) else {
+                    continue;
+                };
+                let child = join(&path, &name);
+                // Strip union tag before resolve so chain uses the source FileInfo.
+                let mut inner = fi.clone();
+                if let Some(UserData::Other(s)) = inner.userdata.last() {
+                    if s.starts_with("union:") {
+                        inner.userdata.pop();
+                    }
+                }
+                if let Some(resolved) = Self::resolve_symlink_chain(src.as_ref(), &child, inner) {
+                    map.insert(name, Self::tag_source(resolved, si));
+                }
+                // On cycle/hop failure leave the symlink entry.
+            }
+        }
+        Some(ListResult::Infos(map))
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -308,6 +448,7 @@ impl MountSource for UnionMountSource {
         if file_version == 0 {
             // Version 0: rightmost wins, but a real directory always beats a symlink
             // so union order cannot hide directory contents (B-4 / #164).
+            // resolve_symlinks does not relax this: real dirs still win first.
             let mut rightmost_any: Option<(usize, FileInfo)> = None;
             let mut rightmost_dir: Option<(usize, FileInfo)> = None;
             for &si in idxs.iter().rev() {
@@ -321,9 +462,14 @@ impl MountSource for UnionMountSource {
                     }
                 }
             }
-            return rightmost_dir
-                .or(rightmost_any)
-                .map(|(si, fi)| Self::tag_source(fi, si));
+            let (si, fi) = rightmost_dir.or(rightmost_any)?;
+            let fi = Self::maybe_resolve_winner(
+                self.sources[si].as_ref(),
+                &path,
+                fi,
+                self.resolve_symlinks,
+            )?;
+            return Some(Self::tag_source(fi, si));
         }
 
         if file_version < 0 {
@@ -332,6 +478,8 @@ impl MountSource for UnionMountSource {
             for &si in idxs.iter().rev() {
                 let src = &self.sources[si];
                 if let Some(fi) = src.lookup(&path, ver) {
+                    let fi =
+                        Self::maybe_resolve_winner(src.as_ref(), &path, fi, self.resolve_symlinks)?;
                     return Some(Self::tag_source(fi, si));
                 }
                 ver += src.versions(&path) as i32;
@@ -345,6 +493,8 @@ impl MountSource for UnionMountSource {
             for &si in &idxs {
                 let src = &self.sources[si];
                 if let Some(fi) = src.lookup(&path, ver) {
+                    let fi =
+                        Self::maybe_resolve_winner(src.as_ref(), &path, fi, self.resolve_symlinks)?;
                     return Some(Self::tag_source(fi, si));
                 }
                 let n = src.versions(&path) as i32;
@@ -374,6 +524,20 @@ impl MountSource for UnionMountSource {
                 if let Some(UserData::Other(s)) = fi.userdata.last() {
                     if s.starts_with("union:") {
                         fi.userdata.pop();
+                    }
+                }
+                // FR-10: if still a symlink and resolve is on, follow within source.
+                if self.resolve_symlinks && is_lnk_mode(fi.mode) {
+                    if let Some(path) = Self::path_from_file_info(&fi) {
+                        match Self::resolve_symlink_chain(src.as_ref(), path, fi.clone()) {
+                            Some(resolved) => fi = resolved,
+                            None => {
+                                return Err(io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    "union symlink resolve failed (cycle or hop limit)",
+                                ));
+                            }
+                        }
                     }
                 }
                 return src.open(&fi, buffering);
@@ -496,10 +660,12 @@ mod tests {
                 max_cache_depth: 8,
                 max_cache_entries: 1000,
                 max_seconds_to_cache: 10.0,
+                ..Default::default()
             },
         );
         assert!(u.folder_cache_len() >= 2, "expected / and /sub cached");
         assert!(u.folder_cache_depth() >= 1);
+        assert!(!u.resolve_symlinks());
 
         let fi = u.lookup("/sub/x.txt", 0).expect("x.txt");
         let mut r = u.open(&fi, 0).unwrap();
@@ -549,6 +715,7 @@ mod tests {
                 max_cache_depth: 100,
                 max_cache_entries: 100,
                 max_seconds_to_cache: 0.0,
+                ..Default::default()
             },
         );
         assert!(u.lookup("/", 0).is_some());
@@ -661,6 +828,7 @@ mod tests {
             max_cache_depth: 8,
             max_cache_entries: 1000,
             max_seconds_to_cache: 10.0,
+            ..Default::default()
         };
 
         for (sources, order_label) in [
@@ -703,5 +871,180 @@ mod tests {
         assert_eq!(resolve_symlink_target("/a/b", "../c"), "/c");
         assert_eq!(resolve_symlink_target("/a/b", "/abs"), "/abs");
         assert_eq!(resolve_symlink_target("/", "x"), "/x");
+    }
+
+    /// FR-10 residual / upstream #160: with `resolve_symlinks`, a winning symlink
+    /// is followed within its source so lookup returns the target file/dir and
+    /// open reads target content. Default (false) keeps the symlink FileInfo.
+    #[test]
+    fn fr10_resolve_symlinks_follows_symlink_to_file() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("target.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("target.txt", a.join("link.txt")).unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+
+        // Default: lookup returns a symlink; open via resolved path still needs follow.
+        let u_default = UnionMountSource::new(vec![sa.clone()]);
+        let fi_link = u_default.lookup("/link.txt", 0).expect("link");
+        assert!(
+            is_lnk_mode(fi_link.mode),
+            "default must preserve symlink (mode={:#o})",
+            fi_link.mode
+        );
+        assert_eq!(fi_link.linkname, "target.txt");
+
+        let u_resolve = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+        assert!(u_resolve.resolve_symlinks());
+        let fi = u_resolve
+            .lookup("/link.txt", 0)
+            .expect("Regression: FR-10 resolve must follow symlink to file");
+        assert!(
+            !is_lnk_mode(fi.mode),
+            "resolve=true lookup must return target file, not symlink (mode={:#o})",
+            fi.mode
+        );
+        let mut r = u_resolve.open(&fi, 0).expect("open resolved file");
+        let mut body = String::new();
+        r.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "payload");
+    }
+
+    /// FR-10: multi-hop symlink chain resolves to the final file.
+    #[test]
+    fn fr10_resolve_symlinks_multi_hop_to_file() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("real.txt"), b"hop-payload").unwrap();
+        std::os::unix::fs::symlink("real.txt", a.join("mid")).unwrap();
+        std::os::unix::fs::symlink("mid", a.join("outer")).unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let u = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+        let fi = u
+            .lookup("/outer", 0)
+            .expect("Regression: multi-hop symlink resolve");
+        assert!(!is_lnk_mode(fi.mode));
+        let mut r = u.open(&fi, 0).unwrap();
+        let mut body = String::new();
+        r.read_to_string(&mut body).unwrap();
+        assert_eq!(body, "hop-payload");
+    }
+
+    /// FR-10: symlink→dir becomes a directory for lookup when resolve is on.
+    #[test]
+    fn fr10_resolve_symlinks_symlink_to_dir() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(a.join("realdir")).unwrap();
+        fs::write(a.join("realdir/child"), b"c").unwrap();
+        std::os::unix::fs::symlink("realdir", a.join("alias")).unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let u = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+        let fi = u.lookup("/alias", 0).expect("alias");
+        assert!(
+            is_dir_mode(fi.mode),
+            "resolve=true: symlink→dir must present as directory"
+        );
+        assert!(!is_lnk_mode(fi.mode));
+        let listing = u.list("/alias").expect("list through resolved dir");
+        let ListResult::Infos(map) = listing else {
+            panic!("expected Infos");
+        };
+        assert!(map.contains_key("child"));
+    }
+
+    /// FR-10: B-4 still holds with resolve_symlinks — real directory wins over
+    /// symlink at the same path for version 0; resolve does not prefer the link.
+    #[test]
+    fn fr10_resolve_still_prefers_real_dir_over_symlink() {
+        let d = tempfile::tempdir().unwrap();
+        let (branch1, branch2) = build_b4_branches(d.path());
+        let s1 = Arc::new(FolderMountSource::new(&branch1).unwrap()) as Arc<dyn MountSource>;
+        let s2 = Arc::new(FolderMountSource::new(&branch2).unwrap()) as Arc<dyn MountSource>;
+        let opts = UnionMountOptions {
+            resolve_symlinks: true,
+            ..Default::default()
+        };
+        // Symlink branch rightmost — without B-4 this would resolve to subdir1.
+        let u = UnionMountSource::new_with_options(vec![s2, s1], opts);
+        assert_b4_union_policy(&u, "resolve=true branch2 then branch1");
+        let subdir0 = u.lookup("/subdir0", 0).unwrap();
+        assert!(is_dir_mode(subdir0.mode) && !is_lnk_mode(subdir0.mode));
+    }
+
+    /// FR-10: cycle / excessive hops → lookup None (no hang).
+    #[test]
+    fn fr10_resolve_symlink_cycle_returns_none() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        std::os::unix::fs::symlink("b", a.join("a_link")).unwrap();
+        std::os::unix::fs::symlink("a_link", a.join("b")).unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let u = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            u.lookup("/a_link", 0).is_none(),
+            "Regression: FR-10 cycle must not hang; lookup returns None"
+        );
+        assert!(u.lookup("/b", 0).is_none());
+    }
+
+    /// FR-10: hop cap — long chain beyond MAX_SYMLINK_RESOLVE_HOPS → None.
+    #[test]
+    fn fr10_resolve_symlink_hop_limit() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        // chain_0 → chain_1 → … → chain_N → final (N+1 hops to file; exceed cap)
+        let hops = MAX_SYMLINK_RESOLVE_HOPS + 2;
+        fs::write(a.join("final"), b"too-deep").unwrap();
+        std::os::unix::fs::symlink("final", a.join(format!("chain_{hops}"))).unwrap();
+        for i in (0..hops).rev() {
+            std::os::unix::fs::symlink(format!("chain_{}", i + 1), a.join(format!("chain_{i}")))
+                .unwrap();
+        }
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let u = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+        assert!(
+            u.lookup("/chain_0", 0).is_none(),
+            "Regression: FR-10 hop limit must yield None without hang"
+        );
     }
 }

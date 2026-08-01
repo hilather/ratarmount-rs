@@ -203,6 +203,11 @@ struct Args {
     #[arg(long = "union-mount-cache-timeout", default_value_t = 60.0)]
     union_mount_cache_timeout: f64,
 
+    /// Follow winning union symlinks within their source (FR-10 / upstream #160).
+    /// Default off: preserve symlink FileInfo. Real directories still beat symlinks (B-4 / #164).
+    #[arg(long = "union-resolve-symlinks", action = ArgAction::SetTrue)]
+    union_resolve_symlinks: bool,
+
     /// Force colored log prefixes (overrides NO_COLOR / CLICOLOR)
     #[arg(long = "color", action = ArgAction::SetTrue, overrides_with = "no_color")]
     color: bool,
@@ -471,6 +476,7 @@ fn main() {
                 max_cache_depth: args.union_mount_cache_max_depth,
                 max_cache_entries: args.union_mount_cache_max_entries,
                 max_seconds_to_cache: args.union_mount_cache_timeout,
+                resolve_symlinks: args.union_resolve_symlinks,
             },
             parallel_nested_threads: args.parallel_nested,
         },
@@ -1121,6 +1127,15 @@ mod parallel_nested_cli_tests {
 
         let zero = Args::try_parse_from(["ratarmount", "--parallel-nested", "0"]).expect("zero");
         assert_eq!(zero.parallel_nested, 0);
+    }
+
+    /// FR-10: `--union-resolve-symlinks` wires into UnionMountOptions.
+    #[test]
+    fn union_resolve_symlinks_cli_flag() {
+        let off = Args::try_parse_from(["ratarmount"]).expect("defaults");
+        assert!(!off.union_resolve_symlinks);
+        let on = Args::try_parse_from(["ratarmount", "--union-resolve-symlinks"]).expect("flag");
+        assert!(on.union_resolve_symlinks);
     }
 
     /// CompositingOptions path: CLI value is the field that apply_compositing forwards.

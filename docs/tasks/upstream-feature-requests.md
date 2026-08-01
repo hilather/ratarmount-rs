@@ -49,7 +49,7 @@ issue from the README feature tables.
 
 | ID | Upstream | Work | Why deferred / hard |
 |----|----------|------|---------------------|
-| FR-10 | [#160](https://github.com/mxmlnkn/ratarmount/issues/160) / [#164](https://github.com/mxmlnkn/ratarmount/issues/164) | Union **symlink resolve** option | **#164 dir-over-symlink done** (B-4); optional explicit resolve/follow flag for #160 still open |
+| FR-10 | [#160](https://github.com/mxmlnkn/ratarmount/issues/160) / [#164](https://github.com/mxmlnkn/ratarmount/issues/164) | Union **symlink resolve** option | **done** — #164 B-4 dir>symlink; `--union-resolve-symlinks` multi-hop within winning source (cap 8, cycles → None). Residual vs full #160: no cross-source symlink target merge beyond B-4 list follow |
 | FR-11 | [#120](https://github.com/mxmlnkn/ratarmount/issues/120) | Writable/rename on compressed TAR | Explicit Python TODO; rename is hard |
 | FR-12 | [#118](https://github.com/mxmlnkn/ratarmount/issues/118) | Multi-volume `tar -M` | Multi-device volume TAR |
 | FR-13 | [#175](https://github.com/mxmlnkn/ratarmount/issues/175) | LD_PRELOAD / syscall wrap FS | Not FUSE; library path exists; out of product scope for now |
@@ -61,9 +61,8 @@ issue from the README feature tables.
 
 ## Suggested implementation order (agents)
 
-**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire).
+**Done:** FR-1, FR-2 (Basic), FR-3, FR-4, FR-5 (readahead), FR-6 (eager AutoMount parallel nested opens + `--parallel-nested` CLI), FR-7, FR-9 (factory zstdblocks/bzip2blocks auto-wire), FR-10 (`--union-resolve-symlinks` + B-4).
 
-1. **FR-10 residual** Optional union symlink-resolve/follow flag for upstream #160 (dir-over-symlink #164 already done).
-2. **FR-8 residual** Pure LZX decoder remains out of scope; documented spool path is accepted.
+1. **FR-8 residual** Pure LZX decoder remains out of scope; documented spool path is accepted.
 
 Update this file when status changes. Keep README **Upstream** column in sync.
