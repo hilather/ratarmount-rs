@@ -1,6 +1,6 @@
 # Gzip binding decision (PR-08a / PR-08b)
 
-**Date:** 2026-07-25 (updated 2026-07-26)  
+**Date:** 2026-07-25 (updated 2026-08-01)  
 **Decision:** **G3** (pure Rust Tier A+B via `flate2` / `miniz_oxide`).
 
 ## Options considered
@@ -76,8 +76,41 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
 | Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip |
 | Factory (done) | Path open keeps typed `Arc<SharedRapidgzip>`; warm SQLite blob load (no panic on garbage); TAR/plain via `open_from_seekable_body` |
-| Residual | Factory must call compress `from_reader` / `with_imported_index` / `export_gzidx_blob` (API exists in compress); open cost vs G3; seek-cache tuning; fair isal A/B; default-on after benches; per-open index clone; exclusive-ownership `Send` |
 | Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
+| Task batch | [docs/tasks/rapidgzip-perf-batch.md](tasks/rapidgzip-perf-batch.md) — P1 factory wire · P2 thruput · P3 harness · P4 FUSE · P5 docs |
+
+### Residual — feature wiring (not thruput)
+
+Items that keep the opt-in backend incomplete even when path cold open works. Compress APIs already exist; factory still has residual stubs on some paths.
+
+| Residual | Detail |
+|----------|--------|
+| Path GZIDX import | Factory hook loads blob then **rebuilds**; must call `open_seekable_gzip_rapidgzip_with_imported_index` |
+| Path GZIDX persist | Factory persist hook is **no-op**; must call `SharedRapidgzip::export_gzidx_blob` |
+| Nested `from_reader` | Prefer-backend → **G3 residual** until `open_seekable_gzip_rapidgzip_from_reader` is wired |
+| Nested imported index | Compress `…_with_imported_index_from_reader` exists; not wired |
+| HTTP/S3 Range | Prefer → G3 residual (same `from_reader` APIs) |
+| Exclusive-ownership `Send` | IndexedReader/`Send` model is path-oriented; nested/Range share constraints with from_reader work |
+
+See matrix below for factory status vs compress API.
+
+### Residual — performance (thruput / cost)
+
+Separate from wiring: even on the verified path FUSE open, **rapidgzip is not yet G3-competitive** on small single-member corpora, and **default remains G3**. Python rapidgzip thruput parity is still open.
+
+| Residual | Spot range / note |
+|----------|-------------------|
+| Cold index wall vs G3 | ~**0.15 s** rapidgzip+ISA-L vs ~**0.05 s** G3 on **64 MiB** single-member gzip |
+| Cold sequential MiB/s vs G3 | ~**500** vs ~**1100** MiB/s (same corpus, ISA-L feature) |
+| Peak RSS vs G3 | ~**52 MiB** vs ~**15 MiB** |
+| vs **Python** rapidgzip | Head-to-head still favors Python on compressed-TAR random/seq in committed results; same-corpus multi-backend CSV is **`benchmarks/gzip-backend-results/` when generated** (see [`benchmarks/README.md`](../benchmarks/README.md)) |
+| Open amortisation | Full `keep_index` decode; each FUSE open reopens FD + `IndexedReader` (per-open index cost) |
+| Seek-cache / prefetch | Tuning knobs + tests still open ([P2](tasks/rapidgzip-perf-batch.md)) |
+| Fair ISA-L A/B | zlib-rs vs ISA-L must be compared with the harness ([P3](tasks/rapidgzip-perf-batch.md)); do not claim ISA-L win without results |
+| FUSE readahead fit | Align `--readahead` / short-read behavior with rapidgzip windows ([P4](tasks/rapidgzip-perf-batch.md)) |
+| Default-on | Flip only after published benches justify it; feature stays opt-in |
+
+**Numbers policy:** ranges above are local spot checks recorded in the [perf batch](tasks/rapidgzip-perf-batch.md). Prefer `benchmarks/gzip-backend-results/{results.md,results.csv}` when present; do not invent new absolute thruput figures.
 
 ### Factory ↔ compress API matrix (Tier D)
 

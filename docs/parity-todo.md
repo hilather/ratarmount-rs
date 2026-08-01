@@ -34,7 +34,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 | Capability | Python | Rust | Status |
 |------------|--------|------|--------|
-| gzip (rapidgzip / seek index) | yes | Tier B + RGZI Tier C + best-effort **GZIDX** (indexed_gzip) | `[x]` / `~` window-dict full interop |
+| gzip (rapidgzip / seek index) | yes | Tier B + RGZI Tier C + best-effort **GZIDX**; opt-in **Tier D** `gzip-rapidgzip` (path POC, not default) | `[x]` / `~` window-dict full interop; thruput still `~` vs Python rapidgzip (G3 default; Tier D behind G3 on 64 MiB spot ~500 vs ~1100 MiB/s — [binding residual](gzip-binding-decision.md#residual--performance-thruput--cost), [perf batch](tasks/rapidgzip-perf-batch.md); see `gzip-backend-results` when generated) |
 | bzip2 block-parallel | yes | multi-stream + file-backed bit-block maps + **bzip2blocks** factory auto-import | `[x]` / `~` open-time size discovery |
 | xz multi-block seek | yes | Stream Footer+Index **footer-first** range map (multi-stream + multi-block / pixz); small single-block Index; large units → full decode + temp spill | `[x]` / `~` exotic filters |
 | zstd multi-frame / seek table | yes | multi-frame map + seek-table + **zstdblocks** factory auto-import; Shared concurrent-safe ([guide](zstd-random-access.md)) | `[x]` |
@@ -106,6 +106,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip solid streaming (large folders) | `~` progressive LZMA2 + 1 MiB LRU windows (≤64); BCJ/AES still full-folder |
 | Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
 | Seekable codecs (drop materialize for gzip+) | `[x]` plain + TAR via SeekableBody / SingleFile; residual SquashFS/lrzip/LZX |
+| Tier D rapidgzip thruput (opt-in) | `~` path open works; cold index/seq still slower than G3 and behind Python rapidgzip class thruput until [perf batch](tasks/rapidgzip-perf-batch.md) P1–P4 land |
 | Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index hard job + optional `benchmark-gates-full` (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`) |
 
 ---
@@ -192,3 +193,4 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
 - **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
+- **Tier D rapidgzip perf residual:** [`docs/tasks/rapidgzip-perf-batch.md`](tasks/rapidgzip-perf-batch.md) · decision residual split in [`docs/gzip-binding-decision.md`](gzip-binding-decision.md)

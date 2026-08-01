@@ -120,7 +120,7 @@ Upstream FR tracker: [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upst
 
 Still missing or partial relative to upstream Python (and open upstream issues we can implement):
 
-1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
+1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher feature; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` MVP done (full rebuild; residual encrypted/multi-part); compressed-TAR rename/write edges ([#120](https://github.com/mxmlnkn/ratarmount/issues/120)).
