@@ -14,7 +14,9 @@ use ratarmount_compositing::{
 };
 use ratarmount_compress::strip_compression_suffix;
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
-use ratarmount_fuse::{clamp_readahead, mount_blocking, parse_byte_size, unmount};
+use ratarmount_fuse::{
+    clamp_readahead, mount_blocking, parse_byte_size, unmount, RECOMMENDED_READAHEAD_BYTES,
+};
 use ratarmount_index::{
     default_index_folders, fill_content_hashes, parse_index_folders, resolve_index_location,
     SqliteIndex, MEMORY_INDEX,
@@ -148,6 +150,11 @@ struct Args {
     /// sequential FUSE reads hit the window (stop-and-go scanners / compressed
     /// remote images; upstream #180). Accepts `K`/`M`/`G` (1024-based), e.g.
     /// `1M`, `256K`. Capped at 64 MiB per handle.
+    ///
+    /// When rapidgzip is preferred (`--use-backend rapidgzip` or
+    /// `RATARMOUNT_GZIP_BACKEND=rapidgzip`) and this flag is omitted, the CLI
+    /// auto-enables the recommended 1 MiB window. Pass `--readahead 0` to keep
+    /// readahead off.
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
@@ -596,6 +603,12 @@ fn main() {
     std::fs::create_dir_all(&mp).ok();
     let writable = overlay_arc.is_some();
     let fuse_opts = args.fuse.clone();
+    let readahead_on_argv = readahead_flag_on_argv(std::env::args());
+    #[cfg(feature = "gzip-rapidgzip")]
+    let prefer_rapidgzip =
+        ratarmount_compress::prefer_rapidgzip_gzip_backend(&open_opts.use_backends);
+    #[cfg(not(feature = "gzip-rapidgzip"))]
+    let prefer_rapidgzip = false;
     let readahead = match parse_byte_size(&args.readahead) {
         Ok(n) => {
             let clamped = clamp_readahead(n);
@@ -606,10 +619,16 @@ fn main() {
                     clamped
                 );
             }
-            if clamped > 0 {
-                log::info!("FUSE readahead enabled: {clamped} bytes per sequential window");
+            let effective = should_auto_readahead(prefer_rapidgzip, readahead_on_argv, clamped);
+            if effective > 0 && clamped == 0 && prefer_rapidgzip && !readahead_on_argv {
+                log::info!(
+                    "auto-enabling FUSE readahead {effective} bytes for rapidgzip \
+                     (pass --readahead 0 to disable)"
+                );
+            } else if effective > 0 {
+                log::info!("FUSE readahead enabled: {effective} bytes per sequential window");
             }
-            clamped
+            effective
         }
         Err(e) => {
             eprintln!("error: invalid --readahead: {e}");
@@ -1055,6 +1074,36 @@ fn default_mountpoint(archive: &Path) -> PathBuf {
     PathBuf::from(stem)
 }
 
+/// True when the user passed `--readahead` / `--readahead=…` on argv.
+///
+/// Used to distinguish clap's default `"0"` from an explicit `--readahead 0`
+/// so rapidgzip can auto-enable the recommended window only when the flag is
+/// omitted.
+fn readahead_flag_on_argv<I, S>(args: I) -> bool
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
+{
+    args.into_iter().any(|a| {
+        let a = a.as_ref();
+        a == "--readahead" || a.starts_with("--readahead=")
+    })
+}
+
+/// Effective FUSE readahead after CLI parse.
+///
+/// When rapidgzip is preferred and the user did **not** pass `--readahead` on
+/// argv, a parsed value of `0` (clap default) becomes
+/// [`RECOMMENDED_READAHEAD_BYTES`]. Explicit `--readahead 0` stays off; any
+/// non-zero parse is left unchanged.
+fn should_auto_readahead(prefer_rgz: bool, readahead_flag_on_argv: bool, parsed: u64) -> u64 {
+    if prefer_rgz && !readahead_flag_on_argv && parsed == 0 {
+        RECOMMENDED_READAHEAD_BYTES
+    } else {
+        parsed
+    }
+}
+
 #[cfg(test)]
 mod mount_probe_tests {
     use super::{mount_output_lists_path, path_mount_candidates};
@@ -1087,6 +1136,67 @@ mod mount_probe_tests {
     fn path_candidates_include_raw() {
         let c = path_mount_candidates(Path::new("/nonexistent/ratarmount-test-path"));
         assert!(c.iter().any(|s| s.contains("ratarmount-test-path")));
+    }
+}
+
+#[cfg(test)]
+mod readahead_auto_cli_tests {
+    use super::{readahead_flag_on_argv, should_auto_readahead, RECOMMENDED_READAHEAD_BYTES};
+
+    /// Regression: auto-enable 1 MiB readahead when rapidgzip preferred and
+    /// `--readahead` omitted; explicit `--readahead 0` stays off.
+    #[test]
+    fn should_auto_readahead_rapidgzip_default_vs_explicit_zero() {
+        assert_eq!(
+            should_auto_readahead(true, false, 0),
+            RECOMMENDED_READAHEAD_BYTES,
+            "prefer rapidgzip + default 0 → recommended"
+        );
+        assert_eq!(
+            should_auto_readahead(true, true, 0),
+            0,
+            "prefer rapidgzip + explicit --readahead 0 → off"
+        );
+        assert_eq!(
+            should_auto_readahead(false, false, 0),
+            0,
+            "no rapidgzip + default 0 → off"
+        );
+        assert_eq!(
+            should_auto_readahead(true, false, 256 * 1024),
+            256 * 1024,
+            "non-zero parse is never overridden"
+        );
+        assert_eq!(
+            should_auto_readahead(true, true, RECOMMENDED_READAHEAD_BYTES),
+            RECOMMENDED_READAHEAD_BYTES,
+            "explicit non-zero is kept"
+        );
+    }
+
+    #[test]
+    fn readahead_flag_on_argv_forms() {
+        assert!(!readahead_flag_on_argv(["ratarmount", "a.tar.gz", "/mnt"]));
+        assert!(readahead_flag_on_argv([
+            "ratarmount",
+            "--readahead",
+            "0",
+            "a.tar.gz",
+            "/mnt"
+        ]));
+        assert!(readahead_flag_on_argv([
+            "ratarmount",
+            "--readahead=1M",
+            "a.tar.gz",
+            "/mnt"
+        ]));
+        assert!(!readahead_flag_on_argv([
+            "ratarmount",
+            "--use-backend",
+            "rapidgzip",
+            "a.tar.gz",
+            "/mnt"
+        ]));
     }
 }
 
