@@ -10,6 +10,8 @@ default = []
 # Parallel gzip + IndexedReader via hilather/rapidgzip-rust (MSRV 1.87+ / edition 2024).
 # Opt-in at open time: RATARMOUNT_GZIP_BACKEND=rapidgzip or --use-backend rapidgzip.
 gzip-rapidgzip = ["dep:rapidgzip-core"]
+# Sequential inflate via Intel ISA-L (requires shared libisal; see ISAL_INSTALL_PREFIX).
+gzip-rapidgzip-isal = ["gzip-rapidgzip", "rapidgzip-core/isal"]
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -26,6 +28,6 @@ lz4_flex = "0.11"
 lzma-rs = { version = "0.3", features = ["raw_decoder"] }
 newtua-lzw-z = "0.1"
 libloading = "0.8"
-# Tier D POC: pure-Rust rapidgzip (path-backed IndexedReader). Pin v0.2.0 tip.
+# Tier D POC: pure-Rust rapidgzip (path-backed IndexedReader). Pin v0.2.1 (ISA-L).
 # crates.io 0.1.0 is an incomplete stub — do not use it.
-rapidgzip-core = { git = "https://github.com/hilather/rapidgzip-rust.git", rev = "30012f674cdacc38cbea1615361f82f6aa639e65", optional = true }
+rapidgzip-core = { git = "https://github.com/hilather/rapidgzip-rust.git", rev = "75c5a24de9b0bc8a2250e312a49daa2e1bf1639a", optional = true }

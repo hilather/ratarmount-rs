@@ -5,13 +5,14 @@
 Focused codec compare for the Tier D rapidgzip feature:
 
 ```bash
-cargo build --release -p ratarmount --features gzip-rapidgzip
+# Default harness builds with gzip-rapidgzip-isal (needs libisal or ISAL_INSTALL_PREFIX).
 ./benchmarks/compare-gzip-backends.sh
 # → benchmarks/gzip-backend-results/{results.csv,results.md}
-# knobs: CORPUS_MIB=64 THREADS=8 RUNS=3 SKIP_BUILD=1
+# knobs: CORPUS_MIB=64 THREADS=8 RUNS=3 SKIP_BUILD=1 RUST_FEATURES=gzip-rapidgzip-isal
+# zlib-rs only: RUST_FEATURES=gzip-rapidgzip
 ```
 
-Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary built with `gzip-rapidgzip`.
+Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary with `gzip-rapidgzip` (optionally `gzip-rapidgzip-isal`).
 
 ## Head-to-head (Python vs Rust)
 

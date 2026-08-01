@@ -67,24 +67,27 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 
 | Item | Detail |
 |------|--------|
-| Crate | [`hilather/rapidgzip-rust`](https://github.com/hilather/rapidgzip-rust) `rapidgzip-core` **v0.2.0** (git pin; crates.io 0.1.0 is an incomplete stub) |
-| Feature | `gzip-rapidgzip` on `ratarmount-compress` / `ratarmount` (requires **rustc ≥ 1.87**, edition 2024 dep) |
+| Crate | [`hilather/rapidgzip-rust`](https://github.com/hilather/rapidgzip-rust) `rapidgzip-core` **v0.2.1** (git pin `75c5a24`; crates.io 0.1.0 is an incomplete stub) |
+| Feature | `gzip-rapidgzip` (+ optional `gzip-rapidgzip-isal`) on `ratarmount-compress` / `ratarmount` (requires **rustc ≥ 1.87**, edition 2024 dep) |
 | Open gate | `RATARMOUNT_GZIP_BACKEND=rapidgzip` or `--use-backend rapidgzip` / `rapidgzip-gzip` |
 | Code | `ratarmount-compress/src/gzip_rapidgzip.rs` → `SharedRapidgzip` + `SeekableBody` |
-| Scope | **Local path** `.gz` / `.tar.gz` only; nested / HTTP Range stay on G3 |
+| Scope | **Local path** `.gz` / `.tar.gz` only; nested / HTTP Range stay on G3 (unless wired later) |
 | Index build | Full decode to sink with `keep_index` (parallel when `-P` allows); each FUSE open reopens FD + `IndexedReader` |
+| Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
 | Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip |
-| Residual | Nested `from_reader` `ReadAt` adapter; RGZI/GZIDX export into SQLite; default-on after benches; ISA-L not required; per-open `GzipIndex` clone; `IndexedReader` marked `Send` via exclusive-ownership `unsafe` (no concurrent multi-thread use of one handle) |
-| Default CI | Feature **off** (workspace MSRV stays 1.74); enable only when rustc ≥ 1.87 |
+| Residual | Nested `from_reader` / GZIDX factory persist (worktree agents); default-on after benches; per-open `GzipIndex` clone; `IndexedReader` `Send` via exclusive-ownership `unsafe` |
+| Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
 
 ```bash
 # Build with the POC backend (rustc ≥ 1.87)
 cargo build -p ratarmount --features gzip-rapidgzip
+# With ISA-L (install libisal-dev, or set ISAL_INSTALL_PREFIX to a prefix with lib/libisal.so)
+cargo build -p ratarmount --features gzip-rapidgzip-isal
 
 # Select at mount time
-RATARMOUNT_GZIP_BACKEND=rapidgzip cargo run --features gzip-rapidgzip -- archive.tar.gz /mnt
+RATARMOUNT_GZIP_BACKEND=rapidgzip cargo run --features gzip-rapidgzip-isal -- archive.tar.gz /mnt
 # or
-cargo run --features gzip-rapidgzip -- --use-backend rapidgzip -P gzip:8 archive.tar.gz /mnt
+cargo run --features gzip-rapidgzip-isal -- --use-backend rapidgzip -P gzip:8 archive.tar.gz /mnt
 # Explicit rapidgzip worker budget (optional):
-cargo run --features gzip-rapidgzip -- --use-backend rapidgzip -P rapidgzip-gzip:16 archive.tar.gz /mnt
+cargo run --features gzip-rapidgzip-isal -- --use-backend rapidgzip -P rapidgzip-gzip:16 archive.tar.gz /mnt
 ```

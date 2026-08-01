@@ -5,13 +5,15 @@
 #   ./benchmarks/compare-gzip-backends.sh
 #
 # Env:
-#   RUST_BIN     binary with gzip-rapidgzip feature (default: target/release/ratarmount)
+#   RUST_BIN     binary (default: target/release/ratarmount)
+#   RUST_FEATURES cargo features for the release build (default: gzip-rapidgzip-isal)
 #   SKIP_BUILD=1 do not cargo build
 #   RUNS=3       timed cold-index samples (median)
 #   CORPUS_MIB=64 uncompressed large blob size
 #   THREADS=8    -P gzip:N / rapidgzip-gzip:N
 #   OUT_DIR      results dir (default: benchmarks/gzip-backend-results)
 #   COMPARE_KEEP=1 keep workdir
+#   ISAL_INSTALL_PREFIX  optional prefix with lib/libisal.so (default: sibling rapidgzip-rust/.isal-prefix if present)
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -19,11 +21,24 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 source "$ROOT/test-harness/env.sh"
 
 RUST_BIN="${RUST_BIN:-$ROOT/target/release/ratarmount}"
+RUST_FEATURES="${RUST_FEATURES:-gzip-rapidgzip-isal}"
 RUNS="${RUNS:-3}"
 CORPUS_MIB="${CORPUS_MIB:-64}"
 THREADS="${THREADS:-8}"
 OUT_DIR="${OUT_DIR:-$ROOT/benchmarks/gzip-backend-results}"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
+
+# Prefer sibling rapidgzip-rust ISA-L prefix when system libisal is missing.
+if [[ -z "${ISAL_INSTALL_PREFIX:-}" && -f "$ROOT/../rapidgzip-rust/.isal-prefix/lib/libisal.so" ]]; then
+  ISAL_INSTALL_PREFIX="$ROOT/../rapidgzip-rust/.isal-prefix"
+fi
+if [[ -n "${ISAL_INSTALL_PREFIX:-}" ]]; then
+  export ISAL_INSTALL_PREFIX
+  export LIBRARY_PATH="${ISAL_INSTALL_PREFIX}/lib${LIBRARY_PATH:+:$LIBRARY_PATH}"
+  export LD_LIBRARY_PATH="${ISAL_INSTALL_PREFIX}/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+  export PKG_CONFIG_PATH="${ISAL_INSTALL_PREFIX}/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+  export CPATH="${ISAL_INSTALL_PREFIX}/include${CPATH:+:$CPATH}"
+fi
 
 if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
   PY_PYTHON="${PY_PYTHON:-$ROOT/benchmarks/.venv-py/bin/python}"
@@ -87,8 +102,11 @@ median_of() {
 
 # ---- build ----
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-  echoerr "Building release with --features gzip-rapidgzip..."
-  (cd "$ROOT" && cargo build --release -p ratarmount --features gzip-rapidgzip 2>&1 | tee -a "$LOG" | tail -5)
+  echoerr "Building release with --features ${RUST_FEATURES}..."
+  if [[ -n "${ISAL_INSTALL_PREFIX:-}" ]]; then
+    echoerr "ISAL_INSTALL_PREFIX=${ISAL_INSTALL_PREFIX}"
+  fi
+  (cd "$ROOT" && cargo build --release -p ratarmount --features "${RUST_FEATURES}" 2>&1 | tee -a "$LOG" | tail -15)
 fi
 if [[ ! -x "$RUST_BIN" ]]; then
   echoerr "Missing RUST_BIN=$RUST_BIN"
@@ -371,7 +389,8 @@ fi
   echo "| CORPUS_MIB | ${CORPUS_MIB} |"
   echo "| RUNS (cold index) | ${RUNS} |"
   echo "| RUST_BIN | ${RUST_BIN} |"
-  echo "| feature | gzip-rapidgzip |"
+  echo "| RUST_FEATURES | ${RUST_FEATURES} |"
+  echo "| ISAL_INSTALL_PREFIX | ${ISAL_INSTALL_PREFIX:-"(system/default)"} |"
   echo "| rustc | $(rustc --version) |"
   echo
   echo "## Results (CSV)"

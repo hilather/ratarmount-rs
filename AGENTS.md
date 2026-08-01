@@ -39,7 +39,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 |---------------|----------|
 | Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
-| Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip` |
+| Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip` · optional ISA-L: `--features gzip-rapidgzip-isal` (+ `libisal` / `ISAL_INSTALL_PREFIX`) |
 | 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
 | Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
