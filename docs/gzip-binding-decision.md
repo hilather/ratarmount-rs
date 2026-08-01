@@ -51,7 +51,7 @@ Example: `ratarmount -gs 4 archive.tar.gz /mnt` (or `--gzip-seek-point-spacing 4
 
 | Item | Status (see [G3 batch](tasks/g3-polish-batch.md)) |
 |------|-----------------------------------------------------|
-| Decoded-window **LRU** on `SeekableGzipReader` (G3-A) | **done** — 8 chunks / 16 MiB per reader; reverse/nearby seeks skip re-inflate |
+| Decoded-window **LRU** on `SeekableGzipReader` (G3-A) | **done** — 256×64 KiB chunks / 16 MiB per reader; reverse/nearby seeks skip re-inflate |
 | RGZI warm remount on all default path mounts (G3-B) | **done** — plain `.gz` + path/live Range create index shell and persist RGZI |
 | Auto FUSE readahead 1 MiB for default gzip when `--readahead` omitted (G3-C) | **done** — auto when rapidgzip preferred **or** input looks like gzip; `--readahead 0`/`N` overrides |
 | Full **GZIDX window** apply on import (G3-D) | **partial** residual — windows/bits stored for re-export; inflate still soft-rehydrates (miniz has no dict/prime API) |
@@ -104,7 +104,7 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
 | Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip (path; Range when reopen remains). Nested prefer has no reopen — error if rapidgzip fails ([R1](tasks/rapidgzip-residual-batch.md)) |
 | Factory (done) | Path/nested/Range prefer rapidgzip; typed `Arc<SharedRapidgzip>` + GZIDX import/export; invalid blob rebuild (no panic); TAR/plain via `open_from_seekable_body` |
-| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); thruput vs G3 **open pending re-bench** after P2/P4; fair isal A/B numbers ([R3](tasks/rapidgzip-residual-batch.md)); default-on after benches; per-open index clone; nested thruput serializes on shared mutex ([R2](tasks/rapidgzip-residual-batch.md)); auto FUSE readahead when prefer ([R4](tasks/rapidgzip-residual-batch.md)) |
+| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); thruput vs G3 needs re-bench before product claims; default-on rapidgzip after benches; per-open index clone; large nested `from_reader` still mutex ([R2](tasks/rapidgzip-residual-batch.md) partial); R1/R3/R4 **done** |
 | Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
 
 ### Residual — performance (thruput / cost)

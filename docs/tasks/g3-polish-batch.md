@@ -9,7 +9,7 @@
 
 | ID | Task | Owner | Status |
 |----|------|--------|--------|
-| **G3-A** | Decoded-window LRU cache on `SeekableGzipReader` | `gzip_seek.rs` | **done** — per-reader LRU (`G3_SEEK_CACHE_CHUNKS`=8 / `G3_SEEK_CACHE_BYTES`=16 MiB); reverse/nearby seeks hit cache; concurrent `Shared` readers keep private caches |
+| **G3-A** | Decoded-window LRU cache on `SeekableGzipReader` | `gzip_seek.rs` | **done** — per-reader LRU (`G3_SEEK_CACHE_CHUNKS`=256 / `G3_SEEK_CACHE_BYTES`=16 MiB at 64 KiB chunks); reverse/nearby seeks hit cache; concurrent `Shared` readers keep private caches |
 | **G3-B** | Ensure RGZI warm remount always on default path mounts | factory | **done** — plain `.gz` + path/live Range persist RGZI via `open_or_create_writable_index` shell; units `plain_gzip_rgzi_*` / `gzip_rgzi_*` |
 | **G3-C** | Auto FUSE readahead (1 MiB) for gzip/`.tar.gz` when `--readahead` omitted | `main.rs` | **done** — auto 1 MiB when flag omitted and rapidgzip preferred **or** input looks like `.gz`/`.tgz`/`.tar.gz`/`.gzip`; explicit `--readahead 0`/`N` overrides |
 | **G3-D** | Full **GZIDX window** apply on import (not soft rehydrate only) | `gzip_seek.rs` | **partial** — 32 KiB windows + bit residuals **parsed and stored** for re-export; inflate still soft-rehydrates (miniz cannot `inflateSetDictionary` / `inflatePrime`) |
@@ -22,7 +22,7 @@ Legend: **done** · **partial** · **open**. Status refreshed after A–C merge 
 
 | ID | Notes |
 |----|--------|
-| **G3-A** | **Landed.** Per-reader decoded-window LRU (8×64 KiB chunks, 16 MiB cap). Sequential FUSE re-seeks still use the working buffer; reverse/nearby hit LRU. |
+| **G3-A** | **Landed.** Per-reader decoded-window LRU (256×64 KiB chunks, 16 MiB byte cap). Sequential FUSE re-seeks still use the working buffer; reverse/nearby hit LRU. |
 | **G3-B** | **Landed.** Plain `.gz` cold open creates index shell + RGZI; warm import on remount. Nested in-memory still has no side table (by design). |
 | **G3-C** | **Landed.** Auto 1 MiB readahead for gzip-ish inputs and rapidgzip prefer when `--readahead` omitted. |
 

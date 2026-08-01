@@ -9,20 +9,20 @@
 
 | ID | Residual | Owner | Status |
 |----|----------|--------|--------|
-| **R1** | Nested prefer rapidgzip fail: rewind + G3 fallback when `Seek` works | factory | **open** |
-| **R2** | Shared-reader mutex thruput: materialize small nested gzip into `Arc<[u8]>` ReadAt (no mutex) | compress | **open** |
-| **R3** | Run fair zlib vs ISA-L A/B; capture numbers into docs note | benchmarks | **open** (harness exists; numbers not published) |
-| **R4** | Auto-enable FUSE readahead (1 MiB) when rapidgzip prefer and user left `--readahead 0` | main.rs (+ fuse const) | **open** |
+| **R1** | Nested prefer rapidgzip fail: rewind + G3 fallback when `Seek` works | factory | **done** (`00c70a3`) |
+| **R2** | Shared-reader mutex thruput: materialize small nested gzip into `Arc<[u8]>` ReadAt (no mutex) | compress | **done** (`4dcc234` — small bodies slurp; large residual still mutex) |
+| **R3** | Run fair zlib vs ISA-L A/B; capture numbers into docs note | benchmarks | **done** (`f11c7da` + harness; spot numbers in binding decision) |
+| **R4** | Auto-enable FUSE readahead (1 MiB) when rapidgzip prefer and user left `--readahead 0` | main.rs (+ fuse const) | **done** — also covers default G3 gzip-ish inputs ([G3-C](g3-polish-batch.md)) |
 | **R5** | Docs: mark P1–P5 done; refresh residual checklist | docs | **done** (this batch status + perf-batch / binding decision refresh) |
 
-## Open residuals (detail)
+## Residuals (detail)
 
 | ID | Notes |
 |----|--------|
-| **R1** | Nested prefer has no reopen path today — rapidgzip fail surfaces as error instead of G3. Path/Range already fall back when reopen remains. |
-| **R2** | Nested / shared `from_reader` serializes decode on one mutex; small members may be cheaper as `Arc<[u8]>` + ReadAt. |
-| **R3** | `./benchmarks/compare-gzip-isal-ab.sh` (and `compare-gzip-backends.sh`); write results under `gzip-backend-results` / residual note — do not invent thruput. |
-| **R4** | P4 aligned short-read behavior when readahead &gt; 0; default remains off. Auto 1 MiB (`RECOMMENDED_READAHEAD_BYTES`) only when backend prefer is rapidgzip. |
+| **R1** | **Landed.** Nested prefer fail recovers Arc-held reader, rewinds, falls through to G3 when Seek works. |
+| **R2** | **Landed** for small `from_reader` (slurp → Arc ReadAt). Oversized nested streams still mutex-serialize (documented residual). |
+| **R3** | **Landed.** Fair A/B harness + published smoke note; re-bench after major thruput work still recommended before product claims. |
+| **R4** | **Landed.** Auto 1 MiB (`RECOMMENDED_READAHEAD_BYTES`) when `--readahead` omitted and (rapidgzip preferred **or** any mount input looks like gzip). Explicit `--readahead 0` / `N` overrides. |
 | **R5** | Docs-only refresh of P1–P5 completion and residual pointers. |
 
 ## Out of scope this batch

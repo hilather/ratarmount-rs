@@ -7,8 +7,9 @@
 //!
 //! ## Per-reader decoded-window LRU
 //! Each [`SeekableGzipReader`] keeps a small LRU of recent uncompressed windows
-//! ([`G3_SEEK_CACHE_CHUNKS`] × [`G3_SEEK_CACHE_BYTES`]). Sequential FUSE-style
-//! re-seeks hit the working buffer; reverse / nearby seeks can hit the LRU without
+//! (dual cap: [`G3_SEEK_CACHE_CHUNKS`] entries **and** [`G3_SEEK_CACHE_BYTES`]
+//! total; default ≈ **16 MiB** at 64 KiB chunks). Sequential FUSE-style re-seeks
+//! hit the working buffer; reverse / nearby seeks can hit the LRU without
 //! re-inflating. Concurrent [`SharedSeekableGzip`] readers each own a private cache
 //! (no shared mutable window cache).
 //!
@@ -87,11 +88,14 @@ pub const INDEXED_GZIP_INDEX_VERSION: u8 = 1;
 /// Standard predecessor-window size for `indexed_gzip` / zran (`GZIDX`).
 pub const INDEXED_GZIP_WINDOW_SIZE: u32 = 32 * 1024;
 
-/// Per-reader decoded-window LRU entry cap (G3; smaller RSS than Tier D's 16).
+/// Per-reader decoded-window LRU entry cap (G3).
 ///
+/// Sized so `G3_SEEK_CACHE_CHUNKS × G3_CACHE_CHUNK` ≈ [`G3_SEEK_CACHE_BYTES`]
+/// (256 × 64 KiB = 16 MiB). Both caps apply on insert; the byte cap is the hard
+/// RSS ceiling when some stashed windows are larger than `G3_CACHE_CHUNK`.
 /// Each [`SeekableGzipReader`] (including concurrent Shared opens) owns its own
 /// cache — multi-open FUSE multiplies this × open count.
-pub const G3_SEEK_CACHE_CHUNKS: usize = 8;
+pub const G3_SEEK_CACHE_CHUNKS: usize = 256;
 
 /// Per-reader decoded-window LRU byte cap (16 MiB; Tier D rapidgzip uses 64 MiB).
 pub const G3_SEEK_CACHE_BYTES: usize = 16 * 1024 * 1024;
@@ -3193,8 +3197,14 @@ mod tests {
 
     #[test]
     fn g3_cache_defaults_documented() {
-        assert_eq!(G3_SEEK_CACHE_CHUNKS, 8);
+        assert_eq!(G3_SEEK_CACHE_CHUNKS, 256);
         assert_eq!(G3_SEEK_CACHE_BYTES, 16 * 1024 * 1024);
+        // Chunk count × stash size lands on the byte cap (dual-cap design).
+        assert_eq!(
+            G3_SEEK_CACHE_CHUNKS * G3_CACHE_CHUNK,
+            G3_SEEK_CACHE_BYTES,
+            "chunk cap should allow filling the full 16 MiB byte budget at 64 KiB stash size"
+        );
         assert_eq!(INDEXED_GZIP_WINDOW_SIZE, 32 * 1024);
     }
 }
