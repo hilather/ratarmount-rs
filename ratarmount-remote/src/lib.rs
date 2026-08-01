@@ -3,10 +3,14 @@
 //! - `file://` → local path
 //! - `http(s)://` → fetch to temp (prefer Range when supported) and live Range I/O via
 //!   [`resolve_http`] / [`open_http_range`] / [`HttpRangeFile`].
-//!   **HTTP Basic auth** (upstream [#157](https://github.com/mxmlnkn/ratarmount/issues/157) / FR-2):
-//!   credentials from URL userinfo (`https://user:pass@host/path`) and/or env
-//!   [`HTTP_USER_ENV`] / [`HTTP_PASSWORD_ENV`]; sent as `Authorization: Basic …` on HEAD,
-//!   GET, and Range requests. Cookie auth is not implemented.
+//!   **HTTP auth** (upstream [#157](https://github.com/mxmlnkn/ratarmount/issues/157) / FR-2):
+//!   - **Basic:** URL userinfo (`https://user:pass@host/path`) and/or env
+//!     [`HTTP_USER_ENV`] / [`HTTP_PASSWORD_ENV`] → `Authorization: Basic …`
+//!   - **Cookie:** env [`HTTP_COOKIE_ENV`] (raw Cookie header) or
+//!     [`HTTP_COOKIE_FILE_ENV`] (Netscape jar / simple cookie lines) → `Cookie: …`
+//!
+//!   Both may be sent together on HEAD, GET, and Range requests. Not a browser cookie
+//!   jar (no `Set-Cookie` persistence / per-domain store).
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp (OpenSSH config subset:
@@ -69,6 +73,16 @@ pub const HTTP_RANGE_CHUNK: u64 = 4 * 1024 * 1024;
 pub const HTTP_USER_ENV: &str = "RATARMOUNT_HTTP_USER";
 /// Env: HTTP Basic password (pairs with [`HTTP_USER_ENV`], or fills missing URL password).
 pub const HTTP_PASSWORD_ENV: &str = "RATARMOUNT_HTTP_PASSWORD";
+/// Env: raw HTTP `Cookie` header value for `http(s)://` (FR-2 residual / #157).
+///
+/// Example: `session=abc; token=xyz`. Wins over [`HTTP_COOKIE_FILE_ENV`] when both are set.
+pub const HTTP_COOKIE_ENV: &str = "RATARMOUNT_HTTP_COOKIE";
+/// Env: path to a cookie file used when [`HTTP_COOKIE_ENV`] is unset.
+///
+/// Accepts a Netscape HTTP cookie file and/or simple non-comment lines of
+/// `name=value` (joined with `"; "` into a single `Cookie` header). Not a full
+/// browser jar: no `Set-Cookie` persistence and no per-domain filtering.
+pub const HTTP_COOKIE_FILE_ENV: &str = "RATARMOUNT_HTTP_COOKIE_FILE";
 
 pub(crate) const USER_AGENT: &str = "ratarmount-rs/0.1";
 
@@ -96,22 +110,115 @@ impl std::fmt::Debug for HttpAuth {
     }
 }
 
-/// HTTP(S) request target: clean URL (no userinfo) + optional Basic auth.
-#[derive(Debug, Clone)]
+/// HTTP(S) request target: clean URL (no userinfo) + optional Basic auth and/or Cookie.
+#[derive(Clone)]
 pub struct HttpLocation {
     /// `http://` or `https://` URL without userinfo.
     pub url: String,
     pub auth: Option<HttpAuth>,
+    /// Raw `Cookie` header value from env / file, if any.
+    pub cookie: Option<String>,
+}
+
+impl std::fmt::Debug for HttpLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HttpLocation")
+            .field("url", &self.url)
+            .field("auth", &self.auth)
+            .field("cookie", &self.cookie.as_deref().map(redact_cookie_header))
+            .finish()
+    }
+}
+
+/// Redact cookie header values for logs / Debug (`name=***; other=***`).
+///
+/// Never log full cookie secrets (same policy as passwords / Dropbox tokens).
+pub fn redact_cookie_header(cookie: &str) -> String {
+    cookie
+        .split(';')
+        .filter_map(|part| {
+            let part = part.trim();
+            if part.is_empty() {
+                return None;
+            }
+            Some(match part.split_once('=') {
+                Some((name, _)) => format!("{}=***", name.trim()),
+                None => "***".to_string(),
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// Parse cookie file text into a single `Cookie` header value.
+///
+/// - **Netscape** lines: tab-separated fields; name/value are fields 6 and 7
+///   (1-based). `#HttpOnly_` domain prefix is accepted.
+/// - **Simple**: non-comment lines containing `=` are treated as Cookie fragments
+///   and joined with `"; "`.
+///
+/// Comment lines (`#…`) and blanks are ignored. Returns `None` when nothing usable
+/// is found.
+pub fn parse_cookie_file_contents(text: &str) -> Option<String> {
+    let mut netscape_pairs: Vec<String> = Vec::new();
+    let mut raw_lines: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        // Netscape HttpOnly marker (still a cookie record).
+        if let Some(rest) = line.strip_prefix("#HttpOnly_") {
+            if let Some(pair) = parse_netscape_cookie_line(rest) {
+                netscape_pairs.push(pair);
+            }
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        if let Some(pair) = parse_netscape_cookie_line(line) {
+            netscape_pairs.push(pair);
+        } else if line.contains('=') {
+            raw_lines.push(line.to_string());
+        }
+    }
+    if !netscape_pairs.is_empty() {
+        return Some(netscape_pairs.join("; "));
+    }
+    if raw_lines.is_empty() {
+        None
+    } else {
+        Some(raw_lines.join("; "))
+    }
+}
+
+fn parse_netscape_cookie_line(line: &str) -> Option<String> {
+    // domain \t include_subdomains \t path \t secure \t expiry \t name \t value
+    let parts: Vec<&str> = line.split('\t').collect();
+    if parts.len() < 7 {
+        return None;
+    }
+    let name = parts[5].trim();
+    let value = parts[6].trim();
+    if name.is_empty() {
+        return None;
+    }
+    Some(format!("{name}={value}"))
 }
 
 /// Parse an `http://` / `https://` URL for wire requests.
 ///
-/// Credentials resolution order:
+/// **Basic credentials** resolution order:
 /// 1. URL userinfo (`https://user:pass@host/path`) — username required for this branch;
 ///    password may fall back to [`HTTP_PASSWORD_ENV`] when the URL has a user but no password.
 /// 2. Else [`HTTP_USER_ENV`] (+ optional [`HTTP_PASSWORD_ENV`]).
 ///
-/// Cookie-based auth is not supported.
+/// **Cookie** (independent of Basic; both may be sent):
+/// 1. [`HTTP_COOKIE_ENV`] if non-empty
+/// 2. Else contents of the file at [`HTTP_COOKIE_FILE_ENV`] (see [`parse_cookie_file_contents`])
+///
+/// Residual: not a browser cookie jar (`Set-Cookie` persistence / per-domain store).
 pub fn parse_http_url(url_str: &str) -> Result<HttpLocation> {
     let url = Url::parse(url_str).map_err(|e| RemoteError::Url(e.to_string()))?;
     match url.scheme() {
@@ -135,6 +242,7 @@ pub fn parse_http_url(url_str: &str) -> Result<HttpLocation> {
     } else {
         load_http_auth_from_env()
     };
+    let cookie = load_http_cookie()?;
 
     let mut clean = url.clone();
     let _ = clean.set_username("");
@@ -143,6 +251,7 @@ pub fn parse_http_url(url_str: &str) -> Result<HttpLocation> {
     Ok(HttpLocation {
         url: clean.to_string(),
         auth,
+        cookie,
     })
 }
 
@@ -156,9 +265,40 @@ fn load_http_auth_from_env() -> Option<HttpAuth> {
     Some(HttpAuth { username, password })
 }
 
-fn apply_http_auth(mut req: ureq::Request, auth: Option<&HttpAuth>) -> ureq::Request {
+/// Load Cookie header from [`HTTP_COOKIE_ENV`] or [`HTTP_COOKIE_FILE_ENV`].
+fn load_http_cookie() -> Result<Option<String>> {
+    if let Some(c) = non_empty_env(HTTP_COOKIE_ENV) {
+        return Ok(Some(c));
+    }
+    let Some(path) = non_empty_env(HTTP_COOKIE_FILE_ENV) else {
+        return Ok(None);
+    };
+    let text = std::fs::read_to_string(&path).map_err(|e| {
+        RemoteError::Http(format!(
+            "failed to read {HTTP_COOKIE_FILE_ENV} ({path}): {e}"
+        ))
+    })?;
+    match parse_cookie_file_contents(&text) {
+        Some(c) if !c.is_empty() => Ok(Some(c)),
+        _ => Err(RemoteError::Http(format!(
+            "{HTTP_COOKIE_FILE_ENV} ({path}) has no usable cookies"
+        ))),
+    }
+}
+
+/// Attach Basic `Authorization` and/or `Cookie` headers for HTTP(S) requests.
+fn apply_http_auth(
+    mut req: ureq::Request,
+    auth: Option<&HttpAuth>,
+    cookie: Option<&str>,
+) -> ureq::Request {
     if let Some(a) = auth {
         req = req.set("Authorization", &a.authorization_header());
+    }
+    if let Some(c) = cookie {
+        if !c.is_empty() {
+            req = req.set("Cookie", c);
+        }
     }
     req
 }
@@ -166,7 +306,8 @@ fn apply_http_auth(mut req: ureq::Request, auth: Option<&HttpAuth>) -> ureq::Req
 fn http_unauthorized(url: &str) -> RemoteError {
     RemoteError::Http(format!(
         "HTTP 401 Unauthorized for {url}; provide credentials via URL userinfo \
-         (https://user:pass@host/...) or {HTTP_USER_ENV}/{HTTP_PASSWORD_ENV}"
+         (https://user:pass@host/...), {HTTP_USER_ENV}/{HTTP_PASSWORD_ENV}, \
+         or Cookie via {HTTP_COOKIE_ENV}/{HTTP_COOKIE_FILE_ENV}"
     ))
 }
 
@@ -360,8 +501,8 @@ pub fn range_chunk_windows(size: u64, chunk: u64) -> Vec<(u64, u64)> {
 /// Probe an HTTP(S) URL for Content-Length and Accept-Ranges support.
 ///
 /// Tries HEAD first; on failure or missing length with ranges advertised, probes with
-/// `Range: bytes=0-0` (206 + Content-Range total). Sends Basic auth when credentials
-/// are present (URL userinfo or env).
+/// `Range: bytes=0-0` (206 + Content-Range total). Sends Basic auth and/or Cookie when
+/// configured (URL userinfo / env).
 pub fn probe_http(url: &str) -> Result<HttpProbe> {
     let loc = parse_http_url(url)?;
     probe_http_location(&loc)
@@ -372,6 +513,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
     match apply_http_auth(
         ureq::head(url).set("User-Agent", USER_AGENT),
         loc.auth.as_ref(),
+        loc.cookie.as_deref(),
     )
     .call()
     {
@@ -441,6 +583,7 @@ fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
             .set("User-Agent", USER_AGENT)
             .set("Range", "bytes=0-0"),
         loc.auth.as_ref(),
+        loc.cookie.as_deref(),
     )
     .call()
     {
@@ -524,6 +667,7 @@ fn fetch_http_full_get(loc: &HttpLocation) -> Result<(NamedTempFile, u64)> {
     let resp = apply_http_auth(
         ureq::get(&loc.url).set("User-Agent", USER_AGENT),
         loc.auth.as_ref(),
+        loc.cookie.as_deref(),
     )
     .call()
     .map_err(|e| map_ureq_http_error(e, &loc.url))?;
@@ -553,6 +697,7 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
                 .set("User-Agent", USER_AGENT)
                 .set("Range", &range),
             loc.auth.as_ref(),
+            loc.cookie.as_deref(),
         )
         .call()
         .map_err(|e| map_ureq_http_error(e, &loc.url))?;
@@ -594,11 +739,12 @@ fn fetch_http_via_ranges(loc: &HttpLocation, size: u64) -> Result<(NamedTempFile
 /// Prefer [`open_http_range`] / [`resolve_http`] for the public entry points.
 /// [`resolve_to_local`] still fully materializes HTTP(S) for path-based openers.
 ///
-/// Basic auth from the open URL / env is retained for subsequent Range GETs.
+/// Basic auth and/or Cookie from the open URL / env are retained for subsequent Range GETs.
 pub struct HttpRangeFile {
     /// Wire URL without userinfo.
     url: String,
     auth: Option<HttpAuth>,
+    cookie: Option<String>,
     size: u64,
     pos: u64,
     /// Optional fully buffered body if ranges unavailable
@@ -610,6 +756,7 @@ impl std::fmt::Debug for HttpRangeFile {
         f.debug_struct("HttpRangeFile")
             .field("url", &self.url)
             .field("auth", &self.auth)
+            .field("cookie", &self.cookie.as_deref().map(redact_cookie_header))
             .field("size", &self.size)
             .field("pos", &self.pos)
             .field("uses_ranges", &self.uses_ranges())
@@ -641,6 +788,7 @@ impl HttpRangeFile {
         Self {
             url: loc.url,
             auth: loc.auth,
+            cookie: loc.cookie,
             size,
             pos: 0,
             buffered,
@@ -649,13 +797,14 @@ impl HttpRangeFile {
 
     /// Construct a live Range-backed reader (no probe; caller must know size).
     ///
-    /// Parses Basic auth from URL userinfo / env the same way as [`open`].
+    /// Parses Basic auth and Cookie from URL userinfo / env the same way as [`open`].
     pub fn range_backed(url: &str, size: u64) -> Self {
         match parse_http_url(url) {
             Ok(loc) => Self::from_location(loc, size, None),
             Err(_) => Self {
                 url: url.to_string(),
                 auth: None,
+                cookie: None,
                 size,
                 pos: 0,
                 buffered: None,
@@ -670,6 +819,11 @@ impl HttpRangeFile {
     /// Basic auth retained for live Range GETs, if any.
     pub fn auth(&self) -> Option<&HttpAuth> {
         self.auth.as_ref()
+    }
+
+    /// Cookie header retained for live Range GETs, if any.
+    pub fn cookie(&self) -> Option<&str> {
+        self.cookie.as_deref()
     }
 
     pub fn len(&self) -> u64 {
@@ -830,12 +984,13 @@ impl Read for HttpRangeFile {
                 .set("User-Agent", USER_AGENT)
                 .set("Range", &range),
             self.auth.as_ref(),
+            self.cookie.as_deref(),
         )
         .call()
         .map_err(|e| match e {
             ureq::Error::Status(401, _) => io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo or {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV
+                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
+                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
             )),
             other => io::Error::other(other.to_string()),
         })?;
@@ -866,8 +1021,8 @@ impl Read for HttpRangeFile {
         }
         if status == 401 {
             return Err(io::Error::other(format!(
-                "HTTP 401 Unauthorized for {}; check URL userinfo or {}/{}",
-                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV
+                "HTTP 401 Unauthorized for {}; check URL userinfo, {}/{}, or Cookie via {}/{}",
+                self.url, HTTP_USER_ENV, HTTP_PASSWORD_ENV, HTTP_COOKIE_ENV, HTTP_COOKIE_FILE_ENV
             )));
         }
         Err(io::Error::other(format!(
@@ -1050,6 +1205,8 @@ mod tests {
         head_rejects: bool,
         /// If set, require `Authorization: Basic …` matching this user:pass.
         require_basic: Option<(String, String)>,
+        /// If set, require exact `Cookie` header value.
+        require_cookie: Option<String>,
     }
 
     impl MockHttp {
@@ -1075,6 +1232,7 @@ mod tests {
                     let mut headers = Vec::new();
                     let mut range_hdr: Option<String> = None;
                     let mut auth_hdr: Option<String> = None;
+                    let mut cookie_hdr: Option<String> = None;
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -1090,6 +1248,12 @@ mod tests {
                         if let Some(v) = line.strip_prefix("Authorization:") {
                             auth_hdr = Some(v.trim().to_string());
                         }
+                        // Case-insensitive Cookie: (HTTP headers are case-insensitive).
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(rest) = lower.strip_prefix("cookie:") {
+                            let start = line.len() - rest.len();
+                            cookie_hdr = Some(line[start..].trim().to_string());
+                        }
                     }
                     {
                         let mut lg = log_c.lock().unwrap();
@@ -1100,6 +1264,11 @@ mod tests {
                         if let Some(a) = &auth_hdr {
                             lg.push(format!("Authorization: {a}"));
                         }
+                        if let Some(c) = &cookie_hdr {
+                            lg.push(format!("Cookie: {c}"));
+                        } else {
+                            lg.push("Cookie: absent".into());
+                        }
                     }
 
                     if let Some((user, pass)) = &cfg.require_basic {
@@ -1109,6 +1278,19 @@ mod tests {
                             let _ = write!(
                                 stream,
                                 "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Basic realm=\"http\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            );
+                            let _ = stream.write_all(body);
+                            continue;
+                        }
+                    }
+
+                    if let Some(expected_cookie) = &cfg.require_cookie {
+                        if cookie_hdr.as_deref() != Some(expected_cookie.as_str()) {
+                            let body = b"unauthorized cookie";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: Cookie\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                                 body.len()
                             );
                             let _ = stream.write_all(body);
@@ -1265,6 +1447,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1291,6 +1474,7 @@ mod tests {
             honor_range: false,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1311,6 +1495,7 @@ mod tests {
             honor_range: true,
             head_rejects: true,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/blob.bin");
         let (mut tmp, size) = fetch_http_to_temp_prefer_range(&url).unwrap();
@@ -1330,6 +1515,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/blob.bin");
         let mut f = HttpRangeFile::open(&url).unwrap();
@@ -1363,6 +1549,7 @@ mod tests {
             honor_range: false,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/blob.bin");
         let mut f = HttpRangeFile::open(&url).unwrap();
@@ -1383,6 +1570,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/a.tar");
         let local = resolve_to_local(&url).unwrap();
@@ -1399,6 +1587,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/live.bin");
         let access = resolve_http(&url).unwrap();
@@ -1430,6 +1619,7 @@ mod tests {
             honor_range: false,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/full.bin");
         let access = resolve_http(&url).unwrap();
@@ -1450,6 +1640,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/api.bin");
         let mut f = open_http_range(&url).unwrap();
@@ -1469,6 +1660,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: None,
+            require_cookie: None,
         });
         let url = mock.url("/acc.bin");
         let acc = resolve_access(&url).unwrap();
@@ -1536,6 +1728,7 @@ mod tests {
             honor_range: false,
             head_rejects: false,
             require_basic: Some(("alice".into(), "s3cret".into())),
+            require_cookie: None,
         });
         let bare = mock.url("/secret.bin");
         let err = fetch_http_to_temp(&bare).unwrap_err().to_string();
@@ -1571,6 +1764,7 @@ mod tests {
             honor_range: false,
             head_rejects: false,
             require_basic: Some(("envuser".into(), "envpass".into())),
+            require_cookie: None,
         });
         let _g = HttpEnvGuard::acquire(&[HTTP_USER_ENV, HTTP_PASSWORD_ENV]);
         _g.set(HTTP_USER_ENV, "envuser");
@@ -1593,6 +1787,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: Some(("rangeuser".into(), "rangepass".into())),
+            require_cookie: None,
         });
         let url = mock.url_with_auth("rangeuser", "rangepass", "/ranged.bin");
         let mut f = HttpRangeFile::open(&url).unwrap();
@@ -1628,6 +1823,7 @@ mod tests {
             honor_range: true,
             head_rejects: false,
             require_basic: Some(("good".into(), "pass".into())),
+            require_cookie: None,
         });
         let bad = mock.url_with_auth("good", "wrong", "/x.bin");
         let err = open_http_range(&bad).unwrap_err().to_string();
@@ -1635,6 +1831,231 @@ mod tests {
         assert!(
             err.contains("Unauthorized") || err.contains(HTTP_USER_ENV),
             "got {err}"
+        );
+    }
+
+    // --- FR-2 residual / #157: Cookie-based HTTP authentication ---
+
+    #[test]
+    fn redact_cookie_header_hides_values() {
+        assert_eq!(
+            redact_cookie_header("session=abc; token=xyz"),
+            "session=***; token=***"
+        );
+        assert_eq!(redact_cookie_header("solo=secret"), "solo=***");
+        assert_eq!(redact_cookie_header("  a=1 ; b=2  "), "a=***; b=***");
+        // Malformed fragment without '=' still redacted.
+        assert_eq!(redact_cookie_header("noequals"), "***");
+    }
+
+    #[test]
+    fn parse_cookie_file_simple_and_netscape() {
+        let simple = parse_cookie_file_contents("session=abc\ntoken=xyz\n").unwrap();
+        assert_eq!(simple, "session=abc; token=xyz");
+
+        let netscape = "\
+# Netscape HTTP Cookie File
+.example.com\tTRUE\t/\tFALSE\t0\tsession\tabc123
+.example.com\tTRUE\t/\tTRUE\t0\ttoken\txyz789
+";
+        assert_eq!(
+            parse_cookie_file_contents(netscape).as_deref(),
+            Some("session=abc123; token=xyz789")
+        );
+
+        let httponly = "#HttpOnly_.example.com\tTRUE\t/\tFALSE\t0\thid\tval\n";
+        assert_eq!(
+            parse_cookie_file_contents(httponly).as_deref(),
+            Some("hid=val")
+        );
+
+        assert!(parse_cookie_file_contents("# only comments\n\n").is_none());
+    }
+
+    #[test]
+    fn parse_http_url_cookie_from_env() {
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(HTTP_COOKIE_ENV, "session=abc; token=xyz");
+        let loc = parse_http_url("http://127.0.0.1:9/blob.bin").unwrap();
+        assert!(loc.auth.is_none());
+        assert_eq!(loc.cookie.as_deref(), Some("session=abc; token=xyz"));
+        // Debug must not leak cookie values.
+        let dbg = format!("{loc:?}");
+        assert!(
+            !dbg.contains("abc") && !dbg.contains("xyz"),
+            "Debug leaked cookie value: {dbg}"
+        );
+        assert!(dbg.contains("session=***") || dbg.contains("***"), "{dbg}");
+    }
+
+    #[test]
+    fn parse_http_url_cookie_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.txt");
+        std::fs::write(
+            &path,
+            "# Netscape HTTP Cookie File\n\
+             .example.com\tTRUE\t/\tFALSE\t0\tsid\tfilecookie\n",
+        )
+        .unwrap();
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(HTTP_COOKIE_FILE_ENV, path.to_str().unwrap());
+        let loc = parse_http_url("http://127.0.0.1:9/blob.bin").unwrap();
+        assert_eq!(loc.cookie.as_deref(), Some("sid=filecookie"));
+    }
+
+    #[test]
+    fn parse_http_url_cookie_env_wins_over_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cookies.txt");
+        std::fs::write(&path, "fromfile=1\n").unwrap();
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(HTTP_COOKIE_ENV, "fromenv=1");
+        _g.set(HTTP_COOKIE_FILE_ENV, path.to_str().unwrap());
+        let loc = parse_http_url("http://127.0.0.1:9/x").unwrap();
+        assert_eq!(loc.cookie.as_deref(), Some("fromenv=1"));
+    }
+
+    /// Regression: Cookie header sent on GET materialize; absent without env.
+    #[test]
+    fn http_cookie_auth_from_env() {
+        let body = b"cookie-payload".to_vec();
+        let cookie = "session=s3cr3t-session; role=user";
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+            require_basic: None,
+            require_cookie: Some(cookie.into()),
+        });
+        let url = mock.url("/cookie.bin");
+
+        // Without cookie → 401.
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        let err = fetch_http_to_temp(&url).unwrap_err().to_string();
+        assert!(
+            err.contains("401"),
+            "expected 401 without cookie, got {err}"
+        );
+        assert!(
+            err.contains(HTTP_COOKIE_ENV) || err.contains("Unauthorized"),
+            "401 should mention cookie/credential sources, got {err}"
+        );
+
+        _g.set(HTTP_COOKIE_ENV, cookie);
+        let (mut tmp, size) = fetch_http_to_temp(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l == &format!("Cookie: {cookie}")),
+            "expected Cookie on GET, log={log:?}"
+        );
+    }
+
+    /// Regression: Cookie + Basic Authorization both sent when both configured.
+    #[test]
+    fn http_basic_and_cookie_together() {
+        let body = b"both-auth-payload".to_vec();
+        let cookie = "sid=combo";
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+            require_basic: Some(("alice".into(), "s3cret".into())),
+            require_cookie: Some(cookie.into()),
+        });
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(HTTP_COOKIE_ENV, cookie);
+        // URL Basic + env Cookie.
+        let url = mock.url_with_auth("alice", "s3cret", "/both.bin");
+        let (mut tmp, size) = fetch_http_to_temp(&url).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("Authorization: Basic ")),
+            "expected Basic, log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l == &format!("Cookie: {cookie}")),
+            "expected Cookie, log={log:?}"
+        );
+    }
+
+    /// Regression: Cookie retained on live Range GETs after open.
+    #[test]
+    fn http_cookie_on_range_requests() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(2048).collect();
+        let cookie = "range=cookie-val";
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: true,
+            honor_range: true,
+            head_rejects: false,
+            require_basic: None,
+            require_cookie: Some(cookie.into()),
+        });
+        let _g = HttpEnvGuard::acquire(&[
+            HTTP_USER_ENV,
+            HTTP_PASSWORD_ENV,
+            HTTP_COOKIE_ENV,
+            HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(HTTP_COOKIE_ENV, cookie);
+        let url = mock.url("/ranged-cookie.bin");
+        let mut f = HttpRangeFile::open(&url).unwrap();
+        assert!(f.uses_ranges());
+        assert_eq!(f.cookie(), Some(cookie));
+        // Debug redacts cookie values.
+        let dbg = format!("{f:?}");
+        assert!(
+            !dbg.contains("cookie-val"),
+            "HttpRangeFile Debug leaked cookie: {dbg}"
+        );
+
+        f.seek(SeekFrom::Start(100)).unwrap();
+        let mut buf = [0u8; 32];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, &body[100..132]);
+        assert!(mock.range_gets.load(Ordering::SeqCst) >= 1);
+        let log = mock.log.lock().unwrap();
+        let cookie_line = format!("Cookie: {cookie}");
+        let cookie_count = log.iter().filter(|l| *l == &cookie_line).count();
+        assert!(
+            cookie_count >= 2,
+            "expected Cookie on probe + Range GET, log={log:?}"
         );
     }
 
