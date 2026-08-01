@@ -247,7 +247,7 @@ On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and
 
 Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md):
 
-1. **Codec depth** — rapidgzip-class gzip throughput; exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
+1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md), [binding decision](docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges.
@@ -280,12 +280,14 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
 | [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table & producer recipes |
-| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design |
+| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
+| [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/packaging.md](docs/packaging.md) | Packages + cosign verify |
 | [docs/macos.md](docs/macos.md) | macOS FUSE / FSKit |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
 | [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers |
+| [benchmarks/README.md](benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
 | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) | Dual-run / crates.io notes |
 
 ---
