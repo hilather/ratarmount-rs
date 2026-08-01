@@ -807,8 +807,9 @@ fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
 
 /// Nested gzip body: seekable checkpoints + TAR / format / single-file (no temp spool).
 ///
-/// With `gzip-rapidgzip` + prefer backend, tries rapidgzip `from_reader` when compress
-/// exports it; otherwise G3 [`SharedSeekableGzip`] (still no temp spool).
+/// With `gzip-rapidgzip` + prefer backend, uses rapidgzip `from_reader` (kind
+/// `gzip-rapidgzip`). On failure the reader is consumed so G3 cannot run — return
+/// the error. Without prefer, G3 [`SharedSeekableGzip`] (still no temp spool).
 fn open_nested_gzip_tar(
     reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
@@ -825,39 +826,37 @@ fn open_nested_gzip_tar(
         label.display()
     );
 
-    // Planned (compress `open_seekable_gzip_rapidgzip_from_reader`):
-    //   #[cfg(feature = "gzip-rapidgzip")]
-    //   if prefer_rapidgzip_gzip_backend(&opts.use_backends) {
-    //       let rg_threads = rapidgzip_threads(opts);
-    //       match open_seekable_gzip_rapidgzip_from_reader(reader, spacing, rg_threads, label) {
-    //           Ok(body) => {
-    //               let is_tar = name_suggests_compressed_tar(label)
-    //                   || body_looks_like_tar(&body).unwrap_or(false);
-    //               if is_tar {
-    //                   return open_tar_body(label, body, None, opts, true)
-    //                       .map(|s| Arc::new(s) as Arc<dyn MountSource>)
-    //                       .map_err(|e| std::io::Error::other(e));
-    //               }
-    //               return open_nested_non_tar_seekable_body(
-    //                   label, body, opts, "gzip-rapidgzip",
-    //               );
-    //           }
-    //           Err(e) => {
-    //               // Reader was consumed — only retry G3 when a reopen path exists.
-    //               log::warn!("nested rapidgzip failed ({e}); need reopen for G3");
-    //               return Err(...);
-    //           }
-    //       }
-    //   }
     #[cfg(feature = "gzip-rapidgzip")]
     if ratarmount_compress::prefer_rapidgzip_gzip_backend(&opts.use_backends) {
-        // Residual: compress has path-only rapidgzip (no from_reader). Stay on G3
-        // SharedSeekableGzip below — still no materialize / temp spool.
-        // When from_reader lands, use rapidgzip_threads(opts) in the match arm above.
-        log::debug!(
-            "nested gzip: prefer_rapidgzip for {} but from_reader residual; using G3",
-            label.display()
-        );
+        let rg_threads = rapidgzip_threads(opts);
+        match ratarmount_compress::open_seekable_gzip_rapidgzip_from_reader(
+            reader, spacing, rg_threads, label,
+        ) {
+            Ok(body) => {
+                log::debug!(
+                    "nested reader open: {} gzip-rapidgzip ({} uncompressed bytes, {} checkpoints, kind={})",
+                    label.display(),
+                    body.size(),
+                    body.checkpoint_count(),
+                    body.kind()
+                );
+                let is_tar = name_suggests_compressed_tar(label)
+                    || body_looks_like_tar(&body).unwrap_or(false);
+                if is_tar {
+                    return open_tar_body(label, body, None, opts, true)
+                        .map(|s| Arc::new(s) as Arc<dyn MountSource>)
+                        .map_err(std::io::Error::other);
+                }
+                return open_nested_non_tar_seekable_body(label, body, opts, "gzip-rapidgzip");
+            }
+            Err(e) => {
+                // Reader was consumed — cannot fall back to G3 without a reopen path.
+                log::warn!("nested rapidgzip open failed for {}: {e}", label.display());
+                return Err(std::io::Error::other(format!(
+                    "nested rapidgzip open failed: {e}"
+                )));
+            }
+        }
     }
 
     let gzip = SharedSeekableGzip::open_with_threads_from_reader(reader, spacing, threads, label)
@@ -1552,16 +1551,14 @@ fn rapidgzip_threads(options: &OpenOptions) -> u32 {
     }
 }
 
-/// Open path-backed rapidgzip, optionally hydrating a SQLite GZIDX/RGZI blob first.
+/// Open path-backed rapidgzip, optionally hydrating a SQLite GZIDX blob first.
 ///
 /// Keeps a typed [`ratarmount_compress::SharedRapidgzip`] so GZIDX export can run after
 /// TAR/body open without downcasting `Arc<dyn SeekableBody>`.
 ///
-/// **Compress API today (path-only POC):** cold
-/// [`SharedRapidgzip::open_with_threads`](ratarmount_compress::SharedRapidgzip::open_with_threads).
-/// Any stored blob is loaded so the warm-index control flow matches G3; import is a
-/// no-op until compress exports `open_seekable_gzip_rapidgzip_with_imported_index`
-/// (invalid blobs must never panic — fall through to rebuild).
+/// Tries [`SharedRapidgzip::open_with_imported_index`] when a side-table blob loads;
+/// invalid / foreign (e.g. RGZI-only) blobs fall through to a cold
+/// [`SharedRapidgzip::open_with_threads`] rebuild (never panics).
 #[cfg(feature = "gzip-rapidgzip")]
 fn open_shared_rapidgzip_path(
     path: &Path,
@@ -1570,29 +1567,42 @@ fn open_shared_rapidgzip_path(
     index_path: Option<&Path>,
     recreate: bool,
 ) -> Result<Arc<ratarmount_compress::SharedRapidgzip>, String> {
-    // Planned (compress):
-    //   if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
-    //       match open_seekable_gzip_rapidgzip_with_imported_index(path, spacing, threads, &blob) {
-    //           Ok(shared) => return Ok(shared),
-    //           Err(e) => eprintln!("info: rapidgzip GZIDX import failed ({e}); rebuilding"),
-    //       }
-    //   }
-    // Today: exercise load so garbage blobs cannot panic the open path; always rebuild.
-    if let Some(_blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
-        log::debug!(
-            "rapidgzip path open: index blob present for {} but with_imported_index residual; rebuilding",
-            path.display()
-        );
+    if let Some(blob) = try_load_gzip_index_blob(index_path, Some(path), recreate) {
+        match ratarmount_compress::SharedRapidgzip::open_with_imported_index(
+            path, spacing, threads, &blob,
+        ) {
+            Ok(shared) => {
+                eprintln!(
+                    "seekable gzip-rapidgzip (imported GZIDX): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
+                    path.display(),
+                    shared.size(),
+                    shared.checkpoint_count(),
+                    threads
+                );
+                return Ok(shared);
+            }
+            Err(e) => {
+                eprintln!("info: rapidgzip GZIDX import failed ({e}); rebuilding seek index");
+            }
+        }
     }
-    ratarmount_compress::SharedRapidgzip::open_with_threads(path, spacing, threads)
-        .map_err(|e| e.to_string())
+    let shared = ratarmount_compress::SharedRapidgzip::open_with_threads(path, spacing, threads)
+        .map_err(|e| e.to_string())?;
+    eprintln!(
+        "seekable gzip-rapidgzip: {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
+        path.display(),
+        shared.size(),
+        shared.checkpoint_count(),
+        threads
+    );
+    Ok(shared)
 }
 
 /// Persist rapidgzip GZIDX into the SQLite side table when writable.
 ///
-/// **Residual:** no-op until compress exports `SharedRapidgzip::export_gzidx_blob()`
-/// (or a free-function export). Mirrors [`persist_gzip_index_blob`] control flow so
-/// the call site is ready for a one-line export swap.
+/// Mirrors [`persist_gzip_index_blob`] control flow (`write_index`, not RO / `:memory:`,
+/// index path exists). Stores Python `indexed_gzip` (`GZIDX`) bytes via
+/// [`SharedRapidgzip::export_gzidx_blob`](ratarmount_compress::SharedRapidgzip::export_gzidx_blob).
 #[cfg(feature = "gzip-rapidgzip")]
 fn persist_rapidgzip_index_blob(
     shared: &ratarmount_compress::SharedRapidgzip,
@@ -1608,26 +1618,45 @@ fn persist_rapidgzip_index_blob(
     if !ip.exists() {
         return;
     }
-    // Planned (compress):
-    //   let blob = shared.export_gzidx_blob();
-    //   match SqliteIndex::open_writable(ip) { ... set_gzip_index_blob + store_tarstats ... }
-    let _ = (shared, ip);
-    log::debug!(
-        "rapidgzip GZIDX persist residual (export_gzidx_blob not in compress); skip for {}",
-        ip.display()
-    );
+    let blob = match shared.export_gzidx_blob() {
+        Ok(b) => b,
+        Err(e) => {
+            eprintln!("info: rapidgzip GZIDX export failed: {e}");
+            return;
+        }
+    };
+    match SqliteIndex::open_writable(ip) {
+        Ok(idx) => {
+            if let Err(e) = idx.ensure_compression_tables() {
+                eprintln!("info: could not ensure compression tables for gzip blob: {e}");
+                return;
+            }
+            match idx.set_gzip_index_blob(&blob) {
+                Ok(()) => eprintln!(
+                    "gzip GZIDX (rapidgzip): stored {}-byte seek index in {}",
+                    blob.len(),
+                    ip.display()
+                ),
+                Err(e) => eprintln!("info: could not store rapidgzip GZIDX blob: {e}"),
+            }
+            if let Err(e) = idx.store_tarstats_for_path(shared.path()) {
+                eprintln!("info: could not store tarstats for rapidgzip index: {e}");
+            }
+        }
+        Err(e) => eprintln!("info: could not open index to store rapidgzip GZIDX: {e}"),
+    }
 }
 
-/// Open gzip: always seekable (RGZI import when present); TAR / formats / single-file over body.
+/// Open gzip: always seekable (RGZI/GZIDX import when present); TAR / formats / single-file over body.
 ///
 /// Plain single-file `.gz` uses [`SingleFileMountSource::from_seekable_body`] — **no materialize**.
 /// Path-only residual backends (EXT4 superblock, SquashFS, libarchive-only) may still materialize.
 ///
 /// With feature `gzip-rapidgzip` and `RATARMOUNT_GZIP_BACKEND=rapidgzip` (or
-/// `--use-backend rapidgzip`), path opens try the parallel IndexedReader POC first
-/// (typed [`SharedRapidgzip`](ratarmount_compress::SharedRapidgzip) for future GZIDX
-/// import/export) and fall back to G3 on failure. Nested / Range prefer the same
-/// backend when compress exposes `from_reader`; until then they stay on G3.
+/// `--use-backend rapidgzip`), path / nested / Range opens prefer the parallel
+/// IndexedReader backend (typed [`SharedRapidgzip`](ratarmount_compress::SharedRapidgzip)
+/// for GZIDX import/export) and fall back to G3 on path open failure (nested has no
+/// reopen — prefer failure returns error; Range reopens when possible).
 fn open_gzip(
     path: &Path,
     index_path: Option<&Path>,
@@ -2726,26 +2755,87 @@ where
                 "{transport} gzip: {input} ({range_len} compressed bytes, live Range, -P gzip:{threads})"
             );
 
-            // Planned (compress `open_seekable_gzip_rapidgzip_from_reader` /
-            // `…_with_imported_index_from_reader`): when prefer_rapidgzip, try
-            // import+open on `range`; on failure `reopen()` and rebuild G3.
-            // Residual today: path-only rapidgzip — live Range stays on G3 below.
+            // Single reopen token shared by rapidgzip prefer-path and G3 import-fail.
+            let mut reopen_opt = Some(reopen);
+
             #[cfg(feature = "gzip-rapidgzip")]
             if ratarmount_compress::prefer_rapidgzip_gzip_backend(&o.use_backends) {
-                // When from_reader lands, use rapidgzip_threads(&o) + reopen() on fail.
-                log::debug!(
-                    "{transport} gzip: prefer_rapidgzip for {input} but Range from_reader residual; using G3"
-                );
+                let rg_threads = rapidgzip_threads(&o);
+                let rg_result: Result<Arc<ratarmount_compress::SharedRapidgzip>, String> =
+                    if let Some(blob) = try_load_gzip_index_blob(ip, Some(&label), recreate) {
+                        match ratarmount_compress::SharedRapidgzip::open_with_imported_index_from_reader(
+                            range, spacing, rg_threads, &label, &blob,
+                        ) {
+                            Ok(shared) => {
+                                eprintln!(
+                                    "seekable gzip-rapidgzip (imported GZIDX): {} ({} uncompressed bytes, {} checkpoints, -P rapidgzip-gzip:{})",
+                                    label.display(),
+                                    shared.size(),
+                                    shared.checkpoint_count(),
+                                    rg_threads
+                                );
+                                Ok(shared)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "info: rapidgzip GZIDX import failed ({e}); rebuilding seek index"
+                                );
+                                let reopen_fn = reopen_opt.take().ok_or_else(|| {
+                                    "internal: reopen already consumed".to_string()
+                                })?;
+                                let fresh = reopen_fn()?;
+                                ratarmount_compress::SharedRapidgzip::open_with_threads_from_reader(
+                                    fresh, spacing, rg_threads, &label,
+                                )
+                                .map_err(|e| e.to_string())
+                            }
+                        }
+                    } else {
+                        ratarmount_compress::SharedRapidgzip::open_with_threads_from_reader(
+                            range, spacing, rg_threads, &label,
+                        )
+                        .map_err(|e| e.to_string())
+                    };
+
+                match rg_result {
+                    Ok(shared) => {
+                        let body: Arc<dyn SeekableBody> = shared.clone();
+                        let src = open_from_seekable_body(
+                            &label,
+                            body,
+                            ip,
+                            &o,
+                            recreate,
+                            "gzip-rapidgzip",
+                        )?;
+                        persist_rapidgzip_index_blob(shared.as_ref(), ip, &o);
+                        return Ok(Some((label, src)));
+                    }
+                    Err(e) => {
+                        eprintln!(
+                            "info: rapidgzip gzip open failed ({e}); falling back to G3 seekable gzip"
+                        );
+                        let reopen_fn = reopen_opt.take().ok_or_else(|| {
+                            format!(
+                                "rapidgzip gzip open failed and no {transport} Range reopen left: {e}"
+                            )
+                        })?;
+                        range = reopen_fn()?;
+                    }
+                }
             }
 
-            // Prefer RGZI import; on failure rebuild with a fresh Range handle.
+            // Prefer RGZI/GZIDX import; on failure rebuild with a fresh Range handle.
             let gzip = if try_load_gzip_index_blob(ip, Some(&label), recreate).is_some() {
                 match try_open_gzip_imported_from_reader(
                     range, &label, spacing, threads, ip, recreate,
                 ) {
                     Some(g) => g,
                     None => {
-                        let fresh = reopen()?;
+                        let reopen_fn = reopen_opt
+                            .take()
+                            .ok_or_else(|| "internal: reopen already consumed".to_string())?;
+                        let fresh = reopen_fn()?;
                         open_gzip_rebuilt_from_reader(fresh, &label, spacing, threads)?
                     }
                 }
@@ -4366,10 +4456,9 @@ mod tests {
                 .expect("poison gzip blob");
         }
 
-        // Prefer rapidgzip: blob load must not panic; open rebuilds cold rapidgzip index.
-        // (Import residual today — garbage blob is ignored, not applied.)
+        // Prefer rapidgzip: import of garbage must fail open (no panic); cold rebuild.
         let opts = OpenOptions {
-            index_file_path: Some(index),
+            index_file_path: Some(index.clone()),
             gzip_seek_point_spacing: 4 * 1024,
             use_backends: vec!["rapidgzip".into()],
             parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
@@ -4380,15 +4469,71 @@ mod tests {
             read_all(src.as_ref(), "/hello.txt"),
             b"hello world\n".as_slice()
         );
+        drop(src);
 
-        // Direct compress open still proves rapidgzip path works for this corpus.
-        let body = ratarmount_compress::open_seekable_gzip_rapidgzip(&archive, 4 * 1024, 2)
-            .expect("rapidgzip open must succeed for this corpus");
-        assert_eq!(body.kind(), ratarmount_compress::RAPIDGZIP_BODY_KIND);
+        // Rebuild rewrites a valid GZIDX blob for warm remount.
+        let idx = SqliteIndex::open_read_only(&index).expect("ro index");
+        let blobs = idx.get_gzip_index_blobs().expect("blobs");
+        assert!(!blobs.is_empty());
+        assert!(
+            blobs[0].starts_with(b"GZIDX"),
+            "expected GZIDX after rapidgzip rebuild, got {:?}",
+            blobs[0].get(..8)
+        );
     }
 
-    /// Nested plain `.gz` with prefer_rapidgzip still opens (G3 residual until
-    /// compress `open_seekable_gzip_rapidgzip_from_reader` lands).
+    /// Regression: prefer rapidgzip + write_index stores GZIDX; second open imports it
+    /// (skips full keep_index rebuild) and still serves members.
+    #[cfg(feature = "gzip-rapidgzip")]
+    #[test]
+    fn plain_gzip_rapidgzip_gzidx_persisted_and_reimported() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = make_tiny_tar_gz(dir.path());
+        let index = dir.path().join("tiny-rgz-gzidx.index.sqlite");
+        let opts = OpenOptions {
+            index_file_path: Some(index.clone()),
+            gzip_seek_point_spacing: 4 * 1024,
+            use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
+            ..Default::default()
+        };
+
+        // Cold open: build rapidgzip index + TAR, then persist GZIDX side blob.
+        let src = open_path(&archive, &opts, true).expect("cold rapidgzip open");
+        assert_eq!(
+            read_all(src.as_ref(), "/hello.txt"),
+            b"hello world\n".as_slice()
+        );
+        drop(src);
+
+        let idx = SqliteIndex::open_read_only(&index).expect("open index");
+        let blobs = idx.get_gzip_index_blobs().expect("get blobs");
+        assert_eq!(blobs.len(), 1, "expected single gzipindex blob");
+        assert!(
+            blobs[0].starts_with(b"GZIDX"),
+            "blob should be GZIDX magic, got {:?}",
+            blobs[0].get(..8)
+        );
+        let stored = blobs[0].clone();
+        drop(idx);
+
+        // Warm open: import blob (no full keep_index rebuild required).
+        let src2 = open_path(&archive, &opts, false).expect("warm open with GZIDX import");
+        assert_eq!(
+            read_all(src2.as_ref(), "/hello.txt"),
+            b"hello world\n".as_slice()
+        );
+        drop(src2);
+
+        let idx2 = SqliteIndex::open_read_only(&index).expect("reopen index");
+        let blobs2 = idx2.get_gzip_index_blobs().expect("blobs again");
+        assert_eq!(blobs2, vec![stored]);
+    }
+
+    /// Nested plain `.gz` with prefer_rapidgzip uses rapidgzip `from_reader` (no G3 residual).
+    ///
+    /// Compress `from_reader` reports `RAPIDGZIP_BODY_KIND`; factory must open the same
+    /// corpus via nested cursor without falling back to the residual G3-only log path.
     #[cfg(feature = "gzip-rapidgzip")]
     #[test]
     fn nested_plain_gzip_prefer_rapidgzip_from_cursor_still_opens() {
@@ -4406,16 +4551,32 @@ mod tests {
         assert!(status.success(), "gzip CLI failed");
 
         let bytes = std::fs::read(&gz).expect("read gz");
+
+        // Prove compress from_reader takes the rapidgzip body path for this corpus.
+        let body = ratarmount_compress::open_seekable_gzip_rapidgzip_from_reader(
+            std::io::Cursor::new(bytes.clone()),
+            16 * 1024,
+            2,
+            Path::new("nested.bin.gz"),
+        )
+        .expect("rapidgzip from_reader must succeed for this corpus");
+        assert_eq!(
+            body.kind(),
+            ratarmount_compress::RAPIDGZIP_BODY_KIND,
+            "nested prefer path must use rapidgzip SeekableBody kind"
+        );
+
         let opts = OpenOptions {
             index_in_memory: true,
             gzip_seek_point_spacing: 16 * 1024,
             use_backends: vec!["rapidgzip".into()],
+            parallelization: ratarmount_core::ParallelizationSpec::parse("gzip:2").unwrap(),
             ..Default::default()
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(std::io::Cursor::new(bytes));
         let inner = opener(boxed, Path::new("nested.bin.gz"))
-            .expect("nested plain gzip with prefer_rapidgzip must still open (G3 residual)");
+            .expect("nested plain gzip with prefer_rapidgzip must open via from_reader");
         assert_eq!(read_all(inner.as_ref(), "/nested.bin"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/nested.bin", 8);
         assert_eq!(mid.as_slice(), &payload[8..]);

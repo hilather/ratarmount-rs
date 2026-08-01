@@ -63,7 +63,7 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 
 ## Tier D POC — pure-Rust rapidgzip (`gzip-rapidgzip`)
 
-**Status:** opt-in path-backed backend with factory wiring hooks (2026-08-01). Does **not** replace G3 as default.
+**Status:** opt-in path / nested / Range rapidgzip when preferred (factory wired to compress from_reader + GZIDX; 2026-08-01). Does **not** replace G3 as default.
 
 | Item | Detail |
 |------|--------|
@@ -71,28 +71,13 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Feature | `gzip-rapidgzip` (+ optional `gzip-rapidgzip-isal`) on `ratarmount-compress` / `ratarmount` (requires **rustc ≥ 1.87**, edition 2024 dep) |
 | Open gate | `RATARMOUNT_GZIP_BACKEND=rapidgzip` or `--use-backend rapidgzip` / `rapidgzip-gzip` |
 | Code | `ratarmount-compress/src/gzip_rapidgzip.rs` → `SharedRapidgzip` + `SeekableBody` (+ from_reader / GZIDX); factory `open_shared_rapidgzip_path` / `persist_rapidgzip_index_blob` |
-| Scope | **Path** rapidgzip when preferred; nested/Range factory branches prefer-backend with G3 residual until wired to compress from_reader |
-| Index build | Full decode to sink with `keep_index` (parallel when `-P` allows); each FUSE open reopens FD + `IndexedReader` |
+| Scope | **Path / nested / HTTP·S3 Range** rapidgzip when preferred (`--use-backend rapidgzip` / env); G3 fallback on path open failure and Range reopen when available |
+| Index build | Full decode to sink with `keep_index` (parallel when `-P` allows); warm remount imports SQLite GZIDX and skips keep_index; each FUSE open reopens FD + `IndexedReader` |
 | Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
-| Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip |
-| Factory (done) | Path open keeps typed `Arc<SharedRapidgzip>`; warm SQLite blob load (no panic on garbage); TAR/plain via `open_from_seekable_body` |
+| Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip (path; Range when reopen remains). Nested prefer has no reopen — error if rapidgzip fails |
+| Factory (done) | Path/nested/Range prefer rapidgzip; typed `Arc<SharedRapidgzip>` + GZIDX import/export; invalid blob rebuild (no panic); TAR/plain via `open_from_seekable_body` |
+| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); open cost vs G3; seek-cache tuning; fair isal A/B; default-on after benches; per-open index clone; exclusive-ownership `Send`; nested thruput serializes on shared mutex |
 | Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
-| Task batch | [docs/tasks/rapidgzip-perf-batch.md](tasks/rapidgzip-perf-batch.md) — P1 factory wire · P2 thruput · P3 harness · P4 FUSE · P5 docs |
-
-### Residual — feature wiring (not thruput)
-
-Items that keep the opt-in backend incomplete even when path cold open works. Compress APIs already exist; factory still has residual stubs on some paths.
-
-| Residual | Detail |
-|----------|--------|
-| Path GZIDX import | Factory hook loads blob then **rebuilds**; must call `open_seekable_gzip_rapidgzip_with_imported_index` |
-| Path GZIDX persist | Factory persist hook is **no-op**; must call `SharedRapidgzip::export_gzidx_blob` |
-| Nested `from_reader` | Prefer-backend → **G3 residual** until `open_seekable_gzip_rapidgzip_from_reader` is wired |
-| Nested imported index | Compress `…_with_imported_index_from_reader` exists; not wired |
-| HTTP/S3 Range | Prefer → G3 residual (same `from_reader` APIs) |
-| Exclusive-ownership `Send` | IndexedReader/`Send` model is path-oriented; nested/Range share constraints with from_reader work |
-
-See matrix below for factory status vs compress API.
 
 ### Residual — performance (thruput / cost)
 
@@ -112,17 +97,18 @@ Separate from wiring: even on the verified path FUSE open, **rapidgzip is not ye
 
 **Numbers policy:** ranges above are local spot checks recorded in the [perf batch](tasks/rapidgzip-perf-batch.md). Prefer `benchmarks/gzip-backend-results/{results.md,results.csv}` when present; do not invent new absolute thruput figures.
 
+
 ### Factory ↔ compress API matrix (Tier D)
 
 | Capability | Factory status | Compress API |
 |------------|----------------|--------------|
-| Path cold open | **Done** | `open_seekable_gzip_rapidgzip` |
+| Path cold open | **Done** | `open_seekable_gzip_rapidgzip` / `SharedRapidgzip::open_with_threads` |
 | Path prefer + G3 fallback | **Done** | — |
-| Path GZIDX import | Hook only (load + rebuild) | **Exists:** `open_seekable_gzip_rapidgzip_with_imported_index` — wire in factory |
-| Path GZIDX persist | Hook only (no-op) | **Exists:** `SharedRapidgzip::export_gzidx_blob` — wire in factory |
-| Nested `from_reader` | Prefer → G3 residual | **Exists:** `open_seekable_gzip_rapidgzip_from_reader` — wire in factory |
-| Nested imported index | Not wired | `…_with_imported_index_from_reader` exists in compress |
-| HTTP/S3 Range | Prefer → G3 residual | same `from_reader` APIs |
+| Path GZIDX import | **Done** | `SharedRapidgzip::open_with_imported_index` |
+| Path GZIDX persist | **Done** | `SharedRapidgzip::export_gzidx_blob` + `SqliteIndex::set_gzip_index_blob` |
+| Nested `from_reader` | **Done** | `open_seekable_gzip_rapidgzip_from_reader` |
+| Nested imported index | Not wired (no nested side table) | `…_with_imported_index_from_reader` exists in compress |
+| HTTP/S3 Range | **Done** (prefer + import; reopen on fail → rebuild / G3) | same `from_reader` / `…_with_imported_index_from_reader` APIs |
 
 ```bash
 # Build with the POC backend (rustc ≥ 1.87)
