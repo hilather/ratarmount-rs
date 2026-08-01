@@ -1906,7 +1906,9 @@ mod tests {
             stream_flags: [0, 0],
             whole_stream: false,
         };
-        assert!(index_map_suitable_for_seekable(std::slice::from_ref(&small)));
+        assert!(index_map_suitable_for_seekable(std::slice::from_ref(
+            &small
+        )));
         assert!(index_map_suitable_for_seekable(&[
             small.clone(),
             small.clone()
@@ -1917,7 +1919,9 @@ mod tests {
             uncompressed_size: DEFAULT_MEMORY_CAP + 1,
             ..small
         };
-        assert!(!index_map_suitable_for_seekable(std::slice::from_ref(&huge)));
+        assert!(!index_map_suitable_for_seekable(std::slice::from_ref(
+            &huge
+        )));
         // One large unit among small ones still rejects (cache would pin it).
         assert!(!index_map_suitable_for_seekable(&[small, huge]));
     }
