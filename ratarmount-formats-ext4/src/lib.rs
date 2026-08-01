@@ -10,19 +10,39 @@
 //! backend we reopen the image per operation. That is still far cheaper than
 //! a full-tree materialize for random access.
 //!
-//! When `ext4-view` cannot load the image (corrupt, unsupported feature set,
-//! or other incompatibilities), we fall back to materializing the tree with
+//! When `ext4-view` cannot load a **path** image (corrupt, unsupported feature
+//! set, or other incompatibilities), we fall back to materializing the tree with
 //! `debugfs -R 'rdump / OUT'` (e2fsprogs) into a temp dir served by
 //! [`FolderMountSource`].
 //!
+//! # Nested archives (AutoMount / `open_from_reader`)
+//!
+//! Nested EXT members can be opened without `/tmp` when the outer archive yields
+//! a seekable stream and **ext4-view** can load the image:
+//! [`Ext4MountSource::open_from_reader`] (and
+//! [`Ext4MountSource::open_from_reader_with_offset`]) validate the superblock
+//! magic, retain a mutex-shared `Read + Seek` body, and reopen ext4-view per
+//! operation. No `NamedTempFile` spool on the success path; the image is **not**
+//! fully copied into a second buffer by this method (the parent may already hold
+//! a `Cursor` or stencil).
+//!
+//! **Residual:** if pure load fails for a stream open, `open_from_reader*`
+//! returns a clear [`Ext4Error`] and does **not** invoke debugfs (which needs a
+//! host path and writes under `/tmp`). Factory / AutoMount should then temp-spool
+//! the member and call path [`Ext4MountSource::open`] (which may use the
+//! debugfs materialize fallback). Wire nested detection via
+//! [`looks_like_ext4_reader`] (or name `*.ext2`/`*.ext3`/`*.ext4`).
+//!
 //! ## Partitioned images
 //!
-//! Use [`Ext4MountSource::open_with_offset`] with the byte offset of the
+//! Use [`Ext4MountSource::open_with_offset`] /
+//! [`Ext4MountSource::open_from_reader_with_offset`] with the byte offset of the
 //! filesystem partition. Offset is supported on the pure path via a custom
-//! [`ext4_view::Ext4Read`] wrapper. The debugfs fallback only runs for
-//! `offset == 0` (partition must be extracted first for materialize).
+//! [`ext4_view::Ext4Read`] wrapper. The debugfs fallback only runs for path
+//! opens with `offset == 0` (partition must be extracted first for materialize).
 //!
-//! Superblock detection ([`looks_like_ext4`] / [`looks_like_ext4_at`]) remains
+//! Superblock detection ([`looks_like_ext4`] / [`looks_like_ext4_at`] /
+//! [`looks_like_ext4_reader`] / [`looks_like_ext4_reader_at`]) remains
 //! independent of the reader backend (magic `0xEF53` at offset+1080).
 
 use std::collections::BTreeMap;
@@ -30,7 +50,7 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use ext4_view::{Ext4, Ext4Read, FileType, Metadata};
 use ratarmount_compositing::FolderMountSource;
@@ -55,6 +75,10 @@ const EXT_MAGIC: u16 = 0xEF53;
 const SUPERBLOCK_OFFSET: u64 = 1024;
 const MAGIC_OFFSET_IN_SB: u64 = 0x38;
 
+/// Object-safe `Read + Seek + Send` for the shared nested backend.
+trait SeekRead: Read + Seek + Send {}
+impl<T: Read + Seek + Send> SeekRead for T {}
+
 /// File-backed reader with an optional partition byte offset.
 struct OffsetReader {
     file: File,
@@ -77,12 +101,47 @@ impl Ext4Read for OffsetReader {
     }
 }
 
+/// Shared stream reader with optional partition byte offset (nested no-tmp).
+struct SharedOffsetReader {
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    offset: u64,
+}
+
+impl Ext4Read for SharedOffsetReader {
+    fn read(
+        &mut self,
+        start_byte: u64,
+        dst: &mut [u8],
+    ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
+        let pos = self
+            .offset
+            .checked_add(start_byte)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| io::Error::other("shared EXT4 reader poisoned"))?;
+        guard.seek(SeekFrom::Start(pos))?;
+        guard.read_exact(dst)?;
+        Ok(())
+    }
+}
+
 /// Pure path: reopen image per call (ext4-view is !Send/!Sync).
-/// Materialized: full-tree extract via debugfs when pure load fails.
+/// Pure shared: nested stream, same reopen pattern, no `/tmp`.
+/// Materialized: full-tree extract via debugfs when pure path load fails.
 enum Backend {
     Pure {
         path: PathBuf,
         partition_offset: u64,
+    },
+    /// Nested / stream open: mutex-shared `Read + Seek` (no temp spool).
+    PureShared {
+        shared: Arc<Mutex<Box<dyn SeekRead>>>,
+        partition_offset: u64,
+        /// Diagnostic label (nested member name / virtual path).
+        #[allow(dead_code)]
+        archive_label: PathBuf,
     },
     Materialized {
         inner: FolderMountSource,
@@ -145,10 +204,84 @@ impl Ext4MountSource {
         }
     }
 
+    /// Open an EXT image from any `Read + Seek` source without `/tmp`.
+    ///
+    /// For nested AutoMount / in-memory / remote images. The reader is retained
+    /// under a mutex; each list/lookup/open reopens ext4-view over that shared
+    /// body. The full image is **not** copied into a second buffer by this
+    /// method (the parent may already hold a `Cursor` or stencil).
+    ///
+    /// `archive_label` is used for diagnostics only (may be a nested member name).
+    ///
+    /// # Residual / factory
+    ///
+    /// Pure load only — no debugfs materialize (that needs a host path and
+    /// writes under `/tmp`). On pure failure, returns [`Ext4Error`] so
+    /// AutoMount can temp-spool and call path [`Self::open`]. Wire from
+    /// `open_nested_reader_fn` via [`looks_like_ext4_reader`] or name
+    /// (`*.ext2` / `*.ext3` / `*.ext4`).
+    pub fn open_from_reader<R>(reader: R, archive_label: impl AsRef<Path>) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        Self::open_from_reader_with_offset(reader, archive_label, 0)
+    }
+
+    /// Like [`Self::open_from_reader`], with a filesystem partition byte offset.
+    ///
+    /// Success path never writes `/tmp`. Pure-load failure is a hard error
+    /// (debugfs residual is path-only).
+    pub fn open_from_reader_with_offset<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        partition_offset: u64,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let archive_label = archive_label.as_ref().to_path_buf();
+        let mut reader = reader;
+        reader.seek(SeekFrom::Start(0))?;
+        if !looks_like_ext4_reader_at(&mut reader, partition_offset) {
+            return Err(Ext4Error::Msg(format!(
+                "{} is not an EXT2/3/4 image (superblock magic 0xEF53 not found at offset {})",
+                archive_label.display(),
+                partition_offset.saturating_add(SUPERBLOCK_OFFSET + MAGIC_OFFSET_IN_SB)
+            )));
+        }
+        reader.seek(SeekFrom::Start(0))?;
+
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> =
+            Arc::new(Mutex::new(Box::new(reader) as Box<dyn SeekRead>));
+
+        match try_open_pure_shared(Arc::clone(&shared), partition_offset) {
+            Ok(_fs) => {
+                log::debug!(
+                    "EXT4: pure ext4-view shared backend for {} (offset={partition_offset})",
+                    archive_label.display()
+                );
+                Ok(Self {
+                    backend: Backend::PureShared {
+                        shared,
+                        partition_offset,
+                        archive_label,
+                    },
+                })
+            }
+            Err(pure_err) => Err(Ext4Error::Msg(format!(
+                "failed to open EXT image {} at offset {partition_offset} with in-process \
+                 ext4-view ({pure_err}); open_from_reader does not fall back to debugfs \
+                 (requires a host path and /tmp). Nested AutoMount may temp-spool and use \
+                 path open instead.",
+                archive_label.display()
+            ))),
+        }
+    }
+
     /// Which backend is active (`"ext4-view"` or `"debugfs"`).
     pub fn backend_kind(&self) -> &'static str {
         match self.backend {
-            Backend::Pure { .. } => "ext4-view",
+            Backend::Pure { .. } | Backend::PureShared { .. } => "ext4-view",
             Backend::Materialized { .. } => "debugfs",
         }
     }
@@ -161,6 +294,14 @@ impl Ext4MountSource {
                 partition_offset,
             } => {
                 let fs = try_open_pure(path, *partition_offset)?;
+                f(&fs)
+            }
+            Backend::PureShared {
+                shared,
+                partition_offset,
+                ..
+            } => {
+                let fs = try_open_pure_shared(Arc::clone(shared), *partition_offset)?;
                 f(&fs)
             }
             Backend::Materialized { .. } => Err(Ext4Error::Msg(
@@ -252,7 +393,7 @@ impl Ext4MountSource {
 impl MountSource for Ext4MountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
         match &self.backend {
-            Backend::Pure { .. } => {
+            Backend::Pure { .. } | Backend::PureShared { .. } => {
                 let map = self.list_dir(path)?;
                 Some(ListResult::Infos(map))
             }
@@ -262,7 +403,7 @@ impl MountSource for Ext4MountSource {
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
         match &self.backend {
-            Backend::Pure { .. } => {
+            Backend::Pure { .. } | Backend::PureShared { .. } => {
                 let map = self.list_dir(path)?;
                 Some(ListModeResult::Modes(
                     map.into_iter().map(|(k, v)| (k, v.mode)).collect(),
@@ -274,7 +415,7 @@ impl MountSource for Ext4MountSource {
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         match &self.backend {
-            Backend::Pure { .. } => self.find_entry_info(path),
+            Backend::Pure { .. } | Backend::PureShared { .. } => self.find_entry_info(path),
             Backend::Materialized { inner, .. } => inner.lookup(path, file_version),
         }
     }
@@ -285,7 +426,7 @@ impl MountSource for Ext4MountSource {
         buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         match &self.backend {
-            Backend::Pure { .. } => {
+            Backend::Pure { .. } | Backend::PureShared { .. } => {
                 if file_info.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
                     return Err(io::Error::new(
                         io::ErrorKind::IsADirectory,
@@ -324,6 +465,21 @@ fn try_open_pure(path: &Path, partition_offset: u64) -> Result<Ext4> {
         Ext4Error::Msg(format!(
             "ext4-view load failed for {} (offset={partition_offset}): {e}",
             path.display()
+        ))
+    })
+}
+
+fn try_open_pure_shared(
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    partition_offset: u64,
+) -> Result<Ext4> {
+    let reader = SharedOffsetReader {
+        shared,
+        offset: partition_offset,
+    };
+    Ext4::load(Box::new(reader)).map_err(|e| {
+        Ext4Error::Msg(format!(
+            "ext4-view load failed for shared stream (offset={partition_offset}): {e}"
         ))
     })
 }
@@ -436,14 +592,32 @@ pub fn looks_like_ext4_at(path: &Path, partition_offset: u64) -> bool {
     })
 }
 
+/// Superblock magic probe for nested streams (does not use filename).
+///
+/// Leaves the reader at an unspecified position; callers should seek to 0 after.
+pub fn looks_like_ext4_reader<R: Read + Seek>(reader: &mut R) -> bool {
+    looks_like_ext4_reader_at(reader, 0)
+}
+
+/// Superblock magic at `partition_offset + 1024 + 0x38` on a seekable stream.
+///
+/// Leaves the reader at an unspecified position; callers should seek to 0 after.
+pub fn looks_like_ext4_reader_at<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
+    magic_at_reader(reader, partition_offset).is_some_and(|m| m == EXT_MAGIC)
+}
+
 fn magic_at(path: &Path, partition_offset: u64) -> Option<u16> {
     let mut f = File::open(path).ok()?;
+    magic_at_reader(&mut f, partition_offset)
+}
+
+fn magic_at_reader<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> Option<u16> {
     let pos = partition_offset
         .checked_add(SUPERBLOCK_OFFSET)?
         .checked_add(MAGIC_OFFSET_IN_SB)?;
-    f.seek(SeekFrom::Start(pos)).ok()?;
+    reader.seek(SeekFrom::Start(pos)).ok()?;
     let mut buf = [0u8; 2];
-    f.read_exact(&mut buf).ok()?;
+    reader.read_exact(&mut buf).ok()?;
     Some(u16::from_le_bytes(buf))
 }
 
@@ -498,6 +672,57 @@ mod tests {
             return None;
         }
         Some((dir, img))
+    }
+
+    fn load_fixture_bytes(name: &str) -> Option<Vec<u8>> {
+        let (_dir, img) = decompress_fixture(name)?;
+        std::fs::read(&img).ok()
+    }
+
+    /// Minimal EXT4 via mke2fs when the Python fixture tree is unavailable.
+    fn mke2fs_minimal_bytes() -> Option<Vec<u8>> {
+        let mke2fs = which_mke2fs()?;
+        let dir = tempfile::tempdir().ok()?;
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(seed.join("foo/fighter")).ok()?;
+        std::fs::write(seed.join("foo/fighter/ufo"), b"iriya\n").ok()?;
+        let img = dir.path().join("min.ext4");
+        // Sparse 1MiB image is enough for a tiny FS with one file.
+        {
+            let f = File::create(&img).ok()?;
+            f.set_len(1024 * 1024).ok()?;
+        }
+        let status = Command::new(&mke2fs)
+            .args(["-t", "ext4", "-F", "-q", "-d"])
+            .arg(&seed)
+            .arg(&img)
+            .status()
+            .ok()?;
+        if !status.success() {
+            eprintln!("skip: mke2fs failed");
+            return None;
+        }
+        std::fs::read(&img).ok()
+    }
+
+    fn which_mke2fs() -> Option<PathBuf> {
+        if let Some(path) = std::env::var_os("PATH") {
+            for dir in std::env::split_paths(&path) {
+                let p = dir.join("mke2fs");
+                if p.is_file() {
+                    return Some(p);
+                }
+            }
+        }
+        let p = PathBuf::from("/usr/sbin/mke2fs");
+        if p.is_file() {
+            return Some(p);
+        }
+        None
+    }
+
+    fn any_ext4_bytes() -> Option<Vec<u8>> {
+        load_fixture_bytes("nested-tar-1M.ext4.bz2").or_else(mke2fs_minimal_bytes)
     }
 
     #[test]
@@ -627,5 +852,132 @@ mod tests {
             .err()
             .expect("expected open failure for non-EXT file");
         assert!(err.to_string().contains("not an EXT"), "got: {err}");
+    }
+
+    #[test]
+    fn looks_like_ext4_reader_magic() {
+        let Some(bytes) = any_ext4_bytes() else {
+            eprintln!("skip: no EXT4 fixture and mke2fs unavailable");
+            return;
+        };
+        assert!(looks_like_ext4_reader(&mut Cursor::new(&bytes)));
+        assert!(!looks_like_ext4_reader(&mut Cursor::new(vec![0u8; 4096])));
+        assert!(!looks_like_ext4_reader(&mut Cursor::new(
+            b"not ext".to_vec()
+        )));
+    }
+
+    #[test]
+    fn open_from_reader_cursor_list_and_read() {
+        // Nested no-tmp path: image bytes via Cursor → open_from_reader (no host file
+        // retained by the mount source; pure ext4-view backend only).
+        let Some(bytes) = any_ext4_bytes() else {
+            eprintln!("skip: no EXT4 fixture and mke2fs unavailable");
+            return;
+        };
+        assert!(looks_like_ext4_reader(&mut Cursor::new(&bytes)));
+
+        let m = Ext4MountSource::open_from_reader(Cursor::new(bytes), "nested.ext4")
+            .expect("open_from_reader");
+        assert_eq!(
+            m.backend_kind(),
+            "ext4-view",
+            "open_from_reader success path must use pure backend (no debugfs /tmp)"
+        );
+
+        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo");
+        assert_eq!(fi.size, 6);
+        assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
+
+        let list = m.list("/foo").expect("list /foo");
+        match list {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("fighter"),
+                    "expected fighter in /foo, got {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            ListResult::Names(names) => {
+                assert!(names.iter().any(|n| n == "fighter"));
+            }
+        }
+    }
+
+    #[test]
+    fn open_from_reader_rejects_bad_magic() {
+        let err = Ext4MountSource::open_from_reader(Cursor::new(vec![0u8; 4096]), "fake.img")
+            .err()
+            .expect("expected open_from_reader failure for non-EXT bytes");
+        assert!(
+            err.to_string().contains("not an EXT"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn open_from_reader_with_offset_padded() {
+        let Some(bytes) = any_ext4_bytes() else {
+            eprintln!("skip: no EXT4 fixture and mke2fs unavailable");
+            return;
+        };
+        let mut padded = vec![0u8; 8192];
+        padded.extend_from_slice(&bytes);
+
+        assert!(!looks_like_ext4_reader_at(&mut Cursor::new(&padded), 0));
+        assert!(looks_like_ext4_reader_at(&mut Cursor::new(&padded), 8192));
+
+        let m = Ext4MountSource::open_from_reader_with_offset(
+            Cursor::new(padded),
+            "padded-nested.img",
+            8192,
+        )
+        .expect("open_from_reader_with_offset");
+        assert_eq!(m.backend_kind(), "ext4-view");
+        let fi = m.lookup("/foo/fighter/ufo", 0).expect("ufo via offset");
+        assert_eq!(fi.size, 6);
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut s = String::new();
+        r.read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
+    }
+
+    #[test]
+    fn open_from_reader_equals_path_when_fixture_present() {
+        let Some((_dir, img)) = decompress_fixture("nested-tar-1M.ext4.bz2") else {
+            return;
+        };
+        let bytes = std::fs::read(&img).expect("read fixture");
+        let from_path = Ext4MountSource::open(&img).expect("path open");
+        let from_reader = Ext4MountSource::open_from_reader(Cursor::new(bytes), "nested.ext4")
+            .expect("open_from_reader");
+        assert_eq!(from_path.backend_kind(), "ext4-view");
+        assert_eq!(from_reader.backend_kind(), "ext4-view");
+
+        let fi_p = from_path.lookup("/foo/fighter/ufo", 0).expect("path ufo");
+        let fi_r = from_reader
+            .lookup("/foo/fighter/ufo", 0)
+            .expect("reader ufo");
+        assert_eq!(fi_p.size, fi_r.size);
+
+        let mut sp = String::new();
+        from_path
+            .open(&fi_p, 0)
+            .unwrap()
+            .read_to_string(&mut sp)
+            .unwrap();
+        let mut sr = String::new();
+        from_reader
+            .open(&fi_r, 0)
+            .unwrap()
+            .read_to_string(&mut sr)
+            .unwrap();
+        assert_eq!(sp, sr);
+        assert_eq!(sp, "iriya\n");
     }
 }
