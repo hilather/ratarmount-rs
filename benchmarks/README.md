@@ -1,5 +1,37 @@
 # Benchmarks
 
+## Fair disk + FUSE kernel tuning
+
+**Use this** for media baseline (O_DIRECT) vs FUSE mount knobs (`noatime`,
+`--readahead`, per-connection `max_background`). Operator guide:
+[`docs/fuse-kernel-tuning.md`](../docs/fuse-kernel-tuning.md).
+
+```bash
+# Full matrix (disk O_DIRECT + page-cache contrast + FUSE configs)
+./benchmarks/compare-fuse-kernel-tuning.sh
+# → benchmarks/fuse-kernel-results/{results.csv,results.md}
+
+# Disk only / FUSE only / larger probe / more parallel readers
+SKIP_FUSE=1 SIZE_MIB=512 ./benchmarks/compare-fuse-kernel-tuning.sh
+SKIP_DISK=1 PARALLEL=8 SIZE_MIB=64 ./benchmarks/compare-fuse-kernel-tuning.sh
+
+# True cold disk (optional root drop_caches)
+DROP_CACHES=1 SIZE_MIB=512 ./benchmarks/compare-fuse-kernel-tuning.sh
+```
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `SIZE_MIB` | `64` | Disk probe + gzip payload size |
+| `PARALLEL` | `4` | Concurrent 1 MiB window readers (aggregate thruput) |
+| `RUNS` | `2` | Samples per metric (median) |
+| `SKIP_DISK` / `SKIP_FUSE` | `0` | Drop a section |
+| `DROP_CACHES` | `0` | `1` = try `drop_caches` before O_DIRECT read (needs root) |
+| `OUT_DIR` | `benchmarks/fuse-kernel-results` | Gitignored CSV/MD |
+| `DATA_DIR` | `$OUT_DIR/data` | Probe + corpus (prefer real block FS, not tmpfs) |
+
+**Fairness:** quote **O_DIRECT** for disk; do not call page-cache multi‑GB/s “disk speed.”
+FUSE numbers are **uncompressed** member MiB/s.
+
 ## Fair rapidgzip A/B (zlib-rs vs ISA-L)
 
 **Use this for inflate-backend comparisons.** ISA-L vs zlib-rs is a **compile-time**

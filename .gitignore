@@ -11,5 +11,6 @@
 benchmarks/.venv-py/
 **/bench-results/
 benchmarks/gzip-backend-results/
+benchmarks/fuse-kernel-results/
 *.log
 .cargo-cache/
