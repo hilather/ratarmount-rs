@@ -65,14 +65,15 @@ pub use gzip_rapidgzip::{
     RAPIDGZIP_SEEK_CACHE_CHUNKS, RAPIDGZIP_SEEK_PREFETCH_WINDOWS,
 };
 pub use gzip_seek::{
-    encode_gzip_seek_index_blob, import_seek_points, import_seek_points_with_mode,
-    open_seekable_gzip, open_seekable_gzip_from_reader, open_seekable_gzip_with_imported_index,
-    open_seekable_gzip_with_imported_index_from_reader, open_seekable_gzip_with_threads,
-    open_seekable_gzip_with_threads_from_reader, parse_gzip_seek_index_blob,
-    parse_indexed_gzip_index_blob, try_import_gzip_seek_blob, try_parallel_multi_member_decode,
-    GzipSeekBlobFormat, GzipSeekIndexBlob, SeekableGzip, SeekableGzipReader, SharedSeekableGzip,
-    DEFAULT_GZIP_SEEK_SPACING, GZIP_SEEK_INDEX_MAGIC, GZIP_SEEK_INDEX_VERSION,
-    INDEXED_GZIP_INDEX_MAGIC, INDEXED_GZIP_INDEX_VERSION,
+    encode_gzip_seek_index_blob, encode_indexed_gzip_index_blob, import_seek_points,
+    import_seek_points_with_mode, open_seekable_gzip, open_seekable_gzip_from_reader,
+    open_seekable_gzip_with_imported_index, open_seekable_gzip_with_imported_index_from_reader,
+    open_seekable_gzip_with_threads, open_seekable_gzip_with_threads_from_reader,
+    parse_gzip_seek_index_blob, parse_indexed_gzip_index_blob, try_import_gzip_seek_blob,
+    try_parallel_multi_member_decode, GzipSeekBlobFormat, GzipSeekIndexBlob, SeekableGzip,
+    SeekableGzipReader, SharedSeekableGzip, DEFAULT_GZIP_SEEK_SPACING, G3_SEEK_CACHE_BYTES,
+    G3_SEEK_CACHE_CHUNKS, GZIP_SEEK_INDEX_MAGIC, GZIP_SEEK_INDEX_VERSION, INDEXED_GZIP_INDEX_MAGIC,
+    INDEXED_GZIP_INDEX_VERSION, INDEXED_GZIP_WINDOW_SIZE,
 };
 pub use lrzip_seek::{
     looks_like_lrzip, lrzip_available, lrzip_cli_available, materialize_lrzip,

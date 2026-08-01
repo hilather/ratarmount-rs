@@ -5,6 +5,13 @@
 //! `spacing` uncompressed bytes. Random access restores the nearest checkpoint and
 //! decodes forward (at most ~spacing work per seek).
 //!
+//! ## Per-reader decoded-window LRU
+//! Each [`SeekableGzipReader`] keeps a small LRU of recent uncompressed windows
+//! ([`G3_SEEK_CACHE_CHUNKS`] × [`G3_SEEK_CACHE_BYTES`]). Sequential FUSE-style
+//! re-seeks hit the working buffer; reverse / nearby seeks can hit the LRU without
+//! re-inflating. Concurrent [`SharedSeekableGzip`] readers each own a private cache
+//! (no shared mutable window cache).
+//!
 //! ## Tier C — seek-index blob import/export
 //! Two on-disk encodings are recognized on **import** via
 //! [`try_import_gzip_seek_blob`]:
@@ -13,17 +20,22 @@
 //!    `(compressed_offset, uncompressed_offset)` plus spacing / size. This is what
 //!    [`SeekableGzip::export_seek_index_blob`] / [`encode_gzip_seek_index_blob`]
 //!    write. Round-trip remount is exact (strict compressed-offset check).
-//! 2. **`GZIDX` v0/v1** (Python `indexed_gzip` / zran) — best-effort subset:
-//!    header + per-point offset/bits/(optional data flag) are parsed; the 32 KiB
-//!    window payloads are **skipped** (not applied as zlib dictionaries). Inflate
-//!    state is rehydrated in one forward pass at the imported uncompressed
-//!    offsets, so mid-stream bit alignment and window data are unnecessary.
-//!    Compressed offsets from zran may differ from `miniz_oxide` cursors; import
-//!    uses soft matching (uncompressed only).
+//!    **Primary** warm remount format.
+//! 2. **`GZIDX` v0/v1** (Python `indexed_gzip` / zran) — header + per-point
+//!    offset/bits/data flag + **32 KiB window payloads are parsed and stored**.
+//!    **Residual:** `miniz_oxide` does not expose `inflateSetDictionary` /
+//!    `inflatePrime`, so windows and bit residuals cannot skip rehydration.
+//!    Inflate state is still rebuilt in one forward pass at the imported
+//!    uncompressed offsets (soft compressed-offset match). Windows are retained
+//!    for re-export via [`SeekableGzip::export_indexed_gzip_blob`].
 //!
-//! **Export stays `RGZI`.** Rust→Python consumers that only understand `GZIDX`
-//! would need a separate conversion path later; SQLite side tables store the
-//! opaque blob as-is.
+//! **Export:**
+//! * [`SeekableGzip::export_seek_index_blob`] → native **`RGZI`** (primary).
+//! * [`SeekableGzip::export_indexed_gzip_blob`] → best-effort **`GZIDX`** with
+//!   predecessor windows captured during index build / rehydration (last 32 KiB
+//!   of uncompressed history). Bit residual is always `0` (miniz byte cursors).
+//!   Full Python interop is not guaranteed for mid-block G3 checkpoints; tests
+//!   cover our parser round-trip.
 //!
 //! The index crate persists these bytes opaquely; this module only understands
 //! the blob layouts (no dependency on `ratarmount-index`).
@@ -43,6 +55,7 @@
 //!   an [`export_seek_index_blob`] (`RGZI`) or Python `indexed_gzip` (`GZIDX`)
 //!   payload via [`try_import_gzip_seek_blob`].
 
+use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -70,6 +83,21 @@ pub const GZIP_SEEK_INDEX_VERSION: u32 = 1;
 
 /// Maximum supported `indexed_gzip` / zran file format version.
 pub const INDEXED_GZIP_INDEX_VERSION: u8 = 1;
+
+/// Standard predecessor-window size for `indexed_gzip` / zran (`GZIDX`).
+pub const INDEXED_GZIP_WINDOW_SIZE: u32 = 32 * 1024;
+
+/// Per-reader decoded-window LRU entry cap (G3; smaller RSS than Tier D's 16).
+///
+/// Each [`SeekableGzipReader`] (including concurrent Shared opens) owns its own
+/// cache — multi-open FUSE multiplies this × open count.
+pub const G3_SEEK_CACHE_CHUNKS: usize = 8;
+
+/// Per-reader decoded-window LRU byte cap (16 MiB; Tier D rapidgzip uses 64 MiB).
+pub const G3_SEEK_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+/// Chunk size when stashing the working buffer into the LRU.
+const G3_CACHE_CHUNK: usize = 64 * 1024;
 
 /// Minimum RGZI header size: magic(4) + version(4) + flags(4) + spacing(8)
 /// + uncompressed_size(8) + point_count(4).
@@ -100,6 +128,13 @@ struct Checkpoint {
     /// Uncompressed bytes produced before this state.
     uncompressed_offset: u64,
     state: Box<InflateState>,
+    /// Predecessor history for GZIDX export (last ≤ 32 KiB of uncompressed data
+    /// ending at `uncompressed_offset`). Empty at stream / member start.
+    ///
+    /// Not used for runtime seek (runtime uses `state` clones). Captured during
+    /// index build / rehydration so [`SeekableGzip::export_indexed_gzip_blob`]
+    /// can emit real window payloads.
+    window: Vec<u8>,
 }
 
 /// Built seek table for one gzip file (possibly multi-member).
@@ -107,6 +142,8 @@ pub struct GzipSeekIndex {
     checkpoints: Vec<Checkpoint>,
     uncompressed_size: u64,
     spacing: u64,
+    /// Compressed archive size when known (for GZIDX export header); 0 if unknown.
+    compressed_size: u64,
 }
 
 /// Parsed Tier C seek-index blob (offset pairs + metadata; no inflate state).
@@ -142,23 +179,36 @@ pub struct GzipSeekIndex {
 /// stores these bytes opaquely; only this module interprets them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GzipSeekIndexBlob {
-    /// On-disk encoding this blob was parsed from (export always writes `RGZI`).
+    /// On-disk encoding this blob was parsed from (`RGZI` or `GZIDX`).
     pub format: GzipSeekBlobFormat,
     pub version: u32,
     pub flags: u32,
     pub spacing: u64,
     pub uncompressed_size: u64,
+    /// Compressed archive size from `GZIDX` header (`0` for `RGZI`).
+    pub compressed_size: u64,
+    /// Window size from `GZIDX` header (`0` for `RGZI`; typically 32768).
+    pub window_size: u32,
     /// `(compressed_offset, uncompressed_offset)` pairs.
     ///
     /// For `IndexedGzip`, compressed offsets are informational (zran may use a
     /// non-zero bit residual); rehydration matches on uncompressed offset only.
     pub points: Vec<(u64, u64)>,
+    /// Per-point bit residual (`GZIDX` only; empty for `RGZI`). Length matches
+    /// `points` after EOF markers are dropped.
+    pub point_bits: Vec<u8>,
+    /// Per-point predecessor window (`GZIDX` only). `None` when `data_flag == 0`.
+    ///
+    /// **Residual:** windows are stored for re-export but **not** applied as zlib
+    /// dictionaries on import — `miniz_oxide` cannot `inflateSetDictionary` /
+    /// `inflatePrime`. Rehydration still walks the stream once.
+    pub point_windows: Vec<Option<Vec<u8>>>,
 }
 
 /// Encode a Tier C **`RGZI`** seek-index blob from spacing, size, and seek points.
 ///
-/// Export is intentionally native-only. Python `indexed_gzip` consumers that only
-/// accept `GZIDX` would need a separate converter (not implemented here).
+/// This is the primary warm-remount format. For Python `indexed_gzip` consumers
+/// see [`encode_indexed_gzip_index_blob`] / [`SeekableGzip::export_indexed_gzip_blob`].
 pub fn encode_gzip_seek_index_blob(
     spacing: u64,
     uncompressed_size: u64,
@@ -178,6 +228,86 @@ pub fn encode_gzip_seek_index_blob(
         out.extend_from_slice(&u.to_le_bytes());
     }
     out
+}
+
+/// Encode a Python **`indexed_gzip` / zran `GZIDX` v1** blob.
+///
+/// `points` entries are `(compressed_offset, uncompressed_offset, bits, window)`.
+/// `window == None` or empty → `data_flag = 0` (no payload). Non-empty windows are
+/// written as exactly `window_size` bytes (leading-zero pad or trailing truncate).
+///
+/// Bit residual is stored as-is (G3 export always uses `0`). Full Python interop
+/// for mid-block G3 checkpoints is best-effort; our parser round-trips the blob.
+pub fn encode_indexed_gzip_index_blob(
+    compressed_size: u64,
+    uncompressed_size: u64,
+    spacing: u32,
+    window_size: u32,
+    points: &[(u64, u64, u8, Option<&[u8]>)],
+) -> Vec<u8> {
+    let w = window_size.max(INDEXED_GZIP_WINDOW_SIZE) as usize;
+    let n = u32::try_from(points.len()).unwrap_or(u32::MAX) as usize;
+    let n_windows = points
+        .iter()
+        .take(n)
+        .filter(|p| p.3.map(|d| !d.is_empty()).unwrap_or(false))
+        .count();
+    let mut out =
+        Vec::with_capacity(INDEXED_GZIP_HEADER_LEN + n * INDEXED_GZIP_POINT_V1_LEN + n_windows * w);
+    out.extend_from_slice(INDEXED_GZIP_INDEX_MAGIC);
+    out.push(1); // version
+    out.push(0); // reserved
+    out.extend_from_slice(&compressed_size.to_le_bytes());
+    out.extend_from_slice(&uncompressed_size.to_le_bytes());
+    out.extend_from_slice(&spacing.to_le_bytes());
+    out.extend_from_slice(&(w as u32).to_le_bytes());
+    out.extend_from_slice(&(n as u32).to_le_bytes());
+    let mut payloads: Vec<Vec<u8>> = Vec::new();
+    for &(c, u, bits, window) in points.iter().take(n) {
+        let data_flag = if window.map(|d| !d.is_empty()).unwrap_or(false) {
+            1u8
+        } else {
+            0u8
+        };
+        out.extend_from_slice(&c.to_le_bytes());
+        out.extend_from_slice(&u.to_le_bytes());
+        out.push(bits);
+        out.push(data_flag);
+        if data_flag != 0 {
+            payloads.push(pad_or_trunc_window(window.unwrap_or(&[]), w));
+        }
+    }
+    for p in payloads {
+        out.extend_from_slice(&p);
+    }
+    out
+}
+
+/// Pad with leading zeros or take trailing `window_size` bytes (indexed_gzip style).
+fn pad_or_trunc_window(raw: &[u8], window_size: usize) -> Vec<u8> {
+    if raw.len() == window_size {
+        return raw.to_vec();
+    }
+    if raw.len() > window_size {
+        return raw[raw.len() - window_size..].to_vec();
+    }
+    let mut padded = vec![0u8; window_size];
+    let start = window_size - raw.len();
+    padded[start..].copy_from_slice(raw);
+    padded
+}
+
+/// Append `data` into a rolling ≤ 32 KiB predecessor history buffer.
+fn push_predecessor_history(hist: &mut Vec<u8>, data: &[u8]) {
+    if data.is_empty() {
+        return;
+    }
+    let cap = INDEXED_GZIP_WINDOW_SIZE as usize;
+    hist.extend_from_slice(data);
+    if hist.len() > cap {
+        let excess = hist.len() - cap;
+        hist.drain(..excess);
+    }
 }
 
 /// Detect seek-index blob magic and parse **`RGZI`** or **`GZIDX`** (indexed_gzip).
@@ -267,15 +397,21 @@ pub fn parse_gzip_seek_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         flags,
         spacing,
         uncompressed_size,
+        compressed_size: 0,
+        window_size: 0,
         points,
+        point_bits: Vec::new(),
+        point_windows: Vec::new(),
     })
 }
 
 /// Parse a Python **`indexed_gzip` / zran `GZIDX`** index (best-effort).
 ///
-/// Extracts spacing, uncompressed size, and `(cmp_offset, uncmp_offset)` seek
-/// points. Window payloads and bit residuals are not applied; callers rehydrate
-/// inflate state by decoding forward (see [`import_seek_points`]).
+/// Extracts spacing, sizes, `(cmp_offset, uncmp_offset)` seek points, bit
+/// residuals, and 32 KiB window payloads. **Windows are stored** on the blob for
+/// re-export; they are **not** applied as zlib dictionaries (miniz residual —
+/// see module docs). Callers rehydrate inflate state by decoding forward (see
+/// [`import_seek_points`]).
 ///
 /// Points at or past `uncompressed_size` (zran often records an EOF marker) are
 /// dropped — they are not useful inflate restart positions for this backend.
@@ -304,15 +440,16 @@ pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
             "indexed_gzip GZIDX reserved byte must be 0 (got {reserved})"
         )));
     }
-    let _compressed_size = u64::from_le_bytes(blob[7..15].try_into().unwrap());
+    let compressed_size = u64::from_le_bytes(blob[7..15].try_into().unwrap());
     let uncompressed_size = u64::from_le_bytes(blob[15..23].try_into().unwrap());
     let spacing = u32::from_le_bytes(blob[23..27].try_into().unwrap()) as u64;
     let window_size = u32::from_le_bytes(blob[27..31].try_into().unwrap()) as usize;
     let point_count = u32::from_le_bytes(blob[31..35].try_into().unwrap()) as usize;
 
-    if window_size < 32_768 {
+    if window_size < INDEXED_GZIP_WINDOW_SIZE as usize {
         return Err(CompressError::Msg(format!(
-            "indexed_gzip GZIDX window_size {window_size} < 32768"
+            "indexed_gzip GZIDX window_size {window_size} < {}",
+            INDEXED_GZIP_WINDOW_SIZE
         )));
     }
     // zran requires spacing >= window_size; be tolerant of odd blobs but reject 0 window.
@@ -334,13 +471,21 @@ pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         )));
     }
 
-    let mut points = Vec::with_capacity(point_count);
+    // First pass: record all points + data flags (including EOF markers, for
+    // correct window section layout), then drop EOF from the kept lists.
+    struct RawPoint {
+        c: u64,
+        u: u64,
+        bits: u8,
+        data_flag: u8,
+    }
+    let mut raw_points = Vec::with_capacity(point_count);
     let mut windows_with_data = 0usize;
     let mut off = INDEXED_GZIP_HEADER_LEN;
     for i in 0..point_count {
         let c = u64::from_le_bytes(blob[off..off + 8].try_into().unwrap());
         let u = u64::from_le_bytes(blob[off + 8..off + 16].try_into().unwrap());
-        let _bits = blob[off + 16];
+        let bits = blob[off + 16];
         let data_flag = if version >= 1 {
             blob[off + 17]
         } else {
@@ -354,10 +499,12 @@ pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         if data_flag != 0 {
             windows_with_data += 1;
         }
-        // Skip EOF / past-end markers — not restart positions for rehydration.
-        if uncompressed_size == 0 || u < uncompressed_size {
-            points.push((c, u));
-        }
+        raw_points.push(RawPoint {
+            c,
+            u,
+            bits,
+            data_flag,
+        });
         off += point_len;
     }
 
@@ -377,6 +524,27 @@ pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         )));
     }
 
+    // Second pass: slice window payloads in point order.
+    let mut win_off = points_end;
+    let mut points = Vec::with_capacity(point_count);
+    let mut point_bits = Vec::with_capacity(point_count);
+    let mut point_windows: Vec<Option<Vec<u8>>> = Vec::with_capacity(point_count);
+    for rp in &raw_points {
+        let window = if rp.data_flag != 0 {
+            let w = blob[win_off..win_off + window_size].to_vec();
+            win_off += window_size;
+            Some(w)
+        } else {
+            None
+        };
+        // Skip EOF / past-end markers — not restart positions for rehydration.
+        if uncompressed_size == 0 || rp.u < uncompressed_size {
+            points.push((rp.c, rp.u));
+            point_bits.push(rp.bits);
+            point_windows.push(window);
+        }
+    }
+
     for w in points.windows(2) {
         if w[1].1 < w[0].1 {
             return Err(CompressError::Msg(
@@ -391,7 +559,11 @@ pub fn parse_indexed_gzip_index_blob(blob: &[u8]) -> Result<GzipSeekIndexBlob> {
         flags: 0,
         spacing,
         uncompressed_size,
+        compressed_size,
+        window_size: window_size as u32,
         points,
+        point_bits,
+        point_windows,
     })
 }
 
@@ -564,8 +736,9 @@ impl SeekableGzip {
         self.index.spacing
     }
 
-    /// Export a Tier C seek-index blob (offset pairs + metadata) for persistence
-    /// or round-trip reopen via [`Self::open_with_imported_index`].
+    /// Export a Tier C **`RGZI`** seek-index blob (primary warm remount format).
+    ///
+    /// For Python `indexed_gzip` consumers see [`Self::export_indexed_gzip_blob`].
     pub fn export_seek_index_blob(&self) -> Vec<u8> {
         let points: Vec<(u64, u64)> = self
             .index
@@ -574,6 +747,45 @@ impl SeekableGzip {
             .map(|c| (c.compressed_offset, c.uncompressed_offset))
             .collect();
         encode_gzip_seek_index_blob(self.index.spacing, self.index.uncompressed_size, &points)
+    }
+
+    /// Export a best-effort **`GZIDX`** (indexed_gzip) blob with predecessor windows.
+    ///
+    /// Windows are the last ≤ 32 KiB of uncompressed history captured at each
+    /// checkpoint during index build / rehydration. Bit residual is always `0`
+    /// (miniz reports byte cursors only). Mid-block G3 checkpoints may not seek
+    /// correctly under Python zran without rehydration — prefer `RGZI` for native
+    /// remount. Round-trips through our own [`parse_indexed_gzip_index_blob`].
+    pub fn export_indexed_gzip_blob(&self) -> Vec<u8> {
+        let spacing = u32::try_from(self.index.spacing.min(u64::from(u32::MAX)))
+            .unwrap_or(u32::MAX)
+            .max(INDEXED_GZIP_WINDOW_SIZE);
+        let usize = self.index.uncompressed_size;
+        // Drop points at/past EOF — zran-style parsers treat them as markers, and
+        // our own import skips them. Prefer unique (c,u) mid-stream restarts.
+        let mut seen = std::collections::BTreeSet::new();
+        let points: Vec<(u64, u64, u8, Option<&[u8]>)> = self
+            .index
+            .checkpoints
+            .iter()
+            .filter(|c| usize == 0 || c.uncompressed_offset < usize)
+            .filter(|c| seen.insert((c.compressed_offset, c.uncompressed_offset)))
+            .map(|c| {
+                let win = if c.window.is_empty() {
+                    None
+                } else {
+                    Some(c.window.as_slice())
+                };
+                (c.compressed_offset, c.uncompressed_offset, 0u8, win)
+            })
+            .collect();
+        encode_indexed_gzip_index_blob(
+            self.index.compressed_size,
+            self.index.uncompressed_size,
+            spacing,
+            INDEXED_GZIP_WINDOW_SIZE,
+            &points,
+        )
     }
 
     /// Independent reader (own file fd or shared stream handle + logical position).
@@ -658,6 +870,77 @@ impl Seek for CompressedHandle {
     }
 }
 
+/// Per-reader LRU of recently decoded uncompressed windows.
+///
+/// Independent of other readers (including concurrent SharedSeekableGzip opens).
+struct DecodedWindowCache {
+    /// Oldest at front, newest at back.
+    entries: VecDeque<CachedWindow>,
+    total_bytes: usize,
+    max_chunks: usize,
+    max_bytes: usize,
+}
+
+struct CachedWindow {
+    start: u64,
+    data: Vec<u8>,
+}
+
+impl DecodedWindowCache {
+    fn new() -> Self {
+        Self {
+            entries: VecDeque::new(),
+            total_bytes: 0,
+            max_chunks: G3_SEEK_CACHE_CHUNKS,
+            max_bytes: G3_SEEK_CACHE_BYTES,
+        }
+    }
+
+    fn insert(&mut self, start: u64, data: Vec<u8>) {
+        if data.is_empty() {
+            return;
+        }
+        // Drop exact-start duplicates (refresh to newest).
+        if let Some(pos) = self.entries.iter().position(|e| e.start == start) {
+            self.total_bytes = self
+                .total_bytes
+                .saturating_sub(self.entries[pos].data.len());
+            self.entries.remove(pos);
+        }
+        self.total_bytes = self.total_bytes.saturating_add(data.len());
+        self.entries.push_back(CachedWindow { start, data });
+        self.evict();
+    }
+
+    fn evict(&mut self) {
+        while (!self.entries.is_empty())
+            && (self.entries.len() > self.max_chunks || self.total_bytes > self.max_bytes)
+        {
+            if let Some(old) = self.entries.pop_front() {
+                self.total_bytes = self.total_bytes.saturating_sub(old.data.len());
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Newest entry covering `target`, if any.
+    fn lookup(&self, target: u64) -> Option<(u64, &[u8])> {
+        for e in self.entries.iter().rev() {
+            let end = e.start.saturating_add(e.data.len() as u64);
+            if target >= e.start && target < end {
+                return Some((e.start, e.data.as_slice()));
+            }
+        }
+        None
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
 /// Read + Seek view of a [`SeekableGzip`].
 pub struct SeekableGzipReader {
     gzip: Arc<SeekableGzip>,
@@ -673,6 +956,11 @@ pub struct SeekableGzipReader {
     eof: bool,
     /// Whether inflate cursor is valid (false after construction until primed).
     primed: bool,
+    /// `state` / `compressed_at` / `next_out` are consistent for further inflate.
+    /// Cleared when a decode window is served from the LRU without re-inflate.
+    inflate_valid: bool,
+    /// Recent decoded windows (private to this reader).
+    window_cache: DecodedWindowCache,
 }
 
 impl SeekableGzipReader {
@@ -695,37 +983,92 @@ impl SeekableGzipReader {
             state: Box::new(InflateState::new(DataFormat::Raw)),
             eof: false,
             primed: false,
+            inflate_valid: false,
+            window_cache: DecodedWindowCache::new(),
         })
+    }
+
+    /// Stash the current working buffer into the LRU as fixed-size chunks.
+    fn stash_buf_to_cache(&mut self) {
+        if self.buf.is_empty() {
+            return;
+        }
+        let mut off = self.buf_start;
+        let mut i = 0usize;
+        while i < self.buf.len() {
+            let end = (i + G3_CACHE_CHUNK).min(self.buf.len());
+            self.window_cache.insert(off, self.buf[i..end].to_vec());
+            off += (end - i) as u64;
+            i = end;
+        }
+    }
+
+    /// Remember a newly produced chunk in the LRU.
+    fn remember_chunk(&mut self, start: u64, data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.window_cache.insert(start, data.to_vec());
     }
 
     /// Restore nearest checkpoint ≤ `target` and discard output until `target`.
     fn prime_at(&mut self, target: u64) -> io::Result<()> {
+        self.prime_at_inner(target, /*force_checkpoint=*/ false)
+    }
+
+    /// Like [`Self::prime_at`] but skips working-buf / LRU hits so inflate state
+    /// is always rehydrated (used when filling past a cache-served window).
+    fn force_checkpoint_at(&mut self, target: u64) -> io::Result<()> {
+        self.prime_at_inner(target, /*force_checkpoint=*/ true)
+    }
+
+    fn prime_at_inner(&mut self, target: u64, force_checkpoint: bool) -> io::Result<()> {
         let size = self.gzip.index.uncompressed_size;
         if target >= size {
             self.eof = true;
             self.primed = true;
+            self.inflate_valid = false;
             self.buf.clear();
             self.buf_start = target;
             self.next_out = size;
             return Ok(());
         }
 
-        // Reuse if buffer already covers target or we can only decode forward.
-        if self.primed {
-            let buf_end = self.buf_start + self.buf.len() as u64;
-            if target >= self.buf_start && target < buf_end {
-                return Ok(());
+        if !force_checkpoint {
+            // Reuse if buffer already covers target or we can only decode forward.
+            if self.primed {
+                let buf_end = self.buf_start + self.buf.len() as u64;
+                if target >= self.buf_start && target < buf_end {
+                    return Ok(());
+                }
+                if self.inflate_valid
+                    && target >= self.next_out
+                    && !self.eof
+                    && target - self.next_out < self.gzip.index.spacing.saturating_mul(2)
+                {
+                    // Decode forward discarding until target.
+                    self.discard_until(target)?;
+                    return Ok(());
+                }
             }
-            if target >= self.next_out
-                && !self.eof
-                && target - self.next_out < self.gzip.index.spacing.saturating_mul(2)
-            {
-                // Decode forward discarding until target.
-                self.discard_until(target)?;
+
+            // LRU hit — serve without re-inflate (inflate cursor becomes invalid).
+            if let Some((start, data)) = self.window_cache.lookup(target) {
+                // Own the data before mutating self fields that might alias.
+                let owned = data.to_vec();
+                self.stash_buf_to_cache();
+                self.buf = owned;
+                self.buf_start = start;
+                self.next_out = start.saturating_add(self.buf.len() as u64);
+                self.eof = false;
+                self.primed = true;
+                self.inflate_valid = false;
                 return Ok(());
             }
         }
 
+        // Full checkpoint restore.
+        self.stash_buf_to_cache();
         let cps = &self.gzip.index.checkpoints;
         let mut best = 0usize;
         for (i, cp) in cps.iter().enumerate() {
@@ -743,11 +1086,13 @@ impl SeekableGzipReader {
         self.buf_start = self.next_out;
         self.eof = false;
         self.primed = true;
+        self.inflate_valid = true;
         self.discard_until(target)?;
         Ok(())
     }
 
     fn discard_until(&mut self, target: u64) -> io::Result<()> {
+        debug_assert!(self.inflate_valid);
         let mut scratch = vec![0u8; 256 * 1024];
         while self.next_out < target && !self.eof {
             let want = (target - self.next_out).min(scratch.len() as u64) as usize;
@@ -766,12 +1111,17 @@ impl SeekableGzipReader {
             } else {
                 n // discard all
             };
+            // Cache discarded/kept portions for reverse seeks.
+            if keep_from > 0 {
+                self.remember_chunk(self.next_out, &scratch[..keep_from]);
+            }
             self.next_out += n as u64;
             if keep_from < n {
                 // Kept tail becomes the buffer starting at `target`.
                 self.buf.clear();
                 self.buf.extend_from_slice(&scratch[keep_from..n]);
                 self.buf_start = target;
+                self.remember_chunk(target, &scratch[keep_from..n]);
                 return Ok(());
             }
         }
@@ -791,6 +1141,7 @@ impl SeekableGzipReader {
             } else {
                 self.buf.extend_from_slice(&chunk[..n]);
                 self.next_out += n as u64;
+                self.remember_chunk(target, &chunk[..n]);
             }
         }
         Ok(())
@@ -799,6 +1150,17 @@ impl SeekableGzipReader {
     fn fill_buf(&mut self) -> io::Result<()> {
         if self.eof {
             return Ok(());
+        }
+        // Cache-served windows need a real inflate cursor before filling past them.
+        if !self.inflate_valid {
+            let target = self.pos.max(self.buf_start + self.buf.len() as u64);
+            self.force_checkpoint_at(target)?;
+            if self.buf_start + self.buf.len() as u64 > self.pos {
+                return Ok(());
+            }
+            if self.eof || !self.inflate_valid {
+                return Ok(());
+            }
         }
         let mut chunk = vec![0u8; 64 * 1024];
         let n = inflate_more(
@@ -811,17 +1173,26 @@ impl SeekableGzipReader {
             self.eof = true;
             return Ok(());
         }
+        let chunk_start = self.next_out;
         // Append if contiguous, else replace.
         let buf_end = self.buf_start + self.buf.len() as u64;
         if buf_end == self.next_out {
             self.buf.extend_from_slice(&chunk[..n]);
         } else {
+            self.stash_buf_to_cache();
             self.buf.clear();
             self.buf.extend_from_slice(&chunk[..n]);
             self.buf_start = self.next_out;
         }
         self.next_out += n as u64;
+        self.remember_chunk(chunk_start, &chunk[..n]);
         Ok(())
+    }
+
+    /// Test helper: number of LRU entries currently retained.
+    #[cfg(test)]
+    fn cache_len(&self) -> usize {
+        self.window_cache.len()
     }
 }
 
@@ -952,6 +1323,8 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
     let mut checkpoints = Vec::new();
     let mut uncompressed_total = 0u64;
     let mut compressed_at = 0u64;
+    // Rolling ≤ 32 KiB predecessor history for GZIDX export windows.
+    let mut hist: Vec<u8> = Vec::with_capacity(INDEXED_GZIP_WINDOW_SIZE as usize);
 
     // Multi-member loop
     while compressed_at < file_len {
@@ -967,19 +1340,30 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
             compressed_offset: compressed_at,
             uncompressed_offset: uncompressed_total,
             state: state.clone(),
+            window: hist.clone(),
         });
         let mut next_cp_at = uncompressed_total + spacing;
         let mut in_buf = [0u8; 64 * 1024];
         let mut out_buf = vec![0u8; 256 * 1024];
 
         loop {
+            // Cap inflate output so checkpoints land on spacing boundaries instead
+            // of bunching at the end of a large out-buffer (which made mid-stream
+            // points look like EOF markers for GZIDX export).
+            let out_cap = if next_cp_at > uncompressed_total {
+                ((next_cp_at - uncompressed_total) as usize)
+                    .min(out_buf.len())
+                    .max(1)
+            } else {
+                out_buf.len()
+            };
             file.seek(SeekFrom::Start(compressed_at))?;
             let n_in = file.read(&mut in_buf)?;
             let input = if n_in == 0 { &[][..] } else { &in_buf[..n_in] };
             let res = inflate(
                 state.as_mut(),
                 input,
-                &mut out_buf,
+                &mut out_buf[..out_cap],
                 if n_in == 0 {
                     MZFlush::Finish
                 } else {
@@ -995,13 +1379,19 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
                 }
             }
             compressed_at += res.bytes_consumed as u64;
+            if res.bytes_written > 0 {
+                push_predecessor_history(&mut hist, &out_buf[..res.bytes_written]);
+            }
             uncompressed_total += res.bytes_written as u64;
 
             while uncompressed_total >= next_cp_at {
+                // Prefer the intended spacing offset when we landed exactly;
+                // otherwise record the actual cursor (partial last chunk).
                 checkpoints.push(Checkpoint {
                     compressed_offset: compressed_at,
                     uncompressed_offset: uncompressed_total,
                     state: state.clone(),
+                    window: hist.clone(),
                 });
                 next_cp_at += spacing;
             }
@@ -1025,6 +1415,7 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
             compressed_offset: 0,
             uncompressed_offset: 0,
             state: Box::new(InflateState::new(DataFormat::Raw)),
+            window: Vec::new(),
         });
     }
 
@@ -1032,6 +1423,7 @@ fn build_index<R: Read + Seek>(file: &mut R, spacing: u64) -> Result<GzipSeekInd
         checkpoints,
         uncompressed_size: uncompressed_total,
         spacing,
+        compressed_size: file_len,
     })
 }
 
@@ -1089,10 +1481,12 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
     let mut uncompressed_total = 0u64;
     let mut compressed_at = 0u64;
     let mut next_target = 0usize;
+    let mut hist: Vec<u8> = Vec::with_capacity(INDEXED_GZIP_WINDOW_SIZE as usize);
 
     let take_if_due = |compressed_at: u64,
                        uncompressed_total: u64,
                        state: &InflateState,
+                       hist: &Vec<u8>,
                        checkpoints: &mut Vec<Checkpoint>,
                        next_target: &mut usize|
      -> Result<()> {
@@ -1113,6 +1507,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
                 compressed_offset: compressed_at,
                 uncompressed_offset: uncompressed_total,
                 state: Box::new(state.clone()),
+                window: hist.clone(),
             });
             *next_target += 1;
         }
@@ -1132,6 +1527,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
             compressed_at,
             uncompressed_total,
             state.as_ref(),
+            &hist,
             &mut checkpoints,
             &mut next_target,
         )?;
@@ -1177,12 +1573,16 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
                 }
             }
             compressed_at += res.bytes_consumed as u64;
+            if res.bytes_written > 0 {
+                push_predecessor_history(&mut hist, &out_buf[..res.bytes_written]);
+            }
             uncompressed_total += res.bytes_written as u64;
 
             take_if_due(
                 compressed_at,
                 uncompressed_total,
                 state.as_ref(),
+                &hist,
                 &mut checkpoints,
                 &mut next_target,
             )?;
@@ -1218,6 +1618,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
             compressed_offset: 0,
             uncompressed_offset: 0,
             state: Box::new(InflateState::new(DataFormat::Raw)),
+            window: Vec::new(),
         });
     }
 
@@ -1225,6 +1626,7 @@ pub fn import_seek_points_with_mode<R: Read + Seek>(
         checkpoints,
         uncompressed_size: uncompressed_total,
         spacing,
+        compressed_size: file_len,
     })
 }
 
@@ -1603,6 +2005,11 @@ impl SharedSeekableGzip {
     /// Export Tier C seek-index blob (see [`SeekableGzip::export_seek_index_blob`]).
     pub fn export_seek_index_blob(&self) -> Vec<u8> {
         self.inner.export_seek_index_blob()
+    }
+
+    /// Export best-effort `GZIDX` (see [`SeekableGzip::export_indexed_gzip_blob`]).
+    pub fn export_indexed_gzip_blob(&self) -> Vec<u8> {
+        self.inner.export_indexed_gzip_blob()
     }
 }
 
@@ -2102,13 +2509,42 @@ mod tests {
 
     /// Encode a minimal `GZIDX` v1 blob (indexed_gzip / zran) for pure-Rust tests.
     ///
-    /// Window payloads are zero-filled when `data_flag` is set; import ignores them.
+    /// When `data_flag` is set, window payload is zero-filled unless a custom
+    /// window is supplied via [`encode_gzidx_v1_with_windows`].
     fn encode_gzidx_v1(
         compressed_size: u64,
         uncompressed_size: u64,
         spacing: u32,
         window_size: u32,
         points: &[(u64, u64, u8, u8)], // c, u, bits, data_flag
+    ) -> Vec<u8> {
+        let wins: Vec<Option<Vec<u8>>> = points
+            .iter()
+            .map(|p| {
+                if p.3 != 0 {
+                    Some(vec![0u8; window_size as usize])
+                } else {
+                    None
+                }
+            })
+            .collect();
+        encode_gzidx_v1_with_windows(
+            compressed_size,
+            uncompressed_size,
+            spacing,
+            window_size,
+            points,
+            &wins,
+        )
+    }
+
+    fn encode_gzidx_v1_with_windows(
+        compressed_size: u64,
+        uncompressed_size: u64,
+        spacing: u32,
+        window_size: u32,
+        points: &[(u64, u64, u8, u8)],
+        windows: &[Option<Vec<u8>>],
     ) -> Vec<u8> {
         let n = points.len() as u32;
         let n_windows = points.iter().filter(|p| p.3 != 0).count();
@@ -2131,9 +2567,14 @@ mod tests {
             out.push(bits);
             out.push(data_flag);
         }
-        for &(.., data_flag) in points {
+        for (i, &(.., data_flag)) in points.iter().enumerate() {
             if data_flag != 0 {
-                out.resize(out.len() + window_size as usize, 0);
+                let w = windows
+                    .get(i)
+                    .and_then(|o| o.as_ref())
+                    .map(|v| pad_or_trunc_window(v, window_size as usize))
+                    .unwrap_or_else(|| vec![0u8; window_size as usize]);
+                out.extend_from_slice(&w);
             }
         }
         out
@@ -2157,8 +2598,16 @@ mod tests {
         assert_eq!(g.version, 1);
         assert_eq!(g.spacing, 32_768);
         assert_eq!(g.uncompressed_size, 50_000);
-        // EOF marker (u == size) is dropped.
+        assert_eq!(g.window_size, 32_768);
+        assert_eq!(g.compressed_size, 100);
+        // EOF marker (u == size) is dropped — and its window is not retained.
         assert_eq!(g.points, vec![(10, 0), (50, 16_384)]);
+        assert_eq!(g.point_bits, vec![0, 0]);
+        assert_eq!(g.point_windows.len(), 2);
+        assert!(g.point_windows[0].is_none());
+        assert!(g.point_windows[1]
+            .as_ref()
+            .is_some_and(|w| w.len() == 32_768));
 
         let err = try_import_gzip_seek_blob(b"XXXX not an index").unwrap_err();
         let msg = err.to_string();
@@ -2263,10 +2712,14 @@ mod tests {
             assert_eq!(&buf[..n], &raw[off as usize..off as usize + n], "off {off}");
         }
 
-        // Export remains RGZI (not GZIDX).
+        // Primary export remains RGZI (not GZIDX).
         let re_export = imported.export_seek_index_blob();
         assert!(re_export.starts_with(GZIP_SEEK_INDEX_MAGIC));
         assert!(!re_export.starts_with(INDEXED_GZIP_INDEX_MAGIC));
+
+        // Optional GZIDX export is available alongside RGZI.
+        let gzidx_out = imported.export_indexed_gzip_blob();
+        assert!(gzidx_out.starts_with(INDEXED_GZIP_INDEX_MAGIC));
     }
 
     #[test]
@@ -2425,5 +2878,323 @@ mod tests {
         assert_eq!(hydrated.uncompressed_size, payload.len() as u64);
         assert_eq!(hydrated.checkpoints.len(), points.len());
     }
+
+    /// Regression: decoded-window LRU serves reverse seeks without wrong data.
+    #[test]
+    fn g3_decoded_window_cache_reverse_and_random_seeks() {
+        let mut raw = Vec::new();
+        for i in 0..6000 {
+            writeln!(&mut raw, "cache {i:05} {}", "c".repeat(48)).unwrap();
+        }
+        assert!(raw.len() > 128 * 1024, "need multi-chunk payload");
+        let compressed = encode_gz(&raw);
+        let g = SeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            Path::new("cache://g3.gz"),
+        )
+        .unwrap();
+        let mut r = g.reader().unwrap();
+
+        // Sequential full read warms cache.
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, raw);
+        assert!(
+            r.cache_len() > 0,
+            "expected LRU entries after sequential read"
+        );
+
+        // Reverse seeks into earlier regions (should hit cache / still correct).
+        for &off in &[
+            0u64,
+            100,
+            raw.len() as u64 / 4,
+            raw.len() as u64 / 2,
+            raw.len() as u64 * 3 / 4,
+            raw.len() as u64 - 64,
+        ] {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 48];
+            let n = r.read(&mut buf).unwrap();
+            assert!(n > 0, "off {off}");
+            assert_eq!(&buf[..n], &raw[off as usize..off as usize + n], "off {off}");
+        }
+
+        // Random-order seeks.
+        let offs = [
+            raw.len() as u64 - 80,
+            17,
+            raw.len() as u64 / 3,
+            0,
+            raw.len() as u64 / 2 + 11,
+        ];
+        for &off in &offs {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 32];
+            let n = r.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &raw[off as usize..off as usize + n]);
+        }
+
+        // Continue reading past a reverse seek (forces re-prime after cache hit).
+        r.seek(SeekFrom::Start(200)).unwrap();
+        let mut mid = vec![0u8; 8 * 1024];
+        r.read_exact(&mut mid).unwrap();
+        assert_eq!(mid, raw[200..200 + 8 * 1024]);
+    }
+
+    /// Regression: concurrent SharedSeekableGzip readers each keep private caches.
+    #[test]
+    fn g3_shared_concurrent_cache_full_payload() {
+        use std::thread;
+        let mut raw = Vec::new();
+        for i in 0..3500 {
+            writeln!(&mut raw, "sh {i:05} {}", "s".repeat(50)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            Path::new("shared://cache.gz"),
+        )
+        .unwrap();
+        let expected = Arc::new(raw);
+        let mut handles = Vec::new();
+        for t in 0..6 {
+            let g = Arc::clone(&shared);
+            let exp = Arc::clone(&expected);
+            handles.push(thread::spawn(move || {
+                let mut r = g.reader().unwrap();
+                // Warm sequential.
+                let mut out = Vec::new();
+                r.read_to_end(&mut out).unwrap();
+                assert_eq!(out, *exp, "thread {t} full");
+                // Reverse mid.
+                let mid = exp.len() as u64 / 3;
+                r.seek(SeekFrom::Start(mid)).unwrap();
+                let mut tail = Vec::new();
+                r.read_to_end(&mut tail).unwrap();
+                assert_eq!(tail, exp[mid as usize..], "thread {t} mid");
+            }));
+        }
+        for h in handles {
+            h.join().expect("worker panicked");
+        }
+    }
+
+    /// GZIDX import stores windows; random seeks still correct (rehydrate path).
+    #[test]
+    fn gzidx_import_with_windows_seeks_correctly() {
+        let mut raw = Vec::new();
+        for i in 0..2500 {
+            writeln!(&mut raw, "win {i:05} {}", "w".repeat(64)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let spacing = 8 * 1024u64;
+        let built = SeekableGzip::open_from_reader(
+            Cursor::new(compressed.clone()),
+            spacing,
+            Path::new("win://src.gz"),
+        )
+        .unwrap();
+        let rgzi = built.export_seek_index_blob();
+        let parsed_rgzi = parse_gzip_seek_index_blob(&rgzi).unwrap();
+
+        // Synthetic non-zero windows (distinct pattern) so we can assert parse stores them.
+        let mut points = Vec::new();
+        let mut wins = Vec::new();
+        for (i, &(c, u)) in parsed_rgzi.points.iter().enumerate() {
+            let data_flag = if i == 0 { 0u8 } else { 1u8 };
+            points.push((c.wrapping_add(999), u, 0u8, data_flag)); // poison compressed
+            if data_flag != 0 {
+                let mut w = vec![0u8; 32_768];
+                for (j, b) in w.iter_mut().enumerate() {
+                    *b = ((i + j) % 251) as u8;
+                }
+                wins.push(Some(w));
+            } else {
+                wins.push(None);
+            }
+        }
+        let gzidx = encode_gzidx_v1_with_windows(
+            compressed.len() as u64,
+            raw.len() as u64,
+            spacing as u32,
+            32_768,
+            &points,
+            &wins,
+        );
+        let parsed = parse_indexed_gzip_index_blob(&gzidx).unwrap();
+        assert_eq!(parsed.format, GzipSeekBlobFormat::IndexedGzip);
+        assert_eq!(parsed.point_windows.len(), parsed.points.len());
+        // First point no window; later points retain synthetic payload.
+        assert!(parsed.point_windows[0].is_none());
+        if parsed.point_windows.len() > 1 {
+            let w = parsed.point_windows[1].as_ref().expect("window stored");
+            assert_eq!(w.len(), 32_768);
+            assert_eq!(w[0], 1u8);
+            assert_ne!(w[100], 0); // not zero-filled
+        }
+
+        let imported = SeekableGzip::open_with_imported_index_from_reader(
+            Cursor::new(compressed),
+            spacing,
+            1,
+            Path::new("win://imp.gz"),
+            &gzidx,
+        )
+        .unwrap();
+        assert_eq!(imported.uncompressed_size(), raw.len() as u64);
+        let mut r = imported.reader().unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, raw);
+        for &off in &[0u64, 50, raw.len() as u64 / 2, raw.len() as u64 - 20] {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 24];
+            let n = r.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &raw[off as usize..off as usize + n]);
+        }
+    }
+
+    /// G3 GZIDX export → our parser reimport → payload seeks (not full Python interop).
+    #[test]
+    fn g3_export_gzidx_reimport_our_parser_seeks() {
+        let mut raw = Vec::new();
+        for i in 0..2800 {
+            writeln!(&mut raw, "exp {i:05} {}", "e".repeat(70)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let spacing = 8 * 1024u64;
+        let built = SeekableGzip::open_from_reader(
+            Cursor::new(compressed.clone()),
+            spacing,
+            Path::new("exp://g3.gz"),
+        )
+        .unwrap();
+        assert!(built.checkpoint_count() >= 2);
+        // Intermediate checkpoints should carry predecessor history for export.
+        let has_window = built.index.checkpoints.iter().any(|c| !c.window.is_empty());
+        assert!(
+            has_window,
+            "expected at least one checkpoint window for GZIDX export"
+        );
+
+        let gzidx = built.export_indexed_gzip_blob();
+        assert!(gzidx.starts_with(INDEXED_GZIP_INDEX_MAGIC));
+        let parsed = parse_indexed_gzip_index_blob(&gzidx).unwrap();
+        assert_eq!(parsed.format, GzipSeekBlobFormat::IndexedGzip);
+        assert_eq!(parsed.uncompressed_size, raw.len() as u64);
+        // EOF-style points (u == size) are dropped by the GZIDX parser; mid-stream
+        // checkpoints from a spacing-aligned build should remain.
+        assert!(
+            parsed.points.len() >= 2,
+            "expected ≥2 GZIDX points after export, got {}",
+            parsed.points.len()
+        );
+        assert!(
+            parsed.points.len() <= built.checkpoint_count(),
+            "parser should not invent points"
+        );
+        // At least one stored window after the stream-start point.
+        assert!(
+            parsed.point_windows.iter().any(|w| w.is_some()),
+            "GZIDX export should include window payloads"
+        );
+
+        // Our-parser reimport (soft match / rehydrate).
+        let imported = SeekableGzip::open_with_imported_index_from_reader(
+            Cursor::new(compressed),
+            spacing,
+            1,
+            Path::new("exp://re.gz"),
+            &gzidx,
+        )
+        .unwrap();
+        assert_eq!(imported.uncompressed_size(), raw.len() as u64);
+        let mut r = imported.reader().unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, raw);
+        for &off in &[0u64, 33, raw.len() as u64 / 2, raw.len() as u64 - 40] {
+            r.seek(SeekFrom::Start(off)).unwrap();
+            let mut buf = [0u8; 40];
+            let n = r.read(&mut buf).unwrap();
+            assert_eq!(&buf[..n], &raw[off as usize..off as usize + n], "off {off}");
+        }
+
+        // encode_indexed_gzip_index_blob pure round-trip of parse fields.
+        let points: Vec<(u64, u64, u8, Option<&[u8]>)> = parsed
+            .points
+            .iter()
+            .enumerate()
+            .map(|(i, &(c, u))| {
+                let bits = parsed.point_bits.get(i).copied().unwrap_or(0);
+                let win = parsed.point_windows.get(i).and_then(|o| o.as_deref());
+                (c, u, bits, win)
+            })
+            .collect();
+        let re_enc = encode_indexed_gzip_index_blob(
+            parsed.compressed_size,
+            parsed.uncompressed_size,
+            parsed.spacing as u32,
+            parsed.window_size,
+            &points,
+        );
+        let re_parsed = parse_indexed_gzip_index_blob(&re_enc).unwrap();
+        assert_eq!(re_parsed.points, parsed.points);
+        assert_eq!(re_parsed.point_windows, parsed.point_windows);
+    }
+
+    /// RGZI export/import still strict and correct after G3 polish.
+    #[test]
+    fn rgzi_export_import_still_strict_after_g3_polish() {
+        let mut raw = Vec::new();
+        for i in 0..1800 {
+            writeln!(&mut raw, "rgzi {i:05} {}", "r".repeat(40)).unwrap();
+        }
+        let compressed = encode_gz(&raw);
+        let built = SeekableGzip::open_from_reader(
+            Cursor::new(compressed.clone()),
+            8 * 1024,
+            Path::new("rgzi://a.gz"),
+        )
+        .unwrap();
+        let blob = built.export_seek_index_blob();
+        assert!(blob.starts_with(GZIP_SEEK_INDEX_MAGIC));
+        let imported = SeekableGzip::open_with_imported_index_from_reader(
+            Cursor::new(compressed),
+            8 * 1024,
+            1,
+            Path::new("rgzi://b.gz"),
+            &blob,
+        )
+        .unwrap();
+        assert_eq!(imported.checkpoint_count(), built.checkpoint_count());
+        let mut r = imported.reader().unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, raw);
+
+        // Shared path export helpers.
+        let shared = SharedSeekableGzip::open_from_reader(
+            Cursor::new(encode_gz(&raw)),
+            8 * 1024,
+            "shared-rgzi.gz",
+        )
+        .unwrap();
+        assert!(shared
+            .export_seek_index_blob()
+            .starts_with(GZIP_SEEK_INDEX_MAGIC));
+        assert!(shared
+            .export_indexed_gzip_blob()
+            .starts_with(INDEXED_GZIP_INDEX_MAGIC));
+    }
+
+    #[test]
+    fn g3_cache_defaults_documented() {
+        assert_eq!(G3_SEEK_CACHE_CHUNKS, 8);
+        assert_eq!(G3_SEEK_CACHE_BYTES, 16 * 1024 * 1024);
+        assert_eq!(INDEXED_GZIP_WINDOW_SIZE, 32 * 1024);
+    }
 }
-// temp - better use search_replace for a proper test
