@@ -623,10 +623,17 @@ impl SqliteIndex {
     ///
     /// Promotes the insert-time compact [`MemIndexBuilder`] to the hot MemIndex (string
     /// pool + compact rows) when the row count is within [`MEM_INDEX_MAX_FILES`].
+    ///
+    /// On-disk indexes leave bulk-build `locking_mode=EXCLUSIVE` / `journal_mode=OFF` and
+    /// **reopen** as a true read-only connection. Otherwise the exclusive file lock is not
+    /// fully released until the connection is closed, and factory side-table writers
+    /// (`open_writable` for gzip/zstd/bzip2 blocks, `--index-minimum-file-count`) hit
+    /// `database is locked` while the mount still holds the index.
     pub fn into_read_only(mut self) -> Result<Self> {
         self.finalize_build()?;
         if !self.read_only {
             if !self.compact_only {
+                let path = self.path.clone();
                 self.with_conn(|conn| {
                     // Drop intermediary tables so Python's completeness check accepts the index.
                     let _ = conn.execute_batch(
@@ -635,17 +642,50 @@ impl SqliteIndex {
                     DROP TABLE IF EXISTS "parentfolders";
                     "#,
                     );
-                    conn.execute_batch(
+                    // Exit bulk-build EXCLUSIVE + journal OFF. WAL allows concurrent RO
+                    // (mount) + RW (side tables) opens after we reopen below.
+                    let _ = conn.execute_batch(
                         r#"
+                    PRAGMA journal_mode = WAL;
+                    PRAGMA synchronous = NORMAL;
                     PRAGMA locking_mode = NORMAL;
+                    "#,
+                    );
+                    // Force an unlock transition out of EXCLUSIVE (SQLite defers until unlock).
+                    let _: i64 =
+                        conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
+                    Ok(())
+                })?;
+
+                if let Some(ref p) = path {
+                    // Close the exclusive-era handle and reopen RO so no exclusive file
+                    // lock remains for factory open_writable / discard-index helpers.
+                    let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
+                    *guard = Connection::open_with_flags(
+                        p,
+                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                    )?;
+                    guard.execute_batch(
+                        r#"
                     PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
                     PRAGMA cache_size = -65536;
                     PRAGMA mmap_size = 268435456;
                     "#,
                     )?;
-                    Ok(())
-                })?;
+                } else {
+                    // Pure :memory: — keep the same connection; no second openers.
+                    self.with_conn(|conn| {
+                        conn.execute_batch(
+                            r#"
+                    PRAGMA query_only = ON;
+                    PRAGMA temp_store = MEMORY;
+                    PRAGMA cache_size = -65536;
+                    "#,
+                        )?;
+                        Ok(())
+                    })?;
+                }
             }
             self.read_only = true;
         }
@@ -1177,11 +1217,14 @@ impl SqliteIndex {
     pub fn open_writable(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open(path)?;
+        // Brief wait if a concurrent reader is finishing (mount RO + side-table write).
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.execute_batch(
             r#"
             PRAGMA temp_store = MEMORY;
             PRAGMA journal_mode = WAL;
             PRAGMA synchronous = NORMAL;
+            PRAGMA locking_mode = NORMAL;
             "#,
         )?;
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
@@ -1692,6 +1735,7 @@ pub fn index_file_row_count(path: impl AsRef<Path>) -> Result<u64> {
         path,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )?;
+    conn.busy_timeout(std::time::Duration::from_secs(10))?;
     // Favor a quick meta-only open; ignore mmap for a one-shot COUNT.
     let _ = conn.execute_batch("PRAGMA query_only = ON;");
     let n: i64 = conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
@@ -2196,6 +2240,31 @@ mod tests {
         assert!(ro.mem_dir_path_is_shared("/shared/dir"));
         assert_eq!(ro.file_count().unwrap(), 12);
         assert!(ro.lookup("/shared/dir/f0001.txt", 0).unwrap().is_some());
+    }
+
+    /// Regression: after seal, a second open_writable must not hit `database is locked`
+    /// while the sealed RO index connection is still live (factory side tables / B-119).
+    #[test]
+    fn into_read_only_releases_exclusive_for_second_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("side.index.sqlite");
+        let sealed = {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.begin_write().unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.commit_write().unwrap();
+            idx.into_read_only().unwrap()
+        };
+        assert!(sealed.path().is_some());
+        // Concurrent with sealed still in scope (mount holds this).
+        let w = SqliteIndex::open_writable(&path).expect("open_writable while RO live");
+        w.set_zstd_blocks(&[(0, 0), (100, 50)])
+            .expect("write side table while mount RO holds index");
+        assert_eq!(w.get_zstd_blocks().unwrap().len(), 2);
+        // B-119 path: row count via a third connection
+        assert_eq!(index_file_row_count(&path).unwrap(), 1);
+        drop(sealed);
     }
 
     /// Nested compact-only: no SQLite files table as file-table store.
