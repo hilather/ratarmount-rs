@@ -14,10 +14,10 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 
 | Question | Answer |
 |----------|--------|
-| **Does `.tar` inside a ZIP use `/tmp`?** | **No for the nested archive body**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR is indexed from that stream. A small **index spill** file under `TMPDIR` may appear for the SQLite `files` table (not the member payload). |
-| **Does `.tar.gz` inside a 7z use `/tmp`?** | **No for the nested body** (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. Nested indexes still use temp-spill SQLite under `TMPDIR`. |
-| **When *is* `/tmp` used?** | Nested **body** fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without body spool. Nested **indexes** always spill under `TMPDIR` by default (tiny vs multi‑GB bodies). |
-| **Is “no body `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. Index spill is small relative to large archives. |
+| **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR is indexed from that stream in memory. |
+| **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
+| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without spool. |
+| **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
 | **Large recursive trees (`-r` on huge `.deb`s)?** | Prefer **`-l` / `--lazy`** (and optional **`--recursion-depth`**). Eager `-r` can use multi‑GB RAM and minutes; not a correctness bug ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)). |
 
 ---
@@ -52,7 +52,7 @@ With **recursive automount** (`-r`), when a path looks like a nested archive:
 3. Prefer nested *reader* open (no host path):
       open_nested_reader_fn(stream, label)
          sniff magic → 7z | ZIP | TAR | gzip|zstd|bz2|xz → TAR
-         build temp-spill SQLite index + MemIndex; mount as another MountSource
+         build in-memory index; mount as another MountSource
 4. On Unsupported / error → *temp spool* fallback:
       copy member → NamedTempFile under TMPDIR (/tmp) → open_nested_fn(path)
 ```
@@ -62,29 +62,17 @@ With **recursive automount** (`-r`), when a path looks like a nested archive:
 │  member: inner.tar  /  inner.tar.gz  /  inner.zip │
 │  open() → seekable body (stencil, inflate, …)    │
 └───────────────────────┬─────────────────────────┘
-                        │  no archive-body /tmp
+                        │  no /tmp
                         ▼
               nested reader open (magic)
           ┌─────────────┼──────────────┐
           ▼             ▼              ▼
         TAR           ZIP/7z     gzip→tar (etc.)
-   temp-spill       temp-spill   seek index + TAR
-   SQLite index     SQLite index temp-spill index
+     in-memory      in-memory    seek index + TAR
+        index          index      in-memory index
 ```
 
-### Nested index memory model
-
-Nested indexes are **not** written next to a virtual label (there is no host path). By default the nested reader path:
-
-| Piece | Behavior |
-|-------|----------|
-| **SQLite `files` table** | Built on a **temp spill file** under `TMPDIR` (`ratarmount-nested-*.index.sqlite`), not pure `:memory:` heap pages |
-| **MemIndex** | Hot list/lookup projection with **interned** path/name strings (shared `Arc` per unique path) |
-| **Dual hold** | After seal, MemIndex is the hot copy; pure `:memory:` (if forced) drops `files` rows; spill/on-disk keeps durable rows with a tiny SQLite page cache |
-| **Cleanup** | Spill file is deleted when the nested mount source is dropped |
-| **Residual** | Parent may still hold a large inflated member body (e.g. deflate ZIP); solid 7z open cost is separate from index RAM |
-
-Explicit `--index-file :memory:` still uses pure in-process SQLite (with the dual-hold slim after MemIndex). Nested AutoMount does **not** force that path.
+Nested indexes are **in-memory** (`:memory:` SQLite); they are not written next to a virtual label.
 
 Enable logs to see which path ran:
 

@@ -281,7 +281,7 @@ impl LibarchiveMountSource {
         let t0 = Instant::now();
 
         let handle = ArchiveHandle::open_path(archive_path)?;
-        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         let mut generated = BTreeSet::new();
         let mut entry_index: i64 = 0;

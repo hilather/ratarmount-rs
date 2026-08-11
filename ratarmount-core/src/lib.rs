@@ -225,11 +225,6 @@ pub struct OpenOptions {
     pub index_file_path: Option<PathBuf>,
     /// When true, keep the SQLite index purely in memory (`--index-file :memory:`).
     pub index_in_memory: bool,
-    /// When true and no explicit index path is set (and not [`Self::index_in_memory`]),
-    /// build the SQLite index on a temp spill file under `TMPDIR` instead of pure
-    /// `:memory:`. Used by nested reader opens so large embedded archives do not hold
-    /// the full `files` table in the SQLite heap.
-    pub index_temp_spill: bool,
     /// Folders to try for index storage (empty entry = next to archive).
     /// Empty vec means use Python-compatible defaults at resolve time.
     pub index_folders: Vec<PathBuf>,
@@ -268,7 +263,6 @@ impl Default for OpenOptions {
             clear_index_cache: false,
             index_file_path: None,
             index_in_memory: false,
-            index_temp_spill: false,
             index_folders: Vec::new(),
             verify_modification_time: false,
             // Harness always forces 0 via CLI; default matches common interactive use later.

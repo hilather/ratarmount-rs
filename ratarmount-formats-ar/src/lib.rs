@@ -191,7 +191,7 @@ impl ArMountSource {
         let size = reader.seek(SeekFrom::End(0)).unwrap_or(0);
         reader.seek(SeekFrom::Start(0))?;
 
-        let index = SqliteIndex::create_writable_for_open(index_path_buf.as_deref(), options)?;
+        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
         index.begin_write()?;
         parse_ar_into_index(&mut reader, &index)?;
         index.store_versions(product_version)?;
@@ -249,7 +249,7 @@ impl ArMountSource {
         let size = file.seek(SeekFrom::End(0)).unwrap_or(0);
         file.seek(SeekFrom::Start(0))?;
 
-        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
         parse_ar_into_index(&mut file, &index)?;
         index.store_versions(product_version)?;

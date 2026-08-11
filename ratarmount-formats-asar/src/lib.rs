@@ -286,7 +286,7 @@ impl AsarMountSource {
         let header: Value = serde_json::from_slice(&header_bytes)
             .map_err(|e| AsarError::Msg(format!("ASAR JSON header: {e}")))?;
 
-        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        let index = SqliteIndex::create_writable(index_path)?;
         index.begin_write()?;
 
         let rows = walk_asar_entries(&header, data_offset);
