@@ -95,6 +95,16 @@ pub struct SevenZipMountSource {
 }
 
 impl SevenZipMountSource {
+    /// True when the SQLite index is a nested temp-spill file (deleted when this source drops).
+    pub fn index_is_temp_spill(&self) -> bool {
+        self.index.is_temp_spill()
+    }
+
+    /// True when list/lookup use the in-memory MemIndex projection.
+    pub fn index_has_mem_index(&self) -> bool {
+        self.index.has_mem_index()
+    }
+
     pub fn open(
         archive_path: impl AsRef<Path>,
         index_path: Option<&Path>,
@@ -117,7 +127,7 @@ impl SevenZipMountSource {
     /// Open a 7z archive from any seekable reader (nested AutoMount without temp spool).
     ///
     /// `archive_label` is used for logs / index metadata (may be a nested member name).
-    /// Prefer `index_path: None` or `options.index_in_memory` for nested mounts.
+    /// Prefer `index_path: None` with [`OpenOptions::index_temp_spill`] for nested mounts.
     pub fn open_from_reader<R>(
         reader: R,
         archive_label: impl AsRef<Path>,
@@ -349,7 +359,7 @@ impl SevenZipMountSource {
             options.passwords.first().cloned()
         };
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
 
         let mut batch = Vec::new();
@@ -1344,6 +1354,45 @@ mod tests {
         let mut mid = Vec::new();
         r.read_to_end(&mut mid).unwrap();
         assert_eq!(mid.as_slice(), &bp[1..]);
+    }
+
+    /// Regression: nested-style spill index (not pure `:memory:`) list/open still work.
+    #[test]
+    fn open_from_reader_temp_spill_list_and_read() {
+        let path = py_fixture("store-copy-two-files.7z");
+        if !path.exists() {
+            eprintln!("skip: missing fixture {}", path.display());
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_temp_spill: true,
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let src = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested://store.7z"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("spill open_from_reader");
+        assert!(
+            src.index_is_temp_spill(),
+            "nested spill flag must create temp-spill SQLite index"
+        );
+        assert!(src.index_has_mem_index());
+        let fi = src.lookup("/a.txt", 0).expect("lookup a.txt");
+        let mut buf = Vec::new();
+        src.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert!(!buf.is_empty(), "member payload must be readable");
+        let listed = src.list("/").expect("list root");
+        match listed {
+            ListResult::Infos(map) => assert!(map.len() >= 2, "expected multi-file fixture"),
+            other => panic!("unexpected list: {other:?}"),
+        }
     }
 
     #[test]

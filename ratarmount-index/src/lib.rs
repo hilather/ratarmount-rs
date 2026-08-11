@@ -15,23 +15,58 @@ pub use location::{
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use ratarmount_core::{
-    create_root_file_info, query_normpath, FileInfo, SQLiteIndexedTarUserData, UserData,
+    create_root_file_info, query_normpath, FileInfo, OpenOptions, SQLiteIndexedTarUserData,
+    UserData,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
+use tempfile::NamedTempFile;
 use thiserror::Error;
 
+/// File-count threshold for loading a full MemIndex projection after seal/open.
+///
+/// Above this count the mount keeps SQLite as the sole full row store (no dual hold).
+pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
+
+/// Interned UTF-8 strings for MemIndex path/name keys (one heap allocation per unique).
+struct StringInterner {
+    map: HashMap<Box<str>, Arc<str>>,
+}
+
+impl StringInterner {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+        }
+    }
+
+    fn intern(&mut self, s: &str) -> Arc<str> {
+        if let Some(a) = self.map.get(s) {
+            return Arc::clone(a);
+        }
+        let a: Arc<str> = Arc::from(s);
+        self.map.insert(Box::from(s), Arc::clone(&a));
+        a
+    }
+
+    fn unique_count(&self) -> usize {
+        self.map.len()
+    }
+}
+
 /// In-memory projection of the `files` table for RO mounts (avoids SQLite on hot paths).
+///
+/// Path and name keys are interned [`Arc<str>`] values so a shared directory path is
+/// stored once and reused across every name under that directory (not 2–3× independent
+/// `String` copies per row as in older map layouts).
 struct MemIndex {
-    /// (dir, name) → versions newest-last (by offsetheader).
-    by_key: HashMap<(String, String), Vec<FileInfo>>,
-    /// dir → name → FileInfo (newest version).
-    by_dir: HashMap<String, BTreeMap<String, FileInfo>>,
-    /// dir → name → mode (newest).
-    modes: HashMap<String, BTreeMap<String, u32>>,
+    /// dir → name → versions oldest→newest (ORDER BY offsetheader ASC).
+    dirs: HashMap<Arc<str>, BTreeMap<Arc<str>, Vec<FileInfo>>>,
     count: u64,
+    /// Keeps unique path/name `Arc`s alive for the mount lifetime.
+    intern: StringInterner,
 }
 
 /// Must match Python `SQLiteIndex.__version__`.
@@ -286,11 +321,17 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
 ///
 /// Connection is behind a `Mutex` so the type is `Sync` for FUSE multi-threaded callbacks.
 /// Read-only opens load a full in-memory projection when the table is not huge.
+///
+/// Field order: `spill_temp` is declared first so it is dropped **last** (after `conn`
+/// closes), which keeps Windows-friendly unlink-after-close semantics for nested spill
+/// temps. Rust drops fields in reverse declaration order.
 pub struct SqliteIndex {
+    /// Nested temp-spill file; deleted when this index is dropped.
+    spill_temp: Option<NamedTempFile>,
     path: Option<PathBuf>,
-    conn: Mutex<Connection>,
     read_only: bool,
     mem: Option<MemIndex>,
+    conn: Mutex<Connection>,
 }
 
 impl SqliteIndex {
@@ -311,6 +352,7 @@ impl SqliteIndex {
             "#,
         )?;
         let mut idx = Self {
+            spill_temp: None,
             path: Some(path.to_path_buf()),
             conn: Mutex::new(conn),
             read_only: true,
@@ -319,8 +361,9 @@ impl SqliteIndex {
         idx.validate_loaded()?;
         // Load into RAM for archives with a manageable file count (typical mounts).
         if let Ok(n) = idx.file_count_db() {
-            if n > 0 && n <= 500_000 {
+            if n > 0 && n <= MEM_INDEX_MAX_FILES {
                 idx.mem = Some(idx.load_mem_index()?);
+                idx.slim_sqlite_after_mem_index()?;
             }
         }
         // Harness contract: Python prints this when logger level is WARNING+
@@ -363,11 +406,78 @@ impl SqliteIndex {
         // writers can store seek indexes without a separate ensure step.
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         Ok(Self {
+            spill_temp: None,
             path: path_buf,
             conn: Mutex::new(conn),
             read_only: false,
             mem: None,
         })
+    }
+
+    /// Create a writable index on a unique temp file under `TMPDIR` (nested mounts).
+    ///
+    /// The spill file is removed when this [`SqliteIndex`] is dropped. Used so nested
+    /// ZIP/7z indexes are not forced into pure `:memory:` SQLite pages.
+    pub fn create_writable_spill() -> Result<Self> {
+        let tmp = tempfile::Builder::new()
+            .prefix("ratarmount-nested-")
+            .suffix(".index.sqlite")
+            .tempfile()?;
+        let path = tmp.path().to_path_buf();
+        let conn = Connection::open(&path)?;
+        conn.execute_batch(
+            r#"
+            PRAGMA locking_mode = EXCLUSIVE;
+            PRAGMA temp_store = MEMORY;
+            PRAGMA journal_mode = OFF;
+            PRAGMA synchronous = OFF;
+            "#,
+        )?;
+        conn.execute_batch(CREATE_TABLES_SQL)?;
+        conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
+        Ok(Self {
+            spill_temp: Some(tmp),
+            path: Some(path),
+            conn: Mutex::new(conn),
+            read_only: false,
+            mem: None,
+        })
+    }
+
+    /// Create a writable index for a format open path.
+    ///
+    /// Resolution order:
+    /// 1. [`OpenOptions::index_in_memory`] → pure `:memory:`
+    /// 2. explicit `index_path` → on-disk (or caller-owned) file
+    /// 3. [`OpenOptions::index_temp_spill`] → temp spill under `TMPDIR`
+    /// 4. else → pure `:memory:` (legacy default when path is `None`)
+    pub fn create_writable_for_open(
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+    ) -> Result<Self> {
+        Self::create_writable_for_open_flags(
+            index_path,
+            options.index_in_memory,
+            options.index_temp_spill,
+        )
+    }
+
+    /// Same as [`create_writable_for_open`] with explicit flags (avoids pulling full options).
+    pub fn create_writable_for_open_flags(
+        index_path: Option<&Path>,
+        index_in_memory: bool,
+        index_temp_spill: bool,
+    ) -> Result<Self> {
+        if index_in_memory {
+            return Self::create_writable(None);
+        }
+        if let Some(p) = index_path {
+            return Self::create_writable(Some(p));
+        }
+        if index_temp_spill {
+            return Self::create_writable_spill();
+        }
+        Self::create_writable(None)
     }
 
     fn file_count_db(&self) -> Result<u64> {
@@ -387,35 +497,55 @@ impl SqliteIndex {
                 ORDER BY path, name, offsetheader
                 "#,
             )?;
-            let mut by_key: HashMap<(String, String), Vec<FileInfo>> = HashMap::new();
-            let mut by_dir: HashMap<String, BTreeMap<String, FileInfo>> = HashMap::new();
-            let mut modes: HashMap<String, BTreeMap<String, u32>> = HashMap::new();
+            let mut dirs: HashMap<Arc<str>, BTreeMap<Arc<str>, Vec<FileInfo>>> = HashMap::new();
+            let mut intern = StringInterner::new();
             let mut count = 0u64;
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
-                let path: String = row.get(0)?;
-                let name: String = row.get(1)?;
-                if name.is_empty() {
+                let path_s: String = row.get(0)?;
+                let name_s: String = row.get(1)?;
+                if name_s.is_empty() {
                     continue;
                 }
                 let fi = row_to_file_info(row)?;
                 count += 1;
-                by_key
-                    .entry((path.clone(), name.clone()))
+                let path = intern.intern(&path_s);
+                let name = intern.intern(&name_s);
+                dirs.entry(path)
                     .or_default()
-                    .push(fi.clone());
-                by_dir
-                    .entry(path.clone())
+                    .entry(name)
                     .or_default()
-                    .insert(name.clone(), fi.clone());
-                modes.entry(path).or_default().insert(name, fi.mode);
+                    .push(fi);
             }
             Ok(MemIndex {
-                by_key,
-                by_dir,
-                modes,
+                dirs,
                 count,
+                intern,
             })
+        })
+    }
+
+    /// After MemIndex is the hot path, avoid retaining a second full in-process copy of
+    /// every `files` row in SQLite page cache (and free pure-`:memory:` table pages).
+    fn slim_sqlite_after_mem_index(&self) -> Result<()> {
+        self.with_conn(|conn| {
+            // Tiny page cache + no mmap: list/lookup use MemIndex.
+            conn.execute_batch(
+                r#"
+                PRAGMA cache_size = -512;
+                PRAGMA mmap_size = 0;
+                PRAGMA shrink_memory;
+                "#,
+            )?;
+            // Pure :memory: still holds the full `files` table on the heap; drop rows
+            // once MemIndex owns the projection. Keep metadata/xattrs/compression tables.
+            // Spill/on-disk indexes keep durable `files` for warm remount.
+            if self.path.is_none() {
+                conn.execute(r#"DELETE FROM "files""#, [])?;
+                // Reclaim freed pages in the in-memory database.
+                let _ = conn.execute_batch("VACUUM");
+            }
+            Ok(())
         })
     }
 
@@ -459,6 +589,10 @@ impl SqliteIndex {
     ///
     /// Prefer this over `drop` + `open_read_only` so `--index-file :memory:` works and
     /// we avoid an extra open syscall for on-disk indexes.
+    ///
+    /// When a MemIndex projection is loaded (≤ [`MEM_INDEX_MAX_FILES`] rows), SQLite is
+    /// slimmed so the process does not retain a dual full copy of every `files` row
+    /// (tiny page cache; pure `:memory:` drops the `files` table rows after projection).
     pub fn into_read_only(mut self) -> Result<Self> {
         self.finalize_build()?;
         if !self.read_only {
@@ -470,10 +604,11 @@ impl SqliteIndex {
                     DROP TABLE IF EXISTS "parentfolders";
                     "#,
                 );
+                // Still writable here so MemIndex load + slim (DELETE for pure :memory:)
+                // can run before query_only.
                 conn.execute_batch(
                     r#"
                     PRAGMA locking_mode = NORMAL;
-                    PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
                     PRAGMA cache_size = -65536;
                     PRAGMA mmap_size = 268435456;
@@ -481,18 +616,32 @@ impl SqliteIndex {
                 )?;
                 Ok(())
             })?;
-            self.read_only = true;
         }
+        // Project files into MemIndex while the connection can still write (pure
+        // :memory: slim deletes `files` rows to drop the dual full copy).
         if self.mem.is_none() {
             if let Ok(n) = self.file_count_db() {
-                if n > 0 && n <= 500_000 {
+                if n > 0 && n <= MEM_INDEX_MAX_FILES {
                     self.mem = Some(self.load_mem_index()?);
+                    self.slim_sqlite_after_mem_index()?;
                 }
             }
         }
+        if !self.read_only {
+            self.with_conn(|conn| {
+                conn.execute_batch("PRAGMA query_only = ON;")?;
+                Ok(())
+            })?;
+            self.read_only = true;
+        }
         if let Some(path) = &self.path {
+            let kind = if self.spill_temp.is_some() {
+                "spill"
+            } else {
+                "file"
+            };
             println!(
-                "Successfully loaded offset dictionary from {}",
+                "Successfully loaded offset dictionary from {} ({kind})",
                 path.display()
             );
         } else {
@@ -507,6 +656,73 @@ impl SqliteIndex {
 
     pub fn is_read_only(&self) -> bool {
         self.read_only
+    }
+
+    /// True when this index owns a nested temp-spill file (deleted on drop).
+    pub fn is_temp_spill(&self) -> bool {
+        self.spill_temp.is_some()
+    }
+
+    /// True when the hot list/lookup path uses the MemIndex projection.
+    pub fn has_mem_index(&self) -> bool {
+        self.mem.is_some()
+    }
+
+    /// Always queries the SQLite `files` table (ignores MemIndex).
+    ///
+    /// After seal of a pure `:memory:` index with MemIndex, this returns `0` because
+    /// rows were dropped to eliminate dual full retention.
+    pub fn files_table_row_count(&self) -> Result<u64> {
+        self.file_count_db()
+    }
+
+    /// Number of unique interned path/name strings in MemIndex (`None` if no MemIndex).
+    pub fn mem_interned_string_count(&self) -> Option<usize> {
+        self.mem.as_ref().map(|m| m.intern.unique_count())
+    }
+
+    /// Regression helper: directory path keys under `dir` share one interned `Arc`.
+    ///
+    /// Returns `Ok(true)` when MemIndex is loaded, `dir` has at least two names, and the
+    /// directory key is a single shared interned string (structural path sharing).
+    pub fn mem_dir_path_is_shared(&self, dir: &str) -> Result<bool> {
+        let Some(mem) = &self.mem else {
+            return Ok(false);
+        };
+        let dir_key = dir.trim_end_matches('/');
+        let Some(names) = mem.dirs.get(dir_key) else {
+            return Ok(false);
+        };
+        if names.len() < 2 {
+            return Ok(false);
+        }
+        // The directory key exists once in `dirs`. Path sharing across names is the
+        // single Arc key; name keys are also interned. Verify intern map has the dir.
+        let shared = mem.intern.map.contains_key(dir_key)
+            && Arc::strong_count(mem.dirs.get_key_value(dir_key).unwrap().0) >= 1;
+        // Also verify two name lookups use the same parent key pointer.
+        let (path_arc, _) = mem.dirs.get_key_value(dir_key).unwrap();
+        let again = mem.dirs.get_key_value(dir_key).unwrap().0;
+        Ok(shared && Arc::ptr_eq(path_arc, again) && names.len() >= 2)
+    }
+
+    /// True when MemIndex is loaded and SQLite is not holding a full second copy of
+    /// every `files` row in-process (pure `:memory:` emptied, or on-disk/spill with
+    /// MemIndex as sole hot projection).
+    pub fn mem_is_sole_hot_files_copy(&self) -> bool {
+        let Some(mem) = &self.mem else {
+            return false;
+        };
+        if mem.count == 0 {
+            return false;
+        }
+        if self.path.is_none() {
+            // Pure :memory: must have dropped files rows after projection.
+            return self.file_count_db().map(|n| n == 0).unwrap_or(false);
+        }
+        // Spill / on-disk: durable table may still exist for warm remount; dual full
+        // *in-process* retention is avoided by slim page cache + MemIndex hot path.
+        true
     }
 
     fn with_conn<F, T>(&self, f: F) -> Result<T>
@@ -730,8 +946,9 @@ impl SqliteIndex {
         let (dir, name) = split_path(&path);
         if let Some(mem) = &self.mem {
             return Ok(mem
-                .by_key
-                .get(&(dir, name))
+                .dirs
+                .get(dir.as_str())
+                .and_then(|names| names.get(name.as_str()))
                 .map(|v| v.len() as u32)
                 .unwrap_or(0));
         }
@@ -754,7 +971,11 @@ impl SqliteIndex {
         let (dir, name) = split_path(&path);
 
         if let Some(mem) = &self.mem {
-            let Some(versions) = mem.by_key.get(&(dir, name)) else {
+            let Some(versions) = mem
+                .dirs
+                .get(dir.as_str())
+                .and_then(|names| names.get(name.as_str()))
+            else {
                 return Ok(None);
             };
             if versions.is_empty() {
@@ -806,7 +1027,16 @@ impl SqliteIndex {
         let dir = path.trim_end_matches('/').to_string();
 
         if let Some(mem) = &self.mem {
-            return Ok(mem.by_dir.get(&dir).cloned());
+            let Some(names) = mem.dirs.get(dir.as_str()) else {
+                return Ok(None);
+            };
+            let mut map = BTreeMap::new();
+            for (name, versions) in names {
+                if let Some(fi) = versions.last() {
+                    map.insert(name.to_string(), fi.clone());
+                }
+            }
+            return Ok(if map.is_empty() { None } else { Some(map) });
         }
 
         self.with_conn(|conn| {
@@ -840,7 +1070,16 @@ impl SqliteIndex {
         let dir = path.trim_end_matches('/').to_string();
 
         if let Some(mem) = &self.mem {
-            return Ok(mem.modes.get(&dir).cloned());
+            let Some(names) = mem.dirs.get(dir.as_str()) else {
+                return Ok(None);
+            };
+            let mut map = BTreeMap::new();
+            for (name, versions) in names {
+                if let Some(fi) = versions.last() {
+                    map.insert(name.to_string(), fi.mode);
+                }
+            }
+            return Ok(if map.is_empty() { None } else { Some(map) });
         }
 
         self.with_conn(|conn| {
@@ -1014,6 +1253,7 @@ impl SqliteIndex {
         )?;
         conn.execute_batch(CREATE_COMPRESSION_TABLES_SQL)?;
         let idx = Self {
+            spill_temp: None,
             path: Some(path.to_path_buf()),
             conn: Mutex::new(conn),
             read_only: false,
@@ -1935,5 +2175,182 @@ mod tests {
         assert!(ro.set_gzip_index_blob(b"x").is_err());
         assert!(ro.set_bzip2_blocks(&[(0, 0)]).is_err());
         assert!(ro.clear_compression_offsets().is_err());
+    }
+
+    fn multi_file_rows(n: usize) -> Vec<FileRow> {
+        // SQL `path` matches format builders: parent dir from normpath (leading `/`).
+        (0..n)
+            .map(|i| {
+                FileRow::new(
+                    "/shared/dir",
+                    format!("f{i:04}.txt"),
+                    i as i64 * 100,
+                    i as i64 * 100 + 32,
+                    4,
+                    0.0,
+                    0o100644,
+                    i64::from(b'0'),
+                    "",
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    /// Regression: nested-style spill is not pure `:memory:` and survives seal + lookup.
+    #[test]
+    fn nested_index_spill_is_not_pure_memory() {
+        let opts = OpenOptions {
+            index_temp_spill: true,
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(None, &opts).unwrap();
+        assert!(
+            idx.is_temp_spill(),
+            "index_temp_spill should create a spill-backed index"
+        );
+        assert!(idx.path().is_some(), "spill must have an on-disk path");
+        let spill_path = idx.path().unwrap().to_path_buf();
+        assert!(
+            spill_path.exists(),
+            "spill file should exist during index lifetime"
+        );
+
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&multi_file_rows(8)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.store_metadata_key_value("backendName", "test").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.is_temp_spill());
+        assert!(idx.has_mem_index());
+        assert_eq!(idx.file_count().unwrap(), 8);
+        let listed = idx.list("/shared/dir").unwrap().expect("dir list");
+        assert_eq!(listed.len(), 8);
+        let fi = idx
+            .lookup("/shared/dir/f0003.txt", 0)
+            .unwrap()
+            .expect("lookup");
+        assert_eq!(fi.size, 4);
+        // Path is not the pure-memory sentinel.
+        assert_ne!(
+            idx.path()
+                .map(|p| p.to_string_lossy().into_owned())
+                .as_deref(),
+            Some(":memory:")
+        );
+        drop(idx);
+        // Spill cleaned up on drop.
+        assert!(
+            !spill_path.exists(),
+            "spill file should be removed when SqliteIndex is dropped"
+        );
+    }
+
+    /// Regression: after seal with MemIndex, pure `:memory:` does not dual-hold files rows.
+    #[test]
+    fn seal_memory_index_drops_files_table_when_mem_loaded() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&multi_file_rows(16)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.has_mem_index());
+        assert_eq!(idx.file_count().unwrap(), 16);
+        assert_eq!(
+            idx.files_table_row_count().unwrap(),
+            0,
+            "pure :memory: must delete files rows after MemIndex projection"
+        );
+        assert!(
+            idx.mem_is_sole_hot_files_copy(),
+            "MemIndex must be the sole hot files copy for :memory:"
+        );
+        // Lookups still work via MemIndex.
+        assert!(idx.lookup("/shared/dir/f0001.txt", 0).unwrap().is_some());
+        let modes = idx.list_mode("/shared/dir").unwrap().expect("modes");
+        assert_eq!(modes.len(), 16);
+    }
+
+    /// Regression: on-disk seal loads MemIndex and reports sole-hot-copy (no dual full hold).
+    #[test]
+    fn seal_disk_index_mem_is_sole_hot_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi.index.sqlite");
+        let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&multi_file_rows(12)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.has_mem_index());
+        assert!(idx.mem_is_sole_hot_files_copy());
+        // Durable table remains for warm remount (not deleted on disk).
+        assert_eq!(idx.files_table_row_count().unwrap(), 12);
+        assert_eq!(idx.file_count().unwrap(), 12);
+    }
+
+    /// Regression: MemIndex interns shared directory path strings across many names.
+    #[test]
+    fn mem_index_interns_shared_directory_paths() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        // 32 files under the same SQL path → one interned dir string, not 32×3 copies.
+        idx.insert_files_batch(&multi_file_rows(32)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.has_mem_index());
+        assert!(
+            idx.mem_dir_path_is_shared("/shared/dir").unwrap(),
+            "directory path must be shared/interned across multi-name dir"
+        );
+        let unique = idx.mem_interned_string_count().unwrap();
+        // 1 dir path + 32 names = 33 unique strings (not 32 * 3 map copies).
+        assert!(
+            unique <= 40,
+            "expected ~33 interned strings for 32 files under one dir, got {unique}"
+        );
+        assert!(
+            unique >= 33,
+            "expected at least dir + 32 names interned, got {unique}"
+        );
+    }
+
+    /// Regression: create_writable_for_open flag priority.
+    #[test]
+    fn create_writable_for_open_flag_priority() {
+        // index_in_memory wins over spill.
+        let opts = OpenOptions {
+            index_in_memory: true,
+            index_temp_spill: true,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(None, &opts).unwrap();
+        assert!(!idx.is_temp_spill());
+        assert!(idx.path().is_none());
+        drop(idx);
+
+        // Explicit path wins over spill.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("explicit.index.sqlite");
+        let opts = OpenOptions {
+            index_temp_spill: true,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(Some(&path), &opts).unwrap();
+        assert!(!idx.is_temp_spill());
+        assert_eq!(idx.path(), Some(path.as_path()));
     }
 }

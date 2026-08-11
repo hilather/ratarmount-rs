@@ -201,7 +201,7 @@ impl XarMountSource {
             return Err(XarError::Msg("XAR archive contains no files".into()));
         }
 
-        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        let index = SqliteIndex::create_writable_for_open(index_path_buf.as_deref(), options)?;
         index.begin_write()?;
         insert_rows(&index, &rows)?;
         index.store_versions(product_version)?;
@@ -266,7 +266,7 @@ impl XarMountSource {
             return Err(XarError::Msg("XAR archive contains no files".into()));
         }
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         insert_rows(&index, &rows)?;
         index.store_versions(product_version)?;

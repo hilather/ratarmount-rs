@@ -199,7 +199,7 @@ impl WarcMountSource {
             ));
         }
 
-        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        let index = SqliteIndex::create_writable_for_open(index_path_buf.as_deref(), options)?;
         index.begin_write()?;
         fill_index_from_data(&index, &data)?;
         index.store_versions(product_version)?;
@@ -264,7 +264,7 @@ impl WarcMountSource {
             ));
         }
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         fill_index_from_data(&index, &data)?;
         index.store_versions(product_version)?;

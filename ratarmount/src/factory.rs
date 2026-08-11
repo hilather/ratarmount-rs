@@ -512,9 +512,12 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut opts = options.clone();
-        // Nested indexes cannot live next to a virtual label; keep them in memory.
+        // Nested indexes cannot live next to a virtual label. Prefer a temp spill
+        // under TMPDIR (off-heap SQLite pages) over pure `:memory:` so large embedded
+        // ZIP/7z indexes do not dual-hold the full `files` table in process RAM.
         opts.index_file_path = None;
-        opts.index_in_memory = true;
+        opts.index_in_memory = false;
+        opts.index_temp_spill = true;
         opts.clear_index_cache = true;
 
         let mut magic = [0u8; 512];
@@ -972,7 +975,7 @@ fn open_nested_gzip_tar(
             gzip.size(),
             gzip.checkpoint_count()
         );
-        // Nested: always rebuild in-memory index (opts already force index_in_memory).
+        // Nested: rebuild via temp-spill index (opts force index_temp_spill).
         return SqliteIndexedTar::create_index_gzip(label, gzip, None, opts, VERSION)
             .map(|s| {
                 log::debug!(

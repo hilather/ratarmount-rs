@@ -120,7 +120,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | 7z `open_from_reader` / shared pack IO | **done** | `SharedArchiveIo` + `SeekPackSource` |
 | TAR nested via `open_from_reader` (stencil) | **done** | factory nested reader opens TAR |
 | ZIP store stencil nested open | later | factory already tries ZIP from reader |
-| Virtual nested index (lazy child SQLite) | later | `:memory:` used for nested today |
+| Virtual nested index (lazy child SQLite) | later | temp-spill under `TMPDIR` for nested reader opens (not pure `:memory:`) |
 | Flattened recursive TAR index | later | outer absolute offsets |
 | 7z store-in-solid nested no-tmp | later | progressive outer + inner reader |
 | Tests: nested 7z + nested TAR | **done** | sevenzip + automount unit tests |

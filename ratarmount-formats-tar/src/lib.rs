@@ -455,7 +455,7 @@ impl SqliteIndexedTar {
         );
         let t0 = Instant::now();
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(&mut reader, &index, options)?;
 
@@ -531,7 +531,7 @@ impl SqliteIndexedTar {
         );
         let t0 = Instant::now();
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(reader, &index, options)?;
 

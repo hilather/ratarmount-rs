@@ -342,6 +342,16 @@ pub struct ZipMountSource {
 }
 
 impl ZipMountSource {
+    /// True when the SQLite index is a nested temp-spill file (deleted when this source drops).
+    pub fn index_is_temp_spill(&self) -> bool {
+        self.index.is_temp_spill()
+    }
+
+    /// True when list/lookup use the in-memory MemIndex projection.
+    pub fn index_has_mem_index(&self) -> bool {
+        self.index.has_mem_index()
+    }
+
     /// `index_path`: `Some(path)` for on-disk index, `None` for in-memory (`:memory:`).
     pub fn open(
         archive_path: impl AsRef<Path>,
@@ -472,6 +482,7 @@ impl ZipMountSource {
             StatsSource::Synthetic(size),
             &options.hashes,
             None,
+            options,
         )?;
         // Drop ZipArchive before keeping shared for open path.
         drop(archive);
@@ -537,6 +548,7 @@ impl ZipMountSource {
             StatsSource::Path(opened.open_path.as_path()),
             &options.hashes,
             Some(&opened.file),
+            options,
         )?;
         drop(archive);
 
@@ -581,8 +593,9 @@ impl ZipMountSource {
         stats: StatsSource<'_>,
         hash_algorithms: &[String],
         parallel_file: Option<&File>,
+        options: &OpenOptions,
     ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let mut members = HashMap::new();
         let mut generated_dirs: std::collections::BTreeSet<String> =
@@ -1917,6 +1930,50 @@ mod tests {
             ListResult::Infos(map) => assert!(map.contains_key("hello.txt")),
             other => panic!("unexpected list: {other:?}"),
         }
+    }
+
+    /// Regression: nested-style spill index (not pure `:memory:`) list/open still work.
+    #[test]
+    fn open_from_reader_temp_spill_list_and_read() {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut buf);
+            let zopts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a.txt", zopts).unwrap();
+            zw.write_all(b"alpha-spill\n").unwrap();
+            zw.start_file("b.txt", zopts).unwrap();
+            zw.write_all(b"beta-spill-payload\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let opts = OpenOptions {
+            index_temp_spill: true,
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open_from_reader(
+            io::Cursor::new(bytes),
+            Path::new("nested://multi.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("spill open_from_reader");
+        assert!(
+            src.index_is_temp_spill(),
+            "nested spill flag must create temp-spill SQLite index"
+        );
+        assert!(src.index_has_mem_index());
+        let fi = src.lookup("/a.txt", 0).expect("lookup a");
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"alpha-spill\n");
+        let fi_b = src.lookup("/b.txt", 0).expect("lookup b");
+        let mut r = src.open(&fi_b, 0).unwrap();
+        out.clear();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"beta-spill-payload\n");
     }
 
     fn write_encrypted_zip(path: &Path, name: &str, data: &[u8], password: &str) {
