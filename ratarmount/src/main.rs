@@ -406,6 +406,7 @@ fn main() {
         index_minimum_file_count: args.index_minimum_file_count,
         index_file_path,
         index_in_memory,
+        index_compact_only: false,
         index_folders,
         clear_index_cache: args.recreate_index && !args.no_recreate_index,
         write_index: !args.no_recreate_index,

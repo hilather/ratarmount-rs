@@ -48,7 +48,7 @@
 - [x] Sniff magic after rewind: gzip `1f 8b`, zstd frame, xz, bzip2 `BZh`
 - [x] Name / body probe for compressed TAR
 - [x] On hit: open seekable body **from the member reader** (no copy to disk)
-- [x] Keep in-memory nested indexes (`index_in_memory = true`)
+- [x] Nested compact-only file table (`index_compact_only`; no nested SQLite `files` store)
 - [x] On unsupported inner body: error → existing temp-spool fallback (do not regress)
 
 ### A2. Nested `.tar.gz` path (N2 / N4 / N5)

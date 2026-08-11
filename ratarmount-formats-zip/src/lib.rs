@@ -181,9 +181,9 @@ pub type Result<T> = std::result::Result<T, ZipError>;
 
 #[derive(Clone, Debug)]
 struct ZipMemberMeta {
-    /// Member path inside the archive (debug / future by-name open).
+    /// Member path — shared with compact index string pool when available.
     #[allow(dead_code)]
-    name: String,
+    name: std::sync::Arc<str>,
     data_start: u64,
     compressed_size: u64,
     method: u16,
@@ -342,6 +342,19 @@ pub struct ZipMountSource {
 }
 
 impl ZipMountSource {
+    /// True when the nested compact-only file table is used (no SQLite `files` store).
+    pub fn index_is_compact_only(&self) -> bool {
+        self.index.is_compact_only()
+    }
+
+    /// Shared pooled member name with the compact index (post-build).
+    pub fn member_name_pooled(&self, header: u64) -> Option<std::sync::Arc<str>> {
+        let meta = self.members.get(&header)?;
+        let pooled = self.index.lookup_pooled_string(meta.name.as_ref())?;
+        // Same string content; prefer identity when pool shared at build time.
+        Some(pooled)
+    }
+
     /// `index_path`: `Some(path)` for on-disk index, `None` for in-memory (`:memory:`).
     pub fn open(
         archive_path: impl AsRef<Path>,
@@ -472,6 +485,7 @@ impl ZipMountSource {
             StatsSource::Synthetic(size),
             &options.hashes,
             None,
+            options,
         )?;
         // Drop ZipArchive before keeping shared for open path.
         drop(archive);
@@ -537,6 +551,7 @@ impl ZipMountSource {
             StatsSource::Path(opened.open_path.as_path()),
             &options.hashes,
             Some(&opened.file),
+            options,
         )?;
         drop(archive);
 
@@ -581,8 +596,9 @@ impl ZipMountSource {
         stats: StatsSource<'_>,
         hash_algorithms: &[String],
         parallel_file: Option<&File>,
+        options: &OpenOptions,
     ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let mut members = HashMap::new();
         let mut generated_dirs: std::collections::BTreeSet<String> =
@@ -592,7 +608,12 @@ impl ZipMountSource {
 
         for i in 0..archive.len() {
             let zf = open_member(archive, i, password)?;
-            let name = zf.name().to_string();
+            let name_raw = zf.name().to_string();
+            // Share name with compact index string pool when building.
+            let name_arc: std::sync::Arc<str> = index
+                .intern_during_build(&name_raw)
+                .unwrap_or_else(|| std::sync::Arc::from(name_raw.as_str()));
+            let name = name_raw;
             let header_offset = zf.header_start();
             let data_start = zf.data_start();
             let size = zf.size();
@@ -681,7 +702,7 @@ impl ZipMountSource {
             members.insert(
                 header_offset,
                 ZipMemberMeta {
-                    name: name.clone(),
+                    name: std::sync::Arc::clone(&name_arc),
                     data_start,
                     compressed_size,
                     method,
@@ -1249,7 +1270,7 @@ fn member_meta_map<R: Read + Seek>(
         members.insert(
             file.header_start(),
             ZipMemberMeta {
-                name: file.name().to_string(),
+                name: std::sync::Arc::from(file.name()),
                 data_start: file.data_start(),
                 compressed_size: file.compressed_size(),
                 method,
@@ -1917,6 +1938,54 @@ mod tests {
             ListResult::Infos(map) => assert!(map.contains_key("hello.txt")),
             other => panic!("unexpected list: {other:?}"),
         }
+    }
+
+    /// Nested compact-only: no SQLite files table; list/open work; names share pool.
+    #[test]
+    fn open_from_reader_compact_only_list_open_and_pool() {
+        let mut buf = io::Cursor::new(Vec::new());
+        {
+            let mut zw = ZipWriter::new(&mut buf);
+            let zopts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a.txt", zopts).unwrap();
+            zw.write_all(b"alpha\n").unwrap();
+            zw.start_file("b.txt", zopts).unwrap();
+            zw.write_all(b"beta-payload\n").unwrap();
+            zw.finish().unwrap();
+        }
+        let bytes = buf.into_inner();
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open_from_reader(
+            io::Cursor::new(bytes),
+            Path::new("nested://multi.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("compact open_from_reader");
+        assert!(
+            src.index_is_compact_only(),
+            "nested-style open must use compact-only index"
+        );
+        let fi = src.lookup("/a.txt", 0).expect("lookup a");
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, b"alpha\n");
+        // Sidecar name shares compact pool (same Arc content identity when interned).
+        let oh = fi
+            .userdata
+            .iter()
+            .find_map(|u| match u {
+                ratarmount_core::UserData::Tar(t) => t.offsetheader,
+                _ => None,
+            })
+            .expect("offsetheader");
+        let pooled = src.member_name_pooled(oh).expect("pooled member name");
+        assert_eq!(&*pooled, "a.txt");
     }
 
     fn write_encrypted_zip(path: &Path, name: &str, data: &[u8], password: &str) {

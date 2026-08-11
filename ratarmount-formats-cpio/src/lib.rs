@@ -235,7 +235,7 @@ impl CpioMountSource {
         let kind = detect_kind(&mut reader)?;
         reader.seek(SeekFrom::Start(0))?;
 
-        let index = SqliteIndex::create_writable(index_path_buf.as_deref())?;
+        let index = SqliteIndex::create_writable_for_open(index_path_buf.as_deref(), options)?;
         index.begin_write()?;
         let mut generated = std::collections::BTreeSet::new();
 
@@ -302,7 +302,7 @@ impl CpioMountSource {
         let kind = detect_kind(&mut file)?;
         file.seek(SeekFrom::Start(0))?;
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let mut generated = std::collections::BTreeSet::new();
 

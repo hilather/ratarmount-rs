@@ -104,7 +104,7 @@ Default `xz -c` emits **one block**. Open can still parse Index with a few range
 | Inflate | Default: zlib-rs. With **`gzip-rapidgzip-isal`**: Intel ISA-L sequential inflater (`rapidgzip-core/isal`; needs shared `libisal`, or `ISAL_INSTALL_PREFIX`) |
 | Fallback | On rapidgzip open failure, factory falls back to G3 seekable gzip: **path** and **Range** (reopen when available); **nested** prefer recovers Arc-held reader, rewinds when `Seek` works, then opens G3 ([R1](tasks/rapidgzip-residual-batch.md) **done** `00c70a3`) |
 | Factory (done) | Path/nested/Range prefer rapidgzip; typed `Arc<SharedRapidgzip>` + GZIDX import/export; invalid blob rebuild (no panic); TAR/plain via `open_from_seekable_body` |
-| Residual | Nested imported-index not wired (nested is `:memory:` / no side table); thruput vs G3 needs re-bench before product claims; default-on rapidgzip after benches; per-open index clone; large nested `from_reader` still mutex (small-body slurp [R2](tasks/rapidgzip-residual-batch.md) **done**); R1/R3/R4 **done** |
+| Residual | Nested imported-index not wired (nested is compact-only / no SQLite side table); thruput vs G3 needs re-bench before product claims; default-on rapidgzip after benches; per-open index clone; large nested `from_reader` still mutex (small-body slurp [R2](tasks/rapidgzip-residual-batch.md) **done**); R1/R3/R4 **done** |
 | Default CI | Feature **off** (workspace MSRV stays 1.74; ISA-L needs system lib) |
 
 ### Residual — performance (thruput / cost)

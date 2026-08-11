@@ -188,6 +188,7 @@ impl Iso9660MountSource {
         let index = build_iso_index(
             &mut reader,
             index_path_buf.as_deref(),
+            options,
             product_version,
             StatsSource::Synthetic(size),
         )?;
@@ -245,6 +246,7 @@ impl Iso9660MountSource {
         let index = build_iso_index(
             &mut file,
             index_path,
+            options,
             product_version,
             StatsSource::Path(archive_path),
         )?;
@@ -333,6 +335,7 @@ enum StatsSource<'a> {
 fn build_iso_index<R: Read + Seek>(
     file: &mut R,
     index_path: Option<&Path>,
+    options: &OpenOptions,
     product_version: &str,
     stats: StatsSource<'_>,
 ) -> Result<SqliteIndex> {
@@ -348,7 +351,7 @@ fn build_iso_index<R: Read + Seek>(
     let root = parse_directory_record(&pvd, 156)
         .ok_or_else(|| IsoError::Msg("ISO 9660 PVD has no root directory".into()))?;
 
-    let index = SqliteIndex::create_writable(index_path)?;
+    let index = SqliteIndex::create_writable_for_open(index_path, options)?;
     index.begin_write()?;
     let mut seen = HashSet::new();
     walk_directory(file, root.extent, root.size, "", &index, &mut seen)?;

@@ -95,6 +95,11 @@ pub struct SevenZipMountSource {
 }
 
 impl SevenZipMountSource {
+    /// True when the nested compact-only file table is used (no SQLite `files` store).
+    pub fn index_is_compact_only(&self) -> bool {
+        self.index.is_compact_only()
+    }
+
     pub fn open(
         archive_path: impl AsRef<Path>,
         index_path: Option<&Path>,
@@ -349,7 +354,7 @@ impl SevenZipMountSource {
             options.passwords.first().cloned()
         };
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
 
         let mut batch = Vec::new();
@@ -1298,6 +1303,35 @@ mod tests {
                 assert_eq!(buf.len(), fi.size as usize);
             }
         }
+    }
+
+    /// Nested compact-only 7z: no SQLite files table; list/open succeed.
+    #[test]
+    fn open_from_reader_compact_only_list_and_read() {
+        let path = py_fixture("store-copy-two-files.7z");
+        if !path.exists() {
+            eprintln!("skip: missing fixture {}", path.display());
+            return;
+        }
+        let bytes = std::fs::read(&path).unwrap();
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let src = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested://store.7z"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("compact open_from_reader");
+        assert!(src.index_is_compact_only());
+        let fi = src.lookup("/a.txt", 0).expect("lookup a.txt");
+        let mut buf = Vec::new();
+        src.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert!(!buf.is_empty());
     }
 
     #[test]

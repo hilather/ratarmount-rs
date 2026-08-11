@@ -364,7 +364,7 @@ impl CabMountSource {
         );
         let t0 = Instant::now();
 
-        let index = SqliteIndex::create_writable(index_path)?;
+        let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
         let mut generated = std::collections::BTreeSet::new();
 

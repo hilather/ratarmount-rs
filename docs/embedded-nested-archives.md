@@ -14,8 +14,8 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 
 | Question | Answer |
 |----------|--------|
-| **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR is indexed from that stream in memory. |
-| **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
+| **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR uses a **compact-only** in-process file table (no SQLite `files` store). |
+| **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR compact index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
 | **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without spool. |
 | **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
 | **Large recursive trees (`-r` on huge `.deb`s)?** | Prefer **`-l` / `--lazy`** (and optional **`--recursion-depth`**). Eager `-r` can use multi‑GB RAM and minutes; not a correctness bug ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)). |
@@ -52,7 +52,7 @@ With **recursive automount** (`-r`), when a path looks like a nested archive:
 3. Prefer nested *reader* open (no host path):
       open_nested_reader_fn(stream, label)
          sniff magic → 7z | ZIP | TAR | gzip|zstd|bz2|xz → TAR
-         build in-memory index; mount as another MountSource
+         build compact-only file table (no SQLite files); mount as MountSource
 4. On Unsupported / error → *temp spool* fallback:
       copy member → NamedTempFile under TMPDIR (/tmp) → open_nested_fn(path)
 ```
@@ -62,17 +62,29 @@ With **recursive automount** (`-r`), when a path looks like a nested archive:
 │  member: inner.tar  /  inner.tar.gz  /  inner.zip │
 │  open() → seekable body (stencil, inflate, …)    │
 └───────────────────────┬─────────────────────────┘
-                        │  no /tmp
+                        │  no archive-body /tmp
                         ▼
               nested reader open (magic)
           ┌─────────────┼──────────────┐
           ▼             ▼              ▼
         TAR           ZIP/7z     gzip→tar (etc.)
-     in-memory      in-memory    seek index + TAR
-        index          index      in-memory index
+   compact-only    compact-only  seek index + TAR
+   file table      file table    compact-only TAR
 ```
 
-Nested indexes are **in-memory** (`:memory:` SQLite); they are not written next to a virtual label.
+### Nested index memory model
+
+Nested indexes are **not** written next to a virtual label. By default the nested reader path uses a **compact-only** file table:
+
+| Piece | Behavior |
+|-------|----------|
+| **File table** | In-process **compact** projection: string pool, path **segments**, SoA rows, optional dir **shards** — **no** SQLite `files` table |
+| **Top-level contrast** | Path mounts still use on-disk / `:memory:` SQLite for warm remount and Python interop |
+| **Fat `FileInfo`** | Materialized only at list/lookup; open can use compact offset cookies |
+| **ZIP sidecars** | Member names interned into the same string pool during index build |
+| **Residual** | Parent may still hold a large inflated member body; solid 7z open cost is separate |
+
+Explicit top-level `--index-file :memory:` still uses SQLite in process for that mount; nested AutoMount does **not** force a nested SQLite `files` store.
 
 Enable logs to see which path ran:
 

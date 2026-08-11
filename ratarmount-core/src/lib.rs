@@ -225,6 +225,10 @@ pub struct OpenOptions {
     pub index_file_path: Option<PathBuf>,
     /// When true, keep the SQLite index purely in memory (`--index-file :memory:`).
     pub index_in_memory: bool,
+    /// When true, nested-style mounts use a **compact-only** file table (string pool +
+    /// SoA rows) with **no** SQLite `files` store. Top-level warm remount / on-disk
+    /// indexes are unchanged when this is false.
+    pub index_compact_only: bool,
     /// Folders to try for index storage (empty entry = next to archive).
     /// Empty vec means use Python-compatible defaults at resolve time.
     pub index_folders: Vec<PathBuf>,
@@ -263,6 +267,7 @@ impl Default for OpenOptions {
             clear_index_cache: false,
             index_file_path: None,
             index_in_memory: false,
+            index_compact_only: false,
             index_folders: Vec::new(),
             verify_modification_time: false,
             // Harness always forces 0 via CLI; default matches common interactive use later.

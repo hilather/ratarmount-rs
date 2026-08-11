@@ -2,6 +2,7 @@
 
 mod hashing;
 mod location;
+mod mem;
 
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
@@ -13,7 +14,7 @@ pub use location::{
     sibling_index_url, IndexLocation, MEMORY_INDEX,
 };
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -23,16 +24,13 @@ use ratarmount_core::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use thiserror::Error;
 
-/// In-memory projection of the `files` table for RO mounts (avoids SQLite on hot paths).
-struct MemIndex {
-    /// (dir, name) → versions newest-last (by offsetheader).
-    by_key: HashMap<(String, String), Vec<FileInfo>>,
-    /// dir → name → FileInfo (newest version).
-    by_dir: HashMap<String, BTreeMap<String, FileInfo>>,
-    /// dir → name → mode (newest).
-    modes: HashMap<String, BTreeMap<String, u32>>,
-    count: u64,
-}
+use mem::{mem_index_from_sql_rows, MemIndex, MemIndexBuilder, SqlMemRow};
+use ratarmount_core::OpenOptions;
+
+pub use mem::{CompactOpenCookie, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
+
+/// Max `files` rows for which a full MemIndex projection is kept after seal/open.
+pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
 
 /// Must match Python `SQLiteIndex.__version__`.
 pub const INDEX_VERSION: &str = "0.7.0";
@@ -285,12 +283,18 @@ pub fn serialize_tarstats(stats: &TarStats) -> String {
 /// Open and query an existing ratarmount SQLite index.
 ///
 /// Connection is behind a `Mutex` so the type is `Sync` for FUSE multi-threaded callbacks.
-/// Read-only opens load a full in-memory projection when the table is not huge.
+/// Read-only opens load a compact in-memory projection (string pool + fixed rows) when
+/// the table is not huge. Cold builds fill that projection at insert time via
+/// [`MemIndexBuilder`] so seal does not re-scan SQLite into fat `FileInfo` maps.
 pub struct SqliteIndex {
     path: Option<PathBuf>,
     conn: Mutex<Connection>,
     read_only: bool,
     mem: Option<MemIndex>,
+    /// Populated during [`create_writable`] inserts; taken at seal into [`Self::mem`].
+    mem_builder: Mutex<Option<MemIndexBuilder>>,
+    /// Nested compact-only: no SQLite `files` rows; MemIndex is the sole file table.
+    compact_only: bool,
 }
 
 impl SqliteIndex {
@@ -315,11 +319,13 @@ impl SqliteIndex {
             conn: Mutex::new(conn),
             read_only: true,
             mem: None,
+            mem_builder: Mutex::new(None),
+            compact_only: false,
         };
         idx.validate_loaded()?;
-        // Load into RAM for archives with a manageable file count (typical mounts).
+        // Load compact projection for archives with a manageable file count.
         if let Ok(n) = idx.file_count_db() {
-            if n > 0 && n <= 500_000 {
+            if n > 0 && n <= MEM_INDEX_MAX_FILES {
                 idx.mem = Some(idx.load_mem_index()?);
             }
         }
@@ -335,6 +341,9 @@ impl SqliteIndex {
     ///
     /// Applies Python-compatible bulk-build PRAGMAs (exclusive lock, memory temp,
     /// journal off, synchronous off) so cold index creation stays fast.
+    ///
+    /// Also starts a [`MemIndexBuilder`] so path/name strings are interned and
+    /// compact rows are filled at insert time (no fat dual maps at seal).
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
         let (conn, path_buf) = match path {
             Some(p) => {
@@ -367,16 +376,59 @@ impl SqliteIndex {
             conn: Mutex::new(conn),
             read_only: false,
             mem: None,
+            mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
+            compact_only: false,
         })
     }
 
+    /// Nested file table: compact MemIndex only — **no** SQLite `files` inserts.
+    ///
+    /// Used by nested AutoMount reader opens. Top-level warm remount still uses
+    /// [`create_writable`] / on-disk SQLite.
+    pub fn create_compact_only() -> Result<Self> {
+        // Minimal in-memory SQLite shell so metadata helpers that touch `conn` stay
+        // safe; the `files` table is never written for compact-only indexes.
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(CREATE_TABLES_SQL)?;
+        Ok(Self {
+            path: None,
+            conn: Mutex::new(conn),
+            read_only: false,
+            mem: None,
+            mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
+            compact_only: true,
+        })
+    }
+
+    /// Create index for a format open: compact-only when
+    /// [`OpenOptions::index_compact_only`], else path / `:memory:` SQLite.
+    pub fn create_writable_for_open(
+        index_path: Option<&Path>,
+        options: &OpenOptions,
+    ) -> Result<Self> {
+        if options.index_compact_only {
+            return Self::create_compact_only();
+        }
+        if options.index_in_memory {
+            return Self::create_writable(None);
+        }
+        if let Some(p) = index_path {
+            return Self::create_writable(Some(p));
+        }
+        Self::create_writable(None)
+    }
+
     fn file_count_db(&self) -> Result<u64> {
+        if self.compact_only {
+            return Ok(0);
+        }
         self.with_conn(|conn| {
             let n: i64 = conn.query_row("SELECT COUNT(*) FROM \"files\"", [], |r| r.get(0))?;
             Ok(n as u64)
         })
     }
 
+    /// Load compact MemIndex from SQLite (warm open / path without builder).
     fn load_mem_index(&self) -> Result<MemIndex> {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare(
@@ -387,10 +439,7 @@ impl SqliteIndex {
                 ORDER BY path, name, offsetheader
                 "#,
             )?;
-            let mut by_key: HashMap<(String, String), Vec<FileInfo>> = HashMap::new();
-            let mut by_dir: HashMap<String, BTreeMap<String, FileInfo>> = HashMap::new();
-            let mut modes: HashMap<String, BTreeMap<String, u32>> = HashMap::new();
-            let mut count = 0u64;
+            let mut sql_rows = Vec::new();
             let mut rows = stmt.query([])?;
             while let Some(row) = rows.next()? {
                 let path: String = row.get(0)?;
@@ -398,31 +447,140 @@ impl SqliteIndex {
                 if name.is_empty() {
                     continue;
                 }
-                let fi = row_to_file_info(row)?;
-                count += 1;
-                by_key
-                    .entry((path.clone(), name.clone()))
-                    .or_default()
-                    .push(fi.clone());
-                by_dir
-                    .entry(path.clone())
-                    .or_default()
-                    .insert(name.clone(), fi.clone());
-                modes.entry(path).or_default().insert(name, fi.mode);
+                let offsetheader: i64 = row.get(2)?;
+                let offset: i64 = row.get(3)?;
+                let size: i64 = row.get(4)?;
+                let mtime: f64 = row.get(5)?;
+                let mode: i64 = row.get(6)?;
+                let linkname: String = row.get(8).unwrap_or_default();
+                let uid: i64 = row.get(9).unwrap_or(0);
+                let gid: i64 = row.get(10).unwrap_or(0);
+                let istar: bool = row.get::<_, i64>(11).unwrap_or(0) != 0;
+                let issparse: bool = row.get::<_, i64>(12).unwrap_or(0) != 0;
+                let isgenerated: bool = row.get::<_, i64>(13).unwrap_or(0) != 0;
+                let recursiondepth: i64 = row.get(14).unwrap_or(0);
+                sql_rows.push(SqlMemRow {
+                    path,
+                    name,
+                    offsetheader,
+                    offset: offset.max(0) as u64,
+                    size: size.max(0) as u64,
+                    mtime,
+                    mode: mode as u32,
+                    linkname,
+                    uid: uid.max(0) as u32,
+                    gid: gid.max(0) as u32,
+                    istar,
+                    issparse,
+                    isgenerated,
+                    recursiondepth: recursiondepth.max(0) as u32,
+                });
             }
-            Ok(MemIndex {
-                by_key,
-                by_dir,
-                modes,
-                count,
-            })
+            Ok(mem_index_from_sql_rows(sql_rows))
         })
+    }
+
+    /// Finalize MemIndex from the insert-time builder, or load from SQLite.
+    fn seal_mem_index(&mut self) -> Result<()> {
+        if self.mem.is_some() {
+            return Ok(());
+        }
+        let builder = self
+            .mem_builder
+            .lock()
+            .expect("mem_builder mutex poisoned")
+            .take();
+        if let Some(b) = builder {
+            let n = b.count();
+            // Compact-only has no SQLite fallback — always seal MemIndex when non-empty.
+            if n > 0 && (self.compact_only || n <= MEM_INDEX_MAX_FILES) {
+                self.mem = Some(b.finish());
+            }
+            return Ok(());
+        }
+        if self.compact_only {
+            return Ok(());
+        }
+        if let Ok(n) = self.file_count_db() {
+            if n > 0 && n <= MEM_INDEX_MAX_FILES {
+                self.mem = Some(self.load_mem_index()?);
+            }
+        }
+        Ok(())
+    }
+
+    /// True when the hot path uses the compact MemIndex projection.
+    pub fn has_mem_index(&self) -> bool {
+        self.mem.is_some()
+    }
+
+    /// Nested compact-only: no SQLite `files` table as the file-table store.
+    pub fn is_compact_only(&self) -> bool {
+        self.compact_only
+    }
+
+    /// SQLite `files` row count (always 0 for compact-only).
+    pub fn files_table_row_count(&self) -> Result<u64> {
+        self.file_count_db()
+    }
+
+    /// Unique interned strings in MemIndex (`None` if no MemIndex).
+    pub fn mem_pool_unique_count(&self) -> Option<usize> {
+        self.mem.as_ref().map(|m| m.pool_unique_count())
+    }
+
+    /// Regression helper: directory path is shared across ≥2 names in MemIndex.
+    pub fn mem_dir_path_is_shared(&self, dir: &str) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.dir_path_is_shared(dir))
+    }
+
+    pub fn mem_uses_path_segments(&self) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.uses_path_segments())
+    }
+
+    pub fn mem_is_soa_layout(&self) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.is_soa_layout())
+    }
+
+    pub fn mem_is_dir_sharded(&self) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.is_dir_sharded())
+    }
+
+    /// Compact open cookie without materializing fat [`FileInfo`].
+    pub fn lookup_open_cookie(
+        &self,
+        path: &str,
+        file_version: i32,
+    ) -> Result<Option<CompactOpenCookie>> {
+        let path = query_normpath(path);
+        if path == "/" {
+            return Ok(None);
+        }
+        let (dir, name) = split_path(&path);
+        if let Some(mem) = &self.mem {
+            return Ok(mem.lookup_open_cookie(dir.as_str(), name.as_str(), file_version));
+        }
+        Ok(None)
+    }
+
+    /// Share a pooled string with format sidecars (post-seal, existing only).
+    pub fn lookup_pooled_string(&self, s: &str) -> Option<std::sync::Arc<str>> {
+        self.mem.as_ref().and_then(|m| m.lookup_pooled(s))
+    }
+
+    /// Intern during build so ZIP/7z sidecars share the compact string pool.
+    pub fn intern_during_build(&self, s: &str) -> Option<std::sync::Arc<str>> {
+        let mut g = self.mem_builder.lock().ok()?;
+        Some(g.as_mut()?.intern_shared(s))
     }
 
     /// Begin an exclusive write transaction for bulk index builds.
     pub fn begin_write(&self) -> Result<()> {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if self.compact_only {
+            return Ok(());
         }
         self.with_conn(|conn| {
             conn.execute_batch("BEGIN IMMEDIATE")?;
@@ -435,6 +593,9 @@ impl SqliteIndex {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
         }
+        if self.compact_only {
+            return Ok(());
+        }
         self.with_conn(|conn| {
             conn.execute_batch("COMMIT")?;
             Ok(())
@@ -443,7 +604,7 @@ impl SqliteIndex {
 
     /// Finalize a freshly built index: commit if needed, then reopen is left to caller.
     pub fn finalize_build(&self) -> Result<()> {
-        if self.read_only {
+        if self.read_only || self.compact_only {
             return Ok(());
         }
         self.with_conn(|conn| {
@@ -459,38 +620,45 @@ impl SqliteIndex {
     ///
     /// Prefer this over `drop` + `open_read_only` so `--index-file :memory:` works and
     /// we avoid an extra open syscall for on-disk indexes.
+    ///
+    /// Promotes the insert-time compact [`MemIndexBuilder`] to the hot MemIndex (string
+    /// pool + compact rows) when the row count is within [`MEM_INDEX_MAX_FILES`].
     pub fn into_read_only(mut self) -> Result<Self> {
         self.finalize_build()?;
         if !self.read_only {
-            self.with_conn(|conn| {
-                // Drop intermediary tables so Python's completeness check accepts the index.
-                let _ = conn.execute_batch(
-                    r#"
+            if !self.compact_only {
+                self.with_conn(|conn| {
+                    // Drop intermediary tables so Python's completeness check accepts the index.
+                    let _ = conn.execute_batch(
+                        r#"
                     DROP TABLE IF EXISTS "filestmp";
                     DROP TABLE IF EXISTS "parentfolders";
                     "#,
-                );
-                conn.execute_batch(
-                    r#"
+                    );
+                    conn.execute_batch(
+                        r#"
                     PRAGMA locking_mode = NORMAL;
                     PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
                     PRAGMA cache_size = -65536;
                     PRAGMA mmap_size = 268435456;
                     "#,
-                )?;
-                Ok(())
-            })?;
+                    )?;
+                    Ok(())
+                })?;
+            }
             self.read_only = true;
         }
-        if self.mem.is_none() {
-            if let Ok(n) = self.file_count_db() {
-                if n > 0 && n <= 500_000 {
-                    self.mem = Some(self.load_mem_index()?);
-                }
-            }
-        }
-        if let Some(path) = &self.path {
+        self.seal_mem_index()?;
+        // Compact-only: never keep a SQLite files table as the file store.
+        if self.compact_only {
+            // Ensure files stays empty (we never insert, but be explicit).
+            let _ = self.with_conn(|conn| {
+                let _ = conn.execute(r#"DELETE FROM "files""#, []);
+                Ok(())
+            });
+            println!("Successfully loaded compact offset dictionary (no SQLite files table)");
+        } else if let Some(path) = &self.path {
             println!(
                 "Successfully loaded offset dictionary from {}",
                 path.display()
@@ -693,7 +861,7 @@ impl SqliteIndex {
 
     pub fn file_count(&self) -> Result<u64> {
         if let Some(m) = &self.mem {
-            return Ok(m.count);
+            return Ok(m.count());
         }
         self.file_count_db()
     }
@@ -729,11 +897,7 @@ impl SqliteIndex {
         }
         let (dir, name) = split_path(&path);
         if let Some(mem) = &self.mem {
-            return Ok(mem
-                .by_key
-                .get(&(dir, name))
-                .map(|v| v.len() as u32)
-                .unwrap_or(0));
+            return Ok(mem.version_count(dir.as_str(), name.as_str()));
         }
         self.with_conn(|conn| {
             let n: i64 = conn.query_row(
@@ -754,20 +918,7 @@ impl SqliteIndex {
         let (dir, name) = split_path(&path);
 
         if let Some(mem) = &self.mem {
-            let Some(versions) = mem.by_key.get(&(dir, name)) else {
-                return Ok(None);
-            };
-            if versions.is_empty() {
-                return Ok(None);
-            }
-            // versions stored oldest→newest (ORDER BY offsetheader ASC)
-            let idx = if file_version <= 0 {
-                let n = (-file_version) as usize;
-                versions.len().saturating_sub(1 + n)
-            } else {
-                (file_version as usize).saturating_sub(1)
-            };
-            return Ok(versions.get(idx).cloned());
+            return Ok(mem.lookup(dir.as_str(), name.as_str(), file_version));
         }
 
         // file_version: 0 = most recent (DESC + offset 0), >0 = oldest-first occurrence
@@ -806,7 +957,7 @@ impl SqliteIndex {
         let dir = path.trim_end_matches('/').to_string();
 
         if let Some(mem) = &self.mem {
-            return Ok(mem.by_dir.get(&dir).cloned());
+            return Ok(mem.list(dir.as_str()));
         }
 
         self.with_conn(|conn| {
@@ -840,7 +991,7 @@ impl SqliteIndex {
         let dir = path.trim_end_matches('/').to_string();
 
         if let Some(mem) = &self.mem {
-            return Ok(mem.modes.get(&dir).cloned());
+            return Ok(mem.list_mode(dir.as_str()));
         }
 
         self.with_conn(|conn| {
@@ -867,6 +1018,10 @@ impl SqliteIndex {
     pub fn store_versions(&self, ratarmount_version: &str) -> Result<()> {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if self.compact_only {
+            let _ = ratarmount_version;
+            return Ok(());
         }
         let versions = [("ratarmount", ratarmount_version), ("index", INDEX_VERSION)];
         self.with_conn(|conn| {
@@ -906,6 +1061,10 @@ impl SqliteIndex {
     pub fn store_metadata_key_value(&self, key: &str, value: &str) -> Result<()> {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if self.compact_only {
+            let _ = (key, value);
+            return Ok(());
         }
         self.with_conn(|conn| {
             conn.execute(
@@ -958,6 +1117,9 @@ impl SqliteIndex {
     /// Bulk insert `files` rows with a prepared statement (Python `executemany` path).
     ///
     /// Caller should wrap the whole build in [`begin_write`] / [`commit_write`] for best speed.
+    ///
+    /// Also feeds the insert-time [`MemIndexBuilder`] (string pool + compact rows) when
+    /// this index was created via [`create_writable`].
     pub fn insert_files_batch(&self, rows: &[FileRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -965,36 +1127,46 @@ impl SqliteIndex {
         if self.read_only {
             return Err(IndexError::Invalid("index is read-only".into()));
         }
-        self.with_conn(|conn| {
-            let mut stmt = conn.prepare_cached(
-                r#"
+        // Compact-only nested: MemIndex builder is the sole file-table store.
+        if !self.compact_only {
+            self.with_conn(|conn| {
+                let mut stmt = conn.prepare_cached(
+                    r#"
                 INSERT OR REPLACE INTO "files"
                 (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
                  uid, gid, istar, issparse, isgenerated, recursiondepth)
                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
                 "#,
-            )?;
-            for r in rows {
-                stmt.execute(params![
-                    r.path,
-                    r.name,
-                    r.offsetheader,
-                    r.offset,
-                    r.size,
-                    r.mtime,
-                    r.mode,
-                    r.typeflag,
-                    r.linkname,
-                    r.uid,
-                    r.gid,
-                    r.istar,
-                    r.issparse,
-                    r.isgenerated,
-                    r.recursiondepth,
-                ])?;
+                )?;
+                for r in rows {
+                    stmt.execute(params![
+                        r.path,
+                        r.name,
+                        r.offsetheader,
+                        r.offset,
+                        r.size,
+                        r.mtime,
+                        r.mode,
+                        r.typeflag,
+                        r.linkname,
+                        r.uid,
+                        r.gid,
+                        r.istar,
+                        r.issparse,
+                        r.isgenerated,
+                        r.recursiondepth,
+                    ])?;
+                }
+                Ok(())
+            })?;
+        }
+        // Compact projection at parse/build time (shared path/name segments + SoA).
+        if let Ok(mut guard) = self.mem_builder.lock() {
+            if let Some(b) = guard.as_mut() {
+                b.push_rows(rows);
             }
-            Ok(())
-        })
+        }
+        Ok(())
     }
 
     /// Open an existing on-disk index for read/write (e.g. to fill content-hash xattrs).
@@ -1018,6 +1190,9 @@ impl SqliteIndex {
             conn: Mutex::new(conn),
             read_only: false,
             mem: None,
+            // Existing DB: do not build MemIndex on write; open_read_only loads it.
+            mem_builder: Mutex::new(None),
+            compact_only: false,
         };
         idx.validate_loaded()?;
         Ok(idx)
@@ -1935,5 +2110,183 @@ mod tests {
         assert!(ro.set_gzip_index_blob(b"x").is_err());
         assert!(ro.set_bzip2_blocks(&[(0, 0)]).is_err());
         assert!(ro.clear_compression_offsets().is_err());
+    }
+
+    fn multi_under_dir(n: usize) -> Vec<FileRow> {
+        (0..n)
+            .map(|i| {
+                FileRow::new(
+                    "/shared/dir",
+                    format!("f{i:04}.txt"),
+                    i as i64 * 100,
+                    i as i64 * 100 + 32,
+                    4,
+                    0.0,
+                    0o100644,
+                    i64::from(b'0'),
+                    "",
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    /// Regression: cold build fills compact MemIndex at insert time (string pool + rows).
+    #[test]
+    fn compact_mem_index_built_at_insert_time() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&multi_under_dir(24)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.has_mem_index());
+        assert!(idx.mem_is_soa_layout());
+        assert!(idx.mem_uses_path_segments());
+        assert_eq!(idx.file_count().unwrap(), 24);
+        assert!(
+            idx.mem_dir_path_is_shared("/shared/dir"),
+            "directory path must be interned/shared across names"
+        );
+        let unique = idx.mem_pool_unique_count().unwrap();
+        // segments shared + 24 names (not full path × 24)
+        assert!(
+            unique < 40,
+            "expected compact path segments + names, got {unique}"
+        );
+
+        let fi = idx
+            .lookup("/shared/dir/f0007.txt", 0)
+            .unwrap()
+            .expect("lookup");
+        assert_eq!(fi.size, 4);
+        let cookie = idx
+            .lookup_open_cookie("/shared/dir/f0007.txt", 0)
+            .unwrap()
+            .expect("open cookie");
+        assert_eq!(cookie.size, 4);
+        let listed = idx.list("/shared/dir").unwrap().expect("list");
+        assert_eq!(listed.len(), 24);
+        let modes = idx.list_mode("/shared/dir").unwrap().expect("modes");
+        assert_eq!(modes.len(), 24);
+    }
+
+    /// Regression: warm open_read_only also uses compact pool (not fat triple maps).
+    #[test]
+    fn compact_mem_index_on_open_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compact.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.begin_write().unwrap();
+            idx.insert_files_batch(&multi_under_dir(12)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.commit_write().unwrap();
+            let idx = idx.into_read_only().unwrap();
+            assert!(idx.has_mem_index());
+        }
+        let ro = SqliteIndex::open_read_only(&path).unwrap();
+        assert!(ro.has_mem_index());
+        assert!(ro.mem_dir_path_is_shared("/shared/dir"));
+        assert_eq!(ro.file_count().unwrap(), 12);
+        assert!(ro.lookup("/shared/dir/f0001.txt", 0).unwrap().is_some());
+    }
+
+    /// Nested compact-only: no SQLite files table as file-table store.
+    #[test]
+    fn nested_compact_only_no_sqlite_files_table() {
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(None, &opts).unwrap();
+        assert!(idx.is_compact_only());
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&multi_under_dir(8)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.store_metadata_key_value("backendName", "test").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.is_compact_only());
+        assert!(idx.has_mem_index());
+        assert_eq!(
+            idx.files_table_row_count().unwrap(),
+            0,
+            "compact-only must not use SQLite files as the nested file table"
+        );
+        assert_eq!(idx.file_count().unwrap(), 8);
+        assert!(idx.lookup("/shared/dir/f0002.txt", 0).unwrap().is_some());
+        assert!(idx.mem_is_soa_layout());
+        assert!(idx.mem_uses_path_segments());
+    }
+
+    /// Path segments + SoA + optional sharding contracts on multi-dir trees.
+    #[test]
+    fn multi_dir_path_segments_and_sharding_contracts() {
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(None, &opts).unwrap();
+        let mut rows = Vec::new();
+        // Deep tree
+        for i in 0..5 {
+            rows.push(FileRow::new(
+                "/a/b/c/d",
+                format!("leaf{i}.txt"),
+                i as i64,
+                i as i64 + 10,
+                1,
+                0.0,
+                0o100644,
+                0,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ));
+        }
+        // Many dirs → sharding
+        let n_dirs = (DIR_SHARD_THRESHOLD as usize) + 5;
+        for i in 0..n_dirs {
+            rows.push(FileRow::new(
+                format!("/wide{i}"),
+                "x.txt",
+                1000 + i as i64,
+                2000 + i as i64,
+                2,
+                0.0,
+                0o100644,
+                0,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ));
+        }
+        idx.insert_files_batch(&rows).unwrap();
+        let idx = idx.into_read_only().unwrap();
+        assert!(idx.mem_uses_path_segments());
+        assert!(idx.mem_is_soa_layout());
+        assert!(idx.mem_is_dir_sharded());
+        assert!(idx.lookup("/a/b/c/d/leaf2.txt", 0).unwrap().is_some());
+        assert!(idx.lookup("/wide0/x.txt", 0).unwrap().is_some());
+        assert!(idx
+            .lookup(&format!("/wide{}/x.txt", n_dirs - 1), 0)
+            .unwrap()
+            .is_some());
     }
 }
