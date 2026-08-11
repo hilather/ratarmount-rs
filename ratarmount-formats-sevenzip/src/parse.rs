@@ -238,7 +238,8 @@ pub struct StreamsInfo {
 
 #[derive(Debug, Clone)]
 pub struct SevenZipFileEntry {
-    pub path: String,
+    /// Member path; after index build may share the compact index string pool (`Arc` identity).
+    pub path: std::sync::Arc<str>,
     pub size: u64,
     pub mtime: f64,
     pub mode: u32,
@@ -839,7 +840,7 @@ fn build_file_entries(
                 is_empty_file,
             );
             entries.push(SevenZipFileEntry {
-                path: raw.filename.trim_end_matches('/').to_string(),
+                path: std::sync::Arc::from(raw.filename.trim_end_matches('/')),
                 size: 0,
                 mtime: filetime_to_unix(raw.mtime),
                 mode: attributes_to_mode(raw.attributes, is_dir),
@@ -919,7 +920,7 @@ fn build_file_entries(
         if is_empty_stream || is_dir {
             let dir = is_dir || (is_empty_stream && !is_empty_file);
             entries.push(SevenZipFileEntry {
-                path: raw.filename.trim_end_matches('/').to_string(),
+                path: std::sync::Arc::from(raw.filename.trim_end_matches('/')),
                 size: 0,
                 mtime,
                 mode: attributes_to_mode(raw.attributes, dir),
@@ -953,7 +954,7 @@ fn build_file_entries(
             .sum();
 
         entries.push(SevenZipFileEntry {
-            path: raw.filename.trim_end_matches('/').to_string(),
+            path: std::sync::Arc::from(raw.filename.trim_end_matches('/')),
             size,
             mtime,
             mode: attributes_to_mode(raw.attributes, false),

@@ -100,6 +100,17 @@ impl SevenZipMountSource {
         self.index.is_compact_only()
     }
 
+    /// True when entry `path` Arc is the same allocation as the compact index pool.
+    pub fn entry_path_shares_pool(&self, entry_index: usize) -> bool {
+        let Some(entry) = self.archive.files.get(entry_index) else {
+            return false;
+        };
+        let Some(pooled) = self.index.lookup_pooled_string(entry.path.as_ref()) else {
+            return false;
+        };
+        std::sync::Arc::ptr_eq(&entry.path, &pooled)
+    }
+
     pub fn open(
         archive_path: impl AsRef<Path>,
         index_path: Option<&Path>,
@@ -244,7 +255,7 @@ impl SevenZipMountSource {
         let t0 = Instant::now();
 
         // Parse once (encoded-header decompress uses no password typically).
-        let archive = parse::parse_7z_archive(&mut reader, |folder, packed| {
+        let mut archive = parse::parse_7z_archive(&mut reader, |folder, packed| {
             decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
@@ -440,6 +451,13 @@ impl SevenZipMountSource {
         }
         if !batch.is_empty() {
             index.insert_files_batch(&batch)?;
+        }
+
+        // Share entry paths with the compact index string pool (Arc identity).
+        for entry in &mut archive.files {
+            if let Some(pooled) = index.intern_during_build(entry.path.as_ref()) {
+                entry.path = pooled;
+            }
         }
 
         // Content hashes (`--hashes` / OpenOptions.hashes) → user.hash.* xattrs.
@@ -1305,7 +1323,7 @@ mod tests {
         }
     }
 
-    /// Nested compact-only 7z: no SQLite files table; list/open succeed.
+    /// Nested compact-only 7z: no SQLite files table; list/open; Arc::ptr_eq path pool.
     #[test]
     fn open_from_reader_compact_only_list_and_read() {
         let path = py_fixture("store-copy-two-files.7z");
@@ -1332,6 +1350,20 @@ mod tests {
         let mut buf = Vec::new();
         src.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
         assert!(!buf.is_empty());
+        // Every non-empty entry path must share the compact pool Arc.
+        let mut shared = 0usize;
+        for i in 0..src.archive.files.len() {
+            let p = src.archive.files[i].path.as_ref();
+            if p.is_empty() {
+                continue;
+            }
+            assert!(
+                src.entry_path_shares_pool(i),
+                "7z entry path {p:?} must Arc::ptr_eq compact pool (not independent String heap)"
+            );
+            shared += 1;
+        }
+        assert!(shared >= 1, "expected at least one shared path");
     }
 
     #[test]

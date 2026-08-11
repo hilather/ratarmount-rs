@@ -1831,7 +1831,7 @@ sys.stdout.buffer.write(packed)
         let med = archive
             .files
             .iter()
-            .find(|f| f.path.ends_with("medium.bin") || f.path == "medium.bin")
+            .find(|f| f.path.ends_with("medium.bin") || f.path.as_ref() == "medium.bin")
             .expect("medium.bin entry");
         assert_eq!(med.size, 2 * 1024 * 1024);
         let fi = med.folder_index.expect("folder");

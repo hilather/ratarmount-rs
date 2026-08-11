@@ -347,12 +347,22 @@ impl ZipMountSource {
         self.index.is_compact_only()
     }
 
-    /// Shared pooled member name with the compact index (post-build).
-    pub fn member_name_pooled(&self, header: u64) -> Option<std::sync::Arc<str>> {
-        let meta = self.members.get(&header)?;
-        let pooled = self.index.lookup_pooled_string(meta.name.as_ref())?;
-        // Same string content; prefer identity when pool shared at build time.
-        Some(pooled)
+    /// Sidecar member name Arc (ZIP CD path as stored at index build).
+    pub fn member_name_arc(&self, header: u64) -> Option<std::sync::Arc<str>> {
+        self.members
+            .get(&header)
+            .map(|m| std::sync::Arc::clone(&m.name))
+    }
+
+    /// True when the sidecar name Arc is the same allocation as the compact index pool.
+    pub fn member_name_shares_pool(&self, header: u64) -> bool {
+        let Some(meta) = self.members.get(&header) else {
+            return false;
+        };
+        let Some(pooled) = self.index.lookup_pooled_string(meta.name.as_ref()) else {
+            return false;
+        };
+        std::sync::Arc::ptr_eq(&meta.name, &pooled)
     }
 
     /// `index_path`: `Some(path)` for on-disk index, `None` for in-memory (`:memory:`).
@@ -1940,16 +1950,17 @@ mod tests {
         }
     }
 
-    /// Nested compact-only: no SQLite files table; list/open work; names share pool.
+    /// Nested compact-only: no SQLite files table; list/open; Arc::ptr_eq with pool.
     #[test]
     fn open_from_reader_compact_only_list_open_and_pool() {
         let mut buf = io::Cursor::new(Vec::new());
         {
             let mut zw = ZipWriter::new(&mut buf);
             let zopts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-            zw.start_file("a.txt", zopts).unwrap();
+            // Multi-segment CD names — must share pool Arc, not only content equality.
+            zw.start_file("nested/dir/alpha.txt", zopts).unwrap();
             zw.write_all(b"alpha\n").unwrap();
-            zw.start_file("b.txt", zopts).unwrap();
+            zw.start_file("nested/dir/beta.txt", zopts).unwrap();
             zw.write_all(b"beta-payload\n").unwrap();
             zw.finish().unwrap();
         }
@@ -1970,12 +1981,13 @@ mod tests {
             src.index_is_compact_only(),
             "nested-style open must use compact-only index"
         );
-        let fi = src.lookup("/a.txt", 0).expect("lookup a");
+        let fi = src
+            .lookup("/nested/dir/alpha.txt", 0)
+            .expect("lookup alpha");
         let mut r = src.open(&fi, 0).unwrap();
         let mut out = Vec::new();
         r.read_to_end(&mut out).unwrap();
         assert_eq!(out, b"alpha\n");
-        // Sidecar name shares compact pool (same Arc content identity when interned).
         let oh = fi
             .userdata
             .iter()
@@ -1984,8 +1996,24 @@ mod tests {
                 _ => None,
             })
             .expect("offsetheader");
-        let pooled = src.member_name_pooled(oh).expect("pooled member name");
-        assert_eq!(&*pooled, "a.txt");
+        let sidecar = src.member_name_arc(oh).expect("sidecar name");
+        assert_eq!(&*sidecar, "nested/dir/alpha.txt");
+        assert!(
+            src.member_name_shares_pool(oh),
+            "ZIP sidecar name Arc must be the same allocation as the compact index pool \
+             (Arc::ptr_eq); content-only match is insufficient"
+        );
+        // Second multi-segment member also shares.
+        let fi_b = src.lookup("/nested/dir/beta.txt", 0).expect("lookup beta");
+        let oh_b = fi_b
+            .userdata
+            .iter()
+            .find_map(|u| match u {
+                ratarmount_core::UserData::Tar(t) => t.offsetheader,
+                _ => None,
+            })
+            .expect("offsetheader b");
+        assert!(src.member_name_shares_pool(oh_b));
     }
 
     fn write_encrypted_zip(path: &Path, name: &str, data: &[u8], password: &str) {
