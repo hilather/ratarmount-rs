@@ -364,8 +364,8 @@ impl<'a> Cursor<'a> {
     }
 }
 
-fn crc32(data: &[u8]) -> u32 {
-    // IEEE CRC-32 (same as zlib)
+/// IEEE CRC-32 (zlib/7z). Used for password-trial verification of folder digests.
+pub(crate) fn crc32(data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
     for &b in data {
         crc ^= u32::from(b);
@@ -375,6 +375,11 @@ fn crc32(data: &[u8]) -> u32 {
         }
     }
     !crc
+}
+
+/// Alias for password-trial call sites (keeps trial code readable).
+pub(crate) fn crc32_for_password_trial(data: &[u8]) -> u32 {
+    crc32(data)
 }
 
 fn filetime_to_unix(filetime: u64) -> f64 {

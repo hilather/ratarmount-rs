@@ -706,13 +706,45 @@ impl SevenZipMountSource {
             Some(password),
             sizes.as_deref(),
         )?;
-        if (data.len() as u64) >= folder.get_unpack_size() || data.len() >= entry.size as usize {
-            Ok(())
-        } else {
-            Err(SevenZipError::Msg(
+        let need = folder.get_unpack_size().max(entry.size);
+        if (data.len() as u64) < need && data.len() < entry.size as usize {
+            return Err(SevenZipError::Msg(
                 "password trial produced short data".into(),
-            ))
+            ));
         }
+        // Length alone is not enough: AES with a wrong key can still yield a
+        // full-size buffer (store/Copy folders). Prefer folder CRC when present.
+        if folder.has_crc {
+            let slice = if (data.len() as u64) >= folder.get_unpack_size() {
+                &data[..folder.get_unpack_size() as usize]
+            } else {
+                &data[..]
+            };
+            let got = parse::crc32_for_password_trial(slice);
+            if got != folder.crc {
+                return Err(SevenZipError::Msg(format!(
+                    "password trial CRC mismatch (got {got:#010x}, want {:#010x})",
+                    folder.crc
+                )));
+            }
+        } else if entry.size > 0 {
+            // No folder CRC: reject if member slice is not fully present.
+            let end = (entry.unpack_offset + entry.size) as usize;
+            if end > data.len() {
+                return Err(SevenZipError::Msg(
+                    "password trial member slice out of range".into(),
+                ));
+            }
+            // Wrong AES key often still expands to the right length; require at
+            // least one non-zero byte for non-empty members (empty is rare).
+            let member = &data[entry.unpack_offset as usize..end];
+            if member.iter().all(|&b| b == 0) && entry.size > 4 {
+                return Err(SevenZipError::Msg(
+                    "password trial produced all-zero member (likely wrong password)".into(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     fn pack_stream_sizes_for(&self, entry: &SevenZipFileEntry) -> Option<Vec<u64>> {
@@ -2530,11 +2562,14 @@ sys.stdout.buffer.write(packed)
         for bin in ["7z", "7za"] {
             // Content encryption only (`-mhe=off`): list/stat works without password
             // (metadata-only mount). Header encryption would block listing.
+            // Use LZMA2 (not store): wrong-password AES on store often yields a
+            // full-size buffer that passes a length-only trial; LZMA2 fails closed.
             let status = Command::new(bin)
                 .args([
                     "a",
                     "-t7z",
-                    "-mx=0",
+                    "-m0=LZMA2",
+                    "-mx=1",
                     &pw_arg,
                     "-mhe=off",
                     archive_name,
