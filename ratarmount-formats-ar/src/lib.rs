@@ -215,6 +215,54 @@ impl ArMountSource {
         })
     }
 
+    /// Open AR using an imported durable nested index (skip cold file-table rebuild).
+    pub fn open_from_reader_with_durable<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        blob: &ratarmount_index::DurableNestedBlob,
+        options: OpenOptions,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        use ratarmount_index::NESTED_FORMAT_AR;
+        if blob.format != NESTED_FORMAT_AR {
+            return Err(ArError::Msg(format!(
+                "durable nested blob format {} is not ar",
+                blob.format
+            )));
+        }
+        let archive_path = archive_label.as_ref().to_path_buf();
+        reader.seek(SeekFrom::Start(0))?;
+        let index = SqliteIndex::create_compact_from_nested_blob(blob)?;
+        eprintln!(
+            "nested durable index: imported AR file table for {} ({} rows)",
+            archive_path.display(),
+            index.file_count().unwrap_or(0)
+        );
+        Ok(Self {
+            archive_path,
+            backend: ArBackend::Shared(SharedSeekReader::new(reader)),
+            index,
+            options,
+        })
+    }
+
+    /// Export compact nested durable blob.
+    pub fn export_nested_durable(
+        &self,
+        fingerprint: ratarmount_index::NestedBodyFingerprint,
+    ) -> Result<Vec<u8>> {
+        use ratarmount_index::NESTED_FORMAT_AR;
+        self.index
+            .export_nested_blob(NESTED_FORMAT_AR, fingerprint, vec![])
+            .map_err(Into::into)
+    }
+
+    pub fn index_is_compact_only(&self) -> bool {
+        self.index.is_compact_only()
+    }
+
     fn open_existing(
         archive_path: &Path,
         index_path: &Path,

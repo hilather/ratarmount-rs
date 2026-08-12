@@ -126,7 +126,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 |----------|------|----------------|
 | P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **69** TAR; phase6 **12** ZIP; phase7 **37** nested; phase9 AR/CPIO **28**, 7z **19**, SQLAR/sqfs **20**, libarchive **13** |
 | P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | `[x]` `run-fixed-archive-subset.sh` |
-| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; encrypted still unit-only |
+| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; **encrypted** password + metadata-only unit + phase9 `|password` harness row; multi-GB non-LZMA2 solid residual |
 | P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `~` phase8 overlay (replace/readdir/empty-create/delete+recreate) + complex (union rightmost, B-4 both orders, commit-overlay tar/gzip/zip); versioned FUSE residual |
 | P1 | Remote: SSH fixture server (`start-asyncssh-server.py`) + optional S3/MinIO | Live optional; unit always |
 | P1 | Index interop golden: Py builds index → Rust mounts; reverse | `[x]` TAR+ZIP+7z py→rs; TAR rs→py |

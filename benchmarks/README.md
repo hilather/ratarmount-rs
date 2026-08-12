@@ -1,5 +1,29 @@
 # Benchmarks
 
+## Nested durable indexes (with vs without)
+
+Measures eager recursive nested open (`-r --no-mount`) when the outer SQLite
+index **stores/loads** nested file tables (`nestedindexes`) versus when nested
+indexes are absent (DROP side table or `:memory:` outer).
+
+```bash
+# Default: 2000-member store ZIP in TAR (+ 7z leg if 7z/7za present), 3 runs median
+./benchmarks/compare-nested-durable.sh
+# → benchmarks/nested-durable-results/{results-*.csv,results-*.md}
+
+N_FILES=5000 RUNS=5 INCLUDE_7Z=0 ./benchmarks/compare-nested-durable.sh
+```
+
+| Mode | Meaning |
+|------|---------|
+| `cold_first` | `-c -r`: cold outer + cold nested; **stores** `nestedindexes` |
+| `warm_with_nested` | remount `-r` with nestedindexes present (**import hit**) |
+| `warm_without_nested` | remount after `DROP nestedindexes` (outer warm, nested rebuild) |
+| `cold_no_durable` | `-c -r --index-file :memory:` (no durable nested home) |
+
+Phase 11 smoke also records a smaller with/without nested sample:
+`./test-harness/run-phase11-bench.sh`.
+
 ## Fair disk + FUSE kernel tuning
 
 **Use this** for media baseline (O_DIRECT) vs FUSE mount knobs (`noatime`,

@@ -517,6 +517,96 @@ impl ZipMountSource {
         })
     }
 
+    /// Open ZIP using an imported durable nested index (skip cold file-table rebuild).
+    pub fn open_from_reader_with_durable<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        blob: &ratarmount_index::DurableNestedBlob,
+        options: &OpenOptions,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        use ratarmount_index::NESTED_FORMAT_ZIP;
+        if blob.format != NESTED_FORMAT_ZIP {
+            return Err(ZipError::Msg(format!(
+                "durable nested blob format {} is not zip",
+                blob.format
+            )));
+        }
+        let archive_path = archive_label.as_ref().to_path_buf();
+        let mut reader = reader;
+        reader.seek(SeekFrom::Start(0))?;
+        let shared: Arc<Mutex<Box<dyn SeekRead>>> = Arc::new(Mutex::new(Box::new(reader)));
+        let handle = SharedSeekHandle::new(Arc::clone(&shared));
+        let mut archive = ZipArchive::new(handle).map_err(|e| {
+            ZipError::Msg(format!(
+                "failed to open ZIP from reader ({}): {e}",
+                archive_path.display()
+            ))
+        })?;
+        let password = find_password(&mut archive, &options.passwords)?;
+        let members = if !blob.zip_members.is_empty() {
+            let mut map = HashMap::new();
+            for m in &blob.zip_members {
+                map.insert(
+                    m.offsetheader,
+                    ZipMemberMeta {
+                        name: std::sync::Arc::from(m.name.as_str()),
+                        data_start: m.data_start,
+                        compressed_size: m.compressed_size,
+                        method: m.method,
+                        encrypted: m.encrypted,
+                        index: m.index,
+                    },
+                );
+            }
+            map
+        } else {
+            member_meta_map(&mut archive, password.as_deref())?
+        };
+        drop(archive);
+        let index = SqliteIndex::create_compact_from_nested_blob(blob)?;
+        eprintln!(
+            "nested durable index: imported ZIP file table for {} ({} rows)",
+            archive_path.display(),
+            index.file_count().unwrap_or(0)
+        );
+        Ok(Self {
+            archive_path,
+            backend: ZipBackend::Shared(shared),
+            index,
+            members,
+            inflate_cache: InflateCache::new(),
+            password,
+            options: options.clone(),
+        })
+    }
+
+    /// Export compact nested durable blob (for outer-index `nestedindexes` side table).
+    pub fn export_nested_durable(
+        &self,
+        fingerprint: ratarmount_index::NestedBodyFingerprint,
+    ) -> Result<Vec<u8>> {
+        use ratarmount_index::{DurableZipMember, NESTED_FORMAT_ZIP};
+        let zip_members: Vec<DurableZipMember> = self
+            .members
+            .iter()
+            .map(|(h, m)| DurableZipMember {
+                offsetheader: *h,
+                data_start: m.data_start,
+                compressed_size: m.compressed_size,
+                method: m.method,
+                encrypted: m.encrypted,
+                index: m.index,
+                name: m.name.to_string(),
+            })
+            .collect();
+        self.index
+            .export_nested_blob(NESTED_FORMAT_ZIP, fingerprint, zip_members)
+            .map_err(Into::into)
+    }
+
     fn create_index(
         archive_path: &Path,
         index_path: Option<&Path>,

@@ -20,11 +20,32 @@ use tempfile::NamedTempFile;
 /// Open a nested archive from a filesystem path into a MountSource.
 pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + Send + Sync>;
 
+/// Context for nested reader open (identity + durable outer index home).
+#[derive(Clone, Debug, Default)]
+pub struct NestedOpenContext {
+    /// Uncompressed nested member size from the parent file table.
+    pub member_size: u64,
+    /// Parent index `offsetheader` when available.
+    pub offsetheader: Option<i64>,
+    /// Path of the nested member inside the parent mount (e.g. `/inner.zip`).
+    pub member_path: String,
+    /// Outer on-disk SQLite index path for durable nested index side table.
+    pub outer_index_path: Option<PathBuf>,
+    /// When true, persist nested index after successful open (respects write_index).
+    pub write_nested_index: bool,
+}
+
 /// Open a nested archive from a seekable member stream (no temp spool).
 ///
 /// The `label` is a virtual name (e.g. `inner-hello.7z`) for logs/index metadata.
+/// `NestedOpenContext` carries member identity and outer index path for durable
+/// nested index load/store.
 pub type OpenNestedReaderFn = Arc<
-    dyn Fn(Box<dyn ratarmount_core::ArchiveRead>, &Path) -> io::Result<Arc<dyn MountSource>>
+    dyn Fn(
+            Box<dyn ratarmount_core::ArchiveRead>,
+            &Path,
+            NestedOpenContext,
+        ) -> io::Result<Arc<dyn MountSource>>
         + Send
         + Sync,
 >;
@@ -55,6 +76,10 @@ pub struct AutoMountOptions {
     ///
     /// Lazy mode always mounts on access single-threaded; this field is ignored.
     pub parallel_nested_threads: u32,
+    /// Outer on-disk index path for durable nested index side table (`nestedindexes`).
+    pub outer_index_path: Option<PathBuf>,
+    /// Persist nested durable indexes when the outer index is writable.
+    pub write_nested_index: bool,
 }
 
 /// Configured set of filename suffixes for recursive automount.
@@ -353,6 +378,8 @@ pub struct AutoMountLayer {
     transform: Option<(Regex, String)>,
     /// Cap for parallel eager nested opens (`0` = auto). See [`AutoMountOptions`].
     parallel_nested_threads: u32,
+    outer_index_path: Option<PathBuf>,
+    write_nested_index: bool,
 }
 
 impl AutoMountLayer {
@@ -414,6 +441,8 @@ impl AutoMountLayer {
             ext_set: opts.recursive_extensions,
             transform,
             parallel_nested_threads: opts.parallel_nested_threads,
+            outer_index_path: opts.outer_index_path,
+            write_nested_index: opts.write_nested_index,
         };
         if !opts.lazy {
             layer.scan_and_mount();
@@ -685,7 +714,18 @@ impl AutoMountLayer {
             match parent.open(&fi, 0) {
                 Ok(reader) => {
                     if let Some(ref open_r) = self.open_nested_reader {
-                        match open_r(reader, &label) {
+                        let oh = fi.userdata.iter().rev().find_map(|u| match u {
+                            UserData::Tar(t) => t.offsetheader.map(|v| v as i64),
+                            _ => None,
+                        });
+                        let ctx = NestedOpenContext {
+                            member_size: fi.size,
+                            offsetheader: oh,
+                            member_path: rest.clone(),
+                            outer_index_path: self.outer_index_path.clone(),
+                            write_nested_index: self.write_nested_index,
+                        };
+                        match open_r(reader, &label, ctx) {
                             Ok(nested) => {
                                 let mut mounted = self.mounted.lock().expect("automount mutex");
                                 let key =
@@ -1384,7 +1424,7 @@ mod tests {
                 .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
             Ok(Arc::new(ms) as Arc<dyn MountSource>)
         });
-        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label| {
+        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label, _ctx| {
             reader_c.store(true, AOrd::SeqCst);
             let opts = OpenOptions {
                 index_in_memory: true,
@@ -1459,7 +1499,7 @@ mod tests {
                 "path spool should not be used for nested 7z store",
             ))
         });
-        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label| {
+        let open_reader: OpenNestedReaderFn = Arc::new(move |reader, label, _ctx| {
             reader_c.store(true, AOrd::SeqCst);
             let opts = OpenOptions {
                 index_in_memory: true,

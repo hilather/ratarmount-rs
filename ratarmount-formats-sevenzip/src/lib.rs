@@ -90,6 +90,8 @@ pub struct SevenZipMountSource {
     password: Option<String>,
     /// Encrypted archive mounted without a valid password: list/stat only.
     content_locked: bool,
+    /// Opened via durable blob that included 7z structure (no header re-parse).
+    from_durable_structure: bool,
     #[allow(dead_code)]
     options: OpenOptions,
 }
@@ -98,6 +100,119 @@ impl SevenZipMountSource {
     /// True when the nested compact-only file table is used (no SQLite `files` store).
     pub fn index_is_compact_only(&self) -> bool {
         self.index.is_compact_only()
+    }
+
+    /// Open 7z using an imported durable nested index (skip cold file-table rebuild).
+    ///
+    /// When the blob includes [`DurableNestedBlob::sevenzip`] structure sidecars, the
+    /// 7z header is **not** re-parsed — only the seekable body is attached. Legacy blobs
+    /// without structure fall back to header parse + file-table import.
+    pub fn open_from_reader_with_durable<R>(
+        mut reader: R,
+        archive_label: impl AsRef<Path>,
+        blob: &ratarmount_index::DurableNestedBlob,
+        options: &OpenOptions,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        use ratarmount_index::NESTED_FORMAT_SEVENZIP;
+        if blob.format != NESTED_FORMAT_SEVENZIP {
+            return Err(SzError::Msg(format!(
+                "durable nested blob format {} is not 7z",
+                blob.format
+            )));
+        }
+        let archive_path = archive_label.as_ref().to_path_buf();
+        reader.seek(SeekFrom::Start(0))?;
+
+        let (mut archive, from_structure) = if let Some(ref sz) = blob.sevenzip {
+            match archive_info_from_durable(sz) {
+                Ok(a) => (a, true),
+                Err(e) => {
+                    eprintln!(
+                        "info: nested durable 7z structure import failed ({e}); re-parsing header"
+                    );
+                    let a = parse::parse_7z_archive(&mut reader, |folder, packed| {
+                        decode::decompress_folder(folder, packed, None)
+                            .map_err(|err| parse::SevenZipError::Msg(err.to_string()))
+                    })?;
+                    reader.seek(SeekFrom::Start(0))?;
+                    (a, false)
+                }
+            }
+        } else {
+            let a = parse::parse_7z_archive(&mut reader, |folder, packed| {
+                decode::decompress_folder(folder, packed, None)
+                    .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
+            })?;
+            reader.seek(SeekFrom::Start(0))?;
+            (a, false)
+        };
+
+        reader.seek(SeekFrom::Start(0))?;
+        let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(reader)));
+
+        let (password, content_locked) =
+            Self::resolve_password_for_archive(&archive_io, &archive, options)?;
+
+        let index = SqliteIndex::create_compact_from_nested_blob(blob)?;
+        // Re-share entry path Arcs with the compact string pool.
+        for entry in &mut archive.files {
+            if let Some(pooled) = index.lookup_pooled_string(entry.path.as_ref()) {
+                entry.path = pooled;
+            }
+        }
+        let entry_by_offsets = entry_offset_map(&archive);
+        if from_structure {
+            eprintln!(
+                "nested durable index: imported 7z file table + structure for {} ({} rows, no header re-parse)",
+                archive_path.display(),
+                index.file_count().unwrap_or(0)
+            );
+        } else {
+            eprintln!(
+                "nested durable index: imported 7z file table for {} ({} rows; structure re-parsed)",
+                archive_path.display(),
+                index.file_count().unwrap_or(0)
+            );
+        }
+        Ok(Self {
+            archive_path,
+            archive,
+            index,
+            archive_io,
+            folder_cache: Mutex::new(HashMap::new()),
+            packed_cache: Mutex::new(HashMap::new()),
+            lzma2_decoders: Mutex::new(HashMap::new()),
+            entry_by_offsets,
+            password,
+            content_locked,
+            from_durable_structure: from_structure,
+            options: options.clone(),
+        })
+    }
+
+    /// Export compact nested durable blob including 7z structure sidecars.
+    pub fn export_nested_durable(
+        &self,
+        fingerprint: ratarmount_index::NestedBodyFingerprint,
+    ) -> Result<Vec<u8>> {
+        use ratarmount_index::NESTED_FORMAT_SEVENZIP;
+        let structure = durable_from_archive_info(&self.archive);
+        self.index
+            .export_nested_blob_with_sidecars(
+                NESTED_FORMAT_SEVENZIP,
+                fingerprint,
+                vec![],
+                Some(structure),
+            )
+            .map_err(Into::into)
+    }
+
+    /// True when this mount imported 7z structure from a durable blob (no header parse).
+    pub fn opened_from_durable_structure(&self) -> bool {
+        self.from_durable_structure
     }
 
     /// True when entry `path` Arc is the same allocation as the compact index pool.
@@ -234,6 +349,7 @@ impl SevenZipMountSource {
             entry_by_offsets,
             password,
             content_locked,
+            from_durable_structure: false,
             options: options.clone(),
         })
     }
@@ -510,8 +626,69 @@ impl SevenZipMountSource {
             entry_by_offsets,
             password,
             content_locked,
+            from_durable_structure: false,
             options: options.clone(),
         })
+    }
+
+    /// Password trial / content_locked for a parsed or imported archive graph.
+    fn resolve_password_for_archive(
+        archive_io: &SharedArchiveIo,
+        archive: &SevenZipArchiveInfo,
+        options: &OpenOptions,
+    ) -> Result<(Option<String>, bool)> {
+        let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
+        if !encrypted {
+            return Ok((options.passwords.first().cloned(), false));
+        }
+        for folder in &archive.folders {
+            if folder.is_encrypted() && !folder.is_supported_for_open(true) {
+                return Err(SzError::Seven(SevenZipError::Msg(format!(
+                    "Unsupported encrypted 7z coder chain: {:?}",
+                    folder
+                        .coders
+                        .iter()
+                        .map(|c| format!("{:02x?}", c.method))
+                        .collect::<Vec<_>>()
+                ))));
+            }
+        }
+        if options.passwords.is_empty() {
+            return Ok((None, true));
+        }
+        let mut chosen = None;
+        let mut last_err = None;
+        for pw in options.passwords.iter() {
+            if let Some(entry) = archive
+                .files
+                .iter()
+                .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
+            {
+                let fi = entry.folder_index.unwrap();
+                let folder = &archive.folders[fi];
+                match Self::try_decrypt_entry_io(archive_io, archive, entry, folder, pw) {
+                    Ok(()) => {
+                        chosen = Some(pw.clone());
+                        break;
+                    }
+                    Err(e) => {
+                        last_err = Some(e);
+                        continue;
+                    }
+                }
+            } else {
+                chosen = Some(pw.clone());
+                break;
+            }
+        }
+        if chosen.is_none() {
+            return Err(SzError::Seven(last_err.unwrap_or_else(|| {
+                SevenZipError::Msg(
+                    "Could not decrypt 7z archive with the provided password(s)".into(),
+                )
+            })));
+        }
+        Ok((chosen, false))
     }
 
     fn try_decrypt_entry_io(
@@ -737,6 +914,140 @@ fn entry_offset_map(archive: &SevenZipArchiveInfo) -> HashMap<(u64, u64), usize>
         map.insert((entry.pack_offset, entry.unpack_offset), i);
     }
     map
+}
+
+/// Serialize live archive graph into a durable nested blob sidecar.
+fn durable_from_archive_info(
+    archive: &SevenZipArchiveInfo,
+) -> ratarmount_index::DurableSevenZipArchive {
+    use ratarmount_index::{
+        DurableSevenZipArchive, DurableSevenZipCoder, DurableSevenZipFileEntry,
+        DurableSevenZipFolder, DurableSevenZipPackInfo,
+    };
+    DurableSevenZipArchive {
+        after_header: archive.after_header,
+        pack_pos_base: archive.pack_pos_base,
+        folders: archive
+            .folders
+            .iter()
+            .map(|f| DurableSevenZipFolder {
+                coders: f
+                    .coders
+                    .iter()
+                    .map(|c| DurableSevenZipCoder {
+                        method: c.method.clone(),
+                        num_in_streams: c.num_in_streams,
+                        num_out_streams: c.num_out_streams,
+                        properties: c.properties.clone(),
+                    })
+                    .collect(),
+                bind_pairs: f.bind_pairs.clone(),
+                packed_indices: f.packed_indices.clone(),
+                unpack_sizes: f.unpack_sizes.clone(),
+                has_crc: f.has_crc,
+                crc: f.crc,
+            })
+            .collect(),
+        pack_info: archive.pack_info.as_ref().map(|p| DurableSevenZipPackInfo {
+            pack_pos: p.pack_pos,
+            pack_sizes: p.pack_sizes.clone(),
+            crcs: p.crcs.clone(),
+        }),
+        files: archive
+            .files
+            .iter()
+            .map(|e| DurableSevenZipFileEntry {
+                path: e.path.to_string(),
+                size: e.size,
+                mtime: e.mtime,
+                mode: e.mode,
+                is_dir: e.is_dir,
+                is_empty_stream: e.is_empty_stream,
+                is_empty_file: e.is_empty_file,
+                folder_index: e.folder_index,
+                unpack_offset: e.unpack_offset,
+                pack_offset: e.pack_offset,
+                pack_size: e.pack_size,
+                pack_stream_index: e.pack_stream_index,
+            })
+            .collect(),
+        solid: archive.solid,
+    }
+}
+
+/// Rebuild archive graph from durable structure (warm open without header parse).
+fn archive_info_from_durable(
+    d: &ratarmount_index::DurableSevenZipArchive,
+) -> Result<SevenZipArchiveInfo> {
+    use parse::{Coder, Folder, PackInfo, SevenZipFileEntry};
+    if d.files.is_empty() && d.folders.is_empty() {
+        return Err(SzError::Msg(
+            "durable 7z structure is empty (cannot import)".into(),
+        ));
+    }
+    let folders: Vec<Folder> = d
+        .folders
+        .iter()
+        .map(|f| Folder {
+            coders: f
+                .coders
+                .iter()
+                .map(|c| Coder {
+                    method: c.method.clone(),
+                    num_in_streams: c.num_in_streams,
+                    num_out_streams: c.num_out_streams,
+                    properties: c.properties.clone(),
+                })
+                .collect(),
+            bind_pairs: f.bind_pairs.clone(),
+            packed_indices: f.packed_indices.clone(),
+            unpack_sizes: f.unpack_sizes.clone(),
+            has_crc: f.has_crc,
+            crc: f.crc,
+        })
+        .collect();
+    let pack_info = d.pack_info.as_ref().map(|p| PackInfo {
+        pack_pos: p.pack_pos,
+        pack_sizes: p.pack_sizes.clone(),
+        crcs: p.crcs.clone(),
+    });
+    let files: Vec<SevenZipFileEntry> = d
+        .files
+        .iter()
+        .map(|e| SevenZipFileEntry {
+            path: std::sync::Arc::from(e.path.as_str()),
+            size: e.size,
+            mtime: e.mtime,
+            mode: e.mode,
+            is_dir: e.is_dir,
+            is_empty_stream: e.is_empty_stream,
+            is_empty_file: e.is_empty_file,
+            folder_index: e.folder_index,
+            unpack_offset: e.unpack_offset,
+            pack_offset: e.pack_offset,
+            pack_size: e.pack_size,
+            pack_stream_index: e.pack_stream_index,
+        })
+        .collect();
+    // Validate folder indices reference existing folders.
+    for e in &files {
+        if let Some(fi) = e.folder_index {
+            if fi >= folders.len() {
+                return Err(SzError::Msg(format!(
+                    "durable 7z structure: folder_index {fi} out of range ({})",
+                    folders.len()
+                )));
+            }
+        }
+    }
+    Ok(SevenZipArchiveInfo {
+        after_header: d.after_header,
+        pack_pos_base: d.pack_pos_base,
+        folders,
+        pack_info,
+        files,
+        solid: d.solid,
+    })
 }
 
 fn pack_stream_sizes(archive: &SevenZipArchiveInfo, entry: &SevenZipFileEntry) -> Option<Vec<u64>> {
@@ -1238,40 +1549,160 @@ mod tests {
         r.read_exact(&mut one).unwrap();
     }
 
+    /// Shipped path open: encrypted 7z with correct password returns member bytes.
     #[test]
     fn encrypted_hello() {
-        let path = py_fixture("encrypted-hello.7z");
-        if !path.exists() {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
+        let (path, expected) = match ensure_encrypted_hello_fixture(dir.path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("skip: no encrypted-hello.7z fixture and cannot create with 7z CLI");
+                return;
+            }
+        };
         let idx = dir.path().join("i.sqlite");
         let opts = OpenOptions {
             passwords: vec!["secret".into()],
             ..OpenOptions::default()
         };
-        let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true).unwrap();
-        let fi = m.lookup("/secret.txt", 0).expect("secret");
-        let mut r = m.open(&fi, 0).unwrap();
-        let mut s = String::new();
-        r.read_to_string(&mut s).unwrap();
-        assert!(s.contains("secret") || !s.is_empty());
+        let m = SevenZipMountSource::open(&path, Some(&idx), &opts, "0.1.0", true)
+            .expect("open encrypted with password");
+        let fi = m.lookup("/secret.txt", 0).expect("secret.txt list/lookup");
+        let mut r = m.open(&fi, 0).expect("open member with password");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(
+            got, expected,
+            "password path must return exact member bytes on shipped open"
+        );
     }
 
+    /// Shipped path: no password → metadata list/stat OK; member open = PermissionDenied (EACCES).
     #[test]
     fn encrypted_metadata_only_without_password() {
-        let path = py_fixture("encrypted-hello.7z");
-        if !path.exists() {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
+        let (path, expected) = match ensure_encrypted_hello_fixture(dir.path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("skip: no encrypted-hello.7z fixture and cannot create with 7z CLI");
+                return;
+            }
+        };
         let idx = dir.path().join("i.sqlite");
         let m =
             SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
-                .expect("metadata-only mount");
-        let fi = m.lookup("/secret.txt", 0).expect("list/stat works");
-        assert!(fi.size > 0);
-        assert!(m.open(&fi, 0).is_err());
+                .expect("metadata-only mount must succeed without password");
+        let fi = m
+            .lookup("/secret.txt", 0)
+            .expect("list/stat works without password");
+        assert_eq!(fi.size, expected.len() as u64);
+        // List root must include the member (metadata-only).
+        match m.list("/") {
+            Some(ListResult::Infos(infos)) => {
+                assert!(
+                    infos.keys().any(|k| k.contains("secret")),
+                    "list must show encrypted member names"
+                );
+            }
+            other => panic!("expected Infos list, got {other:?}"),
+        }
+        let err = match m.open(&fi, 0) {
+            Ok(_) => panic!("open must fail when content-locked"),
+            Err(e) => e,
+        };
+        assert_eq!(
+            err.kind(),
+            io::ErrorKind::PermissionDenied,
+            "content-locked open must be PermissionDenied (FUSE EACCES), got {err}"
+        );
+        let msg = err.to_string().to_ascii_lowercase();
+        assert!(
+            msg.contains("password"),
+            "error should mention password: {msg}"
+        );
+    }
+
+    /// Nested reader path: encrypted body without password is content-locked (PermissionDenied).
+    #[test]
+    fn encrypted_open_from_reader_metadata_only_and_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, expected) = match ensure_encrypted_hello_fixture(dir.path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("skip: no encrypted fixture");
+                return;
+            }
+        };
+        let bytes = std::fs::read(&path).unwrap();
+        let opts_locked = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let locked = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes.clone()),
+            Path::new("nested://encrypted.7z"),
+            None,
+            &opts_locked,
+            "0.1.0",
+            true,
+        )
+        .expect("nested metadata-only open_from_reader");
+        let fi = locked.lookup("/secret.txt", 0).expect("lookup nested");
+        let err = match locked.open(&fi, 0) {
+            Ok(_) => panic!("nested content-locked open must fail"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+
+        let opts_pw = OpenOptions {
+            index_compact_only: true,
+            passwords: vec!["secret".into()],
+            ..OpenOptions::default()
+        };
+        let unlocked = SevenZipMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested://encrypted.7z"),
+            None,
+            &opts_pw,
+            "0.1.0",
+            true,
+        )
+        .expect("nested open_from_reader with password");
+        let fi2 = unlocked.lookup("/secret.txt", 0).unwrap();
+        let mut got = Vec::new();
+        unlocked
+            .open(&fi2, 0)
+            .unwrap()
+            .read_to_end(&mut got)
+            .unwrap();
+        assert_eq!(got, expected);
+    }
+
+    /// Wrong password fails closed at mount open (not silent metadata-only success).
+    #[test]
+    fn encrypted_wrong_password_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = match ensure_encrypted_hello_fixture(dir.path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("skip: no encrypted fixture");
+                return;
+            }
+        };
+        let opts = OpenOptions {
+            passwords: vec!["not-the-password".into()],
+            ..OpenOptions::default()
+        };
+        let err = SevenZipMountSource::open(&path, None, &opts, "0.1.0", true)
+            .err()
+            .expect("wrong password must fail mount open");
+        // Decoder may surface as lzma/AES error rather than a polished password string;
+        // fail-closed (no metadata-only success) is the contract.
+        let msg = err.to_string();
+        assert!(
+            !msg.is_empty(),
+            "wrong password must produce an error (got empty)"
+        );
     }
 
     #[test]
@@ -2062,6 +2493,63 @@ sys.stdout.buffer.write(packed)
         );
     }
 
+    /// Prefer Python `encrypted-hello.7z` fixture; otherwise create with system `7z`.
+    /// Returns `(archive_path, expected_secret_txt_bytes)`.
+    fn ensure_encrypted_hello_fixture(work: &Path) -> Option<(PathBuf, Vec<u8>)> {
+        let py = py_fixture("encrypted-hello.7z");
+        if py.is_file() {
+            // Canonical fixture payload (15 bytes including trailing newline).
+            return Some((py, b"secret content\n".to_vec()));
+        }
+        let payload = b"secret content\n";
+        let archive = work.join("encrypted-hello.7z");
+        if write_encrypted_sample_7z(&archive, "secret.txt", payload, "secret") {
+            Some((archive, payload.to_vec()))
+        } else {
+            None
+        }
+    }
+
+    /// Build an encrypted 7z (AES) via system CLI. Returns false if CLI missing/fails.
+    fn write_encrypted_sample_7z(
+        archive: &Path,
+        member_name: &str,
+        payload: &[u8],
+        password: &str,
+    ) -> bool {
+        use std::process::Command;
+        let dir = archive.parent().expect("archive parent");
+        let plain = dir.join(member_name);
+        if let Err(e) = std::fs::write(&plain, payload) {
+            eprintln!("skip: write encrypted payload: {e}");
+            return false;
+        }
+        let _ = std::fs::remove_file(archive);
+        let archive_name = archive.file_name().and_then(|s| s.to_str()).unwrap();
+        let pw_arg = format!("-p{password}");
+        for bin in ["7z", "7za"] {
+            // Content encryption only (`-mhe=off`): list/stat works without password
+            // (metadata-only mount). Header encryption would block listing.
+            let status = Command::new(bin)
+                .args([
+                    "a",
+                    "-t7z",
+                    "-mx=0",
+                    &pw_arg,
+                    "-mhe=off",
+                    archive_name,
+                    member_name,
+                ])
+                .current_dir(dir)
+                .status();
+            if matches!(status, Ok(s) if s.success()) && archive.is_file() {
+                return true;
+            }
+        }
+        eprintln!("skip: 7z encrypted archive create failed");
+        false
+    }
+
     /// Build a minimal single-file 7z at `archive` containing `member_name` → `payload`.
     /// Returns false when the `7z` CLI is missing or fails (caller should skip).
     fn write_sample_7z(archive: &Path, member_name: &str, payload: &[u8]) -> bool {
@@ -2190,5 +2678,80 @@ sys.stdout.buffer.write(packed)
             buf2, "7z-v2-longer\n",
             "must serve new 7z data after tarstats mismatch rebuild"
         );
+    }
+
+    /// Durable structure export/import: warm open skips header re-parse, still reads members.
+    #[test]
+    fn durable_structure_roundtrip_open_without_header_parse() {
+        use ratarmount_index::{NestedBodyFingerprint, NESTED_FORMAT_SEVENZIP};
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("struct.7z");
+        let payload = b"structure-warm-payload-xyz\n";
+        if !write_sample_7z(&archive, "hello.txt", payload) {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        }
+        let bytes = std::fs::read(&archive).unwrap();
+        let body_size = bytes.len() as u64;
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let cold = SevenZipMountSource::open_from_reader(
+            std::io::Cursor::new(bytes.clone()),
+            "struct.7z",
+            None,
+            &opts,
+            "test",
+            true,
+        )
+        .expect("cold nested 7z");
+        assert!(!cold.opened_from_durable_structure());
+        let mut c = std::io::Cursor::new(bytes.clone());
+        let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body_size).unwrap();
+        let blob_bytes = cold.export_nested_durable(fp.clone()).expect("export");
+        let blob = ratarmount_index::DurableNestedBlob::from_bytes(&blob_bytes).unwrap();
+        assert_eq!(blob.format, NESTED_FORMAT_SEVENZIP);
+        assert!(
+            blob.has_sevenzip_structure(),
+            "export must include 7z structure sidecars"
+        );
+        // Pure structure round-trip (no I/O).
+        let rebuilt = archive_info_from_durable(blob.sevenzip.as_ref().unwrap()).unwrap();
+        assert_eq!(rebuilt.files.len(), cold.archive.files.len());
+        assert_eq!(rebuilt.folders.len(), cold.archive.folders.len());
+        drop(cold);
+
+        let warm = SevenZipMountSource::open_from_reader_with_durable(
+            std::io::Cursor::new(bytes),
+            "struct.7z",
+            &blob,
+            &opts,
+        )
+        .expect("warm durable 7z");
+        assert!(
+            warm.opened_from_durable_structure(),
+            "warm open must use structure sidecars (no header re-parse)"
+        );
+        assert!(warm.index_is_compact_only());
+        let fi = warm.lookup("/hello.txt", 0).expect("lookup");
+        let mut r = warm.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// Structure serialize/deserialize unit (no mount): empty structure rejected.
+    #[test]
+    fn durable_structure_empty_rejected() {
+        let empty = ratarmount_index::DurableSevenZipArchive {
+            after_header: 0,
+            pack_pos_base: 0,
+            folders: vec![],
+            pack_info: None,
+            files: vec![],
+            solid: false,
+        };
+        assert!(archive_info_from_durable(&empty).is_err());
     }
 }

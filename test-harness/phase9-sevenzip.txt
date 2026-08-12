@@ -23,4 +23,5 @@ tests/bcj-lzma2-x86.7z|x.bin|
 tests/zip.7z|natsu.zip|
 tests/nested-inner-hello.7z|inner-hello.7z|
 # Nested zip-in-7z / lighter.tar require -r → phase7-nested.txt
-# Encrypted with password (CLI harness uses no password by default — covered by unit tests)
+# Encrypted: optional 4th field is --password (content AES; list works metadata-only without it)
+tests/encrypted-hello.7z|secret.txt|secret content|secret

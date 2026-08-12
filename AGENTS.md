@@ -42,12 +42,13 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_invalid` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip_fail_rewinds_to_g3` · optional ISA-L: `--features gzip-rapidgzip-isal` (+ `libisal` / `ISAL_INSTALL_PREFIX`) |
 | Plain `.gz` rapidgzip GZIDX shell create (no pre-existing index) | `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_plain_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx_skipped` · `cargo test -p ratarmount gzip_seek_index_format_label` |
 | 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
-| Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` |
+| Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` (metadata-only PermissionDenied; password exact bytes; wrong pw fails open) |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
 | Sequential FUSE readahead window (`--readahead`, #180) | `cargo test -p ratarmount-fuse --lib readahead` |
 | Plain compress no `/tmp` spool (gz/zstd/bz2) | `cargo test -p ratarmount plain_gzip` · `cargo test -p ratarmount plain_zstd` · nested: `nested_plain_gzip` |
 | Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |
+| Nested durable indexes (ZIP/TAR/7z structure+file table/CPIO/AR) | `cargo test -p ratarmount --bin ratarmount nested_durable` · `cargo test -p ratarmount-formats-sevenzip --lib durable_structure` · `cargo test -p ratarmount-index --lib nested` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount gzip_rgzi` · `cargo test -p ratarmount plain_gzip_rgzi` · `cargo test -p ratarmount plain_gzip` |
@@ -102,15 +103,21 @@ Tagging alone is not enough: **`Packages` must publish a GitHub Release with rea
 assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
 [`.github/workflows/packages.yml`](`.github/workflows/packages.yml`).
 
+**After every release tag, watch CI until settled** (fix failures, re-tag if needed).
+Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
+
 ### Version bump checklist
 
-1. Bump **workspace** `version` in root [`Cargo.toml`](Cargo.toml).
-2. Bump every `VERSION: "x.y.z"` env in [`.github/workflows/packages.yml`](.github/workflows/packages.yml)
-   (deb / rpm / portable / macos jobs).
-3. Update README version strings that mention the release tag.
-4. `cargo test -p ratarmount-compress --lib` (and full workspace when touching more).
+1. Bump **workspace** `version` in root [`Cargo.toml`](Cargo.toml) (Packages resolve
+   version from the tag + Cargo.toml — do **not** hardcode per-job `VERSION` envs).
+2. Update README / docs version strings that mention the release tag (if any).
+3. `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
+4. `cargo test --workspace` (or full relevant crates when the release is large).
 5. Commit on `main`, then **annotated tag** `vX.Y.Z` matching Cargo version.
 6. `git push origin main && git push origin vX.Y.Z`.
+7. **Watch CI** (`gh run list` / `gh run watch`): **`fmt + clippy + test`** green;
+   **Packages** publishes real assets (macOS-only residual OK if Linux packages ship).
+8. Confirm `gh release view vX.Y.Z` has package assets. If red: fix, harden, **new patch tag**.
 
 ### What “success” looks like
 
@@ -120,6 +127,7 @@ assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
 | **Sign & release** | Creates/updates GitHub Release for the tag |
 | [github.com/…/releases](https://github.com/hilather/ratarmount-rs/releases) | Tag has **package** assets (not only tiny sidecars) |
 | Workflow overall | Prefer green; macOS-only failure is OK if Linux packages published |
+| Agent did not walk away after `git push --tags` | CI watched / failures fixed |
 
 **Workflow “failure” with empty Releases is not a release.** Builds may still
 leave a downloadable **`signed-release-bundle`** Actions artifact (expires).

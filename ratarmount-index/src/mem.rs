@@ -150,6 +150,25 @@ impl PathTable {
     fn uses_segments(&self) -> bool {
         true
     }
+
+    /// Reconstruct SQL-style directory path for export (`""` root, else `/a/b`).
+    fn flat_string_for_export(&self, pool: &StringPool, path_id: u32) -> String {
+        let segs = match self.paths.get(path_id as usize) {
+            Some(s) => s.as_slice(),
+            None => return String::new(),
+        };
+        if segs.is_empty() {
+            return String::new();
+        }
+        let mut out = String::from("/");
+        for (i, &sid) in segs.iter().enumerate() {
+            if i > 0 {
+                out.push('/');
+            }
+            out.push_str(pool.get(sid));
+        }
+        out
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -516,6 +535,54 @@ impl MemIndex {
         } else {
             Some(map)
         }
+    }
+
+    /// Export every version as [`FileRow`]s for durable nested index blobs.
+    pub fn export_file_rows(&self) -> Vec<FileRow> {
+        let mut rows = Vec::with_capacity(self.count as usize);
+        let path_ids: Vec<u32> = if let Some(shards) = &self.shards {
+            let mut ids = Vec::new();
+            for sh in shards {
+                ids.extend(sh.keys().copied());
+            }
+            ids.sort_unstable();
+            ids
+        } else {
+            let mut ids: Vec<u32> = self.dirs.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        };
+        for pid in path_ids {
+            let path_str = self.paths.flat_string_for_export(&self.pool, pid);
+            let Some(de) = self.dir_entries(pid) else {
+                continue;
+            };
+            for (&nid, versions) in &de.names {
+                let name = self.pool.get(nid).to_string();
+                for &idx in versions {
+                    let i = idx as usize;
+                    let f = self.soa.flags[i];
+                    rows.push(FileRow::new(
+                        path_str.clone(),
+                        name.clone(),
+                        self.soa.offsetheader[i],
+                        self.soa.offset[i] as i64,
+                        self.soa.size[i] as i64,
+                        self.soa.mtime[i],
+                        self.soa.mode[i] as i64,
+                        0,
+                        self.pool.get(self.soa.linkname_id[i]).to_string(),
+                        self.soa.uid[i] as i64,
+                        self.soa.gid[i] as i64,
+                        f & 1 != 0,
+                        f & 2 != 0,
+                        f & 4 != 0,
+                        self.soa.recursiondepth[i] as i64,
+                    ));
+                }
+            }
+        }
+        rows
     }
 }
 

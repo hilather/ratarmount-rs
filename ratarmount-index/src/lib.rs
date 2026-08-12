@@ -3,6 +3,7 @@
 mod hashing;
 mod location;
 mod mem;
+mod nested;
 
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
@@ -28,6 +29,13 @@ use mem::{mem_index_from_sql_rows, MemIndex, MemIndexBuilder, SqlMemRow};
 use ratarmount_core::OpenOptions;
 
 pub use mem::{CompactOpenCookie, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
+pub use nested::{
+    DurableNestedBlob, DurableSevenZipArchive, DurableSevenZipCoder, DurableSevenZipFileEntry,
+    DurableSevenZipFolder, DurableSevenZipPackInfo, DurableZipMember, NestedBodyFingerprint,
+    NestedMemberKey, CREATE_NESTED_INDEXES_SQL, NESTED_BLOB_VERSION, NESTED_FORMAT_AR,
+    NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
+    NESTED_INDEXES_TABLE,
+};
 
 /// Max `files` rows for which a full MemIndex projection is kept after seal/open.
 pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
@@ -78,6 +86,17 @@ CREATE TABLE IF NOT EXISTS "bzip2blocks" (
 CREATE TABLE IF NOT EXISTS "zstdblocks" (
     "blockoffset" INTEGER PRIMARY KEY,
     "dataoffset" INTEGER
+);
+/* Nested archive durable indexes (Rust-only; warm remount of embedded ZIP/TAR/7z) */
+CREATE TABLE IF NOT EXISTS "nestedindexes" (
+    "member_key" TEXT PRIMARY KEY,
+    "body_size" INTEGER NOT NULL,
+    "prefix_sha256" TEXT NOT NULL,
+    "suffix_sha256" TEXT NOT NULL,
+    "mid_sha256" TEXT NOT NULL DEFAULT '',
+    "format" TEXT NOT NULL,
+    "schema_version" INTEGER NOT NULL,
+    "blob" BLOB NOT NULL
 );
 "#;
 
@@ -572,6 +591,227 @@ impl SqliteIndex {
     pub fn intern_during_build(&self, s: &str) -> Option<std::sync::Arc<str>> {
         let mut g = self.mem_builder.lock().ok()?;
         Some(g.as_mut()?.intern_shared(s))
+    }
+
+    /// Export sealed MemIndex as a durable nested blob (compact rows + fingerprint).
+    pub fn export_nested_blob(
+        &self,
+        format: &str,
+        fingerprint: nested::NestedBodyFingerprint,
+        zip_members: Vec<nested::DurableZipMember>,
+    ) -> Result<Vec<u8>> {
+        self.export_nested_blob_with_sidecars(format, fingerprint, zip_members, None)
+    }
+
+    /// Export nested blob with optional ZIP / 7z structure sidecars.
+    pub fn export_nested_blob_with_sidecars(
+        &self,
+        format: &str,
+        fingerprint: nested::NestedBodyFingerprint,
+        zip_members: Vec<nested::DurableZipMember>,
+        sevenzip: Option<nested::DurableSevenZipArchive>,
+    ) -> Result<Vec<u8>> {
+        let mem = self
+            .mem
+            .as_ref()
+            .ok_or_else(|| IndexError::Invalid("no MemIndex to export".into()))?;
+        let blob = nested::DurableNestedBlob::from_mem_index_with_sidecars(
+            format,
+            fingerprint,
+            mem,
+            zip_members,
+            sevenzip,
+        );
+        blob.to_bytes()
+    }
+
+    /// Create a sealed compact-only index from a durable nested blob (import hit).
+    pub fn create_compact_from_nested_blob(blob: &nested::DurableNestedBlob) -> Result<Self> {
+        let mem = blob.to_mem_index();
+        // Minimal shell DB (unused for file table).
+        let conn = Connection::open_in_memory()?;
+        conn.execute_batch(CREATE_TABLES_SQL)?;
+        Ok(Self {
+            path: None,
+            conn: Mutex::new(conn),
+            read_only: true,
+            mem: Some(mem),
+            mem_builder: Mutex::new(None),
+            compact_only: true,
+        })
+    }
+
+    /// Ensure `nestedindexes` side table exists (outer writable index).
+    pub fn ensure_nested_indexes_table(&self) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if self.compact_only {
+            return Err(IndexError::Invalid(
+                "compact-only index cannot store nestedindexes".into(),
+            ));
+        }
+        self.with_conn(|conn| {
+            conn.execute_batch(nested::CREATE_NESTED_INDEXES_SQL)?;
+            // Legacy outer indexes created before mid_sha256.
+            let _ = conn.execute(
+                r#"ALTER TABLE "nestedindexes" ADD COLUMN "mid_sha256" TEXT NOT NULL DEFAULT ''"#,
+                [],
+            );
+            Ok(())
+        })
+    }
+
+    /// Store a nested durable blob on the outer index (keyed by member identity).
+    pub fn set_nested_index(
+        &self,
+        key: &nested::NestedMemberKey,
+        fingerprint: &nested::NestedBodyFingerprint,
+        format: &str,
+        blob: &[u8],
+    ) -> Result<()> {
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        self.ensure_nested_indexes_table()?;
+        let sk = key.storage_key();
+        self.with_conn(|conn| {
+            // Migrate legacy tables that lack mid_sha256.
+            let _ = conn.execute(
+                r#"ALTER TABLE "nestedindexes" ADD COLUMN "mid_sha256" TEXT NOT NULL DEFAULT ''"#,
+                [],
+            );
+            conn.execute(
+                r#"INSERT OR REPLACE INTO "nestedindexes"
+                   (member_key, body_size, prefix_sha256, suffix_sha256, mid_sha256, format, schema_version, blob)
+                   VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)"#,
+                params![
+                    sk,
+                    fingerprint.body_size as i64,
+                    fingerprint.prefix_sha256,
+                    fingerprint.suffix_sha256,
+                    fingerprint.mid_sha256,
+                    format,
+                    nested::NESTED_BLOB_VERSION as i64,
+                    blob,
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
+    /// Load nested durable blob if present and fingerprint matches.
+    pub fn get_nested_index(
+        &self,
+        key: &nested::NestedMemberKey,
+        fingerprint: &nested::NestedBodyFingerprint,
+        format: &str,
+    ) -> Result<Option<nested::DurableNestedBlob>> {
+        if self.compact_only {
+            return Ok(None);
+        }
+        let sk = key.storage_key();
+        self.with_conn(|conn| {
+            // Table may not exist on legacy indexes.
+            let exists: i64 = conn.query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nestedindexes'"#,
+                [],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Ok(None);
+            }
+            // Prefer mid-aware SELECT; fall back if legacy schema lacks the column.
+            type NestedRow = (
+                i64,
+                String,
+                String,
+                String,
+                String,
+                i64,
+                Vec<u8>,
+            );
+            let map_full = |r: &rusqlite::Row<'_>| -> rusqlite::Result<NestedRow> {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            };
+            let row: Option<NestedRow> = conn
+                .query_row(
+                    r#"SELECT body_size, prefix_sha256, suffix_sha256,
+                              COALESCE(mid_sha256, ''), format, schema_version, blob
+                       FROM "nestedindexes" WHERE member_key = ?1"#,
+                    params![sk],
+                    map_full,
+                )
+                .optional()
+                .or_else(|_| {
+                    conn.query_row(
+                        r#"SELECT body_size, prefix_sha256, suffix_sha256, format, schema_version, blob
+                           FROM "nestedindexes" WHERE member_key = ?1"#,
+                        params![sk],
+                        |r| {
+                            Ok((
+                                r.get(0)?,
+                                r.get(1)?,
+                                r.get(2)?,
+                                String::new(),
+                                r.get(3)?,
+                                r.get(4)?,
+                                r.get(5)?,
+                            ))
+                        },
+                    )
+                    .optional()
+                })?;
+            let Some((sz, pre, suf, mid, fmt, _ver, blob_bytes)) = row else {
+                return Ok(None);
+            };
+            let stored_fp = nested::NestedBodyFingerprint {
+                body_size: sz as u64,
+                prefix_sha256: pre,
+                suffix_sha256: suf,
+                mid_sha256: mid,
+            };
+            if fmt != format || !stored_fp.matches(fingerprint) {
+                return Ok(None);
+            }
+            let blob = nested::DurableNestedBlob::from_bytes(&blob_bytes)?;
+            if !blob.is_valid_for(format, fingerprint) {
+                return Ok(None);
+            }
+            Ok(Some(blob))
+        })
+    }
+
+    /// Whether a nestedindexes row exists for `key` (ignores fingerprint; for tests).
+    pub fn has_nested_index_key(&self, key: &nested::NestedMemberKey) -> Result<bool> {
+        if self.compact_only {
+            return Ok(false);
+        }
+        let sk = key.storage_key();
+        self.with_conn(|conn| {
+            let exists: i64 = conn.query_row(
+                r#"SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='nestedindexes'"#,
+                [],
+                |r| r.get(0),
+            )?;
+            if exists == 0 {
+                return Ok(false);
+            }
+            let n: i64 = conn.query_row(
+                r#"SELECT COUNT(*) FROM "nestedindexes" WHERE member_key = ?1"#,
+                params![sk],
+                |r| r.get(0),
+            )?;
+            Ok(n > 0)
+        })
     }
 
     /// Begin an exclusive write transaction for bulk index builds.

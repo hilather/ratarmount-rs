@@ -15,21 +15,27 @@ mkdir -p "$WORKDIR/mnt"
 echo "RATARMOUNT_CMD=$BIN"
 echo "==> SevenZip allowlist: $ALLOWLIST"
 
-while IFS='|' read -r archive member expect || [[ -n "${archive:-}" ]]; do
+# format: archive_relpath|member_path|expected_substring_or_empty[|password]
+while IFS='|' read -r archive member expect password || [[ -n "${archive:-}" ]]; do
     [[ -z "${archive// }" || "$archive" =~ ^# ]] && continue
     archive="${archive//$'\r'/}"
     member="${member//$'\r'/}"
     expect="${expect//$'\r'/}"
+    password="${password//$'\r'/}"
     src="$PY_ROOT/$archive"
     if [[ ! -f "$src" ]]; then
         echo "  [skip] missing $src"
         continue
     fi
-    echo "  [run] $archive  (path=$member)"
+    echo "  [run] $archive  (path=$member${password:+ password=***})"
     idx="$WORKDIR/$(basename "$archive").index.sqlite"
     rm -f "$idx"
     ratar_unmount "$WORKDIR/mnt"
-    "$BIN" -f -c --index-file "$idx" "$src" "$WORKDIR/mnt" &
+    if [[ -n "${password:-}" ]]; then
+        "$BIN" -f -c --index-file "$idx" --password "$password" "$src" "$WORKDIR/mnt" &
+    else
+        "$BIN" -f -c --index-file "$idx" "$src" "$WORKDIR/mnt" &
+    fi
     pid=$!
     ok=0
     for _ in $(seq 1 100); do

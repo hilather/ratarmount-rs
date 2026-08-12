@@ -50,9 +50,11 @@ With **recursive automount** (`-r`), when a path looks like a nested archive:
 1. Lookup the nested file in the parent mount (TAR/ZIP/7z/…).
 2. parent.open(member)  →  seekable Read+Seek stream of the member bytes
 3. Prefer nested *reader* open (no host path):
-      open_nested_reader_fn(stream, label)
-         sniff magic → 7z | ZIP | TAR | gzip|zstd|bz2|xz → TAR
-         build compact-only file table (no SQLite files); mount as MountSource
+      open_nested_reader_fn(stream, label, NestedOpenContext)
+         sniff magic → 7z | ZIP | TAR | CPIO | AR | gzip|zstd|bz2|xz → TAR | …
+         ZIP/TAR/7z/CPIO/AR: try load durable nestedindexes from outer index (fingerprint match)
+         else build compact-only file table (no SQLite files); mount as MountSource
+         on success + writable outer index: export nestedindexes blob
 4. On Unsupported / error → *temp spool* fallback:
       copy member → NamedTempFile under TMPDIR (/tmp) → open_nested_fn(path)
 ```
@@ -78,13 +80,39 @@ Nested indexes are **not** written next to a virtual label. By default the neste
 
 | Piece | Behavior |
 |-------|----------|
-| **File table** | In-process **compact** projection: string pool, path **segments**, SoA rows, optional dir **shards** — **no** SQLite `files` table |
+| **File table (live)** | In-process **compact** projection: string pool, path **segments**, SoA rows, optional dir **shards** — **no** SQLite `files` table |
 | **Top-level contrast** | Path mounts still use on-disk / `:memory:` SQLite for warm remount and Python interop |
 | **Fat `FileInfo`** | Materialized only at list/lookup; open can use compact offset cookies |
 | **ZIP sidecars** | Member names interned into the same string pool during index build |
 | **Residual** | Parent may still hold a large inflated member body; solid 7z open cost is separate |
 
-Explicit top-level `--index-file :memory:` still uses SQLite in process for that mount; nested AutoMount does **not** force a nested SQLite `files` store.
+Explicit top-level `--index-file :memory:` still uses SQLite in process for that mount; nested AutoMount does **not** force a nested SQLite `files` store as the live nested table.
+
+### Durable nested indexes (warm remount of embedded ZIP/TAR)
+
+When the **outer** archive has a **writable on-disk** SQLite index, a successful nested open of **uncompressed ZIP** or **uncompressed TAR** can **export** the compact nested file table into the outer index side table `nestedindexes`. The next open of the same nested member (same remount or new process) **imports** that blob after a fingerprint check, so nested list/lookup does not rebuild the nested file table from the member stream.
+
+| Piece | Behavior |
+|-------|----------|
+| **Storage** | Outer SQLite table `nestedindexes` (Rust-only extension): `member_key`, body size, prefix/suffix SHA-256, format tag, JSON blob of compact rows (+ ZIP member sidecars) |
+| **Identity** | Nested member path + optional parent `offsetheader` + body size |
+| **Fingerprint** | Head / mid / tail SHA-256 samples (4 KiB windows) of the seekable nested body; size mismatch or sampled content change → rebuild. Residual: same-size edits outside sampled windows on multi-GB members are not full-content hashed |
+| **Live mount after import** | Still **compact-only** MemIndex — durable storage is export/import, not nested SQLite `files` as the hot path |
+| **Formats (warm)** | Nested **ZIP**, uncompressed **TAR**, **7z** (file table **+ structure** sidecars — no header re-parse), **CPIO**, **AR** via outer `nestedindexes` |
+| **Formats still cold** | Nested compressed streams (`.tar.gz`/zstd/bz2/xz file table after codec), ISO/WARC/ASAR/XAR/CAB/SQLAR/FAT/SquashFS/EXT4 (residual — not yet durable-wired) |
+| **7z warm details** | Blob stores compact file rows **and** folder/pack/member open cookies; warm open attaches seekable body + imports graph (logs: `imported 7z file table + structure … no header re-parse`). Solid folder decompress CPU/RAM still applies on member open |
+| **Policy** | No nested durable write when `write_index=false`, outer index is `:memory:`, read-only index mode, or no on-disk outer index path |
+| **Logs** | `nested durable index: stored …` / `loaded …` / `imported … file table` |
+
+```text
+outer.sqlite
+  ├── files / tarstats / …     (outer warm remount — existing)
+  └── nestedindexes            (nested ZIP/TAR compact blobs)
+         │
+         └── import → compact-only MemIndex (live nested mount)
+```
+
+Residuals: fingerprint samples head/mid/tail (not full multi-GB solid body hash); nested **7z** warm still pays solid-folder decompress on member open (structure + file table only); deep `-r` can grow the outer index with one blob per nested archive opened; Python does not need to understand `nestedindexes` for outer warm remount.
 
 Enable logs to see which path ran:
 

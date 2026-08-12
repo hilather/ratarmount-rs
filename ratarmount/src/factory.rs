@@ -5,8 +5,8 @@ use std::sync::Arc;
 
 use ratarmount_compositing::{
     parse_recursive_extensions, AutoMountLayer, AutoMountOptions, FileVersionLayer,
-    FolderMountSource, OpenNestedFn, OpenNestedReaderFn, PrefixMountSource, RecursiveExtSet,
-    TransformMountSource, UnionMountOptions, UnionMountSource,
+    FolderMountSource, NestedOpenContext, OpenNestedFn, OpenNestedReaderFn, PrefixMountSource,
+    RecursiveExtSet, TransformMountSource, UnionMountOptions, UnionMountSource,
 };
 use ratarmount_compress::{
     body_looks_like_tar, check_for_split_file_in_folder, detect_compression, export_bzip2_blocks,
@@ -48,7 +48,9 @@ use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
 use ratarmount_index::{
-    discard_index_file_if_below_minimum, resolve_index_location, IndexLocation, SqliteIndex,
+    discard_index_file_if_below_minimum, resolve_index_location, DurableNestedBlob, IndexLocation,
+    NestedBodyFingerprint, NestedMemberKey, SqliteIndex, NESTED_FORMAT_AR, NESTED_FORMAT_CPIO,
+    NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
 };
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -505,10 +507,14 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 /// - **EXT2/3/4** via pure ext4-view on a shared stream; pure fail → temp spool + path open
 ///   (may use debugfs)
 ///
+/// When [`NestedOpenContext`] carries a writable outer on-disk index, nested **ZIP**
+/// and uncompressed **TAR** load/store durable compact file tables in the outer
+/// `nestedindexes` side table (warm remount without cold nested rebuild).
+///
 /// Other formats fail so AutoMount can fall back to materializing a temp file
 /// and [`open_nested_fn`].
 pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
-    Arc::new(move |mut reader, label| {
+    Arc::new(move |mut reader, label, ctx| {
         use std::io::{Read, Seek, SeekFrom};
 
         let mut opts = options.clone();
@@ -538,27 +544,12 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 label.display(),
                 opts.passwords.len()
             );
-            return SevenZipMountSource::open_from_reader(
-                reader, label, None, &opts, VERSION, true,
-            )
-            .map(|s| {
-                log::debug!(
-                    "nested reader open: 7z {} mounted successfully",
-                    label.display()
-                );
-                Arc::new(s) as Arc<dyn MountSource>
-            })
-            .map_err(|e| {
-                log::warn!("nested reader open: 7z {} failed: {e}", label.display());
-                std::io::Error::other(e.to_string())
-            });
+            return open_nested_7z_with_durable(reader, label, &opts, &ctx);
         }
 
         // Unix ar
         if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
-            return map_nested_open("AR", label, || {
-                ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
-            });
+            return open_nested_ar_with_durable(reader, label, &opts, &ctx);
         }
 
         // XAR
@@ -584,9 +575,7 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
 
         // CPIO newc/crc/odc (ASCII) or binary magic
         if head_looks_like_cpio(head) {
-            return map_nested_open("CPIO", label, || {
-                CpioMountSource::open_from_reader(reader, label, None, &opts, VERSION)
-            });
+            return open_nested_cpio_with_durable(reader, label, &opts, &ctx);
         }
 
         // WARC
@@ -638,23 +627,17 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
                 )
             }
             "zip" => {
-                return map_nested_open("ZIP", label, || {
-                    ZipMountSource::open_from_reader(reader, label, None, &opts, VERSION)
-                });
+                return open_nested_zip_with_durable(reader, label, &opts, &ctx);
             }
             "tar" => {
-                return map_nested_open("TAR", label, || {
-                    SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
-                });
+                return open_nested_tar_with_durable(reader, label, &opts, &ctx);
             }
             _ => {}
         }
 
         // Uncompressed TAR by name (no ustar magic in first 512 — rare)
         if name_suggests_plain_tar(label) {
-            return map_nested_open("TAR", label, || {
-                SqliteIndexedTar::open_from_reader(reader, label, None, &opts, VERSION)
-            });
+            return open_nested_tar_with_durable(reader, label, &opts, &ctx);
         }
 
         // ISO 9660: PVD at sector 16 (beyond first 512 bytes) — probe stream or name
@@ -749,6 +732,386 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             ),
         ))
     })
+}
+
+/// Stable nested member path for `nestedindexes` keys.
+fn nested_member_path_for_key(ctx: &NestedOpenContext, label: &Path) -> String {
+    let raw = if !ctx.member_path.is_empty() {
+        ctx.member_path.as_str()
+    } else {
+        label.to_str().unwrap_or("nested")
+    };
+    raw.trim_start_matches('/').to_string()
+}
+
+/// Resolve nested body size for fingerprinting (parent file table or stream length).
+fn nested_body_size(
+    reader: &mut dyn ratarmount_core::ArchiveRead,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<u64> {
+    use std::io::SeekFrom;
+    if ctx.member_size > 0 {
+        return Ok(ctx.member_size);
+    }
+    let end = reader.seek(SeekFrom::End(0))?;
+    reader.seek(SeekFrom::Start(0))?;
+    Ok(end)
+}
+
+fn try_load_nested_durable(
+    outer_index_path: Option<&Path>,
+    key: &NestedMemberKey,
+    fingerprint: &NestedBodyFingerprint,
+    format: &str,
+) -> Option<DurableNestedBlob> {
+    let path = outer_index_path?;
+    if !path.is_file() {
+        return None;
+    }
+    let idx = match SqliteIndex::open_read_only(path) {
+        Ok(i) => i,
+        Err(e) => {
+            log::debug!(
+                "nested durable: open outer index {} for load failed: {e}",
+                path.display()
+            );
+            return None;
+        }
+    };
+    match idx.get_nested_index(key, fingerprint, format) {
+        Ok(Some(blob)) => {
+            eprintln!(
+                "nested durable index: loaded {format} file table for {} from {}",
+                key.member_path,
+                path.display()
+            );
+            Some(blob)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            log::debug!("nested durable: get_nested_index failed: {e}");
+            None
+        }
+    }
+}
+
+fn try_store_nested_durable(
+    ctx: &NestedOpenContext,
+    key: &NestedMemberKey,
+    fingerprint: &NestedBodyFingerprint,
+    format: &str,
+    blob: &[u8],
+) {
+    if !ctx.write_nested_index {
+        return;
+    }
+    let Some(ip) = ctx.outer_index_path.as_deref() else {
+        return;
+    };
+    match open_or_create_writable_index(ip) {
+        Ok(idx) => match idx.set_nested_index(key, fingerprint, format, blob) {
+            Ok(()) => eprintln!(
+                "nested durable index: stored {format} file table for {} ({} bytes) in {}",
+                key.member_path,
+                blob.len(),
+                ip.display()
+            ),
+            Err(e) => eprintln!(
+                "info: could not store nested durable index for {}: {e}",
+                key.member_path
+            ),
+        },
+        Err(e) => eprintln!(
+            "info: could not open outer index {} to store nested durable: {e}",
+            ip.display()
+        ),
+    }
+}
+
+/// Nested ZIP: load durable file table when fingerprint matches, else cold open + store.
+fn open_nested_zip_with_durable(
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
+    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+        .map_err(std::io::Error::other)?;
+    let key = NestedMemberKey {
+        member_path: nested_member_path_for_key(ctx, label),
+        offsetheader: ctx.offsetheader,
+        body_size,
+    };
+
+    if let Some(blob) = try_load_nested_durable(
+        ctx.outer_index_path.as_deref(),
+        &key,
+        &fingerprint,
+        NESTED_FORMAT_ZIP,
+    ) {
+        match ZipMountSource::open_from_reader_with_durable(reader, label, &blob, opts) {
+            Ok(s) => {
+                log::debug!(
+                    "nested reader open: ZIP {} mounted via durable index",
+                    label.display()
+                );
+                return Ok(Arc::new(s) as Arc<dyn MountSource>);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: nested durable ZIP import failed for {} ({e}); cold rebuild",
+                    label.display()
+                );
+                // Reader was consumed; cannot cold-rebuild without a new stream.
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+
+    let src = ZipMountSource::open_from_reader(reader, label, None, opts, VERSION)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if ctx.write_nested_index {
+        match src.export_nested_durable(fingerprint.clone()) {
+            Ok(bytes) => {
+                try_store_nested_durable(ctx, &key, &fingerprint, NESTED_FORMAT_ZIP, &bytes);
+            }
+            Err(e) => log::debug!("nested durable ZIP export skipped: {e}"),
+        }
+    }
+    log::debug!(
+        "nested reader open: ZIP {} mounted successfully (cold)",
+        label.display()
+    );
+    Ok(Arc::new(src) as Arc<dyn MountSource>)
+}
+
+/// Nested TAR: load durable file table when fingerprint matches, else cold open + store.
+fn open_nested_tar_with_durable(
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
+    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+        .map_err(std::io::Error::other)?;
+    let key = NestedMemberKey {
+        member_path: nested_member_path_for_key(ctx, label),
+        offsetheader: ctx.offsetheader,
+        body_size,
+    };
+
+    if let Some(blob) = try_load_nested_durable(
+        ctx.outer_index_path.as_deref(),
+        &key,
+        &fingerprint,
+        NESTED_FORMAT_TAR,
+    ) {
+        match SqliteIndexedTar::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
+            Ok(s) => {
+                log::debug!(
+                    "nested reader open: TAR {} mounted via durable index",
+                    label.display()
+                );
+                return Ok(Arc::new(s) as Arc<dyn MountSource>);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: nested durable TAR import failed for {} ({e}); cold rebuild",
+                    label.display()
+                );
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+
+    let src = SqliteIndexedTar::open_from_reader(reader, label, None, opts, VERSION)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if ctx.write_nested_index {
+        match src.export_nested_durable(fingerprint.clone()) {
+            Ok(bytes) => {
+                try_store_nested_durable(ctx, &key, &fingerprint, NESTED_FORMAT_TAR, &bytes);
+            }
+            Err(e) => log::debug!("nested durable TAR export skipped: {e}"),
+        }
+    }
+    log::debug!(
+        "nested reader open: TAR {} mounted successfully (cold)",
+        label.display()
+    );
+    Ok(Arc::new(src) as Arc<dyn MountSource>)
+}
+
+/// Nested 7z: durable file table load/store; always re-parses 7z structure for open.
+fn open_nested_7z_with_durable(
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
+    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+        .map_err(std::io::Error::other)?;
+    let key = NestedMemberKey {
+        member_path: nested_member_path_for_key(ctx, label),
+        offsetheader: ctx.offsetheader,
+        body_size,
+    };
+
+    if let Some(blob) = try_load_nested_durable(
+        ctx.outer_index_path.as_deref(),
+        &key,
+        &fingerprint,
+        NESTED_FORMAT_SEVENZIP,
+    ) {
+        match SevenZipMountSource::open_from_reader_with_durable(reader, label, &blob, opts) {
+            Ok(s) => {
+                log::debug!(
+                    "nested reader open: 7z {} mounted via durable index",
+                    label.display()
+                );
+                return Ok(Arc::new(s) as Arc<dyn MountSource>);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: nested durable 7z import failed for {} ({e}); cold rebuild",
+                    label.display()
+                );
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+
+    let src = SevenZipMountSource::open_from_reader(reader, label, None, opts, VERSION, true)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if ctx.write_nested_index {
+        match src.export_nested_durable(fingerprint.clone()) {
+            Ok(bytes) => {
+                try_store_nested_durable(ctx, &key, &fingerprint, NESTED_FORMAT_SEVENZIP, &bytes);
+            }
+            Err(e) => log::debug!("nested durable 7z export skipped: {e}"),
+        }
+    }
+    log::debug!(
+        "nested reader open: 7z {} mounted successfully (cold)",
+        label.display()
+    );
+    Ok(Arc::new(src) as Arc<dyn MountSource>)
+}
+
+/// Nested CPIO: durable file table load/store.
+fn open_nested_cpio_with_durable(
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
+    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+        .map_err(std::io::Error::other)?;
+    let key = NestedMemberKey {
+        member_path: nested_member_path_for_key(ctx, label),
+        offsetheader: ctx.offsetheader,
+        body_size,
+    };
+
+    if let Some(blob) = try_load_nested_durable(
+        ctx.outer_index_path.as_deref(),
+        &key,
+        &fingerprint,
+        NESTED_FORMAT_CPIO,
+    ) {
+        match CpioMountSource::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
+            Ok(s) => {
+                log::debug!(
+                    "nested reader open: CPIO {} mounted via durable index",
+                    label.display()
+                );
+                return Ok(Arc::new(s) as Arc<dyn MountSource>);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: nested durable CPIO import failed for {} ({e}); cold rebuild",
+                    label.display()
+                );
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+
+    let src = CpioMountSource::open_from_reader(reader, label, None, opts, VERSION)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if ctx.write_nested_index {
+        match src.export_nested_durable(fingerprint.clone()) {
+            Ok(bytes) => {
+                try_store_nested_durable(ctx, &key, &fingerprint, NESTED_FORMAT_CPIO, &bytes);
+            }
+            Err(e) => log::debug!("nested durable CPIO export skipped: {e}"),
+        }
+    }
+    log::debug!(
+        "nested reader open: CPIO {} mounted successfully (cold)",
+        label.display()
+    );
+    Ok(Arc::new(src) as Arc<dyn MountSource>)
+}
+
+/// Nested AR: durable file table load/store.
+fn open_nested_ar_with_durable(
+    mut reader: Box<dyn ratarmount_core::ArchiveRead>,
+    label: &Path,
+    opts: &OpenOptions,
+    ctx: &NestedOpenContext,
+) -> std::io::Result<Arc<dyn MountSource>> {
+    let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
+    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+        .map_err(std::io::Error::other)?;
+    let key = NestedMemberKey {
+        member_path: nested_member_path_for_key(ctx, label),
+        offsetheader: ctx.offsetheader,
+        body_size,
+    };
+
+    if let Some(blob) = try_load_nested_durable(
+        ctx.outer_index_path.as_deref(),
+        &key,
+        &fingerprint,
+        NESTED_FORMAT_AR,
+    ) {
+        match ArMountSource::open_from_reader_with_durable(reader, label, &blob, opts.clone()) {
+            Ok(s) => {
+                log::debug!(
+                    "nested reader open: AR {} mounted via durable index",
+                    label.display()
+                );
+                return Ok(Arc::new(s) as Arc<dyn MountSource>);
+            }
+            Err(e) => {
+                eprintln!(
+                    "info: nested durable AR import failed for {} ({e}); cold rebuild",
+                    label.display()
+                );
+                return Err(std::io::Error::other(e.to_string()));
+            }
+        }
+    }
+
+    let src = ArMountSource::open_from_reader(reader, label, None, opts, VERSION)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if ctx.write_nested_index {
+        match src.export_nested_durable(fingerprint.clone()) {
+            Ok(bytes) => {
+                try_store_nested_durable(ctx, &key, &fingerprint, NESTED_FORMAT_AR, &bytes);
+            }
+            Err(e) => log::debug!("nested durable AR export skipped: {e}"),
+        }
+    }
+    log::debug!(
+        "nested reader open: AR {} mounted successfully (cold)",
+        label.display()
+    );
+    Ok(Arc::new(src) as Arc<dyn MountSource>)
 }
 
 fn map_nested_open<S, E>(
@@ -2763,6 +3126,9 @@ pub struct CompositingOptions {
 }
 
 /// Apply transform / recursive AutoMount / disable-union prefix layers.
+///
+/// `archive_path` is the outer archive path used to resolve the default on-disk
+/// index location for durable nested indexes (`nestedindexes` side table).
 fn apply_compositing(
     mut src: Arc<dyn MountSource>,
     opts: &OpenOptions,
@@ -2770,6 +3136,7 @@ fn apply_compositing(
     ext_set: &RecursiveExtSet,
     n_sources: usize,
     folder_hint: &str,
+    archive_path: &Path,
 ) -> Result<Arc<dyn MountSource>, String> {
     if let Some((ref pat, ref rep)) = comp.transform {
         src = Arc::new(TransformMountSource::new(pat, rep, src)?);
@@ -2781,6 +3148,23 @@ fn apply_compositing(
             d if d < 0 => 0,
             d => d as u32,
         };
+        // Outer on-disk index home for nested durable side table (`nestedindexes`).
+        // Resolve the same default sibling / folders path that `open_path` used so
+        // warm nested load works even when `opts.index_file_path` was unset (default).
+        let outer_index_path = if opts.index_in_memory {
+            None
+        } else if let Some(ref p) = opts.index_file_path {
+            Some(p.clone())
+        } else if !archive_path.as_os_str().is_empty() {
+            let loc = resolved_index(archive_path, opts, false);
+            loc.as_path().map(|p| p.to_path_buf())
+        } else {
+            None
+        };
+        let write_nested_index = opts.write_index
+            && !opts.read_only_index
+            && !opts.index_in_memory
+            && outer_index_path.is_some();
         let layer = AutoMountLayer::new_with_openers(
             src,
             depth,
@@ -2793,6 +3177,8 @@ fn apply_compositing(
                 recursive_extensions: ext_set.clone(),
                 // FR-6 / #80: CLI `--parallel-nested` (0 = auto available_parallelism).
                 parallel_nested_threads: comp.parallel_nested_threads,
+                outer_index_path,
+                write_nested_index,
             },
         );
         src = Arc::new(layer);
@@ -3337,7 +3723,15 @@ pub fn build_mount_source_ex(
             match ratarmount_remote::DropboxMountSource::open(input.as_ref()) {
                 Ok(ms) => {
                     let mut src: Arc<dyn MountSource> = Arc::new(ms);
-                    src = apply_compositing(src, &opts, &comp, &ext_set, paths.len(), "dropbox")?;
+                    src = apply_compositing(
+                        src,
+                        &opts,
+                        &comp,
+                        &ext_set,
+                        paths.len(),
+                        "dropbox",
+                        Path::new(""),
+                    )?;
                     sources.push(src);
                     continue;
                 }
@@ -3363,7 +3757,15 @@ pub fn build_mount_source_ex(
             .file_name()
             .and_then(|s| s.to_str())
             .unwrap_or("source");
-        src = apply_compositing(src, &opts, &comp, &ext_set, paths.len(), folder_hint)?;
+        src = apply_compositing(
+            src,
+            &opts,
+            &comp,
+            &ext_set,
+            paths.len(),
+            folder_hint,
+            &local_path,
+        )?;
         sources.push(src);
     }
     let mut source = if sources.len() == 1 {
@@ -4456,7 +4858,7 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(std::io::Cursor::new(bytes));
-        let inner = opener(boxed, Path::new(label)).unwrap_or_else(|e| {
+        let inner = opener(boxed, Path::new(label), NestedOpenContext::default()).unwrap_or_else(|e| {
             panic!("nested {label} open_nested_reader_fn from Cursor must succeed without temp spool: {e}")
         });
         assert_eq!(
@@ -4551,9 +4953,12 @@ mod tests {
             .expect("open nested member stream (no tmp)");
 
         let opener = open_nested_reader_fn(opts.clone());
-        let inner = opener(nested_reader, Path::new(nested_name)).expect(
-            "nested open_nested_reader_fn must open .tar.gz from 7z member without temp spool",
-        );
+        let inner = opener(
+            nested_reader,
+            Path::new(nested_name),
+            NestedOpenContext::default(),
+        )
+        .expect("nested open_nested_reader_fn must open .tar.gz from 7z member without temp spool");
 
         let alpha = read_all(inner.as_ref(), "/alpha.txt");
         assert_eq!(alpha, b"alpha-payload-line\n");
@@ -4588,8 +4993,12 @@ mod tests {
             .expect("open zip member stream");
 
         let opener = open_nested_reader_fn(opts);
-        let inner = opener(nested_reader, Path::new(nested_name))
-            .expect("nested ZIP open_from_reader without temp spool");
+        let inner = opener(
+            nested_reader,
+            Path::new(nested_name),
+            NestedOpenContext::default(),
+        )
+        .expect("nested ZIP open_from_reader without temp spool");
 
         let one = read_all(inner.as_ref(), "/one.txt");
         assert_eq!(one, b"zip-one-contents\n");
@@ -4613,7 +5022,12 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("inner.tar.gz")).expect("gzip→tar nested");
+        let inner = opener(
+            boxed,
+            Path::new("inner.tar.gz"),
+            NestedOpenContext::default(),
+        )
+        .expect("gzip→tar nested");
         assert_eq!(
             read_all(inner.as_ref(), "/alpha.txt"),
             b"alpha-payload-line\n"
@@ -5064,8 +5478,12 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(std::io::Cursor::new(bytes));
-        let inner = opener(boxed, Path::new("nested.bin.gz"))
-            .expect("nested plain gzip with prefer_rapidgzip must open via from_reader");
+        let inner = opener(
+            boxed,
+            Path::new("nested.bin.gz"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested plain gzip with prefer_rapidgzip must open via from_reader");
         assert_eq!(read_all(inner.as_ref(), "/nested.bin"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/nested.bin", 8);
         assert_eq!(mid.as_slice(), &payload[8..]);
@@ -5185,7 +5603,12 @@ mod tests {
             pos: 0,
             read_calls: AtomicUsize::new(0),
         });
-        let inner = opener(boxed, Path::new("nested.bin.gz")).expect(
+        let inner = opener(
+            boxed,
+            Path::new("nested.bin.gz"),
+            NestedOpenContext::default(),
+        )
+        .expect(
             "nested prefer rapidgzip fail must rewind and open via G3 when stream is recoverable",
         );
         assert_eq!(read_all(inner.as_ref(), "/nested.bin"), payload);
@@ -5293,8 +5716,12 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("data.bin.gz"))
-            .expect("nested plain gzip must open as single-file without temp spool");
+        let inner = opener(
+            boxed,
+            Path::new("data.bin.gz"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested plain gzip must open as single-file without temp spool");
         assert_eq!(read_all(inner.as_ref(), "/data.bin"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/data.bin", 7);
         assert_eq!(mid.as_slice(), &payload[7..]);
@@ -5335,6 +5762,7 @@ mod tests {
         let inner = opener(
             Box::new(std::io::Cursor::new(bytes)),
             Path::new("blob.bin.gz"),
+            NestedOpenContext::default(),
         )
         .expect("nested large gzip open");
         let fi = inner.lookup("/blob.bin", 0).expect("lookup");
@@ -5407,8 +5835,12 @@ mod tests {
             .expect("open tar member from zip (store region or inflated buffer)");
 
         let opener = open_nested_reader_fn(opts);
-        let inner = opener(nested_reader, Path::new("inner.tar"))
-            .expect("nested TAR inside ZIP must open without temp spool");
+        let inner = opener(
+            nested_reader,
+            Path::new("inner.tar"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested TAR inside ZIP must open without temp spool");
 
         assert_eq!(
             read_all(inner.as_ref(), "/hi.txt"),
@@ -5546,7 +5978,7 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("inner.cpio"))
+        let inner = opener(boxed, Path::new("inner.cpio"), NestedOpenContext::default())
             .expect("nested CPIO open_from_reader without temp spool");
 
         assert_eq!(read_all(inner.as_ref(), "/hello.txt"), payload);
@@ -5565,7 +5997,7 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("inner.a"))
+        let inner = opener(boxed, Path::new("inner.a"), NestedOpenContext::default())
             .expect("nested AR open_from_reader without temp spool");
 
         assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
@@ -5584,7 +6016,7 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("inner.warc"))
+        let inner = opener(boxed, Path::new("inner.warc"), NestedOpenContext::default())
             .expect("nested WARC open_from_reader without temp spool");
 
         assert_eq!(read_all(inner.as_ref(), "/example.com/hello.txt"), payload);
@@ -5604,7 +6036,7 @@ mod tests {
         };
         let opener = open_nested_reader_fn(opts);
         let boxed: Box<dyn ratarmount_core::ArchiveRead> = Box::new(reader);
-        let inner = opener(boxed, Path::new("inner.asar"))
+        let inner = opener(boxed, Path::new("inner.asar"), NestedOpenContext::default())
             .expect("nested ASAR open_from_reader without temp spool");
 
         assert_eq!(read_all(inner.as_ref(), "/hello.txt"), b"world\n");
@@ -5664,6 +6096,7 @@ mod tests {
         let inner = opener(
             Box::new(std::io::Cursor::new(bytes)),
             Path::new("inner.cab"),
+            NestedOpenContext::default(),
         )
         .expect("nested CAB open without temp spool");
         assert_eq!(read_all(inner.as_ref(), "/member.txt"), payload);
@@ -5734,6 +6167,7 @@ mod tests {
         let inner = opener(
             Box::new(std::io::Cursor::new(bytes)),
             Path::new("inner.ext4"),
+            NestedOpenContext::default(),
         )
         .expect("nested EXT4 open without temp spool");
         // Fixture / mke2fs seed both place payload at /foo/fighter/ufo.
@@ -5786,6 +6220,7 @@ mod tests {
         let inner = opener(
             Box::new(std::io::Cursor::new(bytes)),
             Path::new("inner.squashfs"),
+            NestedOpenContext::default(),
         )
         .expect("nested SquashFS open without temp spool");
         assert_eq!(read_all(inner.as_ref(), "/ufo"), payload);
@@ -5822,11 +6257,782 @@ mod tests {
             .expect("open cpio member stream");
 
         let opener = open_nested_reader_fn(opts);
-        let inner = opener(nested_reader, Path::new(nested_name))
-            .expect("nested CPIO inside 7z must open without temp spool");
+        let inner = opener(
+            nested_reader,
+            Path::new(nested_name),
+            NestedOpenContext::default(),
+        )
+        .expect("nested CPIO inside 7z must open without temp spool");
 
         assert_eq!(read_all(inner.as_ref(), "/nested.txt"), payload);
         let mid = read_seek_mid(inner.as_ref(), "/nested.txt", 5);
         assert_eq!(mid.as_slice(), &payload[5..]);
+    }
+
+    /// Build a multi-file store ZIP as bytes for durable nested tests.
+    fn make_nested_zip_bytes(dir: &Path) -> Vec<u8> {
+        let data = dir.join("zip-data-durable");
+        std::fs::create_dir_all(&data).expect("mkdir");
+        std::fs::write(data.join("hello.txt"), b"durable-nested-hello\n").expect("write");
+        std::fs::write(data.join("seek.bin"), b"ABCDEFGHIJKLMNOP").expect("write");
+        let zip_path = dir.join("inner-durable.zip");
+        let status = std::process::Command::new("zip")
+            .args(["-q", "-0", "-j"])
+            .arg(&zip_path)
+            .arg(data.join("hello.txt"))
+            .arg(data.join("seek.bin"))
+            .status()
+            .expect("spawn zip");
+        assert!(status.success(), "zip CLI failed");
+        std::fs::read(&zip_path).expect("read zip")
+    }
+
+    /// Regression: nested ZIP durable warm remount via shipped `open_nested_reader_fn`.
+    /// First open persists into outer `nestedindexes`; second open imports compact-only.
+    #[test]
+    fn nested_durable_zip_warm_remount_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = make_nested_zip_bytes(dir.path());
+        let body_size = zip_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-for-nested.index.sqlite");
+        // Shell outer index (no outer files table required for nestedindexes).
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).expect("create outer index");
+            idx.ensure_nested_indexes_table()
+                .expect("nestedindexes DDL");
+            drop(idx);
+        }
+
+        let opener = open_nested_reader_fn(OpenOptions {
+            index_compact_only: true,
+            ..Default::default()
+        });
+        let ctx_write = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(512),
+            member_path: "inner-durable.zip".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let cold = opener(
+            Box::new(std::io::Cursor::new(zip_bytes.clone())),
+            Path::new("inner-durable.zip"),
+            ctx_write.clone(),
+        )
+        .expect("cold nested ZIP open");
+        assert_eq!(
+            read_all(cold.as_ref(), "/hello.txt"),
+            b"durable-nested-hello\n"
+        );
+        drop(cold);
+
+        // Structural: outer index holds nestedindexes row.
+        let key = NestedMemberKey {
+            member_path: "inner-durable.zip".into(),
+            offsetheader: Some(512),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).expect("reopen outer");
+            assert!(
+                idx.has_nested_index_key(&key).expect("has key"),
+                "first open must persist nested durable index"
+            );
+            let mut c = std::io::Cursor::new(zip_bytes.clone());
+            let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body_size).unwrap();
+            let blob = idx
+                .get_nested_index(&key, &fp, NESTED_FORMAT_ZIP)
+                .expect("get")
+                .expect("fingerprint must match stored nested index");
+            assert_eq!(blob.format, NESTED_FORMAT_ZIP);
+            assert!(!blob.rows.is_empty());
+            // Import path produces compact-only live store.
+            let warm_idx =
+                SqliteIndex::create_compact_from_nested_blob(&blob).expect("import blob");
+            assert!(warm_idx.is_compact_only());
+            assert!(warm_idx.lookup("/hello.txt", 0).ok().flatten().is_some());
+        }
+
+        // Second open via shipped opener must load durable (import hit) and list correctly.
+        let ctx_read = NestedOpenContext {
+            write_nested_index: false,
+            ..ctx_write
+        };
+        let warm = opener(
+            Box::new(std::io::Cursor::new(zip_bytes.clone())),
+            Path::new("inner-durable.zip"),
+            ctx_read,
+        )
+        .expect("warm nested ZIP open");
+        assert_eq!(
+            read_all(warm.as_ref(), "/hello.txt"),
+            b"durable-nested-hello\n"
+        );
+        let mid = read_seek_mid(warm.as_ref(), "/seek.bin", 4);
+        assert_eq!(mid.as_slice(), b"EFGHIJKLMNOP");
+    }
+
+    /// Regression: nested TAR durable warm remount via shipped opener.
+    #[test]
+    fn nested_durable_tar_warm_remount_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("tar-data");
+        std::fs::create_dir_all(&data).unwrap();
+        std::fs::write(data.join("payload.txt"), b"tar-durable-payload\n").unwrap();
+        let tar_path = dir.path().join("inner-durable.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar_path)
+            .arg("-C")
+            .arg(&data)
+            .arg("payload.txt")
+            .status()
+            .unwrap()
+            .success());
+        let tar_bytes = std::fs::read(&tar_path).unwrap();
+        let body_size = tar_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-tar-nested.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner-durable.tar".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let cold = opener(
+            Box::new(std::io::Cursor::new(tar_bytes.clone())),
+            Path::new("inner-durable.tar"),
+            ctx.clone(),
+        )
+        .expect("cold nested TAR");
+        assert_eq!(
+            read_all(cold.as_ref(), "/payload.txt"),
+            b"tar-durable-payload\n"
+        );
+        drop(cold);
+
+        let key = NestedMemberKey {
+            member_path: "inner-durable.tar".into(),
+            offsetheader: Some(0),
+            body_size,
+        };
+        let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+        assert!(idx.has_nested_index_key(&key).unwrap());
+
+        let warm = opener(
+            Box::new(std::io::Cursor::new(tar_bytes)),
+            Path::new("inner-durable.tar"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested TAR");
+        assert_eq!(
+            read_all(warm.as_ref(), "/payload.txt"),
+            b"tar-durable-payload\n"
+        );
+    }
+
+    /// Regression: fingerprint mismatch must not reuse stale nested index.
+    #[test]
+    fn nested_durable_zip_invalidates_on_body_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_a = make_nested_zip_bytes(dir.path());
+        let body_size = zip_a.len() as u64;
+        // Same size, different content: rewrite a payload and re-zip with fixed-size padding.
+        let data = dir.path().join("zip-b-data");
+        std::fs::create_dir_all(&data).unwrap();
+        // Keep total archive size equal by matching store layout carefully is hard;
+        // instead mutate one byte of zip_a in place after copy (same size).
+        let mut zip_b = zip_a.clone();
+        // Flip a non-header-ish byte in the middle of the body when possible.
+        let mid = zip_b.len() / 2;
+        zip_b[mid] ^= 0xff;
+        assert_eq!(zip_a.len(), zip_b.len());
+
+        let outer_idx = dir.path().join("outer-inv.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(100),
+            member_path: "inner.zip".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let _ = opener(
+            Box::new(std::io::Cursor::new(zip_a.clone())),
+            Path::new("inner.zip"),
+            ctx.clone(),
+        )
+        .expect("store A");
+
+        let key = NestedMemberKey {
+            member_path: "inner.zip".into(),
+            offsetheader: Some(100),
+            body_size,
+        };
+        let mut ca = std::io::Cursor::new(zip_a);
+        let fp_a = NestedBodyFingerprint::from_seekable_body(&mut ca, body_size).unwrap();
+        let mut cb = std::io::Cursor::new(zip_b.clone());
+        let fp_b = NestedBodyFingerprint::from_seekable_body(&mut cb, body_size).unwrap();
+        assert!(
+            !fp_a.matches(&fp_b),
+            "mutated body must change nested fingerprint"
+        );
+
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(idx.has_nested_index_key(&key).unwrap());
+            assert!(
+                idx.get_nested_index(&key, &fp_b, NESTED_FORMAT_ZIP)
+                    .unwrap()
+                    .is_none(),
+                "stale nested index must not match new fingerprint"
+            );
+        }
+
+        // Opening mutated body: may fail as ZIP if we corrupted structure, or succeed cold.
+        // Either way, must not silently serve A's file table as success with wrong fp.
+        let open_b = opener(
+            Box::new(std::io::Cursor::new(zip_b)),
+            Path::new("inner.zip"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        );
+        match open_b {
+            Ok(ms) => {
+                // Cold rebuild of a still-valid ZIP would be OK; ensure we can list.
+                // If mutation broke CD, open would have failed.
+                let _ = ms.list("/");
+            }
+            Err(_) => {
+                // Corrupt ZIP after flip — acceptable; critical is no wrong durable hit.
+            }
+        }
+    }
+
+    /// Regression: no durable nested write when outer index is :memory: / write disabled.
+    #[test]
+    fn nested_durable_zip_policy_no_write_memory_or_disabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = make_nested_zip_bytes(dir.path());
+        let body_size = zip_bytes.len() as u64;
+        let outer_idx = dir.path().join("policy.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+
+        // write_nested_index=false → no store
+        let _ = opener(
+            Box::new(std::io::Cursor::new(zip_bytes.clone())),
+            Path::new("inner.zip"),
+            NestedOpenContext {
+                member_size: body_size,
+                offsetheader: Some(1),
+                member_path: "inner.zip".into(),
+                outer_index_path: Some(outer_idx.clone()),
+                write_nested_index: false,
+            },
+        )
+        .expect("open without write");
+        let key = NestedMemberKey {
+            member_path: "inner.zip".into(),
+            offsetheader: Some(1),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(
+                !idx.has_nested_index_key(&key).unwrap(),
+                "write_nested_index=false must not persist nestedindexes"
+            );
+        }
+
+        // No outer path → no store
+        let _ = opener(
+            Box::new(std::io::Cursor::new(zip_bytes)),
+            Path::new("inner.zip"),
+            NestedOpenContext {
+                member_size: body_size,
+                offsetheader: Some(2),
+                member_path: "inner.zip".into(),
+                outer_index_path: None,
+                write_nested_index: true,
+            },
+        )
+        .expect("open without outer path");
+        // Outer file unchanged for key with oh=2
+        let key2 = NestedMemberKey {
+            member_path: "inner.zip".into(),
+            offsetheader: Some(2),
+            body_size,
+        };
+        let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+        assert!(!idx.has_nested_index_key(&key2).unwrap());
+    }
+
+    /// End-to-end: outer TAR + nested ZIP via AutoMount + recursive build, durable side table.
+    #[test]
+    fn nested_durable_zip_via_automount_outer_index() {
+        use std::process::Command;
+        let dir = tempfile::tempdir().unwrap();
+        let zip_bytes = make_nested_zip_bytes(dir.path());
+        let zip_path = dir.path().join("inner-durable.zip");
+        std::fs::write(&zip_path, &zip_bytes).unwrap();
+        let outer_tar = dir.path().join("outer.tar");
+        assert!(Command::new("tar")
+            .args(["-cf"])
+            .arg(&outer_tar)
+            .arg("-C")
+            .arg(dir.path())
+            .arg("inner-durable.zip")
+            .status()
+            .unwrap()
+            .success());
+        let index_path = dir.path().join("outer.tar.index.sqlite");
+
+        let opts = OpenOptions {
+            index_file_path: Some(index_path.clone()),
+            write_index: true,
+            recursion_depth: Some(2),
+            ..Default::default()
+        };
+        let comp = CompositingOptions {
+            recursive: true,
+            lazy: false,
+            file_versions: false,
+            prefix: None,
+            strip_recursive_extension: false,
+            transform_recursive: None,
+            transform: None,
+            disable_union_mount: false,
+            recursive_extensions: None,
+            union_cache: Default::default(),
+            parallel_nested_threads: 1,
+        };
+        let bundle =
+            build_mount_source_ex(std::slice::from_ref(&outer_tar), &opts, true, comp.clone())
+                .expect("first mount with recursive nested");
+        // Touch nested content (eager scan should have opened inner.zip).
+        let fi = bundle
+            .source
+            .lookup("/inner-durable.zip/hello.txt", 0)
+            .or_else(|| bundle.source.lookup("/inner-durable/hello.txt", 0));
+        assert!(
+            fi.is_some(),
+            "nested ZIP member must be visible via AutoMount"
+        );
+        let fi = fi.unwrap();
+        let mut r = bundle.source.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+        assert_eq!(buf, b"durable-nested-hello\n");
+        drop(bundle);
+
+        assert!(
+            index_path.is_file(),
+            "outer index must exist after first mount"
+        );
+        // nestedindexes row: key uses AutoMount member path + parent offsetheader + size.
+        let body_size = zip_bytes.len() as u64;
+        let idx = SqliteIndex::open_read_only(&index_path).expect("open outer index");
+        let oh = idx.list("/").ok().flatten().and_then(|m| {
+            m.iter().find_map(|(name, fi)| {
+                if name == "inner-durable.zip" {
+                    fi.userdata.iter().rev().find_map(|u| match u {
+                        ratarmount_core::UserData::Tar(t) => t.offsetheader.map(|v| v as i64),
+                        _ => None,
+                    })
+                } else {
+                    None
+                }
+            })
+        });
+        let key = NestedMemberKey {
+            member_path: "inner-durable.zip".into(),
+            offsetheader: oh,
+            body_size,
+        };
+        assert!(
+            idx.has_nested_index_key(&key).unwrap_or(false)
+                || idx
+                    .has_nested_index_key(&NestedMemberKey {
+                        member_path: "inner-durable.zip".into(),
+                        offsetheader: None,
+                        body_size,
+                    })
+                    .unwrap_or(false),
+            "AutoMount nested ZIP open must store nestedindexes for inner-durable.zip \
+             (body_size={body_size}, oh={oh:?})"
+        );
+        drop(idx);
+
+        // Second mount: warm nested load; still serves content.
+        let bundle2 =
+            build_mount_source_ex(&[outer_tar], &opts, false, comp).expect("second warm mount");
+        let fi2 = bundle2
+            .source
+            .lookup("/inner-durable.zip/hello.txt", 0)
+            .or_else(|| bundle2.source.lookup("/inner-durable/hello.txt", 0))
+            .expect("warm nested lookup");
+        let mut r2 = bundle2.source.open(&fi2, 0).unwrap();
+        let mut buf2 = Vec::new();
+        std::io::Read::read_to_end(&mut r2, &mut buf2).unwrap();
+        assert_eq!(buf2, b"durable-nested-hello\n");
+    }
+
+    /// Regression: nested 7z durable warm remount via shipped `open_nested_reader_fn`.
+    #[test]
+    fn nested_durable_7z_warm_remount_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"sevenzip-durable-payload\n";
+        let data = dir.path().join("hello.txt");
+        std::fs::write(&data, payload).unwrap();
+        let Some(sz_path) = (|| {
+            let out = dir.path().join("inner-durable.7z");
+            for bin in ["7z", "7za"] {
+                let status = std::process::Command::new(bin)
+                    .args(["a", "-t7z", "-mx0", "-y"])
+                    .arg(&out)
+                    .arg(&data)
+                    .status();
+                if matches!(status, Ok(s) if s.success()) && out.exists() {
+                    return Some(out);
+                }
+            }
+            None
+        })() else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+        let sz_bytes = std::fs::read(&sz_path).unwrap();
+        let body_size = sz_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-7z-nested.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner-durable.7z".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let cold = opener(
+            Box::new(std::io::Cursor::new(sz_bytes.clone())),
+            Path::new("inner-durable.7z"),
+            ctx.clone(),
+        )
+        .expect("cold nested 7z");
+        assert_eq!(read_all(cold.as_ref(), "/hello.txt"), payload);
+        drop(cold);
+
+        let key = NestedMemberKey {
+            member_path: "inner-durable.7z".into(),
+            offsetheader: Some(0),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(
+                idx.has_nested_index_key(&key).unwrap(),
+                "first open must persist nested 7z durable index"
+            );
+            let mut c = std::io::Cursor::new(sz_bytes.clone());
+            let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body_size).unwrap();
+            let blob = idx
+                .get_nested_index(&key, &fp, NESTED_FORMAT_SEVENZIP)
+                .unwrap()
+                .expect("fingerprint must match stored 7z nested index");
+            assert_eq!(blob.format, NESTED_FORMAT_SEVENZIP);
+            assert!(
+                blob.has_sevenzip_structure(),
+                "stored nested 7z blob must include structure sidecars"
+            );
+            let warm_idx = SqliteIndex::create_compact_from_nested_blob(&blob).unwrap();
+            assert!(warm_idx.is_compact_only());
+            // Direct durable import (shipped open path used by factory warm hit).
+            let direct = SevenZipMountSource::open_from_reader_with_durable(
+                std::io::Cursor::new(sz_bytes.clone()),
+                "inner-durable.7z",
+                &blob,
+                &OpenOptions {
+                    index_compact_only: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("structure warm open");
+            assert!(
+                direct.opened_from_durable_structure(),
+                "import must rebuild structure without header re-parse"
+            );
+            assert_eq!(read_all(&direct, "/hello.txt"), payload);
+        }
+
+        let warm = opener(
+            Box::new(std::io::Cursor::new(sz_bytes)),
+            Path::new("inner-durable.7z"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested 7z");
+        assert_eq!(read_all(warm.as_ref(), "/hello.txt"), payload);
+    }
+
+    /// Regression: nested CPIO durable warm remount via shipped opener.
+    #[test]
+    fn nested_durable_cpio_warm_remount_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"cpio-durable-SEEK-payload";
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let cpio_bytes = build_newc_cpio("nested.txt", payload, mode);
+        let body_size = cpio_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-cpio-nested.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner.cpio".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let cold = opener(
+            Box::new(std::io::Cursor::new(cpio_bytes.clone())),
+            Path::new("inner.cpio"),
+            ctx.clone(),
+        )
+        .expect("cold nested CPIO");
+        assert_eq!(read_all(cold.as_ref(), "/nested.txt"), payload);
+        drop(cold);
+
+        let key = NestedMemberKey {
+            member_path: "inner.cpio".into(),
+            offsetheader: Some(0),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(idx.has_nested_index_key(&key).unwrap());
+            let mut c = std::io::Cursor::new(cpio_bytes.clone());
+            let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body_size).unwrap();
+            let blob = idx
+                .get_nested_index(&key, &fp, NESTED_FORMAT_CPIO)
+                .unwrap()
+                .expect("stored CPIO nested index");
+            assert!(SqliteIndex::create_compact_from_nested_blob(&blob)
+                .unwrap()
+                .is_compact_only());
+        }
+
+        let warm = opener(
+            Box::new(std::io::Cursor::new(cpio_bytes)),
+            Path::new("inner.cpio"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested CPIO");
+        assert_eq!(read_all(warm.as_ref(), "/nested.txt"), payload);
+        let mid = read_seek_mid(warm.as_ref(), "/nested.txt", 5);
+        assert_eq!(mid.as_slice(), &payload[5..]);
+    }
+
+    /// Regression: nested AR durable warm remount via shipped opener.
+    #[test]
+    fn nested_durable_ar_warm_remount_via_opener() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"ar-durable-SEEK-payload-xyz";
+        let ar_bytes = synthetic_ar("member.txt", payload);
+        let body_size = ar_bytes.len() as u64;
+        let outer_idx = dir.path().join("outer-ar-nested.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(0),
+            member_path: "inner.a".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let cold = opener(
+            Box::new(std::io::Cursor::new(ar_bytes.clone())),
+            Path::new("inner.a"),
+            ctx.clone(),
+        )
+        .expect("cold nested AR");
+        assert_eq!(read_all(cold.as_ref(), "/member.txt"), payload);
+        drop(cold);
+
+        let key = NestedMemberKey {
+            member_path: "inner.a".into(),
+            offsetheader: Some(0),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(idx.has_nested_index_key(&key).unwrap());
+            let mut c = std::io::Cursor::new(ar_bytes.clone());
+            let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body_size).unwrap();
+            let blob = idx
+                .get_nested_index(&key, &fp, NESTED_FORMAT_AR)
+                .unwrap()
+                .expect("stored AR nested index");
+            assert_eq!(blob.format, NESTED_FORMAT_AR);
+        }
+
+        let warm = opener(
+            Box::new(std::io::Cursor::new(ar_bytes)),
+            Path::new("inner.a"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        )
+        .expect("warm nested AR");
+        assert_eq!(read_all(warm.as_ref(), "/member.txt"), payload);
+        let mid = read_seek_mid(warm.as_ref(), "/member.txt", 3);
+        assert_eq!(mid.as_slice(), &payload[3..]);
+    }
+
+    /// Regression: nested 7z fingerprint mismatch rejects stale blob; policy skips write.
+    #[test]
+    fn nested_durable_7z_invalidates_and_policy() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_a = dir.path().join("a.txt");
+        std::fs::write(&data_a, b"payload-A-same-size!!\n").unwrap();
+        let data_b = dir.path().join("b.txt");
+        std::fs::write(&data_b, b"payload-B-same-size!!\n").unwrap();
+        let mk7z = |name: &str, member: &Path| -> Option<PathBuf> {
+            let out = dir.path().join(name);
+            for bin in ["7z", "7za"] {
+                let status = std::process::Command::new(bin)
+                    .args(["a", "-t7z", "-mx0", "-y"])
+                    .arg(&out)
+                    .arg(member)
+                    .status();
+                if matches!(status, Ok(s) if s.success()) && out.exists() {
+                    return Some(out);
+                }
+            }
+            None
+        };
+        let Some(path_a) = mk7z("a.7z", &data_a) else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+        let Some(path_b) = mk7z("b.7z", &data_b) else {
+            eprintln!("skip: 7z/7za not available");
+            return;
+        };
+        let bytes_a = std::fs::read(&path_a).unwrap();
+        let mut bytes_b = std::fs::read(&path_b).unwrap();
+        // Prefer same-size bodies for fingerprint-only invalidation when possible.
+        if bytes_a.len() != bytes_b.len() {
+            // Fall back: mutate mid byte of A for size-stable mismatch.
+            bytes_b = bytes_a.clone();
+            let mid = bytes_b.len() / 2;
+            bytes_b[mid] ^= 0xff;
+        }
+        let body_size = bytes_a.len() as u64;
+        assert_eq!(bytes_a.len(), bytes_b.len());
+
+        let outer_idx = dir.path().join("outer-7z-pol.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            idx.ensure_nested_indexes_table().unwrap();
+        }
+        let opener = open_nested_reader_fn(OpenOptions::default());
+
+        // Policy: write_nested_index=false → no store
+        let _ = opener(
+            Box::new(std::io::Cursor::new(bytes_a.clone())),
+            Path::new("inner.7z"),
+            NestedOpenContext {
+                member_size: body_size,
+                offsetheader: Some(1),
+                member_path: "inner.7z".into(),
+                outer_index_path: Some(outer_idx.clone()),
+                write_nested_index: false,
+            },
+        )
+        .expect("7z open without write");
+        let key_pol = NestedMemberKey {
+            member_path: "inner.7z".into(),
+            offsetheader: Some(1),
+            body_size,
+        };
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(!idx.has_nested_index_key(&key_pol).unwrap());
+        }
+
+        // Store then invalidate on body change
+        let ctx = NestedOpenContext {
+            member_size: body_size,
+            offsetheader: Some(2),
+            member_path: "inner.7z".into(),
+            outer_index_path: Some(outer_idx.clone()),
+            write_nested_index: true,
+        };
+        let _ = opener(
+            Box::new(std::io::Cursor::new(bytes_a.clone())),
+            Path::new("inner.7z"),
+            ctx.clone(),
+        )
+        .expect("store 7z durable");
+        let key = NestedMemberKey {
+            member_path: "inner.7z".into(),
+            offsetheader: Some(2),
+            body_size,
+        };
+        let mut ca = std::io::Cursor::new(bytes_a);
+        let fp_a = NestedBodyFingerprint::from_seekable_body(&mut ca, body_size).unwrap();
+        let mut cb = std::io::Cursor::new(bytes_b.clone());
+        let fp_b = NestedBodyFingerprint::from_seekable_body(&mut cb, body_size).unwrap();
+        assert!(!fp_a.matches(&fp_b));
+        {
+            let idx = SqliteIndex::open_read_only(&outer_idx).unwrap();
+            assert!(idx.has_nested_index_key(&key).unwrap());
+            assert!(idx
+                .get_nested_index(&key, &fp_b, NESTED_FORMAT_SEVENZIP)
+                .unwrap()
+                .is_none());
+        }
+        // Opening B must not import A's table (cold open or error if mutation broke archive).
+        let _ = opener(
+            Box::new(std::io::Cursor::new(bytes_b)),
+            Path::new("inner.7z"),
+            NestedOpenContext {
+                write_nested_index: false,
+                ..ctx
+            },
+        );
     }
 }
