@@ -34,9 +34,9 @@
 
 | Residual | Status |
 |----------|--------|
-| Progressive multi-GB solid decode that never materializes full unpack for **BCJ / AES / non-pure-LZMA2** folders | **Documented residual** — pure LZMA2 large solids use progressive `Lzma2MemberReader`; other solid folders may still full-folder materialize |
+| Progressive multi-GB solid decode that never materializes full unpack for **BCJ / AES / non-pure-LZMA2** folders | **Documented residual** — pure LZMA2 large folders use `Lzma2MemberReader` with a live sequential cursor + independent-chunk resume; other solid folders may still full-folder materialize |
 | Full Python `test_sevenzip.py` line-for-line scenario count | Partial harness + cargo unit coverage; expand opportunistically |
-| Nested body full-content fingerprint for multi-GB solid | Head/mid/tail sample only (shared nested durable policy) |
+| Nested body full-content fingerprint for multi-GB solid | Store/stencil: head/mid/tail. Progressive compressed parent member: head+size only (mid/tail would fully decompress) |
 
 ## Goal (historical)
 

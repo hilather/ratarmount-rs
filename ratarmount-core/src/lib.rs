@@ -317,6 +317,13 @@ pub trait MountSource: Send + Sync {
 
     fn open(&self, file_info: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>>;
 
+    /// When false, the body from [`Self::open`] is a progressive/compressed
+    /// stream: mid/tail seeks fully decompress the member. Default is cheap
+    /// (store/stencil / already-materialized `Cursor`).
+    fn member_seek_is_cheap(&self, _file_info: &FileInfo) -> bool {
+        true
+    }
+
     fn read(&self, file_info: &FileInfo, size: usize, offset: u64) -> io::Result<Vec<u8>> {
         let mut file = self.open(file_info, 0)?;
         file.seek(io::SeekFrom::Start(offset))?;

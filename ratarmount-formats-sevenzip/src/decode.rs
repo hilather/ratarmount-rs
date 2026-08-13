@@ -1008,12 +1008,80 @@ fn lzma_stream_decode_chain(
     }
 }
 
+fn start_lzma2_live_cursor(
+    coder: &Coder,
+    packed_pos: usize,
+    unpacked_pos: u64,
+) -> Result<LiveLzma2Cursor> {
+    use std::os::raw::c_void;
+
+    let mut filter_coders: Vec<&Coder> = std::slice::from_ref(coder)
+        .iter()
+        .filter(|c| c.method.as_slice() != METHOD_COPY)
+        .collect();
+    if filter_coders.is_empty() {
+        return Err(SevenZipError::Msg("Empty native filter chain".into()));
+    }
+    filter_coders.reverse();
+
+    unsafe {
+        let mut filters: Vec<lzma_sys::lzma_filter> = Vec::with_capacity(filter_coders.len() + 1);
+        let mut opts_ptrs: Vec<*mut c_void> = Vec::new();
+        for c in &filter_coders {
+            let filter_id = method_to_lzma_filter_id(c.method.as_slice()).ok_or_else(|| {
+                SevenZipError::Msg(format!("Not a native lzma-chain coder: {:02x?}", c.method))
+            })?;
+            let props = c.properties.as_deref().unwrap_or(&[]);
+            let mut filter = lzma_sys::lzma_filter {
+                id: filter_id,
+                options: std::ptr::null_mut(),
+            };
+            if !props.is_empty() || filter_id == lzma_sys::LZMA_FILTER_LZMA1 {
+                let ret = lzma_sys::lzma_properties_decode(
+                    &mut filter,
+                    std::ptr::null(),
+                    props.as_ptr(),
+                    props.len(),
+                );
+                if ret != lzma_sys::LZMA_OK {
+                    free_opts(&opts_ptrs);
+                    return Err(SevenZipError::Msg(format!(
+                        "lzma_properties_decode failed: {ret}"
+                    )));
+                }
+            }
+            if !filter.options.is_null() {
+                opts_ptrs.push(filter.options);
+            }
+            filters.push(filter);
+        }
+        filters.push(lzma_sys::lzma_filter {
+            id: lzma_sys::LZMA_VLI_UNKNOWN,
+            options: std::ptr::null_mut(),
+        });
+
+        let mut stream: lzma_sys::lzma_stream = std::mem::zeroed();
+        let ret = lzma_sys::lzma_raw_decoder(&mut stream, filters.as_ptr());
+        if ret != lzma_sys::LZMA_OK {
+            free_opts(&opts_ptrs);
+            return Err(SevenZipError::Msg(format!("lzma_raw_decoder: {ret}")));
+        }
+        Ok(LiveLzma2Cursor {
+            stream,
+            opts_ptrs,
+            unpacked_pos,
+            packed_pos,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // LZMA2 chunk-indexed random access (Python Lzma2RandomAccessDecoder parity)
 // ---------------------------------------------------------------------------
 
 /// One LZMA2 chunk in a folder's packed stream.
 #[derive(Debug, Clone)]
+#[allow(dead_code)] // packed_size / control / is_lzma used by indexer + tests
 pub struct Lzma2ChunkIndex {
     pub index: usize,
     pub packed_offset: usize,
@@ -1026,19 +1094,13 @@ pub struct Lzma2ChunkIndex {
     pub independent: bool,
 }
 
-// Fields are populated by the indexer and used by progressive decode paths / tests.
-#[allow(dead_code)]
-fn _lzma2_chunk_index_allow_dead_fields(c: &Lzma2ChunkIndex) {
-    let _ = (
-        c.index,
-        c.packed_offset,
-        c.packed_size,
-        c.unpacked_offset,
-        c.unpacked_size,
-        c.control,
-        c.is_lzma,
-        c.independent,
-    );
+/// True when `open` should return a progressive [`Lzma2MemberReader`]
+/// (pure LZMA2 folder larger than the small-folder full-cache threshold).
+pub fn lzma2_folder_uses_progressive(folder: &Folder, folder_unpack: u64) -> bool {
+    folder.coders.len() == 1
+        && folder.coders[0].method.as_slice() == METHOD_LZMA2
+        && !folder.is_encrypted()
+        && folder_unpack > SMALL_FOLDER_FULL_CACHE
 }
 
 /// Walk an LZMA2 packed stream and record chunk boundaries without decompressing.
@@ -1132,6 +1194,78 @@ pub fn index_lzma2_chunks(packed: &[u8]) -> Result<Vec<Lzma2ChunkIndex>> {
     Ok(chunks)
 }
 
+/// Incremental liblzma raw decoder that can continue from `unpacked_pos`.
+///
+/// `lzma_stream` holds pointers into the current in/out buffers only for the
+/// duration of [`LiveLzma2Cursor::decode_into`]; those are rebound each call.
+struct LiveLzma2Cursor {
+    stream: lzma_sys::lzma_stream,
+    opts_ptrs: Vec<*mut std::os::raw::c_void>,
+    unpacked_pos: u64,
+    packed_pos: usize,
+}
+
+// The raw pointers are only used while this cursor is exclusively owned by
+// `Lzma2RandomAccessDecoder` (itself behind a Mutex when shared).
+unsafe impl Send for LiveLzma2Cursor {}
+
+impl Drop for LiveLzma2Cursor {
+    fn drop(&mut self) {
+        unsafe {
+            lzma_sys::lzma_end(&mut self.stream);
+        }
+        free_opts(&self.opts_ptrs);
+    }
+}
+
+impl LiveLzma2Cursor {
+    fn decode_into(&mut self, packed: &[u8], out: &mut [u8]) -> Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        if self.packed_pos > packed.len() {
+            return Err(SevenZipError::Msg(format!(
+                "LZMA2 live cursor packed_pos {} past pack {}",
+                self.packed_pos,
+                packed.len()
+            )));
+        }
+        unsafe {
+            self.stream.next_in = packed.as_ptr().add(self.packed_pos);
+            self.stream.avail_in = packed.len() - self.packed_pos;
+            self.stream.next_out = out.as_mut_ptr();
+            self.stream.avail_out = out.len();
+            let mut action = if self.stream.avail_in == 0 {
+                lzma_sys::LZMA_FINISH
+            } else {
+                lzma_sys::LZMA_RUN
+            };
+            loop {
+                let ret = lzma_sys::lzma_code(&mut self.stream, action);
+                if ret == lzma_sys::LZMA_STREAM_END {
+                    break;
+                }
+                if ret != lzma_sys::LZMA_OK {
+                    return Err(SevenZipError::Msg(format!("lzma_code (live LZMA2): {ret}")));
+                }
+                if self.stream.avail_out == 0 {
+                    break;
+                }
+                if self.stream.avail_in == 0 {
+                    action = lzma_sys::LZMA_FINISH;
+                    continue;
+                }
+                // No output and input remains unused: treat as stall.
+                break;
+            }
+            let produced = out.len() - self.stream.avail_out;
+            self.packed_pos = packed.len() - self.stream.avail_in;
+            self.unpacked_pos += produced as u64;
+            Ok(produced)
+        }
+    }
+}
+
 /// Serve random unpacked ranges from an LZMA2 folder.
 ///
 /// Port of Python `Lzma2RandomAccessDecoder` (hilather a0bc76e):
@@ -1141,16 +1275,19 @@ pub fn index_lzma2_chunks(packed: &[u8]) -> Result<Vec<Lzma2ChunkIndex>> {
 /// **Small folders** (≤ `SMALL_FOLDER_FULL_CACHE`) keep a full unpack cache
 /// after the first decode for repeated random access.
 ///
-/// **Large folders** use a bounded LRU cache of fixed-size unpacked windows
-/// (`chunk_size` × `max_cached_chunks`, defaults 1 MiB × 64). On miss, a single
-/// progressive prefix decode fills all needed windows through the range end
-/// (LZMA2 solid streams have no cheap mid-stream resume without a live
-/// decompressor cursor). Subsequent hits in the window cache are O(1).
+/// **Large folders** keep a live liblzma cursor: sequential reads continue
+/// from `bytes_produced` (O(range) work). Backward / random reads resume at
+/// the latest independent LZMA2 dict-reset chunk that covers the start
+/// (not from folder byte 0). A bounded LRU of unpacked windows still
+/// amortizes local re-reads.
+///
+/// **Non-solid / single-member** folders set [`Self::set_retain_from_zero`]:
+/// a decode that walks from unpacked 0 (typical nested 7z header-at-end)
+/// keeps that prefix so the next earlier-range read does not restart.
 pub struct Lzma2RandomAccessDecoder {
     packed: Vec<u8>,
     folder_props: Option<Vec<u8>>,
-    /// Indexed LZMA2 stream chunk map (validation / tests / future resume points).
-    #[allow(dead_code)]
+    /// Indexed LZMA2 stream chunk map (independent chunks are resume points).
     chunks: Vec<Lzma2ChunkIndex>,
     unpack_size: u64,
     full: Option<Vec<u8>>,
@@ -1163,6 +1300,18 @@ pub struct Lzma2RandomAccessDecoder {
     window_cache: HashMap<usize, Vec<u8>>,
     /// LRU order: oldest window index at the front.
     window_lru: Vec<usize>,
+    live: Option<LiveLzma2Cursor>,
+    /// Contiguous unpack prefix from 0 (non-solid retain path).
+    prefix_from_zero: Vec<u8>,
+    retain_from_zero: bool,
+    /// New decompressor started at unpacked offset 0.
+    prefix_from_zero_starts: u64,
+    /// New decompressor started (any resume point).
+    decoder_starts: u64,
+    /// Unpacked bytes emitted by the decompressor (including skip).
+    bytes_decompressed: u64,
+    /// Last resume unpacked offset used to start a decompressor.
+    last_resume_unpacked: u64,
 }
 
 /// Folders at or below this unpack size keep a full decode cache.
@@ -1202,7 +1351,42 @@ impl Lzma2RandomAccessDecoder {
             max_cached_chunks: max_cached_chunks.max(1),
             window_cache: HashMap::new(),
             window_lru: Vec::new(),
+            live: None,
+            prefix_from_zero: Vec::new(),
+            retain_from_zero: false,
+            prefix_from_zero_starts: 0,
+            decoder_starts: 0,
+            bytes_decompressed: 0,
+            last_resume_unpacked: 0,
         })
+    }
+
+    /// Keep a contiguous unpack prefix from 0 (non-solid / single-member folders).
+    ///
+    /// After a header-at-end decode that walks from unpacked 0, the next earlier
+    /// member read hits this prefix instead of restarting the decompressor.
+    pub fn set_retain_from_zero(&mut self, retain: bool) {
+        self.retain_from_zero = retain;
+    }
+
+    #[allow(dead_code)] // shipped decode-pass counters (tests + diagnostics)
+    pub fn prefix_from_zero_starts(&self) -> u64 {
+        self.prefix_from_zero_starts
+    }
+
+    #[allow(dead_code)]
+    pub fn decoder_starts(&self) -> u64 {
+        self.decoder_starts
+    }
+
+    #[allow(dead_code)]
+    pub fn bytes_decompressed(&self) -> u64 {
+        self.bytes_decompressed
+    }
+
+    #[allow(dead_code)]
+    pub fn last_resume_unpacked(&self) -> u64 {
+        self.last_resume_unpacked
     }
 
     fn folder_coder(&self) -> Coder {
@@ -1218,22 +1402,152 @@ impl Lzma2RandomAccessDecoder {
         if self.full.is_some() {
             return Ok(());
         }
+        if self.prefix_from_zero.len() as u64 >= self.unpack_size && self.unpack_size > 0 {
+            let mut full = std::mem::take(&mut self.prefix_from_zero);
+            full.truncate(self.unpack_size as usize);
+            self.full = Some(full);
+            return Ok(());
+        }
         // Folder-level filter only — critical for solid multi-chunk streams (a0bc76e).
         let out = lzma_decompress_chain(
             &[self.folder_coder()],
             &self.packed,
             self.unpack_size.max(1) as usize,
         )?;
+        self.bytes_decompressed = self.bytes_decompressed.saturating_add(out.len() as u64);
+        self.prefix_from_zero_starts = self.prefix_from_zero_starts.saturating_add(1);
+        self.decoder_starts = self.decoder_starts.saturating_add(1);
+        self.last_resume_unpacked = 0;
         self.full = Some(out);
         Ok(())
     }
 
-    /// Progressive: decompress only the prefix needed for `[0, end)`.
-    fn decode_prefix(&self, end: usize) -> Result<Vec<u8>> {
-        if end == 0 {
+    /// Latest independent LZMA2 chunk with `unpacked_offset <= start` (or 0).
+    fn resume_point(&self, start: u64) -> (usize, u64) {
+        let mut packed = 0usize;
+        let mut unpacked = 0u64;
+        for c in &self.chunks {
+            if c.unpacked_offset > start {
+                break;
+            }
+            if c.independent {
+                packed = c.packed_offset;
+                unpacked = c.unpacked_offset;
+            }
+        }
+        (packed, unpacked)
+    }
+
+    fn start_live_at(&mut self, packed_pos: usize, unpacked_pos: u64) -> Result<()> {
+        let cursor = start_lzma2_live_cursor(&self.folder_coder(), packed_pos, unpacked_pos)?;
+        self.live = Some(cursor);
+        self.decoder_starts = self.decoder_starts.saturating_add(1);
+        self.last_resume_unpacked = unpacked_pos;
+        if unpacked_pos == 0 {
+            self.prefix_from_zero_starts = self.prefix_from_zero_starts.saturating_add(1);
+        }
+        Ok(())
+    }
+
+    /// Position the live cursor so the next produced byte is `start`.
+    fn position_live_at(&mut self, start: u64) -> Result<()> {
+        if start > self.unpack_size {
+            return Ok(());
+        }
+        let (resume_packed, resume_unpacked) = self.resume_point(start);
+        let can_continue = self
+            .live
+            .as_ref()
+            .is_some_and(|c| c.unpacked_pos <= start && c.unpacked_pos >= resume_unpacked);
+        if !can_continue {
+            self.start_live_at(resume_packed, resume_unpacked)?;
+        }
+        let have = self.live.as_ref().map(|c| c.unpacked_pos).unwrap_or(0);
+        if have < start {
+            self.live_skip_to(start)?;
+        }
+        Ok(())
+    }
+
+    fn live_skip_to(&mut self, target: u64) -> Result<()> {
+        let mut buf = vec![0u8; 64 * 1024];
+        while self.live.as_ref().is_some_and(|c| c.unpacked_pos < target) {
+            let want =
+                (target - self.live.as_ref().map(|c| c.unpacked_pos).unwrap_or(target)) as usize;
+            let n = {
+                let packed = &self.packed;
+                let take = want.min(buf.len());
+                let live = self
+                    .live
+                    .as_mut()
+                    .ok_or_else(|| SevenZipError::Msg("LZMA2 live cursor missing".into()))?;
+                live.decode_into(packed, &mut buf[..take])?
+            };
+            if n == 0 {
+                return Err(SevenZipError::Msg(format!(
+                    "LZMA2 live skip stalled at {} want {target}",
+                    self.live.as_ref().map(|c| c.unpacked_pos).unwrap_or(0)
+                )));
+            }
+            self.bytes_decompressed = self.bytes_decompressed.saturating_add(n as u64);
+            let produced_end = self.live.as_ref().map(|c| c.unpacked_pos).unwrap_or(0);
+            let produced_start = produced_end.saturating_sub(n as u64);
+            self.note_produced(produced_start, &buf[..n]);
+        }
+        Ok(())
+    }
+
+    fn live_decode_span(&mut self, start: usize, end: usize) -> Result<Vec<u8>> {
+        if end <= start {
             return Ok(vec![]);
         }
-        lzma_decompress_chain(&[self.folder_coder()], &self.packed, end)
+        self.position_live_at(start as u64)?;
+        let mut out = vec![0u8; end - start];
+        let mut filled = 0usize;
+        while filled < out.len() {
+            let n = {
+                let packed = &self.packed;
+                let live = self
+                    .live
+                    .as_mut()
+                    .ok_or_else(|| SevenZipError::Msg("LZMA2 live cursor missing".into()))?;
+                live.decode_into(packed, &mut out[filled..])?
+            };
+            if n == 0 {
+                return Err(SevenZipError::Msg(format!(
+                    "LZMA2 live decode short: got {filled} want {}",
+                    out.len()
+                )));
+            }
+            self.bytes_decompressed = self.bytes_decompressed.saturating_add(n as u64);
+            self.note_produced((start + filled) as u64, &out[filled..filled + n]);
+            filled += n;
+        }
+        Ok(out)
+    }
+
+    fn note_produced(&mut self, start: u64, data: &[u8]) {
+        if !self.retain_from_zero || data.is_empty() {
+            return;
+        }
+        let start = start as usize;
+        if start > self.prefix_from_zero.len() {
+            return;
+        }
+        if start < self.prefix_from_zero.len() {
+            let overlap = self.prefix_from_zero.len() - start;
+            if overlap >= data.len() {
+                return;
+            }
+            self.prefix_from_zero.extend_from_slice(&data[overlap..]);
+        } else {
+            self.prefix_from_zero.extend_from_slice(data);
+        }
+        if self.prefix_from_zero.len() as u64 >= self.unpack_size && self.full.is_none() {
+            let mut full = std::mem::take(&mut self.prefix_from_zero);
+            full.truncate(self.unpack_size as usize);
+            self.full = Some(full);
+        }
     }
 
     fn touch_window(&mut self, index: usize) {
@@ -1253,60 +1567,6 @@ impl Lzma2RandomAccessDecoder {
         }
         self.window_cache.insert(index, data);
         self.touch_window(index);
-    }
-
-    /// Cache windows covered by `prefix` (unpacked [0, prefix.len())).
-    /// Requested windows `first..=last` are stored first (MRU) so they survive
-    /// eviction when warming earlier windows from the same decode pass.
-    fn cache_prefix_windows(&mut self, prefix: &[u8], first: usize, last: usize) {
-        let n_windows = prefix.len().div_ceil(self.chunk_size);
-        // Ensure requested windows are present and most-recently used.
-        for i in first..=last {
-            if i >= n_windows {
-                break;
-            }
-            let start = i * self.chunk_size;
-            let end = (start + self.chunk_size).min(prefix.len());
-            if start >= end {
-                break;
-            }
-            if !self.window_cache.contains_key(&i) {
-                self.store_window(i, prefix[start..end].to_vec());
-            } else {
-                self.touch_window(i);
-            }
-        }
-        // Opportunistically keep other windows from this decode while capacity remains.
-        for i in 0..n_windows {
-            if i >= first && i <= last {
-                continue;
-            }
-            if self.window_cache.len() >= self.max_cached_chunks {
-                break;
-            }
-            if self.window_cache.contains_key(&i) {
-                continue;
-            }
-            let start = i * self.chunk_size;
-            let end = (start + self.chunk_size).min(prefix.len());
-            if start >= end {
-                break;
-            }
-            // Insert without promoting to MRU ahead of requested windows: put at LRU front.
-            self.window_cache.insert(i, prefix[start..end].to_vec());
-            if !self.window_lru.contains(&i) {
-                self.window_lru.insert(0, i);
-            }
-            while self.window_lru.len() > self.max_cached_chunks {
-                let old = self.window_lru.remove(0);
-                // Never drop a still-needed window from the request range.
-                if old >= first && old <= last && self.window_cache.contains_key(&old) {
-                    self.window_lru.push(old);
-                    break;
-                }
-                self.window_cache.remove(&old);
-            }
-        }
     }
 
     fn assemble_from_windows(&mut self, start: usize, end: usize) -> Result<Vec<u8>> {
@@ -1336,7 +1596,7 @@ impl Lzma2RandomAccessDecoder {
         Ok(out)
     }
 
-    /// Ensure windows covering `[start, end)` are cached; one progressive decode on miss.
+    /// Ensure windows covering `[start, end)` are cached; live-cursor decode on miss.
     fn ensure_windows(&mut self, start: usize, end: usize) -> Result<()> {
         if end <= start {
             return Ok(());
@@ -1349,32 +1609,51 @@ impl Lzma2RandomAccessDecoder {
             }
             return Ok(());
         }
-        // Solid LZMA2: decode from folder start through end of last needed window.
+        let need_from = (first..=last)
+            .find(|i| !self.window_cache.contains_key(i))
+            .map(|i| i * self.chunk_size)
+            .unwrap_or(start)
+            .min(start);
         let need_through = ((last + 1) * self.chunk_size).min(self.unpack_size as usize);
-        let prefix = self.decode_prefix(need_through)?;
-        if prefix.len() < end.min(self.unpack_size as usize) {
-            return Err(SevenZipError::Msg(format!(
-                "LZMA2 progressive decode short: got {} want through {}",
-                prefix.len(),
-                need_through
-            )));
-        }
-        self.cache_prefix_windows(&prefix, first, last);
-        // Verify requested windows landed in cache.
+        let span = self.live_decode_span(need_from, need_through)?;
+        self.cache_span_windows(need_from, &span, first, last);
         for i in first..=last {
             let win_start = i * self.chunk_size;
             if win_start >= self.unpack_size as usize {
                 break;
             }
-            if !self.window_cache.contains_key(&i) {
-                // Range larger than max_cached_chunks: re-store from prefix without LRU eviction mid-way.
-                let win_end = (win_start + self.chunk_size).min(prefix.len());
-                self.window_cache
-                    .insert(i, prefix[win_start..win_end].to_vec());
-                self.touch_window(i);
+            if !self.window_cache.contains_key(&i) && win_start >= need_from {
+                let off = win_start - need_from;
+                let win_end = (win_start + self.chunk_size).min(need_from + span.len());
+                if off < span.len() && win_end > win_start {
+                    self.window_cache
+                        .insert(i, span[off..off + (win_end - win_start)].to_vec());
+                    self.touch_window(i);
+                }
             }
         }
         Ok(())
+    }
+
+    /// Cache windows covered by `data` starting at unpacked `span_start`.
+    fn cache_span_windows(&mut self, span_start: usize, data: &[u8], first: usize, last: usize) {
+        let span_end = span_start + data.len();
+        if span_end <= span_start {
+            return;
+        }
+        for i in first..=last {
+            let win_start = i * self.chunk_size;
+            let win_end = (win_start + self.chunk_size).min(self.unpack_size as usize);
+            if win_start >= span_start && win_end <= span_end && win_end > win_start {
+                let off = win_start - span_start;
+                let slice = &data[off..off + (win_end - win_start)];
+                if !self.window_cache.contains_key(&i) {
+                    self.store_window(i, slice.to_vec());
+                } else {
+                    self.touch_window(i);
+                }
+            }
+        }
     }
 
     pub fn read_range(&mut self, start: u64, length: usize) -> Result<Vec<u8>> {
@@ -1397,23 +1676,27 @@ impl Lzma2RandomAccessDecoder {
             return Ok(full[s..e].to_vec());
         }
 
-        // Progressive path: fill overlapping windows via one prefix decode per miss batch.
+        if self.retain_from_zero && self.prefix_from_zero.len() >= end {
+            return Ok(self.prefix_from_zero[s..end].to_vec());
+        }
+
         let first = s / self.chunk_size;
         let last = (end - 1) / self.chunk_size;
         let windows_needed = last - first + 1;
-        // If the request spans more windows than the LRU can hold, decode once and
-        // return the slice directly (still warm the cache for the MRU end of the range).
+        // Wide request: one live-cursor pass, return the slice, warm MRU windows.
         if windows_needed > self.max_cached_chunks {
             let need_through = ((last + 1) * self.chunk_size).min(self.unpack_size as usize);
-            let prefix = self.decode_prefix(need_through)?;
-            self.cache_prefix_windows(&prefix, first, last);
-            if s >= prefix.len() {
-                return Ok(vec![]);
-            }
-            return Ok(prefix[s..end.min(prefix.len())].to_vec());
+            let span = self.live_decode_span(s, need_through)?;
+            self.cache_span_windows(s, &span, first, last);
+            let take = (end - s).min(span.len());
+            return Ok(span[..take].to_vec());
         }
         self.ensure_windows(s, end)?;
-        self.assemble_from_windows(s, end)
+        if (first..=last).all(|i| self.window_cache.contains_key(&i)) {
+            return self.assemble_from_windows(s, end);
+        }
+        // Partial windows (unaligned first read): decode the exact range.
+        self.live_decode_span(s, end)
     }
 
     pub fn unpack_size(&self) -> u64 {
@@ -1435,6 +1718,8 @@ impl Lzma2RandomAccessDecoder {
     pub fn force_progressive_for_test(&mut self) {
         self.cache_full = false;
         self.full = None;
+        self.live = None;
+        self.prefix_from_zero.clear();
     }
 }
 
@@ -1718,7 +2003,50 @@ mod lzma2_random_tests {
     use std::io::{Read, Seek};
     use std::process::Command;
 
+    fn lzma2_compress_raw(data: &[u8]) -> Option<Vec<u8>> {
+        unsafe {
+            let mut opt: lzma_sys::lzma_options_lzma = std::mem::zeroed();
+            if lzma_sys::lzma_lzma_preset(&mut opt, 1) != 0 {
+                return None;
+            }
+            let filters = [
+                lzma_sys::lzma_filter {
+                    id: lzma_sys::LZMA_FILTER_LZMA2,
+                    options: std::ptr::from_mut(&mut opt).cast(),
+                },
+                lzma_sys::lzma_filter {
+                    id: lzma_sys::LZMA_VLI_UNKNOWN,
+                    options: std::ptr::null_mut(),
+                },
+            ];
+            let cap = (data.len() * 2 + 4096).max(4096);
+            let mut out = vec![0u8; cap];
+            let mut stream: lzma_sys::lzma_stream = std::mem::zeroed();
+            if lzma_sys::lzma_raw_encoder(&mut stream, filters.as_ptr()) != lzma_sys::LZMA_OK {
+                return None;
+            }
+            stream.next_in = data.as_ptr();
+            stream.avail_in = data.len();
+            stream.next_out = out.as_mut_ptr();
+            stream.avail_out = out.len();
+            let ret = lzma_sys::lzma_code(&mut stream, lzma_sys::LZMA_FINISH);
+            let produced = stream.total_out as usize;
+            lzma_sys::lzma_end(&mut stream);
+            if ret != lzma_sys::LZMA_STREAM_END && ret != lzma_sys::LZMA_OK {
+                return None;
+            }
+            out.truncate(produced);
+            if out.is_empty() {
+                return None;
+            }
+            Some(out)
+        }
+    }
+
     fn py_lzma2_compress(data: &[u8]) -> Option<Vec<u8>> {
+        if let Some(p) = lzma2_compress_raw(data) {
+            return Some(p);
+        }
         let status = Command::new("python3")
             .args([
                 "-c",
@@ -1870,5 +2198,144 @@ sys.stdout.buffer.write(packed)
         let full_b = full_dec.read_range(base + 1024 * 1024, 4096).unwrap();
         assert_eq!(a, full_a);
         assert_eq!(b, full_b);
+    }
+
+    /// Regression: sequential 1 MiB-step reads of a >4 MiB LZMA2 member are
+    /// linear (one prefix start), not N(N+1)/2 prefix restarts from 0.
+    #[test]
+    fn regression_sequential_windows_are_linear_not_quadratic() {
+        const WIN: usize = 1024 * 1024;
+        const N: usize = 6;
+        let data: Vec<u8> = (0u32..(N * WIN) as u32)
+            .map(|i| (i.wrapping_mul(1664525).wrapping_add(1013904223) >> 24) as u8)
+            .collect();
+        let packed = lzma2_compress_raw(&data).expect("lzma2 compress");
+        let folder = lzma2_folder(data.len() as u64, Some(vec![22]));
+        let mut decoder =
+            Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, WIN, 8).expect("decoder");
+        decoder.force_progressive_for_test();
+
+        for i in 0..N {
+            let got = decoder.read_range((i * WIN) as u64, WIN).expect("window");
+            assert_eq!(got, data[i * WIN..(i + 1) * WIN], "window {i}");
+        }
+        assert_eq!(
+            decoder.prefix_from_zero_starts(),
+            1,
+            "sequential windows must start the decompressor from 0 once"
+        );
+        assert_eq!(
+            decoder.decoder_starts(),
+            1,
+            "sequential windows must not start extra decompressor instances"
+        );
+        // Old path decoded 1+2+…+N windows. New path is one pass of N windows
+        // (plus at most one aligned window of slack).
+        let quadratic = (N * (N + 1) / 2) * WIN;
+        assert!(
+            decoder.bytes_decompressed() as usize <= N * WIN + WIN,
+            "decompressed {} bytes (quadratic would be {quadratic})",
+            decoder.bytes_decompressed()
+        );
+        assert!(
+            (decoder.bytes_decompressed() as usize) < quadratic / 2,
+            "still in quadratic territory: {}",
+            decoder.bytes_decompressed()
+        );
+    }
+
+    /// Regression: mid-stream read resumes at an independent LZMA2 reset, not
+    /// unpacked offset 0.
+    #[test]
+    fn regression_independent_chunk_resume_skips_folder_start() {
+        const PART: usize = 2 * 1024 * 1024;
+        let part1: Vec<u8> = (0..PART).map(|i| (i % 251) as u8).collect();
+        let part2: Vec<u8> = (0..PART).map(|i| (i % 241) as u8 + 3).collect();
+        let mut packed = lzma2_compress_raw(&part1).expect("compress part1");
+        // A finished raw LZMA2 stream ends with a single control-0 byte; drop
+        // only that so the second independent stream is visible to the indexer.
+        if packed.last() == Some(&0) {
+            packed.pop();
+        }
+        let packed2 = lzma2_compress_raw(&part2).expect("compress part2");
+        packed.extend_from_slice(&packed2);
+        let mut data = part1.clone();
+        data.extend_from_slice(&part2);
+
+        let chunks = index_lzma2_chunks(&packed).expect("index");
+        assert!(
+            chunks
+                .iter()
+                .any(|c| c.independent && c.unpacked_offset >= PART as u64),
+            "concatenated raw LZMA2 streams must have a reset at part2"
+        );
+
+        let folder = lzma2_folder(data.len() as u64, Some(vec![22]));
+        let mut decoder = Lzma2RandomAccessDecoder::with_chunk_size(
+            &folder,
+            packed,
+            256 * 1024,
+            DEFAULT_MAX_CACHED_CHUNKS,
+        )
+        .expect("decoder");
+        decoder.force_progressive_for_test();
+
+        let mid = PART as u64 + 4096;
+        let got = decoder.read_range(mid, 8192).expect("mid range");
+        assert_eq!(got, data[mid as usize..mid as usize + 8192]);
+        assert_eq!(
+            decoder.prefix_from_zero_starts(),
+            0,
+            "must not start at unpacked 0 when an independent chunk covers mid"
+        );
+        assert!(
+            decoder.last_resume_unpacked() >= PART as u64,
+            "resume at/after part2 reset, got {}",
+            decoder.last_resume_unpacked()
+        );
+        assert!(
+            decoder.bytes_decompressed() < (PART + 8192 + 256 * 1024) as u64,
+            "must not decode part1 prefix: {}",
+            decoder.bytes_decompressed()
+        );
+    }
+
+    /// Regression: after a header-at-end read, the next earlier-range read
+    /// must not pay a second full prefix from 0 (retain 0..N on non-solid).
+    #[test]
+    fn regression_header_at_end_retains_prefix_for_next_read() {
+        const SIZE: usize = 5 * 1024 * 1024;
+        let data: Vec<u8> = (0..SIZE).map(|i| (i % 199) as u8).collect();
+        let packed = lzma2_compress_raw(&data).expect("compress");
+        let folder = lzma2_folder(data.len() as u64, Some(vec![22]));
+        let mut decoder =
+            Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, 1024 * 1024, 8)
+                .expect("decoder");
+        decoder.force_progressive_for_test();
+        decoder.set_retain_from_zero(true);
+
+        // Nested 7z: head sample, then header-at-end, then first member near 0.
+        let head0 = decoder.read_range(0, 4096).expect("head sample");
+        assert_eq!(head0, data[..4096]);
+        let starts_after_head = decoder.prefix_from_zero_starts();
+        assert_eq!(starts_after_head, 1);
+
+        let tail = decoder
+            .read_range((SIZE - 4096) as u64, 4096)
+            .expect("header-at-end");
+        assert_eq!(tail, data[SIZE - 4096..]);
+        assert_eq!(
+            decoder.prefix_from_zero_starts(),
+            starts_after_head,
+            "header-at-end must continue the live cursor, not restart from 0"
+        );
+
+        let head = decoder.read_range(0, 4096).expect("first member range");
+        assert_eq!(head, data[..4096]);
+        assert_eq!(
+            decoder.prefix_from_zero_starts(),
+            starts_after_head,
+            "earlier-range read must use retained prefix, not a second from-0 start"
+        );
     }
 }

@@ -21,7 +21,7 @@ use tempfile::NamedTempFile;
 pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + Send + Sync>;
 
 /// Context for nested reader open (identity + durable outer index home).
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct NestedOpenContext {
     /// Uncompressed nested member size from the parent file table.
     pub member_size: u64,
@@ -33,6 +33,22 @@ pub struct NestedOpenContext {
     pub outer_index_path: Option<PathBuf>,
     /// When true, persist nested index after successful open (respects write_index).
     pub write_nested_index: bool,
+    /// When false, the parent member body is progressive/compressed: nested
+    /// fingerprint must not seek mid/tail (those seeks fully decompress).
+    pub body_seek_is_cheap: bool,
+}
+
+impl Default for NestedOpenContext {
+    fn default() -> Self {
+        Self {
+            member_size: 0,
+            offsetheader: None,
+            member_path: String::new(),
+            outer_index_path: None,
+            write_nested_index: false,
+            body_seek_is_cheap: true,
+        }
+    }
 }
 
 /// Open a nested archive from a seekable member stream (no temp spool).
@@ -724,6 +740,7 @@ impl AutoMountLayer {
                             member_path: rest.clone(),
                             outer_index_path: self.outer_index_path.clone(),
                             write_nested_index: self.write_nested_index,
+                            body_seek_is_cheap: parent.member_seek_is_cheap(&fi),
                         };
                         match open_r(reader, &label, ctx) {
                             Ok(nested) => {

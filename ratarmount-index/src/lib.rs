@@ -32,9 +32,9 @@ pub use mem::{CompactOpenCookie, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
 pub use nested::{
     DurableNestedBlob, DurableSevenZipArchive, DurableSevenZipCoder, DurableSevenZipFileEntry,
     DurableSevenZipFolder, DurableSevenZipPackInfo, DurableZipMember, NestedBodyFingerprint,
-    NestedMemberKey, CREATE_NESTED_INDEXES_SQL, NESTED_BLOB_VERSION, NESTED_FORMAT_AR,
-    NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
-    NESTED_INDEXES_TABLE,
+    NestedMemberKey, CREATE_NESTED_INDEXES_SQL, NESTED_BLOB_VERSION, NESTED_FINGERPRINT_SAMPLE,
+    NESTED_FORMAT_AR, NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR,
+    NESTED_FORMAT_ZIP, NESTED_INDEXES_TABLE,
 };
 
 /// Max `files` rows for which a full MemIndex projection is kept after seal/open.

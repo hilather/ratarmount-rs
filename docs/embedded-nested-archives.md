@@ -96,7 +96,7 @@ When the **outer** archive has a **writable on-disk** SQLite index, a successful
 |-------|----------|
 | **Storage** | Outer SQLite table `nestedindexes` (Rust-only extension): `member_key`, body size, prefix/suffix SHA-256, format tag, JSON blob of compact rows (+ ZIP member sidecars) |
 | **Identity** | Nested member path + optional parent `offsetheader` + body size |
-| **Fingerprint** | Head / mid / tail SHA-256 samples (4 KiB windows) of the seekable nested body; size mismatch or sampled content change → rebuild. Residual: same-size edits outside sampled windows on multi-GB members are not full-content hashed |
+| **Fingerprint** | Store/stencil bodies: head / mid / tail SHA-256 (4 KiB). Progressive/compressed parent members (large pure-LZMA2 7z): **head + size only** — mid/tail seeks would fully decompress the member. Residual: same-size edits outside sampled windows are not full-content hashed |
 | **Live mount after import** | Still **compact-only** MemIndex — durable storage is export/import, not nested SQLite `files` as the hot path |
 | **Formats (warm)** | Nested **ZIP**, uncompressed **TAR**, **7z** (file table **+ structure** sidecars — no header re-parse), **CPIO**, **AR** via outer `nestedindexes` |
 | **Formats still cold** | Nested compressed streams (`.tar.gz`/zstd/bz2/xz file table after codec), ISO/WARC/ASAR/XAR/CAB/SQLAR/FAT/SquashFS/EXT4 (residual — not yet durable-wired) |
@@ -112,7 +112,7 @@ outer.sqlite
          └── import → compact-only MemIndex (live nested mount)
 ```
 
-Residuals: fingerprint samples head/mid/tail (not full multi-GB solid body hash); nested **7z** warm still pays solid-folder decompress on member open (structure + file table only); deep `-r` can grow the outer index with one blob per nested archive opened; Python does not need to understand `nestedindexes` for outer warm remount.
+Residuals: fingerprint is not a full-content hash (store: head/mid/tail; progressive parent: head+size); nested **7z** warm still pays solid-folder decompress on member open (structure + file table only); a nested 7z header-at-end parse of a large non-solid LZMA2 parent member is one linear decode (prefix retained — not a second restart); deep `-r` can grow the outer index with one blob per nested archive opened; Python does not need to understand `nestedindexes` for outer warm remount.
 
 Enable logs to see which path ran:
 
@@ -226,7 +226,7 @@ Temp files are held for the life of that nested mount and removed when the neste
 | TAR stencil / ZIP store / 7z store | ~disk `pread` (best) |
 | gzip / zstd / bzip2 seek + TAR | Jump to checkpoint/frame + local decompress |
 | ZIP deflate member (as nested *or* as parent open of nested TAR) | Inflate whole member once (cached); then free seeks in RAM |
-| 7z pure LZMA2 solid | Prefix decompress to offset (can be large); window cache helps locality |
+| 7z pure LZMA2 (solid or large non-solid) | Live sequential cursor (linear `cat`); random reads resume at independent LZMA2 reset chunks. Window LRU helps locality. Non-solid folders retain the 0..N prefix after a header-at-end walk |
 | Temp spool path | One disk write of nested body, then normal path open |
 
 **Recommendation:** For nested archives you care about, pack the **outer** with **store/copy** (ZIP store, 7z `-mx0`, uncompressed TAR) so the nested open is a pure stencil.

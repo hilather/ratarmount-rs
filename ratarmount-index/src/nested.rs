@@ -121,6 +121,30 @@ impl NestedBodyFingerprint {
         })
     }
 
+    /// Size + head sample only (no mid/tail seeks).
+    ///
+    /// Use when the nested body is a progressive/compressed stream: seeking
+    /// to mid or tail would fully decompress the member.
+    pub fn from_head_only<R: Read + Seek + ?Sized>(
+        reader: &mut R,
+        body_size: u64,
+    ) -> std::io::Result<Self> {
+        let sample = NESTED_FINGERPRINT_SAMPLE as u64;
+        let prefix_len = sample.min(body_size) as usize;
+        let mut prefix = vec![0u8; prefix_len];
+        reader.seek(SeekFrom::Start(0))?;
+        if prefix_len > 0 {
+            reader.read_exact(&mut prefix)?;
+        }
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            body_size,
+            prefix_sha256: hex_sha256(&prefix),
+            suffix_sha256: String::new(),
+            mid_sha256: String::new(),
+        })
+    }
+
     pub fn matches(&self, other: &Self) -> bool {
         self.body_size == other.body_size
             && self.prefix_sha256 == other.prefix_sha256
@@ -357,7 +381,7 @@ impl DurableNestedBlob {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Seek, SeekFrom};
 
     #[test]
     fn fingerprint_roundtrip_and_mismatch() {
@@ -374,6 +398,71 @@ mod tests {
         let mut c3 = Cursor::new(other);
         let fp3 = NestedBodyFingerprint::from_seekable_body(&mut c3, body.len() as u64).unwrap();
         assert!(!fp.matches(&fp3));
+    }
+
+    /// Regression: head-only fingerprint must not seek mid or tail.
+    #[test]
+    fn regression_head_only_fingerprint_does_not_seek_mid_tail() {
+        struct SeekLog {
+            data: Vec<u8>,
+            pos: u64,
+            seeks: Vec<u64>,
+        }
+        impl Read for SeekLog {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let start = self.pos as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.data.len() - start);
+                buf[..n].copy_from_slice(&self.data[start..start + n]);
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+        impl Seek for SeekLog {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                let new = match from {
+                    SeekFrom::Start(o) => o as i64,
+                    SeekFrom::End(o) => self.data.len() as i64 + o,
+                    SeekFrom::Current(o) => self.pos as i64 + o,
+                };
+                assert!(new >= 0);
+                self.pos = new as u64;
+                self.seeks.push(self.pos);
+                Ok(self.pos)
+            }
+        }
+
+        let body = vec![7u8; 1024 * 1024];
+        let mut log = SeekLog {
+            data: body.clone(),
+            pos: 0,
+            seeks: Vec::new(),
+        };
+        let fp = NestedBodyFingerprint::from_head_only(&mut log, body.len() as u64).unwrap();
+        assert_eq!(fp.body_size, body.len() as u64);
+        assert!(!fp.prefix_sha256.is_empty());
+        assert!(fp.suffix_sha256.is_empty());
+        assert!(fp.mid_sha256.is_empty());
+        let sample = NESTED_FINGERPRINT_SAMPLE as u64;
+        assert!(
+            log.seeks.iter().all(|&p| p == 0 || p <= sample),
+            "head-only must not seek mid/tail: {:?}",
+            log.seeks
+        );
+
+        let mut cheap = SeekLog {
+            data: body,
+            pos: 0,
+            seeks: Vec::new(),
+        };
+        let _ = NestedBodyFingerprint::from_seekable_body(&mut cheap, 1024 * 1024).unwrap();
+        assert!(
+            cheap.seeks.iter().any(|&p| p > sample * 2),
+            "cheap path still samples mid/tail: {:?}",
+            cheap.seeks
+        );
     }
 
     #[test]

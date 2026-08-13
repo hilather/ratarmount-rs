@@ -13,7 +13,7 @@
 //! |----------------------|---------------|---------------------------|
 //! | **Store / Copy** (non-solid) | [`SharedArchiveView`] over shared archive IO | Yes — zero-copy stencil |
 //! | **Pure LZMA2 solid** (small folder ≤ 4 MiB unpack) | `Cursor` of the member slice | Yes — fully buffered seekable |
-//! | **Pure LZMA2 solid** (large folder) | [`decode::Lzma2MemberReader`] progressive windows | Yes — seek-to-0 / random read OK |
+//! | **Pure LZMA2** (large folder) | [`decode::Lzma2MemberReader`] live cursor + chunk resume | Yes — sequential is linear; random resumes at dict reset |
 //! | BCJ2 / multi-pack / AES content | `Cursor` after full-folder decompress | Yes for fixture sizes; multi-GB may hold a large unpack buffer |
 //!
 //! **Residual / not free:** multi-GB solid non-LZMA2 (or BCJ2) still materializes
@@ -42,19 +42,18 @@ use ratarmount_index::{
 use thiserror::Error;
 
 use decode::{
-    Lzma2MemberReader, PackSource, SeekPackSource, SharedArchiveIo, SharedArchiveView,
-    SharedLzma2Decoder, DEFAULT_MAX_CACHED_CHUNKS,
+    lzma2_folder_uses_progressive, Lzma2MemberReader, PackSource, SeekPackSource, SharedArchiveIo,
+    SharedArchiveView, SharedLzma2Decoder, DEFAULT_MAX_CACHED_CHUNKS,
 };
 
 pub use parse::{looks_like_7z, SevenZipArchiveInfo, SevenZipError, SevenZipFileEntry};
 
 pub const BACKEND_NAME: &str = "SevenZipMountSource";
 
-/// Below this folder unpack size, solid pure-LZMA2 members materialize into a
-/// `Cursor` (Python `_DEFAULT_SMALL_FOLDER_THRESHOLD`). Larger pure-LZMA2
-/// folders use progressive [`Lzma2MemberReader`] so nested open need not hold a
-/// second full copy of the member when random-accessing the stream.
-const SMALL_FOLDER_THRESHOLD: u64 = 4 * 1024 * 1024;
+/// Below [`decode::SMALL_FOLDER_FULL_CACHE`], solid pure-LZMA2 members
+/// materialize into a `Cursor`. Larger folders use [`Lzma2MemberReader`]
+/// with a live sequential cursor (non-solid folders also retain the 0..N
+/// prefix so nested header-at-end parse is not a second full restart).
 
 #[derive(Debug, Error)]
 pub enum SzError {
@@ -751,6 +750,29 @@ impl SevenZipMountSource {
         pack_stream_sizes(&self.archive, entry)
     }
 
+    /// True when `folder_index` has at most one non-empty file (non-solid member).
+    fn folder_is_single_member(&self, folder_index: usize) -> bool {
+        self.archive
+            .files
+            .iter()
+            .filter(|e| e.folder_index == Some(folder_index) && !e.is_dir && !e.is_empty_stream)
+            .count()
+            <= 1
+    }
+
+    /// Open of this `FileInfo` returns a progressive (expensive-seek) body.
+    fn member_open_is_progressive(&self, file_info: &FileInfo) -> bool {
+        let Ok(entry) = self.find_entry(file_info) else {
+            return false;
+        };
+        let Some(fi) = entry.folder_index else {
+            return false;
+        };
+        let folder = &self.archive.folders[fi];
+        lzma2_folder_uses_progressive(folder, folder.get_unpack_size())
+            && self.pack_stream_sizes_for(entry).is_none()
+    }
+
     fn find_entry(&self, file_info: &FileInfo) -> Result<&SevenZipFileEntry> {
         let ud = file_info.userdata.iter().rev().find_map(|u| match u {
             UserData::Tar(t) => Some(t),
@@ -915,9 +937,12 @@ impl SevenZipMountSource {
         }
         let folder = &self.archive.folders[fi];
         let packed = self.read_packed_for_folder(fi, entry)?;
-        let decoder =
+        let mut decoder =
             decode::Lzma2RandomAccessDecoder::new(folder, packed, DEFAULT_MAX_CACHED_CHUNKS)
                 .map_err(SzError::Seven)?;
+        // Non-solid / single-unpack-stream folders keep the 0..N prefix so a
+        // header-at-end parse does not force a second full restart on first read.
+        decoder.set_retain_from_zero(self.folder_is_single_member(fi));
         let shared: SharedLzma2Decoder = Arc::new(Mutex::new(decoder));
         let mut cache = self.lzma2_decoders.lock().unwrap();
         // Another open may have won the race; prefer the existing entry.
@@ -1426,16 +1451,16 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(view));
         }
 
-        // Pure LZMA2 solid folders: chunk-indexed random access (Python a0bc76e).
-        // Small folders → Cursor (member materialize); large → progressive Lzma2MemberReader.
-        // Both are fully seekable so nested open_from_reader works without temp spool.
+        // Pure LZMA2: small folders → Cursor; large → Lzma2MemberReader with a
+        // live sequential cursor. Non-solid (single-member) folders retain the
+        // 0..N prefix so nested header-at-end parse is not a second full restart.
         if folder.coders.len() == 1
             && folder.coders[0].method.as_slice() == parse::METHOD_LZMA2
             && !folder.is_encrypted()
             && self.pack_stream_sizes_for(entry).is_none()
         {
             let folder_unpack = folder.get_unpack_size();
-            if folder_unpack > SMALL_FOLDER_THRESHOLD {
+            if lzma2_folder_uses_progressive(folder, folder_unpack) {
                 debug!(
                     "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack})",
                     self.archive_path.display(),
@@ -1502,6 +1527,10 @@ impl MountSource for SevenZipMountSource {
         true
     }
 
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        !self.member_open_is_progressive(file_info)
+    }
+
     /// Xattr keys stored in the SQLite index (Python `user.hash.<algo>` content hashes).
     fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
         let Some(oh) = sz_offsetheader(file_info) else {
@@ -1546,6 +1575,31 @@ mod tests {
         assert!(!s.is_empty());
         let fi2 = m.lookup("/b.txt", 0).expect("b.txt");
         assert!(fi2.size > 0);
+        assert!(
+            m.member_seek_is_cheap(&fi2),
+            "store/copy members are cheap to seek"
+        );
+    }
+
+    #[test]
+    fn regression_lzma2_progressive_helper_and_store_not_progressive() {
+        use crate::parse::{Folder, METHOD_LZMA2};
+        let small = Folder {
+            coders: vec![parse::Coder {
+                method: METHOD_LZMA2.to_vec(),
+                num_in_streams: 1,
+                num_out_streams: 1,
+                properties: Some(vec![22]),
+            }],
+            bind_pairs: vec![],
+            packed_indices: vec![],
+            unpack_sizes: vec![1024],
+            has_crc: false,
+            crc: 0,
+        };
+        assert!(!lzma2_folder_uses_progressive(&small, 1024));
+        let large_unpack = decode::SMALL_FOLDER_FULL_CACHE + 1;
+        assert!(lzma2_folder_uses_progressive(&small, large_unpack));
     }
 
     #[test]

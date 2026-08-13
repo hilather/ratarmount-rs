@@ -744,6 +744,20 @@ fn nested_member_path_for_key(ctx: &NestedOpenContext, label: &Path) -> String {
     raw.trim_start_matches('/').to_string()
 }
 
+/// Fingerprint a nested body. Progressive/compressed members use head+size only
+/// so mid/tail seeks cannot force a full decompress.
+fn fingerprint_nested_body(
+    reader: &mut dyn ratarmount_core::ArchiveRead,
+    body_size: u64,
+    seek_is_cheap: bool,
+) -> std::io::Result<NestedBodyFingerprint> {
+    if seek_is_cheap {
+        NestedBodyFingerprint::from_seekable_body(reader, body_size)
+    } else {
+        NestedBodyFingerprint::from_head_only(reader, body_size)
+    }
+}
+
 /// Resolve nested body size for fingerprinting (parent file table or stream length).
 fn nested_body_size(
     reader: &mut dyn ratarmount_core::ArchiveRead,
@@ -836,7 +850,7 @@ fn open_nested_zip_with_durable(
     ctx: &NestedOpenContext,
 ) -> std::io::Result<Arc<dyn MountSource>> {
     let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
-    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+    let fingerprint = fingerprint_nested_body(reader.as_mut(), body_size, ctx.body_seek_is_cheap)
         .map_err(std::io::Error::other)?;
     let key = NestedMemberKey {
         member_path: nested_member_path_for_key(ctx, label),
@@ -894,7 +908,7 @@ fn open_nested_tar_with_durable(
     ctx: &NestedOpenContext,
 ) -> std::io::Result<Arc<dyn MountSource>> {
     let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
-    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+    let fingerprint = fingerprint_nested_body(reader.as_mut(), body_size, ctx.body_seek_is_cheap)
         .map_err(std::io::Error::other)?;
     let key = NestedMemberKey {
         member_path: nested_member_path_for_key(ctx, label),
@@ -943,7 +957,8 @@ fn open_nested_tar_with_durable(
     Ok(Arc::new(src) as Arc<dyn MountSource>)
 }
 
-/// Nested 7z: durable file table load/store; always re-parses 7z structure for open.
+/// Nested 7z: durable file table + structure load/store.
+/// Progressive parent members fingerprint head+size only (no mid/tail seeks).
 fn open_nested_7z_with_durable(
     mut reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
@@ -951,7 +966,7 @@ fn open_nested_7z_with_durable(
     ctx: &NestedOpenContext,
 ) -> std::io::Result<Arc<dyn MountSource>> {
     let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
-    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+    let fingerprint = fingerprint_nested_body(reader.as_mut(), body_size, ctx.body_seek_is_cheap)
         .map_err(std::io::Error::other)?;
     let key = NestedMemberKey {
         member_path: nested_member_path_for_key(ctx, label),
@@ -1008,7 +1023,7 @@ fn open_nested_cpio_with_durable(
     ctx: &NestedOpenContext,
 ) -> std::io::Result<Arc<dyn MountSource>> {
     let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
-    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+    let fingerprint = fingerprint_nested_body(reader.as_mut(), body_size, ctx.body_seek_is_cheap)
         .map_err(std::io::Error::other)?;
     let key = NestedMemberKey {
         member_path: nested_member_path_for_key(ctx, label),
@@ -1065,7 +1080,7 @@ fn open_nested_ar_with_durable(
     ctx: &NestedOpenContext,
 ) -> std::io::Result<Arc<dyn MountSource>> {
     let body_size = nested_body_size(reader.as_mut(), ctx).map_err(std::io::Error::other)?;
-    let fingerprint = NestedBodyFingerprint::from_seekable_body(reader.as_mut(), body_size)
+    let fingerprint = fingerprint_nested_body(reader.as_mut(), body_size, ctx.body_seek_is_cheap)
         .map_err(std::io::Error::other)?;
     let key = NestedMemberKey {
         member_path: nested_member_path_for_key(ctx, label),
@@ -3805,7 +3820,7 @@ fn strip_source_name(name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
+    use std::io::{Read, Seek, SeekFrom};
     use std::process::Command;
 
     /// Plain 1-file TAR for B-119 index-minimum-file-count regression tests.
@@ -6287,6 +6302,68 @@ mod tests {
         std::fs::read(&zip_path).expect("read zip")
     }
 
+    /// Regression: progressive nested bodies fingerprint head+size only (no mid/tail).
+    #[test]
+    fn regression_progressive_nested_fingerprint_skips_mid_tail() {
+        struct SeekLog {
+            data: Vec<u8>,
+            pos: u64,
+            seeks: Vec<u64>,
+        }
+        impl Read for SeekLog {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let start = self.pos as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                let n = buf.len().min(self.data.len() - start);
+                buf[..n].copy_from_slice(&self.data[start..start + n]);
+                self.pos += n as u64;
+                Ok(n)
+            }
+        }
+        impl Seek for SeekLog {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                let new = match from {
+                    SeekFrom::Start(o) => o as i64,
+                    SeekFrom::End(o) => self.data.len() as i64 + o,
+                    SeekFrom::Current(o) => self.pos as i64 + o,
+                };
+                self.pos = new.max(0) as u64;
+                self.seeks.push(self.pos);
+                Ok(self.pos)
+            }
+        }
+
+        let body = vec![3u8; 512 * 1024];
+        let sample = ratarmount_index::NESTED_FINGERPRINT_SAMPLE as u64;
+        let mut expensive = SeekLog {
+            data: body.clone(),
+            pos: 0,
+            seeks: Vec::new(),
+        };
+        let fp = fingerprint_nested_body(&mut expensive, body.len() as u64, false).unwrap();
+        assert!(fp.suffix_sha256.is_empty());
+        assert!(fp.mid_sha256.is_empty());
+        assert!(
+            expensive.seeks.iter().all(|&p| p == 0 || p <= sample),
+            "progressive fingerprint sought mid/tail: {:?}",
+            expensive.seeks
+        );
+
+        let mut cheap = SeekLog {
+            data: body,
+            pos: 0,
+            seeks: Vec::new(),
+        };
+        let _ = fingerprint_nested_body(&mut cheap, 512 * 1024, true).unwrap();
+        assert!(
+            cheap.seeks.iter().any(|&p| p > sample * 2),
+            "cheap fingerprint should still sample mid/tail: {:?}",
+            cheap.seeks
+        );
+    }
+
     /// Regression: nested ZIP durable warm remount via shipped `open_nested_reader_fn`.
     /// First open persists into outer `nestedindexes`; second open imports compact-only.
     #[test]
@@ -6313,6 +6390,7 @@ mod tests {
             member_path: "inner-durable.zip".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let cold = opener(
             Box::new(std::io::Cursor::new(zip_bytes.clone())),
@@ -6404,6 +6482,7 @@ mod tests {
             member_path: "inner-durable.tar".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let cold = opener(
             Box::new(std::io::Cursor::new(tar_bytes.clone())),
@@ -6469,6 +6548,7 @@ mod tests {
             member_path: "inner.zip".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let _ = opener(
             Box::new(std::io::Cursor::new(zip_a.clone())),
@@ -6547,6 +6627,7 @@ mod tests {
                 member_path: "inner.zip".into(),
                 outer_index_path: Some(outer_idx.clone()),
                 write_nested_index: false,
+                body_seek_is_cheap: true,
             },
         )
         .expect("open without write");
@@ -6573,6 +6654,7 @@ mod tests {
                 member_path: "inner.zip".into(),
                 outer_index_path: None,
                 write_nested_index: true,
+                body_seek_is_cheap: true,
             },
         )
         .expect("open without outer path");
@@ -6734,6 +6816,7 @@ mod tests {
             member_path: "inner-durable.7z".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let cold = opener(
             Box::new(std::io::Cursor::new(sz_bytes.clone())),
@@ -6818,6 +6901,7 @@ mod tests {
             member_path: "inner.cpio".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let cold = opener(
             Box::new(std::io::Cursor::new(cpio_bytes.clone())),
@@ -6880,6 +6964,7 @@ mod tests {
             member_path: "inner.a".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let cold = opener(
             Box::new(std::io::Cursor::new(ar_bytes.clone())),
@@ -6980,6 +7065,7 @@ mod tests {
                 member_path: "inner.7z".into(),
                 outer_index_path: Some(outer_idx.clone()),
                 write_nested_index: false,
+                body_seek_is_cheap: true,
             },
         )
         .expect("7z open without write");
@@ -7000,6 +7086,7 @@ mod tests {
             member_path: "inner.7z".into(),
             outer_index_path: Some(outer_idx.clone()),
             write_nested_index: true,
+            body_seek_is_cheap: true,
         };
         let _ = opener(
             Box::new(std::io::Cursor::new(bytes_a.clone())),
