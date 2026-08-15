@@ -2038,6 +2038,7 @@ dependencies = [
  "nfsserve",
  "ratarmount-compositing",
  "ratarmount-core",
+ "ratarmount-formats-tar",
  "tempfile",
  "thiserror",
  "tokio",
