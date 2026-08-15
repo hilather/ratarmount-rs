@@ -445,6 +445,12 @@ impl RatarmountFs {
         self.list_mode_cached(path)
     }
 
+    /// Same resolution as FUSE `readlink` (inode-cached `FileInfo.linkname`).
+    #[cfg(test)]
+    fn readlink_target(&self, ino: u64) -> Option<String> {
+        self.file_info_for_ino(ino).map(|fi| fi.linkname)
+    }
+
     /// Kernel TTL for `readdirplus` attrs.
     ///
     /// When dirents carry real sizes (ZIP/TAR/7z `list_dirents`), use the same
@@ -1113,11 +1119,8 @@ impl Filesystem for RatarmountFs {
     }
 
     fn readlink(&mut self, _req: &Request<'_>, ino: u64, reply: ReplyData) {
-        let Some(path) = self.path_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let Some(fi) = self.source.lookup(&path, 0) else {
+        // Same cache/overlay policy as getattr — do not force a second source.lookup.
+        let Some(fi) = self.file_info_for_ino(ino) else {
             reply.error(ENOENT);
             return;
         };
@@ -1307,7 +1310,7 @@ fn _pb() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratarmount_core::{ListModeResult, ListResult, MountSource, S_IFREG};
+    use ratarmount_core::{ListModeResult, ListResult, MountSource, S_IFLNK, S_IFMT, S_IFREG};
     use std::collections::BTreeMap;
     use std::io::{self, Seek};
 
@@ -1737,6 +1740,107 @@ mod tests {
             Duration::ZERO,
             "all-zero sizes must not pin placeholder attrs"
         );
+    }
+
+    /// Regression: readlink after lookup incremented lookup_calls.
+    #[test]
+    fn readlink_uses_cached_file_info_without_second_lookup() {
+        let mut children = BTreeMap::new();
+        children.insert(
+            "link".into(),
+            FileInfo {
+                size: 6,
+                mtime: 1.0,
+                mode: S_IFLNK | 0o777,
+                linkname: "target".into(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        let fi = children.get("link").cloned().expect("link FileInfo");
+        let src = Arc::new(ListCallTracker::new(children));
+        let fs = RatarmountFs::new(Arc::clone(&src) as Arc<dyn MountSource>, None);
+        let ino = fs.ino_for_path_with_fi("/link", Some(fi));
+        let before = src.lookup_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let target = fs.readlink_target(ino).expect("readlink");
+        assert_eq!(target, "target");
+        assert_eq!(
+            src.lookup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "readlink must reuse inode-cached FileInfo (no second lookup)"
+        );
+    }
+
+    /// Regression: after `readdir_dirents`, `lookup` mode disagrees with the cheap
+    /// dirent on the successful-resolve FR-10 path (type flip under 60s TTL).
+    /// Cycle/hop-limit names are a pre-existing list()/lookup split — not asserted.
+    #[test]
+    fn readdirplus_dirent_type_matches_lookup() {
+        use ratarmount_compositing::{FolderMountSource, UnionMountOptions, UnionMountSource};
+
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        std::fs::write(a.join("target.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("target.txt", a.join("link.txt")).unwrap();
+        std::fs::write(b.join("other.txt"), b"from-b").unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let sb = Arc::new(FolderMountSource::new(&b).unwrap()) as Arc<dyn MountSource>;
+
+        // FR-10 on: list_dirents type must match lookup (S_IFREG after resolve).
+        let u_on = Arc::new(UnionMountSource::new_with_options(
+            vec![sa.clone(), sb.clone()],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        ));
+        let fs_on = RatarmountFs::new(Arc::clone(&u_on) as Arc<dyn MountSource>, None);
+        let dents_on = fs_on.readdir_dirents("/").expect("readdir FR-10");
+        let link_on = dents_on
+            .iter()
+            .find(|(n, ..)| n == "link.txt")
+            .expect("link.txt dirent");
+        assert_eq!(
+            link_on.1 & S_IFMT,
+            S_IFREG,
+            "FR-10 readdirplus must advertise resolved file, not symlink"
+        );
+        let fi_on = fs_on.source.lookup("/link.txt", 0).expect("lookup FR-10");
+        assert_eq!(
+            fi_on.mode & S_IFMT,
+            S_IFREG,
+            "FR-10 lookup must return the target file"
+        );
+        assert_eq!(
+            link_on.1 & S_IFMT,
+            fi_on.mode & S_IFMT,
+            "cheap dirent type must match lookup after FR-10 resolve"
+        );
+
+        // Default off: dirent stays symlink and lookup is symlink.
+        let u_off = Arc::new(UnionMountSource::new(vec![sa, sb]));
+        let fs_off = RatarmountFs::new(Arc::clone(&u_off) as Arc<dyn MountSource>, None);
+        let dents_off = fs_off.readdir_dirents("/").expect("readdir default");
+        let link_off = dents_off
+            .iter()
+            .find(|(n, ..)| n == "link.txt")
+            .expect("link.txt dirent default");
+        assert_eq!(
+            link_off.1 & S_IFMT,
+            S_IFLNK,
+            "default union must keep symlink in readdir"
+        );
+        let fi_off = fs_off
+            .source
+            .lookup("/link.txt", 0)
+            .expect("lookup default");
+        assert_eq!(fi_off.mode & S_IFMT, S_IFLNK);
+        assert_eq!(link_off.1 & S_IFMT, fi_off.mode & S_IFMT);
     }
 
     /// Regression: immutable open must reuse getattr/lookup FileInfo (no second lookup).
