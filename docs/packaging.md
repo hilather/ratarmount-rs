@@ -91,7 +91,7 @@ Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`
 
 `--print-features` on a packaged binary prints `nfsv4: compiled`. `--oss-attributions` lists **embednfs** (MIT) when compiled.
 
-Residuals (honest): **Linux kernel client unverified** (no privileged `vers=4.1,tcp,port=,sec=sys` mount recorded — do **not** claim “usable on Linux”); no Kerberos / LAN / Windows; no v3/v4 mux; idle TTL is not CLOSE; embednfs is macOS-first over localhost. Regression: [`packaging/test-nfsv4-features.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-nfsv4-features.sh).
+Residuals (honest): Linux kernel client **verified** on loopback (privileged Docker [`test-harness/nfs-docker/run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/nfs-docker/run.sh), 2026-08-15 — not default CI); no Kerberos / LAN / Windows; no v3/v4 mux; idle TTL is not CLOSE; embednfs is macOS-first over localhost. Regression: [`packaging/test-nfsv4-features.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-nfsv4-features.sh).
 
 ### Install examples
 

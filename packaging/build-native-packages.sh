@@ -99,7 +99,8 @@ Built on: ${DISTRO_LABEL} (${ARCH_UNAME})
 Install:  install -m 755 ratarmount /usr/local/bin/
 Runtime:  fuse3, libarchive (and optional e2fsprogs, squashfs-tools)
 NFS:      --nfs is NFSv3; --nfs-vers 4 is NFSv4.1 (compiled in this package).
-          Linux kernel NFSv4 client is unverified — see docs/nfs-export.md.
+          Linux kernel client verified on loopback (privileged Docker
+          test-harness/nfs-docker; not default CI). See docs/nfs-export.md.
 EOF
 tar -C "$STAGE" -czf "$TARBALL" ratarmount README.txt
 rm -rf "$STAGE"

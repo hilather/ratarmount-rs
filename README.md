@@ -69,7 +69,8 @@ export PATH="$HOME/.cargo/bin:$PATH"
 make release && make install   # → ~/.local/bin/ratarmount
 # or: cargo install --path ratarmount
 # NFSv4.1 (opt-in; rustc ≥ 1.88): cargo build --release -p ratarmount --features nfsv4
-# Release packages already compile nfsv4. Linux kernel NFSv4 client is unverified.
+# Release packages already compile nfsv4. Linux kernel client: privileged Docker
+#   ./test-harness/nfs-docker/run.sh   (not default CI)
 ```
 
 **macOS** (beta) — full guide: [`docs/macos.md`](docs/macos.md)
@@ -116,7 +117,7 @@ ratarmount --nfs archive.tar.gz
 # Opt-in NFSv4.1 (Linux/macOS packages compile nfsv4; source: --features nfsv4, rustc ≥ 1.88)
 #   ratarmount --nfs --nfs-vers 4
 #   Linux: mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ mnt
-# Linux kernel NFSv4 client is unverified — do not treat as a supported Linux mount.
+# Loopback kernel client verified via privileged Docker (./test-harness/nfs-docker/run.sh).
 
 # Unmount
 ratarmount -u mnt/
@@ -150,7 +151,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
-| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; **Linux kernel client unverified**; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
+| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
 
 ### Remote backends
 
@@ -268,7 +269,7 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges.
 5. **Remote** — HTTP Basic + Cookie env auth done; residual full browser cookie jar & full `ssh_config` edges.
 6. **Platforms** — macOS is **beta** ([docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)).
-7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. **Linux kernel client unverified** (no privileged mount recorded). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
 ---
 

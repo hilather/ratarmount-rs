@@ -1,6 +1,6 @@
 # NFSv3 userspace export (and optional NFSv4.1)
 
-Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` is compiled into **Linux release packages** (deb/rpm/portable/AppImage) and **macOS tarballs** (`packaging/build-*-packages.sh` / `build-appimage.sh` / `build-macos-tarball.sh` pass `--features nfsv4`; rustc ≥ 1.88). Source builds without the feature: `--nfs --nfs-vers 4` exits 2. RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. Reader slots idle **90s** are dropped (lease approximation, **not** a CLOSE hook). **Linux kernel client unverified** — no privileged `vers=4.1,tcp,port=,sec=sys` mount has been recorded. Do **not** treat v4 as “usable on Linux.” Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
+Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` is compiled into **Linux release packages** (deb/rpm/portable/AppImage) and **macOS tarballs** (`packaging/build-*-packages.sh` / `build-appimage.sh` / `build-macos-tarball.sh` pass `--features nfsv4`; rustc ≥ 1.88). Source builds without the feature: `--nfs --nfs-vers 4` exits 2. RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. Reader slots idle **90s** are dropped (lease approximation, **not** a CLOSE hook). **Linux kernel client verified** on loopback (privileged Docker, 2026-08-15: `./test-harness/nfs-docker/run.sh` — `vers=3` and `vers=4.1,sec=sys` `ls`/`cat` matched fixture files). Default unprivileged CI does **not** run that driver. Residuals: Kerberos / LAN / Windows / no mux / idle-TTL-not-CLOSE. Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
 
 `ratarmount --nfs` serves the same `MountSource` tree as FUSE over **in-process NFSv3** (`nfsserve` 0.11) by default. `--nfs-vers 4` selects **NFSv4.1** (`embednfs` 0.4.1, no MOUNT/portmap). No kernel `nfsd`, no FUSE mount, no extra system library. There is **no v3/v4 mux** on one port.
 
@@ -28,13 +28,23 @@ ratarmount --nfs --nfs-vers 4 archive.tar.gz
 # ratarmount --nfs --nfs-vers 4 --nfs-bind 2049 archive.tar.gz
 ```
 
-Linux client (v1 acceptance):
+Linux client (loopback; kernel client verified in privileged Docker):
 
 ```bash
 mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ /mnt
 # or:
 mount.nfs -o user,noacl,nolock,vers=3,tcp,rsize=131072,port=20490,mountport=20490 127.0.0.1:/ mnt
 ```
+
+Privileged kernel-client check (not default CI):
+
+```bash
+./test-harness/nfs-docker/run.sh        # NFSv3 then NFSv4.1
+./test-harness/nfs-docker/run.sh 3
+./test-harness/nfs-docker/run.sh 4
+```
+
+The driver starts the **shipped** `ratarmount` (`--nfs` / `--nfs --nfs-vers 4`) and uses real `mount -t nfs` inside one privileged Ubuntu 24.04 container (`nfs-common`). Fixture member bytes are written to a file, packed into a tar, then `cmp`'d after `cat` — expected bytes are never hard-coded independently. **Skip** (exit 0) when docker is missing, the daemon is unusable, `/proc/filesystems` has no `nfs`/`nfs4`, or `mount` reports “must be superuser”. A mount that succeeds with empty or wrong member bytes is a **fail** (exit 1).
 
 macOS (documented, not CI):
 
@@ -85,7 +95,7 @@ cargo run --features nfsv4 -- --nfs --nfs-vers 4 archive.tar.gz
 # Accepts `4` or `4.1`. Rejects `4.0` (macOS `vers=4` is NFSv4.0).
 ```
 
-Linux client recipe (**kernel client unverified** — unprivileged CI cannot `mount -t nfs`; no privileged mount has been recorded, so this is **not** a “usable on Linux” claim):
+Linux client recipe (loopback kernel mount **verified** 2026-08-15 via `./test-harness/nfs-docker/run.sh 4`; unprivileged CI still cannot `mount -t nfs`):
 
 ```bash
 mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ /mnt
@@ -120,7 +130,7 @@ Status: **PASSED** (2026-08-15, rustc 1.97.1).
 | `TcpListener::bind("127.0.0.1:0")` + `NfsServer::new(MemFs::new()).serve` + `NfsStop` | Exits within 2s (`v4_bind_ipv4_high_port`) |
 | `NfsServer::listen("127.0.0.1:0")` | Starts; stop returns (`v4_listen_string_ipv4`) |
 | Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
-| Live Linux `mount -t nfs` | **Linux kernel client unverified** — `mount` exits 32 (`must be superuser to use mount`) |
+| Live Linux `mount -t nfs` | **PASSED** (2026-08-15) privileged Docker `./test-harness/nfs-docker/run.sh` — NFSv3 `vers=3,tcp,nolock,port=,mountport=` and NFSv4.1 `vers=4.1,tcp,port=,sec=sys`; `ls`/`cat` matched fixture files. Unprivileged host `mount` still exits 32 (`must be superuser`). |
 
 **Packaging (PR 6):** Linux `packaging/build-native-packages.sh` and `packaging/build-appimage.sh` pass `--features nfsv4` on the **cargo** line. macOS `packaging/build-macos-tarball.sh` does too (rustup **stable**, rustc ≥ 1.88 assumed). Editing only `.github/workflows/packages.yml` does **not** compile v4. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
 
@@ -139,7 +149,7 @@ embednfs non-promises (do not advertise LAN / Windows / Kerberos): “does not g
 
 ### Blockers
 
-None for compile / bind / EXCHANGE_ID. Residual: **Linux kernel client unverified** (unprivileged CI cannot `mount -t nfs`). That blocks the README Linux claim; it is **not** a from-scratch-stack trigger.
+None for compile / bind / EXCHANGE_ID / Linux loopback kernel mount. Residual: Kerberos / LAN / Windows / no mux; default CI stays unprivileged (no `mount -t nfs` there).
 
 Source builds of `--features nfsv4` need **rustc ≥ 1.88**. rustc &lt; 1.88 cannot compile embednfs; do not vendor an NFS4 codec.
 
@@ -185,7 +195,7 @@ Linux client on 2049 (v3 recipe unchanged except `port=` / `mountport=`):
 ```bash
 # v3
 mount -t nfs -o vers=3,tcp,nolock,port=2049,mountport=2049 127.0.0.1:/ /mnt
-# v4.1 — kernel client still unverified; same idmap / sec=sys notes as above
+# v4.1 — same idmap / sec=sys notes as above
 mount -t nfs -o vers=4.1,tcp,port=2049,sec=sys 127.0.0.1:/ /mnt
 ```
 

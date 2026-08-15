@@ -76,6 +76,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS `--nfs-vers` 3\|4 clap | `cargo test -p ratarmount --bin ratarmount nfs_vers` |
 | NFSv4 EXCHANGE_ID smoke | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_exchange_id` |
 | Linux/macOS packages compile `nfsv4` | `./packaging/test-nfsv4-features.sh` |
+| Kernel NFS Docker (v3 + v4.1) | `./test-harness/nfs-docker/run.sh` (privileged Docker + real `mount -t nfs`; skip if docker/privileged unavailable; empty/wrong bytes = fail) |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
@@ -122,7 +123,7 @@ assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
 **After every release tag, watch CI until settled** (fix failures, re-tag if needed).
 Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
 
-Linux/macOS package scripts compile **`--features nfsv4`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4. Workspace MSRV stays 1.74; default CI `fmt + clippy + test` does not compile embednfs. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) and [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+Linux/macOS package scripts compile **`--features nfsv4`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4. Workspace MSRV stays 1.74; default CI `fmt + clippy + test` does not compile embednfs. Privileged kernel-client check (not default CI): `./test-harness/nfs-docker/run.sh`. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) and [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
 ### Version bump checklist
 
