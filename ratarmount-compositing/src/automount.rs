@@ -12,7 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use log::debug;
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
+    MountSource, UserData,
 };
 use regex::Regex;
 use tempfile::NamedTempFile;
@@ -1032,6 +1033,40 @@ impl AutoMountLayer {
             _ => None,
         })
     }
+
+    /// Remap one child of `parent`.
+    ///
+    /// Mount point or strip-ext hit → S_IFDIR, **size = 0**.
+    /// Else forward inner mode/size.
+    fn remap_child(
+        &self,
+        name: String,
+        mode: u32,
+        size: u64,
+        parent: &str,
+        mounted: &MountedTable,
+    ) -> CheapDirent {
+        let full = join(parent, &name);
+        if mounted.contains_key(&full) {
+            return CheapDirent {
+                name,
+                mode: (mode & 0o7777) | ratarmount_core::S_IFDIR,
+                size: 0,
+            };
+        }
+        if self.strip_ext && is_archive_filename_with(&name, &self.ext_set) {
+            let stripped = strip_archive_extension(&name);
+            let alt = join(parent, &stripped);
+            if mounted.contains_key(&alt) {
+                return CheapDirent {
+                    name: stripped,
+                    mode: (mode & 0o7777) | ratarmount_core::S_IFDIR,
+                    size: 0,
+                };
+            }
+        }
+        CheapDirent { name, mode, size }
+    }
 }
 
 impl MountSource for AutoMountLayer {
@@ -1108,69 +1143,31 @@ impl MountSource for AutoMountLayer {
         }
     }
 
-    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
         let path = normpath(path);
         self.ensure_lazy_mount(&path);
         self.ensure_lazy_children(&path);
 
         let mounted = self.mounted.lock().expect("automount mutex");
         if let Some(m) = mounted.get(&path) {
-            return match m.source.list_mode("/")? {
-                ListModeResult::Modes(map) => Some(ListModeResult::Modes(map)),
-                ListModeResult::Names(names) => Some(ListModeResult::Names(names)),
-            };
+            return m.source.list_dirents("/");
         }
         let (mp, rest) = mounted.find_mounted_in(&path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
-        match src.list_mode(&rest)? {
-            ListModeResult::Modes(map) => {
-                let mut remapped = std::collections::BTreeMap::new();
-                for (name, mut mode) in map {
-                    let full = join(&path, &name);
-                    let mut key = name;
-                    if mounted.contains_key(&full) {
-                        mode = (mode & 0o7777) | ratarmount_core::S_IFDIR;
-                    } else if self.strip_ext && is_archive_filename_with(&key, &self.ext_set) {
-                        let stripped = strip_archive_extension(&key);
-                        let alt = join(&path, &stripped);
-                        if mounted.contains_key(&alt) {
-                            key = stripped;
-                            mode = (mode & 0o7777) | ratarmount_core::S_IFDIR;
-                        }
-                    }
-                    remapped.insert(key, mode);
-                }
-                Some(ListModeResult::Modes(remapped))
-            }
-            ListModeResult::Names(names) => {
-                let mut modes = std::collections::BTreeMap::new();
-                for name in names {
-                    let full = join(&path, &name);
-                    let child_rest = join(&rest, &name);
-                    let mut key = name.clone();
-                    let mode = if mounted.contains_key(&full) {
-                        ratarmount_core::S_IFDIR | 0o755
-                    } else if self.strip_ext && is_archive_filename_with(&name, &self.ext_set) {
-                        let stripped = strip_archive_extension(&name);
-                        let alt = join(&path, &stripped);
-                        if mounted.contains_key(&alt) {
-                            key = stripped;
-                            ratarmount_core::S_IFDIR | 0o755
-                        } else if let Some(fi) = src.lookup(&child_rest, 0) {
-                            fi.mode
-                        } else {
-                            ratarmount_core::S_IFREG
-                        }
-                    } else if let Some(fi) = src.lookup(&child_rest, 0) {
-                        fi.mode
-                    } else {
-                        ratarmount_core::S_IFREG
-                    };
-                    modes.insert(key, mode);
-                }
-                Some(ListModeResult::Modes(modes))
-            }
-        }
+        let dents = src.list_dirents(&rest)?;
+        Some(
+            dents
+                .into_iter()
+                .map(|d| self.remap_child(d.name, d.mode, d.size, &path, &mounted))
+                .collect(),
+        )
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -2070,5 +2067,163 @@ mod tests {
             }
             ListResult::Names(_) => panic!("expected Infos"),
         }
+    }
+
+    /// Counts `list()` so we can prove AutoMount uses `list_dirents`.
+    struct ListCallCounter {
+        inner: Arc<dyn MountSource>,
+        list_calls: AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    fn write_zip_member(path: &Path, name: &str, body: &[u8]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+        let file = fs::File::create(path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+        zw.start_file(name, opts).unwrap();
+        zw.write_all(body).unwrap();
+        zw.finish().unwrap();
+    }
+
+    fn zip_opener() -> OpenNestedFn {
+        use ratarmount_core::OpenOptions;
+        use ratarmount_formats_zip::ZipMountSource;
+        Arc::new(|path: &Path| {
+            let opts = OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            };
+            let ms = ZipMountSource::open(path, None, &opts, "test", true)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+            Ok(Arc::new(ms) as Arc<dyn MountSource>)
+        })
+    }
+
+    /// Regression: `-r` readdirplus TTL 0 / archive not a dir / sibling size 0.
+    #[test]
+    fn automount_list_dirents_forwards_sizes_and_remaps_mount_to_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_body = b"zip-inner-payload\n";
+        let sibling = b"sibling-regular-bytes\n";
+        write_zip_member(&dir.path().join("nested.zip"), "inner.txt", zip_body);
+        fs::write(dir.path().join("readme.txt"), sibling).unwrap();
+
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        let counted = Arc::new(ListCallCounter {
+            inner: Arc::new(folder) as Arc<dyn MountSource>,
+            list_calls: AtomicUsize::new(0),
+        });
+        let layer = AutoMountLayer::new(
+            Arc::clone(&counted) as Arc<dyn MountSource>,
+            1,
+            zip_opener(),
+        );
+        let after_mount = counted.list_calls.load(Ordering::SeqCst);
+
+        let dents = layer.list_dirents("/").expect("dirents /");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            after_mount,
+            "list_dirents must not call list() after mounts exist"
+        );
+
+        let by_name: std::collections::BTreeMap<_, _> =
+            dents.into_iter().map(|d| (d.name.clone(), d)).collect();
+        let zip_dent = by_name.get("nested.zip").expect("archive key present");
+        assert_eq!(
+            zip_dent.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR,
+            "mounted archive must appear as a directory"
+        );
+        assert_eq!(zip_dent.size, 0, "mount-point dirent size is 0");
+        let sib = by_name.get("readme.txt").expect("sibling present");
+        assert_eq!(
+            sib.size,
+            sibling.len() as u64,
+            "sibling must keep real size"
+        );
+        assert_eq!(sib.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+    }
+
+    /// Regression: strip-ext key missing, sibling size 0, or fat `list()`.
+    #[test]
+    fn automount_list_dirents_strip_ext_renames_without_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_body = b"zip-inner-payload\n";
+        let sibling = b"sibling-regular-bytes\n";
+        write_zip_member(&dir.path().join("archive.zip"), "inner.txt", zip_body);
+        fs::write(dir.path().join("readme.txt"), sibling).unwrap();
+
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        let counted = Arc::new(ListCallCounter {
+            inner: Arc::new(folder) as Arc<dyn MountSource>,
+            list_calls: AtomicUsize::new(0),
+        });
+        let layer = AutoMountLayer::new_with_options(
+            Arc::clone(&counted) as Arc<dyn MountSource>,
+            1,
+            zip_opener(),
+            AutoMountOptions {
+                strip_recursive_extension: true,
+                parallel_nested_threads: 1,
+                ..Default::default()
+            },
+        );
+        let after_mount = counted.list_calls.load(Ordering::SeqCst);
+
+        let dents = layer.list_dirents("/").expect("dirents /");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            after_mount,
+            "list_dirents must not call list() after mounts exist"
+        );
+
+        let by_name: std::collections::BTreeMap<_, _> =
+            dents.into_iter().map(|d| (d.name.clone(), d)).collect();
+        assert!(
+            !by_name.contains_key("archive.zip"),
+            "strip-ext must rename archive.zip"
+        );
+        let renamed = by_name.get("archive").expect("renamed key present");
+        assert_eq!(
+            renamed.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        assert_eq!(renamed.size, 0);
+        let sib = by_name.get("readme.txt").expect("sibling present");
+        assert_eq!(sib.size, sibling.len() as u64);
     }
 }

@@ -23,8 +23,8 @@ use std::time::Instant;
 
 use log::warn;
 use ratarmount_core::{
-    create_root_file_info, is_dir_mode, is_lnk_mode, normpath, FileInfo, ListModeResult,
-    ListResult, MountSource, UserData,
+    create_root_file_info, is_dir_mode, is_lnk_mode, normpath, CheapDirent, FileInfo,
+    ListModeResult, ListResult, MountSource, UserData,
 };
 
 use crate::path_intern::PathIntern;
@@ -303,16 +303,17 @@ impl UnionMountSource {
         map.insert(name, fi);
     }
 
-    /// List a path from one source. If the source has a symlink at `path`, try to
-    /// follow within that source so symlink→dir branches still contribute.
-    /// Default: one hop (B-4). With `resolve_symlinks`, multi-hop up to the cap.
-    fn list_from_source(
+    /// Try `try_list(path)`. If missing, follow a symlink-at-`path` within `src`
+    /// (B-4 one hop, or FR-10 cap) and `try_list` each target.
+    /// Distinct from FR-10 *child* resolve after merge.
+    fn follow_symlink_then<T>(
         src: &dyn MountSource,
         path: &str,
         resolve_symlinks: bool,
-    ) -> Option<ListResult> {
-        if let Some(listing) = src.list(path) {
-            return Some(listing);
+        try_list: impl Fn(&str) -> Option<T>,
+    ) -> Option<T> {
+        if let Some(v) = try_list(path) {
+            return Some(v);
         }
         let fi = src.lookup(path, 0)?;
         if !is_lnk_mode(fi.mode) || fi.linkname.is_empty() {
@@ -335,13 +336,56 @@ impl UnionMountSource {
             if !seen.insert(target.clone()) {
                 return None; // cycle
             }
-            if let Some(listing) = src.list(&target) {
-                return Some(listing);
+            if let Some(v) = try_list(&target) {
+                return Some(v);
             }
             current = src.lookup(&target, 0)?;
             current_path = target;
         }
         None
+    }
+
+    fn list_from_source(
+        src: &dyn MountSource,
+        path: &str,
+        resolve_symlinks: bool,
+    ) -> Option<ListResult> {
+        Self::follow_symlink_then(src, path, resolve_symlinks, |p| src.list(p))
+    }
+
+    fn list_dirents_from_source(
+        src: &dyn MountSource,
+        path: &str,
+        resolve_symlinks: bool,
+    ) -> Option<Vec<CheapDirent>> {
+        Self::follow_symlink_then(src, path, resolve_symlinks, |p| src.list_dirents(p))
+    }
+
+    /// Later source wins, except a directory is never replaced by a symlink (B-4).
+    fn merge_dirent(map: &mut BTreeMap<String, CheapDirent>, d: CheapDirent) {
+        if let Some(existing) = map.get(&d.name) {
+            if is_dir_mode(existing.mode) && is_lnk_mode(d.mode) {
+                return;
+            }
+        }
+        map.insert(d.name.clone(), d);
+    }
+
+    fn list_dirents_b4_only(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        let mut map: BTreeMap<String, CheapDirent> = BTreeMap::new();
+        let mut any = false;
+        for src in &self.sources {
+            if let Some(dents) =
+                Self::list_dirents_from_source(src.as_ref(), &path, self.resolve_symlinks)
+            {
+                any = true;
+                for d in dents {
+                    Self::merge_dirent(&mut map, d);
+                }
+            }
+        }
+        any.then(|| map.into_values().collect())
     }
 
     /// After a union pick, optionally follow a winning symlink within `src`.
@@ -460,13 +504,42 @@ impl MountSource for UnionMountSource {
         Some(ListResult::Infos(map))
     }
 
-    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        match self.list(path)? {
-            ListResult::Infos(m) => Some(ListModeResult::Modes(
-                m.into_iter().map(|(k, v)| (k, v.mode)).collect(),
-            )),
-            ListResult::Names(n) => Some(ListModeResult::Names(n)),
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        if self.resolve_symlinks {
+            // Opt-in: same post-merge FR-10 resolve as list(); do not invent a
+            // second resolve. On the successful-resolve path, sizes come from
+            // the resolved FileInfo so TTL 60s is safe (type is REG — kernel
+            // will not readlink). Cycle leftovers stay S_IFLNK, matching list().
+            return match self.list(path)? {
+                ListResult::Infos(map) => Some(
+                    map.into_iter()
+                        .map(|(name, fi)| CheapDirent {
+                            name,
+                            mode: fi.mode,
+                            size: fi.size,
+                        })
+                        .collect(),
+                ),
+                ListResult::Names(names) => Some(
+                    names
+                        .into_iter()
+                        .map(|name| CheapDirent {
+                            name,
+                            mode: 0,
+                            size: 0,
+                        })
+                        .collect(),
+                ),
+            };
         }
+        self.list_dirents_b4_only(path)
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -1282,5 +1355,242 @@ mod tests {
 
         let leaf = u.lookup("/l1/l2/l3/l4/l5", 0).expect("leaf dir");
         assert!(is_dir_mode(leaf.mode));
+    }
+
+    /// Counts `list()` so we can prove Union uses `list_dirents` on the default path.
+    struct ListCallCounter {
+        inner: Arc<dyn MountSource>,
+        list_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    fn counted_folder(path: &std::path::Path) -> Arc<ListCallCounter> {
+        Arc::new(ListCallCounter {
+            inner: Arc::new(FolderMountSource::new(path).unwrap()) as Arc<dyn MountSource>,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Regression: 2-folder union readdir called `list()` on the default path.
+    #[test]
+    fn union_list_dirents_merges_inner_dirents_without_list() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        fs::create_dir_all(&a).unwrap();
+        fs::create_dir_all(&b).unwrap();
+        let a_body = b"from-a-payload\n";
+        let b_body = b"from-b-longer-bytes\n";
+        let only_a = b"only-a\n";
+        fs::write(a.join("x.txt"), a_body).unwrap();
+        fs::write(a.join("only-a.txt"), only_a).unwrap();
+        fs::write(b.join("x.txt"), b_body).unwrap();
+
+        let ca = counted_folder(&a);
+        let cb = counted_folder(&b);
+        let u = UnionMountSource::new(vec![
+            Arc::clone(&ca) as Arc<dyn MountSource>,
+            Arc::clone(&cb) as Arc<dyn MountSource>,
+        ]);
+
+        let dents = u.list_dirents("/").expect("union dirents");
+        assert_eq!(
+            ca.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default union list_dirents must not call list() on source a"
+        );
+        assert_eq!(
+            cb.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default union list_dirents must not call list() on source b"
+        );
+        let by_name: BTreeMap<_, _> = dents.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("x.txt").copied(), Some(b_body.len() as u64));
+        assert_eq!(
+            by_name.get("only-a.txt").copied(),
+            Some(only_a.len() as u64)
+        );
+    }
+
+    /// Regression: `list_dirents` showed symlink at `/subdir0`, or
+    /// `/subdir0/subdir2` missing `file1`/`file2`.
+    #[test]
+    fn union_list_dirents_b4_dir_wins_and_merges_children() {
+        let d = tempfile::tempdir().unwrap();
+        let (branch1, branch2) = build_b4_branches(d.path());
+
+        for (left, right, order_label) in [
+            (branch1.as_path(), branch2.as_path(), "branch1 then branch2"),
+            (branch2.as_path(), branch1.as_path(), "branch2 then branch1"),
+        ] {
+            let c1 = counted_folder(left);
+            let c2 = counted_folder(right);
+            let u = UnionMountSource::new(vec![
+                Arc::clone(&c1) as Arc<dyn MountSource>,
+                Arc::clone(&c2) as Arc<dyn MountSource>,
+            ]);
+
+            let root = u
+                .list_dirents("/")
+                .unwrap_or_else(|| panic!("{order_label}: list_dirents /"));
+            let root_s0 = root
+                .iter()
+                .find(|d| d.name == "subdir0")
+                .unwrap_or_else(|| panic!("{order_label}: dirents missing subdir0"));
+            assert!(
+                is_dir_mode(root_s0.mode),
+                "{order_label}: listed subdir0 must be directory (mode={:#o})",
+                root_s0.mode
+            );
+            assert!(
+                !is_lnk_mode(root_s0.mode),
+                "{order_label}: listed subdir0 must not be a symlink"
+            );
+
+            let sub = u.list_dirents("/subdir0/subdir2").unwrap_or_else(|| {
+                panic!("{order_label}: list_dirents /subdir0/subdir2");
+            });
+            let names: HashSet<&str> = sub.iter().map(|d| d.name.as_str()).collect();
+            assert!(
+                names.contains("file1"),
+                "{order_label}: /subdir0/subdir2 must contain file1 (one-hop follow); got {names:?}"
+            );
+            assert!(
+                names.contains("file2"),
+                "{order_label}: /subdir0/subdir2 must contain file2 (real dir); got {names:?}"
+            );
+            assert_eq!(
+                c1.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{order_label}: B-4 list_dirents must not call list()"
+            );
+            assert_eq!(
+                c2.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+                0,
+                "{order_label}: B-4 list_dirents must not call list()"
+            );
+            assert_b4_union_policy(&u, order_label);
+        }
+    }
+
+    /// Regression: FR-10 `list_dirents` advertised `S_IFLNK` while `list()`/`lookup`
+    /// are `S_IFREG` on the successful-resolve (symlink→file) fixture.
+    #[test]
+    fn union_list_dirents_resolve_symlinks_modes_match_list() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        let payload = b"payload";
+        fs::write(a.join("target.txt"), payload).unwrap();
+        std::os::unix::fs::symlink("target.txt", a.join("link.txt")).unwrap();
+
+        let sa = Arc::new(FolderMountSource::new(&a).unwrap()) as Arc<dyn MountSource>;
+        let u = UnionMountSource::new_with_options(
+            vec![sa],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+
+        let ListResult::Infos(list_map) = u.list("/").expect("list /") else {
+            panic!("expected Infos");
+        };
+        let list_link = list_map.get("link.txt").expect("list has link.txt");
+        assert!(
+            !is_lnk_mode(list_link.mode),
+            "list() must resolve symlink→file to regular (mode={:#o})",
+            list_link.mode
+        );
+        assert_eq!(
+            list_link.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert_eq!(list_link.size, payload.len() as u64);
+
+        let dents = u.list_dirents("/").expect("dirents /");
+        let dent = dents
+            .iter()
+            .find(|d| d.name == "link.txt")
+            .expect("dirents has link.txt");
+        assert_eq!(
+            dent.mode, list_link.mode,
+            "Regression: FR-10 list_dirents mode must match list()"
+        );
+        assert_eq!(dent.size, list_link.size);
+        assert_eq!(
+            dent.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+
+        let looked = u.lookup("/link.txt", 0).expect("lookup resolved file");
+        assert_eq!(
+            looked.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG,
+            "successful-resolve lookup is a regular file"
+        );
+        assert_eq!(looked.mode, dent.mode);
+    }
+
+    /// Flag off: child stays `S_IFLNK`, `list()` not called.
+    #[test]
+    fn union_list_dirents_default_keeps_symlink_without_list() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        fs::write(a.join("target.txt"), b"payload").unwrap();
+        std::os::unix::fs::symlink("target.txt", a.join("link.txt")).unwrap();
+
+        let counted = counted_folder(&a);
+        let u = UnionMountSource::new(vec![Arc::clone(&counted) as Arc<dyn MountSource>]);
+
+        let dents = u.list_dirents("/").expect("dirents /");
+        assert_eq!(
+            counted.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default list_dirents must not call list()"
+        );
+        let dent = dents
+            .iter()
+            .find(|d| d.name == "link.txt")
+            .expect("dirents has link.txt");
+        assert!(
+            is_lnk_mode(dent.mode),
+            "flag off: winning symlink must stay S_IFLNK (mode={:#o})",
+            dent.mode
+        );
+        let fi = u.lookup("/link.txt", 0).expect("lookup");
+        assert!(is_lnk_mode(fi.mode));
     }
 }

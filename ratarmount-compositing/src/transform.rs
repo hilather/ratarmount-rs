@@ -8,7 +8,7 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource,
+    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource,
 };
 use regex::Regex;
 
@@ -156,13 +156,107 @@ impl MountSource for TransformMountSource {
         Some(ListResult::Infos(out))
     }
 
-    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        match self.list(path)? {
-            ListResult::Names(n) => Some(ListModeResult::Names(n)),
-            ListResult::Infos(m) => Some(ListModeResult::Modes(
-                m.into_iter().map(|(k, v)| (k, v.mode)).collect(),
-            )),
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.ensure_map();
+        let path = normpath(path);
+        let guard = self.map.lock().ok()?;
+        let map = guard.as_ref()?;
+        let prefix = if path == "/" {
+            "/".to_string()
+        } else {
+            format!("{path}/")
+        };
+
+        let mut child_names: Vec<String> = Vec::new();
+        let mut seen = std::collections::BTreeSet::new();
+        for external in map.keys() {
+            if external == &path {
+                continue;
+            }
+            let name = if path == "/" {
+                external
+                    .strip_prefix('/')
+                    .unwrap_or(external)
+                    .split('/')
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            } else if let Some(rest) = external.strip_prefix(&prefix) {
+                rest.split('/').next().unwrap_or("").to_string()
+            } else {
+                continue;
+            };
+            if name.is_empty() || !seen.insert(name.clone()) {
+                continue;
+            }
+            child_names.push(name);
         }
+
+        let mut parent_listings: BTreeMap<String, BTreeMap<String, CheapDirent>> = BTreeMap::new();
+        for name in &child_names {
+            let child_ext = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            if let Some(internal) = map.get(&child_ext) {
+                parent_listings
+                    .entry(internal_parent(internal))
+                    .or_default();
+            }
+        }
+        for parent in parent_listings.keys().cloned().collect::<Vec<_>>() {
+            if let Some(dents) = self.inner.list_dirents(&parent) {
+                let idx = dents.into_iter().map(|d| (d.name.clone(), d)).collect();
+                parent_listings.insert(parent, idx);
+            }
+        }
+
+        let mut out = Vec::new();
+        for name in child_names {
+            let child_ext = if path == "/" {
+                format!("/{name}")
+            } else {
+                format!("{path}/{name}")
+            };
+            if let Some(internal) = map.get(&child_ext) {
+                let parent = internal_parent(internal);
+                let base = internal_basename(internal);
+                if let Some(d) = parent_listings.get(&parent).and_then(|idx| idx.get(&base)) {
+                    out.push(CheapDirent {
+                        name,
+                        mode: d.mode,
+                        size: d.size,
+                    });
+                    continue;
+                }
+            }
+            if map
+                .keys()
+                .any(|e| e.starts_with(&(child_ext.clone() + "/")))
+            {
+                out.push(CheapDirent {
+                    name,
+                    mode: ratarmount_core::S_IFDIR | 0o755,
+                    size: 0,
+                });
+            }
+        }
+
+        if out.is_empty() && path != "/" {
+            if map.contains_key(&path) || map.keys().any(|e| e.starts_with(&prefix)) {
+                return Some(out);
+            }
+            return None;
+        }
+        Some(out)
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -208,5 +302,155 @@ impl MountSource for TransformMountSource {
 
     fn is_immutable(&self) -> bool {
         self.inner.is_immutable()
+    }
+}
+
+fn internal_parent(path: &str) -> String {
+    if path == "/" {
+        return "/".into();
+    }
+    match path.rfind('/') {
+        Some(0) | None => "/".into(),
+        Some(i) => path[..i].to_string(),
+    }
+}
+
+fn internal_basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or("").to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratarmount_core::OpenOptions;
+    use ratarmount_formats_zip::ZipMountSource;
+    use std::io::Write;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    /// Counts `list()` so we can prove Transform uses `list_dirents` after `ensure_map`.
+    struct ListCallCounter {
+        inner: ZipMountSource,
+        list_calls: AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    fn zip_with_two_members() -> (
+        tempfile::TempDir,
+        Arc<ListCallCounter>,
+        &'static [u8],
+        &'static [u8],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("xform.zip");
+        let a: &'static [u8] = b"alpha-payload\n";
+        let b: &'static [u8] = b"bravo-bytes-here\n";
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a.txt", opts).unwrap();
+            zw.write_all(a).unwrap();
+            zw.start_file("b.bin", opts).unwrap();
+            zw.write_all(b).unwrap();
+            zw.finish().unwrap();
+        }
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let zip = ZipMountSource::open(&path, None, &opts, "test", true).expect("open zip");
+        let counted = Arc::new(ListCallCounter {
+            inner: zip,
+            list_calls: AtomicUsize::new(0),
+        });
+        (dir, counted, a, b)
+    }
+
+    /// Regression: `--transform` readdir called `inner.list()` after `ensure_map`,
+    /// or dropped sizes.
+    #[test]
+    fn transform_list_dirents_forwards_inner_sizes_without_list_after_ensure_map() {
+        let (_dir, counted, a, b) = zip_with_two_members();
+        let layer =
+            TransformMountSource::new("$", "", Arc::clone(&counted) as Arc<dyn MountSource>)
+                .expect("identity transform");
+
+        let first = layer.list_dirents("/").expect("warmup dirents");
+        let after_map = counted.list_calls.load(Ordering::SeqCst);
+        assert!(
+            after_map > 0,
+            "ensure_map may list() once while building the path map"
+        );
+        let by_name: BTreeMap<_, _> = first.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("a.txt").copied(), Some(a.len() as u64));
+        assert_eq!(by_name.get("b.bin").copied(), Some(b.len() as u64));
+
+        let second = layer.list_dirents("/").expect("second dirents");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            after_map,
+            "list_dirents must not call inner.list() after ensure_map"
+        );
+        let by_name: BTreeMap<_, _> = second.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("a.txt").copied(), Some(a.len() as u64));
+        assert_eq!(by_name.get("b.bin").copied(), Some(b.len() as u64));
+    }
+
+    /// Collapsed/split tree missing a synthesized `S_IFDIR` size-0 parent.
+    #[test]
+    fn transform_list_dirents_synthesizes_intermediate_dirs() {
+        let (_dir, counted, a, b) = zip_with_two_members();
+        let layer =
+            TransformMountSource::new("^/", "/virt/", Arc::clone(&counted) as Arc<dyn MountSource>)
+                .expect("prefix transform");
+
+        let root = layer.list_dirents("/").expect("root dirents");
+        assert_eq!(root.len(), 1, "root should show one synthesized parent");
+        assert_eq!(root[0].name, "virt");
+        assert_eq!(root[0].mode, ratarmount_core::S_IFDIR | 0o755);
+        assert_eq!(root[0].size, 0);
+
+        let after_map = counted.list_calls.load(Ordering::SeqCst);
+        let kids = layer.list_dirents("/virt").expect("virt dirents");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            after_map,
+            "second list_dirents must not call inner.list() after ensure_map"
+        );
+        let by_name: BTreeMap<_, _> = kids.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("a.txt").copied(), Some(a.len() as u64));
+        assert_eq!(by_name.get("b.bin").copied(), Some(b.len() as u64));
     }
 }
