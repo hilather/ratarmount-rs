@@ -460,6 +460,18 @@ mod binfmt {
             self.0 = t;
             Ok(h)
         }
+
+        /// Reject a claimed count that cannot fit in the remaining bytes
+        /// (avoids `Vec::with_capacity(u32::MAX)` on a corrupt blob).
+        fn ensure_count(&self, n: usize, min_per: usize) -> Result<()> {
+            let need = n
+                .checked_mul(min_per)
+                .ok_or_else(|| IndexError::Invalid("nested blob row count overflow".into()))?;
+            if need > self.0.len() {
+                return Err(IndexError::Invalid("nested blob truncated".into()));
+            }
+            Ok(())
+        }
         fn u8(&mut self) -> Result<u8> {
             Ok(self.take(1)?[0])
         }
@@ -557,6 +569,9 @@ mod binfmt {
 
     fn decode_rows(r: &mut R<'_>) -> Result<Vec<DurableFileRow>> {
         let n = r.u32()? as usize;
+        // Empty strings still cost a u32 length each (path/name/linkname) plus
+        // nine i64/f64 and three bools ≈ 87 bytes/row.
+        r.ensure_count(n, 87)?;
         let paths = read_n_str(r, n)?;
         let names = read_n_str(r, n)?;
         let offsetheader = read_n_i64(r, n)?;
@@ -650,6 +665,8 @@ mod binfmt {
 
     fn decode_zip(r: &mut R<'_>) -> Result<Vec<DurableZipMember>> {
         let n = r.u32()? as usize;
+        // 3×u64 + u16 + bool + u64 index + u32 name-len.
+        r.ensure_count(n, 39)?;
         let mut offsetheader = Vec::with_capacity(n);
         let mut data_start = Vec::with_capacity(n);
         let mut compressed_size = Vec::with_capacity(n);
@@ -774,9 +791,11 @@ mod binfmt {
         let pack_pos_base = r.u64()?;
         let solid = r.bool()?;
         let n_folders = r.u32()? as usize;
+        r.ensure_count(n_folders, 4)?;
         let mut folders = Vec::with_capacity(n_folders);
         for _ in 0..n_folders {
             let n_coders = r.u32()? as usize;
+            r.ensure_count(n_coders, 4)?;
             let mut coders = Vec::with_capacity(n_coders);
             for _ in 0..n_coders {
                 let method = r.bytes()?;
@@ -791,16 +810,19 @@ mod binfmt {
                 });
             }
             let n_bind = r.u32()? as usize;
+            r.ensure_count(n_bind, 16)?;
             let mut bind_pairs = Vec::with_capacity(n_bind);
             for _ in 0..n_bind {
                 bind_pairs.push((r.u64()?, r.u64()?));
             }
             let n_packed = r.u32()? as usize;
+            r.ensure_count(n_packed, 8)?;
             let mut packed_indices = Vec::with_capacity(n_packed);
             for _ in 0..n_packed {
                 packed_indices.push(r.u64()?);
             }
             let n_unpack = r.u32()? as usize;
+            r.ensure_count(n_unpack, 8)?;
             let mut unpack_sizes = Vec::with_capacity(n_unpack);
             for _ in 0..n_unpack {
                 unpack_sizes.push(r.u64()?);
@@ -819,11 +841,13 @@ mod binfmt {
         let pack_info = if r.bool()? {
             let pack_pos = r.u64()?;
             let n_sizes = r.u32()? as usize;
+            r.ensure_count(n_sizes, 8)?;
             let mut pack_sizes = Vec::with_capacity(n_sizes);
             for _ in 0..n_sizes {
                 pack_sizes.push(r.u64()?);
             }
             let n_crcs = r.u32()? as usize;
+            r.ensure_count(n_crcs, 1)?;
             let mut crcs = Vec::with_capacity(n_crcs);
             for _ in 0..n_crcs {
                 crcs.push(if r.bool()? { Some(r.u32()?) } else { None });
@@ -837,6 +861,7 @@ mod binfmt {
             None
         };
         let n_files = r.u32()? as usize;
+        r.ensure_count(n_files, 4)?;
         let mut files = Vec::with_capacity(n_files);
         for _ in 0..n_files {
             files.push(DurableSevenZipFileEntry {
@@ -1148,6 +1173,24 @@ mod tests {
         assert!(
             DurableNestedBlob::from_bytes(&corrupt).is_err(),
             "flipped tail"
+        );
+
+        // Claimed row count that cannot fit remaining bytes must fail closed
+        // (not Vec::with_capacity(u32::MAX)).
+        let mut count_bomb = NESTED_BLOB_MAGIC.to_vec();
+        count_bomb.extend_from_slice(&NESTED_BLOB_VERSION.to_le_bytes());
+        count_bomb.extend_from_slice(&NESTED_BLOB_VERSION.to_le_bytes());
+        count_bomb.extend_from_slice(&3u32.to_le_bytes());
+        count_bomb.extend_from_slice(b"tar");
+        count_bomb.extend_from_slice(&0u64.to_le_bytes());
+        for _ in 0..3 {
+            count_bomb.extend_from_slice(&0u32.to_le_bytes());
+        }
+        count_bomb.extend_from_slice(&u32::MAX.to_le_bytes());
+        let err = DurableNestedBlob::from_bytes(&count_bomb).unwrap_err();
+        assert!(
+            matches!(err, IndexError::Invalid(_)),
+            "huge row count must fail closed, got {err:?}"
         );
     }
 

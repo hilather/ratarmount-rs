@@ -114,9 +114,9 @@ impl StringPool {
         }
     }
 
-    /// Materialize `Arc<str>` at the API boundary. During build, repeated
-    /// intern of the same bytes returns the same Arc; after [`Self::seal`]
-    /// a new Arc is allocated from the slab (no live `Vec<Arc<str>>`).
+    /// Materialize `Arc<str>` at the API boundary. Repeated intern of the
+    /// same bytes returns the same Arc; that identity is kept across
+    /// [`Self::seal`] so ZIP/7z sidecars can `Arc::ptr_eq` the pool.
     pub fn intern(&mut self, s: &str) -> Arc<str> {
         let id = self.intern_id(s);
         if let Some(arcs) = &self.arcs {
@@ -1018,9 +1018,10 @@ mod tests {
         let shared = b.intern_shared("member.bin");
         let mem = b.finish();
         let again = mem.lookup_pooled("member.bin").unwrap();
-        // After seal, Arc is materialized from the slab at the lookup boundary
-        // (no live intern identity). ZIP/7z sidecars compare string equality.
-        assert_eq!(&*shared, &*again);
+        assert!(
+            Arc::ptr_eq(&shared, &again),
+            "intern() identity must survive seal for ZIP/7z sidecar sharing"
+        );
         assert_eq!(&*again, "member.bin");
     }
 

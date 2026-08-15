@@ -445,6 +445,11 @@ impl RatarmountFs {
         self.list_mode_cached(path)
     }
 
+    /// `readdirplus` must not pin placeholder attrs in the kernel cache.
+    fn readdirplus_entry_ttl() -> Duration {
+        Duration::ZERO
+    }
+
     /// Drop a parent directory listing so create/unlink/mkdir/rmdir are visible
     /// to readdir before the 30s TTL expires.
     fn invalidate_dir_cache(&self, parent: &str) {
@@ -694,8 +699,12 @@ impl Filesystem for RatarmountFs {
             let cino = self.ino_for_path(&child);
             full.push((cino, name, Self::file_attr(cino, &fi)));
         }
+        // Zero entry/attr TTL: dirents may carry size=0 / parent mtime/uid
+        // when a backend's default list_dirents cannot fill them. A 60s TTL
+        // would let ls -l / stat cache those placeholders.
+        let entry_ttl = Self::readdirplus_entry_ttl();
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(cino, (i + 1) as i64, name, &self.attr_ttl(), &attr, 0) {
+            if reply.add(cino, (i + 1) as i64, name, &entry_ttl, &attr, 0) {
                 break;
             }
         }
@@ -1692,6 +1701,11 @@ mod tests {
             src.list_calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "lookup/getattr must not go through list()"
+        );
+        assert_eq!(
+            RatarmountFs::readdirplus_entry_ttl(),
+            Duration::ZERO,
+            "readdirplus placeholder attrs must not use the 60s kernel TTL"
         );
     }
 

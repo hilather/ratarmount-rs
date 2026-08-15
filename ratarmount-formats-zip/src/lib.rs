@@ -262,20 +262,36 @@ impl ZipMemberTable {
     }
 
     /// Sort columns by header so [`Self::get`] can binary-search.
+    ///
+    /// Duplicate headers last-insert-wins (same as the old `HashMap`).
     fn finish(&mut self) {
         let n = self.headers.len();
-        if n <= 1 || self.headers.windows(2).all(|w| w[0] <= w[1]) {
+        if n <= 1 {
             return;
         }
         let mut order: Vec<usize> = (0..n).collect();
-        order.sort_unstable_by_key(|&i| self.headers[i]);
-        self.headers = order.iter().map(|&i| self.headers[i]).collect();
-        self.data_start = order.iter().map(|&i| self.data_start[i]).collect();
-        self.compressed_size = order.iter().map(|&i| self.compressed_size[i]).collect();
-        self.method = order.iter().map(|&i| self.method[i]).collect();
-        self.encrypted = order.iter().map(|&i| self.encrypted[i]).collect();
-        self.index = order.iter().map(|&i| self.index[i]).collect();
-        self.name = order.iter().map(|&i| Arc::clone(&self.name[i])).collect();
+        order.sort_by_key(|&i| self.headers[i]);
+        let mut keep: Vec<usize> = Vec::with_capacity(n);
+        for &i in &order {
+            if keep
+                .last()
+                .is_some_and(|&j| self.headers[j] == self.headers[i])
+            {
+                *keep.last_mut().unwrap() = i;
+            } else {
+                keep.push(i);
+            }
+        }
+        if keep.len() == n && self.headers.windows(2).all(|w| w[0] < w[1]) {
+            return;
+        }
+        self.headers = keep.iter().map(|&i| self.headers[i]).collect();
+        self.data_start = keep.iter().map(|&i| self.data_start[i]).collect();
+        self.compressed_size = keep.iter().map(|&i| self.compressed_size[i]).collect();
+        self.method = keep.iter().map(|&i| self.method[i]).collect();
+        self.encrypted = keep.iter().map(|&i| self.encrypted[i]).collect();
+        self.index = keep.iter().map(|&i| self.index[i]).collect();
+        self.name = keep.iter().map(|&i| Arc::clone(&self.name[i])).collect();
     }
 
     fn get(&self, header: u64) -> Option<ZipMemberView<'_>> {
@@ -3027,6 +3043,25 @@ mod tests {
         assert_eq!(b.index, 1);
         assert_eq!(t.get(300).unwrap().data_start, 301);
         assert!(t.get(999).is_none());
+
+        // Duplicate header: last insert wins (HashMap parity).
+        t.insert(
+            100,
+            ZipMemberMeta {
+                name: Arc::from("a-last"),
+                data_start: 1999,
+                compressed_size: 1,
+                method: METHOD_STORED,
+                encrypted: false,
+                index: 9,
+            },
+        );
+        t.finish();
+        let a = t.get(100).unwrap();
+        assert_eq!(&**a.name, "a-last");
+        assert_eq!(a.data_start, 1999);
+        assert_eq!(a.index, 9);
+        assert_eq!(t.len(), 3);
     }
 
     /// Store stencil path remains random-access (not forced through inflate cache).
