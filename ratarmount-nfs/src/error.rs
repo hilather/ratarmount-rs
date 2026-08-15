@@ -11,6 +11,7 @@ pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
         ErrorKind::NotFound => nfsstat3::NFS3ERR_NOENT,
         ErrorKind::PermissionDenied => nfsstat3::NFS3ERR_ACCES,
         ErrorKind::IsADirectory => nfsstat3::NFS3ERR_ISDIR,
+        ErrorKind::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
         ErrorKind::InvalidInput => nfsstat3::NFS3ERR_INVAL,
         ErrorKind::Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
         // `ErrorKind::NotADirectory` is Rust 1.83+; MSRV is 1.74. VFS-layer
@@ -45,6 +46,10 @@ mod tests {
         assert_eq!(
             as_u32(io_to_nfsstat3(&Error::new(ErrorKind::IsADirectory, "x"))),
             as_u32(nfsstat3::NFS3ERR_ISDIR)
+        );
+        assert_eq!(
+            as_u32(io_to_nfsstat3(&Error::new(ErrorKind::AlreadyExists, "x"))),
+            as_u32(nfsstat3::NFS3ERR_EXIST)
         );
         assert_eq!(
             as_u32(io_to_nfsstat3(&Error::new(ErrorKind::InvalidInput, "x"))),

@@ -70,6 +70,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS compositing pin (`member_seek_is_cheap`) | `cargo test -p ratarmount-compositing --lib file_version_layer_forwards` · `cargo test -p ratarmount-compositing --lib automount_forwards` |
 | NFS serve stop | `cargo test -p ratarmount-nfs --lib serve_stop` |
 | NFS overlay write / stale reader after truncate | `cargo test -p ratarmount-nfs --lib overlay_` · `cargo test -p ratarmount-nfs --lib writers_rofs` |
+| NFS overlay rename / symlink | `cargo test -p ratarmount-nfs --lib overlay_rename` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay_rename` |
+| Live overlay commit (uncompressed TAR) | `cargo test -p ratarmount-compositing --lib live_commit` · `cargo test -p ratarmount --test commit_overlay_live` |
 | NFSv4.1 RO adapter (lookup/read/readdir) | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_` |
 | NFSv4 overlay create/write invalidate | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay` |
 | NFSv4 reader idle/lease drop | `cargo test -p ratarmount-nfs --features nfsv4 --lib evict_idle` |
@@ -77,6 +79,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFSv4 EXCHANGE_ID smoke | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_exchange_id` |
 | Linux/macOS packages compile `nfsv4` | `./packaging/test-nfsv4-features.sh` |
 | Kernel NFS Docker (v3 + v4.1) | `./test-harness/nfs-docker/run.sh` (privileged Docker + real `mount -t nfs`; skip if docker/privileged unavailable; empty/wrong bytes = fail) |
+| Kernel NFS Docker overlay write | `./test-harness/nfs-docker/run.sh 3 write` · `./test-harness/nfs-docker/run.sh 4 write` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

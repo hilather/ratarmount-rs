@@ -2,8 +2,8 @@
 //!
 //! Userspace NFSv3 adapter (default). Optional NFSv4.1 (`--features nfsv4`,
 //! `--nfs-vers 4`) shares the same `MountSource` and `-w` overlay. Overlay
-//! create/write/mkdir/remove/setattr-size land on v4 when `-w` is set;
-//! rename and symlink stay `ReadOnly`. The bind parser and error map live
+//! create/write/mkdir/remove/setattr-size/rename/symlink land on v4 when
+//! `-w` is set. The bind parser and error map live
 //! here so the CLI can validate `--nfs-bind` / `--nfs-vers` without starting
 //! a listener.
 

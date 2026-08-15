@@ -341,10 +341,69 @@ impl RatarmountNfs {
         }
         self.getattr_sync(id)
     }
+
+    pub fn rename_sync(
+        &self,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
+    ) -> Result<(), nfsstat3> {
+        let ov = self.overlay()?;
+        let from_name = decode_filename(from_filename)?;
+        let to_name = decode_filename(to_filename)?;
+        let from_parent = self
+            .inodes
+            .path_for_id(from_dirid)
+            .ok_or(nfsstat3::NFS3ERR_STALE)?;
+        let to_parent = self
+            .inodes
+            .path_for_id(to_dirid)
+            .ok_or(nfsstat3::NFS3ERR_STALE)?;
+        let from = join_path(&from_parent, &from_name);
+        let to = join_path(&to_parent, &to_name);
+        let from_id = self.inodes.id_for_path(&from);
+        if let Some(dest_id) = self.inodes.id_if_present(&to) {
+            self.bump_after_mutate(dest_id);
+        }
+        ov.rename(&from, &to).map_err(overlay_to_nfs)?;
+        self.inodes.rebind_path(from_id, &to);
+        self.bump_after_mutate(from_id);
+        Ok(())
+    }
+
+    pub fn symlink_sync(
+        &self,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
+        _attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        let ov = self.overlay()?;
+        let name = decode_filename(linkname)?;
+        let parent = self
+            .inodes
+            .path_for_id(dirid)
+            .ok_or(nfsstat3::NFS3ERR_STALE)?;
+        let path = join_path(&parent, &name);
+        let target = std::str::from_utf8(symlink.as_ref())
+            .map_err(|_| nfsstat3::NFS3ERR_INVAL)?
+            .to_string();
+        ov.create_symlink(&path, &target).map_err(overlay_to_nfs)?;
+        let id = self.inodes.id_for_path(&path);
+        self.bump_after_mutate(id);
+        if let Some(fi) = self.source.lookup(&path, 0) {
+            self.inodes.store_lookup_fi(id, fi);
+        }
+        Ok((id, self.getattr_sync(id)?))
+    }
 }
 
-fn overlay_to_nfs(err: impl std::fmt::Display) -> nfsstat3 {
-    crate::io_to_nfsstat3(&io::Error::other(err.to_string()))
+fn overlay_to_nfs(err: ratarmount_compositing::OverlayError) -> nfsstat3 {
+    match err {
+        ratarmount_compositing::OverlayError::Io(e) => crate::io_to_nfsstat3(&e),
+        other => crate::io_to_nfsstat3(&io::Error::other(other.to_string())),
+    }
 }
 
 fn close_overlay_fd(fd: i32) {
@@ -500,12 +559,12 @@ impl NFSFileSystem for RatarmountNfs {
 
     async fn rename(
         &self,
-        _from_dirid: fileid3,
-        _from_filename: &filename3,
-        _to_dirid: fileid3,
-        _to_filename: &filename3,
+        from_dirid: fileid3,
+        from_filename: &filename3,
+        to_dirid: fileid3,
+        to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        self.rename_sync(from_dirid, from_filename, to_dirid, to_filename)
     }
 
     async fn readdir(
@@ -519,12 +578,12 @@ impl NFSFileSystem for RatarmountNfs {
 
     async fn symlink(
         &self,
-        _dirid: fileid3,
-        _linkname: &filename3,
-        _symlink: &nfspath3,
-        _attr: &sattr3,
+        dirid: fileid3,
+        linkname: &filename3,
+        symlink: &nfspath3,
+        attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
-        Err(nfsstat3::NFS3ERR_ROFS)
+        self.symlink_sync(dirid, linkname, symlink, attr)
     }
 
     async fn readlink(&self, id: fileid3) -> Result<nfspath3, nfsstat3> {
@@ -765,6 +824,18 @@ mod tests {
             stat_u32(nfs.create_exclusive_sync(1, &name("x")).unwrap_err()),
             stat_u32(nfsstat3::NFS3ERR_ROFS)
         );
+        assert_eq!(
+            stat_u32(nfs.rename_sync(1, &name("a"), 1, &name("b")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_ROFS)
+        );
+        let target = nfspath3::from(&b"t"[..]);
+        assert_eq!(
+            stat_u32(
+                nfs.symlink_sync(1, &name("l"), &target, &sattr3::default())
+                    .unwrap_err()
+            ),
+            stat_u32(nfsstat3::NFS3ERR_ROFS)
+        );
     }
 
     fn overlay_export(base: Synth) -> (tempfile::TempDir, RatarmountNfs) {
@@ -808,6 +879,45 @@ mod tests {
         assert!(names.iter().any(|n| n == "new.txt"), "{names:?}");
         assert!(names.iter().any(|n| n == "sub"), "{names:?}");
         assert!(names.iter().any(|n| n == "keep"), "{names:?}");
+    }
+
+    #[test]
+    fn overlay_rename_and_symlink() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+
+        let (id, _) = nfs
+            .create_sync(1, &name("src.txt"), sattr3::default())
+            .expect("create");
+        nfs.write_sync(id, 0, b"moved").expect("write");
+        nfs.rename_sync(1, &name("src.txt"), 1, &name("dst.txt"))
+            .expect("rename");
+        assert_eq!(
+            stat_u32(nfs.lookup_sync(1, &name("src.txt")).unwrap_err()),
+            stat_u32(nfsstat3::NFS3ERR_NOENT)
+        );
+        let dst = nfs.lookup_sync(1, &name("dst.txt")).expect("dst lookup");
+        let (buf, _) = nfs.read_sync(dst, 0, 32).expect("read renamed");
+        assert_eq!(buf, b"moved");
+
+        let target = nfspath3::from(&b"dst.txt"[..]);
+        let (lid, lattr) = nfs
+            .symlink_sync(1, &name("link"), &target, &sattr3::default())
+            .expect("symlink");
+        assert_eq!(lattr.ftype as u32, ftype3::NF3LNK as u32);
+        let got = nfs.readlink_sync(lid).expect("readlink");
+        assert_eq!(got.as_ref(), b"dst.txt");
+
+        let listing = nfs.readdir_sync(1, 0, 32).expect("readdir");
+        let names: Vec<String> = listing
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name.as_ref()).into_owned())
+            .collect();
+        assert!(names.iter().any(|n| n == "dst.txt"), "{names:?}");
+        assert!(names.iter().any(|n| n == "link"), "{names:?}");
+        assert!(!names.iter().any(|n| n == "src.txt"), "{names:?}");
     }
 
     #[test]

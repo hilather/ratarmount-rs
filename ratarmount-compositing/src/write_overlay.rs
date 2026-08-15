@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
 use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
@@ -53,8 +53,12 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     base: Arc<dyn MountSource>,
+    /// After a live uncompressed-TAR commit, the reopened archive.
+    replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
     db: Mutex<Connection>,
+    /// Writers take a read lock; live commit takes the write lock.
+    commit_gate: RwLock<()>,
 }
 
 impl WriteOverlay {
@@ -78,13 +82,28 @@ impl WriteOverlay {
         conn.execute_batch(SCHEMA)?;
         Ok(Self {
             base,
+            replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
+            commit_gate: RwLock::new(()),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    fn current_base(&self) -> Arc<dyn MountSource> {
+        self.replacement
+            .read()
+            .expect("overlay replacement")
+            .clone()
+            .unwrap_or_else(|| Arc::clone(&self.base))
+    }
+
+    /// Swap the archive view after a successful live commit (interval).
+    pub fn replace_base(&self, new_base: Arc<dyn MountSource>) {
+        *self.replacement.write().expect("overlay replacement") = Some(new_base);
     }
 
     fn realpath(&self, path: &str) -> PathBuf {
@@ -239,7 +258,7 @@ impl WriteOverlay {
     fn mark_deleted(&self, path: &str) -> Result<()> {
         let (folder, name) = Self::split(path);
         let db = self.db.lock().expect("overlay db");
-        if self.base.exists(path) {
+        if self.current_base().exists(path) {
             db.execute(
                 r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
                 params![folder, name],
@@ -274,7 +293,7 @@ impl WriteOverlay {
         }
         let real_parent = self.realpath(&parent);
         self.ensure_under_root(&real_parent)?;
-        if !real_parent.exists() && self.base.is_dir(&parent) {
+        if !real_parent.exists() && self.current_base().is_dir(&parent) {
             fs::create_dir_all(&real_parent)?;
         }
         Ok(())
@@ -290,7 +309,7 @@ impl WriteOverlay {
             // Existing entry must stay under root (final symlink already rejected).
             return Ok(());
         }
-        let Some(fi) = self.base.lookup(path, 0) else {
+        let Some(fi) = self.current_base().lookup(path, 0) else {
             // New file: just ensure parent
             return Ok(());
         };
@@ -298,7 +317,7 @@ impl WriteOverlay {
             fs::create_dir_all(&real)?;
             return Ok(());
         }
-        let mut src = self.base.open(&fi, 0)?;
+        let mut src = self.current_base().open(&fi, 0)?;
         let mut dst = FsOpenOptions::new()
             .write(true)
             .create_new(true)
@@ -315,6 +334,11 @@ impl WriteOverlay {
     }
 
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        self.create_file_inner(path, mode)
+    }
+
+    fn create_file_inner(&self, path: &str, mode: u32) -> Result<i32> {
         self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -339,6 +363,7 @@ impl WriteOverlay {
     }
 
     pub fn open_overlay_fd(&self, path: &str, flags: i32) -> Result<i32> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -346,7 +371,7 @@ impl WriteOverlay {
         if fs::symlink_metadata(&real).is_err()
             && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
         {
-            self.create_file(path, 0o644)?;
+            self.create_file_inner(path, 0o644)?;
         }
         if fs::symlink_metadata(&real).is_err() {
             return Err(OverlayError::Io(io::Error::new(
@@ -380,6 +405,7 @@ impl WriteOverlay {
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -390,6 +416,11 @@ impl WriteOverlay {
     }
 
     pub fn unlink(&self, path: &str) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        self.unlink_inner(path)
+    }
+
+    fn unlink_inner(&self, path: &str) -> Result<()> {
         let real = self.realpath(path);
         // unlink of a symlink removes the link itself (safe); refuse only when the
         // joined path is not under the overlay root by construction.
@@ -408,6 +439,7 @@ impl WriteOverlay {
     }
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         if real.exists() {
@@ -418,6 +450,7 @@ impl WriteOverlay {
     }
 
     pub fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -429,11 +462,233 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// Create a symlink in the overlay folder (`O_NOFOLLOW` / no escape).
+    pub fn create_symlink(&self, path: &str, target: &str) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        if target.is_empty() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "empty symlink target",
+            )));
+        }
+        self.ensure_parent(path)?;
+        let real = self.realpath(path);
+        self.ensure_under_root(&real)?;
+        if fs::symlink_metadata(&real).is_ok() || self.lookup(path, 0).is_some() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("symlink destination exists: {path}"),
+            )));
+        }
+        if let Some(parent) = real.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(target, &real)?;
+        self.mark_present(path, ratarmount_core::S_IFLNK | 0o777)?;
+        Ok(())
+    }
+
+    /// Rename within the overlay (COW archive members first).
+    pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let from = normpath(from);
+        let to = normpath(to);
+        if from == "/" || to == "/" || from == to {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "invalid rename paths",
+            )));
+        }
+        self.ensure_parent(&to)?;
+        let from_real_meta = fs::symlink_metadata(self.realpath(&from));
+        let from_is_dir = from_real_meta
+            .as_ref()
+            .map(|m| m.file_type().is_dir())
+            .unwrap_or_else(|_| self.current_base().is_dir(&from));
+        if from_is_dir {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::IsADirectory,
+                "directory rename is not supported on the write overlay",
+            )));
+        }
+        if self.lookup(&to, 0).is_some() {
+            let dest_real = self.realpath(&to);
+            let dest_is_dir = fs::symlink_metadata(&dest_real)
+                .map(|m| m.file_type().is_dir())
+                .unwrap_or_else(|_| self.current_base().is_dir(&to));
+            if dest_is_dir {
+                return Err(OverlayError::Io(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "rename destination is a directory",
+                )));
+            }
+            self.unlink_inner(&to)?;
+        }
+        self.ensure_modifiable(&from)?;
+        let from_real = self.realpath(&from);
+        let to_real = self.realpath(&to);
+        self.ensure_under_root(&from_real)?;
+        self.ensure_under_root(&to_real)?;
+        if fs::symlink_metadata(&from_real).is_err() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("rename source missing: {from}"),
+            )));
+        }
+        if let Some(parent) = to_real.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::rename(&from_real, &to_real)?;
+        self.mark_deleted(&from)?;
+        let mode = fs::symlink_metadata(&to_real)?.mode();
+        self.mark_present(&to, mode)?;
+        Ok(())
+    }
+
+    /// True when `archive` can be live-committed (uncompressed TAR only).
+    pub fn live_commit_supported(archive: &Path) -> Result<()> {
+        live_commit_is_supported(archive)
+    }
+
+    /// Rewrite `archive` via a sibling copy + GNU tar (never mutate the live inode).
+    ///
+    /// Does not clear the overlay or swap the base — caller does that after reopen.
+    pub fn commit_uncompressed_tar_atomic(&self, archive: &Path) -> Result<bool> {
+        live_commit_is_supported(archive)?;
+        ensure_gnu_tar()?;
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let plan = {
+            let db = self.db.lock().expect("overlay db");
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
+        };
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        self.persist_uncompressed_tar_plan(archive, &plan)?;
+        Ok(true)
+    }
+
+    /// Persist, swap base, and wipe overlay under **one** write lock (interval).
+    pub fn commit_live_uncompressed_tar(
+        &self,
+        archive: &Path,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<bool> {
+        live_commit_is_supported(archive)?;
+        ensure_gnu_tar()?;
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let plan = {
+            let db = self.db.lock().expect("overlay db");
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
+        };
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        // Reuse the unlocked persist body by temporarily... no, call the same
+        // steps as commit_uncompressed_tar_atomic without taking the gate again.
+        self.persist_uncompressed_tar_plan(archive, &plan)?;
+        let new_base = reopen(archive)?;
+        *self.replacement.write().expect("overlay replacement") = Some(new_base);
+        reset_overlay_dir(&self.root)?;
+        self.db
+            .lock()
+            .expect("overlay db")
+            .execute(r#"DELETE FROM "files""#, [])?;
+        Ok(true)
+    }
+
+    fn persist_uncompressed_tar_plan(
+        &self,
+        archive: &Path,
+        plan: &OverlayCommitPlan,
+    ) -> Result<()> {
+        let parent = archive.parent().filter(|p| !p.as_os_str().is_empty());
+        let mut tmp = match parent {
+            Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
+            None => tempfile::NamedTempFile::new()?,
+        };
+        {
+            let mut src = File::open(archive)?;
+            io::copy(&mut src, tmp.as_file_mut())?;
+            tmp.as_file().sync_all()?;
+        }
+        let work_tar = tmp.path().to_path_buf();
+        let list_dir = tempfile::tempdir()?;
+        let deletion_list = list_dir.path().join("deletions.lst");
+        let append_list = list_dir.path().join("append.lst");
+        fs::write(&deletion_list, &plan.deletions_nul)?;
+        fs::write(&append_list, &plan.appends_nul)?;
+        if !plan.deletions_nul.is_empty() {
+            let output = tar_env_command()
+                .args([
+                    "--delete",
+                    "--null",
+                    &format!("--files-from={}", deletion_list.display()),
+                    "--file",
+                ])
+                .arg(&work_tar)
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()?;
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let unfiltered: Vec<&str> = stderr
+                .lines()
+                .filter(|line| {
+                    let line = line.trim();
+                    !line.is_empty()
+                        && !line.contains("tar: Exiting with failure")
+                        && !line.contains("Not found in archive")
+                })
+                .collect();
+            if !unfiltered.is_empty() {
+                for line in &unfiltered {
+                    eprintln!("{line}");
+                }
+                return Err(OverlayError::Msg(
+                    "There were problems when trying to delete files.".into(),
+                ));
+            }
+        }
+        if !plan.appends_nul.is_empty() {
+            let status = tar_env_command()
+                .args(["--append", "-C"])
+                .arg(&self.root)
+                .args([
+                    "--null",
+                    &format!("--files-from={}", append_list.display()),
+                    "--file",
+                ])
+                .arg(&work_tar)
+                .status()?;
+            if !status.success() {
+                return Err(OverlayError::Msg(format!(
+                    "tar --append failed with {status}"
+                )));
+            }
+        }
+        tmp.as_file().sync_all()?;
+        tmp.persist(archive).map_err(|e| {
+            OverlayError::Msg(format!(
+                "Failed to replace '{}' after live TAR commit: {}",
+                archive.display(),
+                e.error
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Remove overlay files (except the hidden DB) and clear deletion/present rows.
+    pub fn reset_overlay_contents(&self) -> Result<()> {
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        reset_overlay_dir(&self.root)?;
+        let db = self.db.lock().expect("overlay db");
+        db.execute(r#"DELETE FROM "files""#, [])?;
+        Ok(())
+    }
+
     fn overlay_file_info(&self, path: &str) -> Option<FileInfo> {
         let real = self.realpath(path);
-        if !real.exists() {
-            return None;
-        }
+        // symlink_metadata so a dangling overlay symlink is still visible.
         let meta = fs::symlink_metadata(&real).ok()?;
         let linkname = if meta.file_type().is_symlink() {
             fs::read_link(&real)
@@ -465,7 +720,7 @@ impl MountSource for WriteOverlay {
 
         let mut map = std::collections::BTreeMap::new();
 
-        if let Some(base_list) = self.base.list(&path) {
+        if let Some(base_list) = self.current_base().list(&path) {
             match base_list {
                 ListResult::Infos(m) => {
                     for (k, v) in m {
@@ -480,7 +735,7 @@ impl MountSource for WriteOverlay {
                             continue;
                         }
                         let full = join(&path, &name);
-                        if let Some(fi) = self.base.lookup(&full, 0) {
+                        if let Some(fi) = self.current_base().lookup(&full, 0) {
                             map.insert(name, fi);
                         }
                     }
@@ -503,7 +758,7 @@ impl MountSource for WriteOverlay {
             }
         }
 
-        if path == "/" || !map.is_empty() || self.base.is_dir(&path) {
+        if path == "/" || !map.is_empty() || self.current_base().is_dir(&path) {
             Some(ListResult::Infos(map))
         } else {
             None
@@ -518,7 +773,7 @@ impl MountSource for WriteOverlay {
         let deleted: HashSet<String> = self.list_deleted(&path).into_iter().collect();
         let mut by_name: BTreeMap<String, CheapDirent> = BTreeMap::new();
 
-        if let Some(base_dents) = self.base.list_dirents(&path) {
+        if let Some(base_dents) = self.current_base().list_dirents(&path) {
             for d in base_dents {
                 if !deleted.contains(&d.name) {
                     by_name.insert(d.name.clone(), d);
@@ -547,7 +802,7 @@ impl MountSource for WriteOverlay {
             }
         }
 
-        if path == "/" || !by_name.is_empty() || self.base.is_dir(&path) {
+        if path == "/" || !by_name.is_empty() || self.current_base().is_dir(&path) {
             Some(by_name.into_values().collect())
         } else {
             None
@@ -572,7 +827,7 @@ impl MountSource for WriteOverlay {
         if let Some(fi) = self.overlay_file_info(&path) {
             return Some(fi);
         }
-        self.base.lookup(&path, file_version)
+        self.current_base().lookup(&path, file_version)
     }
 
     fn open(
@@ -593,7 +848,7 @@ impl MountSource for WriteOverlay {
             }
         }
         // If real overlay file exists for a path we cannot recover, fall back to base.
-        self.base.open(file_info, buffering)
+        self.current_base().open(file_info, buffering)
     }
 
     fn is_immutable(&self) -> bool {
@@ -606,7 +861,7 @@ impl MountSource for WriteOverlay {
                 return true;
             }
         }
-        self.base.member_seek_is_cheap(file_info)
+        self.current_base().member_seek_is_cheap(file_info)
     }
 }
 
@@ -710,18 +965,28 @@ impl OverlayCommitPlan {
 }
 
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
+    let db_path = write_overlay.join(HIDDEN_DB);
+    let conn = if db_path.is_file() {
+        Some(Connection::open_with_flags(
+            &db_path,
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )?)
+    } else {
+        None
+    };
+    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref())
+}
+
+fn collect_overlay_commit_plan_from_conn(
+    write_overlay: &Path,
+    conn: Option<&Connection>,
+) -> Result<OverlayCommitPlan> {
     let mut deletions_nul: Vec<u8> = Vec::new();
     let mut appends_nul: Vec<u8> = Vec::new();
     let mut deleted_paths: HashSet<String> = HashSet::new();
     let mut append_entries: Vec<(String, bool)> = Vec::new();
 
-    // Deletions from hidden DB
-    let db_path = write_overlay.join(HIDDEN_DB);
-    if db_path.is_file() {
-        let conn = Connection::open_with_flags(
-            &db_path,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )?;
+    if let Some(conn) = conn {
         let mut stmt = conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#)?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?;
         for row in rows {
@@ -1252,6 +1517,63 @@ fn add_deletion_variants(buf: &mut Vec<u8>, path_relative_to_root: &str) {
         buf.extend(variant.as_bytes());
         buf.push(0);
     }
+}
+
+/// Uncompressed TAR only — gzip/bzip2/xz TAR and ZIP are full rewrites.
+pub fn live_commit_is_supported(archive: &Path) -> Result<()> {
+    if is_zip_archive(archive)? {
+        return Err(OverlayError::Msg(
+            "live overlay commit supports uncompressed TAR only (not ZIP)".into(),
+        ));
+    }
+    let format = detect_compression(archive).map_err(|e| {
+        OverlayError::Msg(format!(
+            "Failed to detect compression for '{}': {e}",
+            archive.display()
+        ))
+    })?;
+    if format != CompressionFormat::None {
+        return Err(OverlayError::Msg(format!(
+            "live overlay commit supports uncompressed TAR only (got {format:?})"
+        )));
+    }
+    if !is_uncompressed_tar(archive)? {
+        return Err(OverlayError::Msg(format!(
+            "'{}' is not an uncompressed TAR",
+            archive.display()
+        )));
+    }
+    Ok(())
+}
+
+fn reset_overlay_dir(root: &Path) -> Result<()> {
+    let rd = match fs::read_dir(root) {
+        Ok(r) => r,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name();
+        let name_s = name.to_string_lossy();
+        if name_s == HIDDEN_DB
+            || name_s == format!("{HIDDEN_DB}-journal")
+            || name_s == format!("{HIDDEN_DB}-shm")
+            || name_s == format!("{HIDDEN_DB}-wal")
+        {
+            continue;
+        }
+        let p = ent.path();
+        let meta = match fs::symlink_metadata(&p) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        if meta.file_type().is_dir() {
+            fs::remove_dir_all(&p)?;
+        } else {
+            fs::remove_file(&p)?;
+        }
+    }
+    Ok(())
 }
 
 fn is_uncompressed_tar(path: &Path) -> Result<bool> {
@@ -1933,6 +2255,188 @@ mod tests {
             0,
             "create-then-list must not report leftover base size {}",
             a.len()
+        );
+    }
+
+    fn make_tiny_tar(dir: &Path, members: &[(&str, &[u8])]) -> PathBuf {
+        let tree = dir.join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        for (name, body) in members {
+            let p = tree.join(name);
+            if let Some(parent) = p.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(&p, body).unwrap();
+        }
+        let tar = dir.join("a.tar");
+        let mut cmd = StdCommand::new("tar");
+        cmd.arg("-cf").arg(&tar).arg("-C").arg(&tree);
+        for (name, _) in members {
+            cmd.arg(name);
+        }
+        assert!(cmd.status().unwrap().success());
+        tar
+    }
+
+    #[test]
+    fn overlay_rename_and_symlink_persist() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let fd = ov.create_file("/src.txt", 0o644).unwrap();
+        unsafe {
+            libc::close(fd);
+        }
+        fs::write(overlay.join("src.txt"), b"renamed-bytes\n").unwrap();
+        ov.rename("/src.txt", "/dst.txt").expect("rename");
+        assert!(ov.lookup("/src.txt", 0).is_none());
+        let fi = ov.lookup("/dst.txt", 0).expect("dst");
+        assert_eq!(fi.size, b"renamed-bytes\n".len() as u64);
+
+        ov.create_symlink("/link", "dst.txt").expect("symlink");
+        let link = ov.lookup("/link", 0).expect("link info");
+        assert!(ratarmount_core::is_lnk_mode(link.mode));
+        assert_eq!(link.linkname, "dst.txt");
+        let dents = ov.list_dirents("/").unwrap();
+        let names: Vec<_> = dents.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"dst.txt"), "{names:?}");
+        assert!(names.contains(&"link"), "{names:?}");
+    }
+
+    #[test]
+    fn live_commit_uncompressed_tar_add_replace_delete_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_payload = dir.path().join("old-expected.bin");
+        fs::write(&old_payload, b"old-body\n").unwrap();
+        let new_payload = dir.path().join("new-expected.bin");
+        fs::write(&new_payload, b"new-body-unique\n").unwrap();
+        let replaced_payload = dir.path().join("replaced-expected.bin");
+        fs::write(&replaced_payload, b"replaced-body\n").unwrap();
+
+        let tar = make_tiny_tar(
+            dir.path(),
+            &[
+                ("old.txt", &fs::read(&old_payload).unwrap()),
+                ("gone.txt", b"delete-me\n"),
+                ("keep.txt", b"orig-keep\n"),
+            ],
+        );
+        let _ = replaced_payload;
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let mut materialised = None;
+        let base = ratarmount_formats_tar::SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &opts,
+            "test",
+            &mut materialised,
+        )
+        .expect("index tar");
+        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        fs::write(overlay.join("new.txt"), fs::read(&new_payload).unwrap()).unwrap();
+        fs::write(overlay.join("keep.txt"), b"replaced-body\n").unwrap();
+        ov.unlink("/gone.txt").expect("mark gone deleted");
+
+        match ov.commit_uncompressed_tar_atomic(&tar) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("commit_uncompressed_tar_atomic: {other:?}"),
+        }
+
+        let list = StdCommand::new("tar")
+            .args(["-tf"])
+            .arg(&tar)
+            .output()
+            .unwrap();
+        let text = String::from_utf8_lossy(&list.stdout);
+        assert!(text.contains("new.txt"), "{text}");
+        assert!(text.contains("old.txt"), "{text}");
+        assert!(text.contains("keep.txt"), "{text}");
+        assert!(
+            !text.contains("gone.txt"),
+            "deleted member still listed: {text}"
+        );
+        let new_count = text
+            .lines()
+            .filter(|l| l.trim_end_matches('/') == "new.txt")
+            .count();
+        assert_eq!(new_count, 1, "first commit must not duplicate: {text}");
+
+        let extracted = dir.path().join("ex");
+        fs::create_dir_all(&extracted).unwrap();
+        assert!(StdCommand::new("tar")
+            .args(["-xf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&extracted)
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            fs::read(extracted.join("new.txt")).unwrap() == fs::read(&new_payload).unwrap(),
+            "new.txt must cmp to overlay source file"
+        );
+        assert_eq!(
+            fs::read(extracted.join("keep.txt")).unwrap(),
+            b"replaced-body\n"
+        );
+
+        ov.reset_overlay_contents().expect("reset");
+        assert!(!overlay.join("new.txt").exists());
+        match ov.commit_uncompressed_tar_atomic(&tar) {
+            Ok(false) => {}
+            Ok(true) => panic!("second commit with empty overlay must be a no-op"),
+            Err(e) => panic!("second commit: {e}"),
+        }
+        let list2 = StdCommand::new("tar")
+            .args(["-tf"])
+            .arg(&tar)
+            .output()
+            .unwrap();
+        let text2 = String::from_utf8_lossy(&list2.stdout);
+        let new_count2 = text2
+            .lines()
+            .filter(|l| l.trim_end_matches('/') == "new.txt")
+            .count();
+        assert_eq!(new_count2, 1, "second tick must not duplicate: {text2}");
+    }
+
+    #[test]
+    fn live_commit_rejects_gzip_and_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("t");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("a"), b"x").unwrap();
+        let tgz = dir.path().join("a.tar.gz");
+        let st = StdCommand::new("tar")
+            .args(["-czf"])
+            .arg(&tgz)
+            .arg("-C")
+            .arg(&src)
+            .arg("a")
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let err = live_commit_is_supported(&tgz).unwrap_err().to_string();
+        assert!(err.contains("uncompressed TAR"), "{err}");
+
+        let zip = dir.path().join("a.zip");
+        write_sample_zip(&zip, &[("a", b"x", CompressionMethod::Stored)]);
+        let err = live_commit_is_supported(&zip).unwrap_err().to_string();
+        assert!(
+            err.contains("ZIP") || err.contains("uncompressed TAR"),
+            "{err}"
         );
     }
 }

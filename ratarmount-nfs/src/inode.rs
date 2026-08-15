@@ -41,6 +41,15 @@ impl InodeTable {
         }
     }
 
+    pub fn id_if_present(&self, path: &str) -> Option<u64> {
+        let path = normpath(path);
+        self.path_to_id
+            .lock()
+            .expect("inode path map")
+            .get(&path)
+            .copied()
+    }
+
     /// Assign or reuse a fileid for `path`. Does **not** write `FileInfo`.
     pub fn id_for_path(&self, path: &str) -> u64 {
         let path = normpath(path);
@@ -88,6 +97,28 @@ impl InodeTable {
         if let Some(ent) = self.inodes.lock().expect("inode map").get_mut(&id) {
             ent.file_info = None;
         }
+    }
+
+    /// Keep the same fileid after overlay rename (path mapping only).
+    pub fn rebind_path(&self, id: u64, new_path: &str) {
+        let new_path = normpath(new_path);
+        let mut p2i = self.path_to_id.lock().expect("inode path map");
+        let mut inodes = self.inodes.lock().expect("inode map");
+        if let Some(&old_dest) = p2i.get(&new_path) {
+            if old_dest != id {
+                p2i.remove(&new_path);
+                if let Some(ent) = inodes.get_mut(&old_dest) {
+                    ent.file_info = None;
+                    ent.path = format!("\0stale-{old_dest}");
+                }
+            }
+        }
+        if let Some(ent) = inodes.get_mut(&id) {
+            p2i.remove(&ent.path);
+            ent.path = new_path.clone();
+            ent.file_info = None;
+        }
+        p2i.insert(new_path, id);
     }
 }
 

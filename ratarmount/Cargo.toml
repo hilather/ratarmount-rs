@@ -52,5 +52,9 @@ clap.workspace = true
 env_logger.workspace = true
 log.workspace = true
 url = "2"
-nix = { version = "0.29", features = ["process"] }
+nix = { version = "0.29", features = ["process", "signal"] }
 libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+nix = { version = "0.29", features = ["signal"] }

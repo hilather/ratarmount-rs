@@ -206,8 +206,15 @@ impl ReaderLru {
         {
             let mut map = self.slots.lock().expect("reader lru");
             if let Some(slot) = map.get_mut(&id) {
-                slot.last_used = Instant::now();
-                return Ok((slot.fi.clone(), Arc::clone(&slot.state)));
+                let overlay_tagged = slot.fi.userdata.iter().any(|u| {
+                    matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:"))
+                });
+                if !overlay_tagged {
+                    slot.last_used = Instant::now();
+                    return Ok((slot.fi.clone(), Arc::clone(&slot.state)));
+                }
+                // Overlay-backed slots are invalid after live commit wipes the folder.
+                map.remove(&id);
             }
         }
 

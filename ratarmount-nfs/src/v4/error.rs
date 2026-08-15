@@ -12,6 +12,7 @@ use embednfs::FsError;
 /// [`FsError::NotFound`] without going through `io::Error`.
 pub fn io_to_fserror(err: &std::io::Error) -> FsError {
     match err.kind() {
+        ErrorKind::AlreadyExists => FsError::AlreadyExists,
         ErrorKind::NotFound => FsError::NotFound,
         ErrorKind::PermissionDenied => FsError::AccessDenied,
         ErrorKind::IsADirectory => FsError::IsDirectory,
@@ -28,6 +29,10 @@ mod tests {
 
     #[test]
     fn v4_io_to_fserror_maps_kinds() {
+        assert_eq!(
+            io_to_fserror(&Error::new(ErrorKind::AlreadyExists, "x")),
+            FsError::AlreadyExists
+        );
         assert_eq!(
             io_to_fserror(&Error::new(ErrorKind::NotFound, "x")),
             FsError::NotFound

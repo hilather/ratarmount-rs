@@ -118,6 +118,7 @@ ratarmount --nfs archive.tar.gz
 #   ratarmount --nfs --nfs-vers 4
 #   Linux: mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ mnt
 # Loopback kernel client verified via privileged Docker (./test-harness/nfs-docker/run.sh).
+# Uncompressed TAR only: --commit-overlay-on-exit / --commit-overlay-interval (durable -w).
 
 # Unmount
 ratarmount -u mnt/

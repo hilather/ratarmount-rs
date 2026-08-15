@@ -1,8 +1,8 @@
 //! Feature-gated NFSv4.1 export (`embednfs` 0.4.1).
 //!
 //! `MountSource` adapter + bind/serve. `-w` overlay create/write/mkdir/remove
-//! /setattr-size match v3; rename and create_symlink stay `ReadOnly`.
-//! Linux kernel `mount -t nfs` remains unverified (unprivileged CI).
+//! /setattr-size/rename/create_symlink match v3 when `-w` is set.
+//! Linux kernel `mount -t nfs` is verified on loopback via privileged Docker.
 
 mod adapter;
 mod error;

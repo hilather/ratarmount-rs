@@ -9,9 +9,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
-    AccessMask, Attrs, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage, FileSystem,
-    FsCapabilities, FsError, FsLimits, FsResult, FsStats, ObjectType, ReadResult, RequestContext,
-    SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
+    AccessMask, Attrs, CommitSupport, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage,
+    FileSystem, FsCapabilities, FsError, FsLimits, FsResult, FsStats, ObjectType, ReadResult,
+    RequestContext, SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
 };
 use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{is_dir_mode, is_lnk_mode, FileInfo, MountSource};
@@ -347,6 +347,52 @@ impl RatarmountNfs4 {
         self.getattr_sync(id)
     }
 
+    pub fn rename_sync(
+        &self,
+        from_dir: u64,
+        from_name: &str,
+        to_dir: u64,
+        to_name: &str,
+    ) -> FsResult<()> {
+        let ov = self.overlay()?;
+        Self::check_name(from_name)?;
+        Self::check_name(to_name)?;
+        let from_parent = self.inodes.path_for_id(from_dir).ok_or(FsError::Stale)?;
+        let to_parent = self.inodes.path_for_id(to_dir).ok_or(FsError::Stale)?;
+        let from = join_path(&from_parent, from_name);
+        let to = join_path(&to_parent, to_name);
+        let from_id = self.inodes.id_for_path(&from);
+        if let Some(dest_id) = self.inodes.id_if_present(&to) {
+            self.bump_after_mutate(dest_id);
+        }
+        ov.rename(&from, &to).map_err(overlay_to_fs)?;
+        self.inodes.rebind_path(from_id, &to);
+        self.bump_after_mutate(from_id);
+        Ok(())
+    }
+
+    pub fn symlink_sync(
+        &self,
+        parent: u64,
+        name: &str,
+        target: &str,
+    ) -> FsResult<CreateResult<u64>> {
+        let ov = self.overlay()?;
+        Self::check_name(name)?;
+        let parent_path_str = self.inodes.path_for_id(parent).ok_or(FsError::Stale)?;
+        let path = join_path(&parent_path_str, name);
+        ov.create_symlink(&path, target).map_err(overlay_to_fs)?;
+        let id = self.inodes.id_for_path(&path);
+        self.bump_after_mutate(id);
+        if let Some(fi) = self.source.lookup(&path, 0) {
+            self.inodes.store_lookup_fi(id, fi);
+        }
+        Ok(CreateResult {
+            handle: id,
+            attrs: self.getattr_sync(id)?,
+        })
+    }
+
     pub fn statfs_sync(&self) -> FsStats {
         FsStats {
             total_bytes: 0,
@@ -402,8 +448,11 @@ fn read_member(
     })
 }
 
-fn overlay_to_fs(err: impl std::fmt::Display) -> FsError {
-    io_to_fserror(&io::Error::other(err.to_string()))
+fn overlay_to_fs(err: ratarmount_compositing::OverlayError) -> FsError {
+    match err {
+        ratarmount_compositing::OverlayError::Io(e) => io_to_fserror(&e),
+        other => io_to_fserror(&io::Error::other(other.to_string())),
+    }
 }
 
 fn close_overlay_fd(fd: i32) {
@@ -446,7 +495,9 @@ impl FileSystem for RatarmountNfs4 {
             symlinks: true,
             hard_links: false,
             xattrs: false,
-            explicit_sync: false,
+            // Linux kernel CLOSE often sends COMMIT; advertise + implement a no-op
+            // (writes already reported DataSync into the overlay file).
+            explicit_sync: true,
             case_sensitive: true,
             case_preserving: true,
         }
@@ -567,12 +618,12 @@ impl FileSystem for RatarmountNfs4 {
     async fn rename(
         &self,
         _ctx: &RequestContext,
-        _from_dir: &Self::Handle,
-        _from_name: &str,
-        _to_dir: &Self::Handle,
-        _to_name: &str,
+        from_dir: &Self::Handle,
+        from_name: &str,
+        to_dir: &Self::Handle,
+        to_name: &str,
     ) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+        self.rename_sync(*from_dir, from_name, *to_dir, to_name)
     }
 
     async fn setattr(
@@ -587,6 +638,10 @@ impl FileSystem for RatarmountNfs4 {
     fn symlinks(&self) -> Option<&dyn Symlinks<Self::Handle>> {
         Some(self)
     }
+
+    fn commit_support(&self) -> Option<&dyn CommitSupport<Self::Handle>> {
+        Some(self)
+    }
 }
 
 #[async_trait]
@@ -594,16 +649,31 @@ impl Symlinks<u64> for RatarmountNfs4 {
     async fn create_symlink(
         &self,
         _ctx: &RequestContext,
-        _parent: &u64,
-        _name: &str,
-        _target: &str,
+        parent: &u64,
+        name: &str,
+        target: &str,
         _attrs: &SetAttrs,
     ) -> FsResult<CreateResult<u64>> {
-        Err(FsError::ReadOnly)
+        self.symlink_sync(*parent, name, target)
     }
 
     async fn readlink(&self, _ctx: &RequestContext, handle: &u64) -> FsResult<String> {
         self.readlink_sync(*handle)
+    }
+}
+
+#[async_trait]
+impl CommitSupport<u64> for RatarmountNfs4 {
+    async fn commit(
+        &self,
+        _ctx: &RequestContext,
+        handle: &u64,
+        _offset: u64,
+        _count: u32,
+    ) -> FsResult<()> {
+        // Overlay writes already reached the host file; COMMIT is a verifier bump.
+        let _ = self.file_info_for_id(*handle)?;
+        Ok(())
     }
 }
 
@@ -1075,21 +1145,59 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn v4_overlay_rename_and_symlink_readonly() {
+    async fn v4_overlay_rename_and_symlink() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+        let c = ctx();
+        let created = nfs
+            .create(
+                &c,
+                &1,
+                "src.txt",
+                CreateRequest {
+                    kind: embednfs::CreateKind::File,
+                    attrs: SetAttrs::default(),
+                },
+            )
+            .await
+            .expect("create");
+        nfs.write_sync(created.handle, 0, b"moved").expect("write");
+        nfs.rename(&c, &1, "src.txt", &1, "dst.txt")
+            .await
+            .expect("rename");
+        assert_eq!(
+            nfs.lookup_sync(1, "src.txt").unwrap_err(),
+            FsError::NotFound
+        );
+        let dst = nfs.lookup_sync(1, "dst.txt").expect("dst");
+        let got = nfs.read_sync(dst, 0, 32).expect("read renamed");
+        assert_eq!(&got.data[..], b"moved");
+
+        let link = nfs
+            .create_symlink(&c, &1, "link", "dst.txt", &SetAttrs::default())
+            .await
+            .expect("symlink");
+        assert_eq!(link.attrs.object_type, ObjectType::Symlink);
+        assert_eq!(nfs.readlink_sync(link.handle).expect("readlink"), "dst.txt");
+
+        let page = nfs.readdir_sync(1, 0, 32, false).expect("readdir");
+        let names: Vec<&str> = page.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"dst.txt"), "{names:?}");
+        assert!(names.contains(&"link"), "{names:?}");
+        assert!(!names.contains(&"src.txt"), "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn v4_overlay_commit_ok() {
         let mut base = Synth::new();
         base.add_file("/a", b"x", vec![UserData::Other("t".into())]);
         let (_td, nfs) = overlay_export(base);
         let c = ctx();
-        assert_eq!(
-            nfs.rename(&c, &1, "a", &1, "b").await.unwrap_err(),
-            FsError::ReadOnly
-        );
-        assert_eq!(
-            nfs.create_symlink(&c, &1, "l", "t", &SetAttrs::default())
-                .await
-                .unwrap_err(),
-            FsError::ReadOnly
-        );
+        assert!(nfs.commit_support().is_some());
+        nfs.commit(&c, &1, 0, 0).await.expect("commit root");
+        let id = nfs.lookup_sync(1, "a").unwrap();
+        nfs.commit(&c, &id, 0, 0).await.expect("commit file");
     }
 
     #[test]

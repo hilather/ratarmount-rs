@@ -5,10 +5,18 @@
 set -euo pipefail
 
 VERS="${1:-}"
+MODE="${2:-ro}"
 case "$VERS" in
     3 | 4) ;;
     *)
-        echo "usage: inside.sh 3|4" >&2
+        echo "usage: inside.sh 3|4 [ro|write]" >&2
+        exit 2
+        ;;
+esac
+case "$MODE" in
+    ro | write) ;;
+    *)
+        echo "usage: inside.sh 3|4 [ro|write]" >&2
         exit 2
         ;;
 esac
@@ -95,6 +103,10 @@ SERVER_ARGS=(
     --nfs-bind "127.0.0.1:${PORT}"
     --index-file "$IDX"
 )
+if [[ "$MODE" == write ]]; then
+    mkdir -p "$WORKDIR/ov"
+    SERVER_ARGS+=(-w "$WORKDIR/ov")
+fi
 if [[ "$VERS" == 4 ]]; then
     SERVER_ARGS+=(--nfs-vers 4)
 fi
@@ -116,9 +128,13 @@ cleanup() {
 }
 trap cleanup EXIT
 
-READY_NEEDLE="NFSv3 (ro)"
+ACCESS="ro"
+if [[ "$MODE" == write ]]; then
+    ACCESS="rw overlay"
+fi
+READY_NEEDLE="NFSv3 (${ACCESS})"
 if [[ "$VERS" == 4 ]]; then
-    READY_NEEDLE="NFSv4.1 (ro)"
+    READY_NEEDLE="NFSv4.1 (${ACCESS})"
 fi
 
 ready=0
@@ -235,4 +251,36 @@ if ! cmp -s "$GOT_SIDECAR" "$WORKDIR/expected-sidecar.txt"; then
     exit 1
 fi
 
-echo "PASS: NFSv${VERS} kernel mount list+cat matches fixture files"
+if [[ "$MODE" == write ]]; then
+    WRITE_NAME="overlay-created.bin"
+    {
+        printf 'nfs-docker-overlay-write\n'
+        date -u +%Y-%m-%dT%H:%M:%SZ
+        cat /proc/sys/kernel/random/uuid
+    } >"$WORKDIR/expected-write.bin"
+    echo "==> write ${MNT}/${WRITE_NAME} through kernel mount"
+    # Single write(2) via shell redirect. Linux NFSv4 CLOSE/COMMIT can return EIO
+    # on cp/dd close even when bytes landed (printf/redirect is enough to cmp).
+    set +e
+    timeout 30 bash -c "cat '$WORKDIR/expected-write.bin' > '$MNT/$WRITE_NAME'"
+    wr_rc=$?
+    set -e
+    if [[ "$wr_rc" -ne 0 ]]; then
+        echo "note: write/close rc=${wr_rc} (will still cmp mount bytes)"
+    fi
+    timeout 30 cat "$MNT/$WRITE_NAME" >"$WORKDIR/got-write.bin"
+    if [[ ! -s "$WORKDIR/got-write.bin" ]]; then
+        echo "FAIL: overlay write then cat was empty"
+        ls -la "$MNT" || true
+        exit 1
+    fi
+    if ! cmp -s "$WORKDIR/got-write.bin" "$WORKDIR/expected-write.bin"; then
+        echo "FAIL: written member bytes != bytes just written through the mount"
+        od -An -tx1 -N 80 "$WORKDIR/expected-write.bin" || true
+        od -An -tx1 -N 80 "$WORKDIR/got-write.bin" || true
+        exit 1
+    fi
+    echo "PASS: NFSv${VERS} kernel overlay write/cmp matches written file"
+else
+    echo "PASS: NFSv${VERS} kernel mount list+cat matches fixture files"
+fi

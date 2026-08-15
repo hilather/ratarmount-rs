@@ -12,13 +12,21 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 VERS="${1:-all}"
+MODE="${2:-ro}"
 IMAGE="${NFS_IT_IMAGE:-ratarmount-nfs-it:local}"
 PROFILE="${NFS_IT_PROFILE:-debug}"
 
 case "$VERS" in
     3 | 4 | all) ;;
     *)
-        echo "usage: $0 [3|4|all]" >&2
+        echo "usage: $0 [3|4|all] [ro|write]" >&2
+        exit 2
+        ;;
+esac
+case "$MODE" in
+    ro | write) ;;
+    *)
+        echo "usage: $0 [3|4|all] [ro|write]" >&2
         exit 2
         ;;
 esac
@@ -84,7 +92,7 @@ run_one() {
         -e "RATARMOUNT_BIN=/usr/local/bin/ratarmount" \
         -v "$BIN:/usr/local/bin/ratarmount:ro" \
         -v "$SCRIPT_DIR/inside.sh:/usr/local/bin/nfs-it-inside.sh:ro" \
-        "$IMAGE" "$v"
+        "$IMAGE" "$v" "$MODE"
 }
 
 if [[ "$VERS" == all ]]; then

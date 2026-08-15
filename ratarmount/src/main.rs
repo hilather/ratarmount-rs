@@ -25,6 +25,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod factory;
+mod overlay_commit;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -278,6 +279,20 @@ struct Args {
     /// Skip interactive confirmation for `--commit-overlay` (type "commit" otherwise).
     #[arg(long = "yes", action = ArgAction::SetTrue)]
     yes: bool,
+
+    /// On SIGINT/SIGTERM or NFS/FUSE return, commit `-w` into an uncompressed TAR.
+    /// Rejects `:temp:` and gzip/bzip2/xz TAR / ZIP (no silent full rewrite).
+    #[arg(long = "commit-overlay-on-exit", action = ArgAction::SetTrue)]
+    commit_overlay_on_exit: bool,
+
+    /// Periodically commit `-w` into an uncompressed TAR while serving (`2s`/`15m`/`1h`).
+    /// `0` (default) is off. In-process; promptless. Requires durable `-w`.
+    #[arg(
+        long = "commit-overlay-interval",
+        value_name = "DURATION",
+        default_value = "0"
+    )]
+    commit_overlay_interval: String,
 
     /// Password for encrypted archives (repeatable)
     #[arg(long = "password", action = ArgAction::Append)]
@@ -624,6 +639,28 @@ fn main() {
         }
     }
 
+    let commit_interval = match overlay_commit::parse_interval(&args.commit_overlay_interval) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    };
+    let live_commit_archive = if args.commit_overlay_on_exit || commit_interval.is_some() {
+        match overlay_commit::validate_live_commit_args(args.write_overlay.as_deref(), &inputs) {
+            Ok(p) => Some(p),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+    if args.commit_overlay_on_exit || commit_interval.is_some() {
+        overlay_commit::install_term_signal_flag();
+    }
+
     if args.no_mount && args.nfs {
         eprintln!("error: --nfs cannot be combined with --no-mount");
         std::process::exit(2);
@@ -769,7 +806,14 @@ fn main() {
             vers: nfs_vers,
         };
         match fuse_mp {
-            None => run_nfs_only(bundle.source, nfs_opts),
+            None => run_nfs_only(
+                bundle.source,
+                nfs_opts,
+                overlay_arc,
+                live_commit_archive,
+                args.commit_overlay_on_exit,
+                commit_interval,
+            ),
             Some(mp) => run_fuse_and_nfs(
                 bundle.source,
                 mp,
@@ -780,6 +824,9 @@ fn main() {
                 nfs_opts,
                 args.foreground,
                 args.log_file.is_some(),
+                live_commit_archive,
+                args.commit_overlay_on_exit,
+                commit_interval,
             ),
         }
         return;
@@ -795,6 +842,9 @@ fn main() {
         readahead,
         args.foreground,
         args.log_file.is_some(),
+        live_commit_archive,
+        args.commit_overlay_on_exit,
+        commit_interval,
     );
 }
 
@@ -838,9 +888,30 @@ fn spawn_nfs_for_opts(
     }
 }
 
-fn run_nfs_only(source: Arc<dyn MountSource>, opts: ratarmount_nfs::NfsOptions) {
+fn run_nfs_only(
+    source: Arc<dyn MountSource>,
+    mut opts: ratarmount_nfs::NfsOptions,
+    overlay: Option<Arc<WriteOverlay>>,
+    live_archive: Option<PathBuf>,
+    commit_on_exit: bool,
+    commit_interval: Option<Duration>,
+) {
+    let stop = ratarmount_nfs::NfsStop::new();
+    opts.stop = Some(stop.clone());
+    overlay_commit::spawn_signal_nfs_stop(stop.clone());
+    if let (Some(ov), Some(archive), Some(dur)) =
+        (overlay.clone(), live_archive.clone(), commit_interval)
+    {
+        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop));
+    }
     eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
-    if let Err(e) = serve_nfs_blocking(source, opts) {
+    let serve_err = serve_nfs_blocking(source, opts);
+    overlay_commit::maybe_commit_on_exit(
+        overlay.as_deref(),
+        live_archive.as_deref(),
+        commit_on_exit,
+    );
+    if let Err(e) = serve_err {
         eprintln!("error starting NFS server: {e}");
         std::process::exit(1);
     }
@@ -857,10 +928,19 @@ fn run_fuse_and_nfs(
     mut nfs_opts: ratarmount_nfs::NfsOptions,
     foreground: bool,
     has_log_file: bool,
+    live_archive: Option<PathBuf>,
+    commit_on_exit: bool,
+    commit_interval: Option<Duration>,
 ) {
     if foreground {
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
+        overlay_commit::spawn_signal_nfs_stop(stop.clone());
+        if let (Some(ov), Some(archive), Some(dur)) =
+            (overlay_arc.clone(), live_archive.clone(), commit_interval)
+        {
+            overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop.clone()));
+        }
         let ready = nfs_opts.clone();
         let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
             Ok(h) => h,
@@ -876,12 +956,17 @@ fn run_fuse_and_nfs(
             &mp,
             true,
             writable,
-            overlay_arc,
+            overlay_arc.clone(),
             fuse_opts,
             readahead,
         );
         stop.request_stop();
         let _ = handle.join();
+        overlay_commit::maybe_commit_on_exit(
+            overlay_arc.as_deref(),
+            live_archive.as_deref(),
+            commit_on_exit,
+        );
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
@@ -913,6 +998,11 @@ fn run_fuse_and_nfs(
             }
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
+            if let (Some(ov), Some(archive), Some(dur)) =
+                (overlay_arc.clone(), live_archive.clone(), commit_interval)
+            {
+                overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop.clone()));
+            }
             if let Err(e) = spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-nfs-error.log",
@@ -920,22 +1010,28 @@ fn run_fuse_and_nfs(
                 );
                 std::process::exit(1);
             }
-            if let Err(e) = mount_blocking(
+            let mount_err = mount_blocking(
                 source,
                 &mp,
                 true,
                 writable,
-                overlay_arc,
+                overlay_arc.clone(),
                 fuse_opts,
                 readahead,
-            ) {
+            );
+            stop.request_stop();
+            overlay_commit::maybe_commit_on_exit(
+                overlay_arc.as_deref(),
+                live_archive.as_deref(),
+                commit_on_exit,
+            );
+            if let Err(e) = mount_err {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
                     format!("mount error: {e}\n"),
                 );
                 std::process::exit(1);
             }
-            stop.request_stop();
             std::process::exit(0);
         }
         Err(e) => {
@@ -955,17 +1051,26 @@ fn run_fuse_only(
     readahead: u64,
     foreground: bool,
     has_log_file: bool,
+    live_archive: Option<PathBuf>,
+    commit_on_exit: bool,
+    commit_interval: Option<Duration>,
 ) {
     if foreground {
-        if let Err(e) = mount_blocking(
+        let mount_err = mount_blocking(
             source,
             &mp,
             true,
             writable,
-            overlay_arc,
+            overlay_arc.clone(),
             fuse_opts,
             readahead,
-        ) {
+        );
+        overlay_commit::maybe_commit_on_exit(
+            overlay_arc.as_deref(),
+            live_archive.as_deref(),
+            commit_on_exit,
+        );
+        if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
         }
@@ -989,15 +1094,26 @@ fn run_fuse_only(
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
-            if let Err(e) = mount_blocking(
+            if let (Some(ov), Some(archive), Some(dur)) =
+                (overlay_arc.clone(), live_archive.clone(), commit_interval)
+            {
+                overlay_commit::spawn_interval_commits(ov, archive, dur, None);
+            }
+            let mount_err = mount_blocking(
                 source,
                 &mp,
                 true,
                 writable,
-                overlay_arc,
+                overlay_arc.clone(),
                 fuse_opts,
                 readahead,
-            ) {
+            );
+            overlay_commit::maybe_commit_on_exit(
+                overlay_arc.as_deref(),
+                live_archive.as_deref(),
+                commit_on_exit,
+            );
+            if let Err(e) = mount_err {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
                     format!("mount error: {e}\n"),
@@ -1687,6 +1803,39 @@ mod nfs_cli_tests {
         assert!(a.nfs);
         assert_eq!(a.paths, vec![PathBuf::from("testdata.tar.gz")]);
         assert_eq!(a.nfs_bind, "127.0.0.1:20490");
+    }
+
+    #[test]
+    fn commit_overlay_on_exit_and_interval_parse() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--nfs",
+            "-w",
+            "/tmp/ov",
+            "--commit-overlay-on-exit",
+            "--commit-overlay-interval",
+            "2s",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.commit_overlay_on_exit);
+        assert_eq!(a.commit_overlay_interval, "2s");
+        assert_eq!(
+            crate::overlay_commit::parse_interval(&a.commit_overlay_interval).unwrap(),
+            Some(std::time::Duration::from_secs(2))
+        );
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn commit_overlay_interval_default_off() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "a.tar"]).expect("parse");
+        assert!(!a.commit_overlay_on_exit);
+        assert_eq!(a.commit_overlay_interval, "0");
+        assert_eq!(
+            crate::overlay_commit::parse_interval(&a.commit_overlay_interval).unwrap(),
+            None
+        );
     }
 
     #[test]

@@ -63,8 +63,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `--use-backend` | yes | accepted (priority list stored) | `~` |
 | FUSE extra options (`-o`) | yes | yes | `[x]` |
 | Sequential readahead (`--readahead`) | no (issue #180) | yes (`0` off; K/M/G; max 64 MiB) | `[x]` |
-| NFSv3 userspace export | no | yes (`--nfs` / `--nfs-bind`; IPv4, localhost default; `-w` overlay writes) | `[x]` / residual Windows READDIR + NFS rename/symlink |
-| NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`; Linux/macOS packages compile `nfsv4`; source `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes) | `~` / Linux kernel client **verified** (privileged Docker loopback `test-harness/nfs-docker`, 2026-08-15; not default CI); no Kerberos/LAN/Windows; no v3/v4 mux; idle-TTL-not-CLOSE; embednfs macOS-first; rename/symlink `ReadOnly` |
+| NFSv3 userspace export | no | yes (`--nfs` / `--nfs-bind`; IPv4, localhost default; `-w` overlay writes including rename/symlink) | `[x]` / residual Windows READDIR |
+| NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`; Linux/macOS packages compile `nfsv4`; source `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes including rename/symlink) | `~` / Linux kernel client **verified** (privileged Docker loopback `test-harness/nfs-docker`, 2026-08-15; not default CI); no Kerberos/LAN/Windows; no v3/v4 mux; idle-TTL-not-CLOSE; embednfs macOS-first |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
 | Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |

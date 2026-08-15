@@ -29,6 +29,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--transform` (member path rewrite) | yes | **added** | `[x]` |
 | `-w` / `--write-overlay` / `:temp:` | yes | yes | `[x]` |
 | `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; ZIP full rebuild) | `[x]` / residual encrypted ZIP |
+| `--commit-overlay-on-exit` | no | **added** (uncompressed TAR + durable `-w` only; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
+| `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR + durable `-w`; in-process) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |
@@ -70,8 +72,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Ability | Python | Rust | Status |
 |---------|--------|------|--------|
 | Single archive FUSE mount | yes | yes | `[x]` |
-| NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes) | `[x]` Rust-only |
-| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; Linux/macOS packages compile `nfsv4`; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker; no Kerberos/LAN/Windows/mux) | `~` Rust-only |
+| NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes including rename/symlink) | `[x]` Rust-only |
+| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; Linux/macOS packages compile `nfsv4`; `-w` overlay create/write/rename/symlink; Linux kernel client **verified** on loopback via privileged Docker; no Kerberos/LAN/Windows/mux) | `~` Rust-only |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |
 | Subfolder layout (`--disable-union-mount`) | yes | **added** | `[x]` |
 | Recursive nested archives | yes | yes | `[x]` |
