@@ -208,6 +208,14 @@ pub enum ListModeResult {
     Modes(BTreeMap<String, u32>),
 }
 
+/// Cheap readdir entry (name / mode / size) without a fat [`FileInfo`].
+#[derive(Clone, Debug)]
+pub struct CheapDirent {
+    pub name: String,
+    pub mode: u32,
+    pub size: u64,
+}
+
 /// Subset of POSIX `statvfs` fields used by FUSE.
 #[derive(Clone, Debug, Default)]
 pub struct StatFs {
@@ -310,6 +318,31 @@ pub trait MountSource: Send + Sync {
             ListResult::Infos(map) => Some(ListModeResult::Modes(
                 map.into_iter().map(|(k, v)| (k, v.mode)).collect(),
             )),
+        }
+    }
+
+    /// Cheap readdir. Default derives from [`Self::list_mode`] with `size = 0`.
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        match self.list_mode(path)? {
+            ListModeResult::Names(names) => Some(
+                names
+                    .into_iter()
+                    .map(|name| CheapDirent {
+                        name,
+                        mode: 0,
+                        size: 0,
+                    })
+                    .collect(),
+            ),
+            ListModeResult::Modes(map) => Some(
+                map.into_iter()
+                    .map(|(name, mode)| CheapDirent {
+                        name,
+                        mode,
+                        size: 0,
+                    })
+                    .collect(),
+            ),
         }
     }
 
@@ -518,5 +551,50 @@ mod tests {
         };
         assert_eq!(opts.threads_for("bzip2"), 3);
         assert_eq!(opts.threads_for("zstd"), 2);
+    }
+
+    /// Regression: default list_dirents derives from list_mode with size=0.
+    #[test]
+    fn regression_default_list_dirents_size_zero() {
+        struct Dummy;
+        impl MountSource for Dummy {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path != "/" {
+                    return None;
+                }
+                let mut m = BTreeMap::new();
+                m.insert(
+                    "a".into(),
+                    FileInfo {
+                        size: 99,
+                        mtime: 0.0,
+                        mode: 0o100644,
+                        linkname: String::new(),
+                        uid: 0,
+                        gid: 0,
+                        userdata: Vec::new(),
+                    },
+                );
+                Some(ListResult::Infos(m))
+            }
+            fn lookup(&self, _path: &str, _file_version: i32) -> Option<FileInfo> {
+                None
+            }
+            fn open(
+                &self,
+                _file_info: &FileInfo,
+                _buffering: i32,
+            ) -> io::Result<Box<dyn ArchiveRead>> {
+                Err(io::Error::other("no"))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let dents = Dummy.list_dirents("/").expect("dirents");
+        assert_eq!(dents.len(), 1);
+        assert_eq!(dents[0].name, "a");
+        assert_eq!(dents[0].mode, 0o100644);
+        assert_eq!(dents[0].size, 0, "default list_dirents size is 0");
     }
 }

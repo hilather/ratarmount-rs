@@ -22,11 +22,27 @@ pub const DIR_SHARD_COUNT: u32 = 32;
 // String pool
 // ---------------------------------------------------------------------------
 
-/// Interned UTF-8 strings (paths segments, names, link targets, full dirs).
+/// Build-time HashMap vs post-seal sorted-hash binary search.
+#[derive(Debug, Clone)]
+enum PoolLookup {
+    Build(HashMap<Box<str>, u32>),
+    /// `(fnv1a64, id)` sorted by hash then id. Collisions compare slab bytes.
+    Sealed(Vec<(u64, u32)>),
+}
+
+/// Interned UTF-8 strings stored as a byte slab + `(start, len)` spans.
+///
+/// Rows keep `u32` ids; [`get`] slices the slab. `Arc<str>` / `String` are
+/// materialized only at API boundaries ([`intern`], [`lookup_arc`]). After
+/// [`Self::seal`], the build HashMap is dropped and lookup is read-only.
 #[derive(Debug, Clone)]
 pub struct StringPool {
-    strings: Vec<Arc<str>>,
-    by_str: HashMap<Box<str>, u32>,
+    slab: Vec<u8>,
+    /// `(start, len)` in `slab` for each string id.
+    spans: Vec<(u32, u32)>,
+    lookup: PoolLookup,
+    /// Build-time intern() identity only; dropped on [`Self::seal`].
+    arcs: Option<HashMap<u32, Arc<str>>>,
 }
 
 impl Default for StringPool {
@@ -35,55 +51,132 @@ impl Default for StringPool {
     }
 }
 
+fn fnv1a64(s: &str) -> u64 {
+    let mut h = 0xcbf29ce484222325u64;
+    for b in s.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
 impl StringPool {
     pub fn new() -> Self {
-        let empty: Arc<str> = Arc::from("");
         let mut by_str = HashMap::new();
         by_str.insert(Box::from(""), 0u32);
         Self {
-            strings: vec![empty],
-            by_str,
+            slab: Vec::new(),
+            spans: vec![(0, 0)],
+            lookup: PoolLookup::Build(by_str),
+            arcs: Some(HashMap::new()),
         }
     }
 
-    pub fn intern(&mut self, s: &str) -> Arc<str> {
-        if let Some(&id) = self.by_str.get(s) {
-            return Arc::clone(&self.strings[id as usize]);
+    /// Freeze the pool: drop the build HashMap and interned-Arc cache.
+    pub fn seal(&mut self) {
+        if matches!(self.lookup, PoolLookup::Sealed(_)) {
+            self.arcs = None;
+            return;
         }
-        let id = self.strings.len() as u32;
-        let a: Arc<str> = Arc::from(s);
-        self.by_str.insert(Box::from(s), id);
-        self.strings.push(Arc::clone(&a));
+        self.rebuild_sealed_lookup();
+        self.arcs = None;
+    }
+
+    fn rebuild_sealed_lookup(&mut self) {
+        let mut pairs: Vec<(u64, u32)> = (0..self.spans.len() as u32)
+            .map(|id| (fnv1a64(self.get(id)), id))
+            .collect();
+        pairs.sort_unstable_by_key(|&(h, id)| (h, id));
+        self.lookup = PoolLookup::Sealed(pairs);
+    }
+
+    pub fn is_sealed_slab(&self) -> bool {
+        matches!(self.lookup, PoolLookup::Sealed(_)) && self.arcs.is_none()
+    }
+
+    fn lookup_id(&self, s: &str) -> Option<u32> {
+        match &self.lookup {
+            PoolLookup::Build(m) => m.get(s).copied(),
+            PoolLookup::Sealed(v) => {
+                let h = fnv1a64(s);
+                let i = v.partition_point(|&(hv, _)| hv < h);
+                for &(hv, id) in &v[i..] {
+                    if hv != h {
+                        break;
+                    }
+                    if self.get(id) == s {
+                        return Some(id);
+                    }
+                }
+                None
+            }
+        }
+    }
+
+    /// Materialize `Arc<str>` at the API boundary. During build, repeated
+    /// intern of the same bytes returns the same Arc; after [`Self::seal`]
+    /// a new Arc is allocated from the slab (no live `Vec<Arc<str>>`).
+    pub fn intern(&mut self, s: &str) -> Arc<str> {
+        let id = self.intern_id(s);
+        if let Some(arcs) = &self.arcs {
+            if let Some(a) = arcs.get(&id) {
+                return Arc::clone(a);
+            }
+        }
+        let a: Arc<str> = Arc::from(self.get(id));
+        if let Some(arcs) = &mut self.arcs {
+            arcs.insert(id, Arc::clone(&a));
+        }
         a
     }
 
     pub fn intern_id(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.by_str.get(s) {
+        if let Some(id) = self.lookup_id(s) {
             return id;
         }
-        let id = self.strings.len() as u32;
-        let a: Arc<str> = Arc::from(s);
-        self.by_str.insert(Box::from(s), id);
-        self.strings.push(a);
+        let id = self.spans.len() as u32;
+        let start = self.slab.len() as u32;
+        self.slab.extend_from_slice(s.as_bytes());
+        self.spans.push((start, s.len() as u32));
+        let reseal = matches!(self.lookup, PoolLookup::Sealed(_));
+        if let PoolLookup::Build(m) = &mut self.lookup {
+            m.insert(Box::from(s), id);
+        }
+        if reseal {
+            self.rebuild_sealed_lookup();
+        }
         id
     }
 
     pub fn get(&self, id: u32) -> &str {
-        self.strings
-            .get(id as usize)
-            .map(|a| a.as_ref())
-            .unwrap_or("")
+        let Some(&(start, len)) = self.spans.get(id as usize) else {
+            return "";
+        };
+        let start = start as usize;
+        let end = start + len as usize;
+        if end > self.slab.len() {
+            return "";
+        }
+        // Only UTF-8 is written into the slab.
+        std::str::from_utf8(&self.slab[start..end]).unwrap_or("")
     }
 
     /// Resolve an existing pooled string without inserting.
+    ///
+    /// After seal, the returned Arc is materialized from the slab (not a
+    /// retained intern identity).
     pub fn lookup_arc(&self, s: &str) -> Option<Arc<str>> {
-        self.by_str
-            .get(s)
-            .map(|&id| Arc::clone(&self.strings[id as usize]))
+        let id = self.lookup_id(s)?;
+        if let Some(arcs) = &self.arcs {
+            if let Some(a) = arcs.get(&id) {
+                return Some(Arc::clone(a));
+            }
+        }
+        Some(Arc::from(self.get(id)))
     }
 
     pub fn unique_count(&self) -> usize {
-        self.strings.len()
+        self.spans.len()
     }
 }
 
@@ -93,14 +186,23 @@ impl StringPool {
 
 /// Directory path as a chain of segment string-ids (root = empty chain).
 ///
+/// Live store is CSR: `offsets[path_id] .. offsets[path_id+1]` indexes `seg_ids`.
 /// Full path strings are not stored once per file; each unique directory is a
 /// small id chain. Segments themselves are interned in the string pool.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 struct PathTable {
-    /// path_id → segment string ids (empty vec = root SQL path `""`).
-    paths: Vec<Vec<u32>>,
-    /// Flattened path string → path_id (for lookup during build).
+    /// path_id → start in `seg_ids`; extra trailing length (`offsets.len() == path_count + 1`).
+    offsets: Vec<u32>,
+    /// Concatenated segment string-ids.
+    seg_ids: Vec<u32>,
+    /// Flattened path string → path_id (for lookup during build / resolve).
     by_flat: HashMap<Box<str>, u32>,
+}
+
+impl Default for PathTable {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl PathTable {
@@ -109,7 +211,8 @@ impl PathTable {
         let mut by_flat = HashMap::new();
         by_flat.insert(Box::from(""), 0u32);
         Self {
-            paths: vec![Vec::new()],
+            offsets: vec![0, 0],
+            seg_ids: Vec::new(),
             by_flat,
         }
     }
@@ -118,32 +221,27 @@ impl PathTable {
         if let Some(&id) = self.by_flat.get(dir) {
             return id;
         }
-        let mut segs = Vec::new();
+        let start = self.seg_ids.len() as u32;
         if !dir.is_empty() {
             // dir may be "/a/b" or "a/b" — strip leading slash for segments
             let d = dir.trim_start_matches('/');
             if !d.is_empty() {
                 for part in d.split('/') {
                     if !part.is_empty() {
-                        segs.push(pool.intern_id(part));
+                        self.seg_ids.push(pool.intern_id(part));
                     }
                 }
             }
         }
-        let id = self.paths.len() as u32;
-        // Also store flattened form for reverse (with leading slash if original had it)
+        let id = (self.offsets.len() - 1) as u32;
+        self.offsets.push(self.seg_ids.len() as u32);
+        debug_assert_eq!(self.offsets[id as usize], start);
         self.by_flat.insert(Box::from(dir), id);
-        // Normalize key: if dir was "/a/b" we already inserted that
-        if dir.starts_with('/') && dir.len() > 1 {
-            // also map without double entries handled by get
-        }
-        self.paths.push(segs);
         id
     }
 
-    #[allow(dead_code)]
     fn path_count(&self) -> usize {
-        self.paths.len()
+        self.offsets.len().saturating_sub(1)
     }
 
     /// True if path storage is segment-based (not one independent full string per file).
@@ -151,12 +249,31 @@ impl PathTable {
         true
     }
 
+    /// CSR contract: offsets[0]==0, last offset == seg_ids.len(), one extra trailing length.
+    fn is_csr(&self) -> bool {
+        let n = self.path_count();
+        self.offsets.len() == n + 1
+            && self.offsets.first().copied() == Some(0)
+            && self.offsets.last().copied() == Some(self.seg_ids.len() as u32)
+            && self.offsets.windows(2).all(|w| w[0] <= w[1])
+    }
+
+    fn segs(&self, path_id: u32) -> &[u32] {
+        let i = path_id as usize;
+        if i + 1 >= self.offsets.len() {
+            return &[];
+        }
+        let start = self.offsets[i] as usize;
+        let end = self.offsets[i + 1] as usize;
+        if start > end || end > self.seg_ids.len() {
+            return &[];
+        }
+        &self.seg_ids[start..end]
+    }
+
     /// Reconstruct SQL-style directory path for export (`""` root, else `/a/b`).
     fn flat_string_for_export(&self, pool: &StringPool, path_id: u32) -> String {
-        let segs = match self.paths.get(path_id as usize) {
-            Some(s) => s.as_slice(),
-            None => return String::new(),
-        };
+        let segs = self.segs(path_id);
         if segs.is_empty() {
             return String::new();
         }
@@ -186,6 +303,15 @@ pub struct CompactOpenCookie {
     pub issparse: bool,
     pub isgenerated: bool,
     pub recursiondepth: u32,
+}
+
+/// Cheap readdir entry: pool name + SoA mode/size + open cookie (no [`FileInfo`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct IndexDirent {
+    pub name: String,
+    pub mode: u32,
+    pub size: u64,
+    pub cookie: CompactOpenCookie,
 }
 
 /// Columnar storage for all file versions.
@@ -385,6 +511,16 @@ impl MemIndex {
         self.sharded
     }
 
+    /// True when directory prefixes live as CSR `offsets` + `seg_ids` (not `Vec<Vec<u32>>`).
+    pub fn path_table_is_csr(&self) -> bool {
+        self.paths.is_csr()
+    }
+
+    /// True when the string pool is a sealed byte slab (no live `Vec<Arc<str>>` / build HashMap).
+    pub fn pool_is_sealed_slab(&self) -> bool {
+        self.pool.is_sealed_slab()
+    }
+
     #[allow(dead_code)] // test / observability contracts
     pub fn soa_row_count(&self) -> usize {
         self.soa.len()
@@ -456,7 +592,7 @@ impl MemIndex {
     }
 
     fn resolve_name_id(&self, name: &str) -> Option<u32> {
-        self.pool.by_str.get(name).copied()
+        self.pool.lookup_id(name)
     }
 
     pub fn version_count(&self, dir: &str, name: &str) -> u32 {
@@ -521,19 +657,30 @@ impl MemIndex {
     }
 
     pub fn list_mode(&self, dir: &str) -> Option<BTreeMap<String, u32>> {
+        let dents = self.list_dirents(dir)?;
+        Some(dents.into_iter().map(|d| (d.name, d.mode)).collect())
+    }
+
+    /// Stream name / mode / size / open cookie from the pool + SoA (no [`FileInfo`]).
+    pub fn list_dirents(&self, dir: &str) -> Option<Vec<IndexDirent>> {
         let pid = self.resolve_path_id(dir)?;
         let d = self.dir_entries(pid)?;
-        let mut map = BTreeMap::new();
+        let mut out = Vec::with_capacity(d.names.len());
         for (&nid, versions) in &d.names {
             if let Some(&idx) = versions.last() {
-                let name = self.pool.get(nid).to_string();
-                map.insert(name, self.soa.mode[idx as usize]);
+                let i = idx as usize;
+                out.push(IndexDirent {
+                    name: self.pool.get(nid).to_string(),
+                    mode: self.soa.mode[i],
+                    size: self.soa.size[i],
+                    cookie: self.soa.open_cookie(idx),
+                });
             }
         }
-        if map.is_empty() {
+        if out.is_empty() {
             None
         } else {
-            Some(map)
+            Some(out)
         }
     }
 
@@ -703,8 +850,10 @@ impl MemIndexBuilder {
         } else {
             (self.dirs, None, false)
         };
+        let mut pool = self.pool;
+        pool.seal();
         MemIndex {
-            pool: self.pool,
+            pool,
             paths: self.paths,
             soa: self.soa,
             dirs,
@@ -868,6 +1017,75 @@ mod tests {
         let shared = b.intern_shared("member.bin");
         let mem = b.finish();
         let again = mem.lookup_pooled("member.bin").unwrap();
-        assert!(Arc::ptr_eq(&shared, &again));
+        // After seal, Arc is materialized from the slab at the lookup boundary
+        // (no live intern identity). ZIP/7z sidecars compare string equality.
+        assert_eq!(&*shared, &*again);
+        assert_eq!(&*again, "member.bin");
+    }
+
+    /// Regression: finish() must seal the pool as a byte slab and keep PathTable as CSR.
+    #[test]
+    fn regression_finished_memindex_is_csr_and_sealed_slab() {
+        let mut b = MemIndexBuilder::new();
+        b.push_row(&row("/a/b", "x.txt", 1));
+        b.push_row(&row("/a/b", "y.txt", 2));
+        b.push_row(&row("/a/c", "z.txt", 3));
+        let mem = b.finish();
+        assert!(
+            mem.path_table_is_csr(),
+            "PathTable live store must be CSR offsets+seg_ids"
+        );
+        assert!(
+            mem.pool_is_sealed_slab(),
+            "StringPool must be a sealed slab after finish()"
+        );
+        assert!(mem.uses_path_segments());
+        assert!(mem.is_soa_layout());
+        assert_eq!(mem.lookup("/a/b", "x.txt", 0).unwrap().size, 4);
+        assert_eq!(
+            mem.paths.flat_string_for_export(&mem.pool, 0),
+            "",
+            "root path_id 0 exports SQL-style empty string"
+        );
+    }
+
+    /// Regression: list_dirents on a large flat dir must match list()/lookup cookies
+    /// without building FileInfo (list_mode is a thin wrapper over list_dirents).
+    #[test]
+    fn regression_list_dirents_large_flat_dir_matches_list() {
+        let mut b = MemIndexBuilder::new();
+        for i in 0..220 {
+            let mut r = row("/flat", &format!("n{i:04}.dat"), i as i64 * 10);
+            r.size = 100 + i as i64;
+            r.mode = if i % 2 == 0 { 0o100644 } else { 0o100755 };
+            b.push_row(&r);
+        }
+        let mem = b.finish();
+        assert!(mem.path_table_is_csr());
+        assert!(mem.pool_is_sealed_slab());
+
+        let dents = mem
+            .list_dirents("/flat")
+            .expect("list_dirents on 220-name dir");
+        assert_eq!(dents.len(), 220);
+        let listed = mem.list("/flat").expect("list");
+        assert_eq!(listed.len(), 220);
+        let modes = mem
+            .list_mode("/flat")
+            .expect("list_mode wraps list_dirents");
+        assert_eq!(modes.len(), 220);
+
+        for d in &dents {
+            let fi = listed
+                .get(&d.name)
+                .expect("name from list_dirents in list()");
+            assert_eq!(d.mode, fi.mode, "mode {}", d.name);
+            assert_eq!(d.size, fi.size, "size {}", d.name);
+            assert_eq!(modes.get(&d.name).copied(), Some(d.mode));
+            let cookie = mem
+                .lookup_open_cookie("/flat", &d.name, 0)
+                .expect("lookup_open_cookie");
+            assert_eq!(d.cookie, cookie, "cookie {}", d.name);
+        }
     }
 }

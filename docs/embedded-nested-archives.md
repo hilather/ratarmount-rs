@@ -94,7 +94,7 @@ When the **outer** archive has a **writable on-disk** SQLite index, a successful
 
 | Piece | Behavior |
 |-------|----------|
-| **Storage** | Outer SQLite table `nestedindexes` (Rust-only extension): `member_key`, body size, prefix/suffix SHA-256, format tag, JSON blob of compact rows (+ ZIP member sidecars) |
+| **Storage** | Outer SQLite table `nestedindexes` (Rust-only extension): `member_key`, body size, prefix/suffix/mid SHA-256, format tag, **versioned binary/columnar** blob of compact rows (+ ZIP / 7z sidecars). Magic `RNIB` prefix; schema v2. Legacy JSON v1 still imports. Decode errors (corrupt, truncated, unsupported version) **fail closed** so the nested open cold-rebuilds. JSON debug dump (`to_json_debug`) is optional for triage — not the default `to_bytes` encoding |
 | **Identity** | Nested member path + optional parent `offsetheader` + body size |
 | **Fingerprint** | Store/stencil bodies: head / mid / tail SHA-256 (4 KiB). Progressive/compressed parent members (large pure-LZMA2 7z): **head + size only** — mid/tail seeks would fully decompress the member. Residual: same-size edits outside sampled windows are not full-content hashed |
 | **Live mount after import** | Still **compact-only** MemIndex — durable storage is export/import, not nested SQLite `files` as the hot path |

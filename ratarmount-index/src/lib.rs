@@ -28,13 +28,13 @@ use thiserror::Error;
 use mem::{mem_index_from_sql_rows, MemIndex, MemIndexBuilder, SqlMemRow};
 use ratarmount_core::OpenOptions;
 
-pub use mem::{CompactOpenCookie, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
+pub use mem::{CompactOpenCookie, IndexDirent, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
 pub use nested::{
     DurableNestedBlob, DurableSevenZipArchive, DurableSevenZipCoder, DurableSevenZipFileEntry,
     DurableSevenZipFolder, DurableSevenZipPackInfo, DurableZipMember, NestedBodyFingerprint,
-    NestedMemberKey, CREATE_NESTED_INDEXES_SQL, NESTED_BLOB_VERSION, NESTED_FINGERPRINT_SAMPLE,
-    NESTED_FORMAT_AR, NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR,
-    NESTED_FORMAT_ZIP, NESTED_INDEXES_TABLE,
+    NestedMemberKey, CREATE_NESTED_INDEXES_SQL, NESTED_BLOB_MAGIC, NESTED_BLOB_VERSION,
+    NESTED_FINGERPRINT_SAMPLE, NESTED_FORMAT_AR, NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP,
+    NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP, NESTED_INDEXES_TABLE,
 };
 
 /// Max `files` rows for which a full MemIndex projection is kept after seal/open.
@@ -563,6 +563,14 @@ impl SqliteIndex {
 
     pub fn mem_is_dir_sharded(&self) -> bool {
         self.mem.as_ref().is_some_and(|m| m.is_dir_sharded())
+    }
+
+    pub fn mem_path_table_is_csr(&self) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.path_table_is_csr())
+    }
+
+    pub fn mem_pool_is_sealed_slab(&self) -> bool {
+        self.mem.as_ref().is_some_and(|m| m.pool_is_sealed_slab())
     }
 
     /// Compact open cookie without materializing fat [`FileInfo`].
@@ -1267,18 +1275,32 @@ impl SqliteIndex {
     }
 
     pub fn list_mode(&self, path: &str) -> Result<Option<BTreeMap<String, u32>>> {
+        match self.list_dirents(path)? {
+            Some(dents) => Ok(Some(dents.into_iter().map(|d| (d.name, d.mode)).collect())),
+            None => Ok(None),
+        }
+    }
+
+    /// Cheap readdir: names / modes / sizes / open cookies without fat [`FileInfo`].
+    pub fn list_dirents(&self, path: &str) -> Result<Option<Vec<IndexDirent>>> {
         let path = query_normpath(path);
         let dir = path.trim_end_matches('/').to_string();
 
         if let Some(mem) = &self.mem {
-            return Ok(mem.list_mode(dir.as_str()));
+            return Ok(mem.list_dirents(dir.as_str()));
         }
 
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                r#"SELECT name, mode FROM "files" WHERE "path" = ?1 ORDER BY "offsetheader""#,
+                r#"
+                SELECT name, offsetheader, offset, size, mode,
+                       istar, issparse, isgenerated, recursiondepth
+                FROM "files"
+                WHERE "path" = ?1
+                ORDER BY "offsetheader"
+                "#,
             )?;
-            let mut map = BTreeMap::new();
+            let mut by_name: BTreeMap<String, IndexDirent> = BTreeMap::new();
             let mut rows = stmt.query(params![dir])?;
             let mut got = false;
             while let Some(row) = rows.next()? {
@@ -1287,10 +1309,40 @@ impl SqliteIndex {
                 if name.is_empty() {
                     continue;
                 }
-                let mode: i64 = row.get(1)?;
-                map.insert(name, mode as u32);
+                let offsetheader: i64 = row.get(1)?;
+                let offset: i64 = row.get(2)?;
+                let size: i64 = row.get(3)?;
+                let mode: i64 = row.get(4)?;
+                let istar: bool = row.get::<_, i64>(5).unwrap_or(0) != 0;
+                let issparse: bool = row.get::<_, i64>(6).unwrap_or(0) != 0;
+                let isgenerated: bool = row.get::<_, i64>(7).unwrap_or(0) != 0;
+                let recursiondepth: i64 = row.get(8).unwrap_or(0);
+                let size_u = size.max(0) as u64;
+                let mode_u = mode as u32;
+                by_name.insert(
+                    name.clone(),
+                    IndexDirent {
+                        name,
+                        mode: mode_u,
+                        size: size_u,
+                        cookie: CompactOpenCookie {
+                            offsetheader,
+                            offset: offset.max(0) as u64,
+                            size: size_u,
+                            mode: mode_u,
+                            istar,
+                            issparse,
+                            isgenerated,
+                            recursiondepth: recursiondepth.max(0) as u32,
+                        },
+                    },
+                );
             }
-            Ok(if got { Some(map) } else { None })
+            Ok(if got {
+                Some(by_name.into_values().collect())
+            } else {
+                None
+            })
         })
     }
 
@@ -2597,5 +2649,58 @@ mod tests {
             .lookup(&format!("/wide{}/x.txt", n_dirs - 1), 0)
             .unwrap()
             .is_some());
+    }
+
+    /// Regression: sealed path-mount / SQLite MemIndex uses SoA + CSR + sealed slab
+    /// (same dense live store as nested; no fat residual rows).
+    #[test]
+    fn regression_sealed_path_mount_memindex_uses_soa_csr_slab() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        let mut rows = multi_under_dir(80);
+        for i in 0..4 {
+            rows.push(FileRow::new(
+                format!("/other{i}"),
+                "x.bin",
+                10_000 + i as i64,
+                10_000 + i as i64,
+                16 + i as i64,
+                0.0,
+                0o040755,
+                0,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ));
+        }
+        idx.insert_files_batch(&rows).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let idx = idx.into_read_only().unwrap();
+
+        assert!(idx.has_mem_index());
+        assert!(idx.mem_is_soa_layout());
+        assert!(idx.mem_uses_path_segments());
+        assert!(idx.mem_path_table_is_csr());
+        assert!(idx.mem_pool_is_sealed_slab());
+
+        let dents = idx.list_dirents("/shared/dir").unwrap().expect("dirents");
+        let listed = idx.list("/shared/dir").unwrap().expect("list");
+        assert_eq!(dents.len(), listed.len());
+        assert_eq!(dents.len(), 80);
+        for d in &dents {
+            let fi = listed.get(&d.name).expect("name in list()");
+            assert_eq!(d.mode, fi.mode);
+            assert_eq!(d.size, fi.size);
+            let cookie = idx
+                .lookup_open_cookie(&format!("/shared/dir/{}", d.name), 0)
+                .unwrap()
+                .expect("cookie");
+            assert_eq!(d.cookie, cookie);
+        }
     }
 }
