@@ -82,7 +82,7 @@ Nested indexes are **not** written next to a virtual label. By default the neste
 |-------|----------|
 | **File table (live)** | In-process **compact** projection: string pool, path **segments**, SoA rows, optional dir **shards** — **no** SQLite `files` table |
 | **Top-level contrast** | Path mounts still use on-disk / `:memory:` SQLite for warm remount and Python interop |
-| **Fat `FileInfo`** | Materialized only at `list()` / `lookup` / getattr / open; readdir uses cheap `list_dirents` (name/mode/size + cookie) from the string pool + SoA |
+| **Fat `FileInfo`** | Materialized only at `list()` / `lookup` / getattr / open; readdir uses cheap `list_dirents` (name/mode/size + cookie) from the string pool + SoA. Compositing wrappers on the FUSE path (Prefix / Union default / AutoMount / Overlay / Control / Folder / Transform / FileVersionLayer) forward that cheap path; Union `--union-resolve-symlinks` still projects fat `list()` so advertised type matches `lookup`. |
 | **ZIP sidecars** | Member names interned into the same string pool during index build |
 | **Residual** | Parent may still hold a large inflated member body; solid 7z open cost is separate |
 

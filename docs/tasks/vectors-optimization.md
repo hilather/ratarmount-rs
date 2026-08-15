@@ -33,7 +33,11 @@
 - [x] Keep/extend `list_mode` (and similar) as the cheap API; fat `FileInfo` only at getattr/open boundaries
 - [x] Regression: large flat directory readdir RSS + timing vs fat map materialization
 
-Residual: `list()` still builds a fat map for callers that need full `FileInfo`. TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides (ZIP / 7z / TAR / MemIndex / `FileVersionLayer` do). FUSE crate tests cover the fat-map skip; live huge-dir RSS is optional evidence.
+Residual: `list()` still builds a fat map for callers that need full `FileInfo`. TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides.
+
+Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer) and the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF). Union `--union-resolve-symlinks` still projects fat `list()` so FUSE type matches `lookup`. Union folder-cache **build** still uses fat `list()`. Control `status` dirent size is a placeholder 0 (getattr/open recompute).
+
+Still default size-0: ext4 / fat / squashfs / git / sqlar / remotes / `SingleFileMountSource`. FUSE crate tests cover the fat-map skip; live huge-dir RSS is optional evidence.
 
 ### ZIP member sidecar density
 
