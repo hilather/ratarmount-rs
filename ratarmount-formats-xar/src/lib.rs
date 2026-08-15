@@ -17,7 +17,7 @@ use quick_xml::events::Event;
 use quick_xml::Reader;
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -575,6 +575,18 @@ impl MountSource for XarMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -850,6 +862,25 @@ mod tests {
         )
         .expect("open_from_reader");
         assert_eq!(read_member(&m, "/hello.txt"), b"hello");
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello";
+        let bytes = build_store_xar("hello.txt", payload);
+        let src = XarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("nested.xar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     #[test]

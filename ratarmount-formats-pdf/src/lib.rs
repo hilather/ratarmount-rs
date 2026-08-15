@@ -37,7 +37,7 @@ use std::time::Instant;
 use flate2::read::{DeflateDecoder, ZlibDecoder};
 use lopdf::{Document, Object, ObjectId, Stream};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -1171,6 +1171,18 @@ impl MountSource for PdfMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -1452,6 +1464,26 @@ mod tests {
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, jpeg);
         assert_eq!(&buf[..2], &[0xFF, 0xD8]);
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("with-image.pdf");
+        write_pdf_with_jpeg_image(&path);
+        let src = PdfMountSource::open(&path, None, &OpenOptions::default(), "0.1.0", true)
+            .expect("open pdf");
+        let dents = src.list_dirents("/images").expect("dirents");
+        let d = dents
+            .iter()
+            .find(|e| e.name == "page1-img0.jpg")
+            .expect("image dirent");
+        assert_eq!(d.size, tiny_jpeg().len() as u64);
+        assert_eq!(
+            src.lookup("/images/page1-img0.jpg", 0).unwrap().size,
+            d.size
+        );
     }
 
     #[test]

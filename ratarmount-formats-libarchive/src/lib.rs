@@ -26,7 +26,7 @@ use std::time::Instant;
 
 use log::info;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -548,6 +548,18 @@ impl MountSource for LibarchiveMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -951,6 +963,25 @@ mod tests {
             out.push(b'\n');
         }
         out
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("hello.a");
+        let payload = b"hello-libarchive";
+        std::fs::write(&archive, synthetic_ar("hello.txt", payload)).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src =
+            LibarchiveMountSource::open(&archive, None, &opts, "0.1.0", true).expect("open ar");
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     /// Regression: open_existing rejects when archive size/mtime no longer match tarstats.

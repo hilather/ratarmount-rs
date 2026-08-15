@@ -17,7 +17,7 @@ use std::time::Instant;
 
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{FileRow, IndexError, SqliteIndex};
 use serde_json::Value;
@@ -412,6 +412,18 @@ impl MountSource for AsarMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -578,6 +590,30 @@ mod tests {
         let mut mid = String::new();
         r3.read_to_string(&mut mid).unwrap();
         assert_eq!(mid, "orld\n");
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"world\n";
+        let bytes = build_minimal_asar(&[("hello.txt", payload), ("b.bin", b"xyz")]);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = AsarMountSource::open_from_reader(
+            Cursor::new(bytes),
+            Path::new("virtual/minimal.asar"),
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader");
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     #[test]

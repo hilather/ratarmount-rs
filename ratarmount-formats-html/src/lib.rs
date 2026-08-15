@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use regex::Regex;
@@ -374,6 +374,18 @@ impl MountSource for HtmlMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -511,5 +523,31 @@ mod tests {
             }
             _ => panic!("expected infos"),
         }
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (always-on data: URL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_from_data_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("embed.html");
+        let payload = b"hello-html-payload";
+        let b64 = base64::engine::general_purpose::STANDARD.encode(payload);
+        std::fs::write(
+            &path,
+            format!(r#"<!DOCTYPE html><img src="data:text/plain;base64,{b64}">"#),
+        )
+        .unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = HtmlMountSource::open(&path, None, &opts, "0.1.0", true).expect("open html");
+        let dents = m.list_dirents("/").expect("dirents");
+        let d = dents
+            .iter()
+            .find(|e| e.size == payload.len() as u64)
+            .expect("payload dirent");
+        let fi = m.lookup(&format!("/{}", d.name), 0).expect("lookup");
+        assert_eq!(fi.size, d.size);
     }
 }

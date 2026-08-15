@@ -11,7 +11,7 @@ use std::time::Instant;
 
 use ratarmount_compress::StenciledFile;
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -361,6 +361,18 @@ impl MountSource for OggMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -506,6 +518,27 @@ mod tests {
             }
             _ => panic!("expected infos"),
         }
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let data = synthetic_ogg();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("t.ogg");
+        std::fs::write(&path, &data).unwrap();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = OggMountSource::open(&path, None, &opts, "0.1.0", true).expect("open ogg");
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents
+            .iter()
+            .find(|e| e.name.contains("audio_"))
+            .expect("stream dirent");
+        assert!(d.size > 0);
+        assert_eq!(src.lookup(&format!("/{}", d.name), 0).unwrap().size, d.size);
     }
 
     /// Alternate synthetic Ogg with a different serial (and different size payload) so
