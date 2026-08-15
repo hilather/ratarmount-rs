@@ -1,7 +1,7 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -14,7 +14,8 @@ use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
 use ratarmount_compress::{detect_compression, materialize, CompressionFormat};
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
+    MountSource, UserData,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -509,13 +510,55 @@ impl MountSource for WriteOverlay {
         }
     }
 
-    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        match self.list(path)? {
-            ListResult::Infos(m) => Some(ListModeResult::Modes(
-                m.into_iter().map(|(k, v)| (k, v.mode)).collect(),
-            )),
-            ListResult::Names(n) => Some(ListModeResult::Names(n)),
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if self.is_deleted(&path) && path != "/" {
+            return None;
         }
+        let deleted: HashSet<String> = self.list_deleted(&path).into_iter().collect();
+        let mut by_name: BTreeMap<String, CheapDirent> = BTreeMap::new();
+
+        if let Some(base_dents) = self.base.list_dirents(&path) {
+            for d in base_dents {
+                if !deleted.contains(&d.name) {
+                    by_name.insert(d.name.clone(), d);
+                }
+            }
+        }
+
+        let real = self.realpath(&path);
+        if let Ok(rd) = fs::read_dir(&real) {
+            for ent in rd.flatten() {
+                let name = ent.file_name().to_string_lossy().into_owned();
+                if name.starts_with(HIDDEN_DB) || deleted.contains(&name) {
+                    continue;
+                }
+                let full = join(&path, &name);
+                if let Some(fi) = self.overlay_file_info(&full) {
+                    by_name.insert(
+                        name.clone(),
+                        CheapDirent {
+                            name,
+                            mode: fi.mode,
+                            size: fi.size,
+                        },
+                    );
+                }
+            }
+        }
+
+        if path == "/" || !by_name.is_empty() || self.base.is_dir(&path) {
+            Some(by_name.into_values().collect())
+        } else {
+            None
+        }
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -1738,5 +1781,149 @@ mod tests {
             libc::close(fd);
         }
         assert!(overlay.join("safe.txt").exists() || ov.root().join("safe.txt").exists());
+    }
+
+    /// Counts `list()` so we can prove WriteOverlay uses `base.list_dirents`.
+    struct ListCallCounter {
+        inner: ratarmount_formats_zip::ZipMountSource,
+        list_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    fn zip_counted_base() -> (
+        tempfile::TempDir,
+        Arc<ListCallCounter>,
+        &'static [u8],
+        &'static [u8],
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("overlay-base.zip");
+        let a: &'static [u8] = b"alpha-payload\n";
+        let b: &'static [u8] = b"bravo-bytes-here\n";
+        write_sample_zip(
+            &path,
+            &[
+                ("a.txt", a, CompressionMethod::Stored),
+                ("b.bin", b, CompressionMethod::Stored),
+            ],
+        );
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let zip = ratarmount_formats_zip::ZipMountSource::open(&path, None, &opts, "test", true)
+            .expect("open zip");
+        let counted = Arc::new(ListCallCounter {
+            inner: zip,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        (dir, counted, a, b)
+    }
+
+    /// Regression: `-w` readdir called `base.list()`.
+    #[test]
+    fn overlay_list_dirents_base_plus_overlay_minus_deletes_without_base_list() {
+        let (dir, counted, _a, b) = zip_counted_base();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+            .expect("overlay");
+
+        ov.unlink("/a.txt").expect("delete base a.txt");
+        let fd = ov.create_file("/c.txt", 0o644).expect("overlay create");
+        unsafe {
+            libc::close(fd);
+        }
+        fs::write(ov.root().join("c.txt"), b"overlay-only\n").unwrap();
+
+        let dents = ov.list_dirents("/").expect("cheap overlay dirents");
+        assert_eq!(
+            counted.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "WriteOverlay::list_dirents must not call base.list() (fat FileInfo map)"
+        );
+        let by_name: BTreeMap<_, _> = dents.into_iter().map(|d| (d.name, d.size)).collect();
+        assert!(
+            !by_name.contains_key("a.txt"),
+            "deleted base name must be gone: {by_name:?}"
+        );
+        assert_eq!(by_name.get("b.bin").copied(), Some(b.len() as u64));
+        assert_eq!(
+            by_name.get("c.txt").copied(),
+            Some(b"overlay-only\n".len() as u64)
+        );
+        assert!(
+            !by_name.keys().any(|n| n.starts_with(HIDDEN_DB)),
+            "overlay DB must stay hidden: {by_name:?}"
+        );
+    }
+
+    /// Regression: create-then-list reported leftover base size.
+    #[test]
+    fn overlay_list_dirents_create_empty_has_size_zero() {
+        let (dir, counted, a, _b) = zip_counted_base();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::clone(&counted) as Arc<dyn MountSource>, &overlay)
+            .expect("overlay");
+
+        assert!(
+            !a.is_empty(),
+            "base member must have a leftover size to regress against"
+        );
+        let fd = ov
+            .create_file("/a.txt", 0o644)
+            .expect("create empty overlay");
+        unsafe {
+            libc::close(fd);
+        }
+
+        let dents = ov.list_dirents("/").expect("cheap overlay dirents");
+        assert_eq!(
+            counted.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "WriteOverlay::list_dirents must not call base.list()"
+        );
+        let a_dent = dents
+            .iter()
+            .find(|d| d.name == "a.txt")
+            .expect("overlay-created a.txt");
+        assert_eq!(
+            a_dent.size,
+            0,
+            "create-then-list must not report leftover base size {}",
+            a.len()
+        );
     }
 }

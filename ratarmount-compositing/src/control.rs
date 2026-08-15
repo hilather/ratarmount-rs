@@ -9,8 +9,8 @@ use std::io::{self, Cursor};
 use std::sync::Arc;
 
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData,
-    S_IFDIR, S_IFMT, S_IFREG,
+    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
+    MountSource, UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
 
 /// Directory name at the mount root (hidden, leading dot).
@@ -210,6 +210,28 @@ impl ControlFolderMountSource {
         }
     }
 
+    fn control_file_dirent(name: &str) -> Option<CheapDirent> {
+        let mode = if name == "unmount" {
+            S_IFREG | 0o666
+        } else {
+            S_IFREG | 0o444
+        };
+        // Placeholder sizes only. Never content_for_name — status_text calls
+        // inner.list("/"). getattr/lookup still advertise the real length.
+        let size = match name {
+            "pid" => Self::pid_text().len() as u64,
+            "unmount" => Self::unmount_text().len() as u64,
+            "help" => Self::help_text().len() as u64,
+            "status" => 0,
+            _ => return None,
+        };
+        Some(CheapDirent {
+            name: name.to_string(),
+            mode,
+            size,
+        })
+    }
+
     fn merge_control_into_root(&self, listing: ListResult) -> ListResult {
         let dir_fi = Self::control_dir_info();
         match listing {
@@ -259,13 +281,38 @@ impl MountSource for ControlFolderMountSource {
         }
     }
 
-    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        match self.list(path)? {
-            ListResult::Names(n) => Some(ListModeResult::Names(n)),
-            ListResult::Infos(m) => Some(ListModeResult::Modes(
-                m.into_iter().map(|(k, v)| (k, v.mode)).collect(),
-            )),
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if !self.enabled {
+            return self.inner.list_dirents(&path);
         }
+        if path == CONTROL_DIR_PATH {
+            return Some(
+                CONTROL_FILES
+                    .iter()
+                    .filter_map(|name| Self::control_file_dirent(name))
+                    .collect(),
+            );
+        }
+        if Self::is_control_path(&path) {
+            return None;
+        }
+        let mut dents = self.inner.list_dirents(&path)?;
+        if path == "/" && !dents.iter().any(|d| d.name == CONTROL_DIR_NAME) {
+            dents.push(CheapDirent {
+                name: CONTROL_DIR_NAME.to_string(),
+                mode: S_IFDIR | 0o555,
+                size: 0,
+            });
+        }
+        Some(dents)
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -556,5 +603,137 @@ mod tests {
             Err(e) => e,
         };
         assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+    }
+
+    /// Counts `list()` so we can prove Control uses `list_dirents`.
+    struct ListCallCounter {
+        inner: ratarmount_formats_zip::ZipMountSource,
+        list_calls: AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    fn zip_counted() -> (tempfile::TempDir, Arc<ListCallCounter>, &'static [u8]) {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.zip");
+        let a: &'static [u8] = b"alpha-payload\n";
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a.txt", opts).unwrap();
+            zw.write_all(a).unwrap();
+            zw.finish().unwrap();
+        }
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let zip = ratarmount_formats_zip::ZipMountSource::open(&path, None, &opts, "test", true)
+            .expect("open zip");
+        let counted = Arc::new(ListCallCounter {
+            inner: zip,
+            list_calls: AtomicUsize::new(0),
+        });
+        (dir, counted, a)
+    }
+
+    /// Regression: `--control-interface` readdir fat-listed `/`.
+    #[test]
+    fn control_list_dirents_forwards_and_injects_control_dir() {
+        let (_dir, counted, a) = zip_counted();
+        let ms = ControlFolderMountSource::new(
+            Arc::clone(&counted) as Arc<dyn MountSource>,
+            ControlFolderOptions::enabled(),
+        );
+
+        let dents = ms.list_dirents("/").expect("cheap root dirents");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            0,
+            "ControlFolderMountSource::list_dirents must not call inner.list()"
+        );
+        let by_name: BTreeMap<_, _> = dents.into_iter().map(|d| (d.name.clone(), d)).collect();
+        let a_dent = by_name.get("a.txt").expect("forward inner file");
+        assert_eq!(a_dent.size, a.len() as u64);
+        let ctrl = by_name.get(CONTROL_DIR_NAME).expect("inject control dir");
+        assert_eq!(ctrl.mode, S_IFDIR | 0o555);
+        assert_eq!(ctrl.size, 0);
+    }
+
+    /// Regression: `ls /.ratarmount-control` must not increment inner `list()`.
+    /// `status_text()` would call `inner.list("/")` if list_dirents used
+    /// `content_for_name("status")`.
+    #[test]
+    fn control_list_dirents_control_dir_does_not_list_root() {
+        let (_dir, counted, _a) = zip_counted();
+        let ms = ControlFolderMountSource::new(
+            Arc::clone(&counted) as Arc<dyn MountSource>,
+            ControlFolderOptions::enabled(),
+        );
+
+        let dents = ms
+            .list_dirents(CONTROL_DIR_PATH)
+            .expect("control dir dirents");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            0,
+            "ls /.ratarmount-control must not call inner.list() via status_text"
+        );
+        let by_name: BTreeMap<_, _> = dents.into_iter().map(|d| (d.name.clone(), d)).collect();
+        for expected in CONTROL_FILES {
+            assert!(
+                by_name.contains_key(*expected),
+                "missing {expected} in {by_name:?}"
+            );
+        }
+        assert_eq!(by_name["status"].size, 0, "status uses placeholder size");
+        assert_eq!(by_name["status"].mode, S_IFREG | 0o444);
+        assert_eq!(
+            by_name["pid"].size,
+            ControlFolderMountSource::pid_text().len() as u64
+        );
+        assert_eq!(
+            by_name["help"].size,
+            ControlFolderMountSource::help_text().len() as u64
+        );
+        assert_eq!(
+            by_name["unmount"].size,
+            ControlFolderMountSource::unmount_text().len() as u64
+        );
+        assert_eq!(by_name["unmount"].mode, S_IFREG | 0o666);
     }
 }
