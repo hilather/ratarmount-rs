@@ -1,6 +1,6 @@
 # NFSv3 userspace export (and optional NFSv4.1)
 
-Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` (`--features nfsv4`, rustc ≥ 1.88) is RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. **Linux kernel client unverified** (unprivileged `mount` skipped). Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
+Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` (`--features nfsv4`, rustc ≥ 1.88) is RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. Reader slots idle **90s** are dropped (lease approximation, not a CLOSE hook). **Linux kernel client unverified** (unprivileged `mount` skipped). Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
 
 `ratarmount --nfs` serves the same `MountSource` tree as FUSE over **in-process NFSv3** (`nfsserve` 0.11) by default. `--nfs-vers 4` selects **NFSv4.1** (`embednfs` 0.4.1, no MOUNT/portmap). No kernel `nfsd`, no FUSE mount, no extra system library. Do **not** treat v4 as “usable on Linux” until a privileged `vers=4.1,tcp,port=,sec=sys` mount is recorded.
 
@@ -96,6 +96,12 @@ If localhost still maps `nobody` after `sec=sys`, try `nfs4_disable_idmapping=1`
 
 Without `-w`, v4 mutators return `NFS4ERR_ROFS` (`FsError::ReadOnly`). With `-w` / `--write-overlay` (`:temp:` ok), create / write / mkdir / remove / size-setattr persist on the same `WriteOverlay` as FUSE and NFSv3. Writes report `WriteStability::DataSync` (bytes reached the overlay file/page cache; no extra `fsync`). Rename and create-symlink stay `ReadOnly`. `--nfs-export-name` is ignored (no MOUNT). AUTH_SYS is accepted and **not** used for authorization (same localhost boundary as v3).
 
+### Reader idle TTL (not a CLOSE hook)
+
+embednfs 0.4.1 `FileSystem` has **no** `open` / `close` / `lease_expired` hooks. OPEN/CLOSE/clientid/leases live inside `NfsServer` / `StateManager` (`DEFAULT_LEASE_TIME_SECS = 90`). We do **not** receive CLOSE.
+
+v4 therefore drops live `ArchiveRead` slots whose `last_used` is older than **90s** (`READER_IDLE_TTL`, same as embednfs’s lease). `serve_v4` sweeps at ~1 Hz; a new slot insert also evicts idle entries. This **approximates** NFSv4.1 lease expiry. A client that CLOSEs immediately still holds the decompressor until idle TTL (or the cap-64 LRU). Pinned solid-7z slots are also dropped after 90s idle — the next READ re-opens (prefix-from-0). Cap-pressure eviction still prefers cheap (unpinned) slots first.
+
 ### Spike / protocol (PR 2, still green)
 
 Status: **PASSED** (2026-08-15, rustc 1.97.1).
@@ -108,7 +114,7 @@ Status: **PASSED** (2026-08-15, rustc 1.97.1).
 | Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
 | Live Linux `mount -t nfs` | **Linux kernel client unverified** — `mount` exits 32 (`must be superuser to use mount`) |
 
-**Not shipped:** packaging `--features nfsv4`, idle/lease reader drop. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3).
+**Not shipped:** packaging `--features nfsv4`. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
 
 ### embednfs 0.4.1 API actually used
 
@@ -117,9 +123,9 @@ Status: **PASSED** (2026-08-15, rustc 1.97.1).
 - `NfsServer::listen(self, addr: &str) -> io::Result<()>` — `TcpListener::bind(addr)` then `serve`. `"127.0.0.1:0"` works.
 - `NfsServerBuilder` only exposes `id_mapper` + `build`. No lease-time, bind-hook, or accept-filter.
 
-### FileSystem / lease finding (for later PRs)
+### FileSystem / lease finding
 
-Grep of `~/.cargo/registry/src/**/embednfs-0.4.1`: `FileSystem` has **no** `open` / `close` / `lease_expired` hooks. OPEN/CLOSE/leases live inside `NfsServer` / `StateManager` (`DEFAULT_LEASE_TIME_SECS = 90`). Idle-TTL approximation remains the v1 contract (roadmap PR 5).
+Grep of `~/.cargo/registry/src/**/embednfs-0.4.1`: `FileSystem` has **no** `open` / `close` / `lease_expired` hooks. OPEN/CLOSE/leases live inside `NfsServer` / `StateManager` (`DEFAULT_LEASE_TIME_SECS = 90`). No hidden builder callback. **v1 contract:** 90s idle TTL (see above), not a CLOSE hook.
 
 embednfs non-promises (do not advertise LAN / Windows / Kerberos): “does not guarantee correct or robust behavior over a real network”; “does not guarantee correct behavior for non-macOS clients.” Support target is **macOS over localhost**.
 

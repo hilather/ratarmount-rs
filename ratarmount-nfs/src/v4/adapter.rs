@@ -4,6 +4,7 @@ use std::io::{self, Seek, SeekFrom, Write};
 use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -20,6 +21,12 @@ use crate::names::{join_path, parent_path, MAX_NAME_LEN};
 use crate::reader::{fill_from_state, ReaderLru, DEFAULT_READER_SLOTS};
 
 use super::error::io_to_fserror;
+
+/// Approximate NFSv4.1 lease expiry for live `ArchiveRead` slots.
+///
+/// embednfs 0.4.1 `FileSystem` has no OPEN/CLOSE/`lease_expired` hook.
+/// Matches embednfs `DEFAULT_LEASE_TIME_SECS` (90). Not a CLI flag.
+pub const READER_IDLE_TTL: Duration = Duration::from_secs(90);
 
 /// Userspace NFSv4.1 view of a factory-built [`MountSource`].
 pub struct RatarmountNfs4 {
@@ -45,10 +52,17 @@ impl RatarmountNfs4 {
             source,
             overlay,
             inodes: Arc::new(InodeTable::new()),
-            readers: Arc::new(ReaderLru::new(DEFAULT_READER_SLOTS)),
+            readers: Arc::new(ReaderLru::with_idle_ttl(
+                DEFAULT_READER_SLOTS,
+                READER_IDLE_TTL,
+            )),
             readahead_bytes,
             change: AtomicU64::new(1),
         }
+    }
+
+    pub(crate) fn readers(&self) -> Arc<ReaderLru> {
+        Arc::clone(&self.readers)
     }
 
     fn change_id(&self) -> u64 {

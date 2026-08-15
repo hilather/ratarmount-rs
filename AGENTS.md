@@ -72,6 +72,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS overlay write / stale reader after truncate | `cargo test -p ratarmount-nfs --lib overlay_` · `cargo test -p ratarmount-nfs --lib writers_rofs` |
 | NFSv4.1 RO adapter (lookup/read/readdir) | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_` |
 | NFSv4 overlay create/write invalidate | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay` |
+| NFSv4 reader idle/lease drop | `cargo test -p ratarmount-nfs --features nfsv4 --lib evict_idle` |
 | NFS `--nfs-vers` 3\|4 clap | `cargo test -p ratarmount --bin ratarmount nfs_vers` |
 | NFSv4 EXCHANGE_ID smoke | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_exchange_id` |
 

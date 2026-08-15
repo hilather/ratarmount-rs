@@ -8,10 +8,11 @@ use std::time::Duration;
 
 use ratarmount_core::MountSource;
 
+use crate::reader::ReaderLru;
 use crate::serve::{access_label, NfsOptions, NfsServerHandle};
 use crate::NfsStop;
 
-use super::adapter::RatarmountNfs4;
+use super::adapter::{RatarmountNfs4, READER_IDLE_TTL};
 
 async fn wait_stop(stop: NfsStop) {
     while !stop.is_stopped() {
@@ -56,18 +57,35 @@ fn nfs4_from_opts(source: Arc<dyn MountSource>, opts: &NfsOptions) -> Ratarmount
     )
 }
 
+/// Drop idle `ArchiveRead` slots ~once per second (lease approximation).
+///
+/// Not a real CLOSE: embednfs 0.4.1 `FileSystem` has no OPEN/CLOSE hook.
+async fn idle_reader_sweep(readers: Arc<ReaderLru>) {
+    loop {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        readers.evict_idle(READER_IDLE_TTL);
+    }
+}
+
 async fn serve_v4_listener(
     listener: tokio::net::TcpListener,
     fs: RatarmountNfs4,
     stop: Option<NfsStop>,
 ) -> io::Result<()> {
+    let readers = fs.readers();
     let server = embednfs::NfsServer::new(fs);
     match stop {
-        None => server.serve(listener).await,
+        None => {
+            tokio::select! {
+                r = server.serve(listener) => r,
+                _ = idle_reader_sweep(readers) => Ok(()),
+            }
+        }
         Some(s) => {
             tokio::select! {
                 r = server.serve(listener) => r,
                 _ = wait_stop(s) => Ok(()),
+                _ = idle_reader_sweep(readers) => Ok(()),
             }
         }
     }
