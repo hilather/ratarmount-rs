@@ -15,7 +15,7 @@ use fuser::{
 use libc::{EACCES, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::debug;
 use ratarmount_compositing::WriteOverlay;
-use ratarmount_core::{FileInfo, ListModeResult, ListResult, MountSource};
+use ratarmount_core::{FileInfo, ListModeResult, MountSource};
 use std::io::ErrorKind;
 
 /// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
@@ -410,6 +410,10 @@ impl RatarmountFs {
         }
     }
 
+    /// Cheap readdir listing: names + modes only (no fat [`FileInfo`] map).
+    ///
+    /// Always goes through [`MountSource::list_mode`], never [`MountSource::list`].
+    /// Fat `FileInfo` is materialized later at getattr/lookup/open.
     fn list_mode_cached(&self, path: &str) -> Option<Vec<(String, u32)>> {
         {
             let cache = self.dir_cache.lock().unwrap();
@@ -435,6 +439,12 @@ impl RatarmountFs {
             },
         );
         Some(entries)
+    }
+
+    /// Shared cheap listing for `readdir` / `readdirplus` (test-visible).
+    #[cfg(test)]
+    fn readdir_dirents(&self, path: &str) -> Option<Vec<(String, u32)>> {
+        self.list_mode_cached(path)
     }
 
     /// Drop a parent directory listing so create/unlink/mkdir/rmdir are visible
@@ -641,50 +651,21 @@ impl Filesystem for RatarmountFs {
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
-        // One list() call + attr packing (no N× getattr round-trips for find).
+        // Cheap list_mode only — do not call MountSource::list (fat FileInfo map).
+        // Full attrs (size/mtime/uid) are filled at getattr/lookup/open.
         let Some(path) = self.path_for_ino(ino) else {
             reply.error(ENOENT);
             return;
         };
-        let Some(ListResult::Infos(map)) = self.source.list(&path) else {
-            // Fall back: modes only
-            let Some(entries) = self.list_mode_cached(&path) else {
-                reply.error(ENOENT);
-                return;
-            };
-            let self_fi = self
-                .cached_fi(ino)
-                .unwrap_or_else(ratarmount_core::create_root_file_info);
-            let mut full: Vec<(u64, String, FileAttr)> = Vec::new();
-            full.push((ino, ".".into(), Self::file_attr(ino, &self_fi)));
-            full.push((ino, "..".into(), Self::file_attr(ino, &self_fi)));
-            for (name, mode) in entries {
-                let child = join_path(&path, &name);
-                let fi = FileInfo {
-                    size: 0,
-                    mtime: self_fi.mtime,
-                    mode,
-                    linkname: String::new(),
-                    uid: self_fi.uid,
-                    gid: self_fi.gid,
-                    userdata: vec![],
-                };
-                let cino = self.ino_for_path_with_fi(&child, Some(fi.clone()));
-                full.push((cino, name, Self::file_attr(cino, &fi)));
-            }
-            for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
-                if reply.add(cino, (i + 1) as i64, name, &TTL, &attr, 0) {
-                    break;
-                }
-            }
-            reply.ok();
+        let Some(entries) = self.list_mode_cached(&path) else {
+            reply.error(ENOENT);
             return;
         };
         let self_fi = self
             .cached_fi(ino)
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
-        let mut full: Vec<(u64, String, FileAttr)> = Vec::with_capacity(map.len() + 2);
+        let mut full: Vec<(u64, String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
         full.push((ino, ".".into(), Self::file_attr(ino, &self_fi)));
         let parent_ino = if path == "/" {
             ino
@@ -701,13 +682,22 @@ impl Filesystem for RatarmountFs {
             "..".into(),
             Self::file_attr(parent_ino, &self_fi),
         ));
-        for (name, fi) in map {
+        for (name, mode) in entries {
             let child = join_path(&path, &name);
-            let cino = self.ino_for_path_with_fi(&child, Some(fi.clone()));
+            let fi = FileInfo {
+                size: 0,
+                mtime: self_fi.mtime,
+                mode,
+                linkname: String::new(),
+                uid: self_fi.uid,
+                gid: self_fi.gid,
+                userdata: vec![],
+            };
+            let cino = self.ino_for_path(&child);
             full.push((cino, name, Self::file_attr(cino, &fi)));
         }
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
-            if reply.add(cino, (i + 1) as i64, name, &TTL, &attr, 0) {
+            if reply.add(cino, (i + 1) as i64, name, &self.attr_ttl(), &attr, 0) {
                 break;
             }
         }
@@ -1571,6 +1561,118 @@ mod tests {
         assert!(
             after.iter().any(|(n, _)| n == "created.txt"),
             "after invalidate, readdir path must list the newly created name"
+        );
+    }
+
+    /// Counting source: list() builds a fat FileInfo map; list_mode is cheap.
+    struct ListCallTracker {
+        list_calls: std::sync::atomic::AtomicUsize,
+        list_mode_calls: std::sync::atomic::AtomicUsize,
+        children: BTreeMap<String, FileInfo>,
+    }
+
+    impl ListCallTracker {
+        fn new(children: BTreeMap<String, FileInfo>) -> Self {
+            Self {
+                list_calls: std::sync::atomic::AtomicUsize::new(0),
+                list_mode_calls: std::sync::atomic::AtomicUsize::new(0),
+                children,
+            }
+        }
+    }
+
+    impl MountSource for ListCallTracker {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if path == "/" {
+                Some(ListResult::Infos(self.children.clone()))
+            } else {
+                None
+            }
+        }
+
+        fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+            self.list_mode_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if path == "/" {
+                Some(ListModeResult::Modes(
+                    self.children
+                        .iter()
+                        .map(|(n, fi)| (n.clone(), fi.mode))
+                        .collect(),
+                ))
+            } else {
+                None
+            }
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            let name = path.strip_prefix('/').unwrap_or(path);
+            self.children.get(name).cloned()
+        }
+
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(ErrorKind::NotFound, "tracker"))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: readdir / readdirplus must not build a fat FileInfo map via list().
+    #[test]
+    fn readdir_path_does_not_call_fat_list() {
+        let mut children = BTreeMap::new();
+        for i in 0..64 {
+            children.insert(
+                format!("f{i:02}.txt"),
+                FileInfo {
+                    size: 100 + i,
+                    mtime: 1.0,
+                    mode: S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                },
+            );
+        }
+        let src = Arc::new(ListCallTracker::new(children.clone()));
+        let fs = RatarmountFs::new(Arc::clone(&src) as Arc<dyn MountSource>, None);
+
+        let entries = fs.readdir_dirents("/").expect("cheap readdir listing");
+        assert_eq!(entries.len(), children.len());
+        for (name, mode) in &entries {
+            let fi = children.get(name).expect("name from cheap listing");
+            assert_eq!(*mode, fi.mode);
+        }
+        assert_eq!(
+            src.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "readdir path must not call MountSource::list (fat FileInfo map)"
+        );
+        assert!(
+            src.list_mode_calls
+                .load(std::sync::atomic::Ordering::SeqCst)
+                >= 1,
+            "readdir path must use list_mode"
+        );
+
+        // getattr/open still materialize FileInfo via lookup, not list().
+        let fi = fs
+            .source
+            .lookup("/f00.txt", 0)
+            .expect("lookup fat FileInfo at getattr boundary");
+        assert_eq!(fi.size, 100);
+        assert_eq!(
+            src.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "lookup/getattr must not go through list()"
         );
     }
 

@@ -17,6 +17,11 @@
 //! pair is an EOF sentinel (totals). Import skips seek-table / multi-frame rescan.
 //! Export via [`export_zstd_blocks`] / [`SeekableZstd::zstd_blocks`].
 //!
+//! **Density:** the live map is a sealed `Vec<FrameInfo>` (parallel offset/size
+//! fields, no per-frame `HashMap`). `Vec<(u64, u64)>` exists only at the
+//! import/export API to match Python/SQLite `zstdblocks`; it is converted into
+//! `FrameInfo` rows on open and is not the hot-path store.
+//!
 //! Thread hint (`open_seekable_zstd_with_threads` / Python `-P` zstd backend):
 //! * Multi-frame maps keep **per-frame** random access; frames are independent, so
 //!   concurrent readers already decode different frames without a shared lock.

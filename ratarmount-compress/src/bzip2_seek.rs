@@ -21,6 +21,11 @@
 //! skips the bit-scan + size-discovery pass when a valid map is supplied.
 //! Export via [`export_bzip2_blocks`] / [`SeekableBzip2::bzip2_blocks`].
 //!
+//! **Density:** the live map is a sealed `Arc<Vec<BlockInfo>>` (SoA-like rows:
+//! bit range + uncompressed offset/size). `Vec<(u64, u64)>` is the
+//! Python/SQLite `bzip2blocks` import/export convenience type only — not the
+//! per-block hot-path store.
+//!
 //! # Opening from paths and readers
 //!
 //! * **Path open**: compressed size ≤ [`IN_MEMORY_COMPRESSED_CAP`] (256 MiB)

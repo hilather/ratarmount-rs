@@ -240,6 +240,11 @@ pub struct GzipSeekIndexBlob {
     ///
     /// For `IndexedGzip`, compressed offsets are informational (zran may use a
     /// non-zero bit residual); rehydration matches on uncompressed offset only.
+    ///
+    /// **Density residual:** this `Vec<(u64, u64)>` is the parsed-blob / API
+    /// convenience form. The live seek table is [`GzipSeekIndex::checkpoints`]
+    /// (`Vec<Checkpoint>`: parallel offset columns plus restore/window sidecars).
+    /// Import copies pairs into checkpoints; export rebuilds pairs from them.
     pub points: Vec<(u64, u64)>,
     /// Per-point bit residual (`GZIDX` only; empty for `RGZI`). Length matches
     /// `points` after EOF markers are dropped.
