@@ -44,7 +44,7 @@ use std::time::Instant;
 use flate2::{Decompress, FlushDecompress, Status};
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -531,6 +531,18 @@ impl MountSource for CabMountSource {
             .ok()
             .flatten()
             .map(ListModeResult::Modes)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -1115,6 +1127,31 @@ mod tests {
         let mut one = [0u8; 1];
         r.read_exact(&mut one).unwrap();
         assert_eq!(&one, b"o");
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-cab-dirents";
+        let cab = synthetic_store_cab("hello.txt", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let src = CabMountSource::open_from_reader(
+            Cursor::new(cab),
+            "dirents.cab",
+            None,
+            &opts,
+            "0.1.0",
+            true,
+        )
+        .expect("open_from_reader store");
+
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     #[test]

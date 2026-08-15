@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -299,6 +299,18 @@ impl MountSource for WarcMountSource {
             .ok()
             .flatten()
             .map(ListModeResult::Modes)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -698,6 +710,34 @@ mod tests {
         let mut tail = Vec::new();
         r.read_to_end(&mut tail).unwrap();
         assert_eq!(tail, b"World");
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-warc-dirents";
+        let warc = synthetic_response_warc("http://example.com/hello.txt", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = WarcMountSource::open_from_reader(
+            Cursor::new(warc),
+            "dirents.warc",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        // WARC paths are host + URI path (`/example.com/hello.txt`).
+        let dents = src.list_dirents("/example.com").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(
+            src.lookup("/example.com/hello.txt", 0).unwrap().size,
+            d.size
+        );
     }
 
     #[test]

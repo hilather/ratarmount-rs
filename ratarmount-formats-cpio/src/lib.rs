@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -393,6 +393,18 @@ impl MountSource for CpioMountSource {
             .ok()
             .flatten()
             .map(ListModeResult::Modes)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -997,6 +1009,31 @@ mod tests {
 
         // synthetic label is not a real path; size was recorded for indexing
         let _ = size;
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let mode = ratarmount_core::S_IFREG | 0o644;
+        let payload = b"hello-cpio-dirents";
+        let bytes = build_newc_cpio("hello.txt", payload, mode);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = CpioMountSource::open_from_reader(
+            Cursor::new(bytes),
+            "virtual://dirents.cpio",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     fn write_sample_cpio(path: &Path, name: &str, data: &[u8]) {

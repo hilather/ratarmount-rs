@@ -16,7 +16,7 @@ use std::time::Instant;
 
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
@@ -277,6 +277,18 @@ impl MountSource for Iso9660MountSource {
             .ok()
             .flatten()
             .map(ListModeResult::Modes)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -566,6 +578,55 @@ mod tests {
     use super::*;
     use std::io::{Cursor, Write};
 
+    /// Minimal single-file ISO 9660 (PVD + root dir + one data extent). Always-on.
+    fn synthetic_iso(name: &str, payload: &[u8]) -> Vec<u8> {
+        const SECTOR: usize = 2048;
+        let file_extent = 19u32;
+        let root_extent = 18u32;
+        let mut img = vec![0u8; 20 * SECTOR];
+
+        fn dir_rec(extent: u32, size: u32, is_dir: bool, name: &[u8]) -> Vec<u8> {
+            let name_len = name.len();
+            let mut len = 33 + name_len;
+            if len % 2 == 1 {
+                len += 1;
+            }
+            let mut rec = vec![0u8; len];
+            rec[0] = len as u8;
+            rec[2..6].copy_from_slice(&extent.to_le_bytes());
+            rec[6..10].copy_from_slice(&extent.to_be_bytes());
+            rec[10..14].copy_from_slice(&size.to_le_bytes());
+            rec[14..18].copy_from_slice(&size.to_be_bytes());
+            rec[25] = if is_dir { 0x02 } else { 0 };
+            rec[28..30].copy_from_slice(&1u16.to_le_bytes());
+            rec[30..32].copy_from_slice(&1u16.to_be_bytes());
+            rec[32] = name_len as u8;
+            rec[33..33 + name_len].copy_from_slice(name);
+            rec
+        }
+
+        let pvd = 16 * SECTOR;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 6] = 1;
+        let root_rec = dir_rec(root_extent, SECTOR as u32, true, &[0]);
+        img[pvd + 156..pvd + 156 + root_rec.len()].copy_from_slice(&root_rec);
+
+        let root = 18 * SECTOR;
+        let r1 = dir_rec(root_extent, SECTOR as u32, true, &[0]);
+        let r2 = dir_rec(root_extent, SECTOR as u32, true, &[1]);
+        let r3 = dir_rec(file_extent, payload.len() as u32, false, name.as_bytes());
+        let mut off = root;
+        for r in [r1, r2, r3] {
+            img[off..off + r.len()].copy_from_slice(&r);
+            off += r.len();
+        }
+
+        let data = 19 * SECTOR;
+        img[data..data + payload.len()].copy_from_slice(payload);
+        img
+    }
+
     fn load_single_file_iso() -> Option<Vec<u8>> {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
@@ -636,6 +697,30 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert_eq!(buf, b"foo\n");
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-iso-dirents";
+        let iso = synthetic_iso("hello.txt", payload);
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = Iso9660MountSource::open_from_reader(
+            Cursor::new(iso),
+            "dirents.iso",
+            None,
+            &opts,
+            "0.1.0",
+        )
+        .expect("open_from_reader");
+
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "hello.txt").unwrap();
+        assert_eq!(d.size, payload.len() as u64);
+        assert_eq!(src.lookup("/hello.txt", 0).unwrap().size, d.size);
     }
 
     #[test]
