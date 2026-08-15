@@ -445,9 +445,39 @@ impl RatarmountFs {
         self.list_mode_cached(path)
     }
 
-    /// `readdirplus` must not pin placeholder attrs in the kernel cache.
-    fn readdirplus_entry_ttl() -> Duration {
-        Duration::ZERO
+    /// Kernel TTL for `readdirplus` attrs.
+    ///
+    /// When dirents carry real sizes (ZIP/TAR/7z `list_dirents`), use the same
+    /// attr TTL as lookup so `cat` after `find` does not re-getattr every file.
+    /// When every size is 0 we cannot tell empty files from the default
+    /// `list_dirents` fallback — do not cache those placeholders.
+    fn readdirplus_entry_ttl(&self, entries: &[(String, u32, u64)]) -> Duration {
+        if self.overlay.is_some() {
+            return OVERLAY_ATTR_TTL;
+        }
+        if entries.iter().any(|(_, _, sz)| *sz > 0) {
+            TTL
+        } else {
+            Duration::ZERO
+        }
+    }
+
+    /// FileInfo for `open`. Immutable mounts reuse the lookup/getattr cache;
+    /// overlay always re-looks up so create(size 0) → write is visible.
+    fn file_info_for_open(&self, ino: u64, path: &str) -> Option<FileInfo> {
+        if self.overlay.is_some() {
+            if let Some(fi) = self.source.lookup(path, 0) {
+                self.store_fi(ino, fi.clone());
+                return Some(fi);
+            }
+            return self.cached_fi(ino);
+        }
+        if let Some(c) = self.cached_fi(ino) {
+            return Some(c);
+        }
+        let fi = self.source.lookup(path, 0)?;
+        self.store_fi(ino, fi.clone());
+        Some(fi)
     }
 
     /// Drop a parent directory listing so create/unlink/mkdir/rmdir are visible
@@ -685,6 +715,7 @@ impl Filesystem for RatarmountFs {
             "..".into(),
             Self::file_attr(parent_ino, &self_fi),
         ));
+        let entry_ttl = self.readdirplus_entry_ttl(&entries);
         for (name, mode, size) in entries {
             let child = join_path(&path, &name);
             let fi = FileInfo {
@@ -699,10 +730,6 @@ impl Filesystem for RatarmountFs {
             let cino = self.ino_for_path(&child);
             full.push((cino, name, Self::file_attr(cino, &fi)));
         }
-        // Zero entry/attr TTL: dirents may carry size=0 / parent mtime/uid
-        // when a backend's default list_dirents cannot fill them. A 60s TTL
-        // would let ls -l / stat cache those placeholders.
-        let entry_ttl = Self::readdirplus_entry_ttl();
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
             if reply.add(cino, (i + 1) as i64, name, &entry_ttl, &attr, 0) {
                 break;
@@ -752,13 +779,7 @@ impl Filesystem for RatarmountFs {
             return;
         }
 
-        // Fresh lookup so we do not treat post-write size as still 0 from create cache.
-        let fi = if let Some(fi) = self.source.lookup(&path, 0) {
-            self.store_fi(ino, fi.clone());
-            fi
-        } else if let Some(c) = self.cached_fi(ino) {
-            c
-        } else {
+        let Some(fi) = self.file_info_for_open(ino, &path) else {
             reply.error(ENOENT);
             return;
         };
@@ -1575,6 +1596,7 @@ mod tests {
     struct ListCallTracker {
         list_calls: std::sync::atomic::AtomicUsize,
         list_mode_calls: std::sync::atomic::AtomicUsize,
+        lookup_calls: std::sync::atomic::AtomicUsize,
         children: BTreeMap<String, FileInfo>,
     }
 
@@ -1583,6 +1605,7 @@ mod tests {
             Self {
                 list_calls: std::sync::atomic::AtomicUsize::new(0),
                 list_mode_calls: std::sync::atomic::AtomicUsize::new(0),
+                lookup_calls: std::sync::atomic::AtomicUsize::new(0),
                 children,
             }
         }
@@ -1635,6 +1658,8 @@ mod tests {
         }
 
         fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            self.lookup_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             if path == "/" {
                 return Some(ratarmount_core::create_root_file_info());
             }
@@ -1703,9 +1728,44 @@ mod tests {
             "lookup/getattr must not go through list()"
         );
         assert_eq!(
-            RatarmountFs::readdirplus_entry_ttl(),
+            fs.readdirplus_entry_ttl(&entries),
+            TTL,
+            "nonzero dirent sizes must use kernel attr TTL so cat after find is cached"
+        );
+        assert_eq!(
+            fs.readdirplus_entry_ttl(&[("e".into(), S_IFREG, 0)]),
             Duration::ZERO,
-            "readdirplus placeholder attrs must not use the 60s kernel TTL"
+            "all-zero sizes must not pin placeholder attrs"
+        );
+    }
+
+    /// Regression: immutable open must reuse getattr/lookup FileInfo (no second lookup).
+    #[test]
+    fn immutable_open_reuses_cached_file_info() {
+        let mut children = BTreeMap::new();
+        children.insert(
+            "a.bin".into(),
+            FileInfo {
+                size: 64,
+                mtime: 1.0,
+                mode: S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        let src = Arc::new(ListCallTracker::new(children));
+        let fs = RatarmountFs::new(Arc::clone(&src) as Arc<dyn MountSource>, None);
+        let fi = fs.source.lookup("/a.bin", 0).expect("lookup");
+        let ino = fs.ino_for_path_with_fi("/a.bin", Some(fi));
+        let before = src.lookup_calls.load(std::sync::atomic::Ordering::SeqCst);
+        let again = fs.file_info_for_open(ino, "/a.bin").expect("cached open");
+        assert_eq!(again.size, 64);
+        assert_eq!(
+            src.lookup_calls.load(std::sync::atomic::Ordering::SeqCst),
+            before,
+            "immutable open must not re-lookup when inode already has FileInfo"
         );
     }
 
