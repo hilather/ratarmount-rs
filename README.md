@@ -146,7 +146,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
-| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (`nfsv4` feature / rustc ≥ 1.88; RO; **Linux kernel client unverified**) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
+| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (`nfsv4` feature / rustc ≥ 1.88; `-w` overlay create/write; **Linux kernel client unverified**) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
 
 ### Remote backends
 

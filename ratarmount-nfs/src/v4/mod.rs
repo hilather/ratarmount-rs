@@ -1,6 +1,7 @@
 //! Feature-gated NFSv4.1 export (`embednfs` 0.4.1).
 //!
-//! Read-only `MountSource` adapter + bind/serve. Overlay writes are a later PR.
+//! `MountSource` adapter + bind/serve. `-w` overlay create/write/mkdir/remove
+//! /setattr-size match v3; rename and create_symlink stay `ReadOnly`.
 //! Linux kernel `mount -t nfs` remains unverified (unprivileged CI).
 
 mod adapter;

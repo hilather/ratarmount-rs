@@ -64,7 +64,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | FUSE extra options (`-o`) | yes | yes | `[x]` |
 | Sequential readahead (`--readahead`) | no (issue #180) | yes (`0` off; K/M/G; max 64 MiB) | `[x]` |
 | NFSv3 userspace export | no | yes (`--nfs` / `--nfs-bind`; IPv4, localhost default; `-w` overlay writes) | `[x]` / residual Windows READDIR + NFS rename/symlink |
-| NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`, `--features nfsv4`, rustc ≥ 1.88; RO lookup/read/readdir) | `~` / Linux kernel client unverified; no overlay writes; no Kerberos/LAN |
+| NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`, `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes) | `~` / Linux kernel client unverified; no Kerberos/LAN; rename/symlink `ReadOnly` |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
 | Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |

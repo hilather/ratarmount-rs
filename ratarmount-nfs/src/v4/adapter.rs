@@ -1,15 +1,16 @@
-//! `embednfs::FileSystem` on `MountSource` (read-only; overlay writes are PR 4).
+//! `embednfs::FileSystem` on `MountSource`, with optional write overlay.
 
-use std::io;
+use std::io::{self, Seek, SeekFrom, Write};
+use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use embednfs::{
-    AccessMask, Attrs, CreateRequest, CreateResult, DirEntry, DirPage, FileSystem, FsCapabilities,
-    FsError, FsLimits, FsResult, FsStats, ObjectType, ReadResult, RequestContext, SetAttrs,
-    Symlinks, Timestamp, WriteResult, WriteStability,
+    AccessMask, Attrs, CreateKind, CreateRequest, CreateResult, DirEntry, DirPage, FileSystem,
+    FsCapabilities, FsError, FsLimits, FsResult, FsStats, ObjectType, ReadResult, RequestContext,
+    SetAttrs, Symlinks, Timestamp, WriteResult, WriteStability,
 };
 use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{is_dir_mode, is_lnk_mode, FileInfo, MountSource};
@@ -52,6 +53,16 @@ impl RatarmountNfs4 {
 
     fn change_id(&self) -> u64 {
         self.change.load(Ordering::Relaxed)
+    }
+
+    fn overlay(&self) -> FsResult<&WriteOverlay> {
+        self.overlay.as_deref().ok_or(FsError::ReadOnly)
+    }
+
+    fn bump_after_mutate(&self, id: u64) {
+        self.readers.invalidate(id);
+        self.inodes.clear_lookup_fi(id);
+        self.change.fetch_add(1, Ordering::Relaxed);
     }
 
     fn file_info_for_id(&self, id: u64) -> FsResult<FileInfo> {
@@ -235,9 +246,91 @@ impl RatarmountNfs4 {
 
     pub fn access_sync(&self, id: u64, requested: AccessMask) -> FsResult<AccessMask> {
         let _ = self.file_info_for_id(id)?;
-        // PR 3 is RO even when an overlay handle is stored (writes land in PR 4).
-        let granted = AccessMask::READ | AccessMask::LOOKUP | AccessMask::EXECUTE;
+        let mut granted = AccessMask::READ | AccessMask::LOOKUP | AccessMask::EXECUTE;
+        if self.overlay.is_some() {
+            granted |= AccessMask::MODIFY | AccessMask::EXTEND | AccessMask::DELETE;
+        }
         Ok(requested & granted)
+    }
+
+    pub fn create_sync(
+        &self,
+        parent: u64,
+        name: &str,
+        req: CreateRequest,
+    ) -> FsResult<CreateResult<u64>> {
+        let ov = self.overlay()?;
+        Self::check_name(name)?;
+        let parent_path_str = self.inodes.path_for_id(parent).ok_or(FsError::Stale)?;
+        let path = join_path(&parent_path_str, name);
+        match req.kind {
+            CreateKind::File => {
+                let mode = req.attrs.mode.unwrap_or(0o644);
+                let fd = ov.create_file(&path, mode).map_err(overlay_to_fs)?;
+                // NFS create is stateless — close the overlay fd (FUSE would keep it).
+                close_overlay_fd(fd);
+            }
+            CreateKind::Directory => {
+                let mode = req.attrs.mode.unwrap_or(0o755);
+                ov.mkdir(&path, mode).map_err(overlay_to_fs)?;
+            }
+        }
+        let id = self.inodes.id_for_path(&path);
+        self.bump_after_mutate(id);
+        if let Some(fi) = self.source.lookup(&path, 0) {
+            self.inodes.store_lookup_fi(id, fi);
+        }
+        Ok(CreateResult {
+            handle: id,
+            attrs: self.getattr_sync(id)?,
+        })
+    }
+
+    pub fn write_sync(&self, id: u64, offset: u64, data: &[u8]) -> FsResult<WriteResult> {
+        let ov = self.overlay()?;
+        let path = self.inodes.path_for_id(id).ok_or(FsError::Stale)?;
+        let flags = libc::O_RDWR | libc::O_CREAT;
+        let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_fs)?;
+        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| io_to_fserror(&e))?;
+        file.write_all(data).map_err(|e| io_to_fserror(&e))?;
+        drop(file);
+        self.bump_after_mutate(id);
+        Ok(WriteResult {
+            written: u32::try_from(data.len()).unwrap_or(u32::MAX),
+            stability: WriteStability::DataSync,
+        })
+    }
+
+    pub fn remove_sync(&self, parent: u64, name: &str) -> FsResult<()> {
+        let ov = self.overlay()?;
+        Self::check_name(name)?;
+        let parent_path_str = self.inodes.path_for_id(parent).ok_or(FsError::Stale)?;
+        let path = join_path(&parent_path_str, name);
+        let id = self.inodes.id_for_path(&path);
+        let is_dir = self
+            .source
+            .lookup(&path, 0)
+            .map(|fi| is_dir_mode(fi.mode))
+            .unwrap_or(false);
+        if is_dir {
+            ov.rmdir(&path).map_err(overlay_to_fs)?;
+        } else {
+            ov.unlink(&path).map_err(overlay_to_fs)?;
+        }
+        self.bump_after_mutate(id);
+        Ok(())
+    }
+
+    pub fn setattr_sync(&self, id: u64, attrs: &SetAttrs) -> FsResult<Attrs> {
+        let ov = self.overlay()?;
+        let path = self.inodes.path_for_id(id).ok_or(FsError::Stale)?;
+        if let Some(sz) = attrs.size {
+            ov.truncate(&path, sz).map_err(overlay_to_fs)?;
+            self.bump_after_mutate(id);
+        }
+        self.getattr_sync(id)
     }
 
     pub fn statfs_sync(&self) -> FsStats {
@@ -295,6 +388,14 @@ fn read_member(
     })
 }
 
+fn overlay_to_fs(err: impl std::fmt::Display) -> FsError {
+    io_to_fserror(&io::Error::other(err.to_string()))
+}
+
+fn close_overlay_fd(fd: i32) {
+    let _ = unsafe { std::fs::File::from_raw_fd(fd) };
+}
+
 fn mode_to_object_type(mode: u32) -> ObjectType {
     if is_dir_mode(mode) {
         ObjectType::Directory
@@ -342,7 +443,7 @@ impl FileSystem for RatarmountNfs4 {
         FsLimits {
             max_name_bytes: namemax.max(1),
             max_read: 1_048_576,
-            max_write: 0,
+            max_write: if self.overlay.is_some() { 1_048_576 } else { 0 },
             max_file_size: u64::MAX,
         }
     }
@@ -422,31 +523,31 @@ impl FileSystem for RatarmountNfs4 {
     async fn write(
         &self,
         _ctx: &RequestContext,
-        _handle: &Self::Handle,
-        _offset: u64,
-        _data: Bytes,
+        handle: &Self::Handle,
+        offset: u64,
+        data: Bytes,
         _requested: WriteStability,
     ) -> FsResult<WriteResult> {
-        Err(FsError::ReadOnly)
+        self.write_sync(*handle, offset, data.as_ref())
     }
 
     async fn create(
         &self,
         _ctx: &RequestContext,
-        _parent: &Self::Handle,
-        _name: &str,
-        _req: CreateRequest,
+        parent: &Self::Handle,
+        name: &str,
+        req: CreateRequest,
     ) -> FsResult<CreateResult<Self::Handle>> {
-        Err(FsError::ReadOnly)
+        self.create_sync(*parent, name, req)
     }
 
     async fn remove(
         &self,
         _ctx: &RequestContext,
-        _parent: &Self::Handle,
-        _name: &str,
+        parent: &Self::Handle,
+        name: &str,
     ) -> FsResult<()> {
-        Err(FsError::ReadOnly)
+        self.remove_sync(*parent, name)
     }
 
     async fn rename(
@@ -463,10 +564,10 @@ impl FileSystem for RatarmountNfs4 {
     async fn setattr(
         &self,
         _ctx: &RequestContext,
-        _handle: &Self::Handle,
-        _attrs: &SetAttrs,
+        handle: &Self::Handle,
+        attrs: &SetAttrs,
     ) -> FsResult<Attrs> {
-        Err(FsError::ReadOnly)
+        self.setattr_sync(*handle, attrs)
     }
 
     fn symlinks(&self) -> Option<&dyn Symlinks<Self::Handle>> {
@@ -866,5 +967,129 @@ mod tests {
         let got = FileSystem::read(&nfs, &c, &id, 0, 16).await.unwrap();
         assert_eq!(&got.data[..], b"hello");
         assert!(got.eof);
+    }
+
+    fn overlay_export(base: Synth) -> (tempfile::TempDir, RatarmountNfs4) {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, td.path()).expect("overlay"),
+        );
+        let nfs = RatarmountNfs4::with_overlay(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            0,
+            Some(Arc::clone(&ov)),
+        );
+        (td, nfs)
+    }
+
+    fn file_create() -> CreateRequest {
+        CreateRequest {
+            kind: CreateKind::File,
+            attrs: SetAttrs::default(),
+        }
+    }
+
+    #[test]
+    fn v4_overlay_create_write_read_mkdir_readdir() {
+        let mut base = Synth::new();
+        base.add_file("/keep", b"archive", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+
+        let created = nfs
+            .create_sync(1, "new.txt", file_create())
+            .expect("create");
+        assert_eq!(created.attrs.size, 0);
+        let wr = nfs
+            .write_sync(created.handle, 0, b"hello-overlay")
+            .expect("write");
+        assert_eq!(wr.written, 13);
+        assert_eq!(wr.stability, WriteStability::DataSync);
+        let got = nfs.getattr_sync(created.handle).expect("getattr");
+        assert_eq!(got.size, 13);
+        assert!(got.change > created.attrs.change);
+        let data = nfs.read_sync(created.handle, 0, 32).expect("read");
+        assert_eq!(&data.data[..], b"hello-overlay");
+        assert!(data.eof);
+
+        let dir = nfs
+            .create_sync(
+                1,
+                "sub",
+                CreateRequest {
+                    kind: CreateKind::Directory,
+                    attrs: SetAttrs::default(),
+                },
+            )
+            .expect("mkdir");
+        assert_eq!(dir.attrs.object_type, ObjectType::Directory);
+        let listing = nfs.readdir_sync(1, 0, 32, false).expect("readdir");
+        let names: Vec<&str> = listing.entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"new.txt"), "{names:?}");
+        assert!(names.contains(&"sub"), "{names:?}");
+        assert!(names.contains(&"keep"), "{names:?}");
+    }
+
+    #[test]
+    fn v4_overlay_truncate_and_unlink_invalidate_reader() {
+        let mut base = Synth::new();
+        base.add_file(
+            "/member",
+            b"0123456789ABCDEF",
+            vec![UserData::Other("t".into())],
+        );
+        let (_td, nfs) = overlay_export(base);
+        let id = nfs.lookup_sync(1, "member").expect("lookup");
+        let before = nfs.read_sync(id, 0, 32).expect("read archive");
+        assert_eq!(&before.data[..], b"0123456789ABCDEF");
+
+        let sat = SetAttrs {
+            size: Some(4),
+            ..SetAttrs::default()
+        };
+        let after_tr = nfs.setattr_sync(id, &sat).expect("truncate");
+        assert_eq!(after_tr.size, 4);
+        let trunc = nfs.read_sync(id, 0, 32).expect("read truncated");
+        assert_eq!(&trunc.data[..], b"0123");
+        assert!(trunc.eof);
+
+        nfs.write_sync(id, 0, b"ZZ").expect("replace prefix");
+        let replaced = nfs.read_sync(id, 0, 32).expect("read replaced");
+        assert_eq!(&replaced.data[..], b"ZZ23");
+
+        nfs.remove_sync(1, "member").expect("unlink");
+        assert_eq!(nfs.lookup_sync(1, "member").unwrap_err(), FsError::NotFound);
+    }
+
+    #[tokio::test]
+    async fn v4_overlay_rename_and_symlink_readonly() {
+        let mut base = Synth::new();
+        base.add_file("/a", b"x", vec![UserData::Other("t".into())]);
+        let (_td, nfs) = overlay_export(base);
+        let c = ctx();
+        assert_eq!(
+            nfs.rename(&c, &1, "a", &1, "b").await.unwrap_err(),
+            FsError::ReadOnly
+        );
+        assert_eq!(
+            nfs.create_symlink(&c, &1, "l", "t", &SetAttrs::default())
+                .await
+                .unwrap_err(),
+            FsError::ReadOnly
+        );
+    }
+
+    #[test]
+    fn v4_overlay_access_and_limits() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        let all = AccessMask::READ
+            | AccessMask::LOOKUP
+            | AccessMask::MODIFY
+            | AccessMask::EXTEND
+            | AccessMask::DELETE
+            | AccessMask::EXECUTE;
+        let got = nfs.access_sync(1, all).unwrap();
+        assert_eq!(got, all);
+        let lim = nfs.limits();
+        assert_eq!(lim.max_write, 1_048_576);
     }
 }

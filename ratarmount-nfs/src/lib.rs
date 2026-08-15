@@ -1,8 +1,9 @@
 //! In-process NFS export of a [`ratarmount_core::MountSource`].
 //!
 //! Userspace NFSv3 adapter (default). Optional NFSv4.1 (`--features nfsv4`,
-//! `--nfs-vers 4`) is read-only in this crate revision. `-w` overlay writes
-//! are v3-only until the v4 overlay PR. The bind parser and error map live
+//! `--nfs-vers 4`) shares the same `MountSource` and `-w` overlay. Overlay
+//! create/write/mkdir/remove/setattr-size land on v4 when `-w` is set;
+//! rename and symlink stay `ReadOnly`. The bind parser and error map live
 //! here so the CLI can validate `--nfs-bind` / `--nfs-vers` without starting
 //! a listener.
 

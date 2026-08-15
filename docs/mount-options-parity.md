@@ -71,7 +71,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 |---------|--------|------|--------|
 | Single archive FUSE mount | yes | yes | `[x]` |
 | NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes) | `[x]` Rust-only |
-| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (RO `MountSource` via embednfs; overlay writes later; **Linux kernel client unverified**) | `~` Rust-only |
+| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; `-w` overlay create/write; **Linux kernel client unverified**) | `~` Rust-only |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |
 | Subfolder layout (`--disable-union-mount`) | yes | **added** | `[x]` |
 | Recursive nested archives | yes | yes | `[x]` |

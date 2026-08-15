@@ -91,7 +91,7 @@ pub struct NfsOptions {
     pub readahead_bytes: u64,
     pub reader_slots: usize,
     pub stop: Option<NfsStop>,
-    /// When set, NFSv3 create/write/mkdir/remove/setattr-size go to this overlay.
+    /// When set, NFSv3/v4 create/write/mkdir/remove/setattr-size go to this overlay.
     pub overlay: Option<Arc<WriteOverlay>>,
     /// Protocol. Default [`NfsVers::V3`]. CLI sets this only when `--nfs` is set.
     pub vers: NfsVers,
