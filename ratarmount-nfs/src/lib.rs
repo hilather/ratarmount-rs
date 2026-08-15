@@ -12,6 +12,12 @@ mod reader;
 mod serve;
 mod vfs;
 
+#[cfg(feature = "nfsv4")]
+mod v4;
+
+#[cfg(feature = "nfsv4")]
+pub use v4::{listen_v4_memfs_smoke, serve_v4_memfs_smoke};
+
 pub use bind::{nfs_bind_string, parse_nfs_bind, BindError, DEFAULT_NFS_BIND};
 pub use error::io_to_nfsstat3;
 pub use inode::ROOT_FILEID;

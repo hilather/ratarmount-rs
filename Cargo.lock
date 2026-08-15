@@ -463,6 +463,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "dashmap"
+version = "6.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e6361d5c062261c78a176addb82d4c821ae42bed6089de0e12603cd25de2059c"
+dependencies = [
+ "cfg-if",
+ "crossbeam-utils",
+ "hashbrown 0.14.5",
+ "lock_api",
+ "once_cell",
+ "parking_lot_core",
+]
+
+[[package]]
 name = "deflate64"
 version = "0.1.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -568,6 +582,32 @@ name = "either"
 version = "1.17.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9e5e8f6c15a24b9a3ee5efec809ccd006d3b30e8b3bb63c39af737c7f87daa1d"
+
+[[package]]
+name = "embednfs"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f1cb2d640c17302d0848458b744a26e2847f3ea4b5e69e1418fd6f8a2638cae"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "embednfs-proto",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "embednfs-proto"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ecd6b4ea3292480ae4cd679aa984849bf1b1d3b36db63dcde38cf821a2be1592"
+dependencies = [
+ "bytes",
+ "num-derive",
+ "num-traits",
+]
 
 [[package]]
 name = "encoding_rs"
@@ -1991,6 +2031,8 @@ name = "ratarmount-nfs"
 version = "0.1.20"
 dependencies = [
  "async-trait",
+ "bytes",
+ "embednfs",
  "libc",
  "log",
  "nfsserve",
@@ -2255,6 +2297,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "signal-hook-registry"
+version = "1.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c4db69cba1110affc0e9f7bcd48bbf87b3f4fc7c61fc9155afd4c469eb3d6c1b"
+dependencies = [
+ "errno",
+ "libc",
+]
+
+[[package]]
 name = "simd-adler32"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2439,7 +2491,9 @@ dependencies = [
  "bytes",
  "libc",
  "mio",
+ "parking_lot",
  "pin-project-lite",
+ "signal-hook-registry",
  "socket2",
  "tokio-macros",
  "windows-sys 0.61.2",

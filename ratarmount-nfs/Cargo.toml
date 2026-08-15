@@ -5,15 +5,23 @@ edition.workspace = true
 license.workspace = true
 description = "In-process NFSv3 export of a ratarmount MountSource"
 
+[features]
+default = []
+# NFSv4.1 via embednfs (requires rustc ≥ 1.88 / edition 2024).
+nfsv4 = ["dep:embednfs", "dep:bytes"]
+
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-compositing.workspace = true
 nfsserve = "0.11"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util"] }
 log.workspace = true
 thiserror.workspace = true
 libc.workspace = true
+# Optional NFSv4.1 stack (edition 2024 / rustc ≥ 1.88). Not compiled by default CI.
+embednfs = { version = "0.4.1", optional = true }
+bytes = { version = "1", optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -17,6 +17,8 @@ gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
 # rapidgzip + ISA-L sequential inflate (needs system/prefix libisal).
 # Enables this crate's `gzip-rapidgzip` cfg (factory/tests) plus compress ISA-L.
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
+# NFSv4.1 via embednfs (requires rustc ≥ 1.88 / edition 2024). See docs/nfs-export.md.
+nfsv4 = ["ratarmount-nfs/nfsv4"]
 
 [dependencies]
 ratarmount-core.workspace = true
