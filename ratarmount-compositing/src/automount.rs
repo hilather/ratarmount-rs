@@ -17,6 +17,8 @@ use ratarmount_core::{
 use regex::Regex;
 use tempfile::NamedTempFile;
 
+use crate::path_intern::{path_is_self_or_descendant, PathIntern};
+
 /// Open a nested archive from a filesystem path into a MountSource.
 pub type OpenNestedFn = Arc<dyn Fn(&Path) -> io::Result<Arc<dyn MountSource>> + Send + Sync>;
 
@@ -380,10 +382,72 @@ struct NestedMount {
     depth: u32,
 }
 
+/// Nested mounts keyed by interned mount-point id (one string per distinct key).
+struct MountedTable {
+    intern: PathIntern,
+    by_id: HashMap<u32, NestedMount>,
+}
+
+impl MountedTable {
+    fn new() -> Self {
+        Self {
+            intern: PathIntern::new(),
+            by_id: HashMap::new(),
+        }
+    }
+
+    fn clear(&mut self) {
+        self.by_id.clear();
+        self.intern.clear();
+    }
+
+    fn get(&self, path: &str) -> Option<&NestedMount> {
+        let id = self.intern.lookup(path)?;
+        self.by_id.get(&id)
+    }
+
+    fn contains_key(&self, path: &str) -> bool {
+        self.get(path).is_some()
+    }
+
+    fn insert(&mut self, path: String, mount: NestedMount) {
+        let id = self.intern.intern(&path);
+        self.by_id.insert(id, mount);
+    }
+
+    /// Longest mounted prefix of `path`. Does not allocate `mp + "/"` per key.
+    fn find_mounted_in(&self, path: &str) -> (&str, String) {
+        let path = normpath(path);
+        if path == "/" {
+            return ("/", "/".into());
+        }
+        let mut best: &str = "/";
+        for &id in self.by_id.keys() {
+            let mp = self.intern.get(id);
+            if path_is_self_or_descendant(path.as_str(), mp) && mp.len() > best.len() {
+                best = mp;
+            }
+        }
+        if best == "/" {
+            ("/", path)
+        } else if path == best {
+            (best, "/".into())
+        } else {
+            (best, path[best.len()..].to_string())
+        }
+    }
+
+    #[cfg(test)]
+    fn keys_are_interned(&self) -> bool {
+        let _: &HashMap<u32, NestedMount> = &self.by_id;
+        true
+    }
+}
+
 /// Wraps a mount source and exposes nested archives as subfolders.
 pub struct AutoMountLayer {
     root: Arc<dyn MountSource>,
-    mounted: Mutex<HashMap<String, NestedMount>>,
+    mounted: Mutex<MountedTable>,
     max_depth: u32,
     open_nested: OpenNestedFn,
     /// Optional no-tmp nested open (TAR/7z/ZIP from parent member stream).
@@ -448,7 +512,7 @@ impl AutoMountLayer {
             .and_then(|(pat, rep)| Regex::new(&pat).ok().map(|re| (re, rep)));
         let layer = Self {
             root,
-            mounted: Mutex::new(HashMap::new()),
+            mounted: Mutex::new(MountedTable::new()),
             max_depth: if max_depth == 0 { 32 } else { max_depth },
             open_nested,
             open_nested_reader,
@@ -565,7 +629,7 @@ impl AutoMountLayer {
 
     fn depth_at(&self, path: &str) -> u32 {
         let mounted = self.mounted.lock().expect("automount mutex");
-        let (mp, _) = Self::find_mounted_in(&mounted, path);
+        let (mp, _) = mounted.find_mounted_in(path);
         if mp == "/" {
             0
         } else {
@@ -575,7 +639,7 @@ impl AutoMountLayer {
 
     fn list_names_no_lazy(&self, path: &str) -> Option<Vec<String>> {
         let mounted = self.mounted.lock().expect("automount mutex");
-        let (mp, rest) = Self::find_mounted_in(&mounted, path);
+        let (mp, rest) = mounted.find_mounted_in(path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
         match src.list(&rest)? {
             ListResult::Infos(m) => Some(m.into_keys().collect()),
@@ -597,13 +661,13 @@ impl AutoMountLayer {
 
     fn lookup_raw(&self, path: &str) -> Option<FileInfo> {
         let mounted = self.mounted.lock().expect("automount mutex");
-        let (mp, rest) = Self::find_mounted_in(&mounted, path);
+        let (mp, rest) = mounted.find_mounted_in(path);
         Self::source_at_locked(&self.root, &mounted, mp).lookup(&rest, 0)
     }
 
     fn source_at_locked(
         root: &Arc<dyn MountSource>,
-        mounted: &HashMap<String, NestedMount>,
+        mounted: &MountedTable,
         mount_point: &str,
     ) -> Arc<dyn MountSource> {
         if mount_point == "/" {
@@ -616,29 +680,16 @@ impl AutoMountLayer {
         }
     }
 
-    fn find_mounted_in<'a>(
-        mounted: &'a HashMap<String, NestedMount>,
-        path: &str,
-    ) -> (&'a str, String) {
-        let path = normpath(path);
-        if path == "/" {
-            return ("/", "/".into());
-        }
-        let mut best: &str = "/";
-        for mp in mounted.keys() {
-            if (path == mp.as_str() || path.starts_with(&(mp.clone() + "/")))
-                && mp.len() > best.len()
-            {
-                best = mp.as_str();
-            }
-        }
-        if best == "/" {
-            ("/", path)
-        } else if path == best {
-            (best, "/".into())
-        } else {
-            (best, path[best.len()..].to_string())
-        }
+    /// Test-only: true when nested mounts are keyed by interned path ids.
+    ///
+    /// A `HashMap<String, _>` store would not type-check against the ascription
+    /// in [`MountedTable::keys_are_interned`] (the helper would have to return `false`).
+    #[cfg(test)]
+    fn mounted_keys_are_interned(&self) -> bool {
+        self.mounted
+            .lock()
+            .expect("automount mutex")
+            .keys_are_interned()
     }
 
     /// Compute mount point path for an archive file path.
@@ -697,7 +748,7 @@ impl AutoMountLayer {
 
         let (mp, rest) = {
             let mounted = self.mounted.lock().expect("automount mutex");
-            let (m, r) = Self::find_mounted_in(&mounted, path);
+            let (m, r) = mounted.find_mounted_in(path);
             (m.to_string(), r)
         };
         let parent = {
@@ -1004,7 +1055,7 @@ impl MountSource for AutoMountLayer {
                 }
             };
         }
-        let (mp, rest) = Self::find_mounted_in(&mounted, &path);
+        let (mp, rest) = mounted.find_mounted_in(&path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
         let listing = src.list(&rest)?;
         match listing {
@@ -1069,7 +1120,7 @@ impl MountSource for AutoMountLayer {
                 ListModeResult::Names(names) => Some(ListModeResult::Names(names)),
             };
         }
-        let (mp, rest) = Self::find_mounted_in(&mounted, &path);
+        let (mp, rest) = mounted.find_mounted_in(&path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
         match src.list_mode(&rest)? {
             ListModeResult::Modes(map) => {
@@ -1148,7 +1199,7 @@ impl MountSource for AutoMountLayer {
             fi.size = 0;
             return Some(Self::tag(fi, &path));
         }
-        let (mp, rest) = Self::find_mounted_in(&mounted, &path);
+        let (mp, rest) = mounted.find_mounted_in(&path);
         if mp != "/" {
             let fi =
                 Self::source_at_locked(&self.root, &mounted, mp).lookup(&rest, file_version)?;
@@ -1337,6 +1388,68 @@ mod tests {
         fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
             Err(io::Error::new(io::ErrorKind::NotFound, "empty nested"))
         }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    /// One regular file at `/inner.txt` (or `name`) for interned-key automount tests.
+    struct OneFileNested {
+        name: String,
+        body: Vec<u8>,
+    }
+
+    impl OneFileNested {
+        fn new(name: &str, body: &[u8]) -> Self {
+            Self {
+                name: name.to_string(),
+                body: body.to_vec(),
+            }
+        }
+
+        fn file_path(&self) -> String {
+            format!("/{}", self.name)
+        }
+
+        fn file_info(&self) -> FileInfo {
+            FileInfo {
+                size: self.body.len() as u64,
+                mtime: 0.0,
+                mode: ratarmount_core::S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Other(self.file_path())],
+            }
+        }
+    }
+
+    impl MountSource for OneFileNested {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if normpath(path) == "/" {
+                let mut map = std::collections::BTreeMap::new();
+                map.insert(self.name.clone(), self.file_info());
+                Some(ListResult::Infos(map))
+            } else {
+                None
+            }
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            let path = normpath(path);
+            if path == "/" {
+                Some(create_root_file_info())
+            } else if path == self.file_path() {
+                Some(self.file_info())
+            } else {
+                None
+            }
+        }
+
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(std::io::Cursor::new(self.body.clone())))
+        }
+
         fn is_immutable(&self) -> bool {
             true
         }
@@ -1847,5 +1960,115 @@ mod tests {
             .read_to_string(&mut right)
             .unwrap();
         assert_eq!(right, "R");
+    }
+
+    /// Regression: interned AutoMount nested keys.
+    ///
+    /// Symptom: each nested mount point stored an owned `String` key, and
+    /// `find_mounted_in` allocated `mp.clone() + "/"` on every prefix compare.
+    /// Nested mounts are keyed by interned path ids.
+    #[test]
+    fn interned_automount_nested_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        // Prefix-overlapping names: `/foo` must not steal `/foobar` (or `/foo.tar` vs `/foobar.tar`).
+        // Body is the original archive name so the path-based opener (temp spool) can label inner files.
+        for name in ["foo.tar", "foobar.tar", "other.tar"] {
+            fs::write(dir.path().join(name), name.as_bytes()).unwrap();
+        }
+
+        let open_nested: OpenNestedFn = Arc::new(|path: &Path| {
+            let label = fs::read_to_string(path).unwrap_or_else(|_| "inner".into());
+            let stem = label.trim_end_matches(".tar");
+            let body = format!("payload-{stem}").into_bytes();
+            Ok(Arc::new(OneFileNested::new("inner.txt", &body)) as Arc<dyn MountSource>)
+        });
+
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new_with_options(
+            root,
+            2,
+            open_nested,
+            AutoMountOptions {
+                lazy: false,
+                parallel_nested_threads: 1,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            layer.mounted_keys_are_interned(),
+            "Regression: AutoMount mounted map must be keyed by interned path ids, not String"
+        );
+
+        for name in ["foo.tar", "foobar.tar", "other.tar"] {
+            let fi = layer
+                .lookup(&format!("/{name}"), 0)
+                .unwrap_or_else(|| panic!("expected nested root {name}"));
+            assert_eq!(
+                fi.mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFDIR,
+                "{name} must appear as a directory"
+            );
+        }
+
+        match layer.list("/").expect("list /") {
+            ListResult::Infos(map) => {
+                for name in ["foo.tar", "foobar.tar", "other.tar"] {
+                    let mode = map
+                        .get(name)
+                        .unwrap_or_else(|| panic!("listed {name}"))
+                        .mode;
+                    assert_eq!(
+                        mode & ratarmount_core::S_IFMT,
+                        ratarmount_core::S_IFDIR,
+                        "{name} listed as dir"
+                    );
+                }
+            }
+            ListResult::Names(_) => panic!("expected Infos"),
+        }
+
+        let modes = layer.list_mode("/").expect("list_mode /");
+        match modes {
+            ListModeResult::Modes(map) => {
+                assert_eq!(
+                    map.get("foo.tar").copied().unwrap() & ratarmount_core::S_IFMT,
+                    ratarmount_core::S_IFDIR
+                );
+                assert_eq!(
+                    map.get("foobar.tar").copied().unwrap() & ratarmount_core::S_IFMT,
+                    ratarmount_core::S_IFDIR
+                );
+            }
+            ListModeResult::Names(_) => panic!("expected Modes"),
+        }
+
+        for (name, stem) in [
+            ("foo.tar", "foo"),
+            ("foobar.tar", "foobar"),
+            ("other.tar", "other"),
+        ] {
+            let inner = format!("/{name}/inner.txt");
+            let fi = layer
+                .lookup(&inner, 0)
+                .unwrap_or_else(|| panic!("inner file {inner}"));
+            assert_eq!(fi.mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFREG);
+            let mut body = String::new();
+            layer
+                .open(&fi, 0)
+                .unwrap()
+                .read_to_string(&mut body)
+                .unwrap();
+            assert_eq!(body, format!("payload-{stem}"));
+        }
+
+        // Longest prefix: `/foobar.tar/inner.txt` must not resolve through `/foo.tar`.
+        match layer.list("/foobar.tar").expect("list foobar") {
+            ListResult::Infos(map) => {
+                assert!(map.contains_key("inner.txt"));
+            }
+            ListResult::Names(_) => panic!("expected Infos"),
+        }
     }
 }

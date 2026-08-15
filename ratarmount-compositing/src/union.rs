@@ -27,6 +27,8 @@ use ratarmount_core::{
     ListResult, MountSource, UserData,
 };
 
+use crate::path_intern::PathIntern;
+
 /// Max symlink hops when [`UnionMountOptions::resolve_symlinks`] is enabled.
 const MAX_SYMLINK_RESOLVE_HOPS: usize = 8;
 
@@ -59,8 +61,10 @@ impl Default for UnionMountOptions {
 /// Union of mount sources; later sources override earlier ones for the same path.
 pub struct UnionMountSource {
     sources: Vec<Arc<dyn MountSource>>,
-    /// Cached folders: path → which **immutable** sources contain that directory.
-    folder_cache: HashMap<String, Vec<usize>>,
+    /// Interned folder-cache keys (one string per distinct cached path).
+    path_intern: PathIntern,
+    /// Cached folders: interned path id → which **immutable** sources contain that directory.
+    folder_cache: HashMap<u32, Vec<usize>>,
     /// Depth actually cached (0 = only `/` or empty).
     folder_cache_depth: usize,
     /// When true, resolve winning symlinks within the chosen source (FR-10).
@@ -75,6 +79,7 @@ impl UnionMountSource {
     pub fn new_with_options(sources: Vec<Arc<dyn MountSource>>, opts: UnionMountOptions) -> Self {
         let mut u = Self {
             sources,
+            path_intern: PathIntern::new(),
             folder_cache: HashMap::new(),
             folder_cache_depth: 0,
             resolve_symlinks: opts.resolve_symlinks,
@@ -106,6 +111,24 @@ impl UnionMountSource {
         self.folder_cache.len()
     }
 
+    /// Test-only: true when the live folder cache is keyed by interned path ids.
+    ///
+    /// A `HashMap<String, _>` store would not type-check against this ascription
+    /// (the helper would have to be changed to return `false`).
+    #[cfg(test)]
+    fn folder_cache_uses_path_ids(&self) -> bool {
+        let _: &HashMap<u32, Vec<usize>> = &self.folder_cache;
+        true
+    }
+
+    /// Test-only: whether `path` is present in the interned folder cache.
+    #[cfg(test)]
+    fn folder_cache_contains(&self, path: &str) -> bool {
+        self.path_intern
+            .lookup(path)
+            .is_some_and(|id| self.folder_cache.contains_key(&id))
+    }
+
     fn build_folder_cache(
         &mut self,
         max_cache_depth: usize,
@@ -117,7 +140,7 @@ impl UnionMountSource {
 
         // Root: only immutable sources (mutable always consulted at runtime).
         let mut entries_left = max_cache_entries;
-        let mut folder_cache: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut folder_cache: HashMap<u32, Vec<usize>> = HashMap::new();
         let root_idxs: Vec<usize> = self
             .sources
             .iter()
@@ -125,14 +148,17 @@ impl UnionMountSource {
             .filter(|(_, m)| m.is_immutable())
             .map(|(i, _)| i)
             .collect();
-        folder_cache.insert("/".into(), root_idxs);
-        let mut last: HashMap<String, Vec<usize>> = folder_cache.clone();
+        let intern = &mut self.path_intern;
+        let root_id = intern.intern("/");
+        folder_cache.insert(root_id, root_idxs);
+        let mut last: HashMap<u32, Vec<usize>> = folder_cache.clone();
         let mut depth_done = 0usize;
 
         for depth in 1..max_cache_depth {
-            let mut new_cache: HashMap<String, Vec<usize>> = HashMap::new();
+            let mut new_cache: HashMap<u32, Vec<usize>> = HashMap::new();
 
-            for (folder, idxs) in &last {
+            for (&folder_id, idxs) in &last {
+                let folder = intern.get(folder_id).to_string();
                 for &si in idxs {
                     if t0.elapsed().as_secs_f64() > max_seconds || entries_left == 0 {
                         self.folder_cache = folder_cache;
@@ -149,7 +175,7 @@ impl UnionMountSource {
                     // walk continues into symlink→dir branches (immutable archives).
                     let Some(listing) = Self::list_from_source(
                         self.sources[si].as_ref(),
-                        folder,
+                        &folder,
                         self.resolve_symlinks,
                     ) else {
                         continue;
@@ -170,7 +196,7 @@ impl UnionMountSource {
                             );
                             return;
                         }
-                        let full = join(folder, &name);
+                        let full = join(&folder, &name);
                         // Cache real directories *and* followable symlink→dir paths.
                         // Previously only S_IFDIR was recorded, so immutable sources
                         // with a symlink branch were dropped from sources_for_path
@@ -185,7 +211,8 @@ impl UnionMountSource {
                             continue;
                         }
                         entries_left = entries_left.saturating_sub(1);
-                        new_cache.entry(full).or_default().push(si);
+                        let full_id = intern.intern(&full);
+                        new_cache.entry(full_id).or_default().push(si);
                     }
                 }
             }
@@ -193,7 +220,7 @@ impl UnionMountSource {
             if new_cache.is_empty() {
                 break;
             }
-            folder_cache.extend(new_cache.iter().map(|(k, v)| (k.clone(), v.clone())));
+            folder_cache.extend(new_cache.iter().map(|(&k, v)| (k, v.clone())));
             depth_done = depth;
             last = new_cache;
         }
@@ -214,16 +241,21 @@ impl UnionMountSource {
             return (0..self.sources.len()).collect();
         }
 
-        let cached: Option<&Vec<usize>> = if let Some(c) = self.folder_cache.get(path) {
-            // path is a cached folder
-            Some(c)
-        } else if self.folder_cache_depth > 0 && path.starts_with('/') {
-            // Look up parent at the cached depth (Python: split with maxdepth+1)
-            let parent = parent_at_depth(path, self.folder_cache_depth);
-            self.folder_cache.get(&parent)
-        } else {
-            None
-        };
+        let cached: Option<&Vec<usize>> = self
+            .path_intern
+            .lookup(path)
+            .and_then(|id| self.folder_cache.get(&id))
+            .or_else(|| {
+                // Look up parent at the cached depth (Python: split with maxdepth+1)
+                if self.folder_cache_depth > 0 && path.starts_with('/') {
+                    let parent = parent_at_depth(path, self.folder_cache_depth);
+                    self.path_intern
+                        .lookup(&parent)
+                        .and_then(|id| self.folder_cache.get(&id))
+                } else {
+                    None
+                }
+            });
 
         let mut out = Vec::new();
         for (i, src) in self.sources.iter().enumerate() {
@@ -1046,5 +1078,209 @@ mod tests {
             u.lookup("/chain_0", 0).is_none(),
             "Regression: FR-10 hop limit must yield None without hang"
         );
+    }
+
+    /// Immutable in-memory tree for interned folder-cache tests.
+    struct SynthTree {
+        dirs: HashSet<String>,
+        files: HashMap<String, Vec<u8>>,
+    }
+
+    impl SynthTree {
+        fn with_dirs_and_files(dir_list: &[&str], file_list: &[(&str, &[u8])]) -> Self {
+            let mut dirs = HashSet::new();
+            dirs.insert("/".into());
+            for d in dir_list {
+                insert_dir_and_ancestors(&mut dirs, d);
+            }
+            let mut files = HashMap::new();
+            for (p, body) in file_list {
+                let p = normpath(p);
+                if let Some(i) = p.rfind('/') {
+                    let parent = if i == 0 { "/" } else { &p[..i] };
+                    insert_dir_and_ancestors(&mut dirs, parent);
+                }
+                files.insert(p, body.to_vec());
+            }
+            Self { dirs, files }
+        }
+    }
+
+    fn insert_dir_and_ancestors(dirs: &mut HashSet<String>, path: &str) {
+        let path = normpath(path);
+        dirs.insert("/".into());
+        if path == "/" {
+            return;
+        }
+        let mut acc = String::new();
+        for part in path.trim_start_matches('/').split('/') {
+            acc.push('/');
+            acc.push_str(part);
+            dirs.insert(acc.clone());
+        }
+    }
+
+    fn synth_dir_info(path: &str) -> FileInfo {
+        FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: ratarmount_core::S_IFDIR | 0o755,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Other(path.to_string())],
+        }
+    }
+
+    fn synth_file_info(path: &str, size: u64) -> FileInfo {
+        FileInfo {
+            size,
+            mtime: 0.0,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Other(path.to_string())],
+        }
+    }
+
+    impl MountSource for SynthTree {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            let path = normpath(path);
+            if !self.dirs.contains(&path) {
+                return None;
+            }
+            let prefix = if path == "/" {
+                "/".to_string()
+            } else {
+                format!("{path}/")
+            };
+            let mut map = BTreeMap::new();
+            for d in &self.dirs {
+                if let Some(rest) = d.strip_prefix(&prefix) {
+                    if !rest.is_empty() && !rest.contains('/') {
+                        map.insert(rest.to_string(), synth_dir_info(d));
+                    }
+                }
+            }
+            for (f, body) in &self.files {
+                if let Some(rest) = f.strip_prefix(&prefix) {
+                    if !rest.is_empty() && !rest.contains('/') {
+                        map.insert(rest.to_string(), synth_file_info(f, body.len() as u64));
+                    }
+                }
+            }
+            Some(ListResult::Infos(map))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            let path = normpath(path);
+            if self.dirs.contains(&path) {
+                return Some(synth_dir_info(&path));
+            }
+            self.files
+                .get(&path)
+                .map(|body| synth_file_info(&path, body.len() as u64))
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            let path = fi
+                .userdata
+                .iter()
+                .rev()
+                .find_map(|u| match u {
+                    UserData::Other(s) if s.starts_with('/') => Some(s.as_str()),
+                    _ => None,
+                })
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing path"))?;
+            let body = self.files.get(path).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("synth file {path}"))
+            })?;
+            Ok(Box::new(std::io::Cursor::new(body.clone())))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: interned union folder-cache keys.
+    ///
+    /// Symptom: deep unions stored one owned `String` per cached folder (duplicated
+    /// long prefixes). The live cache is keyed by interned path ids.
+    #[test]
+    fn interned_union_folder_cache_keys() {
+        let mut sibs: Vec<String> = (0..8).map(|i| format!("/l1/l2/l3/sib{i}")).collect();
+        sibs.push("/l1/l2/l3/l4/l5".into());
+        let sib_refs: Vec<&str> = sibs.iter().map(|s| s.as_str()).collect();
+
+        let a = Arc::new(SynthTree::with_dirs_and_files(
+            &["/l1/l2/l3/l4/l5"],
+            &[("/l1/l2/l3/l4/l5/file_a", b"from-a")],
+        )) as Arc<dyn MountSource>;
+        let b = Arc::new(SynthTree::with_dirs_and_files(
+            &sib_refs,
+            &[("/l1/l2/l3/l4/l5/file_b", b"from-b")],
+        )) as Arc<dyn MountSource>;
+
+        let u = UnionMountSource::new_with_options(
+            vec![a, b],
+            UnionMountOptions {
+                max_cache_depth: 16,
+                max_cache_entries: 10_000,
+                max_seconds_to_cache: 10.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            u.folder_cache_uses_path_ids(),
+            "Regression: folder_cache must be keyed by interned path ids, not String"
+        );
+        assert!(
+            u.folder_cache_len() >= 2,
+            "expected / and children cached; len={}",
+            u.folder_cache_len()
+        );
+        assert!(u.folder_cache_contains("/"), "root must be cached");
+        assert!(u.folder_cache_contains("/l1"));
+        assert!(u.folder_cache_contains("/l1/l2"));
+        assert!(u.folder_cache_contains("/l1/l2/l3"));
+        assert!(u.folder_cache_contains("/l1/l2/l3/l4"));
+        assert!(u.folder_cache_contains("/l1/l2/l3/l4/l5"));
+        for i in 0..8 {
+            assert!(
+                u.folder_cache_contains(&format!("/l1/l2/l3/sib{i}")),
+                "sibling sib{i} must be cached"
+            );
+        }
+
+        let listing = u.list("/l1/l2/l3").expect("list deep dir");
+        let ListResult::Infos(map) = listing else {
+            panic!("expected Infos");
+        };
+        assert!(map.contains_key("l4"));
+        assert!(map.contains_key("sib0"));
+        assert!(map.contains_key("sib7"));
+
+        let modes = u.list_mode("/l1/l2/l3").expect("list_mode");
+        let ListModeResult::Modes(modes) = modes else {
+            panic!("expected Modes");
+        };
+        assert!(is_dir_mode(*modes.get("l4").expect("l4 mode")));
+        assert!(is_dir_mode(*modes.get("sib3").expect("sib3 mode")));
+
+        let fi_a = u.lookup("/l1/l2/l3/l4/l5/file_a", 0).expect("file_a");
+        let mut body = String::new();
+        u.open(&fi_a, 0).unwrap().read_to_string(&mut body).unwrap();
+        assert_eq!(body, "from-a");
+
+        let fi_b = u.lookup("/l1/l2/l3/l4/l5/file_b", 0).expect("file_b");
+        let mut body = String::new();
+        u.open(&fi_b, 0).unwrap().read_to_string(&mut body).unwrap();
+        assert_eq!(body, "from-b");
+
+        let leaf = u.lookup("/l1/l2/l3/l4/l5", 0).expect("leaf dir");
+        assert!(is_dir_mode(leaf.mode));
     }
 }

@@ -4,6 +4,7 @@
 mod automount;
 mod control;
 mod folder;
+mod path_intern;
 mod prefix;
 mod transform;
 mod union;
