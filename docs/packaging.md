@@ -11,7 +11,7 @@ cargo install --path ratarmount
 
 ## Distro packages (Ubuntu .deb / Rocky .rpm / portable)
 
-CI workflow: [`.github/workflows/packages.yml`](../.github/workflows/packages.yml)
+CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml)
 
 | Target | Job | Arch | Artifact |
 |--------|-----|------|----------|
@@ -77,7 +77,21 @@ macOS guide: [`docs/macos.md`](macos.md)
 
 Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if missing).
 
-**NFSv3 export** (`--nfs`) is userspace (`nfsserve` + tokio). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+**NFS export** is userspace (`nfsserve` NFSv3 + optional `embednfs` NFSv4.1). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). Binding **2049** needs root or `CAP_NET_BIND_SERVICE` (`--nfs-bind 2049`; already parsed). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+
+**`nfsv4` is enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** compile v4.
+
+| Script | `cargo build --release -p ratarmount` |
+|--------|----------------------------------------|
+| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4` |
+| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4` |
+| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4` (rustup **stable**, rustc ≥ 1.88 assumed) |
+
+Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Workspace MSRV stays **1.74**; default `cargo test --workspace` does not compile embednfs. Current package jobs install rustup **stable**, so 1.88+ is expected. If a Rocky/portable/macOS builder is ever pinned below 1.88, keep the feature off in that script and update this table.
+
+`--print-features` on a packaged binary prints `nfsv4: compiled`. `--oss-attributions` lists **embednfs** (MIT) when compiled.
+
+Residuals (honest): **Linux kernel client unverified** (no privileged `vers=4.1,tcp,port=,sec=sys` mount recorded — do **not** claim “usable on Linux”); no Kerberos / LAN / Windows; no v3/v4 mux; idle TTL is not CLOSE; embednfs is macOS-first over localhost. Regression: [`packaging/test-nfsv4-features.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-nfsv4-features.sh).
 
 ### Install examples
 

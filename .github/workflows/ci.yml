@@ -38,6 +38,47 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+  # Optional feature: NFSv4.1 (embednfs, rustc ≥ 1.88). Default check job
+  # stays on workspace MSRV 1.74 and does not compile embednfs. After the
+  # RO adapter landed, this job is required so packaging --features nfsv4
+  # cannot go stale. Soft-skip is not allowed for the unit tests.
+  nfsv4:
+    name: nfsv4 feature tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: nfsv4
+
+      - name: cargo clippy (nfsv4)
+        run: cargo clippy -p ratarmount-nfs --all-targets --features nfsv4 -- -D warnings
+
+      - name: cargo test (nfsv4)
+        run: |
+          cargo test -p ratarmount-nfs --features nfsv4 --lib v4_
+          cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay
+          cargo test -p ratarmount-nfs --features nfsv4 --lib evict_idle
+          cargo test -p ratarmount-nfs --features nfsv4 --lib v4_exchange_id
+          cargo test -p ratarmount --features nfsv4 --bin ratarmount nfs_vers
+
+      - name: packaging compile-line check
+        run: |
+          chmod +x packaging/test-nfsv4-features.sh
+          ./packaging/test-nfsv4-features.sh
+
   # Pure-Rust cold-index microbench from benchmarks/baselines/rust-gates.json.
   # No /dev/fuse and no Python required at runtime (--no-mount only).
   benchmark-gates:

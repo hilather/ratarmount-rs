@@ -27,7 +27,10 @@ command_exists() { command -v "$1" >/dev/null 2>&1; }
 
 echo "==> Building release binary"
 export PATH="${HOME}/.cargo/bin:${PATH}"
-cargo build --release -p ratarmount
+# NFSv4.1 via embednfs (rustc ≥ 1.88). AppImage uses rustup stable like the
+# native package jobs. Workflow YAML alone does not compile v4.
+echo "==> cargo build --release -p ratarmount --features nfsv4"
+cargo build --release -p ratarmount --features nfsv4
 
 mkdir -p "$OUT_DIR"
 rm -rf "$APPDIR"

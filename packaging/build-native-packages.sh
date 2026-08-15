@@ -77,8 +77,12 @@ FAMILY="$(detect_family)"
 mkdir -p "$OUT_DIR"
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-    echo "==> cargo build --release -p ratarmount"
-    cargo build --release -p ratarmount
+    # NFSv4.1 via embednfs (rustc ≥ 1.88). Linux package jobs install rustup
+    # stable, so this is on. Stronger than gzip-rapidgzip (still off). If a
+    # Rocky/portable builder is ever pinned below 1.88, drop --features nfsv4
+    # and document in docs/packaging.md. Workflow YAML alone does not compile v4.
+    echo "==> cargo build --release -p ratarmount --features nfsv4"
+    cargo build --release -p ratarmount --features nfsv4
 fi
 test -x target/release/ratarmount
 
@@ -94,6 +98,8 @@ ${NAME} ${VERSION}
 Built on: ${DISTRO_LABEL} (${ARCH_UNAME})
 Install:  install -m 755 ratarmount /usr/local/bin/
 Runtime:  fuse3, libarchive (and optional e2fsprogs, squashfs-tools)
+NFS:      --nfs is NFSv3; --nfs-vers 4 is NFSv4.1 (compiled in this package).
+          Linux kernel NFSv4 client is unverified — see docs/nfs-export.md.
 EOF
 tar -C "$STAGE" -czf "$TARBALL" ratarmount README.txt
 rm -rf "$STAGE"

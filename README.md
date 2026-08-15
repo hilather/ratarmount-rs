@@ -68,6 +68,8 @@ See [`docs/packaging.md`](docs/packaging.md) for verification and package layout
 export PATH="$HOME/.cargo/bin:$PATH"
 make release && make install   # → ~/.local/bin/ratarmount
 # or: cargo install --path ratarmount
+# NFSv4.1 (opt-in; rustc ≥ 1.88): cargo build --release -p ratarmount --features nfsv4
+# Release packages already compile nfsv4. Linux kernel NFSv4 client is unverified.
 ```
 
 **macOS** (beta) — full guide: [`docs/macos.md`](docs/macos.md)
@@ -111,8 +113,10 @@ ratarmount --no-mount -c archive.tar
 # NFSv3 userspace export (no FUSE mountpoint; default)
 ratarmount --nfs archive.tar.gz
 # Linux: mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ mnt
-# Opt-in NFSv4.1 (`--features nfsv4`): --nfs --nfs-vers 4
-# Linux kernel NFSv4 client is unverified — do not treat as a supported mount.
+# Opt-in NFSv4.1 (Linux/macOS packages compile nfsv4; source: --features nfsv4, rustc ≥ 1.88)
+#   ratarmount --nfs --nfs-vers 4
+#   Linux: mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ mnt
+# Linux kernel NFSv4 client is unverified — do not treat as a supported Linux mount.
 
 # Unmount
 ratarmount -u mnt/
@@ -146,7 +150,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
-| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (`nfsv4` feature / rustc ≥ 1.88; `-w` overlay create/write; **Linux kernel client unverified**) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
+| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; **Linux kernel client unverified**; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
 
 ### Remote backends
 
@@ -208,7 +212,7 @@ flowchart LR
 | `ratarmount-core` | `MountSource` trait & options |
 | `ratarmount-index` | SQLite 0.7.x index |
 | `ratarmount-fuse` | `fuser` low-level filesystem |
-| `ratarmount-nfs` | In-process NFSv3 export (`--nfs`); optional NFSv4.1 (`--nfs-vers 4`) |
+| `ratarmount-nfs` | In-process NFSv3 export (`--nfs`); optional NFSv4.1 (`--nfs-vers 4`, `nfsv4` feature) |
 | `ratarmount-compress` | Seekable codecs + stencils |
 | `ratarmount-formats-*` | TAR, ZIP, 7z, ISO, SquashFS, EXT4, … |
 | `ratarmount-compositing` | Folder, union, automount, overlay |
@@ -263,7 +267,8 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges.
 5. **Remote** — HTTP Basic + Cookie env auth done; residual full browser cookie jar & full `ssh_config` edges.
-6. **Platforms** — macOS is **beta** ([docs/macos.md](docs/macos.md)).
+6. **Platforms** — macOS is **beta** ([docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)).
+7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. **Linux kernel client unverified** (no privileged mount recorded). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
 ---
 
@@ -293,8 +298,9 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table & producer recipes |
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
 | [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
-| [docs/packaging.md](docs/packaging.md) | Packages + cosign verify |
-| [docs/macos.md](docs/macos.md) | macOS FUSE / FSKit |
+| [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
+| [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) | Packages + cosign verify |
+| [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) | macOS FUSE / FSKit |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
 | [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.20) |

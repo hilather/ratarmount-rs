@@ -9,6 +9,11 @@
 #   - macOS arm64 (macos-14); x86_64 deferred (GHA macos-13 capacity)
 #
 # Triggers: tag v*, workflow_dispatch, packaging PR paths
+#
+# NFSv4.1 is compiled in packaging/build-native-packages.sh,
+# packaging/build-appimage.sh, and packaging/build-macos-tarball.sh
+# (`cargo build --release -p ratarmount --features nfsv4`). Editing this
+# YAML is not sufficient. rustup stable (rustc ≥ 1.88) is required.
 name: Packages
 
 on:

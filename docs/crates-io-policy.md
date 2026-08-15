@@ -2,7 +2,7 @@
 
 Status: **policy documented** (2026-07-28). No coordinated crates.io publish is required for dual-run or 1.0-class **binary** distribution.
 
-Related: [`docs/packaging.md`](packaging.md) (binary/deb/rpm/AppImage), [`docs/phase12-dual-run.md`](phase12-dual-run.md) (dual-run announce runbook; crates.io not required).
+Related: [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) (binary/deb/rpm/AppImage), [`docs/phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md) (dual-run announce runbook; crates.io not required), [`docs/nfs-export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) (NFSv3 + optional NFSv4.1).
 
 ---
 
@@ -36,7 +36,7 @@ Stable-ish building blocks for embedders. Publish only after docs + semver story
 | **L1 — codecs** | `ratarmount-compress` | Seekable gzip/bzip2/xz/zstd/… helpers |
 | **L2 — formats** | `ratarmount-formats-*` (tar, zip, ar, cpio, sevenzip, …) | Per-format MountSource backends |
 | **L3 — I/O & compose** | `ratarmount-remote`, `ratarmount-compositing` | URL backends; union/automount/overlay |
-| **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. |
+| **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) + optional NFSv4.1 (`embednfs` 0.4.1, feature `nfsv4`, rustc ≥ 1.88) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. Linux/macOS packages compile `nfsv4`; default crates stay MSRV 1.74. |
 
 ### System / FFI caveats
 

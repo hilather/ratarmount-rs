@@ -59,8 +59,11 @@ esac
 mkdir -p "$OUT_DIR"
 
 if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
-    echo "==> cargo build --release -p ratarmount"
-    cargo build --release -p ratarmount
+    # NFSv4.1 via embednfs. Packages.yml installs rustup stable (rustc ≥ 1.88
+    # assumed). If a macOS builder is ever pinned below 1.88, drop this feature
+    # and document in docs/packaging.md.
+    echo "==> cargo build --release -p ratarmount --features nfsv4"
+    cargo build --release -p ratarmount --features nfsv4
 fi
 test -x target/release/ratarmount
 
@@ -74,6 +77,10 @@ if [[ -f README.md ]]; then
 fi
 cat >"$STAGE/$STAGE_NAME/MACOS.txt" <<EOF
 ${NAME} ${VERSION} (macOS ${ARCH_LABEL})
+
+NFS: --nfs is NFSv3; --nfs-vers 4 is NFSv4.1 (compiled when rustc ≥ 1.88).
+macOS clients must pass vers=4.1 (vers=4 is NFSv4.0). embednfs is macOS-first
+over localhost; do not treat this as a LAN NAS.
 
 Install binary:
   install -m 755 ratarmount ~/.local/bin/

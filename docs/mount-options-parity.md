@@ -1,6 +1,6 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-08-01.
+Last updated: 2026-08-15.
 
 ## Summary
 
@@ -34,7 +34,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |
 | `--nfs` | no | **added** (userspace NFS; NFSv3 default; no FUSE mount required) | `[x]` Rust-only |
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
-| `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + `--features nfsv4`; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
+| `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
 | `--nfs-export-name` | no | **added** (MOUNT export name; warned/ignored on `--nfs-vers 4`) | `[x]` |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
@@ -71,7 +71,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 |---------|--------|------|--------|
 | Single archive FUSE mount | yes | yes | `[x]` |
 | NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes) | `[x]` Rust-only |
-| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; `-w` overlay create/write; **Linux kernel client unverified**) | `~` Rust-only |
+| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; Linux/macOS packages compile `nfsv4`; `-w` overlay create/write; **Linux kernel client unverified**; no Kerberos/LAN/Windows/mux) | `~` Rust-only |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |
 | Subfolder layout (`--disable-union-mount`) | yes | **added** | `[x]` |
 | Recursive nested archives | yes | yes | `[x]` |

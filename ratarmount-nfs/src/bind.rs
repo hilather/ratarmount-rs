@@ -94,6 +94,11 @@ mod tests {
         let want = SocketAddr::from((Ipv4Addr::LOCALHOST, 20490));
         assert_eq!(parse_nfs_bind("20490").unwrap(), want);
         assert_eq!(parse_nfs_bind(":20490").unwrap(), want);
+        // Privileged well-known port (docs recipe). Needs root / CAP_NET_BIND_SERVICE.
+        assert_eq!(
+            parse_nfs_bind("2049").unwrap(),
+            SocketAddr::from((Ipv4Addr::LOCALHOST, 2049))
+        );
     }
 
     #[test]

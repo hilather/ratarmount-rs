@@ -1093,7 +1093,7 @@ fn print_features() {
     println!("features:");
     println!("  fuse: fuser (low-level)");
     println!(
-        "  nfs: nfsserve NFSv3 (--nfs, default); NFSv4.1 embednfs (--nfs-vers 4, --features nfsv4, rustc>=1.88)"
+        "  nfs: nfsserve NFSv3 (--nfs, default); NFSv4.1 embednfs (--nfs-vers 4; Linux/macOS packages enable nfsv4; source: --features nfsv4, rustc>=1.88)"
     );
     #[cfg(feature = "nfsv4")]
     println!("  nfsv4: compiled");
