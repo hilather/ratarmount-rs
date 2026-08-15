@@ -77,7 +77,6 @@ impl MountSource for FolderMountSource {
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
         let real = self.realpath(path);
-        // None only if this path is not a listable directory (same as list()).
         let rd = fs::read_dir(&real).ok()?;
         let mut dents = Vec::new();
         for ent in rd.flatten() {

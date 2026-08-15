@@ -298,7 +298,10 @@ impl MountSource for ControlFolderMountSource {
             return None;
         }
         let mut dents = self.inner.list_dirents(&path)?;
-        if path == "/" && !dents.iter().any(|d| d.name == CONTROL_DIR_NAME) {
+        if path == "/" {
+            // Same as merge_control_into_root Infos: overwrite a colliding
+            // inner child so readdir type matches lookup/list().
+            dents.retain(|d| d.name != CONTROL_DIR_NAME);
             dents.push(CheapDirent {
                 name: CONTROL_DIR_NAME.to_string(),
                 mode: S_IFDIR | 0o555,
@@ -735,5 +738,71 @@ mod tests {
             ControlFolderMountSource::unmount_text().len() as u64
         );
         assert_eq!(by_name["unmount"].mode, S_IFREG | 0o666);
+    }
+
+    /// Regression: inner `.ratarmount-control` file must not keep S_IFREG
+    /// on cheap readdir while lookup/list() force the virtual directory.
+    #[test]
+    fn control_list_dirents_overwrites_inner_control_name() {
+        use std::io::Write;
+        use zip::write::SimpleFileOptions;
+        use zip::{CompressionMethod, ZipWriter};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("collide.zip");
+        let payload = b"not-the-control-dir\n";
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file(CONTROL_DIR_NAME, opts).unwrap();
+            zw.write_all(payload).unwrap();
+            zw.finish().unwrap();
+        }
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let zip = ratarmount_formats_zip::ZipMountSource::open(&path, None, &opts, "test", true)
+            .expect("open zip");
+        let counted = Arc::new(ListCallCounter {
+            inner: zip,
+            list_calls: AtomicUsize::new(0),
+        });
+        let ms = ControlFolderMountSource::new(
+            Arc::clone(&counted) as Arc<dyn MountSource>,
+            ControlFolderOptions::enabled(),
+        );
+
+        let dents = ms.list_dirents("/").expect("cheap root dirents");
+        assert_eq!(counted.list_calls.load(Ordering::SeqCst), 0);
+        let ctrl = dents
+            .iter()
+            .find(|d| d.name == CONTROL_DIR_NAME)
+            .expect("control dirent");
+        assert_eq!(ctrl.mode, S_IFDIR | 0o555);
+        assert_eq!(ctrl.size, 0);
+        assert_eq!(
+            dents.iter().filter(|d| d.name == CONTROL_DIR_NAME).count(),
+            1
+        );
+
+        let list_fi = match ms.list("/").expect("fat list") {
+            ListResult::Infos(map) => map.get(CONTROL_DIR_NAME).cloned().expect("list control"),
+            ListResult::Names(_) => panic!("expected Infos"),
+        };
+        let lookup_fi = ms.lookup(CONTROL_DIR_PATH, 0).expect("lookup control dir");
+        assert_eq!(
+            list_fi.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        assert_eq!(
+            lookup_fi.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        assert_eq!(
+            ctrl.mode & ratarmount_core::S_IFMT,
+            list_fi.mode & ratarmount_core::S_IFMT
+        );
     }
 }
