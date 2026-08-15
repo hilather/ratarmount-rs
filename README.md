@@ -32,7 +32,7 @@ cat mnt/file     # true random access — even inside compressed streams
 
 | | What you get |
 |---|---|
-| **~3.6× faster cold mounts** | Index + mount in a fraction of the Python baseline |
+| **~3.9× faster cold mounts** | Index + mount in a fraction of the Python baseline (~5.4× warm) |
 | **~6–8× lower peak RSS** | Typical **14–28 MiB** vs 110–350 MiB for Python ratarmount |
 | **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
 | **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z |
@@ -41,7 +41,7 @@ cat mnt/file     # true random access — even inside compressed streams
 
 > Prefer Python when you need rapidgzip-class throughput or the widest fsspec surface. Prefer **Rust** when mounts are frequent, memory is tight, or you want a static-friendly binary.
 
-Full methodology and fixtures: [`benchmarks/python-vs-rust-results.md`](benchmarks/python-vs-rust-results.md) · harness: [`benchmarks/compare-python-vs-rust.sh`](benchmarks/compare-python-vs-rust.sh)
+Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) · harness: [benchmarks/compare-python-vs-rust.sh](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/compare-python-vs-rust.sh)
 
 ---
 
@@ -151,23 +151,23 @@ Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) 
 
 ## Performance at a glance
 
-Head-to-head vs Python ratarmount (geo-mean, 2026-07-28). **Factor > 1 ⇒ Rust wins.**
+Head-to-head vs Python ratarmount (geo-mean, 2026-08-15, v0.1.20). **Factor > 1 ⇒ Rust wins.**
 
 | Metric | Cold | Warm |
 |--------|-----:|-----:|
-| Mount time | **3.63×** | **3.84×** |
-| Peak RSS | **6.47×** | **8.01×** |
-| `find` walk | 1.21× | 1.26× |
-| Random `cat` | 0.84× | 0.75× |
-| Sequential bandwidth | 0.88× | 0.78× |
+| Mount time | **3.85×** | **5.43×** |
+| Peak RSS | **6.03×** | **8.53×** |
+| `find` walk | **1.45×** | **1.33×** |
+| Random `cat` | **1.14×** | 0.95× |
+| Sequential bandwidth | 0.97× | 0.73× |
 
 **Standouts on this host**
 
-- `small-100.tar.gz` — warm mount **7.8×** faster; warm RSS **~25×** lower (~14 MiB vs ~351 MiB)
+- `small-100.tar.gz` — warm mount **8.8×** faster; warm RSS **~24×** lower (~14 MiB vs ~351 MiB)
 - `large-64m.tar` — random access **~4×** faster; sequential multi‑GiB/s
-- `empty-1k.tar` — cold mount **5.7×** faster
+- `empty-1k.tar` — cold mount **5.5×** faster; warm `find` **1.4×** faster than Python
 
-Rust leads hard on **mount cost** and **memory**. Python can still edge compressed random/`cat` paths where rapidgzip / block-parallel decoders apply. Numbers are single-host directional benches — re-run the harness on your hardware.
+Rust leads hard on **mount cost**, **memory**, and uncompressed `find` / random `cat`. Python can still edge **gzip** random/`cat` (rapidgzip). Sequential geo-mean excludes a tiny nested-TAR member. Numbers are single-host directional benches — re-run the harness on your hardware. Three-way vs v0.1.19: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results-v0.1.19-vs-0.1.20.md).
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount
@@ -286,7 +286,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/macos.md](docs/macos.md) | macOS FUSE / FSKit |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
-| [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers |
+| [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.20) |
 | [benchmarks/README.md](benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
 | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) | Dual-run / crates.io notes |
 

@@ -185,7 +185,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 ## 5. Tracking
 
 - Design: `../ratarmount/docs/design-rust-rewrite.md` (or copy into this repo later)
-- Benchmarks: `benchmarks/python-vs-rust-results.md`
+- Benchmarks: [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) (v0.1.20 vs Python 1.3.0, 2026-08-15)
 - Format notes: `docs/phase9-formats.md`, `docs/phase10-remote.md`, `docs/tasks/sevenzip-random-access.md`
 - **Fork → Rust task list:** [`docs/tasks/python-fork-parity.md`](tasks/python-fork-parity.md) (hilather sevenzip-random-access + stencil/stream codecs)
 - **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)

@@ -37,7 +37,7 @@ Residual: `list()` still builds a fat map for callers that need full `FileInfo`.
 
 Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer) and the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF). Union `--union-resolve-symlinks` still projects fat `list()` so FUSE type matches `lookup`. Union folder-cache **build** still uses fat `list()`. Control `status` dirent size is a placeholder 0 (getattr/open recompute).
 
-Still default size-0: ext4 / fat / squashfs / git / sqlar / remotes / `SingleFileMountSource`. FUSE crate tests cover the fat-map skip; live huge-dir RSS is optional evidence.
+Still default size-0: ext4 / fat / squashfs / git / sqlar / remotes / `SingleFileMountSource`. FUSE crate tests cover the fat-map skip. 2026-08-15 head-to-head (v0.1.20 vs Python 1.3.0): `find` geo-mean **1.45× / 1.33×** (cold/warm); uncompressed random `cat` **1.14×** cold / **0.95×** warm. Gzip random/seq still favor Python. See [python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md).
 
 ### ZIP member sidecar density
 

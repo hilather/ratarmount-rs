@@ -138,7 +138,7 @@ Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary with `gzip
 
 ## Head-to-head (Python vs Rust)
 
-Latest committed numbers: [`python-vs-rust-results.md`](python-vs-rust-results.md) (**2026-07-28**, ratarmount-rs **v0.1.3** area).
+Latest committed numbers: [python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) (**2026-08-15**, ratarmount-rs **v0.1.20**). Three-way vs last release: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results-v0.1.19-vs-0.1.20.md).
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount   # sibling checkout with Python package
