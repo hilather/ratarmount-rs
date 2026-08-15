@@ -59,7 +59,7 @@ use ratarmount_compress::{
     check_for_split_file_in_folder, materialize_joined_parts, SeekRead, SharedArchiveFile,
 };
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{compute_hashes_limited, IndexError, SqliteIndex};
@@ -1178,6 +1178,18 @@ impl MountSource for ZipMountSource {
             .ok()
             .flatten()
             .map(ListModeResult::Modes)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -2864,6 +2876,15 @@ mod tests {
             ("/b.bin", stored_b),
             ("/c.dat", &deflate_c),
         ];
+        let dirents = src.list_dirents("/").expect("cheap list_dirents");
+        assert_eq!(dirents.len(), 3);
+        for (name, payload) in cases {
+            let d = dirents
+                .iter()
+                .find(|e| e.name == name.trim_start_matches('/'))
+                .unwrap_or_else(|| panic!("dirent {name}"));
+            assert_eq!(d.size, payload.len() as u64, "dirent size {name}");
+        }
         for (name, payload) in cases {
             let fi = src
                 .lookup(name, 0)

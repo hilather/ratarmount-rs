@@ -41,7 +41,9 @@ pub struct StringPool {
     /// `(start, len)` in `slab` for each string id.
     spans: Vec<(u32, u32)>,
     lookup: PoolLookup,
-    /// Build-time intern() identity only; dropped on [`Self::seal`].
+    /// Intern() identity cache (API boundary). Kept after [`Self::seal`] so
+    /// ZIP/7z sidecar names that called [`Self::intern`] still `Arc::ptr_eq`
+    /// [`Self::lookup_arc`]. The live store is the slab, not this map.
     arcs: Option<HashMap<u32, Arc<str>>>,
 }
 
@@ -72,14 +74,13 @@ impl StringPool {
         }
     }
 
-    /// Freeze the pool: drop the build HashMap and interned-Arc cache.
+    /// Freeze the pool: drop the build HashMap. Interned Arc identity is kept
+    /// so `intern` + post-seal `lookup_arc` stay the same allocation.
     pub fn seal(&mut self) {
         if matches!(self.lookup, PoolLookup::Sealed(_)) {
-            self.arcs = None;
             return;
         }
         self.rebuild_sealed_lookup();
-        self.arcs = None;
     }
 
     fn rebuild_sealed_lookup(&mut self) {
@@ -91,7 +92,7 @@ impl StringPool {
     }
 
     pub fn is_sealed_slab(&self) -> bool {
-        matches!(self.lookup, PoolLookup::Sealed(_)) && self.arcs.is_none()
+        matches!(self.lookup, PoolLookup::Sealed(_))
     }
 
     fn lookup_id(&self, s: &str) -> Option<u32> {
@@ -163,8 +164,8 @@ impl StringPool {
 
     /// Resolve an existing pooled string without inserting.
     ///
-    /// After seal, the returned Arc is materialized from the slab (not a
-    /// retained intern identity).
+    /// If the string was [`intern`]ed during build, the same Arc is returned
+    /// after seal. Otherwise a fresh Arc is materialized from the slab.
     pub fn lookup_arc(&self, s: &str) -> Option<Arc<str>> {
         let id = self.lookup_id(s)?;
         if let Some(arcs) = &self.arcs {

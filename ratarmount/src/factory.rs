@@ -1573,6 +1573,9 @@ impl MountSource for KeepAliveMount {
     fn list_mode(&self, path: &str) -> Option<ratarmount_core::ListModeResult> {
         self.inner.list_mode(path)
     }
+    fn list_dirents(&self, path: &str) -> Option<Vec<ratarmount_core::CheapDirent>> {
+        self.inner.list_dirents(path)
+    }
     fn lookup(&self, path: &str, file_version: i32) -> Option<ratarmount_core::FileInfo> {
         self.inner.lookup(path, file_version)
     }

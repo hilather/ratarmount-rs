@@ -34,7 +34,7 @@ use std::time::Instant;
 
 use log::{debug, info, warn};
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{
     compute_hashes_limited, normalize_algorithm, FileRow, IndexError, SqliteIndex,
@@ -1391,6 +1391,18 @@ impl MountSource for SevenZipMountSource {
             .map(ListModeResult::Modes)
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.index.list_dirents(path).ok().flatten().map(|rows| {
+            rows.into_iter()
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect()
+        })
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         self.index.lookup(path, file_version).ok().flatten()
     }
@@ -1768,6 +1780,17 @@ mod tests {
             "offset table must index all store members, got {}",
             m.entry_by_offsets.len()
         );
+
+        let dirents = m.list_dirents("/").expect("cheap list_dirents");
+        assert_eq!(dirents.len(), N, "list_dirents must cover all members");
+        for (path, body) in &expected {
+            let base = path.trim_start_matches('/');
+            let d = dirents
+                .iter()
+                .find(|e| e.name == base || e.name == *path)
+                .unwrap_or_else(|| panic!("dirent missing {base}"));
+            assert_eq!(d.size, body.len() as u64, "dirent size {base}");
+        }
 
         let names: Vec<String> = match m.list("/") {
             Some(ListResult::Infos(infos)) => infos.keys().cloned().collect(),

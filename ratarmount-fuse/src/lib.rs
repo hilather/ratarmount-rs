@@ -15,7 +15,7 @@ use fuser::{
 use libc::{EACCES, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::debug;
 use ratarmount_compositing::WriteOverlay;
-use ratarmount_core::{FileInfo, ListModeResult, MountSource};
+use ratarmount_core::{CheapDirent, FileInfo, MountSource};
 use std::io::ErrorKind;
 
 /// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
@@ -305,7 +305,8 @@ struct InodeEntry {
 }
 
 struct DirCacheEntry {
-    entries: Vec<(String, u32)>,
+    /// `(name, mode, size)` from cheap [`MountSource::list_dirents`] (no fat FileInfo).
+    entries: Vec<(String, u32, u64)>,
     at: std::time::Instant,
 }
 
@@ -410,11 +411,11 @@ impl RatarmountFs {
         }
     }
 
-    /// Cheap readdir listing: names + modes only (no fat [`FileInfo`] map).
+    /// Cheap readdir listing: name / mode / size (no fat [`FileInfo`] map).
     ///
-    /// Always goes through [`MountSource::list_mode`], never [`MountSource::list`].
+    /// Always goes through [`MountSource::list_dirents`], never [`MountSource::list`].
     /// Fat `FileInfo` is materialized later at getattr/lookup/open.
-    fn list_mode_cached(&self, path: &str) -> Option<Vec<(String, u32)>> {
+    fn list_mode_cached(&self, path: &str) -> Option<Vec<(String, u32, u64)>> {
         {
             let cache = self.dir_cache.lock().unwrap();
             if let Some(e) = cache.get(path) {
@@ -423,14 +424,11 @@ impl RatarmountFs {
                 }
             }
         }
-        let listing = self.source.list_mode(path)?;
-        let entries: Vec<(String, u32)> = match listing {
-            ListModeResult::Modes(m) => m.into_iter().collect(),
-            ListModeResult::Names(names) => names
-                .into_iter()
-                .map(|n| (n, ratarmount_core::S_IFREG))
-                .collect(),
-        };
+        let listing = self.source.list_dirents(path)?;
+        let entries: Vec<(String, u32, u64)> = listing
+            .into_iter()
+            .map(|CheapDirent { name, mode, size }| (name, mode, size))
+            .collect();
         self.dir_cache.lock().unwrap().insert(
             path.to_string(),
             DirCacheEntry {
@@ -443,7 +441,7 @@ impl RatarmountFs {
 
     /// Shared cheap listing for `readdir` / `readdirplus` (test-visible).
     #[cfg(test)]
-    fn readdir_dirents(&self, path: &str) -> Option<Vec<(String, u32)>> {
+    fn readdir_dirents(&self, path: &str) -> Option<Vec<(String, u32, u64)>> {
         self.list_mode_cached(path)
     }
 
@@ -628,7 +626,7 @@ impl Filesystem for RatarmountFs {
             FileType::Directory,
             "..".into(),
         ));
-        for (name, mode) in entries {
+        for (name, mode, _size) in entries {
             let child = join_path(&path, &name);
             let cino = self.ino_for_path(&child);
             full.push((cino, mode_to_kind(mode), name));
@@ -682,10 +680,10 @@ impl Filesystem for RatarmountFs {
             "..".into(),
             Self::file_attr(parent_ino, &self_fi),
         ));
-        for (name, mode) in entries {
+        for (name, mode, size) in entries {
             let child = join_path(&path, &name);
             let fi = FileInfo {
-                size: 0,
+                size,
                 mtime: self_fi.mtime,
                 mode,
                 linkname: String::new(),
@@ -1545,7 +1543,7 @@ mod tests {
         // Prime dir_cache for "/" while empty (same as first readdir).
         let before = fs.list_mode_cached("/").expect("list root");
         assert!(
-            !before.iter().any(|(n, _)| n == "created.txt"),
+            !before.iter().any(|(n, ..)| n == "created.txt"),
             "precondition: new name not listed yet"
         );
         assert!(
@@ -1559,7 +1557,7 @@ mod tests {
         fs.invalidate_dir_cache("/");
         let after = fs.list_mode_cached("/").expect("list after create");
         assert!(
-            after.iter().any(|(n, _)| n == "created.txt"),
+            after.iter().any(|(n, ..)| n == "created.txt"),
             "after invalidate, readdir path must list the newly created name"
         );
     }
@@ -1607,6 +1605,26 @@ mod tests {
             }
         }
 
+        fn list_dirents(&self, path: &str) -> Option<Vec<ratarmount_core::CheapDirent>> {
+            // Default would call list_mode; implement directly so sizes stream
+            // from the cheap path (same data as children, no FileInfo map).
+            if path != "/" {
+                return None;
+            }
+            self.list_mode_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(
+                self.children
+                    .iter()
+                    .map(|(n, fi)| ratarmount_core::CheapDirent {
+                        name: n.clone(),
+                        mode: fi.mode,
+                        size: fi.size,
+                    })
+                    .collect(),
+            )
+        }
+
         fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
             if path == "/" {
                 return Some(ratarmount_core::create_root_file_info());
@@ -1647,9 +1665,10 @@ mod tests {
 
         let entries = fs.readdir_dirents("/").expect("cheap readdir listing");
         assert_eq!(entries.len(), children.len());
-        for (name, mode) in &entries {
+        for (name, mode, size) in &entries {
             let fi = children.get(name).expect("name from cheap listing");
             assert_eq!(*mode, fi.mode);
+            assert_eq!(*size, fi.size);
         }
         assert_eq!(
             src.list_calls.load(std::sync::atomic::Ordering::SeqCst),
@@ -1691,13 +1710,13 @@ mod tests {
 
         ov.create_file("/gone.txt", 0o644).expect("create");
         let listed = fs.list_mode_cached("/").expect("list with file");
-        assert!(listed.iter().any(|(n, _)| n == "gone.txt"));
+        assert!(listed.iter().any(|(n, ..)| n == "gone.txt"));
 
         ov.unlink("/gone.txt").expect("unlink");
         fs.invalidate_dir_cache("/");
         let after = fs.list_mode_cached("/").expect("list after unlink");
         assert!(
-            !after.iter().any(|(n, _)| n == "gone.txt"),
+            !after.iter().any(|(n, ..)| n == "gone.txt"),
             "after invalidate, readdir path must not ghost the deleted name"
         );
     }
