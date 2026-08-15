@@ -662,6 +662,21 @@ impl MountSource for UnionMountSource {
     fn is_immutable(&self) -> bool {
         self.sources.iter().all(|s| s.is_immutable())
     }
+
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        if let Some(si) = self.source_from_info(file_info) {
+            if let Some(src) = self.sources.get(si) {
+                let mut fi = file_info.clone();
+                if let Some(UserData::Other(s)) = fi.userdata.last() {
+                    if s.starts_with("union:") {
+                        fi.userdata.pop();
+                    }
+                }
+                return src.member_seek_is_cheap(&fi);
+            }
+        }
+        true
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {

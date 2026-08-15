@@ -1234,6 +1234,19 @@ impl MountSource for AutoMountLayer {
     fn is_immutable(&self) -> bool {
         self.root.is_immutable()
     }
+
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        if let Some(key) = Self::automount_key(file_info) {
+            if key == "/" {
+                return self.root.member_seek_is_cheap(file_info);
+            }
+            let mounted = self.mounted.lock().expect("automount mutex");
+            if let Some(m) = mounted.get(key) {
+                return m.source.member_seek_is_cheap(file_info);
+            }
+        }
+        self.root.member_seek_is_cheap(file_info)
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {
@@ -1450,6 +1463,50 @@ mod tests {
         fn is_immutable(&self) -> bool {
             true
         }
+    }
+
+    struct ExpensiveNested {
+        inner: OneFileNested,
+    }
+
+    impl MountSource for ExpensiveNested {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.inner.list(path)
+        }
+        fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, v)
+        }
+        fn open(&self, fi: &FileInfo, b: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(fi, b)
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+        fn member_seek_is_cheap(&self, _: &FileInfo) -> bool {
+            false
+        }
+    }
+
+    /// Regression: NFS pin of solid 7z must see through AutoMount + nested source.
+    #[test]
+    fn automount_forwards_member_seek_is_cheap() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("nested.tar"), b"fake-archive").unwrap();
+        let open_nested: OpenNestedFn = Arc::new(|_| {
+            Ok(Arc::new(ExpensiveNested {
+                inner: OneFileNested::new("payload.txt", b"x"),
+            }) as Arc<dyn MountSource>)
+        });
+        let root = Arc::new(crate::folder::FolderMountSource::new(dir.path()).unwrap())
+            as Arc<dyn MountSource>;
+        let layer = AutoMountLayer::new(root, 1, open_nested);
+        let fi = layer
+            .lookup("/nested.tar/payload.txt", 0)
+            .expect("nested member");
+        assert!(
+            !layer.member_seek_is_cheap(&fi),
+            "AutoMount must forward nested member_seek_is_cheap"
+        );
     }
 
     #[test]

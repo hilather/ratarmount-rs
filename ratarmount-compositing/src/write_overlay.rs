@@ -599,6 +599,15 @@ impl MountSource for WriteOverlay {
     fn is_immutable(&self) -> bool {
         false
     }
+
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        if let Some(UserData::Other(s)) = file_info.userdata.last() {
+            if s.starts_with("overlay:") {
+                return true;
+            }
+        }
+        self.base.member_seek_is_cheap(file_info)
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {

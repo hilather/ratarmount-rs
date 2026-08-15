@@ -401,6 +401,13 @@ impl MountSource for ControlFolderMountSource {
         self.inner.is_immutable()
     }
 
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        if Self::control_tag(file_info).is_some() {
+            return true;
+        }
+        self.inner.member_seek_is_cheap(file_info)
+    }
+
     fn statfs(&self) -> ratarmount_core::StatFs {
         self.inner.statfs()
     }

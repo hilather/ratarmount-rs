@@ -199,6 +199,19 @@ impl MountSource for FileVersionLayer {
         self.inner.is_immutable()
     }
 
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        let mut fi = file_info.clone();
+        if let Some(UserData::Other(s)) = fi.userdata.last() {
+            if s == TAG_FOLDER {
+                return true;
+            }
+            if s == TAG_FILE {
+                fi.userdata.pop();
+            }
+        }
+        self.inner.member_seek_is_cheap(&fi)
+    }
+
     fn statfs(&self) -> ratarmount_core::StatFs {
         self.inner.statfs()
     }
@@ -249,6 +262,56 @@ mod tests {
         fn is_immutable(&self) -> bool {
             self.inner.is_immutable()
         }
+    }
+
+    struct ExpensiveInner;
+
+    impl MountSource for ExpensiveInner {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                Some(ListResult::Names(vec!["f".into()]))
+            } else {
+                None
+            }
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                Some(ratarmount_core::create_root_file_info())
+            } else if path == "/f" {
+                Some(FileInfo {
+                    size: 1,
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                })
+            } else {
+                None
+            }
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(vec![b'x'])))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+        fn member_seek_is_cheap(&self, _: &FileInfo) -> bool {
+            false
+        }
+    }
+
+    /// Regression: NFS reader LRU pin must see through the factory default wrap.
+    #[test]
+    fn file_version_layer_forwards_member_seek_is_cheap() {
+        let inner = Arc::new(ExpensiveInner) as Arc<dyn MountSource>;
+        let layer = FileVersionLayer::new(inner);
+        let fi = layer.lookup("/f", 0).expect("file");
+        assert!(
+            !layer.member_seek_is_cheap(&fi),
+            "FileVersionLayer must forward inner false"
+        );
     }
 
     /// Regression: factory wraps every mount in FileVersionLayer; readdir must

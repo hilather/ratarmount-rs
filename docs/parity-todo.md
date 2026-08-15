@@ -63,6 +63,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `--use-backend` | yes | accepted (priority list stored) | `~` |
 | FUSE extra options (`-o`) | yes | yes | `[x]` |
 | Sequential readahead (`--readahead`) | no (issue #180) | yes (`0` off; K/M/G; max 64 MiB) | `[x]` |
+| NFSv3 userspace export | no | yes (`--nfs` / `--nfs-bind`; IPv4, localhost default; `-w` overlay writes) | `[x]` / residual Windows READDIR + NFS rename/symlink |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
 | Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |

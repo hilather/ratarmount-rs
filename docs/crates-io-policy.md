@@ -36,7 +36,7 @@ Stable-ish building blocks for embedders. Publish only after docs + semver story
 | **L1 — codecs** | `ratarmount-compress` | Seekable gzip/bzip2/xz/zstd/… helpers |
 | **L2 — formats** | `ratarmount-formats-*` (tar, zip, ar, cpio, sevenzip, …) | Per-format MountSource backends |
 | **L3 — I/O & compose** | `ratarmount-remote`, `ratarmount-compositing` | URL backends; union/automount/overlay |
-| **L4 — FUSE adapter** | `ratarmount-fuse` | **Library** wrapping `fuser` low-level — *not* the CLI binary. Publish only if embedders need the same FUSE bridge; document `fuser`/platform constraints. |
+| **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. |
 
 ### System / FFI caveats
 

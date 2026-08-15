@@ -77,6 +77,8 @@ macOS guide: [`docs/macos.md`](macos.md)
 
 Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if missing).
 
+**NFSv3 export** (`--nfs`) is userspace (`nfsserve` + tokio). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+
 ### Install examples
 
 ```bash

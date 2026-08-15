@@ -43,6 +43,7 @@ ratarmount-formats-git.workspace = true
 ratarmount-remote.workspace = true
 ratarmount-compositing.workspace = true
 ratarmount-fuse.workspace = true
+ratarmount-nfs.workspace = true
 ratarmount-compress.workspace = true
 tempfile.workspace = true
 clap.workspace = true

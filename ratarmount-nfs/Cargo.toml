@@ -1,0 +1,20 @@
+[package]
+name = "ratarmount-nfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process NFSv3 export of a ratarmount MountSource"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+nfsserve = "0.11"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "time"] }
+log.workspace = true
+thiserror.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }

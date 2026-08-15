@@ -96,6 +96,24 @@ struct Args {
     #[arg(long = "control-interface", action = ArgAction::SetTrue)]
     control_interface: bool,
 
+    /// Export the archive as NFSv3 (userspace). Does not require a FUSE mountpoint.
+    /// Bind address is `--nfs-bind` (default 127.0.0.1:20490).
+    #[arg(long = "nfs", action = ArgAction::SetTrue)]
+    nfs: bool,
+
+    /// NFSv3 listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20490.
+    /// Bare port (`20490`) or `:20490` → 127.0.0.1:that port.
+    #[arg(
+        long = "nfs-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20490"
+    )]
+    nfs_bind: String,
+
+    /// MOUNT export name without slashes (nfsserve `with_export_name`). Default: `/`.
+    #[arg(long = "nfs-export-name", value_name = "NAME")]
+    nfs_export_name: Option<String>,
+
     /// Detect GNU incremental archives (heuristic)
     #[arg(long = "detect-gnu-incremental", action = ArgAction::SetTrue)]
     detect_gnu_incremental: bool,
@@ -590,21 +608,14 @@ fn main() {
         }
     }
 
+    if args.no_mount && args.nfs {
+        eprintln!("error: --nfs cannot be combined with --no-mount");
+        std::process::exit(2);
+    }
     if args.no_mount {
         return;
     }
 
-    let mp = match mountpoint {
-        Some(mp) => mp,
-        None => {
-            let mp = default_mountpoint(&inputs[0]);
-            std::fs::create_dir_all(&mp).ok();
-            mp
-        }
-    };
-    std::fs::create_dir_all(&mp).ok();
-    let writable = overlay_arc.is_some();
-    let fuse_opts = args.fuse.clone();
     let readahead_on_argv = readahead_flag_on_argv(std::env::args());
     #[cfg(feature = "gzip-rapidgzip")]
     let prefer_rapidgzip =
@@ -645,9 +656,49 @@ fn main() {
         }
     };
 
+    let nfs_bind = if args.nfs {
+        match ratarmount_nfs::parse_nfs_bind(&args.nfs_bind) {
+            Ok(a) => Some(a),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        None
+    };
+
+    // NFS-only: do not invent a FUSE mountpoint / stem directory.
+    let fuse_mp = if args.nfs && mountpoint.is_none() {
+        None
+    } else {
+        Some(match mountpoint {
+            Some(mp) => mp,
+            None => {
+                let mp = default_mountpoint(&inputs[0]);
+                std::fs::create_dir_all(&mp).ok();
+                mp
+            }
+        })
+    };
+    if let Some(mp) = &fuse_mp {
+        std::fs::create_dir_all(mp).ok();
+    }
+
+    if args.nfs && fuse_mp.is_none() && args.control_interface {
+        eprintln!(
+            "error: --control-interface requires a FUSE mountpoint (NFS-only is not supported)"
+        );
+        std::process::exit(2);
+    }
+
+    let writable = overlay_arc.is_some();
+    let fuse_opts = args.fuse.clone();
+
     // Optional control: Unix socket + in-FS `/.ratarmount-control/` (Python parity).
     let control_stop = Arc::new(AtomicBool::new(false));
     let _control_sock = if args.control_interface {
+        let mp = fuse_mp.as_ref().expect("control requires FUSE mp");
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
         bundle.source = Arc::new(ControlFolderMountSource::new(
@@ -659,29 +710,131 @@ fn main() {
                     let _ = unmount(&mp_ctrl);
                 })),
         )) as Arc<dyn MountSource>;
-        start_control_interface(&mp, Arc::clone(&control_stop))
+        start_control_interface(mp, Arc::clone(&control_stop))
     } else {
         None
     };
 
-    if args.foreground {
-        if let Err(e) = mount_blocking(
-            Arc::clone(&bundle.source),
+    if let Some(bind) = nfs_bind {
+        if !bind.ip().is_loopback() {
+            eprintln!(
+                "warning: NFSv3 bound on {} (AUTH_SYS, no allowlist). \
+                 Prefer 127.0.0.1 unless you trust the LAN.",
+                bind
+            );
+        }
+        let nfs_opts = ratarmount_nfs::NfsOptions {
+            bind,
+            export_name: args.nfs_export_name.clone(),
+            readahead_bytes: readahead,
+            reader_slots: ratarmount_nfs::DEFAULT_READER_SLOTS,
+            stop: None,
+            overlay: overlay_arc.clone(),
+        };
+        match fuse_mp {
+            None => run_nfs_only(bundle.source, nfs_opts),
+            Some(mp) => run_fuse_and_nfs(
+                bundle.source,
+                mp,
+                writable,
+                overlay_arc,
+                &fuse_opts,
+                readahead,
+                nfs_opts,
+                args.foreground,
+                args.log_file.is_some(),
+            ),
+        }
+        return;
+    }
+
+    let mp = fuse_mp.expect("FUSE path has a mountpoint");
+    run_fuse_only(
+        bundle.source,
+        mp,
+        writable,
+        overlay_arc,
+        &fuse_opts,
+        readahead,
+        args.foreground,
+        args.log_file.is_some(),
+    );
+}
+
+fn run_nfs_only(source: Arc<dyn MountSource>, opts: ratarmount_nfs::NfsOptions) {
+    let access = if opts.overlay.is_some() {
+        "rw overlay"
+    } else {
+        "ro"
+    };
+    eprintln!(
+        "NFSv3 ({access}) on {}. Client: mount -t nfs -o vers=3,tcp,nolock,port={},mountport={} {}:/ <dir>",
+        opts.bind,
+        opts.bind.port(),
+        opts.bind.port(),
+        opts.bind.ip()
+    );
+    if let Err(e) = ratarmount_nfs::serve_blocking(source, opts) {
+        eprintln!("error starting NFS server: {e}");
+        std::process::exit(1);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fuse_and_nfs(
+    source: Arc<dyn MountSource>,
+    mp: PathBuf,
+    writable: bool,
+    overlay_arc: Option<Arc<WriteOverlay>>,
+    fuse_opts: &str,
+    readahead: u64,
+    mut nfs_opts: ratarmount_nfs::NfsOptions,
+    foreground: bool,
+    has_log_file: bool,
+) {
+    if foreground {
+        let stop = ratarmount_nfs::NfsStop::new();
+        nfs_opts.stop = Some(stop.clone());
+        let handle = match ratarmount_nfs::spawn_nfs_thread(Arc::clone(&source), nfs_opts) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("error starting NFS server: {e}");
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "NFSv3 ({}) on port {}. FUSE at {}",
+            if overlay_arc.is_some() {
+                "rw overlay"
+            } else {
+                "ro"
+            },
+            handle.port,
+            mp.display()
+        );
+        let mount_err = mount_blocking(
+            Arc::clone(&source),
             &mp,
             true,
             writable,
             overlay_arc,
-            &fuse_opts,
+            fuse_opts,
             readahead,
-        ) {
+        );
+        stop.request_stop();
+        let _ = handle.join();
+        if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
         }
-        drop(bundle);
         return;
     }
 
-    // Daemonize: parent waits for mount readiness, child runs FUSE.
+    // Daemonize: probe NFS bind in the parent so a dead port is not silent.
+    if let Err(e) = std::net::TcpListener::bind(nfs_opts.bind) {
+        eprintln!("error: cannot bind NFS on {}: {e}", nfs_opts.bind);
+        std::process::exit(1);
+    }
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
             if !wait_until_mounted(&mp, Duration::from_secs(30)) {
@@ -692,33 +845,106 @@ fn main() {
                 let _ = unmount(&mp);
                 std::process::exit(1);
             }
-            // Parent exits successfully; child continues FUSE session.
-            drop(bundle);
             std::process::exit(0);
         }
         Ok(ForkResult::Child) => {
             let _ = setsid();
-            // Detach stdio so the terminal is free (logs only if RUST_LOG set via inherited env)
-            if args.log_file.is_none() {
+            if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
+            let stop = ratarmount_nfs::NfsStop::new();
+            nfs_opts.stop = Some(stop.clone());
+            if let Err(e) = ratarmount_nfs::spawn_nfs_thread(Arc::clone(&source), nfs_opts) {
+                let _ = std::fs::write(
+                    "/tmp/ratarmount-rs-nfs-error.log",
+                    format!("NFS bind error: {e}\n"),
+                );
+                std::process::exit(1);
+            }
             if let Err(e) = mount_blocking(
-                Arc::clone(&bundle.source),
+                source,
                 &mp,
                 true,
                 writable,
                 overlay_arc,
-                &fuse_opts,
+                fuse_opts,
                 readahead,
             ) {
-                // Best-effort: write to /tmp if possible
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
                     format!("mount error: {e}\n"),
                 );
                 std::process::exit(1);
             }
-            drop(bundle);
+            stop.request_stop();
+            std::process::exit(0);
+        }
+        Err(e) => {
+            eprintln!("error: fork failed: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_fuse_only(
+    source: Arc<dyn MountSource>,
+    mp: PathBuf,
+    writable: bool,
+    overlay_arc: Option<Arc<WriteOverlay>>,
+    fuse_opts: &str,
+    readahead: u64,
+    foreground: bool,
+    has_log_file: bool,
+) {
+    if foreground {
+        if let Err(e) = mount_blocking(
+            source,
+            &mp,
+            true,
+            writable,
+            overlay_arc,
+            fuse_opts,
+            readahead,
+        ) {
+            eprintln!("error mounting at {}: {e}", mp.display());
+            std::process::exit(1);
+        }
+        return;
+    }
+
+    match unsafe { fork() } {
+        Ok(ForkResult::Parent { child }) => {
+            if !wait_until_mounted(&mp, Duration::from_secs(30)) {
+                eprintln!(
+                    "error: timed out waiting for mount at {} (child pid {child})",
+                    mp.display()
+                );
+                let _ = unmount(&mp);
+                std::process::exit(1);
+            }
+            std::process::exit(0);
+        }
+        Ok(ForkResult::Child) => {
+            let _ = setsid();
+            if !has_log_file {
+                let _ = redirect_stdio_to_null();
+            }
+            if let Err(e) = mount_blocking(
+                source,
+                &mp,
+                true,
+                writable,
+                overlay_arc,
+                fuse_opts,
+                readahead,
+            ) {
+                let _ = std::fs::write(
+                    "/tmp/ratarmount-rs-fuse-error.log",
+                    format!("mount error: {e}\n"),
+                );
+                std::process::exit(1);
+            }
             std::process::exit(0);
         }
         Err(e) => {
@@ -807,6 +1033,7 @@ fn print_features() {
     println!("ratarmount {VERSION} (Rust)");
     println!("features:");
     println!("  fuse: fuser (low-level)");
+    println!("  nfs: nfsserve NFSv3 userspace export (--nfs, --nfs-bind; -w overlay writes)");
     println!(
         "  compress: gzip/bzip2/xz/zstd/lz4/lzip/lzo/Z/lzma/zlib seekable bodies; plain single-file materialize"
     );
@@ -841,6 +1068,7 @@ fn print_oss_attributions(full: bool) {
         "nix / libc — Unix syscalls (MIT)",
         "regex / thiserror / anyhow / url / tempfile — utilities",
         "reqwest / ssh2 / … — remote backends (http/s3/ssh)",
+        "nfsserve / tokio — in-process NFSv3 export (--nfs)",
     ];
     for s in short {
         println!("  - {s}");
@@ -1376,5 +1604,55 @@ mod parallel_nested_cli_tests {
             crate::factory::CompositingOptions::default().parallel_nested_threads,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod nfs_cli_tests {
+    use super::Args;
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    /// Regression: boolean `--nfs` must not steal the archive path.
+    #[test]
+    fn nfs_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "testdata.tar.gz"]).expect("parse");
+        assert!(a.nfs);
+        assert_eq!(a.paths, vec![PathBuf::from("testdata.tar.gz")]);
+        assert_eq!(a.nfs_bind, "127.0.0.1:20490");
+    }
+
+    #[test]
+    fn nfs_with_write_overlay_keeps_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--nfs",
+            "--write-overlay",
+            "/tmp/ov",
+            "testdata.tar.gz",
+        ])
+        .expect("parse");
+        assert!(a.nfs);
+        assert_eq!(
+            a.write_overlay.as_deref(),
+            Some(std::path::Path::new("/tmp/ov"))
+        );
+        assert_eq!(a.paths, vec![PathBuf::from("testdata.tar.gz")]);
+    }
+
+    #[test]
+    fn nfs_bind_and_mountpoint() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--nfs",
+            "--nfs-bind",
+            "0.0.0.0:20490",
+            "a.tar",
+            "mnt",
+        ])
+        .expect("parse");
+        assert!(a.nfs);
+        assert_eq!(a.nfs_bind, "0.0.0.0:20490");
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar"), PathBuf::from("mnt")]);
     }
 }

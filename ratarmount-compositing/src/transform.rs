@@ -303,6 +303,10 @@ impl MountSource for TransformMountSource {
     fn is_immutable(&self) -> bool {
         self.inner.is_immutable()
     }
+
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        self.inner.member_seek_is_cheap(file_info)
+    }
 }
 
 fn internal_parent(path: &str) -> String {

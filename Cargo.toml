@@ -27,6 +27,7 @@ members = [
     "ratarmount-formats-git",
     "ratarmount-remote",
     "ratarmount-compositing",
+    "ratarmount-nfs",
 ]
 default-members = ["ratarmount"]
 
@@ -63,6 +64,7 @@ ratarmount-formats-pdf = { path = "ratarmount-formats-pdf" }
 ratarmount-formats-git = { path = "ratarmount-formats-git" }
 ratarmount-remote = { path = "ratarmount-remote" }
 ratarmount-compositing = { path = "ratarmount-compositing" }
+ratarmount-nfs = { path = "ratarmount-nfs" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }
