@@ -6,7 +6,9 @@
 use std::io;
 use std::sync::Arc;
 
-use ratarmount_core::{normpath, FileInfo, ListModeResult, ListResult, MountSource, UserData};
+use ratarmount_core::{
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+};
 
 const VERSIONS_SUFFIX: &str = ".versions";
 const TAG_FILE: &str = "versionlayer:file";
@@ -112,12 +114,36 @@ impl MountSource for FileVersionLayer {
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        match self.list(path)? {
-            ListResult::Names(n) => Some(ListModeResult::Names(n)),
-            ListResult::Infos(m) => Some(ListModeResult::Modes(
-                m.into_iter().map(|(k, v)| (k, v.mode)).collect(),
-            )),
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
+    }
+
+    /// Forward cheap dirents from the inner source. Versions-folder listings
+    /// are numbered names only — never `inner.list()` (fat `FileInfo` maps).
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if let Some(dents) = self.inner.list_dirents(&path) {
+            return Some(dents);
         }
+        let (real, is_vers, _) = self.decode(&path)?;
+        if !is_vers {
+            return self.inner.list_dirents(&real);
+        }
+        let n = self.inner.versions(&real);
+        if n == 0 {
+            return None;
+        }
+        Some(
+            (1..=n)
+                .map(|i| CheapDirent {
+                    name: i.to_string(),
+                    mode: ratarmount_core::S_IFREG,
+                    size: 0,
+                })
+                .collect(),
+        )
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -175,5 +201,103 @@ impl MountSource for FileVersionLayer {
 
     fn statfs(&self) -> ratarmount_core::StatFs {
         self.inner.statfs()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratarmount_core::OpenOptions;
+    use ratarmount_formats_zip::ZipMountSource;
+    use std::io::{self, Write};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use zip::write::SimpleFileOptions;
+    use zip::{CompressionMethod, ZipWriter};
+
+    /// Counts `list()` so we can prove FileVersionLayer uses `list_dirents`.
+    struct ListCallCounter {
+        inner: ZipMountSource,
+        list_calls: AtomicUsize,
+    }
+
+    impl MountSource for ListCallCounter {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.inner.list_dirents(path)
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn versions(&self, path: &str) -> u32 {
+            self.inner.versions(path)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
+    /// Regression: factory wraps every mount in FileVersionLayer; readdir must
+    /// reach ZIP/MemIndex list_dirents instead of building a fat FileInfo map.
+    #[test]
+    fn file_version_layer_list_dirents_forwards_zip_without_fat_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layer.zip");
+        let a = b"alpha-payload\n";
+        let b = b"bravo-bytes-here\n";
+        {
+            let file = std::fs::File::create(&path).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a.txt", opts).unwrap();
+            zw.write_all(a).unwrap();
+            zw.start_file("b.bin", opts).unwrap();
+            zw.write_all(b).unwrap();
+            zw.finish().unwrap();
+        }
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let zip = ZipMountSource::open(&path, None, &opts, "test", true).expect("open zip");
+        let counted = Arc::new(ListCallCounter {
+            inner: zip,
+            list_calls: AtomicUsize::new(0),
+        });
+        let layer = FileVersionLayer::new(Arc::clone(&counted) as Arc<dyn MountSource>);
+
+        let dents = layer
+            .list_dirents("/")
+            .expect("cheap dirents through layer");
+        assert_eq!(
+            counted.list_calls.load(Ordering::SeqCst),
+            0,
+            "FileVersionLayer::list_dirents must not call inner.list() (fat FileInfo map)"
+        );
+        let by_name: std::collections::BTreeMap<_, _> =
+            dents.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("a.txt").copied(), Some(a.len() as u64));
+        assert_eq!(by_name.get("b.bin").copied(), Some(b.len() as u64));
+
+        let fi = layer.lookup("/a.txt", 0).expect("lookup");
+        let mut r = layer.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut out).unwrap();
+        assert_eq!(out, a);
     }
 }

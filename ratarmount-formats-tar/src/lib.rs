@@ -25,7 +25,7 @@ use ratarmount_compress::{
     FileSegment, SeekRead, SeekableBody, SegmentedFile, SharedSeekableGzip, StenciledFile,
 };
 use ratarmount_core::{
-    normpath, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
+    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{FileRow, IndexError, SqliteIndex};
@@ -685,12 +685,24 @@ impl MountSource for SqliteIndexedTar {
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
-        // Prefer list() so tombstones are filtered consistently with Infos.
-        let ListResult::Infos(infos) = self.list(path)? else {
-            return None;
-        };
-        let modes = infos.into_iter().map(|(n, fi)| (n, fi.mode)).collect();
-        Some(ListModeResult::Modes(modes))
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let rows = self.index.list_dirents(path).ok().flatten()?;
+        Some(
+            rows.into_iter()
+                .filter(|d| d.linkname != DUMPDIR_DELETE_LINKNAME)
+                .map(|d| CheapDirent {
+                    name: d.name,
+                    mode: d.mode,
+                    size: d.size,
+                })
+                .collect(),
+        )
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
@@ -3876,6 +3888,23 @@ mod tests {
         );
         assert!(map.contains_key("3"), "3 present: {:?}", map.keys());
         assert!(map.contains_key("moved"), "moved present: {:?}", map.keys());
+
+        // Cheap list_dirents must hide tombstones without building FileInfo.
+        let dents = m.list_dirents("/foo").expect("list_dirents /foo");
+        let names: Vec<&str> = dents.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"1") && !names.contains(&"2"),
+            "tombstones must be omitted from list_dirents: {names:?}"
+        );
+        let d3 = dents.iter().find(|d| d.name == "3").expect("dirent 3");
+        assert_eq!(d3.size, map["3"].size);
+        assert_eq!(d3.mode, map["3"].mode);
+        let dm = dents
+            .iter()
+            .find(|d| d.name == "moved")
+            .expect("dirent moved");
+        assert_eq!(dm.size, map["moved"].size);
+        assert_eq!(dents.len(), map.len());
     }
 
     /// Regression: dumpdir tombstone must hide *all* versions for mount APIs.

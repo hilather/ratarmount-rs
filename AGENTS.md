@@ -60,6 +60,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
 | Union symlink resolve (FR-10) | `cargo test -p ratarmount-compositing --lib fr10_resolve` |
+| FileVersionLayer / TAR cheap readdir (no fat FileInfo map) | `cargo test -p ratarmount-compositing --lib file_version_layer_list_dirents` · `cargo test -p ratarmount-formats-tar --lib gnu_incremental_dumpdir_deletes` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.

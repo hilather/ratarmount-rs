@@ -24,4 +24,5 @@ zip = { version = "2", default-features = true }
 [dev-dependencies]
 ratarmount-formats-tar.workspace = true
 ratarmount-formats-sevenzip.workspace = true
+ratarmount-formats-zip.workspace = true
 tempfile.workspace = true

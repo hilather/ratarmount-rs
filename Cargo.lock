@@ -1569,6 +1569,7 @@ dependencies = [
  "ratarmount-core",
  "ratarmount-formats-sevenzip",
  "ratarmount-formats-tar",
+ "ratarmount-formats-zip",
  "regex",
  "rusqlite",
  "tempfile",

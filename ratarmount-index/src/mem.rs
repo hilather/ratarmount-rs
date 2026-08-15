@@ -312,6 +312,9 @@ pub struct IndexDirent {
     pub name: String,
     pub mode: u32,
     pub size: u64,
+    /// Link target (empty if none). Used to hide GNU dumpdir tombstones
+    /// without materializing [`FileInfo`].
+    pub linkname: String,
     pub cookie: CompactOpenCookie,
 }
 
@@ -674,6 +677,7 @@ impl MemIndex {
                     name: self.pool.get(nid).to_string(),
                     mode: self.soa.mode[i],
                     size: self.soa.size[i],
+                    linkname: self.pool.get(self.soa.linkname_id[i]).to_string(),
                     cookie: self.soa.open_cookie(idx),
                 });
             }
@@ -1083,6 +1087,7 @@ mod tests {
                 .expect("name from list_dirents in list()");
             assert_eq!(d.mode, fi.mode, "mode {}", d.name);
             assert_eq!(d.size, fi.size, "size {}", d.name);
+            assert_eq!(d.linkname, fi.linkname, "linkname {}", d.name);
             assert_eq!(modes.get(&d.name).copied(), Some(d.mode));
             let cookie = mem
                 .lookup_open_cookie("/flat", &d.name, 0)

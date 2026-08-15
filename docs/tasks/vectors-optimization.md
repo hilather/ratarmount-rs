@@ -33,7 +33,7 @@
 - [x] Keep/extend `list_mode` (and similar) as the cheap API; fat `FileInfo` only at getattr/open boundaries
 - [x] Regression: large flat directory readdir RSS + timing vs fat map materialization
 
-Residual: `list()` still builds a fat map for callers that need full `FileInfo`. GNU incremental TAR `list_mode` still goes through `list()` so dumpdir tombstones filter correctly. Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides (ZIP / 7z / MemIndex do). FUSE crate tests cover the fat-map skip; live huge-dir RSS is optional evidence.
+Residual: `list()` still builds a fat map for callers that need full `FileInfo`. TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides (ZIP / 7z / TAR / MemIndex / `FileVersionLayer` do). FUSE crate tests cover the fat-map skip; live huge-dir RSS is optional evidence.
 
 ### ZIP member sidecar density
 

@@ -1293,7 +1293,7 @@ impl SqliteIndex {
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
                 r#"
-                SELECT name, offsetheader, offset, size, mode,
+                SELECT name, offsetheader, offset, size, mode, linkname,
                        istar, issparse, isgenerated, recursiondepth
                 FROM "files"
                 WHERE "path" = ?1
@@ -1313,10 +1313,11 @@ impl SqliteIndex {
                 let offset: i64 = row.get(2)?;
                 let size: i64 = row.get(3)?;
                 let mode: i64 = row.get(4)?;
-                let istar: bool = row.get::<_, i64>(5).unwrap_or(0) != 0;
-                let issparse: bool = row.get::<_, i64>(6).unwrap_or(0) != 0;
-                let isgenerated: bool = row.get::<_, i64>(7).unwrap_or(0) != 0;
-                let recursiondepth: i64 = row.get(8).unwrap_or(0);
+                let linkname: String = row.get(5).unwrap_or_default();
+                let istar: bool = row.get::<_, i64>(6).unwrap_or(0) != 0;
+                let issparse: bool = row.get::<_, i64>(7).unwrap_or(0) != 0;
+                let isgenerated: bool = row.get::<_, i64>(8).unwrap_or(0) != 0;
+                let recursiondepth: i64 = row.get(9).unwrap_or(0);
                 let size_u = size.max(0) as u64;
                 let mode_u = mode as u32;
                 by_name.insert(
@@ -1325,6 +1326,7 @@ impl SqliteIndex {
                         name,
                         mode: mode_u,
                         size: size_u,
+                        linkname,
                         cookie: CompactOpenCookie {
                             offsetheader,
                             offset: offset.max(0) as u64,
