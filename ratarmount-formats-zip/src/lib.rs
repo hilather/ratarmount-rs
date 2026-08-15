@@ -179,17 +179,142 @@ pub enum ZipError {
 
 pub type Result<T> = std::result::Result<T, ZipError>;
 
+/// Cloneable owned view of one sidecar row (parallel-hash / decode helpers).
+///
+/// The **store** is [`ZipMemberTable`] (sorted SoA columns), not a HashMap of these.
 #[derive(Clone, Debug)]
 struct ZipMemberMeta {
     /// Member path — shared with compact index string pool when available.
-    #[allow(dead_code)]
-    name: std::sync::Arc<str>,
+    name: Arc<str>,
     data_start: u64,
     compressed_size: u64,
     method: u16,
     encrypted: bool,
     /// Central-directory index for `by_index_decrypt`.
     index: usize,
+}
+
+/// Borrowed view of one ZIP member sidecar row.
+#[derive(Clone, Copy, Debug)]
+struct ZipMemberView<'a> {
+    name: &'a Arc<str>,
+    data_start: u64,
+    compressed_size: u64,
+    method: u16,
+    encrypted: bool,
+    /// Central-directory index for `by_index_decrypt`.
+    index: usize,
+}
+
+impl ZipMemberView<'_> {
+    fn to_owned_meta(self) -> ZipMemberMeta {
+        ZipMemberMeta {
+            name: Arc::clone(self.name),
+            data_start: self.data_start,
+            compressed_size: self.compressed_size,
+            method: self.method,
+            encrypted: self.encrypted,
+            index: self.index,
+        }
+    }
+}
+
+/// Dense ZIP open sidecar: sorted header offsets + parallel columns.
+///
+/// Lookup is binary search on `headers` (local-header / CD `offsetheader`). Replaces a
+/// `HashMap<u64, ZipMemberMeta>` of fat structs while keeping every open column.
+struct ZipMemberTable {
+    /// Lookup key (`offsetheader` / local header offset), sorted ascending.
+    headers: Vec<u64>,
+    data_start: Vec<u64>,
+    compressed_size: Vec<u64>,
+    method: Vec<u16>,
+    /// 0/1 (not `Vec<bool>` — that is not a dense byte column).
+    encrypted: Vec<u8>,
+    /// Central-directory index (`by_index` / `by_index_decrypt`).
+    index: Vec<u32>,
+    /// Name Arc — same allocation as the compact index pool when interned at build.
+    name: Vec<Arc<str>>,
+}
+
+impl ZipMemberTable {
+    fn with_capacity(n: usize) -> Self {
+        Self {
+            headers: Vec::with_capacity(n),
+            data_start: Vec::with_capacity(n),
+            compressed_size: Vec::with_capacity(n),
+            method: Vec::with_capacity(n),
+            encrypted: Vec::with_capacity(n),
+            index: Vec::with_capacity(n),
+            name: Vec::with_capacity(n),
+        }
+    }
+
+    fn insert(&mut self, header: u64, meta: ZipMemberMeta) {
+        self.headers.push(header);
+        self.data_start.push(meta.data_start);
+        self.compressed_size.push(meta.compressed_size);
+        self.method.push(meta.method);
+        self.encrypted.push(u8::from(meta.encrypted));
+        self.index
+            .push(u32::try_from(meta.index).unwrap_or(u32::MAX));
+        self.name.push(meta.name);
+    }
+
+    /// Sort columns by header so [`Self::get`] can binary-search.
+    fn finish(&mut self) {
+        let n = self.headers.len();
+        if n <= 1 || self.headers.windows(2).all(|w| w[0] <= w[1]) {
+            return;
+        }
+        let mut order: Vec<usize> = (0..n).collect();
+        order.sort_unstable_by_key(|&i| self.headers[i]);
+        self.headers = order.iter().map(|&i| self.headers[i]).collect();
+        self.data_start = order.iter().map(|&i| self.data_start[i]).collect();
+        self.compressed_size = order.iter().map(|&i| self.compressed_size[i]).collect();
+        self.method = order.iter().map(|&i| self.method[i]).collect();
+        self.encrypted = order.iter().map(|&i| self.encrypted[i]).collect();
+        self.index = order.iter().map(|&i| self.index[i]).collect();
+        self.name = order.iter().map(|&i| Arc::clone(&self.name[i])).collect();
+    }
+
+    fn get(&self, header: u64) -> Option<ZipMemberView<'_>> {
+        let i = self.headers.binary_search(&header).ok()?;
+        Some(self.view_at(i))
+    }
+
+    fn view_at(&self, i: usize) -> ZipMemberView<'_> {
+        ZipMemberView {
+            name: &self.name[i],
+            data_start: self.data_start[i],
+            compressed_size: self.compressed_size[i],
+            method: self.method[i],
+            encrypted: self.encrypted[i] != 0,
+            index: self.index[i] as usize,
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.headers.len()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (u64, ZipMemberView<'_>)> + '_ {
+        (0..self.headers.len()).map(|i| (self.headers[i], self.view_at(i)))
+    }
+
+    /// Parallel columns of equal length, headers sorted — not a HashMap store.
+    #[cfg(test)]
+    fn is_dense(&self) -> bool {
+        let n = self.headers.len();
+        n == self.data_start.len()
+            && n == self.compressed_size.len()
+            && n == self.method.len()
+            && n == self.encrypted.len()
+            && n == self.index.len()
+            && n == self.name.len()
+            && self.headers.windows(2).all(|w| w[0] <= w[1])
+    }
 }
 
 /// Resolved on-disk archive: original path plus optional joined multi-part temp file.
@@ -331,8 +456,8 @@ pub struct ZipMountSource {
     archive_path: PathBuf,
     backend: ZipBackend,
     index: SqliteIndex,
-    /// local header offset → member layout for open
-    members: HashMap<u64, ZipMemberMeta>,
+    /// Sorted SoA sidecar (header offset → member layout for open).
+    members: ZipMemberTable,
     /// Single-flight Deflate decode cache (header_offset → inflated bytes).
     inflate_cache: InflateCache,
     /// Working password for encrypted members (`None` if archive is unencrypted).
@@ -349,20 +474,30 @@ impl ZipMountSource {
 
     /// Sidecar member name Arc (ZIP CD path as stored at index build).
     pub fn member_name_arc(&self, header: u64) -> Option<std::sync::Arc<str>> {
-        self.members
-            .get(&header)
-            .map(|m| std::sync::Arc::clone(&m.name))
+        self.members.get(header).map(|m| Arc::clone(m.name))
     }
 
     /// True when the sidecar name Arc is the same allocation as the compact index pool.
     pub fn member_name_shares_pool(&self, header: u64) -> bool {
-        let Some(meta) = self.members.get(&header) else {
+        let Some(meta) = self.members.get(header) else {
             return false;
         };
         let Some(pooled) = self.index.lookup_pooled_string(meta.name.as_ref()) else {
             return false;
         };
-        std::sync::Arc::ptr_eq(&meta.name, &pooled)
+        Arc::ptr_eq(meta.name, &pooled)
+    }
+
+    /// True when the open sidecar is dense SoA columns (not a HashMap of fat structs).
+    #[cfg(test)]
+    fn members_is_dense(&self) -> bool {
+        self.members.is_dense()
+    }
+
+    /// Number of ZIP members in the open sidecar.
+    #[cfg(test)]
+    fn member_count(&self) -> usize {
+        self.members.len()
     }
 
     /// `index_path`: `Some(path)` for on-disk index, `None` for in-memory (`:memory:`).
@@ -426,7 +561,7 @@ impl ZipMountSource {
             }
         };
         let password = find_password(&mut archive, &options.passwords)?;
-        let members = member_meta_map(&mut archive, password.as_deref())?;
+        let members = member_meta_table(&mut archive, password.as_deref())?;
         Ok(Self {
             archive_path: opened.user_path,
             backend: ZipBackend::File {
@@ -547,12 +682,12 @@ impl ZipMountSource {
         })?;
         let password = find_password(&mut archive, &options.passwords)?;
         let members = if !blob.zip_members.is_empty() {
-            let mut map = HashMap::new();
+            let mut table = ZipMemberTable::with_capacity(blob.zip_members.len());
             for m in &blob.zip_members {
-                map.insert(
+                table.insert(
                     m.offsetheader,
                     ZipMemberMeta {
-                        name: std::sync::Arc::from(m.name.as_str()),
+                        name: Arc::from(m.name.as_str()),
                         data_start: m.data_start,
                         compressed_size: m.compressed_size,
                         method: m.method,
@@ -561,9 +696,10 @@ impl ZipMountSource {
                     },
                 );
             }
-            map
+            table.finish();
+            table
         } else {
-            member_meta_map(&mut archive, password.as_deref())?
+            member_meta_table(&mut archive, password.as_deref())?
         };
         drop(archive);
         let index = SqliteIndex::create_compact_from_nested_blob(blob)?;
@@ -593,7 +729,7 @@ impl ZipMountSource {
             .members
             .iter()
             .map(|(h, m)| DurableZipMember {
-                offsetheader: *h,
+                offsetheader: h,
                 data_start: m.data_start,
                 compressed_size: m.compressed_size,
                 method: m.method,
@@ -697,10 +833,10 @@ impl ZipMountSource {
         hash_algorithms: &[String],
         parallel_file: Option<&File>,
         options: &OpenOptions,
-    ) -> Result<(SqliteIndex, HashMap<u64, ZipMemberMeta>)> {
+    ) -> Result<(SqliteIndex, ZipMemberTable)> {
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
-        let mut members = HashMap::new();
+        let mut members = ZipMemberTable::with_capacity(archive.len());
         let mut generated_dirs: std::collections::BTreeSet<String> =
             std::collections::BTreeSet::new();
         // (offsetheader, central-directory index, uncompressed size) for content hashing.
@@ -802,7 +938,7 @@ impl ZipMountSource {
             members.insert(
                 header_offset,
                 ZipMemberMeta {
-                    name: std::sync::Arc::clone(&name_arc),
+                    name: Arc::clone(&name_arc),
                     data_start,
                     compressed_size,
                     method,
@@ -811,6 +947,7 @@ impl ZipMountSource {
                 },
             );
         }
+        members.finish();
 
         if !hash_targets.is_empty() {
             store_member_content_hashes(
@@ -851,7 +988,7 @@ fn store_member_content_hashes<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     index: &SqliteIndex,
     password: Option<&str>,
-    members: &HashMap<u64, ZipMemberMeta>,
+    members: &ZipMemberTable,
     targets: &[(i64, usize, u64)],
     algorithms: &[String],
     parallel_file: Option<&File>,
@@ -867,14 +1004,14 @@ fn store_member_content_hashes<R: Read + Seek>(
 
     for &(offsetheader, member_index, size) in targets {
         let header = offsetheader as u64;
-        let meta = members.get(&header);
+        let meta = members.get(header);
         let can_parallel = parallel_file.is_some()
             && meta.is_some_and(|m| {
                 !m.encrypted && (m.method == METHOD_STORED || m.method == METHOD_DEFLATE)
             });
         if can_parallel {
             if let Some(m) = meta {
-                parallel_plain.push((offsetheader, size, m.clone()));
+                parallel_plain.push((offsetheader, size, m.to_owned_meta()));
             }
         } else {
             sequential.push((offsetheader, member_index, size));
@@ -1069,7 +1206,7 @@ impl MountSource for ZipMountSource {
 
         let meta = self
             .members
-            .get(&header)
+            .get(header)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "zip member meta not found"))?;
 
         // Encrypted members always go through zip crate decrypt (password required).
@@ -1130,7 +1267,7 @@ impl ZipMountSource {
     fn open_deflate(
         &self,
         header: u64,
-        meta: &ZipMemberMeta,
+        meta: ZipMemberView<'_>,
         data_start: u64,
         size: u64,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
@@ -1168,7 +1305,7 @@ impl ZipMountSource {
 
     fn open_via_zip_crate(
         &self,
-        meta: &ZipMemberMeta,
+        meta: ZipMemberView<'_>,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         match &self.backend {
             ZipBackend::File { raw_file, .. } => {
@@ -1184,7 +1321,7 @@ impl ZipMountSource {
 
     fn read_member_via_zip_archive<R: Read + Seek>(
         reader: R,
-        meta: &ZipMemberMeta,
+        meta: ZipMemberView<'_>,
         password: Option<&str>,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         let mut archive = ZipArchive::new(reader).map_err(io::Error::other)?;
@@ -1355,11 +1492,11 @@ fn find_password<R: Read + Seek>(
     }
 }
 
-fn member_meta_map<R: Read + Seek>(
+fn member_meta_table<R: Read + Seek>(
     archive: &mut ZipArchive<R>,
     password: Option<&str>,
-) -> Result<HashMap<u64, ZipMemberMeta>> {
-    let mut members = HashMap::new();
+) -> Result<ZipMemberTable> {
+    let mut members = ZipMemberTable::with_capacity(archive.len());
     for i in 0..archive.len() {
         let file = open_member(archive, i, password)?;
         let method = match file.compression() {
@@ -1370,7 +1507,7 @@ fn member_meta_map<R: Read + Seek>(
         members.insert(
             file.header_start(),
             ZipMemberMeta {
-                name: std::sync::Arc::from(file.name()),
+                name: Arc::from(file.name()),
                 data_start: file.data_start(),
                 compressed_size: file.compressed_size(),
                 method,
@@ -1379,6 +1516,7 @@ fn member_meta_map<R: Read + Seek>(
             },
         );
     }
+    members.finish();
     Ok(members)
 }
 
@@ -2067,6 +2205,7 @@ mod tests {
             "test",
         )
         .expect("compact open_from_reader");
+        assert!(src.members_is_dense());
         assert!(
             src.index_is_compact_only(),
             "nested-style open must use compact-only index"
@@ -2380,6 +2519,22 @@ mod tests {
         );
     }
 
+    fn write_mixed_zip(path: &Path, files: &[(&str, &[u8], bool)]) {
+        let file = File::create(path).unwrap();
+        let mut zw = ZipWriter::new(file);
+        for (name, data, deflate) in files {
+            let method = if *deflate {
+                CompressionMethod::Deflated
+            } else {
+                CompressionMethod::Stored
+            };
+            let opts = SimpleFileOptions::default().compression_method(method);
+            zw.start_file(*name, opts).unwrap();
+            zw.write_all(data).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
     fn write_deflate_zip(path: &Path, files: &[(&str, &[u8])]) {
         let file = File::create(path).unwrap();
         let mut zw = ZipWriter::new(file);
@@ -2422,6 +2577,8 @@ mod tests {
         let src = Arc::new(
             ZipMountSource::open(&path, None, &opts, "test", true).expect("open deflate zip"),
         );
+        assert!(src.members_is_dense());
+        assert_eq!(src.member_count(), 1);
         let fi = src.lookup("/big.bin", 0).expect("lookup");
         assert_eq!(fi.size, payload.len() as u64);
 
@@ -2470,6 +2627,8 @@ mod tests {
         let src = Arc::new(
             ZipMountSource::open(&path, None, &opts, "test", true).expect("open multi deflate"),
         );
+        assert!(src.members_is_dense());
+        assert_eq!(src.member_count(), 3);
         let fi_a = src.lookup("/a.bin", 0).expect("a");
         let fi_b = src.lookup("/b.bin", 0).expect("b");
         let fi_c = src.lookup("/c.bin", 0).expect("c");
@@ -2517,6 +2676,8 @@ mod tests {
             )
             .expect("open_from_reader"),
         );
+        assert!(src.members_is_dense());
+        assert_eq!(src.member_count(), 1);
         let fi = src.lookup("/x.bin", 0).expect("lookup");
         let mut handles = Vec::new();
         for _ in 0..6 {
@@ -2671,6 +2832,182 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
+    /// Regression: multi-file ZIP open — dense sidecar lookup + open matches payloads.
+    #[test]
+    fn regression_multi_file_zip_open_dense_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("multi-dense.zip");
+        let stored_a = b"stored-member-alpha\n";
+        let stored_b = b"stored-member-bravo-payload\n";
+        let deflate_c: Vec<u8> = (0..4096).map(|i| b"MIXEDZIP"[i % 8]).collect();
+        write_mixed_zip(
+            &path,
+            &[
+                ("a.txt", stored_a.as_slice(), false),
+                ("b.bin", stored_b.as_slice(), false),
+                ("c.dat", deflate_c.as_slice(), true),
+            ],
+        );
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).expect("open");
+        assert!(
+            src.members_is_dense(),
+            "sidecar must be sorted SoA columns, not a HashMap of fat structs"
+        );
+        assert_eq!(src.member_count(), 3);
+
+        let cases: &[(&str, &[u8])] = &[
+            ("/a.txt", stored_a),
+            ("/b.bin", stored_b),
+            ("/c.dat", &deflate_c),
+        ];
+        for (name, payload) in cases {
+            let fi = src
+                .lookup(name, 0)
+                .unwrap_or_else(|| panic!("lookup {name}"));
+            assert_eq!(fi.size, payload.len() as u64, "size {name}");
+            let mut r = src.open(&fi, 0).unwrap();
+            let mut out = Vec::new();
+            r.read_to_end(&mut out).unwrap();
+            assert_eq!(out.as_slice(), *payload, "bytes {name}");
+        }
+
+        // Shared-stream backend: same fixture via `open_from_reader`.
+        let bytes = std::fs::read(&path).unwrap();
+        let src2 = ZipMountSource::open_from_reader(
+            io::Cursor::new(bytes),
+            Path::new("memory://multi-dense.zip"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("open_from_reader");
+        assert!(src2.members_is_dense());
+        assert_eq!(src2.member_count(), 3);
+        let fi = src2.lookup("/c.dat", 0).expect("lookup c");
+        let mut r = src2.open(&fi, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, deflate_c);
+        let fi_a = src2.lookup("/a.txt", 0).expect("lookup a");
+        let mut r = src2.open(&fi_a, 0).unwrap();
+        let mut out = Vec::new();
+        r.read_to_end(&mut out).unwrap();
+        assert_eq!(out, stored_a);
+    }
+
+    /// Store-stencil open must honor `data_start`/`method` columns (seek + isolation).
+    #[test]
+    fn store_member_open_seek_uses_data_start_column() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("store-seek.zip");
+        let a = b"AAAAAAAA-first-stored-member-AAAAAAAA";
+        let b = b"BBBBBBBB-second-stored-member-BBBBBBBB";
+        let c = b"CCCCCCCC-third-stored-member-CCCCCCCC";
+        write_mixed_zip(
+            &path,
+            &[
+                ("one.bin", a.as_slice(), false),
+                ("two.bin", b.as_slice(), false),
+                ("three.bin", c.as_slice(), false),
+            ],
+        );
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        assert!(src.members_is_dense());
+        assert_eq!(src.member_count(), 3);
+
+        let fi = src.lookup("/two.bin", 0).expect("lookup two");
+        let mut r = src.open(&fi, 0).unwrap();
+        // Seek into member two — must not leak member one/three bytes.
+        let mid = 8u64;
+        assert_eq!(r.seek(SeekFrom::Start(mid)).unwrap(), mid);
+        let mut tail = Vec::new();
+        r.read_to_end(&mut tail).unwrap();
+        assert_eq!(tail.as_slice(), &b[mid as usize..]);
+
+        assert_eq!(r.seek(SeekFrom::Start(0)).unwrap(), 0);
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all.as_slice(), b.as_slice());
+
+        assert_eq!(r.seek(SeekFrom::End(-8)).unwrap(), b.len() as u64 - 8);
+        let mut last = Vec::new();
+        r.read_to_end(&mut last).unwrap();
+        assert_eq!(last.as_slice(), &b[b.len() - 8..]);
+
+        assert_eq!(
+            src.inflate_cache.completed_len(),
+            0,
+            "stored members must stay on the stencil path"
+        );
+    }
+
+    /// Unsorted inserts must still binary-search after `finish`.
+    #[test]
+    fn zip_member_table_sorts_headers_for_binary_search() {
+        let mut t = ZipMemberTable::with_capacity(3);
+        t.insert(
+            300,
+            ZipMemberMeta {
+                name: Arc::from("c"),
+                data_start: 301,
+                compressed_size: 10,
+                method: METHOD_STORED,
+                encrypted: false,
+                index: 2,
+            },
+        );
+        t.insert(
+            100,
+            ZipMemberMeta {
+                name: Arc::from("a"),
+                data_start: 101,
+                compressed_size: 20,
+                method: METHOD_DEFLATE,
+                encrypted: false,
+                index: 0,
+            },
+        );
+        t.insert(
+            200,
+            ZipMemberMeta {
+                name: Arc::from("b"),
+                data_start: 201,
+                compressed_size: 30,
+                method: METHOD_STORED,
+                encrypted: true,
+                index: 1,
+            },
+        );
+        assert!(
+            !t.headers.windows(2).all(|w| w[0] <= w[1]),
+            "fixture must start unsorted"
+        );
+        t.finish();
+        assert!(t.is_dense());
+        assert_eq!(t.len(), 3);
+        let a = t.get(100).unwrap();
+        assert_eq!(&**a.name, "a");
+        assert_eq!(a.data_start, 101);
+        assert_eq!(a.compressed_size, 20);
+        assert_eq!(a.method, METHOD_DEFLATE);
+        assert!(!a.encrypted);
+        assert_eq!(a.index, 0);
+        let b = t.get(200).unwrap();
+        assert_eq!(&**b.name, "b");
+        assert!(b.encrypted);
+        assert_eq!(b.index, 1);
+        assert_eq!(t.get(300).unwrap().data_start, 301);
+        assert!(t.get(999).is_none());
+    }
+
     /// Store stencil path remains random-access (not forced through inflate cache).
     #[test]
     fn store_member_not_via_inflate_cache() {
@@ -2682,6 +3019,7 @@ mod tests {
             ..OpenOptions::default()
         };
         let src = ZipMountSource::open(&path, None, &opts, "test", true).unwrap();
+        assert!(src.members_is_dense());
         let fi = src.lookup("/plain.txt", 0).unwrap();
         let mut r = src.open(&fi, 0).unwrap();
         let mut out = String::new();
