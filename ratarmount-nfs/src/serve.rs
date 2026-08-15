@@ -15,6 +15,50 @@ use ratarmount_core::MountSource;
 use crate::bind::{nfs_bind_string, BindError};
 use crate::vfs::RatarmountNfs;
 
+/// NFS protocol version selected by `--nfs-vers` (only when `--nfs` is set).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NfsVers {
+    /// nfsserve NFSv3 + MOUNT + portmap (CLI default).
+    V3,
+    /// embednfs NFSv4.1 (requires `--features nfsv4`).
+    #[cfg(feature = "nfsv4")]
+    V4,
+}
+
+/// Why [`parse_nfs_vers`] rejected a string.
+#[derive(Debug, thiserror::Error, Clone, PartialEq, Eq)]
+pub enum NfsVersError {
+    #[error("rebuild with --features nfsv4 (rustc >= 1.88)")]
+    FeatureRequired,
+    #[error("only NFSv4.1; embednfs rejects v4.0-only ops")]
+    V40NotSupported,
+    #[error("invalid --nfs-vers {0:?}; expected 3 or 4 (or 4.1)")]
+    Invalid(String),
+}
+
+/// Parse `--nfs-vers`. Call **only** when `--nfs` is set.
+///
+/// `3` → [`NfsVers::V3`]. `4` / `4.1` → [`NfsVers::V4`] when compiled with
+/// `nfsv4`, otherwise [`NfsVersError::FeatureRequired`]. `4.0` is always
+/// rejected (macOS `vers=4` is NFSv4.0).
+pub fn parse_nfs_vers(s: &str) -> Result<NfsVers, NfsVersError> {
+    match s.trim() {
+        "" | "3" => Ok(NfsVers::V3),
+        "4.0" => Err(NfsVersError::V40NotSupported),
+        "4" | "4.1" => {
+            #[cfg(feature = "nfsv4")]
+            {
+                Ok(NfsVers::V4)
+            }
+            #[cfg(not(feature = "nfsv4"))]
+            {
+                Err(NfsVersError::FeatureRequired)
+            }
+        }
+        other => Err(NfsVersError::Invalid(other.to_string())),
+    }
+}
+
 /// Tokio-free stop flag (`main.rs` must not name tokio).
 #[derive(Clone, Debug)]
 pub struct NfsStop(Arc<AtomicBool>);
@@ -49,6 +93,8 @@ pub struct NfsOptions {
     pub stop: Option<NfsStop>,
     /// When set, NFSv3 create/write/mkdir/remove/setattr-size go to this overlay.
     pub overlay: Option<Arc<WriteOverlay>>,
+    /// Protocol. Default [`NfsVers::V3`]. CLI sets this only when `--nfs` is set.
+    pub vers: NfsVers,
 }
 
 impl Default for NfsOptions {
@@ -60,6 +106,7 @@ impl Default for NfsOptions {
             reader_slots: crate::DEFAULT_READER_SLOTS,
             stop: None,
             overlay: None,
+            vers: NfsVers::V3,
         }
     }
 }
@@ -73,6 +120,7 @@ impl std::fmt::Debug for NfsOptions {
             .field("reader_slots", &self.reader_slots)
             .field("stop", &self.stop.as_ref().map(|_| "NfsStop"))
             .field("overlay", &self.overlay.is_some())
+            .field("vers", &self.vers)
             .finish()
     }
 }
@@ -84,6 +132,13 @@ pub struct NfsServerHandle {
 }
 
 impl NfsServerHandle {
+    pub(crate) fn from_join(port: u16, join: JoinHandle<io::Result<()>>) -> Self {
+        Self {
+            port,
+            join: Some(join),
+        }
+    }
+
     /// Wait for the NFS thread to exit (after [`NfsStop::request_stop`]).
     pub fn join(mut self) -> io::Result<()> {
         match self.join.take() {
@@ -130,7 +185,7 @@ pub async fn serve_listener<T: NFSTcp>(listener: T, stop: Option<NfsStop>) -> io
     }
 }
 
-fn access_label(opts: &NfsOptions) -> &'static str {
+pub(crate) fn access_label(opts: &NfsOptions) -> &'static str {
     if opts.overlay.is_some() {
         "rw overlay"
     } else {
@@ -211,10 +266,7 @@ pub fn spawn_nfs_thread(
     let port = rx.recv().map_err(|_| {
         io::Error::new(io::ErrorKind::BrokenPipe, "NFS thread exited before bind")
     })??;
-    Ok(NfsServerHandle {
-        port,
-        join: Some(join),
-    })
+    Ok(NfsServerHandle::from_join(port, join))
 }
 
 #[cfg(test)]
@@ -293,5 +345,48 @@ mod tests {
             .expect("serve timed out")
             .expect("join");
         assert!(r.is_ok(), "{r:?}");
+    }
+
+    #[test]
+    fn parse_nfs_vers_3_is_default() {
+        assert_eq!(parse_nfs_vers("3").unwrap(), NfsVers::V3);
+        assert_eq!(parse_nfs_vers("").unwrap(), NfsVers::V3);
+        assert_eq!(parse_nfs_vers(" 3 ").unwrap(), NfsVers::V3);
+    }
+
+    #[test]
+    fn parse_nfs_vers_40_rejected() {
+        assert_eq!(
+            parse_nfs_vers("4.0").unwrap_err(),
+            NfsVersError::V40NotSupported
+        );
+    }
+
+    #[test]
+    fn parse_nfs_vers_garbage_rejected() {
+        assert!(matches!(
+            parse_nfs_vers("testdata.tar.gz"),
+            Err(NfsVersError::Invalid(_))
+        ));
+    }
+
+    #[cfg(not(feature = "nfsv4"))]
+    #[test]
+    fn parse_nfs_vers_4_requires_feature() {
+        assert_eq!(
+            parse_nfs_vers("4").unwrap_err(),
+            NfsVersError::FeatureRequired
+        );
+        assert_eq!(
+            parse_nfs_vers("4.1").unwrap_err(),
+            NfsVersError::FeatureRequired
+        );
+    }
+
+    #[cfg(feature = "nfsv4")]
+    #[test]
+    fn parse_nfs_vers_4_and_41_accepted() {
+        assert_eq!(parse_nfs_vers("4").unwrap(), NfsVers::V4);
+        assert_eq!(parse_nfs_vers("4.1").unwrap(), NfsVers::V4);
     }
 }

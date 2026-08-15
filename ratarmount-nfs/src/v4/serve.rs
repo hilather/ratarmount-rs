@@ -1,10 +1,17 @@
-//! Bind / serve spike for embednfs 0.4.1 (`NfsServer` + `MemFs`).
+//! Bind / serve NFSv4.1 (`NfsServer` + `RatarmountNfs4` / smoke `MemFs`).
 
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
+use std::thread;
 use std::time::Duration;
 
+use ratarmount_core::MountSource;
+
+use crate::serve::{access_label, NfsOptions, NfsServerHandle};
 use crate::NfsStop;
+
+use super::adapter::RatarmountNfs4;
 
 async fn wait_stop(stop: NfsStop) {
     while !stop.is_stopped() {
@@ -39,6 +46,105 @@ pub async fn listen_v4_memfs_smoke(addr: &str, stop: NfsStop) -> io::Result<()> 
         r = server.listen(addr) => r,
         _ = wait_stop(stop) => Ok(()),
     }
+}
+
+fn nfs4_from_opts(source: Arc<dyn MountSource>, opts: &NfsOptions) -> RatarmountNfs4 {
+    RatarmountNfs4::with_overlay(
+        source,
+        usize::try_from(opts.readahead_bytes).unwrap_or(usize::MAX),
+        opts.overlay.clone(),
+    )
+}
+
+async fn serve_v4_listener(
+    listener: tokio::net::TcpListener,
+    fs: RatarmountNfs4,
+    stop: Option<NfsStop>,
+) -> io::Result<()> {
+    let server = embednfs::NfsServer::new(fs);
+    match stop {
+        None => server.serve(listener).await,
+        Some(s) => {
+            tokio::select! {
+                r = server.serve(listener) => r,
+                _ = wait_stop(s) => Ok(()),
+            }
+        }
+    }
+}
+
+/// Bind + serve NFSv4.1 on the current tokio Runtime.
+pub async fn serve_v4(source: Arc<dyn MountSource>, opts: NfsOptions) -> io::Result<()> {
+    let access = access_label(&opts);
+    let fs = nfs4_from_opts(source, &opts);
+    let listener = tokio::net::TcpListener::bind(opts.bind).await?;
+    let port = listener.local_addr()?.port();
+    let ip = opts.bind.ip();
+    log::info!(
+        "NFSv4.1 listening on {ip}:{port} ({access}). mount: mount -t nfs -o vers=4.1,tcp,port={port},sec=sys {ip}:/ <dir>"
+    );
+    serve_v4_listener(listener, fs, opts.stop).await
+}
+
+/// NFS-only: this thread owns the only Runtime (bind then serve).
+pub fn serve_v4_blocking(source: Arc<dyn MountSource>, opts: NfsOptions) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("ratarmount-nfs4-worker")
+        .build()?;
+    rt.block_on(serve_v4(source, opts))
+}
+
+/// FUSE+NFS: dedicated thread owns the only Runtime. Returns after bind.
+pub fn spawn_nfs4_thread(
+    source: Arc<dyn MountSource>,
+    opts: NfsOptions,
+) -> io::Result<NfsServerHandle> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let join = thread::Builder::new()
+        .name("ratarmount-nfs4".into())
+        .spawn(move || {
+            let rt = match tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("ratarmount-nfs4-worker")
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    let _ = tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                    return Err(e);
+                }
+            };
+            rt.block_on(async {
+                let access = access_label(&opts);
+                let fs = nfs4_from_opts(source, &opts);
+                match tokio::net::TcpListener::bind(opts.bind).await {
+                    Ok(listener) => {
+                        let port = match listener.local_addr() {
+                            Ok(a) => a.port(),
+                            Err(e) => {
+                                let _ = tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                                return Err(e);
+                            }
+                        };
+                        let ip = opts.bind.ip();
+                        log::info!(
+                            "NFSv4.1 listening on {ip}:{port} ({access}). mount: mount -t nfs -o vers=4.1,tcp,port={port},sec=sys {ip}:/ <dir>"
+                        );
+                        let _ = tx.send(Ok(port));
+                        serve_v4_listener(listener, fs, opts.stop).await
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(io::Error::new(e.kind(), e.to_string())));
+                        Err(e)
+                    }
+                }
+            })
+        })?;
+    let port = rx.recv().map_err(|_| {
+        io::Error::new(io::ErrorKind::BrokenPipe, "NFS thread exited before bind")
+    })??;
+    Ok(NfsServerHandle::from_join(port, join))
 }
 
 #[cfg(test)]

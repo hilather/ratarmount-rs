@@ -32,9 +32,10 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |
-| `--nfs` | no | **added** (userspace NFSv3; no FUSE mount required) | `[x]` Rust-only |
+| `--nfs` | no | **added** (userspace NFS; NFSv3 default; no FUSE mount required) | `[x]` Rust-only |
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
-| `--nfs-export-name` | no | **added** (MOUNT export name) | `[x]` |
+| `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + `--features nfsv4`; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
+| `--nfs-export-name` | no | **added** (MOUNT export name; warned/ignored on `--nfs-vers 4`) | `[x]` |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
 | `-i` / `--ignore-zeros` | yes | yes (`-i` + long) | `[x]` |
@@ -70,6 +71,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 |---------|--------|------|--------|
 | Single archive FUSE mount | yes | yes | `[x]` |
 | NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes) | `[x]` Rust-only |
+| NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (RO `MountSource` via embednfs; overlay writes later; **Linux kernel client unverified**) | `~` Rust-only |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |
 | Subfolder layout (`--disable-union-mount`) | yes | **added** | `[x]` |
 | Recursive nested archives | yes | yes | `[x]` |

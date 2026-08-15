@@ -1,8 +1,8 @@
-# NFSv3 userspace export (and NFSv4.1 spike)
+# NFSv3 userspace export (and optional NFSv4.1)
 
-Status: **NFSv3 v1 + overlay writes**. NFSv4.1: **spike PASSED** (bind + unprivileged EXCHANGE_ID; no CLI yet). Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
+Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1 RO** via `--nfs --nfs-vers 4` (`--features nfsv4`, rustc ≥ 1.88). **Linux kernel client unverified** (unprivileged `mount` skipped). Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
 
-`ratarmount --nfs` serves the same `MountSource` tree as FUSE over **in-process NFSv3** (`nfsserve` 0.11). No kernel `nfsd`, no FUSE mount, no extra system library.
+`ratarmount --nfs` serves the same `MountSource` tree as FUSE over **in-process NFSv3** (`nfsserve` 0.11) by default. `--nfs-vers 4` selects **NFSv4.1** (`embednfs` 0.4.1, no MOUNT/portmap). No kernel `nfsd`, no FUSE mount, no extra system library. Do **not** treat v4 as “usable on Linux” until a privileged `vers=4.1,tcp,port=,sec=sys` mount is recorded.
 
 ## Quick start
 
@@ -16,8 +16,11 @@ ratarmount --nfs --nfs-bind 127.0.0.1:20490 archive.tar.gz
 # FUSE + NFS (explicit mountpoint)
 ratarmount --nfs -f archive.tar.gz mnt/
 
-# Writable overlay (same `-w` / `:temp:` as FUSE)
+# Writable overlay (same `-w` / `:temp:` as FUSE) — NFSv3 only today
 ratarmount --nfs -w :temp: archive.tar.gz
+
+# NFSv4.1 (opt-in; needs a binary built with --features nfsv4)
+ratarmount --nfs --nfs-vers 4 archive.tar.gz
 ```
 
 Linux client (v1 acceptance):
@@ -56,29 +59,26 @@ Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist
 - **Windows** `mount.exe` / `dir`: nfsserve `READDIR` is unimplemented (Linux/macOS use `READDIRPLUS`). Default client port is often 2049, not 20490.
 - Overlay **rename** / **symlink** over NFS (FUSE overlay may support more; NFS leaves these `NFS3ERR_ROFS`).
 - `--commit-overlay` over NFS (use the existing CLI; not a network op).
-- Kerberos, ACLs, NLM. NFSv4.1 is a compile-gated spike (see below); there is no `--nfs-vers` CLI yet.
+- Kerberos, ACLs, NLM. NFSv4.1 is opt-in (`--nfs-vers 4`) and read-only; overlay writes on v4 are not shipped yet.
 - NFS-only daemonize (v1 NFS-only stays in the foreground).
+- `--nfs-vers` without `--nfs` is ignored (must not fail FUSE-only mounts).
+- `--nfs-export-name` is a v3 MOUNT name; warned and ignored on v4.
 
-## NFSv4.1 spike (PR 2)
+## NFSv4.1 (`--nfs --nfs-vers 4`)
 
-Status: **PASSED** (2026-08-15, rustc 1.97.1). Optional feature `nfsv4` on `ratarmount-nfs` (forwarded from `ratarmount`) compiles [embednfs 0.4.1](https://docs.rs/embednfs/0.4.1/embednfs/) (`rust-version = "1.88"`, edition 2024). Workspace MSRV stays **1.74**; default `cargo test` / CI does **not** compile embednfs (same pattern as `gzip-rapidgzip`).
-
-| Check | Result |
-|-------|--------|
-| `embednfs = "0.4.1"` behind `--features nfsv4` | Compiles on rustc ≥ 1.88 |
-| `TcpListener::bind("127.0.0.1:0")` + `NfsServer::new(MemFs::new()).serve` + `NfsStop` | Exits within 2s (`v4_bind_ipv4_high_port`) |
-| `NfsServer::listen("127.0.0.1:0")` | Starts; stop returns (`v4_listen_string_ipv4`) |
-| Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
-| Live Linux `mount -t nfs` | **Linux kernel client unverified** — `mount` exits 32 (`must be superuser to use mount`) |
-
-**Not shipped:** `--nfs-vers`, `FileSystem` on `MountSource`, packaging `--features nfsv4`. `--nfs` remains NFSv3.
-
-### Minimal Linux kernel option set (product claim, not yet verified)
-
-Until a privileged `vers=4.1,tcp,port=,sec=sys` mount succeeds, README must not say “usable on Linux.” The recipe to try:
+Status: **RO adapter shipped**. Optional feature `nfsv4` on `ratarmount-nfs` (forwarded from `ratarmount`) compiles [embednfs 0.4.1](https://docs.rs/embednfs/0.4.1/embednfs/) (`rust-version = "1.88"`, edition 2024). Workspace MSRV stays **1.74**; default `cargo test` / CI does **not** compile embednfs (same pattern as `gzip-rapidgzip`). `--nfs` without `--nfs-vers` remains NFSv3.
 
 ```bash
-# After a future `--nfs --nfs-vers 4` binary (not in this spike):
+# Requires a nfsv4-enabled binary (source: cargo run --features nfsv4 -- …).
+# Without the feature, `--nfs --nfs-vers 4` exits 2:
+#   rebuild with --features nfsv4 (rustc >= 1.88)
+ratarmount --nfs --nfs-vers 4 archive.tar.gz
+# Accepts `4` or `4.1`. Rejects `4.0` (macOS `vers=4` is NFSv4.0).
+```
+
+Linux client recipe (**kernel client unverified** on this tree — unprivileged CI cannot `mount -t nfs`):
+
+```bash
 mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ /mnt
 # Remount after server restart may also need nosharecache.
 ```
@@ -92,6 +92,22 @@ mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ /mnt
 | `nosharecache` | Optional if remounting the same `server:port` after a restart. |
 
 If localhost still maps `nobody` after `sec=sys`, try `nfs4_disable_idmapping=1` or `Domain = localdomain` in `/etc/idmapd.conf`.
+
+v4 export is **read-only** (`NFS4ERR_ROFS` on write/create/remove/rename/setattr). `-w` overlay writes stay on the NFSv3 path. `--nfs-export-name` is ignored (no MOUNT). AUTH_SYS is accepted and **not** used for authorization (same localhost boundary as v3).
+
+### Spike / protocol (PR 2, still green)
+
+Status: **PASSED** (2026-08-15, rustc 1.97.1).
+
+| Check | Result |
+|-------|--------|
+| `embednfs = "0.4.1"` behind `--features nfsv4` | Compiles on rustc ≥ 1.88 |
+| `TcpListener::bind("127.0.0.1:0")` + `NfsServer::new(MemFs::new()).serve` + `NfsStop` | Exits within 2s (`v4_bind_ipv4_high_port`) |
+| `NfsServer::listen("127.0.0.1:0")` | Starts; stop returns (`v4_listen_string_ipv4`) |
+| Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
+| Live Linux `mount -t nfs` | **Linux kernel client unverified** — `mount` exits 32 (`must be superuser to use mount`) |
+
+**Not shipped:** overlay writes on v4, packaging `--features nfsv4`, idle/lease reader drop. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary.
 
 ### embednfs 0.4.1 API actually used
 

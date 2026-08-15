@@ -108,9 +108,11 @@ ratarmount --password secret encrypted.7z mnt/
 # Index only (no FUSE)
 ratarmount --no-mount -c archive.tar
 
-# NFSv3 userspace export (no FUSE mountpoint)
+# NFSv3 userspace export (no FUSE mountpoint; default)
 ratarmount --nfs archive.tar.gz
 # Linux: mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ mnt
+# Opt-in NFSv4.1 (`--features nfsv4`): --nfs --nfs-vers 4
+# Linux kernel NFSv4 client is unverified — do not treat as a supported mount.
 
 # Unmount
 ratarmount -u mnt/
@@ -144,7 +146,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
-| NFSv3 export | `--nfs` / `--nfs-bind` — userspace share (no FUSE mount required); `-w` overlay writes — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
+| NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (`nfsv4` feature / rustc ≥ 1.88; RO; **Linux kernel client unverified**) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
 
 ### Remote backends
 
@@ -193,7 +195,7 @@ flowchart LR
   Factory --> Composite[Union · AutoMount · Overlay]
   Formats --> Index[(SQLite index 0.7.x)]
   Composite --> FUSE[fuser low-level FS]
-  Composite --> NFS[nfsserve NFSv3]
+  Composite --> NFS[nfsserve NFSv3 / embednfs NFSv4.1]
   Index --> FUSE
   Index --> NFS
   Compress --> Formats
@@ -206,7 +208,7 @@ flowchart LR
 | `ratarmount-core` | `MountSource` trait & options |
 | `ratarmount-index` | SQLite 0.7.x index |
 | `ratarmount-fuse` | `fuser` low-level filesystem |
-| `ratarmount-nfs` | In-process NFSv3 export (`--nfs`) |
+| `ratarmount-nfs` | In-process NFSv3 export (`--nfs`); optional NFSv4.1 (`--nfs-vers 4`) |
 | `ratarmount-compress` | Seekable codecs + stencils |
 | `ratarmount-formats-*` | TAR, ZIP, 7z, ISO, SquashFS, EXT4, … |
 | `ratarmount-compositing` | Folder, union, automount, overlay |
@@ -217,7 +219,7 @@ ratarmount/                 # CLI
 ratarmount-core/            # MountSource trait, options
 ratarmount-index/           # SQLite 0.7.x
 ratarmount-fuse/            # fuser low-level FS
-ratarmount-nfs/             # NFSv3 userspace export
+ratarmount-nfs/             # NFSv3 userspace export + optional NFSv4.1
 ratarmount-compress/        # seekable codecs + stencils
 ratarmount-formats-*/       # per-format backends
 ratarmount-compositing/     # folder, union, automount, overlay

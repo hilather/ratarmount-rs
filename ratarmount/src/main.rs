@@ -34,7 +34,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     version = VERSION,
     about = "Random Access To Archived Resources (Rust rewrite)",
     long_about = "Mount archives (TAR/ZIP/AR/CPIO/libarchive, compressed) via FUSE.\n\
-                  Supports recursive automount (-r), write overlay (-w), and http(s)/file URLs."
+                  Supports recursive automount (-r), write overlay (-w), http(s)/file URLs,\n\
+                  and userspace NFS (--nfs, NFSv3 default; --nfs-vers 4 for NFSv4.1)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -96,12 +97,12 @@ struct Args {
     #[arg(long = "control-interface", action = ArgAction::SetTrue)]
     control_interface: bool,
 
-    /// Export the archive as NFSv3 (userspace). Does not require a FUSE mountpoint.
-    /// Bind address is `--nfs-bind` (default 127.0.0.1:20490).
+    /// Export the archive as NFS (userspace). Does not require a FUSE mountpoint.
+    /// Default protocol is NFSv3. Bind address is `--nfs-bind` (default 127.0.0.1:20490).
     #[arg(long = "nfs", action = ArgAction::SetTrue)]
     nfs: bool,
 
-    /// NFSv3 listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20490.
+    /// NFS listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20490.
     /// Bare port (`20490`) or `:20490` → 127.0.0.1:that port.
     #[arg(
         long = "nfs-bind",
@@ -110,7 +111,22 @@ struct Args {
     )]
     nfs_bind: String,
 
+    /// NFS protocol version. Default 3 (nfsserve). `4` is NFSv4.1 (embednfs;
+    /// needs `--features nfsv4`). Required value (`num_args = 1`). Do **not**
+    /// use `num_args = 0..=1` — that recreates the `--nfs` archive-steal bug.
+    /// `--nfs --nfs-vers testdata.tar.gz` (missing value) consumes the archive
+    /// as the version string; clap succeeds, then parse fails (exit 2).
+    /// Parsed only when `--nfs` is set; FUSE-only `--nfs-vers 4` is ignored.
+    #[arg(
+        long = "nfs-vers",
+        value_name = "3|4",
+        default_value = "3",
+        num_args = 1
+    )]
+    nfs_vers: String,
+
     /// MOUNT export name without slashes (nfsserve `with_export_name`). Default: `/`.
+    /// Ignored on NFSv4.1 (no MOUNT).
     #[arg(long = "nfs-export-name", value_name = "NAME")]
     nfs_export_name: Option<String>,
 
@@ -667,6 +683,26 @@ fn main() {
     } else {
         None
     };
+    // Same gate as `--nfs-bind`: ignore `--nfs-vers` unless `--nfs` is set
+    // (FUSE-only `--nfs-vers 4 archive mnt` must not exit 2).
+    let nfs_vers = if args.nfs {
+        match ratarmount_nfs::parse_nfs_vers(&args.nfs_vers) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+    } else {
+        if args.nfs_vers != "3" {
+            log::debug!("ignoring --nfs-vers without --nfs");
+        }
+        ratarmount_nfs::NfsVers::V3
+    };
+    #[cfg(feature = "nfsv4")]
+    if args.nfs && args.nfs_export_name.is_some() && nfs_vers == ratarmount_nfs::NfsVers::V4 {
+        eprintln!("warning: --nfs-export-name is ignored on NFSv4.1 (no MOUNT)");
+    }
 
     // NFS-only: do not invent a FUSE mountpoint / stem directory.
     let fuse_mp = if args.nfs && mountpoint.is_none() {
@@ -718,7 +754,7 @@ fn main() {
     if let Some(bind) = nfs_bind {
         if !bind.ip().is_loopback() {
             eprintln!(
-                "warning: NFSv3 bound on {} (AUTH_SYS, no allowlist). \
+                "warning: NFS bound on {} (AUTH_SYS, no allowlist). \
                  Prefer 127.0.0.1 unless you trust the LAN.",
                 bind
             );
@@ -730,6 +766,7 @@ fn main() {
             reader_slots: ratarmount_nfs::DEFAULT_READER_SLOTS,
             stop: None,
             overlay: overlay_arc.clone(),
+            vers: nfs_vers,
         };
         match fuse_mp {
             None => run_nfs_only(bundle.source, nfs_opts),
@@ -761,20 +798,49 @@ fn main() {
     );
 }
 
-fn run_nfs_only(source: Arc<dyn MountSource>, opts: ratarmount_nfs::NfsOptions) {
+fn nfs_ready_line(opts: &ratarmount_nfs::NfsOptions, port: u16) -> String {
     let access = if opts.overlay.is_some() {
         "rw overlay"
     } else {
         "ro"
     };
-    eprintln!(
-        "NFSv3 ({access}) on {}. Client: mount -t nfs -o vers=3,tcp,nolock,port={},mountport={} {}:/ <dir>",
-        opts.bind,
-        opts.bind.port(),
-        opts.bind.port(),
-        opts.bind.ip()
-    );
-    if let Err(e) = ratarmount_nfs::serve_blocking(source, opts) {
+    let ip = opts.bind.ip();
+    match opts.vers {
+        ratarmount_nfs::NfsVers::V3 => format!(
+            "NFSv3 ({access}) on {ip}:{port}. Client: mount -t nfs -o vers=3,tcp,nolock,port={port},mountport={port} {ip}:/ <dir>"
+        ),
+        #[cfg(feature = "nfsv4")]
+        ratarmount_nfs::NfsVers::V4 => format!(
+            "NFSv4.1 ({access}) on {ip}:{port}. Client: mount -t nfs -o vers=4.1,tcp,port={port},sec=sys {ip}:/ <dir>"
+        ),
+    }
+}
+
+fn serve_nfs_blocking(
+    source: Arc<dyn MountSource>,
+    opts: ratarmount_nfs::NfsOptions,
+) -> std::io::Result<()> {
+    match opts.vers {
+        ratarmount_nfs::NfsVers::V3 => ratarmount_nfs::serve_blocking(source, opts),
+        #[cfg(feature = "nfsv4")]
+        ratarmount_nfs::NfsVers::V4 => ratarmount_nfs::serve_v4_blocking(source, opts),
+    }
+}
+
+fn spawn_nfs_for_opts(
+    source: Arc<dyn MountSource>,
+    opts: ratarmount_nfs::NfsOptions,
+) -> std::io::Result<ratarmount_nfs::NfsServerHandle> {
+    match opts.vers {
+        ratarmount_nfs::NfsVers::V3 => ratarmount_nfs::spawn_nfs_thread(source, opts),
+        #[cfg(feature = "nfsv4")]
+        ratarmount_nfs::NfsVers::V4 => ratarmount_nfs::spawn_nfs4_thread(source, opts),
+    }
+}
+
+fn run_nfs_only(source: Arc<dyn MountSource>, opts: ratarmount_nfs::NfsOptions) {
+    eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
+    if let Err(e) = serve_nfs_blocking(source, opts) {
         eprintln!("error starting NFS server: {e}");
         std::process::exit(1);
     }
@@ -795,23 +861,16 @@ fn run_fuse_and_nfs(
     if foreground {
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
-        let handle = match ratarmount_nfs::spawn_nfs_thread(Arc::clone(&source), nfs_opts) {
+        let ready = nfs_opts.clone();
+        let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("error starting NFS server: {e}");
                 std::process::exit(1);
             }
         };
-        eprintln!(
-            "NFSv3 ({}) on port {}. FUSE at {}",
-            if overlay_arc.is_some() {
-                "rw overlay"
-            } else {
-                "ro"
-            },
-            handle.port,
-            mp.display()
-        );
+        eprintln!("{}", nfs_ready_line(&ready, handle.port));
+        eprintln!("FUSE at {}", mp.display());
         let mount_err = mount_blocking(
             Arc::clone(&source),
             &mp,
@@ -854,7 +913,7 @@ fn run_fuse_and_nfs(
             }
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
-            if let Err(e) = ratarmount_nfs::spawn_nfs_thread(Arc::clone(&source), nfs_opts) {
+            if let Err(e) = spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-nfs-error.log",
                     format!("NFS bind error: {e}\n"),
@@ -1033,7 +1092,13 @@ fn print_features() {
     println!("ratarmount {VERSION} (Rust)");
     println!("features:");
     println!("  fuse: fuser (low-level)");
-    println!("  nfs: nfsserve NFSv3 userspace export (--nfs, --nfs-bind; -w overlay writes)");
+    println!(
+        "  nfs: nfsserve NFSv3 (--nfs, default); NFSv4.1 embednfs (--nfs-vers 4, --features nfsv4, rustc>=1.88)"
+    );
+    #[cfg(feature = "nfsv4")]
+    println!("  nfsv4: compiled");
+    #[cfg(not(feature = "nfsv4"))]
+    println!("  nfsv4: not compiled");
     println!(
         "  compress: gzip/bzip2/xz/zstd/lz4/lzip/lzo/Z/lzma/zlib seekable bodies; plain single-file materialize"
     );
@@ -1069,6 +1134,8 @@ fn print_oss_attributions(full: bool) {
         "regex / thiserror / anyhow / url / tempfile — utilities",
         "reqwest / ssh2 / … — remote backends (http/s3/ssh)",
         "nfsserve / tokio — in-process NFSv3 export (--nfs)",
+        #[cfg(feature = "nfsv4")]
+        "embednfs — in-process NFSv4.1 export (--nfs-vers 4) (MIT)",
     ];
     for s in short {
         println!("  - {s}");
@@ -1654,5 +1721,110 @@ mod nfs_cli_tests {
         assert!(a.nfs);
         assert_eq!(a.nfs_bind, "0.0.0.0:20490");
         assert_eq!(a.paths, vec![PathBuf::from("a.tar"), PathBuf::from("mnt")]);
+    }
+
+    #[test]
+    fn nfs_vers_default_is_3() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "a.tar"]).expect("parse");
+        assert!(a.nfs);
+        assert_eq!(a.nfs_vers, "3");
+        assert_eq!(
+            ratarmount_nfs::parse_nfs_vers(&a.nfs_vers).unwrap(),
+            ratarmount_nfs::NfsVers::V3
+        );
+    }
+
+    /// Regression: required-value `--nfs-vers 4` must not steal the archive.
+    #[test]
+    fn nfs_vers_4_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "--nfs-vers", "4", "testdata.tar.gz"])
+            .expect("parse");
+        assert!(a.nfs);
+        assert_eq!(a.nfs_vers, "4");
+        assert_eq!(a.paths, vec![PathBuf::from("testdata.tar.gz")]);
+    }
+
+    #[test]
+    fn nfs_vers_ignored_without_nfs() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs-vers", "4", "archive.tar.gz", "mnt"])
+            .expect("parse");
+        assert!(!a.nfs);
+        assert_eq!(a.nfs_vers, "4");
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("archive.tar.gz"), PathBuf::from("mnt")]
+        );
+        // Vers gate is only applied when `nfs` is set (see main).
+    }
+
+    /// `--nfs --nfs-vers testdata.tar.gz` treats the archive as the version
+    /// string. clap succeeds; `parse_nfs_vers` then fails (exit 2). Acceptable.
+    #[test]
+    fn nfs_vers_missing_value_exits_2() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "--nfs-vers", "testdata.tar.gz"])
+            .expect("clap treats archive as version value");
+        assert_eq!(a.nfs_vers, "testdata.tar.gz");
+        assert!(a.paths.is_empty());
+        assert!(ratarmount_nfs::parse_nfs_vers(&a.nfs_vers).is_err());
+    }
+
+    #[test]
+    fn nfs_vers_40_rejected() {
+        assert_eq!(
+            ratarmount_nfs::parse_nfs_vers("4.0").unwrap_err(),
+            ratarmount_nfs::NfsVersError::V40NotSupported
+        );
+    }
+
+    #[cfg(not(feature = "nfsv4"))]
+    #[test]
+    fn nfs_vers_4_rejected_without_feature() {
+        assert_eq!(
+            ratarmount_nfs::parse_nfs_vers("4").unwrap_err(),
+            ratarmount_nfs::NfsVersError::FeatureRequired
+        );
+    }
+
+    #[cfg(feature = "nfsv4")]
+    #[test]
+    fn nfs_vers_4_accepted() {
+        assert_eq!(
+            ratarmount_nfs::parse_nfs_vers("4").unwrap(),
+            ratarmount_nfs::NfsVers::V4
+        );
+        assert_eq!(
+            ratarmount_nfs::parse_nfs_vers("4.1").unwrap(),
+            ratarmount_nfs::NfsVers::V4
+        );
+    }
+
+    #[test]
+    fn nfs_vers_ready_line_v3() {
+        let opts = ratarmount_nfs::NfsOptions {
+            bind: "127.0.0.1:20490".parse().unwrap(),
+            vers: ratarmount_nfs::NfsVers::V3,
+            ..ratarmount_nfs::NfsOptions::default()
+        };
+        let line = super::nfs_ready_line(&opts, 20490);
+        assert!(line.contains("NFSv3"), "{line}");
+        assert!(
+            line.contains("vers=3,tcp,nolock,port=20490,mountport=20490"),
+            "{line}"
+        );
+    }
+
+    #[cfg(feature = "nfsv4")]
+    #[test]
+    fn nfs_vers_ready_line_v4() {
+        let opts = ratarmount_nfs::NfsOptions {
+            bind: "127.0.0.1:20490".parse().unwrap(),
+            vers: ratarmount_nfs::NfsVers::V4,
+            ..ratarmount_nfs::NfsOptions::default()
+        };
+        let line = super::nfs_ready_line(&opts, 20490);
+        assert!(line.contains("NFSv4.1"), "{line}");
+        assert!(line.contains("vers=4.1,tcp,port=20490,sec=sys"), "{line}");
+        assert!(!line.contains("mountport="), "{line}");
+        assert!(!line.contains("nolock"), "{line}");
     }
 }
