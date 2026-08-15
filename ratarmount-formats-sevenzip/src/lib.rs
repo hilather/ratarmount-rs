@@ -84,8 +84,8 @@ pub struct SevenZipMountSource {
     packed_cache: Mutex<HashMap<usize, Vec<u8>>>,
     /// folder_index → shared pure-LZMA2 progressive decoder (large solid folders).
     lzma2_decoders: Mutex<HashMap<usize, SharedLzma2Decoder>>,
-    /// (pack_offset, unpack_offset) → file index for O(1) open lookup.
-    entry_by_offsets: HashMap<(u64, u64), usize>,
+    /// Sorted (pack_offset, unpack_offset) → file index (binary search).
+    entry_by_offsets: EntryOffsetTable,
     password: Option<String>,
     /// Encrypted archive mounted without a valid password: list/stat only.
     content_locked: bool,
@@ -223,6 +223,11 @@ impl SevenZipMountSource {
             return false;
         };
         std::sync::Arc::ptr_eq(&entry.path, &pooled)
+    }
+
+    #[cfg(test)]
+    fn entry_offset_table_is_sorted(&self) -> bool {
+        self.entry_by_offsets.entry_offset_table_is_sorted()
     }
 
     pub fn open(
@@ -791,7 +796,7 @@ impl SevenZipMountSource {
         let pack_offset = ud.offsetheader.unwrap_or(0);
         let unpack_offset = ud.offset;
 
-        if let Some(&idx) = self.entry_by_offsets.get(&(pack_offset, unpack_offset)) {
+        if let Some(idx) = self.entry_by_offsets.get(pack_offset, unpack_offset) {
             if let Some(entry) = self.archive.files.get(idx) {
                 let is_link =
                     (file_info.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFLNK;
@@ -962,15 +967,61 @@ impl SevenZipMountSource {
     }
 }
 
-fn entry_offset_map(archive: &SevenZipArchiveInfo) -> HashMap<(u64, u64), usize> {
-    let mut map = HashMap::new();
-    for (i, entry) in archive.files.iter().enumerate() {
-        if entry.is_dir || entry.is_empty_stream {
-            continue;
+/// Sorted `(pack_offset, unpack_offset) → file-table index` for open lookup.
+///
+/// Replaces `HashMap<(u64, u64), usize>` so huge member counts pay a compact
+/// `Vec` + binary search instead of hash-table buckets. Folder / coder graphs
+/// stay on [`SevenZipArchiveInfo`] and are not cloned into this table.
+/// Size / path remain on [`SevenZipFileEntry`] (already allocated at parse).
+#[derive(Debug)]
+struct EntryOffsetTable {
+    keys: Vec<(u64, u64)>,
+    idxs: Vec<usize>,
+}
+
+impl EntryOffsetTable {
+    fn from_unsorted_pairs(pairs: impl IntoIterator<Item = ((u64, u64), usize)>) -> Self {
+        let mut items: Vec<((u64, u64), usize)> = pairs.into_iter().collect();
+        // Stable sort: last insert wins on duplicate keys (HashMap parity).
+        items.sort_by_key(|(k, _)| *k);
+        let mut keys = Vec::with_capacity(items.len());
+        let mut idxs = Vec::with_capacity(items.len());
+        for (k, i) in items {
+            if keys.last() == Some(&k) {
+                *idxs.last_mut().unwrap() = i;
+            } else {
+                keys.push(k);
+                idxs.push(i);
+            }
         }
-        map.insert((entry.pack_offset, entry.unpack_offset), i);
+        Self { keys, idxs }
     }
-    map
+
+    fn get(&self, pack: u64, unpack: u64) -> Option<usize> {
+        self.keys
+            .binary_search(&(pack, unpack))
+            .ok()
+            .map(|i| self.idxs[i])
+    }
+
+    fn len(&self) -> usize {
+        self.keys.len()
+    }
+
+    #[cfg(test)]
+    fn entry_offset_table_is_sorted(&self) -> bool {
+        self.keys.windows(2).all(|w| w[0] <= w[1]) && self.keys.len() == self.idxs.len()
+    }
+}
+
+fn entry_offset_map(archive: &SevenZipArchiveInfo) -> EntryOffsetTable {
+    EntryOffsetTable::from_unsorted_pairs(archive.files.iter().enumerate().filter_map(|(i, e)| {
+        if e.is_dir || e.is_empty_stream {
+            None
+        } else {
+            Some(((e.pack_offset, e.unpack_offset), i))
+        }
+    }))
 }
 
 /// Serialize live archive graph into a durable nested blob sidecar.
@@ -1555,6 +1606,196 @@ mod tests {
         let root = std::env::var("RATARMOUNT_PY_ROOT")
             .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
         PathBuf::from(root).join("tests").join(name)
+    }
+
+    fn synthetic_offset_entry(
+        path: &str,
+        pack: u64,
+        unpack: u64,
+        is_dir: bool,
+        is_empty_stream: bool,
+    ) -> SevenZipFileEntry {
+        SevenZipFileEntry {
+            path: path.into(),
+            size: if is_dir || is_empty_stream { 0 } else { 8 },
+            mtime: 0.0,
+            mode: if is_dir { 0o040755 } else { 0o100644 },
+            is_dir,
+            is_empty_stream,
+            is_empty_file: is_empty_stream,
+            folder_index: if is_dir || is_empty_stream {
+                None
+            } else {
+                Some(0)
+            },
+            unpack_offset: unpack,
+            pack_offset: pack,
+            pack_size: 8,
+            pack_stream_index: 0,
+        }
+    }
+
+    /// Unit: shipped offset table is sorted binary-search (not HashMap-only).
+    #[test]
+    fn entry_offset_table_finds_unsorted_inserts_and_rejects_missing() {
+        // Unsorted insert order (high pack first) plus dirs/empty streams that
+        // must not appear in the table. Last of a duplicate key wins.
+        let mut files = vec![
+            synthetic_offset_entry("dir", 0, 0, true, false),
+            synthetic_offset_entry("empty", 1, 0, false, true),
+        ];
+        let mut expected: Vec<((u64, u64), usize)> = Vec::new();
+        // 80 members, reverse pack order so construction is unsorted.
+        for n in (0u64..80).rev() {
+            let pack = n.wrapping_mul(4099).wrapping_add(17);
+            let unpack = (79 - n).wrapping_mul(8);
+            let path = format!("m{n:02}");
+            files.push(synthetic_offset_entry(&path, pack, unpack, false, false));
+            expected.push(((pack, unpack), files.len() - 1));
+        }
+        // Duplicate key: last insert overwrites (HashMap parity).
+        files.push(synthetic_offset_entry(
+            "dup-first",
+            999_999,
+            7,
+            false,
+            false,
+        ));
+        let dup_first_idx = files.len() - 1;
+        files.push(synthetic_offset_entry("dup-last", 999_999, 7, false, false));
+        let dup_last_idx = files.len() - 1;
+
+        let archive = SevenZipArchiveInfo {
+            after_header: 32,
+            pack_pos_base: 32,
+            folders: vec![],
+            pack_info: None,
+            files,
+            solid: false,
+        };
+        let table = entry_offset_map(&archive);
+        assert!(
+            table.entry_offset_table_is_sorted(),
+            "shipped EntryOffsetTable keys must be sorted for binary search"
+        );
+        assert_eq!(
+            table.len(),
+            expected.len() + 1,
+            "dirs/empty skipped; dup collapsed"
+        );
+        for (key, idx) in &expected {
+            assert_eq!(
+                table.get(key.0, key.1),
+                Some(*idx),
+                "get({key:?}) must return file index {idx}"
+            );
+        }
+        assert_eq!(
+            table.get(999_999, 7),
+            Some(dup_last_idx),
+            "duplicate key must keep last insert, not {dup_first_idx}"
+        );
+        assert_eq!(table.get(u64::MAX, 0), None);
+        assert_eq!(table.get(0, u64::MAX), None);
+        assert_eq!(table.get(1, 2), None);
+        // Direct constructor (same type as production), shuffled pairs.
+        let shuffled = {
+            let mut p = expected.clone();
+            p.reverse();
+            p.push(((3, 1), 1234));
+            p.push(((3, 0), 99));
+            p
+        };
+        let from_pairs = EntryOffsetTable::from_unsorted_pairs(shuffled);
+        assert!(from_pairs.entry_offset_table_is_sorted());
+        assert_eq!(from_pairs.get(3, 1), Some(1234));
+        assert_eq!(from_pairs.get(3, 0), Some(99));
+        assert_eq!(from_pairs.get(4, 0), None);
+        for (key, idx) in &expected {
+            assert_eq!(from_pairs.get(key.0, key.1), Some(*idx));
+        }
+    }
+
+    /// Regression: multi-member 7z list + random open via sorted offset table.
+    #[test]
+    fn regression_multi_member_list_and_random_open_via_offset_table() {
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz = ["7z", "7za"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok());
+        let Some(sevenz) = sevenz else {
+            eprintln!("skip: 7z/7za unavailable for multi-member offset-table fixture");
+            return;
+        };
+
+        const N: usize = 32;
+        let mut expected: Vec<(String, Vec<u8>)> = Vec::with_capacity(N);
+        for i in 0..N {
+            let name = format!("f{i:02}.txt");
+            let body = format!("member-{i}-payload\n").into_bytes();
+            std::fs::write(dir.path().join(&name), &body).unwrap();
+            expected.push((format!("/{name}"), body));
+        }
+        let archive = dir.path().join("multi-offset.7z");
+        let mut cmd = std::process::Command::new(sevenz);
+        cmd.args(["a", "-t7z", "-m0=Copy", "-ms=off"])
+            .arg(&archive)
+            .current_dir(dir.path());
+        for i in 0..N {
+            cmd.arg(format!("f{i:02}.txt"));
+        }
+        let out = cmd.output().expect("run 7z");
+        if !out.status.success() || !archive.exists() {
+            eprintln!(
+                "skip: 7z create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, None, &opts, "0.1.0", true)
+            .expect("open multi-member 7z");
+        assert!(
+            m.entry_offset_table_is_sorted(),
+            "live mount offset table must stay sorted"
+        );
+        assert!(
+            m.entry_by_offsets.len() >= N,
+            "offset table must index all store members, got {}",
+            m.entry_by_offsets.len()
+        );
+
+        let names: Vec<String> = match m.list("/") {
+            Some(ListResult::Infos(infos)) => infos.keys().cloned().collect(),
+            other => panic!("expected Infos list, got {other:?}"),
+        };
+        for (path, _) in &expected {
+            let base = path.trim_start_matches('/');
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n == base || n == path || n.ends_with(base)),
+                "list(\"/\") missing {base}, have {names:?}"
+            );
+        }
+
+        let sample = [0usize, 1, N / 2, N - 2, N - 1];
+        for &i in &sample {
+            let (path, body) = &expected[i];
+            let fi = m.lookup(path, 0).unwrap_or_else(|| {
+                panic!("lookup {path}");
+            });
+            let mut r = m
+                .open(&fi, 0)
+                .unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let mut got = Vec::new();
+            r.read_to_end(&mut got).unwrap();
+            assert_eq!(&got, body, "random open {path} must match stored bytes");
+        }
     }
 
     #[test]
