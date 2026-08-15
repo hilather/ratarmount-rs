@@ -75,6 +75,21 @@ pub fn spawn_signal_nfs_stop(stop: NfsStop) {
         .expect("signal stopper thread");
 }
 
+/// Watch [`term_requested`] and unmount FUSE so `mount_blocking` returns
+/// (then the caller can `--commit-overlay-on-exit`). Replaces default SIGINT
+/// terminate — without this, Ctrl-C only sets a flag and the mount stays up.
+pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
+    thread::Builder::new()
+        .name("ratarmount-fuse-signal".into())
+        .spawn(move || {
+            while !GOT_TERM.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            let _ = ratarmount_fuse::unmount(&mp);
+        })
+        .expect("fuse signal unmount thread");
+}
+
 pub fn spawn_interval_commits(
     overlay: Arc<WriteOverlay>,
     archive: PathBuf,
@@ -186,6 +201,11 @@ pub fn maybe_commit_on_exit(overlay: Option<&WriteOverlay>, archive: Option<&Pat
 }
 
 #[cfg(test)]
+pub(crate) fn set_term_flag_for_test(v: bool) {
+    GOT_TERM.store(v, Ordering::SeqCst);
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -208,5 +228,18 @@ mod tests {
             Some(Duration::from_secs(3600))
         );
         assert_eq!(parse_interval("3").unwrap(), Some(Duration::from_secs(3)));
+    }
+
+    #[test]
+    fn fuse_unmount_watcher_runs_after_term_flag() {
+        let dir = tempfile::tempdir().unwrap();
+        let mp = dir.path().join("mnt");
+        std::fs::create_dir_all(&mp).unwrap();
+        set_term_flag_for_test(false);
+        spawn_signal_fuse_unmount(mp);
+        set_term_flag_for_test(true);
+        // Watcher must observe the flag and return (unmount of a non-mount is fine).
+        thread::sleep(Duration::from_millis(200));
+        set_term_flag_for_test(false);
     }
 }

@@ -920,6 +920,108 @@ mod tests {
         assert!(!names.iter().any(|n| n == "src.txt"), "{names:?}");
     }
 
+    /// Regression: interval live commit wipes overlay files; a later NFS READ
+    /// must re-lookup the new TAR base (not open a stale overlay: FileInfo).
+    #[test]
+    fn overlay_commit_live_then_nfs_read_readdir() {
+        use std::fs;
+        use std::process::Command as StdCommand;
+        use std::sync::Arc;
+
+        let gnu = StdCommand::new("tar").arg("--version").output();
+        let gnu_ok = gnu
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+            .unwrap_or(false);
+        if !gnu_ok {
+            eprintln!("skip: GNU tar missing");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let expected = dir.path().join("expected.bin");
+        fs::write(
+            &expected,
+            format!("nfs-live-commit-{}\n", std::process::id()),
+        )
+        .unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        fs::write(tree.join("seed.txt"), b"seed\n").unwrap();
+        let tar = dir.path().join("a.tar");
+        assert!(StdCommand::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&tree)
+            .arg("seed.txt")
+            .status()
+            .unwrap()
+            .success());
+
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let mut materialised = None;
+        let base = ratarmount_formats_tar::SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &opts,
+            "test",
+            &mut materialised,
+        )
+        .expect("index tar");
+        let ov_dir = dir.path().join("ov");
+        fs::create_dir_all(&ov_dir).unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).expect("overlay"),
+        );
+        let nfs = RatarmountNfs::with_overlay(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            0,
+            Some(Arc::clone(&ov)),
+        );
+
+        let payload = fs::read(&expected).unwrap();
+        let (id, _) = nfs
+            .create_sync(1, &name("tick.bin"), sattr3::default())
+            .expect("create");
+        nfs.write_sync(id, 0, &payload).expect("write");
+        let (before, _) = nfs.read_sync(id, 0, 64).expect("read overlay");
+        assert_eq!(before, payload);
+
+        ov.commit_live_uncompressed_tar(&tar, |p| {
+            let mut mat = None;
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                p, p, None, &opts, "test", &mut mat,
+            )
+            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+            .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
+        })
+        .expect("commit_live");
+
+        let listing = nfs.readdir_sync(1, 0, 32).expect("readdir after commit");
+        let names: Vec<String> = listing
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name.as_ref()).into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "tick.bin"),
+            "NFS readdir missing committed name: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "seed.txt"), "{names:?}");
+
+        let (got, _) = nfs
+            .read_sync(id, 0, 64)
+            .expect("NFS read after live commit");
+        assert_eq!(
+            got, payload,
+            "NFS cat after live commit must match overlay file bytes"
+        );
+    }
+
     #[test]
     fn overlay_truncate_and_unlink_invalidate_reader() {
         let mut base = Synth::new();

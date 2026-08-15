@@ -840,14 +840,23 @@ impl MountSource for WriteOverlay {
             if let Some(path) = s.strip_prefix("overlay:") {
                 let real = self.realpath(path);
                 self.ensure_under_root(&real)?;
-                let f = FsOpenOptions::new()
+                match FsOpenOptions::new()
                     .read(true)
                     .custom_flags(libc::O_NOFOLLOW)
-                    .open(&real)?;
-                return Ok(Box::new(f));
+                    .open(&real)
+                {
+                    Ok(f) => return Ok(Box::new(f)),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        // Live commit wiped the overlay file; serve from the new base.
+                        if let Some(fi) = self.current_base().lookup(path, 0) {
+                            return self.current_base().open(&fi, buffering);
+                        }
+                        return Err(e);
+                    }
+                    Err(e) => return Err(e),
+                }
             }
         }
-        // If real overlay file exists for a path we cannot recover, fall back to base.
         self.current_base().open(file_info, buffering)
     }
 

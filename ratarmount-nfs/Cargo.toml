@@ -26,3 +26,4 @@ bytes = { version = "1", optional = true }
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+ratarmount-formats-tar.workspace = true

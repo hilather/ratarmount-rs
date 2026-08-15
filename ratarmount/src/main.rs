@@ -936,6 +936,9 @@ fn run_fuse_and_nfs(
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
         overlay_commit::spawn_signal_nfs_stop(stop.clone());
+        if live_archive.is_some() {
+            overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+        }
         if let (Some(ov), Some(archive), Some(dur)) =
             (overlay_arc.clone(), live_archive.clone(), commit_interval)
         {
@@ -998,6 +1001,10 @@ fn run_fuse_and_nfs(
             }
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
+            overlay_commit::spawn_signal_nfs_stop(stop.clone());
+            if live_archive.is_some() {
+                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            }
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)
             {
@@ -1055,6 +1062,9 @@ fn run_fuse_only(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
 ) {
+    if live_archive.is_some() {
+        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+    }
     if foreground {
         let mount_err = mount_blocking(
             source,
@@ -1093,6 +1103,9 @@ fn run_fuse_only(
             let _ = setsid();
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
+            }
+            if live_archive.is_some() {
+                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)

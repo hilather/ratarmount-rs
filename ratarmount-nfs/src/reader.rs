@@ -8,7 +8,13 @@ use std::io;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use ratarmount_core::{FileInfo, MountSource};
+use ratarmount_core::{FileInfo, MountSource, UserData};
+
+fn fi_is_overlay_tagged(fi: &FileInfo) -> bool {
+    fi.userdata
+        .iter()
+        .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:")))
+}
 
 use crate::inode::InodeTable;
 
@@ -206,10 +212,7 @@ impl ReaderLru {
         {
             let mut map = self.slots.lock().expect("reader lru");
             if let Some(slot) = map.get_mut(&id) {
-                let overlay_tagged = slot.fi.userdata.iter().any(|u| {
-                    matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:"))
-                });
-                if !overlay_tagged {
+                if !fi_is_overlay_tagged(&slot.fi) {
                     slot.last_used = Instant::now();
                     return Ok((slot.fi.clone(), Arc::clone(&slot.state)));
                 }
@@ -224,7 +227,15 @@ impl ReaderLru {
         let fi = if path == "/" {
             ratarmount_core::create_root_file_info()
         } else if let Some(c) = inodes.cached_lookup_fi(id) {
-            c
+            // Overlay-tagged cache is stale after live commit wipes the folder.
+            if fi_is_overlay_tagged(&c) {
+                inodes.clear_lookup_fi(id);
+                source
+                    .lookup(&path, 0)
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stale fileid"))?
+            } else {
+                c
+            }
         } else {
             source
                 .lookup(&path, 0)
