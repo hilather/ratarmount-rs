@@ -1108,16 +1108,19 @@ mod tests {
         let (before, _) = nfs.read_sync(id, 0, 64).expect("read overlay");
         assert_eq!(before, payload);
 
-        ov.commit_live(&archive, |p| {
-            let body = ratarmount_compress::open_seekable_zstd(p)
-                .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))?;
-            ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
-                p, body, None, &opts, "test",
-            )
-            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
-            .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
-        })
-        .expect("commit_live");
+        assert!(
+            ov.commit_live(&archive, |p| {
+                let body = ratarmount_compress::open_seekable_zstd(p)
+                    .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))?;
+                ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                    p, body, None, &opts, "test",
+                )
+                .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+                .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
+            })
+            .expect("commit_live"),
+            "persist+swap must run"
+        );
 
         let listing = nfs.readdir_sync(1, 0, 32).expect("readdir after commit");
         let names: Vec<String> = listing
@@ -1130,6 +1133,7 @@ mod tests {
             "NFS readdir missing committed name: {names:?}"
         );
         assert!(names.iter().any(|n| n == "seed.txt"), "{names:?}");
+        assert!(names.iter().any(|n| n == "more.txt"), "{names:?}");
 
         let (got, _) = nfs
             .read_sync(id, 0, 64)
