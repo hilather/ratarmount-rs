@@ -466,7 +466,10 @@ impl SqliteIndex {
                 if name.is_empty() {
                     continue;
                 }
-                let offsetheader: i64 = row.get(2)?;
+                // NULL offsetheader (Python-written non-TAR rows) must not
+                // fail the whole warm open; -1 is the MemIndex "none" sentinel.
+                let offsetheader: Option<i64> = row.get(2)?;
+                let offsetheader = offsetheader.unwrap_or(-1);
                 let offset: i64 = row.get(3)?;
                 let size: i64 = row.get(4)?;
                 let mtime: f64 = row.get(5)?;
@@ -1309,7 +1312,12 @@ impl SqliteIndex {
                 if name.is_empty() {
                     continue;
                 }
-                let offsetheader: i64 = row.get(1)?;
+                // offsetheader is nullable (Python writers leave it NULL for
+                // non-TAR rows); read it like list()/lookup() do so one such
+                // row cannot fail the whole directory listing. NULL maps to
+                // the -1 sentinel (CompactOpenCookie treats < 0 as none).
+                let offsetheader: Option<i64> = row.get(1)?;
+                let offsetheader = offsetheader.unwrap_or(-1);
                 let offset: i64 = row.get(2)?;
                 let size: i64 = row.get(3)?;
                 let mode: i64 = row.get(4)?;
@@ -2704,5 +2712,73 @@ mod tests {
                 .expect("cookie");
             assert_eq!(d.cookie, cookie);
         }
+    }
+
+    /// Regression: a NULL `offsetheader` row (Python writers emit it for
+    /// non-TAR members) must not fail `list_dirents`/`list_mode` on the SQL
+    /// path or `load_mem_index` on warm open — `list()`/`lookup()` already
+    /// tolerate NULL via `Option<i64>`.
+    #[test]
+    fn regression_null_offsetheader_rows_still_list() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        // Raw SQL: FileRow cannot express NULL offsetheader.
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'nullrow.txt', NULL, 0, 3, 1.0, 33188, 0, '',
+                           0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'plain.txt', 512, 512, 5, 1.0, 33188, 0, '',
+                           0, 0, 1, 0, 0, 0)"#,
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        idx.commit_write().unwrap();
+
+        // Pre-seal SQL fallback (mem projection not built yet).
+        let dents = idx
+            .list_dirents("/")
+            .expect("list_dirents must not error on NULL offsetheader")
+            .expect("root listing present");
+        let names: Vec<&str> = dents.iter().map(|d| d.name.as_str()).collect();
+        assert!(names.contains(&"nullrow.txt"), "{names:?}");
+        assert!(names.contains(&"plain.txt"), "{names:?}");
+        let nullrow = dents.iter().find(|d| d.name == "nullrow.txt").unwrap();
+        assert_eq!(nullrow.size, 3);
+        assert!(
+            nullrow.cookie.offsetheader < 0,
+            "NULL maps to the -1 no-header sentinel, got {}",
+            nullrow.cookie.offsetheader
+        );
+        let modes = idx
+            .list_mode("/")
+            .expect("list_mode must not error on NULL offsetheader")
+            .expect("root modes present");
+        assert_eq!(modes.len(), 2);
+
+        // Warm path: sealing must survive the NULL row too.
+        let idx = idx.into_read_only().expect("seal with NULL row");
+        let dents = idx.list_dirents("/").unwrap().expect("dirents after seal");
+        assert_eq!(dents.len(), 2);
+        let nullrow = dents.iter().find(|d| d.name == "nullrow.txt").unwrap();
+        assert_eq!(nullrow.size, 3);
+        assert!(nullrow.cookie.offsetheader < 0);
+        // Fat path parity: lookup still yields no header offset for the row.
+        let fi = idx.lookup("/nullrow.txt", 0).unwrap().expect("lookup");
+        assert_eq!(fi.size, 3);
+        let Some(ratarmount_core::UserData::Tar(ud)) = fi.userdata.first() else {
+            panic!("expected Tar userdata");
+        };
+        assert_eq!(ud.offsetheader, None);
     }
 }
