@@ -4,6 +4,8 @@ use std::collections::{HashMap, HashSet};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
+use ratarmount_core::normpath;
+
 use crate::{
     decode_bytes, pad512, parse_name, parse_octal, parse_pax_records, BLOCK_SIZE,
     MAX_HEADER_PAYLOAD_BYTES,
@@ -21,12 +23,67 @@ const PAX_HDR_PATH_MAX: usize = USTAR_NAME_LEN - 13;
 ///
 /// `stream_offset` is the uncompressed TAR offset of `suffix` byte 0.
 /// Returns the byte offset in `suffix` of the first of those two blocks.
+///
+/// When the suffix *ends* in at least two aligned zero blocks (GNU tar record
+/// padding is typically 20 blocks), this is the start of that trailing run —
+/// not the last overlapping 1024-zero window inside the padding. Only if the
+/// suffix does not end in two zero blocks do we fall back to the last interior
+/// pair (concatenated-TAR frames that were truncated before a new EOF).
 pub fn find_last_tar_eof<R: Read + Seek>(
     suffix: &mut R,
     stream_offset: u64,
 ) -> io::Result<Option<u64>> {
     let len = suffix.seek(SeekFrom::End(0))?;
     let align = stream_align(stream_offset);
+    if let Some(start) = trailing_zero_eof(suffix, align, len)? {
+        return Ok(Some(start));
+    }
+    last_interior_two_zero(suffix, align, len)
+}
+
+/// Start of a trailing aligned zero-block run of at least 1024 bytes, if the
+/// suffix ends in zeros (including a short leftover after the last full block).
+fn trailing_zero_eof<R: Read + Seek>(
+    suffix: &mut R,
+    align: u64,
+    len: u64,
+) -> io::Result<Option<u64>> {
+    if len < align.saturating_add(1024) {
+        return Ok(None);
+    }
+    let nblocks = (len - align) / BLOCK_SIZE;
+    if nblocks < 2 {
+        return Ok(None);
+    }
+    let last_block = align + (nblocks - 1) * BLOCK_SIZE;
+    let leftover_off = last_block + BLOCK_SIZE;
+    if leftover_off < len && !region_all_zero(suffix, leftover_off, len - leftover_off)? {
+        return Ok(None);
+    }
+    let mut run_start: Option<u64> = None;
+    let mut i = last_block;
+    loop {
+        if !region_all_zero(suffix, i, BLOCK_SIZE)? {
+            break;
+        }
+        run_start = Some(i);
+        if i < align + BLOCK_SIZE {
+            break;
+        }
+        i -= BLOCK_SIZE;
+    }
+    match run_start {
+        Some(s) if last_block + BLOCK_SIZE - s >= 1024 => Ok(Some(s)),
+        _ => Ok(None),
+    }
+}
+
+/// Last stream-aligned 1024-zero window that is *not* a trailing padding run.
+fn last_interior_two_zero<R: Read + Seek>(
+    suffix: &mut R,
+    align: u64,
+    len: u64,
+) -> io::Result<Option<u64>> {
     if len < align.saturating_add(1024) {
         return Ok(None);
     }
@@ -46,6 +103,24 @@ pub fn find_last_tar_eof<R: Read + Seek>(
         i -= BLOCK_SIZE;
     }
     Ok(None)
+}
+
+fn region_all_zero<R: Read + Seek>(r: &mut R, start: u64, n: u64) -> io::Result<bool> {
+    if n == 0 {
+        return Ok(true);
+    }
+    r.seek(SeekFrom::Start(start))?;
+    let mut remain = n;
+    let mut buf = [0u8; 512];
+    while remain > 0 {
+        let chunk = remain.min(512) as usize;
+        r.read_exact(&mut buf[..chunk])?;
+        if buf[..chunk].iter().any(|&b| b != 0) {
+            return Ok(false);
+        }
+        remain -= chunk as u64;
+    }
+    Ok(true)
 }
 
 /// Copy kept last-window bytes, drop deleted names (with their PAX/`L`/`K` helpers),
@@ -102,13 +177,38 @@ where
             stats.bytes_kept = copy_span(suffix, out, 0, copy_end)?;
         }
         Some(first_pos) => {
-            let mut bytes_kept = copy_span(suffix, out, 0, first_pos)?;
             let members = collect_members(suffix, first_pos, stream_offset, opts.encoding)?;
             let deleted: HashSet<String> = opts
                 .deleted_paths
                 .iter()
                 .map(|p| normalize_archive_rel_path(p))
                 .collect();
+            let mut seen: HashSet<String> = HashSet::new();
+            for m in &members {
+                if m.typeflag == b'g' {
+                    continue;
+                }
+                let norm = normalize_archive_rel_path(&m.logical_path);
+                if !norm.is_empty() && deleted.contains(&norm) {
+                    seen.insert(norm);
+                }
+            }
+            let mut missing: Vec<&str> = deleted
+                .iter()
+                .filter(|p| !p.is_empty() && !seen.contains(*p))
+                .map(String::as_str)
+                .collect();
+            if !missing.is_empty() {
+                missing.sort_unstable();
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "last-window delete path(s) not found in the suffix: {}",
+                        missing.join(", ")
+                    ),
+                ));
+            }
+            let mut bytes_kept = copy_span(suffix, out, 0, first_pos)?;
             let mut copy_from = first_pos;
             for m in &members {
                 if m.typeflag == b'g' {
@@ -161,6 +261,8 @@ pub struct TarMemberCursor<R> {
     pending: Option<PendingHelper>,
     eof_off: Option<u64>,
     reader_len: u64,
+    /// Set when `new` cannot measure the suffix; `next_member` surfaces it.
+    init_err: Option<io::Error>,
 }
 
 struct PendingHelper {
@@ -170,8 +272,13 @@ struct PendingHelper {
 
 impl<R: Read + Seek> TarMemberCursor<R> {
     pub fn new(mut reader: R, start_pos: u64, stream_offset: u64, encoding: &str) -> Self {
-        let reader_len = reader.seek(SeekFrom::End(0)).unwrap_or(0);
-        let eof_off = find_last_tar_eof(&mut reader, stream_offset).ok().flatten();
+        let (reader_len, eof_off, init_err) = match reader.seek(SeekFrom::End(0)) {
+            Ok(len) => match find_last_tar_eof(&mut reader, stream_offset) {
+                Ok(eof) => (len, eof, None),
+                Err(e) => (len, None, Some(e)),
+            },
+            Err(e) => (0, None, Some(e)),
+        };
         let encoding = if encoding.trim().is_empty() {
             "utf-8".to_string()
         } else {
@@ -185,6 +292,7 @@ impl<R: Read + Seek> TarMemberCursor<R> {
             pending: None,
             eof_off,
             reader_len,
+            init_err,
         }
     }
 
@@ -192,6 +300,9 @@ impl<R: Read + Seek> TarMemberCursor<R> {
     /// Pending typeflag `x` / `L` / `K` are consumed into the returned member
     /// (their raw byte spans are recorded so a drop can skip them too).
     pub fn next_member(&mut self) -> io::Result<Option<TarRawMember>> {
+        if let Some(e) = self.init_err.take() {
+            return Err(e);
+        }
         loop {
             if self.at_stop() {
                 return Ok(None);
@@ -220,6 +331,15 @@ impl<R: Read + Seek> TarMemberCursor<R> {
             let size = parse_octal(&header[124..136]).unwrap_or(0);
 
             if typeflag == b'g' {
+                // Pathological: g between x/L/K and the file. Folding g into the
+                // next file's raw span would drop it; leaving the helper poisons
+                // the following member. GNU tar does not emit this layout.
+                if self.pending.is_some() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "global PAX g between pending extended header and file",
+                    ));
+                }
                 let recs = self.read_helper_body(size, "PAX")?;
                 let parsed = parse_pax_records(&recs);
                 self.pax_global.extend(parsed.map);
@@ -395,12 +515,14 @@ pub fn write_tar_eof<W: Write>(out: &mut W) -> io::Result<()> {
     out.write_all(&[0u8; 1024])
 }
 
-/// Strip leading `./` / `/` and trailing `/` for stable path matching.
+/// Archive-relative path matching: same collapse as the indexer (`normpath`)
+/// with a leading `/` stripped so overlay delete keys line up with tape names.
 pub fn normalize_archive_rel_path(path: &str) -> String {
-    path.trim_start_matches('/')
-        .trim_start_matches("./")
-        .trim_end_matches('/')
-        .to_string()
+    let mut full = path.trim_end_matches('/').to_string();
+    while full.starts_with("./") {
+        full = full[2..].to_string();
+    }
+    normpath(&full).trim_start_matches('/').to_string()
 }
 
 fn stream_align(stream_offset: u64) -> u64 {
@@ -507,11 +629,11 @@ fn write_raw_ustar_header<W: Write>(out: &mut W, f: UstarHeaderFields<'_>) -> io
     let mut h = [0u8; 512];
     let nlen = f.name.len().min(USTAR_NAME_LEN);
     h[..nlen].copy_from_slice(&f.name[..nlen]);
-    write_octal(&mut h[100..108], u64::from(f.mode));
-    write_octal(&mut h[108..116], u64::from(f.uid));
-    write_octal(&mut h[116..124], u64::from(f.gid));
-    write_octal(&mut h[124..136], f.size);
-    write_octal(&mut h[136..148], f.mtime);
+    write_octal(&mut h[100..108], u64::from(f.mode))?;
+    write_octal(&mut h[108..116], u64::from(f.uid))?;
+    write_octal(&mut h[116..124], u64::from(f.gid))?;
+    write_octal(&mut h[124..136], f.size)?;
+    write_octal(&mut h[136..148], f.mtime)?;
     h[156] = f.typeflag;
     let llen = f.linkname.len().min(USTAR_LINK_LEN);
     h[157..157 + llen].copy_from_slice(&f.linkname[..llen]);
@@ -524,16 +646,27 @@ fn write_raw_ustar_header<W: Write>(out: &mut W, f: UstarHeaderFields<'_>) -> io
     out.write_all(&h)
 }
 
-fn write_octal(dst: &mut [u8], value: u64) {
+/// Max value that fits in `digits` octal digits (`8^digits - 1`).
+fn octal_digit_max(digits: u32) -> u64 {
+    (1u64 << (3 * digits)) - 1
+}
+
+fn write_octal(dst: &mut [u8], value: u64) -> io::Result<()> {
     let width = dst.len();
     if width == 0 {
-        return;
+        return Ok(());
     }
-    let s = format!("{:0width$o}", value, width = width - 1);
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(width - 1);
-    dst[..n].copy_from_slice(&bytes[..n]);
+    let digits = width - 1;
+    let s = format!("{value:0digits$o}");
+    if s.len() > digits {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("octal value {value} does not fit in {digits} digits"),
+        ));
+    }
+    dst[..s.len()].copy_from_slice(s.as_bytes());
     dst[width - 1] = 0;
+    Ok(())
 }
 
 fn write_padding<W: Write>(out: &mut W, data_len: u64) -> io::Result<()> {
@@ -609,8 +742,17 @@ fn write_member_headers<W: Write>(
         .map(|t| t.len() > USTAR_LINK_LEN)
         .unwrap_or(false);
     let need_pax_size = body_size > USTAR_MAX_SIZE;
+    let need_pax_uid = u64::from(member.uid) > octal_digit_max(7);
+    let need_pax_gid = u64::from(member.gid) > octal_digit_max(7);
+    let need_pax_mtime = member.mtime > octal_digit_max(11);
 
-    if need_pax_path || need_pax_link || need_pax_size {
+    if need_pax_path
+        || need_pax_link
+        || need_pax_size
+        || need_pax_uid
+        || need_pax_gid
+        || need_pax_mtime
+    {
         let mut pax_body = Vec::new();
         if need_pax_path {
             pax_body.extend(encode_pax_record("path", path.as_bytes())?);
@@ -624,6 +766,21 @@ fn write_member_headers<W: Write>(
         if need_pax_size {
             size_txt = body_size.to_string();
             pax_body.extend(encode_pax_record("size", size_txt.as_bytes())?);
+        }
+        let uid_txt;
+        if need_pax_uid {
+            uid_txt = member.uid.to_string();
+            pax_body.extend(encode_pax_record("uid", uid_txt.as_bytes())?);
+        }
+        let gid_txt;
+        if need_pax_gid {
+            gid_txt = member.gid.to_string();
+            pax_body.extend(encode_pax_record("gid", gid_txt.as_bytes())?);
+        }
+        let mtime_txt;
+        if need_pax_mtime {
+            mtime_txt = member.mtime.to_string();
+            pax_body.extend(encode_pax_record("mtime", mtime_txt.as_bytes())?);
         }
         let pax_name = pax_header_name(path);
         write_raw_ustar_header(
@@ -663,9 +820,9 @@ fn write_member_headers<W: Write>(
             typeflag,
             linkname: link_field,
             mode: member.mode,
-            uid: member.uid,
-            gid: member.gid,
-            mtime: member.mtime,
+            uid: if need_pax_uid { 0 } else { member.uid },
+            gid: if need_pax_gid { 0 } else { member.gid },
+            mtime: if need_pax_mtime { 0 } else { member.mtime },
         },
     )
 }
@@ -984,10 +1141,16 @@ mod tests {
             &mut out,
         )
         .expect("append-only mid-member");
+        let eof = find_last_tar_eof(&mut Cursor::new(suffix.clone()), mid)
+            .expect("eof")
+            .expect("two-zero eof in suffix");
+        let prefix = &suffix[..eof as usize];
         assert!(
-            out.windows(extra.len()).any(|w| w == extra),
-            "appended payload missing from rewrite output"
+            out.starts_with(prefix),
+            "mid-member opaque prefix must be kept up to the old EOF"
         );
+        let expected_tail = pack(&[member_file("extra.txt", extra)]);
+        assert_eq!(&out[prefix.len()..], expected_tail.as_slice());
 
         let mut deleted = HashSet::new();
         deleted.insert("a.bin".to_string());
@@ -1127,5 +1290,193 @@ mod tests {
         assert_eq!(normalize_archive_rel_path("/./foo/bar/"), "foo/bar");
         assert_eq!(normalize_archive_rel_path("./a"), "a");
         assert_eq!(normalize_archive_rel_path("a/b"), "a/b");
+        assert_eq!(normalize_archive_rel_path("foo/./bar"), "foo/bar");
+        assert_eq!(normalize_archive_rel_path("foo//bar"), "foo/bar");
+        assert_eq!(normalize_archive_rel_path("foo/../bar"), "bar");
+    }
+
+    /// Regression: GNU tar record padding (10 KiB / 20-block) must not hide appended members.
+    #[test]
+    fn rewrite_gnu_record_padding_append_visible() {
+        let keep = b"keep-payload";
+        let extra = b"after-padding";
+        let mut archive = pack(&[member_file("keep.txt", keep)]);
+        let real_eof = archive.len() as u64 - 1024;
+        archive.extend(std::iter::repeat_n(0u8, 16 * 512));
+        let padded_len = archive.len() as u64;
+
+        let found = find_last_tar_eof(&mut Cursor::new(archive.clone()), 0).expect("eof");
+        assert_eq!(found, Some(real_eof));
+        assert_ne!(found, Some(padded_len - 1024));
+
+        let empty = HashSet::new();
+        let append = [member_file("extra.txt", extra)];
+        let mut out = Vec::new();
+        rewrite_tar_suffix(
+            &mut Cursor::new(archive),
+            0,
+            &RewriteTarSuffix {
+                deleted_paths: &empty,
+                append: &append,
+                encoding: "utf-8",
+            },
+            &mut out,
+        )
+        .expect("rewrite padded");
+
+        let expected = pack(&[
+            member_file("keep.txt", keep),
+            member_file("extra.txt", extra),
+        ]);
+        assert_eq!(out, expected);
+
+        let m = open_mem(out);
+        assert_eq!(read_path(&m, "/keep.txt"), keep);
+        assert_eq!(read_path(&m, "/extra.txt"), extra);
+    }
+
+    /// Unmatched last-window deletes must fail rather than append a silent second version.
+    #[test]
+    fn rewrite_unmatched_delete_errors() {
+        let archive = pack(&[member_file("keep.txt", b"x")]);
+        let mut deleted = HashSet::new();
+        deleted.insert("missing.txt".to_string());
+        let err = rewrite_tar_suffix(
+            &mut Cursor::new(archive),
+            0,
+            &RewriteTarSuffix {
+                deleted_paths: &deleted,
+                append: &[],
+                encoding: "utf-8",
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("unmatched delete");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("missing.txt"),
+            "error should name the path: {err}"
+        );
+    }
+
+    /// Regression: uid/gid/mtime that do not fit ustar octal fields use PAX, not prefix truncation.
+    #[test]
+    fn writer_pax_uid_gid_mtime_no_octal_prefix_truncate() {
+        let uid = octal_digit_max(7) + 1; // 8^7
+        let gid = uid + 1;
+        let mtime = octal_digit_max(11) + 1;
+        let member = UstarMember {
+            path: "wide.bin",
+            payload: UstarPayload::File { bytes: b"x" },
+            mode: 0o644,
+            uid: uid as u32,
+            gid: gid as u32,
+            mtime,
+        };
+        let mut headers = Vec::new();
+        write_member_headers(&mut headers, &member, 1).expect("headers");
+        assert_eq!(headers[156], b'x');
+        let pax_size = parse_octal(&headers[124..136]).unwrap();
+        let pax_body = &headers[512..512 + pax_size as usize];
+        let pax = String::from_utf8_lossy(pax_body);
+        assert!(pax.contains(&format!("uid={uid}")), "{pax}");
+        assert!(pax.contains(&format!("gid={gid}")), "{pax}");
+        assert!(pax.contains(&format!("mtime={mtime}")), "{pax}");
+        let file_off = 512 + pad512(pax_size);
+        let file_hdr = &headers[file_off as usize..];
+        assert_eq!(parse_octal(&file_hdr[108..116]), Some(0));
+        assert_eq!(parse_octal(&file_hdr[116..124]), Some(0));
+        assert_eq!(parse_octal(&file_hdr[136..148]), Some(0));
+    }
+
+    /// A global `g` between pending PAX `x` and the file is refused (would swallow `g` or poison the next name).
+    #[test]
+    fn rewrite_refuses_global_pax_between_helper_and_file() {
+        let mut archive = Vec::new();
+        let xbody = encode_pax_record("path", b"gone.txt").unwrap();
+        write_raw_ustar_header(
+            &mut archive,
+            UstarHeaderFields {
+                name: b"PaxHeaders.0/gone.txt",
+                size: xbody.len() as u64,
+                typeflag: b'x',
+                linkname: b"",
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        )
+        .unwrap();
+        archive.extend_from_slice(&xbody);
+        write_padding(&mut archive, xbody.len() as u64).unwrap();
+        let gbody = encode_pax_record("comment", b"global").unwrap();
+        write_raw_ustar_header(
+            &mut archive,
+            UstarHeaderFields {
+                name: b"g",
+                size: gbody.len() as u64,
+                typeflag: b'g',
+                linkname: b"",
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        )
+        .unwrap();
+        archive.extend_from_slice(&gbody);
+        write_padding(&mut archive, gbody.len() as u64).unwrap();
+        write_ustar_members(
+            &mut archive,
+            &[
+                member_file("gone.txt", b"drop"),
+                member_file("stay.txt", b"y"),
+            ],
+        )
+        .unwrap();
+        write_tar_eof(&mut archive).unwrap();
+
+        let mut deleted = HashSet::new();
+        deleted.insert("gone.txt".to_string());
+        let err = rewrite_tar_suffix(
+            &mut Cursor::new(archive),
+            0,
+            &RewriteTarSuffix {
+                deleted_paths: &deleted,
+                append: &[],
+                encoding: "utf-8",
+            },
+            &mut Vec::new(),
+        )
+        .expect_err("g between helper and file");
+        assert!(
+            err.to_string().contains("global PAX g between pending"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Seek/EOF-scan failure in `TarMemberCursor::new` must surface on `next_member`.
+    #[test]
+    fn cursor_surfaces_init_seek_error() {
+        struct FailSeek;
+        impl Read for FailSeek {
+            fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+                Ok(0)
+            }
+        }
+        impl Seek for FailSeek {
+            fn seek(&mut self, _from: SeekFrom) -> io::Result<u64> {
+                Err(io::Error::other("seek failed"))
+            }
+        }
+        let mut c = TarMemberCursor::new(FailSeek, 0, 0, "utf-8");
+        let err = c
+            .next_member()
+            .expect_err("init seek must not be swallowed");
+        assert!(
+            err.to_string().contains("seek failed"),
+            "unexpected error: {err}"
+        );
     }
 }
