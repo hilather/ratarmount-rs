@@ -3,19 +3,27 @@
 
 use std::collections::{BTreeMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
-use std::io::{self, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
-use ratarmount_compress::{detect_compression, materialize, CompressionFormat};
+use ratarmount_compress::{
+    body_looks_like_tar, decode_zstd_frames_to, detect_compression, materialize,
+    open_seekable_zstd, scan_zstd_frames_path, splice_zstd_last_frames_replace, CompressionFormat,
+    ZstdFrameMap, DEFAULT_MEMORY_CAP,
+};
 use ratarmount_core::{
     create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
     MountSource, UserData,
+};
+use ratarmount_formats_tar::{
+    find_last_tar_eof, rewrite_tar_suffix, RewriteTarSuffix, UstarMember, UstarPayload,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -53,12 +61,15 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     base: Arc<dyn MountSource>,
-    /// After a live uncompressed-TAR commit, the reopened archive.
+    /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
     db: Mutex<Connection>,
     /// Writers take a read lock; live commit takes the write lock.
     commit_gate: RwLock<()>,
+    /// Set when persist succeeded but reopen failed (K11). Further interval
+    /// ticks must not persist again (overlay still holds the committed names).
+    interval_disabled: AtomicBool,
 }
 
 impl WriteOverlay {
@@ -86,11 +97,17 @@ impl WriteOverlay {
             root,
             db: Mutex::new(conn),
             commit_gate: RwLock::new(()),
+            interval_disabled: AtomicBool::new(false),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// True after persist-ok + reopen-err; further interval ticks must remount.
+    pub fn interval_disabled(&self) -> bool {
+        self.interval_disabled.load(Ordering::SeqCst)
     }
 
     fn current_base(&self) -> Arc<dyn MountSource> {
@@ -545,18 +562,22 @@ impl WriteOverlay {
         Ok(())
     }
 
-    /// True when `archive` can be live-committed (uncompressed TAR only).
+    /// True when `archive` can be live-committed (uncompressed TAR or `.tar.zst`).
     pub fn live_commit_supported(archive: &Path) -> Result<()> {
         live_commit_is_supported(archive)
     }
 
-    /// Rewrite `archive` via a sibling copy + GNU tar (never mutate the live inode).
-    ///
-    /// Does not clear the overlay or swap the base — caller does that after reopen.
-    pub fn commit_uncompressed_tar_atomic(&self, archive: &Path) -> Result<bool> {
+    /// Persist only (on-exit). No reopen/reset.
+    pub fn commit_atomic(&self, archive: &Path) -> Result<bool> {
         live_commit_is_supported(archive)?;
-        ensure_gnu_tar()?;
+        let format = detect_live_commit_format(archive)?;
+        if format != CompressionFormat::Zstd {
+            ensure_gnu_tar()?;
+        }
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
         let plan = {
             let db = self.db.lock().expect("overlay db");
             collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
@@ -564,8 +585,55 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        self.persist_uncompressed_tar_plan(archive, &plan)?;
+        self.persist_by_format(archive, format, &plan)?;
         Ok(true)
+    }
+
+    /// Dispatcher: uncompressed TAR (GNU tar) or `.tar.zst` (last-frame splice).
+    pub fn commit_live(
+        &self,
+        archive: &Path,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<bool> {
+        live_commit_is_supported(archive)?;
+        let format = detect_live_commit_format(archive)?;
+        if format != CompressionFormat::Zstd {
+            ensure_gnu_tar()?;
+        }
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
+        let plan = {
+            let db = self.db.lock().expect("overlay db");
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
+        };
+        if plan.is_empty() {
+            return Ok(false);
+        }
+        self.persist_by_format(archive, format, &plan)?;
+        match reopen(archive) {
+            Ok(src) => {
+                *self.replacement.write().expect("overlay replacement") = Some(src);
+                reset_overlay_dir(&self.root)?;
+                self.db
+                    .lock()
+                    .expect("overlay db")
+                    .execute(r#"DELETE FROM "files""#, [])?;
+                Ok(true)
+            }
+            Err(e) => {
+                self.interval_disabled.store(true, Ordering::SeqCst);
+                Err(OverlayError::Msg(format!(
+                    "persist succeeded; reopen failed (remount required): {e}"
+                )))
+            }
+        }
+    }
+
+    /// Persist only (on-exit). Thin wrapper over [`Self::commit_atomic`].
+    pub fn commit_uncompressed_tar_atomic(&self, archive: &Path) -> Result<bool> {
+        self.commit_atomic(archive)
     }
 
     /// Persist, swap base, and wipe overlay under **one** write lock (interval).
@@ -574,27 +642,85 @@ impl WriteOverlay {
         archive: &Path,
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
-        live_commit_is_supported(archive)?;
-        ensure_gnu_tar()?;
-        let _gate = self.commit_gate.write().expect("overlay commit gate");
-        let plan = {
-            let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
-        };
-        if plan.is_empty() {
-            return Ok(false);
+        self.commit_live(archive, reopen)
+    }
+
+    fn persist_by_format(
+        &self,
+        archive: &Path,
+        format: CompressionFormat,
+        plan: &OverlayCommitPlan,
+    ) -> Result<()> {
+        match format {
+            CompressionFormat::Zstd => self.persist_tar_zst_plan(archive, plan),
+            _ => self.persist_uncompressed_tar_plan(archive, plan),
         }
-        // Reuse the unlocked persist body by temporarily... no, call the same
-        // steps as commit_uncompressed_tar_atomic without taking the gate again.
-        self.persist_uncompressed_tar_plan(archive, &plan)?;
-        let new_base = reopen(archive)?;
-        *self.replacement.write().expect("overlay replacement") = Some(new_base);
-        reset_overlay_dir(&self.root)?;
-        self.db
-            .lock()
-            .expect("overlay db")
-            .execute(r#"DELETE FROM "files""#, [])?;
-        Ok(true)
+    }
+
+    /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
+    fn persist_tar_zst_plan(&self, archive: &Path, plan: &OverlayCommitPlan) -> Result<()> {
+        let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+        let (from_idx, rewrite_window_start_uncomp) = find_last_n_tar_window(archive, &map)?;
+        let base = self.current_base();
+        let mut last_window_deletes = HashSet::new();
+        for path in &plan.deleted_paths {
+            match classify_tar_zst_path(base.as_ref(), path, rewrite_window_start_uncomp)? {
+                TarZstPathClass::OverlayOnly => {}
+                TarZstPathClass::LastWindow => {
+                    last_window_deletes.insert(path.clone());
+                }
+            }
+        }
+        let pending = self.collect_ustar_pending(&plan.append_entries)?;
+        splice_zstd_last_frames_replace(archive, from_idx, |mut suffix, stream_offset, mut out| {
+            let members: Vec<UstarMember<'_>> =
+                pending.iter().map(PendingUstar::as_member).collect();
+            let opts = RewriteTarSuffix {
+                deleted_paths: &last_window_deletes,
+                append: &members,
+                encoding: "utf-8",
+            };
+            // Extra refs so R/W are `&mut dyn …` (Sized); the hook itself is unsized.
+            rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
+        })
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        Ok(())
+    }
+
+    fn collect_ustar_pending(
+        &self,
+        append_entries: &[(String, bool)],
+    ) -> Result<Vec<PendingUstar>> {
+        let mut out = Vec::with_capacity(append_entries.len());
+        for (rel, is_dir) in append_entries {
+            let host = self.realpath(rel);
+            self.ensure_under_root(&host)?;
+            let meta = fs::symlink_metadata(&host)?;
+            let mode = meta.mode() & 0o7777;
+            let uid = meta.uid();
+            let gid = meta.gid();
+            let mtime = meta.mtime().max(0) as u64;
+            let kind = if *is_dir || meta.file_type().is_dir() {
+                PendingKind::Directory
+            } else if meta.file_type().is_symlink() {
+                let target = fs::read_link(&host)?;
+                PendingKind::Symlink {
+                    target: target.to_string_lossy().into_owned(),
+                }
+            } else {
+                PendingKind::FileOnDisk { size: meta.len() }
+            };
+            out.push(PendingUstar {
+                path: rel.clone(),
+                host,
+                kind,
+                mode,
+                uid,
+                gid,
+                mtime,
+            });
+        }
+        Ok(out)
     }
 
     fn persist_uncompressed_tar_plan(
@@ -1528,31 +1654,239 @@ fn add_deletion_variants(buf: &mut Vec<u8>, path_relative_to_root: &str) {
     }
 }
 
-/// Uncompressed TAR only — gzip/bzip2/xz TAR and ZIP are full rewrites.
+/// Uncompressed TAR or `.tar.zst` — gzip/bzip2/xz TAR and ZIP stay rejected.
 pub fn live_commit_is_supported(archive: &Path) -> Result<()> {
     if is_zip_archive(archive)? {
         return Err(OverlayError::Msg(
             "live overlay commit supports uncompressed TAR only (not ZIP)".into(),
         ));
     }
-    let format = detect_compression(archive).map_err(|e| {
+    let format = detect_live_commit_format(archive)?;
+    match format {
+        CompressionFormat::None => {
+            if !is_uncompressed_tar(archive)? {
+                return Err(OverlayError::Msg(format!(
+                    "'{}' is not an uncompressed TAR",
+                    archive.display()
+                )));
+            }
+            Ok(())
+        }
+        CompressionFormat::Zstd => {
+            if !looks_like_tar_zst(archive)? {
+                return Err(OverlayError::Msg(
+                    "plain .zst is not a TAR; live commit not supported".into(),
+                ));
+            }
+            Ok(())
+        }
+        CompressionFormat::Gzip | CompressionFormat::Bzip2 | CompressionFormat::Xz => {
+            Err(OverlayError::Msg(format!(
+                "live overlay commit supports uncompressed TAR and .tar.zst only \
+                 (got {format:?}; gzip/bzip2/xz stay offline --commit-overlay)"
+            )))
+        }
+        other => Err(OverlayError::Msg(format!(
+            "live overlay commit supports uncompressed TAR and .tar.zst only (got {other:?})"
+        ))),
+    }
+}
+
+fn detect_live_commit_format(archive: &Path) -> Result<CompressionFormat> {
+    detect_compression(archive).map_err(|e| {
         OverlayError::Msg(format!(
             "Failed to detect compression for '{}': {e}",
             archive.display()
         ))
-    })?;
-    if format != CompressionFormat::None {
-        return Err(OverlayError::Msg(format!(
-            "live overlay commit supports uncompressed TAR only (got {format:?})"
-        )));
+    })
+}
+
+fn interval_disabled_err() -> OverlayError {
+    OverlayError::Msg("live overlay commit disabled after reopen failure; remount required".into())
+}
+
+/// `.tar.zst` / `.tzst` / `.tar.zstd` only — not `.taz`.
+fn name_suggests_tar_zst(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let l = name.to_ascii_lowercase();
+    l.ends_with(".tar.zst") || l.ends_with(".tzst") || l.ends_with(".tar.zstd")
+}
+
+fn looks_like_tar_zst(archive: &Path) -> Result<bool> {
+    if name_suggests_tar_zst(archive) {
+        return Ok(true);
     }
-    if !is_uncompressed_tar(archive)? {
-        return Err(OverlayError::Msg(format!(
-            "'{}' is not an uncompressed TAR",
-            archive.display()
-        )));
+    let body = open_seekable_zstd(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    body_looks_like_tar(&body).map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+const LAST_FRAME_WARN_BYTES: u64 = 64 * 1024 * 1024;
+
+fn warn_large_zstd_window(window_plain: u64, single_frame: bool) {
+    if single_frame || window_plain > LAST_FRAME_WARN_BYTES {
+        log::warn!(
+            "live .tar.zst commit will rewrite {window_plain} uncompressed \
+             (single-frame or large last frame); persist still copies the compressed file"
+        );
     }
-    Ok(())
+}
+
+/// Grow last-N until the decoded suffix contains a TAR EOF (K6). Never refuse on size.
+fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, u64)> {
+    if map.frames.is_empty() {
+        return Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()));
+    }
+    let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
+    warn_large_zstd_window(last_plain, map.frames.len() == 1);
+    let mut src = File::open(archive)?;
+    for n in 1..=map.frames.len() {
+        let from_idx = map.frames.len() - n;
+        let window_plain: u64 = map.frames[from_idx..]
+            .iter()
+            .map(|f| f.uncompressed_size)
+            .sum();
+        if n > 1 {
+            warn_large_zstd_window(window_plain, false);
+        }
+        let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
+        decode_zstd_frames_to(&mut src, map, from_idx, &mut suffix)
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        suffix.seek(SeekFrom::Start(0))?;
+        let stream_offset = map.frames[from_idx].uncompressed_offset;
+        if find_last_tar_eof(&mut suffix, stream_offset)?.is_some() {
+            return Ok((from_idx, stream_offset));
+        }
+    }
+    Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()))
+}
+
+enum TarZstPathClass {
+    OverlayOnly,
+    LastWindow,
+}
+
+fn tar_offsetheaders_in(fi: &FileInfo) -> impl Iterator<Item = u64> + '_ {
+    fi.userdata.iter().filter_map(|u| match u {
+        UserData::Tar(t) => t.offsetheader,
+        _ => None,
+    })
+}
+
+fn lookup_version(base: &dyn MountSource, path: &str, i: i32) -> Option<FileInfo> {
+    if base.versions(path) > 1 {
+        if let Some(fi) = base.lookup(&format!("{path}.versions/{i}"), 0) {
+            return Some(fi);
+        }
+    }
+    base.lookup(path, i)
+}
+
+fn archive_lookup_path(rel: &str) -> String {
+    let n = normalize_archive_rel_path(rel);
+    if n.is_empty() {
+        "/".into()
+    } else {
+        format!("/{n}")
+    }
+}
+
+fn all_tar_offsetheaders(base: &dyn MountSource, path: &str) -> Result<Vec<u64>> {
+    let path = archive_lookup_path(path);
+    let mut out = Vec::new();
+    let nver = base.versions(&path);
+    if nver == 0 {
+        if let Some(fi) = base.lookup(&path, 0) {
+            out.extend(tar_offsetheaders_in(&fi));
+            if out.is_empty() {
+                return Err(cannot_classify_err(&path));
+            }
+        }
+        return Ok(out);
+    }
+    for i in 1..=nver {
+        if let Some(fi) = lookup_version(base, &path, i as i32) {
+            out.extend(tar_offsetheaders_in(&fi));
+        }
+    }
+    if let Some(fi) = base.lookup(&path, 0) {
+        out.extend(tar_offsetheaders_in(&fi));
+    }
+    out.sort_unstable();
+    out.dedup();
+    if out.is_empty() {
+        return Err(cannot_classify_err(&path));
+    }
+    Ok(out)
+}
+
+fn cannot_classify_err(path: &str) -> OverlayError {
+    OverlayError::Msg(format!(
+        "live overlay commit for .tar.zst cannot classify '{path}' (no TAR offsetheader)"
+    ))
+}
+
+fn earlier_frame_err(path: &str) -> OverlayError {
+    let shown = archive_lookup_path(path);
+    OverlayError::Msg(format!(
+        "error: live overlay commit for .tar.zst is append-only (and last-frame replace/delete);\n\
+               '{shown}' has a version in an earlier zstd frame\n\
+               (delete would undelete that copy). The whole commit was skipped\n\
+               (including pending appends). Undo the delete or omit\n\
+               --commit-overlay-interval / --commit-overlay-on-exit."
+    ))
+}
+
+fn classify_tar_zst_path(
+    base: &dyn MountSource,
+    path: &str,
+    rewrite_window_start_uncomp: u64,
+) -> Result<TarZstPathClass> {
+    let ohs = all_tar_offsetheaders(base, path)?;
+    if ohs.is_empty() {
+        return Ok(TarZstPathClass::OverlayOnly);
+    }
+    if ohs.iter().any(|&oh| oh < rewrite_window_start_uncomp) {
+        return Err(earlier_frame_err(path));
+    }
+    Ok(TarZstPathClass::LastWindow)
+}
+
+struct PendingUstar {
+    path: String,
+    host: PathBuf,
+    kind: PendingKind,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: u64,
+}
+
+enum PendingKind {
+    FileOnDisk { size: u64 },
+    Directory,
+    Symlink { target: String },
+}
+
+impl PendingUstar {
+    fn as_member(&self) -> UstarMember<'_> {
+        UstarMember {
+            path: &self.path,
+            payload: match &self.kind {
+                PendingKind::FileOnDisk { size } => UstarPayload::FileOnDisk {
+                    path: &self.host,
+                    size: *size,
+                },
+                PendingKind::Directory => UstarPayload::Directory,
+                PendingKind::Symlink { target } => UstarPayload::Symlink { target },
+            },
+            mode: self.mode,
+            uid: self.uid,
+            gid: self.gid,
+            mtime: self.mtime,
+        }
+    }
 }
 
 fn reset_overlay_dir(root: &Path) -> Result<()> {
@@ -2438,7 +2772,8 @@ mod tests {
             .unwrap();
         assert!(st.success());
         let err = live_commit_is_supported(&tgz).unwrap_err().to_string();
-        assert!(err.contains("uncompressed TAR"), "{err}");
+        assert!(err.contains("uncompressed"), "{err}");
+        assert!(err.contains("gzip"), "{err}");
 
         let zip = dir.path().join("a.zip");
         write_sample_zip(&zip, &[("a", b"x", CompressionMethod::Stored)]);
@@ -2447,5 +2782,546 @@ mod tests {
             err.contains("ZIP") || err.contains("uncompressed TAR"),
             "{err}"
         );
+    }
+
+    fn generated_payload(tag: &str) -> Vec<u8> {
+        format!("p-{tag}-{}\n", std::process::id()).into_bytes()
+    }
+
+    fn ustar_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
+        UstarMember {
+            path,
+            payload: UstarPayload::File { bytes },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
+    }
+
+    fn pack_tar(members: &[UstarMember<'_>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut buf, members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut buf).unwrap();
+        buf
+    }
+
+    fn pack_tar_no_eof(members: &[UstarMember<'_>]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut buf, members).unwrap();
+        buf
+    }
+
+    fn concat_zstd_frames(plains: &[&[u8]], with_seek_table: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut entries = Vec::new();
+        for p in plains {
+            let f = ratarmount_compress::encode_zstd_frame(p, 3).unwrap();
+            entries.push((f.len() as u32, p.len() as u32));
+            out.extend_from_slice(&f);
+        }
+        if with_seek_table {
+            out.extend_from_slice(&ratarmount_compress::build_seek_table_skippable(&entries));
+        }
+        out
+    }
+
+    /// One uncompressed TAR split across two zstd frames (EOF only in the last frame).
+    fn write_split_tar_zst(
+        path: &Path,
+        first: &[UstarMember<'_>],
+        last: &[UstarMember<'_>],
+        with_seek_table: bool,
+    ) {
+        let f0 = pack_tar_no_eof(first);
+        let mut f1 = pack_tar_no_eof(last);
+        ratarmount_formats_tar::write_tar_eof(&mut f1).unwrap();
+        fs::write(path, concat_zstd_frames(&[&f0, &f1], with_seek_table)).unwrap();
+    }
+
+    fn write_single_frame_tar_zst(path: &Path, members: &[UstarMember<'_>]) {
+        let tar = pack_tar(members);
+        fs::write(path, concat_zstd_frames(&[&tar], false)).unwrap();
+    }
+
+    fn write_complete_tar_frames_zst(path: &Path, frames: &[Vec<u8>]) {
+        let refs: Vec<&[u8]> = frames.iter().map(|v| v.as_slice()).collect();
+        fs::write(path, concat_zstd_frames(&refs, false)).unwrap();
+    }
+
+    fn reopen_tar_zst(
+        path: &Path,
+        ignore_zeros: bool,
+    ) -> std::result::Result<Arc<dyn MountSource>, OverlayError> {
+        let body = open_seekable_zstd(path).map_err(|e| OverlayError::Msg(e.to_string()))?;
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ignore_zeros,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        ratarmount_formats_tar::SqliteIndexedTar::create_index_body(path, body, None, &opts, "test")
+            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+            .map_err(|e| OverlayError::Msg(e.to_string()))
+    }
+
+    fn open_tar_zst_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
+        reopen_tar_zst(path, ignore_zeros).expect("index tar.zst")
+    }
+
+    fn read_member(src: &dyn MountSource, path: &str) -> Vec<u8> {
+        let fi = src
+            .lookup(path, 0)
+            .unwrap_or_else(|| panic!("missing {path}"));
+        src.read(&fi, fi.size as usize, 0).expect("read member")
+    }
+
+    fn overlay_with_base(base: Arc<dyn MountSource>, overlay: &Path) -> WriteOverlay {
+        fs::create_dir_all(overlay).unwrap();
+        WriteOverlay::new(base, overlay).unwrap()
+    }
+
+    fn seek_table_footer_present(bytes: &[u8]) -> bool {
+        if bytes.len() < 4 {
+            return false;
+        }
+        let n = bytes.len();
+        u32::from_le_bytes(bytes[n - 4..].try_into().unwrap()) == 0x8F92_EAB1
+    }
+
+    #[test]
+    fn live_commit_accepts_tar_zst() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("accept");
+        let path = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&path, &[ustar_file("seed.txt", &seed)]);
+        live_commit_is_supported(&path).expect(".tar.zst must be accepted");
+
+        let tzst = dir.path().join("b.tzst");
+        write_single_frame_tar_zst(&tzst, &[ustar_file("seed.txt", &seed)]);
+        live_commit_is_supported(&tzst).expect(".tzst must be accepted");
+
+        let zstd = dir.path().join("c.tar.zstd");
+        write_single_frame_tar_zst(&zstd, &[ustar_file("seed.txt", &seed)]);
+        live_commit_is_supported(&zstd).expect(".tar.zstd must be accepted");
+
+        let plain = dir.path().join("plain.zst");
+        let not_tar = ratarmount_compress::encode_zstd_frame(b"not-a-tar-body", 3).unwrap();
+        fs::write(&plain, not_tar).unwrap();
+        let err = live_commit_is_supported(&plain).unwrap_err().to_string();
+        assert!(
+            err.contains("plain .zst") && err.contains("not a TAR"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn live_commit_tar_zst_multi_frame_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("mf-prefix");
+        let last = generated_payload("mf-last");
+        let extra = generated_payload("mf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_single_frame_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("sf-seed");
+        let extra = generated_payload("sf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_seek_table_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("st-prefix");
+        let last = generated_payload("st-last");
+        let extra = generated_payload("st-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            true,
+        );
+        let before = fs::read(&archive).unwrap();
+        assert!(seek_table_footer_present(&before));
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.seek_table.is_some());
+        let rewrite_start = map.frames.last().unwrap().compressed_offset as usize;
+        let prefix_bytes = before[..rewrite_start].to_vec();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..rewrite_start],
+            prefix_bytes.as_slice(),
+            "prefix frames must stay byte-identical"
+        );
+        assert!(
+            seek_table_footer_present(&after),
+            "seek-table footer must be rewritten"
+        );
+        let out_map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(out_map.seek_table.is_some());
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_last_frame_starts_mid_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = generated_payload("mid-big").repeat(200);
+        let after = generated_payload("mid-after");
+        let extra = generated_payload("mid-new");
+        let tar = pack_tar(&[ustar_file("big.bin", &big), ustar_file("after.txt", &after)]);
+        // First member: 512-byte header + payload. Split inside the payload.
+        let mid = 512 + big.len() / 2;
+        assert!(mid < 512 + big.len(), "split must be mid-payload");
+        let archive = dir.path().join("a.tar.zst");
+        fs::write(
+            &archive,
+            concat_zstd_frames(&[&tar[..mid], &tar[mid..]], false),
+        )
+        .unwrap();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/big.bin"), big);
+        assert_eq!(read_member(src.as_ref(), "/after.txt"), after);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_last_window_replace_two_ticks() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("rw-seed");
+        let tick1 = generated_payload("rw-t1");
+        let tick2 = generated_payload("rw-t2");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("seed.txt", &seed)],
+            &[ustar_file("keep.txt", b"keep\n")],
+            false,
+        );
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("tick.bin"), &tick1).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("tick 1"));
+        assert!(!overlay.join("tick.bin").exists());
+
+        fs::write(overlay.join("tick.bin"), &tick2).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("tick 2"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/tick.bin"), tick2);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_earlier_frame_delete_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("ef-prefix");
+        let last = generated_payload("ef-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("old.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/old.txt").expect("unlink prefix member");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/old.txt"), "{err}");
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            before,
+            "archive must be unchanged"
+        );
+    }
+
+    /// Regression: same name in frame 0 and last frame; unlink must fail the tick.
+    #[test]
+    fn live_commit_tar_zst_same_name_both_frames_unlink_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = generated_payload("dup-v1");
+        let v2 = generated_payload("dup-v2");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("dup.txt", &v1)],
+            &[ustar_file("dup.txt", &v2)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        // ignore_zeros so both versions are indexed (split-suffix still one stream).
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/dup.txt").expect("unlink newest");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/dup.txt"), "{err}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_mixed_plan_skips_pending_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("mix-old");
+        let last = generated_payload("mix-last");
+        let extra = generated_payload("mix-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("old.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        ov.unlink("/old.txt").expect("unlink earlier-frame name");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("pending appends"), "{err}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+        let src = open_tar_zst_base(&archive, false);
+        assert!(
+            src.lookup("/new.txt", 0).is_none(),
+            "new name must not be persisted when the tick fails"
+        );
+        assert!(overlay.join("new.txt").exists());
+    }
+
+    #[test]
+    fn live_commit_tar_zst_reopen_fail_keeps_overlay_and_disables() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("rf-seed");
+        let extra = generated_payload("rf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+
+        let err = ov
+            .commit_live(&archive, |_| {
+                Err(OverlayError::Msg("stub reopen fail".into()))
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("remount required"), "{err}");
+        assert!(
+            overlay.join("new.txt").exists(),
+            "overlay must be kept after reopen failure"
+        );
+        assert!(ov.interval_disabled());
+
+        let second = ov
+            .commit_live(&archive, |_| {
+                panic!("second tick must not persist after interval_disabled")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            second.contains("remount required"),
+            "second tick skipped via interval_disabled, not Ok(false): {second}"
+        );
+        assert!(overlay.join("new.txt").exists());
+        // Persist did run on the first tick — remount should see the new member.
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_empty_second_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("es-seed");
+        let extra = generated_payload("es-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("first tick"));
+        assert!(!overlay.join("new.txt").exists());
+        match ov.commit_live(&archive, |p| reopen_tar_zst(p, false)) {
+            Ok(false) => {}
+            other => panic!("empty second tick must be Ok(false), got {other:?}"),
+        }
+    }
+
+    /// Regression: FileVersionLayer wrap (factory default); same name in both frames.
+    #[test]
+    fn live_commit_tar_zst_file_version_layer_same_name_unlink_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = generated_payload("fvl-v1");
+        let v2 = generated_payload("fvl-v2");
+        let archive = dir.path().join("a.tar.zst");
+        // Two complete-TAR frames so both versions exist only with ignore_zeros.
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("dup.txt", &v1)]),
+                pack_tar(&[ustar_file("dup.txt", &v2)]),
+            ],
+        );
+        let before = fs::read(&archive).unwrap();
+        let tar = open_tar_zst_base(&archive, true);
+        let layered = crate::FileVersionLayer::new(tar);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(Arc::new(layered) as Arc<dyn MountSource>, &overlay);
+        assert!(ov.current_base().versions("/dup.txt") > 1);
+        ov.unlink("/dup.txt").expect("unlink newest");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/dup.txt"), "{err}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    /// Regression: complete-TAR multi-frame remount with ignore_zeros sees prefix + new.
+    #[test]
+    fn live_commit_tar_zst_complete_frames_ignore_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("cf-prefix");
+        let last = generated_payload("cf-last");
+        let extra = generated_payload("cf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, true))
+            .expect("commit"));
+        let src = open_tar_zst_base(&archive, true);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn live_commit_tar_zst_complete_frames_without_ignore_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("cf0-prefix");
+        let last = generated_payload("cf0-last");
+        let extra = generated_payload("cf0-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let overlay = dir.path().join("ov");
+        // Base indexed with -i so last-frame names exist for classification; reopen without.
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+
+        // Default parse stops at the first 512-zero block (end of frame 0).
+        let default = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(default.as_ref(), "/prefix.txt"), prefix);
+        assert!(
+            default.lookup("/last.txt", 0).is_none(),
+            "without ignore_zeros, last-frame names stay invisible"
+        );
+        assert!(
+            default.lookup("/new.txt", 0).is_none(),
+            "new members live after the first frame EOF"
+        );
+
+        // The rewritten last complete TAR frame itself contains last + new, not prefix.
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let last_idx = map.frames.len() - 1;
+        let mut src = File::open(&archive).unwrap();
+        let mut last_plain = Vec::new();
+        decode_zstd_frames_to(&mut src, &map, last_idx, &mut last_plain).unwrap();
+        let last_tar = ratarmount_formats_tar::SqliteIndexedTar::open_from_reader(
+            std::io::Cursor::new(last_plain),
+            "last-frame.tar",
+            None,
+            &ratarmount_core::OpenOptions {
+                index_in_memory: true,
+                ..ratarmount_core::OpenOptions::default()
+            },
+            "test",
+        )
+        .expect("index last frame");
+        assert!(last_tar.lookup("/prefix.txt", 0).is_none());
+        assert_eq!(read_member(&last_tar, "/last.txt"), last);
+        assert_eq!(read_member(&last_tar, "/new.txt"), extra);
     }
 }
