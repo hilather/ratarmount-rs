@@ -420,6 +420,9 @@ fn read_member(
     count: u32,
 ) -> Result<(Vec<u8>, bool), nfsstat3> {
     let path = inodes.path_for_id(id).ok_or(nfsstat3::NFS3ERR_STALE)?;
+    // A live overlay commit invalidates every cached FileInfo at once (base
+    // member offsets shift) — sweep before trusting the cache for the check.
+    readers.sweep_if_generation_advanced(source, inodes);
     let fi_check = if path == "/" {
         ratarmount_core::create_root_file_info()
     } else if let Some(c) = inodes.cached_lookup_fi(id) {
@@ -1020,6 +1023,99 @@ mod tests {
             got, payload,
             "NFS cat after live commit must match overlay file bytes"
         );
+    }
+
+    /// Regression: live commit after an overlay DELETE shifts base member
+    /// offsets; a cached reader slot / FileInfo for an untouched base file
+    /// must be invalidated by the commit generation sweep, or the next NFS
+    /// READ serves bytes from the stale offset.
+    #[test]
+    fn overlay_commit_live_delete_shifts_base_read() {
+        use std::fs;
+        use std::process::Command as StdCommand;
+        use std::sync::Arc;
+
+        let gnu = StdCommand::new("tar").arg("--version").output();
+        let gnu_ok = gnu
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("GNU tar"))
+            .unwrap_or(false);
+        if !gnu_ok {
+            eprintln!("skip: GNU tar missing");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let tree = dir.path().join("tree");
+        fs::create_dir_all(&tree).unwrap();
+        let a_body = b"0123456789abcdef0123456789abcdef\n";
+        let b_body = b"BBBB-distinct-payload-for-shift-detection\n";
+        fs::write(tree.join("a.txt"), a_body).unwrap();
+        fs::write(tree.join("b.txt"), b_body).unwrap();
+        let tar = dir.path().join("a.tar");
+        assert!(StdCommand::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&tree)
+            .arg("a.txt")
+            .arg("b.txt")
+            .status()
+            .unwrap()
+            .success());
+
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let mut materialised = None;
+        let base = ratarmount_formats_tar::SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &opts,
+            "test",
+            &mut materialised,
+        )
+        .expect("index tar");
+        let ov_dir = dir.path().join("ov");
+        fs::create_dir_all(&ov_dir).unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).expect("overlay"),
+        );
+        let nfs = RatarmountNfs::with_overlay(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            0,
+            Some(Arc::clone(&ov)),
+        );
+
+        // Prime the cached FileInfo for base member b.txt via lookup/getattr
+        // only — no read, so no reader slot holding the old inode exists.
+        let b_id = nfs.lookup_sync(1, &name("b.txt")).expect("lookup b.txt");
+        let attr = nfs.getattr_sync(b_id).expect("getattr b.txt");
+        assert_eq!(attr.size as usize, b_body.len());
+
+        // Delete a.txt in the overlay and commit: b.txt shifts 1024 bytes
+        // down (one 512 header + one 512 data block) in the new archive.
+        nfs.remove_sync(1, &name("a.txt")).expect("delete a.txt");
+        ov.commit_live_uncompressed_tar(&tar, |p| {
+            let mut mat = None;
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                p, p, None, &opts, "test", &mut mat,
+            )
+            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+            .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
+        })
+        .expect("commit_live");
+
+        let (after, _) = nfs
+            .read_sync(b_id, 0, 128)
+            .expect("NFS read of b.txt after deleting a.txt and committing");
+        assert_eq!(
+            after, b_body,
+            "base member read after offset-shifting commit must not be stale"
+        );
+        let attr = nfs.getattr_sync(b_id).expect("getattr b.txt after commit");
+        assert_eq!(attr.size as usize, b_body.len(), "cached attr size stale");
     }
 
     /// Regression: NFS READ after live tar.zst commit must re-lookup the new zstd TAR base.

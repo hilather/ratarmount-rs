@@ -99,6 +99,14 @@ impl InodeTable {
         }
     }
 
+    /// Drop every cached lookup `FileInfo` (live overlay commit may have
+    /// shifted base member offsets, invalidating all of them at once).
+    pub fn clear_all_lookup_fi(&self) {
+        for ent in self.inodes.lock().expect("inode map").values_mut() {
+            ent.file_info = None;
+        }
+    }
+
     /// Keep the same fileid after overlay rename (path mapping only).
     pub fn rebind_path(&self, id: u64, new_path: &str) {
         let new_path = normpath(new_path);

@@ -357,6 +357,17 @@ pub trait MountSource: Send + Sync {
         true
     }
 
+    /// Monotonic content generation: bumped when previously issued
+    /// [`FileInfo`] offsets may no longer match the served bytes (e.g. a
+    /// write-overlay live commit swapped the base archive).
+    ///
+    /// Immutable sources keep `0`. Wrappers must forward to their inner
+    /// source(s) so caches above them (NFS reader LRU / inode FileInfo) can
+    /// drop stale entries after a commit.
+    fn content_generation(&self) -> u64 {
+        0
+    }
+
     fn read(&self, file_info: &FileInfo, size: usize, offset: u64) -> io::Result<Vec<u8>> {
         let mut file = self.open(file_info, 0)?;
         file.seek(io::SeekFrom::Start(offset))?;

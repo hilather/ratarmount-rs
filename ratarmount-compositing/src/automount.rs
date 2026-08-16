@@ -1241,6 +1241,10 @@ impl MountSource for AutoMountLayer {
         self.root.is_immutable()
     }
 
+    fn content_generation(&self) -> u64 {
+        self.root.content_generation()
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if let Some(key) = Self::automount_key(file_info) {
             if key == "/" {
@@ -2333,7 +2337,13 @@ mod tests {
         );
         let cheap = dents.iter().find(|d| d.name == "archive").expect("cheap");
         let fat_fi = fat.get("archive").expect("fat");
-        assert_eq!(cheap.mode, fat_fi.mode, "cheap/fat mode parity for `archive`");
-        assert_eq!(cheap.size, fat_fi.size, "cheap/fat size parity for `archive`");
+        assert_eq!(
+            cheap.mode, fat_fi.mode,
+            "cheap/fat mode parity for `archive`"
+        );
+        assert_eq!(
+            cheap.size, fat_fi.size,
+            "cheap/fat size parity for `archive`"
+        );
     }
 }

@@ -401,6 +401,10 @@ impl MountSource for ControlFolderMountSource {
         self.inner.is_immutable()
     }
 
+    fn content_generation(&self) -> u64 {
+        self.inner.content_generation()
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if Self::control_tag(file_info).is_some() {
             return true;

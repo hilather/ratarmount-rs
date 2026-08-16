@@ -415,6 +415,9 @@ fn read_member(
     count: u32,
 ) -> FsResult<ReadResult> {
     let path = inodes.path_for_id(id).ok_or(FsError::Stale)?;
+    // A live overlay commit invalidates every cached FileInfo at once (base
+    // member offsets shift) — sweep before trusting the cache for the check.
+    readers.sweep_if_generation_advanced(source, inodes);
     let fi_check = if path == "/" {
         ratarmount_core::create_root_file_info()
     } else if let Some(c) = inodes.cached_lookup_fi(id) {

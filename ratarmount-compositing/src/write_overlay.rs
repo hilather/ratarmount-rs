@@ -70,6 +70,11 @@ pub struct WriteOverlay {
     /// Set when persist succeeded but reopen failed (K11). Further interval
     /// ticks must not persist again (overlay still holds the committed names).
     interval_disabled: AtomicBool,
+    /// Bumped after every successful commit persist. Cached FileInfos /
+    /// reader handles keyed to pre-commit base offsets are invalid after a
+    /// commit (delete/replace shift TAR member offsets), so read caches
+    /// (NFS reader LRU, inode FileInfo) watch this counter.
+    commit_generation: std::sync::atomic::AtomicU64,
 }
 
 impl WriteOverlay {
@@ -98,6 +103,7 @@ impl WriteOverlay {
             db: Mutex::new(conn),
             commit_gate: RwLock::new(()),
             interval_disabled: AtomicBool::new(false),
+            commit_generation: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
@@ -586,6 +592,7 @@ impl WriteOverlay {
             return Ok(false);
         }
         self.persist_by_format(archive, format, &plan)?;
+        self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
 
@@ -620,6 +627,10 @@ impl WriteOverlay {
                     .lock()
                     .expect("overlay db")
                     .execute(r#"DELETE FROM "files""#, [])?;
+                // All cached FileInfos/reader handles into the old base are
+                // stale now (member offsets shifted); bump after the swap so
+                // watchers never see generation n+1 with the old base live.
+                self.commit_generation.fetch_add(1, Ordering::SeqCst);
                 Ok(true)
             }
             Err(e) => {
@@ -1013,6 +1024,14 @@ impl MountSource for WriteOverlay {
 
     fn is_immutable(&self) -> bool {
         false
+    }
+
+    fn content_generation(&self) -> u64 {
+        // Own commit counter dominates; forward the base in case an inner
+        // mutable source (stacked overlay) also changes under us.
+        self.commit_generation
+            .load(Ordering::SeqCst)
+            .saturating_add(self.base.content_generation())
     }
 
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {

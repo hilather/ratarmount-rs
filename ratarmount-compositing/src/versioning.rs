@@ -199,6 +199,10 @@ impl MountSource for FileVersionLayer {
         self.inner.is_immutable()
     }
 
+    fn content_generation(&self) -> u64 {
+        self.inner.content_generation()
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         let mut fi = file_info.clone();
         if let Some(UserData::Other(s)) = fi.userdata.last() {
