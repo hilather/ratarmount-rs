@@ -67,6 +67,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | AutoMount strip-ext duplicate dirent (dir `a/` + `a.tar` → two `a`) | `cargo test -p ratarmount-compositing --lib list_dirents_strip_ext_dir_archive_collision` |
 | readdirplus cached size-0 placeholder (control `status` cat empty 60s) | `cargo test -p ratarmount-fuse --lib readdirplus_placeholder_zero_size` |
 | NFS stale base read after live commit with delete (offsets shift) | `cargo test -p ratarmount-nfs --lib overlay_commit_live_delete_shifts` |
+| NULL `offsetheader` row breaks cheap readdir / warm open (foreign index) | `cargo test -p ratarmount-index --lib regression_null_offsetheader` |
+| Crafted `inf`/`1e999` mtime panics FUSE daemon (SystemTime overflow) | `cargo test -p ratarmount-fuse --lib unix_float_to_system_time_extreme` |
+| NFS readdir cookie vanished mid-listing aborts `ls`; v4 cookie 1/2 reserved | `cargo test -p ratarmount-nfs --lib readdir_start_after_and_bad_cookie` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_readdir_cookie` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
