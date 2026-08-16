@@ -159,7 +159,13 @@ impl RatarmountNfs {
         } else {
             match kids.iter().position(|(id, _, _, _)| *id == start_after) {
                 Some(i) => i + 1,
-                None => return Err(nfsstat3::NFS3ERR_BAD_COOKIE),
+                // Cookie entry vanished (overlay delete between pages): resume
+                // at the next surviving id instead of failing the listing —
+                // BAD_COOKIE mid-enumeration makes clients abort `ls`.
+                None => kids
+                    .iter()
+                    .position(|(id, _, _, _)| *id > start_after)
+                    .unwrap_or(kids.len()),
             }
         };
         let slice = &kids[start_idx..];
@@ -776,6 +782,9 @@ mod tests {
         );
     }
 
+    /// Regression: an unknown/vanished readdir cookie resumes at the next
+    /// surviving fileid (empty page at end) instead of NFS3ERR_BAD_COOKIE,
+    /// which aborts client listings when entries vanish between pages.
     #[test]
     fn readdir_start_after_and_bad_cookie() {
         let mut s = Synth::new();
@@ -789,10 +798,14 @@ mod tests {
         let rest = nfs.readdir_sync(1, first, 10).unwrap();
         assert_eq!(rest.entries.len(), 1);
         assert!(rest.end);
-        assert_eq!(
-            stat_u32(nfs.readdir_sync(1, 9999, 10).unwrap_err()),
-            stat_u32(nfsstat3::NFS3ERR_BAD_COOKIE)
-        );
+        // Cookie past the last id: empty page, eof — no error.
+        let tail = nfs.readdir_sync(1, 9999, 10).unwrap();
+        assert!(tail.entries.is_empty());
+        assert!(tail.end);
+        // Cookie between the two ids resumes at the next surviving entry.
+        let mid = nfs.readdir_sync(1, first + 1, 10).unwrap();
+        assert_eq!(mid.entries.len(), 0);
+        assert!(mid.end);
     }
 
     #[test]

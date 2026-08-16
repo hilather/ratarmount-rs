@@ -37,7 +37,9 @@ impl InodeTable {
         Self {
             inodes: Mutex::new(inodes),
             path_to_id: Mutex::new(path_to_id),
-            next_id: AtomicU64::new(ROOT_FILEID + 1),
+            // Fileids double as READDIR cookies; embednfs (NFSv4.1) reserves
+            // cookie values 1 and 2, so never hand them out.
+            next_id: AtomicU64::new(ROOT_FILEID + 2),
         }
     }
 
