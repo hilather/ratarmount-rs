@@ -2037,6 +2037,7 @@ dependencies = [
  "log",
  "nfsserve",
  "ratarmount-compositing",
+ "ratarmount-compress",
  "ratarmount-core",
  "ratarmount-formats-tar",
  "tempfile",

@@ -1022,6 +1022,124 @@ mod tests {
         );
     }
 
+    /// Regression: NFS READ after live tar.zst commit must re-lookup the new zstd TAR base.
+    /// Catalog: `cargo test -p ratarmount-nfs --lib overlay_commit_live_tar_zst`
+    #[test]
+    fn overlay_commit_live_tar_zst_then_nfs_read_readdir() {
+        use std::fs;
+        use std::sync::Arc;
+
+        use ratarmount_formats_tar::{
+            write_tar_eof, write_ustar_members, UstarMember, UstarPayload,
+        };
+
+        let dir = tempfile::tempdir().unwrap();
+        let payload = format!("nfs-live-tarzst-{}\n", std::process::id()).into_bytes();
+        let seed = b"seed\n";
+        let more = b"more\n";
+
+        let mut frame0 = Vec::new();
+        write_ustar_members(
+            &mut frame0,
+            &[UstarMember {
+                path: "seed.txt",
+                payload: UstarPayload::File { bytes: seed },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        write_tar_eof(&mut frame0).unwrap();
+
+        let mut frame1 = Vec::new();
+        write_ustar_members(
+            &mut frame1,
+            &[UstarMember {
+                path: "more.txt",
+                payload: UstarPayload::File { bytes: more },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        write_tar_eof(&mut frame1).unwrap();
+
+        let mut packed = ratarmount_compress::encode_zstd_frame(&frame0, 3).unwrap();
+        packed.extend_from_slice(&ratarmount_compress::encode_zstd_frame(&frame1, 3).unwrap());
+        let archive = dir.path().join("a.tar.zst");
+        fs::write(&archive, packed).unwrap();
+        let map = ratarmount_compress::scan_zstd_frames_path(&archive).unwrap();
+        assert!(
+            map.frames.len() >= 2,
+            "fixture must be multi-frame (not single-frame fallback), got {}",
+            map.frames.len()
+        );
+
+        // Two complete-TAR frames: ignore_zeros so last-frame + committed names are visible.
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ignore_zeros: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let body = ratarmount_compress::open_seekable_zstd(&archive).expect("open zstd");
+        let base = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+            &archive, body, None, &opts, "test",
+        )
+        .expect("index tar.zst");
+        let ov_dir = dir.path().join("ov");
+        fs::create_dir_all(&ov_dir).unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).expect("overlay"),
+        );
+        let nfs = RatarmountNfs::with_overlay(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            0,
+            Some(Arc::clone(&ov)),
+        );
+
+        let (id, _) = nfs
+            .create_sync(1, &name("tick.bin"), sattr3::default())
+            .expect("create");
+        nfs.write_sync(id, 0, &payload).expect("write");
+        let (before, _) = nfs.read_sync(id, 0, 64).expect("read overlay");
+        assert_eq!(before, payload);
+
+        ov.commit_live(&archive, |p| {
+            let body = ratarmount_compress::open_seekable_zstd(p)
+                .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))?;
+            ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                p, body, None, &opts, "test",
+            )
+            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+            .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
+        })
+        .expect("commit_live");
+
+        let listing = nfs.readdir_sync(1, 0, 32).expect("readdir after commit");
+        let names: Vec<String> = listing
+            .entries
+            .iter()
+            .map(|e| String::from_utf8_lossy(e.name.as_ref()).into_owned())
+            .collect();
+        assert!(
+            names.iter().any(|n| n == "tick.bin"),
+            "NFS readdir missing committed name: {names:?}"
+        );
+        assert!(names.iter().any(|n| n == "seed.txt"), "{names:?}");
+
+        let (got, _) = nfs
+            .read_sync(id, 0, 64)
+            .expect("NFS read after live tar.zst commit");
+        assert_eq!(
+            got, payload,
+            "NFS cat after live tar.zst commit must match overlay file bytes"
+        );
+    }
+
     #[test]
     fn overlay_truncate_and_unlink_invalidate_reader() {
         let mut base = Synth::new();
