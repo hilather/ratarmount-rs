@@ -40,6 +40,7 @@ mod split;
 mod xz_seek;
 mod zlib_seek;
 mod zstd_seek;
+mod zstd_splice;
 
 pub use split::{
     check_for_split_file_in, check_for_split_file_in_folder, is_first_split_extension,
@@ -101,6 +102,7 @@ pub use zstd_seek::{
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
     SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
 };
+pub use zstd_splice::{splice_zstd_last_frames, splice_zstd_last_frames_replace, SpliceStats};
 
 use std::fs::File;
 use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};
