@@ -128,9 +128,9 @@ pub type Result<T> = std::result::Result<T, TarError>;
 
 mod write;
 pub use write::{
-    find_last_tar_eof, normalize_archive_rel_path, rewrite_tar_suffix, write_tar_eof,
-    write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember,
-    UstarMember, UstarPayload,
+    find_last_tar_eof, normalize_archive_rel_path, rewrite_tar_suffix, window_has_member_boundary,
+    write_tar_eof, write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor,
+    TarRawMember, UstarMember, UstarPayload,
 };
 
 /// Mutex-backed `Read + Seek` for concurrent stencil opens (HTTP Range / Cursor / remote).
@@ -1505,6 +1505,18 @@ fn parse_tar_into_index<R: Read + Seek>(
             }
         }
 
+        // Plain PAX `size` keyword (non-sparse): authoritative over the ustar
+        // size field, which cannot hold values ≥ 8 GiB — writers (GNU tar
+        // --format=pax, our own ustar writer) zero the field and carry the
+        // real size here. Ignoring it mis-indexes the member as size 0 and
+        // derails the member walk into the payload.
+        if !issparse && is_regular_tar_member(typeflag, &name) {
+            if let Some(pax_size) = pax_map.get("size").and_then(|s| s.parse::<u64>().ok()) {
+                logical_size = pax_size;
+                on_tape = pax_size;
+            }
+        }
+
         // Skip junk placeholder paths if any slipped through.
         if name.contains("PaxHeaders/") || name.starts_with("./PaxHeaders/") {
             pos = pos + BLOCK_SIZE + pad512(on_tape);
@@ -1996,6 +2008,14 @@ fn walk_tar_region<R: Read + Seek>(
             } else {
                 let _ = sparse_map_from_pax(&pax_for_sparse);
                 on_tape = size;
+            }
+        }
+
+        // Plain PAX `size` keyword (non-sparse) — see the full-index walk.
+        if !issparse && is_regular_tar_member(typeflag, &name) {
+            if let Some(pax_size) = pax_map.get("size").and_then(|s| s.parse::<u64>().ok()) {
+                logical_size = pax_size;
+                on_tape = pax_size;
             }
         }
 
@@ -4390,6 +4410,75 @@ mod tests {
             m.get_xattr(&fi, "user.tags").as_deref(),
             Some(b"mytag".as_slice())
         );
+    }
+
+    /// Regression: PAX `size` keyword on a regular member overrides a zeroed
+    /// ustar size field (GNU tar --format=pax and our own writer emit this
+    /// shape for ≥ 8 GiB members). The indexer used to record size 0 and then
+    /// parse the payload as the following headers.
+    #[test]
+    fn pax_size_keyword_overrides_zero_ustar_size_field() {
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn hdr(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            h[..nb.len()].copy_from_slice(nb);
+            h[100..108].copy_from_slice(&oct_field(0o644, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            h[257..263].copy_from_slice(b"ustar\0");
+            h[263..265].copy_from_slice(b"00");
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+        let payload = vec![0x5au8; 700];
+        // PAX record for size=700: " size=700\n" is 10 bytes; +2 digits → 12.
+        let pax_body = b"12 size=700\n".to_vec();
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&hdr("PaxHeaders.0/big.bin", pax_body.len() as u64, b'x'));
+        tar.extend_from_slice(&pax_body);
+        tar.extend(std::iter::repeat_n(0u8, 512 - pax_body.len()));
+        tar.extend_from_slice(&hdr("big.bin", 0, b'0')); // zeroed size field
+        tar.extend_from_slice(&payload);
+        tar.extend(std::iter::repeat_n(0u8, 1024 - 700 + 1024)); // pad + EOF pair
+
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("paxsize.tar");
+        std::fs::write(&tar_path, &tar).unwrap();
+        let mut mat = None;
+        let m = SqliteIndexedTar::create_index(
+            &tar_path,
+            &tar_path,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("index pax-size tar");
+
+        let fi = m.lookup("/big.bin", 0).expect("lookup big.bin");
+        assert_eq!(fi.size, 700, "PAX size must win over zeroed ustar field");
+        let mut r = m.open(&fi, 0).expect("open big.bin");
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut got).unwrap();
+        assert_eq!(got, payload);
+        // No junk members parsed out of the payload stream.
+        let Some(ListResult::Infos(root)) = m.list("/") else {
+            panic!("expected root infos");
+        };
+        assert_eq!(root.len(), 1, "payload must not parse as members: {root:?}");
     }
 
     /// Build a minimal ustar+pax archive with the given extended header records.
