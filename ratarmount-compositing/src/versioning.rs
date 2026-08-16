@@ -139,7 +139,9 @@ impl MountSource for FileVersionLayer {
             (1..=n)
                 .map(|i| CheapDirent {
                     name: i.to_string(),
-                    mode: ratarmount_core::S_IFREG,
+                    // Read-only virtual files: bare S_IFREG would render
+                    // perm 000 in readdirplus listings (real mode via lookup).
+                    mode: ratarmount_core::S_IFREG | 0o444,
                     size: 0,
                 })
                 .collect(),
@@ -197,6 +199,10 @@ impl MountSource for FileVersionLayer {
 
     fn is_immutable(&self) -> bool {
         self.inner.is_immutable()
+    }
+
+    fn content_generation(&self) -> u64 {
+        self.inner.content_generation()
     }
 
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
@@ -362,5 +368,18 @@ mod tests {
         let mut out = Vec::new();
         std::io::Read::read_to_end(&mut r, &mut out).unwrap();
         assert_eq!(out, a);
+
+        // Versions-folder dirents must be readable regular files, not bare
+        // S_IFREG with permission bits 000 (regression: perm-less dirents).
+        let vdents = layer
+            .list_dirents("/a.txt.versions")
+            .expect("versions dirents");
+        assert_eq!(vdents.len(), 1);
+        assert_eq!(vdents[0].name, "1");
+        assert_eq!(
+            vdents[0].mode,
+            ratarmount_core::S_IFREG | 0o444,
+            "version entries advertise read-only regular-file mode"
+        );
     }
 }

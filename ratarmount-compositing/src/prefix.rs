@@ -143,6 +143,10 @@ impl MountSource for PrefixMountSource {
         self.inner.is_immutable()
     }
 
+    fn content_generation(&self) -> u64 {
+        self.inner.content_generation()
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         self.inner.member_seek_is_cheap(file_info)
     }

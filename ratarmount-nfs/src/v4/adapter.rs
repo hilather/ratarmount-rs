@@ -189,7 +189,13 @@ impl RatarmountNfs4 {
         } else {
             match kids.iter().position(|(id, _, _, _)| *id == cookie) {
                 Some(i) => i + 1,
-                None => return Err(FsError::InvalidInput),
+                // Cookie entry vanished (overlay delete between pages): resume
+                // at the next surviving id. embednfs maps our error to
+                // NFS4ERR_INVAL (no BadCookie variant), which aborts `ls`.
+                None => kids
+                    .iter()
+                    .position(|(id, _, _, _)| *id > cookie)
+                    .unwrap_or(kids.len()),
             }
         };
         let max = max_entries as usize;
@@ -415,6 +421,9 @@ fn read_member(
     count: u32,
 ) -> FsResult<ReadResult> {
     let path = inodes.path_for_id(id).ok_or(FsError::Stale)?;
+    // A live overlay commit invalidates every cached FileInfo at once (base
+    // member offsets shift) — sweep before trusting the cache for the check.
+    readers.sweep_if_generation_advanced(source, inodes);
     let fi_check = if path == "/" {
         ratarmount_core::create_root_file_info()
     } else if let Some(c) = inodes.cached_lookup_fi(id) {
@@ -846,6 +855,9 @@ mod tests {
         assert_eq!(nfs.getattr_sync(99).unwrap_err(), FsError::Stale);
     }
 
+    /// Regression: an unknown/vanished readdir cookie resumes at the next
+    /// surviving id (empty page at end) instead of an error that embednfs can
+    /// only surface as NFS4ERR_INVAL, aborting client listings mid-enumeration.
     #[test]
     fn v4_readdir_cookie_and_unknown() {
         let mut s = Synth::new();
@@ -856,15 +868,17 @@ mod tests {
         assert_eq!(all.entries.len(), 2);
         assert!(all.eof);
         assert_eq!(all.entries[0].cookie, all.entries[0].handle);
+        // Cookies must not collide with embednfs's reserved values 1 and 2.
+        assert!(all.entries.iter().all(|e| e.cookie > 2));
         let first = all.entries[0].cookie;
         let rest = nfs.readdir_sync(1, first, 10, false).unwrap();
         assert_eq!(rest.entries.len(), 1);
         assert!(rest.eof);
         assert!(rest.entries[0].attrs.is_none());
-        assert_eq!(
-            nfs.readdir_sync(1, 9999, 10, false).unwrap_err(),
-            FsError::InvalidInput
-        );
+        // Cookie past the last id: empty page, eof — no error.
+        let tail = nfs.readdir_sync(1, 9999, 10, false).unwrap();
+        assert!(tail.entries.is_empty());
+        assert!(tail.eof);
     }
 
     #[tokio::test]

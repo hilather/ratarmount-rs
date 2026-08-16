@@ -178,6 +178,10 @@ pub struct ReaderLru {
     cap: usize,
     /// When set, [`Self::get_or_open`] also runs [`Self::evict_idle`] on insert.
     idle_ttl: Option<Duration>,
+    /// Last seen `MountSource::content_generation`. A live overlay commit
+    /// replaces the base archive (member offsets shift), so every cached
+    /// FileInfo and open reader — not just overlay-tagged ones — is stale.
+    source_generation: std::sync::atomic::AtomicU64,
 }
 
 impl ReaderLru {
@@ -186,6 +190,7 @@ impl ReaderLru {
             slots: Mutex::new(HashMap::new()),
             cap: cap.max(1),
             idle_ttl: None,
+            source_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -196,6 +201,25 @@ impl ReaderLru {
             slots: Mutex::new(HashMap::new()),
             cap: cap.max(1),
             idle_ttl: Some(ttl),
+            source_generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Drop all slots + cached inode FileInfos when the source's content
+    /// generation advanced (live overlay commit). `fetch_max` never regresses
+    /// under concurrent sweeps.
+    pub(crate) fn sweep_if_generation_advanced(
+        &self,
+        source: &dyn MountSource,
+        inodes: &InodeTable,
+    ) {
+        let gen = source.content_generation();
+        let prev = self
+            .source_generation
+            .fetch_max(gen, std::sync::atomic::Ordering::SeqCst);
+        if prev < gen {
+            self.slots.lock().expect("reader lru").clear();
+            inodes.clear_all_lookup_fi();
         }
     }
 
@@ -209,6 +233,7 @@ impl ReaderLru {
         inodes: &InodeTable,
         id: u64,
     ) -> io::Result<(FileInfo, Arc<Mutex<SourceReadState>>)> {
+        self.sweep_if_generation_advanced(source, inodes);
         {
             let mut map = self.slots.lock().expect("reader lru");
             if let Some(slot) = map.get_mut(&id) {

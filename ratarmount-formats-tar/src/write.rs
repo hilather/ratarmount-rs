@@ -29,6 +29,11 @@ const PAX_HDR_PATH_MAX: usize = USTAR_NAME_LEN - 13;
 /// not the last overlapping 1024-zero window inside the padding. Only if the
 /// suffix does not end in two zero blocks do we fall back to the last interior
 /// pair (concatenated-TAR frames that were truncated before a new EOF).
+///
+/// **Warning:** the returned position is an *existence probe*, not a safe cut
+/// boundary — a member whose final payload blocks are all zero extends the
+/// trailing run into the payload, so the position can precede the true data
+/// end. `rewrite_tar_suffix` derives the cut from parsed member spans instead.
 pub fn find_last_tar_eof<R: Read + Seek>(
     suffix: &mut R,
     stream_offset: u64,
@@ -161,9 +166,11 @@ where
     W: Write,
 {
     let suffix_len = suffix.seek(SeekFrom::End(0))?;
-    let eof = find_last_tar_eof(suffix, stream_offset)?;
-    let copy_end = eof.unwrap_or(suffix_len);
-    let first = find_first_valid_header(suffix, stream_offset, copy_end)?;
+    // The cut point must come from forward-parsed member spans, never from a
+    // backward zero-run scan: a member whose final payload block(s) are all
+    // zero is indistinguishable from EOF padding when scanning back, and
+    // cutting there silently truncates the member and swallows appends.
+    let first = find_first_valid_header(suffix, stream_offset, suffix_len)?;
 
     let mut stats = RewriteTarSuffixStats::default();
     match first {
@@ -174,10 +181,31 @@ where
                     "could not parse last-window TAR headers; cannot apply last-window delete",
                 ));
             }
-            stats.bytes_kept = copy_span(suffix, out, 0, copy_end)?;
+            if !opts.append.is_empty() && !region_all_zero(suffix, 0, suffix_len)? {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "could not parse last-window TAR headers; the window has no \
+                     member boundary (a member spans the whole window) — cannot \
+                     locate the data end; enlarge the rewrite window",
+                ));
+            }
+            // Pure zero padding (old EOF / record blocks): nothing to keep;
+            // new members must not land behind an early EOF pair.
         }
         Some(first_pos) => {
-            let members = collect_members(suffix, first_pos, stream_offset, opts.encoding)?;
+            let mut cursor =
+                TarMemberCursor::new(&mut *suffix, first_pos, stream_offset, opts.encoding);
+            let mut members = Vec::new();
+            while let Some(m) = cursor.next_member()? {
+                members.push(m);
+            }
+            // Copy kept bytes only up to the end of the last walked member;
+            // anything after (old EOF pair, record padding) is regenerated.
+            let copy_end = members
+                .iter()
+                .map(|m| m.raw_end)
+                .fold(first_pos, |a, b| a.max(b))
+                .min(suffix_len);
             let deleted: HashSet<String> = opts
                 .deleted_paths
                 .iter()
@@ -238,20 +266,6 @@ where
     Ok(stats)
 }
 
-fn collect_members<R: Read + Seek>(
-    suffix: &mut R,
-    first_pos: u64,
-    stream_offset: u64,
-    encoding: &str,
-) -> io::Result<Vec<TarRawMember>> {
-    let mut cursor = TarMemberCursor::new(suffix, first_pos, stream_offset, encoding);
-    let mut members = Vec::new();
-    while let Some(m) = cursor.next_member()? {
-        members.push(m);
-    }
-    Ok(members)
-}
-
 /// Read-only walker over last-window TAR headers (no index inserts / sparse maps).
 pub struct TarMemberCursor<R> {
     reader: R,
@@ -259,6 +273,9 @@ pub struct TarMemberCursor<R> {
     encoding: String,
     pax_global: HashMap<String, String>,
     pending: Option<PendingHelper>,
+    /// Start of the terminal zero run (EOF pair + padding), found by walking
+    /// FORWARD — never by scanning zero runs backward (a member's all-zero
+    /// payload blocks are indistinguishable from padding when scanning back).
     eof_off: Option<u64>,
     reader_len: u64,
     /// Set when `new` cannot measure the suffix; `next_member` surfaces it.
@@ -272,12 +289,10 @@ struct PendingHelper {
 
 impl<R: Read + Seek> TarMemberCursor<R> {
     pub fn new(mut reader: R, start_pos: u64, stream_offset: u64, encoding: &str) -> Self {
-        let (reader_len, eof_off, init_err) = match reader.seek(SeekFrom::End(0)) {
-            Ok(len) => match find_last_tar_eof(&mut reader, stream_offset) {
-                Ok(eof) => (len, eof, None),
-                Err(e) => (len, None, Some(e)),
-            },
-            Err(e) => (0, None, Some(e)),
+        let _ = stream_offset; // alignment is the caller's job (find_first_valid_header)
+        let (reader_len, init_err) = match reader.seek(SeekFrom::End(0)) {
+            Ok(len) => (len, None),
+            Err(e) => (0, Some(e)),
         };
         let encoding = if encoding.trim().is_empty() {
             "utf-8".to_string()
@@ -290,10 +305,15 @@ impl<R: Read + Seek> TarMemberCursor<R> {
             encoding,
             pax_global: HashMap::new(),
             pending: None,
-            eof_off,
+            eof_off: None,
             reader_len,
             init_err,
         }
+    }
+
+    /// Start of the terminal zero run, once the walk has ended.
+    pub fn stream_eof_offset(&self) -> Option<u64> {
+        self.eof_off
     }
 
     /// Next logical member, or None at last two-zero EOF / reader EOF.
@@ -317,7 +337,28 @@ impl<R: Read + Seek> TarMemberCursor<R> {
                 return Ok(None);
             }
             if header.iter().all(|&b| b == 0) {
-                self.pos += BLOCK_SIZE;
+                // Measure this zero run in one sweep (linear total work). A
+                // run that reaches the end of the suffix is the terminal
+                // EOF/padding; interior runs — including an EOF pair between
+                // concatenated members — are gaps and skipped wholesale.
+                let mut run_end = self.pos + BLOCK_SIZE;
+                loop {
+                    let remaining = self.reader_len - run_end;
+                    if remaining == 0 {
+                        break;
+                    }
+                    let n = remaining.min(BLOCK_SIZE) as usize;
+                    if !region_all_zero(&mut self.reader, run_end, n as u64)? {
+                        break;
+                    }
+                    run_end += n as u64;
+                }
+                if run_end >= self.reader_len {
+                    self.eof_off = Some(self.pos);
+                    self.pos = run_end;
+                    return Ok(None);
+                }
+                self.pos = run_end;
                 continue;
             }
             if !checksum_ok(&header) {
@@ -380,7 +421,12 @@ impl<R: Read + Seek> TarMemberCursor<R> {
                 .get("size")
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(size);
-            let raw_end = self.pos + BLOCK_SIZE + pad512(on_tape);
+            // Saturate: a hostile PAX `size` near u64::MAX must not wrap the
+            // span back into the payload (wraps would parse junk members).
+            let raw_end = self
+                .pos
+                .saturating_add(BLOCK_SIZE)
+                .saturating_add(pad512(on_tape));
             self.pos = raw_end;
             return Ok(Some(TarRawMember {
                 raw_start: helper_start,
@@ -549,6 +595,22 @@ fn find_first_valid_header<R: Read + Seek>(
         i += BLOCK_SIZE;
     }
     Ok(None)
+}
+
+/// True when `rewrite_tar_suffix` can safely rewrite this window: either a
+/// parseable member header exists, or the whole window is zero padding.
+/// Without either, the data end is unknowable (a member spans the window)
+/// and rewriting would corrupt the archive — the caller must enlarge the
+/// window instead.
+pub fn window_has_member_boundary<R: Read + Seek>(
+    suffix: &mut R,
+    stream_offset: u64,
+) -> io::Result<bool> {
+    let len = suffix.seek(SeekFrom::End(0))?;
+    if find_first_valid_header(suffix, stream_offset, len)?.is_some() {
+        return Ok(true);
+    }
+    region_all_zero(suffix, 0, len)
 }
 
 fn has_tar_magic(header: &[u8; 512]) -> bool {
@@ -1118,7 +1180,10 @@ mod tests {
         assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
     }
 
-    /// Regression: mid-member suffix is opaque; append-only works; delete needs headers.
+    /// Regression: a mid-member opaque window with nonzero content fails
+    /// closed (the data end is unknowable without a member boundary; the old
+    /// zero-run cut could silently truncate a zero-tailed member). Delete
+    /// without parseable headers also fails.
     #[test]
     fn rewrite_mid_member_opaque_prefix() {
         let payload = vec![0xcd; 600];
@@ -1129,8 +1194,7 @@ mod tests {
 
         let empty = HashSet::new();
         let append = [member_file("extra.txt", extra)];
-        let mut out = Vec::new();
-        rewrite_tar_suffix(
+        let err = rewrite_tar_suffix(
             &mut Cursor::new(suffix.clone()),
             mid,
             &RewriteTarSuffix {
@@ -1138,19 +1202,14 @@ mod tests {
                 append: &append,
                 encoding: "utf-8",
             },
-            &mut out,
+            &mut Vec::new(),
         )
-        .expect("append-only mid-member");
-        let eof = find_last_tar_eof(&mut Cursor::new(suffix.clone()), mid)
-            .expect("eof")
-            .expect("two-zero eof in suffix");
-        let prefix = &suffix[..eof as usize];
+        .expect_err("append into opaque nonzero window must fail closed");
         assert!(
-            out.starts_with(prefix),
-            "mid-member opaque prefix must be kept up to the old EOF"
+            err.to_string()
+                .contains("could not parse last-window TAR headers"),
+            "unexpected error: {err}"
         );
-        let expected_tail = pack(&[member_file("extra.txt", extra)]);
-        assert_eq!(&out[prefix.len()..], expected_tail.as_slice());
 
         let mut deleted = HashSet::new();
         deleted.insert("a.bin".to_string());
@@ -1170,6 +1229,71 @@ mod tests {
                 .contains("could not parse last-window TAR headers"),
             "unexpected error: {err}"
         );
+    }
+
+    /// Regression: all-zero window (old EOF / record padding) accepts appends;
+    /// the padding is dropped so new members are not hidden behind the old
+    /// EOF pair.
+    #[test]
+    fn rewrite_all_zero_window_appends_without_kept_zeros() {
+        let suffix = vec![0u8; 2048];
+        let extra = b"appended";
+        let empty = HashSet::new();
+        let append = [member_file("extra.txt", extra)];
+        let mut out = Vec::new();
+        let stats = rewrite_tar_suffix(
+            &mut Cursor::new(suffix),
+            0,
+            &RewriteTarSuffix {
+                deleted_paths: &empty,
+                append: &append,
+                encoding: "utf-8",
+            },
+            &mut out,
+        )
+        .expect("append into zero padding window");
+        assert_eq!(stats.bytes_kept, 0, "padding must not be kept");
+        assert_eq!(stats.members_appended, 1);
+        let expected = pack(&[member_file("extra.txt", extra)]);
+        assert_eq!(out, expected);
+    }
+
+    /// Regression: zero-tail member must survive a rewrite (the trailing zero
+    /// run scan cut into payload zeros, truncating the member and hiding
+    /// appends behind the padding).
+    #[test]
+    fn rewrite_zero_tail_member_not_truncated() {
+        // 1024-byte all-zero payload: final payload blocks are all zero and
+        // run into the EOF marker contiguously.
+        let zeros = vec![0u8; 1024];
+        let archive = pack(&[member_file("zeros.bin", &zeros)]);
+        let extra = b"new-bytes";
+        let appended = [member_file("new.txt", extra)];
+        let empty = HashSet::new();
+        let mut out = Vec::new();
+        let stats = rewrite_tar_suffix(
+            &mut Cursor::new(archive.clone()),
+            0,
+            &RewriteTarSuffix {
+                deleted_paths: &empty,
+                append: &appended,
+                encoding: "utf-8",
+            },
+            &mut out,
+        )
+        .expect("rewrite with zero-tail member");
+        assert_eq!(stats.members_kept, 1);
+        assert_eq!(stats.members_appended, 1);
+
+        // Byte-exact shape: original member span, then the append, then EOF.
+        let mut expected = archive[..512 + 1024].to_vec();
+        expected.extend_from_slice(&pack(&[member_file("new.txt", extra)]));
+        assert_eq!(out, expected);
+
+        // Parse the result with the real indexer: zeros.bin intact, new.txt present.
+        let m = open_mem(out);
+        assert_eq!(read_path(&m, "/zeros.bin"), zeros.as_slice());
+        assert_eq!(read_path(&m, "/new.txt"), extra);
     }
 
     /// Regression: GNU long-name `L` helper is consumed so a last-window delete works.

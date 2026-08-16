@@ -663,6 +663,14 @@ impl MountSource for UnionMountSource {
         self.sources.iter().all(|s| s.is_immutable())
     }
 
+    fn content_generation(&self) -> u64 {
+        // Generations only increment, so the sum changes whenever any child
+        // bumps (a WriteOverlay branch commit must invalidate merged caches).
+        self.sources
+            .iter()
+            .fold(0u64, |acc, s| acc.saturating_add(s.content_generation()))
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if let Some(si) = self.source_from_info(file_info) {
             if let Some(src) = self.sources.get(si) {

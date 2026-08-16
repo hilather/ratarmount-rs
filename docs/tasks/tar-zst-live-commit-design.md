@@ -277,9 +277,9 @@ loop:
 # Then streaming suffix rewrite + encode + persist (no Vec-only hook)
 ```
 
-`find_last_tar_eof` is specified below (stream-aligned last two-zero pair). Decode **one more** previous frame when that pair is not fully contained. Growing `n` can only make more members in-window (single-frame ⇒ window start 0 ⇒ every version is in-window and original-member delete becomes a full rewrite — allowed).
+`find_last_tar_eof` is specified below (stream-aligned last two-zero pair). Decode **one more** previous frame when that pair is not fully contained **or the window has no parseable member boundary** (a member spanning the whole window has no findable data end). Growing `n` can only make more members in-window (single-frame ⇒ window start 0 ⇒ every version is in-window and original-member delete becomes a full rewrite — allowed).
 
-**`find_last_tar_eof(suffix, stream_offset)`**
+**`find_last_tar_eof(suffix, stream_offset)`** — **existence probe only, never a cut boundary.**
 
 TAR blocks are 512-aligned in the *uncompressed stream*, not necessarily at `suffix[0]`.
 
@@ -293,6 +293,8 @@ return last
 ```
 
 Using the **last** pair (not the first) preserves concatenated-TAR frames that contain their own EOFs (shape 1). The first pair would truncate later members. This is a **write-side** rule. Do not cite the indexer as “stops at first pair”: `parse_tar_into_index` (`ignore_zeros: false`) breaks on the **first 512-byte zero block**; the next-block read does not change control flow (both branches `break`).
+
+**Zero-run scans cannot locate the data end.** A member whose final payload block(s) are all zero extends the trailing zero run into the payload, so any zero-scan position can precede the true data end (regression: zero-tail member truncated, appends hidden behind padding). `rewrite_tar_suffix` therefore derives the cut from the member walk (`TarMemberCursor`), which skips payload by parsed span and treats a zero run as terminal only when it reaches the end of the suffix. Interior zero runs — including EOF pairs between concatenated members — are gaps and are skipped wholesale.
 
 If the suffix starts mid-member, bytes before the first accepted header are **opaque prefix** and are copied raw (see PR 2 contract for the first-header rule).
 
@@ -446,7 +448,7 @@ Mid-member payload can collide with a plausible checksum.
 
 **Rule:** scan stream-aligned 512-byte slots from `align = (512 - (stream_offset % 512)) % 512`. Accept the **first** slot that (1) is not a zero block, (2) has `ustar` / `GNU  ` / `ustar\0` magic at +257, **and** (3) has a valid ustar checksum. Bytes before that slot are opaque prefix and are copied raw.
 
-If **no** slot before `find_last_tar_eof` checksums, treat the entire suffix up to EOF as opaque prefix (copy raw, then append new members + new EOF). Last-window **delete** cannot drop a member in that case — classification already required every version of a deleted name to be in-window, so this is a hostile/corrupt suffix; fail `rewrite_tar_suffix` with “could not parse last-window TAR headers; cannot apply last-window delete” if `deleted_paths` is non-empty. Append-only (empty `deleted_paths`) still succeeds (opaque copy + append).
+If **no** slot checksums anywhere in the window, the suffix has no member boundary: pure zero padding (old EOF / record blocks) is dropped and appends are written fresh; anything else is hostile/corrupt or a member spanning the whole window — fail `rewrite_tar_suffix` with “could not parse last-window TAR headers …” whenever the plan is non-empty. (Earlier revisions allowed an opaque-copy append; that could silently truncate a zero-tailed member, so the caller grows the window to a member boundary instead — see `window_has_member_boundary`.)
 
 Do **not** skip a failed checksum and keep scanning after a later “lucky” header in the middle of a payload if an earlier aligned slot already looked like a header but failed checksum — only the first magic+checksum hit starts the walk. After the walk starts, checksum failures are errors (truncated/corrupt last window).
 

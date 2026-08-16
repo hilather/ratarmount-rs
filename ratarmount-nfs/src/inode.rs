@@ -37,7 +37,9 @@ impl InodeTable {
         Self {
             inodes: Mutex::new(inodes),
             path_to_id: Mutex::new(path_to_id),
-            next_id: AtomicU64::new(ROOT_FILEID + 1),
+            // Fileids double as READDIR cookies; embednfs (NFSv4.1) reserves
+            // cookie values 1 and 2, so never hand them out.
+            next_id: AtomicU64::new(ROOT_FILEID + 2),
         }
     }
 
@@ -95,6 +97,14 @@ impl InodeTable {
     /// Drop cached lookup `FileInfo` so the next getattr/read re-looks up.
     pub fn clear_lookup_fi(&self, id: u64) {
         if let Some(ent) = self.inodes.lock().expect("inode map").get_mut(&id) {
+            ent.file_info = None;
+        }
+    }
+
+    /// Drop every cached lookup `FileInfo` (live overlay commit may have
+    /// shifted base member offsets, invalidating all of them at once).
+    pub fn clear_all_lookup_fi(&self) {
+        for ent in self.inodes.lock().expect("inode map").values_mut() {
             ent.file_info = None;
         }
     }
