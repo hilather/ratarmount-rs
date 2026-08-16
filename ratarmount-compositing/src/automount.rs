@@ -1154,13 +1154,19 @@ impl MountSource for AutoMountLayer {
         }
         let (mp, rest) = mounted.find_mounted_in(&path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
-        let dents = src.list_dirents(&rest)?;
-        Some(
-            dents
-                .into_iter()
-                .map(|d| self.remap_child(d.name, d.mode, d.size, &path, &mounted))
-                .collect(),
-        )
+        let mut dents = src.list_dirents(&rest)?;
+        // Remap can rename (mount-point dir / strip-ext), and two children may
+        // land on the same final name (e.g. real dir `a/` plus `a.tar` mounted
+        // at `/a`). list() dedups via BTreeMap last-wins in name order; mirror
+        // that here so readdir never advertises a duplicate dirent.
+        dents.sort_by(|a, b| a.name.cmp(&b.name));
+        let mut by_name: std::collections::BTreeMap<String, CheapDirent> =
+            std::collections::BTreeMap::new();
+        for d in dents {
+            let remapped = self.remap_child(d.name, d.mode, d.size, &path, &mounted);
+            by_name.insert(remapped.name.clone(), remapped);
+        }
+        Some(by_name.into_values().collect())
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -2282,5 +2288,52 @@ mod tests {
         assert_eq!(renamed.size, 0);
         let sib = by_name.get("readme.txt").expect("sibling present");
         assert_eq!(sib.size, sibling.len() as u64);
+    }
+
+    /// Regression: strip-ext real dir + same-stem archive must not duplicate a dirent.
+    ///
+    /// Root has real dir `archive/` and `archive.zip` mounted at `/archive`.
+    /// Both children remap to the name `archive`; fat list() dedups via its
+    /// BTreeMap, so cheap list_dirents must too (FUSE readdir shows each once).
+    #[test]
+    fn list_dirents_strip_ext_dir_archive_collision_no_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir_all(dir.path().join("archive")).unwrap();
+        fs::write(dir.path().join("archive").join("real.txt"), b"real\n").unwrap();
+        write_zip_member(&dir.path().join("archive.zip"), "inner.txt", b"zip\n");
+
+        let folder = crate::folder::FolderMountSource::new(dir.path()).unwrap();
+        let layer = AutoMountLayer::new_with_options(
+            Arc::new(folder) as Arc<dyn MountSource>,
+            1,
+            zip_opener(),
+            AutoMountOptions {
+                strip_recursive_extension: true,
+                parallel_nested_threads: 1,
+                ..Default::default()
+            },
+        );
+
+        let dents = layer.list_dirents("/").expect("dirents /");
+        let names: Vec<&str> = dents.iter().map(|d| d.name.as_str()).collect();
+        let n_archive = names.iter().filter(|n| **n == "archive").count();
+        assert_eq!(
+            n_archive, 1,
+            "cheap list_dirents must dedup remapped names, got {names:?}"
+        );
+
+        let fat = match layer.list("/").expect("fat list") {
+            ListResult::Infos(m) => m,
+            other => panic!("expected Infos, got {other:?}"),
+        };
+        assert_eq!(
+            fat.keys().filter(|k| k.as_str() == "archive").count(),
+            1,
+            "fat list() must show `archive` once"
+        );
+        let cheap = dents.iter().find(|d| d.name == "archive").expect("cheap");
+        let fat_fi = fat.get("archive").expect("fat");
+        assert_eq!(cheap.mode, fat_fi.mode, "cheap/fat mode parity for `archive`");
+        assert_eq!(cheap.size, fat_fi.size, "cheap/fat size parity for `archive`");
     }
 }
