@@ -280,13 +280,13 @@ struct Args {
     #[arg(long = "yes", action = ArgAction::SetTrue)]
     yes: bool,
 
-    /// On SIGINT/SIGTERM or NFS/FUSE return, commit `-w` into an uncompressed TAR.
-    /// Rejects `:temp:` and gzip/bzip2/xz TAR / ZIP (no silent full rewrite).
+    /// On SIGINT/SIGTERM or NFS/FUSE return, commit `-w` into an uncompressed TAR
+    /// or `.tar.zst`. Rejects `:temp:` and gzip/bzip2/xz TAR / ZIP (no silent full rewrite).
     #[arg(long = "commit-overlay-on-exit", action = ArgAction::SetTrue)]
     commit_overlay_on_exit: bool,
 
-    /// Periodically commit `-w` into an uncompressed TAR while serving (`2s`/`15m`/`1h`).
-    /// `0` (default) is off. In-process; promptless. Requires durable `-w`.
+    /// Periodically commit `-w` into an uncompressed TAR or `.tar.zst` while serving
+    /// (`2s`/`15m`/`1h`). `0` (default) is off. In-process; promptless. Requires durable `-w`.
     #[arg(
         long = "commit-overlay-interval",
         value_name = "DURATION",
@@ -813,6 +813,7 @@ fn main() {
                 live_commit_archive,
                 args.commit_overlay_on_exit,
                 commit_interval,
+                open_opts,
             ),
             Some(mp) => run_fuse_and_nfs(
                 bundle.source,
@@ -827,6 +828,7 @@ fn main() {
                 live_commit_archive,
                 args.commit_overlay_on_exit,
                 commit_interval,
+                open_opts,
             ),
         }
         return;
@@ -845,6 +847,7 @@ fn main() {
         live_commit_archive,
         args.commit_overlay_on_exit,
         commit_interval,
+        open_opts,
     );
 }
 
@@ -895,6 +898,7 @@ fn run_nfs_only(
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
+    open_opts: OpenOptions,
 ) {
     let stop = ratarmount_nfs::NfsStop::new();
     opts.stop = Some(stop.clone());
@@ -902,7 +906,7 @@ fn run_nfs_only(
     if let (Some(ov), Some(archive), Some(dur)) =
         (overlay.clone(), live_archive.clone(), commit_interval)
     {
-        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop));
+        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop), open_opts);
     }
     eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
     let serve_err = serve_nfs_blocking(source, opts);
@@ -931,6 +935,7 @@ fn run_fuse_and_nfs(
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
+    open_opts: OpenOptions,
 ) {
     if foreground {
         let stop = ratarmount_nfs::NfsStop::new();
@@ -942,7 +947,13 @@ fn run_fuse_and_nfs(
         if let (Some(ov), Some(archive), Some(dur)) =
             (overlay_arc.clone(), live_archive.clone(), commit_interval)
         {
-            overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop.clone()));
+            overlay_commit::spawn_interval_commits(
+                ov,
+                archive,
+                dur,
+                Some(stop.clone()),
+                open_opts.clone(),
+            );
         }
         let ready = nfs_opts.clone();
         let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
@@ -1008,7 +1019,13 @@ fn run_fuse_and_nfs(
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)
             {
-                overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop.clone()));
+                overlay_commit::spawn_interval_commits(
+                    ov,
+                    archive,
+                    dur,
+                    Some(stop.clone()),
+                    open_opts.clone(),
+                );
             }
             if let Err(e) = spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
                 let _ = std::fs::write(
@@ -1061,6 +1078,7 @@ fn run_fuse_only(
     live_archive: Option<PathBuf>,
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
+    open_opts: OpenOptions,
 ) {
     if live_archive.is_some() {
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
@@ -1110,7 +1128,7 @@ fn run_fuse_only(
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)
             {
-                overlay_commit::spawn_interval_commits(ov, archive, dur, None);
+                overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts);
             }
             let mount_err = mount_blocking(
                 source,

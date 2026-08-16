@@ -154,12 +154,51 @@ table using the recipes above.
 
 ---
 
+## Live overlay commit
+
+`--commit-overlay-on-exit` and `--commit-overlay-interval` accept a **single**
+host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
+(or zstd magic + TAR body), with durable `-w` (not `:temp:`). See
+[mount-options-parity.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md)
+and [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+
+Producer recipes above stay valid. Persist **rewrites only the last zstd frame**
+(does not recompress the prefix). Prefix frames stay byte-identical, including
+complete-TAR frames (`xargs tar -c | zstd >>`) and split-suffix frames
+(`split -b … | zstd >>`). Official seek-table footers are rebuilt when present
+and dropped when a frame size exceeds the seekable-format `u32` limit.
+
+**Cost model residual (not “O(last frame)” end-to-end):**
+
+| Step | Cost |
+|------|------|
+| Last-frame rewrite | Decode + encode the last N frames only (no prefix recompress) |
+| Persist | Still **copies** the compressed file to a sibling tmp |
+| Remount / interval reopen | Still **reindexes the whole TAR** (sequential decode + parse) |
+
+Plan **2× compressed size** disk headroom (tmp + original until `persist`
+unlinks the old inode). Single-frame `tar \| zstd` is a full last-frame rewrite
+(same recompress class as offline gzip TAR commit). **Never refuse on size** —
+startup warns when `frames.len() == 1` or the last-frame uncompressed size
+exceeds **64 MiB**, then spills decoded/encoded suffix above 256 MiB.
+
+**Not supported (v1):**
+
+- Gzip / bzip2 / xz live splice — rejected with a message that **names gzip**
+  (or the other codec). G3 inflate checkpoints are not deflate cut points.
+- Offline `--commit-overlay` for `.tar.zst` — **not an escape hatch yet**.
+- Plain `.zst` that is not a TAR body.
+- Delete/replace of a name that still has a version in an earlier frame
+  (append-only + last-window mutate).
+
+---
+
 ## Related
 
 | Doc / code | Role |
 |------------|------|
-| [gzip-binding-decision.md](gzip-binding-decision.md) | Gzip checkpoints (analogous idea for deflate) |
-| [embedded-nested-archives.md](embedded-nested-archives.md) | Nested `.tar.zst` / plain `.zst` without `/tmp` |
-| [parity-todo.md](parity-todo.md) | Codec parity checklist |
+| [gzip-binding-decision.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md) | Gzip checkpoints (analogous idea for deflate) |
+| [embedded-nested-archives.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md) | Nested `.tar.zst` / plain `.zst` without `/tmp` |
+| [parity-todo.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) | Codec parity checklist |
 | `ratarmount-compress/src/zstd_seek.rs` | Implementation + unit tests |
 | Upstream [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples |

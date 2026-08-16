@@ -20,9 +20,10 @@ ratarmount --nfs -f archive.tar.gz mnt/
 ratarmount --nfs -w :temp: archive.tar.gz
 ratarmount --nfs --nfs-vers 4 -w :temp: archive.tar.gz
 
-# Live commit into an uncompressed TAR (not :temp:, not .tar.gz/.zip)
+# Live commit into an uncompressed TAR or .tar.zst (not :temp:, not .tar.gz/.zip)
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m archive.tar
+ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar.zst
 
 # NFSv4.1 (opt-in; Linux packages already enable nfsv4)
 ratarmount --nfs --nfs-vers 4 archive.tar.gz
@@ -40,15 +41,17 @@ mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ /mnt
 mount.nfs -o user,noacl,nolock,vers=3,tcp,rsize=131072,port=20490,mountport=20490 127.0.0.1:/ mnt
 ```
 
-Live overlay commit (uncompressed TAR only):
+Live overlay commit (uncompressed TAR or `.tar.zst`):
 
 ```bash
-# Durable overlay required. gzip/bzip2/xz TAR and ZIP are rejected (use offline --commit-overlay).
+# Durable overlay required. gzip/bzip2/xz TAR and ZIP are rejected for live commit.
+# Offline --commit-overlay is not an escape hatch for zstd yet.
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m archive.tar
+ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar.zst
 ```
 
-Interval commit is in-process: sibling copy of the archive, GNU `tar --delete`/`--append`, atomic replace, reopen the TAR, then clear overlay files so a later tick cannot duplicate members. On-exit commits on SIGINT/SIGTERM or when NFS/FUSE returns (no overlay reset). `:temp:` is rejected.
+Interval commit is in-process. Uncompressed TAR: sibling copy, GNU `tar --delete`/`--append`, atomic replace, reopen, then clear overlay files so a later tick cannot duplicate members. `.tar.zst`: rewrites only the last zstd frame (does not recompress the prefix). Persist still copies the compressed file; remount still reindexes the whole TAR. Plan **2× compressed size** disk headroom (sibling tmp + original until replace). Never refuse on size; warn at startup when the archive is single-frame or the last frame is larger than 64 MiB. On-exit commits on SIGINT/SIGTERM or when NFS/FUSE returns (no overlay reset). `:temp:` is rejected. See [zstd-random-access.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md).
 
 Privileged kernel-client check (not default CI):
 
@@ -87,7 +90,7 @@ Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist
 
 - **Windows** `mount.exe` / `dir`: nfsserve `READDIR` is unimplemented (Linux/macOS use `READDIRPLUS`). Default client port is often 2049, not 20490.
 - Overlay **rename** / **symlink** work with `-w` on NFSv3 and NFSv4.1 (same overlay folder as FUSE). Without `-w` they stay `NFS3ERR_ROFS` / `NFS4ERR_ROFS`.
-- Live `--commit-overlay-on-exit` / `--commit-overlay-interval` apply only to **uncompressed TAR** (copy + GNU `tar --delete`/`--append` + replace). gzip/bzip2/xz TAR and ZIP stay the offline `ratarmount --commit-overlay` path (full rewrite). `:temp:` is rejected. There is no NFS RPC to trigger commit.
+- Live `--commit-overlay-on-exit` / `--commit-overlay-interval` apply to **uncompressed TAR** (copy + GNU `tar --delete`/`--append` + replace) and **`.tar.zst`** (last-frame rewrite; does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom). Never refuse on size; warn 64 MiB / single-frame. Gzip stays rejected. Offline `--commit-overlay` is **not** an escape hatch for zstd yet (gzip/bzip2/xz TAR and ZIP stay that offline path). `:temp:` is rejected. There is no NFS RPC to trigger commit.
 - Linux NFSv4.1 `cp`/`cat` **close** can return `Remote I/O error` after a successful write (bytes still match on `cmp`). The adapter implements embednfs `COMMIT`; this is a residual, not silent data loss.
 - Kerberos / RPCSEC_GSS / ACLs / delegations / NLM. NFSv4.1 is opt-in (`--nfs-vers 4`). Overlay create/write/mkdir/remove/setattr-size/rename/symlink work with `-w`.
 - **LAN share** and **Windows** NFSv4 clients (embednfs is macOS-first over localhost; “does not guarantee correct behavior for non-macOS clients”).

@@ -51,7 +51,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
 | AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA)/EXT4(pure) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes | `~` |
-| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild) | `[x]` TAR compressions + ZIP MVP |
+| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild). **Not** `.tar.zst` yet (offline zstd is not an escape hatch). | `[x]` TAR compressions + ZIP MVP / residual zstd |
+| Live `--commit-overlay-on-exit` / `--interval` | no | uncompressed TAR + `.tar.zst` last-frame rewrite (does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn 64 MiB / single-frame). Gzip stays rejected. | `[x]` Rust-only / residual earlier-frame delete |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
 | Control interface socket | yes | Unix socket + in-FS `/.ratarmount-control/` | `[x]` |
 | Lazy mount (`-l`) | yes | yes (mount on first access) | `[x]` |

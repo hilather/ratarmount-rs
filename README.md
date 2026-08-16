@@ -118,7 +118,11 @@ ratarmount --nfs archive.tar.gz
 #   ratarmount --nfs --nfs-vers 4
 #   Linux: mount -t nfs -o vers=4.1,tcp,port=20490,sec=sys 127.0.0.1:/ mnt
 # Loopback kernel client verified via privileged Docker (./test-harness/nfs-docker/run.sh).
-# Uncompressed TAR only: --commit-overlay-on-exit / --commit-overlay-interval (durable -w).
+# Uncompressed TAR or .tar.zst: --commit-overlay-on-exit / --commit-overlay-interval (durable -w).
+# Last-frame rewrite (does not recompress the prefix). Persist still copies the compressed
+# file; remount still reindexes the whole TAR. Plan 2× compressed disk headroom.
+# Never refuses on size; warns at 64 MiB / single-frame. Gzip stays rejected.
+# Offline --commit-overlay is not an escape hatch for zstd yet.
 
 # Unmount
 ratarmount -u mnt/
@@ -146,7 +150,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Recursive automount (`-r`) | Nested open **without `/tmp`** for most stencil formats — [guide](docs/embedded-nested-archives.md) |
 | Lazy mount (`-l`) | Open nested archives on first access — preferred for huge trees |
 | Union of sources | Directory wins over symlink; optional multi-hop resolve |
-| Write overlay (`-w`, `:temp:`) | Full overlay + `--commit-overlay` |
+| Write overlay (`-w`, `:temp:`) | Full overlay + offline `--commit-overlay` (gzip/bzip2/xz TAR + ZIP). Live `--commit-overlay-on-exit` / `--commit-overlay-interval` for uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom). Gzip stays rejected. Offline `--commit-overlay` is not an escape hatch for zstd yet. |
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
@@ -267,7 +271,7 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md), [binding decision](docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
 3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
-4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges.
+4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size, warn 64 MiB / single-frame). Gzip stays rejected. Offline `--commit-overlay` is **not** an escape hatch for zstd yet.
 5. **Remote** — HTTP Basic + Cookie env auth done; residual full browser cookie jar & full `ssh_config` edges.
 6. **Platforms** — macOS is **beta** ([docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)).
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).

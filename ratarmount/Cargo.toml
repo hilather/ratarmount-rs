@@ -58,3 +58,5 @@ libc.workspace = true
 [dev-dependencies]
 tempfile.workspace = true
 nix = { version = "0.29", features = ["signal"] }
+ratarmount-compress.workspace = true
+ratarmount-formats-tar.workspace = true

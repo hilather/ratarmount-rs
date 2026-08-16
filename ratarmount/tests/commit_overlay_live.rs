@@ -294,3 +294,105 @@ fn commit_overlay_interval_zero_never_commits() {
     let _ = child.kill();
     let _ = child.wait();
 }
+
+fn write_split_tar_zst(dir: &Path, first: &[(&str, &[u8])], last: &[(&str, &[u8])]) -> PathBuf {
+    fn pack_no_eof(members: &[(&str, &[u8])]) -> Vec<u8> {
+        let ustar: Vec<ratarmount_formats_tar::UstarMember<'_>> = members
+            .iter()
+            .map(|(n, b)| ratarmount_formats_tar::UstarMember {
+                path: n,
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            })
+            .collect();
+        let mut buf = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut buf, &ustar).unwrap();
+        buf
+    }
+    let f0 = pack_no_eof(first);
+    let mut f1 = pack_no_eof(last);
+    ratarmount_formats_tar::write_tar_eof(&mut f1).unwrap();
+    let mut out = Vec::new();
+    out.extend(ratarmount_compress::encode_zstd_frame(&f0, 3).unwrap());
+    out.extend(ratarmount_compress::encode_zstd_frame(&f1, 3).unwrap());
+    let path = dir.join("a.tar.zst");
+    fs::write(&path, out).unwrap();
+    path
+}
+
+fn decode_tar_zst_to_tar(zst: &Path, dest_tar: &Path) {
+    let map = ratarmount_compress::scan_zstd_frames_path(zst).unwrap();
+    let mut src = fs::File::open(zst).unwrap();
+    let mut out = fs::File::create(dest_tar).unwrap();
+    ratarmount_compress::decode_zstd_frames_to(&mut src, &map, 0, &mut out).unwrap();
+}
+
+#[test]
+fn commit_overlay_on_exit_sigterm_tar_zst_cmp() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected_new = dir.path().join("expected-new.bin");
+    fs::write(&expected_new, format!("p-{}\n", std::process::id())).unwrap();
+    let old = b"keep-zst\n";
+    let last = b"last-frame\n";
+    let zst = write_split_tar_zst(dir.path(), &[("old.txt", old)], &[("last.txt", last)]);
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .arg("--commit-overlay-on-exit")
+        .arg("--index-file")
+        .arg(":memory:")
+        .arg(&zst)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn ratarmount");
+
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(8)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("new.bin"), fs::read(&expected_new).unwrap()).unwrap();
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success() || status.code() == Some(0) || status.code().is_none(),
+        "SIGTERM exit: {status:?} log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let dest_tar = dir.path().join("decoded.tar");
+    decode_tar_zst_to_tar(&zst, &dest_tar);
+    let extract = dir.path().join("ex");
+    fs::create_dir_all(&extract).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-xf"])
+            .arg(&dest_tar)
+            .arg("-C")
+            .arg(&extract)
+            .status()
+            .unwrap()
+            .success(),
+        "tar -xf decoded last-frame rewrite"
+    );
+    assert_eq!(fs::read(extract.join("old.txt")).unwrap(), old);
+    assert_eq!(fs::read(extract.join("last.txt")).unwrap(), last);
+    assert_eq!(
+        fs::read(extract.join("new.bin")).unwrap(),
+        fs::read(&expected_new).unwrap()
+    );
+}

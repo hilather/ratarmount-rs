@@ -1,4 +1,4 @@
-//! Live overlay commit (uncompressed TAR only): interval + on-exit.
+//! Live overlay commit (uncompressed TAR and `.tar.zst`): interval + on-exit.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -7,9 +7,15 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratarmount_compositing::WriteOverlay;
+use ratarmount_compress::{
+    detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
+};
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
 use ratarmount_nfs::NfsStop;
+
+/// Startup / tick warning when the last frame is the whole file or larger than this.
+const LIVE_COMMIT_WARN_LAST_FRAME: u64 = 64 * 1024 * 1024;
 
 static GOT_TERM: AtomicBool = AtomicBool::new(false);
 
@@ -95,6 +101,7 @@ pub fn spawn_interval_commits(
     archive: PathBuf,
     interval: Duration,
     stop: Option<NfsStop>,
+    opts: OpenOptions,
 ) {
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
@@ -109,7 +116,7 @@ pub fn spawn_interval_commits(
             if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                 return;
             }
-            match apply_live_commit(&overlay, &archive, true) {
+            match apply_live_commit(&overlay, &archive, true, &opts) {
                 Ok(true) => log::info!("interval overlay commit wrote {}", archive.display()),
                 Ok(false) => log::debug!("interval overlay commit: nothing to do"),
                 Err(e) => log::error!("interval overlay commit failed: {e}"),
@@ -122,39 +129,61 @@ pub fn apply_live_commit(
     overlay: &WriteOverlay,
     archive: &Path,
     reopen_and_reset: bool,
+    opts: &OpenOptions,
 ) -> Result<bool, String> {
     if reopen_and_reset {
         overlay
-            .commit_live_uncompressed_tar(archive, |p| {
-                reopen_uncompressed_tar(p).map_err(ratarmount_compositing::OverlayError::Msg)
+            .commit_live(archive, |p| {
+                reopen_live_archive(p, opts).map_err(ratarmount_compositing::OverlayError::Msg)
             })
             .map_err(|e| e.to_string())
     } else {
-        overlay
-            .commit_uncompressed_tar_atomic(archive)
-            .map_err(|e| e.to_string())
+        overlay.commit_atomic(archive).map_err(|e| e.to_string())
     }
 }
 
-fn reopen_uncompressed_tar(archive: &Path) -> Result<Arc<dyn MountSource>, String> {
-    let opts = OpenOptions {
-        index_in_memory: true,
-        ..OpenOptions::default()
-    };
-    let mut materialised = None;
-    let tar = SqliteIndexedTar::create_index(
-        archive,
-        archive,
-        None,
-        &opts,
-        env!("CARGO_PKG_VERSION"),
-        &mut materialised,
-    )
-    .map_err(|e| format!("reopen TAR after live commit: {e}"))?;
-    Ok(Arc::new(tar) as Arc<dyn MountSource>)
+fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, String> {
+    let mut o = opts.clone();
+    // Interval swap must not fight the on-disk index / stale zstdblocks.
+    o.index_in_memory = true;
+    match detect_compression(archive) {
+        Ok(CompressionFormat::None) => {
+            let mut materialised = None;
+            let tar = SqliteIndexedTar::create_index(
+                archive,
+                archive,
+                None,
+                &o,
+                env!("CARGO_PKG_VERSION"),
+                &mut materialised,
+            )
+            .map_err(|e| format!("reopen TAR after live commit: {e}"))?;
+            Ok(Arc::new(tar) as Arc<dyn MountSource>)
+        }
+        Ok(CompressionFormat::Zstd) => {
+            // Fresh scan / seek table — do not go through factory::open_zstd
+            // (that would import stale zstdblocks from before persist).
+            let threads = o.threads_for("zstd");
+            let body = open_seekable_zstd_with_threads(archive, threads)
+                .map_err(|e| format!("reopen .tar.zst after live commit: {e}"))?;
+            let tar = SqliteIndexedTar::create_index_body(
+                archive,
+                body,
+                None,
+                &o,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .map_err(|e| format!("reopen .tar.zst after live commit: {e}"))?;
+            Ok(Arc::new(tar) as Arc<dyn MountSource>)
+        }
+        Ok(other) => Err(format!(
+            "live overlay commit reopen supports uncompressed TAR and .tar.zst only (got {other:?})"
+        )),
+        Err(e) => Err(format!("reopen after live commit: detect compression: {e}")),
+    }
 }
 
-/// Startup gate: durable `-w` + a single uncompressed TAR.
+/// Startup gate: durable `-w` + a single uncompressed TAR or `.tar.zst`.
 pub fn validate_live_commit_args(
     write_overlay: Option<&Path>,
     inputs: &[PathBuf],
@@ -171,19 +200,40 @@ pub fn validate_live_commit_args(
     }
     if inputs.len() != 1 {
         return Err(
-            "--commit-overlay-on-exit / --commit-overlay-interval require a single uncompressed TAR"
+            "--commit-overlay-on-exit / --commit-overlay-interval require a single uncompressed TAR or .tar.zst"
                 .into(),
         );
     }
     let archive = inputs[0].clone();
     if !archive.is_file() {
         return Err(format!(
-            "live overlay commit requires an uncompressed TAR file (got {})",
+            "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
             archive.display()
         ));
     }
     ratarmount_compositing::live_commit_is_supported(&archive).map_err(|e| e.to_string())?;
+    maybe_warn_large_zstd_last_frame(&archive);
     Ok(archive)
+}
+
+/// K4: warn once at startup; never refuse on size.
+fn maybe_warn_large_zstd_last_frame(archive: &Path) {
+    match detect_compression(archive) {
+        Ok(CompressionFormat::Zstd) => {}
+        _ => return,
+    }
+    let Ok(map) = scan_zstd_frames_path(archive) else {
+        return;
+    };
+    let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
+    if map.frames.len() == 1 || last_plain > LIVE_COMMIT_WARN_LAST_FRAME {
+        let msg = format!(
+            "live .tar.zst commit will rewrite {last_plain} uncompressed \
+             (single-frame or large last frame); persist still copies the compressed file"
+        );
+        eprintln!("warning: {msg}");
+        log::warn!("{msg}");
+    }
 }
 
 pub fn maybe_commit_on_exit(overlay: Option<&WriteOverlay>, archive: Option<&Path>, enabled: bool) {
@@ -193,7 +243,7 @@ pub fn maybe_commit_on_exit(overlay: Option<&WriteOverlay>, archive: Option<&Pat
     let (Some(ov), Some(path)) = (overlay, archive) else {
         return;
     };
-    match apply_live_commit(ov, path, false) {
+    match apply_live_commit(ov, path, false, &OpenOptions::default()) {
         Ok(true) => eprintln!("committed write overlay into {}", path.display()),
         Ok(false) => log::debug!("on-exit overlay commit: nothing to do"),
         Err(e) => eprintln!("error: on-exit overlay commit failed: {e}"),
@@ -241,5 +291,46 @@ mod tests {
         // Watcher must observe the flag and return (unmount of a non-mount is fine).
         thread::sleep(Duration::from_millis(200));
         set_term_flag_for_test(false);
+    }
+
+    fn write_tiny_tar_zst(path: &std::path::Path) {
+        let payload = b"x\n";
+        let member = ratarmount_formats_tar::UstarMember {
+            path: "a.txt",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        let zst = ratarmount_compress::encode_zstd_frame(&tar, 3).unwrap();
+        std::fs::write(path, zst).unwrap();
+    }
+
+    #[test]
+    fn live_commit_rejects_gzip_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let gz = dir.path().join("a.tar.gz");
+        std::fs::write(&gz, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        let err = validate_live_commit_args(Some(&ov), &[gz]).unwrap_err();
+        assert!(err.contains("gzip"), "{err}");
+        assert!(err.contains("uncompressed"), "{err}");
+    }
+
+    #[test]
+    fn live_commit_accepts_tar_zst() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let path = dir.path().join("a.tar.zst");
+        write_tiny_tar_zst(&path);
+        let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&path))
+            .expect("accept .tar.zst");
+        assert_eq!(got, path);
     }
 }
