@@ -588,13 +588,20 @@ fn mode_to_kind(mode: u32) -> FileType {
     }
 }
 
+/// Far-future saturation for absurd mtimes (2106-02-07). Crafted archives can
+/// carry `inf`/`1e999` mtimes (PAX headers parse as f64); `SystemTime` addition
+/// with a saturated `u64::MAX` seconds would panic, killing the daemon.
+const FAR_FUTURE_SECS: u64 = u32::MAX as u64;
+
 fn unix_float_to_system_time(t: f64) -> SystemTime {
-    if t <= 0.0 {
+    if t <= 0.0 || t.is_nan() {
         return UNIX_EPOCH;
     }
     let secs = t.trunc() as u64;
     let nsec = ((t.fract()) * 1e9) as u32;
-    UNIX_EPOCH + Duration::new(secs, nsec)
+    UNIX_EPOCH
+        .checked_add(Duration::new(secs, nsec))
+        .unwrap_or(UNIX_EPOCH + Duration::new(FAR_FUTURE_SECS, 0))
 }
 
 fn join_path(parent: &str, name: &str) -> String {
@@ -1470,6 +1477,26 @@ mod tests {
         let t = unix_float_to_system_time(1_592_222_400.0); // 2020-06-15 12:00 UTC
         let dur = t.duration_since(UNIX_EPOCH).expect("after epoch");
         assert_eq!(dur.as_secs(), 1_592_222_400);
+    }
+
+    /// Regression: crafted mtime `inf` / `1e999` / NaN must saturate, not
+    /// panic in `SystemTime` addition (daemon crash via a PAX header).
+    #[test]
+    fn unix_float_to_system_time_extreme_saturates_without_panic() {
+        let far = unix_float_to_system_time(f64::INFINITY);
+        assert_eq!(
+            far.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            FAR_FUTURE_SECS
+        );
+        let huge = unix_float_to_system_time(1e300);
+        assert_eq!(
+            huge.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            FAR_FUTURE_SECS
+        );
+        assert_eq!(unix_float_to_system_time(f64::NAN), UNIX_EPOCH);
+        // u64::MAX seconds would overflow SystemTime on every platform.
+        let maxed = unix_float_to_system_time(u64::MAX as f64);
+        assert!(maxed.duration_since(UNIX_EPOCH).is_ok());
     }
 
     /// Empty base archive for overlay unit tests (no members).
