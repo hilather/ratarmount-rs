@@ -1,11 +1,11 @@
 //! TAR-agnostic last-N zstd splice (prefix copy + transform + one new frame).
 //!
-//! Overlay persist (PR 4) chooses `from_idx` and supplies the transform. This
-//! crate does not depend on `ratarmount-formats-tar`. The decoded last-N is
+//! Overlay persist chooses `from_idx` and supplies the transform. This crate
+//! does not depend on `ratarmount-formats-tar`. The decoded last-N is
 //! materialized as [`SeekRead`] so the caller does not recopy the suffix.
 
 use std::fs::File;
-use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 use tempfile::NamedTempFile;
@@ -65,20 +65,17 @@ where
         )));
     }
 
-    let last_n_plain = map.frames[from_idx..]
-        .iter()
-        .try_fold(0u64, |acc, f| acc.checked_add(f.uncompressed_size))
-        .ok_or_else(|| CompressError::Msg("last-N uncompressed size overflow".into()))?;
-
-    let mut suffix = SpillBody::for_expected(last_n_plain)?;
+    let mut suffix = spill_sink();
     decode_zstd_frames_to(src, map, from_idx, &mut suffix)?;
-    suffix.rewind()?;
+    suffix.seek(SeekFrom::Start(0))?;
 
-    let mut new_plain = SpillBody::for_expected(last_n_plain)?;
+    // Spooled: transform output spills to disk once it exceeds DEFAULT_MEMORY_CAP,
+    // independent of the input last-N hint (K4).
+    let mut new_plain = spill_sink();
     let stream_offset = map.frames[from_idx].uncompressed_offset;
     transform(&mut suffix, stream_offset, &mut new_plain)?;
     new_plain.flush()?;
-    new_plain.rewind()?;
+    new_plain.seek(SeekFrom::Start(0))?;
 
     let (new_comp, new_plain_len) = encode_zstd_frame_to(&mut new_plain, dst, SPLICE_ENCODE_LEVEL)?;
 
@@ -129,58 +126,8 @@ where
     Ok(stats)
 }
 
-/// Cursor if `expected` fits in RAM, else a tempfile (same cap as [`DecodedBody`]).
-enum SpillBody {
-    Memory(Cursor<Vec<u8>>),
-    Temp(NamedTempFile),
-}
-
-impl SpillBody {
-    fn for_expected(expected: u64) -> Result<Self> {
-        if expected <= DEFAULT_MEMORY_CAP {
-            Ok(Self::Memory(Cursor::new(Vec::new())))
-        } else {
-            Ok(Self::Temp(NamedTempFile::new()?))
-        }
-    }
-
-    fn rewind(&mut self) -> io::Result<()> {
-        self.seek(SeekFrom::Start(0)).map(|_| ())
-    }
-}
-
-impl Read for SpillBody {
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
-            Self::Memory(c) => c.read(buf),
-            Self::Temp(t) => t.read(buf),
-        }
-    }
-}
-
-impl Write for SpillBody {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        match self {
-            Self::Memory(c) => c.write(buf),
-            Self::Temp(t) => t.write(buf),
-        }
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        match self {
-            Self::Memory(c) => c.flush(),
-            Self::Temp(t) => t.flush(),
-        }
-    }
-}
-
-impl Seek for SpillBody {
-    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match self {
-            Self::Memory(c) => c.seek(pos),
-            Self::Temp(t) => t.seek(pos),
-        }
-    }
+fn spill_sink() -> tempfile::SpooledTempFile {
+    tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize)
 }
 
 /// Rebuild skippable seek table for prefix frames + one new last frame.
@@ -196,12 +143,15 @@ fn maybe_rebuild_seek_table(
     map.seek_table.as_ref()?;
     let mut entries = Vec::with_capacity(from_idx.saturating_add(1));
     for (i, f) in map.frames[..from_idx].iter().enumerate() {
-        let c = match u32::try_from(f.compressed_size) {
-            Ok(v) => v,
-            Err(_) => {
+        // cSize from offset deltas so skippable gaps in the copied prefix stay consistent.
+        let c_raw = map.frames[i + 1]
+            .compressed_offset
+            .checked_sub(map.frames[i].compressed_offset);
+        let c = match c_raw.and_then(|n| u32::try_from(n).ok()) {
+            Some(v) => v,
+            None => {
                 log::warn!(
-                    "dropping zstd seek table: frame size exceeds u32 (frame {i} compressed {})",
-                    f.compressed_size
+                    "dropping zstd seek table: frame size exceeds u32 (frame {i} compressed span)"
                 );
                 return None;
             }
@@ -278,7 +228,7 @@ mod tests {
         extra: Vec<u8>,
     ) -> impl FnOnce(&mut dyn SeekRead, u64, &mut dyn Write) -> io::Result<()> {
         move |suffix, _off, out| {
-            // Seekable hook: PR 4 will scan the suffix; prove we did not hand a forward-only Read.
+            // Seekable hook: overlay persist will scan the suffix; prove we did not hand a forward-only Read.
             let end = suffix.seek(SeekFrom::End(0))?;
             suffix.seek(SeekFrom::Start(0))?;
             let copied = io::copy(suffix, out)?;
@@ -349,6 +299,62 @@ mod tests {
         let (all_st, kind_st) = read_body("splice-mf-st.zst", &dst_st);
         assert_eq!(kind_st, "zstd-seek-table");
         assert_eq!(all_st, expected);
+    }
+
+    /// Last-N merge: three frames, rewrite from frame 1 (not only the final frame).
+    #[test]
+    fn splice_zstd_three_frame_from_idx_one() {
+        let p0 = generated_payload("n3-p0", 40);
+        let p1 = generated_payload("n3-p1", 28);
+        let p2 = generated_payload("n3-p2", 16);
+        let extra = generated_payload("n3-extra", 64);
+
+        let src_bytes = pack_frames(&[&p0, &p1, &p2], true);
+        let mut src = Cursor::new(src_bytes.clone());
+        let map = scan_zstd_frames(&mut src).unwrap();
+        assert_eq!(map.frames.len(), 3);
+        assert!(map.seek_table.is_some());
+        let prefix_end = map.frames[1].compressed_offset as usize;
+
+        let mut dst = Vec::new();
+        let stats =
+            splice_zstd_last_frames(&mut src, &map, 1, append_extra(extra.clone()), &mut dst)
+                .unwrap();
+        assert_eq!(stats.prefix_compressed_bytes, prefix_end as u64);
+        assert_eq!(&dst[..prefix_end], &src_bytes[..prefix_end]);
+        assert!(stats.wrote_seek_table);
+
+        let out_map = scan_zstd_frames(&mut Cursor::new(&dst)).unwrap();
+        assert_eq!(out_map.frames.len(), 2);
+        assert!(out_map.seek_table.is_some());
+        assert_eq!(
+            out_map.frames[0].compressed_size,
+            map.frames[0].compressed_size
+        );
+        assert_eq!(
+            out_map.frames[0].uncompressed_size,
+            map.frames[0].uncompressed_size
+        );
+        assert_eq!(
+            out_map.frames[1].compressed_size,
+            stats.new_frame_compressed_size
+        );
+        assert_eq!(
+            out_map.frames[1].uncompressed_size,
+            stats.new_frame_uncompressed_size
+        );
+
+        let (all, kind) = read_body("splice-n3.zst", &dst);
+        assert_eq!(kind, "zstd-seek-table");
+        let mut expected = p0.clone();
+        expected.extend_from_slice(&p1);
+        expected.extend_from_slice(&p2);
+        expected.extend_from_slice(&extra);
+        assert_eq!(all, expected);
+        assert_eq!(
+            stats.new_frame_uncompressed_size,
+            (p1.len() + p2.len() + extra.len()) as u64
+        );
     }
 
     /// Single-frame rewrite: `from_idx == 0` produces one new data frame.
@@ -468,16 +474,17 @@ mod tests {
     /// u32 overflow drops the footer; spliced data frames still remount.
     #[test]
     fn splice_zstd_seek_table_u32_overflow_drops_footer() {
+        // cSize comes from offset deltas; a span > u32::MAX drops the footer.
         let fake = ZstdFrameMap {
             frames: vec![
                 ZstdFrameInfo {
                     compressed_offset: 0,
                     uncompressed_offset: 0,
-                    compressed_size: u32::MAX as u64 + 1,
+                    compressed_size: 10,
                     uncompressed_size: 10,
                 },
                 ZstdFrameInfo {
-                    compressed_offset: 100,
+                    compressed_offset: u32::MAX as u64 + 1,
                     uncompressed_offset: 10,
                     compressed_size: 20,
                     uncompressed_size: 5,
@@ -518,7 +525,8 @@ mod tests {
         )
         .is_none());
 
-        // Real splice: lie about prefix cSize so the rebuild overflows without 4 GiB I/O.
+        // Real splice: lie about prefix dSize so the rebuild overflows without 4 GiB I/O.
+        // Prefix copy still uses compressed_offset (unchanged).
         let prefix_plain = generated_payload("ov-prefix", 48);
         let last_plain = generated_payload("ov-last", 24);
         let extra = generated_payload("ov-extra", 16);
@@ -526,7 +534,7 @@ mod tests {
         let mut src = Cursor::new(src_bytes);
         let mut map = scan_zstd_frames(&mut src).unwrap();
         assert!(map.seek_table.is_some());
-        map.frames[0].compressed_size = u32::MAX as u64 + 1;
+        map.frames[0].uncompressed_size = u32::MAX as u64 + 1;
 
         let mut dst = Vec::new();
         let stats =
@@ -545,6 +553,31 @@ mod tests {
         expected.extend_from_slice(&last_plain);
         expected.extend_from_slice(&extra);
         assert_eq!(all, expected);
+    }
+
+    /// Prefix seek-table cSize is the compressed_offset span, not recorded compressed_size
+    /// (skippable gaps live inside the byte-copied prefix).
+    #[test]
+    fn splice_zstd_seek_table_prefix_csize_uses_offset_deltas() {
+        let map = ZstdFrameMap {
+            frames: vec![
+                ZstdFrameInfo {
+                    compressed_offset: 0,
+                    uncompressed_offset: 0,
+                    compressed_size: 100,
+                    uncompressed_size: 10,
+                },
+                ZstdFrameInfo {
+                    compressed_offset: 150,
+                    uncompressed_offset: 10,
+                    compressed_size: 20,
+                    uncompressed_size: 5,
+                },
+            ],
+            seek_table: Some(170..190),
+        };
+        let table = maybe_rebuild_seek_table(&map, 1, 20, 5).unwrap();
+        assert_eq!(table, build_seek_table_skippable(&[(150, 10), (20, 5)]));
     }
 
     /// Regression: leaving the old footer after a last-frame rewrite is why K5
@@ -640,6 +673,32 @@ mod tests {
         let err = splice_zstd_last_frames_replace(&path, 99, append_extra(extra)).unwrap_err();
         assert!(err.to_string().contains("from_idx"), "{err}");
         assert_eq!(std::fs::read(&path).unwrap(), before_fail);
+    }
+
+    /// Transform `Err` after a non-empty suffix must not persist over the original inode.
+    #[test]
+    fn splice_zstd_replace_transform_err_leaves_inode() {
+        let prefix_plain = generated_payload("tf-prefix", 24);
+        let last_plain = generated_payload("tf-last", 16);
+        let src_bytes = pack_frames(&[&prefix_plain, &last_plain], false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transform-err.zst");
+        std::fs::write(&path, &src_bytes).unwrap();
+
+        let err = splice_zstd_last_frames_replace(&path, 1, |suffix, _off, _out| {
+            let n = io::copy(suffix, &mut io::sink())?;
+            assert!(n > 0, "transform must see a non-empty decoded suffix");
+            Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "transform failed after suffix",
+            ))
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("transform failed after suffix"),
+            "{err}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), src_bytes);
     }
 
     #[test]
