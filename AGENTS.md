@@ -64,6 +64,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Compositing wrappers fat readdir | `cargo test -p ratarmount-compositing --lib list_dirents` |
 | Index formats missing readdirplus sizes | `cargo test -p ratarmount-formats-cpio --lib list_dirents` · `cargo test -p ratarmount-formats-ar --lib list_dirents` · `cargo test -p ratarmount-formats-warc --lib list_dirents` · `cargo test -p ratarmount-formats-cab --lib list_dirents` · `cargo test -p ratarmount-formats-iso9660 --lib list_dirents` · `cargo test -p ratarmount-formats-asar --lib list_dirents` · `cargo test -p ratarmount-formats-xar --lib list_dirents` · `cargo test -p ratarmount-formats-libarchive --lib list_dirents` · `cargo test -p ratarmount-formats-ogg --lib list_dirents` · `cargo test -p ratarmount-formats-html --lib list_dirents` · `cargo test -p ratarmount-formats-pdf --lib list_dirents` |
 | FUSE readlink extra lookup / FR-10 type mismatch | `cargo test -p ratarmount-fuse --lib readlink_uses_cached` · `cargo test -p ratarmount-fuse --lib readdirplus_dirent_type` |
+| AutoMount strip-ext duplicate dirent (dir `a/` + `a.tar` → two `a`) | `cargo test -p ratarmount-compositing --lib list_dirents_strip_ext_dir_archive_collision` |
+| readdirplus cached size-0 placeholder (control `status` cat empty 60s) | `cargo test -p ratarmount-fuse --lib readdirplus_placeholder_zero_size` |
+| NFS stale base read after live commit with delete (offsets shift) | `cargo test -p ratarmount-nfs --lib overlay_commit_live_delete_shifts` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
