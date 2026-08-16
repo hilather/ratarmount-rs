@@ -26,7 +26,7 @@ available from the compress crate for tooling interop.
 
 Nested mounts (e.g. `.tar.zst` inside ZIP/7z with `-r`) use the same seekable
 body path when the outer member is `Read + Seek` — see
-[embedded-nested-archives.md](embedded-nested-archives.md).
+[embedded-nested-archives.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md).
 
 ---
 

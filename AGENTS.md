@@ -71,7 +71,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS serve stop | `cargo test -p ratarmount-nfs --lib serve_stop` |
 | NFS overlay write / stale reader after truncate | `cargo test -p ratarmount-nfs --lib overlay_` · `cargo test -p ratarmount-nfs --lib writers_rofs` |
 | NFS overlay rename / symlink | `cargo test -p ratarmount-nfs --lib overlay_rename` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay_rename` |
-| Live overlay commit (uncompressed TAR / `.tar.zst`) | `cargo test -p ratarmount-compositing --lib live_commit` · `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount-nfs --lib overlay_commit_live` |
+| Live overlay commit (uncompressed TAR / `.tar.zst`) | `cargo test -p ratarmount-compositing --lib live_commit` · `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount --bin ratarmount -- live_commit` · `cargo test -p ratarmount-nfs --lib overlay_commit_live` |
 | NFSv4.1 RO adapter (lookup/read/readdir) | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_` |
 | NFSv4 overlay create/write invalidate | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_overlay` |
 | NFSv4 reader idle/lease drop | `cargo test -p ratarmount-nfs --features nfsv4 --lib evict_idle` |
