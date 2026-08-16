@@ -451,17 +451,19 @@ impl RatarmountFs {
         self.file_info_for_ino(ino).map(|fi| fi.linkname)
     }
 
-    /// Kernel TTL for `readdirplus` attrs.
+    /// Kernel TTL for one `readdirplus` dirent attr.
     ///
-    /// When dirents carry real sizes (ZIP/TAR/7z `list_dirents`), use the same
-    /// attr TTL as lookup so `cat` after `find` does not re-getattr every file.
-    /// When every size is 0 we cannot tell empty files from the default
-    /// `list_dirents` fallback — do not cache those placeholders.
-    fn readdirplus_entry_ttl(&self, entries: &[(String, u32, u64)]) -> Duration {
+    /// Dirents with a nonzero size (real index `list_dirents` sizes) and
+    /// directories use the same attr TTL as lookup so `cat` after `find` does
+    /// not re-getattr every file. A zero-size non-directory dirent may be a
+    /// placeholder (default `list_dirents` fallback, control `status`,
+    /// versions-folder entries): caching size 0 for a file that is not really
+    /// empty makes the kernel serve reads at EOF, so those revalidate instead.
+    fn readdirplus_entry_ttl(&self, attr: &FileAttr) -> Duration {
         if self.overlay.is_some() {
             return OVERLAY_ATTR_TTL;
         }
-        if entries.iter().any(|(_, _, sz)| *sz > 0) {
+        if attr.kind == FileType::Directory || attr.size > 0 {
             TTL
         } else {
             Duration::ZERO
@@ -721,7 +723,6 @@ impl Filesystem for RatarmountFs {
             "..".into(),
             Self::file_attr(parent_ino, &self_fi),
         ));
-        let entry_ttl = self.readdirplus_entry_ttl(&entries);
         for (name, mode, size) in entries {
             let child = join_path(&path, &name);
             let fi = FileInfo {
@@ -737,6 +738,7 @@ impl Filesystem for RatarmountFs {
             full.push((cino, name, Self::file_attr(cino, &fi)));
         }
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
+            let entry_ttl = self.readdirplus_entry_ttl(&attr);
             if reply.add(cino, (i + 1) as i64, name, &entry_ttl, &attr, 0) {
                 break;
             }
@@ -1730,15 +1732,103 @@ mod tests {
             0,
             "lookup/getattr must not go through list()"
         );
+        let attr_for = |mode: u32, size: u64| {
+            RatarmountFs::file_attr(
+                2,
+                &FileInfo {
+                    size,
+                    mtime: 1.0,
+                    mode,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                },
+            )
+        };
         assert_eq!(
-            fs.readdirplus_entry_ttl(&entries),
+            fs.readdirplus_entry_ttl(&attr_for(S_IFREG, 5)),
             TTL,
             "nonzero dirent sizes must use kernel attr TTL so cat after find is cached"
         );
         assert_eq!(
-            fs.readdirplus_entry_ttl(&[("e".into(), S_IFREG, 0)]),
+            fs.readdirplus_entry_ttl(&attr_for(ratarmount_core::S_IFDIR, 0)),
+            TTL,
+            "directory dirents keep the TTL (size is not load-bearing for dirs)"
+        );
+        assert_eq!(
+            fs.readdirplus_entry_ttl(&attr_for(S_IFREG, 0)),
             Duration::ZERO,
-            "all-zero sizes must not pin placeholder attrs"
+            "zero-size non-dir dirents may be placeholders and must revalidate"
+        );
+    }
+
+    /// Regression: mixed listing with a placeholder size-0 file (control
+    /// `status` next to real-size `pid`/`help`) — the placeholder must not
+    /// inherit the 60s TTL from siblings, or `cat` would read EOF from a
+    /// kernel-cached i_size of 0 for a non-empty virtual file.
+    #[test]
+    fn readdirplus_placeholder_zero_size_not_cached_beside_real_sizes() {
+        let mut children = BTreeMap::new();
+        children.insert(
+            "status".into(),
+            FileInfo {
+                size: 0,
+                mtime: 1.0,
+                mode: S_IFREG | 0o444,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        children.insert(
+            "pid".into(),
+            FileInfo {
+                size: 7,
+                mtime: 1.0,
+                mode: S_IFREG | 0o444,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        let src = Arc::new(ListCallTracker::new(children));
+        let fs = RatarmountFs::new(Arc::clone(&src) as Arc<dyn MountSource>, None);
+        let zero_attr = RatarmountFs::file_attr(
+            2,
+            &FileInfo {
+                size: 0,
+                mtime: 1.0,
+                mode: S_IFREG | 0o444,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        let real_attr = RatarmountFs::file_attr(
+            3,
+            &FileInfo {
+                size: 7,
+                mtime: 1.0,
+                mode: S_IFREG | 0o444,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        assert_eq!(
+            fs.readdirplus_entry_ttl(&zero_attr),
+            Duration::ZERO,
+            "placeholder size-0 dirent must revalidate even beside real sizes"
+        );
+        assert_eq!(
+            fs.readdirplus_entry_ttl(&real_attr),
+            TTL,
+            "real sizes stay kernel-cached"
         );
     }
 
