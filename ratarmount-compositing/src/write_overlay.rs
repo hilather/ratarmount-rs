@@ -786,9 +786,9 @@ impl WriteOverlay {
     /// open/read/write that does not apply here).
     fn ensure_rename_confined(&self, host_path: &Path) -> Result<()> {
         match fs::symlink_metadata(host_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                self.ensure_parent_confined(host_path).map_err(OverlayError::Io)
-            }
+            Ok(meta) if meta.file_type().is_symlink() => self
+                .ensure_parent_confined(host_path)
+                .map_err(OverlayError::Io),
             _ => self.ensure_under_root(host_path).map_err(OverlayError::Io),
         }
     }
@@ -2819,9 +2819,8 @@ mod tests {
         let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
 
         let err = ov.rmdir("/full").expect_err("non-empty base dir");
-        assert_eq!(
+        assert!(
             err.to_string().contains("not empty"),
-            true,
             "unexpected error: {err}"
         );
         let err = ov.rmdir("/file.txt").expect_err("file is not a dir");
@@ -2870,7 +2869,11 @@ mod tests {
                 }
                 None
             }
-            fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
                 Err(io::Error::new(io::ErrorKind::PermissionDenied, "boom"))
             }
             fn is_immutable(&self) -> bool {
@@ -2881,7 +2884,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let ov =
+            WriteOverlay::new(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay).unwrap();
         let fd = ov.create_file("/dst", 0o644).unwrap();
         unsafe {
             libc::close(fd);
