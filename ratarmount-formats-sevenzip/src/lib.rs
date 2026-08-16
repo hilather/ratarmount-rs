@@ -332,16 +332,15 @@ impl SevenZipMountSource {
         index.check_tarstats_matches_archive(archive_path)?;
 
         let mut file = File::open(archive_path)?;
-        let password = options.passwords.first().cloned();
         let archive = parse::parse_7z_archive(&mut file, |folder, packed| {
-            decode::decompress_folder(folder, packed, password.as_deref())
+            decode::decompress_folder(folder, packed, None)
                 .map_err(|e| parse::SevenZipError::Msg(e.to_string()))
         })?;
-        let encrypted = archive.folders.iter().any(|f| f.is_encrypted());
-        let content_locked = encrypted && password.is_none();
-        let entry_by_offsets = entry_offset_map(&archive);
         file.seek(SeekFrom::Start(0))?;
         let archive_io: SharedArchiveIo = Arc::new(Mutex::new(Box::new(file)));
+        let (password, content_locked) =
+            Self::resolve_password_for_archive(&archive_io, &archive, options)?;
+        let entry_by_offsets = entry_offset_map(&archive);
         Ok(Self {
             archive_path: archive_path.to_path_buf(),
             archive,
@@ -390,100 +389,24 @@ impl SevenZipMountSource {
             "7z {}: parsed archive folders={n_folders} files={n_files} encrypted={encrypted}",
             archive_path.display()
         );
-        let mut content_locked = false;
-        let password = if encrypted {
-            // Verify codecs are supported when a password would be used.
-            for folder in &archive.folders {
-                if folder.is_encrypted() && !folder.is_supported_for_open(true) {
-                    return Err(SzError::Seven(SevenZipError::Msg(format!(
-                        "Unsupported encrypted 7z coder chain: {:?}",
-                        folder
-                            .coders
-                            .iter()
-                            .map(|c| format!("{:02x?}", c.method))
-                            .collect::<Vec<_>>()
-                    ))));
-                }
-            }
-            if options.passwords.is_empty() {
-                // Metadata-only mount: list/stat work; open requires password.
-                content_locked = true;
-                warn!(
-                    "7z {}: contents are encrypted; mounting metadata only \
-                     (listing works; reading members fails until --password is provided). \
-                     Nested encrypted archives need the *inner* password \
-                     (e.g. nested-encrypted-inner.7z uses `innerpw`).",
-                    archive_path.display()
-                );
-                // Also print so users without RUST_LOG still see the hint on mount.
-                eprintln!(
-                    "warning: 7z archive contents are encrypted; mounting metadata only \
-                     (listing works; reading members fails until --password is provided). \
-                     Nested encrypted archives need the *inner* password \
-                     (e.g. nested-encrypted-inner.7z uses `innerpw`)."
-                );
-                None
-            } else {
-                debug!(
-                    "7z {}: trying {} password candidate(s) against encrypted archive",
-                    archive_path.display(),
-                    options.passwords.len()
-                );
-                let mut chosen = None;
-                let mut last_err = None;
-                for (i, pw) in options.passwords.iter().enumerate() {
-                    if let Some(entry) = archive
-                        .files
-                        .iter()
-                        .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
-                    {
-                        let fi = entry.folder_index.unwrap();
-                        let folder = &archive.folders[fi];
-                        match Self::try_decrypt_entry_io(&archive_io, &archive, entry, folder, pw) {
-                            Ok(()) => {
-                                debug!(
-                                    "7z {}: password candidate #{i} accepted (trial member={})",
-                                    archive_path.display(),
-                                    entry.path
-                                );
-                                chosen = Some(pw.clone());
-                                break;
-                            }
-                            Err(e) => {
-                                debug!(
-                                    "7z {}: password candidate #{i} rejected for {}: {e}",
-                                    archive_path.display(),
-                                    entry.path
-                                );
-                                last_err = Some(e);
-                                continue;
-                            }
-                        }
-                    } else {
-                        debug!(
-                            "7z {}: no non-empty file to trial; accepting password candidate #{i}",
-                            archive_path.display()
-                        );
-                        chosen = Some(pw.clone());
-                        break;
-                    }
-                }
-                if chosen.is_none() {
-                    warn!(
-                        "7z {}: all password candidates failed",
-                        archive_path.display()
-                    );
-                    return Err(SzError::Seven(last_err.unwrap_or_else(|| {
-                        SevenZipError::Msg(
-                            "Could not decrypt 7z archive with the provided password(s)".into(),
-                        )
-                    })));
-                }
-                chosen
-            }
-        } else {
-            options.passwords.first().cloned()
-        };
+        let (password, content_locked) =
+            Self::resolve_password_for_archive(&archive_io, &archive, options)?;
+        if encrypted && content_locked {
+            warn!(
+                "7z {}: contents are encrypted; mounting metadata only \
+                 (listing works; reading members fails until --password is provided). \
+                 Nested encrypted archives need the *inner* password \
+                 (e.g. nested-encrypted-inner.7z uses `innerpw`).",
+                archive_path.display()
+            );
+            // Also print so users without RUST_LOG still see the hint on mount.
+            eprintln!(
+                "warning: 7z archive contents are encrypted; mounting metadata only \
+                 (listing works; reading members fails until --password is provided). \
+                 Nested encrypted archives need the *inner* password \
+                 (e.g. nested-encrypted-inner.7z uses `innerpw`)."
+            );
+        }
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
@@ -662,27 +585,27 @@ impl SevenZipMountSource {
         }
         let mut chosen = None;
         let mut last_err = None;
+        let Some(entry) = archive
+            .files
+            .iter()
+            .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
+        else {
+            return Err(SzError::Seven(SevenZipError::Msg(
+                "encrypted 7z has no non-empty file to trial the password against".into(),
+            )));
+        };
+        let fi = entry.folder_index.unwrap();
+        let folder = &archive.folders[fi];
         for pw in options.passwords.iter() {
-            if let Some(entry) = archive
-                .files
-                .iter()
-                .find(|e| e.folder_index.is_some() && e.size > 0 && !e.is_dir)
-            {
-                let fi = entry.folder_index.unwrap();
-                let folder = &archive.folders[fi];
-                match Self::try_decrypt_entry_io(archive_io, archive, entry, folder, pw) {
-                    Ok(()) => {
-                        chosen = Some(pw.clone());
-                        break;
-                    }
-                    Err(e) => {
-                        last_err = Some(e);
-                        continue;
-                    }
+            match Self::try_decrypt_entry_io(archive_io, archive, entry, folder, pw) {
+                Ok(()) => {
+                    chosen = Some(pw.clone());
+                    break;
                 }
-            } else {
-                chosen = Some(pw.clone());
-                break;
+                Err(e) => {
+                    last_err = Some(e);
+                    continue;
+                }
             }
         }
         if chosen.is_none() {
@@ -717,7 +640,8 @@ impl SevenZipMountSource {
             ));
         }
         // Length alone is not enough: AES with a wrong key can still yield a
-        // full-size buffer (store/Copy folders). Prefer folder CRC when present.
+        // full-size buffer (store/Copy folders). Prefer folder CRC, then the
+        // file-level Substreams CRC (p7zip often omits folder CRC).
         if folder.has_crc {
             let slice = if (data.len() as u64) >= folder.get_unpack_size() {
                 &data[..folder.get_unpack_size() as usize]
@@ -731,22 +655,35 @@ impl SevenZipMountSource {
                     folder.crc
                 )));
             }
-        } else if entry.size > 0 {
-            // No folder CRC: reject if member slice is not fully present.
+            return Ok(());
+        }
+        if let Some(want) = entry.crc {
             let end = (entry.unpack_offset + entry.size) as usize;
             if end > data.len() {
                 return Err(SevenZipError::Msg(
                     "password trial member slice out of range".into(),
                 ));
             }
-            // Wrong AES key often still expands to the right length; require at
-            // least one non-zero byte for non-empty members (empty is rare).
             let member = &data[entry.unpack_offset as usize..end];
-            if member.iter().all(|&b| b == 0) && entry.size > 4 {
-                return Err(SevenZipError::Msg(
-                    "password trial produced all-zero member (likely wrong password)".into(),
-                ));
+            let got = parse::crc32_for_password_trial(member);
+            if got != want {
+                return Err(SevenZipError::Msg(format!(
+                    "password trial file CRC mismatch (got {got:#010x}, want {want:#010x})"
+                )));
             }
+            return Ok(());
+        }
+        let copy_only = folder.is_copy_only()
+            || folder.content_coders().is_empty()
+            || folder
+                .content_coders()
+                .iter()
+                .all(|c| c.method.as_slice() == parse::METHOD_COPY);
+        if copy_only {
+            // Store+AES without any CRC: garbage is full-size and non-zero.
+            return Err(SevenZipError::Msg(
+                "password trial cannot verify store+AES without a CRC".into(),
+            ));
         }
         Ok(())
     }
@@ -1135,6 +1072,7 @@ fn archive_info_from_durable(
             pack_offset: e.pack_offset,
             pack_size: e.pack_size,
             pack_stream_index: e.pack_stream_index,
+            crc: None,
         })
         .collect();
     // Validate folder indices reference existing folders.
@@ -1644,6 +1582,7 @@ mod tests {
             pack_offset: pack,
             pack_size: 8,
             pack_stream_index: 0,
+            crc: None,
         }
     }
 
@@ -2029,6 +1968,10 @@ mod tests {
     }
 
     /// Wrong password fails closed at mount open (not silent metadata-only success).
+    ///
+    /// Regression: macOS Homebrew p7zip can emit store+AES without a folder CRC;
+    /// a length-only trial then accepted garbage. The vendored fixture is
+    /// LZMA2+AES; file-level CRC is also checked when folder CRC is absent.
     #[test]
     fn encrypted_wrong_password_fails_open() {
         let dir = tempfile::tempdir().unwrap();
@@ -2053,6 +1996,53 @@ mod tests {
             !msg.is_empty(),
             "wrong password must produce an error (got empty)"
         );
+    }
+
+    /// Regression: store+AES (no LZMA2) still fail-closes on a wrong password via
+    /// file CRC — Homebrew p7zip `-m0=LZMA2` can silently fall back to Copy.
+    #[test]
+    fn encrypted_store_aes_wrong_password_fails_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("store-aes.7z");
+        if !write_encrypted_sample_7z_mx(&archive, "secret.txt", b"secret content\n", "secret", 0) {
+            eprintln!("skip: 7z CLI could not create store+AES fixture");
+            return;
+        }
+        let opts = OpenOptions {
+            passwords: vec!["not-the-password".into()],
+            ..OpenOptions::default()
+        };
+        SevenZipMountSource::open(&archive, None, &opts, "0.1.0", true)
+            .err()
+            .expect("Regression: store+AES wrong password must fail mount open");
+    }
+
+    /// Regression: a sibling index from a prior open must not skip the password trial.
+    #[test]
+    fn encrypted_wrong_password_fails_warm_index_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _) = match ensure_encrypted_hello_fixture(dir.path()) {
+            Some(v) => v,
+            None => {
+                eprintln!("skip: no encrypted fixture");
+                return;
+            }
+        };
+        let idx = dir.path().join("warm.sqlite");
+        let good = OpenOptions {
+            passwords: vec!["secret".into()],
+            ..OpenOptions::default()
+        };
+        SevenZipMountSource::open(&path, Some(&idx), &good, "0.1.0", true)
+            .expect("correct password must create a warm index");
+        assert!(idx.is_file(), "index sidecar");
+        let bad = OpenOptions {
+            passwords: vec!["not-the-password".into()],
+            ..OpenOptions::default()
+        };
+        SevenZipMountSource::open(&path, Some(&idx), &bad, "0.1.0", false)
+            .err()
+            .expect("Regression: warm index + wrong password must fail open");
     }
 
     #[test]
@@ -2843,16 +2833,21 @@ sys.stdout.buffer.write(packed)
         );
     }
 
-    /// Prefer Python `encrypted-hello.7z` fixture; otherwise create with system `7z`.
+    /// Prefer Python `encrypted-hello.7z`, then the vendored testdata, then system `7z`.
     /// Returns `(archive_path, expected_secret_txt_bytes)`.
     fn ensure_encrypted_hello_fixture(work: &Path) -> Option<(PathBuf, Vec<u8>)> {
+        let payload = b"secret content\n";
         let py = py_fixture("encrypted-hello.7z");
         if py.is_file() {
-            // Canonical fixture payload (15 bytes including trailing newline).
-            return Some((py, b"secret content\n".to_vec()));
+            return Some((py, payload.to_vec()));
         }
-        let payload = b"secret content\n";
+        // Vendored LZMA2+AES fixture so macOS CI (Homebrew p7zip) cannot
+        // silently build store+AES without a folder CRC and accept a wrong key.
         let archive = work.join("encrypted-hello.7z");
+        const BUNDLED: &[u8] = include_bytes!("../testdata/encrypted-hello.7z");
+        if std::fs::write(&archive, BUNDLED).is_ok() {
+            return Some((archive, payload.to_vec()));
+        }
         if write_encrypted_sample_7z(&archive, "secret.txt", payload, "secret") {
             Some((archive, payload.to_vec()))
         } else {
@@ -2867,6 +2862,16 @@ sys.stdout.buffer.write(packed)
         payload: &[u8],
         password: &str,
     ) -> bool {
+        write_encrypted_sample_7z_mx(archive, member_name, payload, password, 1)
+    }
+
+    fn write_encrypted_sample_7z_mx(
+        archive: &Path,
+        member_name: &str,
+        payload: &[u8],
+        password: &str,
+        mx: u8,
+    ) -> bool {
         use std::process::Command;
         let dir = archive.parent().expect("archive parent");
         let plain = dir.join(member_name);
@@ -2877,24 +2882,20 @@ sys.stdout.buffer.write(packed)
         let _ = std::fs::remove_file(archive);
         let archive_name = archive.file_name().and_then(|s| s.to_str()).unwrap();
         let pw_arg = format!("-p{password}");
-        for bin in ["7z", "7za"] {
+        let mx_arg = format!("-mx={mx}");
+        for bin in ["7zz", "7z", "7za"] {
             // Content encryption only (`-mhe=off`): list/stat works without password
             // (metadata-only mount). Header encryption would block listing.
-            // Use LZMA2 (not store): wrong-password AES on store often yields a
-            // full-size buffer that passes a length-only trial; LZMA2 fails closed.
-            let status = Command::new(bin)
-                .args([
-                    "a",
-                    "-t7z",
-                    "-m0=LZMA2",
-                    "-mx=1",
-                    &pw_arg,
-                    "-mhe=off",
-                    archive_name,
-                    member_name,
-                ])
-                .current_dir(dir)
-                .status();
+            // Prefer LZMA2 (`mx>0`): store+AES can yield full-size garbage. Tests
+            // that need Copy still pass mx=0 and rely on file-level CRC.
+            let mut args = vec!["a", "-t7z"];
+            if mx > 0 {
+                args.extend(["-m0=LZMA2", mx_arg.as_str()]);
+            } else {
+                args.push(mx_arg.as_str());
+            }
+            args.extend([&pw_arg, "-mhe=off", archive_name, member_name]);
+            let status = Command::new(bin).args(&args).current_dir(dir).status();
             if matches!(status, Ok(s) if s.success()) && archive.is_file() {
                 return true;
             }

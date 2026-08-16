@@ -252,6 +252,8 @@ pub struct SevenZipFileEntry {
     pub pack_size: u64,
     /// Index of the first pack stream for this folder in PackInfo.
     pub pack_stream_index: usize,
+    /// File-level CRC from SubstreamsInfo (used when the folder has no CRC).
+    pub crc: Option<u32>,
 }
 
 #[derive(Debug, Clone)]
@@ -857,6 +859,7 @@ fn build_file_entries(
                 pack_offset: 0,
                 pack_size: 0,
                 pack_stream_index: 0,
+                crc: None,
             });
         }
         return Ok((entries, false));
@@ -937,6 +940,7 @@ fn build_file_entries(
                 pack_offset: 0,
                 pack_size: 0,
                 pack_stream_index: 0,
+                crc: None,
             });
             continue;
         }
@@ -945,6 +949,7 @@ fn build_file_entries(
             return Err(err("More non-empty files than unpack streams"));
         }
         let (folder_index, unpack_offset, size, pack_stream_index) = stream_map[stream_index];
+        let crc = substreams.digests.get(stream_index).copied().flatten();
         stream_index += 1;
         let folder = &folders[folder_index];
         let folder_pack_count = if folder.packed_indices.is_empty() {
@@ -971,6 +976,7 @@ fn build_file_entries(
             pack_offset,
             pack_size,
             pack_stream_index,
+            crc,
         });
     }
 
