@@ -694,20 +694,23 @@ impl WriteOverlay {
         let mut out = Vec::with_capacity(append_entries.len());
         for (rel, is_dir) in append_entries {
             let host = self.realpath(rel);
-            self.ensure_under_root(&host)?;
             let meta = fs::symlink_metadata(&host)?;
             let mode = meta.mode() & 0o7777;
             let uid = meta.uid();
             let gid = meta.gid();
             let mtime = meta.mtime().max(0) as u64;
-            let kind = if *is_dir || meta.file_type().is_dir() {
-                PendingKind::Directory
-            } else if meta.file_type().is_symlink() {
+            // Symlink first: `ensure_under_root` refuses the final component.
+            let kind = if meta.file_type().is_symlink() {
+                self.ensure_parent_confined(&host)?;
                 let target = fs::read_link(&host)?;
                 PendingKind::Symlink {
                     target: target.to_string_lossy().into_owned(),
                 }
+            } else if *is_dir || meta.file_type().is_dir() {
+                self.ensure_under_root(&host)?;
+                PendingKind::Directory
             } else {
+                self.ensure_under_root(&host)?;
                 PendingKind::FileOnDisk { size: meta.len() }
             };
             out.push(PendingUstar {
@@ -721,6 +724,28 @@ impl WriteOverlay {
             });
         }
         Ok(out)
+    }
+
+    /// Confine a symlink's parent without following the final component.
+    fn ensure_parent_confined(&self, host_path: &Path) -> io::Result<()> {
+        let parent = host_path.parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "overlay symlink has no parent",
+            )
+        })?;
+        let canon = fs::canonicalize(parent)?;
+        if !path_is_under(&self.root, &canon) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "overlay symlink parent escapes overlay root: {} not under {}",
+                    canon.display(),
+                    self.root.display()
+                ),
+            ));
+        }
+        Ok(())
     }
 
     fn persist_uncompressed_tar_plan(
@@ -1775,7 +1800,10 @@ fn tar_offsetheaders_in(fi: &FileInfo) -> impl Iterator<Item = u64> + '_ {
 }
 
 fn lookup_version(base: &dyn MountSource, path: &str, i: i32) -> Option<FileInfo> {
-    if base.versions(path) > 1 {
+    // Always probe `.versions/{i}` first. `FileVersionLayer(AutoMount)` reports
+    // `versions() == 1` (AutoMount uses the trait default) while older copies
+    // only exist at `{path}.versions/{i}`.
+    if i >= 1 {
         if let Some(fi) = base.lookup(&format!("{path}.versions/{i}"), 0) {
             return Some(fi);
         }
@@ -1795,8 +1823,17 @@ fn archive_lookup_path(rel: &str) -> String {
 fn all_tar_offsetheaders(base: &dyn MountSource, path: &str) -> Result<Vec<u64>> {
     let path = archive_lookup_path(path);
     let mut out = Vec::new();
+    // Walk `.versions/{i}` until miss. Do not stop at `versions()` — AutoMount
+    // (and similar wrappers) report 1 even when FileVersionLayer exposes more.
+    const MAX_VERSION_WALK: i32 = 1024;
+    for i in 1..=MAX_VERSION_WALK {
+        match base.lookup(&format!("{path}.versions/{i}"), 0) {
+            Some(fi) => out.extend(tar_offsetheaders_in(&fi)),
+            None => break,
+        }
+    }
     let nver = base.versions(&path);
-    if nver == 0 {
+    if nver == 0 && out.is_empty() {
         if let Some(fi) = base.lookup(&path, 0) {
             out.extend(tar_offsetheaders_in(&fi));
             if out.is_empty() {
@@ -3240,6 +3277,164 @@ mod tests {
         assert!(err.contains("append-only"), "{err}");
         assert!(err.contains("/dup.txt"), "{err}");
         assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    /// Regression: overlay symlink must persist as a symlink (`linkname` remounts).
+    #[test]
+    fn live_commit_tar_zst_overlay_symlink_persists_linkname() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("sy-seed");
+        let target = format!("tgt-{}", std::process::id());
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.create_symlink("/link", &target)
+            .expect("overlay symlink");
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit symlink"));
+        let src = open_tar_zst_base(&archive, false);
+        let fi = src.lookup("/link", 0).expect("symlink remounted");
+        assert!(
+            ratarmount_core::is_lnk_mode(fi.mode),
+            "expected symlink mode, got {:o}",
+            fi.mode
+        );
+        assert_eq!(fi.linkname, target);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+    }
+
+    /// Regression: FileVersionLayer(AutoMount) reports versions()==1; unlink still rejects.
+    #[test]
+    fn live_commit_tar_zst_file_version_layer_automount_same_name_unlink_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = generated_payload("am-v1");
+        let v2 = generated_payload("am-v2");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("dup.txt", &v1)]),
+                pack_tar(&[ustar_file("dup.txt", &v2)]),
+            ],
+        );
+        let before = fs::read(&archive).unwrap();
+        let tar = open_tar_zst_base(&archive, true);
+        let open_nested: crate::OpenNestedFn =
+            Arc::new(|_p| Err(io::Error::other("no nested open in live-commit test")));
+        let automount = crate::AutoMountLayer::new(tar, 1, open_nested);
+        assert_eq!(
+            automount.versions("/dup.txt"),
+            1,
+            "AutoMount default versions() is 1 if exists"
+        );
+        let layered = crate::FileVersionLayer::new(Arc::new(automount) as Arc<dyn MountSource>);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(Arc::new(layered) as Arc<dyn MountSource>, &overlay);
+        ov.unlink("/dup.txt").expect("unlink newest");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, true))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/dup.txt"), "{err}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    /// Regression: versions()==1 still walks .versions/{i} until miss.
+    #[test]
+    fn live_commit_tar_zst_versions_undercount_still_probes_version_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let v1 = generated_payload("uc-v1");
+        let v2 = generated_payload("uc-v2");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("dup.txt", &v1)],
+            &[ustar_file("dup.txt", &v2)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let last_start = map.frames.last().unwrap().uncompressed_offset;
+        let base = Arc::new(VersionsUndercount {
+            oldest: tar_fi_at(0),
+            newest: tar_fi_at(last_start),
+        }) as Arc<dyn MountSource>;
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(base, &overlay);
+        assert_eq!(ov.current_base().versions("/dup.txt"), 1);
+        assert!(ov.current_base().lookup("/dup.txt.versions/1", 0).is_some());
+        ov.unlink("/dup.txt").expect("unlink newest");
+        let err = ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/dup.txt"), "{err}");
+        assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    fn tar_fi_at(offsetheader: u64) -> FileInfo {
+        FileInfo {
+            size: 1,
+            mtime: 0.0,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                offset: offsetheader.saturating_add(512),
+                offsetheader: Some(offsetheader),
+                istar: false,
+                issparse: false,
+                isgenerated: false,
+                recursiondepth: 0,
+            })],
+        }
+    }
+
+    /// `versions()` lies (always 1) but `.versions/{i}` serves every copy.
+    struct VersionsUndercount {
+        oldest: FileInfo,
+        newest: FileInfo,
+    }
+
+    impl MountSource for VersionsUndercount {
+        fn list(&self, _path: &str) -> Option<ListResult> {
+            Some(ListResult::Infos(Default::default()))
+        }
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            let path = normpath(path);
+            if path == "/dup.txt.versions/1" {
+                return Some(self.oldest.clone());
+            }
+            if path == "/dup.txt.versions/2" || path == "/dup.txt" {
+                let _ = file_version;
+                return Some(self.newest.clone());
+            }
+            if path == "/" {
+                return Some(create_root_file_info());
+            }
+            None
+        }
+        fn versions(&self, path: &str) -> u32 {
+            if normpath(path) == "/dup.txt" {
+                1
+            } else {
+                0
+            }
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "versions-undercount stub",
+            ))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
     }
 
     /// Regression: complete-TAR multi-frame remount with ignore_zeros sees prefix + new.
