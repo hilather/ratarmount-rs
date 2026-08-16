@@ -126,6 +126,13 @@ pub enum TarError {
 
 pub type Result<T> = std::result::Result<T, TarError>;
 
+mod write;
+pub use write::{
+    find_last_tar_eof, normalize_archive_rel_path, rewrite_tar_suffix, write_tar_eof,
+    write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember,
+    UstarMember, UstarPayload,
+};
+
 /// Mutex-backed `Read + Seek` for concurrent stencil opens (HTTP Range / Cursor / remote).
 struct SharedSeekReader {
     inner: Mutex<Box<dyn SeekRead>>,
