@@ -94,10 +94,12 @@ pub use xz_seek::{
 };
 pub use zlib_seek::{looks_like_zlib_header, open_seekable_zlib, open_seekable_zlib_with_threads};
 pub use zstd_seek::{
-    build_seek_table_skippable, export_zstd_blocks, export_zstd_blocks_from_reader,
-    open_seekable_zstd, open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
+    build_seek_table_skippable, decode_zstd_frames_to, encode_zstd_frame, encode_zstd_frame_to,
+    export_zstd_blocks, export_zstd_blocks_from_reader, open_seekable_zstd,
+    open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
     open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks,
-    open_seekable_zstd_with_zstd_blocks_from_reader, SeekableZstd,
+    open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
+    SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
 };
 
 use std::fs::File;

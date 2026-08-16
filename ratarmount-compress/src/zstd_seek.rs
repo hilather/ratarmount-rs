@@ -36,7 +36,7 @@
 //!   `Cursor`); shared under a mutex so random Range reads drive frame decode.
 
 use std::fs::File;
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -140,6 +140,281 @@ pub fn export_zstd_blocks_from_reader<R: Read + Seek>(reader: &mut R) -> Result<
     }
     let (frames, uncomp) = build_frame_map_from_reader(reader)?;
     Ok(zstd_blocks_from_frames(&frames, uncomp))
+}
+
+/// One zstd data frame with concrete sizes (`scan_zstd_frames` errors if unknown).
+///
+/// Not a copy of the private [`FrameInfo`] used by [`SeekableZstd`] (those sizes are `Option`).
+#[derive(Clone, Debug)]
+pub struct ZstdFrameInfo {
+    pub compressed_offset: u64,
+    pub uncompressed_offset: u64,
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+}
+
+/// Frame map for persist / last-N rewrite. Every size is a concrete `u64`.
+#[derive(Clone, Debug)]
+pub struct ZstdFrameMap {
+    pub frames: Vec<ZstdFrameInfo>,
+    /// Byte range of the skippable seek-table frame if present `[start, file_len)`.
+    pub seek_table: Option<std::ops::Range<u64>>,
+}
+
+/// Initial per-frame window for streaming scan. Doubled until the frame fits; no 64 MiB cap.
+const SCAN_FRAME_WINDOW_START: usize = 256 * 1024;
+
+/// Scan concatenated zstd frames without slurping a multi-frame file.
+///
+/// Prefers an official seek-table footer when present; otherwise walks frames
+/// with a growing per-frame window (`ZSTD_findFrameCompressedSize`).
+pub fn scan_zstd_frames<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap> {
+    if let Ok((frames, _)) = try_load_seek_table_from_reader(reader) {
+        if !frames.is_empty() {
+            let seek_table = Some(seek_table_span_from_footer(reader)?);
+            return Ok(ZstdFrameMap {
+                frames: public_frames_from_private(&frames)?,
+                seek_table,
+            });
+        }
+    }
+    scan_zstd_frames_walk(reader)
+}
+
+/// [`scan_zstd_frames`] from a filesystem path.
+pub fn scan_zstd_frames_path(path: &Path) -> Result<ZstdFrameMap> {
+    let mut file = File::open(path)?;
+    scan_zstd_frames(&mut file)
+}
+
+/// Decode frames `[from_idx..]` into `out` (Cursor, tempfile, …). Last-N only.
+pub fn decode_zstd_frames_to<R, W>(
+    reader: &mut R,
+    map: &ZstdFrameMap,
+    from_idx: usize,
+    out: &mut W,
+) -> Result<u64>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    if from_idx > map.frames.len() {
+        return Err(CompressError::Msg(format!(
+            "decode from_idx {from_idx} past {} frames",
+            map.frames.len()
+        )));
+    }
+    let mut written = 0u64;
+    for frame in &map.frames[from_idx..] {
+        reader.seek(SeekFrom::Start(frame.compressed_offset))?;
+        // Limit to this frame so the decoder cannot pull the next frame's bytes.
+        let mut limited = reader.by_ref().take(frame.compressed_size);
+        let mut decoder = zstd::stream::read::Decoder::new(&mut limited)
+            .map_err(|e| CompressError::Msg(e.to_string()))?
+            .single_frame();
+        written += io::copy(&mut decoder, out)?;
+    }
+    Ok(written)
+}
+
+/// Streaming encode of one zstd frame. Returns `(compressed_len, plain_len)`.
+pub fn encode_zstd_frame_to<R, W>(mut src: R, dst: &mut W, level: i32) -> Result<(u64, u64)>
+where
+    R: Read,
+    W: Write,
+{
+    let mut encoder = zstd::stream::write::Encoder::new(
+        CountingWriter {
+            inner: dst,
+            written: 0,
+        },
+        level,
+    )
+    .map_err(|e| CompressError::Msg(e.to_string()))?;
+    let plain_len = io::copy(&mut src, &mut encoder)?;
+    let counted = encoder
+        .finish()
+        .map_err(|e| CompressError::Msg(e.to_string()))?;
+    Ok((counted.written, plain_len))
+}
+
+/// Convenience for tests / tiny frames only — not the persist path.
+pub fn encode_zstd_frame(data: &[u8], level: i32) -> Result<Vec<u8>> {
+    let mut out = Vec::new();
+    encode_zstd_frame_to(data, &mut out, level)?;
+    Ok(out)
+}
+
+struct CountingWriter<W> {
+    inner: W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<W> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+fn public_frames_from_private(frames: &[FrameInfo]) -> Result<Vec<ZstdFrameInfo>> {
+    frames
+        .iter()
+        .map(|f| {
+            let compressed_size = f
+                .compressed_size
+                .ok_or_else(|| CompressError::Msg("zstd frame compressed size unknown".into()))?;
+            let uncompressed_size = f
+                .uncompressed_size
+                .ok_or_else(|| CompressError::Msg("zstd frame uncompressed size unknown".into()))?;
+            if compressed_size == 0 {
+                return Err(CompressError::Msg(
+                    "zstd frame compressed size unknown".into(),
+                ));
+            }
+            Ok(ZstdFrameInfo {
+                compressed_offset: f.compressed_offset,
+                uncompressed_offset: f.uncompressed_offset,
+                compressed_size,
+                uncompressed_size,
+            })
+        })
+        .collect()
+}
+
+/// Footer-only span of the seek-table skippable (`[start, file_len)`).
+fn seek_table_span_from_footer<R: Read + Seek>(reader: &mut R) -> Result<std::ops::Range<u64>> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    if file_len < SEEK_TABLE_FOOTER_SIZE + SKIPPABLE_HEADER_SIZE {
+        return Err(CompressError::Msg("file too small for seek table".into()));
+    }
+    reader.seek(SeekFrom::End(-(SEEK_TABLE_FOOTER_SIZE as i64)))?;
+    let mut footer = [0u8; 9];
+    reader.read_exact(&mut footer)?;
+    let num_frames = u32::from_le_bytes(footer[0..4].try_into().unwrap());
+    let descriptor = footer[4];
+    let magic = u32::from_le_bytes(footer[5..9].try_into().unwrap());
+    if magic != SEEKABLE_MAGIC {
+        return Err(CompressError::Msg("no zstd seekable footer magic".into()));
+    }
+    let checksum_flag = descriptor & 0x80 != 0;
+    let size_per_entry: u64 = if checksum_flag { 12 } else { 8 };
+    let table_size = size_per_entry * u64::from(num_frames);
+    let frame_size = table_size + SEEK_TABLE_FOOTER_SIZE + SKIPPABLE_HEADER_SIZE;
+    if frame_size > file_len {
+        return Err(CompressError::Msg("seek table larger than file".into()));
+    }
+    Ok((file_len - frame_size)..file_len)
+}
+
+/// Walk frames with a growing per-frame window. Does not slurp the whole multi-frame file.
+fn scan_zstd_frames_walk<R: Read + Seek>(reader: &mut R) -> Result<ZstdFrameMap> {
+    let file_len = reader.seek(SeekFrom::End(0))?;
+    let mut frames = Vec::new();
+    let mut pos = 0u64;
+    let mut uncomp = 0u64;
+    let mut seek_table = None;
+
+    while pos + 4 <= file_len {
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut magic_buf = [0u8; 4];
+        match reader.read_exact(&mut magic_buf) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+        let magic = u32::from_le_bytes(magic_buf);
+
+        if (SKIPPABLE_MAGIC_MIN..=SKIPPABLE_MAGIC_MAX).contains(&magic) {
+            let mut size_buf = [0u8; 4];
+            match reader.read_exact(&mut size_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+                Err(e) => return Err(e.into()),
+            }
+            let skip_size = u32::from_le_bytes(size_buf) as u64;
+            let span_end = pos
+                .checked_add(SKIPPABLE_HEADER_SIZE + skip_size)
+                .ok_or_else(|| CompressError::Msg("zstd skippable frame size overflow".into()))?;
+            if magic == SEEK_TABLE_SKIPPABLE_MAGIC && skip_size >= 4 && span_end <= file_len {
+                reader.seek(SeekFrom::Start(span_end - 4))?;
+                let mut footer_magic = [0u8; 4];
+                if reader.read_exact(&mut footer_magic).is_ok()
+                    && u32::from_le_bytes(footer_magic) == SEEKABLE_MAGIC
+                {
+                    seek_table = Some(pos..span_end);
+                }
+            }
+            pos = span_end;
+            continue;
+        }
+        if magic_buf != ZSTD_MAGIC {
+            break;
+        }
+
+        let (comp, frame_uncomp) = measure_frame_at(reader, pos, file_len)?;
+        frames.push(ZstdFrameInfo {
+            compressed_offset: pos,
+            uncompressed_offset: uncomp,
+            compressed_size: comp,
+            uncompressed_size: frame_uncomp,
+        });
+        uncomp += frame_uncomp;
+        pos += comp;
+    }
+
+    if frames.is_empty() {
+        return Err(CompressError::Msg("no zstd frames found".into()));
+    }
+    Ok(ZstdFrameMap { frames, seek_table })
+}
+
+/// Compressed + uncompressed size of the frame at `pos`.
+///
+/// Grows a buffer from 256 KiB (double, no 64 MiB cap) until
+/// `find_frame_compressed_size` succeeds. Uncompressed size uses
+/// [`measure_frame_slice`] on that buffer — never a live file decoder
+/// (the Rust zstd decoder over-reads past the frame end).
+fn measure_frame_at<R: Read + Seek>(reader: &mut R, pos: u64, file_len: u64) -> Result<(u64, u64)> {
+    let remaining = file_len.saturating_sub(pos);
+    if remaining == 0 {
+        return Err(CompressError::Msg(
+            "zstd frame compressed size unknown".into(),
+        ));
+    }
+    let mut window = SCAN_FRAME_WINDOW_START;
+    loop {
+        let to_read = window.min(remaining as usize);
+        reader.seek(SeekFrom::Start(pos))?;
+        let mut buf = vec![0u8; to_read];
+        reader.read_exact(&mut buf).map_err(|e| {
+            if e.kind() == io::ErrorKind::UnexpectedEof {
+                CompressError::Msg("zstd frame compressed size unknown".into())
+            } else {
+                CompressError::from(e)
+            }
+        })?;
+        match zstd::zstd_safe::find_frame_compressed_size(&buf) {
+            Ok(comp) if comp > 0 && comp <= buf.len() => {
+                return measure_frame_slice(&buf);
+            }
+            _ => {
+                if (to_read as u64) >= remaining {
+                    return Err(CompressError::Msg(
+                        "zstd frame compressed size unknown".into(),
+                    ));
+                }
+                window = window.checked_mul(2).ok_or_else(|| {
+                    CompressError::Msg("zstd frame compressed size unknown".into())
+                })?;
+            }
+        }
+    }
 }
 
 const ZSTD_MAGIC: [u8; 4] = [0x28, 0xB5, 0x2F, 0xFD];
@@ -1613,5 +1888,226 @@ mod tests {
         let mut chunk = [0u8; 5];
         r.read_exact(&mut chunk).unwrap();
         assert_eq!(&chunk, &parts[1][7..12]);
+    }
+
+    /// Streaming `Read+Seek` that forbids slurping the whole file (K9).
+    struct NoSlurp<T> {
+        inner: T,
+        file_len: u64,
+        max_read_len: usize,
+    }
+
+    impl<T: Read> Read for NoSlurp<T> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.len() as u64 >= self.file_len {
+                panic!(
+                    "scan_zstd_frames must not request the entire file in one read (buf={}, file={})",
+                    buf.len(),
+                    self.file_len
+                );
+            }
+            self.max_read_len = self.max_read_len.max(buf.len());
+            self.inner.read(buf)
+        }
+
+        fn read_to_end(&mut self, _buf: &mut Vec<u8>) -> io::Result<usize> {
+            panic!("scan_zstd_frames must not slurp via read_to_end");
+        }
+    }
+
+    impl<T: Seek> Seek for NoSlurp<T> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
+
+    /// xorshift64* stream — incompressible and not stored in git.
+    struct XorShiftBytes {
+        state: u64,
+        remaining: u64,
+    }
+
+    impl XorShiftBytes {
+        fn new(seed: u64, remaining: u64) -> Self {
+            Self {
+                state: seed | 1,
+                remaining,
+            }
+        }
+    }
+
+    impl Read for XorShiftBytes {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.remaining == 0 || buf.is_empty() {
+                return Ok(0);
+            }
+            let n = (buf.len() as u64).min(self.remaining) as usize;
+            for chunk in buf[..n].chunks_mut(8) {
+                self.state ^= self.state << 13;
+                self.state ^= self.state >> 7;
+                self.state ^= self.state << 17;
+                let bytes = self.state.to_le_bytes();
+                chunk.copy_from_slice(&bytes[..chunk.len()]);
+            }
+            self.remaining -= n as u64;
+            Ok(n)
+        }
+    }
+
+    /// Regression: `scan_zstd_frames` must not slurp the whole file (`read_to_end`)
+    /// or issue a single `read` of the entire length (K9 streaming scan).
+    #[test]
+    fn scan_zstd_frames_mock_read_does_not_slurp_whole_file() {
+        // Two ~200 KiB incompressible frames so the 256 KiB window is smaller
+        // than the file and still covers frame 0.
+        const PLAIN: u64 = 200 * 1024;
+        let mut data = Vec::new();
+        let (c0, _) =
+            encode_zstd_frame_to(XorShiftBytes::new(0x1234_5678, PLAIN), &mut data, 1).unwrap();
+        let (c1, _) =
+            encode_zstd_frame_to(XorShiftBytes::new(0x9abc_def0, PLAIN), &mut data, 1).unwrap();
+        let file_len = data.len() as u64;
+        assert!(
+            file_len > SCAN_FRAME_WINDOW_START as u64,
+            "fixture must exceed the initial scan window so a whole-file read is detectable"
+        );
+        assert!(c0 > 0 && c1 > 0);
+
+        let mut mock = NoSlurp {
+            inner: Cursor::new(data),
+            file_len,
+            max_read_len: 0,
+        };
+        let map = scan_zstd_frames(&mut mock).unwrap();
+        assert_eq!(map.frames.len(), 2);
+        assert_eq!(map.frames[0].compressed_offset, 0);
+        assert_eq!(map.frames[1].compressed_offset, c0);
+        assert_eq!(
+            map.frames[0].compressed_size + map.frames[1].compressed_size,
+            file_len
+        );
+        assert!(
+            (mock.max_read_len as u64) < file_len,
+            "max read {} must be < file {}",
+            mock.max_read_len,
+            file_len
+        );
+        assert!(map.seek_table.is_none());
+    }
+
+    /// Regression: per-frame grow window has no 64 MiB cap; frame 1 offset is
+    /// the real start of frame 1 after a >64 MiB compressed frame 0.
+    #[test]
+    fn scan_zstd_frames_first_frame_larger_than_64mib() {
+        const OVER_64MIB: u64 = 64 * 1024 * 1024 + 64 * 1024;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        let (c0, p0) = encode_zstd_frame_to(
+            XorShiftBytes::new(0xC0FFEE, OVER_64MIB),
+            tmp.as_file_mut(),
+            1,
+        )
+        .unwrap();
+        assert!(
+            c0 > 64 * 1024 * 1024,
+            "frame 0 compressed size {c0} must exceed 64 MiB (plain {p0})"
+        );
+        let (c1, p1) =
+            encode_zstd_frame_to(&b"tiny-second-frame"[..], tmp.as_file_mut(), 1).unwrap();
+        assert_eq!(p1, 17);
+
+        tmp.as_file_mut().seek(SeekFrom::Start(0)).unwrap();
+        let map = scan_zstd_frames(tmp.as_file_mut()).unwrap();
+        assert_eq!(map.frames.len(), 2, "expected two data frames");
+        assert_eq!(
+            map.frames[1].compressed_offset, c0,
+            "frame 1 offset must equal the real start of frame 1"
+        );
+        assert_eq!(map.frames[0].compressed_size, c0);
+        assert_eq!(map.frames[0].uncompressed_size, p0);
+        assert_eq!(map.frames[1].compressed_size, c1);
+        assert_eq!(map.frames[1].uncompressed_size, p1);
+        assert!(map.seek_table.is_none());
+
+        let via_path = scan_zstd_frames_path(tmp.path()).unwrap();
+        assert_eq!(via_path.frames.len(), 2);
+        assert_eq!(via_path.frames[1].compressed_offset, c0);
+    }
+
+    /// Seek-table footer is recorded as `seek_table` and is not a data frame.
+    #[test]
+    fn scan_zstd_frames_seek_table_excluded_from_frames() {
+        let parts: [&[u8]; 3] = [b"hello world!!!!", b"second frame payload", b"third!"];
+        let mut frames_bin = Vec::new();
+        let mut table_entries = Vec::new();
+        for part in parts {
+            let f = encode_zstd_frame(part, 1).unwrap();
+            table_entries.push((f.len() as u32, part.len() as u32));
+            frames_bin.extend_from_slice(&f);
+        }
+        let table = build_seek_table_skippable(&table_entries);
+        let table_start = frames_bin.len() as u64;
+        let mut compressed = frames_bin;
+        compressed.extend_from_slice(&table);
+        let file_len = compressed.len() as u64;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("seekable-scan.zst");
+        std::fs::write(&path, &compressed).unwrap();
+
+        let map = scan_zstd_frames_path(&path).unwrap();
+        assert_eq!(map.frames.len(), 3);
+        assert_eq!(
+            map.seek_table,
+            Some(table_start..file_len),
+            "seek_table must be the skippable footer span"
+        );
+        let frames_end: u64 = map.frames.iter().map(|f| f.compressed_size).sum();
+        assert_eq!(frames_end, table_start);
+        assert_eq!(map.frames[0].uncompressed_offset, 0);
+        assert_eq!(map.frames[1].uncompressed_offset, parts[0].len() as u64);
+        let total_plain: u64 = parts.iter().map(|p| p.len() as u64).sum();
+        assert_eq!(
+            map.frames.last().unwrap().uncompressed_offset
+                + map.frames.last().unwrap().uncompressed_size,
+            total_plain
+        );
+    }
+
+    /// encode_zstd_frame_to / decode_zstd_frames_to persist-API roundtrip.
+    #[test]
+    fn encode_zstd_frame_to_decode_zstd_frames_to_roundtrip() {
+        let mut plain = Vec::new();
+        for i in 0..4000u32 {
+            writeln!(&mut plain, "line {i:05} {}", "z".repeat(32)).unwrap();
+        }
+
+        let mut compressed = Vec::new();
+        let (c0, p0) = encode_zstd_frame_to(&plain[..], &mut compressed, 3).unwrap();
+        assert_eq!(p0, plain.len() as u64);
+        assert_eq!(c0, compressed.len() as u64);
+
+        let map = scan_zstd_frames(&mut Cursor::new(&compressed)).unwrap();
+        assert_eq!(map.frames.len(), 1);
+        assert_eq!(map.frames[0].compressed_size, c0);
+        assert_eq!(map.frames[0].uncompressed_size, p0);
+
+        let mut out = Vec::new();
+        let n = decode_zstd_frames_to(&mut Cursor::new(&compressed), &map, 0, &mut out).unwrap();
+        assert_eq!(n, p0);
+        assert_eq!(out, plain);
+
+        // Last-N: two generated frames, decode only frame 1.
+        let tail = b"second-generated-frame";
+        let mut two = compressed;
+        let (c1, p1) = encode_zstd_frame_to(&tail[..], &mut two, 3).unwrap();
+        let map2 = scan_zstd_frames(&mut Cursor::new(&two)).unwrap();
+        assert_eq!(map2.frames.len(), 2);
+        assert_eq!(map2.frames[1].compressed_offset, c0);
+        assert_eq!(map2.frames[1].compressed_size, c1);
+        assert_eq!(map2.frames[1].uncompressed_size, p1);
+        let mut last = Vec::new();
+        let n1 = decode_zstd_frames_to(&mut Cursor::new(&two), &map2, 1, &mut last).unwrap();
+        assert_eq!(n1, p1);
+        assert_eq!(last, tail);
     }
 }
