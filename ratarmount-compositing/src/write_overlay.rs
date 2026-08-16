@@ -23,7 +23,8 @@ use ratarmount_core::{
     MountSource, UserData,
 };
 use ratarmount_formats_tar::{
-    find_last_tar_eof, rewrite_tar_suffix, RewriteTarSuffix, UstarMember, UstarPayload,
+    find_last_tar_eof, rewrite_tar_suffix, window_has_member_boundary, RewriteTarSuffix,
+    UstarMember, UstarPayload,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -340,6 +341,16 @@ impl WriteOverlay {
             fs::create_dir_all(&real)?;
             return Ok(());
         }
+        if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
+            // COW a symlink as a symlink: archive symlinks carry no content,
+            // so copying the body would materialize an empty regular file and
+            // a later commit would drop the link member entirely.
+            if let Some(parent) = real.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            std::os::unix::fs::symlink(&fi.linkname, &real)?;
+            return Ok(());
+        }
         let mut src = self.current_base().open(&fi, 0)?;
         let mut dst = FsOpenOptions::new()
             .write(true)
@@ -465,6 +476,36 @@ impl WriteOverlay {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
+        // POSIX: refuse non-directories and non-empty dirs in the union view.
+        // Committing a bare dir tombstone would recursively delete base
+        // children (GNU tar --delete) or orphan them (zstd splice drops only
+        // the dir member) — the two paths also disagree with each other.
+        match self.lookup(path, 0) {
+            Some(fi) if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR => {}
+            Some(_) => {
+                return Err(OverlayError::Io(io::Error::new(
+                    io::ErrorKind::NotADirectory,
+                    format!("rmdir: not a directory: {path}"),
+                )));
+            }
+            None => {
+                return Err(OverlayError::Io(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("rmdir: no such directory: {path}"),
+                )));
+            }
+        }
+        let has_children = match self.list(path) {
+            Some(ListResult::Infos(m)) => !m.is_empty(),
+            Some(ListResult::Names(n)) => !n.is_empty(),
+            None => false,
+        };
+        if has_children {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::DirectoryNotEmpty,
+                format!("rmdir: directory not empty: {path}"),
+            )));
+        }
         if real.exists() {
             fs::remove_dir(&real)?;
         }
@@ -534,6 +575,19 @@ impl WriteOverlay {
                 "directory rename is not supported on the write overlay",
             )));
         }
+        // COW the source before touching the destination: if the copy fails
+        // (read error, ENOSPC), the destination must not already be unlinked.
+        self.ensure_modifiable(&from)?;
+        let from_real = self.realpath(&from);
+        let to_real = self.realpath(&to);
+        self.ensure_rename_confined(&from_real)?;
+        self.ensure_rename_confined(&to_real)?;
+        if fs::symlink_metadata(&from_real).is_err() {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("rename source missing: {from}"),
+            )));
+        }
         if self.lookup(&to, 0).is_some() {
             let dest_real = self.realpath(&to);
             let dest_is_dir = fs::symlink_metadata(&dest_real)
@@ -546,17 +600,6 @@ impl WriteOverlay {
                 )));
             }
             self.unlink_inner(&to)?;
-        }
-        self.ensure_modifiable(&from)?;
-        let from_real = self.realpath(&from);
-        let to_real = self.realpath(&to);
-        self.ensure_under_root(&from_real)?;
-        self.ensure_under_root(&to_real)?;
-        if fs::symlink_metadata(&from_real).is_err() {
-            return Err(OverlayError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("rename source missing: {from}"),
-            )));
         }
         if let Some(parent) = to_real.parent() {
             fs::create_dir_all(parent)?;
@@ -735,6 +778,19 @@ impl WriteOverlay {
             });
         }
         Ok(out)
+    }
+
+    /// Confinement for rename endpoints: `rename(2)` never follows symlinks,
+    /// so a symlink final component only needs a confined parent (the plain
+    /// `ensure_under_root` rejects final symlinks — an anti-escape policy for
+    /// open/read/write that does not apply here).
+    fn ensure_rename_confined(&self, host_path: &Path) -> Result<()> {
+        match fs::symlink_metadata(host_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                self.ensure_parent_confined(host_path).map_err(OverlayError::Io)
+            }
+            _ => self.ensure_under_root(host_path).map_err(OverlayError::Io),
+        }
     }
 
     /// Confine a symlink's parent without following the final component.
@@ -1799,11 +1855,20 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, 
             .map_err(|e| OverlayError::Msg(e.to_string()))?;
         suffix.seek(SeekFrom::Start(0))?;
         let stream_offset = map.frames[from_idx].uncompressed_offset;
-        if find_last_tar_eof(&mut suffix, stream_offset)?.is_some() {
+        // The window must both contain the TAR EOF and start at a parseable
+        // member boundary (or be pure padding). A member spanning the whole
+        // window has no findable data end — grow the window instead of
+        // risking a miscut.
+        let has_eof = find_last_tar_eof(&mut suffix, stream_offset)?.is_some();
+        let has_boundary = window_has_member_boundary(&mut suffix, stream_offset)
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+        if has_eof && has_boundary {
             return Ok((from_idx, stream_offset));
         }
     }
-    Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()))
+    Err(OverlayError::Msg(
+        "TAR EOF / member boundary not found (truncated?)".into(),
+    ))
 }
 
 enum TarZstPathClass {
@@ -2701,6 +2766,139 @@ mod tests {
         let names: Vec<_> = dents.iter().map(|d| d.name.as_str()).collect();
         assert!(names.contains(&"dst.txt"), "{names:?}");
         assert!(names.contains(&"link"), "{names:?}");
+    }
+
+    /// Regression: renaming (or COW-ing) a base symlink must materialize a
+    /// symlink in the overlay — copying its "content" yielded an empty
+    /// regular file, and a later commit dropped the link member entirely.
+    #[test]
+    fn rename_base_symlink_stays_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        fs::create_dir_all(&base_dir).unwrap();
+        fs::write(base_dir.join("target.txt"), b"payload\n").unwrap();
+        std::os::unix::fs::symlink("target.txt", base_dir.join("link")).unwrap();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
+        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+
+        ov.rename("/link", "/link2").expect("rename symlink");
+        let meta = fs::symlink_metadata(overlay.join("link2")).expect("overlay link2");
+        assert!(
+            meta.file_type().is_symlink(),
+            "rename must COW a symlink as a symlink, got {:?}",
+            meta.file_type()
+        );
+        assert_eq!(
+            fs::read_link(overlay.join("link2")).unwrap(),
+            std::path::PathBuf::from("target.txt")
+        );
+        let fi = ov.lookup("/link2", 0).expect("lookup link2");
+        assert!(ratarmount_core::is_lnk_mode(fi.mode));
+        assert_eq!(fi.linkname, "target.txt");
+        assert!(ov.lookup("/link", 0).is_none(), "old name must be gone");
+    }
+
+    /// Regression: rmdir must refuse non-empty union dirs (base children
+    /// included) and non-directories — committing a bare dir tombstone would
+    /// recursively delete or orphan the children depending on commit format.
+    #[test]
+    fn rmdir_refuses_nonempty_and_non_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let base_dir = dir.path().join("base");
+        fs::create_dir_all(base_dir.join("full")).unwrap();
+        fs::write(base_dir.join("full").join("a.txt"), b"a\n").unwrap();
+        fs::create_dir_all(base_dir.join("empty")).unwrap();
+        fs::write(base_dir.join("file.txt"), b"f\n").unwrap();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let base = crate::folder::FolderMountSource::new(&base_dir).unwrap();
+        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+
+        let err = ov.rmdir("/full").expect_err("non-empty base dir");
+        assert_eq!(
+            err.to_string().contains("not empty"),
+            true,
+            "unexpected error: {err}"
+        );
+        let err = ov.rmdir("/file.txt").expect_err("file is not a dir");
+        assert!(
+            err.to_string().contains("not a directory"),
+            "unexpected error: {err}"
+        );
+        let err = ov.rmdir("/missing").expect_err("missing path");
+        assert!(
+            err.to_string().contains("no such directory"),
+            "unexpected error: {err}"
+        );
+        ov.rmdir("/empty").expect("empty dir rmdir");
+        assert!(
+            ov.lookup("/empty", 0).is_none(),
+            "empty dir must be gone from the union view"
+        );
+        // Children of the refused dir are untouched.
+        let fi = ov.lookup("/full/a.txt", 0).expect("child survives");
+        assert_eq!(fi.size, 2);
+    }
+
+    /// Regression: rename must not delete the destination when the source
+    /// COW fails — copy the source first, unlink the destination last.
+    #[test]
+    fn rename_keeps_destination_when_source_cow_fails() {
+        struct FailOpenBase;
+        impl MountSource for FailOpenBase {
+            fn list(&self, _path: &str) -> Option<ListResult> {
+                Some(ListResult::Infos(Default::default()))
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                if path == "/" {
+                    return Some(create_root_file_info());
+                }
+                if path == "/src" {
+                    return Some(FileInfo {
+                        size: 5,
+                        mtime: 0.0,
+                        mode: ratarmount_core::S_IFREG | 0o644,
+                        linkname: String::new(),
+                        uid: 0,
+                        gid: 0,
+                        userdata: vec![],
+                    });
+                }
+                None
+            }
+            fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Err(io::Error::new(io::ErrorKind::PermissionDenied, "boom"))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::new(FailOpenBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        let fd = ov.create_file("/dst", 0o644).unwrap();
+        unsafe {
+            libc::close(fd);
+        }
+        fs::write(overlay.join("dst"), b"precious\n").unwrap();
+
+        let err = ov.rename("/src", "/dst").expect_err("source COW must fail");
+        assert!(
+            err.to_string().contains("boom"),
+            "expected the COW error, got: {err}"
+        );
+        assert_eq!(
+            fs::read(overlay.join("dst")).unwrap(),
+            b"precious\n",
+            "destination must survive a failed rename"
+        );
+        assert!(ov.lookup("/dst", 0).is_some(), "dst still listed");
     }
 
     #[test]
