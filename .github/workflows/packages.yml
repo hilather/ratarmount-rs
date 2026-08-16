@@ -71,8 +71,10 @@ jobs:
       - name: Install build deps
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          sudo apt-get update
-          sudo apt-get install -y \
+          # Acquire::Retries covers transient Debian/Ubuntu CDN resets
+          # (v0.1.21 portable-amd64 lost libfuse3 with "Connection reset by peer").
+          sudo apt-get -o Acquire::Retries=5 update
+          sudo apt-get -o Acquire::Retries=5 install -y \
             build-essential pkg-config curl ca-certificates git \
             libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 
@@ -240,16 +242,16 @@ jobs:
       - name: Bootstrap
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y ca-certificates curl git
+          apt-get -o Acquire::Retries=5 update
+          apt-get -o Acquire::Retries=5 install -y ca-certificates curl git
 
       - uses: actions/checkout@v4
 
       - name: Install build deps
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get update
-          apt-get install -y \
+          apt-get -o Acquire::Retries=5 update
+          apt-get -o Acquire::Retries=5 install -y \
             build-essential pkg-config curl ca-certificates git \
             libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 

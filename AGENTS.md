@@ -65,6 +65,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Index formats missing readdirplus sizes | `cargo test -p ratarmount-formats-cpio --lib list_dirents` · `cargo test -p ratarmount-formats-ar --lib list_dirents` · `cargo test -p ratarmount-formats-warc --lib list_dirents` · `cargo test -p ratarmount-formats-cab --lib list_dirents` · `cargo test -p ratarmount-formats-iso9660 --lib list_dirents` · `cargo test -p ratarmount-formats-asar --lib list_dirents` · `cargo test -p ratarmount-formats-xar --lib list_dirents` · `cargo test -p ratarmount-formats-libarchive --lib list_dirents` · `cargo test -p ratarmount-formats-ogg --lib list_dirents` · `cargo test -p ratarmount-formats-html --lib list_dirents` · `cargo test -p ratarmount-formats-pdf --lib list_dirents` |
 | FUSE readlink extra lookup / FR-10 type mismatch | `cargo test -p ratarmount-fuse --lib readlink_uses_cached` · `cargo test -p ratarmount-fuse --lib readdirplus_dirent_type` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
+| Packages portable apt CDN reset (missing glibc2.31 amd64) | `./packaging/test-packages-apt-retries.sh` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
 | NFS compositing pin (`member_seek_is_cheap`) | `cargo test -p ratarmount-compositing --lib file_version_layer_forwards` · `cargo test -p ratarmount-compositing --lib automount_forwards` |
@@ -167,6 +168,10 @@ leave a downloadable **`signed-release-bundle`** Actions artifact (expires).
    failures are visible without private job-log auth.
 4. Stuck legacy runners (e.g. scarce `macos-13`) — drop or pin to available labels;
    do not block Linux packages on one matrix leg forever.
+5. **apt CDN reset** — Debian `apt-get` in the portable bullseye container can
+   fail mid-fetch (`Connection reset by peer` on `libfuse3`). Symptom: Packages
+   red, GitHub Release missing `portable-glibc2.31` **amd64**. `apt-get` steps
+   must pass `-o Acquire::Retries=5`. Check: `./packaging/test-packages-apt-retries.sh`.
 
 ### After a bad tag
 
