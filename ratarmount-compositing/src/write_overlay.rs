@@ -1806,7 +1806,7 @@ fn interval_disabled_err() -> OverlayError {
 }
 
 /// `.tar.zst` / `.tzst` / `.tar.zstd` only — not `.taz`.
-fn name_suggests_tar_zst(path: &Path) -> bool {
+pub fn name_suggests_tar_zst(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
         return false;
     };
@@ -1824,8 +1824,12 @@ fn looks_like_tar_zst(archive: &Path) -> Result<bool> {
 
 const LAST_FRAME_WARN_BYTES: u64 = 64 * 1024 * 1024;
 
-fn warn_large_zstd_window(window_plain: u64, single_frame: bool) {
-    if single_frame || window_plain > LAST_FRAME_WARN_BYTES {
+fn last_zstd_plain_needs_warn(plain: u64) -> bool {
+    plain > LAST_FRAME_WARN_BYTES
+}
+
+fn warn_large_zstd_window(window_plain: u64) {
+    if last_zstd_plain_needs_warn(window_plain) {
         log::warn!(
             "live .tar.zst commit will rewrite {window_plain} uncompressed \
              (single-frame or large last frame); persist still copies the compressed file"
@@ -1839,7 +1843,7 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, 
         return Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()));
     }
     let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
-    warn_large_zstd_window(last_plain, map.frames.len() == 1);
+    warn_large_zstd_window(last_plain);
     let mut src = File::open(archive)?;
     for n in 1..=map.frames.len() {
         let from_idx = map.frames.len() - n;
@@ -1848,7 +1852,7 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, 
             .map(|f| f.uncompressed_size)
             .sum();
         if n > 1 {
-            warn_large_zstd_window(window_plain, false);
+            warn_large_zstd_window(window_plain);
         }
         let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
         decode_zstd_frames_to(&mut src, map, from_idx, &mut suffix)
@@ -2062,7 +2066,23 @@ fn is_uncompressed_tar(path: &Path) -> Result<bool> {
     f.seek(SeekFrom::Start(257))?;
     let mut ustar = [0u8; 5];
     let n = f.read(&mut ustar)?;
-    Ok(n == 5 && (&ustar == b"ustar" || ustar.starts_with(b"ustar") || &ustar == b"GNU  "))
+    if n == 5 && (&ustar == b"ustar" || ustar.starts_with(b"ustar") || &ustar == b"GNU  ") {
+        return Ok(true);
+    }
+    Ok(is_posix_or_gnu_empty_tar(&mut f)?)
+}
+
+/// POSIX/GNU empty TAR: 1024..=10240, 512-aligned, all-zero. Reads at most 10 KiB.
+fn is_posix_or_gnu_empty_tar(f: &mut File) -> io::Result<bool> {
+    let n = f.metadata()?.len();
+    if !(1024..=10240).contains(&n) || n % 512 != 0 {
+        return Ok(false);
+    }
+    f.seek(SeekFrom::Start(0))?;
+    let mut buf = [0u8; 10240];
+    let len = n as usize;
+    f.read_exact(&mut buf[..len])?;
+    Ok(buf[..len].iter().all(|&b| b == 0))
 }
 
 /// Resolve a GNU tar binary (`tar` on Linux, often `gtar` via Homebrew on macOS).
@@ -2177,6 +2197,87 @@ mod tests {
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    fn write_zero_file(path: &Path, n: usize) {
+        fs::write(path, vec![0u8; n]).unwrap();
+    }
+
+    /// Regression: POSIX empty TAR is recognized as uncompressed TAR.
+    #[test]
+    fn is_uncompressed_tar_posix_empty_1024_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.tar");
+        {
+            let mut f = File::create(&path).unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut f).unwrap();
+        }
+        assert!(
+            is_uncompressed_tar(&path).unwrap(),
+            "1024-zero POSIX empty TAR"
+        );
+        assert!(
+            !ratarmount_compress::looks_like_tar(&path).unwrap(),
+            "looks_like_tar must stay false on 1024 zeros"
+        );
+    }
+
+    #[test]
+    fn is_uncompressed_tar_gnu_empty_10240_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.tar");
+        write_zero_file(&path, 10240);
+        assert!(is_uncompressed_tar(&path).unwrap());
+    }
+
+    #[test]
+    fn is_uncompressed_tar_rejects_too_short_or_unaligned() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [0usize, 512, 1025] {
+            let path = dir.path().join(format!("z{n}.tar"));
+            write_zero_file(&path, n);
+            assert!(
+                !is_uncompressed_tar(&path).unwrap(),
+                "{n}-byte zeros must not be an empty TAR"
+            );
+        }
+    }
+
+    #[test]
+    fn is_uncompressed_tar_rejects_over_10240_zero_head_tail_dirty_middle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirty.tar");
+        let mut buf = vec![0u8; 20 * 1024];
+        buf[12 * 1024] = 1;
+        fs::write(&path, &buf).unwrap();
+        assert!(!is_uncompressed_tar(&path).unwrap());
+    }
+
+    #[test]
+    fn warn_large_zstd_window_1024_one_frame_does_not_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.tar.zst");
+        let mut eof = Vec::new();
+        ratarmount_formats_tar::write_tar_eof(&mut eof).unwrap();
+        let zst = ratarmount_compress::encode_zstd_frame(&eof, 3).unwrap();
+        fs::write(&path, zst).unwrap();
+        let map = scan_zstd_frames_path(&path).unwrap();
+        assert_eq!(map.frames.len(), 1);
+        assert_eq!(map.frames[0].uncompressed_size, 1024);
+        assert!(!last_zstd_plain_needs_warn(map.frames[0].uncompressed_size));
+    }
+
+    #[test]
+    fn warn_large_zstd_window_last_frame_over_64mib_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.tar.zst");
+        let plain = vec![0u8; (LAST_FRAME_WARN_BYTES as usize) + 1];
+        let zst = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+        fs::write(&path, zst).unwrap();
+        let map = scan_zstd_frames_path(&path).unwrap();
+        assert_eq!(map.frames.len(), 1);
+        assert!(map.frames[0].uncompressed_size > LAST_FRAME_WARN_BYTES);
+        assert!(last_zstd_plain_needs_warn(map.frames[0].uncompressed_size));
+    }
 
     fn write_sample_zip(path: &Path, members: &[(&str, &[u8], CompressionMethod)]) {
         let file = File::create(path).unwrap();

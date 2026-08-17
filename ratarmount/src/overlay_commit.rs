@@ -217,22 +217,25 @@ pub fn validate_live_commit_args(
 }
 
 /// K4: warn once at startup; never refuse on size.
-fn maybe_warn_large_zstd_last_frame(archive: &Path) {
+fn maybe_warn_large_zstd_last_frame(archive: &Path) -> bool {
     match detect_compression(archive) {
         Ok(CompressionFormat::Zstd) => {}
-        _ => return,
+        _ => return false,
     }
     let Ok(map) = scan_zstd_frames_path(archive) else {
-        return;
+        return false;
     };
     let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
-    if map.frames.len() == 1 || last_plain > LIVE_COMMIT_WARN_LAST_FRAME {
+    if last_plain > LIVE_COMMIT_WARN_LAST_FRAME {
         let msg = format!(
             "live .tar.zst commit will rewrite {last_plain} uncompressed \
              (single-frame or large last frame); persist still copies the compressed file"
         );
         eprintln!("warning: {msg}");
         log::warn!("{msg}");
+        true
+    } else {
+        false
     }
 }
 
@@ -332,5 +335,26 @@ mod tests {
         let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&path))
             .expect("accept .tar.zst");
         assert_eq!(got, path);
+    }
+
+    #[test]
+    fn live_commit_1024_one_frame_tar_zst_does_not_warn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.tar.zst");
+        let mut eof = Vec::new();
+        ratarmount_formats_tar::write_tar_eof(&mut eof).unwrap();
+        let zst = ratarmount_compress::encode_zstd_frame(&eof, 3).unwrap();
+        std::fs::write(&path, zst).unwrap();
+        assert!(!maybe_warn_large_zstd_last_frame(&path));
+    }
+
+    #[test]
+    fn live_commit_last_frame_over_64mib_still_warns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.tar.zst");
+        let plain = vec![0u8; (LIVE_COMMIT_WARN_LAST_FRAME as usize) + 1];
+        let zst = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+        std::fs::write(&path, zst).unwrap();
+        assert!(maybe_warn_large_zstd_last_frame(&path));
     }
 }
