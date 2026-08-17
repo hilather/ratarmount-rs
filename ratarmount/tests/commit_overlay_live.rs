@@ -396,3 +396,490 @@ fn commit_overlay_on_exit_sigterm_tar_zst_cmp() {
         fs::read(&expected_new).unwrap()
     );
 }
+
+fn write_empty_zip(path: &Path) {
+    let mut bytes = vec![0u8; 22];
+    bytes[0] = 0x50;
+    bytes[1] = 0x4b;
+    bytes[2] = 0x05;
+    bytes[3] = 0x06;
+    fs::write(path, bytes).unwrap();
+}
+
+fn write_tiny_targz(dir: &Path) -> PathBuf {
+    let tree = dir.join("gztree");
+    fs::create_dir_all(&tree).unwrap();
+    fs::write(tree.join("a.txt"), b"gz\n").unwrap();
+    let path = dir.join("existing.tar.gz");
+    assert!(Command::new("tar")
+        .args(["-czf"])
+        .arg(&path)
+        .arg("-C")
+        .arg(&tree)
+        .arg("a.txt")
+        .status()
+        .unwrap()
+        .success());
+    path
+}
+
+/// Regression: missing archive.tar is not found without -w
+#[test]
+fn create_missing_without_w_does_not_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("archive.tar");
+    let out = Command::new(bin())
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("not found"), "{err}");
+    assert!(!archive.exists());
+}
+
+/// Regression: missing .tar.gz refused for write create
+#[test]
+fn create_missing_targz_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("a.tar.gz");
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(
+        err.contains("cannot create") || err.contains("gzip"),
+        "{err}"
+    );
+    assert!(!archive.exists());
+}
+
+/// Regression: existing .tar.gz / .zip still mount under -w
+#[test]
+fn create_missing_existing_targz_zip_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let gz = write_tiny_targz(dir.path());
+    let before_gz = fs::read(&gz).unwrap();
+    let zip = dir.path().join("a.zip");
+    write_empty_zip(&zip);
+    let before_zip = fs::read(&zip).unwrap();
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&gz)
+        .output()
+        .expect("run gzip");
+    assert!(
+        out.status.success(),
+        "existing gzip: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&gz).unwrap(), before_gz);
+
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&zip)
+        .output()
+        .expect("run zip");
+    assert!(
+        out.status.success(),
+        "existing zip: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&zip).unwrap(), before_zip);
+}
+
+/// Regression: missing .iso under -w stays not found
+#[test]
+fn create_missing_iso_stays_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("a.iso");
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!out.status.success(), "{err}");
+    assert!(err.contains("not found"), "{err}");
+    assert!(!archive.exists());
+}
+
+/// Regression: remote URL never creates
+#[test]
+fn create_missing_remote_url_never_creates() {
+    let dir = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .current_dir(dir.path())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg("https://example.com/a.tar")
+        .output()
+        .expect("run");
+    assert!(!dir.path().join("a.tar").exists());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("parent directory does not exist"), "{err}");
+    let _ = out;
+}
+
+/// Regression: offline --commit-overlay remote URL never creates
+#[test]
+fn create_missing_offline_remote_url_never_creates() {
+    let dir = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let out = Command::new(bin())
+        .current_dir(dir.path())
+        .args(["--commit-overlay", "-w"])
+        .arg(&ov)
+        .args(["--yes", "https://example.com/a.tar"])
+        .output()
+        .expect("run");
+    assert!(!dir.path().join("a.tar").exists());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(!err.contains("parent directory does not exist"), "{err}");
+    assert!(!out.status.success(), "{err}");
+}
+
+/// Regression: missing archive.tar + -w mounts empty root
+#[test]
+fn create_missing_tar_is_1024_zeros() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("new.tar");
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let bytes = fs::read(&archive).unwrap();
+    assert_eq!(bytes.len(), 1024);
+    assert!(bytes.iter().all(|&b| b == 0));
+}
+
+/// Regression: offline --commit-overlay missing .tar.zst does not create
+#[test]
+fn create_missing_offline_tar_zst_does_not_create() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("new.tar.zst");
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let out = Command::new(bin())
+        .args(["--commit-overlay", "-w"])
+        .arg(&ov)
+        .arg("--yes")
+        .arg(&archive)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("on-exit") || err.contains("interval"), "{err}");
+    assert!(!archive.exists());
+}
+
+/// Regression: offline --commit-overlay missing .tar creates then commits
+#[test]
+fn create_missing_offline_tar_creates_then_commits() {
+    if skip_no_gnu_tar() {
+        eprintln!("skip: GNU tar missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("new.tar");
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let expected = b"offline-create\n";
+    fs::write(ov.join("hello.txt"), expected).unwrap();
+    let out = Command::new(bin())
+        .args(["--commit-overlay", "-w"])
+        .arg(&ov)
+        .arg("--yes")
+        .arg(&archive)
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(archive.is_file());
+    let extract = dir.path().join("ex");
+    fs::create_dir_all(&extract).unwrap();
+    assert!(Command::new("tar")
+        .args(["-xf"])
+        .arg(&archive)
+        .arg("-C")
+        .arg(&extract)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(fs::read(extract.join("hello.txt")).unwrap(), expected);
+}
+
+/// Refuse existing dir named `*.tar`
+#[test]
+fn create_missing_refuses_dir_named_tar() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("archive.tar");
+    fs::create_dir_all(&archive).unwrap();
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(2), "{err}");
+    assert!(err.contains("is a directory"), "{err}");
+    assert!(archive.is_dir());
+}
+
+/// Existing dir without createable name → folder bind as today
+#[test]
+fn create_missing_folder_bind_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let dest = dir.path().join("dest");
+    fs::create_dir_all(&dest).unwrap();
+    let ov = dir.path().join("ov");
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&dest)
+        .output()
+        .expect("run");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(dest.is_dir());
+}
+
+/// Refuse clobber: pre-write secret into a.tar
+#[test]
+fn create_missing_refuses_clobber() {
+    let dir = tempfile::tempdir().unwrap();
+    let archive = dir.path().join("a.tar");
+    fs::write(&archive, b"secret").unwrap();
+    let ov = dir.path().join("ov");
+    let _ = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&archive)
+        .output()
+        .expect("run");
+    assert_eq!(fs::read(&archive).unwrap(), b"secret");
+}
+
+/// Missing-path on-exit `.tar`: create then write overlay file; SIGTERM; tar -xf + cmp.
+#[test]
+fn create_missing_on_exit_tar_cmp_overlay_files() {
+    if skip_no_gnu_tar() {
+        eprintln!("skip: GNU tar missing");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let expected_new = dir.path().join("expected-new.bin");
+    fs::write(
+        &expected_new,
+        format!("live-on-exit-create-{}\n", std::process::id()),
+    )
+    .unwrap();
+    let tar = dir.path().join("new.tar");
+    assert!(!tar.exists());
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .arg("--commit-overlay-on-exit")
+        .arg("--index-file")
+        .arg(":memory:")
+        .arg(&tar)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn ratarmount");
+
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(8)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    assert!(
+        tar.is_file(),
+        "create-if-missing should have written {tar:?}"
+    );
+    fs::write(ov.join("new.bin"), fs::read(&expected_new).unwrap()).unwrap();
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success() || status.code() == Some(0) || status.code().is_none(),
+        "SIGTERM exit: {status:?} log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let listing = tar_list(&tar);
+    assert!(
+        listing.contains("new.bin"),
+        "missing new.bin after on-exit: {listing}"
+    );
+    let extract = dir.path().join("ex");
+    fs::create_dir_all(&extract).unwrap();
+    assert!(Command::new("tar")
+        .args(["-xf"])
+        .arg(&tar)
+        .arg("-C")
+        .arg(&extract)
+        .status()
+        .unwrap()
+        .success());
+    assert_eq!(
+        fs::read(extract.join("new.bin")).unwrap(),
+        fs::read(&expected_new).unwrap()
+    );
+}
+
+/// Missing-path interval `.tar.zst`: write file; wait for commit; scan_zstd_frames; decode + cmp.
+#[test]
+fn create_missing_interval_tar_zst_cmp() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected = dir.path().join("expected.bin");
+    fs::write(
+        &expected,
+        format!("interval-create-{}\n", std::process::id()),
+    )
+    .unwrap();
+    let zst = dir.path().join("new.tar.zst");
+    assert!(!zst.exists());
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args([
+            "--commit-overlay-interval",
+            "1s",
+            "--index-file",
+            ":memory:",
+        ])
+        .arg(&zst)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(8)) {
+        let _ = child.kill();
+        panic!(
+            "not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    assert!(
+        zst.is_file(),
+        "create-if-missing should have written {zst:?}"
+    );
+    fs::write(ov.join("tick.bin"), fs::read(&expected).unwrap()).unwrap();
+
+    let dest_tar = dir.path().join("decoded.tar");
+    let start = Instant::now();
+    let mut saw = false;
+    while start.elapsed() < Duration::from_secs(8) {
+        if zst.is_file() {
+            if let Ok(map) = ratarmount_compress::scan_zstd_frames_path(&zst) {
+                if !map.frames.is_empty() {
+                    decode_tar_zst_to_tar(&zst, &dest_tar);
+                    if dest_tar.is_file() {
+                        let extract = dir.path().join("ex-poll");
+                        let _ = fs::remove_dir_all(&extract);
+                        fs::create_dir_all(&extract).unwrap();
+                        if Command::new("tar")
+                            .args(["-xf"])
+                            .arg(&dest_tar)
+                            .arg("-C")
+                            .arg(&extract)
+                            .status()
+                            .map(|s| s.success())
+                            .unwrap_or(false)
+                            && extract.join("tick.bin").is_file()
+                        {
+                            saw = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        thread::sleep(Duration::from_millis(150));
+    }
+    assert!(
+        saw,
+        "interval did not persist tick.bin: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let map = ratarmount_compress::scan_zstd_frames_path(&zst).expect("scan frames");
+    assert!(!map.frames.is_empty(), "expected at least one zstd frame");
+    decode_tar_zst_to_tar(&zst, &dest_tar);
+    let extract = dir.path().join("ex");
+    fs::create_dir_all(&extract).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-xf"])
+            .arg(&dest_tar)
+            .arg("-C")
+            .arg(&extract)
+            .status()
+            .unwrap()
+            .success(),
+        "tar -xf decoded created .tar.zst"
+    );
+    assert_eq!(
+        fs::read(extract.join("tick.bin")).unwrap(),
+        fs::read(&expected).unwrap()
+    );
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}

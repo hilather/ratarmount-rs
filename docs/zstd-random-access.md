@@ -158,7 +158,10 @@ table using the recipes above.
 
 `--commit-overlay-on-exit` and `--commit-overlay-interval` accept a **single**
 host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
-(or zstd magic + TAR body), with durable `-w` (not `:temp:`). See
+(or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
+`.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
+no seek table) when `-w` is set. Offline `--commit-overlay` is **not** an
+escape hatch: a missing `.tar.zst` exits 2 without creating a file. See
 [mount-options-parity.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md)
 and [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
@@ -179,14 +182,16 @@ and dropped when a frame size exceeds the seekable-format `u32` limit.
 Plan **2× compressed size** disk headroom (tmp + original until `persist`
 unlinks the old inode). Single-frame `tar \| zstd` is a full last-frame rewrite
 (same recompress class as offline gzip TAR commit). **Never refuse on size** —
-startup warns when `frames.len() == 1` or the last-frame uncompressed size
-exceeds **64 MiB**, then spills decoded/encoded suffix above 256 MiB.
+startup warns when the last-frame uncompressed size exceeds **64 MiB** (a
+brand-new one-frame empty archive does **not** warn), then spills
+decoded/encoded suffix above 256 MiB.
 
 **Not supported (v1):**
 
 - Gzip / bzip2 / xz live splice — rejected with a message that **names gzip**
   (or the other codec). G3 inflate checkpoints are not deflate cut points.
-- Offline `--commit-overlay` for `.tar.zst` — **not an escape hatch yet**.
+- Offline `--commit-overlay` for `.tar.zst` — **not an escape hatch** (missing
+  `.tar.zst` is not created on that branch).
 - Plain `.zst` that is not a TAR body.
 - Delete/replace of a name that still has a version in an earlier frame
   (append-only + last-window mutate).

@@ -6,7 +6,10 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use ratarmount_compositing::WriteOverlay;
+use ratarmount_compositing::{
+    classify_createable_archive, maybe_create_empty_write_archive, EmptyArchiveKind,
+    EmptyCreateOutcome, WriteOverlay,
+};
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
 };
@@ -183,6 +186,45 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
     }
 }
 
+/// Where create-if-missing was requested (`-w` mount vs offline `--commit-overlay`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateMissingContext {
+    Mount,
+    OfflineCommit,
+}
+
+/// Create a missing uncompressed `.tar` / `.tar.zst` before factory open or offline commit.
+///
+/// Remote URLs are never created (including `file://`). Offline `--commit-overlay` refuses
+/// a missing `.tar.zst` without touching the path (K13).
+pub fn maybe_create_missing_write_base(
+    path: &Path,
+    ctx: CreateMissingContext,
+) -> Result<EmptyCreateOutcome, String> {
+    if ratarmount_remote::is_remote_url(&path.to_string_lossy()) {
+        return Ok(EmptyCreateOutcome::Unchanged);
+    }
+    if matches!(ctx, CreateMissingContext::OfflineCommit)
+        && matches!(
+            classify_createable_archive(path),
+            Ok(Some(EmptyArchiveKind::TarZst))
+        )
+    {
+        let missing = matches!(
+            std::fs::symlink_metadata(path),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound
+        );
+        if missing {
+            return Err(
+                "offline --commit-overlay does not support .tar.zst (use --commit-overlay-on-exit / --commit-overlay-interval)"
+                    .into(),
+            );
+        }
+        return Ok(EmptyCreateOutcome::Unchanged);
+    }
+    maybe_create_empty_write_archive(path).map_err(|e| e.to_string())
+}
+
 /// Startup gate: durable `-w` + a single uncompressed TAR or `.tar.zst`.
 pub fn validate_live_commit_args(
     write_overlay: Option<&Path>,
@@ -356,5 +398,61 @@ mod tests {
         let zst = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
         std::fs::write(&path, zst).unwrap();
         assert!(maybe_warn_large_zstd_last_frame(&path));
+    }
+
+    #[test]
+    fn create_missing_validate_live_commit_after_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let tar = dir.path().join("new.tar");
+        maybe_create_missing_write_base(&tar, CreateMissingContext::Mount)
+            .expect("create missing .tar");
+        let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&tar))
+            .expect("accept created .tar");
+        assert_eq!(got, tar);
+
+        let zst = dir.path().join("new.tar.zst");
+        maybe_create_missing_write_base(&zst, CreateMissingContext::Mount)
+            .expect("create missing .tar.zst");
+        let got = validate_live_commit_args(Some(&ov), std::slice::from_ref(&zst))
+            .expect("accept created .tar.zst");
+        assert_eq!(got, zst);
+    }
+
+    #[test]
+    fn create_missing_remote_url_never_creates() {
+        let url = PathBuf::from("https://example.com/a.tar");
+        let got = maybe_create_missing_write_base(&url, CreateMissingContext::Mount)
+            .expect("remote skip");
+        assert_eq!(got, EmptyCreateOutcome::Unchanged);
+        let offline = maybe_create_missing_write_base(&url, CreateMissingContext::OfflineCommit)
+            .expect("offline remote skip");
+        assert_eq!(offline, EmptyCreateOutcome::Unchanged);
+        // Without the remote skip, classify would see basename `a.tar` and try the
+        // parent `https://example.com` → "parent directory does not exist".
+        assert!(!url.exists());
+    }
+
+    #[test]
+    fn create_missing_offline_tar_zst_does_not_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("new.tar.zst");
+        let err = maybe_create_missing_write_base(&path, CreateMissingContext::OfflineCommit)
+            .expect_err("K13");
+        assert!(err.contains("on-exit") || err.contains("interval"), "{err}");
+        assert!(err.contains(".tar.zst"), "{err}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn create_missing_offline_existing_tar_zst_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tar.zst");
+        std::fs::write(&path, b"keep").unwrap();
+        let got = maybe_create_missing_write_base(&path, CreateMissingContext::OfflineCommit)
+            .expect("existing zstd");
+        assert_eq!(got, EmptyCreateOutcome::Unchanged);
+        assert_eq!(std::fs::read(&path).unwrap(), b"keep");
     }
 }

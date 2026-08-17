@@ -27,10 +27,10 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--recursive-extensions` | yes | **added** | `[x]` |
 | `--transform-recursive-mount-point` | yes | yes | `[x]` |
 | `--transform` (member path rewrite) | yes | **added** | `[x]` |
-| `-w` / `--write-overlay` / `:temp:` | yes | yes | `[x]` |
-| `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; ZIP full rebuild) | `[x]` / residual encrypted ZIP |
-| `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; last-frame zstd rewrite — does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size, warn 64 MiB / single-frame; gzip rejected; offline `--commit-overlay` is **not** a zstd escape hatch; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
-| `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; in-process; same last-frame cost model) | `[x]` Rust-only |
+| `-w` / `--write-overlay` / `:temp:` | yes | yes (missing uncompressed `.tar` / `.tar.zst` created as an empty archive; `:temp:` still creates the **archive**) | `[x]` |
+| `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; ZIP full rebuild; create-if-missing for uncompressed `.tar` only; `.tar.zst` remains unsupported offline) | `[x]` / residual encrypted ZIP |
+| `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; last-frame zstd rewrite — does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB; gzip rejected; offline `--commit-overlay` is **not** a zstd escape hatch; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
+| `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; in-process; same last-frame cost model) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
 | `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |
