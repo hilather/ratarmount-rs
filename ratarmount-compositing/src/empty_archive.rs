@@ -2,7 +2,7 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use ratarmount_compress::{encode_zstd_frame_to, name_suggests_compressed_tar};
@@ -149,12 +149,23 @@ fn initialize_empty_archive(
         None => NamedTempFile::new()?,
     };
     write_empty_archive(tmp.as_file_mut(), kind)?;
+    apply_create_mode(tmp.as_file())?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| OverlayError::Io(e.error))?;
     sync_parent_dir(path);
     eprintln!("initialized empty archive {}", path.display());
     log::info!("initialized empty archive {}", path.display());
     Ok(EmptyCreateOutcome::InitializedEmpty)
+}
+
+/// Same as `OpenOptions::mode(0o666)`: umask applies (NamedTempFile is 0o600).
+fn apply_create_mode(file: &File) -> io::Result<()> {
+    let mask = unsafe {
+        let prev = libc::umask(0);
+        libc::umask(prev);
+        prev
+    };
+    file.set_permissions(fs::Permissions::from_mode(0o666 & !(mask as u32)))
 }
 
 fn write_empty_archive<W: Write>(out: &mut W, kind: EmptyArchiveKind) -> io::Result<()> {
@@ -392,6 +403,24 @@ mod tests {
         assert!(bytes.iter().all(|&b| b == 0));
     }
 
+    #[test]
+    fn initialize_empty_matches_create_new_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("created.tar");
+        assert_eq!(
+            maybe_create_empty_write_archive(&created).unwrap(),
+            EmptyCreateOutcome::Created
+        );
+        let init = dir.path().join("init.tar");
+        fs::write(&init, b"").unwrap();
+        assert_eq!(
+            maybe_create_empty_write_archive(&init).unwrap(),
+            EmptyCreateOutcome::InitializedEmpty
+        );
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&created), mode(&init));
+    }
+
     /// Regression: AlreadyExists on a 0-byte regular file does not truncate.
     #[test]
     fn regression_already_exists_zero_byte_regular_file_does_not_truncate() {
@@ -503,6 +532,7 @@ mod tests {
             !(o1 == EmptyCreateOutcome::Created && o2 == EmptyCreateOutcome::Created),
             "O_EXCL must admit only one creator"
         );
+        // InitializedEmpty is K6 (pre-stat of a 0-byte in-progress winner), not AlreadyExists.
         assert!(
             matches!(
                 (o1, o2),

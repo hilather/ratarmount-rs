@@ -229,7 +229,7 @@ fn maybe_warn_large_zstd_last_frame(archive: &Path) -> bool {
     if last_plain > LIVE_COMMIT_WARN_LAST_FRAME {
         let msg = format!(
             "live .tar.zst commit will rewrite {last_plain} uncompressed \
-             (single-frame or large last frame); persist still copies the compressed file"
+             (large last frame); persist still copies the compressed file"
         );
         eprintln!("warning: {msg}");
         log::warn!("{msg}");

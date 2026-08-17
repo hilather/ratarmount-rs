@@ -1832,7 +1832,7 @@ fn warn_large_zstd_window(window_plain: u64) {
     if last_zstd_plain_needs_warn(window_plain) {
         log::warn!(
             "live .tar.zst commit will rewrite {window_plain} uncompressed \
-             (single-frame or large last frame); persist still copies the compressed file"
+             (large last frame); persist still copies the compressed file"
         );
     }
 }
