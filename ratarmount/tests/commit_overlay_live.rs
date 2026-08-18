@@ -406,21 +406,26 @@ fn write_empty_zip(path: &Path) {
     fs::write(path, bytes).unwrap();
 }
 
-fn write_tiny_targz(dir: &Path) -> PathBuf {
+fn write_tiny_targz(dir: &Path) -> Option<PathBuf> {
     let tree = dir.join("gztree");
     fs::create_dir_all(&tree).unwrap();
     fs::write(tree.join("a.txt"), b"gz\n").unwrap();
     let path = dir.join("existing.tar.gz");
-    assert!(Command::new("tar")
+    let ok = Command::new("tar")
         .args(["-czf"])
         .arg(&path)
         .arg("-C")
         .arg(&tree)
         .arg("a.txt")
         .status()
-        .unwrap()
-        .success());
-    path
+        .map(|s| s.success() && path.is_file())
+        .unwrap_or(false);
+    if ok {
+        Some(path)
+    } else {
+        eprintln!("skip: tar -czf missing or failed");
+        None
+    }
 }
 
 /// Regression: missing archive.tar is not found without -w
@@ -465,26 +470,10 @@ fn create_missing_targz_refused() {
 #[test]
 fn create_missing_existing_targz_zip_unchanged() {
     let dir = tempfile::tempdir().unwrap();
-    let gz = write_tiny_targz(dir.path());
-    let before_gz = fs::read(&gz).unwrap();
     let zip = dir.path().join("a.zip");
     write_empty_zip(&zip);
     let before_zip = fs::read(&zip).unwrap();
     let ov = dir.path().join("ov");
-    let out = Command::new(bin())
-        .args(["-w"])
-        .arg(&ov)
-        .args(["--no-mount", "--index-file", ":memory:"])
-        .arg(&gz)
-        .output()
-        .expect("run gzip");
-    assert!(
-        out.status.success(),
-        "existing gzip: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert_eq!(fs::read(&gz).unwrap(), before_gz);
-
     let out = Command::new(bin())
         .args(["-w"])
         .arg(&ov)
@@ -498,6 +487,24 @@ fn create_missing_existing_targz_zip_unchanged() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(fs::read(&zip).unwrap(), before_zip);
+
+    let Some(gz) = write_tiny_targz(dir.path()) else {
+        return;
+    };
+    let before_gz = fs::read(&gz).unwrap();
+    let out = Command::new(bin())
+        .args(["-w"])
+        .arg(&ov)
+        .args(["--no-mount", "--index-file", ":memory:"])
+        .arg(&gz)
+        .output()
+        .expect("run gzip");
+    assert!(
+        out.status.success(),
+        "existing gzip: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read(&gz).unwrap(), before_gz);
 }
 
 /// Regression: missing .iso under -w stays not found

@@ -2089,21 +2089,26 @@ mod create_missing_cli_tests {
         }
     }
 
-    fn write_tiny_targz(dir: &std::path::Path) -> PathBuf {
+    fn write_tiny_targz(dir: &std::path::Path) -> Option<PathBuf> {
         let tree = dir.join("gztree");
         fs::create_dir_all(&tree).unwrap();
         fs::write(tree.join("a.txt"), b"gz\n").unwrap();
         let path = dir.join("existing.tar.gz");
-        assert!(Command::new("tar")
+        let ok = Command::new("tar")
             .args(["-czf"])
             .arg(&path)
             .arg("-C")
             .arg(&tree)
             .arg("a.txt")
             .status()
-            .unwrap()
-            .success());
-        path
+            .map(|s| s.success() && path.is_file())
+            .unwrap_or(false);
+        if ok {
+            Some(path)
+        } else {
+            eprintln!("skip: tar -czf missing or failed");
+            None
+        }
     }
 
     fn write_empty_zip(path: &std::path::Path) {
@@ -2191,13 +2196,22 @@ mod create_missing_cli_tests {
     #[test]
     fn create_missing_existing_targz_zip_unchanged() {
         let dir = tempfile::tempdir().unwrap();
-        let gz = write_tiny_targz(dir.path());
-        let before_gz = fs::read(&gz).unwrap();
+        // K15 helper: dummy / 0-byte .tar.gz must stay Unchanged without `tar`.
+        let dummy_gz = dir.path().join("dummy.tar.gz");
+        fs::write(&dummy_gz, [0x1f, 0x8b, 0x08, 0x00]).unwrap();
+        let dummy_bytes = fs::read(&dummy_gz).unwrap();
         assert_eq!(
-            maybe_create_missing_write_base(&gz, CreateMissingContext::Mount).unwrap(),
+            maybe_create_missing_write_base(&dummy_gz, CreateMissingContext::Mount).unwrap(),
             EmptyCreateOutcome::Unchanged
         );
-        assert_eq!(fs::read(&gz).unwrap(), before_gz);
+        assert_eq!(fs::read(&dummy_gz).unwrap(), dummy_bytes);
+        let zero_gz = dir.path().join("zero.tar.gz");
+        fs::write(&zero_gz, b"").unwrap();
+        assert_eq!(
+            maybe_create_missing_write_base(&zero_gz, CreateMissingContext::Mount).unwrap(),
+            EmptyCreateOutcome::Unchanged
+        );
+        assert_eq!(fs::read(&zero_gz).unwrap(), b"");
 
         let zip = dir.path().join("a.zip");
         write_empty_zip(&zip);
@@ -2208,6 +2222,36 @@ mod create_missing_cli_tests {
         );
         assert_eq!(fs::read(&zip).unwrap(), before_zip);
 
+        if !skip_no_bin() {
+            let ov = dir.path().join("ov");
+            let out = run_cli(
+                &[
+                    "-w",
+                    ov.to_str().unwrap(),
+                    "--no-mount",
+                    "--index-file",
+                    ":memory:",
+                    zip.to_str().unwrap(),
+                ],
+                dir.path(),
+            );
+            assert!(
+                out.status.success(),
+                "existing zip: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            assert_eq!(fs::read(&zip).unwrap(), before_zip);
+        }
+
+        let Some(gz) = write_tiny_targz(dir.path()) else {
+            return;
+        };
+        let before_gz = fs::read(&gz).unwrap();
+        assert_eq!(
+            maybe_create_missing_write_base(&gz, CreateMissingContext::Mount).unwrap(),
+            EmptyCreateOutcome::Unchanged
+        );
+        assert_eq!(fs::read(&gz).unwrap(), before_gz);
         factory::build_mount_source_ex(
             std::slice::from_ref(&gz),
             &open_opts(),
@@ -2237,24 +2281,6 @@ mod create_missing_cli_tests {
             String::from_utf8_lossy(&out.stderr)
         );
         assert_eq!(fs::read(&gz).unwrap(), before_gz);
-
-        let out = run_cli(
-            &[
-                "-w",
-                ov.to_str().unwrap(),
-                "--no-mount",
-                "--index-file",
-                ":memory:",
-                zip.to_str().unwrap(),
-            ],
-            dir.path(),
-        );
-        assert!(
-            out.status.success(),
-            "existing zip: {}",
-            String::from_utf8_lossy(&out.stderr)
-        );
-        assert_eq!(fs::read(&zip).unwrap(), before_zip);
     }
 
     /// Regression: missing .iso under -w stays not found

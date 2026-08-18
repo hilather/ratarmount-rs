@@ -17,7 +17,7 @@ use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
 use ratarmount_nfs::NfsStop;
 
-/// Startup / tick warning when the last frame is the whole file or larger than this.
+/// Warn when the last zstd frame's uncompressed size exceeds this.
 const LIVE_COMMIT_WARN_LAST_FRAME: u64 = 64 * 1024 * 1024;
 
 static GOT_TERM: AtomicBool = AtomicBool::new(false);
