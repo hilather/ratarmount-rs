@@ -161,7 +161,11 @@ host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 (or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
 `.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
 no seek table) when `-w` is set. Offline `--commit-overlay` is **not** an
-escape hatch: a missing `.tar.zst` exits 2 without creating a file. See
+escape hatch: a missing `.tar.zst` exits 2 without creating a file. Interval
+`DURATION` is a **per-file settle time**: only overlay files whose host mtime
+is at least that old are written into the archive; recently modified files
+stay in the overlay until they go idle. On-exit still flushes everything.
+See
 [mount-options-parity.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md)
 and [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 

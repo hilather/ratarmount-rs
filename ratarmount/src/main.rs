@@ -288,9 +288,11 @@ struct Args {
     #[arg(long = "commit-overlay-on-exit", action = ArgAction::SetTrue)]
     commit_overlay_on_exit: bool,
 
-    /// Periodically commit `-w` into an uncompressed TAR or `.tar.zst` while serving
-    /// (`2s`/`15m`/`1h`). `0` (default) is off. In-process; promptless. Requires durable `-w`.
-    /// Same create-if-missing as `-w`.
+    /// Commit `-w` files that have not been modified for DURATION into an
+    /// uncompressed TAR or `.tar.zst` while serving (`2s`/`15m`/`1h`).
+    /// `0` (default) is off. Recently written files stay in the overlay until
+    /// they settle; on-exit still flushes everything. In-process; promptless.
+    /// Requires durable `-w`. Same create-if-missing as `-w`.
     #[arg(
         long = "commit-overlay-interval",
         value_name = "DURATION",

@@ -1,4 +1,8 @@
 //! Live overlay commit (uncompressed TAR and `.tar.zst`): interval + on-exit.
+//!
+//! `--commit-overlay-interval` is a per-file settle time: only overlay files
+//! whose host mtime is at least that old are persisted. On-exit still flushes
+//! the whole overlay.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -106,11 +110,15 @@ pub fn spawn_interval_commits(
     stop: Option<NfsStop>,
     opts: OpenOptions,
 ) {
+    // Poll at least once a second so a file enters the archive ~`interval`
+    // after its last host mtime, not up to 2× interval later. The settle
+    // threshold is still `interval` (only idle files are persisted).
+    let poll = Duration::from_secs(1).min(interval);
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
         .spawn(move || loop {
             let start = Instant::now();
-            while start.elapsed() < interval {
+            while start.elapsed() < poll {
                 if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                     return;
                 }
@@ -119,9 +127,14 @@ pub fn spawn_interval_commits(
             if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                 return;
             }
-            match apply_live_commit(&overlay, &archive, true, &opts) {
-                Ok(true) => log::info!("interval overlay commit wrote {}", archive.display()),
-                Ok(false) => log::debug!("interval overlay commit: nothing to do"),
+            match overlay.commit_live_idle(&archive, interval, |p| {
+                reopen_live_archive(p, &opts).map_err(ratarmount_compositing::OverlayError::Msg)
+            }) {
+                Ok(true) => log::info!(
+                    "interval overlay commit wrote idle files into {}",
+                    archive.display()
+                ),
+                Ok(false) => log::debug!("interval overlay commit: nothing idle to do"),
                 Err(e) => log::error!("interval overlay commit failed: {e}"),
             }
         })

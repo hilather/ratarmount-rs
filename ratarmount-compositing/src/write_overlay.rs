@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::time::{Duration, SystemTime};
 
 use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
@@ -629,7 +630,7 @@ impl WriteOverlay {
         }
         let plan = {
             let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), None)?
         };
         if plan.is_empty() {
             return Ok(false);
@@ -640,9 +641,52 @@ impl WriteOverlay {
     }
 
     /// Dispatcher: uncompressed TAR (GNU tar) or `.tar.zst` (last-frame splice).
+    ///
+    /// Commits every overlay change, then wipes the overlay folder. Interval
+    /// ticks use [`Self::commit_live_idle`] so recently modified files stay
+    /// in the overlay until they settle.
     pub fn commit_live(
         &self,
         archive: &Path,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<bool> {
+        self.commit_live_inner(archive, None, reopen)
+    }
+
+    /// Interval persist: only overlay files whose host mtime is at least
+    /// `idle_for` in the past. Still-hot files (and parent dirs they need)
+    /// stay in the overlay. Delete tombstones are already settled and go
+    /// out on the same tick.
+    pub fn commit_live_idle(
+        &self,
+        archive: &Path,
+        idle_for: Duration,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<bool> {
+        // Shared lock so a 1 Hz empty poll does not stall overlay writers.
+        {
+            let _gate = self.commit_gate.read().expect("overlay commit gate");
+            if self.interval_disabled() {
+                return Err(interval_disabled_err());
+            }
+            let cutoff = SystemTime::now()
+                .checked_sub(idle_for)
+                .unwrap_or(SystemTime::UNIX_EPOCH);
+            let plan = {
+                let db = self.db.lock().expect("overlay db");
+                collect_overlay_commit_plan_from_conn(&self.root, Some(&db), Some(cutoff))?
+            };
+            if plan.is_empty() {
+                return Ok(false);
+            }
+        }
+        self.commit_live_inner(archive, Some(idle_for), reopen)
+    }
+
+    fn commit_live_inner(
+        &self,
+        archive: &Path,
+        idle_for: Option<Duration>,
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
         live_commit_is_supported(archive)?;
@@ -654,9 +698,14 @@ impl WriteOverlay {
         if self.interval_disabled() {
             return Err(interval_disabled_err());
         }
+        let cutoff = idle_for.map(|d| {
+            SystemTime::now()
+                .checked_sub(d)
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
         let plan = {
             let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db))?
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff)?
         };
         if plan.is_empty() {
             return Ok(false);
@@ -665,15 +714,26 @@ impl WriteOverlay {
         match reopen(archive) {
             Ok(src) => {
                 *self.replacement.write().expect("overlay replacement") = Some(src);
-                reset_overlay_dir(&self.root)?;
-                self.db
-                    .lock()
-                    .expect("overlay db")
-                    .execute(r#"DELETE FROM "files""#, [])?;
-                // All cached FileInfos/reader handles into the old base are
-                // stale now (member offsets shifted); bump after the swap so
-                // watchers never see generation n+1 with the old base live.
+                // Bump before overlay cleanup: readers must drop pre-commit
+                // offsets even if forget/reset fails.
                 self.commit_generation.fetch_add(1, Ordering::SeqCst);
+                let cleanup = if idle_for.is_some() {
+                    self.forget_committed_overlay(&plan)
+                } else {
+                    reset_overlay_dir(&self.root).and_then(|_| {
+                        self.db
+                            .lock()
+                            .expect("overlay db")
+                            .execute(r#"DELETE FROM "files""#, [])?;
+                        Ok(())
+                    })
+                };
+                if let Err(e) = cleanup {
+                    self.interval_disabled.store(true, Ordering::SeqCst);
+                    return Err(OverlayError::Msg(format!(
+                        "persist succeeded; overlay cleanup failed (remount required): {e}"
+                    )));
+                }
                 Ok(true)
             }
             Err(e) => {
@@ -683,6 +743,66 @@ impl WriteOverlay {
                 )))
             }
         }
+    }
+
+    /// Drop only the overlay files / tombstones that this idle tick persisted.
+    /// Unsettled siblings stay so the next tick can pick them up.
+    fn forget_committed_overlay(&self, plan: &OverlayCommitPlan) -> Result<()> {
+        let db = self.db.lock().expect("overlay db");
+        let mut dirs: Vec<&str> = Vec::new();
+        for (rel, is_dir) in &plan.append_entries {
+            if *is_dir {
+                dirs.push(rel.as_str());
+                continue;
+            }
+            let host = self.realpath(rel);
+            match fs::remove_file(&host) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            delete_overlay_files_row(&db, rel)?;
+        }
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+        for rel in dirs {
+            let host = self.realpath(rel);
+            // Not empty: a hot child appeared or was skipped. Leave the dir.
+            match fs::remove_dir(&host) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                Err(e) => return Err(e.into()),
+            }
+            delete_overlay_files_row(&db, rel)?;
+        }
+        for rel in &plan.deleted_paths {
+            if plan.append_entries.iter().any(|(p, _)| p == rel) {
+                continue;
+            }
+            delete_overlay_files_row(&db, rel)?;
+        }
+        // Drop leftover empty parents so a later tick does not persist them
+        // as extra TAR directory members. Stop at a dir that still has a
+        // hot sibling.
+        let mut parents: Vec<String> = plan
+            .append_entries
+            .iter()
+            .filter_map(|(rel, is_dir)| {
+                if *is_dir {
+                    None
+                } else {
+                    rel.rsplit_once('/').map(|(p, _)| p.to_string())
+                }
+            })
+            .collect();
+        parents.sort();
+        parents.dedup();
+        parents.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+        for parent in parents {
+            prune_empty_overlay_ancestors(&self.root, &db, &parent)?;
+        }
+        Ok(())
     }
 
     /// Persist only (on-exit). Thin wrapper over [`Self::commit_atomic`].
@@ -1209,17 +1329,19 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
     } else {
         None
     };
-    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref())
+    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref(), None)
 }
 
 fn collect_overlay_commit_plan_from_conn(
     write_overlay: &Path,
     conn: Option<&Connection>,
+    idle_cutoff: Option<SystemTime>,
 ) -> Result<OverlayCommitPlan> {
     let mut deletions_nul: Vec<u8> = Vec::new();
     let mut appends_nul: Vec<u8> = Vec::new();
     let mut deleted_paths: HashSet<String> = HashSet::new();
     let mut append_entries: Vec<(String, bool)> = Vec::new();
+    let mut skipped: HashSet<String> = HashSet::new();
 
     if let Some(conn) = conn {
         let mut stmt = conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#)?;
@@ -1270,6 +1392,12 @@ fn collect_overlay_commit_plan_from_conn(
             continue;
         }
         let norm = normalize_archive_rel_path(&rel);
+        if let Some(cutoff) = idle_cutoff {
+            if !overlay_entry_is_idle(&full, cutoff) {
+                skipped.insert(norm);
+                continue;
+            }
+        }
         if is_dir {
             // Empty dirs only (walkdir_files_and_empty_dirs already filters)
             appends_nul.extend(rel.as_bytes());
@@ -1284,12 +1412,79 @@ fn collect_overlay_commit_plan_from_conn(
         }
     }
 
+    if idle_cutoff.is_some() && !skipped.is_empty() {
+        // A hot file under dir/ must not persist dir/ as an empty member
+        // (and must not wipe that parent from the overlay).
+        append_entries.retain(|(p, is_dir)| {
+            if !is_dir {
+                return true;
+            }
+            !skipped.iter().any(|s| s == p || path_is_under_rel(p, s))
+        });
+        appends_nul.clear();
+        for (rel, _) in &append_entries {
+            appends_nul.extend(rel.as_bytes());
+            appends_nul.push(0);
+        }
+    }
+
     Ok(OverlayCommitPlan {
         deletions_nul,
         appends_nul,
         deleted_paths,
         append_entries,
     })
+}
+
+fn overlay_entry_is_idle(path: &Path, cutoff: SystemTime) -> bool {
+    match fs::symlink_metadata(path).and_then(|m| m.modified()) {
+        Ok(mtime) => mtime <= cutoff,
+        Err(_) => false,
+    }
+}
+
+fn path_is_under_rel(parent: &str, child: &str) -> bool {
+    child.starts_with(parent) && child.as_bytes().get(parent.len()) == Some(&b'/')
+}
+
+fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
+    let (folder, name) = WriteOverlay::split(rel);
+    db.execute(
+        r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+        params![folder, name],
+    )?;
+    Ok(())
+}
+
+fn prune_empty_overlay_ancestors(root: &Path, db: &Connection, start: &str) -> Result<()> {
+    let mut cur = Some(start.to_string());
+    while let Some(rel) = cur {
+        if rel.is_empty() || rel == "/" {
+            break;
+        }
+        let host = if rel == "/" {
+            root.to_path_buf()
+        } else {
+            root.join(rel.trim_start_matches('/'))
+        };
+        if host == root {
+            break;
+        }
+        match fs::remove_dir(&host) {
+            Ok(()) => {
+                delete_overlay_files_row(db, &rel)?;
+                cur = rel.rsplit_once('/').map(|(p, _)| p.to_string());
+            }
+            Err(e)
+                if e.kind() == io::ErrorKind::NotFound
+                    || e.kind() == io::ErrorKind::DirectoryNotEmpty =>
+            {
+                break;
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }
 
 fn confirm_commit(opts: &CommitOverlayOptions) -> Result<bool> {
@@ -3567,6 +3762,243 @@ mod tests {
         match ov.commit_live(&archive, |p| reopen_tar_zst(p, false)) {
             Ok(false) => {}
             other => panic!("empty second tick must be Ok(false), got {other:?}"),
+        }
+    }
+
+    fn set_mtime_age(path: &Path, age: Duration) {
+        use std::os::unix::ffi::OsStrExt;
+        let ts = SystemTime::now()
+            .checked_sub(age)
+            .expect("mtime age within epoch");
+        let d = ts
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("mtime after epoch");
+        let spec = libc::timespec {
+            tv_sec: d.as_secs() as libc::time_t,
+            tv_nsec: d.subsec_nanos() as libc::c_long,
+        };
+        let times = [spec, spec];
+        let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        let rc = unsafe {
+            libc::utimensat(
+                libc::AT_FDCWD,
+                c.as_ptr(),
+                times.as_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        assert_eq!(rc, 0, "utimensat {}", path.display());
+    }
+
+    /// Regression: interval settle time skips files still being written.
+    #[test]
+    fn live_commit_idle_skips_recent_keeps_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-seed");
+        let settled = generated_payload("idle-settled");
+        let hot = generated_payload("idle-hot");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("settled.txt"), &settled).unwrap();
+        fs::write(overlay.join("hot.txt"), &hot).unwrap();
+        set_mtime_age(&overlay.join("settled.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick"));
+        assert!(
+            !overlay.join("settled.txt").exists(),
+            "settled file must leave the overlay"
+        );
+        assert!(
+            overlay.join("hot.txt").exists(),
+            "recently modified file must stay in the overlay"
+        );
+        assert_eq!(fs::read(overlay.join("hot.txt")).unwrap(), hot);
+
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+        assert_eq!(read_member(src.as_ref(), "/settled.txt"), settled);
+        assert!(
+            src.lookup("/hot.txt", 0).is_none(),
+            "hot file must not be in the archive yet"
+        );
+        assert_eq!(
+            read_member(&ov as &dyn MountSource, "/hot.txt"),
+            hot,
+            "mount view still serves the overlay copy"
+        );
+    }
+
+    /// Regression: after the hot file settles, a later tick persists it once.
+    #[test]
+    fn live_commit_idle_second_tick_after_settle() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle2-seed");
+        let settled = generated_payload("idle2-settled");
+        let later = generated_payload("idle2-later");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("settled.txt"), &settled).unwrap();
+        fs::write(overlay.join("later.txt"), &later).unwrap();
+        set_mtime_age(&overlay.join("settled.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("first idle tick"));
+        assert!(overlay.join("later.txt").exists());
+
+        set_mtime_age(&overlay.join("later.txt"), Duration::from_secs(30));
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("second idle tick"));
+        assert!(!overlay.join("later.txt").exists());
+
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/settled.txt"), settled);
+        assert_eq!(read_member(src.as_ref(), "/later.txt"), later);
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(false) => {}
+            other => panic!("third tick must be empty, got {other:?}"),
+        }
+    }
+
+    /// Regression: a hot replace must not delete the base member without appending.
+    #[test]
+    fn live_commit_idle_hot_replace_leaves_base_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let orig = generated_payload("idle-rep-orig");
+        let newer = generated_payload("idle-rep-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("keep.txt", &orig)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("keep.txt"), &newer).unwrap();
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(false) => {}
+            other => panic!("hot replace must not persist, got {other:?}"),
+        }
+        assert!(overlay.join("keep.txt").exists());
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(
+            read_member(src.as_ref(), "/keep.txt"),
+            orig,
+            "base member must survive a skipped hot replace"
+        );
+        assert_eq!(read_member(&ov as &dyn MountSource, "/keep.txt"), newer);
+    }
+
+    /// Regression: delete tombstones are already settled and commit on an idle tick.
+    #[test]
+    fn live_commit_idle_commits_delete_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = generated_payload("idle-del-keep");
+        let gone = generated_payload("idle-del-gone");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(
+            &archive,
+            &[ustar_file("keep.txt", &keep), ustar_file("gone.txt", &gone)],
+        );
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/gone.txt").expect("tombstone");
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle delete tick"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), keep);
+        assert!(
+            src.lookup("/gone.txt", 0).is_none(),
+            "deleted member must leave the archive"
+        );
+        assert!(ov.lookup("/gone.txt", 0).is_none());
+    }
+
+    /// Regression: a hot nested sibling must keep its parent dir in the overlay.
+    #[test]
+    fn live_commit_idle_nested_hot_sibling_keeps_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-nest-seed");
+        let settled = generated_payload("idle-nest-settled");
+        let hot = generated_payload("idle-nest-hot");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::create_dir_all(overlay.join("dir")).unwrap();
+        fs::write(overlay.join("dir/settled.txt"), &settled).unwrap();
+        fs::write(overlay.join("dir/hot.txt"), &hot).unwrap();
+        set_mtime_age(&overlay.join("dir/settled.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle nested tick"));
+        assert!(!overlay.join("dir/settled.txt").exists());
+        assert!(
+            overlay.join("dir/hot.txt").exists(),
+            "hot sibling must keep the parent dir"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/dir/settled.txt"), settled);
+        assert!(src.lookup("/dir/hot.txt", 0).is_none());
+        assert_eq!(read_member(&ov as &dyn MountSource, "/dir/hot.txt"), hot);
+    }
+
+    /// Regression: after the last file in a new dir settles, prune the empty
+    /// parent so a later tick does not persist a bare directory member.
+    #[test]
+    fn live_commit_idle_prunes_empty_parent_after_last_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-prune-seed");
+        let only = generated_payload("idle-prune-only");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::create_dir_all(overlay.join("dir")).unwrap();
+        fs::write(overlay.join("dir/only.txt"), &only).unwrap();
+        set_mtime_age(&overlay.join("dir/only.txt"), Duration::from_secs(30));
+        // Dir mtime is refreshed by the file write; backdate so a leftover
+        // empty dir would look idle on the next tick if it were not pruned.
+        set_mtime_age(&overlay.join("dir"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle prune tick"));
+        assert!(
+            !overlay.join("dir").exists(),
+            "empty parent must be pruned from the overlay"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/dir/only.txt"), only);
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(false) => {}
+            other => panic!("second tick must not persist leftover dir, got {other:?}"),
         }
     }
 
