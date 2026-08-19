@@ -1,10 +1,11 @@
 //! Write overlay: redirect creates/writes/deletes to a host folder.
 //! Mirrors Python `WritableFolderMountSource` (subset) + `commit_overlay`.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -77,6 +78,10 @@ pub struct WriteOverlay {
     /// commit (delete/replace shift TAR member offsets), so read caches
     /// (NFS reader LRU, inode FileInfo) watch this counter.
     commit_generation: std::sync::atomic::AtomicU64,
+    /// Overlay FDs still open for write (FUSE keeps the fd until release).
+    /// Interval settle must not persist/unlink these: later pwrite would hit
+    /// an unlinked inode and the extra bytes would never reach the archive.
+    write_fds: Mutex<HashMap<i32, String>>,
 }
 
 impl WriteOverlay {
@@ -106,6 +111,7 @@ impl WriteOverlay {
             commit_gate: RwLock::new(()),
             interval_disabled: AtomicBool::new(false),
             commit_generation: std::sync::atomic::AtomicU64::new(0),
+            write_fds: Mutex::new(HashMap::new()),
         })
     }
 
@@ -370,7 +376,39 @@ impl WriteOverlay {
 
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
-        self.create_file_inner(path, mode)
+        let fd = self.create_file_inner(path, mode)?;
+        self.register_write_fd(fd, path);
+        Ok(fd)
+    }
+
+    fn register_write_fd(&self, fd: i32, path: &str) {
+        self.write_fds
+            .lock()
+            .expect("overlay write fds")
+            .insert(fd, normpath(path));
+    }
+
+    /// Drop the write-open pin without closing `fd` (caller already closed it).
+    pub fn release_write_fd(&self, fd: i32) {
+        self.write_fds
+            .lock()
+            .expect("overlay write fds")
+            .remove(&fd);
+    }
+
+    /// Unregister a write-open pin and close `fd` (FUSE release / NFS create).
+    pub fn close_overlay_fd(&self, fd: i32) {
+        self.release_write_fd(fd);
+        let _ = unsafe { File::from_raw_fd(fd) };
+    }
+
+    fn write_open_hosts(&self) -> HashSet<PathBuf> {
+        self.write_fds
+            .lock()
+            .expect("overlay write fds")
+            .values()
+            .map(|p| self.realpath(p))
+            .collect()
     }
 
     fn create_file_inner(&self, path: &str, mode: u32) -> Result<i32> {
@@ -429,6 +467,9 @@ impl WriteOverlay {
                     "overlay open resolved outside overlay root",
                 )));
             }
+        }
+        if (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
+            self.register_write_fd(fd, path);
         }
         let (folder, name) = Self::split(path);
         let db = self.db.lock().expect("overlay db");
@@ -630,7 +671,7 @@ impl WriteOverlay {
         }
         let plan = {
             let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), None)?
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), None, &HashSet::new())?
         };
         if plan.is_empty() {
             return Ok(false);
@@ -654,9 +695,9 @@ impl WriteOverlay {
     }
 
     /// Interval persist: only overlay files whose host mtime is at least
-    /// `idle_for` in the past. Still-hot files (and parent dirs they need)
-    /// stay in the overlay. Delete tombstones are already settled and go
-    /// out on the same tick.
+    /// `idle_for` in the past **and** that have no open write fd. Still-hot
+    /// files (and parent dirs they need) stay in the overlay. Delete
+    /// tombstones are already settled and go out on the same tick.
     pub fn commit_live_idle(
         &self,
         archive: &Path,
@@ -672,9 +713,10 @@ impl WriteOverlay {
             let cutoff = SystemTime::now()
                 .checked_sub(idle_for)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            let busy = self.write_open_hosts();
             let plan = {
                 let db = self.db.lock().expect("overlay db");
-                collect_overlay_commit_plan_from_conn(&self.root, Some(&db), Some(cutoff))?
+                collect_overlay_commit_plan_from_conn(&self.root, Some(&db), Some(cutoff), &busy)?
             };
             if plan.is_empty() {
                 return Ok(false);
@@ -703,9 +745,14 @@ impl WriteOverlay {
                 .checked_sub(d)
                 .unwrap_or(SystemTime::UNIX_EPOCH)
         });
+        let busy = if cutoff.is_some() {
+            self.write_open_hosts()
+        } else {
+            HashSet::new()
+        };
         let plan = {
             let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff)?
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff, &busy)?
         };
         if plan.is_empty() {
             return Ok(false);
@@ -1329,13 +1376,14 @@ fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan
     } else {
         None
     };
-    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref(), None)
+    collect_overlay_commit_plan_from_conn(write_overlay, conn.as_ref(), None, &HashSet::new())
 }
 
 fn collect_overlay_commit_plan_from_conn(
     write_overlay: &Path,
     conn: Option<&Connection>,
     idle_cutoff: Option<SystemTime>,
+    busy_hosts: &HashSet<PathBuf>,
 ) -> Result<OverlayCommitPlan> {
     let mut deletions_nul: Vec<u8> = Vec::new();
     let mut appends_nul: Vec<u8> = Vec::new();
@@ -1393,7 +1441,7 @@ fn collect_overlay_commit_plan_from_conn(
         }
         let norm = normalize_archive_rel_path(&rel);
         if let Some(cutoff) = idle_cutoff {
-            if !overlay_entry_is_idle(&full, cutoff) {
+            if !overlay_entry_is_idle(&full, cutoff, busy_hosts) {
                 skipped.insert(norm);
                 continue;
             }
@@ -1436,7 +1484,10 @@ fn collect_overlay_commit_plan_from_conn(
     })
 }
 
-fn overlay_entry_is_idle(path: &Path, cutoff: SystemTime) -> bool {
+fn overlay_entry_is_idle(path: &Path, cutoff: SystemTime, busy_hosts: &HashSet<PathBuf>) -> bool {
+    if busy_hosts.contains(path) {
+        return false;
+    }
     match fs::symlink_metadata(path).and_then(|m| m.modified()) {
         Ok(mtime) => mtime <= cutoff,
         Err(_) => false,
@@ -3832,6 +3883,60 @@ mod tests {
             hot,
             "mount view still serves the overlay copy"
         );
+    }
+
+    /// Regression: interval settle must not persist a file that still has an
+    /// open write fd. FUSE keeps that fd across pauses; unlinking would send
+    /// later pwrite bytes to a detached inode (silent truncation).
+    #[test]
+    fn live_commit_idle_skips_open_write_fd() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-open-seed");
+        let first = generated_payload("idle-open-first");
+        let second = generated_payload("idle-open-second");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        let fd = ov.create_file("/open.txt", 0o644).expect("create");
+        let n = unsafe { libc::write(fd, first.as_ptr() as *const _, first.len()) };
+        assert_eq!(n as usize, first.len(), "first write");
+        set_mtime_age(&overlay.join("open.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(false) => {}
+            other => panic!("open write fd must skip idle persist, got {other:?}"),
+        }
+        assert!(
+            overlay.join("open.txt").exists(),
+            "open write fd must keep the overlay file"
+        );
+
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                second.as_ptr() as *const _,
+                second.len(),
+                first.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, second.len(), "second write after skipped tick");
+        ov.close_overlay_fd(fd);
+        set_mtime_age(&overlay.join("open.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after close"));
+        assert!(!overlay.join("open.txt").exists());
+
+        let mut want = first.clone();
+        want.extend_from_slice(&second);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/open.txt"), want);
     }
 
     /// Regression: after the hot file settles, a later tick persists it once.

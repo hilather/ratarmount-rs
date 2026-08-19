@@ -1120,8 +1120,12 @@ impl Filesystem for RatarmountFs {
         reply: ReplyEmpty,
     ) {
         if let Some(OpenBackend::OverlayFd(fd)) = self.handles.lock().unwrap().remove(&fh) {
-            unsafe {
-                libc::close(fd);
+            if let Some(ov) = &self.overlay {
+                ov.close_overlay_fd(fd);
+            } else {
+                unsafe {
+                    libc::close(fd);
+                }
             }
         }
         reply.ok();
