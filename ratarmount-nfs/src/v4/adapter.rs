@@ -288,7 +288,7 @@ impl RatarmountNfs4 {
                 let mode = req.attrs.mode.unwrap_or(0o644);
                 let fd = ov.create_file(&path, mode).map_err(overlay_to_fs)?;
                 // NFS create is stateless — close the overlay fd (FUSE would keep it).
-                close_overlay_fd(fd);
+                ov.close_overlay_fd(fd);
             }
             CreateKind::Directory => {
                 let mode = req.attrs.mode.unwrap_or(0o755);
@@ -312,10 +312,12 @@ impl RatarmountNfs4 {
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_fs)?;
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| io_to_fserror(&e))?;
-        file.write_all(data).map_err(|e| io_to_fserror(&e))?;
+        let wrote = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(data));
         drop(file);
+        ov.release_write_fd(fd);
+        wrote.map_err(|e| io_to_fserror(&e))?;
         self.bump_after_mutate(id);
         Ok(WriteResult {
             written: u32::try_from(data.len()).unwrap_or(u32::MAX),
@@ -462,10 +464,6 @@ fn overlay_to_fs(err: ratarmount_compositing::OverlayError) -> FsError {
         ratarmount_compositing::OverlayError::Io(e) => io_to_fserror(&e),
         other => io_to_fserror(&io::Error::other(other.to_string())),
     }
-}
-
-fn close_overlay_fd(fd: i32) {
-    let _ = unsafe { std::fs::File::from_raw_fd(fd) };
 }
 
 fn mode_to_object_type(mode: u32) -> ObjectType {

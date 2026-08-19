@@ -252,7 +252,7 @@ impl RatarmountNfs {
         };
         let fd = ov.create_file(&path, mode).map_err(overlay_to_nfs)?;
         // NFS create is stateless — close the overlay fd (FUSE would keep it).
-        close_overlay_fd(fd);
+        ov.close_overlay_fd(fd);
         let id = self.inodes.id_for_path(&path);
         self.bump_after_mutate(id);
         if let Some(fi) = self.source.lookup(&path, 0) {
@@ -285,11 +285,12 @@ impl RatarmountNfs {
         let flags = libc::O_RDWR | libc::O_CREAT;
         let fd = ov.open_overlay_fd(&path, flags).map_err(overlay_to_nfs)?;
         let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        file.seek(SeekFrom::Start(offset))
-            .map_err(|e| crate::io_to_nfsstat3(&e))?;
-        file.write_all(data)
-            .map_err(|e| crate::io_to_nfsstat3(&e))?;
+        let wrote = file
+            .seek(SeekFrom::Start(offset))
+            .and_then(|_| file.write_all(data));
         drop(file);
+        ov.release_write_fd(fd);
+        wrote.map_err(|e| crate::io_to_nfsstat3(&e))?;
         self.bump_after_mutate(id);
         self.getattr_sync(id)
     }
@@ -410,10 +411,6 @@ fn overlay_to_nfs(err: ratarmount_compositing::OverlayError) -> nfsstat3 {
         ratarmount_compositing::OverlayError::Io(e) => crate::io_to_nfsstat3(&e),
         other => crate::io_to_nfsstat3(&io::Error::other(other.to_string())),
     }
-}
-
-fn close_overlay_fd(fd: i32) {
-    let _ = unsafe { std::fs::File::from_raw_fd(fd) };
 }
 
 fn read_member(
