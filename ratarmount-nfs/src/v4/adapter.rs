@@ -176,6 +176,7 @@ impl RatarmountNfs4 {
         };
         let mut kids: Vec<(u64, String, u32, u64)> = dents
             .into_iter()
+            .filter(|d| d.name != "." && d.name != "..")
             .map(|d| {
                 let child = join_path(&path, &d.name);
                 let id = self.inodes.id_for_path(&child);
@@ -184,6 +185,9 @@ impl RatarmountNfs4 {
             .collect();
         kids.sort_by_key(|(id, _, _, _)| *id);
 
+        // Do not emit `.` / `..`. Linux nfs4_setup_readdir injects them at
+        // cookie 0 (reserved cookies 1/2); returning them duplicates `ls -lah`.
+        // lookup still handles "." / "..". Child cookies are fileids (> 2).
         let start_idx = if cookie == 0 {
             0
         } else {
@@ -690,7 +694,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{self, Cursor, Read, Seek};
 
-    use ratarmount_core::{CheapDirent, FileInfo, ListResult, UserData, S_IFLNK, S_IFREG};
+    use ratarmount_core::{CheapDirent, FileInfo, ListResult, UserData, S_IFDIR, S_IFLNK, S_IFREG};
 
     struct ShortRead(Cursor<Vec<u8>>);
     impl Read for ShortRead {
@@ -748,6 +752,31 @@ mod tests {
                 mode: fi.mode,
                 size: fi.size,
             });
+        }
+
+        fn add_dir(&mut self, path: &str) {
+            let name = path.rsplit('/').next().unwrap().to_string();
+            let parent = if path.matches('/').count() == 1 {
+                "/".to_string()
+            } else {
+                path.rsplit_once('/').unwrap().0.to_string()
+            };
+            let fi = FileInfo {
+                size: 0,
+                mtime: 1.0,
+                mode: S_IFDIR | 0o755,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            };
+            self.files.insert(path.into(), (fi.clone(), Vec::new()));
+            self.dirs.entry(parent).or_default().push(CheapDirent {
+                name,
+                mode: fi.mode,
+                size: 0,
+            });
+            self.dirs.entry(path.into()).or_default();
         }
 
         fn add_link(&mut self, path: &str, target: &str) {
@@ -863,20 +892,51 @@ mod tests {
         s.add_file("/b", b"2", vec![UserData::Other("t".into())]);
         let nfs = nfs_of(s);
         let all = nfs.readdir_sync(1, 0, 10, true).unwrap();
-        assert_eq!(all.entries.len(), 2);
+        let kids: Vec<&DirEntry<u64>> = all
+            .entries
+            .iter()
+            .filter(|e| e.name != "." && e.name != "..")
+            .collect();
+        assert_eq!(kids.len(), 2);
         assert!(all.eof);
-        assert_eq!(all.entries[0].cookie, all.entries[0].handle);
+        assert_eq!(kids[0].cookie, kids[0].handle);
         // Cookies must not collide with embednfs's reserved values 1 and 2.
         assert!(all.entries.iter().all(|e| e.cookie > 2));
-        let first = all.entries[0].cookie;
+        // Linux nfs4_setup_readdir injects `.` / `..`; we must not also emit them.
+        assert!(all.entries.iter().all(|e| e.name != "." && e.name != ".."));
+        let first = kids[0].cookie;
         let rest = nfs.readdir_sync(1, first, 10, false).unwrap();
         assert_eq!(rest.entries.len(), 1);
+        assert!(rest.entries.iter().all(|e| e.name != "." && e.name != ".."));
         assert!(rest.eof);
         assert!(rest.entries[0].attrs.is_none());
         // Cookie past the last id: empty page, eof — no error.
         let tail = nfs.readdir_sync(1, 9999, 10, false).unwrap();
         assert!(tail.entries.is_empty());
         assert!(tail.eof);
+    }
+
+    /// Regression: emitting `.` / `..` from NFSv4 READDIR duplicates them on
+    /// Linux (`nfs4_setup_readdir` already injects cookies 1/2).
+    #[test]
+    fn v4_readdir_does_not_emit_dot_dotdot() {
+        let mut s = Synth::new();
+        s.add_file("/root.txt", b"r", vec![UserData::Other("t".into())]);
+        s.add_dir("/sub");
+        s.add_file("/sub/inner.txt", b"i", vec![UserData::Other("t".into())]);
+        let nfs = nfs_of(s);
+
+        let root = nfs.readdir_sync(1, 0, 32, true).unwrap();
+        assert!(root.entries.iter().all(|e| e.name != "." && e.name != ".."));
+        assert!(root.entries.iter().any(|e| e.name == "root.txt"));
+        assert!(root.entries.iter().any(|e| e.name == "sub"));
+        assert!(root.entries.iter().all(|e| e.cookie > 2));
+
+        let sub_id = nfs.lookup_sync(1, "sub").unwrap();
+        let sub = nfs.readdir_sync(sub_id, 0, 32, true).unwrap();
+        assert!(sub.entries.iter().all(|e| e.name != "." && e.name != ".."));
+        assert!(sub.entries.iter().any(|e| e.name == "inner.txt"));
+        assert!(sub.entries.iter().all(|e| e.cookie > 2));
     }
 
     #[tokio::test]
@@ -957,8 +1017,12 @@ mod tests {
         );
         let nfs = nfs_of(s);
         let listing = nfs.readdir_sync(1, 0, 10, true).unwrap();
-        assert_eq!(listing.entries.len(), 1);
-        let id = listing.entries[0].handle;
+        let payload = listing
+            .entries
+            .iter()
+            .find(|e| e.name == "payload")
+            .expect("size-0 listing must include the real child name");
+        let id = payload.handle;
         let got = nfs.read_sync(id, 0, 100).unwrap();
         assert_eq!(&got.data[..], b"0123456789");
         assert!(got.eof);

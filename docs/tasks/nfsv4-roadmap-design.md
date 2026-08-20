@@ -412,7 +412,7 @@ impl RatarmountNfs4 {
 
 **`read`:** clone Arcs, **`spawn_blocking` only here** (copy v3 `NFSFileSystem::read`) → `readers.get_or_open` → `fill_from_state`. EOF: `offset + n >= fi.size || n < count`. Short `Read::read` is **not** EOF. Other `FileSystem` methods stay inline.
 
-**`readdir` cookies:** sort children by fileid (same as v3). `cookie == 0` starts at the beginning. Else skip while `fileid != cookie`, then skip that entry. Unknown cookie → `FsError::InvalidInput` (or `Stale` if we prefer; pick **InvalidInput** and unit-test it — NFS4ERR_BAD_COOKIE mapping is embednfs’s job if it has one; we must not invent wire codes). Each `DirEntry.cookie = fileid`. `eof` when the page includes the last child.
+**`readdir` cookies:** sort children by fileid (same as v3). Do **not** emit `.` / `..` — Linux `nfs4_setup_readdir` injects them at cookie 0 (reserved cookies 1/2); returning them duplicates `ls -lah`. `cookie == 0` starts at the first child. Child `DirEntry.cookie = fileid` (`> 2`). `eof` when the page includes the last child. Unknown/vanished child cookie → resume at the next surviving child (empty page + eof at end), not an error (embednfs maps errors to NFS4ERR_INVAL which aborts `ls`). Returned cookies are never 0, 1, or 2. lookup still handles `"."` / `".."`.
 
 **`access`:** `Ok(requested & granted)` using docs.rs 0.4.1 constructors (`AccessMask::READ` etc. + `BitAnd`). No fallback that returns `requested` unchanged.
 
@@ -712,7 +712,8 @@ Synthetic `MountSource` (copy the v3 `Synth` in `vfs.rs` tests; do not import FU
 |------|---------|
 | `v4_root_and_lookup_stable` | `root() == 1`; stable handle; getattr size/mode. |
 | `v4_missing_is_notfound_unknown_handle_stale` | lookup miss → `NotFound`; getattr(99) → `Stale`. |
-| `v4_readdir_cookie_and_unknown` | Pagination; unknown cookie → `InvalidInput`. |
+| `v4_readdir_cookie_and_unknown` | Pagination of real children by name; unknown cookie → empty page + eof (not an error). Cookies `> 2`. No `.` / `..` entries. |
+| `v4_readdir_does_not_emit_dot_dotdot` | Cookie-0 listings omit `.` / `..` (Linux client injects them). |
 | `v4_writers_readonly` | write/create/remove/rename/setattr-size → `ReadOnly`. |
 | `v4_readlink` | `Symlinks::readlink` returns target. |
 | **`Regression: v4 readdir cheap size 0 then cat`** | Same as v3 `readdir_size_zero_then_read_uses_lookup_userdata`. |

@@ -71,6 +71,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NULL `offsetheader` row breaks cheap readdir / warm open (foreign index) | `cargo test -p ratarmount-index --lib regression_null_offsetheader` |
 | Crafted `inf`/`1e999` mtime panics FUSE daemon (SystemTime overflow) | `cargo test -p ratarmount-fuse --lib unix_float_to_system_time_extreme` |
 | NFS readdir cookie vanished mid-listing aborts `ls`; v4 cookie 1/2 reserved | `cargo test -p ratarmount-nfs --lib readdir_start_after_and_bad_cookie` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_readdir_cookie` |
+| NFS `ls -lah` missing `.` / `..` (v3 READDIR prefix; v4 Linux injects them) | `cargo test -p ratarmount-nfs --lib readdir_dot` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_readdir_does_not_emit` |
 | Live `.tar.zst` commit truncates zero-tail members (zero-run EOF cut) | `cargo test -p ratarmount-formats-tar --lib rewrite_zero_tail` · `cargo test -p ratarmount-formats-tar --lib rewrite_mid_member_opaque_prefix` · `cargo test -p ratarmount-formats-tar --lib rewrite_all_zero_window` |
 | PAX `size=` member (≥ 8 GiB / zeroed ustar field) indexes as size 0 | `cargo test -p ratarmount-formats-tar --lib pax_size_keyword` |
 | Overlay rename loses symlinks / destination on COW failure; rmdir non-empty | `cargo test -p ratarmount-compositing --lib rename_base_symlink` · `cargo test -p ratarmount-compositing --lib rename_keeps_destination` · `cargo test -p ratarmount-compositing --lib rmdir_refuses` |

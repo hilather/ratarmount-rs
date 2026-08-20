@@ -549,10 +549,13 @@ Algorithm:
 2. `source.list_dirents(&path)` (cheap; never fat `list()`). None → `NFS3ERR_NOTDIR` if lookup says file, else `NOENT`.
 3. For each `CheapDirent`: `child_path = join_path(dir, name)`, `cid = id_for_path(child_path)` — **path only, `file_info` stays `None`**.
 4. **Stable order = sort by `fileid` ascending.** Fileids are assigned on first sight; once assigned they never change in-process.
-5. Do **not** emit `.` / `..` in the child list. `lookup` handles `"."` / `".."`.
-6. If `start_after == 0`: take from the beginning.
-7. Else: skip while `fileid != start_after`; then skip that entry; take the rest. If `start_after` is **not** in the list → `NFS3ERR_BAD_COOKIE`.
-8. Return at most `max_entries`. `end = (taken_until == last)`.
+5. Prefix the listing with `.` (fileid = dirid) then `..` (fileid = parent; export-root parent is the export root). Real children stay sorted by fileid after that prefix. Do **not** store a cheap readdir stub for `.` / `..` — attrs come from lookup `FileInfo` of the directory / parent. `lookup` still handles `"."` / `".."`.
+6. If `start_after == 0`: take from the beginning (the `.` / `..` prefix).
+7. Else:
+   - At the export root, `.` and `..` share fileid 1 (nfsserve cookie = `DirEntry.fileid`). Never split them across pages; `start_after == 1` skips both and starts at children. Splitting would make `start_after=1` re-emit `..` forever.
+   - In a subdirectory, `start_after == dirid` starts at `..`; `start_after == parent_id` starts at the first child.
+   - Otherwise skip while `fileid != start_after` among children; then skip that entry; take the rest. If `start_after` is **not** in the list, resume at the next surviving id (do not `BAD_COOKIE` — that aborts `ls`).
+8. Return at most `max_entries` (except the root `.`/`..` pair, which is never split). `end = (taken_until == last)`.
 
 **READDIRPLUS `fattr3.size`:** use `CheapDirent.size` when `> 0`. When `== 0`, do **not** invent a cached `FileInfo`. Either (preferred for v1 correctness on residual formats) `source.lookup` that child for attrs, or emit size 0 **without** storing it on the inode. Never pass a cheap struct to `open`. Clients that cache size 0 from READDIRPLUS on residual formats may skip READ — lookup-on-zero-size for the page being returned is the safe default (one lookup per 0-size dirent in the page, not the whole tree).
 
@@ -922,7 +925,8 @@ Every behavior lands with tests in the same PR. Prefer **no live mount**.
 | **`Regression: readdir cheap size 0 then cat`** | Synthetic `list_dirents` size 0 + `lookup` size N + real body + TAR-like userdata → `read` returns N bytes; `open` FileInfo has userdata. Must **not** return `([], true)`. |
 | `io_to_nfsstat3_maps_permission_denied_to_acces` | Mirror FUSE `io_to_errno` test (AGENTS.md encrypted nested). |
 | `mutating_ops_return_rofs` | write/create/mkdir/remove/rename/setattr/symlink. |
-| `readdir_start_after_fileid` | Deterministic order; pagination; `BAD_COOKIE` on unknown id. |
+| `readdir_start_after_fileid` | Deterministic order; pagination of real children by name; unknown cookie resumes (empty page + eof). |
+| `readdir_dot_dotdot_prefix_root_and_subdir` | Cookie-0 listings start with `.` then `..`; root pair not split; max_entries=1 walk terminates. |
 | `read_empty_file` | After lookup size 0 → `([], true)`. |
 | `filename3_lossy_and_nametoolong` | `name.len() > 255` → `NAMETOOLONG`; non-UTF-8 bytes decode lossy. |
 | **`Regression: short Read::read is not NFS EOF`** | Reader that yields 64 KiB then more; `read(0, 1MiB)` returns full buffer. Copy the FUSE `fill_read_for_fuse_assembles_short_codec_reads` fixture. |
@@ -1016,7 +1020,7 @@ Do **not** mark nested/temp matrices changed (factory open path unchanged).
 | Never cache cheap readdir `FileInfo` | Default `list_dirents` size 0 + empty userdata; TAR `open` needs lookup userdata. |
 | Server-side per-fileid reader LRU (cap 64) + pin after compositing forwards | NFSv3 has no open/close; pin is dead without wrapper forwards. |
 | Steal `fill_read_for_fuse` / `readahead_fill` | Same UnexpectedEof class as AGENTS.md truncated `.gz`. |
-| Readdir order = sort by fileid; cookie = last fileid | Matches nfsserve `start_after` contract, not FUSE index cookies. |
+| Readdir order = `.` / `..` prefix then sort children by fileid; cookie = last fileid | Matches nfsserve `start_after` contract, not FUSE index cookies. Root `.`/`..` share fileid 1 so they are never split across pages. |
 | filename3 = UTF-8 lossy, `>255` → NAMETOOLONG | Match FUSE `to_string_lossy`. |
 | NFS-only forbids `--control-interface` | Live socket/ControlFolder require a FUSE `mp`. |
 | FUSE+NFS `-f` binds before `mount_blocking` | Daemonize bind fail must not look like success. |

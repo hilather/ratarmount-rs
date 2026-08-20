@@ -144,8 +144,22 @@ impl RatarmountNfs {
             }
             return Err(nfsstat3::NFS3ERR_NOENT);
         };
+        // `.` / `..` attrs come from lookup FileInfo, never a cheap dirent stub.
+        let dir_fi = self.file_info_for_id(dirid)?;
+        let parent_id = if path == "/" {
+            dirid
+        } else {
+            self.inodes.id_for_path(&parent_path(&path))
+        };
+        let parent_fi = if parent_id == dirid {
+            dir_fi.clone()
+        } else {
+            self.file_info_for_id(parent_id)?
+        };
+
         let mut kids: Vec<(u64, String, u32, u64)> = dents
             .into_iter()
+            .filter(|d| d.name != "." && d.name != "..")
             .map(|d| {
                 let child = join_path(&path, &d.name);
                 let id = self.inodes.id_for_path(&child);
@@ -154,25 +168,60 @@ impl RatarmountNfs {
             .collect();
         kids.sort_by_key(|(id, _, _, _)| *id);
 
+        // Logical listing is [`.`, `..`, ...children sorted by fileid].
+        // nfsserve cookies equal `DirEntry.fileid`, so at the export root both
+        // `.` and `..` have fileid 1 — never split that pair across pages or
+        // `start_after=1` re-emits `..` forever.
+        let root_listing = parent_id == dirid;
         let start_idx = if start_after == 0 {
             0
+        } else if root_listing && start_after == dirid {
+            2
+        } else if !root_listing && start_after == dirid {
+            1
+        } else if !root_listing && start_after == parent_id {
+            2
         } else {
             match kids.iter().position(|(id, _, _, _)| *id == start_after) {
-                Some(i) => i + 1,
+                Some(i) => 2 + i + 1,
                 // Cookie entry vanished (overlay delete between pages): resume
                 // at the next surviving id instead of failing the listing —
                 // BAD_COOKIE mid-enumeration makes clients abort `ls`.
-                None => kids
-                    .iter()
-                    .position(|(id, _, _, _)| *id > start_after)
-                    .unwrap_or(kids.len()),
+                None => {
+                    2 + kids
+                        .iter()
+                        .position(|(id, _, _, _)| *id > start_after)
+                        .unwrap_or(kids.len())
+                }
             }
         };
-        let slice = &kids[start_idx..];
-        let take = slice.len().min(max_entries);
-        let end = start_idx + take >= kids.len();
+        let full_len = 2 + kids.len();
+        let mut take = max_entries;
+        if root_listing && start_idx == 0 && max_entries > 0 {
+            take = take.max(2);
+        }
+        let remaining = full_len.saturating_sub(start_idx);
+        let take = take.min(remaining);
+        let end = start_idx + take >= full_len;
         let mut entries = Vec::with_capacity(take);
-        for (id, name, mode, cheap_size) in &slice[..take] {
+        for i in start_idx..start_idx + take {
+            if i == 0 {
+                entries.push(DirEntry {
+                    fileid: dirid,
+                    name: encode_filename("."),
+                    attr: Self::fattr(dirid, &dir_fi),
+                });
+                continue;
+            }
+            if i == 1 {
+                entries.push(DirEntry {
+                    fileid: parent_id,
+                    name: encode_filename(".."),
+                    attr: Self::fattr(parent_id, &parent_fi),
+                });
+                continue;
+            }
+            let (id, name, mode, cheap_size) = &kids[i - 2];
             let child = join_path(&path, name);
             let fi = if *cheap_size > 0 {
                 FileInfo {
@@ -627,7 +676,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::io::{self, Cursor};
 
-    use ratarmount_core::{CheapDirent, FileInfo, ListResult, UserData, S_IFLNK, S_IFREG};
+    use ratarmount_core::{CheapDirent, FileInfo, ListResult, UserData, S_IFDIR, S_IFLNK, S_IFREG};
 
     struct Synth {
         files: BTreeMap<String, (FileInfo, Vec<u8>)>,
@@ -669,6 +718,31 @@ mod tests {
                 mode: fi.mode,
                 size: fi.size,
             });
+        }
+
+        fn add_dir(&mut self, path: &str) {
+            let name = path.rsplit('/').next().unwrap().to_string();
+            let parent = if path.matches('/').count() == 1 {
+                "/".to_string()
+            } else {
+                path.rsplit_once('/').unwrap().0.to_string()
+            };
+            let fi = FileInfo {
+                size: 0,
+                mtime: 1.0,
+                mode: S_IFDIR | 0o755,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            };
+            self.files.insert(path.into(), (fi.clone(), Vec::new()));
+            self.dirs.entry(parent).or_default().push(CheapDirent {
+                name,
+                mode: fi.mode,
+                size: 0,
+            });
+            self.dirs.entry(path.into()).or_default();
         }
 
         fn add_link(&mut self, path: &str, target: &str) {
@@ -752,6 +826,38 @@ mod tests {
         s as u32
     }
 
+    fn dirent_name(e: &DirEntry) -> String {
+        String::from_utf8_lossy(e.name.as_ref()).into_owned()
+    }
+
+    fn dirent_names(r: &ReadDirResult) -> Vec<String> {
+        r.entries.iter().map(dirent_name).collect()
+    }
+
+    fn readdir_walk(nfs: &RatarmountNfs, dirid: fileid3, max_entries: usize) -> Vec<String> {
+        let mut start_after = 0;
+        let mut names = Vec::new();
+        let mut ended = false;
+        for _ in 0..64 {
+            let page = nfs.readdir_sync(dirid, start_after, max_entries).unwrap();
+            if page.entries.is_empty() {
+                assert!(page.end, "empty readdir page without eof");
+                ended = true;
+                break;
+            }
+            for e in &page.entries {
+                names.push(dirent_name(e));
+                start_after = e.fileid;
+            }
+            if page.end {
+                ended = true;
+                break;
+            }
+        }
+        assert!(ended, "readdir did not terminate; names={names:?}");
+        names
+    }
+
     #[test]
     fn root_and_lookup_stable() {
         let mut s = Synth::new();
@@ -789,20 +895,96 @@ mod tests {
         s.add_file("/b", b"2", vec![UserData::Other("t".into())]);
         let nfs = nfs_of(s);
         let all = nfs.readdir_sync(1, 0, 10).unwrap();
-        assert_eq!(all.entries.len(), 2);
+        let names = dirent_names(&all);
+        assert_eq!(&names[..2], &[".".to_string(), "..".to_string()]);
+        let kids: Vec<&DirEntry> = all
+            .entries
+            .iter()
+            .filter(|e| {
+                let n = dirent_name(e);
+                n != "." && n != ".."
+            })
+            .collect();
+        assert_eq!(kids.len(), 2, "{names:?}");
         assert!(all.end);
-        let first = all.entries[0].fileid;
+        let first = kids[0].fileid;
         let rest = nfs.readdir_sync(1, first, 10).unwrap();
-        assert_eq!(rest.entries.len(), 1);
+        let rest_names = dirent_names(&rest);
+        assert!(
+            rest_names.iter().all(|n| n != "." && n != ".."),
+            "{rest_names:?}"
+        );
+        assert_eq!(rest.entries.len(), 1, "{rest_names:?}");
         assert!(rest.end);
         // Cookie past the last id: empty page, eof — no error.
         let tail = nfs.readdir_sync(1, 9999, 10).unwrap();
         assert!(tail.entries.is_empty());
         assert!(tail.end);
-        // Cookie between the two ids resumes at the next surviving entry.
+        // Cookie equal to the last child's fileid (consecutive ids: first+1)
+        // starts after that child: empty page, eof — no error.
         let mid = nfs.readdir_sync(1, first + 1, 10).unwrap();
         assert_eq!(mid.entries.len(), 0);
         assert!(mid.end);
+    }
+
+    /// Regression: `ls -lah` on an NFS mount omitted `.` and `..` because
+    /// READDIR/READDIRPLUS listed only archive children.
+    #[test]
+    fn readdir_dot_dotdot_prefix_root_and_subdir() {
+        let mut s = Synth::new();
+        s.add_file("/root.txt", b"r", vec![UserData::Other("t".into())]);
+        s.add_dir("/sub");
+        s.add_file("/sub/inner.txt", b"i", vec![UserData::Other("t".into())]);
+        let nfs = nfs_of(s);
+
+        let root = nfs.readdir_sync(1, 0, 32).unwrap();
+        let root_names = dirent_names(&root);
+        assert_eq!(root_names[0], ".");
+        assert_eq!(root_names[1], "..");
+        assert_eq!(root.entries[0].fileid, 1);
+        assert_eq!(root.entries[1].fileid, 1);
+        assert_eq!(root.entries[0].attr.fileid, 1);
+        assert_eq!(root.entries[1].attr.fileid, 1);
+        let root_kids: Vec<String> = root_names
+            .iter()
+            .filter(|n| n.as_str() != "." && n.as_str() != "..")
+            .cloned()
+            .collect();
+        assert!(root_kids.contains(&"root.txt".into()), "{root_names:?}");
+        assert!(root_kids.contains(&"sub".into()), "{root_names:?}");
+        assert_eq!(root_names.len(), 4, "{root_names:?}");
+
+        let sub_id = nfs.lookup_sync(1, &name("sub")).unwrap();
+        let sub = nfs.readdir_sync(sub_id, 0, 32).unwrap();
+        let sub_names = dirent_names(&sub);
+        assert_eq!(sub_names[0], ".");
+        assert_eq!(sub_names[1], "..");
+        assert_eq!(sub.entries[0].fileid, sub_id);
+        assert_eq!(sub.entries[1].fileid, 1);
+        assert!(sub_names.contains(&"inner.txt".into()), "{sub_names:?}");
+        assert_eq!(sub_names.len(), 3, "{sub_names:?}");
+
+        let root_walk = readdir_walk(&nfs, 1, 1);
+        assert_eq!(root_walk[0], ".");
+        assert_eq!(root_walk[1], "..");
+        let mut walk_sorted = root_walk.clone();
+        walk_sorted.sort();
+        let mut once = root_walk.clone();
+        once.sort();
+        once.dedup();
+        assert_eq!(
+            walk_sorted, once,
+            "duplicate names in max_entries=1 walk: {root_walk:?}"
+        );
+        assert_eq!(root_walk.len(), 4, "{root_walk:?}");
+        assert!(root_walk.contains(&"root.txt".into()));
+        assert!(root_walk.contains(&"sub".into()));
+
+        let sub_walk = readdir_walk(&nfs, sub_id, 1);
+        assert_eq!(
+            sub_walk,
+            vec![".".to_string(), "..".to_string(), "inner.txt".into()]
+        );
     }
 
     #[test]
@@ -1310,8 +1492,12 @@ mod tests {
         );
         let nfs = nfs_of(s);
         let listing = nfs.readdir_sync(1, 0, 10).unwrap();
-        assert_eq!(listing.entries.len(), 1);
-        let id = listing.entries[0].fileid;
+        let payload = listing
+            .entries
+            .iter()
+            .find(|e| dirent_name(e) == "payload")
+            .expect("size-0 listing must include the real child name");
+        let id = payload.fileid;
         // Inode must not have stored the cheap stub in a way that skips userdata.
         let (buf, eof) = nfs.read_sync(id, 0, 100).unwrap();
         assert_eq!(buf, b"0123456789");

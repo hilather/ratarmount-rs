@@ -87,6 +87,7 @@ mount_nfs -o nolocks,vers=3,tcp,rsize=131072,port=20490,mountport=20490 127.0.0.
 | Filehandles | Invalid after process restart (generation = start time) |
 | `--control-interface` | Requires a FUSE mountpoint; NFS-only → exit 2 |
 | `--no-mount` | Incompatible with `--nfs` (exit 2) |
+| READDIR / READDIRPLUS | NFSv3 prefixes POSIX `.` and `..` (fileids of the directory and its parent; export-root `..` is the export root), then archive children sorted by fileid. NFSv4.1 does **not** emit `.` / `..`: the Linux client injects them (`nfs4_setup_readdir`, reserved cookies 1/2); emitting them duplicates `ls -lah`. lookup of `"."` / `".."` still works on both. |
 
 Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist.
 
