@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -400,6 +400,19 @@ impl WriteOverlay {
     pub fn close_overlay_fd(&self, fd: i32) {
         self.release_write_fd(fd);
         let _ = unsafe { File::from_raw_fd(fd) };
+    }
+
+    /// Unregister the write pin, then drop `file` (closes the fd).
+    ///
+    /// NFS WRITE wraps [`Self::open_overlay_fd`] in `File::from_raw_fd`. The
+    /// pin map is keyed by fd number, so unregister **before** close: the
+    /// kernel can reuse that number for another still-open overlay writer
+    /// (FUSE create, a second WRITE). Releasing after close would drop the
+    /// new pin; interval settle could persist/unlink the still-open file and
+    /// later pwrite bytes would hit a detached inode.
+    pub fn finish_owned_write_fd(&self, file: File) {
+        self.release_write_fd(file.as_raw_fd());
+        drop(file);
     }
 
     fn write_open_hosts(&self) -> HashSet<PathBuf> {
@@ -3937,6 +3950,78 @@ mod tests {
         want.extend_from_slice(&second);
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/open.txt"), want);
+    }
+
+    /// Regression: NFS WRITE used to `drop(File)` (close) and then
+    /// `release_write_fd`. The pin map is keyed by fd number; the kernel can
+    /// reuse that number for a still-open FUSE writer. Interval settle would
+    /// persist/unlink the still-open file (later pwrite → detached inode).
+    #[test]
+    fn live_commit_idle_skips_open_write_fd_after_fd_reuse() {
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-reuse-seed");
+        let keep = generated_payload("idle-reuse-keep");
+        let nfs_bytes = generated_payload("idle-reuse-nfs");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+
+        let nfs_fd = ov
+            .open_overlay_fd("/nfs.txt", libc::O_RDWR | libc::O_CREAT)
+            .expect("nfs open");
+        let n = unsafe { libc::write(nfs_fd, nfs_bytes.as_ptr() as *const _, nfs_bytes.len()) };
+        assert_eq!(n as usize, nfs_bytes.len(), "nfs write");
+        let nfs_file = unsafe { std::fs::File::from_raw_fd(nfs_fd) };
+        ov.finish_owned_write_fd(nfs_file);
+
+        // Long-lived FUSE-style writer. If the OS reused `nfs_fd`, the pin
+        // must now belong to this file — not a stale closed number.
+        let keep_fd = ov.create_file("/keep.txt", 0o644).expect("keep create");
+        let n = unsafe { libc::write(keep_fd, keep.as_ptr() as *const _, keep.len()) };
+        assert_eq!(n as usize, keep.len(), "keep write");
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+        set_mtime_age(&overlay.join("nfs.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(_) => {}
+            Err(e) => panic!("idle tick after fd reuse: {e}"),
+        }
+        assert!(
+            overlay.join("keep.txt").exists(),
+            "still-open writer must stay in the overlay after a finished NFS \
+             WRITE reuses/closes another fd (keep_fd={keep_fd}, nfs_fd={nfs_fd})"
+        );
+
+        let extra = generated_payload("idle-reuse-extra");
+        let n = unsafe {
+            libc::pwrite(
+                keep_fd,
+                extra.as_ptr() as *const _,
+                extra.len(),
+                keep.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, extra.len(), "pwrite after skipped tick");
+        ov.close_overlay_fd(keep_fd);
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after keep close"));
+        assert!(!overlay.join("keep.txt").exists());
+
+        let mut want = keep.clone();
+        want.extend_from_slice(&extra);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), want);
+        assert_eq!(read_member(src.as_ref(), "/nfs.txt"), nfs_bytes);
     }
 
     /// Regression: after the hot file settles, a later tick persists it once.
