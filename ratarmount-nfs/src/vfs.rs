@@ -337,8 +337,7 @@ impl RatarmountNfs {
         let wrote = file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| file.write_all(data));
-        drop(file);
-        ov.release_write_fd(fd);
+        ov.finish_owned_write_fd(file);
         wrote.map_err(|e| crate::io_to_nfsstat3(&e))?;
         self.bump_after_mutate(id);
         self.getattr_sync(id)
