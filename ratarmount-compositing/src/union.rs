@@ -2,6 +2,10 @@
 //!
 //! Matches Python `UnionMountSource`: optional folder→sources cache for faster
 //! lookup across many archives (depth / entry count / wall-clock timeout).
+//! Cache build walks `list_dirents`; fat `list()` is only a fallback when
+//! dirents have `mode == 0` (Names-path backends). `--union-resolve-symlinks`
+//! `list_dirents` merges those cheap dirents, then resolves `S_IFLNK` winners
+//! via `lookup` (not a full `list()` map).
 //!
 //! **Directory-over-symlink policy (B-4 / mxmlnkn/ratarmount#164):** when one
 //! source has a real directory at a path and another has a symlink, version-0
@@ -171,20 +175,16 @@ impl UnionMountSource {
                         );
                         return;
                     }
-                    // List via the same symlink follow as B-4 `list`, so
-                    // walk continues into symlink→dir branches (immutable archives).
-                    let Some(listing) = Self::list_from_source(
+                    // Cheap walk (same symlink follow as B-4 `list`) so cache
+                    // build does not materialize fat FileInfo maps.
+                    let Some(dents) = Self::list_dirents_from_source(
                         self.sources[si].as_ref(),
                         &folder,
                         self.resolve_symlinks,
                     ) else {
                         continue;
                     };
-                    let names: Vec<String> = match listing {
-                        ListResult::Names(n) => n,
-                        ListResult::Infos(m) => m.into_keys().collect(),
-                    };
-                    for name in names {
+                    for d in dents {
                         if t0.elapsed().as_secs_f64() > max_seconds || entries_left == 0 {
                             self.folder_cache = folder_cache;
                             self.folder_cache_depth = depth_done;
@@ -196,18 +196,19 @@ impl UnionMountSource {
                             );
                             return;
                         }
-                        let full = join(&folder, &name);
-                        // Cache real directories *and* followable symlink→dir paths.
-                        // Previously only S_IFDIR was recorded, so immutable sources
-                        // with a symlink branch were dropped from sources_for_path
-                        // → lookup/open ENOENT after list still showed their children.
-                        if Self::list_from_source(
+                        let full = join(&folder, &d.name);
+                        // Cache real directories *and* followable symlink→dir
+                        // paths. Previously only S_IFDIR was recorded, so
+                        // immutable sources with a symlink branch were dropped
+                        // from sources_for_path → lookup/open ENOENT after list
+                        // still showed their children. Mode-0 dirents (default
+                        // Names path) must still probe.
+                        if !Self::folder_cache_should_include_child(
                             self.sources[si].as_ref(),
                             &full,
+                            d.mode,
                             self.resolve_symlinks,
-                        )
-                        .is_none()
-                        {
+                        ) {
                             continue;
                         }
                         entries_left = entries_left.saturating_sub(1);
@@ -361,31 +362,58 @@ impl UnionMountSource {
         Self::follow_symlink_then(src, path, resolve_symlinks, |p| src.list_dirents(p))
     }
 
+    /// Cache this child as a folder for `src`.
+    ///
+    /// `S_IFDIR` is sufficient. Followable `S_IFLNK` is probed via cheap
+    /// `list_dirents` (B-4 one-hop / FR-10 hops). `mode == 0` (default Names
+    /// `list_dirents`) probes `list_dirents` then fat `list()` so mode-less
+    /// backends do not drop real directories.
+    fn folder_cache_should_include_child(
+        src: &dyn MountSource,
+        child_path: &str,
+        mode: u32,
+        resolve_symlinks: bool,
+    ) -> bool {
+        if is_dir_mode(mode) {
+            return true;
+        }
+        if is_lnk_mode(mode) {
+            return Self::list_dirents_from_source(src, child_path, resolve_symlinks).is_some();
+        }
+        if mode == 0 {
+            if Self::list_dirents_from_source(src, child_path, resolve_symlinks).is_some() {
+                return true;
+            }
+            return Self::list_from_source(src, child_path, resolve_symlinks).is_some();
+        }
+        false
+    }
+
     /// Later source wins, except a directory is never replaced by a symlink (B-4).
-    fn merge_dirent(map: &mut BTreeMap<String, CheapDirent>, d: CheapDirent) {
-        if let Some(existing) = map.get(&d.name) {
+    fn merge_dirent(map: &mut BTreeMap<String, (CheapDirent, usize)>, d: CheapDirent, si: usize) {
+        if let Some((existing, _)) = map.get(&d.name) {
             if is_dir_mode(existing.mode) && is_lnk_mode(d.mode) {
                 return;
             }
         }
-        map.insert(d.name.clone(), d);
+        map.insert(d.name.clone(), (d, si));
     }
 
-    fn list_dirents_b4_only(&self, path: &str) -> Option<Vec<CheapDirent>> {
+    fn list_dirents_b4_merged(&self, path: &str) -> Option<BTreeMap<String, (CheapDirent, usize)>> {
         let path = normpath(path);
-        let mut map: BTreeMap<String, CheapDirent> = BTreeMap::new();
+        let mut map: BTreeMap<String, (CheapDirent, usize)> = BTreeMap::new();
         let mut any = false;
-        for src in &self.sources {
+        for (si, src) in self.sources.iter().enumerate() {
             if let Some(dents) =
                 Self::list_dirents_from_source(src.as_ref(), &path, self.resolve_symlinks)
             {
                 any = true;
                 for d in dents {
-                    Self::merge_dirent(&mut map, d);
+                    Self::merge_dirent(&mut map, d, si);
                 }
             }
         }
-        any.then(|| map.into_values().collect())
+        any.then_some(map)
     }
 
     /// After a union pick, optionally follow a winning symlink within `src`.
@@ -505,34 +533,36 @@ impl MountSource for UnionMountSource {
     }
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
-        if self.resolve_symlinks {
-            // Opt-in: same post-merge FR-10 resolve as list(); do not invent a
-            // second resolve. On the successful-resolve path, sizes come from
-            // the resolved FileInfo so TTL 60s is safe (type is REG — kernel
-            // will not readlink). Cycle leftovers stay S_IFLNK, matching list().
-            return match self.list(path)? {
-                ListResult::Infos(map) => Some(
-                    map.into_iter()
-                        .map(|(name, fi)| CheapDirent {
-                            name,
-                            mode: fi.mode,
-                            size: fi.size,
-                        })
-                        .collect(),
-                ),
-                ListResult::Names(names) => Some(
-                    names
-                        .into_iter()
-                        .map(|name| CheapDirent {
-                            name,
-                            mode: 0,
-                            size: 0,
-                        })
-                        .collect(),
-                ),
-            };
+        let path = normpath(path);
+        let map = self.list_dirents_b4_merged(&path)?;
+        if !self.resolve_symlinks {
+            return Some(map.into_values().map(|(d, _)| d).collect());
         }
-        self.list_dirents_b4_only(path)
+        // Opt-in FR-10: same `resolve_symlink_chain` as `list()`, but only for
+        // S_IFLNK winners (O(symlink children) lookup, not a fat FileInfo map).
+        // Successful resolve copies mode/size from the target so TTL 60s is
+        // safe (type is REG — kernel will not readlink). Cycle/hop leftovers
+        // stay S_IFLNK, matching list().
+        Some(
+            map.into_values()
+                .map(|(mut d, si)| {
+                    if is_lnk_mode(d.mode) {
+                        if let Some(src) = self.sources.get(si) {
+                            let child = join(&path, &d.name);
+                            if let Some(fi) = src.lookup(&child, 0) {
+                                if let Some(resolved) =
+                                    Self::resolve_symlink_chain(src.as_ref(), &child, fi)
+                                {
+                                    d.mode = resolved.mode;
+                                    d.size = resolved.size;
+                                }
+                            }
+                        }
+                    }
+                    d
+                })
+                .collect(),
+        )
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
@@ -745,6 +775,9 @@ mod tests {
     impl MountSource for ImmFolder {
         fn list(&self, path: &str) -> Option<ListResult> {
             self.0.list(path)
+        }
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            self.0.list_dirents(path)
         }
         fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
             self.0.lookup(path, v)
@@ -1269,6 +1302,42 @@ mod tests {
             Some(ListResult::Infos(map))
         }
 
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            let path = normpath(path);
+            if !self.dirs.contains(&path) {
+                return None;
+            }
+            let prefix = if path == "/" {
+                "/".to_string()
+            } else {
+                format!("{path}/")
+            };
+            let mut dents = Vec::new();
+            for d in &self.dirs {
+                if let Some(rest) = d.strip_prefix(&prefix) {
+                    if !rest.is_empty() && !rest.contains('/') {
+                        dents.push(CheapDirent {
+                            name: rest.to_string(),
+                            mode: ratarmount_core::S_IFDIR | 0o755,
+                            size: 0,
+                        });
+                    }
+                }
+            }
+            for (f, body) in &self.files {
+                if let Some(rest) = f.strip_prefix(&prefix) {
+                    if !rest.is_empty() && !rest.contains('/') {
+                        dents.push(CheapDirent {
+                            name: rest.to_string(),
+                            mode: ratarmount_core::S_IFREG | 0o644,
+                            size: body.len() as u64,
+                        });
+                    }
+                }
+            }
+            Some(dents)
+        }
+
         fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
             let path = normpath(path);
             if self.dirs.contains(&path) {
@@ -1423,6 +1492,59 @@ mod tests {
             inner: Arc::new(FolderMountSource::new(path).unwrap()) as Arc<dyn MountSource>,
             list_calls: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    fn counted_imm_folder(path: &std::path::Path) -> Arc<ListCallCounter> {
+        Arc::new(ListCallCounter {
+            inner: Arc::new(ImmFolder(FolderMountSource::new(path).unwrap()))
+                as Arc<dyn MountSource>,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        })
+    }
+
+    /// Names-path `list_dirents` (`mode == 0`, `size == 0`) over an inner source.
+    struct ModeZeroDirents {
+        inner: Arc<dyn MountSource>,
+    }
+
+    impl MountSource for ModeZeroDirents {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            let listing = self.inner.list(path)?;
+            let names = match listing {
+                ListResult::Names(n) => n,
+                ListResult::Infos(m) => m.into_keys().collect(),
+            };
+            Some(
+                names
+                    .into_iter()
+                    .map(|name| CheapDirent {
+                        name,
+                        mode: 0,
+                        size: 0,
+                    })
+                    .collect(),
+            )
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
     }
 
     /// Regression: 2-folder union readdir called `list()` on the default path.
@@ -1615,5 +1737,310 @@ mod tests {
         );
         let fi = u.lookup("/link.txt", 0).expect("lookup");
         assert!(is_lnk_mode(fi.mode));
+    }
+
+    /// Regression: union folder-cache build called fat `list()` when every
+    /// source already had sized/moded `list_dirents`.
+    #[test]
+    fn union_folder_cache_build_skips_fat_list_when_dirents_are_sized() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        let b = d.path().join("b");
+        fs::create_dir_all(a.join("sub/deep")).unwrap();
+        fs::create_dir_all(b.join("sub/deep")).unwrap();
+        fs::write(a.join("sub/deep/x.txt"), b"from-a").unwrap();
+        fs::write(b.join("sub/deep/x.txt"), b"from-b").unwrap();
+
+        let ca = counted_imm_folder(&a);
+        let cb = counted_imm_folder(&b);
+        let u = UnionMountSource::new_with_options(
+            vec![
+                Arc::clone(&ca) as Arc<dyn MountSource>,
+                Arc::clone(&cb) as Arc<dyn MountSource>,
+            ],
+            UnionMountOptions {
+                max_cache_depth: 8,
+                max_cache_entries: 1000,
+                max_seconds_to_cache: 10.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(u.folder_cache_contains("/"), "root must be cached");
+        assert!(
+            u.folder_cache_contains("/sub"),
+            "Regression: cheap dirents must still cache nested directories"
+        );
+        assert!(u.folder_cache_contains("/sub/deep"));
+        assert_eq!(
+            ca.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Regression: folder-cache build must not call fat list() on source a"
+        );
+        assert_eq!(
+            cb.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Regression: folder-cache build must not call fat list() on source b"
+        );
+
+        let dents = u.list_dirents("/sub/deep").expect("dirents");
+        let by_name: BTreeMap<_, _> = dents.into_iter().map(|d| (d.name, d.size)).collect();
+        assert_eq!(by_name.get("x.txt").copied(), Some(b"from-b".len() as u64));
+        assert_eq!(
+            ca.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default list_dirents after cheap cache build must not call list()"
+        );
+        assert_eq!(
+            cb.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "default list_dirents after cheap cache build must not call list()"
+        );
+    }
+
+    /// Regression: FR-10 `list_dirents` projected fat `list()` so every child
+    /// paid a FileInfo map even when only symlink winners need resolve.
+    #[test]
+    fn union_list_dirents_resolve_symlinks_skips_fat_list() {
+        let d = tempfile::tempdir().unwrap();
+        let a = d.path().join("a");
+        fs::create_dir_all(&a).unwrap();
+        let payload = b"payload";
+        fs::write(a.join("target.txt"), payload).unwrap();
+        std::os::unix::fs::symlink("target.txt", a.join("link.txt")).unwrap();
+        fs::write(a.join("plain.txt"), b"plain").unwrap();
+
+        let counted = counted_folder(&a);
+        let u = UnionMountSource::new_with_options(
+            vec![Arc::clone(&counted) as Arc<dyn MountSource>],
+            UnionMountOptions {
+                resolve_symlinks: true,
+                ..Default::default()
+            },
+        );
+
+        let dents = u.list_dirents("/").expect("dirents /");
+        assert_eq!(
+            counted.list_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "Regression: FR-10 list_dirents must not call fat list() when dirents are sized"
+        );
+        let link = dents
+            .iter()
+            .find(|d| d.name == "link.txt")
+            .expect("link.txt");
+        assert_eq!(
+            link.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert_eq!(link.size, payload.len() as u64);
+        let plain = dents
+            .iter()
+            .find(|d| d.name == "plain.txt")
+            .expect("plain.txt");
+        assert_eq!(
+            plain.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert_eq!(plain.size, b"plain".len() as u64);
+    }
+
+    /// Regression: mode-0 `list_dirents` dropped union folder-cache directories
+    /// (default Names path backends have no S_IFDIR bit).
+    #[test]
+    fn union_folder_cache_mode_zero_dirents_still_caches_directories() {
+        let a = Arc::new(ModeZeroDirents {
+            inner: Arc::new(SynthTree::with_dirs_and_files(
+                &["/l1/l2"],
+                &[("/l1/l2/file_a", b"from-a")],
+            )) as Arc<dyn MountSource>,
+        });
+        let b = Arc::new(ModeZeroDirents {
+            inner: Arc::new(SynthTree::with_dirs_and_files(
+                &["/l1/l2"],
+                &[("/l1/l2/file_b", b"from-b")],
+            )) as Arc<dyn MountSource>,
+        });
+
+        let u = UnionMountSource::new_with_options(
+            vec![
+                Arc::clone(&a) as Arc<dyn MountSource>,
+                Arc::clone(&b) as Arc<dyn MountSource>,
+            ],
+            UnionMountOptions {
+                max_cache_depth: 8,
+                max_cache_entries: 1000,
+                max_seconds_to_cache: 10.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            u.folder_cache_contains("/l1"),
+            "Regression: mode-0 dirents must still cache /l1"
+        );
+        assert!(
+            u.folder_cache_contains("/l1/l2"),
+            "Regression: mode-0 dirents must still cache nested directories"
+        );
+        let fi = u
+            .lookup("/l1/l2/file_b", 0)
+            .expect("file_b via cached path");
+        let mut body = String::new();
+        u.open(&fi, 0).unwrap().read_to_string(&mut body).unwrap();
+        assert_eq!(body, "from-b");
+    }
+
+    /// Regression: mode-0 `list_dirents` dropped immutable symlink→dir branches
+    /// from the folder cache (B-4 file1 ENOENT).
+    #[test]
+    fn union_folder_cache_mode_zero_keeps_symlink_branches() {
+        let d = tempfile::tempdir().unwrap();
+        let (branch1, branch2) = build_b4_branches(d.path());
+
+        let s1 = Arc::new(ModeZeroDirents {
+            inner: Arc::new(ImmFolder(FolderMountSource::new(&branch1).unwrap()))
+                as Arc<dyn MountSource>,
+        });
+        let s2 = Arc::new(ModeZeroDirents {
+            inner: Arc::new(ImmFolder(FolderMountSource::new(&branch2).unwrap()))
+                as Arc<dyn MountSource>,
+        });
+
+        let opts = UnionMountOptions {
+            max_cache_depth: 8,
+            max_cache_entries: 1000,
+            max_seconds_to_cache: 10.0,
+            ..Default::default()
+        };
+
+        for (sources, order_label) in [
+            (
+                vec![
+                    Arc::clone(&s1) as Arc<dyn MountSource>,
+                    Arc::clone(&s2) as Arc<dyn MountSource>,
+                ],
+                "branch1 then branch2",
+            ),
+            (
+                vec![
+                    Arc::clone(&s2) as Arc<dyn MountSource>,
+                    Arc::clone(&s1) as Arc<dyn MountSource>,
+                ],
+                "branch2 then branch1",
+            ),
+        ] {
+            let u = UnionMountSource::new_with_options(sources, opts.clone());
+            assert_b4_union_policy(&u, order_label);
+
+            let fi1 = u
+                .lookup("/subdir0/subdir2/file1", 0)
+                .unwrap_or_else(|| panic!("{order_label}: file1 lookup must not ENOENT"));
+            let mut body = String::new();
+            u.open(&fi1, 0)
+                .unwrap_or_else(|e| panic!("{order_label}: open file1: {e}"))
+                .read_to_string(&mut body)
+                .unwrap();
+            assert_eq!(body, "file1", "{order_label}: file1 content");
+        }
+    }
+
+    /// `list_dirents` yields mode-0 names at `/` only; child probes return
+    /// `None` so folder-cache must fall back to fat `list()`.
+    struct ModeZeroRootDirentsListFallback {
+        inner: Arc<dyn MountSource>,
+        list_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MountSource for ModeZeroRootDirentsListFallback {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.list_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.list(path)
+        }
+
+        fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+            if normpath(path) != "/" {
+                return None;
+            }
+            let listing = self.inner.list(path)?;
+            let names = match listing {
+                ListResult::Names(n) => n,
+                ListResult::Infos(m) => m.into_keys().collect(),
+            };
+            Some(
+                names
+                    .into_iter()
+                    .map(|name| CheapDirent {
+                        name,
+                        mode: 0,
+                        size: 0,
+                    })
+                    .collect(),
+            )
+        }
+
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            self.inner.lookup(path, file_version)
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: mode-0 child probe `list_dirents` None dropped directories
+    /// instead of falling back to `list()`.
+    #[test]
+    fn union_folder_cache_mode_zero_list_fallback_still_caches_directories() {
+        let a = Arc::new(ModeZeroRootDirentsListFallback {
+            inner: Arc::new(SynthTree::with_dirs_and_files(
+                &["/l1/l2"],
+                &[("/l1/l2/file_a", b"from-a")],
+            )) as Arc<dyn MountSource>,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let b = Arc::new(ModeZeroRootDirentsListFallback {
+            inner: Arc::new(SynthTree::with_dirs_and_files(
+                &["/l1/l2"],
+                &[("/l1/l2/file_b", b"from-b")],
+            )) as Arc<dyn MountSource>,
+            list_calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+
+        let u = UnionMountSource::new_with_options(
+            vec![
+                Arc::clone(&a) as Arc<dyn MountSource>,
+                Arc::clone(&b) as Arc<dyn MountSource>,
+            ],
+            UnionMountOptions {
+                max_cache_depth: 8,
+                max_cache_entries: 1000,
+                max_seconds_to_cache: 10.0,
+                ..Default::default()
+            },
+        );
+
+        assert!(
+            u.folder_cache_contains("/l1"),
+            "Regression: mode-0 list() fallback must cache /l1"
+        );
+        assert!(
+            a.list_calls.load(std::sync::atomic::Ordering::SeqCst) > 0
+                || b.list_calls.load(std::sync::atomic::Ordering::SeqCst) > 0,
+            "child probe must fall back to list() when list_dirents is None"
+        );
+        let fi = u.lookup("/l1/l2/file_b", 0).expect("file_b via cached /l1");
+        let mut body = String::new();
+        u.open(&fi, 0).unwrap().read_to_string(&mut body).unwrap();
+        assert_eq!(body, "from-b");
     }
 }
