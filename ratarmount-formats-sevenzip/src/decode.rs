@@ -878,10 +878,9 @@ fn method_to_lzma_filter_id(method: &[u8]) -> Option<lzma_sys::lzma_vli> {
     }
 }
 
-fn lzma_decompress_chain(coders: &[Coder], packed: &[u8], unpack_size: usize) -> Result<Vec<u8>> {
-    use std::os::raw::c_void;
-
-    // 7z pack→unpack order; liblzma wants reverse (prepend).
+/// liblzma raw decoder wants encoder order: filters then LZMA1/2 last.
+/// 7z may store BCJ-first (`-m0=BCJ -m1=LZMA2`) or pack→unpack (LZMA2 first).
+fn liblzma_encoder_order_coders(coders: &[Coder]) -> Result<Vec<&Coder>> {
     let mut filter_coders: Vec<&Coder> = coders
         .iter()
         .filter(|c| c.method.as_slice() != METHOD_COPY)
@@ -889,8 +888,20 @@ fn lzma_decompress_chain(coders: &[Coder], packed: &[u8], unpack_size: usize) ->
     if filter_coders.is_empty() {
         return Err(SevenZipError::Msg("Empty native filter chain".into()));
     }
-    // Prepend: reverse for liblzma
-    filter_coders.reverse();
+    let compressor_last = filter_coders.last().is_some_and(|c| {
+        let m = c.method.as_slice();
+        m == METHOD_LZMA || m == METHOD_LZMA2
+    });
+    if !compressor_last {
+        filter_coders.reverse();
+    }
+    Ok(filter_coders)
+}
+
+fn lzma_decompress_chain(coders: &[Coder], packed: &[u8], unpack_size: usize) -> Result<Vec<u8>> {
+    use std::os::raw::c_void;
+
+    let filter_coders = liblzma_encoder_order_coders(coders)?;
 
     unsafe {
         let mut filters: Vec<lzma_sys::lzma_filter> = Vec::with_capacity(filter_coders.len() + 1);
@@ -975,11 +986,7 @@ fn lzma_stream_decode_chain(
 ) -> Result<Vec<u8>> {
     use std::os::raw::c_void;
 
-    let mut filter_coders: Vec<&Coder> = coders
-        .iter()
-        .filter(|c| c.method.as_slice() != METHOD_COPY)
-        .collect();
-    filter_coders.reverse();
+    let filter_coders = liblzma_encoder_order_coders(coders)?;
 
     unsafe {
         let mut filters: Vec<lzma_sys::lzma_filter> = Vec::with_capacity(filter_coders.len() + 1);
@@ -1072,22 +1079,7 @@ fn start_lzma2_live_cursor(
 ) -> Result<LiveLzma2Cursor> {
     use std::os::raw::c_void;
 
-    let mut filter_coders: Vec<&Coder> = coders
-        .iter()
-        .filter(|c| c.method.as_slice() != METHOD_COPY)
-        .collect();
-    if filter_coders.is_empty() {
-        return Err(SevenZipError::Msg("Empty native filter chain".into()));
-    }
-    // liblzma raw decoder wants encoder order: filters then LZMA1/2 last.
-    // 7z may store BCJ-first (`-m0=BCJ -m1=LZMA2`) or pack→unpack (LZMA2 first).
-    let compressor_last = filter_coders.last().is_some_and(|c| {
-        let m = c.method.as_slice();
-        m == METHOD_LZMA || m == METHOD_LZMA2
-    });
-    if !compressor_last {
-        filter_coders.reverse();
-    }
+    let filter_coders = liblzma_encoder_order_coders(coders)?;
 
     unsafe {
         let mut filters: Vec<lzma_sys::lzma_filter> = Vec::with_capacity(filter_coders.len() + 1);
@@ -1169,6 +1161,22 @@ fn coder_is_bcj_or_delta(coder: &Coder) -> bool {
         || m == METHOD_BCJ_ARM
         || m == METHOD_BCJ_ARMT
         || m == METHOD_BCJ_SPARC
+}
+
+fn coder_is_bcj_filter(coder: &Coder) -> bool {
+    coder_is_bcj_or_delta(coder) && coder.method.as_slice() != METHOD_DELTA
+}
+
+/// Label for open-path debug (`none` / `bcj` / `delta` / `bcj+delta`).
+pub(crate) fn content_filter_label(coders: &[Coder]) -> &'static str {
+    let has_bcj = coders.iter().any(coder_is_bcj_filter);
+    let has_delta = coders.iter().any(|c| c.method.as_slice() == METHOD_DELTA);
+    match (has_bcj, has_delta) {
+        (true, true) => "bcj+delta",
+        (true, false) => "bcj",
+        (false, true) => "delta",
+        (false, false) => "none",
+    }
 }
 
 /// AES-stripped content is a single LZMA2 coder or a native BCJ/Delta+LZMA2 chain.
@@ -1602,6 +1610,11 @@ impl Lzma2RandomAccessDecoder {
         let n = ((pack_size - abs) as usize).min(PACKED_INPUT_WINDOW);
         self.packed_window = self.pack.read_at(abs, n)?;
         self.packed_window_start = abs;
+        if n > 0 && self.packed_window.is_empty() {
+            return Err(SevenZipError::Msg(
+                "packed window refill empty before pack EOF".into(),
+            ));
+        }
         Ok(())
     }
 
@@ -2017,7 +2030,8 @@ impl Lzma2RandomAccessDecoder {
     }
 }
 
-/// Shared pure-LZMA2 solid-folder decoder (multiple members / concurrent opens).
+/// Shared LZMA2 / AES+LZMA2 / native BCJ|Delta+LZMA2 solid-folder decoder
+/// (multiple members / concurrent opens).
 pub type SharedLzma2Decoder = Arc<Mutex<Lzma2RandomAccessDecoder>>;
 
 /// Seekable logical view of one solid-folder member over a shared LZMA2 decoder.
@@ -2931,6 +2945,43 @@ sys.stdout.buffer.write(packed)
                 assert!(
                     msg.contains("bcj2"),
                     "BCJ2 must stay Err naming the method, got {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: empty `read_at` before pack EOF must error, not busy-loop.
+    #[test]
+    fn regression_packed_window_refill_empty_before_eof_errors() {
+        struct EmptyReadPack {
+            len: u64,
+        }
+        impl PackSource for EmptyReadPack {
+            fn size(&self) -> u64 {
+                self.len
+            }
+            fn read_at(&self, _offset: u64, _size: usize) -> Result<Vec<u8>> {
+                Ok(vec![])
+            }
+            fn as_bytes(&self) -> Result<Vec<u8>> {
+                panic!("as_bytes must not be called");
+            }
+        }
+        let folder = lzma2_folder(128 * 1024, Some(vec![22]));
+        let mut decoder = Lzma2RandomAccessDecoder::from_pack(
+            &folder,
+            Box::new(EmptyReadPack { len: 1024 * 1024 }),
+            4,
+        )
+        .expect("empty reads index as zero chunks");
+        decoder.force_progressive_for_test();
+        match decoder.read_range(0, 64) {
+            Ok(_) => panic!("empty refill must not succeed or hang"),
+            Err(e) => {
+                let msg = e.to_string().to_ascii_lowercase();
+                assert!(
+                    msg.contains("refill empty") && msg.contains("eof"),
+                    "got {msg}"
                 );
             }
         }

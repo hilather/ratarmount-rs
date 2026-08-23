@@ -43,9 +43,9 @@ use ratarmount_index::{
 use thiserror::Error;
 
 use decode::{
-    lzma2_folder_can_use_decoder, lzma2_folder_uses_progressive, make_pack_source,
-    Lzma2MemberReader, PackSource, PackSourceReader, SeekPackSource, SharedArchiveIo,
-    SharedArchiveView, SharedLzma2Decoder, DEFAULT_MAX_CACHED_CHUNKS,
+    content_filter_label, lzma2_folder_can_use_decoder, lzma2_folder_uses_progressive,
+    make_pack_source, Lzma2MemberReader, PackSource, PackSourceReader, SeekPackSource,
+    SharedArchiveIo, SharedArchiveView, SharedLzma2Decoder, DEFAULT_MAX_CACHED_CHUNKS,
 };
 
 pub use parse::{looks_like_7z, SevenZipArchiveInfo, SevenZipError, SevenZipFileEntry};
@@ -628,8 +628,38 @@ impl SevenZipMountSource {
         folder: &parse::Folder,
         password: &str,
     ) -> std::result::Result<(), SevenZipError> {
-        let pack = SeekPackSource::new(Arc::clone(archive_io), entry.pack_offset, entry.pack_size);
         let sizes = pack_stream_sizes(archive, entry);
+        // File CRC + member-only progressive decode: a multi-GB AES+LZMA2 solid
+        // must not unpack the whole folder at mount. Full-folder trial remains
+        // when the only digest is folder.has_crc (or the decoder cannot be used).
+        if let Some(want) = entry.crc {
+            if lzma2_folder_can_use_decoder(folder) && sizes.is_none() {
+                let pack =
+                    SeekPackSource::new(Arc::clone(archive_io), entry.pack_offset, entry.pack_size);
+                let (content_folder, content_pack) =
+                    make_pack_source(folder, Box::new(pack), Some(password))?;
+                let mut decoder = decode::Lzma2RandomAccessDecoder::from_pack(
+                    &content_folder,
+                    content_pack,
+                    DEFAULT_MAX_CACHED_CHUNKS,
+                )?;
+                let member = decoder.read_range(entry.unpack_offset, entry.size as usize)?;
+                if (member.len() as u64) < entry.size {
+                    return Err(SevenZipError::Msg(
+                        "password trial produced short data".into(),
+                    ));
+                }
+                let got = parse::crc32_for_password_trial(&member);
+                if got != want {
+                    return Err(SevenZipError::Msg(format!(
+                        "password trial file CRC mismatch (got {got:#010x}, want {want:#010x})"
+                    )));
+                }
+                return Ok(());
+            }
+        }
+
+        let pack = SeekPackSource::new(Arc::clone(archive_io), entry.pack_offset, entry.pack_size);
         let data = decode::decompress_folder_source(
             folder,
             Box::new(pack),
@@ -715,6 +745,15 @@ impl SevenZipMountSource {
             .map(|v| v.len())
             .max()
             .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    fn test_last_resume_unpacked(&self, file_info: &FileInfo) -> Option<u64> {
+        let entry = self.find_entry(file_info).ok()?;
+        let fi = entry.folder_index?;
+        let cache = self.lzma2_decoders.lock().ok()?;
+        let decoder = cache.get(&fi)?;
+        decoder.lock().ok().map(|d| d.last_resume_unpacked())
     }
 
     /// Open of this `FileInfo` returns a progressive (expensive-seek) body.
@@ -871,7 +910,8 @@ impl SevenZipMountSource {
         Ok(data)
     }
 
-    /// Open a pure-LZMA2 solid member via chunk-indexed random access (no full-folder slice).
+    /// Open an LZMA2 / AES+LZMA2 / native BCJ|Delta+LZMA2 member via the
+    /// chunk-indexed decoder (no full-folder slice).
     fn open_lzma2_member(&self, entry: &SevenZipFileEntry) -> Result<Vec<u8>> {
         let decoder = self.get_lzma2_decoder(entry)?;
         let mut g = decoder
@@ -921,7 +961,8 @@ impl SevenZipMountSource {
         ))
     }
 
-    /// Seekable solid pure-LZMA2 member body for nested AutoMount / random access.
+    /// Seekable solid LZMA2 / AES+LZMA2 / native BCJ|Delta+LZMA2 member body
+    /// for nested AutoMount / random access.
     fn open_lzma2_member_reader(&self, entry: &SevenZipFileEntry) -> Result<Lzma2MemberReader> {
         let decoder = self.get_lzma2_decoder(entry)?;
         Ok(Lzma2MemberReader::new(
@@ -1512,27 +1553,18 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(reader));
         }
 
-        // LZMA2 / AES+LZMA2 / native BCJ+LZMA2: small folders → Cursor; large →
-        // Lzma2MemberReader with a live sequential cursor. AES is input-side
-        // (independent-chunk resume OK). BCJ/Delta disable dict-reset resume.
+        // LZMA2 / AES+LZMA2 / native BCJ|Delta+LZMA2: small folders → Cursor;
+        // large → Lzma2MemberReader with a live sequential cursor. AES is
+        // input-side (independent-chunk resume OK). BCJ/Delta disable dict-reset
+        // resume.
         let sizes = self.pack_stream_sizes_for(entry);
         if lzma2_folder_can_use_decoder(folder) && sizes.is_none() {
             let folder_unpack = folder.get_unpack_size();
             let has_aes = folder.is_encrypted();
-            let has_bcj = content_coders.iter().any(|c| {
-                let m = c.method.as_slice();
-                m == parse::METHOD_DELTA
-                    || m == parse::METHOD_BCJ
-                    || m == parse::METHOD_BCJ_X86
-                    || m == parse::METHOD_BCJ_PPC
-                    || m == parse::METHOD_BCJ_IA64
-                    || m == parse::METHOD_BCJ_ARM
-                    || m == parse::METHOD_BCJ_ARMT
-                    || m == parse::METHOD_BCJ_SPARC
-            });
+            let filter = content_filter_label(content_coders);
             if lzma2_folder_uses_progressive(folder, folder_unpack) {
                 debug!(
-                    "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack}, aes={has_aes}, bcj={has_bcj})",
+                    "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack}, aes={has_aes}, filter={filter})",
                     self.archive_path.display(),
                     entry.path
                 );
@@ -1547,7 +1579,7 @@ impl MountSource for SevenZipMountSource {
                 return Ok(Box::new(reader));
             }
             debug!(
-                "7z {}: open {} via LZMA2 full-member Cursor (folder_unpack={folder_unpack}, aes={has_aes}, bcj={has_bcj})",
+                "7z {}: open {} via LZMA2 full-member Cursor (folder_unpack={folder_unpack}, aes={has_aes}, filter={filter})",
                 self.archive_path.display(),
                 entry.path
             );
@@ -2269,6 +2301,15 @@ mod tests {
             return;
         }
 
+        let bad = OpenOptions {
+            passwords: vec!["not-the-password".into()],
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        SevenZipMountSource::open(&archive, None, &bad, "0.1.0", true)
+            .err()
+            .expect("Regression: AES+LZMA2 solid wrong password must fail mount trial");
+
         let opts = OpenOptions {
             passwords: vec!["secret".into()],
             index_in_memory: true,
@@ -2344,10 +2385,25 @@ mod tests {
         );
     }
 
+    fn extract_7z_member_stdout(archive: &Path, member: &str) -> Option<Vec<u8>> {
+        let archive_s = archive.to_str()?;
+        for bin in ["7zz", "7z", "7za"] {
+            let out = std::process::Command::new(bin)
+                .args(["x", "-so", archive_s, member])
+                .output()
+                .ok()?;
+            if out.status.success() && !out.stdout.is_empty() {
+                return Some(out.stdout);
+            }
+        }
+        None
+    }
+
     #[test]
     fn bcj_lzma2_fixture() {
         let path = py_fixture("bcj-lzma2-x86.7z");
         if !path.exists() {
+            eprintln!("skip missing {}", path.display());
             return;
         }
         let dir = tempfile::tempdir().unwrap();
@@ -2355,14 +2411,111 @@ mod tests {
         let m =
             SevenZipMountSource::open(&path, Some(&idx), &OpenOptions::default(), "0.1.0", true)
                 .expect("open bcj+lzma2");
-        if let Some(ListResult::Infos(infos)) = m.list("/") {
-            if let Some((_, fi)) = infos.into_iter().find(|(_, i)| i.size > 0) {
-                let mut r = m.open(&fi, 0).unwrap();
-                let mut buf = Vec::new();
-                r.read_to_end(&mut buf).unwrap();
-                assert_eq!(buf.len(), fi.size as usize);
-            }
+        let Some(ListResult::Infos(infos)) = m.list("/") else {
+            panic!("expected Infos list");
+        };
+        let Some((name, fi)) = infos.into_iter().find(|(_, i)| i.size > 0) else {
+            panic!("bcj+lzma2 fixture has no non-empty member");
+        };
+        let mut r = m.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), fi.size as usize);
+        let member = name.trim_start_matches('/');
+        if let Some(expected) = extract_7z_member_stdout(&path, member) {
+            assert_eq!(
+                buf, expected,
+                "bcj-lzma2-x86.7z member {member} must cmp 7z x -so"
+            );
+        } else {
+            eprintln!("skip: 7z x -so unavailable to cmp {}", path.display());
         }
+    }
+
+    /// Regression: `7z a -m0=BCJ -m1=LZMA2` late member cmps; no dict-reset resume.
+    #[test]
+    fn regression_bcj_lzma2_cli_solid_sequential_from_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz = ["7zz", "7z", "7za"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok());
+        let Some(sevenz) = sevenz else {
+            eprintln!("skip: 7z CLI unavailable for BCJ+LZMA2 solid fixture");
+            return;
+        };
+
+        let a_len = 3 * 1024 * 1024;
+        let b_len = 2 * 1024 * 1024;
+        let payload_a: Vec<u8> = (0..a_len)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
+            .collect();
+        let payload_b: Vec<u8> = (0..b_len)
+            .map(|i| ((i as u32).wrapping_mul(1664525).wrapping_add(1013904223) >> 24) as u8)
+            .collect();
+        std::fs::write(dir.path().join("a.bin"), &payload_a).unwrap();
+        std::fs::write(dir.path().join("b.bin"), &payload_b).unwrap();
+        let archive = dir.path().join("bcj-lzma2-solid.7z");
+        let out = std::process::Command::new(sevenz)
+            .args(["a", "-t7z", "-m0=BCJ", "-m1=LZMA2", "-mx=1", "-ms=on"])
+            .arg(&archive)
+            .arg("a.bin")
+            .arg("b.bin")
+            .current_dir(dir.path())
+            .output()
+            .expect("run 7z");
+        if !out.status.success() || !archive.exists() {
+            eprintln!(
+                "skip: 7z BCJ+LZMA2 create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, None, &opts, "0.1.0", true)
+            .expect("open BCJ+LZMA2 solid");
+        let fi_b = m
+            .lookup("/b.bin", 0)
+            .or_else(|| m.lookup("b.bin", 0))
+            .expect("b.bin");
+        let entry_b = m.find_entry(&fi_b).expect("entry b.bin");
+        let folder = &m.archive.folders[entry_b.folder_index.expect("folder")];
+        let has_bcj = folder.content_coders().iter().any(|c| {
+            let mth = c.method.as_slice();
+            mth == parse::METHOD_BCJ || mth == parse::METHOD_BCJ_X86
+        });
+        if !has_bcj {
+            eprintln!(
+                "skip: 7z did not emit a BCJ coder chain ({:?})",
+                folder
+                    .coders
+                    .iter()
+                    .map(|c| format!("{:02x?}", c.method))
+                    .collect::<Vec<_>>()
+            );
+            return;
+        }
+        assert!(
+            !m.member_seek_is_cheap(&fi_b),
+            "BCJ+LZMA2 folder > 4 MiB must use progressive Lzma2MemberReader"
+        );
+        let mut r = m.open(&fi_b, 0).expect("open second member");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload_b, "BCJ+LZMA2 second member must cmp");
+        assert_eq!(
+            m.test_last_resume_unpacked(&fi_b),
+            Some(0),
+            "BCJ must not independent-chunk resume"
+        );
+        assert_eq!(
+            m.test_folder_cache_max_len(),
+            0,
+            "progressive path must not put a full unpack in folder_cache"
+        );
     }
 
     /// Nested compact-only 7z: no SQLite files table; list/open; Arc::ptr_eq path pool.
