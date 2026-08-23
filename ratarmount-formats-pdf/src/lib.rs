@@ -621,6 +621,7 @@ fn cmyk_to_rgb(cmyk: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut rgb = Vec::with_capacity(cmyk.len() / 4 * 3);
+    #[allow(clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
     for chunk in cmyk.chunks_exact(4) {
         let c = u16::from(chunk[0]);
         let m = u16::from(chunk[1]);
