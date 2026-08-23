@@ -45,7 +45,8 @@ use backhand::{
 };
 use ratarmount_compositing::FolderMountSource;
 use ratarmount_core::{
-    FileInfo, ListModeResult, ListResult, MountSource, UserData, S_IFDIR, S_IFLNK, S_IFMT, S_IFREG,
+    CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData, S_IFDIR, S_IFLNK,
+    S_IFMT, S_IFREG,
 };
 use tempfile::TempDir;
 use thiserror::Error;
@@ -447,24 +448,28 @@ impl SquashFsMountSource {
         })
     }
 
-    fn node_to_file_info(path: &str, node: &backhand::Node<SquashfsFileReader>) -> FileInfo {
+    fn node_mode_size(node: &backhand::Node<SquashfsFileReader>) -> (u32, u64) {
         let perms = u32::from(node.header.permissions) & 0o7777;
-        let (mode, size, linkname) = match &node.inner {
-            InnerNode::Dir(_) => (S_IFDIR | perms, 0u64, String::new()),
-            InnerNode::File(f) => (S_IFREG | perms, f.file_len() as u64, String::new()),
-            InnerNode::Symlink(s) => {
-                let link = s.link.to_string_lossy().into_owned();
-                let len = link.len() as u64;
-                (S_IFLNK | perms, len, link)
-            }
+        match &node.inner {
+            InnerNode::Dir(_) => (S_IFDIR | perms, 0),
+            InnerNode::File(f) => (S_IFREG | perms, f.file_len() as u64),
+            InnerNode::Symlink(s) => (S_IFLNK | perms, s.link.to_string_lossy().len() as u64),
             InnerNode::CharacterDevice(_)
             | InnerNode::BlockDevice(_)
             | InnerNode::NamedPipe
             | InnerNode::Socket => {
                 // Expose special nodes as zero-length regular-ish files with original perms;
                 // FUSE open will fail if content is requested.
-                (S_IFREG | perms, 0, String::new())
+                (S_IFREG | perms, 0)
             }
+        }
+    }
+
+    fn node_to_file_info(path: &str, node: &backhand::Node<SquashfsFileReader>) -> FileInfo {
+        let (mode, size) = Self::node_mode_size(node);
+        let linkname = match &node.inner {
+            InnerNode::Symlink(s) => s.link.to_string_lossy().into_owned(),
+            _ => String::new(),
         };
         FileInfo {
             size,
@@ -516,6 +521,32 @@ impl SquashFsMountSource {
             map.insert(name.clone(), Self::node_to_file_info(child_abs, cnode));
         }
         Some(map)
+    }
+
+    fn list_dirents_inprocess(
+        fs: &FilesystemReader<'static>,
+        by_path: &BTreeMap<String, usize>,
+        children: &BTreeMap<String, BTreeMap<String, String>>,
+        path: &str,
+    ) -> Option<Vec<CheapDirent>> {
+        let abs = norm_abs(path);
+        let node = Self::node_at(fs, by_path, &abs)?;
+        if !matches!(node.inner, InnerNode::Dir(_)) {
+            return None;
+        }
+        let empty = BTreeMap::new();
+        let kids = children.get(&abs).unwrap_or(&empty);
+        let mut dents = Vec::with_capacity(kids.len());
+        for (name, child_abs) in kids {
+            let cnode = Self::node_at(fs, by_path, child_abs)?;
+            let (mode, size) = Self::node_mode_size(cnode);
+            dents.push(CheapDirent {
+                name: name.clone(),
+                mode,
+                size,
+            });
+        }
+        Some(dents)
     }
 
     fn read_file_inprocess(
@@ -574,6 +605,17 @@ impl MountSource for SquashFsMountSource {
                 ))
             }
             Backend::Materialized { inner, .. } => inner.list_mode(path),
+        }
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        match &self.backend {
+            Backend::InProcess {
+                fs,
+                by_path,
+                children,
+            } => Self::list_dirents_inprocess(fs, by_path, children, path),
+            Backend::Materialized { inner, .. } => inner.list_dirents(path),
         }
     }
 
@@ -762,6 +804,7 @@ pub fn open_as_mount_source(path: &Path) -> Result<Arc<dyn MountSource>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use backhand::{FilesystemWriter, NodeHeader};
     use std::io::Write;
 
     fn which_mksquashfs() -> Option<PathBuf> {
@@ -1162,5 +1205,44 @@ mod tests {
         let m = SquashFsMountSource::open_from_bytes(bytes, "bytes.squashfs").expect("from_bytes");
         assert!(m.is_inprocess());
         assert_ufo_content(&m);
+    }
+
+    fn squashfs_image_with_file(name: &str, payload: &[u8]) -> Option<Vec<u8>> {
+        let mut fs = FilesystemWriter::default();
+        fs.set_only_root_id();
+        let compressor = FilesystemCompressor::new(Compressor::Gzip, None).ok()?;
+        fs.set_compressor(compressor);
+        let header = NodeHeader {
+            permissions: 0o644,
+            ..NodeHeader::default()
+        };
+        fs.push_file(Cursor::new(payload.to_vec()), name, header)
+            .ok()?;
+        let mut out = Cursor::new(Vec::new());
+        fs.write(&mut out).ok()?;
+        Some(out.into_inner())
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-squash-dirents";
+        let Some(bytes) = squashfs_image_with_file("hello.txt", payload) else {
+            eprintln!("skip: backhand gzip FilesystemWriter failed");
+            return;
+        };
+        let src = SquashFsMountSource::open_from_reader(Cursor::new(bytes), "dirents.squashfs")
+            .expect("open_from_reader");
+        assert!(src.is_inprocess());
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents
+            .iter()
+            .find(|e| e.name == "hello.txt")
+            .expect("hello.txt dirent");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup");
+        assert_eq!(d.size, fi.size);
+        assert_eq!(d.mode, fi.mode);
+        assert_eq!(d.size, payload.len() as u64);
+        assert_ne!(d.size, 0);
     }
 }

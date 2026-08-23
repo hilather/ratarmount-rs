@@ -54,7 +54,7 @@ use std::sync::{Arc, Mutex};
 
 use ext4_view::{Ext4, Ext4Read, FileType, Metadata};
 use ratarmount_compositing::FolderMountSource;
-use ratarmount_core::{FileInfo, ListModeResult, ListResult, MountSource, UserData};
+use ratarmount_core::{CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData};
 use tempfile::TempDir;
 use thiserror::Error;
 
@@ -380,6 +380,37 @@ impl Ext4MountSource {
         .ok()
     }
 
+    fn list_dirents_pure(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let abs = abs_path(path);
+        self.with_fs(|fs| {
+            let mut dents = Vec::new();
+            let iter = fs
+                .read_dir(abs.as_str())
+                .map_err(|e| Ext4Error::Msg(e.to_string()))?;
+            for entry in iter {
+                let entry = entry.map_err(|e| Ext4Error::Msg(e.to_string()))?;
+                let name = entry.file_name();
+                let name_str = match name.as_str() {
+                    Ok(s) => s.to_string(),
+                    Err(_) => format!("{}", name.display()),
+                };
+                if name_str == "." || name_str == ".." {
+                    continue;
+                }
+                let meta = entry
+                    .metadata()
+                    .map_err(|e| Ext4Error::Msg(e.to_string()))?;
+                dents.push(CheapDirent {
+                    name: name_str,
+                    mode: metadata_mode(&meta),
+                    size: metadata_size(&meta),
+                });
+            }
+            Ok(dents)
+        })
+        .ok()
+    }
+
     fn read_file_pure(&self, path: &str) -> io::Result<Vec<u8>> {
         let abs = abs_path(path);
         self.with_fs(|fs| {
@@ -410,6 +441,13 @@ impl MountSource for Ext4MountSource {
                 ))
             }
             Backend::Materialized { inner, .. } => inner.list_mode(path),
+        }
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        match &self.backend {
+            Backend::Pure { .. } | Backend::PureShared { .. } => self.list_dirents_pure(path),
+            Backend::Materialized { inner, .. } => inner.list_dirents(path),
         }
     }
 
@@ -525,7 +563,7 @@ fn open_debugfs_materialized(path: &Path) -> Result<Backend> {
     })
 }
 
-fn metadata_to_file_info(path: &str, meta: &Metadata, linkname: String) -> FileInfo {
+fn metadata_mode(meta: &Metadata) -> u32 {
     let type_bits = match meta.file_type() {
         FileType::Directory => ratarmount_core::S_IFDIR,
         FileType::Regular => ratarmount_core::S_IFREG,
@@ -535,12 +573,23 @@ fn metadata_to_file_info(path: &str, meta: &Metadata, linkname: String) -> FileI
         FileType::BlockDevice => ratarmount_core::S_IFBLK,
         FileType::Socket => ratarmount_core::S_IFSOCK,
     };
-    let mode = type_bits | (u32::from(meta.mode()) & 0o7777);
+    type_bits | (u32::from(meta.mode()) & 0o7777)
+}
+
+fn metadata_size(meta: &Metadata) -> u64 {
+    if meta.is_dir() {
+        0
+    } else {
+        meta.len()
+    }
+}
+
+fn metadata_to_file_info(path: &str, meta: &Metadata, linkname: String) -> FileInfo {
     FileInfo {
-        size: if meta.is_dir() { 0 } else { meta.len() },
+        size: metadata_size(meta),
         // ext4-view Metadata does not expose mtime yet.
         mtime: 0.0,
-        mode,
+        mode: metadata_mode(meta),
         linkname,
         uid: meta.uid(),
         gid: meta.gid(),
@@ -979,5 +1028,23 @@ mod tests {
             .unwrap();
         assert_eq!(sp, sr);
         assert_eq!(sp, "iriya\n");
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let Some(bytes) = any_ext4_bytes() else {
+            eprintln!("skip: no EXT4 fixture and mke2fs unavailable");
+            return;
+        };
+        let src = Ext4MountSource::open_from_reader(Cursor::new(bytes), "dirents.ext4")
+            .expect("open_from_reader");
+        let dents = src.list_dirents("/foo/fighter").expect("dirents");
+        let d = dents.iter().find(|e| e.name == "ufo").expect("ufo dirent");
+        let fi = src.lookup("/foo/fighter/ufo", 0).expect("lookup");
+        assert_eq!(d.size, fi.size);
+        assert_eq!(d.mode, fi.mode);
+        assert_eq!(d.size, 6);
+        assert_ne!(d.size, 0);
     }
 }

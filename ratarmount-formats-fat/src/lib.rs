@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use fatfs::{Dir, FileSystem, FsOptions};
-use ratarmount_core::{FileInfo, ListModeResult, ListResult, MountSource, UserData};
+use ratarmount_core::{CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData};
 use thiserror::Error;
 
 pub const BACKEND_NAME: &str = "FATMountSource";
@@ -170,14 +170,18 @@ fn dos_datetime_to_unix(dt: fatfs::DateTime) -> f64 {
     days * 86400.0 + f64::from(t.hour) * 3600.0 + f64::from(t.min) * 60.0 + f64::from(t.sec)
 }
 
-fn entry_to_file_info(name_path: &str, is_dir: bool, size: u64, mtime: f64) -> FileInfo {
-    let mode = if is_dir {
-        ratarmount_core::S_IFDIR | 0o777
+fn entry_mode_size(is_dir: bool, size: u64) -> (u32, u64) {
+    if is_dir {
+        (ratarmount_core::S_IFDIR | 0o777, 0)
     } else {
-        ratarmount_core::S_IFREG | 0o777
-    };
+        (ratarmount_core::S_IFREG | 0o777, size)
+    }
+}
+
+fn entry_to_file_info(name_path: &str, is_dir: bool, size: u64, mtime: f64) -> FileInfo {
+    let (mode, size) = entry_mode_size(is_dir, size);
     FileInfo {
-        size: if is_dir { 0 } else { size },
+        size,
         mtime,
         mode,
         linkname: String::new(),
@@ -389,6 +393,34 @@ impl FatMountSource {
         .ok()
     }
 
+    fn list_dirents_dir(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let rel = fatfs_rel(path);
+        self.with_fs(|fs| {
+            let root = fs.root_dir();
+            let dir = if rel.is_empty() {
+                root
+            } else {
+                root.open_dir(&rel).map_err(FatError::Io)?
+            };
+            let mut dents = Vec::new();
+            for e in dir.iter() {
+                let e = e.map_err(FatError::Io)?;
+                let name = e.file_name();
+                if name == "." || name == ".." {
+                    continue;
+                }
+                if e.attributes().contains(fatfs::FileAttributes::VOLUME_ID) {
+                    continue;
+                }
+                let is_dir = e.is_dir();
+                let (mode, size) = entry_mode_size(is_dir, e.len());
+                dents.push(CheapDirent { name, mode, size });
+            }
+            Ok(dents)
+        })
+        .ok()
+    }
+
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
         let rel = fatfs_rel(path);
         if rel.is_empty() {
@@ -415,6 +447,10 @@ impl MountSource for FatMountSource {
         Some(ListModeResult::Modes(
             map.into_iter().map(|(k, v)| (k, v.mode)).collect(),
         ))
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.list_dirents_dir(path)
     }
 
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
@@ -611,5 +647,43 @@ mod tests {
             err.to_string().contains("not a FAT") || err.to_string().contains("failed to open"),
             "unexpected error: {err}"
         );
+    }
+
+    fn fat_image_with_file(name: &str, payload: &[u8]) -> Vec<u8> {
+        let mut storage = vec![0u8; 256 * 1024];
+        {
+            let mut cur = Cursor::new(&mut storage[..]);
+            fatfs::format_volume(&mut cur, fatfs::FormatVolumeOptions::new())
+                .expect("format FAT volume");
+        }
+        {
+            let mut cur = Cursor::new(&mut storage[..]);
+            let fs = FileSystem::new(&mut cur, FsOptions::new()).expect("mount formatted FAT");
+            {
+                let mut f = fs.root_dir().create_file(name).expect("create file");
+                f.write_all(payload).expect("write payload");
+                f.flush().ok();
+            }
+        }
+        storage
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-fat-dirents";
+        let bytes = fat_image_with_file("hello.txt", payload);
+        let src = FatMountSource::open_from_reader(Cursor::new(bytes), "dirents.fat")
+            .expect("open_from_reader");
+        let dents = src.list_dirents("/").expect("dirents");
+        let d = dents
+            .iter()
+            .find(|e| e.name.eq_ignore_ascii_case("hello.txt"))
+            .expect("hello.txt dirent");
+        let fi = src.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        assert_eq!(d.size, fi.size);
+        assert_eq!(d.mode, fi.mode);
+        assert_eq!(d.size, payload.len() as u64);
+        assert_ne!(d.size, 0);
     }
 }
