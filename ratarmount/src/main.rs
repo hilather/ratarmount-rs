@@ -272,9 +272,10 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
-    /// Commit write-overlay changes into a TAR (GNU tar; also gzip/bzip2/xz) or ZIP
-    /// (full rebuild). Does not mount; requires `--write-overlay` and a single archive path.
-    /// Create-if-missing for uncompressed `.tar` only; `.tar.zst` remains unsupported offline.
+    /// Commit write-overlay changes into a TAR (uncompressed / gzip / bzip2 / xz via GNU tar,
+    /// or `.tar.zst` via frame splice) or ZIP (full rebuild). Does not mount; requires
+    /// `--write-overlay` and a single archive path.
+    /// Create-if-missing for uncompressed `.tar` only; empty `.tar.zst` is live/write-mount only.
     #[arg(long = "commit-overlay", action = ArgAction::SetTrue)]
     commit_overlay: bool,
 
@@ -380,7 +381,7 @@ fn main() {
         }
         // Expect: archive [mountpoint-ignored]
         if args.paths.is_empty() {
-            eprintln!("error: --commit-overlay requires <archive.tar|archive.zip>");
+            eprintln!("error: --commit-overlay requires <archive.tar|archive.tar.zst|archive.zip>");
             std::process::exit(2);
         }
         let archive = &args.paths[0];
@@ -398,6 +399,7 @@ fn main() {
         let opts = CommitOverlayOptions {
             yes: args.yes,
             debug: args.debug,
+            encoding: args.encoding.clone(),
         };
         match commit_overlay(overlay, archive, &opts) {
             Ok(_) => return,
@@ -411,7 +413,9 @@ fn main() {
     if args.paths.is_empty() {
         eprintln!("usage: ratarmount [options] <archive|folder|URL>... [mountpoint]");
         eprintln!("       ratarmount -u <mountpoint>");
-        eprintln!("       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.zip>");
+        eprintln!(
+            "       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.tar.zst|archive.zip>"
+        );
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
         std::process::exit(2);
     }
@@ -651,7 +655,8 @@ fn main() {
             w.clone()
         };
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
-            Ok(ov) => {
+            Ok(mut ov) => {
+                ov.set_encoding(&args.encoding);
                 let ov = Arc::new(ov);
                 bundle.source = Arc::clone(&ov) as Arc<dyn MountSource>;
                 overlay_arc = Some(ov);
@@ -1880,6 +1885,23 @@ mod nfs_cli_tests {
             Some(std::time::Duration::from_secs(2))
         );
         assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn commit_overlay_threads_encoding_flag() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--commit-overlay",
+            "-w",
+            "/tmp/ov",
+            "-e",
+            "latin1",
+            "a.tar.zst",
+        ])
+        .expect("parse");
+        assert!(a.commit_overlay);
+        assert_eq!(a.encoding, "latin1");
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar.zst")]);
     }
 
     #[test]

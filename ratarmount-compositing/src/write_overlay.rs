@@ -22,7 +22,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{
     create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
-    MountSource, UserData,
+    MountSource, OpenOptions, UserData,
 };
 use ratarmount_formats_tar::{
     find_last_tar_eof, rewrite_tar_suffix, window_has_member_boundary, RewriteTarSuffix,
@@ -82,6 +82,8 @@ pub struct WriteOverlay {
     /// Interval settle must not persist/unlink these: later pwrite would hit
     /// an unlinked inode and the extra bytes would never reach the archive.
     write_fds: Mutex<HashMap<i32, String>>,
+    /// TAR member-name encoding (`-e`); live `.tar.zst` persist. Default utf-8.
+    encoding: String,
 }
 
 impl WriteOverlay {
@@ -112,11 +114,18 @@ impl WriteOverlay {
             interval_disabled: AtomicBool::new(false),
             commit_generation: std::sync::atomic::AtomicU64::new(0),
             write_fds: Mutex::new(HashMap::new()),
+            encoding: "utf-8".into(),
         })
     }
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// Mount `-e` / `--encoding` for live `.tar.zst` persist (ustar/PAX names).
+    /// Defaults to `"utf-8"` inside [`Self::new`]; fuse/nfs tests need not call this.
+    pub fn set_encoding(&mut self, encoding: &str) {
+        self.encoding = encoding.to_string();
     }
 
     /// True after persist-ok + reopen-err; further interval ticks must remount.
@@ -151,94 +160,7 @@ impl WriteOverlay {
     /// - Final component that is a symlink → PermissionDenied (O_NOFOLLOW policy).
     /// - Resolved parent/path must stay under the canonical overlay root.
     fn ensure_under_root(&self, host_path: &Path) -> io::Result<()> {
-        let root = &self.root;
-
-        match fs::symlink_metadata(host_path) {
-            Ok(meta) if meta.file_type().is_symlink() => {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "overlay refuses to follow symlink at {}",
-                        host_path.display()
-                    ),
-                ));
-            }
-            Ok(_) => {
-                let canon = fs::canonicalize(host_path)?;
-                if !path_is_under(root, &canon) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::PermissionDenied,
-                        format!(
-                            "overlay path escapes overlay root: {} not under {}",
-                            canon.display(),
-                            root.display()
-                        ),
-                    ));
-                }
-                return Ok(());
-            }
-            Err(_) => {
-                // Path missing: walk up to an existing ancestor and verify it.
-            }
-        }
-
-        let mut ancestor = host_path.to_path_buf();
-        while ancestor.pop() {
-            match fs::symlink_metadata(&ancestor) {
-                Ok(meta) if meta.file_type().is_symlink() => {
-                    // Intermediate symlink: resolve and require confinement.
-                    let canon = fs::canonicalize(&ancestor).map_err(|e| {
-                        io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "overlay parent symlink not confinable ({}): {e}",
-                                ancestor.display()
-                            ),
-                        )
-                    })?;
-                    if !path_is_under(root, &canon) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "overlay parent symlink escapes overlay root: {} → {}",
-                                ancestor.display(),
-                                canon.display()
-                            ),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Ok(_) => {
-                    let canon = fs::canonicalize(&ancestor)?;
-                    if !path_is_under(root, &canon) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::PermissionDenied,
-                            format!(
-                                "overlay path escapes overlay root: {} not under {}",
-                                canon.display(),
-                                root.display()
-                            ),
-                        ));
-                    }
-                    return Ok(());
-                }
-                Err(_) => continue,
-            }
-        }
-
-        // No existing ancestor found — joined path must still be under root by construction.
-        if path_is_under(root, host_path) {
-            Ok(())
-        } else {
-            Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "overlay path escapes overlay root: {} not under {}",
-                    host_path.display(),
-                    root.display()
-                ),
-            ))
-        }
+        ensure_overlay_under_root(&self.root, host_path)
     }
 
     fn split(path: &str) -> (String, String) {
@@ -899,7 +821,7 @@ impl WriteOverlay {
             let opts = RewriteTarSuffix {
                 deleted_paths: &last_window_deletes,
                 append: &members,
-                encoding: "utf-8",
+                encoding: self.encoding.as_str(),
             };
             // Extra refs so R/W are `&mut dyn …` (Sized); the hook itself is unsized.
             rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
@@ -912,39 +834,7 @@ impl WriteOverlay {
         &self,
         append_entries: &[(String, bool)],
     ) -> Result<Vec<PendingUstar>> {
-        let mut out = Vec::with_capacity(append_entries.len());
-        for (rel, is_dir) in append_entries {
-            let host = self.realpath(rel);
-            let meta = fs::symlink_metadata(&host)?;
-            let mode = meta.mode() & 0o7777;
-            let uid = meta.uid();
-            let gid = meta.gid();
-            let mtime = meta.mtime().max(0) as u64;
-            // Symlink first: `ensure_under_root` refuses the final component.
-            let kind = if meta.file_type().is_symlink() {
-                self.ensure_parent_confined(&host)?;
-                let target = fs::read_link(&host)?;
-                PendingKind::Symlink {
-                    target: target.to_string_lossy().into_owned(),
-                }
-            } else if *is_dir || meta.file_type().is_dir() {
-                self.ensure_under_root(&host)?;
-                PendingKind::Directory
-            } else {
-                self.ensure_under_root(&host)?;
-                PendingKind::FileOnDisk { size: meta.len() }
-            };
-            out.push(PendingUstar {
-                path: rel.clone(),
-                host,
-                kind,
-                mode,
-                uid,
-                gid,
-                mtime,
-            });
-        }
-        Ok(out)
+        collect_ustar_pending_at(&self.root, append_entries)
     }
 
     /// Confinement for rename endpoints: `rename(2)` never follows symlinks,
@@ -962,24 +852,7 @@ impl WriteOverlay {
 
     /// Confine a symlink's parent without following the final component.
     fn ensure_parent_confined(&self, host_path: &Path) -> io::Result<()> {
-        let parent = host_path.parent().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "overlay symlink has no parent",
-            )
-        })?;
-        let canon = fs::canonicalize(parent)?;
-        if !path_is_under(&self.root, &canon) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                format!(
-                    "overlay symlink parent escapes overlay root: {} not under {}",
-                    canon.display(),
-                    self.root.display()
-                ),
-            ));
-        }
-        Ok(())
+        ensure_overlay_parent_confined(&self.root, host_path)
     }
 
     fn persist_uncompressed_tar_plan(
@@ -1280,6 +1153,161 @@ fn path_is_under(root: &Path, candidate: &Path) -> bool {
     candidate.starts_with(root)
 }
 
+fn overlay_host_path(overlay_root: &Path, rel: &str) -> PathBuf {
+    let path = normpath(rel);
+    if path == "/" {
+        overlay_root.to_path_buf()
+    } else {
+        overlay_root.join(path.trim_start_matches('/'))
+    }
+}
+
+fn ensure_overlay_under_root(root: &Path, host_path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(host_path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "overlay refuses to follow symlink at {}",
+                    host_path.display()
+                ),
+            ));
+        }
+        Ok(_) => {
+            let canon = fs::canonicalize(host_path)?;
+            if !path_is_under(root, &canon) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!(
+                        "overlay path escapes overlay root: {} not under {}",
+                        canon.display(),
+                        root.display()
+                    ),
+                ));
+            }
+            return Ok(());
+        }
+        Err(_) => {
+            // Path missing: walk up to an existing ancestor and verify it.
+        }
+    }
+
+    let mut ancestor = host_path.to_path_buf();
+    while ancestor.pop() {
+        match fs::symlink_metadata(&ancestor) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                let canon = fs::canonicalize(&ancestor).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "overlay parent symlink not confinable ({}): {e}",
+                            ancestor.display()
+                        ),
+                    )
+                })?;
+                if !path_is_under(root, &canon) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "overlay parent symlink escapes overlay root: {} → {}",
+                            ancestor.display(),
+                            canon.display()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Ok(_) => {
+                let canon = fs::canonicalize(&ancestor)?;
+                if !path_is_under(root, &canon) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        format!(
+                            "overlay path escapes overlay root: {} not under {}",
+                            canon.display(),
+                            root.display()
+                        ),
+                    ));
+                }
+                return Ok(());
+            }
+            Err(_) => continue,
+        }
+    }
+
+    if path_is_under(root, host_path) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "overlay path escapes overlay root: {} not under {}",
+                host_path.display(),
+                root.display()
+            ),
+        ))
+    }
+}
+
+fn ensure_overlay_parent_confined(root: &Path, host_path: &Path) -> io::Result<()> {
+    let parent = host_path.parent().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "overlay symlink has no parent",
+        )
+    })?;
+    let canon = fs::canonicalize(parent)?;
+    if !path_is_under(root, &canon) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "overlay symlink parent escapes overlay root: {} not under {}",
+                canon.display(),
+                root.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+fn collect_ustar_pending_at(
+    overlay_root: &Path,
+    append_entries: &[(String, bool)],
+) -> Result<Vec<PendingUstar>> {
+    let mut out = Vec::with_capacity(append_entries.len());
+    for (rel, is_dir) in append_entries {
+        let host = overlay_host_path(overlay_root, rel);
+        let meta = fs::symlink_metadata(&host)?;
+        let mode = meta.mode() & 0o7777;
+        let uid = meta.uid();
+        let gid = meta.gid();
+        let mtime = meta.mtime().max(0) as u64;
+        let kind = if meta.file_type().is_symlink() {
+            ensure_overlay_parent_confined(overlay_root, &host)?;
+            let target = fs::read_link(&host)?;
+            PendingKind::Symlink {
+                target: target.to_string_lossy().into_owned(),
+            }
+        } else if *is_dir || meta.file_type().is_dir() {
+            ensure_overlay_under_root(overlay_root, &host)?;
+            PendingKind::Directory
+        } else {
+            ensure_overlay_under_root(overlay_root, &host)?;
+            PendingKind::FileOnDisk { size: meta.len() }
+        };
+        out.push(PendingUstar {
+            path: rel.clone(),
+            host,
+            kind,
+            mode,
+            uid,
+            gid,
+            mtime,
+        });
+    }
+    Ok(out)
+}
+
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes())
@@ -1293,6 +1321,8 @@ pub struct CommitOverlayOptions {
     pub yes: bool,
     /// Verbosity: 0 = quiet, 1+ = print plan (Python `printDebug`).
     pub debug: u8,
+    /// TAR member-name encoding (`-e` / `--encoding`). Default `"utf-8"`.
+    pub encoding: String,
 }
 
 impl Default for CommitOverlayOptions {
@@ -1300,14 +1330,16 @@ impl Default for CommitOverlayOptions {
         Self {
             yes: false,
             debug: 1,
+            encoding: "utf-8".into(),
         }
     }
 }
 
 /// Apply overlay folder modifications to a TAR or ZIP archive.
 ///
-/// **TAR** (GNU tar): supports uncompressed TAR and gzip / bzip2 / xz compressed TAR
-/// via decompress → `tar --delete` / `tar --append` → recompress.
+/// **TAR**: uncompressed TAR and gzip / bzip2 / xz compressed TAR via GNU tar
+/// (decompress → `tar --delete` / `tar --append` → recompress). `.tar.zst` uses
+/// in-tree last-window / earlier-frame zstd splice (no GNU tar).
 ///
 /// **ZIP** (full rebuild, not in-place): rebuilds a new ZIP from the base archive plus
 /// overlay adds/deletes. Unchanged members are raw-copied (preserves store/deflate and
@@ -1764,20 +1796,31 @@ fn rebuild_zip_with_overlay(
     Ok(())
 }
 
-/// Apply overlay to TAR (GNU tar) — uncompressed or gzip/bzip2/xz.
+/// Apply overlay to TAR — `.tar.zst` splice, else GNU tar (uncompressed / gzip / bzip2 / xz).
 fn commit_overlay_tar(
     write_overlay: &Path,
     tar_file: &Path,
     opts: &CommitOverlayOptions,
 ) -> Result<bool> {
-    ensure_gnu_tar()?;
-
     let format = detect_compression(tar_file).map_err(|e| {
         OverlayError::Msg(format!(
             "Failed to detect compression for '{}': {e}",
             tar_file.display()
         ))
     })?;
+
+    if format == CompressionFormat::Zstd {
+        if !looks_like_tar_zst(tar_file)? {
+            return Err(OverlayError::Msg(
+                "Currently, commit-overlay supports ZIP, uncompressed TAR, gzip/bzip2/xz \
+                 compressed TAR, and .tar.zst (got Zstd; plain .zst is not a TAR)."
+                    .into(),
+            ));
+        }
+        return commit_overlay_tar_zst(write_overlay, tar_file, opts);
+    }
+
+    ensure_gnu_tar()?;
 
     // Keep materialized temp alive until recompress finishes.
     let (work_tar, _materialized): (PathBuf, Option<tempfile::NamedTempFile>) = match format {
@@ -1809,8 +1852,8 @@ fn commit_overlay_tar(
         }
         other => {
             return Err(OverlayError::Msg(format!(
-                "Currently, commit-overlay supports ZIP, uncompressed TAR, and \
-                 gzip/bzip2/xz compressed TAR (got {other:?})."
+                "Currently, commit-overlay supports ZIP, uncompressed TAR, gzip/bzip2/xz \
+                 compressed TAR, and .tar.zst (got {other:?})."
             )));
         }
     };
@@ -1927,6 +1970,111 @@ fn commit_overlay_tar(
     }
 
     if opts.debug >= 1 {
+        println!(
+            "Committed successfully. You can now remove the overlay folder at {}.",
+            write_overlay.display()
+        );
+    }
+    Ok(true)
+}
+
+/// Offline `.tar.zst`: splice from the affected frame (append-only uses last-N).
+/// Never GNU tar / materialize / recompress. Splice already persists atomically.
+fn commit_overlay_tar_zst(
+    write_overlay: &Path,
+    tar_file: &Path,
+    opts: &CommitOverlayOptions,
+) -> Result<bool> {
+    let plan = collect_overlay_commit_plan(write_overlay)?;
+    if plan.is_empty() {
+        if opts.debug >= 1 {
+            println!("Nothing to commit.");
+        }
+        return Ok(false);
+    }
+
+    if opts.debug >= 1 {
+        println!(
+            "To commit the overlay folder to '{}', ratarmount will splice zstd frames \
+             (prefix copy + rewrite from the affected frame; no GNU tar).",
+            tar_file.display()
+        );
+        println!();
+        println!("Committing is an experimental feature!");
+    }
+
+    if !confirm_commit(opts)? {
+        if opts.debug >= 1 {
+            println!("Canceled");
+        }
+        return Ok(false);
+    }
+
+    let map = scan_zstd_frames_path(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let body = open_seekable_zstd(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let index_opts = OpenOptions {
+        write_index: false,
+        index_in_memory: true,
+        encoding: opts.encoding.clone(),
+        ..OpenOptions::default()
+    };
+    let base = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        tar_file,
+        body,
+        None,
+        &index_opts,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+
+    let mut rewrite_deletes = HashSet::new();
+    let mut ohs = Vec::new();
+    for path in &plan.deleted_paths {
+        let path_ohs = all_tar_offsetheaders(&base, path)?;
+        if path_ohs.is_empty() {
+            // Overlay-only add: walk marks replace=delete+append, but the name
+            // is not in the archive. rewrite_tar_suffix errors on a missing delete.
+            continue;
+        }
+        rewrite_deletes.insert(path.clone());
+        ohs.extend(path_ohs);
+    }
+    ohs.sort_unstable();
+    ohs.dedup();
+
+    let from_idx = if ohs.is_empty() {
+        find_last_n_tar_window(tar_file, &map)?.0
+    } else {
+        offline_tar_zst_from_idx(tar_file, &map, ohs[0])?
+    };
+
+    let window_plain: u64 = map.frames[from_idx..]
+        .iter()
+        .map(|f| f.uncompressed_size)
+        .sum();
+    warn_large_zstd_window(window_plain);
+
+    let overlay_root = write_overlay.canonicalize().map_err(OverlayError::Io)?;
+    let pending = collect_ustar_pending_at(&overlay_root, &plan.append_entries)?;
+    let encoding = opts.encoding.clone();
+
+    splice_zstd_last_frames_replace(tar_file, from_idx, |mut suffix, stream_offset, mut out| {
+        let members: Vec<UstarMember<'_>> = pending.iter().map(PendingUstar::as_member).collect();
+        let rewrite = RewriteTarSuffix {
+            deleted_paths: &rewrite_deletes,
+            append: &members,
+            encoding: encoding.as_str(),
+        };
+        rewrite_tar_suffix(&mut suffix, stream_offset, &rewrite, &mut out).map(|_| ())
+    })
+    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+
+    if opts.debug >= 1 {
+        let prefix = map.frames[from_idx].compressed_offset;
+        println!(
+            "Committed .tar.zst ({} frames, from_idx={from_idx}, prefix {prefix} bytes copied).",
+            map.frames.len()
+        );
         println!(
             "Committed successfully. You can now remove the overlay folder at {}.",
             write_overlay.display()
@@ -2204,9 +2352,59 @@ fn earlier_frame_err(path: &str) -> OverlayError {
         "error: live overlay commit for .tar.zst is append-only (and last-frame replace/delete);\n\
                '{shown}' has a version in an earlier zstd frame\n\
                (delete would undelete that copy). The whole commit was skipped\n\
-               (including pending appends). Undo the delete or omit\n\
-               --commit-overlay-interval / --commit-overlay-on-exit."
+               (including pending appends). Undo the delete, omit\n\
+               --commit-overlay-interval / --commit-overlay-on-exit, or use offline\n\
+               --commit-overlay (rewrites from the affected frame)."
     ))
+}
+
+fn frame_covering_uncomp(map: &ZstdFrameMap, uncomp: u64) -> Result<usize> {
+    map.frames
+        .iter()
+        .enumerate()
+        .find_map(|(i, f)| {
+            let start = f.uncompressed_offset;
+            let end = start.saturating_add(f.uncompressed_size);
+            (uncomp >= start && uncomp < end).then_some(i)
+        })
+        .ok_or_else(|| {
+            OverlayError::Msg(format!(
+                "offline .tar.zst commit: offsetheader {uncomp} is not inside any zstd frame"
+            ))
+        })
+}
+
+fn suffix_window_has_member_boundary(
+    src: &mut File,
+    map: &ZstdFrameMap,
+    from_idx: usize,
+) -> Result<bool> {
+    let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
+    decode_zstd_frames_to(src, map, from_idx, &mut suffix)
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    suffix.seek(SeekFrom::Start(0))?;
+    let stream_offset = map.frames[from_idx].uncompressed_offset;
+    window_has_member_boundary(&mut suffix, stream_offset)
+        .map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+/// Ceiling `from_idx`: never start rewrite after the affected member; grow the
+/// window backward until the suffix has a TAR member boundary.
+fn offline_tar_zst_from_idx(archive: &Path, map: &ZstdFrameMap, min_oh: u64) -> Result<usize> {
+    if map.frames.is_empty() {
+        return Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()));
+    }
+    let from_idx0 = frame_covering_uncomp(map, min_oh)?;
+    let mut from_idx = from_idx0;
+    let mut src = File::open(archive)?;
+    while from_idx > 0 {
+        if suffix_window_has_member_boundary(&mut src, map, from_idx)? {
+            break;
+        }
+        from_idx -= 1;
+    }
+    debug_assert!(from_idx <= from_idx0);
+    Ok(from_idx)
 }
 
 fn classify_tar_zst_path(
@@ -2561,6 +2759,7 @@ mod tests {
         let opts = CommitOverlayOptions {
             yes: true,
             debug: 0,
+            ..Default::default()
         };
         commit_overlay(&overlay, &zip_path, &opts).expect("commit_overlay zip");
 
@@ -2656,6 +2855,7 @@ mod tests {
         let opts = CommitOverlayOptions {
             yes: true,
             debug: 0,
+            ..Default::default()
         };
         commit_overlay(&overlay, &zip_path, &opts).expect("commit_overlay zip replace/delete");
 
@@ -2730,6 +2930,7 @@ mod tests {
         let opts = CommitOverlayOptions {
             yes: true,
             debug: 0,
+            ..Default::default()
         };
         match commit_overlay(&overlay, &tar, &opts) {
             Ok(_) => {}
@@ -2782,6 +2983,7 @@ mod tests {
         let opts = CommitOverlayOptions {
             yes: true,
             debug: 0,
+            ..Default::default()
         };
         match commit_overlay(&overlay, &tgz, &opts) {
             Ok(_) => {}
@@ -2828,6 +3030,318 @@ mod tests {
         assert!(st.success());
         let body = fs::read_to_string(extract.join("new.txt")).unwrap();
         assert_eq!(body, "hello gzip commit\n");
+    }
+
+    fn yes_commit_opts() -> CommitOverlayOptions {
+        CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+            ..Default::default()
+        }
+    }
+
+    fn sibling_index_sqlite_paths(dir: &Path) -> Vec<PathBuf> {
+        let mut out: Vec<PathBuf> = fs::read_dir(dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.contains(".index.sqlite"))
+            })
+            .collect();
+        out.sort();
+        out
+    }
+
+    fn padded_ustar_span(payload_len: usize) -> usize {
+        512 + payload_len.div_ceil(512) * 512
+    }
+
+    /// Regression: offline --commit-overlay appends into multi-frame .tar.zst
+    /// without rewriting prefix frames.
+    #[test]
+    fn commit_overlay_tar_zst_multi_frame_append() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-mf-prefix");
+        let last = generated_payload("off-mf-last");
+        let extra = generated_payload("off-mf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let rewrite_start = map.frames.last().unwrap().compressed_offset as usize;
+        let prefix_bytes = before[..rewrite_start].to_vec();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..rewrite_start],
+            prefix_bytes.as_slice(),
+            "prefix frames must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    /// Regression: offline --commit-overlay last-window replace keeps one name.
+    #[test]
+    fn commit_overlay_tar_zst_last_window_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-rw-prefix");
+        let old = generated_payload("off-rw-old");
+        let new = generated_payload("off-rw-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &old)],
+            false,
+        );
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("last.txt"), &new).unwrap();
+
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), new);
+        let names = src.list("/").expect("list");
+        let n = match names {
+            ListResult::Infos(m) => m.keys().filter(|k| *k == "last.txt").count(),
+            ListResult::Names(v) => v.iter().filter(|k| *k == "last.txt").count(),
+        };
+        assert_eq!(n, 1, "replaced name must appear once");
+    }
+
+    /// Regression: prefix-frame delete via offline --commit-overlay.
+    #[test]
+    fn commit_overlay_tar_zst_earlier_frame_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = generated_payload("off-ef-keep");
+        let old = generated_payload("off-ef-old");
+        let last = generated_payload("off-ef-last");
+        let archive = dir.path().join("a.tar.zst");
+        let f0 = pack_tar_no_eof(&[ustar_file("keep.txt", &keep)]);
+        let f1 = pack_tar_no_eof(&[ustar_file("old.txt", &old)]);
+        let mut f2 = pack_tar_no_eof(&[ustar_file("last.txt", &last)]);
+        ratarmount_formats_tar::write_tar_eof(&mut f2).unwrap();
+        fs::write(&archive, concat_zstd_frames(&[&f0, &f1, &f2], false)).unwrap();
+
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.frames.len() >= 3);
+        let prefix_end = map.frames[1].compressed_offset as usize;
+        let prefix_bytes = before[..prefix_end].to_vec();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/old.txt").expect("unlink prefix-frame member");
+        drop(ov);
+
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix before rewrite start must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert!(
+            src.lookup("/old.txt", 0).is_none(),
+            "deleted name must be gone"
+        );
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), keep);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+    }
+
+    /// Regression: offsetheader in frame k but header straddles k−1/k
+    /// (frame k starts mid-member). from_idx is a ceiling, not a floor.
+    #[test]
+    fn commit_overlay_tar_zst_header_straddle_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let keep = generated_payload("off-hs-keep");
+        let big = generated_payload("off-hs-big").repeat(200);
+        let gone = generated_payload("off-hs-gone");
+        let last = generated_payload("off-hs-last");
+        let tar = pack_tar(&[
+            ustar_file("keep.txt", &keep),
+            ustar_file("big.bin", &big),
+            ustar_file("gone.txt", &gone),
+            ustar_file("last.txt", &last),
+        ]);
+        let keep_end = padded_ustar_span(keep.len());
+        let mid_big = keep_end + 512 + big.len() / 2;
+        assert!(mid_big < keep_end + padded_ustar_span(big.len()));
+        let archive = dir.path().join("a.tar.zst");
+        fs::write(
+            &archive,
+            concat_zstd_frames(
+                &[&tar[..keep_end], &tar[keep_end..mid_big], &tar[mid_big..]],
+                false,
+            ),
+        )
+        .unwrap();
+
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert_eq!(map.frames.len(), 3);
+        let base = open_tar_zst_base(&archive, false);
+        let ohs = all_tar_offsetheaders(base.as_ref(), "gone.txt").expect("ohs");
+        let min_oh = *ohs.iter().min().expect("oh");
+        let k = frame_covering_uncomp(&map, min_oh).expect("frame k");
+        assert_eq!(k, 2, "gone.txt header must live in frame 2");
+        let from_idx = offline_tar_zst_from_idx(&archive, &map, min_oh).expect("from_idx");
+        assert!(
+            from_idx <= k,
+            "from_idx is a ceiling (never start after the member): from_idx={from_idx} k={k}"
+        );
+
+        let before = fs::read(&archive).unwrap();
+        let prefix_km1 = map.frames[k - 1].compressed_offset as usize;
+        let prefix_bytes = before[..prefix_km1].to_vec();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(Arc::clone(&base), &overlay);
+        ov.unlink("/gone.txt")
+            .expect("unlink straddling-window name");
+        drop(ov);
+
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_km1],
+            prefix_bytes.as_slice(),
+            "prefix before k-1 must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert!(src.lookup("/gone.txt", 0).is_none());
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), keep);
+        assert_eq!(read_member(src.as_ref(), "/big.bin"), big);
+        assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+    }
+
+    /// Regression: offline --commit-overlay must not create a sibling *.index.sqlite.
+    #[test]
+    fn commit_overlay_tar_zst_no_durable_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("off-idx-seed");
+        let extra = generated_payload("off-idx-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let preexisting = dir.path().join("preexisting.index.sqlite");
+        fs::write(&preexisting, b"leave-me").unwrap();
+        let before_sidecars = sibling_index_sqlite_paths(dir.path());
+        let before_pre = fs::read(&preexisting).unwrap();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+
+        let after_sidecars = sibling_index_sqlite_paths(dir.path());
+        assert_eq!(
+            after_sidecars, before_sidecars,
+            "commit must not create or rename index sidecars: {after_sidecars:?}"
+        );
+        assert_eq!(fs::read(&preexisting).unwrap(), before_pre);
+        let archive_name = archive.file_name().unwrap().to_string_lossy();
+        let next_to = archive.with_file_name(format!("{archive_name}.index.sqlite"));
+        assert!(!next_to.exists(), "must not write {}", next_to.display());
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn commit_overlay_tar_zst_single_frame_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("off-sf-seed");
+        let extra = generated_payload("off-sf-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn commit_overlay_tar_zst_seek_table_rewrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-st-prefix");
+        let last = generated_payload("off-st-last");
+        let extra = generated_payload("off-st-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            true,
+        );
+        let before = fs::read(&archive).unwrap();
+        assert!(seek_table_footer_present(&before));
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let rewrite_start = map.frames.last().unwrap().compressed_offset as usize;
+        let prefix_bytes = before[..rewrite_start].to_vec();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(&after[..rewrite_start], prefix_bytes.as_slice());
+        assert!(
+            seek_table_footer_present(&after),
+            "seek-table footer must be rewritten"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    #[test]
+    fn commit_overlay_tar_zst_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("off-empty");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let committed = commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit");
+        assert!(!committed);
+        assert_eq!(fs::read(&archive).unwrap(), before);
+    }
+
+    #[test]
+    fn commit_overlay_plain_zst_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("plain.zst");
+        let zst = ratarmount_compress::encode_zstd_frame(b"not-a-tar-body", 3).unwrap();
+        fs::write(&archive, zst).unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("x.txt"), b"x").unwrap();
+        let err = commit_overlay(&overlay, &archive, &yes_commit_opts())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("got Zstd"), "{err}");
+        assert!(err.contains("not a TAR"), "{err}");
     }
 
     /// Minimal immutable empty base for WriteOverlay construction in tests.
