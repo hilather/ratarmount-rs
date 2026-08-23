@@ -47,6 +47,8 @@ tests/nested-symlinks.tar	foo/fighter/foo	2709a3348eb2c52302a7606ecf5860bc
 tests/truncated.tar	foo/foo	5753d2a2da40d04ad7f3cc7a024b6e90
 tests/nested-tar-with-overlapping-name.tar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/simple-file-split-in-archive.tar	simple-file-split.001	d3b07384d113edec49eaa6238ad5ff00
+# Split uncompressed TAR volumes (.001+.002 joined at open)
+tests/single-file-split.tar.001	bar	d3b07384d113edec49eaa6238ad5ff00
 # GNU / PAX sparse (512B / 513B / 1MiB)
 tests/sparse.gnu.tar	sparse-512B	bf619eac0cdf3f68d496ea9344137e8b
 tests/sparse.gnu.tar	sparse-513B	370a398ecaff897a26df4747c2036ee5
@@ -82,3 +84,4 @@ tests/single-file-incremental-long-name.tar	000000000100000000020000000003000000
 # - updated-file-implicitly-with-folder full .versions/* — partial (latest paths only above;
 #   foo.versions/2/fighter and bar/par/sora/natsu missing vs Python)
 # - hardlink.tar hardlink/ufo — empty content (d41d8…) vs Python 2709… (allowlist keeps observed empty)
+# - denormal-paths-tarfile.tar — md5 mismatch vs GNU-tar-cleaned denormal-paths.tar (Python tarfile also skips most members)

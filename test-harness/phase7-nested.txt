@@ -21,6 +21,8 @@ tests/zip.7z	natsu.zip/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/zip.7z	natsu.zip/foo	10d6977ec2ab378e60339323c24f9308
 tests/rar.zip	natsu.rar/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/rar.zip	natsu.rar/foo	10d6977ec2ab378e60339323c24f9308
+tests/zip.rar	natsu.zip/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/zip.rar	natsu.zip/foo	10d6977ec2ab378e60339323c24f9308
 # Nested store-method (Copy) 7z containing another 7z
 tests/nested-inner-hello.7z	inner-hello.7z/hello.txt	b96fce030fad4a580a9fa12bd3cac829
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.bz2/ufo	2709a3348eb2c52302a7606ecf5860bc
@@ -28,9 +30,18 @@ tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.gz/ufo	2709a334
 tests/nested-directly-compressed.tar.bz2	directly-compressed/ufo.xz/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.sqlar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-tar-compressed.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar-compressed.sqlar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-tar-trailing-slash.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-tar-denormal.sqlar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.asar	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/nested-tar.asar	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+# Nested TAR inside lz4 with a skippable frame
+tests/nested-tar.skippable-frame.lz4	foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
+tests/nested-tar.skippable-frame.lz4	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+# Nested TAR inside EXT4 images (outer .bz2; factory decompresses)
+tests/nested-tar-1M.ext4.bz2	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
+tests/nested-tar-10M.ext4.bz2	foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
 # Double-compressed nest (outer strip names as .tar.gz / .tar.bz2 / .tar.7z)
 tests/double-compressed-nested-tar.tgz.tgz	nested-tar.tar.gz/foo/fighter/ufo	2709a3348eb2c52302a7606ecf5860bc
 tests/double-compressed-nested-tar.tgz.tgz	nested-tar.tar.gz/foo/lighter.tar/fighter/bar	2b87e29fca6ee7f1df6c1a76cb58e101
@@ -46,6 +57,9 @@ tests/nested-tar-in-cpio.newc.cpio	readme.txt	614c22982b489667d878611e15276c51
 # Residual skips:
 # - nested-tar.tar.pzstd — WrongMagicNumber (pzstd frame)
 # - nested-tar-trailing-slash.sqlar / nested-tar-denormal.sqlar — nested lighter.tar path missing
+#   (foo/fighter/ufo listed above)
 # - 2k-recursive-tars.tar.bz2 — heavy (~800 nested opens); only low-numbered .tar/foo present;
 #   Python high indices (01234/01333/02000) missing under Rust auto-mount caps
 # - triple-compressed-nested-tar.tgz.tgz.gz — outer strip incomplete (stops at compressed member file)
+# - nested-with-symlink.rar — libarchive: Can't decompress an entry marked as a directory
+# - gzip-only packed-100-times / compressed-100-times — skip (slow; gzip)

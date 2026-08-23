@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Complex-usage subset: multi-source union, write overlay, commit-overlay (tar/gz/zip), B-4.
+# Complex-usage subset: multi-source union, write overlay, commit-overlay (tar/gz/zip), B-4,
+# versioned FUSE (.versions on updated-file.tar).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -373,6 +374,74 @@ if command -v zip >/dev/null && command -v unzip >/dev/null; then
     fi
 else
     echo "  [skip] commit-overlay zip (need zip + unzip)"
+fi
+
+# --- Versioned files FUSE: updated-file.tar latest vs .versions/1,2,3 ---
+# md5s match phase2-tar.txt (b3de7534… latest/v3, 2709a334… v1, 9a12be5e… v2).
+UPDATED="${RATARMOUNT_PY_ROOT:+$RATARMOUNT_PY_ROOT/tests/updated-file.tar}"
+if [[ ! -e /dev/fuse ]]; then
+    echo "  [skip] versioned FUSE: /dev/fuse missing"
+elif [[ -z "${UPDATED}" || ! -f "$UPDATED" ]]; then
+    echo "  [skip] versioned FUSE: tests/updated-file.tar missing (set RATARMOUNT_PY_ROOT)"
+else
+    mp="$WORKDIR/mnt-versions"
+    mkdir -p "$mp"
+    echo "  [run] versioned FUSE updated-file.tar"
+    "$RATARMOUNT_CMD" -f -c --ignore-zeros --file-versions "$UPDATED" "$mp" \
+        >"$WORKDIR/versions.log" 2>&1 &
+    MOUNT_PIDS+=($!)
+    if ! wait_mounted "$mp"; then
+        echo "  [FAIL] versioned FUSE mount"
+        cat "$WORKDIR/versions.log" || true
+        failed=1
+    else
+        latest="$mp/foo/fighter/ufo"
+        v1="$mp/foo/fighter/ufo.versions/1"
+        v2="$mp/foo/fighter/ufo.versions/2"
+        v3="$mp/foo/fighter/ufo.versions/3"
+        check_ver_md5() {
+            local path=$1 want=$2 label=$3
+            if [[ ! -f "$path" ]]; then
+                echo "  [FAIL] versioned FUSE missing $label"
+                return 1
+            fi
+            local got
+            got=$(md5sum -- "$path" | awk '{print $1}')
+            if [[ "$got" != "$want" ]]; then
+                echo "  [FAIL] versioned FUSE $label md5 $got want $want"
+                return 1
+            fi
+            return 0
+        }
+        ver_ok=1
+        check_ver_md5 "$latest" "b3de7534cbc8b8a7270c996235d0c2da" "latest" || ver_ok=0
+        check_ver_md5 "$v1" "2709a3348eb2c52302a7606ecf5860bc" "v1" || ver_ok=0
+        check_ver_md5 "$v2" "9a12be5ebb21d497bd1024d159f2cc5f" "v2" || ver_ok=0
+        check_ver_md5 "$v3" "b3de7534cbc8b8a7270c996235d0c2da" "v3" || ver_ok=0
+        if [[ $ver_ok -eq 1 ]]; then
+            if ! cmp -s "$latest" "$v3"; then
+                echo "  [FAIL] versioned FUSE cmp latest vs v3 (should be identical)"
+                ver_ok=0
+            fi
+            if cmp -s "$latest" "$v1"; then
+                echo "  [FAIL] versioned FUSE cmp latest vs v1 (should differ)"
+                ver_ok=0
+            fi
+            if cmp -s "$latest" "$v2"; then
+                echo "  [FAIL] versioned FUSE cmp latest vs v2 (should differ)"
+                ver_ok=0
+            fi
+        fi
+        if [[ $ver_ok -eq 1 ]]; then
+            echo "  [ok] versioned FUSE latest==v3, differs v1/v2"
+        else
+            ls -laR "$mp/foo/fighter" 2>/dev/null || true
+            cat "$WORKDIR/versions.log" || true
+            failed=1
+        fi
+        ratar_unmount "$mp"
+        wait "${MOUNT_PIDS[-1]}" 2>/dev/null || true
+    fi
 fi
 
 if [[ $failed -ne 0 ]]; then
