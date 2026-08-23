@@ -10,7 +10,7 @@ use std::sync::Mutex;
 
 use git2::{ObjectType, Oid, Repository, Tree};
 use ratarmount_core::{
-    create_root_file_info, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    create_root_file_info, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData,
 };
 use thiserror::Error;
 
@@ -243,6 +243,38 @@ impl GitMountSource {
         .ok()
         .flatten()
     }
+
+    /// Cheap readdir: tree entry `filemode` + blob `size()`, no `FileInfo` userdata.
+    fn list_dirents_inner(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.with_repo(|repo| {
+            let obj = match self.look_up_path(repo, path)? {
+                Some(o) => o,
+                None => return Ok(None),
+            };
+            let tree = match obj.into_tree() {
+                Ok(t) => t,
+                Err(_) => return Ok(None),
+            };
+            let mut dents = Vec::new();
+            for entry in tree.iter() {
+                let name = match entry.name() {
+                    Some(n) => n.to_string(),
+                    None => continue,
+                };
+                let child = entry.to_object(repo)?;
+                let mode = Self::convert_mode(&child, entry.filemode());
+                let size = if mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFREG {
+                    child.peel_to_blob().map(|b| b.size() as u64).unwrap_or(0)
+                } else {
+                    0
+                };
+                dents.push(CheapDirent { name, mode, size });
+            }
+            Ok(Some(dents))
+        })
+        .ok()
+        .flatten()
+    }
 }
 
 fn default_reference(repo: &Repository) -> String {
@@ -270,6 +302,10 @@ impl MountSource for GitMountSource {
         Some(ListModeResult::Modes(
             map.into_iter().map(|(k, v)| (k, v.mode)).collect(),
         ))
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.list_dirents_inner(path)
     }
 
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
@@ -376,5 +412,91 @@ mod tests {
             r.read_to_string(&mut s).unwrap();
             assert!(s.contains("[workspace]") || s.contains("ratarmount"));
         }
+    }
+
+    fn commit_workdir(dir: &Path) -> git2::Repository {
+        let repo = git2::Repository::init(dir).unwrap();
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["."].iter(), git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        let tree = repo.find_tree(tree_id).unwrap();
+        let sig = git2::Signature::now("ratarmount", "ratarmount@example.test").unwrap();
+        repo.commit(Some("HEAD"), &sig, &sig, "init", &tree, &[])
+            .unwrap();
+        drop(tree);
+        repo
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let hello = b"hello-git-dirents";
+        std::fs::write(dir.path().join("hello.txt"), hello).unwrap();
+        std::fs::create_dir(dir.path().join("sub")).unwrap();
+        std::fs::write(dir.path().join("sub").join("nested.bin"), b"abcd").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let exec = dir.path().join("run.sh");
+            std::fs::write(&exec, b"#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exec, std::fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("hello.txt", dir.path().join("link")).unwrap();
+        }
+        let _repo = commit_workdir(dir.path());
+
+        let src = GitMountSource::open(dir.path(), None).unwrap();
+        let dents = src.list_dirents("/").expect("dirents");
+        let by_name: BTreeMap<_, _> = dents
+            .into_iter()
+            .map(|d| (d.name, (d.mode, d.size)))
+            .collect();
+
+        let hello_fi = src.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        let (hello_mode, hello_size) = by_name.get("hello.txt").copied().expect("hello.txt dirent");
+        assert_eq!(hello_size, hello.len() as u64);
+        assert_eq!(hello_size, hello_fi.size);
+        assert_eq!(hello_mode, hello_fi.mode);
+        assert_eq!(
+            hello_mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+
+        let sub_fi = src.lookup("/sub", 0).expect("lookup sub");
+        let (sub_mode, sub_size) = by_name.get("sub").copied().expect("sub dirent");
+        assert_eq!(sub_size, 0);
+        assert_eq!(sub_size, sub_fi.size);
+        assert_eq!(sub_mode, sub_fi.mode);
+        assert_eq!(sub_mode & ratarmount_core::S_IFMT, ratarmount_core::S_IFDIR);
+
+        #[cfg(unix)]
+        {
+            let link_fi = src.lookup("/link", 0).expect("lookup link");
+            let (link_mode, link_size) = by_name.get("link").copied().expect("link dirent");
+            assert_eq!(link_size, 0);
+            assert_eq!(link_size, link_fi.size);
+            assert_eq!(link_mode, link_fi.mode);
+            assert_eq!(
+                link_mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFLNK
+            );
+
+            let run_fi = src.lookup("/run.sh", 0).expect("lookup run.sh");
+            let (run_mode, run_size) = by_name.get("run.sh").copied().expect("run.sh dirent");
+            assert_eq!(run_size, run_fi.size);
+            assert_eq!(run_mode, run_fi.mode);
+            assert_eq!(run_mode & 0o111, 0o111);
+        }
+
+        let nested = src.list_dirents("/sub").expect("sub dirents");
+        let n = nested.iter().find(|e| e.name == "nested.bin").unwrap();
+        assert_eq!(n.size, 4);
+        assert_eq!(src.lookup("/sub/nested.bin", 0).unwrap().size, n.size);
+        assert_eq!(src.lookup("/sub/nested.bin", 0).unwrap().mode, n.mode);
+
+        assert!(src.list_dirents("/hello.txt").is_none());
     }
 }

@@ -2823,6 +2823,18 @@ impl MountSource for SingleFileMountSource {
         Some(ListResult::Infos(map))
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if path != "/" {
+            return None;
+        }
+        Some(vec![CheapDirent {
+            name: self.name.clone(),
+            mode: self.mode,
+            size: self.size,
+        }])
+    }
+
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
         let path = normpath(path);
         if path == "/" {
@@ -4608,5 +4620,28 @@ mod tests {
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello path\n");
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let payload = b"hello-singlefile-dirents";
+        let body: Arc<dyn SeekableBody> = ratarmount_compress::DecodedBody::from_bytes(
+            Path::new("virtual.bin"),
+            "test",
+            payload.to_vec(),
+        );
+        let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
+            .expect("from_seekable_body");
+
+        let dents = src.list_dirents("/").expect("dirents");
+        assert_eq!(dents.len(), 1);
+        assert_eq!(dents[0].name, "payload.bin");
+        assert_eq!(dents[0].size, payload.len() as u64);
+        assert_eq!(dents[0].mode, ratarmount_core::S_IFREG | 0o644);
+        let fi = src.lookup("/payload.bin", 0).expect("lookup");
+        assert_eq!(fi.size, dents[0].size);
+        assert_eq!(fi.mode, dents[0].mode);
+        assert!(src.list_dirents("/payload.bin").is_none());
     }
 }

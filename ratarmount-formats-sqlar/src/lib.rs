@@ -66,8 +66,8 @@ use std::sync::Mutex;
 
 use flate2::read::ZlibDecoder;
 use ratarmount_core::{
-    create_root_file_info, normpath, FileInfo, ListModeResult, ListResult, MountSource,
-    OpenOptions, UserData,
+    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
+    MountSource, OpenOptions, UserData,
 };
 use rusqlite::{Connection, OpenFlags, OptionalExtension};
 use thiserror::Error;
@@ -714,6 +714,72 @@ impl MountSource for SqlarMountSource {
         }
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if path != "/" {
+            let fi = self.lookup(&path, 0)?;
+            if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFDIR {
+                return None;
+            }
+        }
+
+        let prefix = if path == "/" {
+            String::new()
+        } else {
+            path.trim_start_matches('/').to_string()
+        };
+
+        self.with_conn(|conn| {
+            let mut map = BTreeMap::new();
+            let mut stmt = conn.prepare("SELECT name, mode, sz FROM sqlar")?;
+            let rows = stmt.query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)?,
+                    r.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in rows {
+                let (name, mode, sz) = row?;
+                let norm = name.trim_start_matches('/');
+                let child = if prefix.is_empty() {
+                    let first = norm.split('/').next().unwrap_or("");
+                    if first.is_empty() {
+                        continue;
+                    }
+                    if norm == first {
+                        Some(first.to_string())
+                    } else {
+                        None
+                    }
+                } else if norm == prefix {
+                    continue;
+                } else if let Some(rest) = norm.strip_prefix(&(prefix.clone() + "/")) {
+                    let first = rest.split('/').next().unwrap_or("");
+                    if first.is_empty() {
+                        None
+                    } else if rest == first {
+                        Some(first.to_string())
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(cname) = child {
+                    map.entry(cname.clone()).or_insert(CheapDirent {
+                        name: cname,
+                        mode: mode as u32,
+                        size: sz.max(0) as u64,
+                    });
+                }
+            }
+            Ok(Some(map.into_values().collect()))
+        })
+        .ok()
+        .flatten()
+    }
+
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
         let path = normpath(path);
         if path == "/" {
@@ -1115,5 +1181,79 @@ mod tests {
             Err(other) => panic!("unexpected error: {other}"),
             Ok(_) => panic!("encrypted stream decrypt is residual"),
         }
+    }
+
+    fn write_sample_sqlar(path: &Path, rows: &[(&str, u32, i64, Option<&[u8]>)]) {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sqlar(
+               name TEXT PRIMARY KEY,
+               mode INT,
+               mtime INT,
+               sz INT,
+               data BLOB
+             );",
+        )
+        .unwrap();
+        for (name, mode, sz, data) in rows {
+            conn.execute(
+                "INSERT INTO sqlar(name, mode, mtime, sz, data) VALUES (?1, ?2, 0, ?3, ?4)",
+                rusqlite::params![name, *mode as i64, sz, data],
+            )
+            .unwrap();
+        }
+    }
+
+    /// Regression: cheap readdirplus sizes.
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("dirents.sqlar");
+        let hello = b"hello-sqlar-dirents";
+        write_sample_sqlar(
+            &path,
+            &[
+                (
+                    "hello.txt",
+                    ratarmount_core::S_IFREG | 0o644,
+                    hello.len() as i64,
+                    Some(hello.as_slice()),
+                ),
+                ("subdir", ratarmount_core::S_IFDIR | 0o755, 0, None),
+                (
+                    "subdir/nested.bin",
+                    ratarmount_core::S_IFREG | 0o644,
+                    4,
+                    Some(b"abcd".as_slice()),
+                ),
+            ],
+        );
+
+        let src = SqlarMountSource::open(&path, &OpenOptions::default()).unwrap();
+        let dents = src.list_dirents("/").expect("dirents");
+        let by_name: BTreeMap<_, _> = dents
+            .into_iter()
+            .map(|d| (d.name, (d.mode, d.size)))
+            .collect();
+
+        let hello_fi = src.lookup("/hello.txt", 0).expect("lookup hello.txt");
+        let (hello_mode, hello_size) = by_name.get("hello.txt").copied().expect("hello.txt dirent");
+        assert_eq!(hello_size, hello.len() as u64);
+        assert_eq!(hello_size, hello_fi.size);
+        assert_eq!(hello_mode, hello_fi.mode);
+
+        let sub_fi = src.lookup("/subdir", 0).expect("lookup subdir");
+        let (sub_mode, sub_size) = by_name.get("subdir").copied().expect("subdir dirent");
+        assert_eq!(sub_size, 0);
+        assert_eq!(sub_size, sub_fi.size);
+        assert_eq!(sub_mode, sub_fi.mode);
+
+        let nested = src.list_dirents("/subdir").expect("subdir dirents");
+        let n = nested.iter().find(|e| e.name == "nested.bin").unwrap();
+        assert_eq!(n.size, 4);
+        assert_eq!(src.lookup("/subdir/nested.bin", 0).unwrap().size, n.size);
+        assert_eq!(src.lookup("/subdir/nested.bin", 0).unwrap().mode, n.mode);
+
+        assert!(src.list_dirents("/hello.txt").is_none());
     }
 }
