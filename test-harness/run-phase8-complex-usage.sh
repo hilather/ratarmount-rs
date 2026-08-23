@@ -387,7 +387,10 @@ else
     mp="$WORKDIR/mnt-versions"
     mkdir -p "$mp"
     echo "  [run] versioned FUSE updated-file.tar"
-    "$RATARMOUNT_CMD" -f -c --ignore-zeros --file-versions "$UPDATED" "$mp" \
+    # Isolate the index under WORKDIR so -c does not write next to the Python fixture.
+    "$RATARMOUNT_CMD" -f -c --ignore-zeros --file-versions \
+        --index-file "$WORKDIR/updated-file.index.sqlite" \
+        "$UPDATED" "$mp" \
         >"$WORKDIR/versions.log" 2>&1 &
     MOUNT_PIDS+=($!)
     if ! wait_mounted "$mp"; then
