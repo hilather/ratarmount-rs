@@ -56,8 +56,8 @@ use std::time::{Duration, Instant};
 
 use log::debug;
 use ratarmount_core::{
-    create_root_file_info, is_dir_mode, normpath, FileInfo, ListResult, MountSource, UserData,
-    S_IFDIR, S_IFMT, S_IFREG,
+    create_root_file_info, is_dir_mode, normpath, CheapDirent, FileInfo, ListResult, MountSource,
+    UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
 use tempfile::NamedTempFile;
 
@@ -1136,6 +1136,24 @@ impl MountSource for DropboxMountSource {
         Some(ListResult::Infos(map))
     }
 
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        // TTL map / list_folder entries already carry size+kind; do not call fat `list()`.
+        let entries = self.list_dir_entries(path).ok()?;
+        Some(
+            entries
+                .into_iter()
+                .map(|ent| CheapDirent {
+                    name: ent.name,
+                    mode: match ent.kind {
+                        DropboxEntryKind::Folder => S_IFDIR | 0o755,
+                        DropboxEntryKind::File => S_IFREG | 0o644,
+                    },
+                    size: ent.size,
+                })
+                .collect(),
+        )
+    }
+
     fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
         let path = normpath(path);
         if path == "/" {
@@ -2074,6 +2092,46 @@ mod tests {
         // Opening a folder must fail.
         let nested = ms.lookup("/nested", 0).unwrap();
         assert!(ms.open(&nested, 0).is_err());
+    }
+
+    /// Regression: cheap list_dirents must expose index sizes (readdirplus TTL).
+    #[test]
+    fn list_dirents_sizes_match_lookup_without_requiring_list() {
+        let token = "sl.dirents-token";
+        let file_body = b"dropbox-dirent-bytes";
+        let mock = MockDropboxFs::spawn(
+            token,
+            "/vault",
+            vec![
+                FolderFile {
+                    rel: "a.tar".into(),
+                    body: file_body.to_vec(),
+                },
+                FolderFile {
+                    rel: "readme.txt".into(),
+                    body: b"readme".to_vec(),
+                },
+            ],
+            vec!["nested".into()],
+        );
+        let ms = DropboxMountSource::open_with_endpoints(
+            "dropbox:///vault",
+            token,
+            &mock.download_url(),
+            &mock.rpc_base(),
+        )
+        .unwrap();
+
+        let dents = ms.list_dirents("/").expect("dirents");
+        let a = dents.iter().find(|d| d.name == "a.tar").expect("a.tar");
+        assert_eq!(a.size, file_body.len() as u64);
+        assert_eq!(a.mode & S_IFMT, S_IFREG);
+        let nested = dents.iter().find(|d| d.name == "nested").expect("nested");
+        assert_eq!(nested.size, 0);
+        assert_eq!(nested.mode & S_IFMT, S_IFDIR);
+        assert_eq!(ms.lookup("/a.tar", 0).unwrap().size, a.size);
+        assert_eq!(ms.lookup("/readme.txt", 0).unwrap().size, 6);
+        // fat `list()` is not required for sized dirents (TTL map / recorded entries).
     }
 
     #[test]

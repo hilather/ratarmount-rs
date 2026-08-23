@@ -14,8 +14,9 @@
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
 //!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp (OpenSSH config subset:
-//!   `HostName`/`User`/`Port`/`IdentityFile`/`IdentitiesOnly`; URL fields override
-//!   config; path via `RATARMOUNT_SSH_CONFIG` or `~/.ssh/config`)
+//!   `HostName`/`User`/`Port`/`IdentityFile`/`IdentitiesOnly`/`ProxyJump`/`Include`;
+//!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
+//!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → download via Samba `smbclient` CLI when present
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
@@ -57,9 +58,9 @@ pub use smb::{
 };
 pub use ssh::{
     expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
-    parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url, resolve_ssh_connect,
-    resolve_ssh_connect_default, ssh_config_path, SshConfig, SshConfigMatch, SshConnectParams,
-    SshLocation, SSH_CONFIG_ENV,
+    parse_proxy_jump_list, parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url,
+    resolve_ssh_connect, resolve_ssh_connect_default, ssh_config_path, SshConfig, SshConfigMatch,
+    SshConnectParams, SshLocation, SshProxyHop, SSH_CONFIG_ENV,
 };
 pub use webdav::{
     fetch_webdav_to_temp, parse_getcontentlength, parse_webdav_url, propfind_content_length,

@@ -13,25 +13,35 @@
 //! | `Port` | TCP port when URL omits port |
 //! | `IdentityFile` | Private key path(s); `~` expanded |
 //! | `IdentitiesOnly` | When `yes`, skip agent + default `~/.ssh/id_*` keys |
+//! | `ProxyJump` | Comma-separated hop chain via libssh2 `direct-tcpip` |
+//! | `Include` | Nested config files (`~`, relative, trailing `*` via `read_dir`) |
 //!
 //! ## Config path
 //!
 //! 1. `RATARMOUNT_SSH_CONFIG` — if set, only that file is read (tests/override)
 //! 2. else `~/.ssh/config` when it exists (missing file → empty config)
 //!
+//! `Include` is expanded only by [`parse_ssh_config_file`] (needs a path for
+//! `base_dir`). [`parse_ssh_config_reader`] is a leaf parser of one file’s
+//! bytes and ignores `Include`. Recursion is capped at 16 with a visited-set of
+//! canonical paths (cycles error). Each included file is capped at 1 MiB;
+//! oversize / IO errors skip that include (`debug!`). Unsupported globs (`?`,
+//! `[]`, interior `*`) are skipped.
+//!
 //! ## Precedence
 //!
 //! URL fields always override config for the same property:
 //!
 //! - **password** from URL (or `RATARMOUNT_SSH_PASSWORD`) wins over keys
-//! - **user** from URL overrides `User`
+//! - **user** from URL overrides `User` (destination only, not ProxyJump hops)
 //! - **port** from URL overrides `Port` (omitted URL port → config → `22`)
 //! - **host** in the URL is the *alias* used for `Host` matching; `HostName`
 //!   replaces the connect address only
 //!
 //! First-obtained single-value options win across matching `Host` blocks
 //! (OpenSSH order: more specific blocks should appear first). `IdentityFile`
-//! accumulates from every matching block.
+//! accumulates from every matching block. `ProxyJump` hops are themselves Host
+//! aliases resolved through the same config (cycle / depth 16 → error).
 //!
 //! ## Authentication order
 //!
@@ -40,10 +50,19 @@
 //! 3. `IdentityFile` keys from config
 //! 4. Default `~/.ssh/id_ed25519|id_rsa|id_ecdsa` (skipped if `IdentitiesOnly yes`)
 //! 5. `RATARMOUNT_SSH_PASSWORD`
+//!
+//! ## Residuals
+//!
+//! - **ProxyCommand** (shell) is out of scope (injection / no pty).
+//! - **Match** exec/host is ignored.
+//! - Live ProxyJump `direct-tcpip` handshake is skip-without-`sshd` (no bastion
+//!   fixture in this crate). Hop **resolution** and cycle errors are unit-tested.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::TcpStream;
+use std::collections::HashSet;
+use std::io::{self, BufRead, BufReader, Write};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::thread::{self, JoinHandle};
 
 use log::debug;
 use ssh2::Session;
@@ -54,6 +73,11 @@ use crate::{RemoteError, Result};
 
 /// Env var: alternate path to an OpenSSH-style config file (unit tests / override).
 pub const SSH_CONFIG_ENV: &str = "RATARMOUNT_SSH_CONFIG";
+
+/// Recursion / hop-chain cap for `Include` and `ProxyJump` alias resolution.
+const SSH_CONFIG_MAX_DEPTH: usize = 16;
+/// Per-included-file size cap (skip oversize with `debug!`).
+const SSH_INCLUDE_MAX_BYTES: u64 = 1024 * 1024;
 
 /// Parsed SSH/SFTP location (from URL only; config applied at connect time).
 #[derive(Debug, Clone)]
@@ -81,6 +105,16 @@ pub struct SshConnectParams {
     /// When true, do not try agent or default identity files.
     pub identities_only: bool,
     pub path: String,
+    /// Resolved ProxyJump hop chain (empty = direct TCP). Nested jumps are flattened.
+    pub proxy_jumps: Vec<SshConnectParams>,
+}
+
+/// One hop from a `ProxyJump` list: `[user@]host[:port]`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshProxyHop {
+    pub user: Option<String>,
+    pub host: String,
+    pub port: Option<u16>,
 }
 
 /// One `Host` block from ssh_config.
@@ -92,6 +126,8 @@ struct HostBlock {
     port: Option<u16>,
     identity_files: Vec<String>,
     identities_only: Option<bool>,
+    /// First-obtained raw `ProxyJump` value for this block.
+    proxy_jump: Option<String>,
 }
 
 /// Parsed OpenSSH config (subset).
@@ -108,6 +144,8 @@ pub struct SshConfigMatch {
     pub port: Option<u16>,
     pub identity_files: Vec<PathBuf>,
     pub identities_only: bool,
+    /// First-obtained `ProxyJump` hops (parsed `[user@]host[:port]` list).
+    pub proxy_jumps: Vec<SshProxyHop>,
 }
 
 /// Parse `ssh://[user[:pass]@]host[:port]/path` or `sftp://…`.
@@ -189,85 +227,289 @@ pub fn load_ssh_config() -> Result<SshConfig> {
     parse_ssh_config_file(&path)
 }
 
-/// Parse an OpenSSH-style config file (subset of keywords).
+/// Parse an OpenSSH-style config file (subset of keywords), expanding `Include`.
+///
+/// `base_dir` is `path.parent()`. Relative includes join that directory; `~` is
+/// expanded via [`expand_tilde`]. Recursion cap 16; canonical visited-set
+/// (cycles error). Included files over 1 MiB or unreadable are skipped.
 pub fn parse_ssh_config_file(path: &Path) -> Result<SshConfig> {
-    let f = std::fs::File::open(path)
-        .map_err(|e| RemoteError::Ssh(format!("ssh_config {}: {e}", path.display())))?;
-    parse_ssh_config_reader(BufReader::new(f))
+    let mut ctx = ParseCtx::default();
+    let mut visiting = HashSet::new();
+    parse_ssh_config_file_into(&mut ctx, path, 0, &mut visiting)?;
+    Ok(ctx.finish())
 }
 
-/// Parse config text from any reader.
+/// Parse config text from any reader (one file’s bytes; **no** `Include`).
 pub fn parse_ssh_config_reader<R: BufRead>(reader: R) -> Result<SshConfig> {
-    let mut blocks: Vec<HostBlock> = Vec::new();
-    let mut current: Option<HostBlock> = None;
-
+    let mut ctx = ParseCtx::default();
     for line in reader.lines() {
         let line = line.map_err(|e| RemoteError::Ssh(format!("ssh_config read: {e}")))?;
-        let line = strip_ssh_comment(&line);
-        let line = line.trim();
-        if line.is_empty() {
-            continue;
+        apply_ssh_config_line(&mut ctx, &line, None)?;
+    }
+    Ok(ctx.finish())
+}
+
+#[derive(Default)]
+struct ParseCtx {
+    blocks: Vec<HostBlock>,
+    current: Option<HostBlock>,
+}
+
+impl ParseCtx {
+    fn finish(mut self) -> SshConfig {
+        if let Some(b) = self.current.take() {
+            self.blocks.push(b);
         }
+        SshConfig {
+            blocks: self.blocks,
+        }
+    }
+}
 
-        let (key, value) = split_ssh_kv(line);
-        let key_l = key.to_ascii_lowercase();
+fn parse_ssh_config_file_into(
+    ctx: &mut ParseCtx,
+    path: &Path,
+    depth: usize,
+    visiting: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    if depth > SSH_CONFIG_MAX_DEPTH {
+        debug!(
+            "ssh_config Include skip: depth cap {} at {}",
+            SSH_CONFIG_MAX_DEPTH,
+            path.display()
+        );
+        return Ok(());
+    }
 
-        if key_l == "host" {
-            if let Some(b) = current.take() {
-                blocks.push(b);
+    let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    if !visiting.insert(canon.clone()) {
+        return Err(RemoteError::Ssh(format!(
+            "ssh_config Include cycle: {}",
+            canon.display()
+        )));
+    }
+
+    let result = (|| -> Result<()> {
+        if depth > 0 {
+            match std::fs::metadata(path) {
+                Ok(meta) if meta.len() > SSH_INCLUDE_MAX_BYTES => {
+                    debug!(
+                        "ssh_config Include skip: {} is {} bytes (cap {SSH_INCLUDE_MAX_BYTES})",
+                        path.display(),
+                        meta.len()
+                    );
+                    return Ok(());
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    debug!("ssh_config Include skip {}: {e}", path.display());
+                    return Ok(());
+                }
             }
-            let patterns: Vec<String> = value
-                .split_whitespace()
-                .filter(|p| !p.is_empty())
-                .map(|s| s.to_string())
-                .collect();
-            current = Some(HostBlock {
-                patterns,
-                ..Default::default()
-            });
-            continue;
         }
+        let f = match std::fs::File::open(path) {
+            Ok(f) => f,
+            Err(e) if depth > 0 => {
+                debug!("ssh_config Include skip {}: {e}", path.display());
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(RemoteError::Ssh(format!(
+                    "ssh_config {}: {e}",
+                    path.display()
+                )));
+            }
+        };
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        let reader = BufReader::new(f);
+        for line in reader.lines() {
+            let line = line.map_err(|e| RemoteError::Ssh(format!("ssh_config read: {e}")))?;
+            apply_ssh_config_line(ctx, &line, Some((base_dir, depth, visiting)))?;
+        }
+        Ok(())
+    })();
 
-        // Options before any Host are treated as matching all hosts ("Host *").
-        let block = current.get_or_insert_with(|| HostBlock {
-            patterns: vec!["*".into()],
+    visiting.remove(&canon);
+    result
+}
+
+/// `include_ctx` is `Some` only when expanding `Include` from a real file path.
+fn apply_ssh_config_line(
+    ctx: &mut ParseCtx,
+    raw_line: &str,
+    include_ctx: Option<(&Path, usize, &mut HashSet<PathBuf>)>,
+) -> Result<()> {
+    let line = strip_ssh_comment(raw_line);
+    let line = line.trim();
+    if line.is_empty() {
+        return Ok(());
+    }
+
+    let (key, value) = split_ssh_kv(line);
+    let key_l = key.to_ascii_lowercase();
+
+    if key_l == "include" {
+        if let Some((base_dir, depth, visiting)) = include_ctx {
+            apply_include(ctx, value, base_dir, depth, visiting)?;
+        }
+        // Leaf reader: ignore Include (no path / base_dir).
+        return Ok(());
+    }
+
+    if key_l == "host" {
+        if let Some(b) = ctx.current.take() {
+            ctx.blocks.push(b);
+        }
+        let patterns: Vec<String> = value
+            .split_whitespace()
+            .filter(|p| !p.is_empty())
+            .map(|s| s.to_string())
+            .collect();
+        ctx.current = Some(HostBlock {
+            patterns,
             ..Default::default()
         });
+        return Ok(());
+    }
 
-        match key_l.as_str() {
-            "hostname" => {
-                if block.hostname.is_none() && !value.is_empty() {
-                    block.hostname = Some(value.to_string());
+    // Options before any Host are treated as matching all hosts ("Host *").
+    let block = ctx.current.get_or_insert_with(|| HostBlock {
+        patterns: vec!["*".into()],
+        ..Default::default()
+    });
+    apply_host_option(block, &key_l, value);
+    Ok(())
+}
+
+fn apply_host_option(block: &mut HostBlock, key_l: &str, value: &str) {
+    match key_l {
+        "hostname" => {
+            if block.hostname.is_none() && !value.is_empty() {
+                block.hostname = Some(value.to_string());
+            }
+        }
+        "user" => {
+            if block.user.is_none() && !value.is_empty() {
+                block.user = Some(value.to_string());
+            }
+        }
+        "port" => {
+            if block.port.is_none() {
+                if let Ok(p) = value.parse::<u16>() {
+                    block.port = Some(p);
                 }
             }
-            "user" => {
-                if block.user.is_none() && !value.is_empty() {
-                    block.user = Some(value.to_string());
+        }
+        "identityfile" => {
+            if !value.is_empty() {
+                block.identity_files.push(value.to_string());
+            }
+        }
+        "identitiesonly" if block.identities_only.is_none() => {
+            block.identities_only = Some(parse_ssh_yes(value));
+        }
+        "proxyjump" if block.proxy_jump.is_none() && !value.is_empty() => {
+            block.proxy_jump = Some(value.to_string());
+        }
+        // Ignore other keywords (Match, ProxyCommand, …).
+        _ => {}
+    }
+}
+
+fn apply_include(
+    ctx: &mut ParseCtx,
+    value: &str,
+    base_dir: &Path,
+    depth: usize,
+    visiting: &mut HashSet<PathBuf>,
+) -> Result<()> {
+    for spec in value.split_whitespace().filter(|s| !s.is_empty()) {
+        for path in expand_include_spec(spec, base_dir) {
+            match parse_ssh_config_file_into(ctx, &path, depth + 1, visiting) {
+                Ok(()) => {}
+                Err(RemoteError::Ssh(msg)) if msg.contains("Include cycle") => {
+                    return Err(RemoteError::Ssh(msg));
+                }
+                Err(e) => {
+                    debug!("ssh_config Include skip {}: {e}", path.display());
                 }
             }
-            "port" => {
-                if block.port.is_none() {
-                    if let Ok(p) = value.parse::<u16>() {
-                        block.port = Some(p);
+        }
+    }
+    Ok(())
+}
+
+/// Non-glob path, or a trailing `*` via `read_dir` on the parent (prefix match).
+/// `?` / `[]` / interior `*` are residual (skip + `debug!`).
+fn expand_include_spec(spec: &str, base_dir: &Path) -> Vec<PathBuf> {
+    let trimmed = spec.trim().trim_matches('"');
+    if trimmed.is_empty() {
+        return Vec::new();
+    }
+    let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
+        expand_tilde(trimmed)
+    } else {
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            base_dir.join(p)
+        }
+    };
+
+    let lossy = expanded.to_string_lossy();
+    if lossy.contains('?') || lossy.contains('[') {
+        debug!("ssh_config Include skip unsupported glob {spec}");
+        return Vec::new();
+    }
+
+    let file_name = match expanded.file_name().and_then(|n| n.to_str()) {
+        Some(n) => n,
+        None => return vec![expanded],
+    };
+
+    if let Some(prefix) = file_name.strip_suffix('*') {
+        let parent_glob = expanded
+            .parent()
+            .map(|p| p.to_string_lossy().contains('*'))
+            .unwrap_or(false);
+        if prefix.contains('*') || parent_glob {
+            debug!("ssh_config Include skip unsupported glob {spec}");
+            return Vec::new();
+        }
+        let parent = expanded.parent().unwrap_or(base_dir);
+        let mut matches = Vec::new();
+        match std::fs::read_dir(parent) {
+            Ok(rd) => {
+                for ent in rd.flatten() {
+                    let name = ent.file_name();
+                    let name_s = name.to_string_lossy();
+                    if name_s.starts_with(prefix) {
+                        let p = ent.path();
+                        if p.is_file() {
+                            matches.push(p);
+                        }
                     }
                 }
             }
-            "identityfile" => {
-                if !value.is_empty() {
-                    block.identity_files.push(value.to_string());
-                }
+            Err(e) => {
+                debug!(
+                    "ssh_config Include skip glob {}: read_dir {}: {e}",
+                    spec,
+                    parent.display()
+                );
+                return Vec::new();
             }
-            "identitiesonly" if block.identities_only.is_none() => {
-                block.identities_only = Some(parse_ssh_yes(value));
-            }
-            // Ignore other keywords (Match, Include, ProxyJump, …) for this subset.
-            _ => {}
         }
+        matches.sort();
+        return matches;
     }
-    if let Some(b) = current.take() {
-        blocks.push(b);
+
+    if lossy.contains('*') {
+        debug!("ssh_config Include skip unsupported glob {spec}");
+        return Vec::new();
     }
-    Ok(SshConfig { blocks })
+    vec![expanded]
 }
 
 fn strip_ssh_comment(line: &str) -> String {
@@ -359,6 +601,7 @@ impl SshConfig {
     pub fn match_host(&self, host: &str) -> SshConfigMatch {
         let mut out = SshConfigMatch::default();
         let mut identities_only_set = false;
+        let mut proxy_jump_set = false;
         for block in &self.blocks {
             if !host_line_matches(&block.patterns, host) {
                 continue;
@@ -384,6 +627,12 @@ impl SshConfig {
                     identities_only_set = true;
                 }
             }
+            if !proxy_jump_set {
+                if let Some(ref raw) = block.proxy_jump {
+                    out.proxy_jumps = parse_proxy_jump_list(raw);
+                    proxy_jump_set = true;
+                }
+            }
             // IdentityFile is multi-valued: accumulate from every matching block.
             for id in &block.identity_files {
                 out.identity_files.push(expand_tilde(id));
@@ -391,6 +640,58 @@ impl SshConfig {
         }
         out
     }
+}
+
+/// Parse `ProxyJump [user@]host[:port][,[user@]host[:port]…]`. Invalid hops are dropped.
+pub fn parse_proxy_jump_list(value: &str) -> Vec<SshProxyHop> {
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        match parse_proxy_jump_hop(part) {
+            Some(h) => out.push(h),
+            None => debug!("ssh_config ProxyJump skip invalid hop {part:?}"),
+        }
+    }
+    out
+}
+
+fn parse_proxy_jump_hop(s: &str) -> Option<SshProxyHop> {
+    let (user, hostport) = match s.rsplit_once('@') {
+        Some((u, h)) if !u.is_empty() && !h.is_empty() => (Some(u.to_string()), h),
+        _ => (None, s),
+    };
+    let (host, port) = if let Some(rest) = hostport.strip_prefix('[') {
+        let end = rest.find(']')?;
+        let host = rest[..end].to_string();
+        if host.is_empty() {
+            return None;
+        }
+        let after = &rest[end + 1..];
+        let port = if after.is_empty() {
+            None
+        } else {
+            let p = after.strip_prefix(':')?;
+            Some(p.parse::<u16>().ok()?)
+        };
+        (host, port)
+    } else if hostport.chars().filter(|c| *c == ':').count() > 1 {
+        // Unbracketed IPv6 residual: treat as host, no port.
+        (hostport.to_string(), None)
+    } else if let Some((h, p)) = hostport.rsplit_once(':') {
+        if h.is_empty() {
+            return None;
+        }
+        (h.to_string(), Some(p.parse::<u16>().ok()?))
+    } else {
+        (hostport.to_string(), None)
+    };
+    if host.is_empty() {
+        return None;
+    }
+    Some(SshProxyHop { user, host, port })
 }
 
 /// Expand leading `~/` using `$HOME`.
@@ -415,13 +716,64 @@ fn default_ssh_user() -> String {
         .unwrap_or_else(|_| "root".into())
 }
 
-/// Merge URL location with ssh_config. URL user/port/password override config.
-pub fn resolve_ssh_connect(loc: &SshLocation, config: &SshConfig) -> SshConnectParams {
+/// Merge URL location with ssh_config. URL user/port/password override config
+/// for the **destination** (not ProxyJump hops).
+///
+/// Hop aliases are resolved through `config` with a depth cap of 16 and a
+/// visited-alias set (`A → B → A` is an error).
+pub fn resolve_ssh_connect(loc: &SshLocation, config: &SshConfig) -> Result<SshConnectParams> {
+    let mut visited = HashSet::new();
+    resolve_ssh_connect_inner(loc, config, &mut visited, 0)
+}
+
+fn resolve_ssh_connect_inner(
+    loc: &SshLocation,
+    config: &SshConfig,
+    visited: &mut HashSet<String>,
+    depth: usize,
+) -> Result<SshConnectParams> {
+    if depth > SSH_CONFIG_MAX_DEPTH {
+        return Err(RemoteError::Ssh(format!(
+            "ProxyJump depth cap {SSH_CONFIG_MAX_DEPTH} exceeded at host alias {}",
+            loc.host
+        )));
+    }
+    if !visited.insert(loc.host.clone()) {
+        return Err(RemoteError::Ssh(format!(
+            "ProxyJump cycle involving host alias {}",
+            loc.host
+        )));
+    }
+
     let m = config.match_host(&loc.host);
-    let host = m.hostname.unwrap_or_else(|| loc.host.clone());
+    let host = m.hostname.clone().unwrap_or_else(|| loc.host.clone());
     let port = loc.port.or(m.port).unwrap_or(22);
-    let user = loc.user.clone().or(m.user).unwrap_or_else(default_ssh_user);
-    SshConnectParams {
+    let user = loc
+        .user
+        .clone()
+        .or_else(|| m.user.clone())
+        .unwrap_or_else(default_ssh_user);
+
+    let mut proxy_jumps = Vec::new();
+    for hop in &m.proxy_jumps {
+        let hop_loc = SshLocation {
+            host: hop.host.clone(),
+            port: hop.port,
+            user: hop.user.clone(),
+            password: None,
+            path: String::new(),
+        };
+        let mut hop_params = resolve_ssh_connect_inner(&hop_loc, config, visited, depth + 1)?;
+        // Flatten nested ProxyJump on the hop, then this hop (no nested list).
+        proxy_jumps.append(&mut hop_params.proxy_jumps);
+        hop_params.proxy_jumps.clear();
+        hop_params.path.clear();
+        proxy_jumps.push(hop_params);
+    }
+
+    visited.remove(&loc.host);
+
+    Ok(SshConnectParams {
         host,
         port,
         user,
@@ -429,13 +781,14 @@ pub fn resolve_ssh_connect(loc: &SshLocation, config: &SshConfig) -> SshConnectP
         identity_files: m.identity_files,
         identities_only: m.identities_only,
         path: loc.path.clone(),
-    }
+        proxy_jumps,
+    })
 }
 
 /// Load default config and resolve connect params for a parsed location.
 pub fn resolve_ssh_connect_default(loc: &SshLocation) -> Result<SshConnectParams> {
     let cfg = load_ssh_config()?;
-    Ok(resolve_ssh_connect(loc, &cfg))
+    resolve_ssh_connect(loc, &cfg)
 }
 
 /// Download remote file via SFTP into a tempfile.
@@ -449,26 +802,53 @@ pub fn fetch_ssh_location_to_temp(loc: &SshLocation) -> Result<(NamedTempFile, u
     fetch_ssh_params_to_temp(&params)
 }
 
+/// Parent hop `Session`s (and their `direct-tcpip` pumps) must outlive the child
+/// session: `ssh2::Channel` is a handle into the parent, and the next
+/// `Session::set_tcp_stream` needs a `'static` fd (socket pair + pump).
+///
+/// Drop order: destination `Session` first, then this stack last-hop-first so
+/// each parent `Session` outlives its child Channel/pump.
+struct HopStack {
+    hops: Vec<HopLink>,
+}
+
+struct HopLink {
+    sess: Session,
+    pump: Option<JoinHandle<()>>,
+}
+
+impl Drop for HopStack {
+    fn drop(&mut self) {
+        while let Some(mut hop) = self.hops.pop() {
+            if let Some(pump) = hop.pump.take() {
+                let _ = pump.join();
+            }
+            drop(hop.sess);
+        }
+    }
+}
+
+fn hop_ssh_err(hop: Option<usize>, host: &str, msg: String) -> RemoteError {
+    match hop {
+        Some(i) => RemoteError::Ssh(format!("ProxyJump hop {i} {host}: {msg}")),
+        None => RemoteError::Ssh(msg),
+    }
+}
+
+fn wrap_hop_err(hop: Option<usize>, host: &str, err: RemoteError) -> RemoteError {
+    match (hop, err) {
+        (Some(i), RemoteError::Ssh(msg)) => {
+            RemoteError::Ssh(format!("ProxyJump hop {i} {host}: {msg}"))
+        }
+        (_, other) => other,
+    }
+}
+
 fn fetch_ssh_params_to_temp(params: &SshConnectParams) -> Result<(NamedTempFile, u64)> {
-    let addr = format!("{}:{}", params.host, params.port);
-    debug!(
-        "ssh connect {addr} user={} path={} identities_only={} identity_files={}",
-        params.user,
-        params.path,
-        params.identities_only,
-        params.identity_files.len()
-    );
+    let mut stack = HopStack { hops: Vec::new() };
+    let dest_sess = connect_ssh_chain(params, &mut stack)?;
 
-    let tcp =
-        TcpStream::connect(&addr).map_err(|e| RemoteError::Ssh(format!("connect {addr}: {e}")))?;
-    let mut sess = Session::new().map_err(|e| RemoteError::Ssh(e.to_string()))?;
-    sess.set_tcp_stream(tcp);
-    sess.handshake()
-        .map_err(|e| RemoteError::Ssh(format!("handshake: {e}")))?;
-
-    authenticate(&mut sess, params)?;
-
-    let sftp = sess
+    let sftp = dest_sess
         .sftp()
         .map_err(|e| RemoteError::Ssh(format!("sftp: {e}")))?;
     let mut remote = sftp
@@ -478,7 +858,122 @@ fn fetch_ssh_params_to_temp(params: &SshConnectParams) -> Result<(NamedTempFile,
     let mut tmp = NamedTempFile::new()?;
     let n = std::io::copy(&mut remote, &mut tmp)?;
     tmp.flush()?;
+    // Destination session first, then reverse hops (see HopStack).
+    drop(dest_sess);
+    drop(stack);
     Ok((tmp, n))
+}
+
+fn connect_ssh_chain(params: &SshConnectParams, stack: &mut HopStack) -> Result<Session> {
+    if params.proxy_jumps.is_empty() {
+        return connect_tcp_session(params, None);
+    }
+
+    let first = &params.proxy_jumps[0];
+    debug!(
+        "ProxyJump hop 0 {} ({}:{}) user={}",
+        first.host, first.host, first.port, first.user
+    );
+    let mut current = connect_tcp_session(first, Some(0))?;
+
+    let mut next_hops: Vec<&SshConnectParams> = params.proxy_jumps[1..].iter().collect();
+    next_hops.push(params);
+
+    for (i, next) in next_hops.into_iter().enumerate() {
+        let hop_index = i + 1;
+        let is_dest = hop_index == params.proxy_jumps.len();
+        let err_hop = if is_dest { None } else { Some(hop_index) };
+        if is_dest {
+            debug!(
+                "ProxyJump dest {} ({}:{}) user={}",
+                next.host, next.host, next.port, next.user
+            );
+        } else {
+            debug!(
+                "ProxyJump hop {hop_index} {} ({}:{}) user={}",
+                next.host, next.host, next.port, next.user
+            );
+        }
+        let channel = current
+            .channel_direct_tcpip(&next.host, next.port, None)
+            .map_err(|e| {
+                hop_ssh_err(
+                    err_hop,
+                    &next.host,
+                    format!("direct-tcpip {}:{}: {e}", next.host, next.port),
+                )
+            })?;
+        let (local, peer) = local_tcp_pair()?;
+        let pump = spawn_channel_pump(channel, peer);
+        let mut child = Session::new().map_err(|e| RemoteError::Ssh(e.to_string()))?;
+        child.set_tcp_stream(local);
+        if let Err(e) = child.handshake() {
+            drop(child);
+            let _ = pump.join();
+            return Err(hop_ssh_err(err_hop, &next.host, format!("handshake: {e}")));
+        }
+        if let Err(e) = authenticate(&mut child, next) {
+            drop(child);
+            let _ = pump.join();
+            return Err(wrap_hop_err(err_hop, &next.host, e));
+        }
+        stack.hops.push(HopLink {
+            sess: current,
+            pump: Some(pump),
+        });
+        current = child;
+    }
+    Ok(current)
+}
+
+fn connect_tcp_session(params: &SshConnectParams, hop: Option<usize>) -> Result<Session> {
+    let addr = format!("{}:{}", params.host, params.port);
+    debug!(
+        "ssh connect {addr} user={} path={} identities_only={} identity_files={}",
+        params.user,
+        params.path,
+        params.identities_only,
+        params.identity_files.len()
+    );
+    let tcp = TcpStream::connect(&addr)
+        .map_err(|e| hop_ssh_err(hop, &params.host, format!("connect {addr}: {e}")))?;
+    let mut sess = Session::new().map_err(|e| RemoteError::Ssh(e.to_string()))?;
+    sess.set_tcp_stream(tcp);
+    sess.handshake()
+        .map_err(|e| hop_ssh_err(hop, &params.host, format!("handshake: {e}")))?;
+    authenticate(&mut sess, params).map_err(|e| wrap_hop_err(hop, &params.host, e))?;
+    Ok(sess)
+}
+
+fn local_tcp_pair() -> Result<(TcpStream, TcpStream)> {
+    let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .map_err(|e| RemoteError::Ssh(format!("ProxyJump socket pair: {e}")))?;
+    let addr = listener
+        .local_addr()
+        .map_err(|e| RemoteError::Ssh(format!("ProxyJump socket pair: {e}")))?;
+    let client = TcpStream::connect(addr)
+        .map_err(|e| RemoteError::Ssh(format!("ProxyJump socket pair: {e}")))?;
+    let (server, _) = listener
+        .accept()
+        .map_err(|e| RemoteError::Ssh(format!("ProxyJump socket pair: {e}")))?;
+    Ok((client, server))
+}
+
+fn spawn_channel_pump(mut channel: ssh2::Channel, mut sock: TcpStream) -> JoinHandle<()> {
+    thread::spawn(move || {
+        let mut sock2 = match sock.try_clone() {
+            Ok(s) => s,
+            Err(_) => return,
+        };
+        let mut chan_rd = channel.clone();
+        let t = thread::spawn(move || {
+            let _ = io::copy(&mut chan_rd, &mut sock2);
+            let _ = sock2.shutdown(Shutdown::Write);
+        });
+        let _ = io::copy(&mut sock, &mut channel);
+        let _ = channel.send_eof();
+        let _ = t.join();
+    })
 }
 
 fn authenticate(sess: &mut Session, params: &SshConnectParams) -> Result<()> {
@@ -622,7 +1117,7 @@ Host *
 
         // Alias → HostName, user/port/keys from block; IdentitiesOnly.
         let loc = parse_ssh_url("ssh://mystage//var/data/a.tar").unwrap();
-        let p = resolve_ssh_connect(&loc, &cfg);
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
         assert_eq!(p.host, "10.0.0.5");
         assert_eq!(p.port, 2222);
         assert_eq!(p.user, "deploy");
@@ -634,7 +1129,7 @@ Host *
 
         // URL overrides User and Port; HostName still from config.
         let loc2 = parse_ssh_url("ssh://alice@mystage:99//tmp/x").unwrap();
-        let p2 = resolve_ssh_connect(&loc2, &cfg);
+        let p2 = resolve_ssh_connect(&loc2, &cfg).unwrap();
         assert_eq!(p2.host, "10.0.0.5");
         assert_eq!(p2.port, 99);
         assert_eq!(p2.user, "alice");
@@ -642,13 +1137,13 @@ Host *
 
         // Password still from URL.
         let loc3 = parse_ssh_url("ssh://alice:s3cr3t@mystage//tmp/x").unwrap();
-        let p3 = resolve_ssh_connect(&loc3, &cfg);
+        let p3 = resolve_ssh_connect(&loc3, &cfg).unwrap();
         assert_eq!(p3.password.as_deref(), Some("s3cr3t"));
         assert_eq!(p3.user, "alice");
 
         // Wildcard host without specific block match for HostName.
         let loc4 = parse_ssh_url("ssh://box.example.com//a").unwrap();
-        let p4 = resolve_ssh_connect(&loc4, &cfg);
+        let p4 = resolve_ssh_connect(&loc4, &cfg).unwrap();
         assert_eq!(p4.host, "box.example.com");
         assert_eq!(p4.user, "fromstar");
         assert_eq!(p4.port, 2200);
@@ -668,7 +1163,7 @@ Host foo
 "#;
         let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
         let loc = parse_ssh_url("ssh://foo//x").unwrap();
-        let p = resolve_ssh_connect(&loc, &cfg);
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
         assert_eq!(p.user, "first");
         assert_eq!(p.port, 2222);
     }
@@ -701,7 +1196,7 @@ Host bar
 
         let cfg = parse_ssh_config_file(tmp.path()).unwrap();
         let loc = parse_ssh_url("ssh://envhost//data/f.tar").unwrap();
-        let p = resolve_ssh_connect(&loc, &cfg);
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
         assert_eq!(p.host, "192.0.2.1");
         assert_eq!(p.user, "envuser");
         assert_eq!(p.port, 2201);
@@ -712,7 +1207,7 @@ Host bar
         assert_eq!(path, tmp.path());
         let loaded = load_ssh_config().unwrap();
         std::env::remove_var(SSH_CONFIG_ENV);
-        let p2 = resolve_ssh_connect(&loc, &loaded);
+        let p2 = resolve_ssh_connect(&loc, &loaded).unwrap();
         assert_eq!(p2.host, "192.0.2.1");
         assert_eq!(p2.port, 2201);
     }
@@ -730,5 +1225,223 @@ Host bar
             Some(v) => std::env::set_var("HOME", v),
             None => std::env::remove_var("HOME"),
         }
+    }
+
+    #[test]
+    fn parse_proxy_jump_user_host_port_list() {
+        let text = r#"
+Host dest
+    HostName dest.example
+    User destuser
+    ProxyJump alice@jump1.example:2222,jump2.example
+Host jump1.example
+    HostName 10.0.0.1
+    User ignored
+Host jump2.example
+    HostName 10.0.0.2
+    User bob
+    Port 2200
+"#;
+        let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
+        let m = cfg.match_host("dest");
+        assert_eq!(
+            m.proxy_jumps,
+            vec![
+                SshProxyHop {
+                    user: Some("alice".into()),
+                    host: "jump1.example".into(),
+                    port: Some(2222),
+                },
+                SshProxyHop {
+                    user: None,
+                    host: "jump2.example".into(),
+                    port: None,
+                },
+            ]
+        );
+        let loc = parse_ssh_url("ssh://dest//data/a.tar").unwrap();
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
+        assert_eq!(p.host, "dest.example");
+        assert_eq!(p.user, "destuser");
+        assert_eq!(p.proxy_jumps.len(), 2);
+        assert_eq!(p.proxy_jumps[0].host, "10.0.0.1");
+        assert_eq!(p.proxy_jumps[0].user, "alice");
+        assert_eq!(p.proxy_jumps[0].port, 2222);
+        assert_eq!(p.proxy_jumps[1].host, "10.0.0.2");
+        assert_eq!(p.proxy_jumps[1].user, "bob");
+        assert_eq!(p.proxy_jumps[1].port, 2200);
+        assert!(p.proxy_jumps[0].proxy_jumps.is_empty());
+    }
+
+    #[test]
+    fn url_user_port_override_destination_not_hop() {
+        let text = r#"
+Host dest
+    HostName dest.example
+    User destuser
+    Port 22
+    ProxyJump bob@jumphost:2222
+Host jumphost
+    HostName 10.1.1.1
+    User jumpuser
+    Port 2200
+"#;
+        let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
+        let loc = parse_ssh_url("ssh://alice@dest:99//tmp/x").unwrap();
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
+        assert_eq!(p.user, "alice");
+        assert_eq!(p.port, 99);
+        assert_eq!(p.host, "dest.example");
+        assert_eq!(p.proxy_jumps.len(), 1);
+        assert_eq!(p.proxy_jumps[0].user, "bob");
+        assert_eq!(p.proxy_jumps[0].port, 2222);
+        assert_eq!(p.proxy_jumps[0].host, "10.1.1.1");
+    }
+
+    #[test]
+    fn identities_only_on_hop_uses_hop_host_block() {
+        let text = r#"
+Host dest
+    HostName dest.example
+    ProxyJump jumphost
+    IdentityFile /keys/dest
+Host jumphost
+    HostName 10.1.1.1
+    IdentityFile /keys/jump
+    IdentitiesOnly yes
+"#;
+        let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
+        let loc = parse_ssh_url("ssh://dest//a").unwrap();
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
+        assert!(!p.identities_only);
+        assert_eq!(p.identity_files, vec![PathBuf::from("/keys/dest")]);
+        assert_eq!(p.proxy_jumps.len(), 1);
+        assert!(p.proxy_jumps[0].identities_only);
+        assert_eq!(
+            p.proxy_jumps[0].identity_files,
+            vec![PathBuf::from("/keys/jump")]
+        );
+    }
+
+    /// Regression: cyclic ProxyJump aliases must error, not hang.
+    #[test]
+    fn proxy_jump_alias_cycle_errors() {
+        let text = r#"
+Host a
+    HostName 10.0.0.1
+    ProxyJump b
+Host b
+    HostName 10.0.0.2
+    ProxyJump a
+"#;
+        let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
+        let loc = parse_ssh_url("ssh://a//x").unwrap();
+        let err = resolve_ssh_connect(&loc, &cfg).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ProxyJump cycle") && msg.contains("a"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn include_merges_hostname_via_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let included = dir.path().join("included");
+        std::fs::write(
+            &included,
+            "Host jump\n    HostName 10.0.0.8\n    User jumper\n    Port 2222\n",
+        )
+        .unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(
+            &config,
+            "Include included\nHost dest\n    HostName 10.0.0.9\n",
+        )
+        .unwrap();
+
+        let cfg = parse_ssh_config_file(&config).unwrap();
+        let loc = parse_ssh_url("ssh://jump//data/a.tar").unwrap();
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
+        assert_eq!(p.host, "10.0.0.8");
+        assert_eq!(p.user, "jumper");
+        assert_eq!(p.port, 2222);
+        let dest = parse_ssh_url("ssh://dest//a").unwrap();
+        let d = resolve_ssh_connect(&dest, &cfg).unwrap();
+        assert_eq!(d.host, "10.0.0.9");
+    }
+
+    /// Regression: cyclic ssh_config Include must error, not hang.
+    #[test]
+    fn include_cycle_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = dir.path().join("a");
+        let b = dir.path().join("b");
+        std::fs::write(&a, "Include b\nHost from-a\n    HostName 10.0.0.1\n").unwrap();
+        std::fs::write(&b, "Include a\nHost from-b\n    HostName 10.0.0.2\n").unwrap();
+        let err = parse_ssh_config_file(&a).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("Include cycle"), "{msg}");
+    }
+
+    #[test]
+    fn include_trailing_star_via_read_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let conf_d = dir.path().join("conf.d");
+        std::fs::create_dir(&conf_d).unwrap();
+        std::fs::write(
+            conf_d.join("z.conf"),
+            "Host zed\n    HostName 10.0.0.9\n    User zeduser\n",
+        )
+        .unwrap();
+        std::fs::write(
+            conf_d.join("a.conf"),
+            "Host aye\n    HostName 10.0.0.8\n    User ayeuser\n",
+        )
+        .unwrap();
+        std::fs::write(conf_d.join("not-a-dir"), "this is a file").unwrap();
+        std::fs::create_dir(conf_d.join("subdir")).unwrap();
+        let config = dir.path().join("config");
+        std::fs::write(&config, "Include conf.d/*\n").unwrap();
+
+        let cfg = parse_ssh_config_file(&config).unwrap();
+        let aye = resolve_ssh_connect(&parse_ssh_url("ssh://aye//x").unwrap(), &cfg).unwrap();
+        assert_eq!(aye.host, "10.0.0.8");
+        assert_eq!(aye.user, "ayeuser");
+        let zed = resolve_ssh_connect(&parse_ssh_url("ssh://zed//x").unwrap(), &cfg).unwrap();
+        assert_eq!(zed.host, "10.0.0.9");
+        assert_eq!(zed.user, "zeduser");
+    }
+
+    #[test]
+    fn include_ignored_by_leaf_reader() {
+        let text = "Include /does/not/exist\nHost foo\n    HostName 192.0.2.9\n";
+        let cfg = parse_ssh_config_reader(text.as_bytes()).unwrap();
+        let loc = parse_ssh_url("ssh://foo//x").unwrap();
+        let p = resolve_ssh_connect(&loc, &cfg).unwrap();
+        assert_eq!(p.host, "192.0.2.9");
+    }
+
+    #[test]
+    fn proxy_jump_connect_chain_skips_without_sshd() {
+        // Live direct-tcpip handshake needs sshd + a bastion fixture.
+        // Resolution is covered above; this is the documented skip residual.
+        let sshd = std::process::Command::new("sshd")
+            .arg("-V")
+            .output()
+            .ok()
+            .or_else(|| {
+                std::process::Command::new("/usr/sbin/sshd")
+                    .arg("-V")
+                    .output()
+                    .ok()
+            });
+        if sshd.is_none() {
+            eprintln!("skip: sshd not available for ProxyJump connect-chain handshake");
+            return;
+        }
+        eprintln!(
+            "skip: live ProxyJump direct-tcpip handshake has no bastion fixture in this crate"
+        );
     }
 }
