@@ -340,6 +340,8 @@ pub enum RemoteError {
     S3(String),
     #[error("ssh: {0}")]
     Ssh(String),
+    #[error("ssh_config Include cycle: {0}")]
+    SshIncludeCycle(String),
     #[error("webdav: {0}")]
     WebDav(String),
     #[error("smb: {0}")]
