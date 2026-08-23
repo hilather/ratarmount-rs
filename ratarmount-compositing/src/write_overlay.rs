@@ -803,7 +803,8 @@ impl WriteOverlay {
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
     fn persist_tar_zst_plan(&self, archive: &Path, plan: &OverlayCommitPlan) -> Result<()> {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
-        let (from_idx, rewrite_window_start_uncomp) = find_last_n_tar_window(archive, &map)?;
+        let (from_idx, rewrite_window_start_uncomp) =
+            find_last_n_tar_window(archive, &map, "live")?;
         let base = self.current_base();
         let mut last_window_deletes = HashSet::new();
         for path in &plan.deleted_paths {
@@ -1323,6 +1324,8 @@ pub struct CommitOverlayOptions {
     pub debug: u8,
     /// TAR member-name encoding (`-e` / `--encoding`). Default `"utf-8"`.
     pub encoding: String,
+    /// Concatenated TAR (`-i` / `--ignore-zeros`). Default false.
+    pub ignore_zeros: bool,
 }
 
 impl Default for CommitOverlayOptions {
@@ -1331,6 +1334,7 @@ impl Default for CommitOverlayOptions {
             yes: false,
             debug: 1,
             encoding: "utf-8".into(),
+            ignore_zeros: false,
         }
     }
 }
@@ -2016,6 +2020,7 @@ fn commit_overlay_tar_zst(
         write_index: false,
         index_in_memory: true,
         encoding: opts.encoding.clone(),
+        ignore_zeros: opts.ignore_zeros,
         ..OpenOptions::default()
     };
     let base = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
@@ -2043,7 +2048,7 @@ fn commit_overlay_tar_zst(
     ohs.dedup();
 
     let from_idx = if ohs.is_empty() {
-        find_last_n_tar_window(tar_file, &map)?.0
+        find_last_n_tar_window(tar_file, &map, "offline --commit-overlay")?.0
     } else {
         offline_tar_zst_from_idx(tar_file, &map, ohs[0])?
     };
@@ -2052,7 +2057,7 @@ fn commit_overlay_tar_zst(
         .iter()
         .map(|f| f.uncompressed_size)
         .sum();
-    warn_large_zstd_window(window_plain);
+    warn_large_zstd_window("offline --commit-overlay", window_plain);
 
     let overlay_root = write_overlay.canonicalize().map_err(OverlayError::Io)?;
     let pending = collect_ustar_pending_at(&overlay_root, &plan.append_entries)?;
@@ -2222,22 +2227,22 @@ fn last_zstd_plain_needs_warn(plain: u64) -> bool {
     plain > LAST_FRAME_WARN_BYTES
 }
 
-fn warn_large_zstd_window(window_plain: u64) {
+fn warn_large_zstd_window(kind: &str, window_plain: u64) {
     if last_zstd_plain_needs_warn(window_plain) {
         log::warn!(
-            "live .tar.zst commit will rewrite {window_plain} uncompressed \
+            "{kind} .tar.zst commit will rewrite {window_plain} uncompressed \
              (large last frame); persist still copies the compressed file"
         );
     }
 }
 
 /// Grow last-N until the decoded suffix contains a TAR EOF (K6). Never refuse on size.
-fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, u64)> {
+fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap, kind: &str) -> Result<(usize, u64)> {
     if map.frames.is_empty() {
         return Err(OverlayError::Msg("TAR EOF not found (truncated?)".into()));
     }
     let last_plain = map.frames.last().map(|f| f.uncompressed_size).unwrap_or(0);
-    warn_large_zstd_window(last_plain);
+    warn_large_zstd_window(kind, last_plain);
     let mut src = File::open(archive)?;
     for n in 1..=map.frames.len() {
         let from_idx = map.frames.len() - n;
@@ -2246,7 +2251,7 @@ fn find_last_n_tar_window(archive: &Path, map: &ZstdFrameMap) -> Result<(usize, 
             .map(|f| f.uncompressed_size)
             .sum();
         if n > 1 {
-            warn_large_zstd_window(window_plain);
+            warn_large_zstd_window(kind, window_plain);
         }
         let mut suffix = tempfile::spooled_tempfile(DEFAULT_MEMORY_CAP as usize);
         decode_zstd_frames_to(&mut src, map, from_idx, &mut suffix)
@@ -2342,7 +2347,7 @@ fn all_tar_offsetheaders(base: &dyn MountSource, path: &str) -> Result<Vec<u64>>
 
 fn cannot_classify_err(path: &str) -> OverlayError {
     OverlayError::Msg(format!(
-        "live overlay commit for .tar.zst cannot classify '{path}' (no TAR offsetheader)"
+        ".tar.zst overlay commit cannot classify '{path}' (no TAR offsetheader)"
     ))
 }
 
@@ -3167,8 +3172,10 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
     }
 
-    /// Regression: offsetheader in frame k but header straddles k−1/k
-    /// (frame k starts mid-member). from_idx is a ceiling, not a floor.
+    /// Regression: offsetheader in frame k but frame k starts mid-member.
+    /// Ceiling stays at k when the suffix still has a later header; opaque
+    /// prefix of `big.bin` is copied. Floor-skip coverage is
+    /// `commit_overlay_tar_zst_earlier_frame_delete`.
     #[test]
     fn commit_overlay_tar_zst_header_straddle_delete() {
         let dir = tempfile::tempdir().unwrap();
@@ -3202,11 +3209,6 @@ mod tests {
         let min_oh = *ohs.iter().min().expect("oh");
         let k = frame_covering_uncomp(&map, min_oh).expect("frame k");
         assert_eq!(k, 2, "gone.txt header must live in frame 2");
-        let from_idx = offline_tar_zst_from_idx(&archive, &map, min_oh).expect("from_idx");
-        assert!(
-            from_idx <= k,
-            "from_idx is a ceiling (never start after the member): from_idx={from_idx} k={k}"
-        );
 
         let before = fs::read(&archive).unwrap();
         let prefix_km1 = map.frames[k - 1].compressed_offset as usize;
@@ -3230,6 +3232,53 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/keep.txt"), keep);
         assert_eq!(read_member(src.as_ref(), "/big.bin"), big);
         assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
+    }
+
+    /// Regression: concatenated complete-TAR later-frame delete needs --ignore-zeros.
+    #[test]
+    fn commit_overlay_tar_zst_concatenated_delete_ignore_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-i-prefix");
+        let last = generated_payload("off-i-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.frames.len() >= 2);
+        let prefix_end = map.frames[1].compressed_offset as usize;
+        let prefix_bytes = before[..prefix_end].to_vec();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        ov.unlink("/last.txt")
+            .expect("unlink later complete-TAR frame");
+        drop(ov);
+
+        let opts = CommitOverlayOptions {
+            yes: true,
+            debug: 0,
+            ignore_zeros: true,
+            ..Default::default()
+        };
+        assert!(commit_overlay(&overlay, &archive, &opts).expect("commit"));
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix complete-TAR frame must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, true);
+        assert!(
+            src.lookup("/last.txt", 0).is_none(),
+            "later-frame name must be gone when classified with ignore_zeros"
+        );
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
     }
 
     /// Regression: offline --commit-overlay must not create a sibling *.index.sqlite.

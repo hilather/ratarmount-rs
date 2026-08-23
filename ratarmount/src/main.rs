@@ -400,6 +400,7 @@ fn main() {
             yes: args.yes,
             debug: args.debug,
             encoding: args.encoding.clone(),
+            ignore_zeros: args.ignore_zeros,
         };
         match commit_overlay(overlay, archive, &opts) {
             Ok(_) => return,
@@ -1896,11 +1897,13 @@ mod nfs_cli_tests {
             "/tmp/ov",
             "-e",
             "latin1",
+            "-i",
             "a.tar.zst",
         ])
         .expect("parse");
         assert!(a.commit_overlay);
         assert_eq!(a.encoding, "latin1");
+        assert!(a.ignore_zeros);
         assert_eq!(a.paths, vec![PathBuf::from("a.tar.zst")]);
     }
 
