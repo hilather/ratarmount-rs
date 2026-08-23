@@ -291,6 +291,10 @@ enum OpenBackend {
         #[allow(dead_code)]
         file_info: FileInfo,
         state: Arc<Mutex<SourceReadState>>,
+        /// `MountSource::content_generation` when this reader was opened. A live
+        /// overlay commit bumps the generation and shifts archive offsets, so a
+        /// smaller value means this handle must re-lookup and reopen.
+        opened_generation: u64,
     },
     /// Empty file — no underlying open.
     Empty,
@@ -321,6 +325,10 @@ pub struct RatarmountFs {
     handles: Mutex<HashMap<u64, OpenBackend>>,
     next_fh: AtomicU64,
     dir_cache: Mutex<HashMap<String, DirCacheEntry>>,
+    /// Last seen `MountSource::content_generation`. Live overlay commit replaces
+    /// the base archive (member offsets shift); cached FileInfo and dirents are
+    /// then stale — same contract as NFS `ReaderLru::sweep_if_generation_advanced`.
+    source_generation: AtomicU64,
 }
 
 impl RatarmountFs {
@@ -358,6 +366,7 @@ impl RatarmountFs {
             handles: Mutex::new(HashMap::new()),
             next_fh: AtomicU64::new(1),
             dir_cache: Mutex::new(HashMap::new()),
+            source_generation: AtomicU64::new(0),
         }
     }
 
@@ -416,6 +425,7 @@ impl RatarmountFs {
     /// Always goes through [`MountSource::list_dirents`], never [`MountSource::list`].
     /// Fat `FileInfo` is materialized later at getattr/lookup/open.
     fn list_mode_cached(&self, path: &str) -> Option<Vec<(String, u32, u64)>> {
+        self.sweep_if_generation_advanced();
         {
             let cache = self.dir_cache.lock().unwrap();
             if let Some(e) = cache.get(path) {
@@ -451,6 +461,19 @@ impl RatarmountFs {
         self.file_info_for_ino(ino).map(|fi| fi.linkname)
     }
 
+    /// RO archive open used by generation-sweep tests (same backend as FUSE `open`).
+    #[cfg(test)]
+    fn test_open_ro(&self, path: &str) -> Result<u64, i32> {
+        let ino = self.ino_for_path(path);
+        let fi = self.file_info_for_open(ino, path).ok_or(ENOENT)?;
+        self.open_source_backend(path.to_string(), fi)
+    }
+
+    #[cfg(test)]
+    fn test_read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        self.read_handle(fh, offset, size)
+    }
+
     /// Kernel TTL for one `readdirplus` dirent attr.
     ///
     /// Dirents with a nonzero size (real index `list_dirents` sizes) and
@@ -473,6 +496,7 @@ impl RatarmountFs {
     /// FileInfo for `open`. Immutable mounts reuse the lookup/getattr cache;
     /// overlay always re-looks up so create(size 0) → write is visible.
     fn file_info_for_open(&self, ino: u64, path: &str) -> Option<FileInfo> {
+        self.sweep_if_generation_advanced();
         if self.overlay.is_some() {
             if let Some(fi) = self.source.lookup(path, 0) {
                 self.store_fi(ino, fi.clone());
@@ -486,6 +510,147 @@ impl RatarmountFs {
         let fi = self.source.lookup(path, 0)?;
         self.store_fi(ino, fi.clone());
         Some(fi)
+    }
+
+    /// Drop cached FileInfos and dirents when a live overlay commit swapped the
+    /// base archive. `fetch_max` never regresses under concurrent sweeps.
+    fn sweep_if_generation_advanced(&self) {
+        let gen = self.source.content_generation();
+        let prev = self.source_generation.fetch_max(gen, Ordering::SeqCst);
+        if prev < gen {
+            for ent in self.inodes.lock().unwrap().values_mut() {
+                ent.file_info = None;
+            }
+            self.dir_cache.lock().unwrap().clear();
+        }
+    }
+
+    fn open_source_backend(&self, path: String, fi: FileInfo) -> Result<u64, i32> {
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        let gen = self.source.content_generation();
+        if fi.size == 0 {
+            self.handles.lock().unwrap().insert(fh, OpenBackend::Empty);
+            return Ok(fh);
+        }
+        let reader = self.source.open(&fi, 0).map_err(|e| io_to_errno(&e))?;
+        self.handles.lock().unwrap().insert(
+            fh,
+            OpenBackend::Source {
+                path,
+                file_info: fi,
+                state: Arc::new(Mutex::new(SourceReadState {
+                    reader,
+                    readahead: ReadaheadState::default(),
+                })),
+                opened_generation: gen,
+            },
+        );
+        Ok(fh)
+    }
+
+    /// Re-lookup and reopen an archive-backed fh after `content_generation` advances.
+    /// Overlay fds stay put (POSIX unlinked-inode). Missing fh is left for `read`.
+    fn refresh_source_handle_if_stale(&self, fh: u64) -> Result<(), i32> {
+        self.sweep_if_generation_advanced();
+        let gen = self.source.content_generation();
+        let path = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh) {
+                Some(OpenBackend::Source {
+                    path,
+                    opened_generation,
+                    ..
+                }) if *opened_generation < gen => path.clone(),
+                _ => return Ok(()),
+            }
+        };
+        let Some(fi) = self.source.lookup(&path, 0) else {
+            return Err(ENOENT);
+        };
+        let new_backend = if fi.size == 0 {
+            OpenBackend::Empty
+        } else {
+            let reader = self.source.open(&fi, 0).map_err(|e| io_to_errno(&e))?;
+            OpenBackend::Source {
+                path: path.clone(),
+                file_info: fi,
+                state: Arc::new(Mutex::new(SourceReadState {
+                    reader,
+                    readahead: ReadaheadState::default(),
+                })),
+                opened_generation: gen,
+            }
+        };
+        let mut handles = self.handles.lock().unwrap();
+        if let Some(OpenBackend::Source {
+            opened_generation, ..
+        }) = handles.get(&fh)
+        {
+            if *opened_generation < gen {
+                handles.insert(fh, new_backend);
+            }
+        }
+        Ok(())
+    }
+
+    fn read_handle(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
+        self.refresh_source_handle_if_stale(fh)?;
+        enum ReadTarget {
+            Empty,
+            OverlayFd(i32),
+            Source {
+                path: String,
+                state: Arc<Mutex<SourceReadState>>,
+            },
+        }
+        let target = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh) {
+                None => return Err(ENOENT),
+                Some(OpenBackend::Empty) => ReadTarget::Empty,
+                Some(OpenBackend::OverlayFd(fd)) => ReadTarget::OverlayFd(*fd),
+                Some(OpenBackend::Source { path, state, .. }) => ReadTarget::Source {
+                    path: path.clone(),
+                    state: Arc::clone(state),
+                },
+            }
+        };
+        match target {
+            ReadTarget::Empty => Ok(Vec::new()),
+            ReadTarget::OverlayFd(fd) => {
+                let mut buf = vec![0u8; size as usize];
+                let n = unsafe {
+                    libc::pread(fd, buf.as_mut_ptr() as *mut _, size as usize, offset.max(0))
+                };
+                if n < 0 {
+                    Err(EIO)
+                } else {
+                    buf.truncate(n as usize);
+                    Ok(buf)
+                }
+            }
+            ReadTarget::Source { path, state } => {
+                let mut g = state.lock().unwrap();
+                let SourceReadState { reader, readahead } = &mut *g;
+                let off = offset.max(0) as u64;
+                match readahead_fill(
+                    reader.as_mut(),
+                    readahead,
+                    self.readahead_bytes,
+                    off,
+                    size as usize,
+                ) {
+                    Ok(buf) => Ok(buf),
+                    Err(e) => {
+                        debug!(
+                            "read error path={path} offset={offset} size={size} kind={:?}: {e}",
+                            e.kind()
+                        );
+                        Err(io_to_errno(&e))
+                    }
+                }
+            }
+        }
     }
 
     /// Drop a parent directory listing so create/unlink/mkdir/rmdir are visible
@@ -535,6 +700,7 @@ impl RatarmountFs {
     /// With a write overlay, always re-lookup so size/mtime after create/write
     /// match the on-disk overlay file (cache may still hold create-time size 0).
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
+        self.sweep_if_generation_advanced();
         let path = self.path_for_ino(ino)?;
         if path == "/" {
             let fi = ratarmount_core::create_root_file_info();
@@ -799,31 +965,14 @@ impl Filesystem for RatarmountFs {
             return;
         };
 
-        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-        if fi.size == 0 {
-            self.handles.lock().unwrap().insert(fh, OpenBackend::Empty);
-            reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
-            return;
-        }
-        match self.source.open(&fi, 0) {
-            Ok(reader) => {
-                self.handles.lock().unwrap().insert(
-                    fh,
-                    OpenBackend::Source {
-                        path,
-                        file_info: fi,
-                        state: Arc::new(Mutex::new(SourceReadState {
-                            reader,
-                            readahead: ReadaheadState::default(),
-                        })),
-                    },
-                );
+        match self.open_source_backend(path, fi) {
+            Ok(fh) => {
                 // Allow kernel page cache of archive member data.
                 reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
             }
             Err(e) => {
-                debug!("open error path={path} kind={:?}: {e}", e.kind());
-                reply.error(io_to_errno(&e));
+                debug!("open error kind={e}");
+                reply.error(e);
             }
         }
     }
@@ -839,68 +988,9 @@ impl Filesystem for RatarmountFs {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        // Resolve backend under the map lock, then drop it before I/O so a large
-        // readahead fill does not stall every other FUSE op on this process.
-        enum ReadTarget {
-            Empty,
-            OverlayFd(i32),
-            Source {
-                path: String,
-                state: Arc<Mutex<SourceReadState>>,
-            },
-        }
-        let target = {
-            let handles = self.handles.lock().unwrap();
-            match handles.get(&fh) {
-                None => {
-                    reply.error(ENOENT);
-                    return;
-                }
-                Some(OpenBackend::Empty) => ReadTarget::Empty,
-                Some(OpenBackend::OverlayFd(fd)) => ReadTarget::OverlayFd(*fd),
-                Some(OpenBackend::Source { path, state, .. }) => ReadTarget::Source {
-                    path: path.clone(),
-                    state: Arc::clone(state),
-                },
-            }
-        };
-        match target {
-            ReadTarget::Empty => {
-                reply.data(&[]);
-            }
-            ReadTarget::OverlayFd(fd) => {
-                let mut buf = vec![0u8; size as usize];
-                let n = unsafe {
-                    libc::pread(fd, buf.as_mut_ptr() as *mut _, size as usize, offset.max(0))
-                };
-                if n < 0 {
-                    reply.error(EIO);
-                } else {
-                    buf.truncate(n as usize);
-                    reply.data(&buf);
-                }
-            }
-            ReadTarget::Source { path, state } => {
-                let mut g = state.lock().unwrap();
-                let SourceReadState { reader, readahead } = &mut *g;
-                let off = offset.max(0) as u64;
-                match readahead_fill(
-                    reader.as_mut(),
-                    readahead,
-                    self.readahead_bytes,
-                    off,
-                    size as usize,
-                ) {
-                    Ok(buf) => reply.data(&buf),
-                    Err(e) => {
-                        debug!(
-                            "read error path={path} offset={offset} size={size} kind={:?}: {e}",
-                            e.kind()
-                        );
-                        reply.error(io_to_errno(&e));
-                    }
-                }
-            }
+        match self.read_handle(fh, offset, size) {
+            Ok(buf) => reply.data(&buf),
+            Err(e) => reply.error(e),
         }
     }
 
@@ -1323,7 +1413,9 @@ fn _pb() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratarmount_core::{ListModeResult, ListResult, MountSource, S_IFLNK, S_IFMT, S_IFREG};
+    use ratarmount_core::{
+        ListModeResult, ListResult, MountSource, UserData, S_IFLNK, S_IFMT, S_IFREG,
+    };
     use std::collections::BTreeMap;
     use std::io::{self, Seek};
 
@@ -1590,6 +1682,181 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut rf, &mut buf).unwrap();
         assert_eq!(buf, b"hello-overlay-payload");
+    }
+
+    /// Live backing store whose member offsets shift when an earlier member is
+    /// deleted — the same class as TAR live overlay commit after `unlink a.txt`.
+    struct OffsetShiftSource {
+        gen: AtomicU64,
+        archive: Arc<Mutex<Vec<u8>>>,
+        members: Mutex<BTreeMap<String, (u64, u64)>>,
+    }
+
+    struct LiveArchiveReader {
+        archive: Arc<Mutex<Vec<u8>>>,
+        base: u64,
+        size: u64,
+        pos: u64,
+    }
+
+    impl std::io::Read for LiveArchiveReader {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.pos >= self.size || buf.is_empty() {
+                return Ok(0);
+            }
+            let data = self.archive.lock().unwrap();
+            let start = match usize::try_from(self.base.saturating_add(self.pos)) {
+                Ok(s) => s,
+                Err(_) => return Ok(0),
+            };
+            let max_end = match usize::try_from(self.base.saturating_add(self.size)) {
+                Ok(e) => e,
+                Err(_) => return Ok(0),
+            };
+            if start >= data.len() {
+                return Ok(0);
+            }
+            let n = (max_end.min(data.len()).saturating_sub(start)).min(buf.len());
+            buf[..n].copy_from_slice(&data[start..start + n]);
+            self.pos += n as u64;
+            Ok(n)
+        }
+    }
+
+    impl Seek for LiveArchiveReader {
+        fn seek(&mut self, from: io::SeekFrom) -> io::Result<u64> {
+            let new = match from {
+                io::SeekFrom::Start(o) => o as i128,
+                io::SeekFrom::Current(d) => self.pos as i128 + i128::from(d),
+                io::SeekFrom::End(d) => self.size as i128 + i128::from(d),
+            };
+            if new < 0 {
+                return Err(io::Error::new(ErrorKind::InvalidInput, "seek before 0"));
+            }
+            self.pos = new as u64;
+            Ok(self.pos)
+        }
+    }
+
+    impl OffsetShiftSource {
+        fn two_members(a: &[u8], b: &[u8]) -> Arc<Self> {
+            let mut archive = Vec::new();
+            archive.extend_from_slice(a);
+            let b_off = archive.len() as u64;
+            archive.extend_from_slice(b);
+            let mut members = BTreeMap::new();
+            members.insert("a.txt".into(), (0, a.len() as u64));
+            members.insert("b.txt".into(), (b_off, b.len() as u64));
+            Arc::new(Self {
+                gen: AtomicU64::new(0),
+                archive: Arc::new(Mutex::new(archive)),
+                members: Mutex::new(members),
+            })
+        }
+
+        /// Delete `a.txt` and slide `b.txt` to offset 0, then bump generation.
+        fn commit_delete_a(&self) {
+            let mut members = self.members.lock().unwrap();
+            let (b_off, b_len) = *members.get("b.txt").expect("b.txt");
+            let b_bytes = {
+                let archive = self.archive.lock().unwrap();
+                archive[b_off as usize..b_off as usize + b_len as usize].to_vec()
+            };
+            *self.archive.lock().unwrap() = b_bytes;
+            members.remove("a.txt");
+            members.insert("b.txt".into(), (0, b_len));
+            self.gen.fetch_add(1, Ordering::SeqCst);
+        }
+
+        fn member_fi(offset: u64, size: u64) -> FileInfo {
+            FileInfo {
+                size,
+                mtime: 1.0,
+                mode: S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Other(offset.to_string())],
+            }
+        }
+    }
+
+    impl MountSource for OffsetShiftSource {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            let mut m = BTreeMap::new();
+            for (name, (off, size)) in self.members.lock().unwrap().iter() {
+                m.insert(name.clone(), Self::member_fi(*off, *size));
+            }
+            Some(ListResult::Infos(m))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            let name = path.strip_prefix('/').unwrap_or(path);
+            let members = self.members.lock().unwrap();
+            let (off, size) = members.get(name)?;
+            Some(Self::member_fi(*off, *size))
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            let offset = fi
+                .userdata
+                .iter()
+                .find_map(|u| match u {
+                    UserData::Other(s) => s.parse().ok(),
+                    _ => None,
+                })
+                .unwrap_or(0);
+            Ok(Box::new(LiveArchiveReader {
+                archive: Arc::clone(&self.archive),
+                base: offset,
+                size: fi.size,
+                pos: 0,
+            }))
+        }
+
+        fn is_immutable(&self) -> bool {
+            false
+        }
+
+        fn content_generation(&self) -> u64 {
+            self.gen.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Regression: FUSE `cat` of an already-open base member returned zeros /
+    /// wrong bytes after a live overlay commit deleted an earlier member and
+    /// shifted archive offsets. NFS sweeps readers on `content_generation`;
+    /// FUSE kept the pre-commit `OpenBackend::Source` reader.
+    #[test]
+    fn overlay_commit_live_delete_shifts_base_read() {
+        let a_body = b"0123456789abcdef0123456789abcdef\n";
+        let b_body = b"BBBB-distinct-payload-for-shift-detection\n";
+        let src = OffsetShiftSource::two_members(a_body, b_body);
+        let fs = RatarmountFs::new(Arc::clone(&src) as Arc<dyn MountSource>, None);
+
+        let fh = fs.test_open_ro("/b.txt").expect("open b.txt before commit");
+        let before = fs.test_read(fh, 0, 128).expect("read before commit");
+        assert_eq!(before, b_body, "precondition: open fh serves b.txt");
+
+        src.commit_delete_a();
+        assert!(
+            src.content_generation() > 0,
+            "commit must bump content_generation"
+        );
+
+        let after = fs
+            .test_read(fh, 0, 128)
+            .expect("FUSE read of b.txt after deleting a.txt and committing");
+        assert_eq!(
+            after, b_body,
+            "base member read after offset-shifting commit must not be stale"
+        );
     }
 
     /// Regression: dir_cache 30s TTL must not hide overlay creates from readdir.
