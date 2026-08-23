@@ -100,7 +100,7 @@ ratarmount -r -l --recursion-depth 2 package.deb mnt/
 # Write overlay + commit back
 ratarmount -w /tmp/ov archive.tar mnt/
 # …edit under mnt/…
-ratarmount --commit-overlay …   # TAR + gzip/bzip2/xz; ZIP full rebuild
+ratarmount --commit-overlay …   # gzip/bzip2/xz GNU tar; .tar.zst splice; ZIP full rebuild
 
 # Missing .tar / .tar.zst + -w creates an empty write-mount base
 ratarmount -w /tmp/ov --commit-overlay-interval 2s new.tar.zst mnt/

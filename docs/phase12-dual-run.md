@@ -43,7 +43,7 @@ Summarized from [`parity-todo.md`](parity-todo.md) and gap batches 1–13. Prefe
 | Perf / CI | **gated** | cold-index hard gate + optional full bench; fmt/clippy/test + FUSE allowlist CI |
 | Packaging | **shippable** | Makefile install, deb/rpm/portable/macOS tarballs, AppImage scaffold, cosign |
 
-**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z without full folder unpack for BCJ/AES, full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred).
+**Not dual-run blockers for common paths:** pure in-process lrzip, pure RAR, PDF Separation/Lab residual, multi-GB solid 7z **BCJ2 / multi-pack** (AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive), full fixed-archive ≥90% allowlist, pure FUSE kernel ABI (deferred).
 
 ---
 
@@ -299,7 +299,7 @@ model, residual gaps, and deprecation timeline.
 
 - Pure RAR / pure in-process lrzip (libarchive and/or CLI fallbacks only)
 - Parallel nested archive indexing (perf; sequential nested index still works)
-- Progressive multi-GB solid 7z with exotic filters (BCJ/AES full-folder residual)
+- Progressive multi-GB solid 7z BCJ2 / multi-pack (AES+LZMA2 and native BCJ/Delta+LZMA2 are progressive; Deflate/BZip2 solids still full-folder)
 - Encrypted ZIP true per-disk offset edges; SQLAR without sqlcipher feature
 - SquashFS classic lzma via `unsquashfs`; some PDF color spaces
 - Full browser HTTP cookie jar (env Cookie MVP shipped); pure `/dev/fuse` ABI (fuser remains the product path)

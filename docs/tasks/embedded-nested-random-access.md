@@ -34,7 +34,7 @@
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
 | N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | **SquashFS+FAT+EXT4 no-tmp** (pure) | SquashFS non-LZMA; FAT; EXT4 pure; residual pure-fail/debugfs |
 | — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
-| — | 7z BCJ/AES multi-GB solid progressive | full-folder residual | partial | deferred (low priority) |
+| — | 7z BCJ2 / multi-pack multi-GB solid progressive | full-folder residual | partial | deferred (AES+LZMA2 / native BCJ+LZMA2 progressive — [`sevenzip-random-access.md`](sevenzip-random-access.md)) |
 
 ---
 
@@ -123,7 +123,7 @@
 
 ## Phase D — Explicit non-goals (this list)
 
-- Pure progressive multi-GB 7z BCJ/AES (separate sevenzip task)
+- Pure progressive multi-GB 7z **BCJ2 / multi-pack** (AES+LZMA2 / native BCJ+LZMA2 shipped — [`sevenzip-random-access.md`](sevenzip-random-access.md))
 - Pure RAR solid random access
 - Nested lrzip without materialize
 - Guaranteeing zero CPU for solid outer 7z deep members (no-tmp ≠ free)

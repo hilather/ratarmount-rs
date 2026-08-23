@@ -11,18 +11,18 @@
 | Area | Today | macOS impact |
 |------|--------|--------------|
 | **FUSE stack** | `fuser` 0.15 + libfuse3; `fuser::mount2` | Compiles against **macFUSE** or **FUSE-T** (libfuse-compatible); runtime needs one of those installed |
-| **Unmount** | `fusermount3` / `fusermount` only (`ratarmount-fuse`) | Must use `umount` / `diskutil unmount` on Darwin |
+| **Unmount** | Linux `fusermount3` / `fusermount`; Darwin `umount` / `diskutil unmount` | **Done** (A2) |
 | **Daemonize** | `nix::fork` + `setsid` + `/dev/null` stdio | Same APIs work on macOS (unix); fine for v1 |
-| **Mount ready probe** | Linux `statfs` + `FUSE_SUPER_MAGIC` (`0x65735546`) | **Broken on Darwin** — different `statfs` layout / fs type; need `mount` table / NFS (FUSE-T) / readdir heuristics |
+| **Mount ready probe** | Linux `statfs` + `FUSE_SUPER_MAGIC`; Darwin `mount` table / wait heuristics | **Done** (A3) — was broken on Darwin `statfs` layout; not a current blocker |
 | **Control socket** | `std::os::unix::net::UnixListener` | OK on macOS |
 | **Unix FS traits** | Widespread `MetadataExt` / `PermissionsExt` / `OpenOptionsExt` | OK (unix, not linux-only) |
 | **libc mode bits** | `S_IFDIR` etc. for FUSE attrs | OK on Darwin |
 | **libarchive** | `pkg-config` in `build.rs` | Need Homebrew `libarchive` (+ `pkg-config`) |
 | **EXT4 / SquashFS MVP** | Shell out to `debugfs` / `unsquashfs` | Tools often missing on Mac; keep soft-skip (already skip-if-absent) |
-| **Packaging** | deb / rpm / portable-glibc tarball | Add macOS **tarball** (and optionally `.pkg` later) |
+| **Packaging** | deb / rpm / portable-glibc tarball + **macOS arm64** tarball on tags | Intel tarball deferred; Homebrew E1 later |
 | **CI** | Linux `check` + **`macos-14` job** (`ci.yml` `macos:`) | Intel `macos-13` deferred |
 
-**Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. The hard blockers are FUSE install/runtime, unmount + mount-ready detection, packaging/CI, and harness scripts that hardcode `fusermount3`.
+**Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. Unmount, mount-ready, packaging/CI, and harness `ratar_unmount` **shipped**. Remaining product leftovers: user must install macFUSE or FUSE-T; Intel tarball and Homebrew (E1) later.
 
 **Hard CI constraint:** GitHub-hosted macOS runners **cannot load macFUSE kexts**. Practical approach:
 

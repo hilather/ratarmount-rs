@@ -6,7 +6,7 @@
 | **Date** | 2026-08-17 |
 | **Status** | Ready for implementation |
 | **Scope** | If the designated archive path is missing, create a POSIX-empty uncompressed TAR or a one-frame `.tar.zst` and mount it as a writable empty root (`-w`). Existing **live** overlay commit then persists into that file. Offline `--commit-overlay` may create a missing **uncompressed `.tar` only**. |
-| **Out of this train** | Creating `.tar.gz` / other compressed TAR / ZIP / 7z; offline `--commit-overlay` persist for `.tar.zst` (prior-train PR 7); `mkdir -p` of missing parents; inventing a zstd seek table; changing persist algorithms; changing `looks_like_tar` / format probe; union / multi-input auto-create; create of a bare filename `tar` |
+| **Out of this train** | Creating `.tar.gz` / other compressed TAR / ZIP / 7z; `mkdir -p` of missing parents; inventing a zstd seek table; changing persist algorithms; changing `looks_like_tar` / format probe; union / multi-input auto-create; create of a bare filename `tar` |
 
 ---
 
@@ -18,7 +18,7 @@ The product request is: **`ratarmount -w <overlay> archive.tar[.zst] [mnt]` when
 
 This design adds a **CLI-layer, O_EXCL create** of a POSIX-empty archive (two 512-byte zero blocks; optionally one zstd frame around those 1024 bytes) **before** `factory::build_mount_source_ex`. It does **not** put create-if-missing inside `factory::open_path` (that function is also the nested-open path). It **does** extend `is_uncompressed_tar` so a POSIX-empty file is recognized as a TAR — without that, live commit would reject the uncompressed file we just created. It does **not** change `looks_like_tar` (format probe).
 
-Offline `--commit-overlay` is **not** a zstd persist path today (`commit_overlay_tar` rejects `CompressionFormat::Zstd`). The offline branch therefore creates a missing **uncompressed `.tar` only**. A missing `.tar.zst` on that branch exits 2 **without creating a file**.
+**Shipped after this design (PR 7):** offline `--commit-overlay` **splices** an **existing** `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing remains uncompressed `.tar` only: a missing `.tar.zst` on the offline branch still exits 2 **without creating a file**. Inner “today / Zstd is rejected” sentences below that still describe persist were the pre-PR7 snapshot.
 
 ---
 
@@ -55,7 +55,7 @@ Relevant existing pieces (do not reinvent):
 | On-exit | `maybe_commit_on_exit` → `commit_atomic` | persist only; no reopen/reset |
 | Uncompressed persist | `WriteOverlay::persist_uncompressed_tar_plan` | sibling `NamedTempFile`, `File::open(archive)` copy, GNU `tar --delete`/`--append`, `persist` |
 | `.tar.zst` **live** persist | `persist_tar_zst_plan` | `scan_zstd_frames_path` + `find_last_n_tar_window` + `splice_zstd_last_frames_replace` |
-| Offline `--commit-overlay` | `commit_overlay` → ZIP or `commit_overlay_tar` | `None` / Gzip / Bzip2 / Xz only. **`CompressionFormat::Zstd` is rejected** (“got {other:?}”). Not an escape hatch ([tar-zst-live-commit-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/tar-zst-live-commit-design.md) PR 7). |
+| Offline `--commit-overlay` | `commit_overlay` → ZIP or `commit_overlay_tar` | gzip/bzip2/xz GNU tar; **`.tar.zst` splice shipped (PR 7)** including earlier-frame delete. Live interval still rejects prefix-frame. Create-if-missing is uncompressed `.tar` only. |
 | Empty TAR bytes | `ratarmount_formats_tar::write_tar_eof` | `write_all(&[0u8; 1024])` |
 | Zstd frame encode | `encode_zstd_frame_to` (`SPLICE_ENCODE_LEVEL = 3`) | persist-grade encoder in `zstd_splice.rs` |
 | Virtual `/` | `create_root_file_info()` / `SqliteIndex::lookup("/")` | synthesized even when the `files` table is empty |
@@ -78,7 +78,7 @@ Consequences if we create 1024 zeros and stop there:
 | Factory open of `foo` (no `.tar`) | Falls through every backend → `SingleFileMountSource`. We will not create such names. |
 | `live_commit_is_supported` on the new `.tar` | **Fails** (`is_uncompressed_tar` false) — interval/on-exit unusable. |
 | Offline `--commit-overlay` on the new `.tar` | Same `is_uncompressed_tar` reject inside `commit_overlay_tar`. |
-| New `.tar.zst` | **Works** for **live** commit: `looks_like_tar_zst` is **name-first**. Persist: one frame, decoded suffix is 1024 zeros, `find_last_tar_eof` + `window_has_member_boundary` (`region_all_zero`) succeed. Factory `open_zstd` treats it as TAR via `name_suggests_compressed_tar`. Offline `--commit-overlay` still **rejects Zstd** (do not create on that branch — K13). |
+| New `.tar.zst` | **Works** for **live** commit: `looks_like_tar_zst` is **name-first**. Persist: one frame, decoded suffix is 1024 zeros, `find_last_tar_eof` + `window_has_member_boundary` (`region_all_zero`) succeed. Factory `open_zstd` treats it as TAR via `name_suggests_compressed_tar`. Offline `--commit-overlay` **does not create** a missing `.tar.zst` (K13). Persist of an existing `.tar.zst` is splice (PR 7); live interval still rejects prefix-frame mutate. |
 
 So the recognition fix is **required for uncompressed `.tar` live and offline persist**, and is scoped to `is_uncompressed_tar` only.
 
@@ -107,7 +107,7 @@ So the recognition fix is **required for uncompressed `.tar` live and offline pe
 | Item | Reason |
 |------|--------|
 | Creating gzip/bzip2/xz TAR or ZIP | Live commit rejects them; offline gzip commit is a different persist path; product said out of scope |
-| Offline `--commit-overlay` for `.tar.zst` | `commit_overlay_tar` rejects Zstd today. Prior-train PR 7. Creating a file then failing is worse than not creating |
+| Create missing `.tar.zst` on offline `--commit-overlay` | Persist of an **existing** `.tar.zst` is splice (PR 7). Creating a missing file on that branch then failing is worse than not creating (K13) |
 | Literal ustar member named `/` or `.` | Indexes already synthesize `/`; a real `/` member is skipped (`full.is_empty()` → `return Ok(())` in `push_entry`, `ratarmount-formats-tar/src/lib.rs` ~2308–2328) |
 | Inventing a zstd seek table on create | Live-commit K5: do not invent a footer if the input did not have one |
 | Changing `looks_like_tar` / `body_looks_like_tar` | Would remount nameless 1024-zero blobs as TAR. Factory `by_ext` already opens created `*.tar` |
@@ -137,7 +137,7 @@ So the recognition fix is **required for uncompressed `.tar` live and offline pe
 | **K10** | **Remote URLs never create.** Check `is_remote_url` in **`main.rs` / `overlay_commit.rs` only**. The compositing helper is local-filesystem-only and must **not** depend on `ratarmount-remote`. `file://` is a URL: refuse even if it points at a local missing path — operator can pass the filesystem path. | Compositing’s `Cargo.toml` has no remote dep (and should not). Both call sites are already in the binary. |
 | **K11** | **FUSE and NFS share the same create-then-open path.** No NFS-specific create. | Both go through `main.rs` → `build_mount_source_ex` → overlay wrap → `validate_live_commit_args`. |
 | **K12** | **No new CLI flag in v1 — neither opt-in nor opt-out.** Create is implied by `-w` + a missing `.tar` / `.tar.zst` (supported name, single local input). **User-confirmed 2026-08-17:** do not add `--no-create-missing-archive` or `--create-missing-archive`. Revisit only if wrapper scripts report surprise files (they already risk creating an overlay dir via `WriteOverlay::new`). | Product is “just create it”. An extra flag is ceremony and was rejected as Open Question #1. |
-| **K13** | **Offline `--commit-overlay` creates a missing uncompressed `.tar` only.** A missing `.tar.zst` / `.tzst` / `.tar.zstd` on that branch exits 2 with `offline --commit-overlay does not support .tar.zst (use --commit-overlay-on-exit / --commit-overlay-interval)` and **does not create a file**. | `commit_overlay_tar` rejects Zstd. Creating then failing leaves a stray archive. Live commit is the zstd persist path. |
+| **K13** | **Offline `--commit-overlay` creates a missing uncompressed `.tar` only.** A missing `.tar.zst` / `.tzst` / `.tar.zstd` on that branch exits 2 and **does not create a file**. Persist of an **existing** `.tar.zst` is splice (PR 7); live interval still rejects prefix-frame mutate. | Creating then failing persist would leave a stray archive. Create-if-missing stays `.tar` only. |
 | **K14** | **Tighten both zstd last-frame warnings** (`overlay_commit::maybe_warn_large_zstd_last_frame` and `write_overlay::warn_large_zstd_window`) to **`last_plain > 64 MiB` only** (drop `frames.len() == 1` / `single_frame`). Required, not optional. | A brand-new 1024-byte one-frame archive would otherwise warn at startup **and** on the first persist. The warning exists for expensive rewrite windows, not for 1 KiB empties. |
 | **K15** | **`classify` `Err` is absence-conditional.** Do **not** `?` the classify result before `symlink_metadata`. `Err` (known type we will not create) + **NotFound** → exit 2. `Err` + **exists** (regular file of any size, dir, symlink, …) → **`Unchanged`** (open as today; never rewrite). `Ok(None)` is always `Unchanged`. `Ok(Some(kind))` follows K5/K6/K8. | `ratarmount -w ov existing.tar.gz mnt` (overlay-only + offline gzip commit), `-w existing.zip`, and `-w existing.7z` are supported today. Treating `classify` `Err` as a hard failure would regress them. A 0-byte existing `.tar.gz` is **not** K6-initialized. |
 
@@ -446,7 +446,7 @@ CLI help (clap):
 
 - `-w` / `--write-overlay`: a missing uncompressed `.tar` or `.tar.zst` is created as an empty archive.
 - `--commit-overlay-on-exit` / `--commit-overlay-interval`: same create-if-missing (still require durable `-w`).
-- `--commit-overlay`: create-if-missing for **uncompressed `.tar` only**; `.tar.zst` remains unsupported offline.
+- `--commit-overlay`: create-if-missing for **uncompressed `.tar` only**; persist of an **existing** `.tar.zst` is splice (PR 7). Live interval still rejects prefix-frame mutate.
 
 Usage blurb (~401) can add:
 

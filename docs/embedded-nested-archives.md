@@ -131,7 +131,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 |---------------|-----------|-------------------|---------------------------|
 | **Uncompressed TAR** | ustar magic or `.tar` name | `SqliteIndexedTar::open_from_reader` | **Yes** — stencil on stream offsets |
 | **ZIP** | `PK` magic | `ZipMountSource::open_from_reader` | Store: true random; deflate: inflate whole member then seek in RAM |
-| **7z** | 7z signature | `SevenZipMountSource::open_from_reader` | Store: true random; pure LZMA2 solid: progressive; other solid: full-folder residual |
+| **7z** | 7z signature | `SevenZipMountSource::open_from_reader` | Store: true random; pure LZMA2 / AES+LZMA2 / native BCJ/Delta+LZMA2 large solids: progressive; BCJ2 / multi-pack / Deflate / BZip2 solid: full-folder residual |
 | **`.tar.gz` / `.tgz`** | gzip magic + TAR body/name | Seekable gzip + `create_index_gzip` | **Yes** — gzip checkpoints + TAR stencil |
 | **Plain `.gz` / `.zst` / `.bz2` / `.xz` (non-TAR)** | compress magic | Seekable body + `SingleFileMountSource::from_seekable_body` (or nested archive if payload is ZIP/7z/…) | **Yes** — no nested member spool |
 | **`.tar.zst`** | zstd magic + TAR | Seekable zstd + TAR body | Yes (frame/map dependent) |
@@ -168,8 +168,8 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **TAR** | `.tar.gz` / `.zip` / `.7z` | **No** | Stencil outer member + nested reader |
 | **`.tar.gz` / `.tgz`** | `.tar` / `.zip` / `.7z` / `.tar.gz` | **No** | Outer is seekable gzip; member open is stencil over gzip |
 | **7z (store/copy)** | `.tar` / `.tar.gz` / `.zip` / `.7z` | **No** | Preferred outer packing for nested random I/O |
-| **7z (solid LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode; not recommended for large solids |
-| **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for BCJ/AES/etc. |
+| **7z (solid LZMA2 / AES+LZMA2 / native BCJ/Delta+LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode (BCJ/Delta sequential-from-0 + LRU; no dict-reset resume); not free for large solids |
+| **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for **BCJ2 / multi-pack / Deflate / BZip2** |
 | **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches |
 | **SQLAR** unencrypted nested | nested | **No** (full image RAM) | deserialize; encrypted still path residual |
 | **CAB LZX / classic SquashFS LZMA / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; classic LZMA → unsquashfs path |
@@ -226,7 +226,9 @@ Temp files are held for the life of that nested mount and removed when the neste
 | TAR stencil / ZIP store / 7z store | ~disk `pread` (best) |
 | gzip / zstd / bzip2 seek + TAR | Jump to checkpoint/frame + local decompress |
 | ZIP deflate member (as nested *or* as parent open of nested TAR) | Inflate whole member once (cached); then free seeks in RAM |
-| 7z pure LZMA2 (solid or large non-solid) | Live sequential cursor (linear `cat`); random reads resume at independent LZMA2 reset chunks. Window LRU helps locality. Non-solid folders retain the 0..N prefix after a header-at-end walk |
+| 7z pure LZMA2 / AES+LZMA2 (solid or large non-solid) | Live sequential cursor (linear `cat`); random reads resume at independent LZMA2 reset chunks. Window LRU helps locality. Non-solid folders retain the 0..N prefix after a header-at-end walk |
+| 7z native BCJ/Delta+LZMA2 (large solid) | Sequential-from-0 + LRU; **no** dict-reset resume (BCJ IP is decoder-relative) |
+| 7z BCJ2 / multi-pack / Deflate / BZip2 solid | Full-folder decompress residual |
 | Temp spool path | One disk write of nested body, then normal path open |
 
 **Recommendation:** For nested archives you care about, pack the **outer** with **store/copy** (ZIP store, 7z `-mx0`, uncompressed TAR) so the nested open is a pure stencil.
