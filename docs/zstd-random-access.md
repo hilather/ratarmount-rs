@@ -160,12 +160,15 @@ table using the recipes above.
 host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 (or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
 `.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
-no seek table) when `-w` is set. Offline `--commit-overlay` is **not** an
-escape hatch: a missing `.tar.zst` exits 2 without creating a file. Interval
-`DURATION` is a **per-file settle time**: only overlay files whose host mtime
-is at least that old **and** that have no open write fd are written into the
-archive; recently modified or still-open files stay in the overlay until they
-go idle. On-exit still flushes everything.
+no seek table) when `-w` is set. Live ticks still **reject** prefix-frame
+mutate (append-only + last-window). Offline `--commit-overlay` **is** the
+escape hatch for earlier-frame delete/replace: splice from the affected frame
+through EOF (prefix frames byte-identical). A missing `.tar.zst` on the
+offline path still exits 2 without creating a file (create-if-missing is
+uncompressed `.tar` only). Interval `DURATION` is a **per-file settle time**:
+only overlay files whose host mtime is at least that old **and** that have no
+open write fd are written into the archive; recently modified or still-open
+files stay in the overlay until they go idle. On-exit still flushes everything.
 See
 [mount-options-parity.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md)
 and [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
@@ -191,15 +194,15 @@ startup warns when the last-frame uncompressed size exceeds **64 MiB** (a
 brand-new one-frame empty archive does **not** warn), then spills
 decoded/encoded suffix above 256 MiB.
 
-**Not supported (v1):**
+**Not supported (live v1):**
 
 - Gzip / bzip2 / xz live splice — rejected with a message that **names gzip**
   (or the other codec). G3 inflate checkpoints are not deflate cut points.
-- Offline `--commit-overlay` for `.tar.zst` — **not an escape hatch** (missing
-  `.tar.zst` is not created on that branch).
+- Live delete/replace of a name that still has a version in an earlier frame
+  (append-only + last-window mutate). Use offline `--commit-overlay` (PR 7
+  shipped: rewrite from the affected frame through EOF).
+- Offline create-if-missing of a missing `.tar.zst` (uncompressed `.tar` only).
 - Plain `.zst` that is not a TAR body.
-- Delete/replace of a name that still has a version in an earlier frame
-  (append-only + last-window mutate).
 
 ---
 

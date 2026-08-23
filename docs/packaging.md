@@ -19,7 +19,7 @@ CI workflow: [`.github/workflows/packages.yml`](https://github.com/hilather/rata
 | Ubuntu 24.04 | `deb` | amd64 + **arm64** | `.deb` + tarball |
 | Rocky Linux 8 | `rpm` (container) | amd64 | `.rpm` + tarball |
 | Portable (Debian bullseye, **glibc 2.31**) | `portable` | amd64 + **arm64** | tarball only |
-| **macOS** | `macos` | **arm64** (`macos-14`) + **x86_64** (`macos-13`) | tarball only |
+| **macOS** | `macos` | **arm64** (`macos-14`) only | tarball only (Intel `macos-13` deferred) |
 
 > **v0.1.0 note:** Ubuntu 20.04 container and Rocky 9 matrix legs are temporarily disabled in CI
 > (apt hang / exit 127). Use the portable glibc 2.31 tarball on older hosts; Rocky 9 packages

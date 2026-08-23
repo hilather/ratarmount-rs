@@ -6,8 +6,8 @@
 |--------|----------|
 | `file://` | Map to local path |
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range |
-| `s3://bucket/key` | AWS SigV4 GetObject → temp file |
-| `ssh://` / `sftp://` / `scp://` | SFTP download → temp file |
+| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous |
+| `ssh://` / `sftp://` / `scp://` | SFTP download → temp file (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include) |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
 | `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH` |
 | bare local paths | Unchanged |
@@ -60,6 +60,18 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
 
 Tried in order: password from URL (`ssh://user:pass@host/…`), SSH agent, `~/.ssh/id_ed25519|id_rsa|id_ecdsa`, then `RATARMOUNT_SSH_PASSWORD`.
 
+Config path: `RATARMOUNT_SSH_CONFIG` or `~/.ssh/config`. URL User/Port override the **destination** only (not ProxyJump hops).
+
+| `ssh_config` keyword | Status |
+|----------------------|--------|
+| `Host` / `HostName` / `User` / `Port` | **Done** |
+| `IdentityFile` / `IdentitiesOnly` | **Done** |
+| `ProxyJump` (comma-separated hops via libssh2 `direct-tcpip`) | **Done** |
+| `Include` (tilde / relative to the config file; trailing `*` via `read_dir`; depth 16; 1 MiB cap) | **Done** |
+| `ProxyCommand` (shell) | **Residual** (injection / no pty) |
+| `Match` exec/host | **Residual** (ignored) |
+| Live hop handshake | Unit tests cover parse + hop resolution + cycles; live `direct-tcpip` is skip-without-`sshd` |
+
 Path rules (fsspec-like):
 
 - `ssh://host/rel/path` → relative `rel/path`
@@ -83,10 +95,10 @@ ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
 ## Not yet
 
 - Pure-Rust SMB (no `smbclient` dependency)
-- Git
 - Recursive WebDAV directory mount as a folder (single-file GET only)
-- Streaming open without full download for multi-GB archives (Range-backed format readers)
-- S3 anonymous / instance-profile auto-refresh beyond static env keys
+- Full browser cookie jar / `Set-Cookie` persistence (env Cookie + Netscape file **are** shipped)
+- ssh_config **ProxyCommand** / **Match** (ProxyJump + Include **are** shipped)
+- S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
 
 ## Usage
 

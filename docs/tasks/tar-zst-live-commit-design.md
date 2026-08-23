@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | TBD |
 | **Date** | 2026-08-15 |
-| **Status** | Implemented (v1 live path; PR 7 offline `--commit-overlay` is follow-on) |
+| **Status** | Implemented (v1 live path **and** PR 7 offline `--commit-overlay`) |
 | **Scope** | Live `--commit-overlay-interval` / `--commit-overlay-on-exit` for `.tar.zst` via last-frame rewrite |
 | **Out of this train** | Efficient gzip splice; `tar --append -z`; concatenated `.tar.gz` visibility |
 
@@ -89,7 +89,7 @@ Gzip members are **not** independent in the same way. That path stays rejected.
 |------|--------|
 | Gzip / bzip2 / xz live splice | Empirically not a last-member append; G3 checkpoints ≠ deflate cuts |
 | Delete/replace when **any** version of the name has `offsetheader` before the rewrite window | Would require rewriting every frame from that member through EOF; v1 **rejects** the **entire** tick (pending appends are not persisted). Uncompressed GNU `tar --delete` removes every occurrence; dropping only the last-window copy would silently undelete an earlier version. |
-| Offline `--commit-overlay` for `.tar.zst` | Follow-on (PR 7). Not required to ship live. Call out that it is **not** an escape hatch until then |
+| Offline `--commit-overlay` for `.tar.zst` | **Done (PR 7)** — splice from the affected frame; live earlier-frame still rejected |
 | GNU long-name (`L`/`K`) writer | PAX covers long names; parser already reads both |
 | Sparse / xattr / hard-link commit | Overlay does not produce these; GNU tar `--append` xattrs are a residual today too |
 | Rewriting last frame as many small frames | One new last frame is enough; preserves seekability of the prefix |
@@ -1088,13 +1088,14 @@ Each PR is independently reviewable and mergeable. Library PRs first; CLI last. 
 
 ---
 
-### PR 7 — Follow-on (not v1): offline `--commit-overlay` for `.tar.zst`
+### PR 7 — **Done:** offline `--commit-overlay` for `.tar.zst`
 
-- **PR title:** `compositing: offline --commit-overlay last-frame / suffix rewrite for .tar.zst`
-- **Files/components affected:** `commit_overlay_tar` / `recompress_replace`; docs
+- **PR title:** `compositing: offline --commit-overlay splice for .tar.zst including earlier-frame delete`
+- **Status:** **Implemented** — `commit_overlay_tar` splits Zstd (`looks_like_tar_zst`) onto splice + `rewrite_tar_suffix`; gzip/bzip2/xz stay GNU tar. Live earlier-frame still `Err` (offline is the escape hatch).
+- **Files/components affected:** `commit_overlay_tar` / `commit_overlay_tar_zst`; no GNU tar on the zstd arm
 - **Dependencies:** PR 4
-- **Description:** Offline path uses the same splice. Append/last-window = last-frame rewrite. Delete/replace of earlier members = rewrite **from the frame containing `offsetheader` through EOF** (copy prefix frames, decode suffix frames, GNU tar **or** in-tree drop+append, recompress as one or N frames). Do **not** full-recompress to a single frame unless the archive was already single-frame. **Not required** to ship live v1. Until this lands, live error text must not claim offline `--commit-overlay` works for zstd.
-- **Test plan:** Offline add/replace/delete on multi-frame and single-frame fixtures; prefix-frame hash unchanged on append; earlier-frame delete changes from the affected frame onward; seek table rebuilt.
+- **Description:** Offline path uses the same splice. Append/last-window = last-frame rewrite. Delete/replace of earlier members = rewrite **from the frame covering `min(offsetheader)` through EOF** (prefix frames byte-identical). In-tree `rewrite_tar_suffix`, not GNU tar. Single-frame = `from_idx = 0` = full rewrite. No sibling `*.index.sqlite` (`write_index: false`, `index_in_memory: true`).
+- **Test plan:** `cargo test -p ratarmount-compositing --lib commit_overlay` (multi-frame append / last-window replace / earlier-frame delete / header-straddle / no durable index / single-frame / seek-table / empty overlay). Live earlier-frame still rejected.
 
 ---
 
@@ -1108,4 +1109,4 @@ Each PR is independently reviewable and mergeable. Library PRs first; CLI last. 
 | 8–12 | PR 4 (overlay classify all-versions + persist + compositing tests) |
 | 12–15 | PR 5 (CLI + docs + bin test) **∥ PR 6** (NFS test) |
 
-PR 7 is a later increment.
+PR 7 (offline `--commit-overlay` for `.tar.zst`) is **done**.

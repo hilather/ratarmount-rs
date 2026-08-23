@@ -10,6 +10,8 @@ This document turns the fork’s recent work (8 commits past upstream master) in
 
 **Status (2026-07-26): IMPLEMENTED** — P0–P3 landed in ratarmount-rs (harness green). Remaining polish (true progressive LZMA chunk streaming for multi-GB solids without full unpack buffer; CAB LZX; lrzip) is deferred as matching Python non-goals or follow-ups.
 
+**Note:** the header is **IMPLEMENTED**; inner `[ ]` checkboxes below are **historical** (the pre-land task list). Do not treat them as open work. Later 7z progressive AES+LZMA2 / BCJ+LZMA2 lives in [`sevenzip-random-access.md`](sevenzip-random-access.md) / [`parity-todo.md`](../parity-todo.md).
+
 ---
 
 ## Commit map (Python → Rust gap)

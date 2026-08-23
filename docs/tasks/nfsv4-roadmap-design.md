@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs |
 | **Date** | 2026-08-15 |
-| **Status** | Draft |
+| **Status** | Implemented (v3 + opt-in v4.1). Overlay **rename/symlink** shipped on v3 and v4 — see [`docs/nfs-export.md`](../nfs-export.md); residual rows below that still say `ReadOnly` are **historical**. |
 | **Workspace** | `/home/mbrewer/projects/ratarmount-rs` (workspace version `0.1.20`, `rust-version = "1.74"`) |
 | **Audience** | Implementers who already know `MountSource`, `ratarmount-nfs` NFSv3, `WriteOverlay`, and the CLI factory |
 
@@ -102,7 +102,7 @@ These stay documented in `docs/nfs-export.md`. Do **not** put them in the implem
 | Residual | Why it is not a v4 blocker |
 |----------|----------------------------|
 | nfsserve protocol `READDIR` / Windows `mount.exe` `dir` | v4 uses embednfs READDIR. Windows v3 stays residual. |
-| Overlay **rename / symlink** over v3 | v3 leaves `NFS3ERR_ROFS`. v4 overlay PR may still leave rename/symlink `ReadOnly` (same as v3). Not a v3-first blocker. |
+| Overlay **rename / symlink** over v3 | **Shipped** on NFSv3 and NFSv4.1 with `-w` (same overlay folder as FUSE). Without `-w` they stay `ROFS`. See [`docs/nfs-export.md`](../nfs-export.md). Historical design text that said `ReadOnly` is stale. |
 | `--nfs-allow` | nfsserve 0.11 `process_socket` is private. embednfs also has no documented accept filter. Localhost remains the boundary. |
 | IPv6 bind on `NFSTcpListener` | nfsserve split-on-first-`:`. v4 bind uses `tokio::net::TcpListener` (could do v6 later); this train stays IPv4 to share `--nfs-bind`. |
 | NFS-only daemonize | v1 NFS-only stays foreground. Unchanged. |
@@ -888,7 +888,7 @@ Update `about` only when `--nfs-vers` exists (PR 3). Mention v3 default.
 | Shared `VfsAdapter` with FUSE | After v4 RO + overlay green. |
 | try-v4-then-v3 mux | Only if a crate API appears. |
 | Windows NFSv4 client | Residual. |
-| Overlay rename/symlink | Separate; FUSE overlay may already support more. |
+| Overlay rename/symlink | **Shipped** (v3 + v4 with `-w`). Not a follow-on. |
 | NFS-only daemonize | Operator request. |
 
 ---
@@ -943,7 +943,7 @@ Ordered, independently reviewable. Implementers execute **in order**. After a sp
 - **Title:** Allow NFSv4.1 writes through the existing write overlay.
 - **Files:** `ratarmount-nfs/src/v4/adapter.rs` (create/write/setattr/remove), tests, `docs/nfs-export.md` (v4 + `-w`).
 - **Depends on:** PR 3.
-- **Description:** When `NfsOptions.overlay` is `Some`, map File/Directory create, write, truncate, unlink/rmdir onto `WriteOverlay` exactly as `vfs.rs` `*_sync`. `create` returns `CreateResult { handle, attrs }`. `write` returns `WriteResult { written, stability: DataSync }` (no `fsync`). `bump_after_mutate` + `Attrs.change++`. rename + create_symlink stay `ReadOnly`. Wire is already there (`main.rs` sets `nfs_opts.overlay`).
+- **Description:** When `NfsOptions.overlay` is `Some`, map File/Directory create, write, truncate, unlink/rmdir onto `WriteOverlay` exactly as `vfs.rs` `*_sync`. `create` returns `CreateResult { handle, attrs }`. `write` returns `WriteResult { written, stability: DataSync }` (no `fsync`). `bump_after_mutate` + `Attrs.change++`. **Shipped later:** overlay **rename/symlink** on v3 and v4 (not `ReadOnly`). Wire is already there (`main.rs` sets `nfs_opts.overlay`).
 - **Test plan:** Port v3 `overlay_create_write_read_mkdir_readdir` and `overlay_truncate_and_unlink_invalidate_reader` to `RatarmountNfs4`. RO tests still pass without overlay. `cargo fmt --all`.
 
 ### PR 5 — Reader idle / lease approximation
@@ -973,7 +973,7 @@ Ordered, independently reviewable. Implementers execute **in order**. After a sp
 ### Explicitly not in this train
 
 - Kerberos / RPCSEC_GSS / ACLs / delegations.
-- v3 Windows READDIR, `--nfs-allow`, IPv6 nfsserve bind, NFS-only daemonize, v3 overlay rename/symlink.
+- v3 Windows READDIR, `--nfs-allow`, IPv6 nfsserve bind, NFS-only daemonize. Overlay rename/symlink **shipped** (v3 + v4).
 
 ---
 

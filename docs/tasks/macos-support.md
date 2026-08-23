@@ -1,12 +1,12 @@
 # macOS support — evaluation & task list
 
-**Status:** Phase A–D implemented in tree; awaiting GHA macOS green + first tag with macOS assets.  
-**Target:** ship Apple Silicon + Intel macOS binaries on release tags, with CI that builds and (as far as GHA allows) tests them.  
+**Status:** **First-class on Apple Silicon** — Phase A–D in tree; GHA `macos-14` job exists (`ci.yml` `macos:`); v0.1.24 GitHub Release ships signed `ratarmount-0.1.24-macos-arm64.tar.gz`. Intel tarball **deferred** (no GHA `macos-13` capacity). Homebrew formula is **E1** (later).  
+**Target:** keep Apple Silicon tarballs on release tags; do not re-add Intel until runners exist.  
 **Related:** [`docs/macos.md`](../macos.md) (FUSE install + Tahoe); `docs/packaging.md`; `.github/workflows/{ci,packages}.yml`.
 
 ---
 
-## 1. Current state (Linux-only product)
+## 1. Current state (Linux + macOS arm64)
 
 | Area | Today | macOS impact |
 |------|--------|--------------|
@@ -20,7 +20,7 @@
 | **libarchive** | `pkg-config` in `build.rs` | Need Homebrew `libarchive` (+ `pkg-config`) |
 | **EXT4 / SquashFS MVP** | Shell out to `debugfs` / `unsquashfs` | Tools often missing on Mac; keep soft-skip (already skip-if-absent) |
 | **Packaging** | deb / rpm / portable-glibc tarball | Add macOS **tarball** (and optionally `.pkg` later) |
-| **CI** | `ubuntu-latest` only | Add `macos-14` (arm64) ± `macos-13` (intel) |
+| **CI** | Linux `check` + **`macos-14` job** (`ci.yml` `macos:`) | Intel `macos-13` deferred |
 
 **Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. The hard blockers are FUSE install/runtime, unmount + mount-ready detection, packaging/CI, and harness scripts that hardcode `fusermount3`.
 
@@ -28,7 +28,7 @@
 
 1. **Always:** compile + unit tests on macOS (link against FUSE headers/libs).
 2. **Mount tests on GHA:** prefer **FUSE-T** (kext-less, NFS/SMB backend) if it works with `fuser` on runners; otherwise gate full FUSE harness as **manual / self-hosted** and keep a small smoke that does not require a live mount.
-3. **Release binaries:** build on `macos-14` (arm64) and optionally `macos-13`/`macos-15` (x86_64 or universal later).
+3. **Release binaries:** build on `macos-14` (arm64). Intel `macos-13`/`macos-15` tarball **deferred**.
 
 ---
 
@@ -46,11 +46,11 @@ Document both in README; link against whichever `pkg-config fuse` (or fuse3) pro
 ### Binary product shape (v1)
 
 - Ship **native release tarballs**:
-  - `ratarmount-<ver>-macos-arm64.tar.gz` (Apple Silicon)
-  - `ratarmount-<ver>-macos-x86_64.tar.gz` (Intel), if runner budget allows
+  - `ratarmount-<ver>-macos-arm64.tar.gz` (Apple Silicon) — **shipped** on tags
+  - `ratarmount-<ver>-macos-x86_64.tar.gz` (Intel) — **deferred** (no GHA Intel runner)
 - **Do not** ship a fat universal binary in v1 unless linking both arches is painless.
 - Dynamic link against system/Homebrew **libfuse** + **libarchive** (document `brew install libarchive macfuse` / `fuse-t`).
-- Optional later: Homebrew formula, `.pkg` installer.
+- Optional later: Homebrew formula (E1), `.pkg` installer.
 
 ### Out of scope for first macOS milestone
 
@@ -211,8 +211,8 @@ Add job `macos` (matrix):
 
 | Label | Runner | Artifact |
 |-------|--------|----------|
-| `macos-arm64` | `macos-14` | `ratarmount-<ver>-macos-arm64.tar.gz` |
-| `macos-x86_64` | `macos-13` (Intel) | `ratarmount-<ver>-macos-x86_64.tar.gz` |
+| `macos-arm64` | `macos-14` | `ratarmount-<ver>-macos-arm64.tar.gz` (**shipped**) |
+| `macos-x86_64` | `macos-13` (Intel) | **Deferred** — GHA macos-13 capacity; do not re-add until runners exist |
 
 Steps:
 
@@ -245,8 +245,8 @@ Either:
 
 ### 5.4 Docs
 
-- README: Platforms → Linux + macOS (beta); install via tarball + brew deps.  
-- `docs/packaging.md`: macOS matrix, verify steps, cosign identity.  
+- README: Platforms → Linux + macOS **arm64** first-class; install via tarball + brew deps. Intel deferred; Homebrew later.  
+- `docs/packaging.md`: macOS matrix is **macos-14 arm64 only**.  
 - Short `docs/macos.md`: enable kext (macFUSE), FUSE-T alternative, `PKG_CONFIG_PATH`, known limits (EXT4/SquashFS helpers).
 
 ---
@@ -255,14 +255,14 @@ Either:
 
 Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** multi-day.
 
-### Phase A — Compile on macOS (blocker)
+### Phase A — Compile on macOS (done)
 
 | ID | Task | Effort | Status |
 |----|------|--------|--------|
 | **A1** | Document local Mac build + **FUSE install** (macFUSE / FUSE-T / Tahoe FSKit) in `docs/macos.md` | S | **done** |
 | **A2** | Fix `unmount()` for Darwin (`umount` / `diskutil`) | S | **done** |
 | **A3** | Fix `path_is_fuse` / `wait_until_mounted` for Darwin | M | **done** |
-| **A4** | Verify `cargo build --release` + `cargo test --workspace` on Apple Silicon | M | **pending GHA / real Mac** |
+| **A4** | Verify `cargo build --release` + `cargo test --workspace` on Apple Silicon | M | **done** — CI job exists (`.github/workflows/ci.yml` `macos:` `runs-on: macos-14`) |
 | **A5** | libarchive brew path notes + CI env | S | **done** (CI + docs) |
 
 ### Phase B — Behavior + harness
@@ -289,8 +289,8 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 | ID | Task | Effort | Status |
 |----|------|--------|--------|
 | **D1** | `packaging/build-macos-tarball.sh` | S | **done** |
-| **D2** | `packages.yml` matrix arm64 + x86_64 | M | **done** |
-| **D3** | macOS tarballs in signed-release-bundle + Release | S | **done** (wired; needs tag run) |
+| **D2** | `packages.yml` matrix arm64 (`macos-14`) | M | **done** (arm64 `[x]`; x86_64 **deferred**, not `[x]` — `macos-13` removed) |
+| **D3** | macOS tarballs in signed-release-bundle + Release | S | **done** (v0.1.24 signed `macos-arm64` asset on GitHub Release) |
 | **D4** | Cosign sign macOS blobs | S | **done** (same release job) |
 | **D5** | packaging docs + release notes + MACOS.txt FUSE install | S | **done** |
 
@@ -298,7 +298,7 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 
 | ID | Task | Effort | Notes |
 |----|------|--------|-------|
-| **E1** | Homebrew formula (tap or core) | L | After tarball stable |
+| **E1** | Homebrew formula (tap or core) | L | `[ ]` After tarball stable — **not** this train |
 | **E2** | Universal binary (lipo) or only arm64 if Intel share is low | M | Optional |
 | **E3** | Finder `volname` / icon / xattr quirks | M | UX |
 | **E4** | Pure SquashFS/EXT4 (drop external tools) | L | Independent of Mac |
@@ -335,12 +335,12 @@ Defer intel matrix, Homebrew formula, and required FUSE smoke until arm64 is sol
 
 ## 9. Acceptance criteria (Mac support “done” for release notes)
 
-- [ ] `cargo test --workspace` green on `macos-14` in CI  
-- [ ] Tag build produces signed `ratarmount-*-macos-arm64.tar.gz` on GitHub Release  
+- [x] `cargo test --workspace` on `macos-14` in CI (`.github/workflows/ci.yml` `macos:`)  
+- [x] Tag build produces signed `ratarmount-*-macos-arm64.tar.gz` on GitHub Release (v0.1.24; Intel tarball **deferred**)  
 - [x] Documented install: brew deps + extract binary + mount sample archive (`docs/macos.md`)  
 - [x] `ratarmount -u` uses Darwin unmount path (`umount` / `diskutil`)  
 - [x] Smoke script: mount tar.gz, read file, unmount (`test-harness/run-macos-smoke.sh`; verified on Linux; Mac CI best-effort)  
-- [x] README platforms line mentions macOS beta
+- [x] README platforms line: macOS **first-class on Apple Silicon** (not beta)
 
 ---
 
@@ -360,4 +360,4 @@ Defer intel matrix, Homebrew formula, and required FUSE smoke until arm64 is sol
 
 ---
 
-*Generated from codebase audit (fuse unmount, daemonize, libarchive build.rs, Linux-only CI/packages, harness fusermount3). Implementation not started.*
+*Generated from codebase audit (fuse unmount, daemonize, libarchive build.rs, CI/packages, harness fusermount3). Phase A–D shipped; Intel tarball and Homebrew (E1) remain later.*

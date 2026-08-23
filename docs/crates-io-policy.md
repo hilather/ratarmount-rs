@@ -44,7 +44,7 @@ Stable-ish building blocks for embedders. Publish only after docs + semver story
 |-------|------|
 | `ratarmount-formats-libarchive` | Links system **libarchive**; publish only with clear `links` / build-deps docs |
 | `ratarmount-formats-git` | Depends on `git2` / libgit2 |
-| `ratarmount-fuse` | Depends on platform FUSE (`fuser`); Linux primary, macOS beta |
+| `ratarmount-fuse` | Depends on platform FUSE (`fuser`); Linux + macOS arm64 first-class (Intel package deferred) |
 
 Crates that shell out (`debugfs`, `unsquashfs`, `lrzip`, `smbclient`) should document optional runtime tools in their crate README when published.
 

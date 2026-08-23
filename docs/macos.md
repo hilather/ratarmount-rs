@@ -1,6 +1,6 @@
 # macOS support
 
-**Status:** beta — Apple Silicon primary; Intel via optional CI matrix.  
+**Status:** **first-class on Apple Silicon** (signed `macos-arm64` tarball on GitHub Release tags). Intel package **deferred** (no GHA Intel runner). Homebrew formula later (E1).  
 **Task list:** [docs/tasks/macos-support.md](tasks/macos-support.md)
 
 ratarmount needs a **FUSE runtime** on macOS (there is no built-in `/dev/fuse` like Linux).  
@@ -160,7 +160,7 @@ export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_P
 From a GitHub Release asset (after CI packages land):
 
 ```bash
-tar -xzf ratarmount-*-macos-arm64.tar.gz   # or macos-x86_64
+tar -xzf ratarmount-*-macos-arm64.tar.gz   # Intel tarball deferred
 cd ratarmount-*-macos-*
 install -m 755 ratarmount ~/.local/bin/    # or /usr/local/bin
 # ensure FUSE is installed first (section 1)

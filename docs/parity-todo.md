@@ -51,7 +51,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
 | AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA)/EXT4(pure) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes (missing uncompressed `.tar` / `.tar.zst` created as an empty archive) | `~` |
-| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; ZIP full rebuild). Create-if-missing for uncompressed `.tar` only. **Not** `.tar.zst` persist (offline zstd is not an escape hatch). | `[x]` TAR compressions + ZIP MVP / residual zstd |
+| `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; `.tar.zst` splice including earlier-frame delete; ZIP full rebuild). Create-if-missing for uncompressed `.tar` only. Live interval still rejects prefix-frame mutate. | `[x]` TAR compressions + ZIP MVP / residual live earlier-frame |
 | Live `--commit-overlay-on-exit` / `--interval` | no | uncompressed TAR + `.tar.zst` last-frame rewrite (does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB). Same create-if-missing as `-w`. Interval is a per-file settle time (idle host mtime ≥ `DURATION` and no open write fd), not a dump of every overlay file. Gzip stays rejected. | `[x]` Rust-only / residual earlier-frame delete |
 | File version paths (`.versions/`) | yes | yes (default on; `--no-file-versions`) | `[x]` |
 | Control interface socket | yes | Unix socket + in-FS `/.ratarmount-control/` | `[x]` |
@@ -77,8 +77,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `file://` | yes | yes | `[x]` |
 | `http(s)://` (full GET) | yes | yes | `[x]` |
 | HTTP Range without full download | yes | live Range for TAR/ZIP/gzip/**bzip2/xz/zstd** + materialize fallback | `[x]` |
-| `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS + anonymous + Range prefer-range | `[x]` / `~` factory live S3RangeFile |
-| `ssh://` / `sftp://` | yes | yes | `~` full ssh_config parity |
+| `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS + anonymous + live Range (`open_s3_range` / `S3RangeFile`) | `[x]` |
+| `ssh://` / `sftp://` | yes | yes | `[x]` / `~` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include done; residual ProxyCommand / Match |
 | SMB / WebDAV / Dropbox | yes | WebDAV + SMB + Dropbox folder (list TTL) + ranged content download | `[x]` |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
 
@@ -106,8 +106,8 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | In-memory index for RO mounts | `[x]` |
 | FUSE open-handle reuse / caches / readdirplus | `[x]` |
 | ZIP store stencil + deflate cache | `[x]` |
-| SevenZip solid streaming (large folders) | `~` progressive LZMA2 + 1 MiB LRU windows (≤64); BCJ/AES still full-folder |
-| Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag |
+| SevenZip solid streaming (large folders) | `~` progressive AES+LZMA2 and native BCJ/Delta+LZMA2 (1 MiB LRU ≤64; BCJ/Delta sequential-from-0, no dict-reset resume); BCJ2 / multi-pack still full-folder |
+| Cold `find` geo-mean ≥ Python | `~` nested/compressed still lag (gzip nested still dominates). Cheap `list_dirents` sizes now on EXT4/FAT/SquashFS/Git/SQLAR/`SingleFileMountSource`/Dropbox + union folder-cache/FR-10; **not** a closed geo-mean |
 | Seekable codecs (drop materialize for gzip+) | `[x]` plain + TAR via SeekableBody / SingleFile; residual SquashFS/lrzip/LZX |
 | Tier D rapidgzip thruput (opt-in) | `~` path/nested/Range + GZIDX wired ([P1–P5](tasks/rapidgzip-perf-batch.md) done); cold index/seq still slower than G3 on pre–P2/P4 spot and behind Python rapidgzip class thruput pending re-bench + [R1–R4](tasks/rapidgzip-residual-batch.md) |
 | Benchmark gates in CI (`rust-gates.json`) | `[x]` cold-index hard job + optional `benchmark-gates-full` (`RUN_FULL_BENCH=1 ALLOW_RATIO_SKIP=1`) |
@@ -118,19 +118,18 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 
 ### Current Rust harness (allowlists)
 
-**~161** fixture lines across phases 2–11 + sevenzip/sqlar/squashfs/ext4/http/remote + index interop
-(phase allowlist `tests/…` rows only; was ~87 before P0 expansion).  
+Summed `tests/` allowlist rows (`^tests/` in `test-harness/*.txt`): phase2 **70**, phase6 **12**, phase7 **46**, phase9 AR/CPIO **28**, SevenZip **20**, SQLAR/sqfs **20**, libarchive **13** (those seven = **209**); plus smaller phase3–5 / phase9 image+stencil+stream lists → **236** total.  
 Python has **100+** fixed archives and three large shells: fixed-archive, complex-usage, remote-backend.  
-Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔Rust SQLite).
+Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔Rust SQLite). Do **not** create `docs/parity-gaps.md` unless leftovers are actually enumerated.
 
 ### Harness expansion TODO
 
 | Priority | Work | Exit criteria |
 |----------|------|----------------|
-| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **69** TAR; phase6 **12** ZIP; phase7 **37** nested; phase9 AR/CPIO **28**, 7z **19**, SQLAR/sqfs **20**, libarchive **13** |
+| P0 | Expand TAR/ZIP/sparse allowlists to all Python fixtures that already pass | `~` phase2 **70** TAR; phase6 **12** ZIP; phase7 **46** nested; phase9 AR/CPIO **28**, 7z **20**, SQLAR/sqfs **20**, libarchive **13** |
 | P0 | Wire `RATARMOUNT_CMD` into Python `run-fixed-archive-tests.sh` with **phase allowlists** (never full AppImage set until ready) | `[x]` `run-fixed-archive-subset.sh` |
-| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; **encrypted** password + metadata-only unit + phase9 `|password` harness row; multi-GB non-LZMA2 solid residual |
-| P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `~` phase8 overlay (replace/readdir/empty-create/delete+recreate) + complex (union rightmost, B-4 both orders, commit-overlay tar/gzip/zip); versioned FUSE residual |
+| P0 | SevenZip: full `test_sevenzip.py` scenarios as shell/cargo tests | `~` store, lzma2, large, folder-symlink, nested members; **encrypted** password + metadata-only unit + phase9 `|password` harness row; AES+LZMA2 / BCJ+LZMA2 cargo progressive; multi-GB BCJ2 / multi-pack solid residual |
+| P1 | Complex usage: multi-source union, write-overlay commit paths, versioned files | `[x]` phase8 overlay (replace/readdir/empty-create/delete+recreate) + complex (union rightmost, B-4 both orders, commit-overlay tar/gzip/zip) + versioned FUSE (`updated-file.tar` `.versions/1,2,3`) |
 | P1 | Remote: SSH fixture server (`start-asyncssh-server.py`) + optional S3/MinIO | Live optional; unit always |
 | P1 | Index interop golden: Py builds index → Rust mounts; reverse | `[x]` TAR+ZIP+7z py→rs; TAR rs→py |
 | P2 | Full fixed-archive (≥90% of ~174 triples) | Gap list in `docs/parity-gaps.md` |

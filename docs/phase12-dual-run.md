@@ -138,7 +138,7 @@ Track detail in [`parity-todo.md`](parity-todo.md), [`tasks/gap-implementation-b
 | SQLAR sqlcipher | feature-gated optional | Build with feature or use Python |
 | SquashFS classic lzma | `unsquashfs` fallback | Install `squashfs-tools` |
 | PDF Separation/Lab (and some color spaces) | XObject JPEG/JP2/Flate path strong | Rare documents |
-| Progressive multi-GB solid 7z (BCJ/AES full-folder) | progressive LZMA2 + LRU windows | Large exotic solids may use more RAM/time |
+| Progressive multi-GB solid 7z (BCJ2 / multi-pack) | AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive | BCJ2 / multi-pack still full-folder |
 | Factory auto-wire zstdblocks/bzip2blocks from index on open | **done** (FR-9) | Warm open imports side tables; skips re-export when map reused |
 | Sequential FUSE readahead (`--readahead`) | **done** (FR-5 / #180) | Shipped; not a residual — listed so announce notes do not re-open it |
 | **Parallel nested archive indexing** (FR-6 / #80) | **done** (eager AutoMount) | Same-dir fan-out default; CLI/`-P` wire residual only |
@@ -146,7 +146,7 @@ Track detail in [`parity-todo.md`](parity-todo.md), [`tasks/gap-implementation-b
 | Full `--use-backend` / Python backend matrix | probe reorder | Priority list accepted |
 | Full fixed-archive ≥90% | allowlist expanding | Track gaps; not cutover-hard |
 | Pure `/dev/fuse` ABI (Annex A) | deferred | `fuser` remains product path |
-| macOS harness depth / Homebrew formula | beta tarballs + CI | See [`macos.md`](macos.md) |
+| macOS Homebrew formula / Intel tarball | arm64 first-class (signed tag asset); Homebrew E1 later | See [`macos.md`](macos.md) |
 | Cookie HTTP auth (FR-2 residual) | Env Cookie + Basic done | Full browser jar / Set-Cookie residual only |
 | Writable/rename on compressed TAR (FR-11) | Python residual too | Use overlay + commit where supported |
 
@@ -262,7 +262,7 @@ Paste into the GitHub Release for the first dual-run tag. Replace placeholders i
 
 ```text
 ratarmount-rs «vX.Y.Z» — dual-run: Rust is the recommended `ratarmount` binary
-for Linux (macOS beta). Keep the Python package as `ratarmount-py` (or
+for Linux and macOS arm64. Keep the Python package as `ratarmount-py` (or
 `python -m ratarmount`) for residual formats during the transition.
 
 This is not 100% Python parity. See docs/phase12-dual-run.md for the dual-run

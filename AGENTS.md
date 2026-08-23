@@ -43,6 +43,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Plain `.gz` rapidgzip GZIDX shell create (no pre-existing index) | `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_plain_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx_skipped` · `cargo test -p ratarmount gzip_seek_index_format_label` |
 | 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
 | Nested/non-solid 7z first `cat` minutes (LZMA2 prefix-from-0) | `cargo test -p ratarmount-formats-sevenzip --lib regression_sequential` · `cargo test -p ratarmount-formats-sevenzip --lib regression_independent_chunk` · `cargo test -p ratarmount-formats-sevenzip --lib regression_header_at_end` · `cargo test -p ratarmount-index --lib regression_head_only` · `cargo test -p ratarmount --bin ratarmount regression_progressive_nested_fingerprint` |
+| AES/BCJ 7z solid first `cat` minutes (pack slurp / full-folder) | `cargo test -p ratarmount-formats-sevenzip --lib regression_aes_lzma2` · `cargo test -p ratarmount-formats-sevenzip --lib regression_bcj_lzma2` · `cargo test -p ratarmount-formats-sevenzip --lib regression_aes_pack_not_slurped` · `cargo test -p ratarmount-formats-sevenzip --lib regression_encrypted_copy` |
 | Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` (metadata-only PermissionDenied; password exact bytes; wrong pw fails open) |
 | 7z wrong password accepted on macOS (store+AES / warm index) | `cargo test -p ratarmount-formats-sevenzip --lib encrypted_wrong_password` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_store_aes` |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
@@ -52,6 +53,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |
 | Nested durable indexes (ZIP/TAR/7z structure+file table/CPIO/AR) | `cargo test -p ratarmount --bin ratarmount nested_durable` · `cargo test -p ratarmount-formats-sevenzip --lib durable_structure` · `cargo test -p ratarmount-index --lib nested` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
+| Offline `--commit-overlay` splice for `.tar.zst` (incl. earlier-frame delete) | `cargo test -p ratarmount-compositing --lib commit_overlay` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount gzip_rgzi` · `cargo test -p ratarmount plain_gzip_rgzi` · `cargo test -p ratarmount plain_gzip` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
@@ -60,10 +62,13 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
+| ssh_config ProxyJump / Include | `cargo test -p ratarmount-remote --lib ssh` |
+| Dropbox cheap `list_dirents` | `cargo test -p ratarmount-remote --lib list_dirents` |
 | Union symlink resolve (FR-10) | `cargo test -p ratarmount-compositing --lib fr10_resolve` |
 | FileVersionLayer / TAR cheap readdir (no fat FileInfo map) | `cargo test -p ratarmount-compositing --lib file_version_layer_list_dirents` · `cargo test -p ratarmount-formats-tar --lib gnu_incremental_dumpdir_deletes` |
 | Compositing wrappers fat readdir | `cargo test -p ratarmount-compositing --lib list_dirents` |
 | Index formats missing readdirplus sizes | `cargo test -p ratarmount-formats-cpio --lib list_dirents` · `cargo test -p ratarmount-formats-ar --lib list_dirents` · `cargo test -p ratarmount-formats-warc --lib list_dirents` · `cargo test -p ratarmount-formats-cab --lib list_dirents` · `cargo test -p ratarmount-formats-iso9660 --lib list_dirents` · `cargo test -p ratarmount-formats-asar --lib list_dirents` · `cargo test -p ratarmount-formats-xar --lib list_dirents` · `cargo test -p ratarmount-formats-libarchive --lib list_dirents` · `cargo test -p ratarmount-formats-ogg --lib list_dirents` · `cargo test -p ratarmount-formats-html --lib list_dirents` · `cargo test -p ratarmount-formats-pdf --lib list_dirents` |
+| Image / Git / SQLAR / SingleFile cheap `list_dirents` | `cargo test -p ratarmount-formats-ext4 --lib list_dirents` · `cargo test -p ratarmount-formats-fat --lib list_dirents` · `cargo test -p ratarmount-formats-squashfs --lib list_dirents` · `cargo test -p ratarmount-formats-git --lib list_dirents` · `cargo test -p ratarmount-formats-sqlar --lib list_dirents` · `cargo test -p ratarmount-formats-tar --lib list_dirents` |
 | FUSE readlink extra lookup / FR-10 type mismatch | `cargo test -p ratarmount-fuse --lib readlink_uses_cached` · `cargo test -p ratarmount-fuse --lib readdirplus_dirent_type` |
 | AutoMount strip-ext duplicate dirent (dir `a/` + `a.tar` → two `a`) | `cargo test -p ratarmount-compositing --lib list_dirents_strip_ext_dir_archive_collision` |
 | readdirplus cached size-0 placeholder (control `status` cat empty 60s) | `cargo test -p ratarmount-fuse --lib readdirplus_placeholder_zero_size` |

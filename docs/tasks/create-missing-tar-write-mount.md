@@ -627,7 +627,7 @@ Skip GNU-tar-dependent persist tests with `skip: GNU tar missing` (existing `ski
 | [`README.md`](https://github.com/hilather/ratarmount-rs/blob/main/README.md) | Write-overlay paragraph + example: missing `archive.tar` / `archive.tar.zst` is created when `-w`. Offline `--commit-overlay` create is `.tar` only. |
 | [`docs/mount-options-parity.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md) | `-w` and live-commit / offline-commit rows |
 | [`docs/nfs-export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | Quick start + residuals: same create behavior on `--nfs` |
-| [`docs/zstd-random-access.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) | Live overlay: missing `.tar.zst` → one empty frame, no seek table; offline still not an escape hatch |
+| [`docs/zstd-random-access.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) | Live overlay: missing `.tar.zst` → one empty frame, no seek table; offline `--commit-overlay` splices existing `.tar.zst` (create-if-missing still uncompressed `.tar` only) |
 | [`docs/parity-todo.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) | Write overlay / live commit rows |
 | `main.rs` clap help | `-w` and commit flags |
 | Absolute HTTPS links only | per repo docs rule |

@@ -14,7 +14,7 @@ A native Rust rewrite of [ratarmount](https://github.com/mxmlnkn/ratarmount): FU
 [![Release](https://img.shields.io/github/v/release/hilather/ratarmount-rs?style=flat-square&label=release&color=0ea5e9)](https://github.com/hilather/ratarmount-rs/releases)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg?style=flat-square)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-1.74%2B-orange.svg?style=flat-square)](https://www.rust-lang.org)
-[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20β-lightgrey.svg?style=flat-square)](docs/macos.md)
+[![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20arm64-lightgrey.svg?style=flat-square)](docs/macos.md)
 
 <br/>
 
@@ -73,7 +73,7 @@ make release && make install   # → ~/.local/bin/ratarmount
 #   ./test-harness/nfs-docker/run.sh   (not default CI)
 ```
 
-**macOS** (beta) — full guide: [`docs/macos.md`](docs/macos.md)
+**macOS** (Apple Silicon first-class) — full guide: [`docs/macos.md`](docs/macos.md)
 
 ```bash
 brew install --cask macfuse          # or fuse-t
@@ -127,8 +127,8 @@ ratarmount --nfs archive.tar.gz
 # Last-frame rewrite (does not recompress the prefix). Persist still copies the compressed
 # file; remount still reindexes the whole TAR. Plan 2× compressed disk headroom.
 # Never refuses on size; warns when the last zstd frame is larger than 64 MiB
-# uncompressed. Gzip stays rejected.
-# Offline --commit-overlay is not an escape hatch for zstd persist.
+# uncompressed. Gzip stays rejected. Live ticks reject prefix-frame mutate;
+# offline --commit-overlay splices .tar.zst from the affected frame.
 
 # Unmount
 ratarmount -u mnt/
@@ -156,7 +156,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Recursive automount (`-r`) | Nested open **without `/tmp`** for most stencil formats — [guide](docs/embedded-nested-archives.md) |
 | Lazy mount (`-l`) | Open nested archives on first access — preferred for huge trees |
 | Union of sources | Directory wins over symlink; optional multi-hop resolve |
-| Write overlay (`-w`, `:temp:`) | Full overlay + offline `--commit-overlay` (gzip/bzip2/xz TAR + ZIP). A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive when `-w` is set (single local path). Offline `--commit-overlay` create-if-missing is uncompressed `.tar` only. Live `--commit-overlay-on-exit` / `--commit-overlay-interval` for uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom). Interval commits files that have not been modified for `DURATION` (still-hot writes, including files still open for write, stay in the overlay). Gzip stays rejected. Offline `--commit-overlay` is not an escape hatch for zstd persist. Warns when the last zstd frame is larger than 64 MiB uncompressed. |
+| Write overlay (`-w`, `:temp:`) | Full overlay + offline `--commit-overlay` (gzip/bzip2/xz TAR + ZIP + `.tar.zst` splice including earlier-frame delete). A missing uncompressed `.tar` or `.tar.zst` is created as an empty archive when `-w` is set (single local path). Offline `--commit-overlay` create-if-missing is uncompressed `.tar` only. Live `--commit-overlay-on-exit` / `--commit-overlay-interval` for uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom). Interval commits files that have not been modified for `DURATION` (still-hot writes, including files still open for write, stay in the overlay). Gzip stays rejected. Live ticks reject prefix-frame `.tar.zst` mutate; offline `--commit-overlay` is the escape hatch. Warns when the last zstd frame is larger than 64 MiB uncompressed. |
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` |
@@ -276,10 +276,10 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 
 1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md), [binding decision](docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
-3. **7z solids** — multi-GB BCJ/AES still full-folder; progressive pure LZMA2 is bounded but not free.
-4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` is **not** an escape hatch for zstd persist (create-if-missing is uncompressed `.tar` only).
-5. **Remote** — HTTP Basic + Cookie env auth done; residual full browser cookie jar & full `ssh_config` edges.
-6. **Platforms** — macOS is **beta** ([docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)).
+3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
+4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
+5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done. Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**.
+6. **Platforms** — macOS is **first-class on Apple Silicon** (signed `macos-arm64` tarball on tags; [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)). Intel package deferred (no GHA Intel runner). Homebrew formula later.
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
 ---

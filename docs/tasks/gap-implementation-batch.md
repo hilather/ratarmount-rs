@@ -165,7 +165,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 |-------|-----------|--------|
 | bzip2blocks API | compress | import/export bit-offset maps |
 | factory side tables | factory | zstdblocks + bzip2blocks wire on open |
-| SSH config | remote | HostName/User/Port/IdentityFile |
+| SSH config | remote | HostName/User/Port/IdentityFile (**later:** ProxyJump + Include) |
 | SQLAR sqlcipher | formats-sqlar | clearer encrypt errors + docs |
 | Phase 12 / crates.io | docs | dual-run + publish policy |
 
@@ -176,7 +176,7 @@ Non-overlapping crate ownership so agents could not stomp each other:
 | Pure in-process lrzip | rare; CLI + libarchive cover practical cases |
 | RAR pure / long-tail beyond libarchive | sequential libarchive only |
 | Encrypted ZIP true per-disk offsets | multi-part join residual |
-| Progressive multi-GB solid 7z (BCJ/AES) | full-folder residual for some filters |
+| Progressive multi-GB solid 7z (BCJ2 / multi-pack) | AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive; BCJ2 / multi-pack still full-folder |
 | Full fixed-archive ≥90% allowlist | harness expansion |
 | Phase 12 **announce / cutover** (ops) | docs ready |
 | crates.io **first publish** (optional) | policy ready |

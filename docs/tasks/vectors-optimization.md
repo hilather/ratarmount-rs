@@ -35,9 +35,9 @@
 
 Residual: `list()` still builds a fat map for callers that need full `FileInfo`. TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides.
 
-Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer) and the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF). Union `--union-resolve-symlinks` still projects fat `list()` so FUSE type matches `lookup`. Union folder-cache **build** still uses fat `list()`. Control `status` dirent size is a placeholder 0 (getattr/open recompute).
+Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer), the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF), **and** EXT4 / FAT / SquashFS / Git / SQLAR / `SingleFileMountSource` / Dropbox. Union folder-cache **build** walks `list_dirents` (fat `list()` only when dirents have `mode == 0`). `--union-resolve-symlinks` `list_dirents` merges cheap dirents then resolves `S_IFLNK` winners via `lookup` (not a fat `list()` map). Control `status` dirent size is a placeholder 0 (getattr/open recompute).
 
-Still default size-0: ext4 / fat / squashfs / git / sqlar / remotes / `SingleFileMountSource`. FUSE crate tests cover the fat-map skip. 2026-08-15 head-to-head (v0.1.20 vs Python 1.3.0): `find` geo-mean **1.45× / 1.33×** (cold/warm); uncompressed random `cat` **1.14×** cold / **0.95×** warm. Gzip random/seq still favor Python. See [python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md).
+HTTP/S3/SSH/SMB/WebDAV are **not** MountSources (download → factory archive); no `list_dirents` to add. Residual: FR-10 `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir. FUSE crate tests cover the fat-map skip. 2026-08-15 head-to-head (v0.1.20 vs Python 1.3.0): `find` geo-mean **1.45× / 1.33×** (cold/warm); uncompressed random `cat` **1.14×** cold / **0.95×** warm. Gzip random/seq still favor Python. Filling real dirent sizes does **not** close that geo-mean (gzip nested still dominates). See [python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md).
 
 ### ZIP member sidecar density
 
@@ -93,7 +93,7 @@ Residual: per-member `SevenZipFileEntry` is still the fat row (path/size/folder 
 - [x] Dir / getattr caches: prefer compact cookies over full `FileInfo` clones
 - [x] Regression: deep `-r` eager scan RSS with many nested roots
 
-Residual: crate-local `PathIntern` (not the index `StringPool`). Folder-cache **build** still copies each path string once per BFS level; the live map is `HashMap<u32, _>`. AutoMount prefix search is still linear over mounted points. No FileInfo cache of nested roots.
+Residual: crate-local `PathIntern` (not the index `StringPool`). Folder-cache **build** walks `list_dirents` and copies each path string once per BFS level; the live map is `HashMap<u32, _>`. AutoMount prefix search is still linear over mounted points. No FileInfo cache of nested roots.
 
 ### Codec block maps (already close)
 

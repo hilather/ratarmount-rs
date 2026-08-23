@@ -1,6 +1,6 @@
 # Task: Port SevenZip random-access backend (from hilather/ratarmount PR #1)
 
-**Status:** **done** (2026-07-25 baseline; **2026-07-26** BCJ2 / stream pack / metadata-only encrypt; **2026-08** nested durable structure warm remount)  
+**Status:** **done** (2026-07-25 baseline; **2026-07-26** BCJ2 / stream pack / metadata-only encrypt; **2026-08** nested durable structure warm remount; **2026-08-23** progressive AES+LZMA2 and native BCJ/Delta+LZMA2 — BCJ2 / multi-pack still full-folder)  
 **Priority:** high (parity + performance vs libarchive/py7zr)  
 **Source PR:** https://github.com/hilather/ratarmount/pull/1  
 **Merged commit (Python):** tip `35a089b` on branch `feature/sevenzip-random-access` in `hilather/ratarmount`
@@ -34,7 +34,7 @@
 
 | Residual | Status |
 |----------|--------|
-| Progressive multi-GB solid decode that never materializes full unpack for **BCJ / AES / non-pure-LZMA2** folders | **Documented residual** — pure LZMA2 large folders use `Lzma2MemberReader` with a live sequential cursor + independent-chunk resume; other solid folders may still full-folder materialize |
+| Progressive multi-GB solid decode that never materializes full unpack for **BCJ2 / multi-pack** folders | **Documented residual** — AES+LZMA2 and native BCJ/Delta+LZMA2 large folders use `Lzma2MemberReader` (AES: independent-chunk resume OK; BCJ/Delta: sequential-from-0 + LRU, no dict-reset resume). BCJ2 / multi-pack / Deflate / BZip2 solids still full-folder materialize |
 | Full Python `test_sevenzip.py` line-for-line scenario count | Partial harness + cargo unit coverage; expand opportunistically |
 | Nested body full-content fingerprint for multi-GB solid | Store/stencil: head/mid/tail. Progressive compressed parent member: head+size only (mid/tail would fully decompress) |
 

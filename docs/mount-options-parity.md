@@ -1,6 +1,6 @@
 # Mount options & abilities: Python vs Rust
 
-Last updated: 2026-08-15.
+Last updated: 2026-08-23.
 
 ## Summary
 
@@ -28,8 +28,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--transform-recursive-mount-point` | yes | yes | `[x]` |
 | `--transform` (member path rewrite) | yes | **added** | `[x]` |
 | `-w` / `--write-overlay` / `:temp:` | yes | yes (missing uncompressed `.tar` / `.tar.zst` created as an empty archive; `:temp:` still creates the **archive**) | `[x]` |
-| `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; ZIP full rebuild; create-if-missing for uncompressed `.tar` only; `.tar.zst` remains unsupported offline) | `[x]` / residual encrypted ZIP |
-| `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; last-frame zstd rewrite — does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB; gzip rejected; offline `--commit-overlay` is **not** a zstd escape hatch; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
+| `--commit-overlay` | yes | yes (TAR + gzip/bzip2/xz via GNU tar; `.tar.zst` splice including earlier-frame delete; ZIP full rebuild; create-if-missing for uncompressed `.tar` only) | `[x]` / residual encrypted ZIP |
+| `--commit-overlay-on-exit` | no | **added** (uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; last-frame zstd rewrite — does not recompress the prefix; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB; gzip rejected; live still **rejects** prefix-frame mutate — offline `--commit-overlay` is the zstd escape hatch; SIGINT/SIGTERM / serve return) | `[x]` Rust-only |
 | `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; in-process; commits overlay files whose host mtime is at least DURATION old **and** that have no open write fd, not a dump of every overlay file on the clock; same last-frame cost model) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
@@ -51,9 +51,9 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--union-mount-cache-max-depth` | yes | yes (folder→sources cache) | `[x]` |
 | `--union-mount-cache-max-entries` | yes | yes | `[x]` |
 | `--union-mount-cache-timeout` | yes | yes (seconds) | `[x]` |
-| `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged) | `~` Rust-only FR-10 residual |
+| `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged; cheap `list_dirents` + per-symlink `lookup`, not fat `list()`) | `~` Rust-only FR-10: `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir |
 | `--index-file` / `:memory:` / folders | yes | yes | `[x]` |
-| Remote/compressed index URL | yes | no | `[ ]` |
+| Remote/compressed index URL | yes | yes (`http(s)://` / `file://` + gzip/xz/zstd/bz2 decompress; `ratarmount-index` `location.rs`) | `[x]` |
 | `--verify-mtime` | yes | yes | `[x]` |
 | `--force-folder-index` | yes | accepted (folders still live) | `~` |
 | `--hashes` | yes | **added** (crc32/md5/sha1/sha256 → index xattrs; path-backed post-build) | `~` |
@@ -80,13 +80,13 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Lazy recursive mount | yes | yes | `[x]` |
 | Configurable recursive extension set | yes | **added** | `[x]` |
 | Write overlay + whiteouts | yes | yes | `[x]` |
-| Commit overlay into TAR | yes | uncompressed + GNU tar | `~` |
+| Commit overlay into TAR | yes | uncompressed + GNU tar (gzip/bzip2/xz); `.tar.zst` splice (offline earlier-frame delete shipped; live last-window only) | `[x]` / residual live prefix-frame |
 | File versions virtual dirs | yes | yes | `[x]` |
 | Prefix remount | yes | yes | `[x]` |
 | Path transform on members | yes | **added** | `[x]` |
 | Encrypted 7z/ZIP password(s) | yes | yes | `~` ZIP crypto limited |
 | Control channel | in-FS folder | Unix socket | `~` |
-| Remote `http(s)/s3/ssh` | yes | yes | `~` no Range readers |
+| Remote `http(s)/s3/ssh` | yes | yes (live Range for TAR/ZIP/gzip/bzip2/xz/zstd + S3 `S3RangeFile`; ssh_config ProxyJump/Include) | `[x]` / `~` ProxyCommand/Match / cookie jar |
 
 ## Implementation notes (this work)
 
