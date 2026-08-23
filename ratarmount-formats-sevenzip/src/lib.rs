@@ -12,15 +12,16 @@
 //! | Outer member packing | `open()` body | Nested open without temp |
 //! |----------------------|---------------|---------------------------|
 //! | **Store / Copy** (non-solid) | [`SharedArchiveView`] over shared archive IO | Yes — zero-copy stencil |
-//! | **Pure LZMA2 solid** (small folder ≤ 4 MiB unpack) | `Cursor` of the member slice | Yes — fully buffered seekable |
-//! | **Pure LZMA2** (large folder) | [`decode::Lzma2MemberReader`] live cursor + chunk resume | Yes — sequential is linear; random resumes at dict reset |
-//! | BCJ2 / multi-pack / AES content | `Cursor` after full-folder decompress | Yes for fixture sizes; multi-GB may hold a large unpack buffer |
+//! | **Encrypted COPY** | [`decode::PackSourceReader`] over [`decode::AesPackSource`] | Yes — range decrypt, not a ciphertext stencil |
+//! | **Pure LZMA2 / AES+LZMA2** (small folder ≤ 4 MiB unpack) | `Cursor` of the member slice | Yes — fully buffered seekable |
+//! | **Pure LZMA2 / AES+LZMA2** (large folder) | [`decode::Lzma2MemberReader`] live cursor + chunk resume | Yes — sequential is linear; random resumes at dict reset |
+//! | **Native BCJ/Delta+LZMA2** (large folder) | [`decode::Lzma2MemberReader`] sequential-from-0 + LRU | Yes — no dict-reset resume (BCJ IP is decoder-relative) |
+//! | BCJ2 / multi-pack / Deflate / BZip2 solid | `Cursor` after full-folder decompress | Yes for fixture sizes; multi-GB may hold a large unpack buffer |
 //!
-//! **Residual / not free:** multi-GB solid non-LZMA2 (or BCJ2) still materializes
-//! the folder (or member) into RAM for a seekable nested body; encrypted folders
-//! need a password before `open`. Store-in-store and solid-in-store nested fixtures
-//! both avoid writing the outer member to a temp file when AutoMount uses the
-//! reader path.
+//! **Residual / not free:** BCJ2 / multi-pack solids still materialize the folder
+//! (or member) into RAM. Encrypted folders need a password before `open`.
+//! Store-in-store and solid-in-store nested fixtures both avoid writing the
+//! outer member to a temp file when AutoMount uses the reader path.
 
 mod decode;
 mod parse;
@@ -42,7 +43,8 @@ use ratarmount_index::{
 use thiserror::Error;
 
 use decode::{
-    lzma2_folder_uses_progressive, Lzma2MemberReader, PackSource, SeekPackSource, SharedArchiveIo,
+    lzma2_folder_can_use_decoder, lzma2_folder_uses_progressive, make_pack_source,
+    Lzma2MemberReader, PackSource, PackSourceReader, SeekPackSource, SharedArchiveIo,
     SharedArchiveView, SharedLzma2Decoder, DEFAULT_MAX_CACHED_CHUNKS,
 };
 
@@ -50,10 +52,11 @@ pub use parse::{looks_like_7z, SevenZipArchiveInfo, SevenZipError, SevenZipFileE
 
 pub const BACKEND_NAME: &str = "SevenZipMountSource";
 
-/// Below [`decode::SMALL_FOLDER_FULL_CACHE`], solid pure-LZMA2 members
-/// materialize into a `Cursor`. Larger folders use [`Lzma2MemberReader`]
-/// with a live sequential cursor (non-solid folders also retain the 0..N
-/// prefix so nested header-at-end parse is not a second full restart).
+/// Below [`decode::SMALL_FOLDER_FULL_CACHE`], solid LZMA2 / AES+LZMA2 /
+/// BCJ+LZMA2 members materialize into a `Cursor`. Larger folders use
+/// [`Lzma2MemberReader`] with a live sequential cursor (non-solid folders
+/// also retain the 0..N prefix so nested header-at-end parse is not a
+/// second full restart). BCJ/Delta chains never independent-chunk resume.
 
 #[derive(Debug, Error)]
 pub enum SzError {
@@ -702,6 +705,18 @@ impl SevenZipMountSource {
             <= 1
     }
 
+    /// Largest fully unpacked folder currently in `folder_cache` (0 if empty).
+    #[cfg(test)]
+    fn test_folder_cache_max_len(&self) -> usize {
+        self.folder_cache
+            .lock()
+            .unwrap()
+            .values()
+            .map(|v| v.len())
+            .max()
+            .unwrap_or(0)
+    }
+
     /// Open of this `FileInfo` returns a progressive (expensive-seek) body.
     fn member_open_is_progressive(&self, file_info: &FileInfo) -> bool {
         let Ok(entry) = self.find_entry(file_info) else {
@@ -866,7 +881,10 @@ impl SevenZipMountSource {
             .map_err(SzError::Seven)
     }
 
-    /// Shared pure-LZMA2 progressive decoder for a solid folder (creates on first use).
+    /// Shared LZMA2 progressive decoder for a solid folder (creates on first use).
+    ///
+    /// Uses [`make_pack_source`] + a sliding packed window. Never slurps the pack
+    /// via `as_bytes` / `packed_cache`.
     fn get_lzma2_decoder(&self, entry: &SevenZipFileEntry) -> Result<SharedLzma2Decoder> {
         let fi = entry
             .folder_index
@@ -878,10 +896,20 @@ impl SevenZipMountSource {
             }
         }
         let folder = &self.archive.folders[fi];
-        let packed = self.read_packed_for_folder(fi, entry)?;
-        let mut decoder =
-            decode::Lzma2RandomAccessDecoder::new(folder, packed, DEFAULT_MAX_CACHED_CHUNKS)
+        let pack = SeekPackSource::new(
+            Arc::clone(&self.archive_io),
+            entry.pack_offset,
+            entry.pack_size,
+        );
+        let (content_folder, content_pack) =
+            make_pack_source(folder, Box::new(pack), self.password.as_deref())
                 .map_err(SzError::Seven)?;
+        let mut decoder = decode::Lzma2RandomAccessDecoder::from_pack(
+            &content_folder,
+            content_pack,
+            DEFAULT_MAX_CACHED_CHUNKS,
+        )
+        .map_err(SzError::Seven)?;
         // Non-solid / single-unpack-stream folders keep the 0..N prefix so a
         // header-at-end parse does not force a second full restart on first read.
         decoder.set_retain_from_zero(self.folder_is_single_member(fi));
@@ -1452,18 +1480,59 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(view));
         }
 
-        // Pure LZMA2: small folders → Cursor; large → Lzma2MemberReader with a
-        // live sequential cursor. Non-solid (single-member) folders retain the
-        // 0..N prefix so nested header-at-end parse is not a second full restart.
-        if folder.coders.len() == 1
-            && folder.coders[0].method.as_slice() == parse::METHOD_LZMA2
-            && !folder.is_encrypted()
-            && self.pack_stream_sizes_for(entry).is_none()
-        {
+        let content_coders = folder.content_coders();
+        let encrypted_copy = folder.is_encrypted()
+            && (content_coders.is_empty()
+                || content_coders
+                    .iter()
+                    .all(|c| c.method.as_slice() == parse::METHOD_COPY));
+        if encrypted_copy {
+            let pack = SeekPackSource::new(
+                Arc::clone(&self.archive_io),
+                entry.pack_offset,
+                entry.pack_size,
+            );
+            let (_content, content_pack) =
+                make_pack_source(folder, Box::new(pack), self.password.as_deref()).map_err(
+                    |e| {
+                        warn!(
+                            "7z {}: encrypted COPY make_pack_source failed for {}: {e}",
+                            self.archive_path.display(),
+                            entry.path
+                        );
+                        io::Error::other(e.to_string())
+                    },
+                )?;
+            debug!(
+                "7z {}: open {} via PackSourceReader (encrypted COPY, aes=true)",
+                self.archive_path.display(),
+                entry.path
+            );
+            let reader = PackSourceReader::new(content_pack, entry.unpack_offset, entry.size);
+            return Ok(Box::new(reader));
+        }
+
+        // LZMA2 / AES+LZMA2 / native BCJ+LZMA2: small folders → Cursor; large →
+        // Lzma2MemberReader with a live sequential cursor. AES is input-side
+        // (independent-chunk resume OK). BCJ/Delta disable dict-reset resume.
+        let sizes = self.pack_stream_sizes_for(entry);
+        if lzma2_folder_can_use_decoder(folder) && sizes.is_none() {
             let folder_unpack = folder.get_unpack_size();
+            let has_aes = folder.is_encrypted();
+            let has_bcj = content_coders.iter().any(|c| {
+                let m = c.method.as_slice();
+                m == parse::METHOD_DELTA
+                    || m == parse::METHOD_BCJ
+                    || m == parse::METHOD_BCJ_X86
+                    || m == parse::METHOD_BCJ_PPC
+                    || m == parse::METHOD_BCJ_IA64
+                    || m == parse::METHOD_BCJ_ARM
+                    || m == parse::METHOD_BCJ_ARMT
+                    || m == parse::METHOD_BCJ_SPARC
+            });
             if lzma2_folder_uses_progressive(folder, folder_unpack) {
                 debug!(
-                    "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack})",
+                    "7z {}: open {} via Lzma2MemberReader (folder_unpack={folder_unpack}, aes={has_aes}, bcj={has_bcj})",
                     self.archive_path.display(),
                     entry.path
                 );
@@ -1478,7 +1547,7 @@ impl MountSource for SevenZipMountSource {
                 return Ok(Box::new(reader));
             }
             debug!(
-                "7z {}: open {} via LZMA2 full-member Cursor (folder_unpack={folder_unpack})",
+                "7z {}: open {} via LZMA2 full-member Cursor (folder_unpack={folder_unpack}, aes={has_aes}, bcj={has_bcj})",
                 self.archive_path.display(),
                 entry.path
             );
@@ -1493,7 +1562,7 @@ impl MountSource for SevenZipMountSource {
             return Ok(Box::new(Cursor::new(data)));
         }
 
-        // Compressed / BCJ2 / multi-pack: full-folder decompress + slice (cached).
+        // BCJ2 / multi-pack / Deflate / BZip2: full-folder decompress + slice (cached).
         // Pack is read via SeekPackSource (shared archive IO — nested-safe).
         debug!(
             "7z {}: open {} via full-folder decompress + slice",
@@ -1786,7 +1855,9 @@ mod tests {
 
     #[test]
     fn regression_lzma2_progressive_helper_and_store_not_progressive() {
-        use crate::parse::{Folder, METHOD_LZMA2};
+        use crate::parse::{
+            Folder, METHOD_AES, METHOD_BCJ, METHOD_BCJ2, METHOD_COPY, METHOD_LZMA2,
+        };
         let small = Folder {
             coders: vec![parse::Coder {
                 method: METHOD_LZMA2.to_vec(),
@@ -1803,6 +1874,84 @@ mod tests {
         assert!(!lzma2_folder_uses_progressive(&small, 1024));
         let large_unpack = decode::SMALL_FOLDER_FULL_CACHE + 1;
         assert!(lzma2_folder_uses_progressive(&small, large_unpack));
+
+        let copy = Folder {
+            coders: vec![parse::Coder {
+                method: METHOD_COPY.to_vec(),
+                num_in_streams: 1,
+                num_out_streams: 1,
+                properties: None,
+            }],
+            bind_pairs: vec![],
+            packed_indices: vec![],
+            unpack_sizes: vec![large_unpack],
+            has_crc: false,
+            crc: 0,
+        };
+        assert!(!lzma2_folder_uses_progressive(&copy, large_unpack));
+        assert!(!lzma2_folder_can_use_decoder(&copy));
+
+        let aes_lzma2 = Folder {
+            coders: vec![
+                parse::Coder {
+                    method: METHOD_AES.to_vec(),
+                    num_in_streams: 1,
+                    num_out_streams: 1,
+                    properties: None,
+                },
+                parse::Coder {
+                    method: METHOD_LZMA2.to_vec(),
+                    num_in_streams: 1,
+                    num_out_streams: 1,
+                    properties: Some(vec![22]),
+                },
+            ],
+            bind_pairs: vec![],
+            packed_indices: vec![],
+            unpack_sizes: vec![16, large_unpack],
+            has_crc: false,
+            crc: 0,
+        };
+        assert!(lzma2_folder_uses_progressive(&aes_lzma2, large_unpack));
+
+        let bcj_lzma2 = Folder {
+            coders: vec![
+                parse::Coder {
+                    method: METHOD_BCJ.to_vec(),
+                    num_in_streams: 1,
+                    num_out_streams: 1,
+                    properties: None,
+                },
+                parse::Coder {
+                    method: METHOD_LZMA2.to_vec(),
+                    num_in_streams: 1,
+                    num_out_streams: 1,
+                    properties: Some(vec![22]),
+                },
+            ],
+            bind_pairs: vec![],
+            packed_indices: vec![],
+            unpack_sizes: vec![large_unpack],
+            has_crc: false,
+            crc: 0,
+        };
+        assert!(lzma2_folder_uses_progressive(&bcj_lzma2, large_unpack));
+
+        let bcj2 = Folder {
+            coders: vec![parse::Coder {
+                method: METHOD_BCJ2.to_vec(),
+                num_in_streams: 4,
+                num_out_streams: 1,
+                properties: None,
+            }],
+            bind_pairs: vec![],
+            packed_indices: vec![0, 1, 2, 3],
+            unpack_sizes: vec![large_unpack],
+            has_crc: false,
+            crc: 0,
+        };
+        assert!(!lzma2_folder_uses_progressive(&bcj2, large_unpack));
+        assert!(!lzma2_folder_can_use_decoder(&bcj2));
     }
 
     #[test]
@@ -2071,6 +2220,128 @@ mod tests {
         let mut buf = Vec::new();
         r.read_to_end(&mut buf).unwrap();
         assert!(!buf.is_empty());
+    }
+
+    /// Regression: AES+LZMA2 solid > 4 MiB uses Lzma2MemberReader (not full-folder cache).
+    #[test]
+    fn regression_aes_lzma2_solid_uses_member_reader_not_folder_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz = ["7zz", "7z", "7za"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok());
+        let Some(sevenz) = sevenz else {
+            eprintln!("skip: 7z CLI unavailable for AES+LZMA2 solid fixture");
+            return;
+        };
+
+        let a_len = 3 * 1024 * 1024;
+        let b_len = 2 * 1024 * 1024;
+        let payload_a: Vec<u8> = (0..a_len)
+            .map(|i| ((i as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15) >> 56) as u8)
+            .collect();
+        let payload_b: Vec<u8> = (0..b_len)
+            .map(|i| ((i as u32).wrapping_mul(1664525).wrapping_add(1013904223) >> 24) as u8)
+            .collect();
+        std::fs::write(dir.path().join("a.bin"), &payload_a).unwrap();
+        std::fs::write(dir.path().join("b.bin"), &payload_b).unwrap();
+        let archive = dir.path().join("aes-lzma2-solid.7z");
+        let out = std::process::Command::new(sevenz)
+            .args([
+                "a",
+                "-t7z",
+                "-m0=LZMA2",
+                "-mx=1",
+                "-ms=on",
+                "-psecret",
+                "-mhe=off",
+            ])
+            .arg(&archive)
+            .arg("a.bin")
+            .arg("b.bin")
+            .current_dir(dir.path())
+            .output()
+            .expect("run 7z");
+        if !out.status.success() || !archive.exists() {
+            eprintln!(
+                "skip: 7z AES+LZMA2 create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let opts = OpenOptions {
+            passwords: vec!["secret".into()],
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, None, &opts, "0.1.0", true)
+            .expect("open AES+LZMA2 solid");
+        let fi_b = m
+            .lookup("/b.bin", 0)
+            .or_else(|| m.lookup("b.bin", 0))
+            .expect("b.bin");
+        assert!(
+            !m.member_seek_is_cheap(&fi_b),
+            "AES+LZMA2 folder > 4 MiB must use progressive Lzma2MemberReader"
+        );
+        let mut r = m.open(&fi_b, 0).expect("open second member");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload_b, "AES+LZMA2 second member must cmp");
+        assert_eq!(
+            m.test_folder_cache_max_len(),
+            0,
+            "progressive path must not put a full unpack in folder_cache"
+        );
+
+        let fi_a = m
+            .lookup("/a.bin", 0)
+            .or_else(|| m.lookup("a.bin", 0))
+            .expect("a.bin");
+        let mut r = m.open(&fi_a, 0).expect("open first member");
+        r.seek(SeekFrom::Start(100)).unwrap();
+        let mut mid = [0u8; 64];
+        r.read_exact(&mut mid).unwrap();
+        assert_eq!(&mid, &payload_a[100..164]);
+        assert_eq!(m.test_folder_cache_max_len(), 0);
+    }
+
+    /// Regression: encrypted COPY mid-member range via PackSourceReader
+    /// (not SharedArchiveView on ciphertext; not folder_cache).
+    #[test]
+    fn regression_encrypted_copy_mid_member_pack_source_reader() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("store-aes-mid.7z");
+        let payload: Vec<u8> = (0..32 * 1024).map(|i| (i % 251) as u8).collect();
+        if !write_encrypted_sample_7z_mx(&archive, "blob.bin", &payload, "secret", 0) {
+            eprintln!("skip: 7z CLI could not create store+AES fixture");
+            return;
+        }
+        let opts = OpenOptions {
+            passwords: vec!["secret".into()],
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, None, &opts, "0.1.0", true)
+            .expect("open store+AES");
+        let fi = m
+            .lookup("/blob.bin", 0)
+            .or_else(|| m.lookup("blob.bin", 0))
+            .expect("blob.bin");
+        let mut r = m.open(&fi, 0).expect("open encrypted COPY member");
+        r.seek(SeekFrom::Start(1000)).unwrap();
+        let mut mid = [0u8; 128];
+        r.read_exact(&mut mid).unwrap();
+        assert_eq!(&mid, &payload[1000..1128], "mid-member range must cmp");
+        r.seek(SeekFrom::Start(0)).unwrap();
+        let mut all = Vec::new();
+        r.read_to_end(&mut all).unwrap();
+        assert_eq!(all, payload);
+        assert_eq!(
+            m.test_folder_cache_max_len(),
+            0,
+            "encrypted COPY must not fill folder_cache"
+        );
     }
 
     #[test]
