@@ -1,5 +1,6 @@
 # Phase 9+ custom SevenZip random-access fixtures (from Python tests/*.7z)
-# format: archive_relpath|member_path|expected_substring_or_empty
+# format: archive_relpath|member_path|expected_substring_or_empty[|password]
+# generated:<kind> rows are built at runtime by run-phase9-sevenzip.sh (not Python).
 tests/store-copy-two-files.7z|a.txt|AAA
 tests/store-copy-two-files.7z|b.txt|BBB
 tests/lzma2-two-files-and-medium.7z|a.txt|AAA
@@ -25,3 +26,8 @@ tests/nested-inner-hello.7z|inner-hello.7z|
 # Nested zip-in-7z / lighter.tar require -r → phase7-nested.txt
 # Encrypted: optional 4th field is --password (content AES; list works metadata-only without it)
 tests/encrypted-hello.7z|secret.txt|secret content|secret
+# Progressive AES/BCJ solid above SMALL_FOLDER_FULL_CACHE (4 MiB unpack). Extra
+# FUSE coverage (PR1 cargo tests are the product gate). Generated under a temp
+# dir when 7z/7zz/7za is present; skip without 7z. Not multi-GB. Cat late b.bin.
+generated:aes-lzma2-solid-4mib|b.bin||secret
+generated:bcj-lzma2-solid-4mib|b.bin|
