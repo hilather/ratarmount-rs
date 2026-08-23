@@ -133,6 +133,7 @@ README / parity tables stale.
 | Nested open / temp spool | [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md) (+ README cheat sheet) |
 | Dual-run / packaging product status | [`docs/phase12-dual-run.md`](docs/phase12-dual-run.md) / packaging notes |
 | Upstream-inspired feature (from mxmlnkn/ratarmount issues) | [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md) status row + README **Upstream** link |
+| New protocol / export / beyond-parity feature (P-/F-/G- IDs) | [`docs/tasks/beyond-parity-roadmap.md`](docs/tasks/beyond-parity-roadmap.md) status |
 | Upstream bug verified fixed/reproduced | [`docs/tasks/upstream-bugs-inspection.md`](docs/tasks/upstream-bugs-inspection.md) status + regression test if fixed |
 
 If the change is pure refactor/tests with **no** user-facing behavior change, skip
@@ -203,7 +204,7 @@ Full packaging user docs: [`docs/packaging.md`](docs/packaging.md).
 
 ## Docs
 
-Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`.
+Living parity: `docs/parity-todo.md`, `docs/tasks/gap-implementation-batch.md`, `docs/tasks/beyond-parity-roadmap.md`.
 
 ### Format / nested / temp-file matrices (keep current)
 

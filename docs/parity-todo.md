@@ -195,4 +195,5 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
 - **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
+- **Beyond-parity roadmap (2026-08-23):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — protocols P-1..P-10, features F-1..F-10, product bets G-1..G-5 (not Python parity)
 - **Tier D rapidgzip perf residual:** [`docs/tasks/rapidgzip-perf-batch.md`](tasks/rapidgzip-perf-batch.md) (P1–P5 done) · post-batch [`docs/tasks/rapidgzip-residual-batch.md`](tasks/rapidgzip-residual-batch.md) (R1–R5) · decision residual split in [`docs/gzip-binding-decision.md`](gzip-binding-decision.md)
