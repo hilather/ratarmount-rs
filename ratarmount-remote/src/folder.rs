@@ -185,11 +185,23 @@ impl<L: RemoteListing> RemoteFolderMountSource<L> {
         let remote = self.remote_for(&v);
         self.listing.stat(&remote)
     }
+
+    /// Log incomplete listings (truncated ListObjectsV2 / prefix too large) to
+    /// stderr so FUSE/NFS ENOENT from [`MountSource::list_dirents`] is not silent.
+    fn dirents_or_log(&self, path: &str) -> Option<Vec<RemoteDirent>> {
+        match self.list_dir_entries(path) {
+            Ok(entries) => Some(entries),
+            Err(e) => {
+                eprintln!("ratarmount: remote folder list {path}: {e}");
+                None
+            }
+        }
+    }
 }
 
 impl<L: RemoteListing + 'static> MountSource for RemoteFolderMountSource<L> {
     fn list(&self, path: &str) -> Option<ListResult> {
-        let entries = self.list_dir_entries(path).ok()?;
+        let entries = self.dirents_or_log(path)?;
         let mut map = BTreeMap::new();
         for ent in entries {
             let mut fi = ent.to_file_info();
@@ -202,7 +214,7 @@ impl<L: RemoteListing + 'static> MountSource for RemoteFolderMountSource<L> {
     }
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
-        let entries = self.list_dir_entries(path).ok()?;
+        let entries = self.dirents_or_log(path)?;
         Some(
             entries
                 .into_iter()
@@ -299,7 +311,16 @@ fn try_open_s3_folder(s: &str) -> Result<Option<Arc<dyn MountSource>>> {
 
 fn try_open_ssh_folder(s: &str) -> Result<Option<Arc<dyn MountSource>>> {
     let loc = parse_ssh_url(s)?;
-    if !ssh_path_is_dir(&loc, &loc.path)? {
+    let trailing = loc.path.ends_with('/');
+    let is_dir = match ssh_path_is_dir(&loc, &loc.path) {
+        Ok(v) => v,
+        Err(_) if trailing => true,
+        Err(e) => {
+            debug!("ssh stat {} failed ({e}); treating as file", loc.path);
+            false
+        }
+    };
+    if !is_dir {
         return Ok(None);
     }
     let root = loc.path.clone();
@@ -898,6 +919,41 @@ mod tests {
         assert_eq!(buf, b"hello-world");
     }
 
+    struct ErrListing {
+        msg: String,
+    }
+
+    impl RemoteListing for ErrListing {
+        fn list(&self, _remote_path: &str) -> Result<Vec<RemoteDirent>> {
+            Err(RemoteError::S3(self.msg.clone()))
+        }
+        fn open_range(&self, _remote_path: &str, _size: u64) -> Result<Box<dyn ArchiveRead>> {
+            Err(RemoteError::S3("no open".into()))
+        }
+    }
+
+    /// Regression: truncated ListObjectsV2 error is not swallowed as a complete listing.
+    /// FUSE/NFS map `list_dirents` None to ENOENT; stderr still has the S3 message.
+    #[test]
+    fn list_dirents_none_on_truncated_listing_error() {
+        let ms = RemoteFolderMountSource::new(
+            "prefix/".into(),
+            ErrListing {
+                msg: "truncated ListObjectsV2 page without NextContinuationToken; listing is not complete".into(),
+            },
+        );
+        assert!(
+            ms.list_dirents("/").is_none(),
+            "incomplete listing must not look like an empty complete page"
+        );
+        assert!(ms.list("/").is_none());
+        let err = ms.list_dir_entries("/").unwrap_err().to_string();
+        assert!(
+            err.contains("not complete") || err.contains("truncated"),
+            "{err}"
+        );
+    }
+
     /// Serialize tests that mutate process AWS env.
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1135,6 +1191,189 @@ mod tests {
         );
     }
 
+    const AWS_KEYS: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ENDPOINT_URL",
+        "S3_ENDPOINT_URL",
+        "AWS_ANONYMOUS",
+        "RATARMOUNT_S3_ANONYMOUS",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "RATARMOUNT_IMDS_BASE",
+    ];
+
+    fn aws_anon(g: &EnvGuard, endpoint: &str) {
+        g.set("AWS_ANONYMOUS", "1");
+        g.set("AWS_ENDPOINT_URL", endpoint);
+        g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+    }
+
+    /// Regression: GetObject-only IAM (ListBucket 403) must still Range-open the file.
+    #[test]
+    fn s3_listbucket_403_falls_through_to_file_open() {
+        let body = b"archive-bytes".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let list_hits = Arc::new(AtomicUsize::new(0));
+        let obj_hits = Arc::new(AtomicUsize::new(0));
+        let lh = Arc::clone(&list_hits);
+        let oh = Arc::clone(&obj_hits);
+        let body_c = body.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                if path.contains("list-type=2") {
+                    lh.fetch_add(1, Ordering::SeqCst);
+                    let msg = b"AccessDenied";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    continue;
+                }
+                oh.fetch_add(1, Ordering::SeqCst);
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nContent-Range: bytes 0-{}/{}\r\nConnection: close\r\n\r\n",
+                    body_c.len(),
+                    body_c.len().saturating_sub(1),
+                    body_c.len()
+                );
+                let _ = stream.write_all(&body_c);
+            }
+        });
+        let _g = EnvGuard::acquire(AWS_KEYS);
+        aws_anon(&_g, &base_url);
+        assert!(
+            try_open_remote_folder("s3://bucket/archive.tar")
+                .unwrap()
+                .is_none(),
+            "ListBucket 403 must not abort file mount"
+        );
+        assert!(list_hits.load(Ordering::SeqCst) >= 1);
+        let mut f = crate::open_s3_range("s3://bucket/archive.tar").unwrap();
+        let mut got = Vec::new();
+        f.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        assert!(obj_hits.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn s3_list_prefix_cap_is_not_silent_truncate() {
+        let mock = MockListS3::spawn(PAGE1.to_string(), PAGE2.to_string(), b"x".to_vec());
+        let _g = EnvGuard::acquire(AWS_KEYS);
+        aws_anon(&_g, &mock.base_url);
+        let err = crate::s3::list_s3_prefix_capped(
+            &S3Location {
+                bucket: "bucket".into(),
+                key: "prefix/".into(),
+            },
+            1,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("prefix too large") || err.contains("not silently truncated"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn empty_truncated_list_objects_v2_page_is_error_not_infinite_loop() {
+        let xml = r#"<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>again</NextContinuationToken>
+</ListBucketResult>"#;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = Arc::clone(&hits);
+        let xml_owned = xml.to_string();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else { continue };
+                h.fetch_add(1, Ordering::SeqCst);
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                let _ = reader.read_line(&mut request_line);
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml_owned}",
+                    xml_owned.len()
+                );
+            }
+        });
+        let _g = EnvGuard::acquire(AWS_KEYS);
+        aws_anon(&_g, &base_url);
+        let err = crate::s3::list_s3_prefix(&S3Location {
+            bucket: "bucket".into(),
+            key: "prefix/".into(),
+        })
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("no keys") || err.contains("not complete") || err.contains("truncated"),
+            "{err}"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) <= 2,
+            "empty truncated page must not loop: {} hits",
+            hits.load(Ordering::SeqCst)
+        );
+    }
+
+    #[test]
+    fn truncated_listing_list_dirents_is_none_not_page1() {
+        let xml = r#"<ListBucketResult>
+  <IsTruncated>true</IsTruncated>
+  <Contents><Key>prefix/a.tar</Key><Size>1</Size></Contents>
+</ListBucketResult>"#;
+        let mock = MockListS3::spawn(xml.to_string(), xml.to_string(), b"x".to_vec());
+        let _g = EnvGuard::acquire(AWS_KEYS);
+        aws_anon(&_g, &mock.base_url);
+        let ms = try_open_remote_folder("s3://bucket/prefix/")
+            .unwrap()
+            .expect("trailing slash is a folder");
+        assert!(
+            ms.list_dirents("/").is_none(),
+            "truncated page must not surface as a complete listing"
+        );
+    }
+
     struct MockHttpIndex {
         addr: String,
         _join: Option<thread::JoinHandle<()>>,
@@ -1326,6 +1565,71 @@ mod tests {
         let mut r = ms.open(&fi, 0).unwrap();
         let mut got = Vec::new();
         r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+    }
+
+    /// Regression: PROPFIND 405 on a file URL must fall through to GET.
+    #[test]
+    fn webdav_propfind_405_falls_through_to_file_open() {
+        let body = b"dav-file!".to_vec();
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = format!("http://{}", listener.local_addr().unwrap());
+        let body_c = body.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.split_once(':') {
+                        if v.0.eq_ignore_ascii_case("content-length") {
+                            content_len = v.1.trim().parse().unwrap_or(0);
+                        }
+                    }
+                }
+                if content_len > 0 {
+                    let mut sink = vec![0u8; content_len];
+                    let _ = std::io::Read::read_exact(&mut reader, &mut sink);
+                }
+                let method = request_line.split_whitespace().next().unwrap_or("");
+                if method.eq_ignore_ascii_case("PROPFIND") {
+                    let msg = b"Method Not Allowed";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        body_c.len()
+                    );
+                    let _ = stream.write_all(&body_c);
+                }
+            }
+        });
+        let url = format!("webdav://{}/a.tar", addr.trim_start_matches("http://"));
+        assert!(
+            try_open_remote_folder(&url).unwrap().is_none(),
+            "PROPFIND 405 must not abort file mount"
+        );
+        let (mut tmp, n) = crate::fetch_webdav_to_temp(&url).unwrap();
+        assert_eq!(n, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
         assert_eq!(got, body);
     }
 

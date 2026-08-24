@@ -251,7 +251,7 @@ pub fn parse_propfind_dirents(xml: &str, self_url: &str) -> Vec<WebDavDirent> {
         if href.is_empty() {
             continue;
         }
-        let is_dir = block.to_ascii_lowercase().contains("collection");
+        let is_dir = resourcetype_is_collection(&block);
         let size = xml_elem_text(&block, "getcontentlength")
             .and_then(|s| s.trim().parse::<u64>().ok())
             .unwrap_or(0);
@@ -412,12 +412,42 @@ fn resolve_webdav_href(base: &str, href: &str) -> String {
     href.to_string()
 }
 
+/// True when a PROPFIND `<resourcetype>` contains a `<collection>` **element**.
+///
+/// Href / property text containing the word `collection` must not count
+/// (`/dav/collection/a.tar` is a file).
+fn resourcetype_is_collection(block: &str) -> bool {
+    for inner in xml_elem_inners(block, "resourcetype") {
+        let lower = inner.to_ascii_lowercase();
+        if find_open_tag(&lower, 0, "collection").is_some() {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_propfind_self_is_collection(xml: &str) -> bool {
+    xml_elem_inners(xml, "response")
+        .first()
+        .map(|b| resourcetype_is_collection(b))
+        .unwrap_or(false)
+}
+
 /// `true` when Depth-0 PROPFIND says this URL is a DAV collection.
+///
+/// PROPFIND 4xx / transport errors on a URL **without** a trailing slash are
+/// `Ok(false)` so GET/Range file open can still run (same as Depth-0 size probe).
 pub fn webdav_is_collection(loc: &WebDavLocation) -> Result<bool> {
     match propfind_self_is_collection(loc) {
         Ok(v) => Ok(v),
         Err(_) if loc.http_url.ends_with('/') => Ok(true),
-        Err(e) => Err(e),
+        Err(e) => {
+            debug!(
+                "webdav PROPFIND {} failed ({e}); treating as file",
+                loc.http_url
+            );
+            Ok(false)
+        }
     }
 }
 
@@ -427,14 +457,24 @@ fn propfind_self_is_collection(loc: &WebDavLocation) -> Result<bool> {
         .set("Depth", "0")
         .set("Content-Type", "application/xml; charset=utf-8");
     let req = apply_auth(req, loc);
-    let resp = req
-        .send_string(PROPFIND_BODY)
-        .map_err(|e| RemoteError::WebDav(e.to_string()))?;
+    let resp = match req.send_string(PROPFIND_BODY) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, _)) => {
+            debug!("PROPFIND {} -> HTTP {code}", loc.http_url);
+            return Ok(false);
+        }
+        Err(e) => {
+            return Err(RemoteError::WebDav(format!(
+                "PROPFIND {} failed: {e}",
+                loc.http_url
+            )));
+        }
+    };
     if resp.status() != 207 && !(200..300).contains(&resp.status()) {
         return Ok(false);
     }
     let body = resp.into_string().unwrap_or_default();
-    Ok(body.to_ascii_lowercase().contains("collection"))
+    Ok(parse_propfind_self_is_collection(&body))
 }
 
 /// Download a WebDAV (or HTTP with Basic auth) file into a tempfile via GET.
@@ -550,5 +590,25 @@ mod unit_tests {
         let sub = ents.iter().find(|e| e.name == "sub").expect("sub");
         assert!(sub.is_dir);
         assert_eq!(sub.size, 0);
+    }
+
+    #[test]
+    fn parse_propfind_href_collection_is_file() {
+        let xml = r#"<?xml version="1.0"?>
+        <D:multistatus xmlns:D="DAV:">
+          <D:response>
+            <D:href>/collection/</D:href>
+            <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
+          </D:response>
+          <D:response>
+            <D:href>/collection/a.tar</D:href>
+            <D:propstat><D:prop><D:getcontentlength>42</D:getcontentlength><D:resourcetype/></D:prop></D:propstat>
+          </D:response>
+        </D:multistatus>"#;
+        let ents = parse_propfind_dirents(xml, "http://host.example/collection/");
+        assert_eq!(ents.len(), 1, "{ents:?}");
+        assert_eq!(ents[0].name, "a.tar");
+        assert!(!ents[0].is_dir, "href containing 'collection' is not a dir");
+        assert_eq!(ents[0].size, 42);
     }
 }

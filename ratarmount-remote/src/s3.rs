@@ -1105,6 +1105,8 @@ fn urlencoding_encode(s: &str) -> String {
 
 /// Hard cap on ListObjectsV2 keys + common prefixes (not silent truncate).
 pub const S3_LIST_KEY_CAP: usize = 100_000;
+/// Hard cap on ListObjectsV2 pages (empty truncated pages must not loop forever).
+pub const S3_LIST_PAGE_CAP: usize = 10_000;
 
 /// One immediate child from ListObjectsV2 (`Contents` or `CommonPrefixes`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1421,9 +1423,25 @@ pub fn list_s3_prefix_capped(loc: &S3Location, cap: usize) -> Result<Vec<S3ListE
     let mut token: Option<String> = None;
     let mut out: Vec<S3ListEntry> = Vec::new();
     let mut total = 0usize;
+    let mut pages = 0usize;
+    let page_cap = cap.saturating_add(1).min(S3_LIST_PAGE_CAP);
     loop {
+        pages = pages.saturating_add(1);
+        if pages > page_cap {
+            return Err(RemoteError::S3(format!(
+                "s3 prefix too large (>{cap} keys) for s3://{}/{}; listing is not silently truncated",
+                loc.bucket, loc.key
+            )));
+        }
         let page = s3_list_objects_v2_page(&loc.bucket, &prefix, token.as_deref())?;
-        total = total.saturating_add(page.objects.len() + page.common_prefixes.len());
+        let n = page.objects.len() + page.common_prefixes.len();
+        // Empty truncated pages never increment `total`; treat as incomplete, not a hang.
+        if page.is_truncated && n == 0 {
+            return Err(RemoteError::S3(
+                "truncated ListObjectsV2 page with no keys; listing is not complete".into(),
+            ));
+        }
+        total = total.saturating_add(n);
         if total > cap {
             return Err(RemoteError::S3(format!(
                 "s3 prefix too large (>{cap} keys) for s3://{}/{}; listing is not silently truncated",
@@ -1454,17 +1472,35 @@ pub fn list_s3_prefix_capped(loc: &S3Location, cap: usize) -> Result<Vec<S3ListE
                     .into(),
             ));
         };
+        if token.as_deref() == Some(next) {
+            return Err(RemoteError::S3(
+                "truncated ListObjectsV2 page repeated NextContinuationToken; listing is not complete"
+                    .into(),
+            ));
+        }
         token = Some(next.to_string());
     }
     Ok(out)
 }
 
 /// Directory probe: empty key, trailing `/`, or children exist without an exact object.
+///
+/// ListBucket failures on a non-prefix key (no trailing `/`) are `Ok(false)` so
+/// GetObject-only IAM can still Range-open the object.
 pub fn s3_location_is_dir(loc: &S3Location) -> Result<bool> {
     if loc.key.is_empty() || loc.key.ends_with('/') {
         return Ok(true);
     }
-    let page = s3_list_objects_v2_page(&loc.bucket, &loc.key, None)?;
+    let page = match s3_list_objects_v2_page(&loc.bucket, &loc.key, None) {
+        Ok(p) => p,
+        Err(e) => {
+            debug!(
+                "s3 ListObjectsV2 probe s3://{}/{} failed ({e}); treating as object",
+                loc.bucket, loc.key
+            );
+            return Ok(false);
+        }
+    };
     let has_exact = page.objects.iter().any(|o| o.key == loc.key);
     if has_exact {
         return Ok(false);
