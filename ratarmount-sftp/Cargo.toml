@@ -3,4 +3,25 @@ name = "ratarmount-sftp"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SFTP export of a ratarmount MountSource (stub)"
+description = "SFTP export of a ratarmount MountSource"
+
+[features]
+default = []
+# russh 0.62+ declares rust-version 1.85 (edition 2024). Workspace MSRV is 1.74,
+# so the SSH daemon is optional — same pattern as ratarmount-nfs `nfsv4`.
+sftp-russh = ["dep:russh", "dep:russh-sftp", "dep:tokio", "dep:rand"]
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-export-core.workspace = true
+log.workspace = true
+libc.workspace = true
+russh = { version = "0.62", optional = true, default-features = false, features = ["flate2", "ring"] }
+russh-sftp = { version = "2.1", optional = true }
+tokio = { version = "1", optional = true, features = ["rt-multi-thread", "net", "macros", "sync", "time", "io-util"] }
+rand = { version = "0.10", optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+ratarmount-formats-tar.workspace = true
