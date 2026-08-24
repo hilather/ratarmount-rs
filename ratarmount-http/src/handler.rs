@@ -49,6 +49,8 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
         Err(e) => return Err(e),
     };
 
+    let send_body = req.method != Method::Head;
+
     let path = match archive_path(&req.path) {
         Ok(p) => p,
         Err(PathError::Escape) => {
@@ -58,7 +60,7 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
                 "Bad Request",
                 "text/plain; charset=utf-8",
                 b"path escape\n",
-                true,
+                send_body,
                 &[],
             );
         }
@@ -69,7 +71,7 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
                 "Bad Request",
                 "text/plain; charset=utf-8",
                 b"bad path\n",
-                true,
+                send_body,
                 &[],
             );
         }
@@ -82,13 +84,13 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
             "Not Found",
             "text/plain; charset=utf-8",
             b"not found\n",
-            true,
+            send_body,
             &[],
         );
     };
 
     if is_dir_mode(fi.mode) {
-        return handle_dir(&mut stream, state, &path, req.method == Method::Head);
+        return handle_dir(&mut stream, state, &path, !send_body);
     }
 
     handle_file(
@@ -149,7 +151,7 @@ fn dir_listing_html(path: &str, dents: &[CheapDirent]) -> String {
     s.push_str("</h1>\n<ul>\n");
     for d in dents {
         let name = html_escape(&d.name);
-        let href = percent_encode_segment(&d.name);
+        let href = child_href(path, &d.name, is_dir_mode(d.mode));
         s.push_str("<li><a href=\"");
         s.push_str(&href);
         s.push_str("\">");
@@ -176,6 +178,26 @@ fn html_escape(s: &str) -> String {
         }
     }
     out
+}
+
+/// Path-absolute href so `GET /sub` (no trailing slash) still links to `/sub/child.txt`.
+/// Directory entries get a trailing `/` so a later relative browse stays under that dir.
+fn child_href(parent: &str, name: &str, is_dir: bool) -> String {
+    let mut href = String::from("/");
+    if parent != "/" {
+        for seg in parent.trim_start_matches('/').split('/') {
+            if seg.is_empty() {
+                continue;
+            }
+            href.push_str(&percent_encode_segment(seg));
+            href.push('/');
+        }
+    }
+    href.push_str(&percent_encode_segment(name));
+    if is_dir && !href.ends_with('/') {
+        href.push('/');
+    }
+    href
 }
 
 fn percent_encode_segment(s: &str) -> String {
@@ -214,7 +236,7 @@ fn handle_file(
                 "Range Not Satisfiable",
                 "application/octet-stream",
                 b"",
-                true,
+                !head,
                 &[("Accept-Ranges", "bytes"), ("Content-Range", cr.as_str())],
             );
         }

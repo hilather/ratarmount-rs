@@ -370,6 +370,70 @@ fn directory_get_is_html_with_child_names() {
     assert!(html.contains("hello.txt"), "listing: {html}");
     assert!(html.contains("gzip-member.bin"), "listing: {html}");
     assert!(html.contains("sub"), "listing: {html}");
+    assert!(
+        html.contains("href=\"/hello.txt\""),
+        "root file href must be path-absolute: {html}"
+    );
+    assert!(
+        html.contains("href=\"/sub/\""),
+        "directory href must be path-absolute with trailing slash: {html}"
+    );
+}
+
+#[test]
+fn nested_directory_listing_hrefs_are_path_absolute() {
+    let srv = Serving::start();
+    let raw = srv.exchange("GET /sub HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 200"),
+        "status: {head}"
+    );
+    let html = String::from_utf8_lossy(body);
+    assert!(
+        html.contains("href=\"/sub/child.txt\""),
+        "GET /sub (no trailing slash) must not emit href=\"child.txt\": {html}"
+    );
+    let raw_slash = srv.exchange("GET /sub/ HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head_slash, body_slash) = split_head_body(&raw_slash);
+    assert!(
+        status_line(&head_slash).starts_with("HTTP/1.1 200"),
+        "GET /sub/ status: {head_slash}"
+    );
+    let html_slash = String::from_utf8_lossy(body_slash);
+    assert!(
+        html_slash.contains("href=\"/sub/child.txt\""),
+        "listing: {html_slash}"
+    );
+    let child = srv.exchange("GET /sub/child.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (chead, cbody) = split_head_body(&child);
+    assert!(
+        status_line(&chead).starts_with("HTTP/1.1 200"),
+        "status: {chead}"
+    );
+    assert_eq!(cbody, b"nested\n");
+}
+
+#[test]
+fn head_error_responses_have_no_body() {
+    let srv = Serving::start();
+    let missing = srv.exchange("HEAD /missing HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&missing);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 404"),
+        "status: {head}"
+    );
+    assert_eq!(header_value(&head, "Content-Length"), Some("10")); // "not found\n"
+    assert!(body.is_empty(), "HEAD 404 must not send a body: {body:?}");
+
+    let escape = srv.exchange("HEAD /../secret HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&escape);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 400"),
+        "status: {head}"
+    );
+    assert_eq!(header_value(&head, "Content-Length"), Some("12")); // "path escape\n"
+    assert!(body.is_empty(), "HEAD 400 must not send a body: {body:?}");
 }
 
 #[test]
