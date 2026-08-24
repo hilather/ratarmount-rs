@@ -53,6 +53,9 @@ use ratarmount_index::{
     NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
 };
 
+#[path = "remote_open.rs"]
+mod remote_open;
+
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Archive format backends probed for uncompressed inputs.
@@ -3529,89 +3532,6 @@ where
     }
 }
 
-/// Materialize a remote URL to a local path and open it.
-fn materialize_remote_input(
-    input: &str,
-    opts: &OpenOptions,
-    recreate: bool,
-    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
-    let remote = ratarmount_remote::resolve_to_local(input).map_err(|e| e.to_string())?;
-    let path = remote.path().to_path_buf();
-    remotes.push(remote);
-    let src = open_path(&path, opts, recreate)?;
-    Ok((path, src))
-}
-
-/// Open a remote URL: prefer live HTTP/S3 Range for TAR/ZIP/codecs; else materialize.
-fn open_remote_input(
-    input: &str,
-    opts: &OpenOptions,
-    recreate: bool,
-    remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
-) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
-    use ratarmount_remote::{open_s3_range, resolve_access, RemoteAccess, RemoteHttp};
-
-    // Live S3 Range I/O (parallel to HTTP Range) when GetObject Range works.
-    if input.starts_with("s3://") {
-        match open_s3_range(input) {
-            Ok(range) if range.uses_ranges() => {
-                let len = range.len();
-                eprintln!("S3 Range: {input} ({len} bytes, live Range GetObject)");
-                let input_owned = input.to_string();
-                match open_from_live_range(range, len, input, opts, recreate, "S3 Range", || {
-                    open_s3_range(&input_owned)
-                        .map_err(|e| e.to_string())
-                        .and_then(|r| {
-                            if r.uses_ranges() {
-                                Ok(r)
-                            } else {
-                                Err("S3 Range reopen lost live Range support".into())
-                            }
-                        })
-                })? {
-                    Some(opened) => return Ok(opened),
-                    None => {
-                        eprintln!("info: S3 Range format unsupported for {input}; materializing");
-                        return materialize_remote_input(input, opts, recreate, remotes);
-                    }
-                }
-            }
-            Ok(_) => {
-                eprintln!(
-                    "info: S3 Range unavailable for {input} (full body buffered); materializing"
-                );
-                return materialize_remote_input(input, opts, recreate, remotes);
-            }
-            Err(e) => {
-                eprintln!("info: S3 Range open failed for {input}: {e}; materializing");
-                return materialize_remote_input(input, opts, recreate, remotes);
-            }
-        }
-    }
-
-    let access = resolve_access(input).map_err(|e| e.to_string())?;
-    match access {
-        RemoteAccess::Http(RemoteHttp::Range(range)) => {
-            let len = range.len();
-            let input_owned = input.to_string();
-            match open_from_live_range(range, len, input, opts, recreate, "HTTP Range", || {
-                // Buffered fallback is still Read+Seek-usable for rebuild.
-                ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
-            })? {
-                Some(opened) => Ok(opened),
-                None => materialize_remote_input(input, opts, recreate, remotes),
-            }
-        }
-        RemoteAccess::Http(RemoteHttp::Materialized(remote)) | RemoteAccess::Path(remote) => {
-            let path = remote.path().to_path_buf();
-            remotes.push(remote);
-            let src = open_path(&path, opts, recreate)?;
-            Ok((path, src))
-        }
-    }
-}
-
 fn probe_archive_magic(magic: &[u8]) -> &'static str {
     // Outer compression first (remote .tar.gz / .bz2 / .xz / .zst)
     if magic.len() >= 2 && magic[0] == 0x1f && magic[1] == 0x8b {
@@ -3737,34 +3657,22 @@ pub fn build_mount_source_ex(
         let recreate_src = recreate && !opts.read_only_index;
 
         // Dropbox folders: browse via API (list + download-on-open). Files fall through.
-        if input.starts_with("dropbox://") || input.starts_with("dropbox:") {
-            match ratarmount_remote::DropboxMountSource::open(input.as_ref()) {
-                Ok(ms) => {
-                    let mut src: Arc<dyn MountSource> = Arc::new(ms);
-                    src = apply_compositing(
-                        src,
-                        &opts,
-                        &comp,
-                        &ext_set,
-                        paths.len(),
-                        "dropbox",
-                        Path::new(""),
-                    )?;
-                    sources.push(src);
-                    continue;
-                }
-                Err(e) => {
-                    let msg = e.to_string();
-                    // File paths: materialize via resolve_to_local below.
-                    if !msg.contains("is a file, not a folder") {
-                        return Err(msg);
-                    }
-                }
-            }
+        if let Some(ms) = remote_open::try_open_dropbox_folder(input.as_ref())? {
+            let src = apply_compositing(
+                ms,
+                &opts,
+                &comp,
+                &ext_set,
+                paths.len(),
+                "dropbox",
+                Path::new(""),
+            )?;
+            sources.push(src);
+            continue;
         }
 
         let (local_path, mut src) = if ratarmount_remote::is_remote_url(&input) {
-            open_remote_input(input.as_ref(), &opts, recreate_src, &mut remotes)?
+            remote_open::open_remote_input(input.as_ref(), &opts, recreate_src, &mut remotes)?
         } else {
             let local_path = p.clone();
             let src = open_path(&local_path, &opts, recreate_src)?;
