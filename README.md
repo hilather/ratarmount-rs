@@ -68,8 +68,9 @@ See [`docs/packaging.md`](docs/packaging.md) for verification and package layout
 export PATH="$HOME/.cargo/bin:$PATH"
 make release && make install   # → ~/.local/bin/ratarmount
 # or: cargo install --path ratarmount
-# NFSv4.1 (opt-in; rustc ≥ 1.88): cargo build --release -p ratarmount --features nfsv4
-# Release packages already compile nfsv4. Linux kernel client: privileged Docker
+# NFSv4.1 + SFTP (opt-in): cargo build --release -p ratarmount --features nfsv4,sftp-russh
+#   nfsv4 needs rustc ≥ 1.88; sftp-russh needs russh MSRV 1.85. Workspace default is 1.74.
+# Release packages already compile both. Linux NFS kernel client: privileged Docker
 #   ./test-harness/nfs-docker/run.sh   (not default CI)
 ```
 
@@ -172,13 +173,13 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
-| Other exports | `--http` (`127.0.0.1:20491`) · `--webdav` (`:20492`) · `--smb` (`:20445`) · `--ninep` (`:20493`) · `--sftp` (`:20222`, `--features sftp-russh`). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`). Booleans remain the stable interface. |
+| Other exports | `--http` (`127.0.0.1:20491`, GET/HEAD) · `--webdav` (`:20492`, LOCK residual) · `--smb` (`:20445`, signing/Finder residual) · `--ninep` (`:20493`, TCP; not `--9p`) · `--sftp` (`:20222`, `--features sftp-russh`, russh MSRV 1.85). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`; booleans remain the stable interface) — [guide](docs/export.md) |
 
 ### Remote backends
 
-`file://` · `http(s)://` (Range + Basic/Cookie auth) · `s3://` (SigV4 / IMDS / anonymous; prefix folders) · `gs://` · `az://` · `ftp://` / `ftps://` · `ssh://` / `sftp://` · WebDAV · SMB · Dropbox · `oci://` / `docker://` (overlayfs layer union) · `ipfs://` / `ipns://` · `rclone://remote:path`
+`file://` · `http(s)://` (Range + Basic/Cookie auth; autoindex folders) · `s3://` (SigV4 / IMDS / anonymous; prefix folders) · `gs://` · `az://` · `ftp://` / `ftps://` · `ssh://` / `sftp://` (SFTP `readdir` folders) · WebDAV (Depth-1 collections) · SMB (`smbclient`) · Dropbox · `oci://` / `docker://` / `ghcr://` (overlayfs layer union) · `ipfs://` / `ipns://` · `rclone://remote:path`
 
-Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) · [`docs/parity-todo.md`](docs/parity-todo.md)
+Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) · [`docs/parity-todo.md`](docs/parity-todo.md) · [`docs/phase10-remote.md`](docs/phase10-remote.md) · [`docs/export.md`](docs/export.md)
 
 ---
 
@@ -218,10 +219,14 @@ flowchart LR
   Factory --> Remote[Remote backends]
   Factory --> Compress[Seekable codecs]
   Factory --> Formats[Format MountSources]
-  Factory --> Composite[Union · AutoMount · Overlay]
+  Factory --> Composite[Union · AutoMount · Overlay · OCI]
   Formats --> Index[(SQLite index 0.7.x)]
   Composite --> FUSE[fuser low-level FS]
   Composite --> NFS[nfsserve NFSv3 / embednfs NFSv4.1]
+  Composite --> HTTP[HTTP GET/HEAD · WebDAV]
+  Composite --> SMB[SMB 2.0.2]
+  Composite --> NINE[9P2000.L TCP]
+  Composite --> SFTP[SFTP]
   Index --> FUSE
   Index --> NFS
   Compress --> Formats
@@ -235,10 +240,15 @@ flowchart LR
 | `ratarmount-index` | SQLite 0.7.x index |
 | `ratarmount-fuse` | `fuser` low-level filesystem |
 | `ratarmount-nfs` | In-process NFSv3 export (`--nfs`); optional NFSv4.1 (`--nfs-vers 4`, `nfsv4` feature) |
+| `ratarmount-export-core` | Shared export bind / stop / inode / `fill_read` |
+| `ratarmount-http` | HTTP GET/HEAD (`--http`) + WebDAV (`--webdav`) |
+| `ratarmount-smb` | Userspace SMB 2.0.2 (`--smb`) |
+| `ratarmount-9p` | 9P2000.L TCP (`--ninep`) |
+| `ratarmount-sftp` | SFTP (`--sftp`, feature `sftp-russh`) |
 | `ratarmount-compress` | Seekable codecs + stencils |
 | `ratarmount-formats-*` | TAR, ZIP, 7z, ISO, SquashFS, EXT4, … |
-| `ratarmount-compositing` | Folder, union, automount, overlay |
-| `ratarmount-remote` | HTTP, S3, SSH, WebDAV, SMB, Dropbox |
+| `ratarmount-compositing` | Folder, union, automount, overlay, OCI whiteouts |
+| `ratarmount-remote` | HTTP, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
 
 ```
 ratarmount/                 # CLI
@@ -246,9 +256,14 @@ ratarmount-core/            # MountSource trait, options
 ratarmount-index/           # SQLite 0.7.x
 ratarmount-fuse/            # fuser low-level FS
 ratarmount-nfs/             # NFSv3 userspace export + optional NFSv4.1
+ratarmount-export-core/     # shared export bind / fill_read
+ratarmount-http/            # HTTP GET/HEAD + WebDAV
+ratarmount-smb/             # userspace SMB 2.0.2
+ratarmount-9p/              # 9P2000.L TCP
+ratarmount-sftp/            # SFTP (sftp-russh)
 ratarmount-compress/        # seekable codecs + stencils
 ratarmount-formats-*/       # per-format backends
-ratarmount-compositing/     # folder, union, automount, overlay
+ratarmount-compositing/     # folder, union, automount, overlay, OCI
 ratarmount-remote/          # remote URL backends
 test-harness/               # phase allowlists + runners
 packaging/                  # deb / rpm / portable / macOS
@@ -288,9 +303,10 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed file; remount still reindexes the whole TAR; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
-5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done. Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**.
+5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` + F-1 prefix folders shipped. Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; GCS HMAC; FTP LIST folders; rclone RC serve. [phase10-remote.md](docs/phase10-remote.md).
 6. **Platforms** — macOS is **first-class on Apple Silicon** (signed `macos-arm64` tarball on tags; [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)). Intel package deferred (no GHA Intel runner). Homebrew formula later.
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+8. **Other exports** — HTTP GET/HEAD `done`; WebDAV **LOCK residual**; SMB **signing/Finder residual**; 9P TCP `done` (virtio residual); SFTP needs `--features sftp-russh` (packages enable it; default CI does not). No `serve` subcommand. [export.md](docs/export.md).
 
 ---
 
@@ -321,6 +337,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
 | [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
+| [docs/export.md](docs/export.md) | HTTP / WebDAV / SMB / 9P / SFTP userspace exports |
 | [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) | Packages + cosign verify |
 | [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) | macOS FUSE / FSKit |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |

@@ -38,11 +38,18 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
 | `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
 | `--nfs-export-name` | no | **added** (MOUNT export name; warned/ignored on `--nfs-vers 4`) | `[x]` |
-| `--http` / `--http-bind` | no | **added** (`127.0.0.1:20491`; GET/HEAD Range; no FUSE mountpoint required) | `[x]` Rust-only |
-| `--webdav` / `--webdav-bind` | no | **added** (`127.0.0.1:20492`; PROPFIND + GET; writes need `-w`) | `[x]` Rust-only |
-| `--smb` / `--smb-bind` / `--smb-share` | no | **added** (`127.0.0.1:20445`; share `ratarmount`) | `[x]` Rust-only |
-| `--ninep` / `--ninep-bind` | no | **added** (`127.0.0.1:20493`; 9P2000.L TCP) | `[x]` Rust-only |
-| `--sftp` / `--sftp-bind` | no | **added** (`127.0.0.1:20222`; `--features sftp-russh`) | `[x]` Rust-only |
+| `--http` | no | **added** (HTTP GET/HEAD Range export; no FUSE mount required; `--http --no-mount` exits 2) | `[x]` Rust-only |
+| `--http-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20491`; required value) | `[x]` |
+| `--webdav` | no | **added** (PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE with `-w`) | `~` LOCK residual |
+| `--webdav-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20492`; required value) | `[x]` |
+| `--smb` | no | **added** (userspace SMB 2.0.2; share `--smb-share` default `ratarmount`) | `~` signing / Finder residual |
+| `--smb-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20445`; required value) | `[x]` |
+| `--smb-share NAME` | no | **added** (TREE_CONNECT share; default `ratarmount`) | `[x]` |
+| `--ninep` | no | **added** (9P2000.L TCP; canonical flag, not `--9p`) | `[x]` / virtio residual |
+| `--ninep-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20493`; required value) | `[x]` |
+| `--sftp` | no | **added** (`--features sftp-russh`; packages enable it; else exit 2) | `~` russh MSRV 1.85 / password residual |
+| `--sftp-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20222`; required value) | `[x]` |
+| `--sftp-authorized-keys PATH` | no | **added** (required when bind is not loopback) | `[x]` |
 | `serve` subcommand | no | **added** (optional sugar: `ratarmount serve --nfs --http ARCHIVE`; ≥1 export required; incompatible with `--no-mount`; no `--fuse`; booleans remain the stable interface) | `[x]` Rust-only |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
@@ -80,6 +87,11 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Single archive FUSE mount | yes | yes | `[x]` |
 | NFSv3 userspace export (`--nfs`) | no | yes (IPv4, localhost default; `-w` overlay writes including rename/symlink) | `[x]` Rust-only |
 | NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; Linux/macOS packages compile `nfsv4`; `-w` overlay create/write/rename/symlink; Linux kernel client **verified** on loopback via privileged Docker; no Kerberos/LAN/Windows/mux) | `~` Rust-only |
+| HTTP GET/HEAD export (`--http`) | no | yes (Range 206; fill-loop; bind `127.0.0.1:20491`) | `[x]` Rust-only |
+| WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1; overlay PUT/DELETE/MKCOL/MOVE with `-w` | `~` LOCK residual |
+| SMB 2.0.2 export (`--smb`) | no | userspace subset; `smbclient` `ls`/`get` localhost | `~` signing / Finder |
+| 9P2000.L TCP (`--ninep`) | no | `trans=tcp` port 20493; writes need `-w` | `[x]` / virtio residual |
+| SFTP export (`--sftp`) | no | TCP `:20222`; `sftp-russh` (packages on; default CI off) | `~` Rust-only |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |
 | Subfolder layout (`--disable-union-mount`) | yes | **added** | `[x]` |
 | Recursive nested archives | yes | yes | `[x]` |
@@ -93,6 +105,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Encrypted 7z/ZIP password(s) | yes | yes | `~` ZIP crypto limited |
 | Control channel | in-FS folder | Unix socket | `~` |
 | Remote `http(s)/s3/ssh` | yes | yes (live Range for TAR/ZIP/gzip/bzip2/xz/zstd + S3 `S3RangeFile`; ssh_config ProxyJump/Include) | `[x]` / `~` ProxyCommand/Match / cookie jar |
+| Remote `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` | mixed | yes (factory scheme-prefix; OCI overlayfs union; rclone argv) | `[x]` / residuals in [`phase10-remote.md`](phase10-remote.md) |
+| Remote directory mounts (S3 prefix / SSH dir / WebDAV / HTTP index) | yes (fsspec) | yes (F-1 `RemoteFolderMountSource`; GCS/Azure/rclone/IPFS folders too) | `[x]` |
 
 ## Implementation notes (this work)
 
@@ -101,6 +115,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 - Path `--transform` is a `TransformMountSource` layer (regex on full path).
 - `--disable-union-mount` wraps each source in a basename prefix then unions.
 - `--use-backend` reorders factory detection for known backend names (see `--print-features`).
+- Export flags (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp`) are booleans (`ArgAction::SetTrue`) with required-value binds (`num_args = 1`). There is no `serve` subcommand and no `--fuse` flag. See [`export.md`](export.md).
 
 ### `-g` / `--gzip-seek-point-spacing` (Python `-gs`)
 

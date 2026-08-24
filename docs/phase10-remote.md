@@ -1,18 +1,31 @@
 # Phase 10 — remote inputs
 
+Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](export.md). Status vs Python: [`parity-todo.md`](parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md).
+
+`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `docker://ubuntu:24.04`.
+
 ## Supported
 
 | Scheme | Behavior |
 |--------|----------|
 | `file://` | Map to local path |
-| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range |
-| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous |
-| `ssh://` / `sftp://` / `scp://` | SFTP download → temp file (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include) |
-| `webdav://` / `webdavs://` | Map to `http`/`https`; optional Depth-0 PROPFIND for size; GET → temp (Basic auth from URL userinfo) |
+| `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`) |
+| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap) |
+| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken`. R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL` |
+| `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://` |
+| `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). LIST/MLSD folders residual |
+| `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
+| `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
 | `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH` |
+| `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
+| `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`) |
+| `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
+| `rclone://remote:path` | argv `rclone cat --offset --count` + `lsjson` (one process per open). Slash alias `rclone://remote/path`. Config stays in rclone |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
+
+Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
 
 ### HTTP(S) Basic authentication (FR-2 / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
 
@@ -45,7 +58,7 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
   ratarmount -f https://example.com/archives/a.tar mnt/
 ```
 
-`webdav://` / `webdavs://` use `fetch_webdav_to_temp` (plain file GET is enough for mounting; recursive directory mount is out of scope). Plain `http(s)://` DAV endpoints that need no special scheme continue to use the HTTP path; put credentials in the URL when using the WebDAV schemes.
+`webdav://` / `webdavs://` use `fetch_webdav_to_temp` for files; **Depth-1 collections** mount as folders (F-1). Plain `http(s)://` DAV endpoints that need no special scheme continue to use the HTTP path; put credentials in the URL when using the WebDAV schemes.
 
 ### S3 credentials / endpoint
 
@@ -55,6 +68,40 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
 | `AWS_SESSION_TOKEN` | Optional STS |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Default `us-east-1` |
 | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
+
+`s3://bucket/prefix/` (trailing slash **or** no object at key + ListObjectsV2 children) mounts as a directory. `list_dirents` returns common prefixes as dirs and objects as files with sizes. Opening a `.tar` child uses `S3RangeFile` (no full-bucket download). Continuation tokens loop until empty; more than 100 000 keys is an error (not a silent truncate). Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30).
+
+### GCS (`gs://`)
+
+XML file GET; JSON list API. HMAC GOOG1 is residual.
+
+| Env | Purpose |
+|-----|---------|
+| `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` | Bearer (tried first) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s) |
+| GCE/GKE IMDS | `Metadata-Flavor: Google` (override `RATARMOUNT_GCS_IMDS_BASE` for tests) |
+| `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET |
+| `RATARMOUNT_GCS_ENDPOINT` | XML/JSON API base override |
+
+### Azure Blob (`az://` / `azure://`)
+
+| Env | Purpose |
+|-----|---------|
+| `AZURE_STORAGE_ACCOUNT` | Required for non-anonymous (host is `{account}.blob.core.windows.net`) |
+| `AZURE_STORAGE_SAS_TOKEN` | Query append (redacted in logs) |
+| `AZURE_STORAGE_KEY` | SharedKey HMAC-SHA256 |
+| IMDS MSI | `Metadata: true`, resource `https://storage.azure.com/` (`RATARMOUNT_AZURE_IMDS_BASE` for tests) |
+| `RATARMOUNT_AZURE_ANONYMOUS` | Anonymous |
+| `AZURE_STORAGE_ENDPOINT` | Azurite / private endpoint |
+
+### FTP / FTPS
+
+| Env | Purpose |
+|-----|---------|
+| `RATARMOUNT_FTP_USER` / `RATARMOUNT_FTP_PASSWORD` | When URL has no userinfo; else anonymous `anonymous`/`ratarmount@` |
+| `RATARMOUNT_FTP_CA_FILE` | PEM CA bundle for `ftps://` |
+
+URL userinfo is redacted in logs (`ftp://user:***@host/…`). Prefer `ftps://`. Implicit FTPS (990) and LIST/MLSD directory mounts are residual.
 
 ### SSH authentication
 
@@ -76,10 +123,11 @@ Path rules (fsspec-like):
 
 - `ssh://host/rel/path` → relative `rel/path`
 - `ssh://host//abs/path` → absolute `/abs/path`
+- `ssh://host//path/dir/` → SFTP `readdir` folder when `stat` says directory
 
-### SMB (`smbclient`)
+### SMB (`smbclient`) inbound
 
-Requires the Samba client binary on `PATH` (`apt install smbclient` / `dnf install samba-client`). Without it, `resolve_to_local` returns a clear install hint.
+Requires the Samba client binary on `PATH` (`apt install smbclient` / `dnf install samba-client`). Without it, `resolve_to_local` returns a clear install hint. Pure-Rust SMB **client** is F-6 (out of this batch). Outbound `--smb` is [`export.md`](export.md).
 
 | Env | Purpose |
 |-----|---------|
@@ -92,13 +140,56 @@ URL path: first segment is the **share**, remainder is the file path inside the 
 ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
 ```
 
+### OCI / Docker / GHCR
+
+Custom parsers — **not** `url::Url`. `docker://ubuntu:24.04` is invalid as a WHATWG URL and is still accepted.
+
+| Env | Purpose |
+|-----|---------|
+| `RATARMOUNT_OCI_USER` / `RATARMOUNT_OCI_PASSWORD` | Registry user/token |
+| `GITHUB_TOKEN` | GHCR password (`USERNAME` or `x-access-token`) |
+| `RATARMOUNT_DOCKER_CONFIG` | Path to docker `config.json` (`auths` / `credHelpers`) |
+
+Layers are overlayfs-unioned (file whiteout `.wh.<name>`, opaque dir `.wh..wh..opq`; `.wh.*` names are never listed). Index key `oci:{digest}` for warm remount. First mount may cold-index every layer tar. Residual: eStargz / SOCI / nydus; `/.oci/config`.
+
+```bash
+ratarmount docker://ubuntu:24.04 mnt/
+ratarmount oci://ghcr.io/org/img:tag mnt/
+```
+
+### IPFS / IPNS
+
+Do **not** embed an IPFS node.
+
+| Env | Purpose |
+|-----|---------|
+| `IPFS_GATEWAY` | Range GET base (default `http://127.0.0.1:8080`) |
+| `IPFS_API` | Kubo `/api/v0/ls` (default `http://127.0.0.1:5001`; Unix socket / multiaddr ok) |
+
+File CIDs work via the gateway if the API is down. A **directory** CID without API is a clear error naming `IPFS_API`.
+
+### rclone
+
+Unlocks Drive / OneDrive / B2 / Swift / HDFS without reimplementing OAuth. Config: `RCLONE_CONFIG` or `~/.config/rclone/rclone.conf`.
+
+| Env | Purpose |
+|-----|---------|
+| `RATARMOUNT_RCLONE` | Absolute path to the `rclone` binary (otherwise `PATH`) |
+
+Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclone://remote/path`**. Missing binary: `rclone not found on PATH; install rclone or use a native scheme`. One process per `open` / listing cache miss (materialize at open). Residual: `rclone rcd` `--rc-serve`.
+
 ## Not yet
 
-- Pure-Rust SMB (no `smbclient` dependency)
-- Recursive WebDAV directory mount as a folder (single-file GET only)
+- Pure-Rust SMB client (no `smbclient` dependency) — F-6
+- SPA HTML indexes; WebDAV Depth-infinity listing
+- FTP LIST/MLSD directory mounts
+- GCS HMAC (`GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET`)
 - Full browser cookie jar / `Set-Cookie` persistence (env Cookie + Netscape file **are** shipped)
 - ssh_config **ProxyCommand** / **Match** (ProxyJump + Include **are** shipped)
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
+- rclone RC HTTP Range; `rclone+remote:path` URL form
+- OCI eStargz / SOCI / nydus / config JSON
+- Write-through / commit-to-remote (F-7)
 
 ## Usage
 
@@ -107,10 +198,17 @@ ratarmount -f http://127.0.0.1:8000/archive.tar mnt/
 ratarmount -f 'https://user:pass@example.com/archive.tar' mnt/
 ratarmount -f file:///path/to/archive.tar mnt/
 ratarmount -f s3://my-bucket/path/archive.tar mnt/
+ratarmount -f s3://my-bucket/prefix/ mnt/          # F-1 prefix folder
+ratarmount -f gs://my-bucket/obj.tar mnt/
+ratarmount -f az://container/blob.tar mnt/
+ratarmount -f 'ftp://mirror.example/debian/a.tar' mnt/
 ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
 ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
+ratarmount -f 'rclone://gdrive:bucket/path.tar' mnt/
+ratarmount -f docker://ubuntu:24.04 mnt/
+ratarmount -f ipfs://bafyhash/path.tar mnt/
 ```
 
 ## Tests
@@ -118,7 +216,11 @@ ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
 ```bash
 ./test-harness/run-phase10-http.sh
 ./test-harness/run-phase10-remote.sh
+# Crate / factory (WHATWG-invalid URLs, folders, Range mocks):
+#   cargo test -p ratarmount-remote --lib
+#   cargo test -p ratarmount --bin ratarmount docker_ubuntu
 # Optional live:
 # RATARMOUNT_TEST_S3_URL=s3://bucket/key.tar AWS_… ./test-harness/run-phase10-remote.sh
 # RATARMOUNT_TEST_SSH_URL=ssh://user@host//path/a.tar ./test-harness/run-phase10-remote.sh
+# RATARMOUNT_TEST_OCI_URL=oci://ghcr.io/org/img:tag
 ```

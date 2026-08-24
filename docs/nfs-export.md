@@ -1,6 +1,8 @@
 # NFSv3 userspace export (and optional NFSv4.1)
 
-Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` is compiled into **Linux release packages** (deb/rpm/portable/AppImage) and **macOS tarballs** (`packaging/build-*-packages.sh` / `build-appimage.sh` / `build-macos-tarball.sh` pass `--features nfsv4`; rustc ≥ 1.88). Source builds without the feature: `--nfs --nfs-vers 4` exits 2. RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. Reader slots idle **90s** are dropped (lease approximation, **not** a CLOSE hook). **Linux kernel client verified** on loopback (privileged Docker, 2026-08-15: `./test-harness/nfs-docker/run.sh` — `vers=3` and `vers=4.1,sec=sys` `ls`/`cat` matched fixture files). Default unprivileged CI does **not** run that driver. Residuals: Kerberos / LAN / Windows / no mux / idle-TTL-not-CLOSE. Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
+Sibling exports (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp`) share the same `MountSource` tree and can run in-process with `--nfs`. Bind ports and residuals: [`export.md`](export.md).
+
+Status: **NFSv3 v1 + overlay writes** (default). **NFSv4.1** via `--nfs --nfs-vers 4` is compiled into **Linux release packages** (deb/rpm/portable/AppImage) and **macOS tarballs** (`packaging/build-*-packages.sh` / `build-appimage.sh` / `build-macos-tarball.sh` pass `--features nfsv4,sftp-russh`; rustc ≥ 1.88). Source builds without the feature: `--nfs --nfs-vers 4` exits 2. RO without `-w`; **`-w` overlay writes** (create/write/mkdir/remove/setattr-size) match v3. Reader slots idle **90s** are dropped (lease approximation, **not** a CLOSE hook). **Linux kernel client verified** on loopback (privileged Docker, 2026-08-15: `./test-harness/nfs-docker/run.sh` — `vers=3` and `vers=4.1,sec=sys` `ls`/`cat` matched fixture files). Default unprivileged CI does **not** run that driver. Residuals: Kerberos / LAN / Windows / no mux / idle-TTL-not-CLOSE. Design: [nfsv3-export-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv3-export-design.md), [nfsv4-roadmap-design.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/nfsv4-roadmap-design.md).
 
 `ratarmount --nfs` serves the same `MountSource` tree as FUSE over **in-process NFSv3** (`nfsserve` 0.11) by default. `--nfs-vers 4` selects **NFSv4.1** (`embednfs` 0.4.1, no MOUNT/portmap). No kernel `nfsd`, no FUSE mount, no extra system library. There is **no v3/v4 mux** on one port.
 
@@ -163,7 +165,7 @@ Status: **PASSED** (2026-08-15, rustc 1.97.1).
 | Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
 | Live Linux `mount -t nfs` | **PASSED** (2026-08-15) privileged Docker `./test-harness/nfs-docker/run.sh` — NFSv3 `vers=3,tcp,nolock,port=,mountport=` and NFSv4.1 `vers=4.1,tcp,port=,sec=sys`; `ls`/`cat` matched fixture files. Unprivileged host `mount` still exits 32 (`must be superuser`). |
 
-**Packaging (PR 6):** Linux `packaging/build-native-packages.sh` and `packaging/build-appimage.sh` pass `--features nfsv4` on the **cargo** line. macOS `packaging/build-macos-tarball.sh` does too (rustup **stable**, rustc ≥ 1.88 assumed). Editing only `.github/workflows/packages.yml` does **not** compile v4. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
+**Packaging (PR 6):** Linux `packaging/build-native-packages.sh` and `packaging/build-appimage.sh` pass `--features nfsv4,sftp-russh` on the **cargo** line. macOS `packaging/build-macos-tarball.sh` does too (rustup **stable**, rustc ≥ 1.88 assumed). Editing only `.github/workflows/packages.yml` does **not** compile v4. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
 
 ### embednfs 0.4.1 API actually used
 
@@ -194,11 +196,11 @@ Userspace only. Deb/rpm/portable tarballs / AppImage do **not** need `nfs-kernel
 
 | Build | `nfsv4` compiled? |
 |-------|-------------------|
-| `cargo test --workspace` / default CI `fmt + clippy + test` | **No** (MSRV 1.74; same pattern as `gzip-rapidgzip`) |
+| `cargo test --workspace` / default CI `fmt + clippy + test` | **No** (MSRV 1.74; same pattern as `gzip-rapidgzip` / `sftp-russh`) |
 | CI job `nfsv4 feature tests` (`ci.yml`) | **Yes** (rustup stable) |
-| `packaging/build-native-packages.sh` (deb/rpm/portable) | **Yes** — `cargo build --release -p ratarmount --features nfsv4` |
+| `packaging/build-native-packages.sh` (deb/rpm/portable) | **Yes** — `cargo build --release -p ratarmount --features nfsv4,sftp-russh` |
 | `packaging/build-appimage.sh` | **Yes** — same cargo line |
-| `packaging/build-macos-tarball.sh` | **Yes** (rustup stable ≥ 1.88 assumed). If a macOS builder is ever pinned below 1.88, drop the feature and update this table. |
+| `packaging/build-macos-tarball.sh` | **Yes** (rustup stable ≥ 1.88 assumed). If a macOS builder is ever pinned below 1.88, drop `nfsv4` and update this table. `sftp-russh` needs rustc ≥ 1.85. |
 | `cargo build` / `make release` (no features) | `--nfs --nfs-vers 4` → exit 2 |
 
 This is a **stronger** packaging commitment than `gzip-rapidgzip` (still off). Current package jobs install rustup **stable**. If a Rocky/portable builder is ever pinned below rustc 1.88, keep the feature off and document here.

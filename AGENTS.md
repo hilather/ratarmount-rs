@@ -86,6 +86,12 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | CI apt CDN hang cancels cold-index / FUSE allowlists | `./packaging/test-ci-apt-retries.sh` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
+| HTTP/WebDAV/SMB/`--ninep`/`--sftp` clap steals archive | `cargo test -p ratarmount --bin ratarmount http_flag` · `cargo test -p ratarmount --bin ratarmount ninep_flag` · `cargo test -p ratarmount --bin ratarmount webdav_flag` · `cargo test -p ratarmount --bin ratarmount smb_flag` · `cargo test -p ratarmount --bin ratarmount sftp_flag` |
+| HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
+| SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
+| 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
+| `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount --bin ratarmount docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
+| SFTP non-loopback without authorized_keys file | `cargo test -p ratarmount-sftp --lib regression_non_loopback` |
 | NFS compositing pin (`member_seek_is_cheap`) | `cargo test -p ratarmount-compositing --lib file_version_layer_forwards` · `cargo test -p ratarmount-compositing --lib automount_forwards` |
 | NFS serve stop | `cargo test -p ratarmount-nfs --lib serve_stop` |
 | NFS overlay write / stale reader after truncate | `cargo test -p ratarmount-nfs --lib overlay_` · `cargo test -p ratarmount-nfs --lib writers_rofs` |
@@ -99,7 +105,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFSv4 reader idle/lease drop | `cargo test -p ratarmount-nfs --features nfsv4 --lib evict_idle` |
 | NFS `--nfs-vers` 3\|4 clap | `cargo test -p ratarmount --bin ratarmount nfs_vers` |
 | NFSv4 EXCHANGE_ID smoke | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_exchange_id` |
-| Linux/macOS packages compile `nfsv4` | `./packaging/test-nfsv4-features.sh` |
+| Linux/macOS packages compile `nfsv4` + `sftp-russh` | `./packaging/test-nfsv4-features.sh` |
 | Kernel NFS Docker (v3 + v4.1) | `./test-harness/nfs-docker/run.sh` (privileged Docker + real `mount -t nfs`; skip if docker/privileged unavailable; empty/wrong bytes = fail) |
 | Kernel NFS Docker overlay write | `./test-harness/nfs-docker/run.sh 3 write` · `./test-harness/nfs-docker/run.sh 4 write` |
 
@@ -149,7 +155,7 @@ assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
 **After every release tag, watch CI until settled** (fix failures, re-tag if needed).
 Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
 
-Linux/macOS package scripts compile **`--features nfsv4`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4. Workspace MSRV stays 1.74; default CI `fmt + clippy + test` does not compile embednfs. Privileged kernel-client check (not default CI): `./test-harness/nfs-docker/run.sh`. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) and [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
+Linux/macOS package scripts compile **`--features nfsv4,sftp-russh`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4 or russh. Workspace MSRV stays 1.74; default CI `fmt + clippy + test` compiles neither embednfs nor russh. Privileged kernel-client check (not default CI): `./test-harness/nfs-docker/run.sh`. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md), [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md), and [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 ### Version bump checklist
 

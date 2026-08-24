@@ -6,7 +6,7 @@
 
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
-Suggested first three: **F-1** remote directory mounts → **F-2** incremental reindex → one of **P-1/F-4** OCI, **P-2** SMB export, or **P-5** HTTP export. Cheap wins around those: **P-4** FTP, **P-9** rclone.
+Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Remaining first bets: **F-2** incremental reindex, then **F-3** FTS5 or **G-2** portable index. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
 
 ---
 
@@ -16,69 +16,87 @@ Inbound = fetch archives / trees. Outbound = serve the same `MountSource` tree (
 
 | ID | Work | Dir | Status | Effort | Ownership |
 |----|------|-----|--------|--------|-----------|
-| P-1 | **OCI / registry** (`oci://`, `docker://`, `ghcr://`) | in | `todo` | L | remote + formats-tar + compositing |
-| P-2 | **SMB/CIFS server** (`--smb`, reverse of the client) | out | `todo` | L | new `ratarmount-smb` or nfs-sibling |
-| P-3 | **GCS `gs://` + Azure Blob `az://`** | in | `todo` | M | `ratarmount-remote` (clone S3 Range) |
-| P-4 | **FTP / FTPS** | in | `todo` | S | `ratarmount-remote` |
-| P-5 | **HTTP Range export** (`--http`) | out | `todo` | M | new export crate / nfs-sibling |
-| P-6 | **WebDAV server** | out | `todo` | M | export crate |
-| P-7 | **9P2000.L / virtio-9p** | out | `todo` | M | export crate |
-| P-8 | **IPFS / IPNS** | in | `todo` | M | `ratarmount-remote` |
-| P-9 | **rclone remote** (`rclone://` or `rclone.conf`) | in | `todo` | S–M | `ratarmount-remote` |
-| P-10 | **SFTP server** (`sftp-server` / `--sftp`) | out | `todo` | M | export crate |
+| P-1 | **OCI / registry** (`oci://`, `docker://`, `ghcr://`) | in | `done` | L | remote fetch + factory layer open + compositing overlayfs |
+| P-2 | **SMB/CIFS server** (`--smb`, reverse of the client) | out | `partial` | L | `ratarmount-smb` (signing / Finder residual) |
+| P-3 | **GCS `gs://` + Azure Blob `az://`** | in | `done` | M | `ratarmount-remote` (clone S3 Range; HMAC GCS residual) |
+| P-4 | **FTP / FTPS** | in | `done` | S | `ratarmount-remote` (LIST/MLSD residual) |
+| P-5 | **HTTP Range export** (`--http`) | out | `done` | M | `ratarmount-http` GET/HEAD |
+| P-6 | **WebDAV server** | out | `partial` | M | `ratarmount-http` (LOCK residual) |
+| P-7 | **9P2000.L / virtio-9p** | out | `done` | M | `ratarmount-9p` TCP (virtio residual) |
+| P-8 | **IPFS / IPNS** | in | `done` | M | `ratarmount-remote` (gateway + optional API) |
+| P-9 | **rclone remote** (`rclone://` or `rclone.conf`) | in | `done` | S–M | `ratarmount-remote` (argv `cat`/`lsjson`) |
+| P-10 | **SFTP server** (`--sftp`) | out | `partial` | M | `ratarmount-sftp` (`sftp-russh`, russh MSRV 1.85) |
 
 Python already has FTP, IPFS, GitHub; it does **not** have in-process NFS, SMB/HTTP/9P/SFTP export, or OCI lazy pull. R2/MinIO already work via `AWS_ENDPOINT_URL` — P-3 is native IAM/listing, not S3-compat.
 
-### P-1 — OCI / registry (`oci://`, `docker://`, `ghcr://`)
+User-facing: [`docs/phase10-remote.md`](../phase10-remote.md) (inbound) · [`docs/export.md`](../export.md) (outbound besides NFS) · [`docs/nfs-export.md`](../nfs-export.md).
+
+### P-1 — OCI / registry (`oci://`, `docker://`, `ghcr://`) — `done`
 
 Container layers **are** gzip/zstd tarballs. We already index TAR, speak HTTP Range, and union-mount. This is SOCI / eStargz / nydus territory with the SQLite index as the zTOC.
 
 | Piece | Notes |
 |-------|-------|
-| Manifest + layer fetch | OCI distribution API; bearer/anonymous; Range GET layer blobs |
-| Layer union | existing union MountSource; overlayfs-style whiteouts later |
-| Index as zTOC | reuse 0.7.x; optional push-back as OCI referrer (see G-2) |
-| CLI | `ratarmount oci://ghcr.io/org/img:tag mnt/` |
+| Manifest + layer fetch | OCI distribution API; bearer/anonymous; `OciBlobRangeFile` Range GET with Bearer (not `HttpRangeFile`) |
+| Layer union | `OciImageMountSource` overlayfs whiteouts + opaque dirs (does **not** wrap `UnionMountSource`) |
+| Index as zTOC | reuse 0.7.x via `resolve_index_location(Path::new("oci:{digest}"))`; optional push-back as OCI referrer (see G-2) |
+| CLI | `ratarmount oci://ghcr.io/org/img:tag mnt/` · `docker://ubuntu:24.04` (scheme-prefix; WHATWG-invalid) |
 
-Product surface is **F-4**. Do not ship a scheme without a layer-union mount.
+Factory (PR-12) opens each layer with `open_from_live_range(layer.open_blob(), reopen = open_blob)` then `OciImageMountSource::new`. Product surface is **F-4**.
 
-### P-2 — SMB/CIFS server export
+**Residual:** eStargz / SOCI / nydus; config JSON at `/.oci/config`; parallel layer index; referrer push (G-2). Cold index of every layer on first mount is v1-OK; warm remount by digest is required.
 
-`--nfs` for Windows shops. Finder/Explorer speak SMB; they do not speak our NFSv3 high-port export. Userspace server (not kernel `ksmbd`). `-w` overlay writes map to SMB create/write/delete like NFS.
+### P-2 — SMB/CIFS server export — `partial`
 
-Residual vs v1: signing, guest vs user, macOS Finder quirks. Localhost-first like NFS.
+`--nfs` for Windows shops. Finder/Explorer speak SMB; they do not speak our NFSv3 high-port export. Userspace SMB 2.0.2 subset (not kernel `ksmbd`). `-w` overlay writes map to SMB create/write/delete like NFS. Default bind `127.0.0.1:20445`, share `ratarmount`. Guest `smbclient -N` `ls`/`get` on localhost is the v1 bar.
 
-### P-3 — GCS `gs://` + Azure Blob `az://`
+**Residual vs v1:** signing, encryption, SMB 3.1.1 preauth, NTLM password verification (username match only), macOS Finder / Explorer quirks. Localhost-first like NFS. See [`docs/export.md`](../export.md).
 
-Copy `open_s3_range` / `S3RangeFile`. IMDS/Workload Identity (GCS) + Azure IMDS. Anonymous GET. List is **F-1**, not this ticket — single-object Range is the MVP.
+### P-3 — GCS `gs://` + Azure Blob `az://` — `done`
 
-### P-4 — FTP / FTPS
+Copy `open_s3_range` / `S3RangeFile`. File Range + prefix listing (`GcsListing` / `AzureListing` on F-1 `RemoteListing`). GCS ADC (token / service-account JWT / IMDS / anonymous). Azure SAS / SharedKey / MSI / anonymous. Factory folder probe in PR-12.
 
-Python parity (`ftp://`). REST/SIZE when the server supports it, else materialize like non-Range HTTP. Debian mirrors and HPC tape robots still live here. Keep credentials out of logs (same redaction as HTTP Basic).
+**Residual:** GCS HMAC `GOOGLE_HMAC_KEY`/`GOOGLE_HMAC_SECRET` (GOOG1). R2/MinIO stay S3 (`AWS_ENDPOINT_URL`). Not `wasb://`.
 
-### P-5 — HTTP Range export
+### P-4 — FTP / FTPS — `done`
 
-Reverse of the HTTP client. Serve the indexed tree with `Accept-Ranges` so another ratarmount, curl, a browser, or an OCI snapshotter can Range-GET members. Bind default `127.0.0.1` high port (NFS pattern). Overlay writes are out of v1 (GET/HEAD only) unless P-6 lands first.
+Python parity (`ftp://` / `ftps://`). REST/SIZE when the server supports it, else materialize like non-Range HTTP. Auth: URL userinfo, `RATARMOUNT_FTP_*`, else anonymous `anonymous`/`ratarmount@`. FTPS is explicit AUTH TLS via `suppaftp` rustls (no `native-tls`).
 
-### P-6 — WebDAV server
+**Residual:** LIST/MLSD directory mounts; implicit FTPS (port 990). Prefer `ftps://` over cleartext.
 
-Reverse of the existing client. macOS Finder, Windows Explorer, Nextcloud. Overlay writes become save-from-Word into the archive. PROPFIND + GET first; PUT/DELETE only with `-w`.
+### P-5 — HTTP Range export — `done`
 
-### P-7 — 9P2000.L / virtio-9p
+Reverse of the HTTP client. Serve the indexed tree with `Accept-Ranges` so another ratarmount, curl, a browser, or an OCI snapshotter can Range-GET members. Bind default `127.0.0.1:20491`. GET/HEAD only. Overlay writes are out of v1 (unless P-6 on `--webdav`). Boolean `--http`; `--http --no-mount` exits 2. Fill-loop mandatory (gzip short `Read::read` ≠ HTTP EOF).
 
-QEMU, Firecracker, WSL, gVisor guests with **no FUSE in the guest**. Same tree already handed to `nfsserve`. One extra adapter. Attach via virtio-9p or a TCP 9P listener.
+### P-6 — WebDAV server — `partial`
 
-### P-8 — IPFS / IPNS
+Reverse of the existing client. macOS Finder, Windows Explorer, Nextcloud. PROPFIND Depth 0/1 + GET/HEAD; PUT/DELETE/MKCOL/MOVE only with `-w` (else 403). Depth infinity → 403. Separate port `127.0.0.1:20492` (not muxed with `--http`). Auth none (localhost).
 
-Python `ipfs://` / `ipns://`. Local daemon or `IPFS_GATEWAY`. UnixFS directory listing + block Range. WARC/TAR datasets (Common Crawl-adjacent). Do not embed a full IPFS node in v1 — gateway + optional Unix socket to `ipfs`.
+**Residual:** LOCK/UNLOCK (Finder save-in-place), COPY, PROPPATCH, Basic auth, same-port HTTP+WebDAV mux.
 
-### P-9 — rclone remote
+### P-7 — 9P2000.L / virtio-9p — `done`
 
-One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's long tail. Exec `rclone cat --offset` / RC API; read `rclone.conf`. Ugly, but wins the long tail the way libarchive wins formats. Do **not** reimplement OAuth.
+QEMU, Firecracker, WSL, gVisor guests with **no FUSE in the guest**. TCP listener `--ninep` / `--ninep-bind` (canonical; **not** `--9p`). Default `127.0.0.1:20493`. Guest: `mount -t 9p -o trans=tcp,port=20493,version=9p2000.L 127.0.0.1 /mnt`. Overlay writes (`Tlcreate`/`Twrite`/…) need `-w` else `EROFS`.
 
-### P-10 — SFTP server
+**Residual:** virtio-9p / vhost-user-9p (needs a QEMU device, not a second VFS).
 
-`sshfs` in reverse. Admins already allow SFTP through firewalls that block NFS. Internal `sftp-server` subsystem or `--sftp-bind`. Overlay writes map to SFTP open/write/close. Auth: reuse SSH keys / `authorized_keys` subset; localhost-first.
+### P-8 — IPFS / IPNS — `done`
+
+Python `ipfs://` / `ipns://`. Local daemon or `IPFS_GATEWAY` (default `http://127.0.0.1:8080`) Range GET. UnixFS directory listing via `IPFS_API` (`/api/v0/ls`). File GET via gateway still works if the API is down; directory mount fails with a clear error. Do not embed a full IPFS node.
+
+### P-9 — rclone remote — `done`
+
+One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's long tail. URL `rclone://remote:path` (custom parser — WHATWG-invalid colon form) plus slash alias. argv `rclone cat --offset --count` + `lsjson` (one process per `open` / listing cache miss; never `sh -c`). Config stays in rclone (`RCLONE_CONFIG` / `rclone.conf`). Missing binary is a clear error.
+
+**Residual:** RC `--rc-serve` HTTP GET; `rclone+remote:path` URL form.
+
+### P-10 — SFTP server — `partial`
+
+`sshfs` in reverse. `--sftp` / `--sftp-bind` default `127.0.0.1:20222`. Overlay writes map to SFTP open/write/close. Auth: `RATARMOUNT_SFTP_AUTHORIZED_KEYS` (default `~/.ssh/authorized_keys` **only on loopback**); non-loopback without an explicit keys file exits 2. Host key: `RATARMOUNT_SFTP_HOST_KEY` or ephemeral ed25519.
+
+**Feature gate:** russh MSRV **1.85** > workspace **1.74**, so SSH-2 is optional `sftp-russh` (same pattern as `nfsv4`). Default `cargo test` does **not** compile russh; `--sftp` exits 2 with a rebuild hint. Linux/macOS packages enable the feature. No from-scratch SSH-2.
+
+**Residual:** password auth; `--sftp-subsystem` stdio `sftp-server`; well-known port 22.
 
 ### Not doing (protocols)
 
@@ -96,10 +114,10 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 
 | ID | Work | Status | Effort | Ownership |
 |----|------|--------|--------|-----------|
-| F-1 | **Remote directory mounts** (S3 prefix / SSH dir / WebDAV PROPFIND / HTTP index) | `todo` | M | remote + compositing FolderMountSource |
+| F-1 | **Remote directory mounts** (S3 prefix / SSH dir / WebDAV PROPFIND / HTTP index) | `done` | M | remote `RemoteFolderMountSource` + factory folder probe |
 | F-2 | **Incremental reindex** after `.tar.zst` splice / append-only TAR | `todo` | L | index + formats-tar + compositing |
 | F-3 | **SQLite FTS5 / locate** over the index | `todo` | M | index + CLI + control plane |
-| F-4 | **OCI image mount** (layer union; product on P-1) | `todo` | L | compositing + remote + tar |
+| F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `todo` | L | fuse + packaging |
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
@@ -107,13 +125,15 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-9 | **Producer: `--repack-seekable`** | `todo` | M | compress + formats-tar + CLI |
 | F-10 | **Library / FFI / `ratar://` replacement** | `todo` | L | core + PyO3 cdylib; crates.io policy already exists |
 
-### F-1 — Remote directory mounts
+### F-1 — Remote directory mounts — `done`
 
-Today HTTP/S3/WebDAV/SSH mostly fetch **one archive**. Python fsspec mounts whole trees. S3 `ListObjectsV2` prefixes, HTTP directory indexes, WebDAV `PROPFIND`, SSH `readdir` should become `FolderMountSource`s that AutoMount nested archives. This is the difference between a tool for a tarball and sshfs that understands tar.
+Today HTTP/S3/WebDAV/SSH mostly fetched **one archive**. Python fsspec mounts whole trees. Shipped: S3 `ListObjectsV2` prefixes (continuation loop, 100k cap), HTTP nginx/apache autoindex, WebDAV Depth-1 `PROPFIND`, SSH `readdir` as `RemoteFolderMountSource`s that AutoMount nested archives. Cheap `list_dirents` carry real sizes. Listing TTL 30s (`RATARMOUNT_REMOTE_LIST_TTL_SECS`).
 
-WebDAV recursive directory mount is explicitly out of scope in [`phase10-remote.md`](../phase10-remote.md) — this ticket lifts that.
+`try_open_remote_folder` is those four backends only. GCS/Azure/rclone/IPFS folders export `open_*_folder` from their modules (wired in factory PR-12). Dropbox stays on its own type.
 
-Depends: none. Unlocks P-3 listing, P-8 UnixFS dirs, P-9 folder remotes.
+WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.md`](../phase10-remote.md) for Depth-1 collections.
+
+**Residual:** SPA HTML indexes; WebDAV Depth-infinity listing; user-facing S3 pagination UI; forcing Dropbox onto the trait; FTP LIST folders.
 
 ### F-2 — Incremental reindex
 
@@ -131,9 +151,11 @@ The 0.7.x catalog already exists. Expose:
 
 Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent a new storage engine.
 
-### F-4 — OCI image mount
+### F-4 — OCI image mount — `done`
 
-`ratarmount oci://ghcr.io/org/img:tag mnt/` fetches the manifest, unions layer tars, Range-GETs file blobs, and reuses the SQLite index as a SOCI-style zTOC. Whiteouts + opaque dirs for a correct rootfs. P-1 is the scheme; this is the union + snapshotter-shaped UX.
+`ratarmount oci://ghcr.io/org/img:tag mnt/` fetches the manifest, unions layer tars, Range-GETs file blobs, and reuses the SQLite index as a SOCI-style zTOC. Whiteouts + opaque dirs for a correct rootfs. P-1 is the scheme; this is the union. Factory wired in PR-12.
+
+**Residual:** same as P-1 (eStargz/SOCI/nydus, config JSON, referrer).
 
 ### F-5 — Windows (WinFsp) + Homebrew + macOS Intel
 
@@ -177,6 +199,10 @@ Tracked elsewhere; listed so agents do not rediscover them as new work:
 - Kerberos NFS / LAN / Windows NFS READDIR
 - ZIP incremental commit (full rebuild today)
 - 7z solid dict-reset resume
+- SMB signing / Finder (P-2)
+- WebDAV LOCK (P-6)
+- SFTP default-path russh (P-10 `sftp-russh`)
+- Phase 12 dual-run announce — docs ready, **ops-pending** [`phase12-dual-run.md`](../phase12-dual-run.md)
 
 ---
 
@@ -186,15 +212,17 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 
 | ID | Work | Status | Effort | Depends |
 |----|------|--------|--------|---------|
-| G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `todo` | L | P-2 / P-5 / P-6 (NFS already) |
+| G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); **booleans**, no `serve` subcommand |
 | G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `todo` | M | index; pairs with P-1 |
 | G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `todo` | L | `--hashes` (partial today) |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
 | G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
 
-### G-1 — `ratarmount serve`
+### G-1 — `ratarmount serve` — `done` (booleans)
 
-`--fuse --nfs --http --webdav --smb` on the same tree. Become the minio of archives: point it at a tarball (or an S3 prefix of tarballs) and every client language gets a filesystem. The control socket already looks like this product. CLI shape is the work; adapters are P-2/P-5/P-6/P-10.
+`--nfs --http --webdav --smb --ninep --sftp` on the same tree (FUSE remains “mountpoint present”; there is **no** `--fuse` flag). Boolean flags + required-value binds (`num_args = 1`) on the existing mount CLI. Combine in one process (`ratarmount --nfs --http archive.tar.gz`). Export-only is allowed without a FUSE mountpoint. SIGINT/SIGTERM stops every export.
+
+A `ratarmount serve` **subcommand was not shipped** (clap positionals steal the archive path). Booleans are the product. Residual: control-plane redesign, IP allowlists.
 
 ### G-2 — Index as a portable artifact
 
@@ -216,21 +244,21 @@ restic / borg / kopia / ZFS send already store trees of archives or content-addr
 
 ## Suggested implementation order (agents)
 
-Parallel-safe splits use the ownership column. Orchestrator owns `ratarmount/src/factory.rs` and CLI flag wiring unless a task says otherwise.
+Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrator owns `ratarmount/src/factory.rs` and CLI flag wiring unless a task says otherwise.
 
-1. **F-1** remote directory mounts (S3 prefix + SSH dir; WebDAV PROPFIND). Unlocks every inbound protocol.
-2. **P-4** FTP — small, Python parity, same fetch path as F-1.
+1. ~~**F-1** remote directory mounts~~ — done (S3/SSH/WebDAV/HTTP).
+2. ~~**P-4** FTP~~ — done (file REST; LIST residual).
 3. **F-2** incremental reindex — unblocks honest live commit and F-7.
-4. Pick **one** outbound story: **P-5** HTTP Range export (smallest) or **P-2** SMB (Windows).
-5. Pick **one** inbound bet: **P-1 + F-4** OCI, or **P-3** GCS/Azure, or **P-9** rclone (widest, least elegant).
+4. ~~**P-5** HTTP Range export~~ / ~~**P-2** SMB~~ — HTTP `done`; SMB `partial` (signing/Finder).
+5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~ — done.
 6. **F-3** FTS5/locate — independent, good control-plane demo.
 7. **F-9** `--repack-seekable` — independent producer.
-8. **G-1** `serve` once two exports exist besides FUSE/NFS.
-9. **G-2** portable index alongside P-1/F-4 if OCI is chosen.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI, P-6/P-7/P-8/P-10.
+8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
+9. **G-2** portable index alongside P-1/F-4.
+10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 signing/Finder, P-6 LOCK, P-10 default-path russh.
 
 ---
 
 ## Tracking
 
-Update this file when status changes. User-visible landings also update [`README.md`](../../README.md) feature tables, [`parity-todo.md`](../parity-todo.md) if it is also a Python gap, [`phase10-remote.md`](../phase10-remote.md) for remotes, and [`nfs-export.md`](../nfs-export.md) if an export lands next to NFS.
+Update this file when status changes. User-visible landings also update [`README.md`](../../README.md) feature tables, [`parity-todo.md`](../parity-todo.md) if it is also a Python gap, [`phase10-remote.md`](../phase10-remote.md) for remotes, [`export.md`](../export.md) for HTTP/SMB/WebDAV/9P/SFTP, and [`nfs-export.md`](../nfs-export.md) for NFS.

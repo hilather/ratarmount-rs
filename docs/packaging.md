@@ -79,19 +79,19 @@ Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if 
 
 **NFS export** is userspace (`nfsserve` NFSv3 + optional `embednfs` NFSv4.1). Packages do **not** depend on `nfs-kernel-server`. Default listen port is **20490** (unprivileged). Binding **2049** needs root or `CAP_NET_BIND_SERVICE` (`--nfs-bind 2049`; already parsed). See [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 
-**`nfsv4` is enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** compile v4.
+**`nfsv4` and `sftp-russh` are enabled in the package compile lines** — a stronger commitment than `gzip-rapidgzip` (still off). Editing only [`.github/workflows/packages.yml`](https://github.com/hilather/ratarmount-rs/blob/main/.github/workflows/packages.yml) does **not** compile either feature.
 
 | Script | `cargo build --release -p ratarmount` |
 |--------|----------------------------------------|
-| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4` |
-| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4` |
-| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4` (rustup **stable**, rustc ≥ 1.88 assumed) |
+| [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh` |
+| [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh` |
+| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh` (rustup **stable**, rustc ≥ 1.88 assumed) |
 
-Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Workspace MSRV stays **1.74**; default `cargo test --workspace` does not compile embednfs. Current package jobs install rustup **stable**, so 1.88+ is expected. If a Rocky/portable/macOS builder is ever pinned below 1.88, keep the feature off in that script and update this table.
+Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Without `--features sftp-russh`, `--sftp` exits 2 (`rebuild with --features sftp-russh`; russh MSRV 1.85 > workspace 1.74). Default `cargo test --workspace` compiles neither embednfs nor russh. Current package jobs install rustup **stable**, so 1.88+ is expected. If a Rocky/portable/macOS builder is ever pinned below 1.88, keep `nfsv4` off in that script and update this table.
 
-`--print-features` on a packaged binary prints `nfsv4: compiled`. `--oss-attributions` lists **embednfs** (MIT) when compiled.
+`--print-features` on a packaged binary prints `nfsv4: compiled` and `sftp-russh: compiled`. `--oss-attributions` lists **embednfs** (MIT) and russh when compiled.
 
-Residuals (honest): Linux kernel client **verified** on loopback (privileged Docker [`test-harness/nfs-docker/run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/nfs-docker/run.sh), 2026-08-15 — not default CI); no Kerberos / LAN / Windows; no v3/v4 mux; idle TTL is not CLOSE; embednfs is macOS-first over localhost. Regression: [`packaging/test-nfsv4-features.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-nfsv4-features.sh).
+Residuals (honest): Linux kernel client **verified** on loopback (privileged Docker [`test-harness/nfs-docker/run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/nfs-docker/run.sh), 2026-08-15 — not default CI); no Kerberos / LAN / Windows; no v3/v4 mux; idle TTL is not CLOSE; embednfs is macOS-first over localhost. HTTP/WebDAV/SMB/9P/SFTP bind table: [`export.md`](export.md). Regression: [`packaging/test-nfsv4-features.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-nfsv4-features.sh).
 
 ### Install examples
 
