@@ -34,6 +34,11 @@ ratarmount --nfs --nfs-vers 4 archive.tar.gz
 # Privileged well-known port (needs root or CAP_NET_BIND_SERVICE)
 # ratarmount --nfs --nfs-bind 2049 archive.tar.gz
 # ratarmount --nfs --nfs-vers 4 --nfs-bind 2049 archive.tar.gz
+
+# Also HTTP / WebDAV / SMB / 9P / SFTP (boolean flags; same MountSource)
+ratarmount --nfs --http archive.tar.gz
+ratarmount --http archive.tar.gz
+ratarmount serve --nfs --http archive.tar.gz   # optional sugar; ≥1 export required
 ```
 
 Linux client (loopback; kernel client verified in privileged Docker):
@@ -88,6 +93,8 @@ mount_nfs -o nolocks,vers=3,tcp,rsize=131072,port=20490,mountport=20490 127.0.0.
 | Filehandles | Invalid after process restart (generation = start time) |
 | `--control-interface` | Requires a FUSE mountpoint; NFS-only → exit 2 |
 | `--no-mount` | Incompatible with `--nfs` (exit 2) |
+| Other exports | `--http` (`127.0.0.1:20491`) · `--webdav` (`:20492`) · `--smb` (`:20445`) · `--ninep` (`:20493`) · `--sftp` (`:20222`, `--features sftp-russh`). Combine with `--nfs` in one process. |
+| `serve` sugar | `ratarmount serve --nfs --http ARCHIVE` requires at least one export and is incompatible with `--no-mount`. No `--fuse` flag (FUSE is “mountpoint present”). Booleans on the mount CLI are the stable interface. |
 | READDIR / READDIRPLUS | NFSv3 prefixes POSIX `.` and `..` (fileids of the directory and its parent; export-root `..` is the export root), then archive children sorted by fileid. NFSv4.1 does **not** emit `.` / `..`: the Linux client injects them (`nfs4_setup_readdir`, reserved cookies 1/2); emitting them duplicates `ls -lah`. lookup of `"."` / `".."` still works on both. |
 
 Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist.

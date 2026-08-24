@@ -125,6 +125,7 @@ ratarmount --nfs archive.tar.gz
 # Also: --http :20491 · --webdav :20492 · --smb :20445 · --ninep :20493 · --sftp :20222
 #   ratarmount --nfs --http archive.tar.gz     # NFS + HTTP in one process
 #   ratarmount --http archive.tar.gz           # HTTP-only (no FUSE mountpoint)
+#   ratarmount serve --nfs --http archive.tar.gz  # optional sugar; ≥1 export required
 #   --sftp needs --features sftp-russh (Linux/macOS packages enable it)
 # Linux: mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ mnt
 # Opt-in NFSv4.1 (Linux/macOS packages compile nfsv4; source: --features nfsv4, rustc ≥ 1.88)
@@ -171,7 +172,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
-| Other exports | `--http` (`127.0.0.1:20491`) · `--webdav` (`:20492`) · `--smb` (`:20445`) · `--ninep` (`:20493`) · `--sftp` (`:20222`, `--features sftp-russh`). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. |
+| Other exports | `--http` (`127.0.0.1:20491`) · `--webdav` (`:20492`) · `--smb` (`:20445`) · `--ninep` (`:20493`) · `--sftp` (`:20222`, `--features sftp-russh`). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`). Booleans remain the stable interface. |
 
 ### Remote backends
 

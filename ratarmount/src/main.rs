@@ -1,5 +1,6 @@
 //! ratarmount CLI (Phases 0–11 + CLI flag parity).
 
+use std::ffi::OsString;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -37,7 +38,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     long_about = "Mount archives (TAR/ZIP/AR/CPIO/libarchive, compressed) via FUSE.\n\
                   Supports recursive automount (-r), write overlay (-w), remote URLs\n\
                   (http(s)/s3/gs/az/ftp/ssh/oci/ipfs/rclone), and userspace exports\n\
-                  (--nfs, --http, --webdav, --smb, --ninep, --sftp)."
+                  (--nfs, --http, --webdav, --smb, --ninep, --sftp).\n\
+                  Optional sugar: ratarmount serve --nfs --http ARCHIVE (requires at\n\
+                  least one export; incompatible with --no-mount).",
+    after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
+                  Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp.\n\
+                  Incompatible with --no-mount. Boolean flags remain the stable interface."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -407,6 +413,11 @@ struct Args {
     /// Input archives/folders/URLs and optional mountpoint
     #[arg(required = false)]
     paths: Vec<PathBuf>,
+
+    /// Set when argv[1] is the `serve` sugar (G-1). Not a clap flag — a
+    /// clap `Subcommand` would require `global = true` on every option.
+    #[arg(skip)]
+    serve: bool,
 }
 
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
@@ -419,8 +430,47 @@ fn parse_parallel_nested(s: &str) -> Result<u32, String> {
         .map_err(|_| format!("expected non-negative integer or 'auto', got {s:?}"))
 }
 
+/// G-1 `serve` sugar: strip argv[1] when it is exactly `serve`, then parse the
+/// existing boolean export CLI. A clap `Subcommand` is hostile here: flags
+/// after `serve` are unknown unless every `Args` field is `global = true`,
+/// which would also treat a later positional `serve` as the subcommand.
+fn parse_args_from<I, T>(iter: I) -> Result<Args, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<OsString> + Clone,
+{
+    let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    let serve = raw.get(1).is_some_and(|s| s == "serve");
+    let stripped: Vec<OsString> = if serve {
+        raw.into_iter()
+            .enumerate()
+            .filter_map(|(i, t)| (i != 1).then_some(t))
+            .collect()
+    } else {
+        raw
+    };
+    let mut args = Args::try_parse_from(stripped)?;
+    args.serve = serve;
+    Ok(args)
+}
+
+fn serve_cli_error(args: &Args) -> Option<&'static str> {
+    if !args.serve {
+        return None;
+    }
+    if args.no_mount {
+        return Some("serve cannot be combined with --no-mount");
+    }
+    if !any_export(args) {
+        return Some(
+            "serve requires at least one export (--nfs, --http, --webdav, --smb, --ninep, --sftp)",
+        );
+    }
+    None
+}
+
 fn main() {
-    let args = Args::parse();
+    let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
     if args.print_features {
         // Features print does not need a full logger.
@@ -430,6 +480,11 @@ fn main() {
     if args.oss_attributions || args.oss_attributions_short {
         print_oss_attributions(args.oss_attributions);
         return;
+    }
+
+    if let Some(msg) = serve_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
     }
 
     let write_style = resolve_color_style(args.color, args.no_color);
@@ -497,6 +552,9 @@ fn main() {
             "       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.tar.zst|archive.zip>"
         );
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
+        eprintln!(
+            "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp <archive>..."
+        );
         std::process::exit(2);
     }
 
@@ -1865,7 +1923,7 @@ fn print_features() {
     #[cfg(not(feature = "nfsv4"))]
     println!("  nfsv4: not compiled");
     println!(
-        "  export: HTTP GET/HEAD (--http :20491); WebDAV (--webdav :20492); SMB2 (--smb :20445); 9P2000.L (--ninep :20493); SFTP (--sftp :20222, --features sftp-russh)"
+        "  export: HTTP GET/HEAD (--http :20491); WebDAV (--webdav :20492); SMB2 (--smb :20445); 9P2000.L (--ninep :20493); SFTP (--sftp :20222, --features sftp-russh); optional `serve` sugar"
     );
     #[cfg(feature = "sftp-russh")]
     println!("  sftp-russh: compiled");
@@ -2799,6 +2857,83 @@ mod export_cli_tests {
             "{}",
             ratarmount_sftp::SFTP_RUSSH_HINT
         );
+    }
+}
+
+#[cfg(test)]
+mod serve_cli_tests {
+    use super::{any_export, parse_args_from, serve_cli_error};
+    use std::path::PathBuf;
+
+    /// Regression: `serve --http --nfs a.tar` must not steal the archive path.
+    #[test]
+    fn serve_http_nfs_does_not_steal_archive() {
+        let a =
+            parse_args_from(["ratarmount", "serve", "--http", "--nfs", "a.tar"]).expect("parse");
+        assert!(a.serve);
+        assert!(a.http);
+        assert!(a.nfs);
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+        assert!(any_export(&a));
+        assert!(serve_cli_error(&a).is_none());
+    }
+
+    #[test]
+    fn serve_http_bind_does_not_steal_archive() {
+        let a = parse_args_from([
+            "ratarmount",
+            "serve",
+            "--http",
+            "--http-bind",
+            "127.0.0.1:20491",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.serve);
+        assert!(a.http);
+        assert_eq!(a.http_bind, "127.0.0.1:20491");
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn serve_requires_at_least_one_export() {
+        let a = parse_args_from(["ratarmount", "serve", "a.tar"]).expect("parse");
+        assert!(a.serve);
+        assert!(!any_export(&a));
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+        let err = serve_cli_error(&a).expect("error");
+        assert!(err.contains("at least one export"), "{err}");
+    }
+
+    #[test]
+    fn serve_no_mount_incompatible() {
+        let a = parse_args_from(["ratarmount", "serve", "--http", "--no-mount", "a.tar"])
+            .expect("parse");
+        assert!(a.serve);
+        assert!(a.http);
+        assert!(a.no_mount);
+        let err = serve_cli_error(&a).expect("error");
+        assert!(err.contains("--no-mount"), "{err}");
+    }
+
+    /// `serve` after flags is an archive name, not the subcommand.
+    #[test]
+    fn serve_after_flags_is_archive_path() {
+        let a = parse_args_from(["ratarmount", "--http", "serve"]).expect("parse");
+        assert!(!a.serve);
+        assert!(a.http);
+        assert_eq!(a.paths, vec![PathBuf::from("serve")]);
+        assert!(serve_cli_error(&a).is_none());
+    }
+
+    /// Booleans on the mount CLI remain the stable interface (no subcommand required).
+    #[test]
+    fn boolean_exports_without_serve_still_parse() {
+        let a = parse_args_from(["ratarmount", "--nfs", "--http", "a.tar"]).expect("parse");
+        assert!(!a.serve);
+        assert!(a.nfs && a.http);
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+        assert!(serve_cli_error(&a).is_none());
     }
 }
 

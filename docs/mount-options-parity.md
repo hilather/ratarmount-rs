@@ -38,6 +38,12 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
 | `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
 | `--nfs-export-name` | no | **added** (MOUNT export name; warned/ignored on `--nfs-vers 4`) | `[x]` |
+| `--http` / `--http-bind` | no | **added** (`127.0.0.1:20491`; GET/HEAD Range; no FUSE mountpoint required) | `[x]` Rust-only |
+| `--webdav` / `--webdav-bind` | no | **added** (`127.0.0.1:20492`; PROPFIND + GET; writes need `-w`) | `[x]` Rust-only |
+| `--smb` / `--smb-bind` / `--smb-share` | no | **added** (`127.0.0.1:20445`; share `ratarmount`) | `[x]` Rust-only |
+| `--ninep` / `--ninep-bind` | no | **added** (`127.0.0.1:20493`; 9P2000.L TCP) | `[x]` Rust-only |
+| `--sftp` / `--sftp-bind` | no | **added** (`127.0.0.1:20222`; `--features sftp-russh`) | `[x]` Rust-only |
+| `serve` subcommand | no | **added** (optional sugar: `ratarmount serve --nfs --http ARCHIVE`; ≥1 export required; incompatible with `--no-mount`; no `--fuse`; booleans remain the stable interface) | `[x]` Rust-only |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
 | `-i` / `--ignore-zeros` | yes | yes (`-i` + long) | `[x]` |
