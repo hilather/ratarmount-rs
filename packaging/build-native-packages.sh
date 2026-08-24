@@ -81,8 +81,8 @@ if [[ "${SKIP_BUILD:-0}" != "1" ]]; then
     # stable, so this is on. Stronger than gzip-rapidgzip (still off). If a
     # Rocky/portable builder is ever pinned below 1.88, drop --features nfsv4
     # and document in docs/packaging.md. Workflow YAML alone does not compile v4.
-    echo "==> cargo build --release -p ratarmount --features nfsv4"
-    cargo build --release -p ratarmount --features nfsv4
+    echo "==> cargo build --release -p ratarmount --features nfsv4,sftp-russh"
+    cargo build --release -p ratarmount --features nfsv4,sftp-russh
 fi
 test -x target/release/ratarmount
 

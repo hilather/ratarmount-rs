@@ -37,7 +37,7 @@ cat mnt/file     # true random access — even inside compressed streams
 | **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
 | **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
-| **Remote-first** | `http(s)`, S3, SSH/SFTP, WebDAV, SMB, Dropbox |
+| **Remote-first** | `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
 
 > Prefer Python when you need rapidgzip-class throughput or the widest fsspec surface. Prefer **Rust** when mounts are frequent, memory is tight, or you want a static-friendly binary.
 
@@ -110,7 +110,11 @@ ratarmount -w /tmp/ov --commit-overlay-interval 2s new.tar.zst mnt/
 # Remote & encrypted
 ratarmount http://host/data.tar mnt/
 ratarmount s3://bucket/key.tar mnt/
+ratarmount gs://bucket/obj.tar mnt/
+ratarmount az://container/blob.tar mnt/
 ratarmount 'ssh://user@host//path/a.tar' mnt/
+ratarmount 'rclone://gdrive:bucket/path.tar' mnt/
+ratarmount docker://ubuntu:24.04 mnt/
 ratarmount --password secret encrypted.7z mnt/
 
 # Index only (no FUSE)
@@ -118,6 +122,10 @@ ratarmount --no-mount -c archive.tar
 
 # NFSv3 userspace export (no FUSE mountpoint; default)
 ratarmount --nfs archive.tar.gz
+# Also: --http :20491 · --webdav :20492 · --smb :20445 · --ninep :20493 · --sftp :20222
+#   ratarmount --nfs --http archive.tar.gz     # NFS + HTTP in one process
+#   ratarmount --http archive.tar.gz           # HTTP-only (no FUSE mountpoint)
+#   --sftp needs --features sftp-russh (Linux/macOS packages enable it)
 # Linux: mount -t nfs -o vers=3,tcp,nolock,port=20490,mountport=20490 127.0.0.1:/ mnt
 # Opt-in NFSv4.1 (Linux/macOS packages compile nfsv4; source: --features nfsv4, rustc ≥ 1.88)
 #   ratarmount --nfs --nfs-vers 4
@@ -163,10 +171,11 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
+| Other exports | `--http` (`127.0.0.1:20491`) · `--webdav` (`:20492`) · `--smb` (`:20445`) · `--ninep` (`:20493`) · `--sftp` (`:20222`, `--features sftp-russh`). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. |
 
 ### Remote backends
 
-`file://` · `http(s)://` (Range + Basic/Cookie auth) · `s3://` (SigV4 / IMDS / anonymous) · `ssh://` / `sftp://` · WebDAV · SMB · Dropbox
+`file://` · `http(s)://` (Range + Basic/Cookie auth) · `s3://` (SigV4 / IMDS / anonymous; prefix folders) · `gs://` · `az://` · `ftp://` / `ftps://` · `ssh://` / `sftp://` · WebDAV · SMB · Dropbox · `oci://` / `docker://` (overlayfs layer union) · `ipfs://` / `ipns://` · `rclone://remote:path`
 
 Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) · [`docs/parity-todo.md`](docs/parity-todo.md)
 

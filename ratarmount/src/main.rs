@@ -35,8 +35,9 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     version = VERSION,
     about = "Random Access To Archived Resources (Rust rewrite)",
     long_about = "Mount archives (TAR/ZIP/AR/CPIO/libarchive, compressed) via FUSE.\n\
-                  Supports recursive automount (-r), write overlay (-w), http(s)/file URLs,\n\
-                  and userspace NFS (--nfs, NFSv3 default; --nfs-vers 4 for NFSv4.1)."
+                  Supports recursive automount (-r), write overlay (-w), remote URLs\n\
+                  (http(s)/s3/gs/az/ftp/ssh/oci/ipfs/rclone), and userspace exports\n\
+                  (--nfs, --http, --webdav, --smb, --ninep, --sftp)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -130,6 +131,84 @@ struct Args {
     /// Ignored on NFSv4.1 (no MOUNT).
     #[arg(long = "nfs-export-name", value_name = "NAME")]
     nfs_export_name: Option<String>,
+
+    /// Export the archive over HTTP GET/HEAD with byte ranges. Default bind
+    /// `--http-bind` (`127.0.0.1:20491`). Does not require a FUSE mountpoint.
+    #[arg(long = "http", action = ArgAction::SetTrue)]
+    http: bool,
+
+    /// HTTP listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20491.
+    #[arg(
+        long = "http-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20491",
+        num_args = 1
+    )]
+    http_bind: String,
+
+    /// Export the archive over WebDAV (PROPFIND + GET; writes need `-w`).
+    /// Default bind `--webdav-bind` (`127.0.0.1:20492`).
+    #[arg(long = "webdav", action = ArgAction::SetTrue)]
+    webdav: bool,
+
+    /// WebDAV listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20492.
+    #[arg(
+        long = "webdav-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20492",
+        num_args = 1
+    )]
+    webdav_bind: String,
+
+    /// Export the archive as userspace SMB 2.0.2. Default bind `--smb-bind`
+    /// (`127.0.0.1:20445`). Share name `--smb-share` (default `ratarmount`).
+    #[arg(long = "smb", action = ArgAction::SetTrue)]
+    smb: bool,
+
+    /// SMB listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20445.
+    #[arg(
+        long = "smb-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20445",
+        num_args = 1
+    )]
+    smb_bind: String,
+
+    /// SMB TREE_CONNECT share name. Default `ratarmount`.
+    #[arg(long = "smb-share", value_name = "NAME", default_value = "ratarmount")]
+    smb_share: String,
+
+    /// Export the archive as 9P2000.L over TCP. Default bind `--ninep-bind`
+    /// (`127.0.0.1:20493`). Canonical flag is `--ninep` (not `--9p`).
+    #[arg(long = "ninep", action = ArgAction::SetTrue)]
+    ninep: bool,
+
+    /// 9P listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20493.
+    #[arg(
+        long = "ninep-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20493",
+        num_args = 1
+    )]
+    ninep_bind: String,
+
+    /// Export the archive as SFTP over TCP. Default bind `--sftp-bind`
+    /// (`127.0.0.1:20222`). Needs `--features sftp-russh` (exit 2 otherwise).
+    #[arg(long = "sftp", action = ArgAction::SetTrue)]
+    sftp: bool,
+
+    /// SFTP listen address (`[host:]port`, IPv4 only). Default 127.0.0.1:20222.
+    #[arg(
+        long = "sftp-bind",
+        value_name = "ADDR:PORT",
+        default_value = "127.0.0.1:20222",
+        num_args = 1
+    )]
+    sftp_bind: String,
+
+    /// Authorized-keys file for `--sftp`. Required when the bind is not loopback.
+    #[arg(long = "sftp-authorized-keys", value_name = "PATH")]
+    sftp_authorized_keys: Option<PathBuf>,
 
     /// Detect GNU incremental archives (heuristic)
     #[arg(long = "detect-gnu-incremental", action = ArgAction::SetTrue)]
@@ -691,12 +770,16 @@ fn main() {
         overlay_commit::install_term_signal_flag();
     }
 
-    if args.no_mount && args.nfs {
-        eprintln!("error: --nfs cannot be combined with --no-mount");
-        std::process::exit(2);
-    }
     if args.no_mount {
+        if let Some(flag) = export_incompatible_with_no_mount(&args) {
+            eprintln!("error: {flag} cannot be combined with --no-mount");
+            std::process::exit(2);
+        }
         return;
+    }
+    if args.sftp && !ratarmount_sftp::sftp_russh_compiled() {
+        eprintln!("error: --sftp: {}", ratarmount_sftp::SFTP_RUSSH_HINT);
+        std::process::exit(2);
     }
 
     let readahead_on_argv = readahead_flag_on_argv(std::env::args());
@@ -771,8 +854,8 @@ fn main() {
         eprintln!("warning: --nfs-export-name is ignored on NFSv4.1 (no MOUNT)");
     }
 
-    // NFS-only: do not invent a FUSE mountpoint / stem directory.
-    let fuse_mp = if args.nfs && mountpoint.is_none() {
+    // Export-only (NFS/HTTP/…): do not invent a FUSE mountpoint / stem directory.
+    let fuse_mp = if any_export(&args) && mountpoint.is_none() {
         None
     } else {
         Some(match mountpoint {
@@ -788,9 +871,9 @@ fn main() {
         std::fs::create_dir_all(mp).ok();
     }
 
-    if args.nfs && fuse_mp.is_none() && args.control_interface {
+    if any_export(&args) && fuse_mp.is_none() && args.control_interface {
         eprintln!(
-            "error: --control-interface requires a FUSE mountpoint (NFS-only is not supported)"
+            "error: --control-interface requires a FUSE mountpoint (export-only is not supported)"
         );
         std::process::exit(2);
     }
@@ -818,6 +901,7 @@ fn main() {
         None
     };
 
+    let other_exports = args.http || args.webdav || args.smb || args.ninep || args.sftp;
     if let Some(bind) = nfs_bind {
         if !bind.ip().is_loopback() {
             eprintln!(
@@ -835,32 +919,73 @@ fn main() {
             overlay: overlay_arc.clone(),
             vers: nfs_vers,
         };
-        match fuse_mp {
-            None => run_nfs_only(
-                bundle.source,
-                nfs_opts,
-                overlay_arc,
-                live_commit_archive,
-                args.commit_overlay_on_exit,
-                commit_interval,
-                open_opts,
-            ),
-            Some(mp) => run_fuse_and_nfs(
-                bundle.source,
-                mp,
-                writable,
-                overlay_arc,
-                &fuse_opts,
-                readahead,
-                nfs_opts,
-                args.foreground,
-                args.log_file.is_some(),
-                live_commit_archive,
-                args.commit_overlay_on_exit,
-                commit_interval,
-                open_opts,
-            ),
+        if !other_exports {
+            match fuse_mp {
+                None => run_nfs_only(
+                    bundle.source,
+                    nfs_opts,
+                    overlay_arc,
+                    live_commit_archive,
+                    args.commit_overlay_on_exit,
+                    commit_interval,
+                    open_opts,
+                ),
+                Some(mp) => run_fuse_and_nfs(
+                    bundle.source,
+                    mp,
+                    writable,
+                    overlay_arc,
+                    &fuse_opts,
+                    readahead,
+                    nfs_opts,
+                    args.foreground,
+                    args.log_file.is_some(),
+                    live_commit_archive,
+                    args.commit_overlay_on_exit,
+                    commit_interval,
+                    open_opts,
+                ),
+            }
+            return;
         }
+        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead);
+        run_exports(
+            bundle.source,
+            fuse_mp,
+            writable,
+            overlay_arc,
+            &fuse_opts,
+            readahead,
+            Some(nfs_opts),
+            plan,
+            args.foreground,
+            args.log_file.is_some(),
+            live_commit_archive,
+            args.commit_overlay_on_exit,
+            commit_interval,
+            open_opts,
+        );
+        return;
+    }
+
+    if other_exports {
+        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead);
+        run_exports(
+            bundle.source,
+            fuse_mp,
+            writable,
+            overlay_arc,
+            &fuse_opts,
+            readahead,
+            None,
+            plan,
+            args.foreground,
+            args.log_file.is_some(),
+            live_commit_archive,
+            args.commit_overlay_on_exit,
+            commit_interval,
+            open_opts,
+        );
         return;
     }
 
@@ -879,6 +1004,469 @@ fn main() {
         commit_interval,
         open_opts,
     );
+}
+
+fn any_export(args: &Args) -> bool {
+    args.nfs || args.http || args.webdav || args.smb || args.ninep || args.sftp
+}
+
+fn export_incompatible_with_no_mount(args: &Args) -> Option<&'static str> {
+    if args.nfs {
+        Some("--nfs")
+    } else if args.http {
+        Some("--http")
+    } else if args.webdav {
+        Some("--webdav")
+    } else if args.smb {
+        Some("--smb")
+    } else if args.ninep {
+        Some("--ninep")
+    } else if args.sftp {
+        Some("--sftp")
+    } else {
+        None
+    }
+}
+
+struct ExportPlan {
+    http: Option<ratarmount_http::HttpOptions>,
+    webdav: Option<ratarmount_http::WebDavOptions>,
+    smb: Option<ratarmount_smb::SmbOptions>,
+    ninep: Option<ratarmount_9p::NinepOptions>,
+    sftp: Option<ratarmount_sftp::SftpOptions>,
+}
+
+fn parse_bind_or_exit<E: std::fmt::Display>(
+    s: &str,
+    parse: impl FnOnce(&str) -> Result<std::net::SocketAddr, E>,
+) -> std::net::SocketAddr {
+    match parse(s) {
+        Ok(a) => a,
+        Err(e) => {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
+    }
+}
+
+fn warn_export_non_loopback(name: &str, bind: std::net::SocketAddr) {
+    if !bind.ip().is_loopback() {
+        eprintln!(
+            "warning: {name} bound on {bind} (no auth). Prefer 127.0.0.1 unless you trust the LAN."
+        );
+    }
+}
+
+fn parse_export_plan(
+    args: &Args,
+    overlay: Option<Arc<WriteOverlay>>,
+    readahead: u64,
+) -> ExportPlan {
+    let readahead_usize = usize::try_from(readahead).unwrap_or(usize::MAX);
+    let mut plan = ExportPlan {
+        http: None,
+        webdav: None,
+        smb: None,
+        ninep: None,
+        sftp: None,
+    };
+    if args.http {
+        let bind = parse_bind_or_exit(&args.http_bind, ratarmount_http::parse_http_bind);
+        warn_export_non_loopback("HTTP", bind);
+        plan.http = Some(ratarmount_http::HttpOptions {
+            bind,
+            stop: None,
+            overlay: overlay.clone(),
+            readahead_bytes: readahead,
+            webdav: false,
+        });
+    }
+    if args.webdav {
+        let bind = parse_bind_or_exit(&args.webdav_bind, ratarmount_http::parse_webdav_bind);
+        warn_export_non_loopback("WebDAV", bind);
+        plan.webdav = Some(ratarmount_http::WebDavOptions {
+            bind,
+            stop: None,
+            overlay: overlay.clone(),
+            readahead_bytes: readahead,
+        });
+    }
+    if args.smb {
+        let bind = parse_bind_or_exit(&args.smb_bind, ratarmount_smb::parse_smb_bind);
+        warn_export_non_loopback("SMB", bind);
+        let (username, password) = ratarmount_smb::smb_credentials_from_env();
+        plan.smb = Some(ratarmount_smb::SmbOptions {
+            bind,
+            stop: None,
+            overlay: overlay.clone(),
+            readahead_bytes: readahead_usize,
+            reader_slots: ratarmount_smb::DEFAULT_READER_SLOTS,
+            share_name: args.smb_share.clone(),
+            username,
+            password,
+        });
+    }
+    if args.ninep {
+        let bind = parse_bind_or_exit(&args.ninep_bind, ratarmount_9p::parse_ninep_bind);
+        warn_export_non_loopback("9P", bind);
+        plan.ninep = Some(ratarmount_9p::NinepOptions {
+            bind,
+            stop: None,
+            overlay: overlay.clone(),
+            readahead_bytes: readahead_usize,
+            reader_slots: ratarmount_9p::DEFAULT_READER_SLOTS,
+        });
+    }
+    if args.sftp {
+        let bind = parse_bind_or_exit(&args.sftp_bind, ratarmount_sftp::parse_sftp_bind);
+        warn_export_non_loopback("SFTP", bind);
+        plan.sftp = Some(ratarmount_sftp::SftpOptions {
+            bind,
+            stop: None,
+            overlay,
+            readahead_bytes: readahead_usize,
+            reader_slots: ratarmount_sftp::DEFAULT_READER_SLOTS,
+            authorized_keys: args.sftp_authorized_keys.clone(),
+            host_key: None,
+        });
+    }
+    plan
+}
+
+struct ExportHandles {
+    nfs: Option<ratarmount_nfs::NfsServerHandle>,
+    others: Vec<ratarmount_http::ExportServerHandle>,
+}
+
+fn attach_export_stops(
+    nfs_opts: &mut Option<ratarmount_nfs::NfsOptions>,
+    plan: &mut ExportPlan,
+    nfs_stop: &ratarmount_nfs::NfsStop,
+    export_stop: &ratarmount_http::ExportStop,
+) {
+    if let Some(opts) = nfs_opts {
+        opts.stop = Some(nfs_stop.clone());
+    }
+    if let Some(opts) = &mut plan.http {
+        opts.stop = Some(export_stop.clone());
+    }
+    if let Some(opts) = &mut plan.webdav {
+        opts.stop = Some(export_stop.clone());
+    }
+    if let Some(opts) = &mut plan.smb {
+        opts.stop = Some(export_stop.clone());
+    }
+    if let Some(opts) = &mut plan.ninep {
+        opts.stop = Some(export_stop.clone());
+    }
+    if let Some(opts) = &mut plan.sftp {
+        opts.stop = Some(export_stop.clone());
+    }
+}
+
+fn spawn_export_threads(
+    source: &Arc<dyn MountSource>,
+    nfs_opts: Option<ratarmount_nfs::NfsOptions>,
+    plan: ExportPlan,
+) -> ExportHandles {
+    let mut handles = ExportHandles {
+        nfs: None,
+        others: Vec::new(),
+    };
+    if let Some(opts) = nfs_opts {
+        let ready = opts.clone();
+        match spawn_nfs_for_opts(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!("{}", nfs_ready_line(&ready, h.port));
+                handles.nfs = Some(h);
+            }
+            Err(e) => {
+                eprintln!("error starting NFS server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(opts) = plan.http {
+        let bind = opts.bind;
+        match ratarmount_http::spawn_http_thread(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!(
+                    "HTTP on {}:{}. curl: curl -r 0-1023 http://{}:{}/member",
+                    bind.ip(),
+                    h.port,
+                    bind.ip(),
+                    h.port
+                );
+                handles.others.push(h);
+            }
+            Err(e) => {
+                eprintln!("error starting HTTP server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(opts) = plan.webdav {
+        let bind = opts.bind;
+        match ratarmount_http::spawn_webdav_thread(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!(
+                    "WebDAV on {}:{}. PROPFIND Depth 0/1; GET/HEAD Range",
+                    bind.ip(),
+                    h.port
+                );
+                handles.others.push(h);
+            }
+            Err(e) => {
+                eprintln!("error starting WebDAV server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(opts) = plan.smb {
+        let bind = opts.bind;
+        let share = opts.share_name.clone();
+        match ratarmount_smb::spawn_smb_thread(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!(
+                    "SMB2 on {}:{}. smbclient //{}/{share} -p {} -N",
+                    bind.ip(),
+                    h.port,
+                    bind.ip(),
+                    h.port
+                );
+                handles.others.push(h);
+            }
+            Err(e) => {
+                eprintln!("error starting SMB server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(opts) = plan.ninep {
+        let bind = opts.bind;
+        match ratarmount_9p::spawn_ninep_thread(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!(
+                    "9P2000.L on {}:{}. mount -t 9p -o trans=tcp,port={},version=9p2000.L {} <dir>",
+                    bind.ip(),
+                    h.port,
+                    h.port,
+                    bind.ip()
+                );
+                handles.others.push(h);
+            }
+            Err(e) => {
+                eprintln!("error starting 9P server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    if let Some(opts) = plan.sftp {
+        let bind = opts.bind;
+        match ratarmount_sftp::spawn_sftp_thread(Arc::clone(source), opts) {
+            Ok(h) => {
+                eprintln!(
+                    "SFTP on {}:{}. sftp -P {} -o StrictHostKeyChecking=no {}",
+                    bind.ip(),
+                    h.port,
+                    h.port,
+                    bind.ip()
+                );
+                handles.others.push(h);
+            }
+            Err(e) => {
+                eprintln!("error starting SFTP server: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    handles
+}
+
+fn probe_export_binds(nfs_opts: &Option<ratarmount_nfs::NfsOptions>, plan: &ExportPlan) {
+    let mut addrs = Vec::new();
+    if let Some(o) = nfs_opts {
+        addrs.push(("NFS", o.bind));
+    }
+    if let Some(o) = &plan.http {
+        addrs.push(("HTTP", o.bind));
+    }
+    if let Some(o) = &plan.webdav {
+        addrs.push(("WebDAV", o.bind));
+    }
+    if let Some(o) = &plan.smb {
+        addrs.push(("SMB", o.bind));
+    }
+    if let Some(o) = &plan.ninep {
+        addrs.push(("9P", o.bind));
+    }
+    if let Some(o) = &plan.sftp {
+        addrs.push(("SFTP", o.bind));
+    }
+    for (name, bind) in addrs {
+        if let Err(e) = std::net::TcpListener::bind(bind) {
+            eprintln!("error: cannot bind {name} on {bind}: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn join_export_handles(handles: ExportHandles) {
+    if let Some(h) = handles.nfs {
+        let _ = h.join();
+    }
+    for h in handles.others {
+        let _ = h.join();
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_exports(
+    source: Arc<dyn MountSource>,
+    fuse_mp: Option<PathBuf>,
+    writable: bool,
+    overlay_arc: Option<Arc<WriteOverlay>>,
+    fuse_opts: &str,
+    readahead: u64,
+    mut nfs_opts: Option<ratarmount_nfs::NfsOptions>,
+    mut plan: ExportPlan,
+    foreground: bool,
+    has_log_file: bool,
+    live_archive: Option<PathBuf>,
+    commit_on_exit: bool,
+    commit_interval: Option<Duration>,
+    open_opts: OpenOptions,
+) {
+    overlay_commit::install_term_signal_flag();
+    let nfs_stop = ratarmount_nfs::NfsStop::new();
+    let export_stop = ratarmount_http::ExportStop::new();
+    let mut callbacks: Vec<Arc<dyn Fn() + Send + Sync>> = Vec::new();
+    {
+        let s = nfs_stop.clone();
+        callbacks.push(Arc::new(move || s.request_stop()));
+    }
+    {
+        let s = export_stop.clone();
+        callbacks.push(Arc::new(move || s.request_stop()));
+    }
+    overlay_commit::spawn_signal_export_stops(callbacks);
+    attach_export_stops(&mut nfs_opts, &mut plan, &nfs_stop, &export_stop);
+
+    if let (Some(ov), Some(archive), Some(dur)) =
+        (overlay_arc.clone(), live_archive.clone(), commit_interval)
+    {
+        overlay_commit::spawn_interval_commits(
+            ov,
+            archive,
+            dur,
+            Some(nfs_stop.clone()),
+            open_opts.clone(),
+        );
+    }
+
+    match fuse_mp {
+        None => {
+            let handles = spawn_export_threads(&source, nfs_opts, plan);
+            while !overlay_commit::term_requested()
+                && !nfs_stop.is_stopped()
+                && !export_stop.is_stopped()
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            nfs_stop.request_stop();
+            export_stop.request_stop();
+            join_export_handles(handles);
+            overlay_commit::maybe_commit_on_exit(
+                overlay_arc.as_deref(),
+                live_archive.as_deref(),
+                commit_on_exit,
+            );
+        }
+        Some(mp) => {
+            if live_archive.is_some() {
+                overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+            }
+            if foreground {
+                eprintln!("FUSE at {}", mp.display());
+                let handles = spawn_export_threads(&source, nfs_opts, plan);
+                let mount_err = mount_blocking(
+                    Arc::clone(&source),
+                    &mp,
+                    true,
+                    writable,
+                    overlay_arc.clone(),
+                    fuse_opts,
+                    readahead,
+                );
+                nfs_stop.request_stop();
+                export_stop.request_stop();
+                join_export_handles(handles);
+                overlay_commit::maybe_commit_on_exit(
+                    overlay_arc.as_deref(),
+                    live_archive.as_deref(),
+                    commit_on_exit,
+                );
+                if let Err(e) = mount_err {
+                    eprintln!("error mounting at {}: {e}", mp.display());
+                    std::process::exit(1);
+                }
+                return;
+            }
+
+            probe_export_binds(&nfs_opts, &plan);
+            match unsafe { fork() } {
+                Ok(ForkResult::Parent { child }) => {
+                    if !wait_until_mounted(&mp, Duration::from_secs(30)) {
+                        eprintln!(
+                            "error: timed out waiting for mount at {} (child pid {child})",
+                            mp.display()
+                        );
+                        let _ = unmount(&mp);
+                        std::process::exit(1);
+                    }
+                    std::process::exit(0);
+                }
+                Ok(ForkResult::Child) => {
+                    let _ = setsid();
+                    if !has_log_file {
+                        let _ = redirect_stdio_to_null();
+                    }
+                    if live_archive.is_some() {
+                        overlay_commit::spawn_signal_fuse_unmount(mp.clone());
+                    }
+                    let _handles = spawn_export_threads(&source, nfs_opts, plan);
+                    let mount_err = mount_blocking(
+                        source,
+                        &mp,
+                        true,
+                        writable,
+                        overlay_arc.clone(),
+                        fuse_opts,
+                        readahead,
+                    );
+                    nfs_stop.request_stop();
+                    export_stop.request_stop();
+                    overlay_commit::maybe_commit_on_exit(
+                        overlay_arc.as_deref(),
+                        live_archive.as_deref(),
+                        commit_on_exit,
+                    );
+                    if let Err(e) = mount_err {
+                        let _ = std::fs::write(
+                            "/tmp/ratarmount-rs-fuse-error.log",
+                            format!("mount error: {e}\n"),
+                        );
+                        std::process::exit(1);
+                    }
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("error: fork failed: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
+    }
 }
 
 fn nfs_ready_line(opts: &ratarmount_nfs::NfsOptions, port: u16) -> String {
@@ -1277,13 +1865,22 @@ fn print_features() {
     #[cfg(not(feature = "nfsv4"))]
     println!("  nfsv4: not compiled");
     println!(
+        "  export: HTTP GET/HEAD (--http :20491); WebDAV (--webdav :20492); SMB2 (--smb :20445); 9P2000.L (--ninep :20493); SFTP (--sftp :20222, --features sftp-russh)"
+    );
+    #[cfg(feature = "sftp-russh")]
+    println!("  sftp-russh: compiled");
+    #[cfg(not(feature = "sftp-russh"))]
+    println!("  sftp-russh: not compiled");
+    println!(
         "  compress: gzip/bzip2/xz/zstd/lz4/lzip/lzo/Z/lzma/zlib seekable bodies; plain single-file materialize"
     );
     println!(
         "  formats: tar,zip,ar,cpio,iso9660,warc,xar,cab,sevenzip,sqlar,squashfs,ext4,fat,asar,ogg,html,pdf,git,libarchive"
     );
-    println!("  compositing: automount,union,folder,write-overlay,file-versions,prefix,transform");
-    println!("  remote: http,https,file,s3,ssh,sftp");
+    println!("  compositing: automount,union,folder,write-overlay,file-versions,prefix,transform,oci-overlayfs");
+    println!(
+        "  remote: http,https,file,s3,gs,az,ftp,ftps,ssh,sftp,webdav,smb,dropbox,oci,docker,ipfs,rclone"
+    );
     println!("  index: --index-file, --index-folders, :memory:");
     println!("  control: --control-interface (unix socket)");
 }
@@ -1309,10 +1906,16 @@ fn print_oss_attributions(full: bool) {
         "env_logger / log — logging (MIT/Apache-2.0)",
         "nix / libc — Unix syscalls (MIT)",
         "regex / thiserror / anyhow / url / tempfile — utilities",
-        "reqwest / ssh2 / … — remote backends (http/s3/ssh)",
+        "ureq / ssh2 / … — remote backends (http/s3/gs/az/ftp/ssh/oci/ipfs/rclone)",
         "nfsserve / tokio — in-process NFSv3 export (--nfs)",
         #[cfg(feature = "nfsv4")]
         "embednfs — in-process NFSv4.1 export (--nfs-vers 4) (MIT)",
+        "httparse — HTTP/WebDAV export (--http / --webdav)",
+        "userspace SMB 2.0.2 (--smb) / 9P2000.L (--ninep)",
+        #[cfg(feature = "sftp-russh")]
+        "russh / russh-sftp — SFTP export (--sftp)",
+        #[cfg(not(feature = "sftp-russh"))]
+        "russh / russh-sftp — SFTP export (--sftp; rebuild with --features sftp-russh)",
     ];
     for s in short {
         println!("  - {s}");
@@ -2055,6 +2658,147 @@ mod nfs_cli_tests {
         assert!(line.contains("vers=4.1,tcp,port=20490,sec=sys"), "{line}");
         assert!(!line.contains("mountport="), "{line}");
         assert!(!line.contains("nolock"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod export_cli_tests {
+    use super::{export_incompatible_with_no_mount, Args};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    fn archive_paths(a: &Args) -> Vec<PathBuf> {
+        a.paths.clone()
+    }
+
+    /// Regression: boolean `--http` must not steal the archive path.
+    #[test]
+    fn http_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--http", "testdata.tar.gz"]).expect("parse");
+        assert!(a.http);
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("testdata.tar.gz")]);
+        assert_eq!(a.http_bind, "127.0.0.1:20491");
+    }
+
+    #[test]
+    fn http_bind_required_value_does_not_steal_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--http",
+            "--http-bind",
+            "127.0.0.1:20491",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.http);
+        assert_eq!(a.http_bind, "127.0.0.1:20491");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn http_no_mount_is_incompatible() {
+        let a =
+            Args::try_parse_from(["ratarmount", "--http", "--no-mount", "a.tar"]).expect("parse");
+        assert!(a.http);
+        assert!(a.no_mount);
+        assert_eq!(export_incompatible_with_no_mount(&a), Some("--http"));
+    }
+
+    #[test]
+    fn nfs_and_http_same_process_parse() {
+        let a = Args::try_parse_from(["ratarmount", "--nfs", "--http", "a.tar"]).expect("parse");
+        assert!(a.nfs);
+        assert!(a.http);
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn webdav_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--webdav", "a.tar"]).expect("parse");
+        assert!(a.webdav);
+        assert_eq!(a.webdav_bind, "127.0.0.1:20492");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn smb_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--smb", "a.tar"]).expect("parse");
+        assert!(a.smb);
+        assert_eq!(a.smb_bind, "127.0.0.1:20445");
+        assert_eq!(a.smb_share, "ratarmount");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn smb_share_required_value_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--smb", "--smb-share", "data", "a.tar"])
+            .expect("parse");
+        assert_eq!(a.smb_share, "data");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    /// Regression: boolean `--ninep` must not steal the archive path.
+    #[test]
+    fn ninep_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--ninep", "a.tar"]).expect("parse");
+        assert!(a.ninep);
+        assert_eq!(a.ninep_bind, "127.0.0.1:20493");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn ninep_bind_and_mountpoint() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--ninep",
+            "--ninep-bind",
+            "0.0.0.0:20493",
+            "a.tar",
+            "mnt",
+        ])
+        .expect("parse");
+        assert!(a.ninep);
+        assert_eq!(a.ninep_bind, "0.0.0.0:20493");
+        assert_eq!(
+            archive_paths(&a),
+            vec![PathBuf::from("a.tar"), PathBuf::from("mnt")]
+        );
+    }
+
+    #[test]
+    fn sftp_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--sftp", "a.tar"]).expect("parse");
+        assert!(a.sftp);
+        assert_eq!(a.sftp_bind, "127.0.0.1:20222");
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn sftp_authorized_keys_does_not_steal_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--sftp",
+            "--sftp-authorized-keys",
+            "/tmp/keys",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert_eq!(
+            a.sftp_authorized_keys.as_deref(),
+            Some(std::path::Path::new("/tmp/keys"))
+        );
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[cfg(not(feature = "sftp-russh"))]
+    #[test]
+    fn sftp_without_russh_feature_has_rebuild_hint() {
+        assert!(!ratarmount_sftp::sftp_russh_compiled());
+        assert!(
+            ratarmount_sftp::SFTP_RUSSH_HINT.contains("sftp-russh"),
+            "{}",
+            ratarmount_sftp::SFTP_RUSSH_HINT
+        );
     }
 }
 

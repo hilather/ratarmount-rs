@@ -88,6 +88,24 @@ pub fn spawn_signal_nfs_stop(stop: NfsStop) {
         .expect("signal stopper thread");
 }
 
+/// SIGINT/`GOT_TERM` calls every export stop (NFS `NfsStop` and `ExportStop`).
+///
+/// NFS-only keeps [`spawn_signal_nfs_stop`]. Multi-export (`--http` + `--nfs`, …)
+/// uses this helper so one Ctrl-C stops every listener.
+pub fn spawn_signal_export_stops(stops: Vec<Arc<dyn Fn() + Send + Sync>>) {
+    thread::Builder::new()
+        .name("ratarmount-export-signal".into())
+        .spawn(move || {
+            while !GOT_TERM.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
+            }
+            for stop in &stops {
+                stop();
+            }
+        })
+        .expect("export signal stopper thread");
+}
+
 /// Watch [`term_requested`] and unmount FUSE so `mount_blocking` returns
 /// (then the caller can `--commit-overlay-on-exit`). Replaces default SIGINT
 /// terminate — without this, Ctrl-C only sets a flag and the mount stays up.
@@ -445,6 +463,13 @@ mod tests {
         // Without the remote skip, classify would see basename `a.tar` and try the
         // parent `https://example.com` → "parent directory does not exist".
         assert!(!url.exists());
+
+        // Regression: docker://ubuntu:24.04 is not a local path (WHATWG-invalid).
+        let docker = PathBuf::from("docker://ubuntu:24.04");
+        let got = maybe_create_missing_write_base(&docker, CreateMissingContext::Mount)
+            .expect("docker skip");
+        assert_eq!(got, EmptyCreateOutcome::Unchanged);
+        assert!(!docker.exists());
     }
 
     #[test]

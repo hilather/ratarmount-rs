@@ -8,12 +8,14 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 fail=0
 
 # The compile line must appear as a real cargo invocation, not only a comment.
+# nfsv4 and sftp-russh share one --features list (packages enable both).
 check_script() {
     local f="$1"
-    if grep -E '^[[:space:]]*cargo build --release -p ratarmount --features nfsv4[[:space:]]*$' "$f" >/dev/null; then
-        echo "PASS: $f compiles nfsv4"
+    if grep -E '^[[:space:]]*cargo build --release -p ratarmount --features [^[:space:]]*nfsv4' "$f" >/dev/null \
+        && grep -E '^[[:space:]]*cargo build --release -p ratarmount --features [^[:space:]]*sftp-russh' "$f" >/dev/null; then
+        echo "PASS: $f compiles nfsv4,sftp-russh"
     else
-        echo "FAIL: $f missing 'cargo build --release -p ratarmount --features nfsv4'" >&2
+        echo "FAIL: $f missing 'cargo build --release -p ratarmount --features …nfsv4…sftp-russh'" >&2
         fail=1
     fi
 }

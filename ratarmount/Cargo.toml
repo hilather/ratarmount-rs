@@ -19,6 +19,8 @@ gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
 # NFSv4.1 via embednfs (requires rustc ≥ 1.88 / edition 2024). See docs/nfs-export.md.
 nfsv4 = ["ratarmount-nfs/nfsv4"]
+# SFTP export via russh (requires rustc ≥ 1.85). Default CI stays 1.74.
+sftp-russh = ["ratarmount-sftp/sftp-russh"]
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -46,6 +48,10 @@ ratarmount-remote.workspace = true
 ratarmount-compositing.workspace = true
 ratarmount-fuse.workspace = true
 ratarmount-nfs.workspace = true
+ratarmount-http.workspace = true
+ratarmount-smb.workspace = true
+ratarmount-9p.workspace = true
+ratarmount-sftp.workspace = true
 ratarmount-compress.workspace = true
 tempfile.workspace = true
 clap.workspace = true

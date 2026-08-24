@@ -383,42 +383,73 @@ pub enum RemoteError {
     Smb(String),
     #[error("dropbox: {0}")]
     Dropbox(String),
+    #[error("gcs: {0}")]
+    Gcs(String),
+    #[error("azure: {0}")]
+    Azure(String),
+    #[error("ftp: {0}")]
+    Ftp(String),
+    #[error("ipfs: {0}")]
+    Ipfs(String),
+    #[error("rclone: {0}")]
+    Rclone(String),
+    #[error("oci: {0}")]
+    Oci(String),
     #[error("unsupported remote scheme: {0}")]
     UnsupportedScheme(String),
 }
 
 pub type Result<T> = std::result::Result<T, RemoteError>;
 
-/// True if `s` looks like a URL with a scheme (not a bare Windows path).
+/// Known inbound schemes. Checked as a **prefix** before `://` — not via
+/// WHATWG [`Url::parse`], which rejects `rclone://remote:path` and
+/// `docker://ubuntu:24.04` (`invalid port number`).
+const REMOTE_SCHEMES: &[&str] = &[
+    "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
+    "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone",
+];
+
+/// ASCII-lowercase scheme before the first `://`, if any.
+pub fn remote_url_scheme(s: &str) -> Option<String> {
+    let (scheme, _) = s.split_once("://")?;
+    if scheme.is_empty() {
+        return None;
+    }
+    Some(scheme.to_ascii_lowercase())
+}
+
+fn is_known_remote_scheme(scheme: &str) -> bool {
+    REMOTE_SCHEMES.contains(&scheme)
+}
+
+/// True if `s` looks like a URL with a known remote scheme (not a bare Windows path).
+///
+/// Scheme-prefix only: `rclone://gdrive:bucket/x` and `docker://ubuntu:24.04`
+/// are remote even when [`Url::parse`] fails.
 pub fn is_remote_url(s: &str) -> bool {
-    Url::parse(s).is_ok_and(|u| {
-        matches!(
-            u.scheme(),
-            "http"
-                | "https"
-                | "file"
-                | "ftp"
-                | "s3"
-                | "ssh"
-                | "sftp"
-                | "scp"
-                | "smb"
-                | "webdav"
-                | "webdavs"
-                | "dropbox"
-        )
-    })
+    remote_url_scheme(s).is_some_and(|scheme| is_known_remote_scheme(&scheme))
+}
+
+/// Copy a seekable/stream body into a kept temp file.
+fn keep_from_reader(input: &str, mut r: impl Read) -> Result<RemoteLocal> {
+    let mut tmp = NamedTempFile::new()?;
+    let size = io::copy(&mut r, &mut tmp)?;
+    keep_fetched(input, tmp, size)
 }
 
 /// Resolve a path or URL to a local filesystem path suitable for openers.
 /// Remote schemes download into a kept temp file; caller must keep [`RemoteLocal`] alive.
+///
+/// `oci://` / `docker://` / `ghcr://` are layer-union mounts (factory
+/// [`open_remote_input`]); they are not single-file downloads.
 pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
     if !is_remote_url(input) {
         return Ok(RemoteLocal::Local(PathBuf::from(input)));
     }
-    let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
-    match url.scheme() {
+    let scheme = remote_url_scheme(input).unwrap_or_default();
+    match scheme.as_str() {
         "file" => {
+            let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
             let path = url
                 .to_file_path()
                 .map_err(|_| RemoteError::Url(format!("invalid file URL: {input}")))?;
@@ -426,7 +457,7 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
         }
         "http" | "https" => {
             // Prefer Range materialization when the server supports it (fsspec-style path).
-            let (tmp, size) = fetch_http_to_temp_prefer_range(url.as_str())?;
+            let (tmp, size) = fetch_http_to_temp_prefer_range(input)?;
             keep_fetched(input, tmp, size)
         }
         "s3" => {
@@ -450,6 +481,45 @@ pub fn resolve_to_local(input: &str) -> Result<RemoteLocal> {
             let (tmp, size) = fetch_dropbox_to_temp(input)?;
             keep_fetched(input, tmp, size)
         }
+        "ftp" | "ftps" => {
+            let (tmp, size) = fetch_ftp_to_temp(input).map_err(|e| match e {
+                RemoteError::Ftp(_) => e,
+                other => RemoteError::Ftp(other.to_string()),
+            })?;
+            keep_fetched(input, tmp, size)
+        }
+        "gs" => {
+            let f = open_gcs_range(input).map_err(|e| match e {
+                RemoteError::Gcs(_) => e,
+                other => RemoteError::Gcs(other.to_string()),
+            })?;
+            keep_from_reader(input, f)
+        }
+        "az" | "azure" => {
+            let f = open_azure_range(input).map_err(|e| match e {
+                RemoteError::Azure(_) => e,
+                other => RemoteError::Azure(other.to_string()),
+            })?;
+            keep_from_reader(input, f)
+        }
+        "ipfs" | "ipns" => {
+            let f = open_ipfs(input).map_err(|e| match e {
+                RemoteError::Ipfs(_) => e,
+                other => RemoteError::Ipfs(other.to_string()),
+            })?;
+            keep_from_reader(input, f)
+        }
+        "rclone" => {
+            let f = open_rclone(input).map_err(|e| match e {
+                RemoteError::Rclone(_) => e,
+                other => RemoteError::Rclone(other.to_string()),
+            })?;
+            keep_from_reader(input, f)
+        }
+        "oci" | "docker" | "ghcr" => Err(RemoteError::Oci(
+            "oci:// / docker:// / ghcr:// is a layer-union image mount, not a single-file download"
+                .into(),
+        )),
         other => Err(RemoteError::UnsupportedScheme(other.to_string())),
     }
 }
@@ -991,9 +1061,9 @@ pub fn resolve_access(input: &str) -> Result<RemoteAccess> {
     if !is_remote_url(input) {
         return Ok(RemoteAccess::Path(RemoteLocal::Local(PathBuf::from(input))));
     }
-    let url = Url::parse(input).map_err(|e| RemoteError::Url(e.to_string()))?;
-    match url.scheme() {
-        "http" | "https" => Ok(RemoteAccess::Http(resolve_http(url.as_str())?)),
+    let scheme = remote_url_scheme(input).unwrap_or_default();
+    match scheme.as_str() {
+        "http" | "https" => Ok(RemoteAccess::Http(resolve_http(input)?)),
         _ => Ok(RemoteAccess::Path(resolve_to_local(input)?)),
     }
 }
@@ -1125,8 +1195,71 @@ mod tests {
         assert!(is_remote_url("smb://server/share/a.tar"));
         assert!(is_remote_url("dropbox:///path/to/file.tar"));
         assert!(is_remote_url("dropbox://path/to/file.tar"));
+        assert!(is_remote_url("ftp://host.example/a.tar"));
+        assert!(is_remote_url("ftps://host.example/a.tar"));
+        assert!(is_remote_url("gs://bucket/obj.tar"));
+        assert!(is_remote_url("az://container/blob.tar"));
+        assert!(is_remote_url("azure://container/blob.tar"));
+        assert!(is_remote_url("ipfs://bafyhash/path"));
+        assert!(is_remote_url("ipns://name/path"));
+        assert!(is_remote_url("oci://ghcr.io/org/img:tag"));
+        assert!(is_remote_url("ghcr://org/img:tag"));
+        // WHATWG-invalid (colon after host-like segment) must still be remote.
+        assert!(is_remote_url("rclone://gdrive:bucket/x"));
+        assert!(is_remote_url("rclone://remote:path"));
+        assert!(is_remote_url("docker://ubuntu:24.04"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
+        assert!(!is_remote_url("C:\\windows\\path"));
+    }
+
+    /// Regression: docker://ubuntu:24.04 is not a local path.
+    ///
+    /// `Url::parse` fails (`invalid port number`); a prefix check must still
+    /// treat it as remote so factory does not `open()` a local file of that name.
+    #[test]
+    fn docker_ubuntu_tag_is_not_a_local_path() {
+        const URL: &str = "docker://ubuntu:24.04";
+        assert!(
+            url::Url::parse(URL).is_err(),
+            "precondition: WHATWG parse must fail for {URL}"
+        );
+        assert!(is_remote_url(URL), "{URL} must be a remote scheme");
+        match resolve_to_local(URL) {
+            Ok(RemoteLocal::Local(ref p)) => panic!("{URL} must not resolve as local path {p:?}"),
+            Ok(other) => panic!("{URL} must not materialize as {other:?}"),
+            Err(RemoteError::Oci(msg)) => {
+                assert!(
+                    msg.contains("layer-union") || msg.contains("oci://"),
+                    "{msg}"
+                );
+            }
+            Err(e) => panic!("expected RemoteError::Oci, got {e}"),
+        }
+        match resolve_access(URL) {
+            Ok(RemoteAccess::Path(RemoteLocal::Local(ref p))) => {
+                panic!("{URL} must not be a local path {p:?}")
+            }
+            Ok(_) => panic!("{URL} must not materialize via resolve_access"),
+            Err(RemoteError::Oci(_)) => {}
+            Err(e) => panic!("expected RemoteError::Oci, got {e}"),
+        }
+    }
+
+    #[test]
+    fn rclone_colon_path_is_remote_not_local() {
+        const URL: &str = "rclone://gdrive:bucket/x";
+        assert!(
+            url::Url::parse(URL).is_err(),
+            "precondition: WHATWG parse must fail for {URL}"
+        );
+        assert!(is_remote_url(URL));
+        match resolve_to_local(URL) {
+            Ok(RemoteLocal::Local(ref p)) => panic!("{URL} must not resolve as local path {p:?}"),
+            Ok(_) => {}
+            Err(RemoteError::Rclone(_)) | Err(RemoteError::Io(_)) | Err(RemoteError::Url(_)) => {}
+            Err(e) => panic!("unexpected error for rclone URL: {e}"),
+        }
     }
 
     #[test]
