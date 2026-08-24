@@ -266,7 +266,8 @@ fn open_oci_image(
     Ok((PathBuf::from(input), Arc::new(src)))
 }
 
-/// F-1 (`s3` / `ssh` / `webdav` / `http`) plus later-scheme folder openers.
+/// F-1 (`s3` / `ssh` / `webdav` / `http`) plus later-scheme folder openers
+/// (`gs` / `az` / `rclone` / `ipfs` / `ftp` / `ftps`).
 ///
 /// Returns `Ok(None)` for other schemes and for file URLs of those schemes.
 fn try_open_remote_folder_url(input: &str) -> Result<Option<Arc<dyn MountSource>>, String> {
@@ -279,6 +280,7 @@ fn try_open_remote_folder_url(input: &str) -> Result<Option<Arc<dyn MountSource>
         "az" | "azure" => ratarmount_remote::open_azure_folder(input).map_err(|e| e.to_string()),
         "rclone" => ratarmount_remote::open_rclone_folder(input).map_err(|e| e.to_string()),
         "ipfs" | "ipns" => ratarmount_remote::open_ipfs_folder(input).map_err(|e| e.to_string()),
+        "ftp" | "ftps" => ratarmount_remote::open_ftp_folder(input).map_err(|e| e.to_string()),
         _ => Ok(None),
     }
 }
@@ -333,7 +335,6 @@ mod tests {
         for input in [
             "dropbox:///vault",
             "smb://host/share/a.tar",
-            "ftp://host/dir/",
             "/local/path",
             "file:///tmp/x",
             "docker://ubuntu:24.04",
@@ -342,6 +343,18 @@ mod tests {
             assert!(
                 try_open_remote_folder_url(input).unwrap().is_none(),
                 "{input} must not be probed as a remote folder"
+            );
+        }
+    }
+
+    /// Regression: `ftp://` / `ftps://` directory URLs dispatch to `open_ftp_folder`
+    /// (file URLs still return `Ok(None)` from that opener; live LIST is crate-tested).
+    #[test]
+    fn try_open_remote_folder_url_dispatches_ftp_scheme() {
+        for input in ["ftp://", "ftps://"] {
+            assert!(
+                try_open_remote_folder_url(input).is_err(),
+                "{input} must hit the FTP folder arm (error), not Ok(None)"
             );
         }
     }

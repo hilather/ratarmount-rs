@@ -38,11 +38,11 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     long_about = "Mount archives (TAR/ZIP/AR/CPIO/libarchive, compressed) via FUSE.\n\
                   Supports recursive automount (-r), write overlay (-w), remote URLs\n\
                   (http(s)/s3/gs/az/ftp/ssh/oci/ipfs/rclone), and userspace exports\n\
-                  (--nfs, --http, --webdav, --smb, --ninep, --sftp).\n\
+                  (--nfs, --http, --webdav, --smb, --ninep, --sftp, --sftp-subsystem).\n\
                   Optional sugar: ratarmount serve --nfs --http ARCHIVE (requires at\n\
                   least one export; incompatible with --no-mount).",
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
-                  Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp.\n\
+                  Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface."
 )]
 struct Args {
@@ -215,6 +215,12 @@ struct Args {
     /// Authorized-keys file for `--sftp`. Required when the bind is not loopback.
     #[arg(long = "sftp-authorized-keys", value_name = "PATH")]
     sftp_authorized_keys: Option<PathBuf>,
+
+    /// Export SFTP v3 on stdin/stdout (OpenSSH `Subsystem sftp`). No listen.
+    /// Exclusive with `--sftp`. Ignores `--sftp-bind` and `--sftp-authorized-keys`.
+    /// Needs `--features sftp-russh` (exit 2 otherwise).
+    #[arg(long = "sftp-subsystem", action = ArgAction::SetTrue)]
+    sftp_subsystem: bool,
 
     /// Detect GNU incremental archives (heuristic)
     #[arg(long = "detect-gnu-incremental", action = ArgAction::SetTrue)]
@@ -463,7 +469,7 @@ fn serve_cli_error(args: &Args) -> Option<&'static str> {
     }
     if !any_export(args) {
         return Some(
-            "serve requires at least one export (--nfs, --http, --webdav, --smb, --ninep, --sftp)",
+            "serve requires at least one export (--nfs, --http, --webdav, --smb, --ninep, --sftp, --sftp-subsystem)",
         );
     }
     None
@@ -483,6 +489,10 @@ fn main() {
     }
 
     if let Some(msg) = serve_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
+    if let Some(msg) = sftp_export_cli_error(&args) {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
@@ -553,7 +563,7 @@ fn main() {
         );
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
         eprintln!(
-            "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp <archive>..."
+            "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
         );
         std::process::exit(2);
     }
@@ -835,9 +845,19 @@ fn main() {
         }
         return;
     }
-    if args.sftp && !ratarmount_sftp::sftp_russh_compiled() {
-        eprintln!("error: --sftp: {}", ratarmount_sftp::SFTP_RUSSH_HINT);
+    if (args.sftp || args.sftp_subsystem) && !ratarmount_sftp::sftp_russh_compiled() {
+        let flag = if args.sftp_subsystem {
+            "--sftp-subsystem"
+        } else {
+            "--sftp"
+        };
+        eprintln!("error: {flag}: {}", ratarmount_sftp::SFTP_RUSSH_HINT);
         std::process::exit(2);
+    }
+    if args.sftp_subsystem
+        && (args.sftp_authorized_keys.is_some() || args.sftp_bind != "127.0.0.1:20222")
+    {
+        eprintln!("warning: --sftp-subsystem ignores --sftp-bind and --sftp-authorized-keys");
     }
 
     let readahead_on_argv = readahead_flag_on_argv(std::env::args());
@@ -928,6 +948,12 @@ fn main() {
     if let Some(mp) = &fuse_mp {
         std::fs::create_dir_all(mp).ok();
     }
+    if args.sftp_subsystem && fuse_mp.is_some() && !args.foreground {
+        eprintln!(
+            "warning: --sftp-subsystem with a FUSE mountpoint daemonizes and redirects stdin; \
+             use -f or omit the mountpoint"
+        );
+    }
 
     if any_export(&args) && fuse_mp.is_none() && args.control_interface {
         eprintln!(
@@ -959,7 +985,8 @@ fn main() {
         None
     };
 
-    let other_exports = args.http || args.webdav || args.smb || args.ninep || args.sftp;
+    let other_exports =
+        args.http || args.webdav || args.smb || args.ninep || args.sftp || args.sftp_subsystem;
     if let Some(bind) = nfs_bind {
         if !bind.ip().is_loopback() {
             eprintln!(
@@ -1065,7 +1092,13 @@ fn main() {
 }
 
 fn any_export(args: &Args) -> bool {
-    args.nfs || args.http || args.webdav || args.smb || args.ninep || args.sftp
+    args.nfs
+        || args.http
+        || args.webdav
+        || args.smb
+        || args.ninep
+        || args.sftp
+        || args.sftp_subsystem
 }
 
 fn export_incompatible_with_no_mount(args: &Args) -> Option<&'static str> {
@@ -1081,6 +1114,17 @@ fn export_incompatible_with_no_mount(args: &Args) -> Option<&'static str> {
         Some("--ninep")
     } else if args.sftp {
         Some("--sftp")
+    } else if args.sftp_subsystem {
+        Some("--sftp-subsystem")
+    } else {
+        None
+    }
+}
+
+/// `--sftp` (TCP) and `--sftp-subsystem` (stdio) cannot share a process.
+fn sftp_export_cli_error(args: &Args) -> Option<&'static str> {
+    if args.sftp && args.sftp_subsystem {
+        Some("--sftp and --sftp-subsystem are mutually exclusive")
     } else {
         None
     }
@@ -1092,6 +1136,8 @@ struct ExportPlan {
     smb: Option<ratarmount_smb::SmbOptions>,
     ninep: Option<ratarmount_9p::NinepOptions>,
     sftp: Option<ratarmount_sftp::SftpOptions>,
+    /// Stdio SFTP v3 (`--sftp-subsystem`). Not a TCP listener.
+    sftp_stdio: Option<ratarmount_sftp::SftpOptions>,
 }
 
 fn parse_bind_or_exit<E: std::fmt::Display>(
@@ -1127,6 +1173,7 @@ fn parse_export_plan(
         smb: None,
         ninep: None,
         sftp: None,
+        sftp_stdio: None,
     };
     if args.http {
         let bind = parse_bind_or_exit(&args.http_bind, ratarmount_http::parse_http_bind);
@@ -1187,6 +1234,17 @@ fn parse_export_plan(
             authorized_keys: args.sftp_authorized_keys.clone(),
             host_key: None,
         });
+    } else if args.sftp_subsystem {
+        // bind / authorized_keys / host_key are ignored by serve_stdio.
+        plan.sftp_stdio = Some(ratarmount_sftp::SftpOptions {
+            bind: ratarmount_sftp::DEFAULT_SFTP_BIND,
+            stop: None,
+            overlay,
+            readahead_bytes: readahead_usize,
+            reader_slots: ratarmount_sftp::DEFAULT_READER_SLOTS,
+            authorized_keys: None,
+            host_key: None,
+        });
     }
     plan
 }
@@ -1220,6 +1278,14 @@ fn attach_export_stops(
     if let Some(opts) = &mut plan.sftp {
         opts.stop = Some(export_stop.clone());
     }
+}
+
+fn spawn_sftp_stdio_thread(source: Arc<dyn MountSource>, opts: ratarmount_sftp::SftpOptions) {
+    thread::spawn(move || {
+        if let Err(e) = ratarmount_sftp::serve_stdio(source, opts) {
+            eprintln!("error starting SFTP stdio server: {e}");
+        }
+    });
 }
 
 fn spawn_export_threads(
@@ -1409,6 +1475,7 @@ fn run_exports(
     }
     overlay_commit::spawn_signal_export_stops(callbacks);
     attach_export_stops(&mut nfs_opts, &mut plan, &nfs_stop, &export_stop);
+    let sftp_stdio = plan.sftp_stdio.take();
 
     if let (Some(ov), Some(archive), Some(dur)) =
         (overlay_arc.clone(), live_archive.clone(), commit_interval)
@@ -1425,6 +1492,22 @@ fn run_exports(
     match fuse_mp {
         None => {
             let handles = spawn_export_threads(&source, nfs_opts, plan);
+            if let Some(opts) = sftp_stdio {
+                let serve_err = ratarmount_sftp::serve_stdio(Arc::clone(&source), opts);
+                nfs_stop.request_stop();
+                export_stop.request_stop();
+                join_export_handles(handles);
+                overlay_commit::maybe_commit_on_exit(
+                    overlay_arc.as_deref(),
+                    live_archive.as_deref(),
+                    commit_on_exit,
+                );
+                if let Err(e) = serve_err {
+                    eprintln!("error starting SFTP stdio server: {e}");
+                    std::process::exit(1);
+                }
+                return;
+            }
             while !overlay_commit::term_requested()
                 && !nfs_stop.is_stopped()
                 && !export_stop.is_stopped()
@@ -1445,6 +1528,9 @@ fn run_exports(
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             if foreground {
+                if let Some(opts) = sftp_stdio {
+                    spawn_sftp_stdio_thread(Arc::clone(&source), opts);
+                }
                 eprintln!("FUSE at {}", mp.display());
                 let handles = spawn_export_threads(&source, nfs_opts, plan);
                 let mount_err = mount_blocking(
@@ -1471,6 +1557,7 @@ fn run_exports(
                 return;
             }
 
+            drop(sftp_stdio);
             probe_export_binds(&nfs_opts, &plan);
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
@@ -1923,7 +2010,7 @@ fn print_features() {
     #[cfg(not(feature = "nfsv4"))]
     println!("  nfsv4: not compiled");
     println!(
-        "  export: HTTP GET/HEAD (--http :20491); WebDAV (--webdav :20492); SMB2 (--smb :20445); 9P2000.L (--ninep :20493); SFTP (--sftp :20222, --features sftp-russh); optional `serve` sugar"
+        "  export: HTTP GET/HEAD (--http :20491); WebDAV (--webdav :20492); SMB2 (--smb :20445); 9P2000.L (--ninep :20493); SFTP (--sftp :20222, --sftp-subsystem stdio, --features sftp-russh); optional `serve` sugar"
     );
     #[cfg(feature = "sftp-russh")]
     println!("  sftp-russh: compiled");
@@ -1971,9 +2058,9 @@ fn print_oss_attributions(full: bool) {
         "httparse — HTTP/WebDAV export (--http / --webdav)",
         "userspace SMB 2.0.2 (--smb) / 9P2000.L (--ninep)",
         #[cfg(feature = "sftp-russh")]
-        "russh / russh-sftp — SFTP export (--sftp)",
+        "russh / russh-sftp — SFTP export (--sftp / --sftp-subsystem)",
         #[cfg(not(feature = "sftp-russh"))]
-        "russh / russh-sftp — SFTP export (--sftp; rebuild with --features sftp-russh)",
+        "russh / russh-sftp — SFTP export (--sftp / --sftp-subsystem; rebuild with --features sftp-russh)",
     ];
     for s in short {
         println!("  - {s}");
@@ -2858,6 +2945,78 @@ mod export_cli_tests {
             ratarmount_sftp::SFTP_RUSSH_HINT
         );
     }
+
+    /// Regression: boolean `--sftp-subsystem` must not steal the archive path.
+    #[test]
+    fn sftp_subsystem_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--sftp-subsystem", "a.tar"]).expect("parse");
+        assert!(a.sftp_subsystem);
+        assert!(!a.sftp);
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+        assert!(super::any_export(&a));
+        assert_eq!(
+            export_incompatible_with_no_mount(&a),
+            Some("--sftp-subsystem")
+        );
+        assert!(super::sftp_export_cli_error(&a).is_none());
+    }
+
+    /// Regression: `--sftp --sftp-subsystem` is exclusive (main exits 2).
+    #[test]
+    fn sftp_and_sftp_subsystem_are_exclusive() {
+        let a = Args::try_parse_from(["ratarmount", "--sftp", "--sftp-subsystem", "a.tar"])
+            .expect("parse");
+        assert!(a.sftp);
+        assert!(a.sftp_subsystem);
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+        assert_eq!(
+            super::sftp_export_cli_error(&a),
+            Some("--sftp and --sftp-subsystem are mutually exclusive")
+        );
+    }
+
+    #[test]
+    fn sftp_subsystem_with_bind_does_not_steal_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--sftp-subsystem",
+            "--sftp-bind",
+            "0.0.0.0:22",
+            "--sftp-authorized-keys",
+            "/tmp/keys",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.sftp_subsystem);
+        assert_eq!(a.sftp_bind, "0.0.0.0:22");
+        assert_eq!(
+            a.sftp_authorized_keys.as_deref(),
+            Some(std::path::Path::new("/tmp/keys"))
+        );
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn sftp_subsystem_with_http_keeps_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--sftp-subsystem", "--http", "a.tar"])
+            .expect("parse");
+        assert!(a.sftp_subsystem);
+        assert!(a.http);
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+        assert!(super::any_export(&a));
+    }
+
+    #[test]
+    fn sftp_subsystem_no_mount_is_incompatible() {
+        let a = Args::try_parse_from(["ratarmount", "--sftp-subsystem", "--no-mount", "a.tar"])
+            .expect("parse");
+        assert!(a.sftp_subsystem);
+        assert!(a.no_mount);
+        assert_eq!(
+            export_incompatible_with_no_mount(&a),
+            Some("--sftp-subsystem")
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2903,6 +3062,19 @@ mod serve_cli_tests {
         assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
         let err = serve_cli_error(&a).expect("error");
         assert!(err.contains("at least one export"), "{err}");
+        assert!(err.contains("--sftp-subsystem"), "{err}");
+    }
+
+    /// Regression: `serve --sftp-subsystem a.tar` is a valid export-only process.
+    #[test]
+    fn serve_sftp_subsystem_does_not_steal_archive() {
+        let a =
+            parse_args_from(["ratarmount", "serve", "--sftp-subsystem", "a.tar"]).expect("parse");
+        assert!(a.serve);
+        assert!(a.sftp_subsystem);
+        assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
+        assert!(any_export(&a));
+        assert!(serve_cli_error(&a).is_none());
     }
 
     #[test]
