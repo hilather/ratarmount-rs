@@ -3,4 +3,14 @@ name = "ratarmount-smb"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "SMB/CIFS export of a ratarmount MountSource (stub)"
+description = "Userspace SMB2 export of a ratarmount MountSource"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-export-core.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
