@@ -1,10 +1,11 @@
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
-//! file versions, path prefix, path transform, in-FS control folder.
+//! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs.
 
 mod automount;
 mod control;
 mod empty_archive;
 mod folder;
+mod oci_whiteout;
 mod path_intern;
 mod prefix;
 mod transform;
@@ -25,6 +26,7 @@ pub use empty_archive::{
     EmptyCreateOutcome,
 };
 pub use folder::FolderMountSource;
+pub use oci_whiteout::OciImageMountSource;
 pub use prefix::PrefixMountSource;
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
