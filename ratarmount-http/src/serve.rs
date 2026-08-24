@@ -13,6 +13,7 @@ use ratarmount_export_core::{
 };
 
 use crate::handler::{handle_connection, HttpState};
+use crate::webdav::WebDavOptions;
 
 /// Default `--http-bind` (`127.0.0.1:20491`).
 pub const DEFAULT_HTTP_BIND: SocketAddr =
@@ -23,10 +24,12 @@ pub const DEFAULT_HTTP_BIND: SocketAddr =
 pub struct HttpOptions {
     pub bind: SocketAddr,
     pub stop: Option<ExportStop>,
-    /// Ignored in v1 (GET/HEAD only). Kept so later CLI glue can pass `-w`.
+    /// WebDAV PUT/DELETE/MKCOL/MOVE. GET/PROPFIND use `source` (pass overlay as both).
     pub overlay: Option<Arc<WriteOverlay>>,
     /// Body fill chunk (0 → 64 KiB). Not a reader LRU — each GET opens, fill-loops, drops.
     pub readahead_bytes: u64,
+    /// Enable PROPFIND and overlay writes. GET/HEAD still work (P-5 reuse).
+    pub webdav: bool,
 }
 
 impl Default for HttpOptions {
@@ -36,6 +39,7 @@ impl Default for HttpOptions {
             stop: None,
             overlay: None,
             readahead_bytes: 0,
+            webdav: false,
         }
     }
 }
@@ -47,6 +51,7 @@ impl std::fmt::Debug for HttpOptions {
             .field("stop", &self.stop.as_ref().map(|_| "ExportStop"))
             .field("overlay", &self.overlay.is_some())
             .field("readahead_bytes", &self.readahead_bytes)
+            .field("webdav", &self.webdav)
             .finish()
     }
 }
@@ -66,15 +71,25 @@ fn fill_chunk(opts: &HttpOptions) -> usize {
     }
 }
 
-fn access_label(_opts: &HttpOptions) -> &'static str {
-    "ro"
+fn access_label(opts: &HttpOptions) -> &'static str {
+    if opts.overlay.is_some() {
+        "rw overlay"
+    } else {
+        "ro"
+    }
 }
 
-fn warn_non_loopback(addr: SocketAddr) {
+fn warn_non_loopback(addr: SocketAddr, webdav: bool) {
     if !addr.ip().is_loopback() {
-        log::warn!(
-            "HTTP bind {addr} is not loopback; GET/HEAD has no auth (localhost is the security boundary)"
-        );
+        if webdav {
+            log::warn!(
+                "WebDAV bind {addr} is not loopback; PROPFIND/GET/PUT has no auth (localhost is the security boundary)"
+            );
+        } else {
+            log::warn!(
+                "HTTP bind {addr} is not loopback; GET/HEAD has no auth (localhost is the security boundary)"
+            );
+        }
     }
 }
 
@@ -85,7 +100,7 @@ fn bind_http(opts: &HttpOptions) -> io::Result<TcpListener> {
             BindError::Ipv6Unsupported.to_string(),
         ));
     }
-    warn_non_loopback(opts.bind);
+    warn_non_loopback(opts.bind, opts.webdav);
     TcpListener::bind(opts.bind)
 }
 
@@ -93,9 +108,15 @@ fn log_listen(addr: SocketAddr, opts: &HttpOptions) {
     let access = access_label(opts);
     let ip = addr.ip();
     let port = addr.port();
-    log::info!(
-        "HTTP listening on {ip}:{port} ({access}). curl: curl -r 0-1023 http://{ip}:{port}/member"
-    );
+    if opts.webdav {
+        log::info!(
+            "WebDAV listening on {ip}:{port} ({access}). PROPFIND Depth 0/1; GET/HEAD Range; writes need overlay (-w)"
+        );
+    } else {
+        log::info!(
+            "HTTP listening on {ip}:{port} ({access}). curl: curl -r 0-1023 http://{ip}:{port}/member"
+        );
+    }
 }
 
 fn serve_listener(
@@ -106,6 +127,8 @@ fn serve_listener(
     let state = Arc::new(HttpState {
         source,
         chunk: fill_chunk(&opts),
+        overlay: opts.overlay.clone(),
+        webdav: opts.webdav,
     });
     match &opts.stop {
         None => {
@@ -145,12 +168,29 @@ fn spawn_conn(stream: TcpStream, state: Arc<HttpState>) {
         });
 }
 
+impl From<WebDavOptions> for HttpOptions {
+    fn from(opts: WebDavOptions) -> Self {
+        Self {
+            bind: opts.bind,
+            stop: opts.stop,
+            overlay: opts.overlay,
+            readahead_bytes: opts.readahead_bytes,
+            webdav: true,
+        }
+    }
+}
+
 /// HTTP-only: this thread owns the listener (bind then serve).
 pub fn serve_blocking(source: Arc<dyn MountSource>, opts: HttpOptions) -> io::Result<()> {
     let listener = bind_http(&opts)?;
     let addr = listener.local_addr()?;
     log_listen(addr, &opts);
     serve_listener(listener, source, opts)
+}
+
+/// WebDAV: same listener loop as HTTP with PROPFIND/PUT enabled.
+pub fn serve_webdav_blocking(source: Arc<dyn MountSource>, opts: WebDavOptions) -> io::Result<()> {
+    serve_blocking(source, HttpOptions::from(opts))
 }
 
 /// FUSE+HTTP: dedicated thread. Returns after bind with the real port.
@@ -183,4 +223,12 @@ pub fn spawn_http_thread(
         io::Error::new(io::ErrorKind::BrokenPipe, "HTTP thread exited before bind")
     })??;
     Ok(ExportServerHandle::from_join(port, join))
+}
+
+/// FUSE+WebDAV: dedicated thread. Returns after bind with the real port.
+pub fn spawn_webdav_thread(
+    source: Arc<dyn MountSource>,
+    opts: WebDavOptions,
+) -> io::Result<ExportServerHandle> {
+    spawn_http_thread(source, HttpOptions::from(opts))
 }

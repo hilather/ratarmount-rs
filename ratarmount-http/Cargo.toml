@@ -10,3 +10,6 @@ ratarmount-core.workspace = true
 ratarmount-export-core.workspace = true
 ratarmount-compositing.workspace = true
 log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

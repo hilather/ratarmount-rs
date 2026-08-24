@@ -11,9 +11,12 @@ use ratarmount_core::{
     S_IFREG,
 };
 
+use ratarmount_compositing::WriteOverlay;
+
 use crate::{
-    parse_http_bind, spawn_http_thread, ExportServerHandle, ExportStop, HttpOptions,
-    DEFAULT_HTTP_BIND, DEFAULT_HTTP_PORT,
+    parse_http_bind, parse_webdav_bind, spawn_http_thread, spawn_webdav_thread, ExportServerHandle,
+    ExportStop, HttpOptions, WebDavOptions, DEFAULT_HTTP_BIND, DEFAULT_HTTP_PORT,
+    DEFAULT_WEBDAV_BIND, DEFAULT_WEBDAV_PORT,
 };
 
 /// One-byte / short-window `Read::read` — gzip inflate windows look like this.
@@ -182,10 +185,15 @@ struct Serving {
     handle: Option<ExportServerHandle>,
     stop: ExportStop,
     addr: SocketAddr,
+    _overlay_dir: Option<tempfile::TempDir>,
 }
 
 impl Serving {
     fn start() -> Self {
+        Self::start_http()
+    }
+
+    fn start_http() -> Self {
         let stop = ExportStop::new();
         let opts = HttpOptions {
             bind: "127.0.0.1:0".parse().unwrap(),
@@ -199,6 +207,47 @@ impl Serving {
             handle: Some(handle),
             stop,
             addr,
+            _overlay_dir: None,
+        }
+    }
+
+    fn start_webdav() -> Self {
+        let stop = ExportStop::new();
+        let opts = WebDavOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            stop: Some(stop.clone()),
+            ..WebDavOptions::default()
+        };
+        let src: Arc<dyn MountSource> = Arc::new(MemFs::fixture());
+        let handle = spawn_webdav_thread(src, opts).expect("bind WebDAV");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
+        Self {
+            handle: Some(handle),
+            stop,
+            addr,
+            _overlay_dir: None,
+        }
+    }
+
+    fn start_webdav_overlay() -> Self {
+        let stop = ExportStop::new();
+        let td = tempfile::tempdir().expect("overlay tempdir");
+        let base: Arc<dyn MountSource> = Arc::new(MemFs::fixture());
+        let ov = Arc::new(WriteOverlay::new(base, td.path()).expect("overlay"));
+        let opts = WebDavOptions {
+            bind: "127.0.0.1:0".parse().unwrap(),
+            stop: Some(stop.clone()),
+            overlay: Some(Arc::clone(&ov)),
+            ..WebDavOptions::default()
+        };
+        let src: Arc<dyn MountSource> = ov;
+        let handle = spawn_webdav_thread(src, opts).expect("bind WebDAV overlay");
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
+        Self {
+            handle: Some(handle),
+            stop,
+            addr,
+            _overlay_dir: Some(td),
         }
     }
 
@@ -447,4 +496,142 @@ fn range_unsatisfiable_is_416() {
         "status: {head}"
     );
     assert_eq!(header_value(&head, "Content-Range"), Some("bytes */26"));
+}
+
+#[test]
+fn parse_webdav_bind_empty_is_20492() {
+    assert_eq!(parse_webdav_bind("").unwrap(), DEFAULT_WEBDAV_BIND);
+    assert_eq!(
+        parse_webdav_bind("20492").unwrap().port(),
+        DEFAULT_WEBDAV_PORT
+    );
+    assert_eq!(DEFAULT_WEBDAV_PORT, 20492);
+    assert_ne!(DEFAULT_WEBDAV_PORT, DEFAULT_HTTP_PORT);
+}
+
+#[test]
+fn propfind_depth_1_xml() {
+    let srv = Serving::start_webdav();
+    let raw = srv.exchange(
+        "PROPFIND / HTTP/1.1\r\nHost: localhost\r\nDepth: 1\r\nContent-Length: 0\r\n\r\n",
+    );
+    let (head, body) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 207"),
+        "status: {head}"
+    );
+    let ct = header_value(&head, "Content-Type").unwrap_or("");
+    assert!(ct.contains("xml"), "content-type: {ct}");
+    let xml = String::from_utf8_lossy(body);
+    assert!(xml.contains("multistatus"), "xml: {xml}");
+    assert!(
+        xml.contains("<D:getcontentlength>26</D:getcontentlength>"),
+        "hello.txt length missing: {xml}"
+    );
+    assert!(xml.contains("/hello.txt"), "href hello.txt: {xml}");
+    assert!(
+        xml.contains("<D:collection/>"),
+        "root/sub must be collections: {xml}"
+    );
+    assert!(xml.contains("/sub/"), "dir href trailing slash: {xml}");
+    assert!(xml.contains("getlastmodified") || xml.contains("getcontentlength"));
+}
+
+/// GET/HEAD on the WebDAV listener reuse the P-5 Range handler.
+#[test]
+fn webdav_get_reuses_http_handler() {
+    let srv = Serving::start_webdav();
+    let raw = srv.exchange("GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 200"),
+        "status: {head}"
+    );
+    assert_eq!(body, b"abcdefghijklmnopqrstuvwxyz");
+    let ranged =
+        srv.exchange("GET /hello.txt HTTP/1.1\r\nHost: localhost\r\nRange: bytes=5-9\r\n\r\n");
+    let (rhead, rbody) = split_head_body(&ranged);
+    assert!(
+        status_line(&rhead).starts_with("HTTP/1.1 206"),
+        "status: {rhead}"
+    );
+    assert_eq!(rbody, b"fghij");
+}
+
+#[test]
+fn put_without_overlay_is_403() {
+    let srv = Serving::start_webdav();
+    let raw =
+        srv.exchange("PUT /new.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+    let (head, _) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 403"),
+        "status: {head}"
+    );
+}
+
+/// PUT then GET through WriteOverlay (`-w`).
+#[test]
+fn put_then_get_with_overlay() {
+    let srv = Serving::start_webdav_overlay();
+    let body = b"webdav-put\n";
+    let put = format!(
+        "PUT /new.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        std::str::from_utf8(body).unwrap()
+    );
+    let raw = srv.exchange(&put);
+    let (head, _) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 201"),
+        "PUT status: {head}"
+    );
+    let get = srv.exchange("GET /new.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (ghead, gbody) = split_head_body(&get);
+    assert!(
+        status_line(&ghead).starts_with("HTTP/1.1 200"),
+        "GET status: {ghead}"
+    );
+    assert_eq!(gbody, body);
+}
+
+#[test]
+fn propfind_depth_infinity_is_403() {
+    let srv = Serving::start_webdav();
+    for depth in ["infinity", "Infinity", "2"] {
+        let raw = srv.exchange(&format!(
+            "PROPFIND / HTTP/1.1\r\nHost: localhost\r\nDepth: {depth}\r\nContent-Length: 0\r\n\r\n"
+        ));
+        let (head, body) = split_head_body(&raw);
+        assert!(
+            status_line(&head).starts_with("HTTP/1.1 403"),
+            "Depth {depth} status: {head}"
+        );
+        let s = String::from_utf8_lossy(body);
+        assert!(
+            s.to_ascii_lowercase().contains("infinity")
+                || s.contains("not supported")
+                || !s.is_empty(),
+            "body: {s}"
+        );
+    }
+    let missing =
+        srv.exchange("PROPFIND / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n");
+    let (head, _) = split_head_body(&missing);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 403"),
+        "missing Depth must be infinity → 403: {head}"
+    );
+}
+
+#[test]
+fn put_on_http_export_is_405() {
+    let srv = Serving::start_http();
+    let raw =
+        srv.exchange("PUT /new.txt HTTP/1.1\r\nHost: localhost\r\nContent-Length: 5\r\n\r\nhello");
+    let (head, _) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 405"),
+        "plain HTTP PUT must stay 405 not 403: {head}"
+    );
 }

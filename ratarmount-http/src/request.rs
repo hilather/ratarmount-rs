@@ -2,18 +2,28 @@
 
 use std::io;
 
-/// Parsed origin-form GET/HEAD request.
+/// Parsed origin-form request (GET/HEAD plus WebDAV when enabled).
 #[derive(Debug, Clone)]
 pub(crate) struct HttpRequest {
     pub method: Method,
     pub path: String,
     pub range: Option<String>,
+    pub depth: Option<String>,
+    pub content_length: Option<u64>,
+    pub destination: Option<String>,
+    pub overwrite: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Method {
     Get,
     Head,
+    Options,
+    Propfind,
+    Put,
+    Delete,
+    Mkcol,
+    Move,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -61,6 +71,12 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
     let method = match method_s {
         "GET" => Method::Get,
         "HEAD" => Method::Head,
+        "OPTIONS" => Method::Options,
+        "PROPFIND" => Method::Propfind,
+        "PUT" => Method::Put,
+        "DELETE" => Method::Delete,
+        "MKCOL" => Method::Mkcol,
+        "MOVE" => Method::Move,
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -75,6 +91,10 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
         ));
     }
     let mut range = None;
+    let mut depth = None;
+    let mut content_length = None;
+    let mut destination = None;
+    let mut overwrite = None;
     for line in lines {
         let line = line.trim_end_matches('\r').trim();
         if line.is_empty() {
@@ -83,15 +103,45 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
         let Some((name, value)) = line.split_once(':') else {
             continue;
         };
+        let value = value.trim();
         if name.eq_ignore_ascii_case("range") && range.is_none() {
-            range = Some(value.trim().to_string());
+            range = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("depth") && depth.is_none() {
+            depth = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("content-length") && content_length.is_none() {
+            let n: u64 = value.parse().map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidData, "invalid Content-Length")
+            })?;
+            content_length = Some(n);
+        } else if name.eq_ignore_ascii_case("destination") && destination.is_none() {
+            destination = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("overwrite") && overwrite.is_none() {
+            overwrite = Some(value.to_string());
         }
     }
     Ok(HttpRequest {
         method,
         path: target.to_string(),
         range,
+        depth,
+        content_length,
+        destination,
+        overwrite,
     })
+}
+
+/// RFC 3986 unreserved + encode the rest of a path segment.
+pub(crate) fn percent_encode_segment(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 /// URL-decode the request target, reject `..` segments, then [`ratarmount_core::normpath`].

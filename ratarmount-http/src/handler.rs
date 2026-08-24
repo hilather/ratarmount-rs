@@ -1,25 +1,41 @@
-//! One GET/HEAD per connection: lookup, directory HTML, file `fill_read`.
+//! One request per connection: GET/HEAD Range, optional WebDAV.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{is_dir_mode, CheapDirent, FileInfo, MountSource};
 use ratarmount_export_core::fill_read;
 
 use crate::request::{
-    archive_path, last_modified_header, parse_request, resolve_range, Method, PathError,
-    ResolvedRange,
+    archive_path, last_modified_header, parse_request, percent_encode_segment, resolve_range,
+    HttpRequest, Method, PathError, ResolvedRange,
+};
+use crate::webdav::{
+    delete_overlay, destination_archive_path, drain_body, mkcol_overlay, move_overlay,
+    overlay_status, parent_is_dir, parse_depth, propfind_multistatus, put_overlay, PropfindDepth,
+    MAX_PUT_BYTES,
 };
 
 pub(crate) struct HttpState {
     pub source: Arc<dyn MountSource>,
     pub chunk: usize,
+    pub overlay: Option<Arc<WriteOverlay>>,
+    pub webdav: bool,
+}
+
+fn allow_list(webdav: bool) -> &'static str {
+    if webdav {
+        "OPTIONS, GET, HEAD, PROPFIND, PUT, DELETE, MKCOL, MOVE"
+    } else {
+        "GET, HEAD"
+    }
 }
 
 pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io::Result<()> {
-    let req = match read_request(&mut stream) {
+    let (req, leftover) = match read_request(&mut stream) {
         Ok(r) => r,
         Err(e) if e.kind() == io::ErrorKind::Unsupported => {
             return write_response(
@@ -29,7 +45,7 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
                 "text/plain; charset=utf-8",
                 b"method not allowed\n",
                 true,
-                &[("Allow", "GET, HEAD")],
+                &[("Allow", allow_list(state.webdav))],
             );
         }
         Err(e)
@@ -48,6 +64,31 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
         }
         Err(e) => return Err(e),
     };
+
+    if state.webdav && req.method == Method::Options {
+        let _ = drain_body(&mut stream, &leftover, req.content_length.unwrap_or(0));
+        return write_response(
+            &mut stream,
+            200,
+            "OK",
+            "text/plain; charset=utf-8",
+            b"",
+            false,
+            &[("Allow", allow_list(true)), ("DAV", "1")],
+        );
+    }
+
+    if !state.webdav && !matches!(req.method, Method::Get | Method::Head) {
+        return write_response(
+            &mut stream,
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"method not allowed\n",
+            true,
+            &[("Allow", allow_list(false))],
+        );
+    }
 
     let send_body = req.method != Method::Head;
 
@@ -77,32 +118,464 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
         }
     };
 
-    let Some(fi) = state.source.lookup(&path, 0) else {
+    match req.method {
+        Method::Get | Method::Head => {
+            let Some(fi) = state.source.lookup(&path, 0) else {
+                return write_response(
+                    &mut stream,
+                    404,
+                    "Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found\n",
+                    send_body,
+                    &[],
+                );
+            };
+            if is_dir_mode(fi.mode) {
+                return handle_dir(&mut stream, state, &path, !send_body);
+            }
+            handle_file(
+                &mut stream,
+                state,
+                &fi,
+                req.method == Method::Head,
+                req.range.as_deref(),
+            )
+        }
+        Method::Propfind => handle_propfind(&mut stream, state, &req, &path, &leftover),
+        Method::Put => handle_put(&mut stream, state, &req, &path, leftover),
+        Method::Delete => handle_delete(&mut stream, state, &req, &path, &leftover),
+        Method::Mkcol => handle_mkcol(&mut stream, state, &req, &path, &leftover),
+        Method::Move => handle_move(&mut stream, state, &req, &path, &leftover),
+        Method::Options => unreachable!("OPTIONS handled before path parse"),
+    }
+}
+
+fn overlay_or_403<'a>(
+    stream: &mut TcpStream,
+    state: &'a HttpState,
+) -> io::Result<Option<&'a WriteOverlay>> {
+    match state.overlay.as_deref() {
+        Some(ov) => Ok(Some(ov)),
+        None => {
+            write_response(
+                stream,
+                403,
+                "Forbidden",
+                "text/plain; charset=utf-8",
+                b"read-only (need overlay / -w)\n",
+                true,
+                &[("DAV", "1")],
+            )?;
+            Ok(None)
+        }
+    }
+}
+
+fn handle_propfind(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    req: &HttpRequest,
+    path: &str,
+    leftover: &[u8],
+) -> io::Result<()> {
+    let _ = drain_body(stream, leftover, req.content_length.unwrap_or(0));
+    match parse_depth(req.depth.as_deref()) {
+        PropfindDepth::ForbiddenInfinity => write_response(
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"Depth infinity is not supported\n",
+            true,
+            &[("DAV", "1")],
+        ),
+        depth => {
+            let Some(fi) = state.source.lookup(path, 0) else {
+                return write_response(
+                    stream,
+                    404,
+                    "Not Found",
+                    "text/plain; charset=utf-8",
+                    b"not found\n",
+                    true,
+                    &[("DAV", "1")],
+                );
+            };
+            let body = propfind_multistatus(state.source.as_ref(), path, &fi, depth);
+            write_response(
+                stream,
+                207,
+                "Multi-Status",
+                "application/xml; charset=utf-8",
+                body.as_bytes(),
+                true,
+                &[("DAV", "1")],
+            )
+        }
+    }
+}
+
+fn handle_put(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    req: &HttpRequest,
+    path: &str,
+    leftover: Vec<u8>,
+) -> io::Result<()> {
+    let Some(ov) = overlay_or_403(stream, state)? else {
+        return Ok(());
+    };
+    if path == "/" {
         return write_response(
-            &mut stream,
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"cannot PUT root\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    if let Some(fi) = state.source.lookup(path, 0) {
+        if is_dir_mode(fi.mode) {
+            return write_response(
+                stream,
+                405,
+                "Method Not Allowed",
+                "text/plain; charset=utf-8",
+                b"PUT on collection\n",
+                true,
+                &[("Allow", allow_list(true)), ("DAV", "1")],
+            );
+        }
+    }
+    if !parent_is_dir(state.source.as_ref(), path) {
+        return write_response(
+            stream,
+            409,
+            "Conflict",
+            "text/plain; charset=utf-8",
+            b"parent missing\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    let Some(len) = req.content_length else {
+        return write_response(
+            stream,
+            411,
+            "Length Required",
+            "text/plain; charset=utf-8",
+            b"Content-Length required\n",
+            true,
+            &[("DAV", "1")],
+        );
+    };
+    if len > MAX_PUT_BYTES {
+        return write_response(
+            stream,
+            413,
+            "Payload Too Large",
+            "text/plain; charset=utf-8",
+            b"PUT too large\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    match put_overlay(ov, path, stream, &leftover, len) {
+        Ok(existed) => {
+            let (status, reason) = if existed {
+                (204u16, "No Content")
+            } else {
+                (201, "Created")
+            };
+            write_response(
+                stream,
+                status,
+                reason,
+                "text/plain; charset=utf-8",
+                b"",
+                false,
+                &[("DAV", "1")],
+            )
+        }
+        Err(e) => {
+            let (status, reason) = overlay_status(&e);
+            write_response(
+                stream,
+                status,
+                reason,
+                "text/plain; charset=utf-8",
+                b"put failed\n",
+                true,
+                &[("DAV", "1")],
+            )
+        }
+    }
+}
+
+fn handle_delete(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    req: &HttpRequest,
+    path: &str,
+    leftover: &[u8],
+) -> io::Result<()> {
+    let _ = drain_body(stream, leftover, req.content_length.unwrap_or(0));
+    let Some(ov) = overlay_or_403(stream, state)? else {
+        return Ok(());
+    };
+    if path == "/" {
+        return write_response(
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"cannot DELETE root\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    if state.source.lookup(path, 0).is_none() {
+        return write_response(
+            stream,
             404,
             "Not Found",
             "text/plain; charset=utf-8",
             b"not found\n",
-            send_body,
-            &[],
+            true,
+            &[("DAV", "1")],
         );
-    };
-
-    if is_dir_mode(fi.mode) {
-        return handle_dir(&mut stream, state, &path, !send_body);
     }
-
-    handle_file(
-        &mut stream,
-        state,
-        &fi,
-        req.method == Method::Head,
-        req.range.as_deref(),
-    )
+    match delete_overlay(ov, path) {
+        Ok(()) => write_response(
+            stream,
+            204,
+            "No Content",
+            "text/plain; charset=utf-8",
+            b"",
+            false,
+            &[("DAV", "1")],
+        ),
+        Err(e) => {
+            let (status, reason) = overlay_status(&e);
+            write_response(
+                stream,
+                status,
+                reason,
+                "text/plain; charset=utf-8",
+                b"delete failed\n",
+                true,
+                &[("DAV", "1")],
+            )
+        }
+    }
 }
 
-fn read_request(stream: &mut TcpStream) -> io::Result<crate::request::HttpRequest> {
+fn handle_mkcol(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    req: &HttpRequest,
+    path: &str,
+    leftover: &[u8],
+) -> io::Result<()> {
+    let _ = drain_body(stream, leftover, req.content_length.unwrap_or(0));
+    let Some(ov) = overlay_or_403(stream, state)? else {
+        return Ok(());
+    };
+    if path == "/" {
+        return write_response(
+            stream,
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"MKCOL root\n",
+            true,
+            &[("Allow", allow_list(true)), ("DAV", "1")],
+        );
+    }
+    if req.content_length.unwrap_or(0) > 0 {
+        // RFC 4918: MKCOL with a body we do not understand.
+        return write_response(
+            stream,
+            415,
+            "Unsupported Media Type",
+            "text/plain; charset=utf-8",
+            b"MKCOL body not supported\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    if state.source.lookup(path, 0).is_some() {
+        return write_response(
+            stream,
+            405,
+            "Method Not Allowed",
+            "text/plain; charset=utf-8",
+            b"MKCOL exists\n",
+            true,
+            &[("Allow", allow_list(true)), ("DAV", "1")],
+        );
+    }
+    if !parent_is_dir(state.source.as_ref(), path) {
+        return write_response(
+            stream,
+            409,
+            "Conflict",
+            "text/plain; charset=utf-8",
+            b"parent missing\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    match mkcol_overlay(ov, path) {
+        Ok(()) => write_response(
+            stream,
+            201,
+            "Created",
+            "text/plain; charset=utf-8",
+            b"",
+            false,
+            &[("DAV", "1")],
+        ),
+        Err(e) => {
+            let (status, reason) = overlay_status(&e);
+            write_response(
+                stream,
+                status,
+                reason,
+                "text/plain; charset=utf-8",
+                b"mkcol failed\n",
+                true,
+                &[("DAV", "1")],
+            )
+        }
+    }
+}
+
+fn handle_move(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    req: &HttpRequest,
+    path: &str,
+    leftover: &[u8],
+) -> io::Result<()> {
+    let _ = drain_body(stream, leftover, req.content_length.unwrap_or(0));
+    let Some(ov) = overlay_or_403(stream, state)? else {
+        return Ok(());
+    };
+    let Some(dest_raw) = req.destination.as_deref() else {
+        return write_response(
+            stream,
+            400,
+            "Bad Request",
+            "text/plain; charset=utf-8",
+            b"Destination required\n",
+            true,
+            &[("DAV", "1")],
+        );
+    };
+    let dest = match destination_archive_path(dest_raw) {
+        Ok(p) => p,
+        Err(PathError::Escape) => {
+            return write_response(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"path escape\n",
+                true,
+                &[("DAV", "1")],
+            );
+        }
+        Err(PathError::BadRequest) => {
+            return write_response(
+                stream,
+                400,
+                "Bad Request",
+                "text/plain; charset=utf-8",
+                b"bad Destination\n",
+                true,
+                &[("DAV", "1")],
+            );
+        }
+    };
+    if path == "/" || dest == "/" || path == dest {
+        return write_response(
+            stream,
+            403,
+            "Forbidden",
+            "text/plain; charset=utf-8",
+            b"invalid MOVE paths\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    if state.source.lookup(path, 0).is_none() {
+        return write_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    let overwrite = req
+        .overwrite
+        .as_deref()
+        .map(|s| s.eq_ignore_ascii_case("T"))
+        .unwrap_or(true);
+    if !overwrite && state.source.lookup(&dest, 0).is_some() {
+        return write_response(
+            stream,
+            412,
+            "Precondition Failed",
+            "text/plain; charset=utf-8",
+            b"destination exists\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    if !parent_is_dir(state.source.as_ref(), &dest) {
+        return write_response(
+            stream,
+            409,
+            "Conflict",
+            "text/plain; charset=utf-8",
+            b"parent missing\n",
+            true,
+            &[("DAV", "1")],
+        );
+    }
+    match move_overlay(ov, path, &dest) {
+        Ok(()) => write_response(
+            stream,
+            201,
+            "Created",
+            "text/plain; charset=utf-8",
+            b"",
+            false,
+            &[("DAV", "1")],
+        ),
+        Err(e) => {
+            let (status, reason) = overlay_status(&e);
+            write_response(
+                stream,
+                status,
+                reason,
+                "text/plain; charset=utf-8",
+                b"move failed\n",
+                true,
+                &[("DAV", "1")],
+            )
+        }
+    }
+}
+
+fn read_request(stream: &mut TcpStream) -> io::Result<(HttpRequest, Vec<u8>)> {
     stream.set_read_timeout(Some(Duration::from_secs(30)))?;
     let mut buf = Vec::new();
     let mut tmp = [0u8; 1024];
@@ -122,7 +595,9 @@ fn read_request(stream: &mut TcpStream) -> io::Result<crate::request::HttpReques
         }
         buf.extend_from_slice(&tmp[..n]);
         if let Some(end) = crate::request::headers_end(&buf) {
-            return parse_request(&buf[..end]);
+            let req = parse_request(&buf[..end])?;
+            let leftover = buf[end..].to_vec();
+            return Ok((req, leftover));
         }
     }
 }
@@ -198,19 +673,6 @@ fn child_href(parent: &str, name: &str, is_dir: bool) -> String {
         href.push('/');
     }
     href
-}
-
-fn percent_encode_segment(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.as_bytes() {
-        match b {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*b as char);
-            }
-            _ => out.push_str(&format!("%{b:02X}")),
-        }
-    }
-    out
 }
 
 fn handle_file(
