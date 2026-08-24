@@ -2201,6 +2201,14 @@ version = "0.1.25"
 [[package]]
 name = "ratarmount-smb"
 version = "0.1.25"
+dependencies = [
+ "libc",
+ "log",
+ "ratarmount-compositing",
+ "ratarmount-core",
+ "ratarmount-export-core",
+ "tempfile",
+]
 
 [[package]]
 name = "rayon"
