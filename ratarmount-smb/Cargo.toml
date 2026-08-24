@@ -11,6 +11,10 @@ ratarmount-compositing.workspace = true
 ratarmount-export-core.workspace = true
 log.workspace = true
 libc.workspace = true
+hmac = "0.12"
+sha2 = "0.10"
+md-5 = "0.10"
+md4 = "0.10"
 
 [dev-dependencies]
 tempfile.workspace = true

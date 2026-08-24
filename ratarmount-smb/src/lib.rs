@@ -12,11 +12,11 @@
 //! require a [`WriteOverlay`] (`-w`); otherwise those ops return
 //! `STATUS_ACCESS_DENIED`.
 //!
-//! **Residual: SMB signing and Finder/Explorer.** The dialect is a 2.0.2
-//! subset (no message signing, no encryption, no preauth 3.1.1). Guest
-//! `smbclient -N` `ls`/`get` on localhost is the v1 bar. NTLM passwords
-//! (`RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`) match the username
-//! only — the NT response is not verified.
+//! **Residual: SMB encryption / 3.1.1 and Finder/Explorer.** The dialect is a
+//! 2.0.2 subset: NTLMv2 password verification and SMB 2.0.2 HMAC-SHA256
+//! signing when `RATARMOUNT_SMB_PASSWORD` is set (guest `smbclient -N` when
+//! unset). No encryption, no preauth 3.1.1. Packet tests stand in for
+//! auth+signing; Finder and Explorer are not a CI bar.
 
 mod serve;
 mod smb2;

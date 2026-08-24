@@ -37,9 +37,10 @@ pub struct SmbOptions {
     pub readahead_bytes: usize,
     pub reader_slots: usize,
     pub share_name: String,
-    /// Required SESSION_SETUP user (`RATARMOUNT_SMB_USER`). `None` = guest.
+    /// Required SESSION_SETUP user (`RATARMOUNT_SMB_USER`). `None` = any user.
     pub username: Option<String>,
-    /// Password is not verified (NTLM residual); stored so CLI can pass it through.
+    /// When set (`RATARMOUNT_SMB_PASSWORD`), NTLMv2 proof is required and SMB 2.0.2
+    /// signing is required. When unset, guest (username match only; unsigned OK).
     pub password: Option<String>,
 }
 
@@ -99,11 +100,21 @@ fn access_label(opts: &SmbOptions) -> &'static str {
     }
 }
 
-fn warn_non_loopback(addr: SocketAddr) {
+fn password_configured(opts: &SmbOptions) -> bool {
+    opts.password.as_deref().is_some_and(|s| !s.is_empty())
+}
+
+fn warn_non_loopback(addr: SocketAddr, opts: &SmbOptions) {
     if !addr.ip().is_loopback() {
-        log::warn!(
-            "SMB bind {addr} is not loopback; SMB2 signing is residual (localhost is the security boundary)"
-        );
+        if password_configured(opts) {
+            log::warn!(
+                "SMB bind {addr} is not loopback; SMB encryption / 3.1.1 are residual (localhost is the security boundary)"
+            );
+        } else {
+            log::warn!(
+                "SMB bind {addr} is not loopback; guest SMB is unsigned (localhost is the security boundary)"
+            );
+        }
     }
 }
 
@@ -123,7 +134,7 @@ fn bind_smb(opts: &SmbOptions) -> io::Result<TcpListener> {
             BindError::Ipv6Unsupported.to_string(),
         ));
     }
-    warn_non_loopback(opts.bind);
+    warn_non_loopback(opts.bind, opts);
     TcpListener::bind(opts.bind)
 }
 
@@ -132,8 +143,9 @@ fn log_listen(addr: SocketAddr, opts: &SmbOptions) {
     let ip = addr.ip();
     let port = addr.port();
     let share = &opts.share_name;
+    let guest = if password_configured(opts) { "" } else { " -N" };
     log::info!(
-        "SMB2 listening on {ip}:{port} ({access}). smbclient: smbclient //{ip}/{share} -p {port} -N"
+        "SMB2 listening on {ip}:{port} ({access}). smbclient: smbclient //{ip}/{share} -p {port}{guest}"
     );
 }
 
@@ -230,6 +242,8 @@ struct Session {
     session_id: u64,
     authed: bool,
     ntlm_started: bool,
+    ntlm_challenge: Option<[u8; 8]>,
+    session_key: Option<[u8; 16]>,
     trees: HashMap<u32, Tree>,
     next_tree: u32,
     opens: HashMap<u64, OpenFile>,
@@ -252,6 +266,8 @@ fn handle_conn(
         session_id: 0,
         authed: false,
         ntlm_started: false,
+        ntlm_challenge: None,
+        session_key: None,
         trees: HashMap::new(),
         next_tree: 1,
         opens: HashMap::new(),
@@ -299,16 +315,52 @@ impl Session {
         let parts = smb2::split_compound(frame)?;
         self.last_compound_fid = None;
         let mut replies = Vec::with_capacity(parts.len());
+        let mut sign_key = self.session_key;
         for part in parts {
             let hdr = smb2::parse_smb2_header(part)?;
+            let skip_verify = hdr.command == smb2::SMB2_SESSION_SETUP && !self.authed;
+            if self.signing_required() && !skip_verify {
+                let ok = sign_key
+                    .as_ref()
+                    .is_some_and(|k| smb2::smb2_verify_packet(part, k));
+                if !ok {
+                    let credits = hdr.credits.clamp(1, 64);
+                    let mut rh = smb2::reply_header(&hdr, 0, credits);
+                    rh.status = smb2::STATUS_ACCESS_DENIED;
+                    if rh.session_id == 0 {
+                        rh.session_id = self.session_id;
+                    }
+                    replies.push(smb2::encode_packet(&rh, &smb2::error_body()));
+                    continue;
+                }
+            }
             let (status, mut rh, body) = self.dispatch_one(&hdr, part);
             rh.status = status;
             if rh.session_id == 0 {
                 rh.session_id = self.session_id;
             }
             replies.push(smb2::encode_packet(&rh, &body));
+            if self.session_key.is_some() {
+                sign_key = self.session_key;
+            }
         }
-        Ok(smb2::stitch_compound(&replies))
+        let mut out = smb2::stitch_compound(&replies);
+        if let Some(key) = sign_key {
+            smb2::smb2_sign_compound(&mut out, &key);
+        }
+        Ok(out)
+    }
+
+    fn signing_required(&self) -> bool {
+        password_configured(&self.cfg) && self.authed
+    }
+
+    fn negotiate_security_mode(&self) -> u16 {
+        if password_configured(&self.cfg) {
+            smb2::NEGOTIATE_SIGNING_ENABLED | smb2::NEGOTIATE_SIGNING_REQUIRED
+        } else {
+            smb2::NEGOTIATE_SIGNING_ENABLED
+        }
     }
 
     fn dispatch_smb1(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
@@ -331,7 +383,11 @@ impl Session {
             session_id: 0,
         };
         let sec = smb2::spnego_neg_token_init();
-        let body = smb2::encode_negotiate_response(smb2::DIALECT_202, &sec);
+        let body = smb2::encode_negotiate_response(
+            smb2::DIALECT_202,
+            &sec,
+            self.negotiate_security_mode(),
+        );
         let mut rh = smb2::reply_header(&fake, smb2::STATUS_SUCCESS, 1);
         rh.credits = 1;
         Ok(smb2::encode_packet(&rh, &body))
@@ -345,6 +401,9 @@ impl Session {
             smb2::SMB2_SESSION_SETUP => self.cmd_session_setup(hdr, cmd, &mut rh),
             smb2::SMB2_LOGOFF => {
                 self.authed = false;
+                self.session_key = None;
+                self.ntlm_started = false;
+                self.ntlm_challenge = None;
                 self.trees.clear();
                 self.opens.clear();
                 (smb2::STATUS_SUCCESS, rh, smb2::encode_empty_sized(4, 4))
@@ -394,7 +453,7 @@ impl Session {
         (
             smb2::STATUS_SUCCESS,
             rh.clone(),
-            smb2::encode_negotiate_response(d, &sec),
+            smb2::encode_negotiate_response(d, &sec, self.negotiate_security_mode()),
         )
     }
 
@@ -416,7 +475,9 @@ impl Session {
         let wrap = smb2::looks_like_spnego(&sec);
         if typ == 1 || (typ != 3 && !self.ntlm_started) {
             self.ntlm_started = true;
-            let t2 = smb2::ntlm_type2(smb2::challenge8(), "RATARMOUNT");
+            let challenge = smb2::challenge8();
+            self.ntlm_challenge = Some(challenge);
+            let t2 = smb2::ntlm_type2(challenge, "RATARMOUNT");
             let buf = if wrap {
                 smb2::spnego_challenge(&t2)
             } else {
@@ -429,16 +490,35 @@ impl Session {
             );
         }
         if typ == 3 {
-            let user = smb2::ntlm_type3_user(&sec).unwrap_or_default();
-            if !auth_ok(self.cfg.username.as_deref(), &user) {
+            let Some(t3) = smb2::parse_ntlm_type3(&sec) else {
                 return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
-            }
-            self.authed = true;
-            let flags = if self.cfg.username.is_none() {
-                smb2::SESSION_FLAG_IS_GUEST
-            } else {
-                0
             };
+            let flags =
+                if let Some(password) = self.cfg.password.as_deref().filter(|s| !s.is_empty()) {
+                    let Some(challenge) = self.ntlm_challenge else {
+                        return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
+                    };
+                    match smb2::ntlm_verify_type3(
+                        &t3,
+                        password,
+                        self.cfg.username.as_deref(),
+                        challenge,
+                    ) {
+                        Ok(key) => self.session_key = Some(key),
+                        Err(st) => return err(rh.clone(), st),
+                    }
+                    0
+                } else {
+                    if !auth_ok(self.cfg.username.as_deref(), &t3.user) {
+                        return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
+                    }
+                    if self.cfg.username.is_none() {
+                        smb2::SESSION_FLAG_IS_GUEST
+                    } else {
+                        0
+                    }
+                };
+            self.authed = true;
             let buf = if wrap {
                 smb2::spnego_accept()
             } else {

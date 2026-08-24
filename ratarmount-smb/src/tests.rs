@@ -211,27 +211,18 @@ struct SmbClient {
     session_id: u64,
     tree_id: u32,
     process_id: u32,
+    session_key: Option<[u8; 16]>,
 }
 
 impl SmbClient {
-    fn connect(addr: SocketAddr) -> Self {
+    fn connect_stream(addr: SocketAddr) -> TcpStream {
         let mut last = None;
         for _ in 0..40 {
             match TcpStream::connect_timeout(&addr, Duration::from_secs(1)) {
                 Ok(stream) => {
                     stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
                     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-                    let mut c = Self {
-                        stream,
-                        mid: 0,
-                        session_id: 0,
-                        tree_id: 0,
-                        process_id: 0xfeff,
-                    };
-                    c.negotiate();
-                    c.session_setup_guest();
-                    c.tree_connect("ratarmount");
-                    return c;
+                    return stream;
                 }
                 Err(e) => {
                     last = Some(e);
@@ -240,6 +231,31 @@ impl SmbClient {
             }
         }
         panic!("connect {addr}: {last:?}");
+    }
+
+    fn from_stream(stream: TcpStream) -> Self {
+        Self {
+            stream,
+            mid: 0,
+            session_id: 0,
+            tree_id: 0,
+            process_id: 0xfeff,
+            session_key: None,
+        }
+    }
+
+    fn connect(addr: SocketAddr) -> Self {
+        let mut c = Self::from_stream(Self::connect_stream(addr));
+        c.negotiate();
+        c.session_setup_guest();
+        c.tree_connect("ratarmount");
+        c
+    }
+
+    fn connect_negotiate(addr: SocketAddr) -> Self {
+        let mut c = Self::from_stream(Self::connect_stream(addr));
+        c.negotiate();
+        c
     }
 
     fn hdr(&mut self, cmd: u16) -> Smb2Header {
@@ -259,7 +275,7 @@ impl SmbClient {
         h
     }
 
-    fn roundtrip(&mut self, pkt: &[u8]) -> (Smb2Header, Vec<u8>) {
+    fn roundtrip_raw(&mut self, pkt: &[u8]) -> Vec<u8> {
         self.stream
             .write_all(&smb2::encode_nbss(pkt))
             .expect("smb write");
@@ -268,6 +284,11 @@ impl SmbClient {
         let n = smb2::decode_nbss_len(nb).expect("nbss len");
         let mut buf = vec![0u8; n];
         self.stream.read_exact(&mut buf).expect("smb body");
+        buf
+    }
+
+    fn roundtrip(&mut self, pkt: &[u8]) -> (Smb2Header, Vec<u8>) {
+        let buf = self.roundtrip_raw(pkt);
         let h = smb2::parse_smb2_header(&buf).expect("hdr");
         let body = buf[smb2::SMB2_HEADER_LEN..].to_vec();
         (h, body)
@@ -311,7 +332,7 @@ impl SmbClient {
         self.session_id = rh.session_id;
     }
 
-    fn session_setup_sec(&mut self, sec: &[u8]) -> (Smb2Header, Vec<u8>) {
+    fn session_setup_sec_raw(&mut self, sec: &[u8]) -> Vec<u8> {
         let mut body = vec![0u8; 24];
         body[0..2].copy_from_slice(&25u16.to_le_bytes());
         body[3] = 1; // signing enabled
@@ -320,10 +341,17 @@ impl SmbClient {
         body[14..16].copy_from_slice(&(sec.len() as u16).to_le_bytes());
         body.extend_from_slice(sec);
         let h = self.hdr(smb2::SMB2_SESSION_SETUP);
-        self.roundtrip(&smb2::encode_packet(&h, &body))
+        self.roundtrip_raw(&smb2::encode_packet(&h, &body))
     }
 
-    fn tree_connect(&mut self, share: &str) {
+    fn session_setup_sec(&mut self, sec: &[u8]) -> (Smb2Header, Vec<u8>) {
+        let buf = self.session_setup_sec_raw(sec);
+        let h = smb2::parse_smb2_header(&buf).expect("hdr");
+        let body = buf[smb2::SMB2_HEADER_LEN..].to_vec();
+        (h, body)
+    }
+
+    fn tree_connect_status(&mut self, share: &str, sign: bool) -> (Smb2Header, Vec<u8>) {
         let unc = format!(r"\\127.0.0.1\{share}");
         let path = smb2::encode_utf16le(&unc);
         let mut body = vec![0u8; 8];
@@ -333,14 +361,27 @@ impl SmbClient {
         body[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
         body.extend_from_slice(&path);
         let h = self.hdr(smb2::SMB2_TREE_CONNECT);
-        let (rh, _) = self.roundtrip(&smb2::encode_packet(&h, &body));
+        let mut pkt = smb2::encode_packet(&h, &body);
+        if sign {
+            if let Some(key) = self.session_key {
+                smb2::smb2_sign_packet(&mut pkt, &key);
+            }
+        }
+        let (rh, body) = self.roundtrip(&pkt);
+        if rh.status == smb2::STATUS_SUCCESS {
+            self.tree_id = rh.tree_id;
+        }
+        (rh, body)
+    }
+
+    fn tree_connect(&mut self, share: &str) {
+        let (rh, _) = self.tree_connect_status(share, self.session_key.is_some());
         assert_eq!(
             rh.status,
             smb2::STATUS_SUCCESS,
             "TREE_CONNECT {:08x}",
             rh.status
         );
-        self.tree_id = rh.tree_id;
     }
 
     fn create(
@@ -632,13 +673,7 @@ fn required_user_rejects_guest() {
             },
         )
         .unwrap_or_else(|| panic!("connect {addr}: {last:?}"));
-    let mut c = SmbClient {
-        stream,
-        mid: 0,
-        session_id: 0,
-        tree_id: 0,
-        process_id: 0xfeff,
-    };
+    let mut c = SmbClient::from_stream(stream);
     c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     c.negotiate();
     let t1 = smb2::ntlm_type1();
@@ -727,4 +762,157 @@ fn smbclient_ls_get_localhost() {
     );
     let got = std::fs::read(dest.path()).expect("read dest");
     assert_eq!(got, b"hello smb\n");
+}
+
+fn start_password_server(username: Option<&str>, password: &str) -> Serving {
+    let stop = ExportStop::new();
+    let opts = SmbOptions {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        stop: Some(stop.clone()),
+        username: username.map(|s| s.to_string()),
+        password: Some(password.to_string()),
+        ..SmbOptions::default()
+    };
+    let src: Arc<dyn MountSource> = Arc::new(MemFs::fixture());
+    let handle = spawn_smb_thread(src, opts).expect("bind SMB");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
+    Serving {
+        handle: Some(handle),
+        stop,
+        addr,
+    }
+}
+
+fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password: &str) -> u32 {
+    let t1 = smb2::ntlm_type1();
+    let (rh, body) = c.session_setup_sec(&t1);
+    assert_eq!(
+        rh.status,
+        smb2::STATUS_MORE_PROCESSING_REQUIRED,
+        "type1 {:08x}",
+        rh.status
+    );
+    c.session_id = rh.session_id;
+    let challenge = smb2::ntlm_type2_challenge(&body).expect("Type2 challenge");
+    let (t3, key) = smb2::ntlm_type3_v2(user, domain, password, challenge);
+    let buf = c.session_setup_sec_raw(&t3);
+    let rh = smb2::parse_smb2_header(&buf).expect("type3 hdr");
+    if rh.status == smb2::STATUS_SUCCESS {
+        c.session_key = Some(key);
+        assert!(
+            smb2::smb2_verify_packet(&buf, &key),
+            "Type3 SESSION_SETUP response must be signed"
+        );
+    }
+    rh.status
+}
+
+/// Regression: guest Type3 still succeeds without NT proof when password unset
+#[test]
+fn guest_type3_succeeds_without_nt_proof_when_password_unset() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    c.session_setup_guest();
+    c.tree_connect("ratarmount");
+}
+
+/// Regression: password-set rejects guest Type3
+#[test]
+fn password_set_rejects_guest_type3() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    let t1 = smb2::ntlm_type1();
+    let (rh, _) = c.session_setup_sec(&t1);
+    assert_eq!(rh.status, smb2::STATUS_MORE_PROCESSING_REQUIRED);
+    c.session_id = rh.session_id;
+    let t3 = smb2::ntlm_type3_guest();
+    let (rh, _) = c.session_setup_sec(&t3);
+    assert_eq!(rh.status, smb2::STATUS_LOGON_FAILURE);
+}
+
+/// Regression: password session rejects unsigned TREE_CONNECT
+#[test]
+fn password_session_rejects_unsigned_tree_connect() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    assert_eq!(
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        smb2::STATUS_SUCCESS
+    );
+    let (rh, _) = c.tree_connect_status("ratarmount", false);
+    assert_eq!(rh.status, smb2::STATUS_ACCESS_DENIED);
+}
+
+/// Regression: signed TREE_CONNECT accepted
+#[test]
+fn signed_tree_connect_accepted() {
+    let srv = start_password_server(Some("User"), "Password");
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    assert_eq!(
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        smb2::STATUS_SUCCESS
+    );
+    let unc = format!(r"\\127.0.0.1\{DEFAULT_SMB_SHARE}");
+    let path = smb2::encode_utf16le(&unc);
+    let mut body = vec![0u8; 8];
+    body[0..2].copy_from_slice(&9u16.to_le_bytes());
+    let off = (smb2::SMB2_HEADER_LEN + 8) as u16;
+    body[4..6].copy_from_slice(&off.to_le_bytes());
+    body[6..8].copy_from_slice(&(path.len() as u16).to_le_bytes());
+    body.extend_from_slice(&path);
+    let h = c.hdr(smb2::SMB2_TREE_CONNECT);
+    let mut pkt = smb2::encode_packet(&h, &body);
+    smb2::smb2_sign_packet(&mut pkt, &c.session_key.unwrap());
+    let buf = c.roundtrip_raw(&pkt);
+    let rh = smb2::parse_smb2_header(&buf).unwrap();
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS, "signed TREE_CONNECT");
+    assert!(
+        smb2::smb2_verify_packet(&buf, &c.session_key.unwrap()),
+        "TREE_CONNECT response must be signed"
+    );
+}
+
+/// Regression: username mismatch still LOGON_FAILURE (password set)
+#[test]
+fn password_username_mismatch_is_logon_failure() {
+    let srv = start_password_server(Some("alice"), "Password");
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    assert_eq!(
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        smb2::STATUS_LOGON_FAILURE
+    );
+}
+
+/// Regression: NTLMv2 Type3 matching password is SUCCESS (live session)
+#[test]
+fn ntlmv2_type3_matching_password_live_success() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::connect_negotiate(srv.addr);
+    assert_eq!(
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        smb2::STATUS_SUCCESS
+    );
+    let (rh, _) = c.tree_connect_status("ratarmount", true);
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+}
+
+/// Password-set NEGOTIATE advertises SIGNING_REQUIRED (0x0003).
+#[test]
+fn password_negotiate_signing_required() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    let mut body = vec![0u8; 36];
+    body[0..2].copy_from_slice(&36u16.to_le_bytes());
+    body[2..4].copy_from_slice(&2u16.to_le_bytes());
+    body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&smb2::DIALECT_202.to_le_bytes());
+    body.extend_from_slice(&smb2::DIALECT_210.to_le_bytes());
+    let h = c.hdr(smb2::SMB2_NEGOTIATE);
+    let (rh, nbody) = c.roundtrip(&smb2::encode_packet(&h, &body));
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+    let mode = u16::from_le_bytes(nbody[2..4].try_into().unwrap());
+    assert_eq!(
+        mode,
+        smb2::NEGOTIATE_SIGNING_ENABLED | smb2::NEGOTIATE_SIGNING_REQUIRED
+    );
 }

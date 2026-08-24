@@ -6,6 +6,11 @@
 use std::io::{self, ErrorKind};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use hmac::{Hmac, Mac};
+use md4::{Digest, Md4};
+use md5::Md5;
+use sha2::Sha256;
+
 // --- commands ---
 
 pub const SMB2_NEGOTIATE: u16 = 0x0000;
@@ -30,6 +35,8 @@ pub const SMB2_SET_INFO: u16 = 0x0011;
 pub const SMB2_HEADER_LEN: usize = 64;
 pub const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
 pub const SMB2_FLAGS_RELATED: u32 = 0x0000_0004;
+/// Signature is encoded header bytes `[48..64]`, not a field on [`Smb2Header`].
+pub const SMB2_FLAGS_SIGNED: u32 = 0x0000_0008;
 
 pub const DIALECT_202: u16 = 0x0202;
 pub const DIALECT_210: u16 = 0x0210;
@@ -37,7 +44,9 @@ pub const DIALECT_300: u16 = 0x0300;
 pub const DIALECT_302: u16 = 0x0302;
 
 pub const NEGOTIATE_SIGNING_ENABLED: u16 = 0x0001;
+pub const NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
 pub const SESSION_FLAG_IS_GUEST: u16 = 0x0001;
+pub const NTLMSSP_NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
 
 pub const SHARE_TYPE_DISK: u8 = 0x01;
 pub const SHARE_TYPE_PIPE: u8 = 0x02;
@@ -284,6 +293,76 @@ pub fn encode_packet(header: &Smb2Header, body: &[u8]) -> Vec<u8> {
     out
 }
 
+type HmacSha256 = Hmac<Sha256>;
+type HmacMd5 = Hmac<Md5>;
+
+/// XOR-loop compare (no `subtle` crate). Length mismatch is not constant-time.
+pub(crate) fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        d |= x ^ y;
+    }
+    d == 0
+}
+
+/// Sign an encoded SMB2 packet: FLAGS_SIGNED at offset 16, HMAC-SHA256 16-byte sig at [48..64].
+pub(crate) fn smb2_sign_packet(msg: &mut [u8], session_key: &[u8; 16]) {
+    if msg.len() < SMB2_HEADER_LEN {
+        return;
+    }
+    let mut flags = u32::from_le_bytes(msg[16..20].try_into().unwrap_or([0; 4]));
+    flags |= SMB2_FLAGS_SIGNED;
+    msg[16..20].copy_from_slice(&flags.to_le_bytes());
+    msg[48..64].fill(0);
+    let mut mac = HmacSha256::new_from_slice(session_key).expect("HMAC-SHA256 key");
+    mac.update(msg);
+    let sig = mac.finalize().into_bytes();
+    msg[48..64].copy_from_slice(&sig[..16]);
+}
+
+/// Verify FLAGS_SIGNED and HMAC-SHA256 over the encoded packet with signature zeroed.
+pub(crate) fn smb2_verify_packet(msg: &[u8], session_key: &[u8; 16]) -> bool {
+    if msg.len() < SMB2_HEADER_LEN {
+        return false;
+    }
+    let Ok(flags) = u32_at(msg, 16) else {
+        return false;
+    };
+    if flags & SMB2_FLAGS_SIGNED == 0 {
+        return false;
+    }
+    let got = &msg[48..64];
+    let mut mac = HmacSha256::new_from_slice(session_key).expect("HMAC-SHA256 key");
+    mac.update(&msg[..48]);
+    mac.update(&[0u8; 16]);
+    if msg.len() > SMB2_HEADER_LEN {
+        mac.update(&msg[SMB2_HEADER_LEN..]);
+    }
+    let computed = mac.finalize().into_bytes();
+    ct_eq(&computed[..16], got)
+}
+
+/// Sign each compound part in place after [`stitch_compound`] (NextCommand already set).
+pub(crate) fn smb2_sign_compound(buf: &mut [u8], session_key: &[u8; 16]) {
+    let mut off = 0usize;
+    while off + SMB2_HEADER_LEN <= buf.len() {
+        let next = u32_at(buf, off + 20).unwrap_or(0) as usize;
+        let end = if next == 0 {
+            buf.len()
+        } else {
+            off.saturating_add(next).min(buf.len())
+        };
+        smb2_sign_packet(&mut buf[off..end], session_key);
+        if next == 0 {
+            break;
+        }
+        off = end;
+    }
+}
+
 /// Split a Direct-TCP payload into compound SMB2 messages (unpadded slices).
 pub fn split_compound(msg: &[u8]) -> io::Result<Vec<&[u8]>> {
     let mut out = Vec::new();
@@ -475,10 +554,10 @@ pub fn pick_dialect(dialects: &[u16]) -> Option<u16> {
     }
 }
 
-pub fn encode_negotiate_response(dialect: u16, sec_buf: &[u8]) -> Vec<u8> {
+pub fn encode_negotiate_response(dialect: u16, sec_buf: &[u8], security_mode: u16) -> Vec<u8> {
     let mut b = vec![0u8; 64];
     b[0..2].copy_from_slice(&65u16.to_le_bytes());
-    b[2..4].copy_from_slice(&NEGOTIATE_SIGNING_ENABLED.to_le_bytes());
+    b[2..4].copy_from_slice(&security_mode.to_le_bytes());
     b[4..6].copy_from_slice(&dialect.to_le_bytes());
     b[8..24].copy_from_slice(&SERVER_GUID);
     // Capabilities: DFS=0, LEASING=0
@@ -1236,27 +1315,149 @@ pub fn ntlm_type(buf: &[u8]) -> Option<u32> {
     u32_at(n, 8).ok()
 }
 
-pub fn ntlm_type3_user(buf: &[u8]) -> Option<String> {
+/// ServerChallenge at offset 24 of a Type2 message (after `NTLMSSP\0`).
+#[cfg(test)]
+pub(crate) fn ntlm_type2_challenge(buf: &[u8]) -> Option<[u8; 8]> {
     let n = extract_ntlm(buf)?;
-    if n.len() < 52 {
+    if ntlm_type(n) != Some(2) || n.len() < 32 {
+        return None;
+    }
+    let mut c = [0u8; 8];
+    c.copy_from_slice(&n[24..32]);
+    Some(c)
+}
+
+/// MS-NLMP AUTHENTICATE_MESSAGE fields used for NTLMv2.
+#[derive(Clone, Debug)]
+pub(crate) struct NtlmType3 {
+    pub user: String,
+    pub domain: String,
+    pub nt_response: Vec<u8>,
+    /// Parsed for MS-NLMP completeness; NTLMv2 proof uses NT only.
+    #[allow(dead_code)]
+    pub lm_response: Vec<u8>,
+    pub flags: u32,
+    pub session_key_len: u16,
+}
+
+fn ntlm_sec_buf(n: &[u8], len_off: usize, off_off: usize) -> Option<&[u8]> {
+    let len = u16_at(n, len_off).ok()? as usize;
+    let off = u32_at(n, off_off).ok()? as usize;
+    n.get(off..off + len)
+}
+
+fn ntlm_decode_str(raw: &[u8], unicode: bool) -> String {
+    if unicode {
+        decode_utf16le(raw)
+    } else {
+        String::from_utf8_lossy(raw).into_owned()
+    }
+}
+
+/// Parse Type3 at MS-NLMP offsets from `NTLMSSP\0`. Minimum header 64 bytes.
+pub(crate) fn parse_ntlm_type3(buf: &[u8]) -> Option<NtlmType3> {
+    let n = extract_ntlm(buf)?;
+    if n.len() < 64 {
         return None;
     }
     let typ = u32_at(n, 8).ok()?;
     if typ != 3 {
         return None;
     }
-    let len = u16_at(n, 36).ok()? as usize;
-    let off = u32_at(n, 40).ok()? as usize;
-    if off + len > n.len() {
-        return None;
+    let flags = u32_at(n, 60).ok()?;
+    let unicode = flags & 1 != 0;
+    let lm_response = ntlm_sec_buf(n, 12, 16)?.to_vec();
+    let nt_response = ntlm_sec_buf(n, 20, 24)?.to_vec();
+    let domain = ntlm_decode_str(ntlm_sec_buf(n, 28, 32)?, unicode);
+    let user = ntlm_decode_str(ntlm_sec_buf(n, 36, 40)?, unicode);
+    let session_key_len = u16_at(n, 52).ok()?;
+    Some(NtlmType3 {
+        user,
+        domain,
+        nt_response,
+        lm_response,
+        flags,
+        session_key_len,
+    })
+}
+
+#[cfg(test)]
+pub fn ntlm_type3_user(buf: &[u8]) -> Option<String> {
+    parse_ntlm_type3(buf).map(|t| t.user)
+}
+
+fn copy16(bytes: impl AsRef<[u8]>) -> [u8; 16] {
+    let b = bytes.as_ref();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&b[..16]);
+    out
+}
+
+fn hmac_md5(key: &[u8], data: &[u8]) -> [u8; 16] {
+    let mut mac = HmacMd5::new_from_slice(key).expect("HMAC-MD5 key");
+    mac.update(data);
+    copy16(mac.finalize().into_bytes())
+}
+
+/// NTOWFv1 = MD4(UTF16LE(password)) — MS-NLMP 3.3.2.
+pub(crate) fn ntowfv1(password: &str) -> [u8; 16] {
+    let mut h = Md4::new();
+    h.update(encode_utf16le(password));
+    copy16(h.finalize())
+}
+
+/// ResponseKeyNT = HMAC-MD5(NTOWFv1, UTF16LE(upper(user) || domain)).
+/// Domain is not uppercased (MS-NLMP 3.3.2).
+pub(crate) fn ntlmv2_response_key_nt(password: &str, user: &str, domain: &str) -> [u8; 16] {
+    let mut material = user.to_uppercase();
+    material.push_str(domain);
+    hmac_md5(&ntowfv1(password), &encode_utf16le(&material))
+}
+
+/// NTProofStr = HMAC-MD5(ResponseKeyNT, server_challenge || temp).
+pub(crate) fn ntlmv2_nt_proof(
+    response_key_nt: &[u8; 16],
+    server_challenge: [u8; 8],
+    temp: &[u8],
+) -> [u8; 16] {
+    let mut data = Vec::with_capacity(8 + temp.len());
+    data.extend_from_slice(&server_challenge);
+    data.extend_from_slice(temp);
+    hmac_md5(response_key_nt, &data)
+}
+
+/// SessionBaseKey = HMAC-MD5(ResponseKeyNT, NTProofStr) — 16-byte SMB2 session key.
+pub(crate) fn ntlmv2_session_base_key(response_key_nt: &[u8; 16], nt_proof: &[u8]) -> [u8; 16] {
+    hmac_md5(response_key_nt, nt_proof)
+}
+
+/// NTLMv2-only Type3 proof. Rejects NTLMv1 (24-byte NT), KEY_EXCH, and empty NT.
+pub(crate) fn ntlm_verify_type3(
+    t3: &NtlmType3,
+    password: &str,
+    required_user: Option<&str>,
+    server_challenge: [u8; 8],
+) -> Result<[u8; 16], u32> {
+    if t3.flags & NTLMSSP_NEGOTIATE_KEY_EXCH != 0 || t3.session_key_len != 0 {
+        return Err(STATUS_LOGON_FAILURE);
     }
-    let raw = &n[off..off + len];
-    let flags = u32_at(n, 60).unwrap_or(1);
-    if flags & 1 != 0 {
-        Some(decode_utf16le(raw))
-    } else {
-        Some(String::from_utf8_lossy(raw).into_owned())
+    // NTLMv1 DES response is exactly 24 bytes; NTLMv2 is 16 + client blob.
+    if t3.nt_response.len() < 16 || t3.nt_response.len() == 24 {
+        return Err(STATUS_LOGON_FAILURE);
     }
+    if let Some(want) = required_user {
+        if !t3.user.eq_ignore_ascii_case(want) {
+            return Err(STATUS_LOGON_FAILURE);
+        }
+    }
+    let rk = ntlmv2_response_key_nt(password, &t3.user, &t3.domain);
+    let nt_proof = &t3.nt_response[..16];
+    let temp = &t3.nt_response[16..];
+    let computed = ntlmv2_nt_proof(&rk, server_challenge, temp);
+    if !ct_eq(&computed, nt_proof) {
+        return Err(STATUS_LOGON_FAILURE);
+    }
+    Ok(ntlmv2_session_base_key(&rk, nt_proof))
 }
 
 #[cfg(test)]
@@ -1281,29 +1482,90 @@ pub fn ntlm_type3_guest() -> Vec<u8> {
 
 #[cfg(test)]
 pub fn ntlm_type3_with_user(user: &str) -> Vec<u8> {
-    let raw = encode_utf16le(user);
+    ntlm_type3_authenticate(user, "", &[], 0x0000_0001 | 0x0000_0200, 0)
+}
+
+/// Build an AUTHENTICATE_MESSAGE with NT response / flags / EncryptedRandomSessionKey.Len.
+#[cfg(test)]
+pub fn ntlm_type3_authenticate(
+    user: &str,
+    domain: &str,
+    nt_response: &[u8],
+    flags: u32,
+    session_key_len: u16,
+) -> Vec<u8> {
+    let unicode = flags & 1 != 0;
+    let user_raw = if unicode {
+        encode_utf16le(user)
+    } else {
+        user.as_bytes().to_vec()
+    };
+    let domain_raw = if unicode {
+        encode_utf16le(domain)
+    } else {
+        domain.as_bytes().to_vec()
+    };
+    let nt_off = 64u32;
+    let domain_off = nt_off + nt_response.len() as u32;
+    let user_off = domain_off + domain_raw.len() as u32;
+    let end_off = user_off + user_raw.len() as u32;
     let mut b = Vec::from(&b"NTLMSSP\0"[..]);
     b.extend_from_slice(&3u32.to_le_bytes());
-    let flags: u32 = 0x0000_0001 | 0x0000_0200;
-    // LM, NT, Domain empty at offset 64
-    for _ in 0..3 {
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&64u32.to_le_bytes());
-    }
-    b.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-    b.extend_from_slice(&(raw.len() as u16).to_le_bytes());
-    b.extend_from_slice(&64u32.to_le_bytes());
-    let after_user = 64 + raw.len() as u32;
-    for _ in 0..2 {
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&0u16.to_le_bytes());
-        b.extend_from_slice(&after_user.to_le_bytes());
-    }
+    // LM empty
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&nt_off.to_le_bytes());
+    // NT
+    b.extend_from_slice(&(nt_response.len() as u16).to_le_bytes());
+    b.extend_from_slice(&(nt_response.len() as u16).to_le_bytes());
+    b.extend_from_slice(&nt_off.to_le_bytes());
+    // Domain
+    b.extend_from_slice(&(domain_raw.len() as u16).to_le_bytes());
+    b.extend_from_slice(&(domain_raw.len() as u16).to_le_bytes());
+    b.extend_from_slice(&domain_off.to_le_bytes());
+    // User
+    b.extend_from_slice(&(user_raw.len() as u16).to_le_bytes());
+    b.extend_from_slice(&(user_raw.len() as u16).to_le_bytes());
+    b.extend_from_slice(&user_off.to_le_bytes());
+    // Workstation empty
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&0u16.to_le_bytes());
+    b.extend_from_slice(&end_off.to_le_bytes());
+    // EncryptedRandomSessionKey
+    b.extend_from_slice(&session_key_len.to_le_bytes());
+    b.extend_from_slice(&session_key_len.to_le_bytes());
+    b.extend_from_slice(&end_off.to_le_bytes());
     b.extend_from_slice(&flags.to_le_bytes());
     debug_assert_eq!(b.len(), 64);
-    b.extend_from_slice(&raw);
+    b.extend_from_slice(nt_response);
+    b.extend_from_slice(&domain_raw);
+    b.extend_from_slice(&user_raw);
+    if session_key_len != 0 {
+        b.resize(b.len() + session_key_len as usize, 0);
+    }
     b
+}
+
+/// Frozen-temp NTLMv2 Type3 + SessionBaseKey for a live Type2 challenge.
+#[cfg(test)]
+pub fn ntlm_type3_v2(
+    user: &str,
+    domain: &str,
+    password: &str,
+    challenge: [u8; 8],
+) -> (Vec<u8>, [u8; 16]) {
+    const FLAGS: u32 = 0x2088_8201;
+    const TEMP: [u8; 28] = [
+        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33,
+        0x44, 0x55, 0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    ];
+    let rk = ntlmv2_response_key_nt(password, user, domain);
+    let proof = ntlmv2_nt_proof(&rk, challenge, &TEMP);
+    let skey = ntlmv2_session_base_key(&rk, &proof);
+    let mut nt = Vec::with_capacity(16 + TEMP.len());
+    nt.extend_from_slice(&proof);
+    nt.extend_from_slice(&TEMP);
+    (ntlm_type3_authenticate(user, domain, &nt, FLAGS, 0), skey)
 }
 
 pub fn challenge8() -> [u8; 8] {
@@ -1474,6 +1736,189 @@ mod tests {
         assert_eq!(parts.len(), 2);
         assert_eq!(parse_smb2_header(parts[0]).unwrap().message_id, 1);
         assert_eq!(parse_smb2_header(parts[1]).unwrap().message_id, 2);
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    const KAT_PASSWORD: &str = "Password";
+    const KAT_USER: &str = "User";
+    const KAT_DOMAIN: &str = "Domain";
+    const KAT_RESPONSE_KEY_NT: &str = "0c868a403bfd7a93a3001ef22ef02e3f";
+    const KAT_CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+    const KAT_TEMP: &str = "01010000000000000000000011223344556677880000000000000000";
+    const KAT_NT_PROOF: &str = "4ee6b0d655f232aca5d7b24da70c136a";
+    const KAT_SESSION_BASE: &str = "e4a9a329aaa4eb0d48818d127f9f77eb";
+    const KAT_TYPE3: &str = concat!(
+        "4e544c4d535350000300000000000000400000002c002c00400000000c000c006c000000",
+        "08000800780000000000000080000000000000008000000001828820",
+        "4ee6b0d655f232aca5d7b24da70c136a",
+        "01010000000000000000000011223344556677880000000000000000",
+        "44006f006d00610069006e005500730065007200",
+    );
+
+    fn kat_type3() -> NtlmType3 {
+        parse_ntlm_type3(&unhex(KAT_TYPE3)).expect("frozen Type3")
+    }
+
+    #[test]
+    fn ntlmv2_response_key_nt_ms_nlmp_4_2_4() {
+        let got = ntlmv2_response_key_nt(KAT_PASSWORD, KAT_USER, KAT_DOMAIN);
+        assert_eq!(got.as_slice(), unhex(KAT_RESPONSE_KEY_NT));
+    }
+
+    #[test]
+    fn ntlmv2_ntproof_and_session_base_key() {
+        let rk = ntlmv2_response_key_nt(KAT_PASSWORD, KAT_USER, KAT_DOMAIN);
+        let proof = ntlmv2_nt_proof(&rk, KAT_CHALLENGE, &unhex(KAT_TEMP));
+        assert_eq!(proof.as_slice(), unhex(KAT_NT_PROOF));
+        let skey = ntlmv2_session_base_key(&rk, &proof);
+        assert_eq!(skey.as_slice(), unhex(KAT_SESSION_BASE));
+    }
+
+    /// Regression: NTLMv2 Type3 wrong password is LOGON_FAILURE
+    #[test]
+    fn ntlmv2_type3_wrong_password_is_logon_failure() {
+        let t3 = kat_type3();
+        assert_eq!(
+            ntlm_verify_type3(&t3, "wrong", None, KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+        assert_eq!(STATUS_LOGON_FAILURE, 0xC000_006D);
+    }
+
+    /// Regression: NTLMv2 Type3 matching password is SUCCESS
+    #[test]
+    fn ntlmv2_type3_matching_password_is_success() {
+        let t3 = kat_type3();
+        assert_eq!(t3.user, KAT_USER);
+        assert_eq!(t3.domain, KAT_DOMAIN);
+        assert_eq!(t3.flags, 0x2088_8201);
+        assert_eq!(t3.session_key_len, 0);
+        assert_eq!(t3.nt_response.len(), 44);
+        let key = ntlm_verify_type3(&t3, KAT_PASSWORD, None, KAT_CHALLENGE).expect("proof");
+        assert_eq!(key.as_slice(), unhex(KAT_SESSION_BASE));
+        let key2 = ntlm_verify_type3(&t3, KAT_PASSWORD, Some(KAT_USER), KAT_CHALLENGE).unwrap();
+        assert_eq!(key, key2);
+    }
+
+    /// Regression: KEY_EXCH Type3 is LOGON_FAILURE
+    #[test]
+    fn key_exch_type3_is_logon_failure() {
+        let mut raw = unhex(KAT_TYPE3);
+        let mut flags = u32::from_le_bytes(raw[60..64].try_into().unwrap());
+        flags |= NTLMSSP_NEGOTIATE_KEY_EXCH;
+        raw[60..64].copy_from_slice(&flags.to_le_bytes());
+        let t3 = parse_ntlm_type3(&raw).unwrap();
+        assert_eq!(
+            ntlm_verify_type3(&t3, KAT_PASSWORD, None, KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+        let t3_len = parse_ntlm_type3(&ntlm_type3_authenticate(
+            KAT_USER,
+            KAT_DOMAIN,
+            &unhex(KAT_TYPE3)[64..108],
+            0x2088_8201,
+            16,
+        ))
+        .unwrap();
+        assert_eq!(t3_len.session_key_len, 16);
+        assert_eq!(
+            ntlm_verify_type3(&t3_len, KAT_PASSWORD, None, KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+        let t2 = ntlm_type2(KAT_CHALLENGE, "RATARMOUNT");
+        let flags2 = u32_at(&t2, 20).unwrap();
+        assert_eq!(flags2 & NTLMSSP_NEGOTIATE_KEY_EXCH, 0);
+    }
+
+    /// Regression: NTLMv1 24-byte NT response is LOGON_FAILURE
+    #[test]
+    fn ntlmv1_24_byte_nt_response_is_logon_failure() {
+        let t3 = parse_ntlm_type3(&ntlm_type3_authenticate(
+            KAT_USER,
+            KAT_DOMAIN,
+            &[0u8; 24],
+            0x2088_8201,
+            0,
+        ))
+        .unwrap();
+        assert_eq!(t3.nt_response.len(), 24);
+        assert_eq!(
+            ntlm_verify_type3(&t3, KAT_PASSWORD, None, KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+    }
+
+    /// Regression: guest Type3 still succeeds without NT proof when password unset
+    #[test]
+    fn guest_type3_parses_empty_nt_response() {
+        let t3 = parse_ntlm_type3(&ntlm_type3_guest()).unwrap();
+        assert_eq!(t3.user, "");
+        assert!(t3.nt_response.is_empty());
+        assert_eq!(
+            ntlm_verify_type3(&t3, KAT_PASSWORD, None, KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+    }
+
+    /// Regression: username mismatch still LOGON_FAILURE
+    #[test]
+    fn username_mismatch_still_logon_failure() {
+        let t3 = kat_type3();
+        assert_eq!(
+            ntlm_verify_type3(&t3, KAT_PASSWORD, Some("alice"), KAT_CHALLENGE),
+            Err(STATUS_LOGON_FAILURE)
+        );
+    }
+
+    #[test]
+    fn sign_encoded_packet_hmac_sha256_16_bytes() {
+        let h = Smb2Header {
+            credit_charge: 1,
+            status: 0,
+            command: SMB2_ECHO,
+            credits: 1,
+            flags: SMB2_FLAGS_SERVER_TO_REDIR,
+            next_command: 0,
+            message_id: 1,
+            process_id: 0xfeff,
+            tree_id: 1,
+            session_id: 1,
+        };
+        let mut pkt = encode_packet(&h, &encode_empty_sized(4, 4));
+        assert_eq!(&pkt[48..64], &[0u8; 16]);
+        let key: [u8; 16] = unhex(KAT_SESSION_BASE).try_into().unwrap();
+        smb2_sign_packet(&mut pkt, &key);
+        let flags = u32::from_le_bytes(pkt[16..20].try_into().unwrap());
+        assert_eq!(flags & SMB2_FLAGS_SIGNED, SMB2_FLAGS_SIGNED);
+        assert_ne!(&pkt[48..64], &[0u8; 16]);
+        assert!(smb2_verify_packet(&pkt, &key));
+        let mut bad = pkt.clone();
+        bad[64] ^= 1;
+        assert!(!smb2_verify_packet(&bad, &key));
+        let mut unsigned = pkt.clone();
+        let mut f = u32::from_le_bytes(unsigned[16..20].try_into().unwrap());
+        f &= !SMB2_FLAGS_SIGNED;
+        unsigned[16..20].copy_from_slice(&f.to_le_bytes());
+        assert!(!smb2_verify_packet(&unsigned, &key));
+    }
+
+    #[test]
+    fn negotiate_security_mode_signing_required_is_0003() {
+        let body = encode_negotiate_response(
+            DIALECT_202,
+            &[],
+            NEGOTIATE_SIGNING_ENABLED | NEGOTIATE_SIGNING_REQUIRED,
+        );
+        assert_eq!(u16::from_le_bytes(body[2..4].try_into().unwrap()), 0x0003);
+        let guest = encode_negotiate_response(DIALECT_202, &[], NEGOTIATE_SIGNING_ENABLED);
+        assert_eq!(u16::from_le_bytes(guest[2..4].try_into().unwrap()), 0x0001);
     }
 
     #[test]
