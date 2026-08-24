@@ -108,6 +108,13 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Linux/macOS packages compile `nfsv4` + `sftp-russh` | `./packaging/test-nfsv4-features.sh` |
 | Kernel NFS Docker (v3 + v4.1) | `./test-harness/nfs-docker/run.sh` (privileged Docker + real `mount -t nfs`; skip if docker/privileged unavailable; empty/wrong bytes = fail) |
 | Kernel NFS Docker overlay write | `./test-harness/nfs-docker/run.sh 3 write` · `./test-harness/nfs-docker/run.sh 4 write` |
+| SMB NTLM password / unsigned session | `cargo test -p ratarmount-smb --lib ntlm` · `cargo test -p ratarmount-smb --lib sign` |
+| WebDAV LOCK 423 / COPY / Basic | `cargo test -p ratarmount-http --lib lock` · `cargo test -p ratarmount-http --lib copy` · `cargo test -p ratarmount-http --lib basic` |
+| SFTP password policy / non-loopback | `cargo test -p ratarmount-sftp --lib password` · `cargo test -p ratarmount-sftp --features sftp-russh --lib password` |
+| GCS GOOG1 HMAC | `cargo test -p ratarmount-remote --lib goog1` · `cargo test -p ratarmount-remote --lib hmac` |
+| FTP LIST/MLSD folder | `cargo test -p ratarmount-remote --lib ftp` |
+| rclone+ URL | `cargo test -p ratarmount-remote --lib rclone` · `cargo test -p ratarmount-remote --lib is_remote_url` |
+| `--sftp-subsystem` clap | `cargo test -p ratarmount --bin ratarmount sftp_subsystem` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

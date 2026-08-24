@@ -67,10 +67,10 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | NFSv3 userspace export | no | yes (`--nfs` / `--nfs-bind`; IPv4, localhost default; `-w` overlay writes including rename/symlink) | `[x]` / residual Windows READDIR |
 | NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`; Linux/macOS packages compile `nfsv4`; source `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes including rename/symlink) | `~` / Linux kernel client **verified** (privileged Docker loopback `test-harness/nfs-docker`, 2026-08-15; not default CI); no Kerberos/LAN/Windows; no v3/v4 mux; idle-TTL-not-CLOSE; embednfs macOS-first |
 | HTTP GET/HEAD export (`--http`) | no | yes (`127.0.0.1:20491`; Range 206; fill-loop) | `[x]` Rust-only |
-| WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE with `-w` | `~` LOCK residual |
-| SMB 2.0.2 export (`--smb`) | no | userspace 2.0.2 subset; `smbclient` `ls`/`get` localhost | `~` signing / Finder residual |
+| WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE/COPY with `-w`; LOCK/UNLOCK; PROPPATCH; Basic env | `[x]` / mux residual |
+| SMB 2.0.2 export (`--smb`) | no | userspace 2.0.2 subset; guest `smbclient -N` unsigned; NTLMv2 + signing when password set | `~` encrypt / 3.1.1 / Finder residual |
 | 9P2000.L TCP (`--ninep`) | no | TCP `trans=tcp` port 20493; writes need `-w` | `[x]` / virtio residual |
-| SFTP export (`--sftp`) | no | TCP `:20222`; `--features sftp-russh` (packages on; default CI off; russh MSRV 1.85) | `~` password / stdio subsystem residual |
+| SFTP export (`--sftp`) | no | TCP `:20222` + `--sftp-subsystem` stdio; password env; `--features sftp-russh` (packages on; default CI off; russh MSRV 1.85) | `[x]` / russh feature note |
 | Daemonize / foreground | yes | yes | `[x]` |
 | readdirplus / attr cache | yes | yes | `[x]` |
 | Full mount-option matrix | — | see [`docs/mount-options-parity.md`](mount-options-parity.md) | `~` |
@@ -83,14 +83,14 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `http(s)://` (full GET) | yes | yes | `[x]` |
 | HTTP Range without full download | yes | live Range for TAR/ZIP/gzip/**bzip2/xz/zstd** + materialize fallback | `[x]` |
 | `s3://` | yes (fsspec) | SigV4 env + IMDS/ECS + anonymous + live Range (`open_s3_range` / `S3RangeFile`) + **prefix folders** (`ListObjectsV2`) | `[x]` |
-| `gs://` / `az://` | yes (fsspec) | GCS XML Range + JSON list (ADC/IMDS/anonymous); Azure Range + List Blobs (SAS/SharedKey/MSI) | `[x]` / `~` GCS HMAC residual |
-| `ftp://` / `ftps://` | yes | REST/SIZE Range or full RETR; explicit AUTH TLS (`suppaftp` rustls) | `[x]` / `~` LIST/MLSD folders |
+| `gs://` / `az://` | yes (fsspec) | GCS XML Range + JSON list (ADC/IMDS/anonymous) + GOOG1 HMAC; Azure Range + List Blobs (SAS/SharedKey/MSI) | `[x]` |
+| `ftp://` / `ftps://` | yes | REST/SIZE Range or full RETR; explicit AUTH TLS (`suppaftp` rustls); LIST/MLSD folders | `[x]` / `~` implicit FTPS :990 |
 | `ssh://` / `sftp://` | yes | yes + SFTP `readdir` directory mounts | `[x]` / `~` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include done; residual ProxyCommand / Match |
-| SMB / WebDAV / Dropbox | yes | WebDAV file GET + **Depth-1 collections**; SMB `smbclient`; Dropbox folder (list TTL) + ranged content download | `[x]` / `~` inbound SMB still CLI; outbound WebDAV LOCK residual |
+| SMB / WebDAV / Dropbox | yes | WebDAV file GET + **Depth-1 collections**; SMB `smbclient`; Dropbox folder (list TTL) + ranged content download | `[x]` / `~` inbound SMB still CLI |
 | `oci://` / `docker://` | no | manifest + Bearer blob Range + overlayfs layer union | `[x]` Rust-only / eStargz residual |
 | `ipfs://` / `ipns://` | yes | gateway Range + UnixFS `IPFS_API` list (no embedded node) | `[x]` |
-| `rclone://remote:path` | yes (fsspec rclone) | argv `cat --offset` + `lsjson` folders | `[x]` / `~` RC serve residual |
-| HTTP/S3/SSH/WebDAV **directory** mounts | yes (fsspec) | F-1 `RemoteFolderMountSource` (autoindex / ListObjects / `readdir` / PROPFIND) | `[x]` |
+| `rclone://remote:path` | yes (fsspec rclone) | argv `cat --offset` + `lsjson` folders; `rclone+remote:path` | `[x]` / `~` RC `--rc-serve` residual |
+| HTTP/S3/SSH/WebDAV **directory** mounts | yes (fsspec) | F-1 `RemoteFolderMountSource` (autoindex / ListObjects / `readdir` / PROPFIND / FTP LIST) | `[x]` |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
 
 ### Index / CLI
@@ -206,5 +206,5 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
 - **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
-- **Beyond-parity roadmap (2026-08-23):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed (`done` or `partial`); remaining F-2..F-10, G-2..G-5. Inbound: [`phase10-remote.md`](phase10-remote.md). Outbound: [`export.md`](export.md) + [`nfs-export.md`](nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
+- **Beyond-parity roadmap (2026-08-23, leftover close-out 2026-08-24):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed; **P-6** / **P-10** `done`; **P-2** stays `partial` (encrypt / 3.1.1 / Finder). Remaining F-2..F-10, G-2..G-5. Inbound: [`phase10-remote.md`](phase10-remote.md). Outbound: [`export.md`](export.md) + [`nfs-export.md`](nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
 - **Tier D rapidgzip perf residual:** [`docs/tasks/rapidgzip-perf-batch.md`](tasks/rapidgzip-perf-batch.md) (P1–P5 done) · post-batch [`docs/tasks/rapidgzip-residual-batch.md`](tasks/rapidgzip-residual-batch.md) (R1–R5) · decision residual split in [`docs/gzip-binding-decision.md`](gzip-binding-decision.md)

@@ -2,7 +2,7 @@
 
 Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](export.md). Status vs Python: [`parity-todo.md`](parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md).
 
-`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `docker://ubuntu:24.04`.
+`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`.
 
 ## Supported
 
@@ -11,21 +11,21 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `file://` | Map to local path |
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`) |
 | `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap) |
-| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken`. R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL` |
+| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL` |
 | `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://` |
-| `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). LIST/MLSD folders residual |
+| `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
 | `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH` |
 | `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
-| `rclone://remote:path` | argv `rclone cat --offset --count` + `lsjson` (one process per open). Slash alias `rclone://remote/path`. Config stays in rclone |
+| `rclone://remote:path` | argv `rclone cat --offset --count` + `lsjson` (one process per open). Slash alias `rclone://remote/path`. Plus-form `rclone+remote:path` / `rclone+remote://path` (no `://` required). Config stays in rclone |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
-Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
+Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
 
 ### HTTP(S) Basic authentication (FR-2 / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
 
@@ -73,11 +73,12 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
 
 ### GCS (`gs://`)
 
-XML file GET; JSON list API. HMAC GOOG1 is residual.
+XML file GET; JSON list API (Bearer/ADC/IMDS). HMAC GOOG1 uses XML ListBucket (query params unsigned on the wire; STS is `/{bucket}` only). Range is sent unsigned.
 
 | Env | Purpose |
 |-----|---------|
 | `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` | Bearer (tried first) |
+| `GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET` | GOOG1 HMAC (both non-empty; selected **before** the ADC/IMDS token cache) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s) |
 | GCE/GKE IMDS | `Metadata-Flavor: Google` (override `RATARMOUNT_GCS_IMDS_BASE` for tests) |
 | `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET |
@@ -101,7 +102,7 @@ XML file GET; JSON list API. HMAC GOOG1 is residual.
 | `RATARMOUNT_FTP_USER` / `RATARMOUNT_FTP_PASSWORD` | When URL has no userinfo; else anonymous `anonymous`/`ratarmount@` |
 | `RATARMOUNT_FTP_CA_FILE` | PEM CA bundle for `ftps://` |
 
-URL userinfo is redacted in logs (`ftp://user:***@host/…`). Prefer `ftps://`. Implicit FTPS (990) and LIST/MLSD directory mounts are residual.
+URL userinfo is redacted in logs (`ftp://user:***@host/…`). Prefer `ftps://`. Directory URLs (trailing `/`, or CWD when SIZE fails) mount as F-1 folders. Implicit FTPS (port 990) is residual.
 
 ### SSH authentication
 
@@ -176,18 +177,18 @@ Unlocks Drive / OneDrive / B2 / Swift / HDFS without reimplementing OAuth. Confi
 |-----|---------|
 | `RATARMOUNT_RCLONE` | Absolute path to the `rclone` binary (otherwise `PATH`) |
 
-Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclone://remote/path`**. Missing binary: `rclone not found on PATH; install rclone or use a native scheme`. One process per `open` / listing cache miss (materialize at open). Residual: `rclone rcd` `--rc-serve`.
+Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclone://remote/path`**. Plus-form **`rclone+remote:path`** / **`rclone+remote://path`** (no `://` required; otherwise treated as a local path). Missing binary: `rclone not found on PATH; install rclone or use a native scheme`. One process per `open` / listing cache miss (materialize at open). Residual: `rclone rcd` `--rc-serve` HTTP GET.
 
 ## Not yet
 
 - Pure-Rust SMB client (no `smbclient` dependency) — F-6
 - SPA HTML indexes; WebDAV Depth-infinity listing
-- FTP LIST/MLSD directory mounts
-- GCS HMAC (`GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET`)
+- Implicit FTPS (port 990)
+- GCS GOOG4-HMAC-SHA256 (only if live keys reject GOOG1 / V2)
 - Full browser cookie jar / `Set-Cookie` persistence (env Cookie + Netscape file **are** shipped)
 - ssh_config **ProxyCommand** / **Match** (ProxyJump + Include **are** shipped)
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
-- rclone RC HTTP Range; `rclone+remote:path` URL form
+- rclone RC `--rc-serve` HTTP GET (`rclone+remote:path` **is** shipped)
 - OCI eStargz / SOCI / nydus / config JSON
 - Write-through / commit-to-remote (F-7)
 
@@ -202,11 +203,13 @@ ratarmount -f s3://my-bucket/prefix/ mnt/          # F-1 prefix folder
 ratarmount -f gs://my-bucket/obj.tar mnt/
 ratarmount -f az://container/blob.tar mnt/
 ratarmount -f 'ftp://mirror.example/debian/a.tar' mnt/
+ratarmount -f 'ftp://mirror.example/debian/' mnt/   # F-1 LIST/MLSD folder
 ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
 ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
 ratarmount -f 'rclone://gdrive:bucket/path.tar' mnt/
+ratarmount -f 'rclone+gdrive:bucket/path.tar' mnt/
 ratarmount -f docker://ubuntu:24.04 mnt/
 ratarmount -f ipfs://bafyhash/path.tar mnt/
 ```

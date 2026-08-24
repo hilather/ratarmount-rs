@@ -1,6 +1,6 @@
 # Userspace exports besides NFS (HTTP, WebDAV, SMB, 9P, SFTP)
 
-Status: **boolean flags shipped** (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp`) on the same `MountSource` tree as FUSE and NFS. Bind default **127.0.0.1** + unprivileged high ports. Auth is localhost (same boundary as NFS AUTH_SYS-not-verified). Overlay writes need `-w` where the protocol includes them; **HTTP GET/HEAD is read-only**.
+Status: **boolean flags shipped** (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp` / `--sftp-subsystem`) on the same `MountSource` tree as FUSE and NFS. Bind default **127.0.0.1** + unprivileged high ports. Auth is localhost unless an env password/user is set (same boundary as NFS AUTH_SYS-not-verified when unset). Overlay writes need `-w` where the protocol includes them; **HTTP GET/HEAD is read-only**.
 
 NFS stays in [`nfs-export.md`](nfs-export.md). This page is the sibling adapters (`ratarmount-http`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`) plus shared bind/stop helpers in `ratarmount-export-core`. Roadmap: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) P-5 / P-6 / P-2 / P-7 / P-10 / G-1.
 
@@ -47,9 +47,9 @@ curl -r 0-1023 http://127.0.0.1:20491/member
 | Auth | None (localhost) |
 | Writes | Out of v1 (use `--webdav -w`) |
 
-## WebDAV (`--webdav`) — P-6 `partial`
+## WebDAV (`--webdav`) — P-6 `done`
 
-Separate port from HTTP (v1 does not mux). PROPFIND Depth 0/1; Depth infinity / missing Depth → 403. GET/HEAD reuse the HTTP handler.
+Separate port from HTTP (v1 does not mux). PROPFIND Depth 0/1; Depth infinity / missing Depth → 403. GET/HEAD reuse the HTTP handler. OPTIONS `DAV: 1,2`.
 
 ```bash
 ratarmount --webdav -w :temp: archive.tar.gz
@@ -61,12 +61,15 @@ curl -X PROPFIND -H 'Depth: 1' http://127.0.0.1:20492/
 |------|----------|
 | PROPFIND | `multistatus` with `getcontentlength`, `getlastmodified`, `resourcetype` |
 | PUT / DELETE / MKCOL / MOVE | Overlay only (`-w`); without overlay → 403 |
-| LOCK / UNLOCK | **Residual** (Finder save-in-place) |
-| COPY / PROPPATCH / Basic | Residual |
+| LOCK / UNLOCK | Exclusive write, in-memory (cap 1024; TTL 600 s). PUT/DELETE/MKCOL/PROPPATCH need `If` with the dest token (423 otherwise). COPY of a locked **source** onto an unlocked dest is allowed |
+| COPY | Overlay only; Depth 0 file / Depth 1 immediate file children; nested collection child → 403 |
+| PROPPATCH | 207 Multi-Status; live props no-op; dead props 403 per-prop |
+| Basic | `RATARMOUNT_WEBDAV_USER` / `RATARMOUNT_WEBDAV_PASSWORD` when user is set; else none (localhost). Missing/wrong → 401 |
+| Residual | Same-port HTTP+WebDAV mux; Finder/Explorer not in CI |
 
 ## SMB 2.0.2 (`--smb`) — P-2 `partial`
 
-Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient` `ls`/`get` on localhost is the v1 bar.
+Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar. Password env requires signing.
 
 ```bash
 ratarmount --smb archive.tar.gz
@@ -78,9 +81,10 @@ smbclient //127.0.0.1/ratarmount -p 20445 -N -c 'get member -'
 |------|----------|
 | Ops | NEGOTIATE, SESSION_SETUP (guest or `RATARMOUNT_SMB_USER`/`RATARMOUNT_SMB_PASSWORD`), TREE_CONNECT, CREATE, READ, QUERY_DIRECTORY, CLOSE, QUERY_INFO |
 | Writes | CREATE-mkdir / WRITE / SET_INFO / DELETE only with `-w` |
-| Signing / encryption / SMB3 | **Residual** |
-| Finder / Explorer | **Residual** |
-| NTLM | Username match only — NT response is not verified |
+| Guest | Password unset: unsigned; `smbclient -N` is the bar. Username match only if `RATARMOUNT_SMB_USER` is set |
+| Password / signing | `RATARMOUNT_SMB_PASSWORD` set: NTLMv2 NT proof required; `SIGNING_REQUIRED`; HMAC-SHA256 on every request after SESSION_SETUP. Guest `-N` is off |
+| Encryption / SMB 3.1.1 | **Residual** |
+| Finder / Explorer | **Residual** (leases, create contexts; not a CI bar) |
 
 ## 9P2000.L TCP (`--ninep`) — P-7 `done`
 
@@ -91,23 +95,24 @@ mount -t 9p -o trans=tcp,port=20493,version=9p2000.L 127.0.0.1 /mnt
 
 Writes (`Tlcreate` / `Twrite` / `Tmkdir` / `Tunlinkat` / `Trenameat` / `Tsymlink`) need `-w` else `EROFS`. **Residual:** virtio-9p / vhost-user-9p.
 
-## SFTP (`--sftp`) — P-10 `partial`
+## SFTP (`--sftp`) — P-10 `done`
 
-TCP listener (not stdio `sftp-server`). Needs **`--features sftp-russh`** (russh MSRV 1.85 > workspace 1.74). Linux/macOS packages enable it. Source builds without the feature: `--sftp` **exits 2** with a rebuild hint. Default CI does not compile russh.
+TCP listener `--sftp` / `--sftp-bind` (port 22 is `--sftp-bind 22`). Stdio OpenSSH `Subsystem sftp`: `--sftp-subsystem` (SFTP v3; no SSH-2). Needs **`--features sftp-russh`** (russh MSRV 1.85 > workspace 1.74 — **feature note**, not a protocol leftover). Linux/macOS packages enable it. Source builds without the feature: `--sftp` / `--sftp-subsystem` **exit 2** with a rebuild hint. Default CI does not compile russh.
 
 ```bash
 # Packaged binary (sftp-russh compiled):
 ratarmount --sftp archive.tar.gz
 sftp -P 20222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 127.0.0.1
+# Stdio (sshd already authenticated):
+#   Subsystem sftp /path/to/ratarmount --sftp-subsystem archive.tar
 ```
 
 | Item | Behavior |
 |------|----------|
-| Auth | `authorized_keys` subset from `--sftp-authorized-keys` or `RATARMOUNT_SFTP_AUTHORIZED_KEYS`. Loopback defaults to `~/.ssh/authorized_keys`. **Non-loopback without an explicit keys file exits 2** (does not expose `$HOME` keys on `0.0.0.0`) |
+| Auth (TCP) | Public-key from `--sftp-authorized-keys` or `RATARMOUNT_SFTP_AUTHORIZED_KEYS`, and/or password from `RATARMOUNT_SFTP_USER` / `RATARMOUNT_SFTP_PASSWORD`. Loopback defaults to `~/.ssh/authorized_keys`. **Non-loopback needs an explicit keys file or password env** (else exit 2; does not expose `$HOME` keys on `0.0.0.0`) |
 | Host key | `RATARMOUNT_SFTP_HOST_KEY` or ephemeral ed25519 |
 | Protocol | SFTP v3 REALPATH, STAT/LSTAT, OPENDIR/READDIR, OPEN/READ/CLOSE, READLINK. With `-w`: MKDIR, REMOVE, RMDIR, RENAME, OPEN-write, SETSTAT size |
-| Password | Residual |
-| `--sftp-subsystem` | Residual (TCP is v1) |
+| `--sftp-subsystem` | Stdio SFTP v3; exclusive with `--sftp`; ignores bind/keys; no SSH auth |
 
 `--print-features` prints `sftp-russh: compiled` on packaged binaries.
 
