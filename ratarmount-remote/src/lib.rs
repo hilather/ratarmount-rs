@@ -38,6 +38,15 @@ pub use ftp::{
     fetch_ftp_to_temp, open_ftp_range, parse_ftp_url, redact_ftp_url, FtpLocation, FtpRangeFile,
     FtpScheme,
 };
+mod gcs;
+pub use gcs::{
+    open_gcs_folder, open_gcs_range, parse_gcs_url, GcsListing, GcsLocation, GcsRangeFile,
+};
+mod azure;
+pub use azure::{
+    open_azure_folder, open_azure_range, parse_azure_url, AzureListing, AzureLocation,
+    AzureRangeFile,
+};
 // --- end inbound protocol modules ---
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
