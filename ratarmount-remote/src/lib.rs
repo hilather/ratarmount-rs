@@ -30,6 +30,14 @@ mod smb;
 mod ssh;
 mod webdav;
 
+// --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
+mod ftp;
+pub use ftp::{
+    fetch_ftp_to_temp, open_ftp_range, parse_ftp_url, redact_ftp_url, FtpLocation, FtpRangeFile,
+    FtpScheme,
+};
+// --- end inbound protocol modules ---
+
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
