@@ -28,6 +28,11 @@ members = [
     "ratarmount-remote",
     "ratarmount-compositing",
     "ratarmount-nfs",
+    "ratarmount-export-core",
+    "ratarmount-http",
+    "ratarmount-smb",
+    "ratarmount-9p",
+    "ratarmount-sftp",
 ]
 default-members = ["ratarmount"]
 
@@ -65,6 +70,11 @@ ratarmount-formats-git = { path = "ratarmount-formats-git" }
 ratarmount-remote = { path = "ratarmount-remote" }
 ratarmount-compositing = { path = "ratarmount-compositing" }
 ratarmount-nfs = { path = "ratarmount-nfs" }
+ratarmount-export-core = { path = "ratarmount-export-core" }
+ratarmount-http = { path = "ratarmount-http" }
+ratarmount-smb = { path = "ratarmount-smb" }
+ratarmount-9p = { path = "ratarmount-9p" }
+ratarmount-sftp = { path = "ratarmount-sftp" }
 rusqlite = { version = "0.32", features = ["bundled"] }
 thiserror = "2"
 clap = { version = "4", features = ["derive", "env"] }

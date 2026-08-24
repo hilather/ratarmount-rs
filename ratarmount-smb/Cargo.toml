@@ -1,0 +1,6 @@
+[package]
+name = "ratarmount-smb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SMB/CIFS export of a ratarmount MountSource (stub)"

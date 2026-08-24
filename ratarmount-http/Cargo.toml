@@ -1,0 +1,6 @@
+[package]
+name = "ratarmount-http"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "HTTP Range export of a ratarmount MountSource (stub)"
