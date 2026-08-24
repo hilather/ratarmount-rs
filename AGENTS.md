@@ -54,6 +54,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested durable indexes (ZIP/TAR/7z structure+file table/CPIO/AR) | `cargo test -p ratarmount --bin ratarmount nested_durable` · `cargo test -p ratarmount-formats-sevenzip --lib durable_structure` · `cargo test -p ratarmount-index --lib nested` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
 | Offline `--commit-overlay` splice for `.tar.zst` (incl. earlier-frame delete) | `cargo test -p ratarmount-compositing --lib commit_overlay` |
+| Offline `.tar.zst` later-frame delete without `-i` (silent skip) | `cargo test -p ratarmount-compositing --lib commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount gzip_rgzi` · `cargo test -p ratarmount plain_gzip_rgzi` · `cargo test -p ratarmount plain_gzip` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |

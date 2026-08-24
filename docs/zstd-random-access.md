@@ -163,7 +163,9 @@ host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 no seek table) when `-w` is set. Live ticks still **reject** prefix-frame
 mutate (append-only + last-window). Offline `--commit-overlay` **is** the
 escape hatch for earlier-frame delete/replace: splice from the affected frame
-through EOF (prefix frames byte-identical). A missing `.tar.zst` on the
+through EOF (prefix frames byte-identical). Classification of that splice
+always walks past per-frame TAR EOF (the `xargs tar -c | zstd >>` shape),
+so a later-frame delete applies even when the commit command omits `-i`. A missing `.tar.zst` on the
 offline path still exits 2 without creating a file (create-if-missing is
 uncompressed `.tar` only). Interval `DURATION` is a **per-file settle time**:
 only overlay files whose host mtime is at least that old **and** that have no
