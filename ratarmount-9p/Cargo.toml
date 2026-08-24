@@ -3,4 +3,15 @@ name = "ratarmount-9p"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "9P2000.L export of a ratarmount MountSource (stub)"
+description = "9P2000.L TCP export of a ratarmount MountSource"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-export-core.workspace = true
+log.workspace = true
+libc.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+ratarmount-formats-tar.workspace = true
