@@ -54,6 +54,11 @@ mod oci;
 pub use oci::{
     fetch_oci_image, parse_docker_url, parse_oci_url, OciBlobRangeFile, OciImage, OciLayer,
     OciLocation, OCI_DOCKER_CONFIG_ENV, OCI_PASSWORD_ENV, OCI_USER_ENV,
+mod ipfs;
+pub use ipfs::{
+    ipfs_api, ipfs_gateway, open_ipfs, open_ipfs_at, open_ipfs_folder, open_ipfs_folder_at,
+    parse_ipfs_url, IpfsHandle, IpfsListing, IpfsLocation, IpfsScheme, DEFAULT_IPFS_API,
+    DEFAULT_IPFS_GATEWAY, IPFS_API_ENV, IPFS_GATEWAY_ENV,
 };
 // --- end inbound protocol modules ---
 
