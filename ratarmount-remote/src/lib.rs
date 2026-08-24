@@ -46,14 +46,17 @@ mod azure;
 pub use azure::{
     open_azure_folder, open_azure_range, parse_azure_url, AzureListing, AzureLocation,
     AzureRangeFile,
+};
 mod rclone;
 pub use rclone::{
     find_rclone, open_rclone, open_rclone_folder, parse_rclone_url, rclone_cat_args,
     rclone_lsjson_args, rclone_lsjson_stat_args, RcloneHandle, RcloneLocation, RCLONE_BIN_ENV,
+};
 mod oci;
 pub use oci::{
     fetch_oci_image, parse_docker_url, parse_oci_url, OciBlobRangeFile, OciImage, OciLayer,
     OciLocation, OCI_DOCKER_CONFIG_ENV, OCI_PASSWORD_ENV, OCI_USER_ENV,
+};
 mod ipfs;
 pub use ipfs::{
     ipfs_api, ipfs_gateway, open_ipfs, open_ipfs_at, open_ipfs_folder, open_ipfs_folder_at,
