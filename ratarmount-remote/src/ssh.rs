@@ -1150,6 +1150,130 @@ fn authenticate(
     )))
 }
 
+/// One SFTP directory entry (from `readdir` or a unit-test fixture).
+#[derive(Debug, Clone, PartialEq)]
+pub struct SshDirent {
+    pub name: String,
+    /// Remote filesystem path (parent joined with name).
+    pub path: String,
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: f64,
+}
+
+/// libssh2 `LIBSSH2_SFTP_S_IFDIR` / POSIX `S_IFDIR` bit in `FileStat.perm`.
+const SSH_S_IFMT: u32 = 0xF000;
+const SSH_S_IFDIR: u32 = 0x4000;
+
+/// Build a dirent from SFTP filename + mode bits (unit tests / mock readdir).
+pub fn ssh_dirent_from_readdir(
+    parent: &str,
+    name: &str,
+    size: u64,
+    perm: u32,
+    mtime: Option<u64>,
+) -> SshDirent {
+    let is_dir = perm & SSH_S_IFMT == SSH_S_IFDIR;
+    let path = if parent.is_empty() || parent == "." {
+        name.to_string()
+    } else if parent.ends_with('/') {
+        format!("{parent}{name}")
+    } else {
+        format!("{parent}/{name}")
+    };
+    SshDirent {
+        name: name.to_string(),
+        path,
+        is_dir,
+        size: if is_dir { 0 } else { size },
+        mtime: mtime.unwrap_or(0) as f64,
+    }
+}
+
+fn ssh_dirent_from_stat(parent: &str, name: &str, stat: &ssh2::FileStat) -> SshDirent {
+    ssh_dirent_from_readdir(
+        parent,
+        name,
+        stat.size.unwrap_or(0),
+        stat.perm.unwrap_or(0),
+        stat.mtime,
+    )
+}
+
+fn ssh_sftp_with<T>(
+    loc: &SshLocation,
+    path: &str,
+    f: impl FnOnce(&ssh2::Sftp, &str) -> Result<T>,
+) -> Result<T> {
+    let mut loc = loc.clone();
+    if !path.is_empty() {
+        loc.path = path.to_string();
+    }
+    let params = resolve_ssh_connect_default(&loc)?;
+    let mut stack = HopStack { hops: Vec::new() };
+    let dest_sess = connect_ssh_chain(&params, &mut stack)?;
+    let remote_path = if params.path.is_empty() {
+        "."
+    } else {
+        params.path.as_str()
+    };
+    let result = (|| {
+        let sftp = dest_sess
+            .sftp()
+            .map_err(|e| RemoteError::Ssh(format!("sftp: {e}")))?;
+        f(&sftp, remote_path)
+    })();
+    drop(dest_sess);
+    drop(stack);
+    result
+}
+
+/// SFTP `readdir` of `path` (or `loc.path` when `path` is empty).
+pub fn list_ssh_path(loc: &SshLocation, path: &str) -> Result<Vec<SshDirent>> {
+    ssh_sftp_with(loc, path, |sftp, remote_path| {
+        let raw = sftp
+            .readdir(Path::new(remote_path))
+            .map_err(|e| RemoteError::Ssh(format!("readdir {remote_path}: {e}")))?;
+        Ok(raw
+            .into_iter()
+            .filter_map(|(p, st)| {
+                let name = p
+                    .file_name()
+                    .map(|n| n.to_string_lossy().into_owned())
+                    .or_else(|| {
+                        p.to_str().map(|s| {
+                            s.trim_end_matches('/')
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(s)
+                                .to_string()
+                        })
+                    })
+                    .filter(|n| !n.is_empty())?;
+                if name == "." || name == ".." {
+                    return None;
+                }
+                Some(ssh_dirent_from_stat(remote_path, &name, &st))
+            })
+            .collect())
+    })
+}
+
+/// SFTP `stat` — `Ok(true)` when `path` is a directory.
+pub fn ssh_path_is_dir(loc: &SshLocation, path: &str) -> Result<bool> {
+    ssh_sftp_with(loc, path, |sftp, remote_path| {
+        let st = sftp
+            .stat(Path::new(remote_path))
+            .map_err(|e| RemoteError::Ssh(format!("stat {remote_path}: {e}")))?;
+        Ok(st.is_dir())
+    })
+}
+
+/// List `loc.path` via SFTP `readdir`.
+pub fn list_ssh_location(loc: &SshLocation) -> Result<Vec<SshDirent>> {
+    list_ssh_path(loc, &loc.path)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1700,5 +1824,41 @@ Host jump
         eprintln!(
             "skip: live ProxyJump direct-tcpip handshake has no bastion fixture in this crate"
         );
+    }
+
+    #[test]
+    fn ssh_dirent_from_readdir_parses_folder_file_mode() {
+        let dir = ssh_dirent_from_readdir("/data", "subdir", 0, SSH_S_IFDIR | 0o755, Some(10));
+        assert_eq!(dir.name, "subdir");
+        assert_eq!(dir.path, "/data/subdir");
+        assert!(dir.is_dir);
+        assert_eq!(dir.size, 0);
+        assert_eq!(dir.mtime, 10.0);
+
+        let file = ssh_dirent_from_readdir("/data/", "a.tar", 99, 0o100644, None);
+        assert_eq!(file.name, "a.tar");
+        assert_eq!(file.path, "/data/a.tar");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 99);
+    }
+
+    #[test]
+    fn ssh_readdir_folder_skips_without_sshd() {
+        let sshd = std::process::Command::new("sshd")
+            .arg("-V")
+            .output()
+            .ok()
+            .or_else(|| {
+                std::process::Command::new("/usr/sbin/sshd")
+                    .arg("-V")
+                    .output()
+                    .ok()
+            });
+        if sshd.is_none() {
+            eprintln!("skip: sshd not available for live SFTP readdir");
+            return;
+        }
+        // No in-crate sshd fixture; parse coverage is `ssh_dirent_from_readdir_parses_folder_file_mode`.
+        eprintln!("skip: live SFTP readdir has no sshd fixture in this crate");
     }
 }

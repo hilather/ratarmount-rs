@@ -31,6 +31,8 @@ mod ssh;
 mod webdav;
 
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
+mod folder;
+pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
 pub use ftp::{
     fetch_ftp_to_temp, open_ftp_range, parse_ftp_url, redact_ftp_url, FtpLocation, FtpRangeFile,
@@ -58,8 +60,8 @@ pub use dropbox::{
 pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
-    fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, S3Location, S3RangeFile,
-    DEFAULT_S3_RANGE_THRESHOLD,
+    fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, parse_s3_url_allow_prefix,
+    S3Location, S3RangeFile, DEFAULT_S3_RANGE_THRESHOLD,
 };
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,

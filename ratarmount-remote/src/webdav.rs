@@ -185,6 +185,258 @@ pub fn parse_getcontentlength(xml: &str) -> Option<u64> {
     None
 }
 
+/// One Depth-1 PROPFIND entry (href + collection flag + size).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebDavDirent {
+    pub name: String,
+    /// Request URL for this resource (`http(s)://…`).
+    pub href: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+const PROPFIND_BODY: &str = concat!(
+    r#"<?xml version="1.0" encoding="utf-8" ?>"#,
+    r#"<D:propfind xmlns:D="DAV:">"#,
+    r#"<D:prop><D:resourcetype/><D:getcontentlength/><D:getlastmodified/></D:prop>"#,
+    r#"</D:propfind>"#
+);
+
+/// Depth-0/1 PROPFIND; `depth == 0` is self only, `1` includes children.
+pub fn propfind_entries(loc: &WebDavLocation, depth: u32) -> Result<Vec<WebDavDirent>> {
+    let depth_s = if depth == 0 { "0" } else { "1" };
+    let req = ureq::request("PROPFIND", &loc.http_url)
+        .set("User-Agent", USER_AGENT)
+        .set("Depth", depth_s)
+        .set("Content-Type", "application/xml; charset=utf-8");
+    let req = apply_auth(req, loc);
+    let resp = match req.send_string(PROPFIND_BODY) {
+        Ok(r) => r,
+        Err(ureq::Error::Status(code, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(RemoteError::WebDav(format!(
+                "PROPFIND HTTP {code} for {}: {body}",
+                loc.http_url
+            )));
+        }
+        Err(e) => {
+            return Err(RemoteError::WebDav(format!(
+                "PROPFIND {} failed: {e}",
+                loc.http_url
+            )));
+        }
+    };
+    let status = resp.status();
+    if status != 207 && !(200..300).contains(&status) {
+        return Err(RemoteError::WebDav(format!(
+            "PROPFIND HTTP {status} for {}",
+            loc.http_url
+        )));
+    }
+    let body = resp
+        .into_string()
+        .map_err(|e| RemoteError::WebDav(e.to_string()))?;
+    Ok(parse_propfind_dirents(&body, &loc.http_url))
+}
+
+/// Parse a PROPFIND multistatus body into dirents (skips the self href).
+pub fn parse_propfind_dirents(xml: &str, self_url: &str) -> Vec<WebDavDirent> {
+    let self_path = href_path(self_url);
+    let mut out = Vec::new();
+    for block in xml_elem_inners(xml, "response") {
+        let Some(href) = xml_elem_text(&block, "href") else {
+            continue;
+        };
+        let href = href.trim().to_string();
+        if href.is_empty() {
+            continue;
+        }
+        let is_dir = block.to_ascii_lowercase().contains("collection");
+        let size = xml_elem_text(&block, "getcontentlength")
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let path = href_path(&href);
+        if paths_equal(&path, &self_path) {
+            continue;
+        }
+        let name = path
+            .trim_end_matches('/')
+            .rsplit('/')
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if name.is_empty() || name == "." || name == ".." {
+            continue;
+        }
+        let abs = resolve_webdav_href(self_url, &href);
+        out.push(WebDavDirent {
+            name,
+            href: abs,
+            is_dir,
+            size: if is_dir { 0 } else { size },
+        });
+    }
+    out
+}
+
+fn find_open_tag(lower: &str, from: usize, tag: &str) -> Option<usize> {
+    let mut search = from;
+    while search < lower.len() {
+        let rel = lower[search..].find(tag)?;
+        let abs = search + rel;
+        if abs == 0 {
+            search = abs + 1;
+            continue;
+        }
+        let prev = lower.as_bytes()[abs - 1];
+        let is_open = match prev {
+            b'<' => true,
+            b':' => lower[..abs]
+                .rfind('<')
+                .is_some_and(|lt| !lower[lt + 1..abs].contains(['<', '>'])),
+            _ => false,
+        };
+        if is_open {
+            return Some(abs);
+        }
+        search = abs + 1;
+    }
+    None
+}
+
+fn find_close_lt(lower: &str, from: usize, tag: &str) -> Option<usize> {
+    let mut search = from;
+    while search < lower.len() {
+        let rel = lower[search..].find(tag)?;
+        let abs = search + rel;
+        if let Some(lt) = lower[..abs].rfind("</") {
+            let between = &lower[lt + 2..abs];
+            if between.is_empty() || (between.ends_with(':') && !between.contains(['<', '>'])) {
+                return Some(lt);
+            }
+        }
+        search = abs + 1;
+    }
+    None
+}
+
+fn xml_elem_inners(xml: &str, tag: &str) -> Vec<String> {
+    let lower = xml.to_ascii_lowercase();
+    let tag = tag.to_ascii_lowercase();
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while let Some(name_at) = find_open_tag(&lower, search_from, &tag) {
+        let Some(gt) = lower[name_at..].find('>') else {
+            break;
+        };
+        let content_at = name_at + gt + 1;
+        if xml[..content_at].trim_end().ends_with("/>") {
+            search_from = content_at;
+            continue;
+        }
+        let Some(close_lt) = find_close_lt(&lower, content_at, &tag) else {
+            break;
+        };
+        out.push(xml[content_at..close_lt].to_string());
+        search_from = close_lt + 1;
+    }
+    out
+}
+
+fn xml_elem_text(xml: &str, tag: &str) -> Option<String> {
+    let lower = xml.to_ascii_lowercase();
+    let tag = tag.to_ascii_lowercase();
+    let name_at = find_open_tag(&lower, 0, &tag)?;
+    let gt = lower[name_at..].find('>')?;
+    let before_gt = xml[name_at + tag.len()..name_at + gt].trim();
+    if before_gt.ends_with('/') {
+        return None;
+    }
+    let content_at = name_at + gt + 1;
+    let end = xml[content_at..].find('<')?;
+    Some(xml[content_at..content_at + end].trim().to_string())
+}
+
+fn href_path(href: &str) -> String {
+    let trimmed = href.trim();
+    let path = if let Ok(u) = Url::parse(trimmed) {
+        u.path().to_string()
+    } else {
+        trimmed.split('?').next().unwrap_or(trimmed).to_string()
+    };
+    percent_decode_path(&path)
+}
+
+fn percent_decode_path(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
+fn paths_equal(a: &str, b: &str) -> bool {
+    let na = a.trim_end_matches('/');
+    let nb = b.trim_end_matches('/');
+    na == nb || na.is_empty() && nb.is_empty()
+}
+
+fn resolve_webdav_href(base: &str, href: &str) -> String {
+    if href.starts_with("http://") || href.starts_with("https://") {
+        return href.to_string();
+    }
+    if let Ok(base_u) = Url::parse(base) {
+        if let Ok(joined) = base_u.join(href) {
+            return joined.to_string();
+        }
+    }
+    href.to_string()
+}
+
+/// `true` when Depth-0 PROPFIND says this URL is a DAV collection.
+pub fn webdav_is_collection(loc: &WebDavLocation) -> Result<bool> {
+    match propfind_self_is_collection(loc) {
+        Ok(v) => Ok(v),
+        Err(_) if loc.http_url.ends_with('/') => Ok(true),
+        Err(e) => Err(e),
+    }
+}
+
+fn propfind_self_is_collection(loc: &WebDavLocation) -> Result<bool> {
+    let req = ureq::request("PROPFIND", &loc.http_url)
+        .set("User-Agent", USER_AGENT)
+        .set("Depth", "0")
+        .set("Content-Type", "application/xml; charset=utf-8");
+    let req = apply_auth(req, loc);
+    let resp = req
+        .send_string(PROPFIND_BODY)
+        .map_err(|e| RemoteError::WebDav(e.to_string()))?;
+    if resp.status() != 207 && !(200..300).contains(&resp.status()) {
+        return Ok(false);
+    }
+    let body = resp.into_string().unwrap_or_default();
+    Ok(body.to_ascii_lowercase().contains("collection"))
+}
+
 /// Download a WebDAV (or HTTP with Basic auth) file into a tempfile via GET.
 pub fn fetch_webdav_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_webdav_url(url_str)?;
@@ -271,5 +523,32 @@ mod unit_tests {
         assert_eq!(parse_getcontentlength(bare), Some(99));
 
         assert_eq!(parse_getcontentlength("<nope/>"), None);
+    }
+
+    #[test]
+    fn parse_propfind_dirents_folder_children() {
+        let xml = r#"<?xml version="1.0"?>
+        <D:multistatus xmlns:D="DAV:">
+          <D:response>
+            <D:href>/dir/</D:href>
+            <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
+          </D:response>
+          <D:response>
+            <D:href>/dir/a.tar</D:href>
+            <D:propstat><D:prop><D:getcontentlength>42</D:getcontentlength><D:resourcetype/></D:prop></D:propstat>
+          </D:response>
+          <D:response>
+            <D:href>/dir/sub/</D:href>
+            <D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype></D:prop></D:propstat>
+          </D:response>
+        </D:multistatus>"#;
+        let ents = parse_propfind_dirents(xml, "http://host.example/dir/");
+        assert_eq!(ents.len(), 2, "{ents:?}");
+        let file = ents.iter().find(|e| e.name == "a.tar").expect("a.tar");
+        assert!(!file.is_dir);
+        assert_eq!(file.size, 42);
+        let sub = ents.iter().find(|e| e.name == "sub").expect("sub");
+        assert!(sub.is_dir);
+        assert_eq!(sub.size, 0);
     }
 }

@@ -33,6 +33,11 @@ pub(super) fn open_remote_input(
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     use ratarmount_remote::{open_s3_range, resolve_access, RemoteAccess, RemoteHttp};
 
+    // F-1 directory mounts (s3 / ssh / webdav / http only). Files fall through.
+    if let Some(ms) = try_open_f1_folder(input)? {
+        return Ok((PathBuf::from(input), ms));
+    }
+
     // Live S3 Range I/O (parallel to HTTP Range) when GetObject Range works.
     if input.starts_with("s3://") {
         match open_s3_range(input) {
@@ -93,6 +98,24 @@ pub(super) fn open_remote_input(
     }
 }
 
+/// F-1 remote directory probe (`s3` / `ssh` / `webdav` / `http` only).
+///
+/// Returns `Ok(None)` for other schemes and for file URLs of those schemes.
+fn try_open_f1_folder(input: &str) -> Result<Option<Arc<dyn MountSource>>, String> {
+    let scheme = input
+        .split_once("://")
+        .map(|(s, _)| s)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if !matches!(
+        scheme.as_str(),
+        "s3" | "ssh" | "sftp" | "scp" | "webdav" | "webdavs" | "http" | "https"
+    ) {
+        return Ok(None);
+    }
+    ratarmount_remote::try_open_remote_folder(input).map_err(|e| e.to_string())
+}
+
 /// Dropbox folders: browse via API (list + download-on-open).
 ///
 /// Returns `Ok(None)` when `input` is not a Dropbox URL, or when it names a
@@ -130,6 +153,22 @@ mod tests {
             assert!(
                 try_open_dropbox_folder(input).unwrap().is_none(),
                 "{input} must not be treated as a Dropbox folder"
+            );
+        }
+    }
+
+    #[test]
+    fn try_open_f1_folder_ignores_non_f1_schemes() {
+        for input in [
+            "dropbox:///vault",
+            "smb://host/share/a.tar",
+            "ftp://host/dir/",
+            "/local/path",
+            "file:///tmp/x",
+        ] {
+            assert!(
+                try_open_f1_folder(input).unwrap().is_none(),
+                "{input} must not be probed as an F-1 folder"
             );
         }
     }

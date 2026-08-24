@@ -73,7 +73,19 @@ pub struct S3Location {
 }
 
 /// Parse `s3://bucket/key/with/slashes`.
+///
+/// Rejects an empty key (`s3://bucket` / `s3://bucket/`). Folder mounts use
+/// [`parse_s3_url_allow_prefix`].
 pub fn parse_s3_url(url_str: &str) -> Result<S3Location> {
+    let loc = parse_s3_url_allow_prefix(url_str)?;
+    if loc.key.is_empty() {
+        return Err(RemoteError::Url("s3 URL missing object key".into()));
+    }
+    Ok(loc)
+}
+
+/// Like [`parse_s3_url`], but an empty key is the bucket root (prefix folder).
+pub fn parse_s3_url_allow_prefix(url_str: &str) -> Result<S3Location> {
     let url = Url::parse(url_str).map_err(|e| RemoteError::Url(e.to_string()))?;
     if url.scheme() != "s3" {
         return Err(RemoteError::UnsupportedScheme(url.scheme().to_string()));
@@ -83,9 +95,6 @@ pub fn parse_s3_url(url_str: &str) -> Result<S3Location> {
         .ok_or_else(|| RemoteError::Url("s3 URL missing bucket (s3://bucket/key)".into()))?
         .to_string();
     let key = url.path().trim_start_matches('/').to_string();
-    if key.is_empty() {
-        return Err(RemoteError::Url("s3 URL missing object key".into()));
-    }
     Ok(S3Location { bucket, key })
 }
 
@@ -1094,6 +1103,384 @@ fn urlencoding_encode(s: &str) -> String {
     out
 }
 
+/// Hard cap on ListObjectsV2 keys + common prefixes (not silent truncate).
+pub const S3_LIST_KEY_CAP: usize = 100_000;
+
+/// One immediate child from ListObjectsV2 (`Contents` or `CommonPrefixes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ListEntry {
+    pub name: String,
+    /// Full object key or common-prefix string (dirs end with `/`).
+    pub key: String,
+    pub is_dir: bool,
+    pub size: u64,
+}
+
+/// One ListObjectsV2 page (continuation is the caller's job).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ListObjectsV2Page {
+    pub objects: Vec<S3ListedObject>,
+    pub common_prefixes: Vec<String>,
+    pub is_truncated: bool,
+    pub next_continuation_token: Option<String>,
+}
+
+/// A `Contents` row from ListObjectsV2 XML.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3ListedObject {
+    pub key: String,
+    pub size: u64,
+}
+
+fn s3_list_prefix(key: &str) -> String {
+    if key.is_empty() || key.ends_with('/') {
+        key.to_string()
+    } else {
+        format!("{key}/")
+    }
+}
+
+fn s3_canonical_query(params: &[(&str, &str)]) -> String {
+    let mut encoded: Vec<(String, String)> = params
+        .iter()
+        .map(|(k, v)| (urlencoding_encode(k), urlencoding_encode(v)))
+        .collect();
+    encoded.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    encoded
+        .into_iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn s3_list_request_target(bucket: &str, region: &str) -> (String, String, bool) {
+    if let Some(endpoint) = custom_endpoint() {
+        let ep = endpoint.trim_end_matches('/');
+        let (scheme, rest) = if let Some(r) = ep.strip_prefix("https://") {
+            ("https", r)
+        } else if let Some(r) = ep.strip_prefix("http://") {
+            ("http", r)
+        } else {
+            ("https", ep)
+        };
+        let host = rest.split('/').next().unwrap_or(rest).to_string();
+        (host, format!("/{bucket}"), scheme == "https")
+    } else {
+        let host = if region == "us-east-1" {
+            format!("{bucket}.s3.amazonaws.com")
+        } else {
+            format!("{bucket}.s3.{region}.amazonaws.com")
+        };
+        (host, "/".to_string(), true)
+    }
+}
+
+/// Parse a ListObjectsV2 XML body (one page). Does not follow continuation.
+pub fn parse_list_objects_v2_xml(xml: &str) -> ListObjectsV2Page {
+    let is_truncated = xml_tag_text(xml, "istruncated")
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let next_continuation_token =
+        xml_tag_text(xml, "nextcontinuationtoken").filter(|s| !s.is_empty());
+    let mut objects = Vec::new();
+    for block in xml_blocks(xml, "contents") {
+        let Some(key) = xml_tag_text(&block, "key").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let size = xml_tag_text(&block, "size")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        objects.push(S3ListedObject { key, size });
+    }
+    let mut common_prefixes = Vec::new();
+    for block in xml_blocks(xml, "commonprefixes") {
+        if let Some(p) = xml_tag_text(&block, "prefix").filter(|s| !s.is_empty()) {
+            common_prefixes.push(p);
+        }
+    }
+    ListObjectsV2Page {
+        objects,
+        common_prefixes,
+        is_truncated,
+        next_continuation_token,
+    }
+}
+
+fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
+    let lower = xml.to_ascii_lowercase();
+    let open_plain = format!("<{tag}");
+    let open_ns = format!(":{tag}");
+    let close_plain = format!("</{tag}>");
+    let close_ns = format!(":{tag}>");
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let rest = &lower[search_from..];
+        let rel = match rest.find(&open_plain) {
+            Some(i) => {
+                // `<tag` at start or after non-name char; skip `</tag`.
+                if i > 0 && rest.as_bytes()[i - 1] == b'/' {
+                    search_from += i + 1;
+                    continue;
+                }
+                i
+            }
+            None => match rest.find(&open_ns) {
+                Some(i) if i > 0 && rest.as_bytes()[i - 1] == b'<' => i,
+                _ => break,
+            },
+        };
+        let abs = search_from + rel;
+        let after_name = match lower[abs..].find('>') {
+            Some(g) => abs + g + 1,
+            None => break,
+        };
+        let close_rel = lower[after_name..].find(&close_plain).or_else(|| {
+            lower[after_name..].find(&close_ns).and_then(|i| {
+                // require `</pref:tag>`
+                let at = after_name + i;
+                lower[..at].rfind('<').map(|_| i)
+            })
+        });
+        let Some(c) = close_rel else { break };
+        let inner = xml[after_name..after_name + c].to_string();
+        out.push(inner);
+        search_from = after_name + c + 1;
+    }
+    out
+}
+
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let lower = xml.to_ascii_lowercase();
+    let mut search = 0;
+    while search < lower.len() {
+        let rest = &lower[search..];
+        let rel = rest.find(tag)?;
+        let abs = search + rel;
+        // tag name start: `<tag` or `:tag`
+        if abs == 0 {
+            search = abs + 1;
+            continue;
+        }
+        let prev = lower.as_bytes()[abs - 1];
+        if prev != b'<' && prev != b':' {
+            search = abs + 1;
+            continue;
+        }
+        let after_name = abs + tag.len();
+        let gt = lower[after_name..].find('>')?;
+        let before_gt = xml[after_name..after_name + gt].trim();
+        if before_gt.ends_with('/') {
+            search = after_name + gt + 1;
+            continue;
+        }
+        let content_at = after_name + gt + 1;
+        let end = xml[content_at..].find('<')?;
+        let text = xml[content_at..content_at + end].trim();
+        return Some(xml_unescape(text));
+    }
+    None
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+}
+
+fn s3_list_objects_v2_page(
+    bucket: &str,
+    prefix: &str,
+    continuation: Option<&str>,
+) -> Result<ListObjectsV2Page> {
+    let auth = resolve_auth()?;
+    let region = region();
+    let (host, uri_path, use_https) = s3_list_request_target(bucket, &region);
+    let mut params: Vec<(&str, &str)> =
+        vec![("list-type", "2"), ("delimiter", "/"), ("max-keys", "1000")];
+    if !prefix.is_empty() {
+        params.push(("prefix", prefix));
+    }
+    if let Some(tok) = continuation {
+        params.push(("continuation-token", tok));
+    }
+    let query = s3_canonical_query(&params);
+    let url = if use_https {
+        format!("https://{host}{uri_path}?{query}")
+    } else {
+        format!("http://{host}{uri_path}?{query}")
+    };
+    debug!("s3 ListObjectsV2 {url} (auth={:?})", auth.source);
+
+    let resp = match &auth.creds {
+        None => ureq::get(&url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+            .map_err(|e| {
+                RemoteError::S3(format!(
+                    "anonymous ListObjectsV2 s3://{bucket}/{prefix}: {e}"
+                ))
+            })?,
+        Some(creds) => {
+            let now = chrono::Utc::now();
+            let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+            let date_stamp = now.format("%Y%m%d").to_string();
+            let payload_hash = sha256_hex(b"");
+            let mut headers_to_sign: Vec<(&str, String)> = vec![
+                ("host", host.clone()),
+                ("x-amz-content-sha256", payload_hash.clone()),
+                ("x-amz-date", amz_date.clone()),
+            ];
+            if let Some(token) = &creds.session_token {
+                headers_to_sign.push(("x-amz-security-token", token.clone()));
+            }
+            headers_to_sign.sort_by(|a, b| a.0.cmp(b.0));
+            let signed_headers = headers_to_sign
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join(";");
+            let canonical_headers = headers_to_sign
+                .iter()
+                .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+                .collect::<String>();
+            let canonical_request = format!(
+                "GET\n{uri_path}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+            );
+            let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+            let string_to_sign = format!(
+                "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+                sha256_hex(canonical_request.as_bytes())
+            );
+            let signature = hex::encode(hmac_sha256(
+                &signing_key(&creds.secret_key, &date_stamp, &region, "s3"),
+                string_to_sign.as_bytes(),
+            ));
+            let authorization = format!(
+                "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+                creds.access_key
+            );
+            let mut req = ureq::get(&url)
+                .set("User-Agent", USER_AGENT)
+                .set("Authorization", &authorization)
+                .set("x-amz-content-sha256", &payload_hash)
+                .set("x-amz-date", &amz_date);
+            if let Some(token) = &creds.session_token {
+                req = req.set("x-amz-security-token", token);
+            }
+            req.call().map_err(|e| {
+                RemoteError::S3(format!("ListObjectsV2 s3://{bucket}/{prefix}: {e}"))
+            })?
+        }
+    };
+
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(RemoteError::S3(format!(
+            "ListObjectsV2 HTTP {status} for s3://{bucket}/{prefix}: {body}"
+        )));
+    }
+    let body = resp
+        .into_string()
+        .map_err(|e| RemoteError::S3(e.to_string()))?;
+    Ok(parse_list_objects_v2_xml(&body))
+}
+
+fn s3_child_entry(prefix: &str, key: &str, size: u64, is_dir: bool) -> Option<S3ListEntry> {
+    let rest = if prefix.is_empty() {
+        key
+    } else {
+        key.strip_prefix(prefix)?
+    };
+    let name = rest.trim_end_matches('/');
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(S3ListEntry {
+        name: name.to_string(),
+        key: key.to_string(),
+        is_dir,
+        size: if is_dir { 0 } else { size },
+    })
+}
+
+/// List immediate children of an S3 prefix (`Delimiter=/`), following continuation tokens.
+///
+/// Errors (does not silently truncate) when more than [`S3_LIST_KEY_CAP`] keys are listed,
+/// or when a page is truncated without `NextContinuationToken`.
+pub fn list_s3_prefix(loc: &S3Location) -> Result<Vec<S3ListEntry>> {
+    list_s3_prefix_capped(loc, S3_LIST_KEY_CAP)
+}
+
+/// ListObjectsV2 loop with an explicit key cap (tests use a small cap).
+pub fn list_s3_prefix_capped(loc: &S3Location, cap: usize) -> Result<Vec<S3ListEntry>> {
+    let prefix = s3_list_prefix(&loc.key);
+    let mut token: Option<String> = None;
+    let mut out: Vec<S3ListEntry> = Vec::new();
+    let mut total = 0usize;
+    loop {
+        let page = s3_list_objects_v2_page(&loc.bucket, &prefix, token.as_deref())?;
+        total = total.saturating_add(page.objects.len() + page.common_prefixes.len());
+        if total > cap {
+            return Err(RemoteError::S3(format!(
+                "s3 prefix too large (>{cap} keys) for s3://{}/{}; listing is not silently truncated",
+                loc.bucket, loc.key
+            )));
+        }
+        for obj in &page.objects {
+            if let Some(ent) = s3_child_entry(&prefix, &obj.key, obj.size, false) {
+                out.push(ent);
+            }
+        }
+        for cp in &page.common_prefixes {
+            if let Some(ent) = s3_child_entry(&prefix, cp, 0, true) {
+                out.push(ent);
+            }
+        }
+        if !page.is_truncated {
+            break;
+        }
+        let Some(next) = page
+            .next_continuation_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|t| !t.is_empty())
+        else {
+            return Err(RemoteError::S3(
+                "truncated ListObjectsV2 page without NextContinuationToken; listing is not complete"
+                    .into(),
+            ));
+        };
+        token = Some(next.to_string());
+    }
+    Ok(out)
+}
+
+/// Directory probe: empty key, trailing `/`, or children exist without an exact object.
+pub fn s3_location_is_dir(loc: &S3Location) -> Result<bool> {
+    if loc.key.is_empty() || loc.key.ends_with('/') {
+        return Ok(true);
+    }
+    let page = s3_list_objects_v2_page(&loc.bucket, &loc.key, None)?;
+    let has_exact = page.objects.iter().any(|o| o.key == loc.key);
+    if has_exact {
+        return Ok(false);
+    }
+    let child_prefix = s3_list_prefix(&loc.key);
+    let has_child_prefix = page
+        .common_prefixes
+        .iter()
+        .any(|p| p == &child_prefix || p.starts_with(&child_prefix));
+    let has_child_key = page
+        .objects
+        .iter()
+        .any(|o| o.key.starts_with(&child_prefix) && o.key != loc.key);
+    Ok(has_child_prefix || has_child_key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1541,6 +1928,71 @@ mod tests {
     #[test]
     fn reject_missing_key() {
         assert!(parse_s3_url("s3://only-bucket/").is_err());
+        assert!(parse_s3_url("s3://only-bucket").is_err());
+    }
+
+    #[test]
+    fn parse_s3_url_allow_prefix_empty_folder_key() {
+        let root = parse_s3_url_allow_prefix("s3://only-bucket").unwrap();
+        assert_eq!(root.bucket, "only-bucket");
+        assert!(root.key.is_empty());
+        let slash = parse_s3_url_allow_prefix("s3://only-bucket/").unwrap();
+        assert!(slash.key.is_empty());
+        let pref = parse_s3_url_allow_prefix("s3://b/prefix/").unwrap();
+        assert_eq!(pref.key, "prefix/");
+    }
+
+    #[test]
+    fn list_objects_v2_page_parse_folder_truncated() {
+        let xml = r#"<?xml version="1.0"?>
+<ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+  <Name>bucket</Name>
+  <Prefix>prefix/</Prefix>
+  <IsTruncated>true</IsTruncated>
+  <NextContinuationToken>page-2-token</NextContinuationToken>
+  <Contents>
+    <Key>prefix/a.tar</Key>
+    <Size>42</Size>
+  </Contents>
+</ListBucketResult>"#;
+        let page = parse_list_objects_v2_xml(xml);
+        assert!(page.is_truncated, "truncated page must not look complete");
+        assert_eq!(
+            page.next_continuation_token.as_deref(),
+            Some("page-2-token")
+        );
+        assert_eq!(page.objects.len(), 1);
+        assert_eq!(page.objects[0].key, "prefix/a.tar");
+        assert_eq!(page.objects[0].size, 42);
+        assert!(page.common_prefixes.is_empty());
+    }
+
+    #[test]
+    fn list_objects_v2_page_parse_folder_common_prefixes() {
+        let xml = r#"<ListBucketResult>
+  <IsTruncated>false</IsTruncated>
+  <Contents><Key>prefix/b.bin</Key><Size>7</Size></Contents>
+  <CommonPrefixes><Prefix>prefix/sub/</Prefix></CommonPrefixes>
+</ListBucketResult>"#;
+        let page = parse_list_objects_v2_xml(xml);
+        assert!(!page.is_truncated);
+        assert!(page.next_continuation_token.is_none());
+        assert_eq!(page.common_prefixes, vec!["prefix/sub/".to_string()]);
+        let kids: Vec<_> = page
+            .objects
+            .iter()
+            .filter_map(|o| s3_child_entry("prefix/", &o.key, o.size, false))
+            .chain(
+                page.common_prefixes
+                    .iter()
+                    .filter_map(|p| s3_child_entry("prefix/", p, 0, true)),
+            )
+            .collect();
+        assert_eq!(kids.len(), 2);
+        assert!(kids
+            .iter()
+            .any(|e| e.name == "b.bin" && !e.is_dir && e.size == 7));
+        assert!(kids.iter().any(|e| e.name == "sub" && e.is_dir));
     }
 
     #[test]
