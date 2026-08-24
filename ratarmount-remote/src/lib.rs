@@ -46,6 +46,10 @@ mod azure;
 pub use azure::{
     open_azure_folder, open_azure_range, parse_azure_url, AzureListing, AzureLocation,
     AzureRangeFile,
+mod rclone;
+pub use rclone::{
+    find_rclone, open_rclone, open_rclone_folder, parse_rclone_url, rclone_cat_args,
+    rclone_lsjson_args, rclone_lsjson_stat_args, RcloneHandle, RcloneLocation, RCLONE_BIN_ENV,
 };
 // --- end inbound protocol modules ---
 
