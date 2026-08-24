@@ -3,7 +3,9 @@
 use std::collections::HashMap;
 use std::io::{self, ErrorKind};
 use std::path::Path;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use russh::keys::{Algorithm, PrivateKey, PublicKey};
@@ -13,12 +15,13 @@ use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 use russh_sftp::server::Handler;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
 use ratarmount_core::{is_dir_mode, is_lnk_mode, FileInfo, MountSource};
 use ratarmount_export_core::{ExportServerHandle, ExportStop, STOP_POLL_INTERVAL};
 
-use crate::auth::{load_authorized_keys, AuthorizedKeysSource};
+use crate::auth::{load_authorized_keys, sftp_password_from_env, AuthorizedKeysSource};
 use crate::serve::{fs_from_opts, log_listen, resolved_host_key, SftpOptions};
 use crate::vfs::{sftp_permissions, unix_mtime_u32, OpenMode, RatarmountSftp, SftpHandle};
 
@@ -70,6 +73,7 @@ async fn serve_russh(
 ) -> io::Result<()> {
     let host_key = load_or_ephemeral_host_key(resolved_host_key(&opts).as_deref())?;
     let allowed = parse_pubkeys(&load_authorized_keys(&keys_src)?)?;
+    let password = Arc::new(sftp_password_from_env());
     let fs = fs_from_opts(source, &opts);
     let listener = tokio::net::TcpListener::bind(opts.bind).await?;
     let addr = listener.local_addr()?;
@@ -88,6 +92,7 @@ async fn serve_russh(
     let mut server = SftpServer {
         fs,
         allowed: Arc::new(allowed),
+        password,
     };
     let stop = opts.stop.clone();
     let run = server.run_on_socket(Arc::new(config), &listener);
@@ -169,6 +174,7 @@ fn write_host_key(path: &Path, key: &PrivateKey) -> io::Result<()> {
 struct SftpServer {
     fs: Arc<RatarmountSftp>,
     allowed: Arc<Vec<PublicKey>>,
+    password: Arc<(Option<String>, Option<String>)>,
 }
 
 impl russh::server::Server for SftpServer {
@@ -178,6 +184,7 @@ impl russh::server::Server for SftpServer {
         SshSession {
             fs: Arc::clone(&self.fs),
             allowed: Arc::clone(&self.allowed),
+            password: Arc::clone(&self.password),
             clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -186,6 +193,7 @@ impl russh::server::Server for SftpServer {
 struct SshSession {
     fs: Arc<RatarmountSftp>,
     allowed: Arc<Vec<PublicKey>>,
+    password: Arc<(Option<String>, Option<String>)>,
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
@@ -196,8 +204,12 @@ impl russh::server::Handler for SshSession {
         Ok(reject())
     }
 
-    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        Ok(reject())
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if crate::auth::password_ok(user, password, self.password.as_ref()) {
+            Ok(Auth::Accept)
+        } else {
+            Ok(reject())
+        }
     }
 
     async fn auth_publickey(
@@ -248,11 +260,7 @@ impl russh::server::Handler for SshSession {
                 return Ok(());
             };
             session.channel_success(channel_id)?;
-            let sftp = SftpSession {
-                fs: Arc::clone(&self.fs),
-                handles: HashMap::new(),
-                next: 1,
-            };
+            let sftp = SftpSession::new(Arc::clone(&self.fs));
             russh_sftp::server::run(channel.into_stream(), sftp).await;
         } else {
             session.channel_failure(channel_id)?;
@@ -268,13 +276,21 @@ fn reject() -> Auth {
     }
 }
 
-struct SftpSession {
+pub(crate) struct SftpSession {
     fs: Arc<RatarmountSftp>,
     handles: HashMap<String, SftpHandle>,
     next: u64,
 }
 
 impl SftpSession {
+    pub(crate) fn new(fs: Arc<RatarmountSftp>) -> Self {
+        Self {
+            fs,
+            handles: HashMap::new(),
+            next: 1,
+        }
+    }
+
     fn alloc_handle(&mut self, h: SftpHandle) -> String {
         let name = format!("{}", self.next);
         self.next = self.next.saturating_add(1);
@@ -548,4 +564,69 @@ impl Handler for SftpSession {
         self.fs.symlink(&linkpath, &targetpath).map_err(map_err)?;
         Ok(Self::ok(id))
     }
+}
+
+/// stdin + stdout as one `AsyncRead + AsyncWrite` for `russh_sftp::server::run`.
+struct StdioDuplex {
+    stdin: tokio::io::Stdin,
+    stdout: tokio::io::Stdout,
+    /// Signalled when the duplex is dropped (`run` returns on stdin EOF).
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl Drop for StdioDuplex {
+    fn drop(&mut self) {
+        if let Some(tx) = self.done.take() {
+            let _ = tx.send(());
+        }
+    }
+}
+
+impl AsyncRead for StdioDuplex {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdin).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for StdioDuplex {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        Pin::new(&mut self.stdout).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_shutdown(cx)
+    }
+}
+
+/// SFTP v3 on stdin/stdout. No SSH auth, bind, or keys.
+pub fn serve_stdio_russh(source: Arc<dyn MountSource>, opts: SftpOptions) -> io::Result<()> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    rt.block_on(async {
+        let fs = fs_from_opts(source, &opts);
+        let sftp = SftpSession::new(fs);
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let duplex = StdioDuplex {
+            stdin: tokio::io::stdin(),
+            stdout: tokio::io::stdout(),
+            done: Some(done_tx),
+        };
+        // `run` spawns a worker and returns; wait until stdin EOF drops the duplex.
+        russh_sftp::server::run(duplex, sftp).await;
+        let _ = done_rx.await;
+        Ok(())
+    })
 }

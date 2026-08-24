@@ -305,3 +305,38 @@ fn serve_blocking_rejects_v6() {
     let err = serve_blocking(Arc::new(EmptyFs), opts).unwrap_err();
     assert_eq!(err.kind(), io::ErrorKind::AddrNotAvailable);
 }
+
+/// Feature-gated: `russh_sftp::server::run` + TCP `SftpSession` on a UnixStream
+/// pair (no SSH handshake). INIT → VERSION.
+#[cfg(all(unix, feature = "sftp-russh"))]
+#[test]
+fn sftp_session_stdio_init_version() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("tokio rt");
+    rt.block_on(async {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (mut client, server) = tokio::net::UnixStream::pair().expect("unix pair");
+        let fs = crate::serve::fs_from_opts(Arc::new(EmptyFs), &SftpOptions::default());
+        let sftp = crate::handler::SftpSession::new(fs);
+        russh_sftp::server::run(server, sftp).await;
+        let mut init = Vec::with_capacity(9);
+        init.extend_from_slice(&5u32.to_be_bytes());
+        init.push(1); // SSH_FXP_INIT
+        init.extend_from_slice(&3u32.to_be_bytes());
+        client.write_all(&init).await.expect("write INIT");
+        let mut len_buf = [0u8; 4];
+        tokio::time::timeout(Duration::from_secs(2), client.read_exact(&mut len_buf))
+            .await
+            .expect("VERSION timeout")
+            .expect("read VERSION length");
+        let len = u32::from_be_bytes(len_buf) as usize;
+        assert!(len >= 5, "VERSION body too short: {len}");
+        let mut body = vec![0u8; len];
+        client.read_exact(&mut body).await.expect("read VERSION");
+        assert_eq!(body[0], 2, "SSH_FXP_VERSION type");
+        assert_eq!(&body[1..5], 3u32.to_be_bytes(), "SFTP version 3");
+    });
+}

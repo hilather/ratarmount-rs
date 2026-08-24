@@ -14,7 +14,8 @@ use ratarmount_export_core::{
 };
 
 use crate::auth::{
-    authorized_keys_from_env, host_key_from_env, resolve_authorized_keys, AuthPolicyError,
+    authorized_keys_from_env, host_key_from_env, resolve_authorized_keys, sftp_password_from_env,
+    AuthPolicyError, AuthorizedKeysSource,
 };
 use crate::vfs::RatarmountSftp;
 
@@ -103,12 +104,23 @@ pub(crate) fn fs_from_opts(
 
 pub(crate) fn resolved_authorized_keys(
     opts: &SftpOptions,
-) -> Result<crate::auth::AuthorizedKeysSource, AuthPolicyError> {
+) -> Result<AuthorizedKeysSource, AuthPolicyError> {
     let explicit = opts
         .authorized_keys
         .clone()
         .or_else(authorized_keys_from_env);
     resolve_authorized_keys(opts.bind, explicit.as_deref())
+}
+
+/// Non-loopback without a keys file is allowed when a password env is set.
+fn authorized_keys_for_start(opts: &SftpOptions) -> io::Result<AuthorizedKeysSource> {
+    match resolved_authorized_keys(opts) {
+        Ok(src) => Ok(src),
+        Err(AuthPolicyError::NonLoopbackNeedsKeys) if sftp_password_from_env().1.is_some() => {
+            Ok(AuthorizedKeysSource::Empty)
+        }
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg_attr(not(feature = "sftp-russh"), allow(dead_code))]
@@ -118,9 +130,15 @@ pub(crate) fn resolved_host_key(opts: &SftpOptions) -> Option<PathBuf> {
 
 fn warn_non_loopback(addr: SocketAddr) {
     if !addr.ip().is_loopback() {
-        log::warn!(
-            "SFTP bind {addr} is not loopback; public-key auth is the security boundary (password residual)"
-        );
+        if sftp_password_from_env().1.is_some() {
+            log::warn!(
+                "SFTP bind {addr} is not loopback; public-key or password auth is the security boundary"
+            );
+        } else {
+            log::warn!(
+                "SFTP bind {addr} is not loopback; public-key auth is the security boundary (password residual)"
+            );
+        }
     }
 }
 
@@ -143,7 +161,7 @@ fn feature_required() -> io::Error {
 pub fn serve_blocking(source: Arc<dyn MountSource>, opts: SftpOptions) -> io::Result<()> {
     reject_v6(opts.bind)?;
     warn_non_loopback(opts.bind);
-    let keys = resolved_authorized_keys(&opts)?;
+    let keys = authorized_keys_for_start(&opts)?;
     if !sftp_russh_compiled() {
         return Err(feature_required());
     }
@@ -165,7 +183,7 @@ pub fn spawn_sftp_thread(
 ) -> io::Result<ExportServerHandle> {
     reject_v6(opts.bind)?;
     warn_non_loopback(opts.bind);
-    let keys = resolved_authorized_keys(&opts)?;
+    let keys = authorized_keys_for_start(&opts)?;
     if !sftp_russh_compiled() {
         return Err(feature_required());
     }
@@ -176,6 +194,24 @@ pub fn spawn_sftp_thread(
     #[cfg(not(feature = "sftp-russh"))]
     {
         let _ = (source, keys);
+        Err(feature_required())
+    }
+}
+
+/// OpenSSH `Subsystem sftp` / inetd: SFTP v3 on stdin/stdout. No SSH auth.
+///
+/// Ignores `bind` / `authorized_keys` / `host_key`. Overlay still applies.
+pub fn serve_stdio(source: Arc<dyn MountSource>, opts: SftpOptions) -> io::Result<()> {
+    if !sftp_russh_compiled() {
+        return Err(feature_required());
+    }
+    #[cfg(feature = "sftp-russh")]
+    {
+        crate::handler::serve_stdio_russh(source, opts)
+    }
+    #[cfg(not(feature = "sftp-russh"))]
+    {
+        let _ = (source, opts);
         Err(feature_required())
     }
 }
@@ -234,23 +270,21 @@ mod tests {
         );
     }
 
+    const SFTP_ENV: &[&str] = &[
+        "RATARMOUNT_SFTP_AUTHORIZED_KEYS",
+        "RATARMOUNT_SFTP_USER",
+        "RATARMOUNT_SFTP_PASSWORD",
+    ];
+
     /// Regression: non-loopback without keys file is rejected before listen.
     #[test]
     fn regression_non_loopback_without_keys_file_exits() {
+        let _g = crate::auth::EnvGuard::acquire(SFTP_ENV);
         let opts = SftpOptions {
             bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
             authorized_keys: None,
             ..SftpOptions::default()
         };
-        // Hermetic: if the process env has RATARMOUNT_SFTP_AUTHORIZED_KEYS the
-        // policy allows start (then feature-gate may still fail). Clear via
-        // resolve_authorized_keys(None) which this opts path uses only when env
-        // is unset — still assert the policy helper, and serve when env is empty.
-        if authorized_keys_from_env().is_some() {
-            let err = resolve_authorized_keys(opts.bind, None).unwrap_err();
-            assert_eq!(err, AuthPolicyError::NonLoopbackNeedsKeys);
-            return;
-        }
         let err = serve_blocking(Arc::new(EmptyFs), opts).unwrap_err();
         let msg = err.to_string();
         assert!(
@@ -260,6 +294,68 @@ mod tests {
             "{msg}"
         );
         assert_eq!(err.kind(), ErrorKind::PermissionDenied);
+    }
+
+    /// Regression: non-loopback without keys or password is still rejected.
+    #[test]
+    fn regression_non_loopback_without_keys_or_password_still_rejected() {
+        let _g = crate::auth::EnvGuard::acquire(SFTP_ENV);
+        let opts = SftpOptions {
+            bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            authorized_keys: None,
+            ..SftpOptions::default()
+        };
+        match spawn_sftp_thread(Arc::new(EmptyFs), opts) {
+            Err(err) => assert_eq!(err.kind(), ErrorKind::PermissionDenied),
+            Ok(_) => panic!("expected PermissionDenied without keys or password"),
+        }
+    }
+
+    /// Regression: non-loopback is allowed when password env is set (password-only).
+    #[test]
+    fn regression_non_loopback_allowed_when_password_env_set() {
+        let _g = crate::auth::EnvGuard::acquire(SFTP_ENV);
+        _g.set("RATARMOUNT_SFTP_PASSWORD", "unit-test-secret");
+        let opts = SftpOptions {
+            bind: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+            authorized_keys: None,
+            ..SftpOptions::default()
+        };
+        #[cfg(not(feature = "sftp-russh"))]
+        {
+            let err = serve_blocking(Arc::new(EmptyFs), opts).unwrap_err();
+            assert_ne!(err.kind(), ErrorKind::PermissionDenied, "{err}");
+            assert_eq!(err.kind(), ErrorKind::Unsupported);
+            assert_eq!(err.to_string(), SFTP_RUSSH_HINT);
+        }
+        #[cfg(feature = "sftp-russh")]
+        {
+            let stop = ratarmount_export_core::ExportStop::new();
+            let opts = SftpOptions {
+                stop: Some(stop.clone()),
+                ..opts
+            };
+            let handle = spawn_sftp_thread(Arc::new(EmptyFs), opts)
+                .expect("non-loopback + password env must start");
+            stop.request_stop();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(handle.join());
+            });
+            rx.recv_timeout(std::time::Duration::from_secs(5))
+                .expect("SFTP serve stop timed out")
+                .expect("join");
+        }
+    }
+
+    #[test]
+    fn serve_stdio_without_russh_is_rebuild_hint() {
+        if sftp_russh_compiled() {
+            return;
+        }
+        let err = serve_stdio(Arc::new(EmptyFs), SftpOptions::default()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Unsupported);
+        assert_eq!(err.to_string(), SFTP_RUSSH_HINT);
     }
 
     #[test]
