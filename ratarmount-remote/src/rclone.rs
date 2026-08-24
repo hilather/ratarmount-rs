@@ -5,7 +5,8 @@
 //!
 //! - **URL:** `rclone://remote:path` (colon after the remote name). This form is
 //!   WHATWG-invalid (`Url::parse` treats `:path` as a port) so parsing is custom.
-//!   Alias: `rclone://remote/path` (slash, no colon).
+//!   Alias: `rclone://remote/path` (slash, no colon). Plus-form (no `://` required):
+//!   `rclone+remote:path` and `rclone+remote://path`. Residual: RC `--rc-serve` HTTP GET.
 //! - **File:** `rclone cat --offset --count remote:path` as a `Command` argv array
 //!   (never `sh -c`). One process per [`RcloneHandle`] open — materialize at open
 //!   so later seeks/reads do not spawn. Not RC `/operations/cat`.
@@ -145,15 +146,22 @@ pub fn open_rclone_folder(s: &str) -> Result<Option<Arc<dyn MountSource>>> {
     ))))
 }
 
-/// Parse `rclone://remote:path` without [`url::Url`] (WHATWG-invalid colon form).
+/// Parse `rclone://remote:path` or `rclone+remote:path` without [`url::Url`].
 ///
 /// - Primary: strip `rclone://`, split on the **first** `:`.
 ///   `rclone://gdrive:bucket/path` → remote=`gdrive`, path=`bucket/path`.
 /// - Alias: `rclone://remote/path` (no colon) → remote=`remote`, path=`path`.
+/// - Plus-form: strip `rclone+`; if the remainder contains `://`, split remote/path
+///   on that; else split on the first `:`. `rclone+gdrive:bucket/path` and
+///   `rclone+gdrive://bucket/path` are the same location.
 pub fn parse_rclone_url(url_str: &str) -> Result<RcloneLocation> {
+    if url_str.len() >= 7 && url_str[..7].eq_ignore_ascii_case("rclone+") {
+        let rest = &url_str[7..];
+        return parse_rclone_plus_rest(rest);
+    }
     let Some((scheme, rest)) = url_str.split_once("://") else {
         return Err(RemoteError::Url(
-            "rclone URL must start with rclone://".into(),
+            "rclone URL must start with rclone:// or rclone+".into(),
         ));
     };
     if !scheme.eq_ignore_ascii_case("rclone") {
@@ -171,6 +179,17 @@ pub fn parse_rclone_url(url_str: &str) -> Result<RcloneLocation> {
         return finish_loc(remote, path);
     }
     if let Some((remote, path)) = rest.split_once('/') {
+        return finish_loc(remote, path);
+    }
+    finish_loc(rest, "")
+}
+
+fn parse_rclone_plus_rest(rest: &str) -> Result<RcloneLocation> {
+    // Do not call Url::parse on plus-form either.
+    if let Some((remote, path)) = rest.split_once("://") {
+        return finish_loc(remote, path);
+    }
+    if let Some((remote, path)) = rest.split_once(':') {
         return finish_loc(remote, path);
     }
     finish_loc(rest, "")
@@ -765,6 +784,31 @@ esac
         assert!(err.to_string().contains("remote"));
         let err = parse_rclone_url("rclone://:path").unwrap_err();
         assert!(err.to_string().contains("remote"));
+        let err = parse_rclone_url("rclone+").unwrap_err();
+        assert!(err.to_string().contains("remote"));
+        let err = parse_rclone_url("rclone+:path").unwrap_err();
+        assert!(err.to_string().contains("remote"));
+    }
+
+    #[test]
+    fn parse_rclone_plus_form_with_and_without_slash_slash() {
+        let loc = parse_rclone_url("rclone+gdrive:bucket/path").unwrap();
+        assert_eq!(loc.remote, "gdrive");
+        assert_eq!(loc.path, "bucket/path");
+        let loc = parse_rclone_url("rclone+gdrive://bucket/path").unwrap();
+        assert_eq!(loc.remote, "gdrive");
+        assert_eq!(loc.path, "bucket/path");
+        let loc = parse_rclone_url("RCLONE+Gdrive:bucket/path").unwrap();
+        assert_eq!(loc.remote, "Gdrive");
+        assert_eq!(loc.path, "bucket/path");
+        assert!(
+            url::Url::parse("rclone+gdrive:bucket/path").is_err()
+                || url::Url::parse("rclone+gdrive:bucket/path")
+                    .ok()
+                    .map(|u| u.scheme() != "rclone")
+                    .unwrap_or(true),
+            "Url::parse must not be used for rclone+ plus-form"
+        );
     }
 
     #[test]
@@ -853,6 +897,14 @@ esac
         }) else {
             return;
         };
+        let ms = open_rclone_folder("rclone+gdrive:bucket/")
+            .unwrap()
+            .expect("rclone+ folder");
+        let plus_dents = ms.list_dirents("/").expect("plus-form dirents");
+        assert!(
+            plus_dents.iter().any(|d| d.name == "hello.txt"),
+            "{plus_dents:?}"
+        );
         let ms = open_rclone_folder("rclone://gdrive:bucket/")
             .unwrap()
             .expect("folder");

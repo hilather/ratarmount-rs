@@ -14,6 +14,7 @@ ureq = { version = "2", default-features = true, features = ["tls"] }
 url = "2"
 ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 hmac = "0.12"
+sha1 = "0.10"
 sha2 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

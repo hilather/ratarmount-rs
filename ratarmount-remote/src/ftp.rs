@@ -1,4 +1,5 @@
-//! FTP / FTPS ingest (`ftp://`, `ftps://`) with REST/SIZE Range or full RETR.
+//! FTP / FTPS ingest (`ftp://`, `ftps://`) with REST/SIZE Range or full RETR,
+//! and LIST/MLSD directory mounts via [`open_ftp_folder`].
 //!
 //! - **URL:** `ftp://[user[:pass]@]host[:port]/path` (default port 21).
 //!   `ftps://` is explicit AUTH TLS (same default port). Implicit FTPS (990) is residual.
@@ -6,11 +7,13 @@
 //!   `anonymous` / `ratarmount@`.
 //! - **Range:** `SIZE` for length + `REST offset` + `RETR` → live [`FtpRangeFile`].
 //!   If either is missing, full RETR is buffered (same shape as non-Range HTTP).
+//! - **Folder:** [`open_ftp_folder`] prefers MLSD, falls back to Unix LIST
+//!   (`RemoteListing`). [`parse_ftp_url`] still requires a file path; use
+//!   [`parse_ftp_url_allow_prefix`] when the path may be `/`.
 //! - **FTPS:** `suppaftp` rustls (explicit AUTH TLS). Roots from [`FTP_CA_FILE_ENV`] or a
 //!   system CA bundle. Do not add `native-tls`.
 //!
-//! Factory `resolve_to_local` / `UnsupportedScheme` wiring is a later PR; this module
-//! is the file MVP (`open_ftp_range`). LIST/MLSD directory mounts are residual.
+//! Factory `resolve_to_local` / `UnsupportedScheme` wiring is a later PR.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::ToSocketAddrs;
@@ -19,10 +22,15 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use log::debug;
+use ratarmount_core::{ArchiveRead, MountSource};
 use tempfile::NamedTempFile;
 use url::Url;
 
+use crate::folder::{RemoteDirent, RemoteFolderMountSource, RemoteListing};
 use crate::{RemoteError, Result};
+
+/// Hard cap on listed FTP entries (not silent truncate).
+pub const FTP_LIST_KEY_CAP: usize = 100_000;
 
 /// Env: FTP username when the URL has no userinfo.
 pub const FTP_USER_ENV: &str = "RATARMOUNT_FTP_USER";
@@ -124,7 +132,21 @@ fn redact_secret(s: &str) -> &'static str {
 }
 
 /// Parse `ftp://` / `ftps://[user[:pass]@]host[:port]/path`.
+///
+/// Empty path / `/` is an error (file ingest). Use [`parse_ftp_url_allow_prefix`]
+/// for directory mounts.
 pub fn parse_ftp_url(url_str: &str) -> Result<FtpLocation> {
+    let loc = parse_ftp_url_allow_prefix(url_str)?;
+    if loc.path.is_empty() || loc.path == "/" {
+        return Err(RemoteError::Url(
+            "ftp URL missing file path (expected ftp://host/path)".into(),
+        ));
+    }
+    Ok(loc)
+}
+
+/// Like [`parse_ftp_url`], but an empty path / `/` is the FTP root (folder mount).
+pub fn parse_ftp_url_allow_prefix(url_str: &str) -> Result<FtpLocation> {
     let url = Url::parse(url_str).map_err(|e| RemoteError::Url(e.to_string()))?;
     let scheme = match url.scheme() {
         "ftp" => FtpScheme::Ftp,
@@ -146,12 +168,6 @@ pub fn parse_ftp_url(url_str: &str) -> Result<FtpLocation> {
     let (user, password) = resolve_ftp_auth(url_user, url_pass);
 
     let path = ftp_path_from_url(&url);
-    if path.is_empty() || path == "/" {
-        return Err(RemoteError::Url(
-            "ftp URL missing file path (expected ftp://host/path)".into(),
-        ));
-    }
-
     Ok(FtpLocation {
         scheme,
         host,
@@ -537,6 +553,233 @@ impl FtpClient {
             Self::Tls(s) => s.quit().map_err(map_ftp),
         }
     }
+
+    fn cwd(&mut self, path: &str) -> Result<()> {
+        match self {
+            Self::Plain(s) => s.cwd(path).map_err(map_ftp),
+            Self::Tls(s) => s.cwd(path).map_err(map_ftp),
+        }
+    }
+
+    fn mlsd(&mut self, path: &str) -> Result<Vec<String>> {
+        let arg = ftp_list_arg(path);
+        match self {
+            Self::Plain(s) => s.mlsd(arg).map_err(map_ftp),
+            Self::Tls(s) => s.mlsd(arg).map_err(map_ftp),
+        }
+    }
+
+    fn list(&mut self, path: &str) -> Result<Vec<String>> {
+        let arg = ftp_list_arg(path);
+        match self {
+            Self::Plain(s) => s.list(arg).map_err(map_ftp),
+            Self::Tls(s) => s.list(arg).map_err(map_ftp),
+        }
+    }
+}
+
+fn ftp_list_arg(path: &str) -> Option<&str> {
+    let t = path.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t)
+    }
+}
+
+fn ftp_url_looks_like_dir(url_str: &str, loc: &FtpLocation) -> bool {
+    if loc.path.is_empty() || loc.path == "/" || loc.path.ends_with('/') {
+        return true;
+    }
+    url_str
+        .split_once("://")
+        .map(|(_, rest)| rest.ends_with('/'))
+        .unwrap_or(false)
+}
+
+fn ftp_location_is_dir(url_str: &str, loc: &FtpLocation) -> Result<bool> {
+    if ftp_url_looks_like_dir(url_str, loc) {
+        return Ok(true);
+    }
+    with_session(loc, |c| match c.size_of(&loc.path) {
+        Ok(_) => Ok(false),
+        Err(_) => match c.cwd(&loc.path) {
+            Ok(()) => Ok(true),
+            Err(_) => Ok(false),
+        },
+    })
+}
+
+fn ftp_child_path(parent: &str, name: &str) -> String {
+    let p = parent.trim_end_matches('/');
+    if p.is_empty() || p == "/" {
+        format!("/{name}")
+    } else if p.starts_with('/') {
+        format!("{p}/{name}")
+    } else {
+        format!("/{p}/{name}")
+    }
+}
+
+/// Parse one MLSD line (`type=dir|file;size=…; name`). Skip `.` / `..`.
+fn parse_mlsd_line(line: &str) -> Option<(String, bool, u64)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (facts, name) = line.split_once(' ')?;
+    let name = name.trim();
+    if name.is_empty() || name == "." || name == ".." {
+        return None;
+    }
+    let name = name
+        .rsplit('/')
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or(name)
+        .to_string();
+    let mut typ: Option<String> = None;
+    let mut size = 0u64;
+    for fact in facts.split(';') {
+        let fact = fact.trim();
+        if fact.is_empty() {
+            continue;
+        }
+        let Some((k, v)) = fact.split_once('=') else {
+            continue;
+        };
+        match k.trim().to_ascii_lowercase().as_str() {
+            "type" => typ = Some(v.trim().to_ascii_lowercase()),
+            "size" => size = v.trim().parse().unwrap_or(0),
+            _ => {}
+        }
+    }
+    let is_dir = match typ.as_deref() {
+        Some("dir") => true,
+        Some("file") => false,
+        _ => return None,
+    };
+    Some((name, is_dir, if is_dir { 0 } else { size }))
+}
+
+/// Parse one Unix LIST line. Skip blank, `total N`, and symlinks (`l`).
+fn parse_unix_list_line(line: &str) -> Option<(String, bool, u64)> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let tokens: Vec<&str> = line.split_whitespace().collect();
+    let first = *tokens.first()?;
+    if first.eq_ignore_ascii_case("total") {
+        return None;
+    }
+    let kind = first.chars().next()?;
+    let is_dir = match kind {
+        'd' => true,
+        '-' => false,
+        'l' => return None,
+        _ => return None,
+    };
+    let name = *tokens.last()?;
+    if name == "." || name == ".." || name == first {
+        return None;
+    }
+    let size = if is_dir {
+        0
+    } else if tokens.len() >= 5 {
+        tokens[4].parse().unwrap_or(0)
+    } else {
+        0
+    };
+    Some((name.to_string(), is_dir, size))
+}
+
+fn collect_ftp_dirents(lines: &[String], parent: &str, mlsd: bool) -> Result<Vec<RemoteDirent>> {
+    let mut out = Vec::new();
+    for line in lines {
+        let parsed = if mlsd {
+            parse_mlsd_line(line)
+        } else {
+            parse_unix_list_line(line)
+        };
+        let Some((name, is_dir, size)) = parsed else {
+            continue;
+        };
+        if out.len() >= FTP_LIST_KEY_CAP {
+            return Err(ftp_io(format!(
+                "ftp listing too large (>{FTP_LIST_KEY_CAP} entries) for {parent}; \
+                 listing is not silently truncated"
+            )));
+        }
+        out.push(RemoteDirent {
+            name: name.clone(),
+            remote_path: ftp_child_path(parent, &name),
+            is_dir,
+            size,
+            mtime: 0.0,
+        });
+    }
+    Ok(out)
+}
+
+struct FtpListing {
+    loc: FtpLocation,
+}
+
+impl RemoteListing for FtpListing {
+    fn list(&self, remote_path: &str) -> Result<Vec<RemoteDirent>> {
+        with_session(&self.loc, |c| {
+            let (lines, mlsd) = match c.mlsd(remote_path) {
+                Ok(lines) => (lines, true),
+                Err(e) => {
+                    debug!("FTP MLSD failed for {remote_path}: {e}; falling back to LIST");
+                    (c.list(remote_path)?, false)
+                }
+            };
+            collect_ftp_dirents(&lines, remote_path, mlsd)
+        })
+    }
+
+    fn is_dir(&self, remote_path: &str) -> Result<bool> {
+        if remote_path.is_empty() || remote_path == "/" || remote_path.ends_with('/') {
+            return Ok(true);
+        }
+        let mut loc = self.loc.clone();
+        loc.path = if remote_path.starts_with('/') {
+            remote_path.to_string()
+        } else {
+            format!("/{remote_path}")
+        };
+        ftp_location_is_dir("", &loc)
+    }
+
+    fn open_range(&self, remote_path: &str, size: u64) -> Result<Box<dyn ArchiveRead>> {
+        let mut loc = self.loc.clone();
+        loc.path = if remote_path.starts_with('/') {
+            remote_path.to_string()
+        } else {
+            format!("/{remote_path}")
+        };
+        if size > 0 {
+            Ok(Box::new(FtpRangeFile::range_backed(loc, size)))
+        } else {
+            Ok(Box::new(FtpRangeFile::open_location(&loc)?))
+        }
+    }
+}
+
+/// Open `ftp://` / `ftps://` as a remote folder when the path is a directory.
+///
+/// `Ok(None)` if the path is a file (factory should fall through to [`open_ftp_range`]).
+pub fn open_ftp_folder(s: &str) -> Result<Option<Arc<dyn MountSource>>> {
+    let loc = parse_ftp_url_allow_prefix(s)?;
+    if !ftp_location_is_dir(s, &loc)? {
+        return Ok(None);
+    }
+    Ok(Some(Arc::new(RemoteFolderMountSource::new(
+        loc.path.clone(),
+        FtpListing { loc },
+    ))))
 }
 
 fn retr_fill_plain(
@@ -709,6 +952,27 @@ mod tests {
         honor_rest: bool,
         /// If set, USER/PASS must match.
         require_user: Option<(String, String)>,
+        honor_mlsd: bool,
+        honor_list: bool,
+        honor_cwd: bool,
+        mlsd_body: String,
+        list_body: String,
+    }
+
+    impl Default for MockConfig {
+        fn default() -> Self {
+            Self {
+                body: Vec::new(),
+                honor_size: true,
+                honor_rest: true,
+                require_user: None,
+                honor_mlsd: false,
+                honor_list: false,
+                honor_cwd: true,
+                mlsd_body: String::new(),
+                list_body: String::new(),
+            }
+        }
     }
 
     impl MockFtp {
@@ -891,8 +1155,57 @@ mod tests {
                 "AUTH" => {
                     write_line(&mut stream, "502 AUTH not implemented");
                 }
+                "CWD" => {
+                    if !logged_in {
+                        write_line(&mut stream, "530 Not logged in");
+                    } else if cfg.honor_cwd {
+                        write_line(&mut stream, "250 Directory changed");
+                    } else {
+                        write_line(&mut stream, "550 Failed to change directory");
+                    }
+                }
+                "MLSD" => {
+                    if !logged_in {
+                        write_line(&mut stream, "530 Not logged in");
+                    } else if cfg.honor_mlsd {
+                        send_data_text(&mut stream, &mut data_listener, &cfg.mlsd_body);
+                    } else {
+                        write_line(&mut stream, "502 MLSD not implemented");
+                    }
+                }
+                "LIST" => {
+                    if !logged_in {
+                        write_line(&mut stream, "530 Not logged in");
+                    } else if cfg.honor_list {
+                        send_data_text(&mut stream, &mut data_listener, &cfg.list_body);
+                    } else {
+                        write_line(&mut stream, "502 LIST not implemented");
+                    }
+                }
                 _ => write_line(&mut stream, "502 Command not implemented"),
             }
+        }
+    }
+
+    fn send_data_text(stream: &mut TcpStream, data_listener: &mut Option<TcpListener>, text: &str) {
+        let Some(listener) = data_listener.take() else {
+            write_line(stream, "425 PASV required");
+            return;
+        };
+        write_line(stream, "150 Opening data connection");
+        match accept_with_timeout(&listener, Duration::from_secs(3)) {
+            Ok(mut data) => {
+                let payload = if text.ends_with('\n') {
+                    text.to_string()
+                } else {
+                    format!("{text}\r\n")
+                };
+                let _ = data.write_all(payload.as_bytes());
+                let _ = data.flush();
+                let _ = data.shutdown(Shutdown::Write);
+                write_line(stream, "226 Transfer complete");
+            }
+            Err(_) => write_line(stream, "425 Can't open data connection"),
         }
     }
 
@@ -1024,6 +1337,7 @@ mod tests {
             honor_size: true,
             honor_rest: true,
             require_user: None,
+            ..Default::default()
         });
         let url = mock.url("/blob.bin");
         let mut f = open_ftp_range(&url).unwrap();
@@ -1069,6 +1383,7 @@ mod tests {
             honor_size: false,
             honor_rest: true,
             require_user: None,
+            ..Default::default()
         });
         let mut f = open_ftp_range(&mock.url("/m.bin")).unwrap();
         assert!(!f.uses_ranges());
@@ -1090,6 +1405,7 @@ mod tests {
             honor_size: true,
             honor_rest: false,
             require_user: None,
+            ..Default::default()
         });
         let mut f = open_ftp_range(&mock.url("/n.bin")).unwrap();
         assert!(!f.uses_ranges());
@@ -1107,6 +1423,7 @@ mod tests {
             honor_size: false,
             honor_rest: false,
             require_user: None,
+            ..Default::default()
         });
         let (mut tmp, size) = fetch_ftp_to_temp(&mock.url("/t.bin")).unwrap();
         assert_eq!(size, body.len() as u64);
@@ -1124,6 +1441,7 @@ mod tests {
             honor_size: true,
             honor_rest: true,
             require_user: Some(("alice".into(), "s3cret".into())),
+            ..Default::default()
         });
         let url = mock.url_with_auth("alice", "s3cret", "/a.bin");
         let mut f = open_ftp_range(&url).unwrap();
@@ -1152,6 +1470,7 @@ mod tests {
             honor_size: true,
             honor_rest: true,
             require_user: Some(("alice".into(), "s3cret".into())),
+            ..Default::default()
         });
         let err = open_ftp_range(&mock.url_with_auth("alice", "wrong", "/x.bin")).unwrap_err();
         match err {
@@ -1189,6 +1508,7 @@ mod tests {
             honor_size: true,
             honor_rest: true,
             require_user: None,
+            ..Default::default()
         });
         let url = format!("ftps://{}/file.bin", mock.addr);
         let err = open_ftp_range(&url).unwrap_err().to_string();
@@ -1200,5 +1520,160 @@ mod tests {
             "unexpected FTPS error: {err}"
         );
         assert!(!err.contains("native-tls"), "{err}");
+    }
+
+    #[test]
+    fn parse_ftp_url_root_still_errors() {
+        let err = parse_ftp_url("ftp://h/").unwrap_err().to_string();
+        assert!(err.contains("path"), "{err}");
+        let loc = parse_ftp_url_allow_prefix("ftp://h/").unwrap();
+        assert_eq!(loc.host, "h");
+        assert_eq!(loc.path, "/");
+        let loc = parse_ftp_url_allow_prefix("ftp://files.example.com/archives/").unwrap();
+        assert_eq!(loc.path, "/archives");
+    }
+
+    #[test]
+    fn parse_ftp_mlsd_and_unix_list_lines() {
+        let (name, is_dir, size) =
+            parse_mlsd_line("type=file;size=11;modify=20260824120000; a.tar").unwrap();
+        assert_eq!(name, "a.tar");
+        assert!(!is_dir);
+        assert_eq!(size, 11);
+        let (name, is_dir, size) = parse_mlsd_line("type=dir;modify=20260824120000; sub").unwrap();
+        assert_eq!(name, "sub");
+        assert!(is_dir);
+        assert_eq!(size, 0);
+        assert!(parse_mlsd_line("type=cdir; .").is_none());
+        assert!(parse_mlsd_line("type=pdir; ..").is_none());
+
+        assert!(parse_unix_list_line("").is_none());
+        assert!(parse_unix_list_line("total 12").is_none());
+        let (name, is_dir, size) =
+            parse_unix_list_line("drwxr-xr-x  2 user group 4096 Jan 1 12:00 sub").unwrap();
+        assert_eq!(name, "sub");
+        assert!(is_dir);
+        assert_eq!(size, 0);
+        let (name, is_dir, size) =
+            parse_unix_list_line("-rw-r--r--   1 user   group    1234 Jan  1 12:00   a.tar")
+                .unwrap();
+        assert_eq!(name, "a.tar");
+        assert!(!is_dir);
+        assert_eq!(size, 1234);
+        assert!(
+            parse_unix_list_line("lrwxrwxrwx 1 user group 8 Jan 1 12:00 link -> dest").is_none()
+        );
+    }
+
+    #[test]
+    fn ftp_list_cap_errors_not_truncate() {
+        let lines: Vec<String> = (0..=FTP_LIST_KEY_CAP)
+            .map(|i| format!("type=file;size=1; f{i}"))
+            .collect();
+        let err = collect_ftp_dirents(&lines, "/", true)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("too large") || err.contains("truncated"),
+            "{err}"
+        );
+        assert!(
+            err.contains(&FTP_LIST_KEY_CAP.to_string()) || err.contains("100000"),
+            "{err}"
+        );
+    }
+
+    /// Regression: FTP directory URL lists sizes via MLSD.
+    #[test]
+    fn open_ftp_folder_lists_sizes() {
+        let _g = EnvGuard::acquire(FTP_ENV_KEYS);
+        let mlsd = concat!(
+            "type=cdir; .\r\n",
+            "type=pdir; ..\r\n",
+            "type=file;size=11; a.tar\r\n",
+            "type=dir; sub\r\n",
+            "type=file;size=7; b.bin\r\n",
+        );
+        let mock = MockFtp::spawn(MockConfig {
+            honor_size: false,
+            honor_mlsd: true,
+            honor_list: false,
+            honor_cwd: true,
+            mlsd_body: mlsd.into(),
+            ..Default::default()
+        });
+        let url = mock.url("/data/");
+        let ms = open_ftp_folder(&url)
+            .unwrap()
+            .expect("ftp folder URL should mount");
+        let dents = ms.list_dirents("/").expect("dirents");
+        assert!(
+            dents.iter().any(|d| d.name == "a.tar" && d.size == 11),
+            "{dents:?}"
+        );
+        assert!(
+            dents.iter().any(|d| d.name == "b.bin" && d.size == 7),
+            "{dents:?}"
+        );
+        assert!(dents.iter().any(|d| d.name == "sub"), "{dents:?}");
+        assert!(!dents.iter().any(|d| d.name == "." || d.name == ".."));
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("MLSD")),
+            "expected MLSD, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn open_ftp_folder_falls_back_to_unix_list() {
+        let _g = EnvGuard::acquire(FTP_ENV_KEYS);
+        let list = concat!(
+            "total 12\r\n",
+            "drwxr-xr-x 2 user group 4096 Jan 1 12:00 sub\r\n",
+            "-rw-r--r-- 1 user group   11 Jan 1 12:00 a.tar\r\n",
+            "lrwxrwxrwx 1 user group    8 Jan 1 12:00 link -> dest\r\n",
+            "\r\n",
+            "-rw-r--r--   1 user   group    7 Jan  1 12:00   b.bin\r\n",
+        );
+        let mock = MockFtp::spawn(MockConfig {
+            honor_size: false,
+            honor_mlsd: false,
+            honor_list: true,
+            honor_cwd: true,
+            list_body: list.into(),
+            ..Default::default()
+        });
+        let ms = open_ftp_folder(&mock.url("/data/"))
+            .unwrap()
+            .expect("folder");
+        let dents = ms.list_dirents("/").expect("dirents");
+        assert!(
+            dents.iter().any(|d| d.name == "a.tar" && d.size == 11),
+            "{dents:?}"
+        );
+        assert!(
+            dents.iter().any(|d| d.name == "b.bin" && d.size == 7),
+            "{dents:?}"
+        );
+        assert!(dents.iter().any(|d| d.name == "sub"), "{dents:?}");
+        assert!(!dents.iter().any(|d| d.name == "link"), "symlinks skipped");
+        let log = mock.log.lock().unwrap();
+        assert!(log.iter().any(|l| l.starts_with("LIST")), "{log:?}");
+    }
+
+    #[test]
+    fn open_ftp_folder_file_url_is_none() {
+        let _g = EnvGuard::acquire(FTP_ENV_KEYS);
+        let mock = MockFtp::spawn(MockConfig {
+            body: b"not-a-dir".to_vec(),
+            honor_size: true,
+            honor_rest: true,
+            honor_cwd: false,
+            ..Default::default()
+        });
+        assert!(
+            open_ftp_folder(&mock.url("/blob.bin")).unwrap().is_none(),
+            "file URL must return Ok(None)"
+        );
     }
 }

@@ -1,27 +1,32 @@
-//! GCS `gs://bucket/object` Range GET (XML path-style) and prefix listing (JSON).
+//! GCS `gs://bucket/object` Range GET (XML path-style) and prefix listing.
 //!
 //! # File wire
 //!
 //! XML API path-style GET: `https://storage.googleapis.com/{bucket}/{object}`
 //! with `Range`. Object names percent-encode each path segment (`/` stays).
-//! JSON `alt=media` is **not** the file MVP.
+//! JSON `alt=media` is **not** the file MVP. HMAC Range is sent unsigned.
 //!
 //! # List wire
 //!
-//! JSON `GET https://storage.googleapis.com/storage/v1/b/{bucket}/o?prefix=&delimiter=/&pageToken=`
-//! (Bearer). Loop `nextPageToken`. Cap [`GCS_LIST_KEY_CAP`] then error (not silent
+//! Bearer/ADC/IMDS: JSON
+//! `GET https://storage.googleapis.com/storage/v1/b/{bucket}/o?prefix=&delimiter=/&pageToken=`
+//! Loop `nextPageToken`. Cap [`GCS_LIST_KEY_CAP`] then error (not silent
 //! truncate).
+//!
+//! HMAC GOOG1: XML ListBucket `GET …/{bucket}?delimiter=/&prefix=&marker=&max-keys=`
+//! (query params stay on the wire **unsigned**; STS CanonicalizedResource is
+//! `/{bucket}` only). Residual: GOOG4-HMAC-SHA256 if live keys reject V2.
 //!
 //! # Auth order
 //!
 //! 1. `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` Bearer
-//! 2. `GOOGLE_APPLICATION_CREDENTIALS` service-account JSON (RS256 JWT via
+//! 2. `GOOGLE_HMAC_KEY` + `GOOGLE_HMAC_SECRET` both non-empty → GOOG1 HMAC
+//!    (**before** the ADC/IMDS token cache)
+//! 3. `GOOGLE_APPLICATION_CREDENTIALS` service-account JSON (RS256 JWT via
 //!    `jsonwebtoken` → oauth2 token, cached until expiry−120s)
-//! 3. GCE/GKE IMDS `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token`
+//! 4. GCE/GKE IMDS `http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token`
 //!    with `Metadata-Flavor: Google` (override [`GCS_IMDS_BASE_ENV`] for tests)
-//! 4. Anonymous GET if `RATARMOUNT_GCS_ANONYMOUS=1` / `CLOUDSDK_ANONYMOUS=1`
-//!
-//! HMAC `GOOGLE_HMAC_KEY`/`GOOGLE_HMAC_SECRET` (GOOG1) is residual.
+//! 5. Anonymous GET if `RATARMOUNT_GCS_ANONYMOUS=1` / `CLOUDSDK_ANONYMOUS=1`
 //!
 //! Factory `gs://` dispatch is a later PR. R2/MinIO remain S3 (`AWS_ENDPOINT_URL`).
 
@@ -29,10 +34,14 @@ use std::io::{self, Read, Seek, SeekFrom};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use hmac::{Hmac, Mac};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use log::debug;
 use ratarmount_core::{ArchiveRead, MountSource};
+use sha1::Sha1;
 use url::Url;
+
+type HmacSha1 = Hmac<Sha1>;
 
 use crate::folder::{RemoteDirent, RemoteFolderMountSource, RemoteListing};
 use crate::{parse_content_range_total, RemoteError, Result, USER_AGENT};
@@ -188,12 +197,50 @@ fn gcs_list_url(bucket: &str, prefix: &str, page_token: Option<&str>) -> String 
     url
 }
 
+/// XML ListBucket URL. Query params stay on the wire unsigned (not in the STS).
+fn gcs_xml_list_url(bucket: &str, prefix: &str, marker: Option<&str>) -> String {
+    let mut url = format!(
+        "{}/{}?delimiter=/&prefix={}&max-keys=1000",
+        api_endpoint(),
+        bucket,
+        urlencoding_encode(prefix)
+    );
+    if let Some(m) = marker.filter(|t| !t.is_empty()) {
+        url.push_str("&marker=");
+        url.push_str(&urlencoding_encode(m));
+    }
+    url
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CredSource {
     EnvToken,
+    Hmac,
     Adc,
     Imds,
     Anonymous,
+}
+
+struct HmacKeys {
+    access_id: String,
+    secret: String,
+}
+
+impl std::fmt::Debug for HmacKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HmacKeys")
+            .field("access_id", &self.access_id)
+            .field("secret", &redact_secret(&self.secret))
+            .finish()
+    }
+}
+
+fn redact_secret(s: &str) -> &'static str {
+    if s.is_empty() {
+        ""
+    } else {
+        "***"
+    }
 }
 
 struct CachedToken {
@@ -233,6 +280,7 @@ struct ResolvedAuth {
     source: CredSource,
     /// `None` = anonymous (no Authorization).
     bearer: Option<String>,
+    hmac: Option<HmacKeys>,
 }
 
 impl std::fmt::Debug for ResolvedAuth {
@@ -240,6 +288,7 @@ impl std::fmt::Debug for ResolvedAuth {
         f.debug_struct("ResolvedAuth")
             .field("source", &self.source)
             .field("bearer", &self.bearer.as_ref().map(|_| "***"))
+            .field("hmac", &self.hmac)
             .finish()
     }
 }
@@ -355,11 +404,27 @@ fn fetch_adc_token() -> Result<CachedToken> {
     exchange_jwt_for_token(&sa)
 }
 
+fn load_hmac_keys() -> Option<HmacKeys> {
+    let access_id = non_empty_env("GOOGLE_HMAC_KEY")?;
+    let secret = non_empty_env("GOOGLE_HMAC_SECRET")?;
+    Some(HmacKeys { access_id, secret })
+}
+
 fn resolve_auth() -> Result<ResolvedAuth> {
     if let Some(tok) = load_env_access_token() {
         return Ok(ResolvedAuth {
             source: CredSource::EnvToken,
             bearer: Some(tok),
+            hmac: None,
+        });
+    }
+    // HMAC before take_cached_token(): a warm ADC/IMDS cache must not shadow keys.
+    if let Some(keys) = load_hmac_keys() {
+        debug!("gcs: using HMAC GOOG1");
+        return Ok(ResolvedAuth {
+            source: CredSource::Hmac,
+            bearer: None,
+            hmac: Some(keys),
         });
     }
     if let Some((source, tok)) = take_cached_token() {
@@ -367,10 +432,14 @@ fn resolve_auth() -> Result<ResolvedAuth> {
         return Ok(ResolvedAuth {
             source,
             bearer: Some(tok),
+            hmac: None,
         });
     }
 
-    let mut tried: Vec<&str> = vec!["env CLOUDSDK_AUTH_ACCESS_TOKEN / GOOGLE_OAUTH_ACCESS_TOKEN"];
+    let mut tried: Vec<&str> = vec![
+        "env CLOUDSDK_AUTH_ACCESS_TOKEN / GOOGLE_OAUTH_ACCESS_TOKEN",
+        "GOOGLE_HMAC_KEY / GOOGLE_HMAC_SECRET",
+    ];
     let mut role_errors: Vec<String> = Vec::new();
 
     tried.push("GOOGLE_APPLICATION_CREDENTIALS ADC");
@@ -382,6 +451,7 @@ fn resolve_auth() -> Result<ResolvedAuth> {
                 return Ok(ResolvedAuth {
                     source: CredSource::Adc,
                     bearer: Some(bearer),
+                    hmac: None,
                 });
             }
             Err(e) => {
@@ -399,6 +469,7 @@ fn resolve_auth() -> Result<ResolvedAuth> {
             return Ok(ResolvedAuth {
                 source: CredSource::Imds,
                 bearer: Some(bearer),
+                hmac: None,
             });
         }
         Err(e) => {
@@ -412,12 +483,14 @@ fn resolve_auth() -> Result<ResolvedAuth> {
         return Ok(ResolvedAuth {
             source: CredSource::Anonymous,
             bearer: None,
+            hmac: None,
         });
     }
 
     let mut msg = format!(
         "no GCS credentials found for gs://; tried: {}; \
          set CLOUDSDK_AUTH_ACCESS_TOKEN / GOOGLE_OAUTH_ACCESS_TOKEN, \
+         GOOGLE_HMAC_KEY + GOOGLE_HMAC_SECRET (GOOG1), \
          GOOGLE_APPLICATION_CREDENTIALS (ADC), run on GCE/GKE with a service account, \
          or set RATARMOUNT_GCS_ANONYMOUS=1 / CLOUDSDK_ANONYMOUS=1 for public buckets",
         tried.join(", ")
@@ -428,12 +501,116 @@ fn resolve_auth() -> Result<ResolvedAuth> {
     Err(gcs_err(msg))
 }
 
-fn apply_gcs_auth(mut req: ureq::Request, auth: &ResolvedAuth) -> ureq::Request {
+/// GOOG1 string-to-sign (AWS V2). Range is not included (unsigned on the wire).
+fn goog1_string_to_sign(verb: &str, date: &str, resource: &str) -> String {
+    format!("{verb}\n\n\n{date}\n{resource}")
+}
+
+fn goog1_canonical_resource_object(bucket: &str, object: &str) -> String {
+    format!("/{bucket}/{}", encode_object_path(object))
+}
+
+fn goog1_canonical_resource_list(bucket: &str) -> String {
+    format!("/{bucket}")
+}
+
+#[cfg(test)]
+fn goog1_sts_object(bucket: &str, object: &str, date: &str, _range: Option<&str>) -> String {
+    goog1_string_to_sign(
+        "GET",
+        date,
+        &goog1_canonical_resource_object(bucket, object),
+    )
+}
+
+#[cfg(test)]
+fn goog1_sts_list(bucket: &str, date: &str) -> String {
+    goog1_string_to_sign("GET", date, &goog1_canonical_resource_list(bucket))
+}
+
+fn rfc1123_gmt(dt: chrono::DateTime<chrono::Utc>) -> String {
+    const WDAYS: [&str; 7] = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    use chrono::{Datelike, Timelike};
+    let wd = WDAYS[dt.weekday().num_days_from_monday() as usize];
+    let mon = MONTHS[(dt.month() as usize).saturating_sub(1)];
+    format!(
+        "{}, {:02} {} {:04} {:02}:{:02}:{:02} GMT",
+        wd,
+        dt.day(),
+        mon,
+        dt.year(),
+        dt.hour(),
+        dt.minute(),
+        dt.second()
+    )
+}
+
+const B64_TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+fn base64_encode(data: &[u8]) -> String {
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    let mut i = 0;
+    while i + 3 <= data.len() {
+        let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8) | (data[i + 2] as u32);
+        out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
+        out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
+        out.push(B64_TABLE[((n >> 6) & 0x3f) as usize] as char);
+        out.push(B64_TABLE[(n & 0x3f) as usize] as char);
+        i += 3;
+    }
+    match data.len() - i {
+        1 => {
+            let n = (data[i] as u32) << 16;
+            out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = ((data[i] as u32) << 16) | ((data[i + 1] as u32) << 8);
+            out.push(B64_TABLE[((n >> 18) & 0x3f) as usize] as char);
+            out.push(B64_TABLE[((n >> 12) & 0x3f) as usize] as char);
+            out.push(B64_TABLE[((n >> 6) & 0x3f) as usize] as char);
+            out.push('=');
+        }
+        _ => {}
+    }
+    out
+}
+
+fn goog1_authorization(access_id: &str, secret: &str, sts: &str) -> Result<String> {
+    let mut mac = HmacSha1::new_from_slice(secret.as_bytes())
+        .map_err(|e| gcs_err(format!("HMAC-SHA1 key: {e}")))?;
+    mac.update(sts.as_bytes());
+    let sig = base64_encode(&mac.finalize().into_bytes());
+    Ok(format!("GOOG1 {access_id}:{sig}"))
+}
+
+fn apply_gcs_auth(
+    mut req: ureq::Request,
+    auth: &ResolvedAuth,
+    verb: &str,
+    resource: &str,
+    date: &str,
+) -> Result<ureq::Request> {
     req = req.set("User-Agent", USER_AGENT);
+    if auth.source == CredSource::Hmac {
+        let keys = auth
+            .hmac
+            .as_ref()
+            .ok_or_else(|| gcs_err("HMAC auth missing keys"))?;
+        let sts = goog1_string_to_sign(verb, date, resource);
+        let hdr = goog1_authorization(&keys.access_id, &keys.secret, &sts)?;
+        req = req.set("Date", date).set("Authorization", &hdr);
+        return Ok(req);
+    }
     if let Some(tok) = &auth.bearer {
         req = req.set("Authorization", &format!("Bearer {tok}"));
     }
-    req
+    Ok(req)
 }
 
 fn gcs_status_error(source: CredSource, status: u16, loc: &GcsLocation, body: &str) -> RemoteError {
@@ -464,7 +641,10 @@ fn gcs_get_object(
         "gcs GET xml {url} (auth={:?}, range={:?})",
         auth.source, range_value
     );
-    let mut req = apply_gcs_auth(ureq::get(&url), &auth);
+    let resource = goog1_canonical_resource_object(&loc.bucket, &loc.object);
+    let date = rfc1123_gmt(chrono::Utc::now());
+    let mut req = apply_gcs_auth(ureq::get(&url), &auth, "GET", &resource, &date)?;
+    // Range is not in the STS; apply after signing.
     if let Some(ref r) = range_value {
         req = req.set("Range", r);
     }
@@ -765,9 +945,13 @@ fn parse_gcs_list_json(text: &str) -> Result<GcsListPage> {
 
 fn gcs_list_page(bucket: &str, prefix: &str, page_token: Option<&str>) -> Result<GcsListPage> {
     let auth = resolve_auth()?;
+    if auth.source == CredSource::Hmac {
+        return gcs_list_page_xml(bucket, prefix, page_token, &auth);
+    }
     let url = gcs_list_url(bucket, prefix, page_token);
     debug!("gcs LIST {url} (auth={:?})", auth.source);
-    let req = apply_gcs_auth(ureq::get(&url), &auth);
+    let date = rfc1123_gmt(chrono::Utc::now());
+    let req = apply_gcs_auth(ureq::get(&url), &auth, "GET", "", &date)?;
     let resp = req
         .call()
         .map_err(|e| gcs_err(format!("list gs://{bucket}/{prefix}: {e}")))?;
@@ -782,6 +966,152 @@ fn gcs_list_page(bucket: &str, prefix: &str, page_token: Option<&str>) -> Result
         });
     }
     parse_gcs_list_json(&body)
+}
+
+fn gcs_list_page_xml(
+    bucket: &str,
+    prefix: &str,
+    marker: Option<&str>,
+    auth: &ResolvedAuth,
+) -> Result<GcsListPage> {
+    let url = gcs_xml_list_url(bucket, prefix, marker);
+    let resource = goog1_canonical_resource_list(bucket);
+    let date = rfc1123_gmt(chrono::Utc::now());
+    debug!("gcs LIST xml {url} (auth={:?})", auth.source);
+    let req = apply_gcs_auth(ureq::get(&url), auth, "GET", &resource, &date)?;
+    let resp = req
+        .call()
+        .map_err(|e| gcs_err(format!("list gs://{bucket}/{prefix}: {e}")))?;
+    let status = resp.status();
+    let body = resp.into_string().unwrap_or_default();
+    if !(200..300).contains(&status) {
+        let msg = format!("list HTTP {status} for gs://{bucket}/{prefix}: {body}");
+        return Err(if status == 401 || status == 403 {
+            gcs_auth_err(msg)
+        } else {
+            gcs_err(msg)
+        });
+    }
+    Ok(parse_gcs_list_xml(&body))
+}
+
+/// Parse a GCS XML ListBucket body (one page). Cloned from S3 `xml_blocks` /
+/// `xml_tag_text` (no XML crate).
+fn parse_gcs_list_xml(xml: &str) -> GcsListPage {
+    let is_truncated = xml_tag_text(xml, "istruncated")
+        .map(|s| s.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let mut objects = Vec::new();
+    for block in xml_blocks(xml, "contents") {
+        let Some(name) = xml_tag_text(&block, "key").filter(|s| !s.is_empty()) else {
+            continue;
+        };
+        let size = xml_tag_text(&block, "size")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        objects.push(GcsListedObject { name, size });
+    }
+    let mut prefixes = Vec::new();
+    for block in xml_blocks(xml, "commonprefixes") {
+        if let Some(p) = xml_tag_text(&block, "prefix").filter(|s| !s.is_empty()) {
+            prefixes.push(p);
+        }
+    }
+    let next_page_token = xml_tag_text(xml, "nextmarker")
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            if is_truncated {
+                objects.last().map(|o| o.name.clone())
+            } else {
+                None
+            }
+        });
+    GcsListPage {
+        objects,
+        prefixes,
+        next_page_token,
+    }
+}
+
+fn xml_blocks(xml: &str, tag: &str) -> Vec<String> {
+    let lower = xml.to_ascii_lowercase();
+    let open_plain = format!("<{tag}");
+    let open_ns = format!(":{tag}");
+    let close_plain = format!("</{tag}>");
+    let close_ns = format!(":{tag}>");
+    let mut out = Vec::new();
+    let mut search_from = 0;
+    while search_from < lower.len() {
+        let rest = &lower[search_from..];
+        let rel = match rest.find(&open_plain) {
+            Some(i) => {
+                if i > 0 && rest.as_bytes()[i - 1] == b'/' {
+                    search_from += i + 1;
+                    continue;
+                }
+                i
+            }
+            None => match rest.find(&open_ns) {
+                Some(i) if i > 0 && rest.as_bytes()[i - 1] == b'<' => i,
+                _ => break,
+            },
+        };
+        let abs = search_from + rel;
+        let after_name = match lower[abs..].find('>') {
+            Some(g) => abs + g + 1,
+            None => break,
+        };
+        let close_rel = lower[after_name..].find(&close_plain).or_else(|| {
+            lower[after_name..].find(&close_ns).and_then(|i| {
+                let at = after_name + i;
+                lower[..at].rfind('<').map(|_| i)
+            })
+        });
+        let Some(c) = close_rel else { break };
+        let inner = xml[after_name..after_name + c].to_string();
+        out.push(inner);
+        search_from = after_name + c + 1;
+    }
+    out
+}
+
+fn xml_tag_text(xml: &str, tag: &str) -> Option<String> {
+    let lower = xml.to_ascii_lowercase();
+    let mut search = 0;
+    while search < lower.len() {
+        let rest = &lower[search..];
+        let rel = rest.find(tag)?;
+        let abs = search + rel;
+        if abs == 0 {
+            search = abs + 1;
+            continue;
+        }
+        let prev = lower.as_bytes()[abs - 1];
+        if prev != b'<' && prev != b':' {
+            search = abs + 1;
+            continue;
+        }
+        let after_name = abs + tag.len();
+        let gt = lower[after_name..].find('>')?;
+        let before_gt = xml[after_name..after_name + gt].trim();
+        if before_gt.ends_with('/') {
+            search = after_name + gt + 1;
+            continue;
+        }
+        let content_at = after_name + gt + 1;
+        let end = xml[content_at..].find('<')?;
+        let text = xml[content_at..content_at + end].trim();
+        return Some(xml_unescape(text));
+    }
+    None
+}
+
+fn xml_unescape(s: &str) -> String {
+    s.replace("&amp;", "&")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
 }
 
 fn gcs_child_entry(prefix: &str, key: &str, size: u64, is_dir: bool) -> Option<GcsListEntry> {
@@ -1006,6 +1336,8 @@ mod tests {
         "CLOUDSDK_AUTH_ACCESS_TOKEN",
         "GOOGLE_OAUTH_ACCESS_TOKEN",
         "GOOGLE_APPLICATION_CREDENTIALS",
+        "GOOGLE_HMAC_KEY",
+        "GOOGLE_HMAC_SECRET",
         "RATARMOUNT_GCS_ANONYMOUS",
         "CLOUDSDK_ANONYMOUS",
         GCS_IMDS_BASE_ENV,
@@ -1055,6 +1387,10 @@ mod tests {
         Oauth {
             body: String,
         },
+        XmlList {
+            xml: String,
+            file_body: Vec<u8>,
+        },
         NotFound,
     }
 
@@ -1083,6 +1419,7 @@ mod tests {
                         continue;
                     }
                     let mut has_auth = false;
+                    let mut auth_value: Option<String> = None;
                     let mut range_hdr: Option<String> = None;
                     let mut meta_flavor: Option<String> = None;
                     let mut content_len: usize = 0;
@@ -1097,6 +1434,9 @@ mod tests {
                         let lower = line.to_ascii_lowercase();
                         if lower.starts_with("authorization:") {
                             has_auth = true;
+                            if let Some((_, v)) = line.split_once(':') {
+                                auth_value = Some(v.trim().to_string());
+                            }
                         }
                         if let Some(rest) = lower.strip_prefix("range:") {
                             let _ = rest;
@@ -1122,6 +1462,9 @@ mod tests {
                         lg.push(request_line.trim().to_string());
                         if has_auth {
                             lg.push("Authorization: present".into());
+                            if let Some(ref v) = auth_value {
+                                lg.push(format!("Authorization-Value: {v}"));
+                            }
                         } else {
                             lg.push("Authorization: absent".into());
                         }
@@ -1286,6 +1629,56 @@ mod tests {
                                 body.len(),
                                 body
                             );
+                        }
+                        MockMode::XmlList { xml, file_body } => {
+                            if path.contains("/storage/v1/") {
+                                let msg = b"json list not used for HMAC";
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    msg.len()
+                                );
+                                let _ = stream.write_all(msg);
+                                continue;
+                            }
+                            if path.contains('?')
+                                && (path.contains("prefix=") || path.contains("delimiter="))
+                            {
+                                list_c.fetch_add(1, Ordering::SeqCst);
+                                gets_c.fetch_add(1, Ordering::SeqCst);
+                                let body = xml.as_bytes();
+                                let _ = write!(
+                                    stream,
+                                    "HTTP/1.1 200 OK\r\nContent-Type: application/xml\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(body);
+                                continue;
+                            }
+                            gets_c.fetch_add(1, Ordering::SeqCst);
+                            if let Some(ref r) = range_hdr {
+                                if let Some((start, end)) = parse_bytes_range(r, file_body.len()) {
+                                    let end = end.min(file_body.len().saturating_sub(1));
+                                    if start <= end && start < file_body.len() {
+                                        let slice = &file_body[start..=end];
+                                        let cr =
+                                            format!("bytes {}-{}/{}", start, end, file_body.len());
+                                        let _ = write!(
+                                            stream,
+                                            "HTTP/1.1 206 Partial Content\r\nContent-Range: {cr}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                            slice.len()
+                                        );
+                                        let _ = stream.write_all(slice);
+                                        continue;
+                                    }
+                                }
+                            }
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                file_body.len()
+                            );
+                            let _ = stream.write_all(file_body);
                         }
                         MockMode::NotFound => {
                             gets_c.fetch_add(1, Ordering::SeqCst);
@@ -1598,5 +1991,169 @@ c8kyOVCJusup7SdkiG+QF64=
         _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
         let none = open_gcs_folder("gs://bucket/prefix/a.tar").unwrap();
         assert!(none.is_none(), "exact object is not a folder");
+    }
+
+    const GOOG1_DATE: &str = "Mon, 24 Aug 2026 12:00:00 GMT";
+
+    #[test]
+    fn goog1_sts_object_ignores_range() {
+        let a = goog1_sts_object("bkt", "obj.bin", GOOG1_DATE, None);
+        let b = goog1_sts_object("bkt", "obj.bin", GOOG1_DATE, Some("bytes=0-99"));
+        assert_eq!(a, b);
+        assert_eq!(a, "GET\n\n\nMon, 24 Aug 2026 12:00:00 GMT\n/bkt/obj.bin");
+        assert!(!a.to_ascii_lowercase().contains("range"));
+    }
+
+    #[test]
+    fn goog1_sts_object_path_is_encode_object_path() {
+        let sts = goog1_sts_object("bkt", "a b/x", GOOG1_DATE, None);
+        let encoded = encode_object_path("a b/x");
+        assert_eq!(encoded, "a%20b/x");
+        assert_eq!(sts, format!("GET\n\n\n{GOOG1_DATE}\n/bkt/{encoded}"));
+        assert!(sts.contains("/bkt/a%20b/x"));
+        assert!(!sts.contains("/bkt/a b/x"));
+    }
+
+    #[test]
+    fn goog1_sts_list_is_bucket_only() {
+        let sts = goog1_sts_list("bkt", GOOG1_DATE);
+        assert_eq!(sts, format!("GET\n\n\n{GOOG1_DATE}\n/bkt"));
+        assert!(sts.ends_with("/bkt"));
+        assert!(!sts.contains('?'));
+        assert!(!sts.contains("prefix"));
+        assert!(!sts.contains("delimiter"));
+        assert!(!sts.contains("marker"));
+        assert!(!sts.contains("max-keys"));
+    }
+
+    /// Regression: HMAC GET sends Authorization GOOG1
+    #[test]
+    fn regression_hmac_get_sends_authorization_goog1() {
+        let body: Vec<u8> = (0u8..=255).cycle().take(512).collect();
+        let mock = MockGcs::spawn(MockMode::Object {
+            body: body.clone(),
+            require_auth: true,
+            honor_range: true,
+        });
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+
+        let mut f = open_gcs_range("gs://bkt/obj.bin").unwrap();
+        let mut got = vec![0u8; 16];
+        f.read_exact(&mut got).unwrap();
+        assert_eq!(&got, &body[..16]);
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("Authorization-Value: GOOG1 GOOG1ACCESS:")),
+            "expected GOOG1 Authorization, log={log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("supersecret")),
+            "HMAC secret leaked in mock log: {log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("Range: ")),
+            "Range must still be sent (unsigned), log={log:?}"
+        );
+    }
+
+    #[test]
+    fn hmac_secret_redacted_in_debug() {
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let auth = resolve_auth().unwrap();
+        assert_eq!(auth.source, CredSource::Hmac);
+        let dbg = format!("{auth:?}");
+        assert!(!dbg.contains("supersecret"), "secret leaked: {dbg}");
+        assert!(dbg.contains("***"), "{dbg}");
+        assert!(dbg.contains("Hmac") || dbg.contains("GOOG1ACCESS"), "{dbg}");
+    }
+
+    #[test]
+    fn hmac_list_uses_xml_not_json() {
+        let xml = concat!(
+            "<ListBucketResult>",
+            "<Contents><Key>prefix/a.tar</Key><Size>11</Size></Contents>",
+            "<CommonPrefixes><Prefix>prefix/sub/</Prefix></CommonPrefixes>",
+            "<IsTruncated>false</IsTruncated>",
+            "</ListBucketResult>"
+        );
+        let mock = MockGcs::spawn(MockMode::XmlList {
+            xml: xml.into(),
+            file_body: b"hello-world".to_vec(),
+        });
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+
+        let loc = GcsLocation {
+            bucket: "bucket".into(),
+            object: "prefix/".into(),
+        };
+        let ents = list_gcs_prefix(&loc).unwrap();
+        assert!(
+            ents.iter().any(|e| e.name == "a.tar" && e.size == 11),
+            "{ents:?}"
+        );
+        assert!(ents.iter().any(|e| e.name == "sub" && e.is_dir), "{ents:?}");
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("GET /bucket?") && l.contains("prefix=")),
+            "XML list URL should keep unsigned query, log={log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("/storage/v1/")),
+            "HMAC list must not use JSON API, log={log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("Authorization-Value: GOOG1 ")),
+            "expected GOOG1 on XML list, log={log:?}"
+        );
+        assert!(mock.list_gets.load(Ordering::SeqCst) >= 1);
+    }
+
+    #[test]
+    fn hmac_bearer_preferred_when_token_and_hmac_both_set() {
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("CLOUDSDK_AUTH_ACCESS_TOKEN", "ya29.wins");
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let auth = resolve_auth().unwrap();
+        assert_eq!(auth.source, CredSource::EnvToken);
+        assert_eq!(auth.bearer.as_deref(), Some("ya29.wins"));
+        assert!(auth.hmac.is_none());
+    }
+
+    #[test]
+    fn hmac_selected_even_if_adc_token_is_cached() {
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        store_cached_token(
+            CredSource::Adc,
+            CachedToken {
+                access_token: "ya29.cached-should-not-win".into(),
+                expiration: chrono::Utc::now() + chrono::Duration::hours(1),
+            },
+        );
+        let auth = resolve_auth().unwrap();
+        assert_eq!(auth.source, CredSource::Hmac);
+        assert!(auth.bearer.is_none());
+        assert_eq!(
+            auth.hmac.as_ref().map(|h| h.access_id.as_str()),
+            Some("GOOG1ACCESS")
+        );
     }
 }

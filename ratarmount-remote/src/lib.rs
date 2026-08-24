@@ -35,8 +35,8 @@ mod folder;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
 pub use ftp::{
-    fetch_ftp_to_temp, open_ftp_range, parse_ftp_url, redact_ftp_url, FtpLocation, FtpRangeFile,
-    FtpScheme,
+    fetch_ftp_to_temp, open_ftp_folder, open_ftp_range, parse_ftp_url, parse_ftp_url_allow_prefix,
+    redact_ftp_url, FtpLocation, FtpRangeFile, FtpScheme,
 };
 mod gcs;
 pub use gcs::{
@@ -410,7 +410,13 @@ const REMOTE_SCHEMES: &[&str] = &[
 ];
 
 /// ASCII-lowercase scheme before the first `://`, if any.
+///
+/// `rclone+remote:path` has no `://`; the `rclone+` prefix (case-insensitive)
+/// is still scheme `rclone` so [`is_remote_url`] does not treat it as a local path.
 pub fn remote_url_scheme(s: &str) -> Option<String> {
+    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("rclone+") {
+        return Some("rclone".into());
+    }
     let (scheme, _) = s.split_once("://")?;
     if scheme.is_empty() {
         return None;
@@ -1207,6 +1213,9 @@ mod tests {
         // WHATWG-invalid (colon after host-like segment) must still be remote.
         assert!(is_remote_url("rclone://gdrive:bucket/x"));
         assert!(is_remote_url("rclone://remote:path"));
+        assert!(is_remote_url("rclone+gdrive:bucket/path"));
+        assert!(is_remote_url("rclone+gdrive://bucket/path"));
+        assert!(is_remote_url("RCLONE+gdrive:bucket/path"));
         assert!(is_remote_url("docker://ubuntu:24.04"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
@@ -1243,6 +1252,28 @@ mod tests {
             Ok(_) => panic!("{URL} must not materialize via resolve_access"),
             Err(RemoteError::Oci(_)) => {}
             Err(e) => panic!("expected RemoteError::Oci, got {e}"),
+        }
+    }
+
+    #[test]
+    fn is_remote_url_rclone_plus_form() {
+        const PLUS: &str = "rclone+gdrive:bucket/path";
+        const PLUS_SLASH: &str = "rclone+gdrive://bucket/path";
+        assert_eq!(remote_url_scheme(PLUS).as_deref(), Some("rclone"));
+        assert_eq!(remote_url_scheme(PLUS_SLASH).as_deref(), Some("rclone"));
+        assert_eq!(
+            remote_url_scheme("RCLONE+gdrive:bucket/path").as_deref(),
+            Some("rclone")
+        );
+        assert!(is_remote_url(PLUS), "{PLUS} must be a remote scheme");
+        assert!(is_remote_url(PLUS_SLASH));
+        match resolve_to_local(PLUS) {
+            Ok(RemoteLocal::Local(ref p)) => {
+                panic!("{PLUS} must not resolve as local path {p:?}")
+            }
+            Ok(_) => {}
+            Err(RemoteError::Rclone(_)) | Err(RemoteError::Io(_)) | Err(RemoteError::Url(_)) => {}
+            Err(e) => panic!("unexpected error for rclone+ URL: {e}"),
         }
     }
 
