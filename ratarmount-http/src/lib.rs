@@ -18,7 +18,9 @@ pub use serve::{
     parse_http_bind, serve_blocking, serve_webdav_blocking, spawn_http_thread, spawn_webdav_thread,
     HttpOptions, DEFAULT_HTTP_BIND,
 };
-pub use webdav::{parse_webdav_bind, WebDavOptions, DEFAULT_WEBDAV_BIND};
+pub use webdav::{
+    parse_webdav_bind, webdav_credentials_from_env, WebDavOptions, DEFAULT_WEBDAV_BIND,
+};
 
 #[cfg(test)]
 mod tests;

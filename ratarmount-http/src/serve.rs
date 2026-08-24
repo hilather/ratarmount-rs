@@ -13,7 +13,7 @@ use ratarmount_export_core::{
 };
 
 use crate::handler::{handle_connection, HttpState};
-use crate::webdav::WebDavOptions;
+use crate::webdav::{webdav_credentials_from_env, LockTable, WebDavOptions};
 
 /// Default `--http-bind` (`127.0.0.1:20491`).
 pub const DEFAULT_HTTP_BIND: SocketAddr =
@@ -82,9 +82,15 @@ fn access_label(opts: &HttpOptions) -> &'static str {
 fn warn_non_loopback(addr: SocketAddr, webdav: bool) {
     if !addr.ip().is_loopback() {
         if webdav {
-            log::warn!(
-                "WebDAV bind {addr} is not loopback; PROPFIND/GET/PUT has no auth (localhost is the security boundary)"
-            );
+            if webdav_credentials_from_env().0.is_some() {
+                log::warn!(
+                    "WebDAV bind {addr} is not loopback; Basic auth is required (RATARMOUNT_WEBDAV_USER)"
+                );
+            } else {
+                log::warn!(
+                    "WebDAV bind {addr} is not loopback; PROPFIND/GET/PUT has no auth (localhost is the security boundary)"
+                );
+            }
         } else {
             log::warn!(
                 "HTTP bind {addr} is not loopback; GET/HEAD has no auth (localhost is the security boundary)"
@@ -109,8 +115,13 @@ fn log_listen(addr: SocketAddr, opts: &HttpOptions) {
     let ip = addr.ip();
     let port = addr.port();
     if opts.webdav {
+        let auth = if webdav_credentials_from_env().0.is_some() {
+            "Basic auth"
+        } else {
+            "auth none"
+        };
         log::info!(
-            "WebDAV listening on {ip}:{port} ({access}). PROPFIND Depth 0/1; GET/HEAD Range; writes need overlay (-w)"
+            "WebDAV listening on {ip}:{port} ({access}, {auth}). PROPFIND Depth 0/1; GET/HEAD Range; LOCK/COPY; writes need overlay (-w)"
         );
     } else {
         log::info!(
@@ -124,11 +135,19 @@ fn serve_listener(
     source: Arc<dyn MountSource>,
     opts: HttpOptions,
 ) -> io::Result<()> {
+    let basic = if opts.webdav {
+        let (user, pass) = webdav_credentials_from_env();
+        user.map(|u| (u, pass.unwrap_or_default()))
+    } else {
+        None
+    };
     let state = Arc::new(HttpState {
         source,
         chunk: fill_chunk(&opts),
         overlay: opts.overlay.clone(),
         webdav: opts.webdav,
+        locks: std::sync::Mutex::new(LockTable::default()),
+        basic,
     });
     match &opts.stop {
         None => {

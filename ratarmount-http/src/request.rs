@@ -1,9 +1,10 @@
 //! HTTP/1.1 request line / headers, URL path, and `Range` (no httparse).
 
+use std::fmt;
 use std::io;
 
 /// Parsed origin-form request (GET/HEAD plus WebDAV when enabled).
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct HttpRequest {
     pub method: Method,
     pub path: String,
@@ -12,6 +13,28 @@ pub(crate) struct HttpRequest {
     pub content_length: Option<u64>,
     pub destination: Option<String>,
     pub overwrite: Option<String>,
+    pub if_header: Option<String>,
+    pub lock_token: Option<String>,
+    pub authorization: Option<String>,
+    pub timeout: Option<String>,
+}
+
+impl fmt::Debug for HttpRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HttpRequest")
+            .field("method", &self.method)
+            .field("path", &self.path)
+            .field("range", &self.range)
+            .field("depth", &self.depth)
+            .field("content_length", &self.content_length)
+            .field("destination", &self.destination)
+            .field("overwrite", &self.overwrite)
+            .field("if_header", &self.if_header)
+            .field("lock_token", &self.lock_token)
+            .field("authorization", &self.authorization.as_ref().map(|_| "***"))
+            .field("timeout", &self.timeout)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,6 +47,10 @@ pub(crate) enum Method {
     Delete,
     Mkcol,
     Move,
+    Lock,
+    Unlock,
+    Copy,
+    Proppatch,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -77,6 +104,10 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
         "DELETE" => Method::Delete,
         "MKCOL" => Method::Mkcol,
         "MOVE" => Method::Move,
+        "LOCK" => Method::Lock,
+        "UNLOCK" => Method::Unlock,
+        "COPY" => Method::Copy,
+        "PROPPATCH" => Method::Proppatch,
         other => {
             return Err(io::Error::new(
                 io::ErrorKind::Unsupported,
@@ -95,6 +126,10 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
     let mut content_length = None;
     let mut destination = None;
     let mut overwrite = None;
+    let mut if_header = None;
+    let mut lock_token = None;
+    let mut authorization = None;
+    let mut timeout = None;
     for line in lines {
         let line = line.trim_end_matches('\r').trim();
         if line.is_empty() {
@@ -117,6 +152,14 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
             destination = Some(value.to_string());
         } else if name.eq_ignore_ascii_case("overwrite") && overwrite.is_none() {
             overwrite = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("if") && if_header.is_none() {
+            if_header = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("lock-token") && lock_token.is_none() {
+            lock_token = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("authorization") && authorization.is_none() {
+            authorization = Some(value.to_string());
+        } else if name.eq_ignore_ascii_case("timeout") && timeout.is_none() {
+            timeout = Some(value.to_string());
         }
     }
     Ok(HttpRequest {
@@ -127,7 +170,50 @@ pub(crate) fn parse_request(header_block: &[u8]) -> io::Result<HttpRequest> {
         content_length,
         destination,
         overwrite,
+        if_header,
+        lock_token,
+        authorization,
+        timeout,
     })
+}
+
+/// Collect every opaque state token from a WebDAV `If` header (RFC 4918).
+///
+/// `If: <t1> <t2>` and tagged `</src> (<t1>) </dest> (<t2>)` both yield two
+/// tokens. Resource tags (`</path>`, `http(s)://…`) are skipped. Does not stop
+/// at the first match.
+pub(crate) fn collect_if_tokens(header: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let bytes = header.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'<' {
+            if let Some(rel_end) = bytes[i + 1..].iter().position(|&c| c == b'>') {
+                let inner = header[i + 1..i + 1 + rel_end].trim();
+                i += rel_end + 2;
+                if inner.is_empty() || is_if_resource_tag(inner) {
+                    continue;
+                }
+                out.push(inner.to_string());
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+fn is_if_resource_tag(inner: &str) -> bool {
+    inner.starts_with('/') || inner.contains("://")
+}
+
+/// Strip optional `<>` around a `Lock-Token` header value.
+pub(crate) fn normalize_lock_token(s: &str) -> String {
+    s.trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim()
+        .to_string()
 }
 
 /// RFC 3986 unreserved + encode the rest of a path segment.
@@ -390,5 +476,50 @@ mod tests {
             resolve_range(Some("bytes=0-0"), 0),
             ResolvedRange::Unsatisfiable
         );
+    }
+
+    #[test]
+    fn if_header_collects_all_opaque_tokens() {
+        let two = collect_if_tokens("<t1> <t2>");
+        assert_eq!(two, vec!["t1".to_string(), "t2".to_string()]);
+        let tagged =
+            collect_if_tokens("</src> (<opaquelocktoken:aaa>) </dest> (<opaquelocktoken:bbb>)");
+        assert_eq!(
+            tagged,
+            vec![
+                "opaquelocktoken:aaa".to_string(),
+                "opaquelocktoken:bbb".to_string()
+            ]
+        );
+        let url_tagged = collect_if_tokens("<http://host/src> (<t1>) <https://host/dest> (<t2>)");
+        assert_eq!(url_tagged, vec!["t1".to_string(), "t2".to_string()]);
+        assert!(collect_if_tokens("</only/path>").is_empty());
+    }
+
+    #[test]
+    fn parse_lock_copy_proppatch_headers() {
+        let req = parse_request(
+            b"LOCK /hello.txt HTTP/1.1\r\nDepth: 0\r\nIf: <t1> <t2>\r\nLock-Token: <opaquelocktoken:abc>\r\nAuthorization: Basic dXNlcjpwYXNz\r\nTimeout: Second-600\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(req.method, Method::Lock);
+        assert_eq!(req.depth.as_deref(), Some("0"));
+        assert_eq!(req.if_header.as_deref(), Some("<t1> <t2>"));
+        assert_eq!(req.lock_token.as_deref(), Some("<opaquelocktoken:abc>"));
+        assert_eq!(req.authorization.as_deref(), Some("Basic dXNlcjpwYXNz"));
+        assert_eq!(req.timeout.as_deref(), Some("Second-600"));
+        let dbg = format!("{req:?}");
+        assert!(
+            !dbg.contains("dXNlcjpwYXNz"),
+            "Authorization redacted: {dbg}"
+        );
+        assert!(dbg.contains("authorization"), "debug has field: {dbg}");
+
+        let copy = parse_request(b"COPY /a HTTP/1.1\r\nDestination: /b\r\n\r\n").unwrap();
+        assert_eq!(copy.method, Method::Copy);
+        let patch = parse_request(b"PROPPATCH /a HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(patch.method, Method::Proppatch);
+        let unlock = parse_request(b"UNLOCK /a HTTP/1.1\r\n\r\n").unwrap();
+        assert_eq!(unlock.method, Method::Unlock);
     }
 }
