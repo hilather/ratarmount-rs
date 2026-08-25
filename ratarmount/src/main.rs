@@ -1501,6 +1501,7 @@ fn run_exports(
                     overlay_arc.as_deref(),
                     live_archive.as_deref(),
                     commit_on_exit,
+                    &open_opts,
                 );
                 if let Err(e) = serve_err {
                     eprintln!("error starting SFTP stdio server: {e}");
@@ -1521,6 +1522,7 @@ fn run_exports(
                 overlay_arc.as_deref(),
                 live_archive.as_deref(),
                 commit_on_exit,
+                &open_opts,
             );
         }
         Some(mp) => {
@@ -1549,6 +1551,7 @@ fn run_exports(
                     overlay_arc.as_deref(),
                     live_archive.as_deref(),
                     commit_on_exit,
+                    &open_opts,
                 );
                 if let Err(e) = mount_err {
                     eprintln!("error mounting at {}: {e}", mp.display());
@@ -1595,6 +1598,7 @@ fn run_exports(
                         overlay_arc.as_deref(),
                         live_archive.as_deref(),
                         commit_on_exit,
+                        &open_opts,
                     );
                     if let Err(e) = mount_err {
                         let _ = std::fs::write(
@@ -1669,7 +1673,7 @@ fn run_nfs_only(
     if let (Some(ov), Some(archive), Some(dur)) =
         (overlay.clone(), live_archive.clone(), commit_interval)
     {
-        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop), open_opts);
+        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop), open_opts.clone());
     }
     eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
     let serve_err = serve_nfs_blocking(source, opts);
@@ -1677,6 +1681,7 @@ fn run_nfs_only(
         overlay.as_deref(),
         live_archive.as_deref(),
         commit_on_exit,
+        &open_opts,
     );
     if let Err(e) = serve_err {
         eprintln!("error starting NFS server: {e}");
@@ -1743,6 +1748,7 @@ fn run_fuse_and_nfs(
             overlay_arc.as_deref(),
             live_archive.as_deref(),
             commit_on_exit,
+            &open_opts,
         );
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
@@ -1811,6 +1817,7 @@ fn run_fuse_and_nfs(
                 overlay_arc.as_deref(),
                 live_archive.as_deref(),
                 commit_on_exit,
+                &open_opts,
             );
             if let Err(e) = mount_err {
                 let _ = std::fs::write(
@@ -1860,6 +1867,7 @@ fn run_fuse_only(
             overlay_arc.as_deref(),
             live_archive.as_deref(),
             commit_on_exit,
+            &open_opts,
         );
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
@@ -1891,7 +1899,7 @@ fn run_fuse_only(
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)
             {
-                overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts);
+                overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
             }
             let mount_err = mount_blocking(
                 source,
@@ -1906,6 +1914,7 @@ fn run_fuse_only(
                 overlay_arc.as_deref(),
                 live_archive.as_deref(),
                 commit_on_exit,
+                &open_opts,
             );
             if let Err(e) = mount_err {
                 let _ = std::fs::write(

@@ -397,6 +397,108 @@ fn commit_overlay_on_exit_sigterm_tar_zst_cmp() {
     );
 }
 
+/// Regression: on-exit splice must patch the sibling sidecar so the next
+/// remount without `-c` is warm (tarstats match; no prefix-frame decode).
+#[test]
+fn live_commit_on_exit_remount_tar_zst() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected_new = dir.path().join("expected-new.bin");
+    fs::write(&expected_new, format!("p-{}\n", std::process::id())).unwrap();
+    let old = b"keep-zst\n";
+    let last = b"last-frame\n";
+    let zst = write_split_tar_zst(dir.path(), &[("old.txt", old)], &[("last.txt", last)]);
+    let map = ratarmount_compress::scan_zstd_frames_path(&zst).unwrap();
+    let prefix_end = map.frames.last().unwrap().compressed_offset as usize;
+    let prefix_bytes = fs::read(&zst).unwrap()[..prefix_end].to_vec();
+
+    // Cold-index once so a sibling sidecar exists (default `{archive}.index.sqlite`).
+    let index_out = Command::new(bin())
+        .args(["--no-mount", "-f"])
+        .arg(&zst)
+        .output()
+        .expect("cold index");
+    assert!(
+        index_out.status.success(),
+        "cold index: {}",
+        String::from_utf8_lossy(&index_out.stderr)
+    );
+    let sidecar = {
+        let mut s = zst.as_os_str().to_os_string();
+        s.push(".index.sqlite");
+        PathBuf::from(s)
+    };
+    assert!(sidecar.is_file(), "sidecar after --no-mount");
+    let cold = String::from_utf8_lossy(&index_out.stdout);
+    assert!(
+        cold.contains("Creating offset dictionary"),
+        "first open is a full parse: {cold}"
+    );
+
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .arg("--commit-overlay-on-exit")
+        .arg(&zst)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn ratarmount");
+
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(8)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("new.bin"), fs::read(&expected_new).unwrap()).unwrap();
+
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success() || status.code() == Some(0) || status.code().is_none(),
+        "SIGTERM exit: {status:?} log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let after = fs::read(&zst).unwrap();
+    assert_eq!(
+        &after[..prefix_end],
+        prefix_bytes.as_slice(),
+        "prefix frames must stay byte-identical after on-exit splice"
+    );
+
+    let remount = Command::new(bin())
+        .args(["--no-mount", "-f"])
+        .arg(&zst)
+        .output()
+        .expect("remount without -c");
+    let remount_out = format!(
+        "{}{}",
+        String::from_utf8_lossy(&remount.stdout),
+        String::from_utf8_lossy(&remount.stderr)
+    );
+    assert!(
+        remount.status.success(),
+        "remount without -c: {remount_out}"
+    );
+    assert!(
+        remount_out.contains("Successfully loaded offset dictionary"),
+        "remount must warm-open patched sidecar: {remount_out}"
+    );
+    assert!(
+        !remount_out.contains("Creating offset dictionary"),
+        "remount without -c must not full-parse: {remount_out}"
+    );
+}
+
 fn write_empty_zip(path: &Path) {
     let mut bytes = vec![0u8; 22];
     bytes[0] = 0x50;

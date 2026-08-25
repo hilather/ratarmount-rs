@@ -11,8 +11,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratarmount_compositing::{
-    classify_createable_archive, maybe_create_empty_write_archive, EmptyArchiveKind,
-    EmptyCreateOutcome, WriteOverlay,
+    classify_createable_archive, maybe_create_empty_write_archive, patch_sidecar_if_present,
+    sidecar_path_for_patch, EmptyArchiveKind, EmptyCreateOutcome, WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
@@ -145,7 +145,11 @@ pub fn spawn_interval_commits(
             if term_requested() || stop.as_ref().is_some_and(|s| s.is_stopped()) {
                 return;
             }
+            let ov = Arc::clone(&overlay);
             match overlay.commit_live_idle(&archive, interval, |p| {
+                if let Some(window) = ov.last_patch_window() {
+                    patch_sidecar_if_present(p, &window, &opts)?;
+                }
                 reopen_live_archive(p, &opts).map_err(ratarmount_compositing::OverlayError::Msg)
             }) {
                 Ok(true) => log::info!(
@@ -168,20 +172,49 @@ pub fn apply_live_commit(
     if reopen_and_reset {
         overlay
             .commit_live(archive, |p| {
+                if let Some(window) = overlay.last_patch_window() {
+                    patch_sidecar_if_present(p, &window, opts)?;
+                }
                 reopen_live_archive(p, opts).map_err(ratarmount_compositing::OverlayError::Msg)
             })
             .map_err(|e| e.to_string())
     } else {
-        overlay.commit_atomic(archive).map_err(|e| e.to_string())
+        let did = overlay.commit_atomic(archive).map_err(|e| e.to_string())?;
+        if did {
+            if let Some(window) = overlay.last_patch_window() {
+                patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(did)
     }
 }
 
 fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, String> {
     let mut o = opts.clone();
-    // Interval swap must not fight the on-disk index / stale zstdblocks.
-    o.index_in_memory = true;
+    let sidecar = sidecar_path_for_patch(archive, &o);
+    // Stop forcing in-memory rebuild when a patched sibling exists (K3).
+    if sidecar.is_none() {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        o.index_in_memory = true;
+    }
     match detect_compression(archive) {
         Ok(CompressionFormat::None) => {
+            if let Some(idx) = sidecar.as_ref() {
+                let mut materialised = None;
+                match SqliteIndexedTar::open_with_existing_index(
+                    archive,
+                    archive,
+                    idx,
+                    o.clone(),
+                    &mut materialised,
+                ) {
+                    Ok(tar) => return Ok(Arc::new(tar) as Arc<dyn MountSource>),
+                    Err(e) => {
+                        log::info!("incremental reindex skipped ({e}); rebuilding");
+                        o.index_in_memory = true;
+                    }
+                }
+            }
             let mut materialised = None;
             let tar = SqliteIndexedTar::create_index(
                 archive,
@@ -196,10 +229,26 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
         }
         Ok(CompressionFormat::Zstd) => {
             // Fresh scan / seek table — do not go through factory::open_zstd
-            // (that would import stale zstdblocks from before persist).
+            // (that would import stale zstdblocks from before persist). After
+            // patch, zstdblocks are new and open_with_existing_index_body may
+            // import them (K6).
             let threads = o.threads_for("zstd");
             let body = open_seekable_zstd_with_threads(archive, threads)
                 .map_err(|e| format!("reopen .tar.zst after live commit: {e}"))?;
+            if let Some(idx) = sidecar.as_ref() {
+                match SqliteIndexedTar::open_with_existing_index_body(
+                    archive,
+                    Arc::clone(&body),
+                    idx,
+                    o.clone(),
+                ) {
+                    Ok(tar) => return Ok(Arc::new(tar) as Arc<dyn MountSource>),
+                    Err(e) => {
+                        log::info!("incremental reindex skipped ({e}); rebuilding");
+                        o.index_in_memory = true;
+                    }
+                }
+            }
             let tar = SqliteIndexedTar::create_index_body(
                 archive,
                 body,
@@ -312,14 +361,19 @@ fn maybe_warn_large_zstd_last_frame(archive: &Path) -> bool {
     }
 }
 
-pub fn maybe_commit_on_exit(overlay: Option<&WriteOverlay>, archive: Option<&Path>, enabled: bool) {
+pub fn maybe_commit_on_exit(
+    overlay: Option<&WriteOverlay>,
+    archive: Option<&Path>,
+    enabled: bool,
+    opts: &OpenOptions,
+) {
     if !enabled {
         return;
     }
     let (Some(ov), Some(path)) = (overlay, archive) else {
         return;
     };
-    match apply_live_commit(ov, path, false, &OpenOptions::default()) {
+    match apply_live_commit(ov, path, false, opts) {
         Ok(true) => eprintln!("committed write overlay into {}", path.display()),
         Ok(false) => log::debug!("on-exit overlay commit: nothing to do"),
         Err(e) => eprintln!("error: on-exit overlay commit failed: {e}"),
@@ -384,6 +438,107 @@ mod tests {
         ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
         let zst = ratarmount_compress::encode_zstd_frame(&tar, 3).unwrap();
         std::fs::write(path, zst).unwrap();
+    }
+
+    fn write_split_tar_zst(path: &std::path::Path, prefix: &[u8], last: &[u8]) {
+        fn member<'a>(path: &'a str, bytes: &'a [u8]) -> ratarmount_formats_tar::UstarMember<'a> {
+            ratarmount_formats_tar::UstarMember {
+                path,
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }
+        }
+        let mut f0 = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut f0, &[member("prefix.txt", prefix)])
+            .unwrap();
+        let mut f1 = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut f1, &[member("last.txt", last)]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut f1).unwrap();
+        let mut out = Vec::new();
+        out.extend(ratarmount_compress::encode_zstd_frame(&f0, 3).unwrap());
+        out.extend(ratarmount_compress::encode_zstd_frame(&f1, 3).unwrap());
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Regression: on-exit persist patches the sibling sidecar so remount
+    /// without `-c` is warm (tarstats match; no prefix-frame decode).
+    #[test]
+    fn live_commit_on_exit_remount_uses_patched_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = b"keep-prefix\n";
+        let last = b"last-frame\n";
+        let extra = b"on-exit-new\n";
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(&archive, prefix, last);
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd_with_threads(&archive, 1).expect("open zstd");
+            let _ = SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                env!("CARGO_PKG_VERSION"),
+            )
+            .expect("create sidecar");
+        }
+        let map_before = scan_zstd_frames_path(&archive).unwrap();
+        let prefix_end = map_before.frames.last().unwrap().compressed_offset as usize;
+        let prefix_bytes = std::fs::read(&archive).unwrap()[..prefix_end].to_vec();
+
+        let overlay_dir = dir.path().join("ov");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        let body = open_seekable_zstd_with_threads(&archive, 1).expect("open zstd");
+        let base = SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions::default(),
+        )
+        .expect("warm base");
+        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap();
+        std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
+
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            ..OpenOptions::default()
+        };
+        assert!(
+            apply_live_commit(&ov, &archive, false, &opts).expect("on-exit persist"),
+            "expected persist"
+        );
+
+        let after = std::fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix frames must stay byte-identical"
+        );
+
+        let idx = ratarmount_index::SqliteIndex::open_read_only(&sidecar).expect("patched sidecar");
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("on-exit patch must bump tarstats");
+
+        // Remount without `-c`: warm-open the patched sidecar (no create_index_body).
+        let body = open_seekable_zstd_with_threads(&archive, 1).expect("fresh zstd");
+        let remount = SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions::default(),
+        )
+        .expect("remount without -c must use patched sidecar");
+        let fi = remount.lookup("/new.bin", 0).expect("new member indexed");
+        let got = remount.read(&fi, extra.len(), 0).expect("read new");
+        assert_eq!(got, extra);
+        let pfi = remount.lookup("/prefix.txt", 0).expect("prefix member");
+        assert_eq!(
+            remount.read(&pfi, prefix.len(), 0).expect("read prefix"),
+            prefix
+        );
     }
 
     #[test]

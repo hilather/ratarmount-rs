@@ -16,9 +16,9 @@ use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
 use flate2::Compression as GzCompression;
 use ratarmount_compress::{
-    body_looks_like_tar, decode_zstd_frames_to, detect_compression, materialize,
-    open_seekable_zstd, scan_zstd_frames_path, splice_zstd_last_frames_replace, CompressionFormat,
-    ZstdFrameMap, DEFAULT_MEMORY_CAP,
+    body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
+    materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
+    splice_zstd_last_frames_replace, CompressionFormat, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
     create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
@@ -26,7 +26,10 @@ use ratarmount_core::{
 };
 use ratarmount_formats_tar::{
     find_last_tar_eof, rewrite_tar_suffix, window_has_member_boundary, RewriteTarSuffix,
-    UstarMember, UstarPayload,
+    SqliteIndexedTar, UstarMember, UstarPayload,
+};
+use ratarmount_index::{
+    fill_content_hashes, resolve_index_location, IndexLocation, SqliteIndex, MEMORY_INDEX,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -61,6 +64,21 @@ pub enum OverlayError {
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
 
+/// Where an archive mutation invalidated the 0.7.x file table.
+///
+/// Persist stashes this on [`WriteOverlay`]; interval closures already capture
+/// `Arc<WriteOverlay>` and can read it. The `commit_live` reopen callback stays
+/// `FnOnce(&Path)` (K20).
+#[derive(Clone, Debug)]
+pub struct IndexPatchWindow {
+    /// Uncompressed TAR byte offset; delete + reparse from here.
+    pub window_start: u64,
+    /// First zstd frame index rewritten (`None` = uncompressed TAR).
+    pub from_frame: Option<usize>,
+    /// `true` when GNU tar `--delete` may have shifted later members.
+    pub offsets_shifted: bool,
+}
+
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     base: Arc<dyn MountSource>,
@@ -84,6 +102,8 @@ pub struct WriteOverlay {
     write_fds: Mutex<HashMap<i32, String>>,
     /// TAR member-name encoding (`-e`); live `.tar.zst` persist. Default utf-8.
     encoding: String,
+    /// Last successful persist window for incremental sidecar patch (F-2).
+    last_patch_window: Mutex<Option<IndexPatchWindow>>,
 }
 
 impl WriteOverlay {
@@ -115,6 +135,7 @@ impl WriteOverlay {
             commit_generation: std::sync::atomic::AtomicU64::new(0),
             write_fds: Mutex::new(HashMap::new()),
             encoding: "utf-8".into(),
+            last_patch_window: Mutex::new(None),
         })
     }
 
@@ -131,6 +152,18 @@ impl WriteOverlay {
     /// True after persist-ok + reopen-err; further interval ticks must remount.
     pub fn interval_disabled(&self) -> bool {
         self.interval_disabled.load(Ordering::SeqCst)
+    }
+
+    /// Uncompressed rewrite window from the last successful persist (F-2).
+    pub fn last_patch_window(&self) -> Option<IndexPatchWindow> {
+        self.last_patch_window
+            .lock()
+            .expect("overlay patch window")
+            .clone()
+    }
+
+    fn stash_patch_window(&self, window: IndexPatchWindow) {
+        *self.last_patch_window.lock().expect("overlay patch window") = Some(window);
     }
 
     fn current_base(&self) -> Arc<dyn MountSource> {
@@ -598,7 +631,8 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        self.persist_by_format(archive, format, &plan)?;
+        let window = self.persist_by_format(archive, format, &plan)?;
+        self.stash_patch_window(window);
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
@@ -679,7 +713,8 @@ impl WriteOverlay {
         if plan.is_empty() {
             return Ok(false);
         }
-        self.persist_by_format(archive, format, &plan)?;
+        let window = self.persist_by_format(archive, format, &plan)?;
+        self.stash_patch_window(window);
         match reopen(archive) {
             Ok(src) => {
                 *self.replacement.write().expect("overlay replacement") = Some(src);
@@ -793,7 +828,7 @@ impl WriteOverlay {
         archive: &Path,
         format: CompressionFormat,
         plan: &OverlayCommitPlan,
-    ) -> Result<()> {
+    ) -> Result<IndexPatchWindow> {
         match format {
             CompressionFormat::Zstd => self.persist_tar_zst_plan(archive, plan),
             _ => self.persist_uncompressed_tar_plan(archive, plan),
@@ -801,7 +836,11 @@ impl WriteOverlay {
     }
 
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
-    fn persist_tar_zst_plan(&self, archive: &Path, plan: &OverlayCommitPlan) -> Result<()> {
+    fn persist_tar_zst_plan(
+        &self,
+        archive: &Path,
+        plan: &OverlayCommitPlan,
+    ) -> Result<IndexPatchWindow> {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let (from_idx, rewrite_window_start_uncomp) =
             find_last_n_tar_window(archive, &map, "live")?;
@@ -828,7 +867,11 @@ impl WriteOverlay {
             rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
         })
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
-        Ok(())
+        Ok(IndexPatchWindow {
+            window_start: rewrite_window_start_uncomp,
+            from_frame: Some(from_idx),
+            offsets_shifted: false,
+        })
     }
 
     fn collect_ustar_pending(
@@ -860,7 +903,11 @@ impl WriteOverlay {
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
-    ) -> Result<()> {
+    ) -> Result<IndexPatchWindow> {
+        // Record GNU `--append` window from the two-zero EOF **before** tar runs.
+        // `metadata().len()` includes EOF padding; parse would start after the
+        // appended members.
+        let window = uncompressed_patch_window(archive, self.current_base().as_ref(), plan)?;
         let parent = archive.parent().filter(|p| !p.as_os_str().is_empty());
         let mut tmp = match parent {
             Some(dir) => tempfile::NamedTempFile::new_in(dir)?,
@@ -933,7 +980,7 @@ impl WriteOverlay {
                 e.error
             ))
         })?;
-        Ok(())
+        Ok(window)
     }
 
     /// Remove overlay files (except the hidden DB) and clear deletion/present rows.
@@ -966,6 +1013,148 @@ impl WriteOverlay {
             userdata: vec![UserData::Other(format!("overlay:{path}"))],
         })
     }
+}
+
+/// Existing on-disk sidecar persist may patch. Never created here (`:memory:` → `None`).
+pub fn sidecar_path_for_patch(archive: &Path, opts: &OpenOptions) -> Option<PathBuf> {
+    if opts.index_in_memory {
+        return None;
+    }
+    let explicit = opts
+        .index_file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    if explicit
+        .as_deref()
+        .is_some_and(|s| s.trim() == MEMORY_INDEX)
+    {
+        return None;
+    }
+    match resolve_index_location(archive, explicit.as_deref(), &opts.index_folders, false) {
+        IndexLocation::Memory => None,
+        IndexLocation::Path(p) if p.is_file() => Some(p),
+        IndexLocation::Path(_) => None,
+    }
+}
+
+/// Patch `{archive}.index.sqlite` (or `--index-file`) after persist. No-op when missing.
+///
+/// One `BEGIN IMMEDIATE` around delete + suffix parse + tarstats + `set_zstd_blocks`.
+/// Never [`SqliteIndex::create_writable`]. Parse-time zstd is a fresh frame scan
+/// ([`open_seekable_zstd_with_threads`]), never pre-splice `zstdblocks`.
+pub fn patch_sidecar_if_present(
+    archive: &Path,
+    window: &IndexPatchWindow,
+    opts: &OpenOptions,
+) -> Result<()> {
+    let Some(sidecar) = sidecar_path_for_patch(archive, opts) else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    let idx = SqliteIndex::open_writable(&sidecar).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    idx.begin_write()
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let format = detect_live_commit_format(archive)?;
+    let stats = match format {
+        CompressionFormat::Zstd => {
+            let threads = opts.threads_for("zstd");
+            let body = open_seekable_zstd_with_threads(archive, threads)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            let mut reader = body
+                .open_reader()
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            SqliteIndexedTar::patch_index_from(
+                &mut reader,
+                &idx,
+                opts,
+                window.window_start,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .map_err(|e| OverlayError::Msg(e.to_string()))?
+        }
+        _ => {
+            let mut file = File::open(archive)?;
+            SqliteIndexedTar::patch_index_from(
+                &mut file,
+                &idx,
+                opts,
+                window.window_start,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .map_err(|e| OverlayError::Msg(e.to_string()))?
+        }
+    };
+    idx.store_tarstats_for_path(archive)
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    if format == CompressionFormat::Zstd {
+        let blocks = export_zstd_blocks(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+        let i64_blocks: Vec<(i64, i64)> =
+            blocks.iter().map(|&(c, d)| (c as i64, d as i64)).collect();
+        idx.set_zstd_blocks(&i64_blocks)
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    }
+    if !opts.hashes.is_empty() && format == CompressionFormat::None {
+        fill_content_hashes(&idx, archive, &opts.hashes)
+            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    }
+    idx.commit_write()
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    log::info!(
+        "incremental reindex {} window_start={} deleted={} inserted={} parse_start={}",
+        archive.display(),
+        window.window_start,
+        stats.rows_deleted,
+        stats.rows_inserted,
+        stats.parse_start
+    );
+    Ok(())
+}
+
+fn uncompressed_patch_window(
+    archive: &Path,
+    base: &dyn MountSource,
+    plan: &OverlayCommitPlan,
+) -> Result<IndexPatchWindow> {
+    let mut window_start = 0u64;
+    let mut offsets_shifted = false;
+    if !plan.deleted_paths.is_empty() {
+        if let Some(min_oh) = min_deleted_offsetheader(base, &plan.deleted_paths) {
+            window_start = min_oh;
+            offsets_shifted = true;
+        }
+    }
+    let eof = {
+        let mut old = File::open(archive)?;
+        find_last_tar_eof(&mut old, 0)?.unwrap_or(0)
+    };
+    if !plan.append_entries.is_empty() {
+        if offsets_shifted {
+            window_start = window_start.min(eof);
+        } else {
+            window_start = eof;
+        }
+    }
+    Ok(IndexPatchWindow {
+        window_start,
+        from_frame: None,
+        offsets_shifted,
+    })
+}
+
+fn min_deleted_offsetheader(base: &dyn MountSource, deleted: &HashSet<String>) -> Option<u64> {
+    let mut min_oh: Option<u64> = None;
+    for path in deleted {
+        let Ok(ohs) = all_tar_offsetheaders(base, path) else {
+            continue;
+        };
+        for oh in ohs {
+            min_oh = Some(match min_oh {
+                Some(m) => m.min(oh),
+                None => oh,
+            });
+        }
+    }
+    min_oh
 }
 
 impl MountSource for WriteOverlay {
@@ -2073,6 +2262,21 @@ fn commit_overlay_tar_zst(
         rewrite_tar_suffix(&mut suffix, stream_offset, &rewrite, &mut out).map(|_| ())
     })
     .map_err(|e| OverlayError::Msg(e.to_string()))?;
+
+    let window = IndexPatchWindow {
+        window_start: map.frames[from_idx].uncompressed_offset,
+        from_frame: Some(from_idx),
+        offsets_shifted: false,
+    };
+    // Sibling only: do not create a sidecar; do not hunt XDG (K3 / offline).
+    let patch_opts = OpenOptions {
+        encoding: opts.encoding.clone(),
+        ignore_zeros: opts.ignore_zeros,
+        write_index: false,
+        index_folders: vec![PathBuf::new()],
+        ..OpenOptions::default()
+    };
+    patch_sidecar_if_present(tar_file, &window, &patch_opts)?;
 
     if opts.debug >= 1 {
         let prefix = map.frames[from_idx].compressed_offset;
@@ -3312,6 +3516,81 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
     }
 
+    /// Regression: offline --commit-overlay patches an existing sibling sidecar
+    /// (does not create one when missing).
+    #[test]
+    fn commit_overlay_tar_zst_patches_existing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-patch-prefix");
+        let last = generated_payload("off-patch-last");
+        let extra = generated_payload("off-patch-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let prefix_end = map.frames.last().unwrap().compressed_offset as usize;
+        let prefix_bytes = before[..prefix_end].to_vec();
+
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd(&archive).expect("open zstd");
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                "test",
+            )
+            .expect("create sidecar");
+        }
+        assert!(sidecar.is_file(), "pre-existing sidecar");
+        let idx_before = fs::metadata(&sidecar).unwrap();
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+
+        assert!(
+            sidecar.is_file(),
+            "must patch existing sidecar, not delete it"
+        );
+        let idx_after = fs::metadata(&sidecar).unwrap();
+        assert!(
+            idx_after.len() > 0,
+            "sidecar must remain a real SQLite file"
+        );
+        let _ = idx_before;
+
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix frames must stay byte-identical"
+        );
+
+        let idx = ratarmount_index::SqliteIndex::open_read_only(&sidecar).expect("open patched");
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("patched tarstats must match spliced archive");
+
+        let body = open_seekable_zstd(&archive).expect("fresh zstd");
+        let src = ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions::default(),
+        )
+        .expect("warm-open patched sidecar");
+        assert_eq!(read_member(&src, "/prefix.txt"), prefix);
+        assert_eq!(read_member(&src, "/last.txt"), last);
+        assert_eq!(read_member(&src, "/new.txt"), extra);
+    }
+
     #[test]
     fn commit_overlay_tar_zst_single_frame_fallback() {
         let dir = tempfile::tempdir().unwrap();
@@ -3923,6 +4202,57 @@ mod tests {
         assert_eq!(new_count2, 1, "second tick must not duplicate: {text2}");
     }
 
+    /// Regression: GNU `tar --append` patch window is `find_last_tar_eof`, not
+    /// `metadata().len()` (EOF padding would skip the new members).
+    #[test]
+    fn live_commit_gnu_append_window_is_eof_not_len() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
+        let file_len = fs::metadata(&tar).unwrap().len();
+        let eof = {
+            let mut f = File::open(&tar).unwrap();
+            find_last_tar_eof(&mut f, 0).unwrap().unwrap_or(0)
+        };
+        assert!(
+            eof < file_len,
+            "GNU tar pads past the two-zero EOF: eof={eof} len={file_len}"
+        );
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let mut materialised = None;
+        let base = ratarmount_formats_tar::SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &opts,
+            "test",
+            &mut materialised,
+        )
+        .expect("index tar");
+        let ov = WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay).unwrap();
+        fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
+        match ov.commit_atomic(&tar) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("commit_atomic: {other:?}"),
+        }
+        let window = ov.last_patch_window().expect("stashed window");
+        assert_eq!(
+            window.window_start, eof,
+            "window_start must be last TAR EOF, not file len {file_len}"
+        );
+        assert!(!window.offsets_shifted);
+        assert!(window.from_frame.is_none());
+    }
+
     #[test]
     fn live_commit_rejects_gzip_and_zip() {
         let dir = tempfile::tempdir().unwrap();
@@ -4095,6 +4425,8 @@ mod tests {
             &[ustar_file("last.txt", &last)],
             false,
         );
+        let map_before = scan_zstd_frames_path(&archive).unwrap();
+        let expected_start = map_before.frames.last().unwrap().uncompressed_offset;
         let overlay = dir.path().join("ov");
         let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
         fs::write(overlay.join("new.txt"), &extra).unwrap();
@@ -4106,6 +4438,13 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
         assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
         assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+        let window = ov.last_patch_window().expect("stashed zstd window");
+        assert_eq!(window.from_frame, Some(map_before.frames.len() - 1));
+        assert!(!window.offsets_shifted);
+        assert_eq!(
+            window.window_start, expected_start,
+            "last-N window must start at the last frame's uncompressed offset"
+        );
     }
 
     #[test]

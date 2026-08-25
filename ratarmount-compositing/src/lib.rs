@@ -32,6 +32,7 @@ pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};
 pub use versioning::FileVersionLayer;
 pub use write_overlay::{
-    commit_overlay, live_commit_is_supported, name_suggests_tar_zst, CommitOverlayOptions,
-    OverlayError, WriteOverlay, HIDDEN_DB,
+    commit_overlay, live_commit_is_supported, name_suggests_tar_zst, patch_sidecar_if_present,
+    sidecar_path_for_patch, CommitOverlayOptions, IndexPatchWindow, OverlayError, WriteOverlay,
+    HIDDEN_DB,
 };

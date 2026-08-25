@@ -10,6 +10,8 @@ ratarmount-core.workspace = true
 ratarmount-compress.workspace = true
 # Live last-frame .tar.zst persist (ustar rewrite + last-EOF)
 ratarmount-formats-tar.workspace = true
+# Incremental sidecar patch after persist (F-2); never create_writable
+ratarmount-index.workspace = true
 libc.workspace = true
 log.workspace = true
 thiserror.workspace = true
