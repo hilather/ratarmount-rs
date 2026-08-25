@@ -4,6 +4,7 @@ mod hashing;
 mod location;
 mod mem;
 mod nested;
+mod patch;
 
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
@@ -968,7 +969,7 @@ impl SqliteIndex {
         self.read_only
     }
 
-    fn with_conn<F, T>(&self, f: F) -> Result<T>
+    pub(crate) fn with_conn<F, T>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T>,
     {
@@ -1951,7 +1952,7 @@ fn split_path(path: &str) -> (String, String) {
     }
 }
 
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+pub(crate) fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
     let n: i64 = conn.query_row(
         r#"SELECT COUNT(*) FROM sqlite_master
            WHERE (type='table' OR type='view') AND name = ?1"#,
