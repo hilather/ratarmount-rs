@@ -2,6 +2,14 @@
 //!
 //! Also materializes remote / URL index paths (`http(s)://`, `file://`) and decompresses
 //! gzip/xz/zstd/bzip2 index blobs for Python parity with `SQLiteIndex._load_index`.
+//!
+//! Portable artifact identity (G-2): [`INDEX_MEDIA_TYPE`] names this SQLite **blob
+//! family** (`v1`). Inner [`crate::INDEX_VERSION`] (`"0.7.0"`) is the `files` schema.
+//! Those are not the same string and this is **not** SOCI / eStargz / nydus zTOC.
+//! Inbound clients parse RFC 8288 `Link: rel="describedby"` on HEAD of the
+//! **archive** URL ([`parse_link_describedby`]) and try http(s) sibling URLs
+//! ([`sibling_index_candidates`]). Local folder order in [`resolve_index_location`]
+//! is unchanged (`oci:{digest}` cache stays first among folder candidates).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -43,6 +51,23 @@ impl IndexLocation {
 
 /// Sentinel accepted by `--index-file`.
 pub const MEMORY_INDEX: &str = ":memory:";
+
+/// HTTP/OCI media type for a portable ratarmount SQLite index **blob**.
+///
+/// `v1` names this artifact family (on-disk or wrapped `.gz` / `.zst` / `.xz` /
+/// `.bz2` SQLite sidecar). It is **not** the inner catalog schema and is **not**
+/// SOCI / eStargz / nydus zTOC. The `files` table schema remains
+/// [`crate::INDEX_VERSION`] (`"0.7.0"`).
+pub const INDEX_MEDIA_TYPE: &str = "application/vnd.ratarmount.index.v1+sqlite";
+
+/// IANA `rel` for an index that describes the archive (RFC 8288 inbound HEAD).
+///
+/// Clients parse `Link` on the **archive** URL. `--http` tree export is not an
+/// archive server; outbound `Link` on `index.sqlite` is not inbound discovery.
+pub const INDEX_LINK_REL: &str = "describedby";
+
+/// Compressed sidecar suffixes tried after `{url}.index.sqlite` (http(s) only).
+const SIBLING_COMPRESSED_SUFFIXES: &[&str] = &[".gz", ".zst", ".xz", ".bz2"];
 
 const USER_AGENT: &str = "ratarmount-rs/0.1";
 
@@ -153,7 +178,8 @@ pub fn is_index_url(s: &str) -> bool {
 
 /// Sibling index URL convention for a remote archive: `archive_url + ".index.sqlite"`.
 ///
-/// Returns `None` when `archive_url` is not `http(s)://`.
+/// Returns `None` when `archive_url` is not `http(s)://`. No S3/GCS/Azure sibling
+/// GET in v1; compressed suffixes are listed by [`sibling_index_candidates`].
 pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     let s = archive_url.trim();
     if s.starts_with("http://") || s.starts_with("https://") {
@@ -161,6 +187,255 @@ pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     } else {
         None
     }
+}
+
+/// http(s) sibling index URLs: uncompressed [`sibling_index_url`] then `.gz` /
+/// `.zst` / `.xz` / `.bz2`. Empty for `s3://`, `file://`, and local paths.
+pub fn sibling_index_candidates(archive_url: &str) -> Vec<String> {
+    let Some(base) = sibling_index_url(archive_url) else {
+        return Vec::new();
+    };
+    let mut out = Vec::with_capacity(1 + SIBLING_COMPRESSED_SUFFIXES.len());
+    out.push(base.clone());
+    for suf in SIBLING_COMPRESSED_SUFFIXES {
+        out.push(format!("{base}{suf}"));
+    }
+    out
+}
+
+/// Parse RFC 8288 `Link` header value(s) from HEAD of an **archive** URL.
+///
+/// Returns the first http(s) target whose `rel` includes [`INDEX_LINK_REL`]
+/// (`describedby`). When several describedby links exist, a matching
+/// [`INDEX_MEDIA_TYPE`] `type` parameter is preferred. Relative targets are
+/// resolved against `archive_url`. Non-http(s) targets (including `s3://`) are
+/// ignored.
+pub fn parse_link_describedby(link_header: &str, archive_url: &str) -> Option<String> {
+    let mut typed = None;
+    let mut untyped = None;
+    for (target, params) in parse_rfc8288_link_values(link_header) {
+        if !rel_includes_describedby(&params) {
+            continue;
+        }
+        let Some(url) = resolve_http_index_url(archive_url, &target) else {
+            continue;
+        };
+        if type_is_index_media(&params) {
+            if typed.is_none() {
+                typed = Some(url);
+            }
+        } else if untyped.is_none() {
+            untyped = Some(url);
+        }
+    }
+    typed.or(untyped)
+}
+
+fn rel_includes_describedby(params: &[(String, String)]) -> bool {
+    params.iter().any(|(k, v)| {
+        k.eq_ignore_ascii_case("rel")
+            && v.split_whitespace()
+                .any(|r| r.eq_ignore_ascii_case(INDEX_LINK_REL))
+    })
+}
+
+fn type_is_index_media(params: &[(String, String)]) -> bool {
+    params.iter().any(|(k, v)| {
+        if !k.eq_ignore_ascii_case("type") {
+            return false;
+        }
+        let got = v.split(';').next().unwrap_or(v).trim();
+        got.eq_ignore_ascii_case(INDEX_MEDIA_TYPE)
+    })
+}
+
+/// Split a `Link` header into `(uri-reference, params)` pairs (RFC 8288).
+fn parse_rfc8288_link_values(header: &str) -> Vec<(String, Vec<(String, String)>)> {
+    let mut out = Vec::new();
+    for raw in split_on_top_level(header, b',') {
+        let raw = raw.trim();
+        if raw.is_empty() || !raw.starts_with('<') {
+            continue;
+        }
+        let Some(end) = raw.find('>') else {
+            continue;
+        };
+        let target = raw[1..end].trim().to_string();
+        if target.is_empty() {
+            continue;
+        }
+        let params = parse_link_params(raw[end + 1..].trim());
+        out.push((target, params));
+    }
+    out
+}
+
+fn parse_link_params(s: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let s = s.trim_start_matches(';').trim();
+    if s.is_empty() {
+        return out;
+    }
+    for part in split_on_top_level(s, b';') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some(pair) = split_link_param(part) {
+            out.push(pair);
+        }
+    }
+    out
+}
+
+fn split_link_param(part: &str) -> Option<(String, String)> {
+    let mut in_quotes = false;
+    let mut escape = false;
+    let mut eq = None;
+    for (i, b) in part.bytes().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_quotes {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        if b == b'"' {
+            in_quotes = true;
+            continue;
+        }
+        if b == b'=' {
+            eq = Some(i);
+            break;
+        }
+    }
+    let eq = eq?;
+    let key = part[..eq].trim();
+    if key.is_empty() {
+        return None;
+    }
+    Some((
+        key.to_string(),
+        unquote_quoted_string(part[eq + 1..].trim()),
+    ))
+}
+
+fn unquote_quoted_string(s: &str) -> String {
+    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
+        let inner = &s[1..s.len() - 1];
+        let mut out = String::with_capacity(inner.len());
+        let mut chars = inner.chars();
+        while let Some(c) = chars.next() {
+            if c == '\\' {
+                if let Some(n) = chars.next() {
+                    out.push(n);
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    } else {
+        s.to_string()
+    }
+}
+
+/// Split `s` on `delim` not inside quoted-strings or `<angle>` URI refs.
+fn split_on_top_level(s: &str, delim: u8) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0usize;
+    let mut in_quotes = false;
+    let mut in_angles = false;
+    let mut escape = false;
+    for (i, b) in s.bytes().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if in_quotes {
+            if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_quotes = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' if !in_angles => in_quotes = true,
+            b'<' if !in_quotes => in_angles = true,
+            b'>' if in_angles => in_angles = false,
+            d if d == delim && !in_angles => {
+                parts.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&s[start..]);
+    parts
+}
+
+fn strip_url_fragment(s: &str) -> &str {
+    s.split_once('#').map(|(b, _)| b).unwrap_or(s)
+}
+
+/// Resolve `target` against an http(s) `archive_url`. Other schemes return `None`.
+fn resolve_http_index_url(archive_url: &str, target: &str) -> Option<String> {
+    let target = strip_url_fragment(target.trim());
+    if target.is_empty() {
+        return None;
+    }
+    if target.starts_with("http://") || target.starts_with("https://") {
+        return Some(target.to_string());
+    }
+    if target.contains("://") {
+        return None;
+    }
+    let base = strip_url_fragment(archive_url.trim());
+    if !(base.starts_with("http://") || base.starts_with("https://")) {
+        return None;
+    }
+    if let Some(rest) = target.strip_prefix("//") {
+        let scheme = if base.starts_with("https://") {
+            "https:"
+        } else {
+            "http:"
+        };
+        return Some(format!("{scheme}//{rest}"));
+    }
+    let (origin, path) = http_origin_and_path(base)?;
+    if target.starts_with('/') {
+        return Some(format!("{origin}{target}"));
+    }
+    let dir = match path.rfind('/') {
+        Some(i) => &path[..=i],
+        None => "/",
+    };
+    Some(format!("{origin}{dir}{target}"))
+}
+
+fn http_origin_and_path(base: &str) -> Option<(&str, &str)> {
+    let scheme_len = if base.starts_with("https://") {
+        8
+    } else if base.starts_with("http://") {
+        7
+    } else {
+        return None;
+    };
+    let after = &base[scheme_len..];
+    let host_len = after
+        .find('/')
+        .or_else(|| after.find('?'))
+        .unwrap_or(after.len());
+    let origin = &base[..scheme_len + host_len];
+    let rest = &after[host_len..];
+    let path = rest.split_once('?').map(|(p, _)| p).unwrap_or(rest);
+    Some((origin, path))
 }
 
 /// Materialize an index path or URL to a local filesystem path ready for SQLite open.
@@ -408,6 +683,10 @@ fn fetch_index_http(url: &str) -> Result<PathBuf> {
 /// [`IndexLocation::Path`]. Compressed indexes are decompressed to a kept tempfile. Fetch /
 /// decompress failures for an explicit remote URL fall through to folder candidates (Python
 /// trial-and-error style) after a warning.
+///
+/// Local folder candidate order is unchanged (G-2 K12): next-to-archive / `oci:{digest}`
+/// cache names stay first among [`possible_index_paths`]. HTTP `Link` / sibling GET /
+/// OCI referrers are applied by callers **after** this function on a local miss.
 pub fn resolve_index_location(
     archive: &Path,
     explicit: Option<&str>,
@@ -528,6 +807,10 @@ mod tests {
 
     impl MockHttp {
         fn spawn(body: Vec<u8>) -> Self {
+            Self::spawn_with_extra_headers(body, Vec::new())
+        }
+
+        fn spawn_with_extra_headers(body: Vec<u8>, extra_headers: Vec<(String, String)>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let base = format!("http://{}", listener.local_addr().unwrap());
             let hits = Arc::new(Mutex::new(0usize));
@@ -554,10 +837,17 @@ mod tests {
                         *hits_c.lock().unwrap() += 1;
                     }
                     let is_head = request_line.starts_with("HEAD ");
-                    let header = format!(
-                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    let mut header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n",
                         body.len()
                     );
+                    for (k, v) in &extra_headers {
+                        header.push_str(k);
+                        header.push_str(": ");
+                        header.push_str(v);
+                        header.push_str("\r\n");
+                    }
+                    header.push_str("\r\n");
                     let _ = stream.write_all(header.as_bytes());
                     if !is_head {
                         let _ = stream.write_all(&body);
@@ -630,6 +920,39 @@ mod tests {
         );
         assert_eq!(sibling_index_url("/local/a.tar"), None);
         assert_eq!(sibling_index_url("file:///tmp/a.tar"), None);
+    }
+
+    #[test]
+    fn sibling_index_candidates_http_only_extends_uncompressed() {
+        let cands = sibling_index_candidates("http://host/path/a.tar");
+        assert_eq!(
+            cands[0],
+            sibling_index_url("http://host/path/a.tar").unwrap()
+        );
+        assert_eq!(
+            cands,
+            vec![
+                "http://host/path/a.tar.index.sqlite".to_string(),
+                "http://host/path/a.tar.index.sqlite.gz".into(),
+                "http://host/path/a.tar.index.sqlite.zst".into(),
+                "http://host/path/a.tar.index.sqlite.xz".into(),
+                "http://host/path/a.tar.index.sqlite.bz2".into(),
+            ]
+        );
+        assert!(sibling_index_candidates("s3://bucket/key").is_empty());
+        assert!(sibling_index_candidates("file:///tmp/a.tar").is_empty());
+        assert!(sibling_index_candidates("/local/a.tar").is_empty());
+    }
+
+    #[test]
+    fn possible_index_paths_empty_folder_first_for_oci_digest_label() {
+        // K12: local folder candidates are unchanged; empty folder (sidecar /
+        // `oci:{digest}` cache name) stays first.
+        let archive = Path::new("oci:sha256:deadbeef");
+        let paths = possible_index_paths(archive, &[PathBuf::new(), PathBuf::from("/cache")]);
+        assert_eq!(paths[0], default_index_path(archive));
+        assert!(paths[0].to_string_lossy().starts_with("oci:"));
+        assert!(paths[1].starts_with("/cache"));
     }
 
     #[test]
@@ -936,5 +1259,119 @@ mod tests {
         assert_sqlite_magic(&out);
         assert_eq!(std::fs::read(&out).unwrap(), body);
         let _ = std::fs::remove_file(&out);
+    }
+
+    #[test]
+    fn parse_link_describedby_rfc8288() {
+        // v1 is the blob family; 0.7.0 is the files schema — not SOCI.
+        assert_ne!(INDEX_MEDIA_TYPE, crate::INDEX_VERSION);
+        assert_eq!(crate::INDEX_VERSION, "0.7.0");
+        assert_eq!(
+            INDEX_MEDIA_TYPE,
+            "application/vnd.ratarmount.index.v1+sqlite"
+        );
+        assert_eq!(INDEX_LINK_REL, "describedby");
+
+        let archive = "http://host/path/a.tar";
+        assert_eq!(
+            parse_link_describedby(
+                &format!("<http://cdn/a.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""),
+                archive
+            )
+            .as_deref(),
+            Some("http://cdn/a.index.sqlite")
+        );
+        // Relative URI; unquoted rel; extra relation tokens.
+        assert_eq!(
+            parse_link_describedby("</a.tar.index.sqlite>; rel=describedby prefetch", archive)
+                .as_deref(),
+            Some("http://host/a.tar.index.sqlite")
+        );
+        // Prefer matching media type over an earlier describedby of another type.
+        let mixed = format!(
+            "<http://host/other.json>; rel=\"describedby\"; type=\"application/json\", \
+             <http://host/good.index.sqlite>; rel=\"describedby\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        assert_eq!(
+            parse_link_describedby(&mixed, archive).as_deref(),
+            Some("http://host/good.index.sqlite")
+        );
+        // Comma inside quoted title must not split links.
+        assert_eq!(
+            parse_link_describedby(
+                "<http://host/idx.sqlite>; rel=\"describedby\"; title=\"a, b\"",
+                archive
+            )
+            .as_deref(),
+            Some("http://host/idx.sqlite")
+        );
+        assert!(parse_link_describedby(
+            "<s3://bucket/a.index.sqlite>; rel=\"describedby\"",
+            archive
+        )
+        .is_none());
+        assert!(
+            parse_link_describedby("<http://host/idx.sqlite>; rel=\"prefetch\"", archive).is_none()
+        );
+        assert!(parse_link_describedby("", archive).is_none());
+    }
+
+    /// Regression: inbound HEAD of an **archive** URL follows RFC 8288
+    /// `Link: rel="describedby"` to the portable index blob (not SOCI).
+    #[test]
+    fn link_describedby_archive_head() {
+        let body = tiny_sqlite_bytes();
+        let link = format!(
+            "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        let mock = MockHttp::spawn_with_extra_headers(body.clone(), vec![("Link".into(), link)]);
+        let archive_url = mock.url("/archive.tar");
+
+        let resp = ureq::head(&archive_url)
+            .set("User-Agent", USER_AGENT)
+            .call()
+            .unwrap();
+        let header = resp.header("Link").expect("archive HEAD must expose Link");
+        let idx_url =
+            parse_link_describedby(header, &archive_url).expect("describedby http(s) index URL");
+        assert!(idx_url.starts_with("http://"));
+        assert_eq!(idx_url, mock.url("/archive.tar.index.sqlite"));
+
+        let path = maybe_fetch_index_url(&idx_url).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_file(&path);
+        assert!(*mock.hits.lock().unwrap() >= 2);
+    }
+
+    /// Regression: http(s) sibling auto-fetch tries uncompressed + compressed
+    /// suffixes; S3/file URLs are not candidates.
+    #[test]
+    fn sibling_candidates_fetch() {
+        let body = tiny_sqlite_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let gz_path = dir.path().join("sib.gz");
+        write_gzip(&gz_path, &body);
+        let gz_bytes = std::fs::read(&gz_path).unwrap();
+
+        let mock = MockHttp::spawn(gz_bytes);
+        let archive_url = mock.url("/data/bundle.tar");
+        let cands = sibling_index_candidates(&archive_url);
+        assert_eq!(
+            cands.first().map(String::as_str),
+            sibling_index_url(&archive_url).as_deref()
+        );
+        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.gz")));
+        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.zst")));
+        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.xz")));
+        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.bz2")));
+        assert_eq!(cands.len(), 5);
+        assert!(sibling_index_candidates("s3://bucket/key").is_empty());
+        assert!(sibling_index_candidates("file:///tmp/a.tar").is_empty());
+
+        let gz = cands.iter().find(|u| u.ends_with(".gz")).unwrap();
+        let path = maybe_fetch_index_url(gz).unwrap();
+        assert_sqlite_magic(&path);
+        assert_eq!(std::fs::read(&path).unwrap(), body);
+        let _ = std::fs::remove_file(&path);
     }
 }

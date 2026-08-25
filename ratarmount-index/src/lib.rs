@@ -1,5 +1,9 @@
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
 //!
+//! Portable HTTP/OCI blobs use [`INDEX_MEDIA_TYPE`] (`v1` = this SQLite sidecar
+//! family). That is distinct from [`INDEX_VERSION`] (`"0.7.0"` = `files` schema)
+//! and is not SOCI / eStargz / nydus zTOC.
+//!
 //! Locate over `files` is [`SqliteIndex::search`] (glob/LIKE by default). Optional
 //! FTS5 is [`SqliteIndex::ensure_fts5`] + [`SqliteIndex::search_fts`]. Workspace
 //! rusqlite 0.32 has no `fts5` cargo feature; bundled libsqlite3-sys always
@@ -20,8 +24,9 @@ pub use hashing::{
 };
 pub use location::{
     default_index_folders, default_index_path, expand_user, is_index_url, materialize_index_file,
-    maybe_fetch_index_url, parse_index_folders, possible_index_paths, resolve_index_location,
-    sibling_index_url, IndexLocation, MEMORY_INDEX,
+    maybe_fetch_index_url, parse_index_folders, parse_link_describedby, possible_index_paths,
+    resolve_index_location, sibling_index_candidates, sibling_index_url, IndexLocation,
+    INDEX_LINK_REL, INDEX_MEDIA_TYPE, MEMORY_INDEX,
 };
 pub use search::{SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
@@ -50,11 +55,12 @@ pub use nested::{
 /// Max `files` rows for which a full MemIndex projection is kept after seal/open.
 pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
 
-/// Must match Python `SQLiteIndex.__version__`.
+/// Must match Python `SQLiteIndex.__version__` (`files` schema).
 ///
-/// Additive Rust-only tables such as `"files_fts"` (see [`SqliteIndex::ensure_fts5`])
-/// do not bump this string. Python ignores unknown tables. FTS5 is compiled into
-/// bundled sqlite (`SQLITE_ENABLE_FTS5`); rusqlite 0.32 has no `fts5` cargo feature.
+/// Distinct from [`INDEX_MEDIA_TYPE`] (`v1` blob family). Additive Rust-only
+/// tables such as `"files_fts"` (see [`SqliteIndex::ensure_fts5`]) do not bump
+/// this string. Python ignores unknown tables. FTS5 is compiled into bundled
+/// sqlite (`SQLITE_ENABLE_FTS5`); rusqlite 0.32 has no `fts5` cargo feature.
 pub const INDEX_VERSION: &str = "0.7.0";
 
 /// Embedded core schema (`create-index-tables.sql`). Compression side tables are runtime-only
@@ -290,6 +296,90 @@ pub fn tar_stats_from_path(path: &Path) -> Result<TarStats> {
         }
     }
     Ok(stats)
+}
+
+/// Compare hex SHA-256 fingerprints without requiring a matching case.
+fn tarstats_hex_eq(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+/// Validate stored `tarstats` against a remote archive fingerprint (HTTP Range /
+/// OCI layer size).
+///
+/// Path-based [`SqliteIndex::check_tarstats_matches_archive`] is a **no-op** when
+/// `archive_path` does not exist (URL labels, `oci:{digest}`). After materializing
+/// a remote sidecar, call this so a swapped catalog is not trusted.
+///
+/// * `st_size` is `Content-Length` / Range length / OCI layer `size`.
+/// * Edge hashes are SHA-256 hex of the first and last up-to-[`TARSTATS_SAMPLE_BYTES`].
+/// * When `st_size <= TARSTATS_FULL_HASH_MAX`, pass `full_sha256`.
+///
+/// Mismatch → [`IndexError::Mismatch`] (caller cold-indexes; fail-open).
+pub fn check_tarstats_matches_remote(
+    stored: &TarStats,
+    st_size: u64,
+    prefix512_sha256: Option<&str>,
+    suffix512_sha256: Option<&str>,
+    full_sha256: Option<&str>,
+) -> Result<()> {
+    if stored.st_size != st_size {
+        return Err(IndexError::Mismatch(format!(
+            "remote archive size mismatch: index tarstats st_size={} current={st_size}",
+            stored.st_size
+        )));
+    }
+
+    let use_full = stored.full_sha256.is_some()
+        && (st_size <= TARSTATS_FULL_HASH_MAX || full_sha256.is_some());
+    if use_full {
+        match (stored.full_sha256.as_deref(), full_sha256) {
+            (Some(want), Some(got)) if tarstats_hex_eq(want, got) => {}
+            (Some(_), Some(_)) => {
+                return Err(IndexError::Mismatch(
+                    "remote archive full content fingerprint mismatch".into(),
+                ));
+            }
+            (Some(_), None) => {
+                return Err(IndexError::Mismatch(
+                    "remote archive full content fingerprint unavailable".into(),
+                ));
+            }
+            (None, _) => {}
+        }
+        return Ok(());
+    }
+
+    if let Some(want) = stored.prefix512_sha256.as_deref() {
+        match prefix512_sha256 {
+            Some(got) if tarstats_hex_eq(want, got) => {}
+            Some(_) => {
+                return Err(IndexError::Mismatch(
+                    "remote archive prefix fingerprint mismatch".into(),
+                ));
+            }
+            None => {
+                return Err(IndexError::Mismatch(
+                    "remote archive prefix fingerprint unavailable".into(),
+                ));
+            }
+        }
+    }
+    if let Some(want) = stored.suffix512_sha256.as_deref() {
+        match suffix512_sha256 {
+            Some(got) if tarstats_hex_eq(want, got) => {}
+            Some(_) => {
+                return Err(IndexError::Mismatch(
+                    "remote archive suffix fingerprint mismatch".into(),
+                ));
+            }
+            None => {
+                return Err(IndexError::Mismatch(
+                    "remote archive suffix fingerprint unavailable".into(),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Serialize [`TarStats`] to the compact JSON form used by format builders.
@@ -1093,6 +1183,8 @@ impl SqliteIndex {
     /// Policy (stricter than Python's optional mtime flag; fail closed for silent wrong data):
     /// - No `tarstats` key → `Ok` (legacy indexes / synthetic nested labels without stats).
     /// - `archive_path` does not exist → `Ok` (virtual labels; cannot fingerprint).
+    ///   URL / `oci:{digest}` labels hit this no-op; after fetching a remote sidecar
+    ///   call [`check_tarstats_matches_remote`] instead.
     /// - Size or whole-second mtime mismatch → [`IndexError::Mismatch`] (caller rebuilds).
     /// - When edge SHA-256 samples are stored, they must match (catches same-size/same-second replaces).
     ///
@@ -2266,6 +2358,61 @@ mod tests {
         let idx2 = SqliteIndex::create_writable(None).unwrap();
         idx2.check_tarstats_matches_archive(&archive)
             .expect("no tarstats → Ok");
+    }
+
+    /// Regression: a wrong-size remote sidecar must not be used. Path tarstats is a
+    /// no-op for URL / `oci:{digest}` labels.
+    #[test]
+    fn remote_tarstats_size_mismatch() {
+        let stored = TarStats {
+            st_size: 1000,
+            st_mtime: 0,
+            st_mtime_ns: None,
+            prefix512_sha256: Some("aa".into()),
+            suffix512_sha256: Some("bb".into()),
+            full_sha256: None,
+        };
+        let err = check_tarstats_matches_remote(&stored, 2000, Some("aa"), Some("bb"), None)
+            .expect_err("size mismatch");
+        assert!(
+            matches!(err, IndexError::Mismatch(_)),
+            "expected Mismatch, got {err:?}"
+        );
+        check_tarstats_matches_remote(&stored, 1000, Some("aa"), Some("bb"), None)
+            .expect("matching size and edges");
+        check_tarstats_matches_remote(&stored, 1000, Some("AA"), Some("BB"), None)
+            .expect("hex fingerprint compare is case-insensitive");
+        let err = check_tarstats_matches_remote(&stored, 1000, Some("cc"), Some("bb"), None)
+            .expect_err("prefix mismatch");
+        assert!(matches!(err, IndexError::Mismatch(_)));
+
+        let small = TarStats {
+            st_size: 64,
+            st_mtime: 0,
+            st_mtime_ns: None,
+            prefix512_sha256: None,
+            suffix512_sha256: None,
+            full_sha256: Some("deadbeef".into()),
+        };
+        check_tarstats_matches_remote(&small, 64, None, None, Some("deadbeef")).unwrap();
+        let err = check_tarstats_matches_remote(&small, 64, None, None, Some("cafebabe"))
+            .expect_err("full hash mismatch");
+        assert!(matches!(err, IndexError::Mismatch(_)));
+        let err = check_tarstats_matches_remote(&small, 64, None, None, None)
+            .expect_err("full hash required when stored");
+        assert!(matches!(err, IndexError::Mismatch(_)));
+
+        // Path-based check is a no-op when the archive label is not on disk.
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.store_metadata_key_value("tarstats", &serialize_tarstats(&stored))
+            .unwrap();
+        idx.check_tarstats_matches_archive(Path::new("http://example.com/a.tar"))
+            .expect("missing URL path is a no-op");
+        idx.check_tarstats_matches_archive(Path::new("oci:sha256:deadbeef"))
+            .expect("oci label is a no-op");
+        // The remote helper still rejects the swapped catalog.
+        let stored_now = idx.tarstats().unwrap().unwrap();
+        assert!(check_tarstats_matches_remote(&stored_now, 9999, None, None, None).is_err());
     }
 
     #[test]
