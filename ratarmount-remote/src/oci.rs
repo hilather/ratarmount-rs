@@ -33,6 +33,14 @@ const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
      application/vnd.oci.image.index.v1+json, \
      application/vnd.docker.distribution.manifest.list.v2+json";
 
+/// OCI 1.1 `artifactType` for a portable ratarmount SQLite index blob.
+///
+/// Same string as `ratarmount_index::INDEX_MEDIA_TYPE` (`v1` blob family, not
+/// SOCI / eStargz / nydus). Inner `files` schema stays `0.7.0`.
+pub const OCI_INDEX_ARTIFACT_TYPE: &str = "application/vnd.ratarmount.index.v1+sqlite";
+
+const REFERRERS_ACCEPT: &str = "application/vnd.oci.image.index.v1+json";
+
 const DOCKER_HUB_REGISTRY: &str = "registry-1.docker.io";
 const CRED_HELPER_TIMEOUT: Duration = Duration::from_secs(5);
 
@@ -89,6 +97,15 @@ impl OciLocation {
             self.name
         )
     }
+
+    /// `GET /v2/<name>/referrers/<digest>` URL (OCI 1.1). No tag-convention fallback.
+    pub fn referrers_url(&self, digest: &str) -> String {
+        format!(
+            "{}/v2/{}/referrers/{digest}",
+            self.registry_base_url(),
+            self.name
+        )
+    }
 }
 
 /// Image descriptors after a successful manifest fetch (no layer bodies).
@@ -130,6 +147,11 @@ impl std::fmt::Debug for OciLayer {
 }
 
 impl OciLayer {
+    /// Cached Bearer token from the manifest fetch, if any.
+    pub fn bearer(&self) -> Option<&str> {
+        self.bearer.as_deref()
+    }
+
     /// Live Range reader for this blob. Safe to call again (factory `reopen`).
     pub fn open_blob(&self) -> Result<OciBlobRangeFile> {
         Ok(OciBlobRangeFile {
@@ -213,6 +235,221 @@ pub fn fetch_oci_image(s: &str) -> Result<OciImage> {
         location: loc,
         layers,
     })
+}
+
+/// One OCI 1.1 referrer descriptor (index artifact manifest).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct OciReferrer {
+    pub digest: String,
+    pub size: u64,
+    pub artifact_type: String,
+    pub media_type: String,
+}
+
+/// List index referrers for `subject_digest` (`artifactType` filter).
+///
+/// Fail-open: missing Referrers API (404 / 405 / 501) or an empty list is
+/// `Ok(vec![])`. No `:sha256-…` tag-convention fallback in v1.
+pub fn list_oci_index_referrers(
+    loc: &OciLocation,
+    subject_digest: &str,
+    bearer: Option<&str>,
+) -> Result<Vec<OciReferrer>> {
+    let mut url = Url::parse(&loc.referrers_url(subject_digest))
+        .map_err(|e| RemoteError::Url(format!("OCI referrers URL: {e}")))?;
+    url.query_pairs_mut()
+        .append_pair("artifactType", OCI_INDEX_ARTIFACT_TYPE);
+    let url = url.to_string();
+    let v = match registry_get_json(&url, bearer, REFERRERS_ACCEPT) {
+        Ok(v) => v,
+        Err(FetchErr::Unauthorized(_)) => {
+            debug!("OCI referrer unauthorized for {subject_digest}; fail-open");
+            return Ok(Vec::new());
+        }
+        Err(FetchErr::Other(e)) => {
+            if referrer_api_missing(&e) {
+                debug!("OCI referrer API missing for {subject_digest}: {e}");
+                return Ok(Vec::new());
+            }
+            debug!("OCI referrer GET failed for {subject_digest}: {e}");
+            return Ok(Vec::new());
+        }
+    };
+    Ok(parse_referrer_index(&v))
+}
+
+/// Fetch a portable index blob via OCI 1.1 Referrers.
+///
+/// * `local_index` existing and non-empty → skip the registry (K12 cache hit).
+/// * Referrers API missing / empty / error → `Ok(None)` (fail-open).
+/// * Hit → download the first matching artifact layer to a kept tempfile.
+pub fn fetch_oci_index_referrer(
+    loc: &OciLocation,
+    subject_digest: &str,
+    bearer: Option<&str>,
+    local_index: Option<&Path>,
+) -> Result<Option<PathBuf>> {
+    if let Some(p) = local_index {
+        if path_is_nonempty_file(p) {
+            debug!("local index cache hit; skip referrer ({})", p.display());
+            return Ok(None);
+        }
+    }
+    let refs = list_oci_index_referrers(loc, subject_digest, bearer)?;
+    let Some(r) = refs.into_iter().next() else {
+        debug!("OCI referrer miss for {subject_digest}");
+        return Ok(None);
+    };
+    log::info!("OCI referrer index for {subject_digest}");
+    let manifest_url = format!(
+        "{}/v2/{}/manifests/{}",
+        loc.registry_base_url(),
+        loc.name,
+        r.digest
+    );
+    let manifest = match registry_get_json(&manifest_url, bearer, MANIFEST_ACCEPT) {
+        Ok(v) => v,
+        Err(e) => {
+            let err = match e {
+                FetchErr::Unauthorized(_) => RemoteError::Http("OCI referrer manifest 401".into()),
+                FetchErr::Other(e) => e,
+            };
+            debug!("OCI referrer manifest failed: {err}");
+            return Ok(None);
+        }
+    };
+    let Some((blob_digest, size)) = index_blob_from_artifact(&manifest) else {
+        debug!("OCI referrer manifest has no index blob for {subject_digest}");
+        return Ok(None);
+    };
+    let blob_url = loc.blob_url(&blob_digest);
+    match registry_get_bytes(&blob_url, bearer, size) {
+        Ok(bytes) if !bytes.is_empty() => {
+            let path = keep_temp_bytes(&bytes, ".sqlite.index")?;
+            Ok(Some(path))
+        }
+        Ok(_) => {
+            debug!("OCI referrer index blob empty for {subject_digest}");
+            Ok(None)
+        }
+        Err(e) => {
+            debug!("OCI referrer blob GET failed: {e}");
+            Ok(None)
+        }
+    }
+}
+
+fn path_is_nonempty_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn referrer_api_missing(err: &RemoteError) -> bool {
+    let s = err.to_string();
+    s.contains("HTTP 404")
+        || s.contains("HTTP 405")
+        || s.contains("HTTP 501")
+        || s.contains("HTTP 400")
+}
+
+fn parse_referrer_index(v: &Value) -> Vec<OciReferrer> {
+    let Some(manifests) = v.get("manifests").and_then(|m| m.as_array()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for m in manifests {
+        let digest = m
+            .get("digest")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+        if digest.is_empty() {
+            continue;
+        }
+        let artifact_type = m
+            .get("artifactType")
+            .and_then(|d| d.as_str())
+            .unwrap_or("")
+            .to_string();
+        if !artifact_type.is_empty() && !artifact_type.eq_ignore_ascii_case(OCI_INDEX_ARTIFACT_TYPE)
+        {
+            continue;
+        }
+        out.push(OciReferrer {
+            size: m.get("size").and_then(|s| s.as_u64()).unwrap_or(0),
+            media_type: m
+                .get("mediaType")
+                .and_then(|d| d.as_str())
+                .unwrap_or("")
+                .to_string(),
+            artifact_type,
+            digest,
+        });
+    }
+    out
+}
+
+fn index_blob_from_artifact(manifest: &Value) -> Option<(String, u64)> {
+    let layers = manifest.get("layers").and_then(|l| l.as_array())?;
+    let mut fallback = None;
+    for layer in layers {
+        let digest = layer.get("digest").and_then(|d| d.as_str())?;
+        let size = layer.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+        let mt = layer
+            .get("mediaType")
+            .and_then(|d| d.as_str())
+            .unwrap_or("");
+        if mt.eq_ignore_ascii_case(OCI_INDEX_ARTIFACT_TYPE) {
+            return Some((digest.to_string(), size));
+        }
+        if fallback.is_none() {
+            fallback = Some((digest.to_string(), size));
+        }
+    }
+    fallback
+}
+
+fn registry_get_bytes(url: &str, bearer: Option<&str>, hint_size: u64) -> Result<Vec<u8>> {
+    let mut req = ureq::get(url).set("User-Agent", USER_AGENT);
+    if let Some(t) = bearer {
+        req = req.set("Authorization", &format!("Bearer {t}"));
+    }
+    match req.call() {
+        Ok(resp) => {
+            let status = resp.status();
+            if !(200..300).contains(&status) {
+                return Err(RemoteError::Http(format!("HTTP {status} for {url}")));
+            }
+            let mut reader = resp.into_reader();
+            let mut buf = if hint_size > 0 && hint_size <= 32 * 1024 * 1024 {
+                Vec::with_capacity(hint_size as usize)
+            } else {
+                Vec::new()
+            };
+            reader
+                .read_to_end(&mut buf)
+                .map_err(|e| RemoteError::Http(format!("reading {url}: {e}")))?;
+            Ok(buf)
+        }
+        Err(ureq::Error::Status(status, resp)) => {
+            let body = resp.into_string().unwrap_or_default();
+            let snippet: String = body.chars().take(200).collect();
+            Err(RemoteError::Http(format!(
+                "HTTP {status} for {url}: {snippet}"
+            )))
+        }
+        Err(e) => Err(RemoteError::Http(e.to_string())),
+    }
+}
+
+fn keep_temp_bytes(bytes: &[u8], suffix: &str) -> io::Result<PathBuf> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix("ratarmount-oci-index-").suffix(suffix);
+    let mut tmp = builder.tempfile()?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.into_temp_path().keep().map_err(|e| e.error)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1054,6 +1291,10 @@ mod tests {
 
     const DIGEST_A: &str =
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const INDEX_BLOB_DIGEST: &str =
+        "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+    const INDEX_MANIFEST_DIGEST: &str =
+        "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
     const TOKEN: &str = "test-oci-bearer-token";
 
     #[test]
@@ -1178,17 +1419,26 @@ mod tests {
 
     impl MockOci {
         fn spawn(blob: Vec<u8>) -> Self {
+            Self::spawn_inner(blob, None)
+        }
+
+        fn spawn_with_index(blob: Vec<u8>, index: Vec<u8>) -> Self {
+            Self::spawn_inner(blob, Some(index))
+        }
+
+        fn spawn_inner(blob: Vec<u8>, index: Option<Vec<u8>>) -> Self {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let bound = listener.local_addr().unwrap();
             let addr = format!("{bound}");
             let log = Arc::new(Mutex::new(Vec::new()));
             let log_c = Arc::clone(&log);
             let blob_c = blob;
+            let index_c = index;
             let join = thread::spawn(move || {
                 listener.set_nonblocking(false).ok();
                 for stream in listener.incoming().take(64) {
                     let Ok(stream) = stream else { continue };
-                    serve_oci(stream, &blob_c, &log_c);
+                    serve_oci(stream, &blob_c, index_c.as_deref(), &log_c);
                 }
             });
             Self {
@@ -1199,7 +1449,12 @@ mod tests {
         }
     }
 
-    fn serve_oci(mut stream: std::net::TcpStream, blob: &[u8], log: &Arc<Mutex<Vec<String>>>) {
+    fn serve_oci(
+        mut stream: std::net::TcpStream,
+        blob: &[u8],
+        index: Option<&[u8]>,
+        log: &Arc<Mutex<Vec<String>>>,
+    ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut request_line = String::new();
         if reader.read_line(&mut request_line).is_err() {
@@ -1262,6 +1517,43 @@ mod tests {
 
         let bearer_ok = auth.as_deref() == Some(&format!("Bearer {TOKEN}"));
 
+        if path.contains("/referrers/") {
+            if !bearer_ok {
+                let realm = match stream.local_addr() {
+                    Ok(a) => format!("http://{a}/token"),
+                    Err(_) => "http://127.0.0.1/token".into(),
+                };
+                let www = format!(
+                    "Bearer realm=\"{realm}\",service=\"registry\",scope=\"repository:foo/bar:pull\""
+                );
+                let body = b"unauthorized";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 401 Unauthorized\r\nWWW-Authenticate: {www}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                let _ = stream.write_all(body);
+                return;
+            }
+            let Some(index_bytes) = index else {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                return;
+            };
+            let referrers = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.index.v1+json","manifests":[{{"mediaType":"application/vnd.oci.image.manifest.v1+json","digest":"{INDEX_MANIFEST_DIGEST}","size":{0},"artifactType":"{OCI_INDEX_ARTIFACT_TYPE}"}}]}}"#,
+                index_bytes.len()
+            );
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.index.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{referrers}",
+                referrers.len()
+            );
+            return;
+        }
+
         if path.contains("/manifests/") {
             if !bearer_ok {
                 let realm = match stream.local_addr() {
@@ -1278,6 +1570,26 @@ mod tests {
                     body.len()
                 );
                 let _ = stream.write_all(body);
+                return;
+            }
+            if path.contains(INDEX_MANIFEST_DIGEST) {
+                let Some(index_bytes) = index else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                    return;
+                };
+                let artifact = format!(
+                    r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","artifactType":"{OCI_INDEX_ARTIFACT_TYPE}","subject":{{"mediaType":"application/vnd.oci.image.layer.v1.tar","digest":"{DIGEST_A}","size":{}}},"layers":[{{"mediaType":"{OCI_INDEX_ARTIFACT_TYPE}","digest":"{INDEX_BLOB_DIGEST}","size":{}}}]}}"#,
+                    blob.len(),
+                    index_bytes.len()
+                );
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/vnd.oci.image.manifest.v1+json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{artifact}",
+                    artifact.len()
+                );
                 return;
             }
             let manifest = format!(
@@ -1303,6 +1615,11 @@ mod tests {
                 let _ = stream.write_all(body);
                 return;
             }
+            let blob = if path.contains(INDEX_BLOB_DIGEST) {
+                index.unwrap_or(blob)
+            } else {
+                blob
+            };
             if let Some(r) = range.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
                 let parts: Vec<&str> = r.splitn(2, '-').collect();
                 if parts.len() == 2 {
@@ -1475,5 +1792,54 @@ mod tests {
         assert_eq!(ch.realm, "https://auth.example/token");
         assert_eq!(ch.service.as_deref(), Some("registry"));
         assert_eq!(ch.scope.as_deref(), Some("repository:foo/bar:pull,push"));
+    }
+
+    /// Regression: OCI referrer GET on local cache miss downloads the index blob.
+    #[test]
+    fn oci_referrer_get_on_miss() {
+        let _g = EnvGuard::acquire(OCI_ENV_KEYS);
+        let body = b"oci-layer-for-referrer".to_vec();
+        let mut index = b"SQLite format 3\0".to_vec();
+        index.extend_from_slice(b"portable-index-blob");
+        let mock = MockOci::spawn_with_index(body, index.clone());
+        let url = format!("oci://{}/foo/bar:v1", mock.addr);
+        let img = fetch_oci_image(&url).expect("fetch_oci_image");
+        let layer = &img.layers[0];
+        let got = fetch_oci_index_referrer(&img.location, &layer.digest, layer.bearer(), None)
+            .expect("referrer fetch")
+            .expect("index blob");
+        assert_eq!(std::fs::read(&got).unwrap(), index);
+        let _ = std::fs::remove_file(&got);
+        let log = mock.log.lock().unwrap().clone();
+        assert!(
+            log.iter().any(|l| l.contains("/referrers/")),
+            "Regression: referrer GET on miss; log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains(INDEX_BLOB_DIGEST)),
+            "index blob GET missing: {log:?}"
+        );
+    }
+
+    /// Regression: existing `oci:{{digest}}` cache must not HEAD the registry.
+    #[test]
+    fn oci_referrer_not_fetched_on_cache_hit() {
+        let _g = EnvGuard::acquire(OCI_ENV_KEYS);
+        let body = b"oci-layer-cache-hit".to_vec();
+        let mut index = b"SQLite format 3\0".to_vec();
+        index.extend_from_slice(b"cached-sidecar");
+        let mock = MockOci::spawn_with_index(body, index.clone());
+        let loc = parse_oci_url(&format!("oci://{}/foo/bar:v1", mock.addr)).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("oci:sha256:aaaaaaaa.index.sqlite");
+        std::fs::write(&cache, &index).unwrap();
+        let got = fetch_oci_index_referrer(&loc, DIGEST_A, None, Some(cache.as_path()))
+            .expect("cache skip");
+        assert!(got.is_none(), "cache hit must not download a tempfile");
+        let log = mock.log.lock().unwrap().clone();
+        assert!(
+            !log.iter().any(|l| l.contains("/referrers/")),
+            "Regression: local oci:digest cache skips referrer; log={log:?}"
+        );
     }
 }

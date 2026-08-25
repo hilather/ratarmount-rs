@@ -1050,8 +1050,76 @@ fn http_state_debug_redacts_password() {
         webdav: true,
         locks: Mutex::new(crate::webdav::LockTable::default()),
         basic: Some(("u".into(), "secret-pass".into())),
+        index_sidecar: None,
     };
     let d = format!("{st:?}");
     assert!(!d.contains("secret-pass"), "{d}");
     assert!(d.contains("***"), "{d}");
+}
+
+/// Regression: HTTP GET of the sidecar is Content-Type `INDEX_MEDIA_TYPE`,
+/// not a FUSE control file, and `--http` still serves the indexed tree.
+#[test]
+fn index_content_type() {
+    let td = tempfile::tempdir().expect("sidecar tempdir");
+    let sidecar = td.path().join("archive.tar.index.sqlite");
+    let blob = b"SQLite format 3\0portable-index-bytes";
+    std::fs::write(&sidecar, blob).unwrap();
+
+    let stop = ExportStop::new();
+    let opts = HttpOptions {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        stop: Some(stop.clone()),
+        index_sidecar: Some(sidecar),
+        ..HttpOptions::default()
+    };
+    let src: Arc<dyn MountSource> = Arc::new(MemFs::fixture());
+    let handle = spawn_http_thread(src, opts).expect("bind HTTP");
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, handle.port));
+    let srv = Serving {
+        handle: Some(handle),
+        stop,
+        addr,
+        _overlay_dir: Some(td),
+        _webdav_env: None,
+    };
+
+    let raw =
+        srv.exchange("GET /.ratarmount-control/index.sqlite HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 200"),
+        "status: {head}"
+    );
+    assert_eq!(
+        header_value(&head, "Content-Type"),
+        Some(crate::INDEX_MEDIA_TYPE)
+    );
+    assert_eq!(body, blob.as_slice());
+    let link = header_value(&head, "Link").unwrap_or("");
+    assert!(
+        link.contains("describedby") && link.contains(crate::INDEX_MEDIA_TYPE),
+        "outbound Link on index resource: {link}"
+    );
+
+    // Tree export is still members, not host archive bytes.
+    let raw = srv.exchange("GET /hello.txt HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, body) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 200"),
+        "member: {head}"
+    );
+    assert_eq!(body, b"abcdefghijklmnopqrstuvwxyz");
+}
+
+#[test]
+fn index_sidecar_missing_is_404() {
+    let srv = Serving::start_http();
+    let raw =
+        srv.exchange("GET /.ratarmount-control/index.sqlite HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    let (head, _) = split_head_body(&raw);
+    assert!(
+        status_line(&head).starts_with("HTTP/1.1 404"),
+        ":memory: / no sidecar: {head}"
+    );
 }

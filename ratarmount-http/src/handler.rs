@@ -1,7 +1,9 @@
 //! One request per connection: GET/HEAD Range, optional WebDAV.
 
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::TcpStream;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -30,6 +32,8 @@ pub(crate) struct HttpState {
     pub locks: Mutex<LockTable>,
     /// `(user, password)` when Basic is required. Password is redacted in [`Debug`].
     pub basic: Option<(String, String)>,
+    /// On-disk SQLite sidecar. HTTP-only; not a FUSE control file.
+    pub index_sidecar: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for HttpState {
@@ -42,6 +46,7 @@ impl std::fmt::Debug for HttpState {
                 "basic",
                 &self.basic.as_ref().map(|(u, _)| (u.as_str(), "***")),
             )
+            .field("index_sidecar", &self.index_sidecar)
             .finish_non_exhaustive()
     }
 }
@@ -172,6 +177,15 @@ pub(crate) fn handle_connection(mut stream: TcpStream, state: &HttpState) -> io:
 
     match req.method {
         Method::Get | Method::Head => {
+            if is_index_sidecar_path(&path) {
+                return handle_index_sidecar(
+                    &mut stream,
+                    state,
+                    req.method == Method::Head,
+                    req.range.as_deref(),
+                    send_body,
+                );
+            }
             let Some(fi) = state.source.lookup(&path, 0) else {
                 return write_response(
                     &mut stream,
@@ -1283,6 +1297,106 @@ fn child_href(parent: &str, name: &str, is_dir: bool) -> String {
         href.push('/');
     }
     href
+}
+
+fn is_index_sidecar_path(path: &str) -> bool {
+    path == crate::INDEX_SIDECAR_PATH
+}
+
+fn handle_index_sidecar(
+    stream: &mut TcpStream,
+    state: &HttpState,
+    head: bool,
+    range_header: Option<&str>,
+    send_body: bool,
+) -> io::Result<()> {
+    let Some(path) = state.index_sidecar.as_deref() else {
+        return write_response(
+            stream,
+            404,
+            "Not Found",
+            "text/plain; charset=utf-8",
+            b"not found\n",
+            send_body,
+            &[],
+        );
+    };
+    let meta = match std::fs::metadata(path) {
+        Ok(m) if m.is_file() && m.len() > 0 => m,
+        _ => {
+            return write_response(
+                stream,
+                404,
+                "Not Found",
+                "text/plain; charset=utf-8",
+                b"not found\n",
+                send_body,
+                &[],
+            );
+        }
+    };
+    let size = meta.len();
+    let resolved = resolve_range(range_header, size);
+    let (status, reason, start, content_len, content_range) = match resolved {
+        ResolvedRange::Full => (200u16, "OK", 0u64, size, None),
+        ResolvedRange::Partial { start, end } => {
+            let len = end.saturating_sub(start).saturating_add(1);
+            let cr = format!("bytes {start}-{end}/{size}");
+            (206, "Partial Content", start, len, Some(cr))
+        }
+        ResolvedRange::Unsatisfiable => {
+            let cr = format!("bytes */{size}");
+            return write_response(
+                stream,
+                416,
+                "Range Not Satisfiable",
+                crate::INDEX_MEDIA_TYPE,
+                b"",
+                send_body,
+                &[("Accept-Ranges", "bytes"), ("Content-Range", cr.as_str())],
+            );
+        }
+    };
+
+    let link = format!(
+        "<{}>; rel=\"describedby\"; type=\"{}\"",
+        crate::INDEX_SIDECAR_PATH,
+        crate::INDEX_MEDIA_TYPE
+    );
+    let mut lines: Vec<String> = vec![
+        format!("HTTP/1.1 {status} {reason}"),
+        "Connection: close".into(),
+        "Accept-Ranges: bytes".into(),
+        format!("Content-Type: {}", crate::INDEX_MEDIA_TYPE),
+        format!("Content-Length: {content_len}"),
+        format!("Link: {link}"),
+    ];
+    if let Some(cr) = content_range {
+        lines.push(format!("Content-Range: {cr}"));
+    }
+    let mut head_bytes = lines.join("\r\n");
+    head_bytes.push_str("\r\n\r\n");
+    stream.write_all(head_bytes.as_bytes())?;
+    if head || content_len == 0 {
+        return Ok(());
+    }
+    let mut file = File::open(path)?;
+    if start > 0 {
+        file.seek(SeekFrom::Start(start))?;
+    }
+    let mut remaining = content_len;
+    let chunk = state.chunk.max(1);
+    let mut buf = vec![0u8; chunk];
+    while remaining > 0 {
+        let want = (remaining as usize).min(buf.len());
+        let n = fill_read(&mut file, &mut buf[..want])?;
+        if n == 0 {
+            break;
+        }
+        stream.write_all(&buf[..n])?;
+        remaining -= n as u64;
+    }
+    Ok(())
 }
 
 fn handle_file(

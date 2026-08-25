@@ -6,7 +6,7 @@
 
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
-Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing shipped; encrypt / 3.1.1 / Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets: **F-2** incremental reindex, then **G-2** portable index (**F-3** locate is `done`). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
+Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing shipped; encrypt / 3.1.1 / Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets after F-2 / F-3 / G-2: F-5..F-10, G-3..G-5. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
 
 ---
 
@@ -113,7 +113,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | ID | Work | Status | Effort | Ownership |
 |----|------|--------|--------|-----------|
 | F-1 | **Remote directory mounts** (S3 prefix / SSH dir / WebDAV PROPFIND / HTTP index) | `done` | M | remote `RemoteFolderMountSource` + factory folder probe |
-| F-2 | **Incremental reindex** after `.tar.zst` splice / append-only TAR | `todo` | L | index + formats-tar + compositing |
+| F-2 | **Incremental reindex** after `.tar.zst` splice / append-only TAR | `done` | L | index + formats-tar + compositing |
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `todo` | L | fuse + packaging |
@@ -133,11 +133,13 @@ WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.m
 
 **Residual:** SPA HTML indexes; WebDAV Depth-infinity listing; user-facing S3 pagination UI; forcing Dropbox onto the trait.
 
-### F-2 — Incremental reindex
+### F-2 — Incremental reindex — `done`
 
-Live `.tar.zst` splice still **reindexes the whole TAR on remount**. That tax will kill the write path. Append-only TAR / last-frame zstd should patch the SQLite index (insert/delete rows, bump tarstats checksum) instead of rebuilding.
+Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-disk 0.7.x sidecar as a persist post-step** (interval, on-exit, offline splice). Prefix frames are not rescanned. Interval reopen uses `open_with_existing_index_body`; on-exit does not reopen in-process — the next remount is warm because tarstats were bumped during persist.
 
-Acceptance: remount after last-frame splice does **not** rescan prefix frames; index row count matches GNU tar listing; `check_tarstats` still detects a replaced archive.
+Acceptance: remount after last-frame splice does **not** rescan prefix frames; patched `files` equals a full `create_index_body`; `check_tarstats` still detects a replaced archive.
+
+**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild.
 
 ### F-3 — SQLite FTS5 / locate — `done`
 
@@ -215,7 +217,7 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 | ID | Work | Status | Effort | Depends |
 |----|------|--------|--------|---------|
 | G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); **booleans**, no `serve` subcommand |
-| G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `todo` | M | index; pairs with P-1 |
+| G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `done` | M | index; pairs with P-1 |
 | G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `todo` | L | `--hashes` (partial today) |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
 | G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
@@ -226,9 +228,15 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 
 A `ratarmount serve` **subcommand was not shipped** (clap positionals steal the archive path). Booleans are the product. Residual: control-plane redesign, IP allowlists.
 
-### G-2 — Index as a portable artifact
+### G-2 — Index as a portable artifact — `done`
 
-Publish `.index.sqlite` (or a SOCI-compatible zTOC) next to the archive. HTTP/S3 already download compressed indexes. Standardize a content-addressed index media type and a `Link:` / OCI referrer so **any** tool can lazy-open the archive. Interop with 0.7.x is the constraint — do not fork the schema without a version bump plan.
+Media type `application/vnd.ratarmount.index.v1+sqlite` names this SQLite **blob family** (`v1`). Inner `INDEX_VERSION` stays `0.7.0` (`files` schema). Not SOCI / eStargz / nydus zTOC.
+
+Discovery (fail-open): explicit `--index-file` → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) sibling GET → OCI 1.1 referrer **on local miss**. After a remote fetch, `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. **No S3/GCS/Azure sibling GET/PUT in v1** (`aws s3 cp`).
+
+Publish: `--publish-index` copies the sidecar next to the archive; `--publish-index-to PATH` is a required value. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
+
+**Residual:** SOCI / eStargz / nydus zTOC converter; S3/GCS/Azure sibling GET/PUT; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
 ### G-3 — Content-addressed member cache
 
@@ -250,13 +258,13 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 
 1. ~~**F-1** remote directory mounts~~ — done (S3/SSH/WebDAV/HTTP + GCS/Azure/rclone/IPFS/FTP folders).
 2. ~~**P-4** FTP~~ — done (file REST + LIST/MLSD folders; implicit :990 residual).
-3. **F-2** incremental reindex — unblocks honest live commit and F-7.
+3. ~~**F-2** incremental reindex~~ — done (sidecar patch; prefix not rescanned; residuals above).
 4. ~~**P-5** HTTP Range export~~ / ~~**P-6** WebDAV~~ — HTTP `done`; WebDAV `done` (mux residual). SMB **P-2** stays `partial` (encrypt / 3.1.1 / Finder).
 5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~, ~~**P-10** SFTP~~ — done (`sftp-russh` is a feature note).
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. **F-9** `--repack-seekable` — independent producer.
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
-9. **G-2** portable index alongside P-1/F-4.
+9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index`; HTTP sidecar GET). Residual SOCI / S3 sibling / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---

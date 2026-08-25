@@ -2,6 +2,7 @@
 
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
@@ -30,6 +31,9 @@ pub struct HttpOptions {
     pub readahead_bytes: u64,
     /// Enable PROPFIND and overlay writes. GET/HEAD still work (P-5 reuse).
     pub webdav: bool,
+    /// On-disk SQLite sidecar served at `/.ratarmount-control/index.sqlite`.
+    /// HTTP-only (not a FUSE control file). `None` / missing / `:memory:` → 404.
+    pub index_sidecar: Option<PathBuf>,
 }
 
 impl Default for HttpOptions {
@@ -40,6 +44,7 @@ impl Default for HttpOptions {
             overlay: None,
             readahead_bytes: 0,
             webdav: false,
+            index_sidecar: None,
         }
     }
 }
@@ -52,6 +57,7 @@ impl std::fmt::Debug for HttpOptions {
             .field("overlay", &self.overlay.is_some())
             .field("readahead_bytes", &self.readahead_bytes)
             .field("webdav", &self.webdav)
+            .field("index_sidecar", &self.index_sidecar)
             .finish()
     }
 }
@@ -148,6 +154,7 @@ fn serve_listener(
         webdav: opts.webdav,
         locks: std::sync::Mutex::new(LockTable::default()),
         basic,
+        index_sidecar: opts.index_sidecar.clone(),
     });
     match &opts.stop {
         None => {
@@ -195,6 +202,7 @@ impl From<WebDavOptions> for HttpOptions {
             overlay: opts.overlay,
             readahead_bytes: opts.readahead_bytes,
             webdav: true,
+            index_sidecar: None,
         }
     }
 }

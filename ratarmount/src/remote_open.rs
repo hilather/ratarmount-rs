@@ -3,14 +3,253 @@
 //! Extracted from [`super`] so protocol PRs can add directory vs file
 //! dispatch here without growing `factory.rs`.
 
-use std::io::{Read, Seek};
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
+use ratarmount_index::{
+    check_tarstats_matches_remote, hash_hex, maybe_fetch_index_url, parse_link_describedby,
+    resolve_index_location, sibling_index_candidates, SqliteIndex, TARSTATS_FULL_HASH_MAX,
+    TARSTATS_SAMPLE_BYTES,
+};
 
 use super::{open_from_live_range, open_path};
+
+/// K12: explicit `--index-file` / local folder candidates (including `oci:{digest}`
+/// cache) then HTTP `Link` on archive HEAD, http(s) sibling GET, OCI referrer on
+/// local miss. Fail-open. No S3 sibling GET. Wrong-size sidecar is not used.
+fn apply_remote_index_discovery(
+    input: &str,
+    opts: &mut OpenOptions,
+    recreate: bool,
+    archive_size: u64,
+    oci: Option<(
+        &ratarmount_remote::OciLocation,
+        &ratarmount_remote::OciLayer,
+    )>,
+) {
+    if recreate || opts.clear_index_cache || opts.index_in_memory {
+        return;
+    }
+    if opts.index_file_path.is_some() {
+        return;
+    }
+    let loc = resolve_index_location(Path::new(input), None, &opts.index_folders, false);
+    if let Some(p) = loc.as_path() {
+        if path_is_nonempty_file(p) {
+            log::debug!("local index cache hit; skip remote discovery ({input})");
+            return;
+        }
+    }
+    let cache_dest = loc.as_path().map(Path::to_path_buf);
+
+    if input.starts_with("http://") || input.starts_with("https://") {
+        match ratarmount_remote::probe_http(input) {
+            Ok(probe) => {
+                if let Some(header) = probe.link.as_deref() {
+                    if let Some(url) = parse_link_describedby(header, input) {
+                        log::debug!("index Link describedby={url}");
+                        if try_fetch_http_index(
+                            opts,
+                            &url,
+                            archive_size,
+                            input,
+                            cache_dest.as_deref(),
+                        ) {
+                            return;
+                        }
+                    }
+                }
+                for cand in sibling_index_candidates(input) {
+                    if try_fetch_http_index(opts, &cand, archive_size, input, cache_dest.as_deref())
+                    {
+                        return;
+                    }
+                    log::debug!("index sibling unusable: {cand}");
+                }
+            }
+            Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
+        }
+        return;
+    }
+
+    if let Some((oloc, layer)) = oci {
+        match ratarmount_remote::fetch_oci_index_referrer(
+            oloc,
+            &layer.digest,
+            layer.bearer(),
+            cache_dest.as_deref(),
+        ) {
+            Ok(Some(path)) => {
+                let (prefix, suffix, full) = oci_fingerprint(layer, archive_size);
+                let _ = try_install_remote_index(
+                    opts,
+                    path,
+                    archive_size,
+                    prefix.as_deref(),
+                    suffix.as_deref(),
+                    full.as_deref(),
+                    cache_dest.as_deref(),
+                );
+            }
+            Ok(None) => {}
+            Err(e) => log::debug!("OCI referrer miss: {e}"),
+        }
+    }
+}
+
+fn path_is_nonempty_file(path: &Path) -> bool {
+    std::fs::metadata(path)
+        .map(|m| m.is_file() && m.len() > 0)
+        .unwrap_or(false)
+}
+
+fn try_fetch_http_index(
+    opts: &mut OpenOptions,
+    index_url: &str,
+    archive_size: u64,
+    archive_url: &str,
+    cache_dest: Option<&Path>,
+) -> bool {
+    match maybe_fetch_index_url(index_url) {
+        Ok(path) => {
+            let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
+            try_install_remote_index(
+                opts,
+                path,
+                archive_size,
+                prefix.as_deref(),
+                suffix.as_deref(),
+                full.as_deref(),
+                cache_dest,
+            )
+        }
+        Err(e) => {
+            log::debug!("index fetch {index_url}: {e}");
+            false
+        }
+    }
+}
+
+fn try_install_remote_index(
+    opts: &mut OpenOptions,
+    fetched: PathBuf,
+    archive_size: u64,
+    prefix: Option<&str>,
+    suffix: Option<&str>,
+    full: Option<&str>,
+    cache_dest: Option<&Path>,
+) -> bool {
+    let stored = match SqliteIndex::open_read_only(&fetched).and_then(|idx| idx.tarstats()) {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            log::warn!("remote index missing tarstats; not using sidecar");
+            let _ = std::fs::remove_file(&fetched);
+            return false;
+        }
+        Err(e) => {
+            log::debug!("remote index open failed: {e}");
+            let _ = std::fs::remove_file(&fetched);
+            return false;
+        }
+    };
+    if let Err(e) = check_tarstats_matches_remote(&stored, archive_size, prefix, suffix, full) {
+        log::warn!("remote archive fingerprint mismatch ({e}); cold index");
+        let _ = std::fs::remove_file(&fetched);
+        return false;
+    }
+    let dest = match cache_dest {
+        Some(d) if d != fetched.as_path() => {
+            if let Some(parent) = d.parent() {
+                if !parent.as_os_str().is_empty() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+            }
+            match std::fs::copy(&fetched, d) {
+                Ok(_) => {
+                    let _ = std::fs::remove_file(&fetched);
+                    d.to_path_buf()
+                }
+                Err(_) => fetched,
+            }
+        }
+        _ => fetched,
+    };
+    opts.index_file_path = Some(dest);
+    true
+}
+
+fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Option<String>) {
+    if size == 0 {
+        return (None, None, None);
+    }
+    let prefix_end = (TARSTATS_SAMPLE_BYTES as u64)
+        .saturating_sub(1)
+        .min(size.saturating_sub(1));
+    let prefix = ratarmount_remote::fetch_http_range_bytes(url, 0, prefix_end)
+        .ok()
+        .and_then(|b| hash_hex("sha256", &b));
+    let suffix = if size as usize <= TARSTATS_SAMPLE_BYTES {
+        prefix.clone()
+    } else {
+        let start = size.saturating_sub(TARSTATS_SAMPLE_BYTES as u64);
+        ratarmount_remote::fetch_http_range_bytes(url, start, size.saturating_sub(1))
+            .ok()
+            .and_then(|b| hash_hex("sha256", &b))
+    };
+    let full = if size <= TARSTATS_FULL_HASH_MAX {
+        ratarmount_remote::fetch_http_range_bytes(url, 0, size.saturating_sub(1))
+            .ok()
+            .and_then(|b| hash_hex("sha256", &b))
+    } else {
+        None
+    };
+    (prefix, suffix, full)
+}
+
+fn oci_fingerprint(
+    layer: &ratarmount_remote::OciLayer,
+    size: u64,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if size == 0 {
+        return (None, None, None);
+    }
+    let Ok(mut blob) = layer.open_blob() else {
+        return (None, None, None);
+    };
+    let prefix_n = TARSTATS_SAMPLE_BYTES.min(size as usize);
+    let mut prefix_buf = vec![0u8; prefix_n];
+    if blob.read_exact(&mut prefix_buf).is_err() {
+        return (None, None, None);
+    }
+    let prefix = hash_hex("sha256", &prefix_buf);
+    let suffix = if size as usize <= TARSTATS_SAMPLE_BYTES {
+        prefix.clone()
+    } else {
+        let mut suffix_buf = vec![0u8; TARSTATS_SAMPLE_BYTES];
+        match blob.seek(SeekFrom::End(-(TARSTATS_SAMPLE_BYTES as i64))) {
+            Ok(_) if blob.read_exact(&mut suffix_buf).is_ok() => hash_hex("sha256", &suffix_buf),
+            _ => None,
+        }
+    };
+    let full = if size <= TARSTATS_FULL_HASH_MAX {
+        if blob.seek(SeekFrom::Start(0)).is_ok() {
+            let mut all = Vec::new();
+            if blob.read_to_end(&mut all).is_ok() {
+                hash_hex("sha256", &all)
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    (prefix, suffix, full)
+}
 
 /// Materialize a remote URL to a local path and open it.
 pub(super) fn materialize_remote_input(
@@ -135,16 +374,27 @@ pub(super) fn open_remote_input(
     match access {
         RemoteAccess::Http(RemoteHttp::Range(range)) => {
             let len = range.len();
+            let mut opts = opts.clone();
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
             let input_owned = input.to_string();
-            match open_from_live_range(range, len, input, opts, recreate, "HTTP Range", || {
+            match open_from_live_range(range, len, input, &opts, recreate, "HTTP Range", || {
                 // Buffered fallback is still Read+Seek-usable for rebuild.
                 ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
-                None => materialize_remote_input(input, opts, recreate, remotes),
+                None => materialize_remote_input(input, &opts, recreate, remotes),
             }
         }
-        RemoteAccess::Http(RemoteHttp::Materialized(remote)) | RemoteAccess::Path(remote) => {
+        RemoteAccess::Http(RemoteHttp::Materialized(remote)) => {
+            let path = remote.path().to_path_buf();
+            let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            let mut opts = opts.clone();
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            remotes.push(remote);
+            let src = open_path(&path, &opts, recreate)?;
+            Ok((path, src))
+        }
+        RemoteAccess::Path(remote) => {
             let path = remote.path().to_path_buf();
             remotes.push(remote);
             let src = open_path(&path, opts, recreate)?;
@@ -242,13 +492,21 @@ fn open_oci_image(
             layer.digest, layer.size, layer.media_type
         );
         let label = format!("oci:{}", layer.digest);
+        let mut layer_opts = opts.clone();
+        apply_remote_index_discovery(
+            &label,
+            &mut layer_opts,
+            recreate,
+            layer.size,
+            Some((&image.location, layer)),
+        );
         let body = layer.open_blob().map_err(|e| e.to_string())?;
         let reopen_layer = layer.clone();
         match open_from_live_range(
             body,
             layer.size,
             &label,
-            opts,
+            &layer_opts,
             recreate,
             "OCI layer",
             move || reopen_layer.open_blob().map_err(|e| e.to_string()),
@@ -436,5 +694,123 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
         assert_eq!(buf, b"hello-oci-layer\n");
+    }
+
+    /// Regression: inbound HEAD of an **archive** URL with `Link: describedby`
+    /// fetches the sidecar when local folder candidates miss.
+    #[test]
+    fn apply_remote_index_discovery_follows_archive_link() {
+        use ratarmount_index::{SqliteIndex, INDEX_LINK_REL, INDEX_MEDIA_TYPE};
+        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let archive_bytes = vec![b'A'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let idx_path = dir.path().join("sidecar.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            idx.store_tarstats_for_path(&archive).unwrap();
+        }
+        let index_bytes = fs::read(&idx_path).unwrap();
+        let folders = vec![dir.path().join("empty-index-folders")];
+        fs::create_dir_all(&folders[0]).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let archive_body = archive_bytes.clone();
+        let index_body = index_bytes.clone();
+        let join = thread::spawn(move || {
+            listener.set_nonblocking(false).ok();
+            for stream in listener.incoming().take(32) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut range_hdr: Option<String> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Range:") {
+                        range_hdr = Some(v.trim().to_string());
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let is_head = request_line.starts_with("HEAD ");
+                let is_index = path.contains("index.sqlite");
+                let body: &[u8] = if is_index { &index_body } else { &archive_body };
+                let mut range_off: Option<(usize, usize)> = None;
+                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                    let parts: Vec<&str> = r.splitn(2, '-').collect();
+                    if parts.len() == 2 {
+                        let start: usize = parts[0].parse().unwrap_or(0);
+                        let end: usize = if parts[1].is_empty() {
+                            body.len().saturating_sub(1)
+                        } else {
+                            parts[1]
+                                .parse()
+                                .unwrap_or(0)
+                                .min(body.len().saturating_sub(1))
+                        };
+                        if start < body.len() && start <= end {
+                            range_off = Some((start, end));
+                        }
+                    }
+                }
+                let slice = match range_off {
+                    Some((s, e)) => &body[s..=e],
+                    None => body,
+                };
+                let status = if range_off.is_some() {
+                    "206 Partial Content"
+                } else {
+                    "200 OK"
+                };
+                let mut hdr = format!(
+                    "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+                    slice.len()
+                );
+                if let Some((start, end)) = range_off {
+                    hdr.push_str(&format!(
+                        "Content-Range: bytes {start}-{end}/{}\r\n",
+                        body.len()
+                    ));
+                }
+                if !is_index {
+                    hdr.push_str(&format!(
+                        "Link: </archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\"\r\n"
+                    ));
+                }
+                hdr.push_str("\r\n");
+                let _ = stream.write_all(hdr.as_bytes());
+                if !is_head {
+                    let _ = stream.write_all(slice);
+                }
+            }
+        });
+
+        let url = format!("http://{addr}/archive.tar");
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("Link describedby must install a sidecar");
+        assert!(got.is_file(), "{}", got.display());
+        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
     }
 }

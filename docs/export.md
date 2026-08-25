@@ -31,12 +31,14 @@ Bind flags take a **required value** (`num_args = 1`) so they cannot steal the a
 
 ## HTTP GET/HEAD (`--http`) — P-5 `done`
 
-Reverse of the HTTP Range client. One `source.open` + `fill_read` per request (gzip short `Read::read` is not EOF). Directories return `text/html` listings from `list_dirents`.
+Reverse of the HTTP Range client. Serves the **indexed tree**, not host archive bytes. One `source.open` + `fill_read` per request (gzip short `Read::read` is not EOF). Directories return `text/html` listings from `list_dirents`.
 
 ```bash
 ratarmount --http archive.tar.gz
 curl -I http://127.0.0.1:20491/member
 curl -r 0-1023 http://127.0.0.1:20491/member
+# Portable sidecar (HTTP-only; not a FUSE control file):
+curl -I http://127.0.0.1:20491/.ratarmount-control/index.sqlite
 ```
 
 | Item | Behavior |
@@ -46,6 +48,7 @@ curl -r 0-1023 http://127.0.0.1:20491/member
 | Range | Single `bytes=start-end` → 206 + `Content-Range`. Multiple ranges: first only or 200 full. Unsatisfiable → 416 |
 | Auth | None (localhost) |
 | Writes | Out of v1 (use `--webdav -w`) |
+| GET `/.ratarmount-control/index.sqlite` | HTTP-only sidecar download; `Content-Type: application/vnd.ratarmount.index.v1+sqlite`. 404 if `:memory:` / missing. Not an archive server. Inbound discovery uses `Link` on the **archive** HEAD, not this export |
 
 ## WebDAV (`--webdav`) — P-6 `done`
 

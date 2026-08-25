@@ -28,6 +28,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 mod factory;
 mod find;
 mod overlay_commit;
+mod publish_index;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -260,6 +261,16 @@ struct Args {
     /// Empty entry = next to the archive. Default: ,$XDG_CACHE_HOME/ratarmount,~/.ratarmount
     #[arg(long = "index-folders")]
     index_folders: Option<String>,
+
+    /// Copy the on-disk SQLite sidecar next to the archive after a successful open.
+    /// Boolean (`SetTrue`); does not steal the archive path.
+    #[arg(long = "publish-index", action = ArgAction::SetTrue)]
+    publish_index: bool,
+
+    /// Copy the on-disk SQLite sidecar to PATH. Required value (`num_args = 1`);
+    /// do not use `num_args = 0..=1` (that steals the archive). No S3 PUT in v1.
+    #[arg(long = "publish-index-to", value_name = "PATH", num_args = 1)]
+    publish_index_to: Option<PathBuf>,
 
     /// Also check archive mtime against the index (stricter reuse)
     #[arg(long = "verify-mtime", action = ArgAction::SetTrue)]
@@ -903,6 +914,29 @@ fn main() {
         }
     }
 
+    let index_sidecar = resolved_on_disk_index(&inputs, &open_opts);
+    if args.publish_index || args.publish_index_to.is_some() {
+        match index_sidecar.as_deref() {
+            Some(src) => {
+                if let Err(e) = publish_index::publish_index(publish_index::PublishIndexOpts {
+                    archive: &inputs[0],
+                    sidecar: src,
+                    dest: args.publish_index_to.as_deref(),
+                    no_recreate_index: args.no_recreate_index,
+                }) {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
+            None => {
+                eprintln!(
+                    "error: --publish-index requires an on-disk SQLite sidecar (not :memory:)"
+                );
+                std::process::exit(2);
+            }
+        }
+    }
+
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
 
@@ -1150,7 +1184,7 @@ fn main() {
             }
             return;
         }
-        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead);
+        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead, index_sidecar.clone());
         run_exports(
             bundle.source,
             fuse_mp,
@@ -1171,7 +1205,7 @@ fn main() {
     }
 
     if other_exports {
-        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead);
+        let plan = parse_export_plan(&args, overlay_arc.clone(), readahead, index_sidecar.clone());
         run_exports(
             bundle.source,
             fuse_mp,
@@ -1278,10 +1312,28 @@ fn warn_export_non_loopback(name: &str, bind: std::net::SocketAddr) {
     }
 }
 
+fn resolved_on_disk_index(inputs: &[PathBuf], opts: &OpenOptions) -> Option<PathBuf> {
+    if opts.index_in_memory {
+        return None;
+    }
+    let archive = inputs.first()?;
+    let explicit = opts
+        .index_file_path
+        .as_ref()
+        .map(|p| p.to_string_lossy().into_owned());
+    let loc = resolve_index_location(archive, explicit.as_deref(), &opts.index_folders, false);
+    let p = loc.as_path()?;
+    match std::fs::metadata(p) {
+        Ok(m) if m.is_file() && m.len() > 0 => Some(p.to_path_buf()),
+        _ => None,
+    }
+}
+
 fn parse_export_plan(
     args: &Args,
     overlay: Option<Arc<WriteOverlay>>,
     readahead: u64,
+    index_sidecar: Option<PathBuf>,
 ) -> ExportPlan {
     let readahead_usize = usize::try_from(readahead).unwrap_or(usize::MAX);
     let mut plan = ExportPlan {
@@ -1301,6 +1353,7 @@ fn parse_export_plan(
             overlay: overlay.clone(),
             readahead_bytes: readahead,
             webdav: false,
+            index_sidecar,
         });
     }
     if args.webdav {
@@ -2152,7 +2205,9 @@ fn print_features() {
     println!(
         "  remote: http,https,file,s3,gs,az,ftp,ftps,ssh,sftp,webdav,smb,dropbox,oci,docker,ipfs,rclone"
     );
-    println!("  index: --index-file, --index-folders, :memory:");
+    println!(
+        "  index: --index-file, --index-folders, :memory:, --publish-index / --publish-index-to"
+    );
     println!(
         "  control: --control-interface (unix socket + in-FS search/<pattern>); ratarmount find PATTERN ARCHIVE"
     );
@@ -3001,6 +3056,42 @@ mod export_cli_tests {
         assert!(a.http);
         assert_eq!(a.http_bind, "127.0.0.1:20491");
         assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    /// Regression: boolean `--publish-index` must not steal the archive path.
+    #[test]
+    fn publish_index_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--publish-index", "a.tar"]).expect("parse");
+        assert!(a.publish_index);
+        assert!(a.publish_index_to.is_none());
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    /// Regression: `--publish-index-to PATH` is `num_args = 1` (not `0..=1`).
+    #[test]
+    fn publish_index_to_required_value_does_not_steal_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--publish-index-to",
+            "/tmp/out.index.sqlite",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert_eq!(
+            a.publish_index_to.as_deref(),
+            Some(std::path::Path::new("/tmp/out.index.sqlite"))
+        );
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn publish_index_to_without_value_is_clap_error() {
+        let err = Args::try_parse_from(["ratarmount", "--publish-index-to"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("publish-index-to") || msg.contains("required") || msg.contains("value"),
+            "{msg}"
+        );
     }
 
     #[test]

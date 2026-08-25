@@ -120,7 +120,8 @@ Plain multi-frame without a footer still works well (`kind`: multi-frame scan).
 | **Mapped read** | Locate frame covering the uncompressed offset; decompress that frame (cached per reader); serve the range |
 | **Full decode** | Stream-decompress once into RAM or temp; then seek in the decoded body |
 | **Threads (`-P` / backend hint)** | Multi-frame maps already isolate frames; full multi-frame materialization can decode frames in parallel when threads > 1 |
-| **Index side tables** | Python-compatible `zstdblocks` import/export for cross-tool maps |
+| **Index side tables** | Python-compatible `zstdblocks` import/export for cross-tool maps. After a last-frame splice, F-2 rewrites `zstdblocks` from a **fresh** frame scan of the new file inside the sidecar patch transaction (pre-splice maps are not imported). |
+| **Incremental reindex (F-2)** | Persist patches the on-disk sidecar from the rewrite window; remount does **not** rescan prefix frames. Persist still **copies** the compressed prefix. `:memory:` / discarded sidecar / single-frame `.tar.zst` still full-rebuild. ZIP commit is still a full rebuild. |
 | **Nested / Shared** | From-reader path shares the compressed stream under a mutex; each open tracks a **private compressed offset** so concurrent FUSE readers cannot interleave `seek`+`read` |
 
 Plain `.zst` (non-TAR payload) uses the same seekable body under a single-file

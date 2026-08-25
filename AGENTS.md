@@ -115,11 +115,24 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FTP LIST/MLSD folder | `cargo test -p ratarmount-remote --lib ftp` |
 | rclone+ URL | `cargo test -p ratarmount-remote --lib rclone` · `cargo test -p ratarmount-remote --lib is_remote_url` |
 | `--sftp-subsystem` clap | `cargo test -p ratarmount --bin ratarmount sftp_subsystem` |
+| Last-frame splice remount rescans prefix | `cargo test -p ratarmount-formats-tar --lib regression_incremental_last_frame_no_prefix_seek` |
+| Incremental `files` ≠ full `create_index_body` | `cargo test -p ratarmount-formats-tar --lib regression_incremental_equals_full_index` |
+| On-exit persist leaves stale sidecar (remount full-parses) | `cargo test -p ratarmount --test commit_overlay_live on_exit_remount` · `cargo test -p ratarmount --bin ratarmount -- live_commit_on_exit_remount` |
+| Interval reopen | `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount --bin ratarmount -- live_commit` |
+| Pre-splice `zstdblocks` used for suffix parse | `cargo test -p ratarmount-formats-tar --lib regression_incremental_zstdblocks_fresh` |
+| GNU `--append` from `pre_size` misses members | `cargo test -p ratarmount-formats-tar --lib regression_incremental_append_eof` |
+| Opaque persist fail-closed | `cargo test -p ratarmount-formats-tar --lib rewrite_mid_member_opaque_prefix` |
+| Opaque prefix + later valid header | `cargo test -p ratarmount-formats-tar --lib regression_incremental_opaque_then_header` |
 | `find '*.fits'` without FUSE | `cargo test -p ratarmount --bin ratarmount find_glob` |
 | `find` clap steals archive / pattern | `cargo test -p ratarmount --bin ratarmount find_flag` |
 | Control read-only `search/<pattern>` | `cargo test -p ratarmount-compositing --lib control_search` |
 | Socket `search` | `cargo test -p ratarmount --bin ratarmount control_search_socket` |
 | FTS5 path + hashes | `cargo test -p ratarmount-index --lib search_fts5` (default `cargo test -p ratarmount-index --lib`, no extra features) |
+| Inbound HEAD **archive** `Link: describedby` → fetch | `cargo test -p ratarmount-index --lib link_describedby_archive_head` · `cargo test -p ratarmount --bin ratarmount apply_remote_index_discovery_follows_archive_link` |
+| Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
+| Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
+| OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
+| Publish local sidecar | `cargo test -p ratarmount --bin ratarmount publish_index` · `publish_index_flag` clap-steal |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

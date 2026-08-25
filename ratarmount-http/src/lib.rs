@@ -2,7 +2,17 @@
 //!
 //! GET/HEAD with byte ranges (default bind `127.0.0.1:20491`). WebDAV PROPFIND
 //! Depth 0/1 plus overlay PUT/DELETE/MKCOL/MOVE (`127.0.0.1:20492`). Writes
-//! need `-w`. CLI `--http` / `--webdav` are wired in a later PR.
+//! need `-w`. `--http` serves the **indexed tree**, not host archive bytes.
+//! Portable index download is HTTP-only `GET /.ratarmount-control/index.sqlite`
+//! ([`INDEX_MEDIA_TYPE`]), not a FUSE control file.
+
+/// Portable 0.7.x SQLite sidecar Content-Type (G-2 blob family `v1`).
+///
+/// Same string as `ratarmount_index::INDEX_MEDIA_TYPE`. Not SOCI / eStargz.
+pub const INDEX_MEDIA_TYPE: &str = "application/vnd.ratarmount.index.v1+sqlite";
+
+/// HTTP-only download path for the sidecar (not a FUSE `/.ratarmount-control` file).
+pub const INDEX_SIDECAR_PATH: &str = "/.ratarmount-control/index.sqlite";
 
 mod handler;
 mod request;

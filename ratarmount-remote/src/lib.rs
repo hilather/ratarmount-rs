@@ -54,8 +54,9 @@ pub use rclone::{
 };
 mod oci;
 pub use oci::{
-    fetch_oci_image, parse_docker_url, parse_oci_url, OciBlobRangeFile, OciImage, OciLayer,
-    OciLocation, OCI_DOCKER_CONFIG_ENV, OCI_PASSWORD_ENV, OCI_USER_ENV,
+    fetch_oci_image, fetch_oci_index_referrer, list_oci_index_referrers, parse_docker_url,
+    parse_oci_url, OciBlobRangeFile, OciImage, OciLayer, OciLocation, OciReferrer,
+    OCI_DOCKER_CONFIG_ENV, OCI_INDEX_ARTIFACT_TYPE, OCI_PASSWORD_ENV, OCI_USER_ENV,
 };
 mod ipfs;
 pub use ipfs::{
@@ -572,6 +573,8 @@ pub struct HttpProbe {
     pub content_length: Option<u64>,
     /// True when the server advertises or demonstrates byte-range support.
     pub accept_ranges: bool,
+    /// RFC 8288 `Link` header from a successful **archive** HEAD (inbound `describedby`).
+    pub link: Option<String>,
 }
 
 /// Parse `Content-Range: bytes start-end/total` and return `total` when present.
@@ -624,6 +627,7 @@ pub fn probe_http(url: &str) -> Result<HttpProbe> {
 
 fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
     let url = loc.url.as_str();
+    let mut link = None;
     match apply_http_auth(
         ureq::head(url).set("User-Agent", USER_AGENT),
         loc.auth.as_ref(),
@@ -632,6 +636,11 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
     .call()
     {
         Ok(resp) if (200..300).contains(&resp.status()) => {
+            link = resp
+                .header("Link")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
             let content_length = resp
                 .header("Content-Length")
                 .and_then(|s| s.parse::<u64>().ok());
@@ -640,11 +649,15 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
                 return Ok(HttpProbe {
                     content_length,
                     accept_ranges: true,
+                    link,
                 });
             }
             if accept_ranges {
                 // Ranges OK but size unknown — try Content-Range probe.
-                if let Some(probe) = probe_range_size(loc)? {
+                if let Some(mut probe) = probe_range_size(loc)? {
+                    if probe.link.is_none() {
+                        probe.link = link;
+                    }
                     return Ok(probe);
                 }
             }
@@ -653,15 +666,20 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
                 return Ok(HttpProbe {
                     content_length,
                     accept_ranges: false,
+                    link,
                 });
             }
             // Fall through to range probe when length missing or ambiguous.
-            if let Some(probe) = probe_range_size(loc)? {
+            if let Some(mut probe) = probe_range_size(loc)? {
+                if probe.link.is_none() {
+                    probe.link = link;
+                }
                 return Ok(probe);
             }
             return Ok(HttpProbe {
                 content_length,
                 accept_ranges: false,
+                link,
             });
         }
         Ok(resp) if resp.status() == 401 => {
@@ -678,7 +696,10 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
         }
     }
 
-    if let Some(probe) = probe_range_size(loc)? {
+    if let Some(mut probe) = probe_range_size(loc)? {
+        if probe.link.is_none() {
+            probe.link = link;
+        }
         return Ok(probe);
     }
 
@@ -686,6 +707,7 @@ fn probe_http_location(loc: &HttpLocation) -> Result<HttpProbe> {
     Ok(HttpProbe {
         content_length: None,
         accept_ranges: false,
+        link,
     })
 }
 
@@ -717,6 +739,7 @@ fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
         return Ok(Some(HttpProbe {
             content_length: total,
             accept_ranges: true,
+            link: None,
         }));
     }
     if status == 401 {
@@ -730,10 +753,34 @@ fn probe_range_size(loc: &HttpLocation) -> Result<Option<HttpProbe>> {
         return Ok(Some(HttpProbe {
             content_length,
             accept_ranges: false,
+            link: None,
         }));
     }
     debug!("Range probe {url} -> HTTP {status}");
     Ok(None)
+}
+
+/// Inclusive Range GET of `url` (`bytes=start-end`). Used for remote tarstats edges.
+pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
+    let loc = parse_http_url(url)?;
+    let range = format!("bytes={start}-{end_inclusive}");
+    let resp = apply_http_auth(
+        ureq::get(loc.url.as_str())
+            .set("User-Agent", USER_AGENT)
+            .set("Range", &range),
+        loc.auth.as_ref(),
+        loc.cookie.as_deref(),
+    )
+    .call()
+    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    let status = resp.status();
+    if status != 206 && !(200..300).contains(&status) {
+        return Err(http_status_err(status, loc.url.as_str()));
+    }
+    let mut reader = resp.into_reader();
+    let mut buf = Vec::new();
+    reader.read_to_end(&mut buf)?;
+    Ok(buf)
 }
 
 /// Full GET download to a tempfile (works without Range support).
