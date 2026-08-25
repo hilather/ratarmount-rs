@@ -237,8 +237,7 @@ impl RatarmountSftp {
         let wrote = file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| file.write_all(data));
-        drop(file);
-        ov.release_write_fd(fd);
+        ov.finish_owned_write_fd(file);
         wrote.map_err(|e| io_to_errno(&e))?;
         self.bump(id);
         Ok(data.len() as u32)

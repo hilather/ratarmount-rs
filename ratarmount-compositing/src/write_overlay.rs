@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::FromRawFd;
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -322,6 +322,19 @@ impl WriteOverlay {
     pub fn close_overlay_fd(&self, fd: i32) {
         self.release_write_fd(fd);
         let _ = unsafe { File::from_raw_fd(fd) };
+    }
+
+    /// Unpin `file` and then drop it (close).
+    ///
+    /// Protocol WRITE helpers that wrap [`Self::open_overlay_fd`] /
+    /// [`Self::create_file`] in `File::from_raw_fd` must use this instead of
+    /// `drop(file)` then [`Self::release_write_fd`]. Closing first lets the
+    /// kernel reuse the fd number; unpinning that number then drops a
+    /// still-open writer's pin, and `--commit-overlay-interval` can
+    /// persist/unlink it (later writes hit a detached inode).
+    pub fn finish_owned_write_fd(&self, file: File) {
+        self.release_write_fd(file.as_raw_fd());
+        drop(file);
     }
 
     fn write_open_hosts(&self) -> HashSet<PathBuf> {
@@ -4500,6 +4513,116 @@ mod tests {
         want.extend_from_slice(&second);
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/open.txt"), want);
+    }
+
+    /// Regression: SMB/SFTP/9P/WebDAV WRITE used to `drop(File)` (close) and
+    /// then `release_write_fd`. The pin map is keyed by fd number; the kernel
+    /// can reuse that number for a still-open writer. Interval settle would
+    /// persist/unlink the still-open file (later pwrite → detached inode).
+    #[test]
+    fn live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-proto-seed");
+        let keep = generated_payload("idle-proto-keep");
+        let proto_bytes = generated_payload("idle-proto-write");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+
+        // Failure mode: close, then a new create reuses the number, then unpin.
+        let stale_fd = ov
+            .open_overlay_fd("/stale.txt", libc::O_RDWR | libc::O_CREAT)
+            .expect("stale open");
+        let n = unsafe {
+            libc::write(
+                stale_fd,
+                proto_bytes.as_ptr() as *const _,
+                proto_bytes.len(),
+            )
+        };
+        assert_eq!(n as usize, proto_bytes.len(), "stale write");
+        drop(unsafe { std::fs::File::from_raw_fd(stale_fd) });
+        let stolen_fd = ov.create_file("/stolen.txt", 0o644).expect("stolen create");
+        ov.release_write_fd(stale_fd);
+        if stolen_fd == stale_fd {
+            set_mtime_age(&overlay.join("stolen.txt"), Duration::from_secs(30));
+            match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+                reopen_tar_zst(p, false)
+            }) {
+                Ok(true) => {}
+                other => panic!(
+                    "drop-then-release must unpin a reused fd so idle persist can unlink it, got {other:?}"
+                ),
+            }
+            assert!(
+                !overlay.join("stolen.txt").exists(),
+                "reused-fd pin was dropped; interval commit unlinked the still-open path"
+            );
+            // The unlinked inode is still writable via stolen_fd; close it.
+            ov.close_overlay_fd(stolen_fd);
+        } else {
+            ov.close_overlay_fd(stolen_fd);
+        }
+
+        // Fixed sequence: unpin while the fd is still open, then close.
+        let proto_fd = ov
+            .open_overlay_fd("/proto.txt", libc::O_RDWR | libc::O_CREAT)
+            .expect("proto open");
+        let n = unsafe {
+            libc::write(
+                proto_fd,
+                proto_bytes.as_ptr() as *const _,
+                proto_bytes.len(),
+            )
+        };
+        assert_eq!(n as usize, proto_bytes.len(), "proto write");
+        let proto_file = unsafe { std::fs::File::from_raw_fd(proto_fd) };
+        ov.finish_owned_write_fd(proto_file);
+
+        let keep_fd = ov.create_file("/keep.txt", 0o644).expect("keep create");
+        let n = unsafe { libc::write(keep_fd, keep.as_ptr() as *const _, keep.len()) };
+        assert_eq!(n as usize, keep.len(), "keep write");
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+        set_mtime_age(&overlay.join("proto.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(_) => {}
+            Err(e) => panic!("idle tick after protocol fd reuse: {e}"),
+        }
+        assert!(
+            overlay.join("keep.txt").exists(),
+            "still-open writer must stay in the overlay after a finished protocol \
+             WRITE reuses/closes another fd (keep_fd={keep_fd}, proto_fd={proto_fd})"
+        );
+
+        let extra = generated_payload("idle-proto-extra");
+        let n = unsafe {
+            libc::pwrite(
+                keep_fd,
+                extra.as_ptr() as *const _,
+                extra.len(),
+                keep.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, extra.len(), "pwrite after skipped tick");
+        ov.close_overlay_fd(keep_fd);
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after keep close"));
+        assert!(!overlay.join("keep.txt").exists());
+
+        let mut want = keep.clone();
+        want.extend_from_slice(&extra);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), want);
+        assert_eq!(read_member(src.as_ref(), "/proto.txt"), proto_bytes);
     }
 
     /// Regression: after the hot file settles, a later tick persists it once.

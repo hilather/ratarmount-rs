@@ -611,9 +611,9 @@ pub(crate) fn put_overlay(
 ) -> io::Result<bool> {
     let existed = MountSource::lookup(overlay, path, 0).is_some();
     let fd = overlay_create_file(overlay, path, 0o644)?;
+    // SAFETY: `overlay_create_file` returns a new fd we own.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| -> io::Result<()> {
-        // SAFETY: `overlay_create_file` returns a new fd we own.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         let mut remaining = content_len;
         if !leftover.is_empty() && remaining > 0 {
             let n = leftover.len().min(remaining as usize);
@@ -636,7 +636,7 @@ pub(crate) fn put_overlay(
         file.flush()?;
         Ok(())
     })();
-    overlay.release_write_fd(fd);
+    overlay.finish_owned_write_fd(file);
     result?;
     Ok(existed)
 }
@@ -664,9 +664,9 @@ pub(crate) fn copy_overlay_file(
         ));
     }
     let fd = overlay_create_file(overlay, dest, 0o644)?;
+    // SAFETY: `overlay_create_file` returns a new fd we own.
+    let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
     let result = (|| -> io::Result<()> {
-        // SAFETY: `overlay_create_file` returns a new fd we own.
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
         if fi.size == 0 {
             file.flush()?;
             return Ok(());
@@ -686,7 +686,7 @@ pub(crate) fn copy_overlay_file(
         file.flush()?;
         Ok(())
     })();
-    overlay.release_write_fd(fd);
+    overlay.finish_owned_write_fd(file);
     result
 }
 

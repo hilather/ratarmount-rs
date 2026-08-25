@@ -370,8 +370,7 @@ impl Ratarmount9p {
         let wrote = file
             .seek(SeekFrom::Start(offset))
             .and_then(|_| file.write_all(data));
-        drop(file);
-        ov.release_write_fd(fd);
+        ov.finish_owned_write_fd(file);
         wrote.map_err(|e| io_to_errno(&e))?;
         self.bump(id);
         Ok(data.len() as u32)
@@ -555,5 +554,23 @@ mod tests {
             fs.require_write_open(libc::O_WRONLY as u32).unwrap_err(),
             libc::EROFS
         );
+    }
+
+    /// Regression: overlay WRITE must unpin-then-close so a reused fd keeps its pin.
+    #[test]
+    fn overlay_write_roundtrip() {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+                .expect("overlay"),
+        );
+        let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov));
+        let (id, _) = fs.lcreate(ROOT_FILEID, "f", 0o644).expect("create");
+        assert_eq!(fs.write(id, 0, b"ninep-ov").unwrap(), 8);
+        let fi = fs.file_info(id).expect("lookup after write");
+        assert!(!is_dir_mode(fi.mode));
+        assert_eq!(fi.size, 8);
+        let body = fs.read(id, 0, 16).expect("read overlay");
+        assert_eq!(body, b"ninep-ov");
     }
 }
