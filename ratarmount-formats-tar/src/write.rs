@@ -597,6 +597,73 @@ fn find_first_valid_header<R: Read + Seek>(
     Ok(None)
 }
 
+/// Reader whose logical offset 0 is `base` in the inner stream.
+///
+/// Lets the suffix-relative [`find_first_valid_header`] walk an absolute
+/// `[abs_start, abs_end)` window without prefix-scanning the full file.
+struct AbsWindow<'a, R: Read + Seek> {
+    inner: &'a mut R,
+    base: u64,
+    pos: u64,
+}
+
+impl<R: Read + Seek> Read for AbsWindow<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.seek(SeekFrom::Start(self.base + self.pos))?;
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for AbsWindow<'_, R> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let new = match from {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => {
+                let end = self.inner.seek(SeekFrom::End(0))?;
+                end.saturating_sub(self.base) as i64 + d
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        self.inner.seek(SeekFrom::Start(self.base + self.pos))?;
+        Ok(self.pos)
+    }
+}
+
+/// First valid ustar/GNU header at or after `abs_start` (absolute offsets).
+///
+/// Do **not** call the suffix-relative rewrite helper on a full-file reader
+/// with `stream_offset = window_start`: that helper `seek(Start(i))`s with
+/// `i ∈ [0, 512)` and would prefix-scan.
+///
+/// Logical 0 of the inner walk is `abs_start`. The returned offset is
+/// absolute. `None` if no checksum-valid header exists in `[abs_start, abs_end)`.
+pub fn find_first_valid_header_from<R: Read + Seek>(
+    reader: &mut R,
+    abs_start: u64,
+    abs_end: u64,
+) -> io::Result<Option<u64>> {
+    if abs_end <= abs_start {
+        return Ok(None);
+    }
+    let scan_end = abs_end - abs_start;
+    let mut window = AbsWindow {
+        inner: reader,
+        base: abs_start,
+        pos: 0,
+    };
+    let rel = find_first_valid_header(&mut window, abs_start, scan_end)?;
+    Ok(rel.map(|o| abs_start + o))
+}
+
 /// True when `rewrite_tar_suffix` can safely rewrite this window: either a
 /// parseable member header exists, or the whole window is zero padding.
 /// Without either, the data end is unknowable (a member spans the window)
@@ -1078,6 +1145,34 @@ mod tests {
         if let ListResult::Infos(map) = m.list("/").expect("list") {
             assert!(map.contains_key("emptydir"), "keys: {:?}", map.keys());
         }
+    }
+
+    /// Absolute first-header helper must not prefix-scan: mid-member `abs_start`
+    /// finds the *next* valid header, not the one at offset 0.
+    #[test]
+    fn find_first_valid_header_from_skips_opaque_prefix() {
+        let payload_a = vec![0xab; 600];
+        let archive = pack(&[member_file("a.bin", &payload_a), member_file("b.txt", b"x")]);
+        let mid = 512 + 50;
+        let b_header = 512 + pad512(600);
+        let found = find_first_valid_header_from(
+            &mut Cursor::new(archive.clone()),
+            mid,
+            archive.len() as u64,
+        )
+        .expect("scan");
+        assert_eq!(found, Some(b_header));
+        let from_zero = find_first_valid_header_from(
+            &mut Cursor::new(archive.clone()),
+            0,
+            archive.len() as u64,
+        )
+        .expect("scan from 0");
+        assert_eq!(from_zero, Some(0));
+        let past_end =
+            find_first_valid_header_from(&mut Cursor::new(archive), b_header + 512, b_header + 512)
+                .expect("empty window");
+        assert_eq!(past_end, None);
     }
 
     /// Regression: last two-zero pair wins; mid-payload `stream_offset` is aligned.

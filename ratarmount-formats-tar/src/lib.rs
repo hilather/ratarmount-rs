@@ -82,6 +82,17 @@ pub struct NestedTarMember {
     pub size: u64,
 }
 
+/// Counters from [`SqliteIndexedTar::patch_index_from`] (persist logs + tests).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PatchStats {
+    /// `files` rows removed by [`SqliteIndex::delete_from_offsetheader`].
+    pub rows_deleted: u64,
+    /// `files` rows inserted while re-parsing the suffix.
+    pub rows_inserted: u64,
+    /// Absolute uncompressed offset where suffix parse started (first valid header).
+    pub parse_start: u64,
+}
+
 /// In-progress nested member with header metadata needed to emit a generated directory row.
 #[derive(Clone, Debug)]
 struct NestedPending {
@@ -128,9 +139,10 @@ pub type Result<T> = std::result::Result<T, TarError>;
 
 mod write;
 pub use write::{
-    find_last_tar_eof, normalize_archive_rel_path, rewrite_tar_suffix, window_has_member_boundary,
-    write_tar_eof, write_ustar_members, RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor,
-    TarRawMember, UstarMember, UstarPayload,
+    find_first_valid_header_from, find_last_tar_eof, normalize_archive_rel_path,
+    rewrite_tar_suffix, window_has_member_boundary, write_tar_eof, write_ustar_members,
+    RewriteTarSuffix, RewriteTarSuffixStats, TarMemberCursor, TarRawMember, UstarMember,
+    UstarPayload,
 };
 
 /// Mutex-backed `Read + Seek` for concurrent stencil opens (HTTP Range / Cursor / remote).
@@ -627,6 +639,80 @@ impl SqliteIndexedTar {
 
     pub fn index(&self) -> &SqliteIndex {
         &self.index
+    }
+
+    /// Patch `index` by re-parsing uncompressed TAR from `window_start`.
+    ///
+    /// `index` must be writable. The caller holds [`SqliteIndex::begin_write`]
+    /// (`BEGIN IMMEDIATE`) so persist can add [`SqliteIndex::set_zstd_blocks`]
+    /// and [`SqliteIndex::store_tarstats_for_path`] in the same transaction
+    /// before [`SqliteIndex::commit_write`].
+    ///
+    /// Deletes `files` / xattrs / suffix `nestedindexes` with
+    /// `offsetheader >= window_start`, then parses from the first valid ustar
+    /// header at or after that offset. Prefix rows stay.
+    ///
+    /// Does **not** call the GNU incremental prefix detector (that
+    /// `seek(Start(0))`s). Reads stored `isGnuIncremental` and ORs dumpdir
+    /// hits in this walk. Nested flatten applies only to members discovered
+    /// in the suffix.
+    ///
+    /// Seeks below `window_start` (including `seek(Start(0))`) are a hard
+    /// error unless `window_start == 0`.
+    ///
+    /// # Residuals
+    ///
+    /// - Mid-member opaque prefix with **no** later valid header: persist
+    ///   fail-closed ([`rewrite_tar_suffix`]); do not call this method.
+    /// - GNU incremental dumpdir **across** the window boundary (empty
+    ///   `dumpdir_state`; prefix dumpdir present-sets are not loaded).
+    /// - Prefix global PAX `g` records are not applied to suffix members.
+    pub fn patch_index_from<R: Read + Seek>(
+        reader: &mut R,
+        index: &SqliteIndex,
+        options: &OpenOptions,
+        window_start: u64,
+        product_version: &str,
+    ) -> Result<PatchStats> {
+        let t0 = Instant::now();
+        let file_len = reader.seek(SeekFrom::End(0))?;
+        let before = index.files_table_row_count()?;
+        let rows_deleted = index.delete_from_offsetheader(window_start as i64)?;
+        let parse_start =
+            find_first_valid_header_from(reader, window_start, file_len)?.unwrap_or(window_start);
+
+        let meta_before = index.metadata()?;
+        let stored_gnu = meta_before.get("isGnuIncremental").map(String::as_str) == Some("1");
+        let missing_backend = !meta_before.contains_key("backendName");
+        let missing_arguments = !meta_before.contains_key("arguments");
+        let is_gnu = match options.gnu_incremental {
+            Some(v) => v,
+            None => stored_gnu,
+        };
+        let is_gnu = parse_tar_from(reader, index, options, parse_start, is_gnu)?;
+        index.store_metadata_key_value("isGnuIncremental", if is_gnu { "1" } else { "0" })?;
+
+        if missing_backend {
+            index.store_metadata_key_value("backendName", BACKEND_NAME)?;
+            index.store_versions(product_version)?;
+        }
+        if missing_arguments {
+            store_arguments(index, options)?;
+        }
+        index.rebuild_fts_if_present()?;
+
+        let after = index.files_table_row_count()?;
+        let after_delete = before.saturating_sub(rows_deleted);
+        let rows_inserted = after.saturating_sub(after_delete);
+        let secs = t0.elapsed().as_secs_f64();
+        log::info!(
+            "incremental reindex window_start={window_start} deleted={rows_deleted} inserted={rows_inserted} parse={secs:.3}s"
+        );
+        Ok(PatchStats {
+            rows_deleted,
+            rows_inserted,
+            parse_start,
+        })
     }
 
     pub fn archive_path(&self) -> &Path {
@@ -1300,13 +1386,106 @@ fn fix_incremental_backup_name_prefixes(name: &str, header: &[u8; 512]) -> Strin
     name.to_string()
 }
 
+/// `Read + Seek` wrapper that hard-fails seeks below `min_abs` unless `min_abs == 0`.
+///
+/// Incremental suffix parse must not prefix-scan (`detect_gnu_incremental` /
+/// flatten of prefix nested TARs). Nested flatten of window members seeks at
+/// absolute offsets `>= min_abs` and is allowed.
+struct PrefixSeekGuard<'a, R: Read + Seek> {
+    inner: &'a mut R,
+    min_abs: u64,
+    pos: u64,
+}
+
+impl<'a, R: Read + Seek> PrefixSeekGuard<'a, R> {
+    fn new(inner: &'a mut R, min_abs: u64) -> io::Result<Self> {
+        inner.seek(SeekFrom::Start(min_abs))?;
+        Ok(Self {
+            inner,
+            min_abs,
+            pos: min_abs,
+        })
+    }
+
+    fn check(&self, new: u64) -> io::Result<u64> {
+        if self.min_abs > 0 && new < self.min_abs {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "incremental TAR parse must not seek to {new} (below window start {})",
+                    self.min_abs
+                ),
+            ));
+        }
+        Ok(new)
+    }
+}
+
+impl<R: Read + Seek> Read for PrefixSeekGuard<'_, R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.inner.seek(SeekFrom::Start(self.pos))?;
+        let n = self.inner.read(buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl<R: Read + Seek> Seek for PrefixSeekGuard<'_, R> {
+    fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+        let new = match from {
+            SeekFrom::Start(n) => n as i64,
+            SeekFrom::Current(d) => self.pos as i64 + d,
+            SeekFrom::End(d) => {
+                let end = self.inner.seek(SeekFrom::End(0))?;
+                end as i64 + d
+            }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        let new = self.check(new as u64)?;
+        self.inner.seek(SeekFrom::Start(new))?;
+        self.pos = new;
+        Ok(self.pos)
+    }
+}
+
 /// Returns whether the archive was treated as GNU incremental (`isGnuIncremental`).
+///
+/// Cold path: still runs the GNU incremental prefix detector then
+/// [`parse_tar_from`] from offset 0.
 fn parse_tar_into_index<R: Read + Seek>(
     reader: &mut R,
     index: &SqliteIndex,
     options: &OpenOptions,
 ) -> Result<bool> {
-    let mut pos: u64 = 0;
+    let is_gnu = match options.gnu_incremental {
+        Some(v) => v,
+        None => detect_gnu_incremental(reader, options.ignore_zeros)?,
+    };
+    parse_tar_from(reader, index, options, 0, is_gnu)
+}
+
+/// Parse uncompressed TAR headers into `index` starting at absolute `start`.
+///
+/// Must **not** call the GNU incremental prefix detector (`seek(Start(0))`).
+/// `is_gnu_incremental` comes from stored metadata and/or [`OpenOptions`];
+/// dumpdir hits in this walk still OR the flag. `dumpdir_state` starts empty
+/// (dumpdir-across-window is residual). Prefix global PAX `g` is not loaded
+/// (residual). Nested flatten only for members discovered in this walk.
+fn parse_tar_from<R: Read + Seek>(
+    reader: &mut R,
+    index: &SqliteIndex,
+    options: &OpenOptions,
+    start: u64,
+    mut is_gnu_incremental: bool,
+) -> Result<bool> {
+    let mut reader = PrefixSeekGuard::new(reader, start)?;
+    let reader = &mut reader;
+    let mut pos: u64 = start;
     let mut header = [0u8; 512];
     let mut generated_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
@@ -1319,13 +1498,9 @@ fn parse_tar_into_index<R: Read + Seek>(
     let mut nested_pending: Vec<NestedPending> = Vec::new();
     let mut xattr_batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH_FLUSH);
     // Prior dumpdir present-name sets per directory (for delete whiteouts).
+    // Incremental: empty — dumpdir across the window is a residual.
     let mut dumpdir_state: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
-
-    let mut is_gnu_incremental = match options.gnu_incremental {
-        Some(v) => v,
-        None => detect_gnu_incremental(reader, options.ignore_zeros)?,
-    };
 
     let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
         if !batch.is_empty() {
@@ -1631,8 +1806,21 @@ fn parse_tar_into_index<R: Read + Seek>(
     flush(&mut batch)?;
     flush_xattrs(&mut xattr_batch)?;
 
-    let nested_members: Vec<NestedTarMember> =
-        nested_pending.iter().map(|n| n.member.clone()).collect();
+    // Keep prefix nested TAR side-list (data offset < parse start). Suffix
+    // keys were already dropped by `delete_from_offsetheader`. Do not
+    // re-flatten prefix nested TARs (would seek below the window).
+    let mut nested_members: Vec<NestedTarMember> = if start > 0 {
+        match index.metadata()?.get(NESTED_TAR_MEMBERS_KEY) {
+            Some(json) => parse_nested_tar_members_json(json)
+                .into_iter()
+                .filter(|m| m.offset < start)
+                .collect(),
+            None => Vec::new(),
+        }
+    } else {
+        Vec::new()
+    };
+    nested_members.extend(nested_pending.iter().map(|n| n.member.clone()));
     store_nested_tar_members(index, &nested_members)?;
 
     // Flatten nested TAR headers into outer index paths (absolute offsets).
@@ -2878,6 +3066,7 @@ impl MountSource for SingleFileMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Write;
     use std::process::Command;
 
     #[test]
@@ -4644,5 +4833,558 @@ mod tests {
         assert_eq!(fi.size, dents[0].size);
         assert_eq!(fi.mode, dents[0].mode);
         assert!(src.list_dirents("/payload.bin").is_none());
+    }
+
+    fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
+        UstarMember {
+            path,
+            payload: UstarPayload::File { bytes },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
+    }
+
+    fn pack_tar(members: &[UstarMember<'_>]) -> Vec<u8> {
+        let mut out = Vec::new();
+        write_ustar_members(&mut out, members).expect("write members");
+        write_tar_eof(&mut out).expect("eof");
+        out
+    }
+
+    fn write_tar(path: &Path, members: &[UstarMember<'_>]) {
+        std::fs::write(path, pack_tar(members)).expect("write tar");
+    }
+
+    /// Hard-fail `seek(Start(n))` below `min_allowed` unless `min_allowed == 0`.
+    struct CountingSeek<R> {
+        inner: R,
+        min_allowed: u64,
+        min_start: Option<u64>,
+    }
+
+    impl<R: Read> Read for CountingSeek<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.inner.read(buf)
+        }
+    }
+
+    impl<R: Seek> Seek for CountingSeek<R> {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            if let SeekFrom::Start(n) = from {
+                if self.min_allowed > 0 && n < self.min_allowed {
+                    panic!(
+                        "Regression: incremental parse sought Start({n}) below window_start {}",
+                        self.min_allowed
+                    );
+                }
+                self.min_start = Some(self.min_start.map_or(n, |m| m.min(n)));
+            }
+            self.inner.seek(from)
+        }
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+    struct CatalogEntry {
+        name: String,
+        offsetheader: Option<u64>,
+        size: u64,
+        isgenerated: bool,
+        linkname: String,
+    }
+
+    fn catalog(idx: &SqliteIndex) -> Vec<CatalogEntry> {
+        let map = idx.list("/").unwrap().unwrap_or_default();
+        let mut rows = Vec::new();
+        for name in map.keys() {
+            let path = format!("/{name}");
+            let nver = idx.version_count(&path).unwrap();
+            for v in 1..=nver {
+                let fi = idx.lookup(&path, v as i32).unwrap().expect("version");
+                let Some(UserData::Tar(ud)) = fi.userdata.first() else {
+                    continue;
+                };
+                rows.push(CatalogEntry {
+                    name: name.clone(),
+                    offsetheader: ud.offsetheader,
+                    size: fi.size,
+                    isgenerated: ud.isgenerated,
+                    linkname: fi.linkname.clone(),
+                });
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    fn logical_names(rows: &[CatalogEntry]) -> Vec<String> {
+        let mut v: Vec<&CatalogEntry> = rows
+            .iter()
+            .filter(|r| !r.isgenerated && r.linkname != DUMPDIR_DELETE_LINKNAME)
+            .collect();
+        v.sort_by_key(|r| r.offsetheader);
+        v.into_iter().map(|r| r.name.clone()).collect()
+    }
+
+    fn gnu_tar_tf(archive: &Path) -> Option<Vec<String>> {
+        let out = Command::new("tar")
+            .args(["-tf"])
+            .arg(archive)
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| {
+                    l.trim()
+                        .trim_end_matches('/')
+                        .trim_start_matches("./")
+                        .to_string()
+                })
+                .filter(|s| !s.is_empty())
+                .collect(),
+        )
+    }
+
+    fn create_on_disk_index(tar: &Path, idx: &Path) {
+        let mut mat = None;
+        let _m = SqliteIndexedTar::create_index(
+            tar,
+            tar,
+            Some(idx),
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .expect("create_index");
+    }
+
+    fn patch_from_file(tar: &Path, idx: &SqliteIndex, window_start: u64) -> PatchStats {
+        let mut f = File::open(tar).unwrap();
+        idx.begin_write().unwrap();
+        let stats = SqliteIndexedTar::patch_index_from(
+            &mut f,
+            idx,
+            &OpenOptions::default(),
+            window_start,
+            "0.1.0",
+        )
+        .expect("patch_index_from");
+        idx.store_tarstats_for_path(tar).unwrap();
+        idx.commit_write().unwrap();
+        stats
+    }
+
+    /// Regression: last-window incremental parse must not seek the uncompressed
+    /// prefix (`detect_gnu_incremental` seek(0) would fail this).
+    #[test]
+    fn regression_incremental_last_frame_no_prefix_seek() {
+        let a = vec![0x11u8; 1024];
+        let b = b"suffix-bytes";
+        let bytes = pack_tar(&[member_file("a.bin", &a), member_file("b.txt", b)]);
+        let window_start = 512 + pad512(a.len() as u64);
+        assert_eq!(window_start, 1536);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("t.tar");
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        std::fs::write(&tar, &bytes).unwrap();
+        create_on_disk_index(&tar, &idx_path);
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        let mut reader = CountingSeek {
+            inner: File::open(&tar).unwrap(),
+            min_allowed: window_start,
+            min_start: None,
+        };
+        idx.begin_write().unwrap();
+        let stats = SqliteIndexedTar::patch_index_from(
+            &mut reader,
+            &idx,
+            &OpenOptions::default(),
+            window_start,
+            "0.1.0",
+        )
+        .expect("patch");
+        idx.commit_write().unwrap();
+        assert_eq!(stats.parse_start, window_start);
+        assert!(
+            reader.min_start.unwrap() >= window_start,
+            "min Start seek {}",
+            reader.min_start.unwrap()
+        );
+        assert!(idx.lookup("/a.bin", 0).unwrap().is_some());
+        assert!(idx.lookup("/b.txt", 0).unwrap().is_some());
+    }
+
+    /// Regression: incremental `files` rows equal a full `create_index` of the
+    /// same spliced archive.
+    #[test]
+    fn regression_incremental_equals_full_index() {
+        let a = b"prefix-aaaa";
+        let b = b"old-suffix";
+        let c = b"new-suffix";
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("t.tar");
+        write_tar(&tar, &[member_file("a.txt", a), member_file("b.txt", b)]);
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        create_on_disk_index(&tar, &idx_path);
+
+        let mut old = File::open(&tar).unwrap();
+        let eof = find_last_tar_eof(&mut old, 0).unwrap().unwrap();
+        drop(old);
+        let mut archive = std::fs::read(&tar).unwrap();
+        archive.truncate(eof as usize);
+        write_ustar_members(
+            &mut archive,
+            &[member_file("b.txt", b), member_file("c.txt", c)],
+        )
+        .unwrap();
+        write_tar_eof(&mut archive).unwrap();
+        std::fs::write(&tar, &archive).unwrap();
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        patch_from_file(&tar, &idx, eof);
+        let patched = catalog(&idx);
+
+        let mut mat = None;
+        let full = SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .unwrap();
+        assert_eq!(
+            idx.files_table_row_count().unwrap(),
+            full.index().files_table_row_count().unwrap()
+        );
+        assert_eq!(patched, catalog(full.index()));
+    }
+
+    /// Regression: logical member names match GNU `tar -tf` when `tar` exists;
+    /// equality vs our full index is always required.
+    #[test]
+    fn regression_incremental_logical_names_gnu_tar() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"aaa").unwrap();
+        std::fs::write(src.join("b.txt"), b"bbb").unwrap();
+        let tar = dir.path().join("t.tar");
+        let used_gnu = Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&src)
+            .arg("a.txt")
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !used_gnu {
+            write_tar(&tar, &[member_file("a.txt", b"aaa")]);
+        }
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        create_on_disk_index(&tar, &idx_path);
+
+        let mut old = File::open(&tar).unwrap();
+        let eof = find_last_tar_eof(&mut old, 0).unwrap().unwrap();
+        drop(old);
+        let appended = if used_gnu {
+            Command::new("tar")
+                .args(["--append", "-f"])
+                .arg(&tar)
+                .arg("-C")
+                .arg(&src)
+                .arg("b.txt")
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        } else {
+            false
+        };
+        if !appended {
+            let mut archive = std::fs::read(&tar).unwrap();
+            archive.truncate(eof as usize);
+            write_ustar_members(&mut archive, &[member_file("b.txt", b"bbb")]).unwrap();
+            write_tar_eof(&mut archive).unwrap();
+            std::fs::write(&tar, archive).unwrap();
+        }
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        patch_from_file(&tar, &idx, eof);
+        let patched_names = logical_names(&catalog(&idx));
+
+        let mut mat = None;
+        let full = SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .unwrap();
+        assert_eq!(patched_names, logical_names(&catalog(full.index())));
+
+        match gnu_tar_tf(&tar) {
+            Some(gnu) => {
+                assert_eq!(patched_names, gnu, "logical names must match GNU tar -tf");
+            }
+            None => eprintln!("skip: GNU tar -tf listing (tar missing)"),
+        }
+    }
+
+    /// Regression: `check_tarstats` still rejects a replaced archive after an
+    /// incremental patch bumped tarstats.
+    #[test]
+    fn regression_incremental_tarstats_replace() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("t.tar");
+        write_tar(&tar, &[member_file("a.txt", b"v1")]);
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        create_on_disk_index(&tar, &idx_path);
+
+        let mut old = File::open(&tar).unwrap();
+        let eof = find_last_tar_eof(&mut old, 0).unwrap().unwrap();
+        drop(old);
+        let mut archive = std::fs::read(&tar).unwrap();
+        archive.truncate(eof as usize);
+        write_ustar_members(&mut archive, &[member_file("b.txt", b"v2")]).unwrap();
+        write_tar_eof(&mut archive).unwrap();
+        std::fs::write(&tar, archive).unwrap();
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        patch_from_file(&tar, &idx, eof);
+        idx.check_tarstats_matches_archive(&tar)
+            .expect("patched tarstats must match spliced archive");
+
+        write_tar(&tar, &[member_file("z.txt", b"replaced-archive")]);
+        match idx.check_tarstats_matches_archive(&tar) {
+            Ok(()) => panic!("replaced archive must fail tarstats"),
+            Err(err) => {
+                let msg = err.to_string();
+                assert!(
+                    msg.contains("size")
+                        || msg.contains("mtime")
+                        || msg.contains("mismatch")
+                        || msg.contains("sha"),
+                    "unexpected error: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: parse-time zstd uses a fresh frame scan; patched
+    /// `zstdblocks` match `export_zstd_blocks` of the new file; prefix
+    /// member bytes unchanged.
+    #[test]
+    fn regression_incremental_zstdblocks_fresh() {
+        let a = b"prefix-payload";
+        let b = b"suffix-one";
+        let c = b"suffix-two";
+        let prefix_members = pack_tar(&[member_file("a.txt", a)]);
+        // Uncompressed TAR: prefix members without EOF + suffix with EOF.
+        let mut plain = prefix_members[..prefix_members.len() - 1024].to_vec();
+        let cut = plain.len() as u64;
+        let suffix = pack_tar(&[member_file("b.txt", b)]);
+        plain.extend_from_slice(&suffix);
+
+        let f0 =
+            ratarmount_compress::encode_zstd_frame(&plain[..cut as usize], 1).expect("frame 0");
+        let f1 =
+            ratarmount_compress::encode_zstd_frame(&plain[cut as usize..], 1).expect("frame 1");
+
+        let dir = tempfile::tempdir().unwrap();
+        let zst = dir.path().join("t.tar.zst");
+        {
+            let mut out = File::create(&zst).unwrap();
+            out.write_all(&f0).unwrap();
+            out.write_all(&f1).unwrap();
+        }
+        let old_blocks = ratarmount_compress::export_zstd_blocks(&zst).unwrap();
+        assert!(old_blocks.len() >= 2);
+
+        let idx_path = dir.path().join("t.tar.zst.index.sqlite");
+        {
+            let body =
+                ratarmount_compress::open_seekable_zstd_with_threads(&zst, 1).expect("open zstd");
+            SqliteIndexedTar::create_index_body(
+                &zst,
+                body,
+                Some(&idx_path),
+                &OpenOptions::default(),
+                "0.1.0",
+            )
+            .expect("create_index_body");
+        }
+        {
+            let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+            let stored: Vec<(i64, i64)> = old_blocks
+                .iter()
+                .map(|&(c, d)| (c as i64, d as i64))
+                .collect();
+            idx.set_zstd_blocks(&stored).unwrap();
+        }
+
+        // Last-frame splice: new suffix with an extra member (compressed size changes).
+        let new_suffix = pack_tar(&[member_file("b.txt", b), member_file("c.txt", c)]);
+        let f1_new =
+            ratarmount_compress::encode_zstd_frame(&new_suffix, 3).expect("new last frame");
+        assert_ne!(
+            f1_new.len(),
+            f1.len(),
+            "spliced last-frame compressed size must change"
+        );
+        {
+            let mut out = File::create(&zst).unwrap();
+            out.write_all(&f0).unwrap();
+            out.write_all(&f1_new).unwrap();
+        }
+        let new_blocks = ratarmount_compress::export_zstd_blocks(&zst).unwrap();
+        assert_ne!(old_blocks, new_blocks);
+
+        // Fresh scan of the new file — never open_seekable_zstd_with_zstd_blocks
+        // with the pre-splice sidecar map.
+        let body =
+            ratarmount_compress::open_seekable_zstd_with_threads(&zst, 1).expect("fresh zstd");
+        let mut reader = CountingSeek {
+            inner: body.open_reader().unwrap(),
+            min_allowed: cut,
+            min_start: None,
+        };
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        idx.begin_write().unwrap();
+        let stats = SqliteIndexedTar::patch_index_from(
+            &mut reader,
+            &idx,
+            &OpenOptions::default(),
+            cut,
+            "0.1.0",
+        )
+        .expect("patch zstd");
+        let exported: Vec<(i64, i64)> = new_blocks
+            .iter()
+            .map(|&(c, d)| (c as i64, d as i64))
+            .collect();
+        idx.set_zstd_blocks(&exported).unwrap();
+        idx.store_tarstats_for_path(&zst).unwrap();
+        idx.commit_write().unwrap();
+        assert_eq!(stats.parse_start, cut);
+        assert_eq!(idx.get_zstd_blocks().unwrap(), exported);
+        assert!(idx.lookup("/a.txt", 0).unwrap().is_some());
+        assert!(idx.lookup("/c.txt", 0).unwrap().is_some());
+
+        let mut r = body.open_reader().unwrap();
+        r.seek(SeekFrom::Start(512)).unwrap();
+        let mut buf = vec![0u8; a.len()];
+        r.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, a, "prefix member bytes unchanged");
+    }
+
+    /// Regression: GNU `--append` window is `find_last_tar_eof(old, 0)` recorded
+    /// before tar runs, not `metadata().len()` (that includes the two-zero EOF).
+    #[test]
+    fn regression_incremental_append_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("t.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hello")]);
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        create_on_disk_index(&tar, &idx_path);
+
+        let pre_size = std::fs::metadata(&tar).unwrap().len();
+        let mut old = File::open(&tar).unwrap();
+        let eof = find_last_tar_eof(&mut old, 0)
+            .unwrap()
+            .expect("two-zero EOF");
+        drop(old);
+        assert!(
+            eof < pre_size,
+            "find_last_tar_eof must precede metadata().len() ({eof} < {pre_size})"
+        );
+
+        let mut archive = std::fs::read(&tar).unwrap();
+        archive.truncate(eof as usize);
+        write_ustar_members(&mut archive, &[member_file("b.txt", b"appended")]).unwrap();
+        write_tar_eof(&mut archive).unwrap();
+        std::fs::write(&tar, &archive).unwrap();
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        let stats = patch_from_file(&tar, &idx, eof);
+        assert_eq!(stats.parse_start, eof);
+
+        let mut mat = None;
+        let full = SqliteIndexedTar::create_index(
+            &tar,
+            &tar,
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+            &mut mat,
+        )
+        .unwrap();
+        assert_eq!(catalog(&idx), catalog(full.index()));
+        let b_fi = idx.lookup("/b.txt", 0).unwrap().expect("appended member");
+        let Some(UserData::Tar(ud)) = b_fi.userdata.first() else {
+            panic!("tar userdata");
+        };
+        assert_eq!(
+            ud.offsetheader,
+            Some(eof),
+            "appended member starts at old EOF, not metadata().len()={pre_size}"
+        );
+    }
+
+    /// Regression: `window_start` mid-member with a later valid header keeps
+    /// prefix rows (`offsetheader < window_start`) and parses from the first
+    /// header. Distinct from persist fail-closed (`rewrite_mid_member_opaque_prefix`).
+    #[test]
+    fn regression_incremental_opaque_then_header() {
+        let a = vec![0xcdu8; 600];
+        let b = b"after";
+        let bytes = pack_tar(&[member_file("a.bin", &a), member_file("b.txt", b)]);
+        let window_start = 512 + 50;
+        let b_header = 512 + pad512(a.len() as u64);
+        assert!(window_start > 512 && window_start < b_header);
+
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("t.tar");
+        let idx_path = dir.path().join("t.tar.index.sqlite");
+        std::fs::write(&tar, &bytes).unwrap();
+        create_on_disk_index(&tar, &idx_path);
+
+        let idx = SqliteIndex::open_writable(&idx_path).unwrap();
+        let mut reader = CountingSeek {
+            inner: File::open(&tar).unwrap(),
+            min_allowed: window_start,
+            min_start: None,
+        };
+        idx.begin_write().unwrap();
+        let stats = SqliteIndexedTar::patch_index_from(
+            &mut reader,
+            &idx,
+            &OpenOptions::default(),
+            window_start,
+            "0.1.0",
+        )
+        .expect("patch from mid-member with later header");
+        idx.commit_write().unwrap();
+        assert_eq!(stats.parse_start, b_header);
+        let a_fi = idx.lookup("/a.bin", 0).unwrap().expect("prefix row kept");
+        let Some(UserData::Tar(ud)) = a_fi.userdata.first() else {
+            panic!("tar userdata");
+        };
+        assert!(
+            ud.offsetheader.unwrap() < window_start,
+            "prefix offsetheader must stay below window_start"
+        );
+        assert!(idx.lookup("/b.txt", 0).unwrap().is_some());
+        assert!(reader.min_start.unwrap() >= window_start);
     }
 }
