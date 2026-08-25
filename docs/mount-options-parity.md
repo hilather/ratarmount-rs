@@ -33,7 +33,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--commit-overlay-interval DURATION` | no | **added** (`0` off; `2s`/`15m`/`1h`; uncompressed TAR or `.tar.zst` + durable `-w`; same create-if-missing as `-w`; in-process; commits overlay files whose host mtime is at least DURATION old **and** that have no open write fd, not a dump of every overlay file on the clock; same last-frame cost model) | `[x]` Rust-only |
 | `-p` / `--prefix` | yes | yes | `[x]` |
 | `--file-versions` / `--no-file-versions` | yes | **both forms** | `[x]` |
-| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket | `~` different surface |
+| `--control-interface` | yes (in-FS `/.ratarmount-control/`) | Unix socket **and** in-FS folder (`status`/`pid`/`unmount`/`help` plus read-only `search/<pattern>` glob locate; quote globs). No FUSE write-then-read `echo pat > search`. | `[x]` / overlay names not in catalog |
 | `--nfs` | no | **added** (userspace NFS; NFSv3 default; no FUSE mount required) | `[x]` Rust-only |
 | `--nfs-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20490`) | `[x]` |
 | `--nfs-vers 3\|4` | no | **added** (default `3`; `4`/`4.1` need `--nfs` + a `nfsv4` binary — Linux/macOS packages compile it; source `--features nfsv4`, rustc ≥ 1.88; ignored without `--nfs`; `4.0` rejected) | `[x]` Rust-only |
@@ -52,6 +52,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--sftp-authorized-keys PATH` | no | **added** (required when bind is not loopback unless password env is set) | `[x]` |
 | `--sftp-subsystem` | no | **added** (stdio SFTP v3; exclusive with `--sftp`; ignores bind/keys; needs `sftp-russh`) | `[x]` Rust-only |
 | `serve` subcommand | no | **added** (optional sugar: `ratarmount serve --nfs --http ARCHIVE`; ≥1 export required; incompatible with `--no-mount`; no `--fuse`; booleans remain the stable interface) | `[x]` Rust-only |
+| `find` sugar | no | **added** (`ratarmount find [--fts] [--hashes] PATTERN ARCHIVE`; no FUSE; TSV `path\tsize\tmtime`; `--fts` is find-argv only, not a mount flag; `--hashes` includes cheap `user.hash.*` columns / fill when `ALGO` is given) | `[x]` Rust-only |
 | `-o` / `--fuse` | yes | yes | `[x]` |
 | `-e` / `--encoding` | yes | yes | `[x]` |
 | `-i` / `--ignore-zeros` | yes | yes (`-i` + long) | `[x]` |
@@ -104,7 +105,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Prefix remount | yes | yes | `[x]` |
 | Path transform on members | yes | **added** | `[x]` |
 | Encrypted 7z/ZIP password(s) | yes | yes | `~` ZIP crypto limited |
-| Control channel | in-FS folder | Unix socket | `~` |
+| Control channel | in-FS folder | Unix socket + in-FS `/.ratarmount-control/` including read-only `search/<pattern>` | `[x]` / no write-then-read search; overlay names not in catalog |
 | Remote `http(s)/s3/ssh` | yes | yes (live Range for TAR/ZIP/gzip/bzip2/xz/zstd + S3 `S3RangeFile`; ssh_config ProxyJump/Include) | `[x]` / `~` ProxyCommand/Match / cookie jar |
 | Remote `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` | mixed | yes (factory scheme-prefix; OCI overlayfs union; rclone argv + `rclone+`; GCS GOOG1 HMAC; FTP LIST/MLSD folders) | `[x]` / residuals in [`phase10-remote.md`](phase10-remote.md) |
 | Remote directory mounts (S3 prefix / SSH dir / WebDAV / HTTP index) | yes (fsspec) | yes (F-1 `RemoteFolderMountSource`; GCS/Azure/rclone/IPFS/FTP folders too) | `[x]` |

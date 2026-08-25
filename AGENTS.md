@@ -115,6 +115,11 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FTP LIST/MLSD folder | `cargo test -p ratarmount-remote --lib ftp` |
 | rclone+ URL | `cargo test -p ratarmount-remote --lib rclone` · `cargo test -p ratarmount-remote --lib is_remote_url` |
 | `--sftp-subsystem` clap | `cargo test -p ratarmount --bin ratarmount sftp_subsystem` |
+| `find '*.fits'` without FUSE | `cargo test -p ratarmount --bin ratarmount find_glob` |
+| `find` clap steals archive / pattern | `cargo test -p ratarmount --bin ratarmount find_flag` |
+| Control read-only `search/<pattern>` | `cargo test -p ratarmount-compositing --lib control_search` |
+| Socket `search` | `cargo test -p ratarmount --bin ratarmount control_search_socket` |
+| FTS5 path + hashes | `cargo test -p ratarmount-index --lib search_fts5` (default `cargo test -p ratarmount-index --lib`, no extra features) |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

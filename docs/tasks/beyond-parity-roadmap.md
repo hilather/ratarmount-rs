@@ -6,7 +6,7 @@
 
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
-Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing shipped; encrypt / 3.1.1 / Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets: **F-2** incremental reindex, then **F-3** FTS5 or **G-2** portable index. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
+Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing shipped; encrypt / 3.1.1 / Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets: **F-2** incremental reindex, then **G-2** portable index (**F-3** locate is `done`). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
 
 ---
 
@@ -114,7 +114,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 |----|------|--------|--------|-----------|
 | F-1 | **Remote directory mounts** (S3 prefix / SSH dir / WebDAV PROPFIND / HTTP index) | `done` | M | remote `RemoteFolderMountSource` + factory folder probe |
 | F-2 | **Incremental reindex** after `.tar.zst` splice / append-only TAR | `todo` | L | index + formats-tar + compositing |
-| F-3 | **SQLite FTS5 / locate** over the index | `todo` | M | index + CLI + control plane |
+| F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `todo` | L | fuse + packaging |
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
@@ -139,15 +139,17 @@ Live `.tar.zst` splice still **reindexes the whole TAR on remount**. That tax wi
 
 Acceptance: remount after last-frame splice does **not** rescan prefix frames; index row count matches GNU tar listing; `check_tarstats` still detects a replaced archive.
 
-### F-3 — SQLite FTS5 / locate
+### F-3 — SQLite FTS5 / locate — `done`
 
-The 0.7.x catalog already exists. Expose:
+The 0.7.x catalog is the locate index. Shipped:
 
-- `ratarmount find '*.fits' archive.tar` (no FUSE)
-- `/.ratarmount-control/search` and the Unix socket
-- optional FTS5 on path + `--hashes` payload
+- `ratarmount find '*.fits' archive.tar` (no FUSE; TSV `path\tsize\tmtime`; exit 0 with matches, 1 if none)
+- `--fts` is **find-argv only** (not a mount flag). Optional FTS5 on path + `--hashes` payload (`ensure_fts5` is not called on a normal mount)
+- Read-only `/.ratarmount-control/search/<pattern>` (quote globs: `cat '/mnt/.ratarmount-control/search/*.fits'`) plus Unix socket `search <pattern>` (TSV + `count N`)
 
 Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent a new storage engine.
+
+**Residual:** overlay-only names are not in the catalog; no Tracker/D-Bus; no mount `--index-fts`; no FUSE write-then-read `echo pat > search`; rusqlite `fts5` is always compiled in (Cargo unification; workspace rusqlite 0.32 has no `fts5` feature, bundled sqlite still enables `SQLITE_ENABLE_FTS5`).
 
 ### F-4 — OCI image mount — `done`
 
@@ -251,7 +253,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 3. **F-2** incremental reindex — unblocks honest live commit and F-7.
 4. ~~**P-5** HTTP Range export~~ / ~~**P-6** WebDAV~~ — HTTP `done`; WebDAV `done` (mux residual). SMB **P-2** stays `partial` (encrypt / 3.1.1 / Finder).
 5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~, ~~**P-10** SFTP~~ — done (`sftp-russh` is a feature note).
-6. **F-3** FTS5/locate — independent, good control-plane demo.
+6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. **F-9** `--repack-seekable` — independent producer.
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
 9. **G-2** portable index alongside P-1/F-4.

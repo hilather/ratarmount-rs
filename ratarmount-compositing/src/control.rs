@@ -1,8 +1,10 @@
 //! In-FS control folder (Python `/.ratarmount-control/`).
 //!
 //! Wraps an inner [`MountSource`] and exposes virtual files under
-//! `/.ratarmount-control/` for status / pid / unmount / help. Opening or
-//! reading `unmount` invokes an optional callback (orchestrator wires unmount).
+//! `/.ratarmount-control/` for status / pid / unmount / help, plus a read-only
+//! `search/<pattern>` locate path (F-3). Opening or reading `unmount` invokes
+//! an optional callback (orchestrator wires unmount). There is no write-then-read
+//! `search` file (`MountSource` has no write).
 
 use std::collections::BTreeMap;
 use std::io::{self, Cursor};
@@ -24,9 +26,19 @@ const TAG_STATUS: &str = "control:status";
 const TAG_PID: &str = "control:pid";
 const TAG_UNMOUNT: &str = "control:unmount";
 const TAG_HELP: &str = "control:help";
+const TAG_SEARCH_DIR: &str = "control:search-dir";
+const TAG_SEARCH_PREFIX: &str = "control:search:";
 
 /// Virtual control file names inside [`CONTROL_DIR_PATH`].
 const CONTROL_FILES: &[&str] = &["status", "pid", "unmount", "help"];
+
+/// Directory of read-only glob locate children (`search/<pattern>`).
+const SEARCH_DIR_NAME: &str = "search";
+/// Absolute path of the locate directory.
+const SEARCH_DIR_PATH: &str = "/.ratarmount-control/search";
+
+/// Glob locate callback: pattern → TSV (or an `error:` line).
+pub type OnSearch = Arc<dyn Fn(&str) -> String + Send + Sync>;
 
 /// Options for [`ControlFolderMountSource`].
 #[derive(Clone, Default)]
@@ -37,15 +49,17 @@ pub struct ControlFolderOptions {
     pub label: Option<String>,
     /// Invoked when `unmount` is opened or read.
     pub on_unmount: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Glob locate: `lookup("/.ratarmount-control/search/<pattern>")` / `open`
+    /// return a Cursor of TSV. `None` → `error: search requires an on-disk index`.
+    pub on_search: Option<OnSearch>,
 }
 
 impl ControlFolderOptions {
-    /// Enabled control folder with no label or unmount callback.
+    /// Enabled control folder with no label or callbacks.
     pub fn enabled() -> Self {
         Self {
             enabled: true,
-            label: None,
-            on_unmount: None,
+            ..Default::default()
         }
     }
 
@@ -58,6 +72,12 @@ impl ControlFolderOptions {
         self.on_unmount = Some(f);
         self
     }
+
+    /// Read-only virtual `search/<pattern>` (percent-decode the child name as the glob).
+    pub fn with_on_search(mut self, f: OnSearch) -> Self {
+        self.on_search = Some(f);
+        self
+    }
 }
 
 /// MountSource wrapper that injects `/.ratarmount-control/` virtual files.
@@ -66,6 +86,7 @@ pub struct ControlFolderMountSource {
     enabled: bool,
     label: Option<String>,
     on_unmount: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_search: Option<OnSearch>,
 }
 
 impl ControlFolderMountSource {
@@ -76,6 +97,7 @@ impl ControlFolderMountSource {
             enabled: options.enabled,
             label: options.label,
             on_unmount: options.on_unmount,
+            on_search: options.on_search,
         }
     }
 
@@ -88,6 +110,30 @@ impl ControlFolderMountSource {
             uid: unsafe { libc::geteuid() },
             gid: unsafe { libc::getegid() },
             userdata: vec![UserData::Other(TAG_DIR.into())],
+        }
+    }
+
+    fn search_dir_info() -> FileInfo {
+        FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: S_IFDIR | 0o555,
+            linkname: String::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            userdata: vec![UserData::Other(TAG_SEARCH_DIR.into())],
+        }
+    }
+
+    fn search_file_info(pattern: &str, content_len: u64) -> FileInfo {
+        FileInfo {
+            size: content_len,
+            mtime: 0.0,
+            mode: S_IFREG | 0o444,
+            linkname: String::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            userdata: vec![UserData::Other(format!("{TAG_SEARCH_PREFIX}{pattern}"))],
         }
     }
 
@@ -137,10 +183,24 @@ impl ControlFolderMountSource {
         let path = normpath(path);
         let prefix = concat!("/.ratarmount-control", "/");
         let rest = path.strip_prefix(prefix)?;
-        if rest.is_empty() || rest.contains('/') {
+        if rest.is_empty() || rest.contains('/') || rest == SEARCH_DIR_NAME {
             return None;
         }
         Some(rest.to_string())
+    }
+
+    /// Percent-decoded glob from `/.ratarmount-control/search/<pattern>`.
+    ///
+    /// Quote the path so `*` stays one component: `cat '.../search/*.fits'`.
+    /// Encoded slashes (`%2F`) let a full-path glob occupy one FUSE name.
+    fn control_search_pattern(path: &str) -> Option<String> {
+        let path = normpath(path);
+        let prefix = concat!("/.ratarmount-control/search", "/");
+        let rest = path.strip_prefix(prefix)?;
+        if rest.is_empty() {
+            return None;
+        }
+        Some(percent_decode_component(rest))
     }
 
     fn status_text(&self) -> String {
@@ -176,8 +236,20 @@ impl ControlFolderMountSource {
          status  - mount status and root listing\n\
          pid     - ratarmount process id\n\
          unmount - open or write to request unmount\n\
-         help    - this text\n"
+         help    - this text\n\
+         search/<pattern> - glob locate (quote globs: cat '.../search/*.fits')\n"
             .to_string()
+    }
+
+    fn search_missing_index_text() -> String {
+        "error: search requires an on-disk index\n".to_string()
+    }
+
+    fn search_text(&self, pattern: &str) -> String {
+        match &self.on_search {
+            Some(cb) => cb(pattern),
+            None => Self::search_missing_index_text(),
+        }
     }
 
     fn unmount_text() -> String {
@@ -249,6 +321,34 @@ impl ControlFolderMountSource {
     }
 }
 
+/// Percent-decode `%XX` (invalid sequences kept as-is). Does not treat `+` as space.
+fn percent_decode_component(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(h), Some(l)) = (from_hex(bytes[i + 1]), from_hex(bytes[i + 2])) {
+                out.push((h << 4) | l);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn from_hex(b: u8) -> Option<u8> {
+    match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'a'..=b'f' => Some(b - b'a' + 10),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    }
+}
+
 impl MountSource for ControlFolderMountSource {
     fn list(&self, path: &str) -> Option<ListResult> {
         let path = normpath(path);
@@ -265,7 +365,13 @@ impl MountSource for ControlFolderMountSource {
                     Self::file_info_for(name, content.len() as u64),
                 );
             }
+            map.insert(SEARCH_DIR_NAME.to_string(), Self::search_dir_info());
             return Some(ListResult::Infos(map));
+        }
+
+        if path == SEARCH_DIR_PATH {
+            // Do not enumerate catalog matches (O(catalog)); empty listing.
+            return Some(ListResult::Infos(BTreeMap::new()));
         }
 
         if Self::is_control_path(&path) {
@@ -287,12 +393,19 @@ impl MountSource for ControlFolderMountSource {
             return self.inner.list_dirents(&path);
         }
         if path == CONTROL_DIR_PATH {
-            return Some(
-                CONTROL_FILES
-                    .iter()
-                    .filter_map(|name| Self::control_file_dirent(name))
-                    .collect(),
-            );
+            let mut dents: Vec<CheapDirent> = CONTROL_FILES
+                .iter()
+                .filter_map(|name| Self::control_file_dirent(name))
+                .collect();
+            dents.push(CheapDirent {
+                name: SEARCH_DIR_NAME.to_string(),
+                mode: S_IFDIR | 0o555,
+                size: 0,
+            });
+            return Some(dents);
+        }
+        if path == SEARCH_DIR_PATH {
+            return Some(Vec::new());
         }
         if Self::is_control_path(&path) {
             return None;
@@ -332,6 +445,15 @@ impl MountSource for ControlFolderMountSource {
             return Some(Self::control_dir_info());
         }
 
+        if path == SEARCH_DIR_PATH {
+            return Some(Self::search_dir_info());
+        }
+
+        if let Some(pattern) = Self::control_search_pattern(&path) {
+            let content = self.search_text(&pattern);
+            return Some(Self::search_file_info(&pattern, content.len() as u64));
+        }
+
         if let Some(name) = Self::control_file_name(&path) {
             let content = self.content_for_name(&name)?;
             return Some(Self::file_info_for(&name, content.len() as u64));
@@ -351,7 +473,7 @@ impl MountSource for ControlFolderMountSource {
         buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
         if let Some(tag) = Self::control_tag(file_info) {
-            if tag == TAG_DIR {
+            if tag == TAG_DIR || tag == TAG_SEARCH_DIR {
                 return Err(io::Error::new(
                     io::ErrorKind::IsADirectory,
                     "control directory",
@@ -359,6 +481,10 @@ impl MountSource for ControlFolderMountSource {
             }
             if tag == TAG_UNMOUNT {
                 self.fire_unmount();
+            }
+            if let Some(pattern) = tag.strip_prefix(TAG_SEARCH_PREFIX) {
+                let content = self.search_text(pattern);
+                return Ok(Box::new(Cursor::new(content.into_bytes())));
             }
             let content = self.content_for_tag(tag).unwrap_or_default();
             return Ok(Box::new(Cursor::new(content.into_bytes())));
@@ -387,7 +513,12 @@ impl MountSource for ControlFolderMountSource {
 
     fn versions(&self, path: &str) -> u32 {
         let path = normpath(path);
-        if self.enabled && (path == CONTROL_DIR_PATH || Self::control_file_name(&path).is_some()) {
+        if self.enabled
+            && (path == CONTROL_DIR_PATH
+                || path == SEARCH_DIR_PATH
+                || Self::control_file_name(&path).is_some()
+                || Self::control_search_pattern(&path).is_some())
+        {
             return 1;
         }
         if self.enabled && Self::is_control_path(&path) {
@@ -814,6 +945,71 @@ mod tests {
         assert_eq!(
             ctrl.mode & ratarmount_core::S_IFMT,
             list_fi.mode & ratarmount_core::S_IFMT
+        );
+    }
+
+    /// Regression: read-only `search/<pattern>` returns a Cursor of TSV (quote globs).
+    #[test]
+    fn control_search() {
+        let tsv = "/a.fits\t4\t1\n/dir/b.fits\t5\t2\n";
+        let seen = Arc::new(std::sync::Mutex::new(String::new()));
+        let seen2 = Arc::clone(&seen);
+        let tsv2 = tsv.to_string();
+        let inner = Arc::new(NullBase) as Arc<dyn MountSource>;
+        let ms = ControlFolderMountSource::new(
+            inner,
+            ControlFolderOptions::enabled().with_on_search(Arc::new(move |pat| {
+                *seen2.lock().unwrap() = pat.to_string();
+                tsv2.clone()
+            })),
+        );
+
+        let search_dir = ms.lookup(SEARCH_DIR_PATH, 0).expect("search dir");
+        assert_eq!(search_dir.mode & S_IFMT, S_IFDIR);
+        let err = match ms.open(&search_dir, 0) {
+            Ok(_) => panic!("expected IsADirectory for search dir open"),
+            Err(e) => e,
+        };
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
+
+        let dents = ms.list_dirents(SEARCH_DIR_PATH).expect("search listing");
+        assert!(
+            dents.is_empty(),
+            "search/ must not enumerate catalog matches: {dents:?}"
+        );
+
+        let path = format!("{SEARCH_DIR_PATH}/*.fits");
+        let body = read_all(&ms, &path);
+        assert_eq!(body, tsv);
+        assert_eq!(seen.lock().unwrap().as_str(), "*.fits");
+        let fi = ms.lookup(&path, 0).expect("lookup glob");
+        assert_eq!(fi.size, tsv.len() as u64);
+        assert_eq!(fi.mode & S_IFMT, S_IFREG);
+
+        let encoded = format!("{SEARCH_DIR_PATH}/%2A.fits");
+        let encoded_body = read_all(&ms, &encoded);
+        assert_eq!(encoded_body, tsv);
+        assert_eq!(seen.lock().unwrap().as_str(), "*.fits");
+
+        let help = read_all(&ms, &format!("{CONTROL_DIR_PATH}/help"));
+        assert!(help.contains("search/<pattern>"), "{help}");
+
+        let names = names_from_list(ms.list(CONTROL_DIR_PATH).unwrap());
+        assert!(
+            names.iter().any(|n| n == SEARCH_DIR_NAME),
+            "control dir lists search: {names:?}"
+        );
+    }
+
+    /// Regression: missing `on_search` still exposes the path with a clear error.
+    #[test]
+    fn control_search_requires_on_disk_index() {
+        let inner = Arc::new(NullBase) as Arc<dyn MountSource>;
+        let ms = ControlFolderMountSource::new(inner, ControlFolderOptions::enabled());
+        let body = read_all(&ms, &format!("{SEARCH_DIR_PATH}/*.fits"));
+        assert!(
+            body.contains("on-disk index"),
+            "expected sidecar error, got {body}"
         );
     }
 }

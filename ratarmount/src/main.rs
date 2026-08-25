@@ -26,6 +26,7 @@ use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 mod factory;
+mod find;
 mod overlay_commit;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -40,10 +41,12 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   (http(s)/s3/gs/az/ftp/ssh/oci/ipfs/rclone), and userspace exports\n\
                   (--nfs, --http, --webdav, --smb, --ninep, --sftp, --sftp-subsystem).\n\
                   Optional sugar: ratarmount serve --nfs --http ARCHIVE (requires at\n\
-                  least one export; incompatible with --no-mount).",
+                  least one export; incompatible with --no-mount).\n\
+                  Locate: ratarmount find '*.fits' ARCHIVE (no FUSE; TSV path/size/mtime).",
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
-                  Incompatible with --no-mount. Boolean flags remain the stable interface."
+                  Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
+                  Locate: ratarmount find [--fts] [--hashes] PATTERN ARCHIVE (no FUSE)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -424,6 +427,18 @@ struct Args {
     /// clap `Subcommand` would require `global = true` on every option.
     #[arg(skip)]
     serve: bool,
+
+    /// Set when argv[1] is the `find` sugar (F-3). Same clap trap as `serve`.
+    #[arg(skip)]
+    find: bool,
+
+    /// Find-argv `--fts` (FTS5 MATCH). Not a global mount flag.
+    #[arg(skip)]
+    find_fts: bool,
+
+    /// Find-argv boolean `--hashes` (include cheap `user.hash.*` TSV columns).
+    #[arg(skip)]
+    find_hashes: bool,
 }
 
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
@@ -436,18 +451,19 @@ fn parse_parallel_nested(s: &str) -> Result<u32, String> {
         .map_err(|_| format!("expected non-negative integer or 'auto', got {s:?}"))
 }
 
-/// G-1 `serve` sugar: strip argv[1] when it is exactly `serve`, then parse the
-/// existing boolean export CLI. A clap `Subcommand` is hostile here: flags
-/// after `serve` are unknown unless every `Args` field is `global = true`,
-/// which would also treat a later positional `serve` as the subcommand.
+/// G-1 `serve` / F-3 `find` sugar: strip argv[1] when it is exactly `serve` or
+/// `find`, then parse the existing CLI. A clap `Subcommand` is hostile here:
+/// flags after the verb are unknown unless every `Args` field is `global = true`,
+/// which would also treat a later positional `serve`/`find` as the subcommand.
 fn parse_args_from<I, T>(iter: I) -> Result<Args, clap::Error>
 where
     I: IntoIterator<Item = T>,
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    let find = raw.get(1).is_some_and(|s| s == "find");
     let serve = raw.get(1).is_some_and(|s| s == "serve");
-    let stripped: Vec<OsString> = if serve {
+    let stripped: Vec<OsString> = if find || serve {
         raw.into_iter()
             .enumerate()
             .filter_map(|(i, t)| (i != 1).then_some(t))
@@ -455,9 +471,73 @@ where
     } else {
         raw
     };
+    let (stripped, find_fts, find_hashes) = if find {
+        strip_find_only_flags(stripped)
+    } else {
+        (stripped, false, false)
+    };
     let mut args = Args::try_parse_from(stripped)?;
     args.serve = serve;
+    args.find = find;
+    args.find_fts = find_fts;
+    args.find_hashes = find_hashes;
+    if find {
+        args.no_mount = true;
+    }
     Ok(args)
+}
+
+/// `--fts` and boolean `--hashes` are find-argv only (not global mount flags).
+/// `--hashes ALGO[,ALGO...]` is left for the existing clap field (fill then search).
+fn strip_find_only_flags(raw: Vec<OsString>) -> (Vec<OsString>, bool, bool) {
+    let mut out = Vec::with_capacity(raw.len());
+    let mut fts = false;
+    let mut hashes = false;
+    let mut iter = raw.into_iter();
+    if let Some(prog) = iter.next() {
+        out.push(prog);
+    }
+    while let Some(tok) = iter.next() {
+        if tok == "--fts" {
+            fts = true;
+            continue;
+        }
+        if tok == "--hashes" {
+            match iter.next() {
+                Some(next) if looks_like_hash_algos(&next) => {
+                    out.push(tok);
+                    out.push(next);
+                }
+                Some(next) => {
+                    hashes = true;
+                    out.push(next);
+                }
+                None => {
+                    hashes = true;
+                }
+            }
+            continue;
+        }
+        out.push(tok);
+    }
+    (out, fts, hashes)
+}
+
+fn looks_like_hash_algos(s: &OsString) -> bool {
+    let Some(text) = s.to_str() else {
+        return false;
+    };
+    if text.starts_with('-') {
+        return false;
+    }
+    let mut any = false;
+    for p in text.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        any = true;
+        if ratarmount_index::normalize_algorithm(p).is_none() {
+            return false;
+        }
+    }
+    any
 }
 
 fn serve_cli_error(args: &Args) -> Option<&'static str> {
@@ -470,6 +550,24 @@ fn serve_cli_error(args: &Args) -> Option<&'static str> {
     if !any_export(args) {
         return Some(
             "serve requires at least one export (--nfs, --http, --webdav, --smb, --ninep, --sftp, --sftp-subsystem)",
+        );
+    }
+    None
+}
+
+fn find_cli_error(args: &Args) -> Option<&'static str> {
+    if !args.find {
+        return None;
+    }
+    if args.paths.len() != 2 {
+        return Some("find requires PATTERN ARCHIVE (ratarmount find '*.fits' archive.tar)");
+    }
+    if args.write_overlay.is_some() {
+        return Some("find cannot be combined with -w / --write-overlay");
+    }
+    if any_export(args) {
+        return Some(
+            "find cannot be combined with --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem",
         );
     }
     None
@@ -489,6 +587,10 @@ fn main() {
     }
 
     if let Some(msg) = serve_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
+    if let Some(msg) = find_cli_error(&args) {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
@@ -565,6 +667,7 @@ fn main() {
         eprintln!(
             "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
         );
+        eprintln!("       ratarmount find [--fts] [--hashes] <pattern> <archive>");
         std::process::exit(2);
     }
 
@@ -672,6 +775,18 @@ fn main() {
 
     if args.force_folder_index {
         eprintln!("info: --force-folder-index accepted; folders still bind-mount without SQLite");
+    }
+
+    if args.find {
+        let pattern = args.paths[0].to_string_lossy();
+        let archive = &args.paths[1];
+        let include_hashes = args.find_hashes || !open_opts.hashes.is_empty();
+        let loc = find::LocateOptions {
+            fts: args.find_fts,
+            include_hashes,
+            fill_hashes: &open_opts.hashes,
+        };
+        std::process::exit(find::run(archive, &pattern, &open_opts, &loc));
     }
 
     let file_versions = !args.no_file_versions;
@@ -971,6 +1086,7 @@ fn main() {
         let mp = fuse_mp.as_ref().expect("control requires FUSE mp");
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
+        let on_search = find::tsv_search_callback(inputs[0].clone(), open_opts.clone());
         bundle.source = Arc::new(ControlFolderMountSource::new(
             Arc::clone(&bundle.source),
             ControlFolderOptions::enabled()
@@ -978,9 +1094,10 @@ fn main() {
                 .with_on_unmount(Arc::new(move || {
                     stop.store(true, Ordering::SeqCst);
                     let _ = unmount(&mp_ctrl);
-                })),
+                }))
+                .with_on_search(Arc::clone(&on_search)),
         )) as Arc<dyn MountSource>;
-        start_control_interface(mp, Arc::clone(&control_stop))
+        start_control_interface(mp, Arc::clone(&control_stop), Some(on_search))
     } else {
         None
     };
@@ -2036,7 +2153,9 @@ fn print_features() {
         "  remote: http,https,file,s3,gs,az,ftp,ftps,ssh,sftp,webdav,smb,dropbox,oci,docker,ipfs,rclone"
     );
     println!("  index: --index-file, --index-folders, :memory:");
-    println!("  control: --control-interface (unix socket)");
+    println!(
+        "  control: --control-interface (unix socket + in-FS search/<pattern>); ratarmount find PATTERN ARCHIVE"
+    );
 }
 
 fn print_oss_attributions(full: bool) {
@@ -2088,8 +2207,14 @@ fn print_oss_attributions(full: bool) {
     }
 }
 
+type SearchFn = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
 /// Listen for line-based control commands on a Unix socket.
-fn start_control_interface(mountpoint: &Path, stop: Arc<AtomicBool>) -> Option<PathBuf> {
+fn start_control_interface(
+    mountpoint: &Path,
+    stop: Arc<AtomicBool>,
+    on_search: Option<SearchFn>,
+) -> Option<PathBuf> {
     let sock = std::env::temp_dir().join(format!("ratarmount-control-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&sock);
     let listener = match UnixListener::bind(&sock) {
@@ -2112,18 +2237,7 @@ fn start_control_interface(mountpoint: &Path, stop: Arc<AtomicBool>) -> Option<P
                     let mut reader = BufReader::new(&stream);
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_ok() {
-                        let cmd = line.trim();
-                        let reply = match cmd {
-                            "ping" => "pong\n".to_string(),
-                            "status" => format!("mounted {}\n", mp.display()),
-                            "unmount" | "quit" | "exit" => {
-                                let _ = unmount(&mp);
-                                stop.store(true, Ordering::Relaxed);
-                                "ok unmounted\n".to_string()
-                            }
-                            "help" => "commands: ping status unmount help\n".to_string(),
-                            other => format!("error: unknown command {other:?}\n"),
-                        };
+                        let reply = control_reply(line.trim(), &mp, &stop, on_search.as_ref());
                         let _ = stream.write_all(reply.as_bytes());
                     }
                 }
@@ -2135,6 +2249,46 @@ fn start_control_interface(mountpoint: &Path, stop: Arc<AtomicBool>) -> Option<P
         let _ = std::fs::remove_file(&sock_path);
     });
     Some(sock)
+}
+
+fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&SearchFn>) -> String {
+    match cmd {
+        "ping" => "pong\n".to_string(),
+        "status" => format!("mounted {}\n", mp.display()),
+        "unmount" | "quit" | "exit" => {
+            let _ = unmount(mp);
+            stop.store(true, Ordering::Relaxed);
+            "ok unmounted\n".to_string()
+        }
+        "help" => "commands: ping status unmount search help\n".to_string(),
+        "search" => "error: search requires a pattern\n".to_string(),
+        other if other.starts_with("search ") => {
+            let pattern = other["search ".len()..].trim();
+            if pattern.is_empty() {
+                return "error: search requires a pattern\n".to_string();
+            }
+            let Some(cb) = on_search else {
+                return "error: search requires an on-disk index\n".to_string();
+            };
+            let tsv = cb(pattern);
+            if tsv.starts_with("error:") {
+                if tsv.ends_with('\n') {
+                    tsv
+                } else {
+                    format!("{tsv}\n")
+                }
+            } else {
+                let n = tsv.lines().filter(|l| !l.is_empty()).count();
+                let mut out = tsv;
+                if !out.is_empty() && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                out.push_str(&format!("count {n}\n"));
+                out
+            }
+        }
+        other => format!("error: unknown command {other:?}\n"),
+    }
 }
 
 fn wait_until_mounted(path: &Path, timeout: Duration) -> bool {
@@ -3115,6 +3269,159 @@ mod serve_cli_tests {
         assert!(a.nfs && a.http);
         assert_eq!(a.paths, vec![PathBuf::from("a.tar")]);
         assert!(serve_cli_error(&a).is_none());
+    }
+}
+
+#[cfg(test)]
+mod find_cli_tests {
+    use super::{control_reply, find_cli_error, parse_args_from, SearchFn};
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Regression: `find '*.fits' a.tar` does not steal the pattern or archive.
+    #[test]
+    fn find_flag_does_not_steal_archive() {
+        let a = parse_args_from(["ratarmount", "find", "*.fits", "a.tar"]).expect("parse");
+        assert!(a.find);
+        assert!(a.no_mount);
+        assert!(!a.find_fts);
+        assert!(!a.find_hashes);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+        assert!(find_cli_error(&a).is_none());
+    }
+
+    /// Regression: find-argv `--fts` must not steal the pattern or archive.
+    #[test]
+    fn find_flag_fts_does_not_steal_archive() {
+        let a = parse_args_from(["ratarmount", "find", "--fts", "*.fits", "a.tar"]).expect("parse");
+        assert!(a.find);
+        assert!(a.find_fts);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+        assert!(find_cli_error(&a).is_none());
+    }
+
+    /// Regression: boolean find `--hashes` must not steal `*.fits` as an algo list.
+    #[test]
+    fn find_flag_hashes_does_not_steal_pattern() {
+        let a =
+            parse_args_from(["ratarmount", "find", "--hashes", "*.fits", "a.tar"]).expect("parse");
+        assert!(a.find);
+        assert!(a.find_hashes);
+        assert!(a.hashes.is_none());
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+    }
+
+    #[test]
+    fn find_flag_hashes_algo_fill_keeps_pattern() {
+        let a = parse_args_from([
+            "ratarmount",
+            "find",
+            "--hashes",
+            "sha256",
+            "*.fits",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.find);
+        assert!(!a.find_hashes);
+        assert_eq!(a.hashes.as_deref(), Some("sha256"));
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+    }
+
+    /// `--fts` is find-argv only, not a global mount flag.
+    #[test]
+    fn find_flag_fts_is_not_a_mount_flag() {
+        let err = parse_args_from(["ratarmount", "--fts", "a.tar", "mnt"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected") || msg.contains("fts") || msg.contains("unrecognized"),
+            "{msg}"
+        );
+    }
+
+    /// `find` after flags is an archive name, not the subcommand.
+    #[test]
+    fn find_after_flags_is_archive_path() {
+        let a = parse_args_from(["ratarmount", "--no-mount", "find"]).expect("parse");
+        assert!(!a.find);
+        assert_eq!(a.paths, vec![PathBuf::from("find")]);
+    }
+
+    #[test]
+    fn find_flag_rejects_nfs() {
+        let a = parse_args_from(["ratarmount", "find", "--nfs", "*.fits", "a.tar"]).expect("parse");
+        let err = find_cli_error(&a).expect("error");
+        assert!(err.contains("--nfs"), "{err}");
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+    }
+
+    #[test]
+    fn find_flag_requires_pattern_and_archive() {
+        let a = parse_args_from(["ratarmount", "find", "a.tar"]).expect("parse");
+        let err = find_cli_error(&a).expect("error");
+        assert!(err.contains("PATTERN"), "{err}");
+    }
+
+    /// Regression: Unix socket `search <pattern>` returns TSV + `count N`.
+    #[test]
+    fn control_search_socket() {
+        let tsv = "/a.fits\t4\t1\n/dir/b.fits\t5\t2\n";
+        let cb: SearchFn = Arc::new({
+            let tsv = tsv.to_string();
+            move |pat: &str| {
+                assert_eq!(pat, "*.fits");
+                tsv.clone()
+            }
+        });
+        let stop = AtomicBool::new(false);
+        let reply = control_reply(
+            "search *.fits",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&cb),
+        );
+        assert!(reply.contains("/a.fits\t4\t1"), "{reply}");
+        assert!(reply.contains("/dir/b.fits\t5\t2"), "{reply}");
+        assert!(reply.contains("count 2"), "{reply}");
+
+        let missing = control_reply("search *.fits", std::path::Path::new("/mnt"), &stop, None);
+        assert!(
+            missing.contains("on-disk index"),
+            "socket :memory:/missing: {missing}"
+        );
+
+        let no_pat = control_reply("search", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        assert!(no_pat.contains("pattern"), "{no_pat}");
+
+        let help = control_reply("help", std::path::Path::new("/mnt"), &stop, Some(&cb));
+        assert!(help.contains("search"), "{help}");
+
+        let err_cb: SearchFn =
+            Arc::new(|_: &str| "error: search requires an on-disk index\n".into());
+        let mem = control_reply(
+            "search *.fits",
+            std::path::Path::new("/mnt"),
+            &stop,
+            Some(&err_cb),
+        );
+        assert!(mem.starts_with("error:"), "{mem}");
+        assert!(!mem.contains("count "), "{mem}");
     }
 }
 
