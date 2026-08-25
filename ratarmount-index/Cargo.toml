@@ -7,6 +7,9 @@ description = "SQLite index 0.7.0 read/write for ratarmount-rs"
 
 [dependencies]
 ratarmount-core.workspace = true
+# Workspace rusqlite 0.32 has no `fts5` cargo feature. Bundled libsqlite3-sys
+# always compiles `-DSQLITE_ENABLE_FTS5`, so FTS5 cannot be compiled out of
+# this binary. Optional locate is the `files_fts` table + MATCH query.
 rusqlite.workspace = true
 thiserror.workspace = true
 serde = { version = "1", features = ["derive"] }

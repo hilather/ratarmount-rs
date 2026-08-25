@@ -51,8 +51,9 @@ impl SqliteIndex {
 
     /// Rebuild optional `files_fts` after a suffix patch (F-3).
     ///
-    /// No-op when `files_fts` is missing (normal 0.7.x indexes). F3-1 fills
-    /// the rebuild body; this stub only checks `sqlite_master`.
+    /// No-op when `files_fts` is missing (normal 0.7.x indexes). When the
+    /// table exists, refill it from `files` + `user.hash.*` xattrs. Does not
+    /// create the table ([`Self::ensure_fts5`]).
     pub fn rebuild_fts_if_present(&self) -> Result<()> {
         if self.is_read_only() {
             return Err(IndexError::Invalid("index is read-only".into()));
@@ -61,11 +62,10 @@ impl SqliteIndex {
             return Ok(());
         }
         self.with_conn(|conn| {
-            if !table_exists(conn, "files_fts")? {
+            if !table_exists(conn, crate::search::FILES_FTS_TABLE)? {
                 return Ok(());
             }
-            // F3-1 hooks FTS5 rebuild here. Until then, presence is a no-op.
-            Ok(())
+            crate::search::refill_files_fts(conn)
         })
     }
 }
@@ -446,13 +446,37 @@ mod tests {
     fn rebuild_fts_if_present_noop_when_missing() {
         let idx = SqliteIndex::create_writable(None).unwrap();
         idx.rebuild_fts_if_present().unwrap();
-        idx.with_conn(|conn| {
-            conn.execute("CREATE TABLE \"files_fts\" (fullpath TEXT)", [])?;
-            Ok(())
-        })
-        .unwrap();
-        idx.rebuild_fts_if_present()
-            .expect("stub is still a no-op when files_fts exists");
+        assert!(
+            !idx.has_files_fts().unwrap(),
+            "rebuild must not create files_fts"
+        );
+    }
+
+    /// Regression: suffix patch refills an existing FTS5 table so MATCH follows
+    /// the new `files` rows (and does not create the table when missing).
+    #[test]
+    fn rebuild_fts_if_present_after_patch() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[file_row("prefix.txt", 0), file_row("old-suffix.txt", 1024)])
+            .unwrap();
+        idx.commit_write().unwrap();
+        idx.ensure_fts5().unwrap();
+        assert_eq!(idx.search_fts("old").unwrap().len(), 1);
+        assert_eq!(idx.search_fts("prefix").unwrap().len(), 1);
+
+        idx.begin_write().unwrap();
+        let deleted = idx.delete_from_offsetheader(1024).unwrap();
+        assert_eq!(deleted, 1);
+        idx.insert_files_batch(&[file_row("new-suffix.txt", 1024)])
+            .unwrap();
+        idx.rebuild_fts_if_present().unwrap();
+        idx.commit_write().unwrap();
+
+        assert!(idx.search_fts("old").unwrap().is_empty());
+        assert_eq!(idx.search_fts("new").unwrap().len(), 1);
+        assert_eq!(idx.search_fts("prefix").unwrap().len(), 1);
+        assert_eq!(INDEX_VERSION, "0.7.0");
     }
 
     #[test]

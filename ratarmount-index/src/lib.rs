@@ -1,10 +1,18 @@
 //! SQLite index compatible with Python `ratarmountcore.SQLiteIndex` (v0.7.0).
+//!
+//! Locate over `files` is [`SqliteIndex::search`] (glob/LIKE by default). Optional
+//! FTS5 is [`SqliteIndex::ensure_fts5`] + [`SqliteIndex::search_fts`]. Workspace
+//! rusqlite 0.32 has no `fts5` cargo feature; bundled libsqlite3-sys always
+//! compiles `SQLITE_ENABLE_FTS5`, so FTS5 cannot be compiled out. [`INDEX_VERSION`]
+//! stays `"0.7.0"`. Normal [`SqliteIndex::create_writable`] / cold index does
+//! **not** create `"files_fts"`.
 
 mod hashing;
 mod location;
 mod mem;
 mod nested;
 mod patch;
+mod search;
 
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
@@ -15,6 +23,7 @@ pub use location::{
     maybe_fetch_index_url, parse_index_folders, possible_index_paths, resolve_index_location,
     sibling_index_url, IndexLocation, MEMORY_INDEX,
 };
+pub use search::{SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -42,6 +51,10 @@ pub use nested::{
 pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
 
 /// Must match Python `SQLiteIndex.__version__`.
+///
+/// Additive Rust-only tables such as `"files_fts"` (see [`SqliteIndex::ensure_fts5`])
+/// do not bump this string. Python ignores unknown tables. FTS5 is compiled into
+/// bundled sqlite (`SQLITE_ENABLE_FTS5`); rusqlite 0.32 has no `fts5` cargo feature.
 pub const INDEX_VERSION: &str = "0.7.0";
 
 /// Embedded core schema (`create-index-tables.sql`). Compression side tables are runtime-only
