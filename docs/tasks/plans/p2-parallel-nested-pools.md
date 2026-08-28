@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs (plan-only; skeptic-reviewed) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft — sweeps 1–2 ACCEPT (nits folded); awaiting fresh sweep 3 |
+| **Status** | **ACCEPT** (skeptic sweeps 1–3; no blockers) |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Parallel nested open pools” |
 | **Scope** | Investigate the eager parallel nested-open path vs compact `StringPool`. Decide whether a per-worker arena + parent-pool merge is justified. If not, close the item as already-isolated. If yes, specify a RAM-only merge that does **not** change the durable nested blob. |
 | **Out of this train** | Durable `nestedindexes` / RNIB encoding; intra-archive parallel ZIP/TAR fill; AutoMount `PathIntern` redesign; parent `SharedArchiveIo` mutex; SIMD; lazy (`-l`) sequential mount |
@@ -361,6 +361,8 @@ Process: sweep 1 is mandatory; each sweep is a **fresh** skeptic; fold blockers 
 |-------|---------|-----------------|
 | 1 | **ACCEPT** (no blockers). Nits folded: spec vs charter; F1 “no parent argument”; F2 reader/import/spool; F3 outer `set_nested_index`; G1 as stop-sign + no `slab_bytes()`; Phase 1 `shards` + `NestedOpenContext` injection. | None (nits only) |
 | 2 | **ACCEPT** (no blockers). Nits folded: ISO reader *has* a private compact pool; Phase 0 test lives in `mem.rs`; Phase 1 needs `MemIndex.pool: Arc<StringPool>` (Clone deep-copies); sidecar attach via `lookup_arc` not `intern`. | None (nits only) |
-| 3 | *(pending — fresh skeptic)* | |
+| 3 | **ACCEPT** (no blockers). Nits not folded (cap): `unique_count()` includes empty id-0; Phase 0 index test cannot observe FR-6; `open_nested_fn` does not force `index_compact_only = false` (default is already false; either value is still a private builder). | None |
 
-**Final:** *(pending sweep 3)*
+**Final: ACCEPT**
+
+Three independent skeptics accepted. Lock-contention P2 is N/A on current `main`. Default later work is Phase 0 (invariant test + backlog rewrite), not a parent-pool merge. Phase 1 remains gated and is not authorized by this document alone. No implementation in this PR.
