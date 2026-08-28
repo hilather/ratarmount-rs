@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs |
 | **Date** | 2026-08-28 |
-| **Status** | Plan (skeptic review in progress) |
+| **Status** | Plan (skeptic review in progress — sweep 1 folded, awaiting sweep 2) |
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-1** Cheap scan then refine (`partial`, M) |
 | **Pairs with** | [`vectors-optimization.md`](../vectors-optimization.md) P0 list/dirents residual; [`beyond-parity-roadmap.md`](../beyond-parity-roadmap.md) **F-3** overlay residual |
 | **Audience** | Implementers who already know `MountSource`, `MemIndex` / `EntrySoa`, F-3 locate, and `WriteOverlay` |
@@ -18,12 +18,15 @@ Steal Cloudflare Vectorize’s **two-phase query** (scan a cheap representation,
 
 V-1 finishes the metadata side of that split:
 
-1. Locate (`ratarmount find`, control `search/<pattern>`, socket `search`, FTS) walks **SoA columns + pool ids** (or the 0.7.x `files` catalog) and allocates path strings **only for emitted hits**.
-2. `list()` grows a typed **“need FileInfo”** flag so a search-like walk cannot default into `BTreeMap<String, FileInfo>`.
-3. Overlay-only names (creates + tombstones) participate in **cheap** search without building a second fat catalog.
-4. Regression: `find '*.fits'` RSS on a 200k-member catalog stays near **cheap `list_dirents` / SoA** RSS, not near a fat `list()` map.
+1. **CLI `find` / FTS stay streaming SQL** over the 0.7.x `files` / `files_fts` catalog. Allocate path strings only for emitted hits. Do **not** load `MemIndex` to answer sidecar `find`.
+2. **Live control/socket / compact-only** walk **SoA columns + pool ids** (`search_cheap` / `MemIndex::scan_glob`) and allocate path strings only for emitted hits.
+3. `list()` grows an additive **`ListNeed`** flag (P0 leftover). Cheap search **must not** call `list()` / `list_with(FileInfo)` — the flag is not the locate API.
+4. Overlay names (creates, **COW/replace/rename-dest**, tombstones) participate in **cheap** control/socket search without a second fat catalog.
+5. Regression: locate `*.fits` on a 200k-row **synthetic SoA** (and SQL `search_query` on a sidecar) stays near cheap `list_dirents` / SoA RSS, not near a fat `list()` map. **No CI 200k on-disk TAR.** Cold `factory::open_path` for a missing sidecar is **out of the RSS bar**.
 
-This is the same toolbox as P0 density. The remaining tax is path materialization, leftover `list()` callers, overlay-blind locate, and compact-only search returning empty — not cosine math.
+This is the same toolbox as P0 density. The remaining tax is leftover `list()` callers, overlay-blind locate, compact-only search returning empty, and implementers “unifying” find onto MemIndex — not cosine math.
+
+**Impl prompt phrase lock:** do **not** tell implementers to “hydrate `FileInfo` only on hits.” Hits are `SearchHit` / `CheapSearchHit`. `FileInfo` is getattr/open only.
 
 ---
 
@@ -35,13 +38,14 @@ This is the same toolbox as P0 density. The remaining tax is path materializatio
 | IVF / k-means / PQ / ANN | Members are not points in \(\mathbb{R}^{D}\); wrong `cat` is corruption |
 | Approximate member contents | A 95% correct `read()` is a bug |
 | Replace the 0.7.x `files` table with centroid files | One SQLite blob per snapshot (V-2) is enough |
-| Load a full `MemIndex` just to run sidecar-only CLI `find` | That **raises** RSS vs streaming SQL; see [Decision D1](#d1-two-backends-one-hit-type) |
+| Load a full `MemIndex` just to run sidecar-only CLI `find` | That **raises** RSS vs streaming SQL; see [D1](#d1-two-backends-one-hit-type) |
 | Run FTS5 `MATCH` over pool ids | FTS lives in `"files_fts"`; SoA has no inverted index |
-| Hydrate `FileInfo` on the locate path “for completeness” | `SearchHit` / `CheapSearchHit` is the emit type; `FileInfo` is getattr/open |
-| Lift CLI `find` + `-w` in v1 | Overlay context is the live mount; see [Decision D4](#d4-overlay-is-controlsocket-not-cli-find--w) |
+| Hydrate `FileInfo` on locate (scan **or** hits) | Emit type is `SearchHit` / `CheapSearchHit` |
+| Lift CLI `find` + `-w` in v1 | Overlay context is the live mount; see [D4](#d4-overlay-merge-ownership) |
+| Recurse AutoMount nested children in locate | Matches today’s sidecar of `inputs[0]` only; see [D5](#d5-search_cheap-hook-and-forwards) |
 | Tracker / D-Bus / mount `--index-fts` / write-then-read `echo pat > search` | F-3 residuals, not V-1 |
 | V-2 snapshot pointer, V-3 remote cache, V-4 commit queue, V-5 offset-order list | Separate items |
-| Change nested open / temp spool / `MountSource::open` | No format-matrix update |
+| Change nested open / temp spool / `MountSource::open` / `factory.rs` open paths | No format-matrix update; orchestrator owns factory glue |
 
 ---
 
@@ -70,6 +74,22 @@ flowchart TB
   fuse --> X
 ```
 
+### Wrap order (live mount) — required for overlay/search wiring
+
+```
+format MountSource
+  → Transform?          (apply_compositing, factory.rs ~3162)
+  → AutoMount?          (recursive, ~3165)
+  → Prefix?             (disable-union multi-source, ~3207)
+  → Union?              (n_sources > 1, ~3697)
+  → FileVersionLayer?   (~3705)
+  → Prefix?             (comp.prefix, ~3708)
+  → WriteOverlay?       (main.rs ~954–958, after factory bundle)
+  → ControlFolder?      (main.rs ~1123–1133, outermost)
+```
+
+Control **wraps overlay**. `tsv_search_callback` closes over `inputs[0]` + `OpenOptions` only — **no `WriteOverlay`**. Socket uses that same sidecar closure. Live `search_cheap` must be invoked on the **outer** `MountSource` (Control → overlay → …) **or** the SearchFn in `main.rs` must hold `overlay_arc` for the sidecar fallback path. Do **not** edit `factory.rs` open paths.
+
 ### CLI `find` — sidecar SQL, no `MountSource`
 
 | Step | Location | Notes |
@@ -77,6 +97,8 @@ flowchart TB
 | Clap | `ratarmount/src/main.rs` `parse_args_from` ~465–488; `find_cli_error` ~569–584 | Rejects `-w` / exports; requires `PATTERN ARCHIVE` |
 | Early exit | `main` ~791–800 | **Before** `factory::build_mount_source_ex` — never wraps `FileVersionLayer` or overlay |
 | Query | `ratarmount/src/find.rs` `locate_hits` → `open_index_for_find` → `query_index` | Cold-index via `factory::open_path` if sidecar stale; then `SqliteIndex::search_query` |
+| Warm open | `SqliteIndex::open_writable` | Leaves `mem: None` — no SoA in the find process |
+| Cold/stale | `find.rs` ~198–217 | `factory::open_path` **does** seal a MemIndex when `n ≤ MEM_INDEX_MAX_FILES` (500k). That peak is **index build**, not locate. **Out of the V-1 RSS bar.** |
 | Hit type | `ratarmount-index/src/search.rs` `SearchHit` | `path: String`, `name: String`, scalars. **Never `FileInfo`.** |
 | SQL | `search_glob_like` ~210–247 | `SELECT` reconstructed `fullpath` + name/size/mtime/offsetheader. Basename `*.fits` predicates on `"name" GLOB` but still **materializes `fullpath` for every hit**. |
 | FTS | `search_fts_match` ~249–279 | `"files_fts" MATCH` + JOIN to `files` on `(name, path, offsetheader)` |
@@ -91,17 +113,21 @@ flowchart TB
 |---------|----------|---------|
 | Control file | `ratarmount-compositing/src/control.rs` `search_text` → `on_search` callback | Same sidecar SQL as find (`find::tsv_search_callback`) |
 | Readdir of `search/` | `control.rs` ~372–374 | **Intentionally empty** (no O(catalog) listing) |
+| `lookup` + `open` | `control.rs` ~452–454, 485–487 | **`search_text` runs twice** per `cat` (size then body). V-1 **accepts 2×**. Do not “fix” this by caching a `FileInfo` map. |
 | Socket | `ratarmount/src/main.rs` `control_reply` ~2320–2342 | Same callback; TSV + `count N` |
 | Wiring | `main.rs` ~1123–1132 | Callback closes over `inputs[0]` + `OpenOptions` only — **no `WriteOverlay`** |
-| Status residual | `control.rs` `status_text` ~206–227 | Still calls **`inner.list("/")`** (fat map) to print ≤128 root names. `list_dirents` of the control dir itself does **not** (regression `control_list_dirents_*`). |
+| Status residual | `control.rs` `status_text` ~206–227 | Still calls **`inner.list("/")`** (fat map) to print ≤128 root names. `list_dirents` of the control dir itself does **not**. |
+| `fts:` on control | `query_index` honors `fts:` prefix; callback uses `LocateOptions::default()` but still splits `fts:` | Live `scan_glob` is glob-only — see [D5](#d5-search_cheap-hook-and-forwards) |
 
 Missing sidecar / `:memory:` → stable `error: search requires an on-disk index`. Compact-only live mounts therefore search-empty even when SoA is in RAM.
 
+Existing `control_search` tests the **callback**, not `MountSource::search_cheap`. They stay green even if live search is wrong — new tests must pin the live path.
+
 ### FTS5
 
-Additive `"files_fts"` (`fullpath`, `hashes`, unindexed path/name/offsetheader). Created only by `ensure_fts5` (find `--fts`), never by cold `create_writable`. `INDEX_VERSION` stays `0.7.0`. Compact-only: `ensure_fts5` is a no-op; `search_query` returns empty.
+Additive `"files_fts"` (`fullpath`, `hashes`, unindexed path/name/offsetheader). Created only by `ensure_fts5` (find `--fts`), never by cold `create_writable`. `INDEX_VERSION` stays `0.7.0`. Compact-only: `ensure_fts5` is a no-op; `search_query` returns empty. `ensure_fts5` already full-rebuilds the table; do not invent a SoA rebuild.
 
-There is **no** pool-id FTS. Porting MATCH onto `StringPool` would be a new inverted index — out of V-1.
+There is **no** pool-id FTS. Porting MATCH onto `StringPool` is out of V-1.
 
 ### `list()` vs `list_dirents()` vs `list_mode()` — no “need FileInfo” flag
 
@@ -114,80 +140,52 @@ There is **no** pool-id FTS. Porting MATCH onto `StringPool` would be a new inve
 | `list_dirents` | calls `list_mode()`, `size = 0` | `CheapDirent { name, mode, size }` |
 | `lookup` | required | one `FileInfo` |
 
-**No `ListNeed` type exists** (grep: proposal text in V-1 only).
+**No `ListNeed` type exists.** Default `list_dirents` still fat-materializes on backends that only implement `list()`.
 
-Live readdir is already cheap:
+Live readdir is already cheap (FUSE `list_mode_cached`, NFS READDIR, compositing `list_dirents` overrides). Residual name-only `list()` callers: `status_text`, `AutoMount::list_names_no_lazy`. Transform `ensure_map` is a one-time BFS — **out of V-1 must-migrate**.
 
-- FUSE `list_mode_cached` → `source.list_dirents` only (`ratarmount-fuse/src/lib.rs` ~423–437). Test: `readdir_path_does_not_call_fat_list`.
-- NFS READDIR → `list_dirents` (`ratarmount-nfs/src/vfs.rs`).
-- Compositing wrappers (Prefix, Union default B-4, AutoMount readdir, WriteOverlay, Control, Folder, Transform `list_dirents`, FileVersionLayer) override `list_dirents`.
-
-**Residual fat `list()` on the mount stack** (not find/search, but the V-1 flag exists so these cannot infect a search walk):
-
-| Caller | Why fat today | Need FileInfo? |
-|--------|---------------|----------------|
-| Default `list_mode` / `list_dirents` | Backends that only implement `list()` | No |
-| `ControlFolderMountSource::status_text` | Root names in `status` | Names only |
-| `AutoMount::list_names_no_lazy` | Lazy child discovery / eager `-r` | Names only |
-| `TransformMountSource::ensure_map` | One-time full-tree BFS | Names + dir-ness |
-| `WriteOverlay::list` / `FileVersionLayer::list` / `UnionMountSource::list` | Legacy API | Readdir already uses `list_dirents` |
-| Format `MountSource::list` | `index.list()` → `BTreeMap<String, FileInfo>` | Tools / tests |
-
-`FileInfo` (`ratarmount-core/src/lib.rs` ~170–179) carries `linkname: String`, `userdata: Vec<UserData>` (TAR offsets, flags). Fat `list("/")` on a 200k flat TAR allocates that per child.
+`FileInfo` carries `linkname: String` + `userdata: Vec<UserData>`. Fat `list("/")` on a 200k flat TAR allocates that per child.
 
 ### FileVersionLayer cheap readdir — already done for FUSE
 
-`ratarmount-compositing/src/versioning.rs`:
+`list_dirents` forwards `inner.list_dirents`; versions-folder synthesizes numbered `CheapDirent`s. Test `file_version_layer_list_dirents_forwards_zip_without_fat_list` asserts `list_calls == 0`.
 
-- `list_dirents` forwards `inner.list_dirents`; versions-folder synthesizes numbered `CheapDirent`s. **Never** `inner.list()`.
-- `list()` still forwards `inner.list()` on normal paths.
-- Test `file_version_layer_list_dirents_forwards_zip_without_fat_list` asserts `list_calls == 0`.
-
-**Find / sidecar search does not go through FileVersionLayer.** V-1 does not change versioning semantics. A new `search_cheap` default on the trait must **forward** here (same bug class as pre-P0 `list_dirents`).
+**Find / sidecar search does not go through FileVersionLayer.** A new `search_cheap` default `None` on the trait **must forward** here. Locate must **not** emit `.versions/*` paths (SQL never did).
 
 ### MemIndex / SoA — cheap per directory, no catalog scan API
 
-`ratarmount-index/src/mem.rs`:
+`StringPool::get(id)` is `&str`. `list_dirents(dir)` still `to_string()` per name. `list(dir)` calls `soa.to_file_info`. **No** public catalog-wide `(path_id, name_id, soa_idx)` scan. No shared glob helper matching SQL `GLOB` (`**` collapse, `/` ⇒ full path, LIKE vs GLOB — `search.rs` ~417–450).
 
-- `StringPool`: slab + span ids; `get(id)` is a `&str` slice (no alloc).
-- `PathTable`: CSR `offsets` + `seg_ids`.
-- `EntrySoa`: parallel `offsetheader/offset/size/mtime/mode/linkname_id/uid/gid/flags/recursiondepth`.
-- `list_dirents(dir)` streams **one directory**: still `pool.get(nid).to_string()` per name (and linkname).
-- `list(dir)` calls `soa.to_file_info` per child.
-- **No** public “visit every `(path_id, name_id, soa_idx)` matching a glob” API.
+`SqliteIndex` formats that already forward `index.list_dirents` (must all get `search_cheap` — same bar):
 
-`SqliteIndex::list_dirents` SELECTs `name, offsetheader, offset, size, mode, linkname, …` for one `"path"` — allocates `String` name/linkname per row, not `FileInfo`.
+TAR, ZIP, 7z, CPIO, AR, WARC, CAB, ISO, ASAR, XAR, libarchive, OGG, HTML, PDF.
 
 ### Overlay vs search — F-3 residual
 
-`WriteOverlay::list_dirents` (`write_overlay.rs` ~1216–1257) already merges `base.list_dirents` + overlay `read_dir` − `list_deleted`, using `overlay_file_info` only for overlay entries (not a base fat map).
+`WriteOverlay::list_dirents` last-wins overlay host over base by name, minus `list_deleted`. Overlay host already holds **creates, COW copies, truncates, replace, rename destinations** (`ensure_modifiable` ~288–322). Tombstones: overlay SQLite `"files"` (`deleted = 1`), keyed by `split(normpath)` → folder `""` or `"/dir"` + name. `is_deleted(path)` uses that split. Commit already `SELECT path, name FROM files WHERE deleted = 1`.
 
-Tombstones live in the overlay SQLite `"files"` table (`deleted = 1`), keyed by `(path, name)`. Creates live on the overlay host directory. **Neither is in the archive sidecar `files` catalog until commit.**
+**Neither overlay host nor tombstones are in the archive sidecar until commit.**
 
-Today:
-
-- CLI `find` **rejects** `-w`.
-- Control / socket search **reopens the sidecar** and never asks `WriteOverlay`.
-- Uncommitted creates are invisible; uncommitted deletes still appear.
-
-`list_deleted` is **per-directory**. There is no recursive “all tombstones / all overlay creates” helper for locate.
-
-### Benchmarks — no 200k `ratarmount find` RSS
-
-`benchmarks/compare-python-vs-rust.sh` `measure_find` runs kernel **`find "$mount"`** (FUSE tree walk), not `ratarmount find`. Largest default fixture is `small-1000.tar`. MemIndex unit regression uses **220** names. V-1’s 200k RSS bar is **not implemented**.
+`:temp:` is the same `WriteOverlay` type — no extra API.
 
 ---
 
 ## Goals (this train → V-1 `done`)
 
-1. **Locate never builds `FileInfo`.** Hits are `SearchHit` / `CheapSearchHit` (path + name + size + mtime [+ offsetheader]). `lookup`/`open` remain the refine pass.
-2. **SoA / pool-id scan** for live compact catalogs: iterate `name_id` / `path_id` + SoA scalars; `pool.get` as `&str` for glob; allocate `String` paths **only for emitted rows**.
-3. **Sidecar SQL find stays streaming SQL.** Do not re-index 200k rows into `MemIndex` to answer `ratarmount find`.
-4. **FTS stays SQL `MATCH`.** Same hit type; no SoA FTS.
-5. **`ListNeed`** so leftover `list()` callers that only want names cannot trip the default Infos path; search/status/automount-name walks use Cheap.
-6. **Overlay-only names in cheap control/socket search** on a live `-w` mount: creates appear, tombstones disappear, no second `BTreeMap<String, FileInfo>`.
-7. **Regression** that a 200k-row catalog `*.fits` locate does not construct N `FileInfo`s and stays near cheap-list RSS (see [Verification](#verification)).
-8. Compact-only live search **stops returning empty** when SoA is present.
+1. **Locate never builds `FileInfo`.** Hits are `SearchHit` / `CheapSearchHit`.
+2. **SoA / pool-id scan** for live compact / format catalogs (`MemIndex::scan_glob`).
+3. **Sidecar SQL find stays streaming SQL.** No MemIndex load for `ratarmount find`.
+4. **FTS stays SQL `MATCH`.** `fts:` on control/socket also stays SQL (not `scan_glob`).
+5. **`ListNeed`** is shipped as the P0 leftover so name-only walks *can* avoid Infos. **V-1 `done` does not depend on Slice 1 alone.**
+6. **Overlay last-wins** on control/socket `-w` mounts: host paths override base hits; tombstones drop; no second fat catalog.
+7. **Regression** as [D6](#d6-rss-bar) — synthetic SoA + SQL no-`FileInfo`, not a 200k TAR `find` RSS number.
+8. Compact-only **live** search stops returning empty when SoA is present. Compact-only **CLI find** without a sidecar stays empty / “on-disk index.”
+
+**V-1 checkbox rewrite** (impl PR updates `vectorize-steal-patterns.md`):
+
+> CLI find / FTS stay streaming SQL (strings on hits only, no `FileInfo`). Live control/socket / compact-only scan SoA + pool ids. Overlay last-wins on control/socket. `ListNeed` additive.
+
+Do not leave the source checkbox as “find / FTS stay on SoA + pool ids” — that is how implementers unify onto MemIndex.
 
 ---
 
@@ -195,86 +193,76 @@ Today:
 
 ### D1. Two backends, one hit type
 
-Locate has two catalogs today. V-1 keeps both and shares an emit struct.
+| Backend | When | Scan | Emit |
+|---------|------|------|------|
+| **SQL sidecar** | CLI `find`; control/socket when live `search_cheap` is `None`; **all `fts:` / `--fts`** | SQLite `files` / `files_fts` cursor | `SearchHit` strings for hits only |
+| **Live SoA** | Control/socket when the mount stack returns `Some` from `search_cheap` (glob only) | `path_id` + `name_id` + SoA idx; glob against `pool.get` `&str` | `CheapSearchHit` strings for hits only |
 
-| Backend | When | Scan representation | Refine (emit) |
-|---------|------|---------------------|---------------|
-| **SQL sidecar** | CLI `find`; control/socket when `search_cheap` is `None` and a sidecar exists | SQLite `files` / `files_fts` cursor | `SearchHit` strings for **hits only** (already true; keep it) |
-| **Live SoA** | Control/socket when the mount implements `search_cheap`; compact-only | `path_id` + `name_id` + SoA idx; glob against `pool.get` `&str` | `CheapSearchHit` strings for **hits only** |
+**Do not** unify CLI find onto MemIndex. Warm `open_writable` has `mem: None`. Loading SoA for `ratarmount find` is the explosion D6 forbids.
 
-**Do not** unify CLI find onto MemIndex. Opening / sealing 200k SoA rows to answer a sidecar query is the explosion the RSS bar forbids. SQL page cache + hit strings is the cheap scan for the no-mount path.
-
-**Do not** unify FTS onto SoA. `--fts` / `fts:` stays `ensure_fts5` + `MATCH`. Compact-only + `--fts` remains empty/no-op (document; do not invent in-memory FTS).
+**Do not** unify FTS onto SoA. Compact-only + `--fts` remains empty/no-op.
 
 ### D2. `FileInfo` is not the refine type for locate
 
-Vectorize’s refine pass rescores floats. Our locate refine is **path string + TSV scalars**, not `FileInfo`. The phrase “hydrate FileInfo only on hits” in the V-1 TODO is **interpreted as: do not hydrate `FileInfo` on the scan; do not hydrate it on hits either** unless a future caller needs getattr-grade metadata (out of v1). Adding `FileInfo` to `SearchHit` would be a regression.
+Locate refine = path string + TSV scalars. **Never** add `FileInfo` to `SearchHit`. The source-TODO phrase “hydrate FileInfo only on hits” is **rejected** as an impl instruction (sweep 1 #6). `lookup` / `open` stay the getattr/open refine.
 
-`lookup` / `open` stay the getattr/open refine for FUSE/NFS.
+### D3. `ListNeed` is additive and is **not** the locate API
 
-### D3. `ListNeed` is additive — do not change `list()`’s signature
-
-Breaking every `MountSource` impl is out of scope.
+Do not change `list()`’s signature.
 
 ```rust
-/// What a listing caller is allowed to force the backend to allocate.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ListNeed {
-    /// Names / modes / sizes. Must not build [`FileInfo`] maps.
-    Cheap,
-    /// Full [`FileInfo`] rows (`list()` today).
-    FileInfo,
+    Cheap,    // must not *require* FileInfo; see caveat
+    FileInfo, // today's list()
 }
 
-fn list_with(&self, path: &str, need: ListNeed) -> Option<ListResult> {
-    match need {
-        ListNeed::Cheap => match self.list_dirents(path)? {
-            dents => Some(ListResult::Names(dents.into_iter().map(|d| d.name).collect())),
-        },
-        ListNeed::FileInfo => self.list(path),
-    }
-}
+fn list_with(&self, path: &str, need: ListNeed) -> Option<ListResult> { /* ... */ }
 ```
 
-Exact shape may use `ListModeResult` when the caller wants modes; the **invariant** is: `ListNeed::Cheap` must not call `list()` on backends that have `list_dirents`. Default `list()` remains the fat API for tests and rare tools.
+**Caveat (default chain):** `list_with(Cheap)` is `list_dirents` as implemented. Default `list_dirents` still derives from `list()`. Un-upgraded backends stay fat. FUSE already requires `list_dirents` overrides. **`ListNeed` does not make search cheap** — search must not call `list()` / `list_with(FileInfo)` at all. Prefer `list_dirents` directly for the two migrations.
 
-**Must migrate in this train** (live FUSE/control paths that still call `list()` for names only):
+**Must migrate (P0 leftover, same PR OK):**
 
-- `ControlFolderMountSource::status_text` → `inner.list_dirents("/")` (or `list_with(..., Cheap)`).
+- `ControlFolderMountSource::status_text` → `inner.list_dirents("/")`.
 - `AutoMount::list_names_no_lazy` → `src.list_dirents(&rest)` names.
 
-**Out of the must-migrate set (document as residual, do not block V-1 `done`):**
+**Out of must-migrate:** `TransformMountSource::ensure_map`; format `list()` impls.
 
-- `TransformMountSource::ensure_map` one-time BFS via `inner.list()` — first `--transform` readdir, not locate. Follow-up; do not expand V-1 into Transform.
-- Format crate `list()` implementations — stay fat for callers that pass `ListNeed::FileInfo`.
+**Slice 1 alone is not V-1 `done`.**
 
-Search / control `search/` / socket **must not** call `list()` or `list_with(..., FileInfo)`.
+### D4. Overlay merge ownership
 
-### D4. Overlay is control/socket, not CLI `find -w`
+CLI `find` keeps rejecting `-w`. Overlay participation is control + socket on a live `-w` mount (`:temp:` included).
 
-CLI `find` stays no-FUSE and **keeps rejecting** `-w`. Overlay participation is:
+#### Semantics (match `list_dirents` last-wins)
 
-- `cat '/mnt/.ratarmount-control/search/*.fits'` on a `-w` mount
-- socket `search *.fits` on the same process
+Not “creates + tombstones” only:
 
-Implementation: a **cheap overlay name iterator** on `WriteOverlay`, merged at hit time:
+1. Start from **base hits** (SoA or SQL).
+2. Drop any hit whose path `WriteOverlay::is_deleted` (same `split(normpath)` as `mark_deleted` — **not** unslashed `join_rel` commit paths).
+3. Walk overlay **host tree** (recursive `read_dir`, skip `HIDDEN_DB` + sqlite sidecars, no symlink escape — reuse `ensure_under_root`). Names that match the glob **override** the base hit with the same full path (COW / truncate / replace / rename-dest / new create). Size/mtime from `symlink_metadata` **on hits only**.
+4. Tombstone rows: `SELECT path, name FROM files WHERE deleted = 1` (already used at commit). Apply via `is_deleted` / the same keys. `rmdir` already refuses nonempty — no recursive dir-tombstone hole.
 
-1. Scan base via `search_cheap` (SoA) or sidecar SQL (same as today).
-2. Drop any hit whose full path is `is_deleted`.
-3. Walk overlay **host tree** + overlay-db tombstone rows as `(dir, name, kind)` **without** `overlay_file_info` / `FileInfo`.
-4. If a create’s basename or reconstructed full path matches the glob, emit a `CheapSearchHit` using overlay `symlink_metadata` size/mtime only (already what `list_dirents` does per entry — allowed on **hits**, not on the whole overlay tree as a fat map).
+**Do not** build `BTreeMap<String, FileInfo>` of overlay ∪ base.
 
-Add `WriteOverlay::list_deleted_all()` (or a cursor) so tombstones are not discovered by walking every base directory. Creates: recursive `read_dir` of the overlay root, skipping `HIDDEN_DB` and sidecars — names only until a glob hit.
+#### `Option` collision — locked
 
-**Do not** build `BTreeMap<String, FileInfo>` of overlay ∪ base for search.
+`search_cheap` → `None` means “not implemented, caller may sidecar.” `Some(v)` means “this is the **full** answer.”
 
-**Union / multi-input:** control today searches `inputs[0]` only. V-1 does not invent union-catalog locate.
+| Layer | Rule |
+|-------|------|
+| `WriteOverlay::search_cheap` | Return `Some(merged)` **only if** `base.search_cheap` was `Some`. If base is `None`, return **`None`** (do not emit overlay-only as a complete answer). |
+| Control / socket SearchFn (`main.rs`) | (1) `outer.search_cheap(pattern)` if `Some` — already merged if overlay implemented it. (2) Else sidecar SQL (today’s callback). (3) If `overlay_arc` is `Some` **and** step 1 was `None`, merge overlay onto the SQL hits **here**. (4) `fts:` / `--fts` → step 2 only (SQL `MATCH`), then step 3 overlay merge. |
 
-### D5. Live search is a `MountSource` hook, not a fatter callback
+This closes overlay names on **Union** and any format that has not yet forwarded `search_cheap` (sidecar + `overlay_arc`). Live SoA + overlay on wired formats goes through `WriteOverlay::search_cheap` (`Some`).
 
-Today `on_search: Arc<dyn Fn(&str) -> String>` cannot see overlay or compact SoA.
+**Residual allowed:** overlay merge on a mount with **no** sidecar and **no** `search_cheap` (compact-only Union, `:memory:`) still errors `search requires an on-disk index` unless a format impl returns `Some`. Document; do not invent a third catalog.
 
-Add to `MountSource` (default `None` = “use sidecar callback”):
+Union-catalog locate (merge all union sources) stays out of v1. Multi-input sidecar remains `inputs[0]`.
+
+### D5. `search_cheap` hook and forwards
+
+`CheapSearchHit` lives in **`ratarmount-core`** (`path`, `name`, `size`, `mtime`, `offsetheader: Option<u64>`). No cycle: core does not depend on index; index depends on core. `SearchHit` stays the SQL type; map for TSV.
 
 ```rust
 fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
@@ -282,103 +270,123 @@ fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
 }
 ```
 
-`CheapSearchHit` lives in **`ratarmount-core`** (path, name, size, mtime; optional `offsetheader: Option<u64>`). `ratarmount-index::SearchHit` stays the SQL type; `find.rs` maps in either direction for TSV.
-
 | Impl | Behavior |
 |------|----------|
 | Default | `None` |
-| TAR / ZIP / 7z / other `SqliteIndex`+`MemIndex` formats | `Some(index.scan_glob(pattern))` — SoA when compact-only or mem projection present; else SQL `search_query` mapped to `CheapSearchHit` |
-| `WriteOverlay` | Base `search_cheap` (or `None`) + overlay merge ([D4](#d4-overlay-is-controlsocket-not-cli-find--w)) |
-| `FileVersionLayer` / Prefix / Control / AutoMount | **Forward** `inner.search_cheap` (versions folder is not a locate corpus) |
-| Union | `None` in v1 (keep sidecar of `inputs[0]`) |
-| Folder / remote folder | `None` (not a 0.7.x catalog; out of V-1) |
+| **Every `SqliteIndex` format** that already forwards `list_dirents` | One-liner `self.index.search_cheap(pattern)` — **not** “TAR/ZIP/7z at minimum.” List: TAR, ZIP, 7z, CPIO, AR, WARC, CAB, ISO, ASAR, XAR, libarchive, OGG, HTML, PDF. |
+| Index | Compact-only / live mem → `MemIndex::scan_glob`. Else SQL `search_query` mapped to `CheapSearchHit` (so `WriteOverlay` gets `Some` on warm sidecar formats too). |
+| `WriteOverlay` | [D4](#d4-overlay-merge-ownership) |
+| **Every compositing wrapper that forwards `list_dirents` / `content_generation`** | **Must forward `search_cheap`:** FileVersionLayer, Prefix, AutoMount, Transform, Control, `OciImageMountSource`. Default `None` is the P0 `list_dirents` bug class. |
+| Union | `None` in v1 (SearchFn uses sidecar of `inputs[0]` + overlay_arc). |
+| Folder / remote folder | `None` |
 
-Control `search_text`: if `self.inner.search_cheap(pattern)` is `Some(hits)`, format TSV; else existing `on_search` / missing-index error. Socket uses the same `SearchFn` built from the **outer** `MountSource` (the overlay-wrapped tree), not a sidecar-only closure.
+**Hit path identity:** TSV paths are **catalog paths** (same as today’s sidecar), **not** Prefix-rewritten or Transform-rewritten mount paths. Wrappers **forward without rewriting**. Transform/Prefix “forward” is enough **because** we lock catalog paths. (Changing that would be a product change vs current `ratarmount find` / control TSV.)
 
-CLI `find` does **not** call `search_cheap`. It stays `SqliteIndex::search_query`.
+**AutoMount:** forward to the **parent** catalog only (`root` / `source_at` `/`). Do **not** BFS `mounted` children. Nested compact-only members are invisible to locate today; stay that way.
 
-Factory / `main.rs` glue: pass the mounted `Arc<dyn MountSource>` into the socket callback (small orchestrator-owned change). Control can call `inner` directly and may drop `on_search` for the glob path once `search_cheap` is wired; keep `on_search` as fallback for sidecar-only mounts without a format impl.
+**FileVersionLayer:** forward; do not emit `.versions/*`.
 
-### D6. RSS bar means cheap listing, not fat `list()`
+**`fts:`:** if the pattern strips to FTS (`fts:` prefix or CLI `--fts`), **do not** call `scan_glob`. SQL `MATCH` only, then D4 step 3 overlay merge. Control paths pass the glob through unchanged today (`control.rs` ~196–203) and `query_index` already splits `fts:`.
 
-The V-1 sentence “stay near `list()` RSS” is **ambiguous** because `list()` is the fat API. **Locked meaning:**
+**Control `search_text`:** prefer `self.inner.search_cheap` when `Some`; else `on_search` / missing-index. Keep `on_search` as sidecar fallback. Control itself **forwards** `search_cheap` to inner so a socket/SearchFn on the outer source does not `None` out.
 
-> Peak RSS / allocated `FileInfo` count for `find '*.fits'` (or `search_cheap("*.fits")`) on a 200k-row catalog must stay in the same band as a cheap `list_dirents` / SoA hold of that catalog, and must be **far below** materializing `MemIndex::list("/")` / `BTreeMap<String, FileInfo>`.
+**Factory:** Slice 3 is `main.rs` SearchFn / `overlay_arc` only. **Do not touch `factory.rs`.**
 
-A test that only proves “find RSS ≤ fat list RSS” is a **weak bar and is not sufficient**.
+**Shared glob:** one helper with SQL `GLOB` semantics (`**` → `*`, `/` ⇒ full-path pred, LIKE vs GLOB). Tests twin `search_glob` cases in `search.rs` ~417–450. Do not reuse SMB `glob_match`.
 
-CI must not depend on a 200k-member **on-disk TAR** (slow, large). Primary regression is a **synthetic `MemIndex`** with 200k SoA rows (short interned names, ~1% `*.fits` hits). Optional BIG-fixture script may exist; missing fixture → `eprintln!("skip: …")` plus the synthetic test still runs.
+### D6. RSS bar
 
-Also pin: CLI `find` on a real sidecar must not construct `FileInfo` (spy / debug-assert / unit on `search_query`). `DEFAULT_SEARCH_LIMIT` stays 10_000 unless a follow-up changes it; the 200k case uses a **selective** glob so hit-string count is small. A second case (`*` or `*.txt` with many hits) asserts we still do not build N `FileInfo`s even if we allocate N hit strings (capped by the limit).
+**Locked meaning:**
 
-### D7. Scope of “scan SoA then refine” vs SQL `fullpath`
+> `FileInfo` construction count for locate (`scan_glob` / `search_query` / control TSV) on a 200k-row catalog is **0**. Peak RSS of the **locate phase** stays in the same band as holding that SoA / SQLite page cache, and **far below** `MemIndex::list("/")` / `BTreeMap<String, FileInfo>`.
 
-SQL already skips `FileInfo`. Remaining SQL cost (reconstruct `fullpath` in the SELECT for every hit) is acceptable in v1. Optional micro-opt (SELECT `path`+`name`, format in Rust) is **not** required to flip V-1 to `done`. Do not spend the train rewriting glob SQL.
+**Not sufficient:** “find RSS ≤ fat `list()` RSS.”
 
-SoA work is the **new** `MemIndex::scan_glob`:
+**Not in the bar:**
 
-- Walk all dir shards / `dirs` map: `(path_id, name_id, last soa_idx)`.
-- Skip `isgenerated` and dumpdir tombstone `linkname_id` (same filters as `catalog_filter_sql`).
-- Basename glob: `wildcard_match(pool.get(name_id), pattern)` — **no** `String` unless it matches.
-- Full-path glob: build a **temporary** path on the stack / a reused `String` buffer from PathTable segments; only `clone` into `CheapSearchHit` on match.
-- Respect `DEFAULT_SEARCH_LIMIT`.
+- Cold/stale CLI find calling `factory::open_path` (seals MemIndex up to 500k rows). That is index build. Warm sidecar `search_query` is the locate phase.
+- A real 200k-member **on-disk TAR** in default CI. Optional script may exist; missing fixture → `eprintln!("skip: …")`. **Do not claim a 200k TAR `find` RSS test exists.**
+- Kernel `find "$mount"` in `benchmarks/compare-python-vs-rust.sh` (different command).
 
-This is the Vectorize PQ-scan analogue: columns + ids in, strings out only for survivors.
+**Primary CI:**
+
+1. Synthetic `MemIndex` 200k SoA rows, short interned names, ~1% `*.fits`. `scan_glob`: `to_file_info` count **0**; path `String` count == hit count (or ≤). Fat `list("/")` FileInfo count == N. If a runner is tight, 50k + the same counts — do not skip the happy path.
+2. SQL unit: `search_query("*.fits")` never calls `to_file_info` (spy / `mem` stays `None`).
+3. Dense-hit case (`*` or many `*.txt`) still 0 `FileInfo` (hit strings may hit `DEFAULT_SEARCH_LIMIT`).
+
+`DEFAULT_SEARCH_LIMIT` stays 10_000.
+
+### D7. SoA `scan_glob` vs SQL `fullpath`
+
+SQL `fullpath` in the SELECT for hits is acceptable. Do not rewrite glob SQL.
+
+`MemIndex::scan_glob`:
+
+- Walk dir shards / `dirs`: `(path_id, name_id, last soa_idx)`.
+- Skip `isgenerated` and dumpdir tombstone `linkname_id` (same as `catalog_filter_sql`).
+- Basename glob: match `pool.get(name_id)` `&str` — no `String` unless hit.
+- Full-path glob: reused buffer from PathTable segments; `clone` into `CheapSearchHit` on match only.
+- `DEFAULT_SEARCH_LIMIT`.
+- Shared glob helper ([D5](#d5-search_cheap-hook-and-forwards)).
 
 ---
 
-## Non-goals (explicit leftovers — do not silently expand)
+## Non-goals (explicit leftovers)
 
 - Transform `ensure_map` fat BFS.
-- Union-catalog locate.
-- CLI `find --write-overlay DIR` (offline overlay merge without a mount).
-- Compact-only CLI `find` without a sidecar (still “on-disk index” / empty).
+- Union-catalog locate (all sources).
+- CLI `find --write-overlay DIR`.
+- Compact-only CLI `find` without a sidecar.
 - In-memory FTS for compact-only.
 - Raising / removing `DEFAULT_SEARCH_LIMIT`.
-- Streaming TSV without `Vec<SearchHit>` (nice-to-have; not the RSS bug).
-- Changing `CheapDirent` to hold pool ids (FUSE still needs `String` names at the kernel boundary).
+- Streaming TSV without `Vec<SearchHit>`.
+- Caching control `search_text` as a `FileInfo` map (2× scan is accepted).
+- Changing `CheapDirent` to hold pool ids.
 - Offset-order find (V-5).
+- Prefix/Transform rewriting locate paths to mount paths.
+- AutoMount nested-child locate.
 
 ---
 
-## Implementation train (one PR is OK; slices if parallelizing)
+## Implementation train
 
-Ownership: **index + core + compositing + CLI glue**. Orchestrator owns `ratarmount/src/factory.rs` / `main.rs` callback wiring if split. Format crates only grow a thin `search_cheap` → index forward (same pattern as `list_dirents`).
+Ownership: **index + core + compositing + format one-liners + `main.rs` SearchFn**. Orchestrator owns `factory.rs` — **this train does not edit it.**
 
-### Slice 1 — Core flag + residual name-only callers
+### Slice 1 — `ListNeed` + name-only `list()` leftovers (not V-1 done)
 
-**Files:** `ratarmount-core/src/lib.rs`; `ratarmount-compositing/src/control.rs`; `ratarmount-compositing/src/automount.rs`; tests next to those.
+**Files:** `ratarmount-core/src/lib.rs`; `control.rs` `status_text`; `automount.rs` `list_names_no_lazy`.
 
-- Add `ListNeed`, `CheapSearchHit`, `MountSource::list_with`, `MountSource::search_cheap` (default `None`).
-- `status_text` and `list_names_no_lazy` stop calling `list()`.
-- Tests: counted `list()` wrapper (same style as `file_version_layer_list_dirents_forwards_zip_without_fat_list`) for control `status` and AutoMount name walk.
+- Add `ListNeed`, `CheapSearchHit`, `list_with`, `search_cheap` default `None`.
+- Counted-`list()` tests for status and AutoMount names.
 
-### Slice 2 — SoA `scan_glob` + format forwards
+### Slice 2 — SoA `scan_glob` + **all** SqliteIndex format forwards
 
-**Files:** `ratarmount-index/src/mem.rs` (new scan); `ratarmount-index/src/search.rs` (map SQL → same filters; compact-only SQL stays empty); format `MountSource::search_cheap` on TAR/ZIP/7z at minimum (the indexes find already uses); FileVersionLayer / Prefix / AutoMount **forward**.
+**Files:** `ratarmount-index/src/mem.rs`; `search.rs` (shared glob + SQL map); **every** format crate listed in [D5](#d5-search_cheap-hook-and-forwards); compositing forwards (FileVersionLayer, Prefix, AutoMount, Transform, Control, OCI).
 
-- Unit: 200k synthetic SoA, `*.fits` hits, **zero** `to_file_info` / `FileInfo` clones (counter on `EntrySoa::to_file_info` under `#[cfg(test)]` or a test-only hook).
-- Unit: compact-only `MemIndex` `scan_glob("*.fits")` returns hits (this is the compact-only locate fix).
-- Keep `search_query` compact-only → empty for **SQL** callers (CLI find without sidecar still errors / empty as today).
+- 200k synthetic SoA: `to_file_info == 0`.
+- Compact-only `scan_glob("*.fits")` hits.
+- Glob twin tests vs `search_glob`.
+- `search_query` compact-only still empty for SQL/CLI.
+- `file_version_layer_search_cheap_forwards_without_list`; Transform/Prefix/Control/OCI forward tests; no `.versions` hits.
 
-### Slice 3 — Overlay merge + control/socket wiring
+### Slice 3 — Overlay last-wins + control/socket SearchFn
 
-**Files:** `ratarmount-compositing/src/write_overlay.rs`; `control.rs`; `ratarmount/src/main.rs` (socket `SearchFn` from mounted source); **not** factory open paths.
+**Files:** `write_overlay.rs`; `control.rs`; **`ratarmount/src/main.rs` only** (SearchFn + `overlay_arc`).
 
-- `search_cheap` on `WriteOverlay`.
-- Tests: overlay create `new.fits` appears; base `old.fits` tombstoned disappears; overlay-only name does **not** go through `base.list()`.
+- `WriteOverlay::search_cheap` per [D4](#d4-overlay-merge-ownership).
+- Tests: create visible; tombstone hidden; **COW/replace overrides size/mtime** (no duplicate TSV); `WriteOverlay` + base `None` → `None` (SearchFn sidecar + overlay_arc still merges); `fts:` still SQL; compact-only **control** TSV (not only `MemIndex::scan_glob`).
 - Existing `find_glob` / `control_search` / `control_search_socket` / `search_fts5` stay green.
-- CLI `find` + `-w` still rejected (`find_flag` / `find_cli_error`).
+- CLI `find` + `-w` still rejected.
 
 ### Slice 4 — Docs + catalog row (same commit as behavior)
 
-- [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) V-1 checkboxes → `[x]` / residual notes.
-- [`beyond-parity-roadmap.md`](../beyond-parity-roadmap.md) F-3 residual: overlay names in **control/socket** search; CLI find still sidecar-only.
-- [`vectors-optimization.md`](../vectors-optimization.md) P0: `ListNeed` + leftover `list()` note.
-- Root `AGENTS.md` regression catalog: new row (see [Verification](#verification)).
-- README: one line under locate / control search if the user-visible claim changes (“write-mount search sees uncommitted names”).
+- `vectorize-steal-patterns.md` V-1: **rewritten checkbox** (SQL find + live SoA), not a silent `[x]` on the old wording.
+- `beyond-parity-roadmap.md` F-3: overlay last-wins on control/socket; CLI find sidecar-only; Union live SoA residual.
+- `vectors-optimization.md` P0: `ListNeed` note.
+- `AGENTS.md` catalog row.
+- README: one line if `-w` control search is advertised.
 
-No `docs/embedded-nested-archives.md` change (no open/tmp/nested behavior).
+No `docs/embedded-nested-archives.md`.
 
 ---
 
@@ -386,42 +394,51 @@ No `docs/embedded-nested-archives.md` change (no open/tmp/nested behavior).
 
 | Risk | Rule |
 |------|------|
-| Implementer “unifies” find onto MemIndex | Forbidden by D1; RSS test must fail if CLI find (sidecar fixture) suddenly holds a 200k SoA without a mount |
-| `search_cheap` default `None` forgotten on FileVersionLayer | Same class as P0 `list_dirents`; test `file_version_layer_search_cheap_forwards_without_list` |
-| Overlay merge calls `overlay_file_info` for every overlay file | Only on glob **hits**; test with many overlay names + sparse glob |
-| Overlay recursive walk follows host symlinks out of the overlay root | Reuse existing overlay escape rejects (`overlay_rejects_symlink_escape_outside_root`) |
-| Control `search/` readdir starts listing the catalog | Keep empty; do not “helpfully” dump hits as dirents |
-| FTS JOIN still allocates `FileInfo` | It must not; `row_to_hit` stays scalars |
-| `list_with(Cheap)` falling back to `list()` when `list_dirents` is the default trait impl | Default `list_dirents` still derives from `list()`. `list_with(Cheap)` should call `list_dirents` **only if the type overrides it**, or accept that un-upgraded backends stay fat. **v1:** document that `list_with(Cheap)` is `list_dirents` as implemented (including the default chain). Migration of format defaults is **not** required; FUSE already requires overrides. |
-| 200k synthetic OOM on small CI | 200k × ~40 B SoA + short pool ≈ low tens of MiB; if a runner is tight, drop to 50k and keep the FileInfo-count assert. Do not skip the happy path. |
+| Unify find onto MemIndex | Forbidden (D1). Warm find must keep `mem: None`. |
+| `search_cheap` `Some` overlay-only when base is `None` | Forbidden (D4). Drops the catalog. |
+| `search_cheap` `None` whenever overlay exists | Overlay never appears on unwired formats unless SearchFn step 3 runs. |
+| Forgotten wrapper forward | Same as P0 `list_dirents`; tests on Transform, Prefix, Control, OCI, FileVersionLayer, AutoMount (parent only). |
+| Overlay `overlay_file_info` for every host file | Hits only. |
+| Host symlink escape | Reuse `ensure_under_root` / existing overlay escape tests. |
+| Tombstone key mismatch | `is_deleted(hit.path)` / `split(normpath)`, not `join_rel`. |
+| Control `search/` readdir lists the catalog | Keep empty. |
+| `fts:` through `scan_glob` | Forbidden (D5). |
+| Cache search as `FileInfo` map | Forbidden. 2× `search_text` is accepted. |
+| `list_with(Cheap)` as “V-1 done” | Slice 1 is P0 leftover only. |
+| Claim 200k TAR `find` RSS test | Do not. Synthetic + SQL spy only. |
+| Touch `factory.rs` | Forbidden. |
+| SMB `glob_match` | Wrong semantics. Shared SQL-GLOB helper. |
+| 200k synthetic OOM | Drop to 50k; keep FileInfo-count assert; no silent skip. |
 
 ---
 
 ## Verification
 
-Every behavior change lands with tests in the **same** PR (`AGENTS.md`). Name/doc with `Regression:` + symptom.
+Every behavior change lands with tests in the **same** PR. Name/doc `Regression:` + symptom.
 
 | Symptom / claim | Command / test |
 |-----------------|----------------|
-| SoA scan does not build `FileInfo` | `cargo test -p ratarmount-index --lib scan_glob` (new; 200k synthetic; `to_file_info` count 0) |
-| Compact-only locate works live | `cargo test -p ratarmount-index --lib scan_glob_compact` + format `search_cheap` test |
+| SoA scan does not build `FileInfo` | `cargo test -p ratarmount-index --lib scan_glob` (200k or 50k synthetic; `to_file_info` count 0) |
+| SQL locate does not build `FileInfo` | `cargo test -p ratarmount-index --lib search_query` / spy `mem.is_none()` |
+| Glob SoA == SQL GLOB | twin cases vs `search_glob` |
+| Compact-only live locate | `scan_glob_compact` + compositing control TSV |
 | CLI find still SQL / no `-w` | `cargo test -p ratarmount --bin ratarmount find_glob` · `find_flag` |
-| FTS unchanged | `cargo test -p ratarmount-index --lib search_fts5` |
-| Control / socket TSV | `cargo test -p ratarmount-compositing --lib control_search` · `cargo test -p ratarmount --bin ratarmount control_search_socket` |
-| Overlay create visible, tombstone hidden | `cargo test -p ratarmount-compositing --lib search_cheap_overlay` (new) |
-| FileVersionLayer does not fat-list | existing `file_version_layer_list_dirents` + new `search_cheap` forward test |
-| `status` / AutoMount names | new counted-`list()` tests in compositing |
-| Cheap readdir still cheap | `cargo test -p ratarmount-compositing --lib list_dirents` · `file_version_layer_list_dirents` |
-| Find RSS vs fat list (synthetic) | same `scan_glob` test: fat `list("/")` FileInfo count == N; cheap scan == 0 |
-| Optional on-disk 200k | `benchmarks/` or `test-harness/` script; `skip:` if fixture absent; **not** a silent pass |
+| FTS unchanged; `fts:` not SoA | `cargo test -p ratarmount-index --lib search_fts5` + new control `fts:` test |
+| Control / socket TSV (callback) | `control_search` · `control_search_socket` (keep green; **not** sufficient) |
+| Live `search_cheap` + overlay last-wins | `cargo test -p ratarmount-compositing --lib search_cheap` (create, tombstone, COW/replace, base `None`) |
+| Wrapper forwards without `list()` | FileVersionLayer + Transform + Prefix + Control + OCI + AutoMount parent-only |
+| No `.versions` hits | FileVersionLayer search test |
+| `status` / AutoMount names | counted-`list()` tests |
+| Cheap readdir still cheap | `list_dirents` · `file_version_layer_list_dirents` |
+| Optional on-disk 200k | script + `skip:` if missing; **not** a silent pass; **not** advertised as the V-1 bar |
 
-**New `AGENTS.md` catalog row** (implementer adds in the impl PR, not this plan PR):
+**New `AGENTS.md` row** (impl PR, not this plan PR):
 
 | Symptom / fix | Commands |
 |---------------|----------|
-| `find '*.fits'` / control search fat `FileInfo` on large catalog; overlay-only names missing | `cargo test -p ratarmount-index --lib scan_glob` · `cargo test -p ratarmount-compositing --lib search_cheap` · existing `find_glob` / `control_search` / `search_fts5` |
+| Locate fat `FileInfo` on large catalog; overlay last-wins missing on control search | `cargo test -p ratarmount-index --lib scan_glob` · `cargo test -p ratarmount-compositing --lib search_cheap` · `find_glob` · `control_search` · `search_fts5` |
 
-Gates before the impl commit: `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` · scoped tests above, then `cargo test --workspace` if the change is cross-crate.
+Gates: `cargo fmt --all` · `cargo clippy --workspace --all-targets -- -D warnings` · scoped tests, then `cargo test --workspace` if cross-crate.
 
 ---
 
@@ -429,11 +446,11 @@ Gates before the impl commit: `cargo fmt --all` · `cargo clippy --workspace --a
 
 | Doc | Change |
 |-----|--------|
-| `docs/tasks/vectorize-steal-patterns.md` | V-1 boxes; status `done` or residual list |
-| `docs/tasks/beyond-parity-roadmap.md` | F-3 overlay residual narrowed |
+| `docs/tasks/vectorize-steal-patterns.md` | **Rewrite** V-1 boxes (SQL find + live SoA); do not `[x]` the old SoA-for-find wording |
+| `docs/tasks/beyond-parity-roadmap.md` | F-3 overlay last-wins on control/socket |
 | `docs/tasks/vectors-optimization.md` | P0 `ListNeed` note |
 | `AGENTS.md` | catalog row |
-| `README.md` | only if control search on `-w` is advertised |
+| `README.md` | only if `-w` control search is advertised |
 
 This **plan** file is not user-facing product docs.
 
@@ -441,12 +458,10 @@ This **plan** file is not user-facing product docs.
 
 ## Suggested impl order
 
-1. Slice 1 (flag + stop name-only `list()`).
-2. Slice 2 (SoA scan + compact-only + FileInfo-count regression).
-3. Slice 3 (overlay + control/socket).
-4. Slice 4 (docs + AGENTS.md).
-
-Slice 2 is the density win. Slice 3 is the F-3 residual. Slice 1 is what makes “cheap search does not force full rows” mechanically true.
+1. Slice 2 (SoA scan + all format + wrapper forwards + FileInfo-count). **This is the density win.**
+2. Slice 3 (overlay last-wins + SearchFn). **This is the F-3 residual.**
+3. Slice 1 (`ListNeed` + status/AutoMount) — same PR OK, not sufficient for `done`.
+4. Slice 4 (docs + AGENTS.md + checkbox rewrite).
 
 ---
 
@@ -455,5 +470,6 @@ Slice 2 is the density win. Slice 3 is the F-3 residual. Slice 1 is what makes �
 | Sweep | Agent | Verdict | Folded |
 |-------|-------|---------|--------|
 | 0 | author (pre-review) | draft | — |
+| 1 | fresh Task (2026-08-28) | **REVISE** | All 4 blockers + importants 5–15. D4 `Option` collision + SearchFn step 3; overlay last-wins (COW/replace); all SqliteIndex formats; all list_dirents wrappers forward; V-1 checkbox rewrite; `ListNeed` ≠ locate done; AutoMount parent-only; `fts:` stays SQL; RSS bar excludes cold-index and 200k TAR claim; accept 2× `search_text`; tombstone keys via `is_deleted`; shared GLOB helper; no `factory.rs`. |
 
-Sweeps 1–3 are filled by a **fresh** skeptic Task each time (never skip sweep 1; cap 3 then BLOCKED).
+Sweeps 2–3: **fresh** skeptic Task (never reuse sweep-1 context). Cap 3 then BLOCKED.
