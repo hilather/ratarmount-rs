@@ -143,7 +143,7 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Still open:**
 
-- [ ] Single-writer commit queue: interval/on-exit/offline enqueue one job; a second tick no-ops or coalesces instead of overlapping splices.
+- [ ] Single-writer commit queue: interval/on-exit/offline enqueue one job; a second tick no-ops or coalesces instead of overlapping splices. Implementation plan: [`plans/v4-wal-coordinator.md`](plans/v4-wal-coordinator.md).
 - [ ] Job record is lightweight (overlay file list + generation), not the spliced bytes. Executor performs splice / ZIP rebuild / sidecar patch, then the coordinator flips “visible archive + index” (local `rename`, later F-7 remote multipart).
 - [ ] Hot files (open for write, younger than interval) stay in the overlay — already specified; keep that invariant in the queue.
 - [ ] Prefix-frame mutate: queue must fail closed the same way live ticks do; do not start an executor that would rewrite the prefix under a reader.
