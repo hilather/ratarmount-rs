@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | **Implemented** (commit SHA pending; hygiene swap only — not True SIMD on multi-MB) |
+| **Status** | **Implemented** (`09f75f171fab3cbbad94ac3ec371595bc67bd531`; hygiene swap only — not True SIMD on multi-MB) |
 | **Date** | 2026-08-28 |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “True SIMD (only on bulk)” — marked **`~`**, not `[x]` |
 | **Companion (not this work)** | [`docs/tasks/vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) — systems patterns; **not** SIMD |
@@ -234,7 +234,13 @@ Process: **never skip sweep 1**. Each sweep is a **fresh** skeptic (not the auth
 
 Followed §§4–7. `parse::crc32` is `crc32fast::hash`; `crc32_for_password_trial` remains the alias. P2 SIMD backlog is **`~`**. Did not touch `xz_seek::crc32_ieee`, `hashing.rs`, `sha2` asm, rapidgzip CRC knobs, inflate backends, `memchr`, path-component SIMD, or CLI flags.
 
-Skeptic-code-review of the implementation diff is recorded in the implement PR (never skip sweep 1; cap 3; stop at ACCEPT or BLOCKED).
+Skeptic-code-review of the implementation diff (never skip sweep 1; cap 3; stop at ACCEPT or BLOCKED):
+
+| Sweep | Role | Verdict | Folded into |
+|-------|------|---------|-------------|
+| 1 | Fresh skeptic (not the implementer) | *(pending)* | |
+| 2 | | | |
+| 3 | | | |
 
 ---
 
