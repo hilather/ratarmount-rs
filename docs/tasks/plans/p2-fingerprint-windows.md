@@ -68,7 +68,7 @@ Add small helpers next to existing hash code (prefer `hashing.rs`, used by `nest
 | Helper | Behavior |
 |--------|----------|
 | `sha256_hex(data: &[u8]) -> String` | Collapse `nested::hex_sha256` and the one-shot SHA-256 in `archive_edge_hashes` / `hash_hex("sha256", …)`. Hex lowercase, same as today. |
-| `sha256_hex_stream(reader) -> io::Result<String>` | Stream **until EOF** (`n == 0`), `Sha256::update` each chunk, return hex. **Stop-on-short**: hash what was read (same as today’s `read_to_end`). Never `read_to_end` into a `Vec`. **Do not** fail when `bytes_read != expected_len` — that would turn a short local file into `IndexError::Io` via `check_tarstats_matches_archive` (`?` on `archive_full_hash`) instead of a digest / `Mismatch`. No `max_bytes` cap on the helper itself. |
+| `sha256_hex_stream(reader) -> io::Result<String>` | Stream **until EOF** (`n == 0`), `Sha256::update` each chunk, return hex. **Stop-on-short**: hash what was read (same as today’s `read_to_end`). Never `read_to_end` into a `Vec`. **Do not** fail when `bytes_read != expected_len` — that would turn a short local file into `IndexError::Io` via `check_tarstats_matches_archive` (`?` on `archive_full_hash`) instead of a digest / `Mismatch`. No `max_bytes` cap on this helper. **`pub` and re-export** so `oci_fingerprint` (`ratarmount/src/remote_open.rs`) can call it — `pub(crate)` will not compile across crates. **Do not** point `compute_hashes_limited` at this helper: that function must keep its `size` remaining loop (hashing past a TAR member is a digest break). |
 | Window fill | `read_exact` into a caller-supplied `&mut [u8]` **sliced to the window length** (`&mut buf[..prefix_len]`). Never `read_exact` the full 4096 when `prefix_len < NESTED_FINGERPRINT_SAMPLE`. Hash `&buf[..prefix_len]` only — hashing the whole `[u8; 4096]` with trailing zeros **changes the digest**. |
 
 `HASH_STREAM_CHUNK`: **64 KiB** (`64 * 1024`). Small enough to be a fixed scratch pad; large enough that `--hashes` on multi-MiB TAR members is not a syscall storm. Must be a named `pub(crate)` / `pub` const so tests can assert “no request larger than chunk” if they wrap `Read`.
@@ -102,8 +102,8 @@ Rewrite `from_seekable_body` / `from_head_only`:
 `http_fingerprint` / `oci_fingerprint` full-hash arms are the same policy as `archive_full_hash`.
 
 - **OCI:** after the existing `size ≤ TARSTATS_FULL_HASH_MAX` gate, `seek(0)` + `sha256_hex_stream(&mut blob)` **until EOF**. Do **not** pass `size` as a read cap — today’s full hash is `read_to_end` after `seek(0)`, so a blob whose length ≠ catalog `size` would change `full_sha256` if capped.
-- **HTTP:** `fetch_http_range_bytes` is **only** used for these fingerprints. It accepts status 200 **and** `read_to_end`s the body (not `end-start+1`). If the server ignores `Range`, a length-capped stream changes the fingerprint. Smallest correct options (pick one, prefer A):
-  - **A.** Add `hash_http_range_sha256(url, start, end_inclusive)` in `ratarmount-remote` that sends the same Range header, then streams the ureq body **to EOF** into SHA-256 (fixed chunk). Use it for the **full-hash** GET when `size ≤ 256 KiB`. Edges may keep the 512-byte `Vec`. Owner is `remote_open.rs` + `ratarmount-remote` (not factory).
+- **HTTP:** `fetch_http_range_bytes` is **only** used for these fingerprints. It accepts status **`206` or `200..300`** and `read_to_end`s the body (not `end-start+1`). If the server ignores `Range`, a length-capped stream changes the fingerprint. Keep `size == 0 → (None, None, None)` — that is **not** local `archive_full_hash` of empty. Smallest correct options (pick one, prefer A):
+  - **A.** Add `hash_http_range_sha256(url, start, end_inclusive)` in `ratarmount-remote`. **Lock:** same status set as today (`206` or `200..300`); `end_inclusive` is **Range-header only**; stream the ureq body **to EOF**; **do not** rewrite `fetch_http_range_bytes` to cap at `end-start+1` or `Content-Length` (that changes fingerprints on HTTP 200 / ignored Range). Use the new helper for the **full-hash** GET when `0 < size ≤ 256 KiB`. Edges may keep the 512-byte `Vec`. If edges also move off the `Vec`, they must hash the response **to EOF** — a 512-byte read cap changes prefix/suffix hex on HTTP 200. Owner is `remote_open.rs` + `ratarmount-remote` (not factory).
   - **B.** Keep fetching the ≤256 KiB `Vec` for HTTP only; document as residual (network already paid; cap is policy). Do **not** leave OCI `read_to_end` if A or local stream is done.
 
 Do not change `check_tarstats_matches_remote` rules.
@@ -133,12 +133,12 @@ Lowest layer first (`ratarmount-index`). Name new tests with `Regression:` + sym
 | Test | Assert |
 |------|--------|
 | Nested large body byte budget | Custom `Read+Seek` over ≥ 1 MiB. `from_seekable_body` **reads ≤ `3 * NESTED_FINGERPRINT_SAMPLE`** payload bytes and never seeks except 0 / mid / tail / rewind. Digests equal a control that hashes the same three slices. |
-| Nested small body policy | Body `< 4096`: prefix hex == SHA-256 of the **entire** body; suffix hex == prefix hex; mid hex == prefix hex. |
+| Nested small / boundary bodies | Body `< 4096` **and `== 4096`**: prefix == SHA-256 of the entire body; suffix == prefix; mid == prefix. Body `== 8192` (`2 * sample`): mid is still prefix (today: mid is prefix iff `body_size ≤ 2 * sample`); tail is the last 4096, not prefix. Body `> 8192`: three distinct windows. Hash `&buf[..window_len]` only. |
 | Nested empty body | `from_seekable_body` with `body_size == 0`: prefix **and** suffix **and** mid are `sha256("")` (not empty strings). `from_head_only` empty: prefix `sha256("")`, suffix/mid empty strings. No panic. |
 | Head-only unchanged | Existing `regression_head_only_fingerprint_does_not_seek_mid_tail` stays; empty suffix/mid. |
 | Factory progressive | Existing `regression_progressive_nested_fingerprint_skips_mid_tail` stays. |
-| `archive_full_hash` / `sha256_hex_stream` no slurp | Digest equals `hash_hex("sha256", &bytes)` for empty / small / `TARSTATS_FULL_HASH_MAX`. File of `TARSTATS_FULL_HASH_MAX + 1` → `None`. **Also** wrap `Read` so any `read` request `> HASH_STREAM_CHUNK` fails — digest-only tests stay green if someone keeps `read_to_end`. You cannot unit-test “no `Vec`” without a custom allocator; the chunk-size wrapper is the enforceable stand-in. |
-| `archive_edge_hashes` | First/last 512 of a file `> 512` match one-shot hashes of those slices; file `≤ 512` suffix == prefix. |
+| `archive_full_hash` / `sha256_hex_stream` no slurp | Digest equals `hash_hex("sha256", &bytes)` for empty / small / `TARSTATS_FULL_HASH_MAX`. File of `TARSTATS_FULL_HASH_MAX + 1` → `None`. **Also** wrap a payload **larger than `HASH_STREAM_CHUNK`** so any `read` request `> HASH_STREAM_CHUNK` fails — a short reader never asks for more than 64 KiB, so `read_to_end` would stay green. You cannot unit-test “no `Vec`” without a custom allocator; the oversized-payload + chunk-size wrapper is the enforceable stand-in. |
+| `archive_edge_hashes` | First/last 512 of a file `> 512` match one-shot hashes of those slices; file `≤ 512` suffix == prefix. **Also** 0-byte and 1-byte files: prefix hex == `hash_hex("sha256", &exact_bytes)` (catches a zero-padded `[u8; 512]`). |
 | `compute_hashes_limited` multi-chunk | Payload **larger than `HASH_STREAM_CHUNK`**. Streamed `(crc32, sha256)` equals `hash_hex` of the full slice. Existing `stream_matches_one_shot` / `fill_content_hashes_from_temp_archive` stay. |
 | Tarstats warm reject | Existing `check_tarstats_matches_archive_rejects_size_or_mtime_mismatch` still sees `full_sha256` on tiny archives and still mismatches same-size edits. |
 
@@ -214,6 +214,14 @@ One commit is enough if tests + the AGENTS.md row travel with the code.
 ---
 
 ## Skeptic review log
+
+### Sweep 2 (2026-08-28) — VERDICT: ACCEPT (nits folded)
+
+Fresh Task skeptic (no resume). Folded lock-tightening before sweep 3:
+
+1. HTTP option A: same status set (`206` or `200..300`); `end_inclusive` is Range-header only; stream to EOF; do not cap `fetch_http_range_bytes`. `size == 0` stays `(None, None, None)`. Edges-off-Vec must also EOF-hash.
+2. `sha256_hex_stream` is `pub` + re-export for OCI; do not reuse it inside `compute_hashes_limited` (member `size` cap).
+3. Tests: chunk wrapper must wrap payload `> HASH_STREAM_CHUNK`; edge 0-byte/1-byte exact hex; nested `== 4096` and `== 8192` boundaries.
 
 ### Sweep 1 (2026-08-28) — VERDICT: ACCEPT (nits folded)
 
