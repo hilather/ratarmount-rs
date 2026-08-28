@@ -3066,7 +3066,7 @@ impl MountSource for SingleFileMountSource {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::io::{Read, Seek, Write};
     use std::process::Command;
 
     #[test]
@@ -5563,6 +5563,197 @@ mod tests {
         assert!(
             m.lookup("/inner.tar/payload.txt", 0).is_some(),
             "flatten must still emit inner members"
+        );
+    }
+
+    fn backward_start_count(starts: &[u64]) -> usize {
+        starts.windows(2).filter(|w| w[1] < w[0]).count()
+    }
+
+    /// Regression: offset-ordered restore has zero backward seeks.
+    ///
+    /// Interleaved multi-dir pack (`z/m00`, `a/m00`, …). Flatten must walk
+    /// archive order (zero backward `SeekFrom::Start`). Name-order on the same
+    /// set has ≥1 backward Start. Concatenating per-dir offset lists fails this
+    /// fixture.
+    #[test]
+    fn regression_offset_order_seeks() {
+        const N_PER_DIR: usize = 16;
+        let mut payloads: Vec<(String, Vec<u8>)> = Vec::new();
+        for i in 0..N_PER_DIR {
+            payloads.push((format!("z/m{i:02}"), vec![b'z'; 8 + i]));
+            payloads.push((format!("a/m{i:02}"), vec![b'a'; 8 + i]));
+        }
+        assert_eq!(payloads.len(), 32);
+        let members: Vec<UstarMember<'_>> =
+            payloads.iter().map(|(p, b)| member_file(p, b)).collect();
+        let bytes = pack_tar(&members);
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(bytes.clone()),
+            Path::new("interleaved.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index interleaved tar");
+
+        let flat = m.index().list_visible_files_by_offset().expect("flatten");
+        assert!(
+            flat.len() >= 32,
+            "flatten must include all payload files, got {}",
+            flat.len()
+        );
+
+        struct StartLog {
+            inner: std::io::Cursor<Vec<u8>>,
+            starts: Vec<u64>,
+        }
+        impl std::io::Read for StartLog {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+        impl std::io::Seek for StartLog {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                if let SeekFrom::Start(n) = from {
+                    self.starts.push(n);
+                }
+                self.inner.seek(from)
+            }
+        }
+
+        let mut offset_reader = StartLog {
+            inner: std::io::Cursor::new(bytes.clone()),
+            starts: Vec::new(),
+        };
+        for mem in &flat {
+            offset_reader
+                .seek(SeekFrom::Start(mem.cookie.offset))
+                .unwrap();
+            let mut buf = vec![0u8; mem.cookie.size as usize];
+            offset_reader.read_exact(&mut buf).unwrap();
+        }
+        let offset_back = backward_start_count(&offset_reader.starts);
+        assert_eq!(
+            offset_back, 0,
+            "flatten must have zero backward Start, starts={:?}",
+            offset_reader.starts
+        );
+
+        let mut by_name = flat.clone();
+        by_name.sort_by(|a, b| {
+            let ap = if a.path.is_empty() || a.path == "/" {
+                format!("/{}", a.name)
+            } else {
+                format!("{}/{}", a.path, a.name)
+            };
+            let bp = if b.path.is_empty() || b.path == "/" {
+                format!("/{}", b.name)
+            } else {
+                format!("{}/{}", b.path, b.name)
+            };
+            ap.cmp(&bp)
+        });
+        let mut name_reader = StartLog {
+            inner: std::io::Cursor::new(bytes),
+            starts: Vec::new(),
+        };
+        for mem in &by_name {
+            name_reader
+                .seek(SeekFrom::Start(mem.cookie.offset))
+                .unwrap();
+            let mut buf = vec![0u8; mem.cookie.size as usize];
+            name_reader.read_exact(&mut buf).unwrap();
+        }
+        let name_back = backward_start_count(&name_reader.starts);
+        assert!(
+            name_back >= 1,
+            "name-order control must have ≥1 backward Start (fixture shuffled), starts={:?}",
+            name_reader.starts
+        );
+    }
+
+    /// Regression: dumpdir newest-then-filter omits a live row after a later tombstone.
+    #[test]
+    fn regression_dumpdir_newest_then_filter_flatten() {
+        fn oct_field(n: u64, width: usize) -> Vec<u8> {
+            let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        }
+        fn gnu_header(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+            let mut h = [0u8; 512];
+            let nb = name.as_bytes();
+            h[..nb.len()].copy_from_slice(nb);
+            h[100..108].copy_from_slice(&oct_field(0o644, 8));
+            h[108..116].copy_from_slice(&oct_field(0, 8));
+            h[116..124].copy_from_slice(&oct_field(0, 8));
+            h[124..136].copy_from_slice(&oct_field(size, 12));
+            h[136..148].copy_from_slice(&oct_field(0, 12));
+            h[156] = typeflag;
+            h[257..265].copy_from_slice(b"ustar  \0");
+            h[148..156].copy_from_slice(b"        ");
+            let csum: u32 = h.iter().map(|&b| b as u32).sum();
+            let cs = format!("{csum:06o}\0 ");
+            h[148..156].copy_from_slice(cs.as_bytes());
+            h
+        }
+        fn pad_payload(p: &[u8]) -> Vec<u8> {
+            let mut v = p.to_vec();
+            let n = (512 - (v.len() % 512)) % 512;
+            v.extend(std::iter::repeat_n(0u8, n));
+            v
+        }
+        fn append_member(out: &mut Vec<u8>, name: &str, typeflag: u8, payload: &[u8]) {
+            out.extend_from_slice(&gnu_header(name, payload.len() as u64, typeflag));
+            out.extend(pad_payload(payload));
+        }
+
+        let mut tar = Vec::new();
+        append_member(&mut tar, "./", b'D', b"Ygone.txt\0Ykeep.txt\0\0");
+        append_member(&mut tar, "gone.txt", b'0', b"live\n");
+        append_member(&mut tar, "keep.txt", b'0', b"keep\n");
+        append_member(&mut tar, "./", b'D', b"Ykeep.txt\0\0");
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("dumpdir-newest-filter.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index dumpdir tar");
+
+        let dents = m.list_dirents("/").expect("list_dirents");
+        let names: Vec<&str> = dents.iter().map(|d| d.name.as_str()).collect();
+        assert!(
+            !names.contains(&"gone.txt"),
+            "TAR-filtered list must omit tombstoned name: {names:?}"
+        );
+        assert!(names.contains(&"keep.txt"), "{names:?}");
+
+        let flat = m.index().list_visible_files_by_offset().expect("flatten");
+        let flat_names: Vec<String> = flat
+            .iter()
+            .map(|v| {
+                if v.path.is_empty() || v.path == "/" {
+                    format!("/{}", v.name)
+                } else {
+                    format!("{}/{}", v.path, v.name)
+                }
+            })
+            .collect();
+        assert!(
+            !flat_names.iter().any(|n| n.ends_with("gone.txt")),
+            "flatten must omit tombstoned name: {flat_names:?}"
+        );
+        assert!(
+            flat_names.iter().any(|n| n.ends_with("keep.txt")),
+            "{flat_names:?}"
         );
     }
 }

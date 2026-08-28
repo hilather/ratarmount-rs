@@ -11,6 +11,7 @@
 //! stays `"0.7.0"`. Normal [`SqliteIndex::create_writable`] / cold index does
 //! **not** create `"files_fts"`.
 
+mod dirent_order;
 mod hashing;
 mod location;
 mod mem;
@@ -18,6 +19,7 @@ mod nested;
 mod patch;
 mod search;
 
+pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
     sha256_hex_stream, HASH_STREAM_CHUNK, SUPPORTED_HASH_ALGORITHMS,

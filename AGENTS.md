@@ -140,6 +140,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
 | Publish local sidecar | `cargo test -p ratarmount --bin ratarmount publish_index` · `publish_index_flag` clap-steal |
 | Fingerprint / tarstats full-hash slurps body `Vec` | `cargo test -p ratarmount-index --lib fingerprint` · `cargo test -p ratarmount-index --lib archive_full_hash` · `cargo test -p ratarmount-index --lib compute_hashes` · keep `regression_head_only` + `regression_progressive_nested_fingerprint` |
+| Offset-order restore / find walks name order | `cargo test -p ratarmount-index --lib dirent_order` · `cargo test -p ratarmount --bin ratarmount find_offset_order` · `cargo test -p ratarmount-formats-tar --lib regression_offset_order_seeks` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

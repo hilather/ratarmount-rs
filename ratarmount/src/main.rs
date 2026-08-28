@@ -47,7 +47,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
-                  Locate: ratarmount find [--fts] [--hashes] PATTERN ARCHIVE (no FUSE)."
+                  Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -450,6 +450,10 @@ struct Args {
     /// Find-argv boolean `--hashes` (include cheap `user.hash.*` TSV columns).
     #[arg(skip)]
     find_hashes: bool,
+
+    /// Find-argv `--offset-order` (re-sort locate hits by `offsetheader`).
+    #[arg(skip)]
+    find_offset_order: bool,
 }
 
 /// Parse `--parallel-nested`: non-negative integer or `auto` (→ 0).
@@ -482,28 +486,32 @@ where
     } else {
         raw
     };
-    let (stripped, find_fts, find_hashes) = if find {
+    let (stripped, find_fts, find_hashes, find_offset_order) = if find {
         strip_find_only_flags(stripped)
     } else {
-        (stripped, false, false)
+        (stripped, false, false, false)
     };
     let mut args = Args::try_parse_from(stripped)?;
     args.serve = serve;
     args.find = find;
     args.find_fts = find_fts;
     args.find_hashes = find_hashes;
+    args.find_offset_order = find_offset_order;
     if find {
         args.no_mount = true;
     }
     Ok(args)
 }
 
-/// `--fts` and boolean `--hashes` are find-argv only (not global mount flags).
-/// `--hashes ALGO[,ALGO...]` is left for the existing clap field (fill then search).
-fn strip_find_only_flags(raw: Vec<OsString>) -> (Vec<OsString>, bool, bool) {
+/// `--fts`, boolean `--hashes`, and `--offset-order` are find-argv only
+/// (not global mount flags). `--hashes ALGO[,ALGO...]` is left for the
+/// existing clap field (fill then search). `--offset-order` is boolean
+/// (copy `--fts`, not value-taking `--hashes`).
+fn strip_find_only_flags(raw: Vec<OsString>) -> (Vec<OsString>, bool, bool, bool) {
     let mut out = Vec::with_capacity(raw.len());
     let mut fts = false;
     let mut hashes = false;
+    let mut offset_order = false;
     let mut iter = raw.into_iter();
     if let Some(prog) = iter.next() {
         out.push(prog);
@@ -511,6 +519,10 @@ fn strip_find_only_flags(raw: Vec<OsString>) -> (Vec<OsString>, bool, bool) {
     while let Some(tok) = iter.next() {
         if tok == "--fts" {
             fts = true;
+            continue;
+        }
+        if tok == "--offset-order" {
+            offset_order = true;
             continue;
         }
         if tok == "--hashes" {
@@ -531,7 +543,7 @@ fn strip_find_only_flags(raw: Vec<OsString>) -> (Vec<OsString>, bool, bool) {
         }
         out.push(tok);
     }
-    (out, fts, hashes)
+    (out, fts, hashes, offset_order)
 }
 
 fn looks_like_hash_algos(s: &OsString) -> bool {
@@ -678,7 +690,7 @@ fn main() {
         eprintln!(
             "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
         );
-        eprintln!("       ratarmount find [--fts] [--hashes] <pattern> <archive>");
+        eprintln!("       ratarmount find [--fts] [--hashes] [--offset-order] <pattern> <archive>");
         std::process::exit(2);
     }
 
@@ -796,6 +808,7 @@ fn main() {
             fts: args.find_fts,
             include_hashes,
             fill_hashes: &open_opts.hashes,
+            offset_order: args.find_offset_order,
         };
         std::process::exit(find::run(archive, &pattern, &open_opts, &loc));
     }
@@ -3378,6 +3391,7 @@ mod find_cli_tests {
         assert!(a.no_mount);
         assert!(!a.find_fts);
         assert!(!a.find_hashes);
+        assert!(!a.find_offset_order);
         assert_eq!(
             a.paths,
             vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
@@ -3467,6 +3481,61 @@ mod find_cli_tests {
         let a = parse_args_from(["ratarmount", "find", "a.tar"]).expect("parse");
         let err = find_cli_error(&a).expect("error");
         assert!(err.contains("PATTERN"), "{err}");
+    }
+
+    /// Regression: find-argv `--offset-order` must not steal PATTERN/ARCHIVE.
+    #[test]
+    fn find_flag_offset_order_does_not_steal_archive() {
+        let a = parse_args_from(["ratarmount", "find", "--offset-order", "*.fits", "a.tar"])
+            .expect("parse");
+        assert!(a.find);
+        assert!(a.find_offset_order);
+        assert!(!a.find_fts);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+        assert!(find_cli_error(&a).is_none());
+    }
+
+    #[test]
+    fn find_flag_fts_offset_order_does_not_steal_archive() {
+        let a = parse_args_from([
+            "ratarmount",
+            "find",
+            "--fts",
+            "--offset-order",
+            "*.fits",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert!(a.find_fts);
+        assert!(a.find_offset_order);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("*.fits"), PathBuf::from("a.tar")]
+        );
+        assert!(find_cli_error(&a).is_none());
+    }
+
+    #[test]
+    fn find_flag_offset_order_still_requires_pattern() {
+        let a = parse_args_from(["ratarmount", "find", "--offset-order", "a.tar"]).expect("parse");
+        let err = find_cli_error(&a).expect("error");
+        assert!(err.contains("PATTERN"), "{err}");
+    }
+
+    /// `--offset-order` is find-argv only, not a global mount flag.
+    #[test]
+    fn find_flag_offset_order_is_not_a_mount_flag() {
+        let err = parse_args_from(["ratarmount", "--offset-order", "a.tar", "mnt"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unexpected")
+                || msg.contains("offset-order")
+                || msg.contains("unrecognized"),
+            "{msg}"
+        );
     }
 
     /// Regression: Unix socket `search <pattern>` returns TSV + `count N`.
