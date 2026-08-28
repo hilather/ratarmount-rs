@@ -369,15 +369,7 @@ impl<'a> Cursor<'a> {
 
 /// IEEE CRC-32 (zlib/7z). Used for password-trial verification of folder digests.
 pub(crate) fn crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFFu32;
-    for &b in data {
-        crc ^= u32::from(b);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
 /// Alias for password-trial call sites (keeps trial code readable).
@@ -1239,5 +1231,27 @@ mod filetime_tests {
         let good = filetime_to_unix(ft);
         assert!((good - unix as f64).abs() < 1.0);
         assert!(good > 0.0);
+    }
+}
+
+#[cfg(test)]
+mod crc32_tests {
+    use super::{crc32, crc32_for_password_trial};
+
+    /// Regression: 7z parse CRC must stay IEEE / zlib (ISO-HDLC) after the
+    /// crc32fast swap. Hardcoded check vector; do not compare to
+    /// `crc32fast::hash` (tautological once `parse::crc32` is a wrapper).
+    #[test]
+    fn crc32_ieee_check_string_123456789() {
+        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32_for_password_trial(b"123456789"), 0xCBF4_3926);
+    }
+
+    /// Regression: empty and one-byte IEEE vectors catch init / final-xor
+    /// mistakes that the 9-byte check string can miss.
+    #[test]
+    fn crc32_ieee_empty_and_one_byte() {
+        assert_eq!(crc32(b""), 0x0000_0000);
+        assert_eq!(crc32(b"a"), 0xE8B7_BE43);
     }
 }

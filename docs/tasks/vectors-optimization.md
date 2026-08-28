@@ -133,8 +133,10 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 
 ### True SIMD (only on bulk)
 
-- [ ] CRC / memchr / bulk hash on multi-MB buffers (inflate output, full-file hash)
+- [~] CRC / memchr / bulk hash on multi-MB buffers (inflate output, full-file hash)
 - [ ] **Not** a priority for short path-component lookups (intern + SoA locality wins first)
+
+Residual: `--hashes` / inflate-output hash already `crc32fast`+`sha2`; 7z `parse::crc32` now `crc32fast` (trial is first file, usually small); **no** memchr-on-inflate path exists; path-component SIMD remains a non-goal. No remaining hand-rolled CRC/hash on payload buffers (memchr-on-inflate never existed). This is **not** “True SIMD on multi-MB landed.” Plan: [`plans/p2-bulk-simd.md`](plans/p2-bulk-simd.md).
 
 ---
 
