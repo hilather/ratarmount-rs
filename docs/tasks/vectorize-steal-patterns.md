@@ -170,10 +170,12 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Still open:**
 
+Implementation plan: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) (plan-only; do not treat this link as shipped behavior).
+
 - [ ] Optional `list_dirents` / extract helper that yields dirents sorted by `offsetheader` (CLI flag or control file; default stays name order for `ls`).
 - [ ] `find` output option: offset order for restore pipelines.
 - [ ] Document that F-9 `--repack-seekable` should also keep members in offset order (already true for tar-in-order).
-- [ ] Regression: restore of a 10k-member TAR via offset-ordered list does fewer backward seeks than name order (can count `pread` offsets in a fake reader).
+- [ ] Regression: restore via offset-ordered flatten does **zero** backward seeks vs name order on an interleaved multi-dir fixture (CI: N≥32; 10k-member bench is residual — see [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) §9.6).
 
 **Why it pays:** Small win locally; large win on HDD and on remote Range (V-3) where backward seeks are extra GETs. This is IVF’s “put nearby items in one file” with “nearby” redefined.
 
