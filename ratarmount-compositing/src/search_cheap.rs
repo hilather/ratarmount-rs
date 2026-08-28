@@ -1,11 +1,14 @@
 //! V-1 live `search_cheap` + overlay last-wins + SearchFn tests.
 
-use std::io::{self, Write};
+use std::io::{self, Cursor, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use ratarmount_core::{
     format_cheap_hits_tsv, CheapDirent, CheapSearchHit, FileInfo, ListResult, MountSource,
+};
+use ratarmount_formats_tar::{
+    write_tar_eof, write_ustar_members, SqliteIndexedTar, UstarMember, UstarPayload,
 };
 use ratarmount_formats_zip::ZipMountSource;
 use ratarmount_index::{locate_pattern_matches, DEFAULT_SEARCH_LIMIT};
@@ -70,6 +73,10 @@ impl CheapBase {
                 },
             ],
         }
+    }
+
+    fn empty() -> Self {
+        Self { hits: vec![] }
     }
 }
 
@@ -153,6 +160,36 @@ impl MountSource for SearchCheapSpy {
     }
 }
 
+/// Counts `list()` / `lookup()` so Union locate stays FileInfo-free.
+struct FileInfoSpy {
+    inner: CheapBase,
+    list_calls: AtomicUsize,
+    lookup_calls: AtomicUsize,
+}
+
+impl MountSource for FileInfoSpy {
+    fn list(&self, path: &str) -> Option<ListResult> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(path)
+    }
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.inner.list_dirents(path)
+    }
+    fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
+        self.lookup_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.lookup(path, v)
+    }
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        self.inner.search_cheap(pattern)
+    }
+    fn open(&self, fi: &FileInfo, b: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        self.inner.open(fi, b)
+    }
+    fn is_immutable(&self) -> bool {
+        true
+    }
+}
+
 struct NoneBase;
 impl MountSource for NoneBase {
     fn list(&self, _: &str) -> Option<ListResult> {
@@ -197,16 +234,53 @@ impl MountSource for ListCallCounter {
 }
 
 fn write_fits_zip(path: &std::path::Path) {
+    write_zip(
+        path,
+        &[
+            ("a.fits", b"fits".as_slice()),
+            ("dir/b.fits", b"fits2".as_slice()),
+            ("readme.txt", b"hello".as_slice()),
+        ],
+    );
+}
+
+fn write_zip(path: &std::path::Path, files: &[(&str, &[u8])]) {
     let file = std::fs::File::create(path).unwrap();
     let mut zw = ZipWriter::new(file);
     let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
-    zw.start_file("a.fits", opts).unwrap();
-    zw.write_all(b"fits").unwrap();
-    zw.start_file("dir/b.fits", opts).unwrap();
-    zw.write_all(b"fits2").unwrap();
-    zw.start_file("readme.txt", opts).unwrap();
-    zw.write_all(b"hello").unwrap();
+    for (name, bytes) in files {
+        zw.start_file(*name, opts).unwrap();
+        zw.write_all(bytes).unwrap();
+    }
     zw.finish().unwrap();
+}
+
+fn write_fits_tar(path: &std::path::Path, files: &[(&str, &[u8])]) {
+    let members: Vec<UstarMember<'_>> = files
+        .iter()
+        .map(|(p, bytes)| UstarMember {
+            path: p,
+            payload: UstarPayload::File { bytes },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        })
+        .collect();
+    let mut buf = Vec::new();
+    write_ustar_members(&mut buf, &members).expect("ustar");
+    write_tar_eof(&mut buf).expect("eof");
+    std::fs::write(path, buf).unwrap();
+}
+
+fn open_tar(path: &std::path::Path) -> SqliteIndexedTar {
+    let opts = ratarmount_core::OpenOptions {
+        index_in_memory: true,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    let bytes = std::fs::read(path).expect("read tar");
+    SqliteIndexedTar::open_from_reader(Cursor::new(bytes), path, None, &opts, "test")
+        .expect("open tar")
 }
 
 fn open_zip(path: &std::path::Path) -> ZipMountSource {
@@ -644,20 +718,149 @@ fn search_cheap_folder_limit_cap() {
     );
 }
 
-/// Regression: Union and OCI stay None (not layer-0 / `.wh.` names).
+/// Regression: Union merges every source (not `sources[0]`).
 #[test]
-fn search_cheap_union_oci_stay_none() {
+fn search_cheap_union_merges_all_sources() {
+    let dir = tempfile::tempdir().unwrap();
+    let tar_path = dir.path().join("a.tar");
+    write_fits_tar(
+        &tar_path,
+        &[
+            ("a.fits", b"tar-a".as_slice()),
+            ("only-tar.fits", b"from-tar".as_slice()),
+        ],
+    );
+    let zip_path = dir.path().join("b.zip");
+    write_zip(
+        &zip_path,
+        &[
+            ("a.fits", b"zip-later".as_slice()),
+            ("only-zip.fits", b"from-zip".as_slice()),
+        ],
+    );
+    let tar = Arc::new(open_tar(&tar_path)) as Arc<dyn MountSource>;
+    let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
+    let union = UnionMountSource::new(vec![Arc::clone(&tar), Arc::clone(&zip)]);
+
+    assert!(
+        union.search_cheap("fts:fits").is_none(),
+        "fts: must stay None"
+    );
+
+    let hits = union.search_cheap("*.fits").expect("Union Some");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/only-tar.fits"),
+        "must not forward sources[0] only: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/only-zip.fits"),
+        "later source unique missing: {paths:?}"
+    );
+    let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
+    assert!(!a.is_empty(), "overlapping name dropped: {hits:?}");
+    if a.len() == 1 {
+        assert_eq!(
+            a[0].size, 9,
+            "same path+offsetheader: later ZIP must win: {a:?}"
+        );
+    }
+
+    let early = Arc::new(FileInfoSpy {
+        inner: CheapBase::two_offsetheader(),
+        list_calls: AtomicUsize::new(0),
+        lookup_calls: AtomicUsize::new(0),
+    });
+    let late = Arc::new(FileInfoSpy {
+        inner: CheapBase {
+            hits: vec![CheapSearchHit {
+                path: "/a.fits".into(),
+                name: "a.fits".into(),
+                size: 99,
+                mtime: 9.0,
+                offsetheader: Some(0),
+            }],
+        },
+        list_calls: AtomicUsize::new(0),
+        lookup_calls: AtomicUsize::new(0),
+    });
+    let union = UnionMountSource::new(vec![
+        Arc::clone(&early) as Arc<dyn MountSource>,
+        Arc::clone(&late) as Arc<dyn MountSource>,
+    ]);
+    let hits = union.search_cheap("*.fits").expect("Union Some");
+    let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
+    assert_eq!(a.len(), 2, "keep both offsetheader rows: {hits:?}");
+    let oh0 = a.iter().find(|h| h.offsetheader == Some(0)).unwrap();
+    let oh512 = a.iter().find(|h| h.offsetheader == Some(512)).unwrap();
+    assert_eq!(oh0.size, 99, "same path+oh later source wins");
+    assert_eq!(oh512.size, 8, "distinct offsetheader must stay");
+    assert_eq!(
+        early.list_calls.load(Ordering::SeqCst) + late.list_calls.load(Ordering::SeqCst),
+        0,
+        "Union search_cheap must not call list()"
+    );
+    assert_eq!(
+        early.lookup_calls.load(Ordering::SeqCst) + late.lookup_calls.load(Ordering::SeqCst),
+        0,
+        "FileInfo count 0: no lookup / no B-4"
+    );
+}
+
+/// Regression: `Some([])` is a contributing catalog, not `None`.
+#[test]
+fn search_cheap_union_empty_catalog_contributes() {
+    let empty = Arc::new(CheapBase::empty()) as Arc<dyn MountSource>;
+    let fits = Arc::new(CheapBase::fits()) as Arc<dyn MountSource>;
+    let union = UnionMountSource::new(vec![empty, fits]);
+    let hits = union
+        .search_cheap("*.fits")
+        .expect("empty catalog contributes");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&"/a.fits"), "{paths:?}");
+    assert!(paths.contains(&"/dir/b.fits"), "{paths:?}");
+}
+
+/// Regression: any source `None` (Folder-without-impl) → Union `None`.
+#[test]
+fn search_cheap_union_none_if_any_source_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("a.zip");
+    write_fits_zip(&zip_path);
+    let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
+    let none = Arc::new(NoneBase) as Arc<dyn MountSource>;
+    let union = UnionMountSource::new(vec![zip, none]);
+    assert!(
+        union.search_cheap("*.fits").is_none(),
+        "any source None must not drop to sources[0]"
+    );
+}
+
+/// Regression: Folder (PR 7) + ZIP both `Some` → Union merge, not `None`.
+#[test]
+fn search_cheap_union_folder_and_zip_merges() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("host.fits"), b"host").unwrap();
+    let zip_dir = tempfile::tempdir().unwrap();
+    let zip_path = zip_dir.path().join("a.zip");
+    write_fits_zip(&zip_path);
+    let folder = Arc::new(FolderMountSource::new(dir.path()).unwrap()) as Arc<dyn MountSource>;
+    let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
+    let union = UnionMountSource::new(vec![folder, zip]);
+    let hits = union.search_cheap("*.fits").expect("Folder+ZIP Some");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&"/host.fits"), "{paths:?}");
+    assert!(paths.contains(&"/a.fits"), "{paths:?}");
+}
+
+/// Regression: OCI stays None (not layer-0 / `.wh.` names).
+#[test]
+fn search_cheap_oci_stay_none() {
     let zip_dir = tempfile::tempdir().unwrap();
     let zip_path = zip_dir.path().join("a.zip");
     write_fits_zip(&zip_path);
     let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
-    let union = UnionMountSource::new(vec![Arc::clone(&zip)]);
-    assert!(
-        union.search_cheap("*.fits").is_none(),
-        "Union must stay None, not layer-0"
-    );
-
-    let oci = OciImageMountSource::new(vec![Arc::clone(&zip)]);
+    let oci = OciImageMountSource::new(vec![zip]);
     let oci_hits = oci.search_cheap("*.fits");
     assert!(
         oci_hits.is_none(),

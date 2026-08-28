@@ -27,9 +27,10 @@ use std::time::Instant;
 
 use log::warn;
 use ratarmount_core::{
-    create_root_file_info, is_dir_mode, is_lnk_mode, normpath, CheapDirent, FileInfo,
-    ListModeResult, ListResult, MountSource, UserData,
+    create_root_file_info, is_dir_mode, is_lnk_mode, normpath, CheapDirent, CheapSearchHit,
+    FileInfo, ListModeResult, ListResult, MountSource, UserData,
 };
+use ratarmount_index::DEFAULT_SEARCH_LIMIT;
 
 use crate::path_intern::PathIntern;
 
@@ -624,6 +625,28 @@ impl MountSource for UnionMountSource {
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
         ))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        // Catalog merge of every source. `None` if any source is `None` so
+        // SearchFn can sidecar `inputs[0]`. `Some([])` is a real empty
+        // catalog, not a third state. Key is path + offsetheader (keep two
+        // GNU-incremental versions); later source wins on that key. Do not
+        // apply B-4 (`CheapSearchHit` has no mode; locate TSV is not `ls`).
+        // Never forward `sources[0]`.
+        let mut merged: BTreeMap<(String, Option<i64>), CheapSearchHit> = BTreeMap::new();
+        for src in &self.sources {
+            let hits = src.search_cheap(pattern)?;
+            for h in hits {
+                merged.insert((h.path.clone(), h.offsetheader), h);
+            }
+        }
+        let mut out: Vec<_> = merged.into_values().collect();
+        out.truncate(DEFAULT_SEARCH_LIMIT);
+        Some(out)
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

@@ -64,8 +64,9 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - [x] Additive `ListNeed` (P0 leftover). It is **not** what makes search cheap.
 - [x] Regression: `FileInfo` construction count is 0 on a synthetic 200k SoA `scan_glob` (not a 200k on-disk TAR `find` RSS test).
 - [x] Folder live glob (`FolderMountSource::search_cheap`): host `read_dir` + `symlink_metadata`, no `list()`, no recurse into `S_IFLNK` dirs, cap `DEFAULT_SEARCH_LIMIT`. `fts:` stays `None`.
+- [x] Union catalog merge (`UnionMountSource::search_cheap`): `None` if any source is `None`; `Some([])` contributes; merge path+`offsetheader` with later source winning that key; no B-4 / no `lookup`; never `sources[0]`. `fts:` stays `None`.
 
-**Residual:** Union / OCI `search_cheap` stay `None` (not layer-0 / `.wh.`). Folder host-tree glob is `Some` (`read_dir` + `symlink_metadata`; no `list()`; no recurse into `S_IFLNK` dirs). `--prefix` / `--transform` + `-w` last-wins is not guaranteed (catalog paths, no Transform inverse). Compact-only CLI find without a sidecar stays empty / “on-disk index.”
+**Residual:** OCI `search_cheap` stays `None` (not layer-0 / `.wh.`). Folder host-tree glob is `Some` (`read_dir` + `symlink_metadata`; no `list()`; no recurse into `S_IFLNK` dirs). Union merge is `Some` when every source is `Some`. `--prefix` / `--transform` + `-w` last-wins is not guaranteed (catalog paths, no Transform inverse). Compact-only CLI find without a sidecar stays empty / “on-disk index.”
 
 **Why it pays:** BIG-suite `find` is already ~1.3× Python; the remaining tax is path materialization and fat maps, not cosine math. Same toolbox as P0 density — do not invent an ANN layer.
 

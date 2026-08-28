@@ -43,7 +43,7 @@ This is the same toolbox as P0 density. The remaining tax is leftover `list()` c
 | Hydrate `FileInfo` on locate (scan **or** hits) | Emit type is `SearchHit` / `CheapSearchHit` |
 | Lift CLI `find` + `-w` in v1 | Overlay context is the live mount; see [D4](#d4-overlay-merge-ownership) |
 | Recurse AutoMount nested children in locate | Matches today’s sidecar of `inputs[0]` only; see [D5](#d5-search_cheap-hook-and-forwards) |
-| Forward `search_cheap` through `OciImageMountSource` / Union | Image-correct locate is overlayfs merge, not a forward; see [D5](#d5-search_cheap-hook-and-forwards). Folder is a host-tree walk residual. |
+| Forward `search_cheap` through `OciImageMountSource` | Image-correct locate is overlayfs merge, not a forward; see [D5](#d5-search_cheap-hook-and-forwards). Folder is a host-tree walk; Union is a path+offsetheader catalog merge. |
 | Rewrite Prefix/Transform hit paths or invent Transform inverse | Overlay last-wins on those stacks is residual; see [D4](#d4-overlay-merge-ownership) |
 | Tracker / D-Bus / mount `--index-fts` / write-then-read `echo pat > search` | F-3 residuals, not V-1 |
 | V-2 snapshot pointer, V-3 remote cache, V-4 commit queue, V-5 offset-order list | Separate items |
@@ -273,7 +273,7 @@ There is **one** `Arc<dyn Fn(&str) -> String>` built in `main.rs` (the SearchFn)
 
 `Control.search_cheap` **forwards** to `inner` so step 2 on the outer source sees WriteOverlay. That forward is **not** a second merge.
 
-**Residual:** no sidecar and no `search_cheap` → `search requires an on-disk index`. Union-catalog locate stays out. Multi-input sidecar remains `inputs[0]`.
+**Residual:** no sidecar and no `search_cheap` → `search requires an on-disk index`. Multi-input sidecar remains `inputs[0]` when live Union is `None` (any source `None`).
 
 Required test: `Control(WriteOverlay(base))` — **identical** TSV from `search_text` and from SearchFn for (i) base `Some` + COW, (ii) base `None` + overlay create (sidecar present), (iii) `fts:`.
 
@@ -301,11 +301,11 @@ If `pattern` has `fts:` prefix, **every** `search_cheap` impl (WriteOverlay, for
 | EXT4 / FAT / SquashFS / Git / SQLAR / `SingleFile` / Dropbox | `None` (no `SqliteIndex`; sidecar or residual) |
 | `WriteOverlay` | [D4](#d4-overlay-merge-ownership) — **not** a forward |
 | **Forward set only** | FileVersionLayer, Prefix, AutoMount (parent catalog only), Transform, Control. Default `None` is the P0 bug class **for this set**. |
-| Union | `None` (SearchFn sidecar of `inputs[0]` + `overlay_arc`) |
-| **`OciImageMountSource`** | **`None` in v1** — same sentence as Union. It **is** the layer union (`oci_whiteout.rs`); forwarding `layers[0]` or `layers.last()` is a **wrong catalog** (`.wh.*` stay in SQL; other layers missing) and `Some` would block SearchFn sidecar. Image-correct locate is overlayfs merge of layer hits — not this train. `inputs[0]` is the URL string, not `oci:{digest}`; today’s callback already errors “on-disk index.” |
+| Union | Catalog merge: `None` if any source is `None`; `Some([])` contributes; path+`offsetheader`, later source wins; no B-4; never `sources[0]`. |
+| **`OciImageMountSource`** | **`None` in v1** — it **is** the layer union (`oci_whiteout.rs`); forwarding `layers[0]` or `layers.last()` is a **wrong catalog** (`.wh.*` stay in SQL; other layers missing) and `Some` would block SearchFn sidecar. Image-correct locate is overlayfs merge of layer hits — PR 8. `inputs[0]` is the URL string, not `oci:{digest}`; today’s callback already errors “on-disk index.” |
 | Folder / remote folder | Folder: host-tree glob via `read_dir` + `symlink_metadata` (no `list()`; no recurse `S_IFLNK` dirs; `DEFAULT_SEARCH_LIMIT`). Remote folder stays `None`. |
 
-**Do not** implement Union-catalog locate because a bold “every `list_dirents` wrapper” sentence told you to. Folder host-tree glob is a later residual (PR 7).
+**Do not** naive-forward Union `sources[0]` or OCI `layers[0]`. Folder host-tree glob and Union catalog merge shipped (PR 7 / PR 6).
 
 **Hit path identity:** TSV paths stay **catalog paths** (today’s sidecar). Wrappers in the forward set **forward without rewriting**. Combined with D4 residual: `--prefix` / `--transform` + `-w` last-wins is **not** guaranteed.
 
@@ -356,7 +356,6 @@ SQL `fullpath` in the SELECT for hits is acceptable. Do not rewrite glob SQL.
 ## Non-goals (explicit leftovers)
 
 - Transform `ensure_map` fat BFS.
-- Union-catalog locate (all sources).
 - CLI `find --write-overlay DIR`.
 - Compact-only CLI `find` without a sidecar.
 - In-memory FTS for compact-only.
@@ -367,7 +366,7 @@ SQL `fullpath` in the SELECT for hits is acceptable. Do not rewrite glob SQL.
 - Offset-order find (V-5).
 - Prefix/Transform rewriting locate paths to mount paths (those stacks + `-w` last-wins stay residual).
 - AutoMount nested-child locate.
-- `OciImageMountSource` / Union catalog merge as `search_cheap` (Folder host-tree glob shipped).
+- `OciImageMountSource` catalog merge as `search_cheap` (Folder host-tree glob and Union path+offsetheader merge shipped).
 - Overlay-only-on-`[]` when there is no sidecar (keep `search requires an on-disk index`).
 
 ---
@@ -393,7 +392,7 @@ Ownership: **index + core + compositing + format one-liners + `main.rs` SearchFn
 - Two-offsetheader SoA == SQL.
 - `search_query` compact-only still empty for SQL/CLI.
 - Forward tests: FileVersionLayer / Transform / Prefix / Control / AutoMount parent-only; no `.versions` hits.
-- OCI / Union `search_cheap` is `None` (not layer-0, not `.wh.` names).
+- OCI `search_cheap` is `None` (not layer-0, not `.wh.` names). Union catalog merge is a later residual (PR 6; shipped).
 
 ### Slice 3 — Overlay last-wins + control/socket SearchFn
 
@@ -424,7 +423,7 @@ No `docs/embedded-nested-archives.md`.
 | Unify find onto MemIndex | Forbidden (D1). Warm find must keep `mem: None`. |
 | `search_cheap` `Some` overlay-only when base is `None` | Forbidden (D4). Drops the catalog. |
 | `search_cheap` `None` whenever overlay exists | Overlay never appears on unwired formats unless SearchFn step 3 runs. |
-| Forgotten wrapper forward | Tests on the **forward set only** (Transform, Prefix, Control, FileVersionLayer, AutoMount parent). Not OCI/Union (Folder host-tree glob is a later residual). |
+| Forgotten wrapper forward | Tests on the **forward set only** (Transform, Prefix, Control, FileVersionLayer, AutoMount parent). Not OCI (Folder host-tree glob and Union catalog merge shipped). |
 | Call `overlay_file_info` from locate | **Forbidden** — that hydrates `FileInfo`. `symlink_metadata` size/mtime on hits only. |
 | Forward OCI `search_cheap` | **Forbidden** — wrong catalog; keep `None`. |
 | Dual locate owners (`search_text` prefer + SearchFn) | **Forbidden** — one `Arc`. |
@@ -458,7 +457,8 @@ Every behavior change lands with tests in the **same** PR. Name/doc `Regression:
 | Control / socket TSV (callback) | `control_search` · `control_search_socket` (keep green; **not** sufficient) |
 | Live `search_cheap` + overlay last-wins | `cargo test -p ratarmount-compositing --lib search_cheap` (create, tombstone, COW/replace, base `None` + control file, `replace_base`, file≡socket, `fts:` spy) |
 | Wrapper forwards without `list()` | FileVersionLayer + Transform + Prefix + Control + AutoMount parent-only |
-| OCI / Union stay `None` | compositing / OCI test: no layer-0 / `.wh.` hits |
+| OCI stay `None` | compositing OCI test: no layer-0 / `.wh.` hits |
+| Union catalog merge | compositing `search_cheap_union_merges_all_sources`: not `sources[0]`; path+oh later-wins; any `None` → `None` |
 | No `.versions` hits; multi-version SoA == SQL | FileVersionLayer + two-offsetheader `scan_glob` |
 | `status` / AutoMount names | counted-`list()` tests |
 | Cheap readdir still cheap | `list_dirents` · `file_version_layer_list_dirents` |
