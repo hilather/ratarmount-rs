@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | **Implemented** (this PR). Plan accepted on [`#11`](https://github.com/hilather/ratarmount-rs/pull/11) (`42a04d7933a035ed00dff0e79254547d0c42f2ca`). Implementation SHA filled after commit. |
+| **Status** | **Implemented** — `ad76363efedaa383d95a1061b251078c45112309`. Plan accepted on [`#11`](https://github.com/hilather/ratarmount-rs/pull/11) (`42a04d7933a035ed00dff0e79254547d0c42f2ca`). |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) § P2 “Hash / fingerprint fixed windows” — fingerprint boxes ticked in this PR |
 | **Date** | 2026-08-28 |
 | **Skeptic review (plan)** | **ACCEPT** after 3/3 sweeps (nits folded on 1–2; sweep 3 clean). Plan PR #11. |
