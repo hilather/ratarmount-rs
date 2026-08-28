@@ -4,7 +4,7 @@
 |-------|--------|
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-4** (partial, M) |
 | **Date** | 2026-08-28 |
-| **Status** | DRAFT — skeptic sweep 1 folded; sweep 2 pending |
+| **Status** | DRAFT — skeptic sweeps 1–2 folded; sweep 3 pending |
 | **Scope** | In-process single-writer commit queue for live interval / on-exit (and in-process offline when a `WriteOverlay` exists). Job = overlay file list + generation. Executor does splice / ZIP rebuild / sidecar patch. Coordinator flips the visible archive + index. |
 | **Ownership** | `ratarmount-compositing` (`write_overlay.rs`) + `ratarmount/src/overlay_commit.rs`. **Not** factory. **Not** formats-tar splice math. |
 | **Out of this train** | Durable Objects / Queues / Workers; IVF / ANN; V-2 pointer schema; F-7 remote multipart; P2 overlay FileInfo cookies; gzip live splice; live ZIP; cross-process archive flock |
@@ -37,7 +37,7 @@ This train adds that coordinator. It does **not** change how a splice is compute
 | `commit_generation: AtomicU64` | `WriteOverlay` | Bumped after successful persist (live: after `replacement` swap; atomic: after persist). `content_generation()` = this + inner base. FUSE `sweep_if_generation_advanced` / NFS reader LRU already watch it. |
 | `interval_disabled` | K11 | Persist-ok + reopen-err (or cleanup-err) → further ticks fail; overlay kept. |
 | Idle filter | `commit_live_idle` | Host mtime older than interval **and** no open write fd (`write_fds`). Hot files stay in the overlay. Delete tombstones are settled and go out on the same tick. |
-| Interval thread | `overlay_commit::spawn_interval_commits` | **One** thread. Poll ≤ 1 s. Calls `commit_live_idle` **synchronously** — a long splice blocks the next poll. |
+| Interval thread | `overlay_commit::spawn_interval_commits` | **One** thread. Poll ≤ 1 s. Calls `commit_live_idle` **synchronously**. Today the `JoinHandle` is **dropped** (detached). V-4 returns it and main joins before on-exit (K14). |
 | On-exit | `maybe_commit_on_exit` → `commit_atomic` | Persist only; **no** reopen / overlay reset. Runs on the **main** thread after unmount / export stop. |
 | Live `.tar.zst` classify | `classify_tar_zst_path` | Any `offsetheader` before the rewrite window → `earlier_frame_err`; **entire** tick skipped; archive bytes unchanged. Offline `--commit-overlay` is the escape hatch (rewrite from affected frame). |
 | Offline `--commit-overlay` | free fn `commit_overlay(overlay_path, archive, opts)` | Walks the overlay **path**. Does **not** take `commit_gate`. ZIP = full rebuild; tar.zst = splice; gzip/bz2/xz = GNU tar. Separate process from a live mount. |
@@ -96,8 +96,8 @@ The interval thread being single-threaded is **not** a coordinator:
 | # | Decision | Rationale |
 |---|----------|-----------|
 | K1 | **Queue lives on `WriteOverlay`**, not a new crate and not the CLI thread. Interval thread and on-exit become `enqueue` callers. Persist helpers stay private. | Crate ownership: compositing owns overlay + persist. Binary only schedules. |
-| K2 | **Executor is the existing interval thread plus a “run if idle” call from on-exit / in-process offline.** No second thread, no `async`, no extra dependency. If no interval thread exists (on-exit-only mount), the caller **runs the job inline** on the same queue state so two inline callers still cannot overlap. | Smallest change that gives single-writer + coalesce. A dedicated executor thread is a follow-on if F-7 uploads must not block unmount. |
-| K3 | **States: `Idle` \| `Running { kind, generation }` + optional `coalesced: Option<LiveIdleHint>`.** `coalesced` is a **side slot**, not a successor state that stops persist. Enqueue `LiveIdle` while `Idle` → `Running` and execute. Enqueue `LiveIdle` while `Running` → set/replace `coalesced` (or no-op if the hint is empty / identical). **Finish + promote is one queue-mutex transition:** if `Running.kind` was `LiveIdle` and `coalesced` is set → next `Running { LiveIdle }` (hint is identity only; persist re-collects). If `Running.kind` was `OnExit` / `Offline` / `LiveFull` → **discard `coalesced`** and go `Idle`. On-exit / offline: **wait until Idle with `coalesced` empty** (or discard coalesced as part of taking the wait), then **fresh** `collect_overlay_commit_plan_from_conn` of what is still on disk. Never promote a `LiveIdle` coalesced job after an OnExit/Offline persist (on-exit does not forget host files — promoting would splice the same names again). Never “take Coalesced” as the persist plan. Interval thread must **not** wait on on-exit. Queue mutex is **not** held across persist. | Sweep-1 B1: OnExit + promote-Coalesced re-persists names still on disk (no forget). Stale coalesced path lists after interval forget are also wrong. Coalesce = “run another idle tick after this LiveIdle”, not a FIFO of splices. |
+| K2 | **Executor is whoever transitions `Idle → Running`.** That stack must **drain until `Idle`** before returning (K13). No second thread, no `async`. Interval thread is one such executor; on-exit / `commit_live` / `commit_offline` are executors when they find `Idle`. If they find `Running`, they **wait** (K14) — they do not start a second splice. | Smallest single-writer. A dedicated executor thread is a follow-on if F-7 uploads must not block unmount. |
+| K3 | **States: `Idle` \| `Running { kind, generation }` + optional `coalesced: Option<LiveIdleHint>`.** `coalesced` is a **side slot**, not a third state. Enqueue `LiveIdle` while `Idle` → `Running` and this stack becomes executor. Enqueue `LiveIdle` while `Running` → set/replace `coalesced`, return `Ok(false)` (this stack is **not** the executor). **Finish + promote is one queue-mutex transition:** if `Running.kind` was `LiveIdle` and `coalesced` is set → stay `Running { LiveIdle }` (hint discarded; persist will re-collect). If `Running.kind` was `OnExit` / `Offline` / `LiveFull` → **discard `coalesced`** and go `Idle`. The **same executor stack** must loop (K13) until the transition lands on `Idle`. Never persist a stored path list. Never promote coalesced after OnExit/Offline/LiveFull. | Sweep-1 B1 + sweep-2 B2: promote without an in-stack drain leaves `Running` with no executor. |
 | K4 | **Job identity is not the persist plan.** Enqueue may snapshot paths as a **hint** for coalesce/no-op (`same names?` / empty). Persist **always** calls `collect_overlay_commit_plan_from_conn` under `commit_gate` **write** (today’s `commit_live_inner`), including idle cutoff, `write_fds`, and parent-dir retain (`skipped` / `path_is_under_rel`). Do not persist a path list collected under a read lock. Do not “re-validate by dropping names from a stale list” — that misses a parent dir whose child went hot, which `live_commit_idle_nested_hot_sibling_keeps_parent` covers. | Sweep-1 B2: hot-file invariant is the full collect under write lock, not a filtered snapshot. Spec “file list + generation” = job **identity**; bytes still come from the overlay dir at persist time. |
 | K5 | **Prefix-frame classify stays inside the persist body, fail-closed, before sibling tmp.** Live zstd: `scan` → `find_last_n_tar_window` → `classify_tar_zst_path` on the **just-collected** plan’s `deleted_paths` → only then `splice_zstd_last_frames_replace`. Failure: `earlier_frame_err`, no tmp, overlay + archive unchanged. Do **not** classify a stale enqueue list before `Running`. `CommitKind::Offline` must call `commit_overlay_tar_zst` / `offline_tar_zst_from_idx` (prefix-frame delete **allowed**), never live `persist_tar_zst_plan`. | Existing tests assert exact error class and byte-identical prefix. Classify needs the rewrite window from `find_last_n` (already true in `persist_tar_zst_plan`). |
 | K6 | **Persist still holds `commit_gate` write for the persist + flip critical section.** Overlay writers (create/unlink/mkdir/rename/truncate) still wait. This keeps GNU `tar --append` / splice `FileOnDisk` stable. The queue’s job is overlapping-**splice** prevention, not concurrent writers. | Unlocking writes during persist is a new race (hot file after snapshot, GNU tar reading a changing inode). Out of v1. |
@@ -107,6 +107,10 @@ The interval thread being single-threaded is **not** a coordinator:
 | K10 | **ZIP stays offline full rebuild.** Live queue never accepts ZIP (`live_commit_is_supported` unchanged). `commit_overlay_zip` tests keep calling the free function. | Do not invent live ZIP. |
 | K11 | **V-2 / F-7 hook is a named function, not a schema.** `fn flip_visible_local(archive, tmp)` is today’s `NamedTempFile::persist`. Comment + `#[allow]`-free stub module note: F-7 replaces the last step with “upload immutable object, then publish V-2 pointer”. No JSON pointer, no `index_id` field, no IVF. | User spec: later uses V-2 pointer; do not invent it. |
 | K12 | **P2 overlay cookies are adjacent, not in scope.** Queue flip already bumps `commit_generation`. FUSE/NFS caches already sweep on that. Do not change `overlay_file_info` to a compact cookie in this PR. | User spec. |
+| K13 | **Drain until Idle on the executor stack.** After persist+flip (or empty collect / classify `Err` / `interval_disabled`), finish+promote. If the mutex transition left `Running { LiveIdle }`, **immediately** take `commit_gate` write again, re-collect, persist. Repeat until finish lands on `Idle`. Do **not** return from `commit_live_idle` / `commit_live` / `commit_atomic` leaving `Running`. The next interval poll is not an executor: if it sees `Running` it only sets `coalesced` (or no-ops). On `GOT_TERM`, the interval thread still finishes this drain, then exits. | Sweep-2 B2: finish+promote + “interval does not start another persist” + `term_requested` before the next poll = `Running` forever; on-exit waits forever. |
+| K14 | **Wait for Idle without `commit_gate`; then collect.** OnExit / Offline / LiveFull that find `Running` wait on a `Condvar` (or bounded sleep) until `Idle` + `coalesced` discarded. **Do not hold `commit_gate` while waiting.** Lock order: queue mutex (brief) → release → (wait) → queue mutex → see Idle → release → `commit_gate` write → collect. Never `commit_gate` then wait on the queue (deadlock vs an executor that needs the write lock to finish+promote). `spawn_interval_commits` **returns `JoinHandle<()>`**; main **joins after unmount / export stop and before `maybe_commit_on_exit`**. Join is the product drain; the condvar covers in-process tests that call `commit_atomic` while a tick is `Running`. Interval thread never waits on on-exit. | Sweep-2 B1: detached thread + `commit_atomic`’s write-then-collect + wait-for-Idle = hang. Today there is no `JoinHandle`. |
+| K15 | **`commit_live` is `LiveFull`.** Wait like OnExit if `Running` (do not coalesce a full wipe into a `LiveIdle` hint). After persist, full `reset_overlay_dir` + `DELETE FROM files` (today’s `commit_live` / `idle_for: None` path). Existing two-tick tests (`live_commit_tar_zst_empty_second_tick`, last-window replace) stay: first call wipes, second is `Ok(false)`. | Sweep-2 nit: LiveFull-while-Running was unspecified; mis-wiring idle forget would break those tests. |
+| K16 | **On-exit generation bump without `replacement` swap is intentional.** Product `maybe_commit_on_exit` runs **after** FUSE/NFS have stopped. Do not “fix” K8 by swapping on-exit or bumping gen while a live FUSE fs still has handles. In-process tests that call `commit_atomic` with a live FUSE/NFS adapter are out of v1 (same as today). | Sweep-2 nit (Hunt-5). |
 
 ---
 
@@ -185,7 +189,14 @@ sequenceDiagram
       E->>F: persist() + reopen + swap + gen++ + forget collected paths
       F-->>T: Ok(true)
     end
-    Q->>Q: finish+promote (one mutex): LiveIdle and coalesced? else Idle
+    loop drain until Idle (K13)
+      Q->>Q: finish+promote (one mutex)
+      alt still Running LiveIdle
+        Q->>E: collect + persist again
+      else Idle
+        Q->>Q: Condvar notify waiters (K14)
+      end
+    end
   end
 ```
 
@@ -195,7 +206,7 @@ sequenceDiagram
 |--|----------|---------|
 | Enqueue | `LiveIdle` | `OnExit` |
 | Idle filter | yes (at **persist** collect, write lock) | no (whole overlay, fresh collect) |
-| If `Running` | set `coalesced` hint; this fire returns `Ok(false)` | **Wait until Idle with coalesced discarded** (K3). Then fresh collect of host files **still** present. Interval thread never waits on on-exit. |
+| If `Running` | set `coalesced` hint; this fire returns `Ok(false)` (not the executor) | **Wait without `commit_gate`** (K14) until Idle. Main **joins** the interval `JoinHandle` first. Then fresh collect of host files **still** present. Interval never waits on on-exit. |
 | After persist | forget **collected** paths (`forget_committed_overlay`) | **no** overlay reset (files stay on disk) |
 | Reopen | yes (interval) | no |
 | Next LiveIdle | finish+promote may run one more idle collect | coalesced **discarded** — must not splice the same still-present names |
@@ -261,8 +272,8 @@ No new workspace crate. No new Cargo features.
 
 | Symbol | Change |
 |--------|--------|
-| `spawn_interval_commits` | Still one thread. Calls `commit_live_idle` (now queue-aware). After `Ok`/`Err`, does not start another persist itself. |
-| `maybe_commit_on_exit` / `apply_live_commit(..., false)` | `commit_atomic` waits out `Running` then snapshots. |
+| `spawn_interval_commits` | Still one thread. **Returns `JoinHandle<()>`** (today the handle is dropped). Calls `commit_live_idle`; that call **drains until Idle** (K13) before returning. The poll loop does not start a second persist for a job it does not own. On `GOT_TERM` / stop: finish in-stack drain, then return so join unblocks. |
+| `maybe_commit_on_exit` / `apply_live_commit(..., false)` | Caller **joins** the interval handle first. Then `commit_atomic` waits out any remaining `Running` **without** holding `commit_gate` (K14), then snapshots. |
 | clap | No new flags. |
 
 ### FUSE / NFS
@@ -277,14 +288,16 @@ Rules: drive shipped functions; generate payloads; name regressions `Regression:
 
 | Case | Layer | Assert |
 |------|--------|--------|
-| **Regression: two interval fires during a long splice** | compositing | Hold persist with a test hook / slow `reopen` **or** inject `Running` and call `commit_live_idle` twice. Second call `Ok(false)`; **one** `persist()` during the first job; archive not truncated; prefix bytes `cmp` identical. |
-| Coalesce is another idle **collect**, not a stored path list | compositing | While `Running`, create a second idle file **and** a hot child under a dir. After finish+promote, persist uses write-lock collect: new idle name once; parent dir of the hot child **not** appended / not forgotten (`live_commit_idle_nested_hot_sibling_keeps_parent` stays green). |
+| **Regression: two interval fires during a long splice** | compositing | Hold persist with a test hook / slow `reopen` **or** inject `Running` and call `commit_live_idle` from a **second** stack. Second call `Ok(false)` (sets `coalesced` only). **One** `persist()` while the overlap is in flight. The **first** stack then drain-promotes and may persist once more (K13) — that is the coalesced idle collect, not a concurrent splice. Archive not truncated; prefix bytes `cmp` identical. |
+| Coalesce is another idle **collect**, not a stored path list | compositing | While `Running`, create a second idle file **and** a hot child under a dir. The **executor** drain (not the overlapping caller) re-collects under write lock: new idle name once; parent dir of the hot child **not** appended / not forgotten (`live_commit_idle_nested_hot_sibling_keeps_parent` stays green). |
 | Prefix-frame mutate fail-closed | compositing | Existing `live_commit_tar_zst_earlier_frame_delete_unchanged` + mixed append+delete still `Err`, archive unchanged. No sibling tmp on reject. |
 | Hot files stay | compositing | Existing `commit_live_idle` tests (open write fd / young mtime). Persist collect under write lock, not a filtered enqueue list. |
-| Overlay read during persist | **fuse** (not only compositing `lookup`) | Drive FUSE `open` (`has_file` → RO `open_overlay_fd` → NotFound fallthrough → `open_source_backend`). `cat` of an overlay file while persist holds the write lock returns overlay bytes and must not hang (timeout). Must not hit size-0 `Empty` (`overlay_file_info` / create-then-cat residual). |
-| Generation flip | fuse + nfs | Existing `overlay_commit_live_delete_shifts` stay green (generation bump after swap). |
+| Overlay read during persist | **fuse** | (1) `cat` of a **non-zero** overlay file while persist holds `commit_gate` write: overlay bytes, no hang (K7 RO open ungated). (2) After swap+forget, FUSE `open` of that name: `has_file` false or `open_overlay_fd` ENOENT → `file_info_for_open` re-lookup → `open_source_backend` serves **base** bytes, not size-0 `Empty`. Do not only assert “must not hang”. |
+| Generation flip | fuse + nfs | Existing `overlay_commit_live_delete_shifts` stay green. **Note:** FUSE test is a mock `OffsetShiftSource` (no `WriteOverlay`); NFS test calls real `commit_live_uncompressed_tar`. Wire `commit_live` as LiveFull (K15) so the NFS catalog test still sees gen-after-swap. |
 | ZIP / offline splice | compositing | `commit_overlay_zip` + `commit_overlay` (incl. earlier-frame delete, seek-table) stay green. |
-| **Regression: on-exit after interval does not splice twice** | compositing | Interval persist (forget settled names) then `commit_atomic` / OnExit: no duplicate TAR members; remaining hot files flushed once; coalesced LiveIdle discarded (sweep-1 B1). |
+| **Regression: on-exit after interval does not splice twice** | compositing | Interval persist (forget settled names) then `commit_atomic` / OnExit: no duplicate TAR members; remaining hot files flushed once; coalesced LiveIdle discarded. |
+| **Regression: on-exit wait does not deadlock** | compositing | Overlap a long persist with `commit_atomic` on another thread: atomic must not take `commit_gate` write until queue is Idle; test finishes (timeout = fail). Also: `spawn_interval_commits` handle is joinable; after `GOT_TERM`, join returns only when queue is Idle. |
+| LiveFull two ticks | compositing | Existing `commit_live` (not idle) empty-second-tick / last-window replace stay green (full wipe, K15). |
 | `interval_disabled` | compositing | Existing persist+reopen-fail: second tick skipped via `interval_disabled`, not `Ok(false)`. |
 | Empty second tick | compositing | Existing `Ok(false)` after forget. |
 
@@ -311,8 +324,8 @@ Add an AGENTS.md catalog row for the overlapping-interval regression in the impl
 
 - **Title:** `compositing: single-writer overlay commit queue`
 - **Files:** `ratarmount-compositing/src/write_overlay.rs` (or `commit_queue.rs` + `mod`)
-- **Behavior:** `Idle` / `Running` / `Coalesced`; `commit_live*` / `commit_atomic` go through enqueue. Persist/classify/flip **unchanged**. K7 RO `open_overlay_fd` split.
-- **Tests:** unit tests on the state machine (second enqueue no-ops; coalesce keeps latest list; `interval_disabled` short-circuit). Existing `live_commit` / `commit_overlay*` green.
+- **Behavior:** `Idle` / `Running { kind }` + **side-slot** `coalesced` (not a third state — sweep-1 B1). `commit_live` = LiveFull (K15); `commit_live_idle` = LiveIdle; `commit_atomic` = OnExit. Persist/classify/flip **unchanged**. K7 / K13 / K14 in this PR or PR 2, but PR 1 must not invent `Coalesced` as a persistable state. K7 RO `open_overlay_fd` split.
+- **Tests:** unit tests: second `LiveIdle` enqueue no-ops; finish+promote drain until Idle; OnExit discards coalesced; wait does not hold `commit_gate`; `interval_disabled` short-circuit. Existing `live_commit` / `commit_overlay*` green.
 - **Docs:** none user-facing if behavior is identical except RO open no longer waits.
 
 ### PR 2 — Overlap regression + on-exit drain
@@ -341,8 +354,9 @@ F-7 / V-2 are **not** PRs in this train.
 | Classify after tmp write | **High** | K5: classify first |
 | Double `persist()` tears `.tar.zst` | **High** | Single `Running`; persist only from executor; sibling tmp + rename |
 | Generation bump before swap | **High** | K8; existing shift tests |
-| RO open ungated + persist `forget` unlinks | Low | POSIX: already-open fd keeps inode; new open falls through to `current_base()` (existing `MountSource::open` NotFound path) |
-| On-exit wait deadlocks interval thread | Medium | Interval thread must not wait on on-exit. On-exit waits for `Running`. No lock order inversion: queue mutex held only for state transitions, not during persist (persist uses `commit_gate` only). |
+| RO open ungated + persist `forget` unlinks | Low | Already-open `OverlayFd` keeps the inode. New FUSE `open` after forget: ENOENT → `file_info_for_open` re-lookup → `open_source_backend` (not size-0 `Empty` unless lookup size is 0). K7 test asserts both. |
+| On-exit wait deadlocks interval thread | **High** | K14: wait without `commit_gate`; join handle before on-exit; lock order queue mutex → release → gate write. New deadlock regression. |
+| Finish+promote leaves `Running` with no executor | **High** | K13: executor drains until Idle; interval poll is not a second executor. |
 | Treating offline live-reject | Medium | `CommitKind::Offline` skips live classify |
 | Scope creep into P2 cookies / V-2 JSON | Medium | K11–K12; skeptic checklist |
 | Unlocking writes during persist “because Vectorize” | **High** | Explicitly refused (K6) |
@@ -388,7 +402,7 @@ This **plan-only** PR adds this file. Do not flip V-4 to `done`.
 | Sweep | Result | Folded |
 |-------|--------|--------|
 | 1 | **BLOCKED** (B1 on-exit+coalesce double persist; B2 persist must re-collect under write lock) | K3 rewritten (discard coalesced on OnExit/Offline; finish+promote one mutex transition; never persist a stored path list). K4 job = identity; persist = `collect_overlay_commit_plan_from_conn` under write lock (parent-dir retain). K5 classify stays inside persist after `find_last_n`. K9 `commit_offline` required to mark V-4 done. Tests: on-exit-after-interval no duplicate; FUSE `open` for K7; coalesce uses write-lock collect. Nits on mermaid / Offline persist path folded. |
-| 2 | *pending* | |
+| 2 | **BLOCKED** (B1 on-exit wait vs detached thread / `commit_gate` deadlock; B2 finish+promote leaves `Running` with no executor) | K13: executor drains until Idle. K14: wait without `commit_gate`; `JoinHandle` joined before on-exit; lock order queue mutex → release → gate write. K15: `commit_live` is LiveFull (wait, do not coalesce into LiveIdle). K16: on-exit gen bump without swap is intentional. Tests: deadlock timeout; K7 FUSE ENOENT fallthrough; PR1 must not treat Coalesced as a state. |
 | 3 | *pending* | |
 
 Stop at **ACCEPT** or **BLOCKED** (cap 3).
