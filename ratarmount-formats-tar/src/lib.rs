@@ -5488,6 +5488,19 @@ mod tests {
             .expect("dumpdir dir oh") as i64;
         assert_ne!(oh_reg, oh_dir, "dumpdir uses two PKs");
         assert_eq!(
+            oh_dir,
+            oh_reg + 1,
+            "dir side is offsetheader+1, not newest-only"
+        );
+        assert_eq!(
+            dump_reg.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert_eq!(
+            dump_dir.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        assert_eq!(
             m.index().sql_files_type("", "foo", oh_reg).unwrap(),
             Some(i64::from(b'D'))
         );

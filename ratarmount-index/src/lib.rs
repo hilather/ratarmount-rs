@@ -3386,6 +3386,11 @@ mod tests {
             Some(8)
         );
         assert_eq!(
+            idx_b.sql_files_type("/shared/prefix", "a.txt", 0).unwrap(),
+            Some(8),
+            "SoA bind must store type on the SoA index, not only via dump equality"
+        );
+        assert_eq!(
             idx_a.sql_files_type("/shared/prefix", "", 1024).unwrap(),
             Some(0xffff)
         );
