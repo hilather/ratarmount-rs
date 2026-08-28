@@ -2,12 +2,13 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Draft — skeptic-plan-review in progress |
+| **Status** | Sweep 1 folded — awaiting sweep 2 |
 | **Date** | 2026-08-28 |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “True SIMD (only on bulk)” |
 | **Companion (not this work)** | [`docs/tasks/vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) — systems patterns; **not** SIMD |
 | **Workspace** | `rust-version = "1.74"`; default CI is `cargo fmt --all -- --check` then clippy+test (no `nfsv4` / `gzip-rapidgzip`) |
 | **Audience** | Implementers who already know `--hashes`, 7z password trial, G3/rapidgzip inflate |
+| **Inventory HEAD** | Plan branch on top of `main` `5475d28`; line numbers checked against that tree (sevenzip `parse.rs` / `lib.rs` still match) |
 
 **Verdict (this document):** stop at skeptic **ACCEPT** or **BLOCKED**. Do not implement from this PR.
 
@@ -22,7 +23,9 @@ The density backlog’s last SIMD line is:
 
 That is a *payload* problem, not a Vectorize / SoA problem. The reference for “when SIMD pays” is **zlib-rs / rapidgzip** (wide loops on decompressed or compressed streams), not Cloudflare Vectorize IVF/PQ.
 
-This plan inventories the existing hash/CRC/scan paths, names the one remaining hand-rolled bulk-capable CRC, and specifies the **smallest correct change**. It does not propose a SIMD program, new CLI flags, or inflate-backend swaps.
+**Sweep 1 correction:** the multi-MB CRC/hash work the bullet names is **already** `crc32fast` + `sha2` on `--hashes` / `compute_hashes_limited` (1 MiB stream chunks, including ZIP/7z inflate output). There is **no** memchr-on-inflate-output path. The remaining hand-rolled IEEE CRC is 7z `parse::crc32`, and its hot password-trial site hashes the **first non-empty file only** — shipped fixtures are 15 bytes, not multi-MB.
+
+This plan therefore does **not** invent a new SIMD program. It (1) records the inventory, (2) specifies a **hygiene swap** of that last scalar payload CRC onto `crc32fast`, and (3) requires an honest `~` backlog residual instead of marking the P2 line `[x]` as “True SIMD on multi-MB buffers.”
 
 ---
 
@@ -30,10 +33,11 @@ This plan inventories the existing hash/CRC/scan paths, names the one remaining 
 
 ### Goals (implementation PR, after this plan is ACCEPTed)
 
-1. Replace the **byte-at-a-time IEEE CRC-32** used on **decompressed 7z member/folder buffers** (password-trial path) with the workspace’s existing **`crc32fast`** crate (PCLMUL / SSE4.2 / NEON; scalar fallback).
+1. Replace the **byte-at-a-time IEEE CRC-32** in `ratarmount-formats-sevenzip/src/parse.rs` with the workspace’s existing **`crc32fast`** crate (PCLMUL / SSE4.2 / NEON; scalar fallback). Same function serves StartHeader (20 bytes), NextHeader (`next_header_size` packed bytes), and password-trial member/folder slices.
 2. Keep bit-identical IEEE CRC-32 (zlib / 7z / xz poly `0xEDB88320`, init `0xFFFFFFFF`, final XOR).
-3. Add the lowest-layer regression tests in the same commit (known vector + existing encrypted-trial tests stay green).
-4. Leave default CI / MSRV 1.74 green: `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings`, `cargo test --workspace` (or scoped `-p ratarmount-formats-sevenzip` + `-p ratarmount-index` if the helper lives in index).
+3. Add the lowest-layer regression tests in the same commit (**hardcoded** IEEE vectors, not tautological crate-vs-crate). Existing encrypted-trial tests stay green.
+4. Leave default CI / MSRV 1.74 green: `cargo fmt --all` before commit; `cargo clippy -p ratarmount-formats-sevenzip --all-targets -- -D warnings`; `cargo test -p ratarmount-formats-sevenzip --lib` (plus `hashing` on index if untouched). Workspace clippy+test only if Rust outside sevenzip changes (it should not).
+5. Close the backlog line as **`~`**, not `[x]` — see §6.
 
 ### Non-goals (do not file as this P2)
 
@@ -43,34 +47,36 @@ This plan inventories the existing hash/CRC/scan paths, names the one remaining 
 | Nested fingerprint windows (`NESTED_FINGERPRINT_SAMPLE` = 4 KiB) | Separate P2 “fixed windows” item; not multi-MB |
 | tarstats edges (512 B) / `TARSTATS_FULL_HASH_MAX` (256 KiB slurp) | Not multi-MB; already `sha2` |
 | Hand-rolled `xz_seek::crc32_ieee` | Footer/index bodies are tens of bytes, not bulk |
-| Adding `memchr` to WARC/HTTP/ZIP signature scans | Happy-path haystacks are headers / last-64 KiB EOCD, not inflate output |
-| Turning on rapidgzip `crc32_enabled` | Adds work; currently off for keep_index cost (`gzip_rapidgzip.rs`) |
+| Adding `memchr` to WARC/HTTP/ZIP/SMB scans | No inflate-output haystack exists; see §3.3 |
+| Turning on rapidgzip `crc32_enabled` | Adds work; currently off for keep_index (`gzip_rapidgzip.rs` path/from_reader force `false`) |
 | G3 miniz → zlib-rs cold-checkpoint swap | Deferred in [`g3-polish-batch.md`](../g3-polish-batch.md); inflate SIMD is a different train |
 | ISA-L / `gzip-rapidgzip` default-on | Feature-gated; MSRV 1.87; not default CI |
 | Cloudflare Vectorize / IVF / PQ / ANN | Wrong domain — see vectorize-steal-patterns |
 | New `--hashes` algorithms, CLI flags, or rayon in `hashing.rs` | ZIP already parallelizes inflate+hash (FR-4) |
 | Streaming 7z CRC during decode (avoid the `Vec`) | RAM / decoder change; not SIMD |
-| `sha2` `asm` / crate major bump | `sha2` 0.10 already uses SHA-NI via `cpufeatures` when present; `asm` is MSRV/CI risk |
+| 7z CRC on every `open`/`cat` | Today CRC runs at header parse + password trial only |
+| `sha2` `asm` / crate major bump | x86 SHA-NI is already on via `cpufeatures` in sha2 0.10.9; aarch64 hardware SHA in that crate is behind `asm`. `asm` is `SHOULD NOT` for library crates and an MSRV/CI risk. Do not enable it. |
 | README / mount-option / nested-matrix updates | No user-visible flag or open-path change |
+| Claiming this PR “lands True SIMD on multi-MB buffers” | `--hashes` already did; trial CRC is usually a small first member |
 
 ---
 
 ## 3. Inventory (existing paths)
 
-Investigated 2026-08-28 on `main` (`5475d28` era). Prefer **existing crates** over new SIMD.
+Investigated 2026-08-28. Prefer **existing crates** over new SIMD.
 
 ### 3.1 Already crate-backed (do not reimplement)
 
 | Path | Crate | Buffer | Notes |
 |------|-------|--------|-------|
-| `--hashes` / `compute_hashes_limited` / `hash_hex` | `crc32fast` 1.5 + `sha2` 0.10 + `sha1` + `md-5` | 1 MiB stream chunks, any member size | **This is the full-file hash path.** CRC is already SIMD. SHA-256 uses SHA-NI when the CPU has it. |
+| `--hashes` / `compute_hashes_limited` / `hash_hex` | `crc32fast` 1.5 + `sha2` 0.10 + `sha1` + `md-5` | 1 MiB stream chunks (`hashing.rs`), any member size | **This is the full-file hash path.** CRC is already SIMD. SHA-256 uses SHA-NI on **x86/x86_64** via `cpufeatures`; not aarch64 without `asm`. |
 | TAR `fill_content_hashes` | same | raw archive bytes at `offset` | Path-backed uncompressed TAR |
 | ZIP `store_member_content_hashes` | same | **decompressed** member (`Cursor` over inflate output) | Parallel Stored/Deflate via `File::try_clone` |
 | 7z `fill_member_content_hashes` | same | decoded member `Vec` then `compute_hashes_limited` | Inflate/decode dominates; hash is crate-SIMD |
 | G3 / ZIP / CAB / XAR inflate | `flate2` / `miniz_oxide` / `zlib-rs` (GZIDX hard restore only) | codec output | Inflate SIMD belongs to those crates, not this P2 |
 | Rapidgzip path | `rapidgzip-core` + zlib-rs or ISA-L | multi-MB gzip | Opt-in feature; CRC gated **off** on keep_index |
 
-`crc32fast` and `sha2` are already in `Cargo.lock`. `memchr` 2.8.3 is a **transitive** dep (not used by our crates for bulk scan).
+`crc32fast` and `sha2` are already in `Cargo.lock`. `memchr` 2.8.3 is a **transitive** dep (no `use memchr` in this workspace). `flate2` already pulls `crc32fast` transitively; sevenzip still needs a **direct** dep to call it from `parse.rs`.
 
 ### 3.2 Hand-rolled IEEE CRC-32 (same poly, scalar byte loop)
 
@@ -82,28 +88,35 @@ for each byte:
 crc = !crc
 ```
 
-| Site | Typical size | Bulk? |
-|------|----------------|-------|
-| `ratarmount-formats-sevenzip/src/parse.rs` `crc32` / `crc32_for_password_trial` | **Decompressed member or whole folder** on encrypted open; also 20-byte start/next-header | **Yes on trial** (inflate output). Headers are not the reason to change. |
-| `ratarmount-compress/src/xz_seek.rs` `crc32_ieee` | xz index/footer (≪ 1 KiB) | **No** — leave alone |
+Verified the same poly/init/xor as `crc32fast::hash` (ISO-HDLC / zlib). xz already asserts `b"123456789" → 0xCBF4_3926`. `hashing.rs` asserts `b"abc"` CRC hex `352441c2`.
 
-Header checks (`parse.rs` ~1053 / ~1072) can keep calling the same function after the swap; speed is irrelevant there. Password trial (`lib.rs` ~652 / ~684 / ~701) is the only place this loop runs on multi-MB inflate output.
+| Site | What is hashed | Typical size | Bulk? |
+|------|----------------|--------------|-------|
+| `parse::crc32` StartHeader | 20-byte `start_data` (offset + size + CRC fields) | 20 B | **No** |
+| `parse::crc32` NextHeader | packed `header_data` of length `next_header_size` | packed 7z header; can grow with file count; **not** inflate output | **No** (metadata) |
+| `parse::crc32_for_password_trial` | First non-empty file only (`resolve_password_for_archive` finds `size > 0 && !is_dir`, then `try_decrypt_entry_io`) | Shipped `ensure_encrypted_hello_fixture` / store+AES: `b"secret content\n"` (**15 B**). Full-folder CRC only when `folder.has_crc` or the progressive LZMA2 decoder is unused. A 3 MiB first member exists only in `regression_aes_lzma2_solid_*` when `a.bin` is first. | **Usually no.** Occasional large first member, not the common path. |
+| `xz_seek::crc32_ieee` | xz index/footer | ≪ 1 KiB | **No** — leave alone |
+
+7z does **not** CRC decompressed members on `open`/`cat` — only header parse + password trial.
+
+The swap still applies to **all** `parse::crc32` callers (headers ride along automatically). Do not describe trial CRC as “the multi-MB inflate-output path.”
 
 ### 3.3 memchr-shaped scans (not this P2)
 
 | Site | Haystack | Verdict |
 |------|----------|---------|
-| WARC `find_subslice` (`windows().position` for `\r\n\r\n`) | Remainder of slurped WARC from `pos` | Happy path stops at a short header. Do not add `memchr` “because the bullet listed it.” |
+| WARC `find_subslice` (`windows().position` for `\r\n\r\n`) | Remainder of slurped WARC from `pos` | Happy path stops at a short header |
 | HTTP `request.rs` header terminator | Request buffer | Small |
-| ZIP EOCD `windows(4).rposition` | Tail of central directory | ≤ 64 KiB + comment |
+| ZIP **production** `find_eocd_in_tail` | Last `EOCD_SEARCH_MAX` (65 535 + 22) bytes | ≤ ~64 KiB tail; **not** the test-only `windows(4).rposition` at zip `lib.rs` ~3247 |
 | HTML doctype windows | Tiny prefix | Small |
+| SMB `extract_ntlm` `windows(8)` for `NTLMSSP\0` | Negotiate blob | Tiny |
 | `StringPool::fnv1a64` | Path components | **Forbidden** |
 
-No call site hashes or scans **inflate output** with a scalar `memchr`-equivalent today. Full-file hash is `crc32fast`/`sha2`, not a byte search.
+No call site scans **inflate output** with `memchr` or `windows().position`. Full-file hash is `crc32fast`/`sha2`, not a byte search. Do not add the `memchr` crate “because the backlog bullet listed it.”
 
 ### 3.4 What “zlib-rs / rapidgzip is the reference” means here
 
-- SIMD only when the buffer is large enough that vector width amortizes (multi-MB inflate output, `--hashes` streams).
+- SIMD only when the buffer is large enough that vector width amortizes. That situation **already** exists on `--hashes` streams, not on typical 7z password trial.
 - Use a **maintained crate** that already has the wide implementation (`crc32fast`, `sha2`, zlib-rs, rapidgzip). Do not write `#[target_feature]` loops.
 - Do **not** copy Vectorize (embeddings, IVF, PQ, ANN). That file already points P2 SIMD here.
 
@@ -111,11 +124,11 @@ No call site hashes or scans **inflate output** with a scalar `memchr`-equivalen
 
 ## 4. Smallest correct change
 
-One behavior-preserving swap, one crate already in the workspace, tests at the parse layer.
+One behavior-preserving swap, one crate already in the workspace, tests at the parse layer. **Hygiene**, not a thruput program.
 
 ### 4.1 Code
 
-1. Add `crc32fast = "1"` to `ratarmount-formats-sevenzip/Cargo.toml` (same version as `ratarmount-index`; lockfile already has 1.5.0).
+1. Add `crc32fast = "1"` to `ratarmount-formats-sevenzip/Cargo.toml` (same version as `ratarmount-index`; lockfile already has 1.5.0). Direct dep is required even though `flate2` pulls it transitively.
 2. Replace `parse::crc32` with:
 
    ```rust
@@ -130,12 +143,12 @@ One behavior-preserving swap, one crate already in the workspace, tests at the p
 
 Alternative (rejected for this pass): re-export `crc32fast::hash` from `ratarmount-index::hashing` to avoid a direct sevenzip dep. sevenzip already depends on index, but parse.rs should not grow an index-hashing import for a container CRC.
 
-### 4.2 Why this and not a larger patch
+### 4.2 Why this and not a larger patch (or no patch)
 
 - `--hashes` CRC/SHA is **already** the bulk-hash SIMD path. Re-tuning `sha2` features is speculation.
-- 7z trial CRC is the **only** remaining scalar loop that runs on decompressed multi-MB buffers.
-- Inflate still dominates trial wall time (AES/LZMA2). This change does **not** claim a user-visible mount speedup. It removes a known-wrong toolbox (hand-rolled CRC next to `crc32fast`) and makes the backlog item honest.
-- If a later bench shows trial CRC ≥ a meaningful share of encrypted-open time, the same crate is already on the path. No second rewrite.
+- 7z `parse::crc32` is the **only remaining hand-rolled payload/container CRC** besides xz footers (leave xz). It is **not** typically multi-MB.
+- Inflate/decrypt still dominates encrypted-open wall time. This change does **not** claim a user-visible mount speedup.
+- Shipping the swap without an honest residual would be a **no-op dressed as P2**. The implementation PR exists to (a) stop maintaining a scalar twin of `crc32fast`, (b) pin IEEE vectors, (c) mark the backlog `~` with the residual in §6.
 
 ### 4.3 Compatibility
 
@@ -147,22 +160,24 @@ Alternative (rejected for this pass): re-export `crc32fast::hash` from `ratarmou
 
 AGENTS.md: every behavior change ships a regression test. Name/doc with `Regression:`.
 
+Pin **hardcoded** IEEE vectors (or a copy of the old 8-step loop on a tiny fixture). After `parse::crc32` becomes `crc32fast::hash`, asserting equality to a second `crc32fast::hash` is tautological and will not catch a wrong wrapper.
+
 | Test | Layer | Assert |
 |------|-------|--------|
-| `parse::crc32` known vector `b"123456789"` → `0xCBF4_3926` | `ratarmount-formats-sevenzip --lib` (next to existing `filetime` / `encrypted` tests) | Bit-identical to IEEE / xz vector |
-| Empty and short buffers (`b""`, `b"a"`) match a second independent `crc32fast::hash` or the old formula on a tiny fixture | same | No off-by-init on empty |
+| `parse::crc32` known vector `b"123456789"` → `0xCBF4_3926` | `ratarmount-formats-sevenzip --lib` | Bit-identical to IEEE / xz vector |
+| Empty + one-byte: `b""` → `0x00000000`, `b"a"` → `0xE8B7BE43` (IEEE) | same | Hardcoded; catches init/xor mistakes |
 | Existing `encrypted` / `encrypted_wrong_password` / `encrypted_store_aes` | same crate | Wrong password still fails; store+AES still exact bytes |
-| `cargo test -p ratarmount-index --lib hashing` | no code change expected | `--hashes` vectors unchanged |
+| `cargo test -p ratarmount-index --lib hashing` | no code change expected | `--hashes` vectors unchanged (`abc` / `foo\n`) |
 
-Do **not** add a CI microbench gate or invent MiB/s numbers. Optional local `criterion` is out of scope.
+Do **not** add a CI microbench gate or invent MiB/s numbers. Do **not** list `filetime` as a CRC filter (`filetime` is FILETIME→Unix only).
 
 When implementing, add one AGENTS.md catalog row, for example:
 
 ```text
-| 7z password-trial CRC uses crc32fast (IEEE) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `… encrypted` · new `crc32` known-vector filter |
+| 7z parse CRC uses crc32fast (IEEE) | `cargo test -p ratarmount-formats-sevenzip --lib crc32` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_wrong_password` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_store_aes` |
 ```
 
-(Use the actual new test filter name.)
+(Use the actual new test filter name. Run filters **separately** — `cargo test` does not treat `|` as OR.)
 
 ---
 
@@ -170,7 +185,7 @@ When implementing, add one AGENTS.md catalog row, for example:
 
 | Doc | Change |
 |-----|--------|
-| [`vectors-optimization.md`](../vectors-optimization.md) P2 SIMD | Mark `[x]`; one-line residual: `--hashes` already crate-SIMD; 7z trial CRC now `crc32fast`; memchr/path SIMD still non-goals |
+| [`vectors-optimization.md`](../vectors-optimization.md) P2 SIMD | Mark **`~`**, **not** `[x]`. Residual text must say: `--hashes` / inflate-output hash already `crc32fast`+`sha2`; 7z `parse::crc32` now `crc32fast` (trial is first file, usually small); **no** memchr-on-inflate path exists; path-component SIMD remains a non-goal. Do not redefine the checkbox as “True SIMD on multi-MB landed.” Optional clarifying gloss: “no remaining hand-rolled CRC/hash on payload buffers (memchr-on-inflate never existed).” |
 | This plan | Set status Implemented + commit SHA |
 | README / parity / mount-options / embedded-nested | **None** (no user-visible capability) |
 | `vectorize-steal-patterns.md` | No change (already points here) |
@@ -179,11 +194,10 @@ When implementing, add one AGENTS.md catalog row, for example:
 
 ## 7. Implementation order (after ACCEPT)
 
-1. `crc32fast` dep + `parse::crc32` swap + known-vector unit test.
-2. Run: `cargo fmt --all` · `cargo clippy -p ratarmount-formats-sevenzip --all-targets -- -D warnings` · `cargo test -p ratarmount-formats-sevenzip --lib` (include `encrypted`, `crc32` / `filetime` filters separately — `cargo test` does not treat `\|` as OR).
-3. Workspace clippy+test before merge if anything outside sevenzip touched (should not be).
-4. Flip backlog checkbox + AGENTS.md row in the **same** commit.
-5. Stop. Do not “also” retouch xz, WARC, or `sha2`.
+1. `crc32fast` dep + `parse::crc32` swap + hardcoded known-vector unit tests.
+2. Run: `cargo fmt --all` · `cargo clippy -p ratarmount-formats-sevenzip --all-targets -- -D warnings` · `cargo test -p ratarmount-formats-sevenzip --lib` then the `encrypted*` filters **separately**.
+3. Same-commit docs: vectors-optimization `~` + AGENTS.md catalog row. `cargo fmt --all` still required (AGENTS.md). Workspace clippy only if Rust outside sevenzip changed.
+4. Stop. Do not “also” retouch xz, WARC, `sha2`, or mark the P2 line `[x]`.
 
 ---
 
@@ -191,26 +205,27 @@ When implementing, add one AGENTS.md catalog row, for example:
 
 | Risk | Mitigation |
 |------|------------|
-| `crc32fast` init/poly disagrees with 7z on some length | Known vector + existing trial tests; fail closed |
-| Reviewer treats this as an inflate or `--hashes` perf claim | PR text: correctness/hygiene; no MiB/s |
+| `crc32fast` init/poly disagrees with 7z on some length | Hardcoded IEEE vectors + existing trial tests; fail closed |
+| Reviewer treats this as an inflate or `--hashes` perf claim | PR text: hygiene; no MiB/s; backlog stays `~` |
 | Scope creep into G3/rapidgzip/ISA-L | Listed as non-goals; those trains have their own docs |
 | MSRV 1.74 | `crc32fast` 1.5 already built on default CI |
 | macOS / non-x86 | `crc32fast` has scalar + NEON; no `#[cfg(target_arch)]` in our code |
+| Closing P2 as done | Forbidden; see §6 |
 
 ---
 
 ## 9. Skeptic-plan-review
 
-Process: **never skip sweep 1**. Each sweep is a **fresh** skeptic (not the author). Fold blockers into this file. **Cap 3** skeptic sweeps; if still unresolved → **BLOCKED**. Stop at **ACCEPT** or **BLOCKED**. This PR does not implement.
+Process: **never skip sweep 1**. Each sweep is a **fresh** skeptic (not the author, not a prior skeptic). Fold blockers into this file. **Cap 3** skeptic sweeps; if still unresolved → **BLOCKED**. Stop at **ACCEPT** or **BLOCKED**. This PR does not implement.
 
 | Sweep | Role | Verdict | Folded into |
 |-------|------|---------|-------------|
-| 0 | Author inventory + smallest-change draft | — | §§1–8 |
-| 1 | Fresh skeptic (required) | *pending* | |
-| 2 | Fresh skeptic (only if sweep 1 is not ACCEPT) | | |
+| 0 | Author inventory + smallest-change draft | — | §§1–8 (superseded by sweep 1) |
+| 1 | Fresh skeptic | **REVISE** | Trial is first-file / usually 15 B (§§1, 3.2, 4.2). NextHeader is `next_header_size`, not 20 B (§3.2). Do not mark P2 `[x]` (§6). Tests must pin hardcoded IEEE vectors (§5). ZIP production EOCD is `find_eocd_in_tail` (§3.3). SHA-NI is x86-only; `asm` stays off (§2). AGENTS.md catalog must not use `filetime` (§5). |
+| 2 | Fresh skeptic (not sweep 1) | *pending* | |
 | 3 | Fresh skeptic (last) | | |
 
-**Final:** *pending sweep 1*
+**Final:** *pending sweep 2*
 
 ---
 
@@ -219,4 +234,4 @@ Process: **never skip sweep 1**. Each sweep is a **fresh** skeptic (not the auth
 - Density backlog: [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md)
 - Vectorize systems (not SIMD): [`docs/tasks/vectorize-steal-patterns.md`](../vectorize-steal-patterns.md)
 - Gzip inflate trains: [`docs/gzip-binding-decision.md`](../../gzip-binding-decision.md), [`g3-polish-batch.md`](../g3-polish-batch.md), [`rapidgzip-perf-batch.md`](../rapidgzip-perf-batch.md)
-- Code: `ratarmount-index/src/hashing.rs`, `ratarmount-formats-sevenzip/src/parse.rs`, `ratarmount-formats-zip/src/lib.rs` (`store_member_content_hashes`), `ratarmount-compress/src/xz_seek.rs`
+- Code: `ratarmount-index/src/hashing.rs`, `ratarmount-formats-sevenzip/src/parse.rs` + `lib.rs` (`resolve_password_for_archive`, `try_decrypt_entry_io`), `ratarmount-formats-zip/src/lib.rs` (`store_member_content_hashes`, `find_eocd_in_tail`), `ratarmount-compress/src/xz_seek.rs`
