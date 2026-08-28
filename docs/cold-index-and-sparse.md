@@ -10,7 +10,7 @@
 
 1. Build PRAGMAs on writable open: `locking_mode=EXCLUSIVE`, `temp_store=MEMORY`, `journal_mode=OFF`, `synchronous=OFF`
 2. Single `BEGIN IMMEDIATE` … `COMMIT` around the full index build
-3. Batched inserts (`insert_files_batch`, flush every 512 rows) with prepared statements
+3. Batched inserts (`insert_files_batch_soa` from a 512-row SoA window, not `Vec<FileRow>`) with the same prepared single-row `INSERT OR REPLACE`
 4. Parent directories buffered in the same batch (no per-file SQLite round-trip)
 
 **Result (empty-1k.tar, release, this host):**

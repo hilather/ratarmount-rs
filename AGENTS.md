@@ -76,6 +76,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS stale base read after live commit with delete (offsets shift) | `cargo test -p ratarmount-nfs --lib overlay_commit_live_delete_shifts` |
 | FUSE stale base read after live commit with delete (offsets shift) | `cargo test -p ratarmount-fuse --lib overlay_commit_live_delete_shifts` |
 | NULL `offsetheader` row breaks cheap readdir / warm open (foreign index) | `cargo test -p ratarmount-index --lib regression_null_offsetheader` |
+| SQLite bulk insert SoA window (P2) | `cargo test -p ratarmount-index --lib insert_files_batch_soa` · `cargo test -p ratarmount-index --lib sql_files_type` · `cargo test -p ratarmount-formats-tar --lib regression_sql_type` · `cargo test -p ratarmount-formats-zip --lib regression_sql_type_deflate` · `cargo test -p ratarmount-formats-sevenzip --lib regression_sql_files_type` |
 | Crafted `inf`/`1e999` mtime panics FUSE daemon (SystemTime overflow) | `cargo test -p ratarmount-fuse --lib unix_float_to_system_time_extreme` |
 | NFS readdir cookie vanished mid-listing aborts `ls`; v4 cookie 1/2 reserved | `cargo test -p ratarmount-nfs --lib readdir_start_after_and_bad_cookie` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_readdir_cookie` |
 | NFS `ls -lah` missing `.` / `..` (v3 READDIR prefix; v4 Linux injects them) | `cargo test -p ratarmount-nfs --lib readdir_dot` · `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_readdir_does_not_emit` |

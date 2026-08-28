@@ -62,7 +62,7 @@ use ratarmount_core::{
     normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
-use ratarmount_index::{compute_hashes_limited, IndexError, SqliteIndex};
+use ratarmount_index::{compute_hashes_limited, FileRowSoa, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use zip::CompressionMethod;
@@ -73,6 +73,7 @@ pub const BACKEND_NAME: &str = "ZipMountSource";
 
 const METHOD_STORED: u16 = 0;
 const METHOD_DEFLATE: u16 = 8;
+const ZIP_BATCH_FLUSH: usize = 512;
 
 /// Soft cap on completed inflate-cache entries (evict completed when exceeded).
 const INFLATE_CACHE_MAX_ENTRIES: usize = 256;
@@ -857,6 +858,7 @@ impl ZipMountSource {
             std::collections::BTreeSet::new();
         // (offsetheader, central-directory index, uncompressed size) for content hashing.
         let mut hash_targets: Vec<(i64, usize, u64)> = Vec::new();
+        let mut batch = FileRowSoa::with_capacity(ZIP_BATCH_FLUSH);
 
         for i in 0..archive.len() {
             let zf = open_member(archive, i, password)?;
@@ -927,10 +929,10 @@ impl ZipMountSource {
                 None => (String::new(), full_path.clone()),
             };
 
-            ensure_parent_dirs(&index, &path, &mut generated_dirs, mtime)?;
+            ensure_parent_dirs(&mut batch, &path, &mut generated_dirs, mtime);
 
             // offset = data_start; type = compression method
-            index.insert_file(
+            batch.push(
                 &path,
                 &base,
                 header_offset as i64,
@@ -946,7 +948,11 @@ impl ZipMountSource {
                 false,
                 false,
                 0,
-            )?;
+            );
+            if batch.len() >= ZIP_BATCH_FLUSH {
+                index.insert_files_batch_soa(&batch)?;
+                batch.clear();
+            }
             // Regular files with size > 0: same eligibility as index `regular_file_payloads`.
             if !hash_algorithms.is_empty() && !is_dir && !is_symlink && size > 0 {
                 hash_targets.push((header_offset as i64, i, size));
@@ -962,6 +968,10 @@ impl ZipMountSource {
                     index: i,
                 },
             );
+        }
+        if !batch.is_empty() {
+            index.insert_files_batch_soa(&batch)?;
+            batch.clear();
         }
         members.finish();
 
@@ -2091,13 +2101,13 @@ fn store_stats_synthetic(index: &SqliteIndex, size: u64) -> Result<()> {
 }
 
 fn ensure_parent_dirs(
-    index: &SqliteIndex,
+    batch: &mut FileRowSoa,
     path: &str,
     generated: &mut std::collections::BTreeSet<String>,
     mtime: f64,
-) -> Result<()> {
+) {
     if path.is_empty() {
-        return Ok(());
+        return;
     }
     let parts: Vec<&str> = path
         .trim_start_matches('/')
@@ -2117,11 +2127,10 @@ fn ensure_parent_dirs(
         }
         generated.insert(cur.clone());
         let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
-        index.insert_file(
+        batch.push(
             &parent, part, 0, 0, 0, mtime, mode, 0, "", 0, 0, false, false, true, 0,
-        )?;
+        );
     }
-    Ok(())
 }
 
 fn msdos_to_unix(year: u16, month: u8, day: u8, hour: u8, min: u8, sec: u8) -> f64 {
@@ -3292,5 +3301,76 @@ mod tests {
             buf2, "zip-v2-longer\n",
             "must serve new ZIP data after tarstats mismatch rebuild"
         );
+    }
+
+    /// Regression: SQL `type` after SoA flush — Deflate member is 8; generated parents are 0.
+    ///
+    /// Stored-only zip cannot catch a dropped typeflag (members and parents are both 0).
+    /// Other-method `0xffff` is residual (no cheap writer in this crate).
+    #[test]
+    fn regression_sql_type_deflate_and_generated_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("mix.zip");
+        let index_path = dir.path().join("mix.zip.index.sqlite");
+        {
+            let file = File::create(&archive).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let stored = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            zw.start_file("a/b/stored.txt", stored).unwrap();
+            zw.write_all(b"stored\n").unwrap();
+            let deflated =
+                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated);
+            zw.start_file("a/b/def.txt", deflated).unwrap();
+            zw.write_all(b"deflate me please repeated repeated\n")
+                .unwrap();
+            zw.finish().unwrap();
+        }
+
+        let opts = OpenOptions {
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&archive, Some(&index_path), &opts, "test", true)
+            .expect("open mixed zip");
+        let fi_def = src.lookup("/a/b/def.txt", 0).expect("def.txt");
+        let fi_stored = src.lookup("/a/b/stored.txt", 0).expect("stored.txt");
+        let fi_a = src.lookup("/a", 0).expect("generated /a");
+        let fi_ab = src.lookup("/a/b", 0).expect("generated /a/b");
+        let oh_def = match fi_def.userdata.first() {
+            Some(UserData::Tar(ud)) => ud.offsetheader.expect("def oh") as i64,
+            _ => panic!("def userdata"),
+        };
+        let oh_stored = match fi_stored.userdata.first() {
+            Some(UserData::Tar(ud)) => ud.offsetheader.expect("stored oh") as i64,
+            _ => panic!("stored userdata"),
+        };
+        match fi_a.userdata.first() {
+            Some(UserData::Tar(ud)) => {
+                assert!(ud.isgenerated);
+                assert_eq!(ud.offsetheader, Some(0));
+            }
+            _ => panic!("/a userdata"),
+        }
+        match fi_ab.userdata.first() {
+            Some(UserData::Tar(ud)) => {
+                assert!(ud.isgenerated);
+                assert_eq!(ud.offsetheader, Some(0));
+            }
+            _ => panic!("/a/b userdata"),
+        }
+        drop(src);
+
+        let idx = SqliteIndex::open_read_only(&index_path).expect("reopen on-disk sidecar");
+        assert_eq!(
+            idx.sql_files_type("/a/b", "def.txt", oh_def).unwrap(),
+            Some(8),
+            "Deflate method must be SQL type 8"
+        );
+        assert_eq!(
+            idx.sql_files_type("/a/b", "stored.txt", oh_stored).unwrap(),
+            Some(0)
+        );
+        assert_eq!(idx.sql_files_type("", "a", 0).unwrap(), Some(0));
+        assert_eq!(idx.sql_files_type("/a", "b", 0).unwrap(), Some(0));
     }
 }
