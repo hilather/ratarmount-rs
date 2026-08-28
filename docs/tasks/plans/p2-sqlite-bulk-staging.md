@@ -325,6 +325,14 @@ Process: sweep 1 required; each sweep a **fresh** skeptic; fold blockers; cap 3 
 | 2 | **BLOCKED** — `sql_files_type` as `#[cfg(test)]` is invisible to format-crate tests; no `rusqlite` / `:memory:` cannot reopen | Helper is normal `pub` on `SqliteIndex`; compat path must not build a temp SoA; flush sites must `clear()`; `pub` SoA + `insert_files_batch_soa`; invariant 6 includes `0xffff`; 7z `type==0` is not coverage; mermaid/`push_row` reuse; format `push(&str)` |
 | 3 | **ACCEPT** (nits only) | `sql_files_type` is PK-exact (dumpdir dual `oh`); rustdoc not README; ZIP/7z type tests use on-disk index (`index` is private); hand-written typeflag `S` (not `tar --sparse`); forbid SoA→`Vec<FileRow>` at flush; mid-loop `clear()`; ZIP peak 1→512 is wall-time |
 
+### Skeptic-code-review (implementation)
+
+| Sweep | Result | Folded |
+|-------|--------|--------|
+| 1 | **ACCEPT** | 7z type test `eprintln!("skip: …")` when CLI missing |
+| 2 | **ACCEPT** | dumpdir `oh_dir == oh_reg + 1` + mode REG/DIR; SoA index `sql_files_type` (not only dump equality) |
+| 3 | **ACCEPT** (nits only) | flatten mid-walk window residual (same as `main`); ZIP `0xffff` residual; 7z `type==0` not coverage |
+
 ---
 
 ## Related
