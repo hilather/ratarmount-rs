@@ -4,7 +4,7 @@
 |-------|--------|
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-5** (todo, S–M) |
 | **Date** | 2026-08-28 |
-| **Status** | **Implemented** (v1; SHA pending first implementation commit) |
+| **Status** | **Implemented** (v1; SHA `b629e07`) |
 | **Implements** | Opt-in catalog / locate order by `offsetheader` so sequential readers hit nearby archive bytes |
 | **Does not implement** | k-means, IVF centroid files, ANN, cosine clustering, default `ls` sort change |
 | **Ownership** | `ratarmount-index` + `ratarmount` find CLI. TAR crate for the seek-count + dumpdir regressions. **Do not** change `factory.rs` glue. |
@@ -447,3 +447,19 @@ No must-fix blockers. Startable if the implementer follows the normative equalit
 Nits folded without reopening design: hardlink exclusion stays; rationale corrected (`open` does not follow the target). Dumpdir `D` already drops via newest-wins → directory row. Residual nits that must **not** reopen: do not “fix” `regression_null_offsetheader` onto `load_mem_index`; do not UTF-8-sort mem iteration; do not expand payload; no second LIMIT rule; no second dumpdir policy.
 
 **Stop.** Do not implement in this PR.
+
+---
+
+## Skeptic-code-review (implementation PR)
+
+Protocol: never skip sweep 1; fresh Task skeptic each sweep; cap 3; fold blockers; stop at ACCEPT or BLOCKED.
+
+### Sweep 1 — ACCEPT
+
+Skeptic: Task `bc-aaace12c-36fe-584b-9402-a7d6e7215389`.
+
+No must-fix or should-fix blockers. Normative equalities hold: `list_dirents` bodies unchanged; `list_dirents_ordered(OffsetHeader) == sort(list_dirents)`; flatten is global; dumpdir newest-then-filter; find `--offset-order` is boolean find-argv and re-sorts after path-order LIMIT; NULL stays `-1` / last.
+
+Nits that must **not** reopen design: SHA filled as `b629e07`; `all_path_ids` may `sort_unstable` (comparator stays `sort_by`); CLI TSV may skip if the bin is missing; seek log uses `cookie.offset`. Residuals §9 stay closed.
+
+**Stop.** ACCEPT.
