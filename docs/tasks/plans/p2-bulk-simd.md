@@ -238,9 +238,11 @@ Skeptic-code-review of the implementation diff (never skip sweep 1; cap 3; stop 
 
 | Sweep | Role | Verdict | Folded into |
 |-------|------|---------|-------------|
-| 1 | Fresh skeptic (not the implementer) | *(pending)* | |
-| 2 | | | |
-| 3 | | | |
+| 1 | Fresh skeptic (not the implementer) | **ACCEPT** | No blockers. Nit: plan SHA is the swap commit `09f75f1`, not the SHA-stamp follow-up (chicken-and-egg; §6 satisfied). |
+| 2 | *(not run — sweep 1 ACCEPT)* | — | |
+| 3 | *(not run)* | — | |
+
+**Final: ACCEPT.** Hygiene swap only. Do not claim True SIMD on multi-MB landed.
 
 ---
 
