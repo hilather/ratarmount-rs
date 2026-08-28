@@ -3234,25 +3234,26 @@ mod tests {
         assert_eq!(ud.offsetheader, None);
     }
 
-    type FilesDump = Vec<(
-        String,
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        String,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-        i64,
-    )>;
+    #[derive(Debug, PartialEq)]
+    struct FilesSqlRow {
+        path: String,
+        name: String,
+        offsetheader: i64,
+        offset: i64,
+        size: i64,
+        mtime: i64,
+        mode: i64,
+        typeflag: i64,
+        linkname: String,
+        uid: i64,
+        gid: i64,
+        istar: i64,
+        issparse: i64,
+        isgenerated: i64,
+        recursiondepth: i64,
+    }
 
-    fn dump_files_sql(idx: &SqliteIndex) -> FilesDump {
+    fn dump_files_sql(idx: &SqliteIndex) -> Vec<FilesSqlRow> {
         idx.with_conn(|conn| {
             let mut stmt = conn.prepare(
                 r#"SELECT path, name, offsetheader, offset, size, CAST(mtime AS INTEGER),
@@ -3261,49 +3262,26 @@ mod tests {
                    FROM "files" ORDER BY path, name, offsetheader"#,
             )?;
             let rows = stmt.query_map([], |r| {
-                Ok((
-                    r.get::<_, String>(0)?,
-                    r.get::<_, String>(1)?,
-                    r.get::<_, i64>(2)?,
-                    r.get::<_, i64>(3)?,
-                    r.get::<_, i64>(4)?,
-                    r.get::<_, i64>(5)?,
-                    r.get::<_, i64>(6)?,
-                    r.get::<_, i64>(7)?,
-                    r.get::<_, String>(8)?,
-                    r.get::<_, i64>(9)?,
-                    r.get::<_, i64>(10)?,
-                    r.get::<_, i64>(11)?,
-                    r.get::<_, i64>(12)?,
-                    r.get::<_, i64>(13)?,
-                    r.get::<_, i64>(14)?,
-                ))
+                Ok(FilesSqlRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    offsetheader: r.get(2)?,
+                    offset: r.get(3)?,
+                    size: r.get(4)?,
+                    mtime: r.get(5)?,
+                    mode: r.get(6)?,
+                    typeflag: r.get(7)?,
+                    linkname: r.get(8)?,
+                    uid: r.get(9)?,
+                    gid: r.get(10)?,
+                    istar: r.get(11)?,
+                    issparse: r.get(12)?,
+                    isgenerated: r.get(13)?,
+                    recursiondepth: r.get(14)?,
+                })
             })?;
-            let mut out = Vec::new();
-            for row in rows {
-                let (
-                    path,
-                    name,
-                    oh,
-                    off,
-                    size,
-                    mtime,
-                    mode,
-                    typ,
-                    link,
-                    uid,
-                    gid,
-                    istar,
-                    issparse,
-                    isgen,
-                    rec,
-                ) = row?;
-                out.push((
-                    path, name, oh, off, size, mtime, mode, typ, link, uid, gid, istar, issparse,
-                    isgen, rec,
-                ));
-            }
-            Ok(out)
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(IndexError::from)
         })
         .unwrap()
     }
@@ -3415,10 +3393,10 @@ mod tests {
         let dump = dump_files_sql(&idx_a);
         let a_row = dump
             .iter()
-            .find(|(p, n, oh, ..)| p == "/shared/prefix" && n == "a.txt" && *oh == 0)
+            .find(|r| r.path == "/shared/prefix" && r.name == "a.txt" && r.offsetheader == 0)
             .expect("replaced a.txt");
-        assert_eq!(a_row.4, 99, "REPLACE must update size");
-        assert!(dump.iter().any(|(_, n, ..)| n.is_empty()));
+        assert_eq!(a_row.size, 99, "REPLACE must update size");
+        assert!(dump.iter().any(|r| r.name.is_empty()));
 
         let idx_b = idx_b.into_read_only().unwrap();
         assert!(
