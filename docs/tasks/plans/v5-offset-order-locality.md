@@ -4,7 +4,7 @@
 |-------|--------|
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-5** (todo, S–M) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft plan (sweeps 1–2 folded; sweep 3 pending) |
+| **Status** | **ACCEPT** (skeptic-plan-review: 3 sweeps; do not implement in this PR) |
 | **Implements** | Opt-in catalog / locate order by `offsetheader` so sequential readers hit nearby archive bytes |
 | **Does not implement** | k-means, IVF centroid files, ANN, cosine clustering, default `ls` sort change |
 | **Ownership** | `ratarmount-index` + `ratarmount` find CLI. TAR crate for the seek-count + dumpdir regressions. **Do not** change `factory.rs` glue. |
@@ -227,7 +227,7 @@ Algorithm (must match walking every directory’s `list_dirents` then TAR dumpdi
 
 1. For each `(path, name)`, take the newest-wins row **including** dumpdir tombstones — same collapse as `list_dirents` / `versions.last()` (max oh; NULL last / never 0).
 2. Drop the name if the winner’s `linkname` is `\0GNU.dumpdir.delete`.
-3. Keep **payload** members only: `(mode & S_IFMT) == S_IFREG`, not dumpdir-tombstone, not generated, **not typeflag `'1'` hardlinks** (`S_IFREG` + nonempty `linkname` — open seeks to the **target**, which is an earlier offset and would inject backward seeks). Dirs and `'2'` symlinks are dropped. Dumpdir `D` meta rows may be excluded; if included they must still obey newest-then-filter. Devices/fifos as `S_IFREG` with empty linkname stay (rare).
+3. Keep **payload** members only: `(mode & S_IFMT) == S_IFREG`, not dumpdir-tombstone, not generated, **not typeflag `'1'` hardlinks**. Mem SoA does not store typeflag; the portable test is `S_IFREG` + nonempty `linkname` (only `'5'`/`/` → dir and `'2'` → symlink in TAR `push_entry`). TAR `open` does **not** follow the hardlink target (size 0 → empty `Cursor`; else stencil at **this** member’s offset) — still exclude hardlinks from the sequential-payload list. Dirs and `'2'` symlinks are dropped. Dumpdir `D` meta is `S_IFREG` at `oh` plus `S_IFDIR` at `oh+1`; newest-wins is the directory, so “drop dirs” already drops `D` names. Devices/fifos as `S_IFREG` with empty linkname stay (rare).
 4. **Global** sort of the surviving rows with §4.1 (`path`/`name` as the name key).
 
 **Forbidden as flatten:** concatenate per-directory `list_dirents_ordered(..., OffsetHeader)` in directory-name / intern-id / walk order. That is not a global offset sort (interleaved dirs keep intra-dir runs and still seek backward).
@@ -399,7 +399,7 @@ Do not wire FUSE, NFS, overlay, or FileVersionLayer production code.
 
 v1 is done when:
 
-- Default `list_dirents` is unchanged on **both** unsealed SQL (UTF-8) and sealed mem (intern-id); FUSE/NFS production paths untouched.
+- Default `list_dirents` is unchanged on unsealed SQL (UTF-8) and **builder-sealed** mem (intern-id via `insert_files_batch`); FUSE/NFS production paths untouched.
 - `find --offset-order` re-sorts today’s hit set (same LIMIT membership) and is NULL-safe / clap-steal-safe.
 - `list_dirents_ordered(..., OffsetHeader)` is `sort(list_dirents)`.
 - `list_visible_files_by_offset` is shipped; dumpdir is newest-then-filter; seek-count uses this helper on an interleaved multi-dir fixture: flatten has **zero** backward seeks; name-order control has ≥1.
@@ -438,6 +438,12 @@ Must-fix folded:
 
 Should-fix folded: hardlink `'1'` excluded from flatten; shared comparator + NULL search hit; NULL vs `oh=0` newest-wins → cookie 0; FTS+LIMIT test; `sort` not `sort_unstable`; do not edit the two `list_dirents` bodies; NFS “no prior child ids”.
 
-### Sweep 3
+### Sweep 3 — ACCEPT
 
-_(pending)_
+Skeptic: Task `bc-ae1752c3-f2f3-57d9-a996-088b3d693383`.
+
+No must-fix blockers. Startable if the implementer follows the normative equalities and the §5 table.
+
+Nits folded without reopening design: hardlink exclusion stays; rationale corrected (`open` does not follow the target). Dumpdir `D` already drops via newest-wins → directory row. Residual nits that must **not** reopen: do not “fix” `regression_null_offsetheader` onto `load_mem_index`; do not UTF-8-sort mem iteration; do not expand payload; no second LIMIT rule; no second dumpdir policy.
+
+**Stop.** Do not implement in this PR.
