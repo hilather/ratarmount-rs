@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs (skeptic-reviewed plan; Phase 0 implement) |
 | **Date** | 2026-08-28 |
-| **Status** | **Implemented Phase 0** (SHA pending commit) — lock-contention reading closed as N/A (already isolated). Phase 1 remains gated / not authorized. |
+| **Status** | **Implemented Phase 0** (`a38ff284c0b8f9da8883512d8d156b1b65583c5e`) — lock-contention reading closed as N/A (already isolated). Phase 1 remains gated / not authorized. |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Parallel nested open pools” |
 | **Scope** | Investigate the eager parallel nested-open path vs compact `StringPool`. Decide whether a per-worker arena + parent-pool merge is justified. If not, close the item as already-isolated. If yes, specify a RAM-only merge that does **not** change the durable nested blob. |
 | **Out of this train** | Durable `nestedindexes` / RNIB encoding; intra-archive parallel ZIP/TAR fill; AutoMount `PathIntern` redesign; parent `SharedArchiveIo` mutex; SIMD; lazy (`-l`) sequential mount |
