@@ -40,7 +40,7 @@ use ratarmount_core::{
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use thiserror::Error;
 
-use mem::{mem_index_from_sql_rows, MemIndex, MemIndexBuilder, SqlMemRow};
+use mem::{mem_index_from_sql_rows, MemIndex, MemIndexBuilder, SqlMemRow, StringPool};
 use ratarmount_core::OpenOptions;
 
 pub use mem::{CompactOpenCookie, IndexDirent, DIR_SHARD_COUNT, DIR_SHARD_THRESHOLD};
@@ -1512,6 +1512,27 @@ impl SqliteIndex {
         })
     }
 
+    /// SQL `files.type` for the exact PK `(path, name, offsetheader)` (test/debug).
+    ///
+    /// Newest-only [`lookup`] cannot see dumpdir’s dual rows (`oh` and `oh+1`) or
+    /// a nested-as-directory row at `offsetheader+1`. `FileInfo` / MemIndex omit `type`.
+    pub fn sql_files_type(&self, path: &str, name: &str, offsetheader: i64) -> Result<Option<i64>> {
+        if self.compact_only {
+            return Ok(None);
+        }
+        self.with_conn(|conn| {
+            let v: Option<i64> = conn
+                .query_row(
+                    r#"SELECT type FROM "files"
+                       WHERE path = ?1 AND name = ?2 AND offsetheader = ?3"#,
+                    params![path, name, offsetheader],
+                    |r| r.get(0),
+                )
+                .optional()?;
+            Ok(v)
+        })
+    }
+
     /// Insert one files row (used by format builders). Prefer [`insert_files_batch`] for cold index.
     #[allow(clippy::too_many_arguments)]
     pub fn insert_file(
@@ -1557,6 +1578,9 @@ impl SqliteIndex {
     ///
     /// Also feeds the insert-time [`MemIndexBuilder`] (string pool + compact rows) when
     /// this index was created via [`create_writable`].
+    ///
+    /// Compatibility path for patch/search/ASAR and other formats. TAR/ZIP/7z cold
+    /// builds use [`insert_files_batch_soa`] so the flush window is not a `Vec<FileRow>`.
     pub fn insert_files_batch(&self, rows: &[FileRow]) -> Result<()> {
         if rows.is_empty() {
             return Ok(());
@@ -1567,32 +1591,26 @@ impl SqliteIndex {
         // Compact-only nested: MemIndex builder is the sole file-table store.
         if !self.compact_only {
             self.with_conn(|conn| {
-                let mut stmt = conn.prepare_cached(
-                    r#"
-                INSERT OR REPLACE INTO "files"
-                (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
-                 uid, gid, istar, issparse, isgenerated, recursiondepth)
-                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
-                "#,
-                )?;
+                let mut stmt = conn.prepare_cached(INSERT_FILES_SQL)?;
                 for r in rows {
-                    stmt.execute(params![
-                        r.path,
-                        r.name,
+                    bind_files_row(
+                        &mut stmt,
+                        &r.path,
+                        &r.name,
                         r.offsetheader,
                         r.offset,
                         r.size,
                         r.mtime,
                         r.mode,
                         r.typeflag,
-                        r.linkname,
+                        &r.linkname,
                         r.uid,
                         r.gid,
                         r.istar,
                         r.issparse,
                         r.isgenerated,
                         r.recursiondepth,
-                    ])?;
+                    )?;
                 }
                 Ok(())
             })?;
@@ -1601,6 +1619,55 @@ impl SqliteIndex {
         if let Ok(mut guard) = self.mem_builder.lock() {
             if let Some(b) = guard.as_mut() {
                 b.push_rows(rows);
+            }
+        }
+        Ok(())
+    }
+
+    /// Bind the existing single-row `INSERT OR REPLACE` from a [`FileRowSoa`] window.
+    ///
+    /// Does **not** clear `rows` — callers must [`FileRowSoa::clear`] after each flush
+    /// so the window pool stays *O(512)*. Reconstructs one [`FileRow`] at a time only
+    /// for [`MemIndexBuilder::push_row`]. Does not allocate a temporary `Vec<FileRow>`.
+    pub fn insert_files_batch_soa(&self, rows: &FileRowSoa) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        if self.read_only {
+            return Err(IndexError::Invalid("index is read-only".into()));
+        }
+        if !self.compact_only {
+            self.with_conn(|conn| {
+                let mut stmt = conn.prepare_cached(INSERT_FILES_SQL)?;
+                for i in 0..rows.len() {
+                    bind_files_row(
+                        &mut stmt,
+                        rows.path_at(i),
+                        rows.name_at(i),
+                        rows.offsetheader[i],
+                        rows.offset[i],
+                        rows.size[i],
+                        rows.mtime[i],
+                        rows.mode[i],
+                        rows.typeflag[i],
+                        rows.linkname_at(i),
+                        rows.uid[i],
+                        rows.gid[i],
+                        rows.istar[i],
+                        rows.issparse[i],
+                        rows.isgenerated[i],
+                        rows.recursiondepth[i],
+                    )?;
+                }
+                Ok(())
+            })?;
+        }
+        if let Ok(mut guard) = self.mem_builder.lock() {
+            if let Some(b) = guard.as_mut() {
+                for i in 0..rows.len() {
+                    let row = rows.file_row_at(i);
+                    b.push_row(&row);
+                }
             }
         }
         Ok(())
@@ -1974,6 +2041,55 @@ impl SqliteIndex {
     }
 }
 
+/// Prepared single-row `INSERT OR REPLACE` used by both [`SqliteIndex::insert_files_batch`]
+/// and [`SqliteIndex::insert_files_batch_soa`]. Do not change — `create-index-tables.sql`
+/// / `INDEX_VERSION` stay 0.7.x.
+const INSERT_FILES_SQL: &str = r#"
+                INSERT OR REPLACE INTO "files"
+                (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                 uid, gid, istar, issparse, isgenerated, recursiondepth)
+                VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15)
+                "#;
+
+#[allow(clippy::too_many_arguments)]
+fn bind_files_row(
+    stmt: &mut rusqlite::CachedStatement<'_>,
+    path: &str,
+    name: &str,
+    offsetheader: i64,
+    offset: i64,
+    size: i64,
+    mtime: f64,
+    mode: i64,
+    typeflag: i64,
+    linkname: &str,
+    uid: i64,
+    gid: i64,
+    istar: bool,
+    issparse: bool,
+    isgenerated: bool,
+    recursiondepth: i64,
+) -> rusqlite::Result<()> {
+    stmt.execute(params![
+        path,
+        name,
+        offsetheader,
+        offset,
+        size,
+        mtime,
+        mode,
+        typeflag,
+        linkname,
+        uid,
+        gid,
+        istar,
+        issparse,
+        isgenerated,
+        recursiondepth,
+    ])?;
+    Ok(())
+}
+
 /// One row for the `files` table (bulk or single insert).
 #[derive(Debug, Clone)]
 pub struct FileRow {
@@ -2030,6 +2146,181 @@ impl FileRow {
             isgenerated,
             recursiondepth,
         }
+    }
+}
+
+/// Build-only SoA flush window for TAR / ZIP / 7z cold index (P2).
+///
+/// Interns full `path` / `name` / `linkname` TEXT in a **window-local** string pool
+/// (`""` → id 0). Not live `EntrySoa` (no `typeflag`, drops empty names, REPLACE
+/// is in-place by SoA index). Call [`Self::clear`] after every
+/// [`SqliteIndex::insert_files_batch_soa`] so the pool does not grow with the archive.
+pub struct FileRowSoa {
+    pool: StringPool,
+    path_id: Vec<u32>,
+    name_id: Vec<u32>,
+    linkname_id: Vec<u32>,
+    offsetheader: Vec<i64>,
+    offset: Vec<i64>,
+    size: Vec<i64>,
+    mtime: Vec<f64>,
+    mode: Vec<i64>,
+    typeflag: Vec<i64>,
+    uid: Vec<i64>,
+    gid: Vec<i64>,
+    istar: Vec<bool>,
+    issparse: Vec<bool>,
+    isgenerated: Vec<bool>,
+    recursiondepth: Vec<i64>,
+}
+
+impl FileRowSoa {
+    pub fn with_capacity(n: usize) -> Self {
+        Self {
+            pool: StringPool::new(),
+            path_id: Vec::with_capacity(n),
+            name_id: Vec::with_capacity(n),
+            linkname_id: Vec::with_capacity(n),
+            offsetheader: Vec::with_capacity(n),
+            offset: Vec::with_capacity(n),
+            size: Vec::with_capacity(n),
+            mtime: Vec::with_capacity(n),
+            mode: Vec::with_capacity(n),
+            typeflag: Vec::with_capacity(n),
+            uid: Vec::with_capacity(n),
+            gid: Vec::with_capacity(n),
+            istar: Vec::with_capacity(n),
+            issparse: Vec::with_capacity(n),
+            isgenerated: Vec::with_capacity(n),
+            recursiondepth: Vec::with_capacity(n),
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.path_id.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.path_id.is_empty()
+    }
+
+    /// Drop column vecs and reset the window pool to `{""}` (id 0 only).
+    pub fn clear(&mut self) {
+        self.pool = StringPool::new();
+        self.path_id.clear();
+        self.name_id.clear();
+        self.linkname_id.clear();
+        self.offsetheader.clear();
+        self.offset.clear();
+        self.size.clear();
+        self.mtime.clear();
+        self.mode.clear();
+        self.typeflag.clear();
+        self.uid.clear();
+        self.gid.clear();
+        self.istar.clear();
+        self.issparse.clear();
+        self.isgenerated.clear();
+        self.recursiondepth.clear();
+    }
+
+    /// Stage one row from `&str` (format-builder hot path). Interns TEXT; no [`FileRow`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn push(
+        &mut self,
+        path: &str,
+        name: &str,
+        offsetheader: i64,
+        offset: i64,
+        size: i64,
+        mtime: f64,
+        mode: i64,
+        typeflag: i64,
+        linkname: &str,
+        uid: i64,
+        gid: i64,
+        istar: bool,
+        issparse: bool,
+        isgenerated: bool,
+        recursiondepth: i64,
+    ) {
+        self.path_id.push(self.pool.intern_id(path));
+        self.name_id.push(self.pool.intern_id(name));
+        self.linkname_id.push(self.pool.intern_id(linkname));
+        self.offsetheader.push(offsetheader);
+        self.offset.push(offset);
+        self.size.push(size);
+        self.mtime.push(mtime);
+        self.mode.push(mode);
+        self.typeflag.push(typeflag);
+        self.uid.push(uid);
+        self.gid.push(gid);
+        self.istar.push(istar);
+        self.issparse.push(issparse);
+        self.isgenerated.push(isgenerated);
+        self.recursiondepth.push(recursiondepth);
+    }
+
+    /// Tests / optional; TAR/ZIP/7z cold builders must call [`Self::push`].
+    pub fn push_file_row(&mut self, row: &FileRow) {
+        self.push(
+            &row.path,
+            &row.name,
+            row.offsetheader,
+            row.offset,
+            row.size,
+            row.mtime,
+            row.mode,
+            row.typeflag,
+            &row.linkname,
+            row.uid,
+            row.gid,
+            row.istar,
+            row.issparse,
+            row.isgenerated,
+            row.recursiondepth,
+        );
+    }
+
+    pub fn path_id_at(&self, i: usize) -> u32 {
+        self.path_id[i]
+    }
+
+    pub fn pool_unique_count(&self) -> usize {
+        self.pool.unique_count()
+    }
+
+    fn path_at(&self, i: usize) -> &str {
+        self.pool.get(self.path_id[i])
+    }
+
+    fn name_at(&self, i: usize) -> &str {
+        self.pool.get(self.name_id[i])
+    }
+
+    fn linkname_at(&self, i: usize) -> &str {
+        self.pool.get(self.linkname_id[i])
+    }
+
+    /// One short-lived [`FileRow`] for [`MemIndexBuilder::push_row`] only.
+    fn file_row_at(&self, i: usize) -> FileRow {
+        FileRow::new(
+            self.path_at(i),
+            self.name_at(i),
+            self.offsetheader[i],
+            self.offset[i],
+            self.size[i],
+            self.mtime[i],
+            self.mode[i],
+            self.typeflag[i],
+            self.linkname_at(i),
+            self.uid[i],
+            self.gid[i],
+            self.istar[i],
+            self.issparse[i],
+            self.isgenerated[i],
+            self.recursiondepth[i],
+        )
     }
 }
 
@@ -3003,5 +3294,425 @@ mod tests {
             panic!("expected Tar userdata");
         };
         assert_eq!(ud.offsetheader, None);
+    }
+
+    #[derive(Debug, PartialEq)]
+    struct FilesSqlRow {
+        path: String,
+        name: String,
+        offsetheader: i64,
+        offset: i64,
+        size: i64,
+        mtime: i64,
+        mode: i64,
+        typeflag: i64,
+        linkname: String,
+        uid: i64,
+        gid: i64,
+        istar: i64,
+        issparse: i64,
+        isgenerated: i64,
+        recursiondepth: i64,
+    }
+
+    fn dump_files_sql(idx: &SqliteIndex) -> Vec<FilesSqlRow> {
+        idx.with_conn(|conn| {
+            let mut stmt = conn.prepare(
+                r#"SELECT path, name, offsetheader, offset, size, CAST(mtime AS INTEGER),
+                          mode, type, linkname, uid, gid, istar, issparse, isgenerated,
+                          recursiondepth
+                   FROM "files" ORDER BY path, name, offsetheader"#,
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(FilesSqlRow {
+                    path: r.get(0)?,
+                    name: r.get(1)?,
+                    offsetheader: r.get(2)?,
+                    offset: r.get(3)?,
+                    size: r.get(4)?,
+                    mtime: r.get(5)?,
+                    mode: r.get(6)?,
+                    typeflag: r.get(7)?,
+                    linkname: r.get(8)?,
+                    uid: r.get(9)?,
+                    gid: r.get(10)?,
+                    istar: r.get(11)?,
+                    issparse: r.get(12)?,
+                    isgenerated: r.get(13)?,
+                    recursiondepth: r.get(14)?,
+                })
+            })?;
+            rows.collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(IndexError::from)
+        })
+        .unwrap()
+    }
+
+    fn sample_logical_rows() -> Vec<FileRow> {
+        vec![
+            FileRow::new(
+                "/shared/prefix",
+                "a.txt",
+                0,
+                100,
+                10,
+                1.0,
+                0o100644,
+                8,
+                "",
+                1,
+                2,
+                false,
+                false,
+                false,
+                0,
+            ),
+            FileRow::new(
+                "/shared/prefix",
+                "b.txt",
+                512,
+                612,
+                20,
+                2.0,
+                0o100644,
+                i64::from(b'0'),
+                "link",
+                3,
+                4,
+                true,
+                true,
+                false,
+                1,
+            ),
+            FileRow::new(
+                "/shared/prefix",
+                "",
+                1024,
+                1124,
+                0,
+                3.0,
+                0,
+                0xffff,
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ),
+            // REPLACE: same PK as a.txt, new size/mtime.
+            FileRow::new(
+                "/shared/prefix",
+                "a.txt",
+                0,
+                100,
+                99,
+                9.0,
+                0o100644,
+                8,
+                "",
+                1,
+                2,
+                false,
+                false,
+                false,
+                0,
+            ),
+        ]
+    }
+
+    /// Regression: fat `FileRow` window / ZIP 1-row insert — SoA flush must match
+    /// `insert_files_batch` SQL (including `type`) and REPLACE / empty-name split.
+    #[test]
+    fn regression_insert_files_batch_soa_matches_file_row_sql_and_replace() {
+        let rows = sample_logical_rows();
+        let idx_a = SqliteIndex::create_writable(None).unwrap();
+        idx_a.begin_write().unwrap();
+        idx_a.insert_files_batch(&rows).unwrap();
+        idx_a.commit_write().unwrap();
+
+        let mut soa = FileRowSoa::with_capacity(rows.len());
+        for r in &rows {
+            soa.push_file_row(r);
+        }
+        let idx_b = SqliteIndex::create_writable(None).unwrap();
+        idx_b.begin_write().unwrap();
+        idx_b.insert_files_batch_soa(&soa).unwrap();
+        soa.clear();
+        idx_b.commit_write().unwrap();
+
+        assert_eq!(dump_files_sql(&idx_a), dump_files_sql(&idx_b));
+        assert_eq!(
+            idx_a.sql_files_type("/shared/prefix", "a.txt", 0).unwrap(),
+            Some(8)
+        );
+        assert_eq!(
+            idx_b.sql_files_type("/shared/prefix", "a.txt", 0).unwrap(),
+            Some(8),
+            "SoA bind must store type on the SoA index, not only via dump equality"
+        );
+        assert_eq!(
+            idx_a.sql_files_type("/shared/prefix", "", 1024).unwrap(),
+            Some(0xffff)
+        );
+        // REPLACE updated size; empty name is in SQL.
+        let dump = dump_files_sql(&idx_a);
+        let a_row = dump
+            .iter()
+            .find(|r| r.path == "/shared/prefix" && r.name == "a.txt" && r.offsetheader == 0)
+            .expect("replaced a.txt");
+        assert_eq!(a_row.size, 99, "REPLACE must update size");
+        assert!(dump.iter().any(|r| r.name.is_empty()));
+
+        let idx_b = idx_b.into_read_only().unwrap();
+        assert!(
+            idx_b.lookup("/shared/prefix/a.txt", 0).unwrap().is_some(),
+            "MemIndex keeps named REPLACE row"
+        );
+        assert!(
+            idx_b.lookup("/shared/prefix/", 0).unwrap().is_none()
+                || idx_b
+                    .list("/shared/prefix")
+                    .unwrap()
+                    .map(|m| !m.contains_key(""))
+                    .unwrap_or(true),
+            "MemIndex skips empty name"
+        );
+        let listed = idx_b.list("/shared/prefix").unwrap().expect("list");
+        assert!(
+            !listed.contains_key(""),
+            "empty-name SQL row must not appear in MemIndex list"
+        );
+        assert!(listed.contains_key("a.txt"));
+        assert!(listed.contains_key("b.txt"));
+        let fi = listed.get("a.txt").unwrap();
+        assert_eq!(fi.size, 99);
+        assert_eq!(fi.mtime, 9.0);
+    }
+
+    /// Regression: fat `FileRow` window / ZIP 1-row insert — compact_only skips SQL.
+    #[test]
+    fn regression_insert_files_batch_soa_compact_only_skips_sql() {
+        let opts = OpenOptions {
+            index_compact_only: true,
+            ..OpenOptions::default()
+        };
+        let idx = SqliteIndex::create_writable_for_open(None, &opts).unwrap();
+        let mut soa = FileRowSoa::with_capacity(1);
+        soa.push(
+            "/d",
+            "f.txt",
+            0,
+            512,
+            4,
+            0.0,
+            0o100644,
+            i64::from(b'0'),
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
+        idx.insert_files_batch_soa(&soa).unwrap();
+        soa.clear();
+        idx.store_versions("0.1.0").unwrap();
+        let idx = idx.into_read_only().unwrap();
+        assert_eq!(idx.files_table_row_count().unwrap(), 0);
+        assert_eq!(idx.sql_files_type("/d", "f.txt", 0).unwrap(), None);
+        assert!(idx.lookup("/d/f.txt", 0).unwrap().is_some());
+    }
+
+    #[test]
+    fn insert_files_batch_soa_interns_identical_full_path_ids() {
+        let mut soa = FileRowSoa::with_capacity(2);
+        soa.push(
+            "/same/full/path",
+            "a",
+            0,
+            0,
+            1,
+            0.0,
+            0,
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
+        soa.push(
+            "/same/full/path",
+            "b",
+            1,
+            0,
+            1,
+            0.0,
+            0,
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
+        assert_eq!(
+            soa.path_id_at(0),
+            soa.path_id_at(1),
+            "same full path string must share one path_id (not prefix segments)"
+        );
+    }
+
+    /// Regression: fat `FileRow` window / ZIP 1-row insert — clear resets the window pool.
+    #[test]
+    fn regression_insert_files_batch_soa_clear_drops_window_pool() {
+        let mut soa = FileRowSoa::with_capacity(2);
+        soa.push(
+            "/old/path",
+            "x",
+            0,
+            0,
+            1,
+            0.0,
+            0,
+            8,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
+        assert!(soa.pool_unique_count() > 1);
+        soa.clear();
+        assert_eq!(
+            soa.pool_unique_count(),
+            1,
+            "clear must leave only interned empty string (id 0)"
+        );
+        assert!(soa.is_empty());
+        soa.push(
+            "/new/path",
+            "y",
+            0,
+            0,
+            1,
+            0.0,
+            0,
+            8,
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        );
+        assert_eq!(
+            soa.pool_unique_count(),
+            3,
+            "after clear, pool is {{'', path, name}} with no leftover /old/path"
+        );
+        assert_eq!(soa.path_at(0), "/new/path");
+    }
+
+    #[test]
+    fn sql_files_type_is_pk_exact() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.insert_files_batch(&[
+            FileRow::new(
+                "",
+                "foo",
+                0,
+                0,
+                4,
+                0.0,
+                0o100644,
+                i64::from(b'D'),
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ),
+            FileRow::new(
+                "",
+                "foo",
+                1,
+                0,
+                0,
+                0.0,
+                0o40755,
+                i64::from(b'D'),
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ),
+            FileRow::new(
+                "",
+                "foo",
+                2,
+                0,
+                0,
+                0.0,
+                0o40755,
+                i64::from(b'5'),
+                "",
+                0,
+                0,
+                false,
+                false,
+                true,
+                0,
+            ),
+        ])
+        .unwrap();
+        assert_eq!(
+            idx.sql_files_type("", "foo", 0).unwrap(),
+            Some(i64::from(b'D'))
+        );
+        assert_eq!(
+            idx.sql_files_type("", "foo", 1).unwrap(),
+            Some(i64::from(b'D'))
+        );
+        assert_eq!(
+            idx.sql_files_type("", "foo", 2).unwrap(),
+            Some(i64::from(b'5'))
+        );
+        assert_eq!(idx.sql_files_type("", "foo", 99).unwrap(), None);
+    }
+
+    #[test]
+    fn regression_insert_files_batch_soa_open_writable_sql_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("side.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_metadata_key_value("backendName", "test").unwrap();
+            let _ = idx.into_read_only().unwrap();
+        }
+        let idx = SqliteIndex::open_writable(&path).unwrap();
+        let mut soa = FileRowSoa::with_capacity(1);
+        soa.push(
+            "/", "only.txt", 0, 512, 4, 0.0, 0o100644, 8, "", 0, 0, false, false, false, 0,
+        );
+        idx.insert_files_batch_soa(&soa).unwrap();
+        soa.clear();
+        assert_eq!(idx.sql_files_type("/", "only.txt", 0).unwrap(), Some(8));
     }
 }

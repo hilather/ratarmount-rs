@@ -1,6 +1,6 @@
 # Task: Vector / density optimizations (SoA, pools, cookies)
 
-**Status:** living backlog — P0+P1 implemented; P2 still open  
+**Status:** living backlog — P0+P1 implemented; P2 SQLite bulk-staging done; other P2 open  
 **Scope:** Compact metadata layouts — string pools, path segments, structure-of-arrays (SoA), open cookies, shards, denser maps. **Not** solid-decode / full-inflate payload work (separate tracks).
 
 **Legend:** `[x]` done · `[ ]` open · `~` partial
@@ -120,8 +120,8 @@ Implemented as allocation-shape only (same windows / digests / progressive head-
 
 ### SQLite bulk insert staging
 
-- [ ] Stage build rows as SoA / batch binds before `insert_files_batch` (path TAR/ZIP/7z cold build)
-- [ ] Does not change on-disk SQLite shape; only peak during build
+- [x] Stage build rows as SoA / batch binds before `insert_files_batch` (path TAR/ZIP/7z cold build)
+- [x] Does not change on-disk SQLite shape; only peak during build
 
 ### Overlay / write path
 

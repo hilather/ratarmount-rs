@@ -38,7 +38,7 @@ use ratarmount_core::{
     normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_index::{
-    compute_hashes_limited, normalize_algorithm, FileRow, IndexError, SqliteIndex,
+    compute_hashes_limited, normalize_algorithm, FileRowSoa, IndexError, SqliteIndex,
 };
 use thiserror::Error;
 
@@ -414,7 +414,7 @@ impl SevenZipMountSource {
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.begin_write()?;
 
-        let mut batch = Vec::new();
+        let mut batch = FileRowSoa::with_capacity(512);
         let mut generated = std::collections::BTreeSet::new();
 
         for (entry_index, entry) in archive.files.iter().enumerate() {
@@ -473,30 +473,31 @@ impl SevenZipMountSource {
             };
             let data_offset = entry.unpack_offset as i64;
 
-            batch.push(FileRow::new(
-                path,
-                name,
+            batch.push(
+                &path,
+                &name,
                 header_offset,
                 data_offset,
                 size,
                 entry.mtime,
                 mode as i64,
                 0,
-                linkname,
+                &linkname,
                 0,
                 0,
                 false,
                 false,
                 false,
                 0,
-            ));
+            );
             if batch.len() >= 512 {
-                index.insert_files_batch(&batch)?;
+                index.insert_files_batch_soa(&batch)?;
                 batch.clear();
             }
         }
         if !batch.is_empty() {
-            index.insert_files_batch(&batch)?;
+            index.insert_files_batch_soa(&batch)?;
+            batch.clear();
         }
 
         // Share entry paths with the compact index string pool (Arc identity).
@@ -1217,7 +1218,7 @@ fn read_member_bytes_io(
 }
 
 fn ensure_parent_dirs(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     path: &str,
     generated: &mut std::collections::BTreeSet<String>,
     mtime: f64,
@@ -1242,9 +1243,9 @@ fn ensure_parent_dirs(
             continue;
         }
         generated.insert(cur.clone());
-        batch.push(FileRow::new(
-            parent,
-            (*part).to_string(),
+        batch.push(
+            &parent,
+            part,
             0,
             0,
             0,
@@ -1258,7 +1259,7 @@ fn ensure_parent_dirs(
             false,
             true,
             0,
-        ));
+        );
     }
 }
 
@@ -3531,5 +3532,44 @@ sys.stdout.buffer.write(packed)
             solid: false,
         };
         assert!(archive_info_from_durable(&empty).is_err());
+    }
+
+    /// Optional existence check only. Member and parent SQL `type` are both 0 today, so
+    /// `type == 0` cannot fail a dropped typeflag — TAR `'S'`/`'D'`/`'5'` and ZIP Deflate
+    /// `8` are the coverage. Uses an on-disk sidecar (`index` is private; `:memory:` cannot reopen).
+    #[test]
+    fn regression_sql_files_type_row_exists_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("nested.7z");
+        if !write_sample_7z(&archive, "a/b/hello.txt", b"hello\n") {
+            eprintln!("skip: 7z CLI not available or failed to create fixture");
+            return;
+        }
+        let idx_path = dir.path().join("nested.7z.index.sqlite");
+        let opts = OpenOptions {
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, Some(&idx_path), &opts, "0.1.0", true)
+            .expect("open 7z");
+        let fi = m.lookup("/a/b/hello.txt", 0).expect("hello.txt");
+        let oh = match fi.userdata.first() {
+            Some(UserData::Tar(ud)) => ud.offsetheader.expect("oh") as i64,
+            _ => panic!("userdata"),
+        };
+        drop(m);
+
+        let idx = SqliteIndex::open_read_only(&idx_path).expect("reopen on-disk sidecar");
+        assert!(
+            idx.sql_files_type("/a/b", "hello.txt", oh)
+                .unwrap()
+                .is_some(),
+            "member row must exist after SoA flush"
+        );
+        assert!(
+            idx.sql_files_type("", "a", 0).unwrap().is_some(),
+            "generated parent row must exist"
+        );
+        assert!(idx.sql_files_type("/a", "b", 0).unwrap().is_some());
     }
 }

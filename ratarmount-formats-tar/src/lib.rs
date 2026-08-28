@@ -28,7 +28,7 @@ use ratarmount_core::{
     normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
     SQLiteIndexedTarUserData, UserData,
 };
-use ratarmount_index::{FileRow, IndexError, SqliteIndex};
+use ratarmount_index::{FileRowSoa, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 
@@ -966,7 +966,7 @@ fn dumpdir_children_sql_path(dir_full: &str) -> String {
 /// tombstoned so list/lookup hide them. Multi-archive union / `.snar` merge is residual.
 #[allow(clippy::too_many_arguments)]
 fn apply_dumpdir_deletes(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     full_name: &str,
     offsetheader: u64,
     payload: &[u8],
@@ -984,9 +984,9 @@ fn apply_dumpdir_deletes(
         for (tomb_i, name) in (0_i64..).zip(prev.difference(&present)) {
             // Unique PK: dumpdir already uses offsetheader and +1 for reg/dir dual entry.
             let oh = offsetheader as i64 + 2 + tomb_i;
-            batch.push(FileRow::new(
-                child_path.clone(),
-                name.clone(),
+            batch.push(
+                &child_path,
+                name,
                 oh,
                 0,
                 0,
@@ -1000,7 +1000,7 @@ fn apply_dumpdir_deletes(
                 false,
                 true, // isgenerated
                 recursiondepth,
-            ));
+            );
         }
     }
     dumpdir_state.insert(dir_full, present);
@@ -1488,7 +1488,7 @@ fn parse_tar_from<R: Read + Seek>(
     let mut pos: u64 = start;
     let mut header = [0u8; 512];
     let mut generated_dirs: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
+    let mut batch = FileRowSoa::with_capacity(BATCH_FLUSH);
     let mut pax_global: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut pax_global_xattrs: std::collections::HashMap<String, Vec<u8>> =
@@ -1502,9 +1502,9 @@ fn parse_tar_from<R: Read + Seek>(
     let mut dumpdir_state: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
-    let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
+    let flush = |batch: &mut FileRowSoa| -> Result<()> {
         if !batch.is_empty() {
-            index.insert_files_batch(batch)?;
+            index.insert_files_batch_soa(batch)?;
             batch.clear();
         }
         Ok(())
@@ -1857,13 +1857,13 @@ fn flatten_nested_tars<R: Read + Seek>(
         return Ok(());
     }
 
-    let mut batch: Vec<FileRow> = Vec::with_capacity(BATCH_FLUSH);
+    let mut batch = FileRowSoa::with_capacity(BATCH_FLUSH);
     let mut xattr_batch: Vec<(i64, String, Vec<u8>)> = Vec::with_capacity(BATCH_FLUSH);
     let mut deeper: Vec<NestedPending> = Vec::new();
 
-    let flush = |batch: &mut Vec<FileRow>| -> Result<()> {
+    let flush = |batch: &mut FileRowSoa| -> Result<()> {
         if !batch.is_empty() {
-            index.insert_files_batch(batch)?;
+            index.insert_files_batch_soa(batch)?;
             batch.clear();
         }
         Ok(())
@@ -1947,7 +1947,7 @@ fn flatten_nested_tars<R: Read + Seek>(
 /// Emit a generated directory version of a nested TAR member so `lookup` returns a dir
 /// and `list` under that path works (Python recursive index parity).
 fn push_nested_member_as_directory(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     pending: &NestedPending,
     content_depth: i32,
     generated_dirs: &mut std::collections::BTreeSet<String>,
@@ -1963,9 +1963,9 @@ fn push_nested_member_as_directory(
     }
     generated_dirs.insert(full_path.to_string());
     let mode = ((pending.mode_bits & 0o7777) | ratarmount_core::S_IFDIR) as i64;
-    batch.push(FileRow::new(
-        path,
-        name,
+    batch.push(
+        &path,
+        &name,
         pending.offsetheader as i64 + 1,
         pending.member.offset as i64 + 1,
         0,
@@ -1979,7 +1979,7 @@ fn push_nested_member_as_directory(
         false, // issparse
         true,  // isgenerated
         i64::from(content_depth),
-    ));
+    );
 }
 
 /// Join outer path prefix with an inner member name (`/inner.tar` + `a/b` → `/inner.tar/a/b`).
@@ -2010,7 +2010,7 @@ fn walk_tar_region<R: Read + Seek>(
     region_end: u64,
     recursion_depth: i32,
     is_gnu_incremental: &mut bool,
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     xattr_batch: &mut Vec<(i64, String, Vec<u8>)>,
     generated_dirs: &mut std::collections::BTreeSet<String>,
     nested_out: &mut Vec<NestedPending>,
@@ -2495,7 +2495,7 @@ fn json_extract_u64_field(obj: &str, key: &str) -> Option<u64> {
 
 #[allow(clippy::too_many_arguments)]
 fn push_entry(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     full_name: &str,
     offsetheader: u64,
     offset: u64,
@@ -2545,9 +2545,9 @@ fn push_entry(
         typeflag as i64
     };
 
-    batch.push(FileRow::new(
-        path,
-        name,
+    batch.push(
+        &path,
+        &name,
         offsetheader as i64,
         offset as i64,
         if is_dir { 0 } else { size as i64 },
@@ -2561,7 +2561,7 @@ fn push_entry(
         issparse,
         false,
         recursiondepth,
-    ));
+    );
     Ok(())
 }
 
@@ -2572,7 +2572,7 @@ fn push_entry(
 /// as a directory (newest version wins by higher `offsetheader`).
 #[allow(clippy::too_many_arguments)]
 fn push_dumpdir_entries(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     full_name: &str,
     offsetheader: u64,
     offset: u64,
@@ -2606,9 +2606,9 @@ fn push_dumpdir_entries(
     let type_store = b'D' as i64;
 
     // Dumpdir metadata (regular file with dumpdir payload size).
-    batch.push(FileRow::new(
-        path.clone(),
-        name.clone(),
+    batch.push(
+        &path,
+        &name,
         offsetheader as i64,
         offset as i64,
         size as i64,
@@ -2622,12 +2622,12 @@ fn push_dumpdir_entries(
         false,
         false,
         recursiondepth,
-    ));
+    );
 
     // Directory side so children can be listed; unique PK via offsetheader+1.
-    batch.push(FileRow::new(
-        path.clone(),
-        name.clone(),
+    batch.push(
+        &path,
+        &name,
         offsetheader as i64 + 1,
         offset as i64,
         0,
@@ -2641,7 +2641,7 @@ fn push_dumpdir_entries(
         false,
         false,
         recursiondepth,
-    ));
+    );
 
     // Prevent `ensure_parent_dirs` from synthesizing a generated parent later.
     let dir_key = if path.is_empty() {
@@ -2655,7 +2655,7 @@ fn push_dumpdir_entries(
 }
 
 fn ensure_parent_dirs(
-    batch: &mut Vec<FileRow>,
+    batch: &mut FileRowSoa,
     path: &str,
     generated: &mut std::collections::BTreeSet<String>,
     mtime: f64,
@@ -2683,9 +2683,9 @@ fn ensure_parent_dirs(
         }
         generated.insert(cur.clone());
         let mode = (ratarmount_core::S_IFDIR | 0o755) as i64;
-        batch.push(FileRow::new(
-            parent,
-            (*part).to_string(),
+        batch.push(
+            &parent,
+            part,
             0,
             0,
             0,
@@ -2699,7 +2699,7 @@ fn ensure_parent_dirs(
             false,
             true,
             0,
-        ));
+        );
     }
 }
 
@@ -5386,5 +5386,183 @@ mod tests {
         );
         assert!(idx.lookup("/b.txt", 0).unwrap().is_some());
         assert!(reader.min_start.unwrap() >= window_start);
+    }
+
+    fn oct_field_sql_type(n: u64, width: usize) -> Vec<u8> {
+        let s = format!("{:0width$o}", n, width = width.saturating_sub(1));
+        let mut v = s.into_bytes();
+        v.push(0);
+        v.resize(width, 0);
+        v
+    }
+
+    fn gnu_header_sql_type(name: &str, size: u64, typeflag: u8) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        let nb = name.as_bytes();
+        assert!(nb.len() < 100, "name too long for ustar name field");
+        h[..nb.len()].copy_from_slice(nb);
+        h[100..108].copy_from_slice(&oct_field_sql_type(0o644, 8));
+        h[108..116].copy_from_slice(&oct_field_sql_type(0, 8));
+        h[116..124].copy_from_slice(&oct_field_sql_type(0, 8));
+        h[124..136].copy_from_slice(&oct_field_sql_type(size, 12));
+        h[136..148].copy_from_slice(&oct_field_sql_type(0, 12));
+        h[156] = typeflag;
+        h[257..265].copy_from_slice(b"ustar  \0");
+        h[148..156].copy_from_slice(b"        ");
+        let csum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        let cs = format!("{csum:06o}\0 ");
+        h[148..156].copy_from_slice(cs.as_bytes());
+        h
+    }
+
+    fn pad512_sql_type(p: &[u8]) -> Vec<u8> {
+        let mut v = p.to_vec();
+        let n = (512 - (v.len() % 512)) % 512;
+        v.extend(std::iter::repeat_n(0u8, n));
+        v
+    }
+
+    fn append_member_sql_type(out: &mut Vec<u8>, name: &str, typeflag: u8, payload: &[u8]) {
+        out.extend_from_slice(&gnu_header_sql_type(name, payload.len() as u64, typeflag));
+        out.extend(pad512_sql_type(payload));
+    }
+
+    /// Regression: SQL `type` after SoA flush — hand-written typeflag `S` (not `tar --sparse`).
+    #[test]
+    fn regression_sql_type_handwritten_gnu_sparse_s() {
+        let mut h = gnu_header_sql_type("sparse.bin", 0, b'S');
+        // GNU sparse realsize @ 483; is_extended @ 482 left 0.
+        h[483..495].copy_from_slice(&oct_field_sql_type(4096, 12));
+        h[148..156].copy_from_slice(b"        ");
+        let csum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        let cs = format!("{csum:06o}\0 ");
+        h[148..156].copy_from_slice(cs.as_bytes());
+
+        let mut tar = h.to_vec();
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("handwritten-sparse-s.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index hand-written typeflag S");
+        let fi = m.lookup("/sparse.bin", 0).expect("sparse.bin");
+        let ud = tar_userdata(&fi).expect("userdata");
+        let oh = ud.offsetheader.expect("offsetheader") as i64;
+        assert_eq!(
+            m.index().sql_files_type("", "sparse.bin", oh).unwrap(),
+            Some(i64::from(b'S')),
+            "hand-written typeflag S must survive SoA bind (PAX/tar --sparse is often type 0)"
+        );
+        assert!(ud.issparse);
+    }
+
+    /// Regression: SQL `type` after SoA flush — dumpdir `D` at both PKs + generated parent `5`.
+    #[test]
+    fn regression_sql_type_dumpdir_both_pks_and_generated_parent() {
+        let mut tar = Vec::new();
+        append_member_sql_type(&mut tar, "foo/", b'D', b"Y1\0\0");
+        append_member_sql_type(&mut tar, "foo/1", b'0', b"one\n");
+        append_member_sql_type(&mut tar, "a/b/c.txt", b'0', b"x\n");
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(tar),
+            Path::new("sql-type-dumpdir.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index dumpdir + nested path");
+
+        let dump_reg = m.lookup("/foo", 1).expect("older dumpdir meta");
+        let dump_dir = m.lookup("/foo", 0).expect("newer dumpdir dir");
+        let oh_reg = tar_userdata(&dump_reg)
+            .and_then(|u| u.offsetheader)
+            .expect("dumpdir oh") as i64;
+        let oh_dir = tar_userdata(&dump_dir)
+            .and_then(|u| u.offsetheader)
+            .expect("dumpdir dir oh") as i64;
+        assert_ne!(oh_reg, oh_dir, "dumpdir uses two PKs");
+        assert_eq!(
+            oh_dir,
+            oh_reg + 1,
+            "dir side is offsetheader+1, not newest-only"
+        );
+        assert_eq!(
+            dump_reg.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFREG
+        );
+        assert_eq!(
+            dump_dir.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        assert_eq!(
+            m.index().sql_files_type("", "foo", oh_reg).unwrap(),
+            Some(i64::from(b'D'))
+        );
+        assert_eq!(
+            m.index().sql_files_type("", "foo", oh_dir).unwrap(),
+            Some(i64::from(b'D'))
+        );
+
+        let parent = m.lookup("/a", 0).expect("generated parent /a");
+        let pud = tar_userdata(&parent).expect("parent userdata");
+        assert!(pud.isgenerated);
+        assert_eq!(pud.offsetheader, Some(0));
+        assert_eq!(
+            m.index().sql_files_type("", "a", 0).unwrap(),
+            Some(i64::from(b'5'))
+        );
+        assert_eq!(
+            m.index().sql_files_type("/a", "b", 0).unwrap(),
+            Some(i64::from(b'5'))
+        );
+    }
+
+    /// Regression: SQL `type` after SoA flush — nested-as-directory row at offsetheader+1.
+    #[test]
+    fn regression_sql_type_nested_as_directory() {
+        let mut inner = Vec::new();
+        append_member_sql_type(&mut inner, "payload.txt", b'0', b"hi\n");
+        inner.extend(std::iter::repeat_n(0u8, 1024));
+
+        let mut outer = Vec::new();
+        append_member_sql_type(&mut outer, "inner.tar", b'0', &inner);
+        outer.extend(std::iter::repeat_n(0u8, 1024));
+
+        let m = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(outer),
+            Path::new("sql-type-nested.tar"),
+            None,
+            &OpenOptions::default(),
+            "0.1.0",
+        )
+        .expect("index nested tar");
+
+        let fi_dir = m.lookup("/inner.tar", 0).expect("generated dir version");
+        let fi_file = m.lookup("/inner.tar", 1).expect("file version");
+        assert_eq!(
+            fi_dir.mode & ratarmount_core::S_IFMT,
+            ratarmount_core::S_IFDIR
+        );
+        let file_oh = tar_userdata(&fi_file)
+            .and_then(|u| u.offsetheader)
+            .expect("file oh") as i64;
+        let dir_oh = tar_userdata(&fi_dir)
+            .and_then(|u| u.offsetheader)
+            .expect("dir oh") as i64;
+        assert_eq!(dir_oh, file_oh + 1);
+        assert_eq!(
+            m.index().sql_files_type("", "inner.tar", dir_oh).unwrap(),
+            Some(i64::from(b'5'))
+        );
+        assert!(
+            m.lookup("/inner.tar/payload.txt", 0).is_some(),
+            "flatten must still emit inner members"
+        );
     }
 }
