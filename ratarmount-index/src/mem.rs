@@ -1029,6 +1029,74 @@ mod tests {
         assert_eq!(&*again, "member.bin");
     }
 
+    /// Regression: shared parent pool lock — nested compact indexes each own a
+    /// private sealed `StringPool`. Two builders filled with the same rows
+    /// finish to two sealed slabs; `MemIndexBuilder::new` takes no parent pool
+    /// argument, so workers cannot intern member names into a shared parent.
+    #[test]
+    fn regression_nested_compact_pools_are_per_index() {
+        // Compile-time: MemIndexBuilder::new() has no pool / parent parameter.
+        let mut left_b = MemIndexBuilder::new();
+        let mut right_b = MemIndexBuilder::new();
+        let rows = [
+            row("/shared/dir", "same.txt", 10),
+            row("/shared/dir", "other.txt", 20),
+            row("/other", "same.txt", 30),
+        ];
+        for r in &rows {
+            left_b.push_row(r);
+            right_b.push_row(r);
+        }
+        // Per-index intern() identity (ZIP/7z sidecar contract) stays local.
+        let left_shared = left_b.intern_shared("same.txt");
+        let right_shared = right_b.intern_shared("same.txt");
+        let left = left_b.finish();
+        let right = right_b.finish();
+
+        assert!(
+            left.pool_is_sealed_slab(),
+            "left nested compact pool must seal"
+        );
+        assert!(
+            right.pool_is_sealed_slab(),
+            "right nested compact pool must seal"
+        );
+        assert!(
+            !left.pool.slab.is_empty() && !right.pool.slab.is_empty(),
+            "slabs must hold interned bytes so pointer compare is meaningful"
+        );
+        assert!(
+            !std::ptr::eq(left.pool.slab.as_ptr(), right.pool.slab.as_ptr()),
+            "nested compact pools must be distinct slabs, not a shared parent"
+        );
+
+        for name in ["same.txt", "other.txt", "shared", "dir", "other"] {
+            let id_l = left.pool.lookup_id(name).expect(name);
+            let id_r = right.pool.lookup_id(name).expect(name);
+            assert_eq!(left.pool.get(id_l), name);
+            assert_eq!(right.pool.get(id_r), name);
+            assert_eq!(left.pool.get(id_l), right.pool.get(id_r));
+        }
+        assert_eq!(left.pool_unique_count(), right.pool_unique_count());
+        assert!(left.lookup("/shared/dir", "same.txt", 0).is_some());
+        assert!(right.lookup("/shared/dir", "same.txt", 0).is_some());
+
+        let left_again = left.lookup_pooled("same.txt").unwrap();
+        let right_again = right.lookup_pooled("same.txt").unwrap();
+        assert!(
+            Arc::ptr_eq(&left_shared, &left_again),
+            "intern() identity stays on the left index after seal"
+        );
+        assert!(
+            Arc::ptr_eq(&right_shared, &right_again),
+            "intern() identity stays on the right index after seal"
+        );
+        assert!(
+            !Arc::ptr_eq(&left_shared, &right_shared),
+            "same logical string must not share Arc identity across indexes"
+        );
+    }
+
     /// Regression: finish() must seal the pool as a byte slab and keep PathTable as CSR.
     #[test]
     fn regression_finished_memindex_is_csr_and_sealed_slab() {
