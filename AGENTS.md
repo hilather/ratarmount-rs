@@ -49,6 +49,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` (metadata-only PermissionDenied; password exact bytes; wrong pw fails open) |
 | 7z wrong password accepted on macOS (store+AES / warm index) | `cargo test -p ratarmount-formats-sevenzip --lib encrypted_wrong_password` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_store_aes` |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
+| Overlay open after create+write (`has_file` → OverlayFd) | `cargo test -p ratarmount-fuse --lib overlay_open_after_create_write` |
 | Sequential FUSE readahead window (`--readahead`, #180) | `cargo test -p ratarmount-fuse --lib readahead` |
 | Plain compress no `/tmp` spool (gz/zstd/bz2) | `cargo test -p ratarmount plain_gzip` · `cargo test -p ratarmount plain_zstd` · nested: `nested_plain_gzip` |
 | Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |

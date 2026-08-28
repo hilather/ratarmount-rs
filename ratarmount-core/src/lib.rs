@@ -216,6 +216,35 @@ pub struct CheapDirent {
     pub size: u64,
 }
 
+/// Compact getattr cache row. No heap `linkname` / `userdata`.
+///
+/// `flags` is unused — do not treat any bit as an open key or userdata substitute.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct InodeAttrCookie {
+    pub size: u64,
+    /// Same clock as [`FileInfo::mtime`]; do not invent a second mtime unit.
+    pub mtime: f64,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+    /// Unused. Do not treat any bit as an open key or userdata substitute.
+    pub flags: u8,
+}
+
+impl InodeAttrCookie {
+    /// Copy getattr scalars. Does not retain `linkname` or `userdata`.
+    pub fn from_file_info(fi: &FileInfo) -> Self {
+        Self {
+            size: fi.size,
+            mtime: fi.mtime,
+            mode: fi.mode,
+            uid: fi.uid,
+            gid: fi.gid,
+            flags: 0,
+        }
+    }
+}
+
 /// Subset of POSIX `statvfs` fields used by FUSE.
 #[derive(Clone, Debug, Default)]
 pub struct StatFs {
@@ -607,5 +636,25 @@ mod tests {
         assert_eq!(dents[0].name, "a");
         assert_eq!(dents[0].mode, 0o100644);
         assert_eq!(dents[0].size, 0, "default list_dirents size is 0");
+    }
+
+    #[test]
+    fn inode_attr_cookie_from_file_info_copies_scalars() {
+        let fi = FileInfo {
+            size: 42,
+            mtime: 1.5,
+            mode: 0o100644,
+            linkname: "ignored-link".into(),
+            uid: 7,
+            gid: 9,
+            userdata: vec![UserData::Other("overlay:/x".into())],
+        };
+        let c = InodeAttrCookie::from_file_info(&fi);
+        assert_eq!(c.size, 42);
+        assert_eq!(c.mtime, 1.5);
+        assert_eq!(c.mode, 0o100644);
+        assert_eq!(c.uid, 7);
+        assert_eq!(c.gid, 9);
+        assert_eq!(c.flags, 0, "flags stay unused; not an overlay/open key");
     }
 }
