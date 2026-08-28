@@ -8,6 +8,7 @@
 | **Related (do not implement)** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-4** (commit queue) |
 | **First implementation crate** | `ratarmount-fuse` (+ cookie type in `ratarmount-core`) |
 | **Existing residual test** | `cargo test -p ratarmount-fuse --lib overlay_file_info` (getattr refresh only — see [Tests](#tests-same-pr-as-the-code-not-this-plan-pr)) |
+| **Skeptic review** | Sweep 1 REVISE (folded). Sweep 2 **ACCEPT**. Final: **ACCEPT**. |
 
 This document is an implementation plan. It must not be treated as a license to land code in the same PR as the plan.
 
@@ -17,7 +18,7 @@ This document is an implementation plan. It must not be treated as a license to 
 
 On **FUSE write-overlay** mounts, store a **Copy cookie plus size/mtime** (and the other getattr scalars) on the inode instead of a fat `FileInfo`, without trusting that cookie for `OpenBackend::Empty` / kernel attr TTL / `MountSource::open`, and without building V-4’s commit queue.
 
-NFS / 9P / SMB / HTTP / SFTP inode tables are **follow-on**, not the first PR.
+NFS and export-core (9P/SMB/SFTP) inode tables are **follow-on**, not the first PR. HTTP is not an `InodeTable` export.
 
 ---
 
@@ -34,7 +35,7 @@ There is **no** `FileInfo` cache inside `WriteOverlay`. `WriteOverlay::overlay_f
 |-------|----------|----------------------|-----------|
 | FUSE inode | `ratarmount-fuse/src/lib.rs` `InodeEntry.file_info` | `file_info_for_ino` / `file_info_for_open` **re-lookup** when `overlay.is_some()`, then `store_fi` the full clone | **First PR** — store cookie, drop fat `FileInfo` |
 | NFS inode | `ratarmount-nfs/src/inode.rs` | `file_info_for_id` skips cache when overlay is set, then `store_lookup_fi` | **Follow-on** |
-| Export-core inode | `ratarmount-export-core/src/inode.rs` (copy of NFS table; 9P/SMB/SFTP) | Same skip-cache-when-overlay pattern (`ratarmount-9p/src/vfs.rs` ~L71) | **Follow-on — do not touch** |
+| Export-core inode | `ratarmount-export-core/src/inode.rs` (copy of NFS table; used by 9P/SMB/SFTP) | Same skip-cache-when-overlay pattern (`ratarmount-9p/src/vfs.rs` ~L71) | **Follow-on — do not touch** |
 | FUSE dir cache | `DirCacheEntry` `(name, mode, size)` | Already cheap | Not this item |
 | NFS / export-core `ReaderLru` | `ReaderSlot.fi: FileInfo` | Per-open handle | Out of this plan |
 | FUSE `OpenBackend::Source.file_info` | `#[allow(dead_code)]` | Per-open archive handle | Out of this plan |
@@ -59,7 +60,7 @@ If the first PR stored cookie-only on NFS and reconstructed `FileInfo` without T
 Therefore:
 
 - First PR is **FUSE-only** (plus a `Copy` type in `ratarmount-core` if it stays unused-elsewhere-clean).
-- NFS + export-core + 9P/SMB/HTTP/SFTP stay fat `FileInfo` until a follow-on that rewires **every** `cached_lookup_fi` consumer (or keeps `file_info` populated for those crates and only adds a cookie beside it).
+- NFS + export-core (9P/SMB/SFTP) stay fat `FileInfo` until a follow-on that rewires **every** `cached_lookup_fi` consumer (or keeps `file_info` populated for those crates and only adds a cookie beside it). HTTP is not an `InodeTable` export.
 - Do **not** imply FUSE+NFS are the only fat inode caches.
 
 `cached_lookup_fi` must remain `file_info.clone()` only — never `cookie.to_file_info(...)`.
@@ -148,7 +149,7 @@ The only shared contract is: **after a live persist, every cached FUSE attr (coo
 | Stop overlay re-lookup / lengthen `OVERLAY_ATTR_TTL` | Reintroduces size-0 if cookie is stale |
 | `WriteOverlay`-internal FileInfo/stat cache | Would add a cache that does not exist; lookup already `stat`s |
 | Change `WriteOverlay::overlay_file_info` return type | Callers still need `FileInfo` |
-| NFS / export-core / 9P / SMB / HTTP / SFTP inode cookie | Readers consume `cached_lookup_fi` for open/read (see above) |
+| NFS / export-core (9P/SMB/SFTP) inode cookie | Readers consume `cached_lookup_fi` for open/read (see above) |
 | Compact `ReaderLru` / `OpenBackend::Source` | Per-open, not the getattr cache |
 | Import `CompactOpenCookie` into fuse | Wrong crate + wrong meaning (TAR offsets) |
 | `factory.rs` | FUSE/core only |
@@ -170,7 +171,7 @@ pub struct InodeAttrCookie {
     pub mode: u32,
     pub uid: u32,
     pub gid: u32,
-    /// bit0 reserved: last lookup was overlay-tagged (diagnostic only; not an open key)
+    /// Unused. Do not treat any bit as an open key or userdata substitute.
     pub flags: u8,
 }
 ```
@@ -195,10 +196,11 @@ InodeEntry { path: String, file_info: Option<FileInfo>, cookie: Option<InodeAttr
 Policy:
 
 - `overlay.is_some()`: `store_fi` / `ino_for_path_with_fi` write **cookie only** and set `file_info = None`.
+- Root (`FUSE_ROOT_ID`) may keep `create_root_file_info()` from `RatarmountFs::new`. “Never both `Some`” applies to **child** overlay inodes after `store_fi`, not a requirement to cookie the root.
 - `overlay.is_none()`: keep storing `FileInfo`. Cookie unused. `ino_for_path_with_fi_updates_stale_cached_size` stays on this path (it constructs `RatarmountFs` with `overlay: None`) — still overwrite fat size 0 with a fresher `FileInfo`, **not** a cookie.
 - `cached_fi`: immutable only. Overlay tests use `cached_cookie()`.
 - `sweep_if_generation_advanced`: clear **both** `file_info` and `cookie`.
-- `readdirplus` uses `cached_fi(ino)` for `.` (`lib.rs` ~L878). On overlay, that becomes `None` → existing `or_else(|| source.lookup)` still fills `.` attrs. Extra lookup is acceptable; do not reconstruct a cookie `FileInfo` here.
+- `readdirplus` uses `cached_fi(ino)` for `.` (`lib.rs` ~L879). On overlay, that becomes `None` → existing `or_else(|| source.lookup)` still fills `.` attrs. Extra lookup is acceptable; do not reconstruct a cookie `FileInfo` here.
 
 Two `Option`s are enough (MSRV 1.74). Overlay: never leave `file_info` set.
 
@@ -239,7 +241,7 @@ Every behavior change lands with tests in the implementation PR (`AGENTS.md`).
 | Test | Layer | Assert |
 |------|-------|--------|
 | Existing `overlay_file_info_for_ino_refreshes_size_after_write` | FUSE helper | Create → write → `file_info_for_ino` size is payload; `attr_ttl` is `OVERLAY_ATTR_TTL`. Update `cached_fi` assert to `cached_cookie().size` (or drop that assert if cookie is not authoritative). Raw `open_overlay_fd` read may stay as a compositing check. |
-| **New** `overlay_open_after_create_write` (name bikeshed-ok) | FUSE helper through **production open** | Create → write payload → helper that mirrors `Filesystem::open` (`has_file` → `OverlayFd`, else `file_info_for_open` + `open_source_backend`) → `read_handle` returns payload, **not** `""`. Doc: *Regression: create-time size 0 → Empty backend*. |
+| **New** `overlay_open_after_create_write` (name bikeshed-ok) | FUSE helper through **production open** | Create → write payload → helper that mirrors `Filesystem::open` (`has_file` → `OverlayFd`). **Do not call `test_open_ro`** (`lib.rs` ~L466): that helper skips `has_file` and goes `file_info_for_open` + `open_source_backend`. Assert the fh is `OverlayFd` (or `has_file` is true) so the test cannot pass on the else-branch alone. `read_handle` returns payload, **not** `""`. Doc: *Regression: write-then-cat empty when open skipped OverlayFd*. `OpenBackend::Empty` stays locked by re-lookup + no `to_file_info`, not by this helper alone. |
 | New: create, **no** write, then production open/read | FUSE helper | Never-written overlay file reads `""`. Opposite polarity of the cache bug. |
 | New: cookie density on overlay store | FUSE unit | After overlay lookup/store, `cookie.is_some()`, `file_info.is_none()`, cookie size matches lookup. |
 | Existing `ino_for_path_with_fi_updates_stale_cached_size` | FUSE **immutable** | Still fat `FileInfo` size 0 → 42 via `cached_fi`. Not a cookie test. |
@@ -310,7 +312,7 @@ Protocol: never skip sweep 1; each sweep is a **fresh** skeptic (no prior review
 | Sweep | Verdict | Folded into plan |
 |-------|---------|------------------|
 | 1 | **REVISE** | (1) Defer NFS/export-core: `cached_lookup_fi` feeds `get_or_open` / `read_member` / size-0 empty cursor; no production `to_file_info`. (2) Existing `overlay_file_info` test is getattr + raw fd, not FUSE `open`; add production-open create→write→read test with a distinct filter. (3) Name export-core / 9P / SMB / SFTP as a third fat inode map; do not claim FUSE+NFS are the only caches. Nits: immutable `ino_for_path_with_fi` is not a cookie test; overlay lookup-miss fallback; `readdirplus` `.` uses `cached_fi`; never leave both Options `Some`; do not duplicate the AGENTS.md `overlay_file_info` row. |
-| 2 | *(pending)* | |
-| 3 | *(if needed)* | |
+| 2 | **ACCEPT** | Nits folded as clarifications only (do not use `test_open_ro`; HTTP has no `InodeTable`; root may stay fat; `flags` unused / not an open key; `readdirplus` `.` is ~L879). No blockers. |
+| 3 | skipped | Cap unused — stopped at ACCEPT. |
 
-Final: pending sweep 2.
+Final: **ACCEPT**.
