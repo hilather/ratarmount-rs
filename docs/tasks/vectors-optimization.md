@@ -116,6 +116,8 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 - [ ] Nested (and similar) fingerprints: fixed head/mid/tail buffers only — no full-body `Vec` unless policy requires
 - [ ] Content-hash fill: stream into fixed hasher state; same pattern as tarstats edge samples
 
+Plan (implementation not started): [`plans/p2-fingerprint-windows.md`](plans/p2-fingerprint-windows.md). Nested head/mid/tail sampling and progressive `from_head_only` already exist; the leftover is file-sized `Vec` slurp on tarstats/`archive_full_hash` (and HTTP/OCI twins), heap window buffers, and a 1 MiB per-member hash scratch. Not solid-decode / full-inflate.
+
 ### SQLite bulk insert staging
 
 - [ ] Stage build rows as SoA / batch binds before `insert_files_batch` (path TAR/ZIP/7z cold build)
