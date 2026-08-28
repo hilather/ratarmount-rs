@@ -183,7 +183,7 @@ Suggested order inside the family: exFAT, then NTFS (read-only), then UDF, then 
 
 `ratarmount --repack-seekable in.tar.gz out.tar.zst` (zstd seek table and/or gzip index sidecar). Random access is only as good as the producer. [`zstd-random-access.md`](../zstd-random-access.md) recipes help; a one-shot rewriter makes every subsequent mount instant.
 
-Do not recompress if the input is already multi-frame + seek-table; just copy + emit index.
+Do not recompress if the input is already multi-frame + seek-table; just copy + emit index. When this lands, keep members in **input offset order** (do not name-sort while packing) so V-5 restore locality stays valid — see [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md).
 
 ### F-10 — Library / FFI / `ratar://` replacement
 

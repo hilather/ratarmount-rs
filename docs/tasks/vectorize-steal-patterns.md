@@ -170,6 +170,8 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Still open:**
 
+Implementation plan: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) (plan-only; do not treat this link as shipped behavior).
+
 - [ ] Optional `list_dirents` / extract helper that yields dirents sorted by `offsetheader` (CLI flag or control file; default stays name order for `ls`).
 - [ ] `find` output option: offset order for restore pipelines.
 - [ ] Document that F-9 `--repack-seekable` should also keep members in offset order (already true for tar-in-order).
