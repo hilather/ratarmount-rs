@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs |
 | **Date** | 2026-08-28 |
-| **Status** | **Implemented** `a21df69` |
+| **Status** | **Implemented** `76ce000` |
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-1** Cheap scan then refine (`partial`, M) |
 | **Pairs with** | [`vectors-optimization.md`](../vectors-optimization.md) P0 list/dirents residual; [`beyond-parity-roadmap.md`](../beyond-parity-roadmap.md) **F-3** overlay residual |
 | **Audience** | Implementers who already know `MountSource`, `MemIndex` / `EntrySoa`, F-3 locate, and `WriteOverlay` |
