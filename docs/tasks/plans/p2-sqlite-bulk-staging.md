@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | Sweep 1 folded (BLOCKED → plan patched); pending sweep 2 |
+| **Status** | Sweep 2 folded (BLOCKED → plan patched); pending sweep 3 |
 | **Date** | 2026-08-28 |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “SQLite bulk insert staging” |
 | **Scope** | Path TAR / ZIP / 7z **cold** index build: stage rows as SoA and bind from columns into the existing `insert_files_batch` SQL |
@@ -120,7 +120,7 @@ flowchart LR
   subgraph index [ratarmount-index]
     B[insert_files_batch_soa]
     SQL["INSERT OR REPLACE files"]
-    M[MemIndexBuilder.push_from_soa]
+    M[MemIndexBuilder.push_row one row at a time]
     B --> SQL
     B --> M
   end
@@ -138,10 +138,12 @@ Parallel columns matching `FileRow` **exactly** (so a round-trip test is mechani
 | `offsetheader`, `offset`, `size`, `mtime`, `mode`, `typeflag`, `uid`, `gid`, `recursiondepth` | existing `FileRow` widths | `typeflag` is first-class — this is why we do not use `EntrySoa` |
 | `istar`, `issparse`, `isgenerated` | `Vec<u8>` flags or three `Vec<bool>` | match today’s SQL `0`/`1` |
 
-API shape (names can move; behavior cannot):
+API shape (`pub`; names can move; behavior cannot):
 
+- `pub struct FileRowSoa`
 - `FileRowSoa::with_capacity(512)`
-- `push(...)` / `push_file_row(&FileRow)` — formats and the compat wrapper
+- `push(&str path, &str name, …)` — **format builders use this** (interns TEXT; no `FileRow` alloc)
+- `push_file_row(&FileRow)` — tests / optional; **not** the TAR/ZIP/7z hot path
 - `len` / `clear` / `is_empty`
 - **`clear` (and every flush) must drop or reset the window `StringPool` and all column vecs.** The SoA object lives for the whole `parse_tar_from` / 7z / ZIP loop. If the pool survives flush, interned TEXT becomes *O(unique strings in the archive)* — a second copy next to `MemIndexBuilder`, which violates the *O(512)* peak claim.
 - `intern` is internal; callers pass `&str` (ZIP already has `intern_during_build` for sidecar `Arc` — that path stays; it is a **different** pool)
@@ -159,17 +161,20 @@ SqliteIndex::insert_files_batch(&[FileRow]) -> Result<()>
 SqliteIndex::insert_file(...)                 // still 1-row FileRow for other crates
 ```
 
-Add:
+Add (both **`pub`**, always compiled — not `#[cfg(test)]`):
 
 ```text
 SqliteIndex::insert_files_batch_soa(&FileRowSoa) -> Result<()>
+SqliteIndex::sql_files_type(path, name, offsetheader) -> Result<Option<i64>>
 ```
 
-`insert_files_batch` becomes a thin wrapper: copy `&[FileRow]` into a stack `FileRowSoa` (or bind FileRow fields directly — **same SQL loop**, so tests that only see SQL cannot tell). Prefer: wrapper builds a temporary `FileRowSoa` **only if** we want one bind loop. Cheaper compat path: existing FileRow loop stays, SoA loop is the new one, both call a private `bind_files_row(stmt, path, name, …)` so the 15 binds cannot drift.
+`insert_files_batch(&[FileRow])` **must not** allocate a temporary `FileRowSoa`. ASAR / `patch.rs` / `search.rs` / other formats stay on the FileRow loop. Both loops call a private `bind_files_row(stmt, path, name, …)` so the 15 binds cannot drift. P2 peak work is TAR/ZIP/7z calling `insert_files_batch_soa` directly.
+
+`FileRowSoa` and `insert_files_batch_soa` are **`pub`** (format crates live outside `ratarmount-index`). `insert_files_batch_soa` does **not** clear the window — callers must `clear()` after each flush (same as today’s `batch.clear()`). That contract is part of format wiring, not an implicit destructor.
 
 SQL statement **unchanged** (prepared, cached, single-row `INSERT OR REPLACE`). Still skip the SQL loop when `compact_only`. Still `push` into `MemIndexBuilder` when present (`open_writable` has `mem_builder = None` — SQL only; preserve that).
 
-MemIndex feed from SoA: `MemIndexBuilder::push_soa_row` or reconstruct a short-lived `FileRow` **one at a time** from `pool.get(id)` for `push_row`. Reconstructing one `FileRow` per row at flush is acceptable (peak is one row, not 512). Prefer `push_row` reuse so REPLACE / empty-name skip stay in one place.
+MemIndex feed from SoA: reconstruct a short-lived `FileRow` **one at a time** from `pool.get(id)` and call existing `MemIndexBuilder::push_row`. **Do not** add `push_from_soa` / `push_soa_row` — that would fork REPLACE / empty-name skip. Peak is one `FileRow`, not 512.
 
 ### Format wiring
 
@@ -186,9 +191,18 @@ MemIndex feed from SoA: `MemIndexBuilder::push_soa_row` or reconstruct a short-l
 
 `BATCH_FLUSH = 512` stays. Xattr batch stays `Vec<(i64, String, Vec<u8>)>`. Incremental `SqliteIndexedTar::patch_index_from` reuses `parse_tar_from` (often on `open_writable`, builder `None`) — same SoA window, SQL-only feed.
 
-**7z** — `create_index_from_reader` (path + reader): same window type; `ensure_parent_dirs` pushes into the SoA. Member and parent `typeflag` stay `0`.
+Format helpers (`push_entry`, `ensure_parent_dirs`, dumpdir, ZIP/7z parents) call `FileRowSoa::push(&str, &str, …)` — **not** `FileRow::new` + `push_file_row`. Otherwise the window still owns three `String`s per row and the SoA intern never runs.
 
-**ZIP** — insert loop is `fill_index_from_archive` (called from private `create_index` and `open_from_reader`). Introduce the same 512 window. `ensure_parent_dirs` **must** push generated parents into the window (not `insert_file`). Flush before `commit_write`. `intern_during_build` for `ZipMemberMeta.name` is unchanged (sidecar `Arc` identity). SQL `type` is the ZIP method: `0` stored, `8` deflate, **`0xffff` other** — not only 0/8.
+Every flush site:
+
+```text
+index.insert_files_batch_soa(&batch)?;
+batch.clear(); // mandatory — resets columns + window StringPool
+```
+
+**7z** — `create_index_from_reader` (path + reader): one window; `ensure_parent_dirs` (~line 1245) pushes into that same SoA (not a second create loop). Member and parent `typeflag` stay `0`.
+
+**ZIP** — insert loop is `fill_index_from_archive` (called from private `create_index` and `open_from_reader`). Introduce the same 512 window. `ensure_parent_dirs` **must** push generated parents into the window (not `insert_file`). Flush + `clear()` before `commit_write`. `intern_during_build` for `ZipMemberMeta.name` is unchanged (sidecar `Arc` identity). SQL `type` is the ZIP method: `0` stored, `8` deflate, **`0xffff` other**.
 
 ### Rejected alternatives
 
@@ -209,7 +223,7 @@ MemIndex feed from SoA: `MemIndexBuilder::push_soa_row` or reconstruct a short-l
 3. **Empty `name`**: SQL insert still happens if the caller staged one; `MemIndexBuilder::push_row` still skips. Do not “clean up” this split.
 4. **`compact_only`**: no `files` writes; builder still receives rows; `files_table_row_count() == 0`.
 5. **`open_writable`**: `mem_builder` is `None`; SoA insert is SQL-only (content-hash / side-table writers).
-6. **`typeflag` / SQL `type`**: TAR `'S'` / `'D'` / `'5'` / regular; ZIP method `0`/`8`; generated parents TAR `b'5' as i64`, ZIP/7z `0` — **byte-identical** to today.
+6. **`typeflag` / SQL `type`**: TAR `'S'` / `'D'` / `'5'` / regular; ZIP method `0` (stored) / `8` (deflate) / **`0xffff` (other)**; generated parents TAR `b'5' as i64`, ZIP/7z `0` — **byte-identical** to today.
 7. **Generated parents**: `offsetheader=0`, `isgenerated=true`, `generated_dirs` still prevents duplicates. ZIP parents stay 1:1 with today’s `insert_file` rows (only the flush grouping changes).
 8. **NULL `offsetheader`**: still not expressible via `FileRow` / SoA (raw SQL test `regression_null_offsetheader_rows_still_list` stays).
 9. **Python completeness**: `into_read_only` still `DROP`s `filestmp` / `parentfolders`. Do not insert into them.
@@ -227,7 +241,7 @@ Ownership: **orchestrator or a single agent** — `ratarmount-index` first, then
    - Intern: two rows with the **same full path string** share one `path_id` (not “shared prefix segments”).
    - `open_writable` + SoA insert does not require a builder.
    - **`FileRowSoa::clear` / post-flush:** pool unique count returns to `{""}` (id 0 only); a later push of a new path must not retain ids from the previous window.
-   - **Raw SQL `type` helper:** add a small public (or `cfg(test)` + re-export) `SqliteIndex` reader such as `sql_files_type(path, name, offsetheader) -> Result<Option<i64>>`. `with_conn` is `pub(crate)`; format crates cannot SELECT today. `FileInfo` / `list` / `lookup` / MemIndex **ignore** SQL `type` (`row_to_file_info` skips column 7; `file_info_from_named_row` skips column 6; `load_mem_index` never stores it). Existing format tests that only `list`/`lookup` **cannot** catch `typeflag=0` wiring bugs.
+   - **Raw SQL `type` helper (must be normal `pub`, always compiled):** `SqliteIndex::sql_files_type(path, name, offsetheader) -> Result<Option<i64>>`. **Not** `#[cfg(test)]` — dependency test cfg is invisible to `ratarmount-formats-{tar,zip,sevenzip}` integration/unit tests. `with_conn` is `pub(crate)`; those crates have **no** `rusqlite` dep; ZIP/7z tests often use `index_in_memory` (`:memory:`), so they cannot open a second file connection. `FileInfo` / `list` / `lookup` / MemIndex **ignore** SQL `type` (`row_to_file_info` skips column 7; `file_info_from_named_row` skips column 6; `load_mem_index` never stores it). Existing format tests that only `list`/`lookup` **cannot** catch `typeflag=0` wiring bugs.
 3. **TAR format-layer `type` tests (required — not optional):** after a real cold `parse_tar_from` / `create_index`, `SELECT`/`sql_files_type` must see:
    - GNU sparse member `type = b'S' as i64`
    - dumpdir rows `type = b'D' as i64` (reg at `oh` and dir at `oh+1`)
@@ -235,7 +249,7 @@ Ownership: **orchestrator or a single agent** — `ratarmount-index` first, then
    - nested-as-directory row `type = b'5' as i64` at `offsetheader+1` when flatten runs  
    Existing `pax_size_keyword` / dumpdir / flatten / incremental tests stay as the catalog net; they are **not** sufficient for `type`.
 4. **ZIP format-layer `type` tests (required):** fixture with **at least one Deflate member** (`type = 8`) plus generated parents (`type = 0`, `isgenerated`). A Stored-only zip (`write_sample_zip` today) is `type=0` for members **and** parents — identical to a dropped typeflag. Also assert one `0xffff` other-method row if cheap (or document as residual and still lock 8 vs 0). Visible catalog after `commit_write`: same PK set as today’s `insert_file` path (INSERT order inside the transaction may change).
-5. **7z**: switch the window. Encrypted metadata-only / wrong-password tests stay. Add a cheap `sql_files_type` assert that a regular member and a generated parent are both `0` (locks “we still write the column”).
+5. **7z**: switch the window. Encrypted metadata-only / wrong-password tests stay. A `sql_files_type == 0` assert on member **and** parent **cannot** fail a dropped/defaulted typeflag (both are already 0 today). Do not treat that as coverage; TAR `'S'`/`'D'`/`'5'` and ZIP Deflate `8` are the tests that can fail. Optional 7z check: row exists via `sql_files_type(...).is_some()` only.
 6. **Docs in the implementation commit**:
    - Tick the P2 checkbox in [`vectors-optimization.md`](../vectors-optimization.md); keep the P0 residual sentence.
    - One line in [`docs/cold-index-and-sparse.md`](../../cold-index-and-sparse.md) that the 512 flush is SoA binds, not `Vec<FileRow>`.
@@ -302,7 +316,7 @@ Process: sweep 1 required; each sweep a **fresh** skeptic; fold blockers; cap 3 
 | Sweep | Result | Folded |
 |-------|--------|--------|
 | 1 | **BLOCKED** — format-layer tests as written cannot observe SQL `type` (`FileInfo` / MemIndex drop it; Stored-only ZIP is `type=0` for members and parents) | Required TAR/ZIP/7z `sql_files_type` asserts; `SqliteIndex` raw `type` helper (`with_conn` is `pub(crate)`); `FileRowSoa::clear` resets pool; TAR symbols `push_entry` / `walk_tar_region`; ZIP loop is `fill_index_from_archive`; method `0xffff`; intern test = full-string id; mutex-coupling nit |
-| 2 | *(pending)* | |
+| 2 | **BLOCKED** — `sql_files_type` as `#[cfg(test)]` is invisible to format-crate tests; no `rusqlite` / `:memory:` cannot reopen | Helper is normal `pub` on `SqliteIndex`; compat path must not build a temp SoA; flush sites must `clear()`; `pub` SoA + `insert_files_batch_soa`; invariant 6 includes `0xffff`; 7z `type==0` is not coverage; mermaid/`push_row` reuse; format `push(&str)` |
 | 3 | *(pending)* | |
 
 ---
