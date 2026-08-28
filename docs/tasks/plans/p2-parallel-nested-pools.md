@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs (plan-only; skeptic-reviewed) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft — sweep 1 ACCEPT (nits folded); awaiting fresh sweep 2 |
+| **Status** | Draft — sweeps 1–2 ACCEPT (nits folded); awaiting fresh sweep 3 |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Parallel nested open pools” |
 | **Scope** | Investigate the eager parallel nested-open path vs compact `StringPool`. Decide whether a per-worker arena + parent-pool merge is justified. If not, close the item as already-isolated. If yes, specify a RAM-only merge that does **not** change the durable nested blob. |
 | **Out of this train** | Durable `nestedindexes` / RNIB encoding; intra-archive parallel ZIP/TAR fill; AutoMount `PathIntern` redesign; parent `SharedArchiveIo` mutex; SIMD; lazy (`-l`) sequential mount |
@@ -83,7 +83,7 @@ try_mount_file
   │     optional try_store_nested_durable → outer set_nested_index
   ├─ else temp spool → open_nested_fn(path)
   │     create_writable({path}.index.sqlite)            // private builder, not compact-only
-  │     ISO/FAT/EXT4/SquashFS/Git/SQLAR/… may have no StringPool
+   │     FAT/EXT4/SquashFS/Git/SQLAR: no StringPool; ISO reader: private compact pool
   └─ mounted.lock: PathIntern.intern(key) + insert      // mount-point string only
 ```
 
@@ -107,7 +107,7 @@ Three nested-open branches, all isolated:
 
 When the worker returns `Arc<dyn MountSource>`, that source **keeps** its own sealed (or path-index) table. There is no post-open “merge into parent” step.
 
-ISO/FAT/EXT4/SquashFS/Git/SQLAR and other image backends may have **no** `StringPool` at all. They still do not intern member names into a parent pool.
+FAT/EXT4/SquashFS/Git/SQLAR have **no** `StringPool`. Nested **ISO 9660** on the reader path uses `SqliteIndex::create_writable_for_open` and therefore **does** get a private compact pool. Neither case intern member names into a parent pool.
 
 This already satisfies “do not intern member names through a global lock.” On the compact reader/import path, the worker slab **is** the live store (no second live copy of that archive’s strings).
 
@@ -202,6 +202,7 @@ Lowest layer first:
    - the two `StringPool` values are **distinct allocations** (not `Arc` shared; compare slab pointer or a new test-only `pool_slab_ptr` / `ptr::eq` on the slab)
    - there is no API that interns into a “parent” (compile-time: `MemIndexBuilder::new` takes no pool argument — document in the test comment)
    Name: `regression_nested_compact_pools_are_per_index` (symptom: “shared parent pool lock”).
+   **Placement:** `MemIndex.pool` is private. Put this test in `ratarmount-index/src/mem.rs` `#[cfg(test)]` (can use `slab.as_ptr()` / `ptr::eq`) **or** add a `#[cfg(test)]` accessor. A `lib.rs` integration test cannot see the slab today.
 
 2. **`ratarmount-compositing`:** extend the existing FR-6 parallel eager tests (or add one) so two real compact nested TAR (or dummy `MountSource` plus a compact-index helper) finish with **independent** intern state. If the dummy `EmptyNested` path cannot see a `StringPool`, keep the index-crate test as the invariant and only assert FR-6 still fans out (`parallel_eager_mounts_multiple_archives_same_level` / `parallel_eager_open_nested_overlaps_with_multiple_archives`). Do **not** weaken those tests.
 
@@ -214,10 +215,12 @@ Rewrite the P2 subsection to something equivalent to:
 ```text
 ### Parallel nested open pools
 
-- [x] Investigated (2026-08-28): eager FR-6 workers each build a private compact
-      StringPool (`create_compact_only`). No parent pool lock exists.
-- Residual: cross-archive intern (RSS) is a different item — see
-  docs/tasks/plans/p2-parallel-nested-pools.md Phase 1 / G1.
+- [x] Investigated (2026-08-28): eager FR-6 workers do not intern into a
+      parent StringPool. Reader = create_compact_only; warm import =
+      to_mem_index(); spool = private create_writable. No shared intern target.
+- Residual: cross-archive intern (RSS) is a different, gated item — see
+  docs/tasks/plans/p2-parallel-nested-pools.md Phase 1 / G1. Do not treat
+  G1 as a program that is expected to authorize merge.
 ```
 
 Add an AGENTS.md catalog row only if Phase 0 introduces a new named regression filter (the index-crate test above).
@@ -252,13 +255,13 @@ Authorized only after G1. Still plan-only here.
    - `DirEntries.names` keys in **`MemIndex.dirs` and every `MemIndex.shards[i]`** (sharded dirs store the same map)
    - builder `by_key_oh` if merge happens before `finish` (prefer **after** seal: fewer maps)
 4. Drop worker slabs after remap so strings are not live in two stores.
-5. Parent pool lives on `AutoMountLayer` (or a small `Arc<Mutex<StringPool>>` **only during merge**, then `Arc<StringPool>` read-only). After merge, nested `MemIndex` must **not** own a second slab.
+5. Sharing one slab across N nested indexes requires changing **`MemIndex.pool` from `StringPool` by value to `Arc<StringPool>`** (or equivalent). Today `StringPool: Clone` **deep-copies the slab**; putting `Arc<StringPool>` only on `AutoMountLayer` does not make nested indexes share it. After the parent is frozen, sidecar attach must use `lookup_arc` / `lookup_pooled_string` (`&self`). `intern` is `&mut self` and is the wrong API on a shared sealed pool.
 
 ### Hard constraints
 
 - **No RNIB change.** Export still `export_file_rows()`. Warm import still `to_mem_index()` into a **private** pool (import is single-threaded per member; sharing across warm remounts would be a third design).
 - **Do not intern during parse through the parent lock.** That would re-create the fictional P2 problem. Merge is post-build.
-- **ZIP/7z:** after `rebind_pool`, re-run sidecar name attach via `lookup_pooled_string` / `intern` on the **parent** so `Arc::ptr_eq` holds again. Test with the existing ZIP/7z pool-share unit tests plus a two-archive merge.
+- **ZIP/7z:** after `rebind_pool`, re-run sidecar name attach via `lookup_pooled_string` / `lookup_arc` on the **shared** pool so `Arc::ptr_eq` holds again (`intern` needs `&mut` and must not run on a frozen shared parent). Test with the existing ZIP/7z pool-share unit tests plus a two-archive merge.
 - **Unmount:** parent slab does not shrink. Document: unique strings from a dropped nested mount remain until AutoMount drop. Acceptable only because eager `-r` already retains all nested sources.
 - **Injection point:** `try_mount_file` stores `Arc<dyn MountSource>`. `MountSource` has no `as_any` / downcast / pool / `MemIndex` hook. A parent merge **after** open is not a small `StringPool` patch. Spike options (pick one, do not sneak all in):
   1. New narrow trait or downcast on `MountSource` (e.g. `CompactIndexMerge`) — compositing-visible.
@@ -357,7 +360,7 @@ Process: sweep 1 is mandatory; each sweep is a **fresh** skeptic; fold blockers 
 | Sweep | Verdict | Blockers folded |
 |-------|---------|-----------------|
 | 1 | **ACCEPT** (no blockers). Nits folded: spec vs charter; F1 “no parent argument”; F2 reader/import/spool; F3 outer `set_nested_index`; G1 as stop-sign + no `slab_bytes()`; Phase 1 `shards` + `NestedOpenContext` injection. | None (nits only) |
-| 2 | *(pending — fresh skeptic)* | |
-| 3 | | |
+| 2 | **ACCEPT** (no blockers). Nits folded: ISO reader *has* a private compact pool; Phase 0 test lives in `mem.rs`; Phase 1 needs `MemIndex.pool: Arc<StringPool>` (Clone deep-copies); sidecar attach via `lookup_arc` not `intern`. | None (nits only) |
+| 3 | *(pending — fresh skeptic)* | |
 
-**Final:** *(pending sweep 2)*
+**Final:** *(pending sweep 3)*
