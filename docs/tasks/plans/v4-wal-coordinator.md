@@ -4,7 +4,7 @@
 |-------|--------|
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-4** (partial, M) |
 | **Date** | 2026-08-28 |
-| **Status** | DRAFT — skeptic-plan-review in progress |
+| **Status** | DRAFT — skeptic sweep 1 folded; sweep 2 pending |
 | **Scope** | In-process single-writer commit queue for live interval / on-exit (and in-process offline when a `WriteOverlay` exists). Job = overlay file list + generation. Executor does splice / ZIP rebuild / sidecar patch. Coordinator flips the visible archive + index. |
 | **Ownership** | `ratarmount-compositing` (`write_overlay.rs`) + `ratarmount/src/overlay_commit.rs`. **Not** factory. **Not** formats-tar splice math. |
 | **Out of this train** | Durable Objects / Queues / Workers; IVF / ANN; V-2 pointer schema; F-7 remote multipart; P2 overlay FileInfo cookies; gzip live splice; live ZIP; cross-process archive flock |
@@ -17,7 +17,7 @@ Pairs with: [`tar-zst-live-commit-design.md`](../tar-zst-live-commit-design.md) 
 
 Vectorize keeps a small WAL of mutation *ids* and lets one executor rebuild objects; only the coordinator flips the root pointer. ratarmount-rs already has the persist bodies (last-frame `.tar.zst` splice, uncompressed GNU `tar --append`, offline ZIP rebuild, F-2 sidecar patch). What it does **not** have is an explicit single-writer *job* with a generation, so a second tick can start another splice or an on-exit persist can pile on after SIGTERM.
 
-This train adds that coordinator. It does **not** change how a splice is computed. Overlay folder + hidden SQLite `files` table stay the mutation log. The job is a **snapshot of overlay paths + `commit_generation`**, not a row-mutation stream and not the spliced bytes.
+This train adds that coordinator. It does **not** change how a splice is computed. Overlay folder + hidden SQLite `files` table stay the mutation log. The job is a **lightweight identity** (kind + `commit_generation` + optional coalesce hint of overlay paths), not a row-mutation stream and not the spliced bytes. The **persist plan** is still collected under `commit_gate` write immediately before splice (same as `commit_live_inner` today).
 
 **Consistency split (non-negotiable):**
 
@@ -48,8 +48,8 @@ This train adds that coordinator. It does **not** change how a splice is compute
 
 The interval thread being single-threaded is **not** a coordinator:
 
-1. **SIGTERM overlap.** Interval persist holds `commit_gate` write. FUSE unmount can return while that persist is still running. `maybe_commit_on_exit` then calls `commit_atomic` on the main thread. Today the write lock serializes them; on-exit may persist a **second** snapshot (or an empty plan after reset). There is no job id, no coalesce, no “already running → no-op”.
-2. **No job identity.** Persist re-walks the overlay under the write lock. There is no recorded generation + file list that a second tick can compare.
+1. **SIGTERM / on-exit overlap.** Interval persist holds `commit_gate` write. FUSE unmount can return while that persist is still running. `maybe_commit_on_exit` then calls `commit_atomic` on the main thread. Today the write lock serializes them, but `commit_live_idle` drops its **read** lock before `commit_live_inner` takes **write** — on-exit can win that gap, persist without forgetting host files, then interval splices the same names again. There is no job id, no “already running → no-op”, and a naive `Coalesced` promote after OnExit repeats that bug.
+2. **No job identity.** Persist already re-walks under the write lock (keep that). There is no recorded generation + kind that a second tick can compare for coalesce vs drain.
 3. **RO overlay open waits on persist.** `open_overlay_fd` takes `commit_gate.read()`. FUSE `open` of an overlay path therefore **blocks** for the whole GNU-tar / last-frame splice. `lookup` / already-open `OverlayFd` do not. That is a latency footgun; it is **not** the Vectorize “eventual overlay” model, but it must be named so we do not make it worse.
 4. **F-7 needs a hook.** Remote multipart cannot hold `commit_gate` for the upload. The portable part is: enqueue lightweight job → executor writes an object → coordinator flips. V-4 ships the in-process shape; F-7 plugs in later with a V-2 pointer (not designed here).
 5. **Offline free function is ungated.** In-process tests (or a future in-process caller) can overlap `commit_overlay` with `commit_live`. Live mount vs a **second process** `--commit-overlay` is a different residual (flock); out of v1.
@@ -61,7 +61,7 @@ The interval thread being single-threaded is **not** a coordinator:
 ### Goals (this train)
 
 1. **Single-writer commit queue** on `WriteOverlay`: interval / on-exit / in-process offline enqueue one job. A second enqueue while `Running` **no-ops or coalesces** — it must not start a second splice.
-2. **Job record** is `CommitJob { generation, kind, deleted_paths, append_entries }` (plus archive path / format already known). Not a per-row mutation stream. Not the spliced bytes.
+2. **Job record** is lightweight: `CommitKind` + `commit_generation` (+ optional coalesce hint). Not a per-row mutation stream. Not the spliced bytes. The executor **re-collects** `OverlayCommitPlan` under the persist write lock (K4).
 3. **Fail closed** on live prefix-frame `.tar.zst` mutate using existing `classify_tar_zst_path` / `earlier_frame_err`. Classify **before** the executor writes the sibling tmp. Entire job skipped; overlay and archive untouched.
 4. **Hot-file invariant** unchanged: open write fds and mtime younger than `--commit-overlay-interval` stay in the overlay (`commit_live_idle` / `overlay_entry_is_idle`).
 5. **Overlay reads immediately consistent:** `lookup` / `has_file` / `overlay_file_info` / already-open overlay fds stay ungated. FUSE `read` after `write` still sees overlay host bytes **before** the base republish. Do not route overlay reads through the executor.
@@ -97,13 +97,13 @@ The interval thread being single-threaded is **not** a coordinator:
 |---|----------|-----------|
 | K1 | **Queue lives on `WriteOverlay`**, not a new crate and not the CLI thread. Interval thread and on-exit become `enqueue` callers. Persist helpers stay private. | Crate ownership: compositing owns overlay + persist. Binary only schedules. |
 | K2 | **Executor is the existing interval thread plus a “run if idle” call from on-exit / in-process offline.** No second thread, no `async`, no extra dependency. If no interval thread exists (on-exit-only mount), the caller **runs the job inline** on the same queue state so two inline callers still cannot overlap. | Smallest change that gives single-writer + coalesce. A dedicated executor thread is a follow-on if F-7 uploads must not block unmount. |
-| K3 | **States: `Idle` \| `Running { job }` \| `Coalesced { job }`.** Enqueue while `Idle` → `Running` and execute. Enqueue while `Running` → store latest snapshot as `Coalesced` (or no-op if the new plan is empty / identical). When `Running` finishes, if `Coalesced` is set, it becomes the next `Running` **only if** `kind` allows (interval idle). On-exit / offline drain: wait for `Running` then run one final snapshot (or take `Coalesced`). | Matches “second tick no-ops or coalesces”. Coalesce = latest file list + current generation, not a FIFO of splices. |
-| K4 | **Job is a path-list snapshot + `commit_generation` at enqueue**, produced by existing `collect_overlay_commit_plan_from_conn`. Executor **re-validates** idle/write-fd for interval jobs immediately before persist (drop files that went hot; leave them in overlay). It does **not** re-walk the whole overlay for new names (those wait for the next tick / coalesced job). | Spec: lightweight list, not bytes. Re-validate prevents persisting a file the user re-opened for write after enqueue. New names belong to the next job. |
-| K5 | **Prefix-frame classify is coordinator-side, fail-closed, before sibling tmp.** Use `classify_tar_zst_path` on the job’s `deleted_paths` (and replace-as-delete). Failure: job aborted, state → `Idle`, overlay + archive unchanged, error text unchanged (`append-only` / whole commit skipped). Offline `.tar.zst` still uses `offline_tar_zst_from_idx` (not this reject). | Existing tests assert exact error class and byte-identical prefix. Do not start an executor that would rewrite the prefix under a live reader. |
+| K3 | **States: `Idle` \| `Running { kind, generation }` + optional `coalesced: Option<LiveIdleHint>`.** `coalesced` is a **side slot**, not a successor state that stops persist. Enqueue `LiveIdle` while `Idle` → `Running` and execute. Enqueue `LiveIdle` while `Running` → set/replace `coalesced` (or no-op if the hint is empty / identical). **Finish + promote is one queue-mutex transition:** if `Running.kind` was `LiveIdle` and `coalesced` is set → next `Running { LiveIdle }` (hint is identity only; persist re-collects). If `Running.kind` was `OnExit` / `Offline` / `LiveFull` → **discard `coalesced`** and go `Idle`. On-exit / offline: **wait until Idle with `coalesced` empty** (or discard coalesced as part of taking the wait), then **fresh** `collect_overlay_commit_plan_from_conn` of what is still on disk. Never promote a `LiveIdle` coalesced job after an OnExit/Offline persist (on-exit does not forget host files — promoting would splice the same names again). Never “take Coalesced” as the persist plan. Interval thread must **not** wait on on-exit. Queue mutex is **not** held across persist. | Sweep-1 B1: OnExit + promote-Coalesced re-persists names still on disk (no forget). Stale coalesced path lists after interval forget are also wrong. Coalesce = “run another idle tick after this LiveIdle”, not a FIFO of splices. |
+| K4 | **Job identity is not the persist plan.** Enqueue may snapshot paths as a **hint** for coalesce/no-op (`same names?` / empty). Persist **always** calls `collect_overlay_commit_plan_from_conn` under `commit_gate` **write** (today’s `commit_live_inner`), including idle cutoff, `write_fds`, and parent-dir retain (`skipped` / `path_is_under_rel`). Do not persist a path list collected under a read lock. Do not “re-validate by dropping names from a stale list” — that misses a parent dir whose child went hot, which `live_commit_idle_nested_hot_sibling_keeps_parent` covers. | Sweep-1 B2: hot-file invariant is the full collect under write lock, not a filtered snapshot. Spec “file list + generation” = job **identity**; bytes still come from the overlay dir at persist time. |
+| K5 | **Prefix-frame classify stays inside the persist body, fail-closed, before sibling tmp.** Live zstd: `scan` → `find_last_n_tar_window` → `classify_tar_zst_path` on the **just-collected** plan’s `deleted_paths` → only then `splice_zstd_last_frames_replace`. Failure: `earlier_frame_err`, no tmp, overlay + archive unchanged. Do **not** classify a stale enqueue list before `Running`. `CommitKind::Offline` must call `commit_overlay_tar_zst` / `offline_tar_zst_from_idx` (prefix-frame delete **allowed**), never live `persist_tar_zst_plan`. | Existing tests assert exact error class and byte-identical prefix. Classify needs the rewrite window from `find_last_n` (already true in `persist_tar_zst_plan`). |
 | K6 | **Persist still holds `commit_gate` write for the persist + flip critical section.** Overlay writers (create/unlink/mkdir/rename/truncate) still wait. This keeps GNU `tar --append` / splice `FileOnDisk` stable. The queue’s job is overlapping-**splice** prevention, not concurrent writers. | Unlocking writes during persist is a new race (hot file after snapshot, GNU tar reading a changing inode). Out of v1. |
 | K7 | **RO overlay open must not take `commit_gate`.** Split `open_overlay_fd`: write flags keep the read-lock (serialize with persist); read-only open uses the same confinement/`O_NOFOLLOW` path **without** the gate (same as `has_file` / `MountSource::open`). FUSE `cat` of an overlay file during a long splice stays on the host inode. | Immediate overlay consistency + no extra wait that looks like “eventual”. Does not redesign FileInfo. |
 | K8 | **Flip order unchanged (K11):** persist sibling → `persist()` over archive → reopen (interval) → `replacement = Some` → `commit_generation += 1` → `forget_committed_overlay` (idle) or full reset (full live). Reopen-fail: overlay kept, `interval_disabled`, remount required. On-exit / `commit_atomic`: persist + generation bump, **no** reset. | `overlay_commit_live_delete_shifts` (FUSE + NFS) depends on generation advancing so cached base readers re-lookup. Do not bump generation before the new bytes are visible. |
-| K9 | **In-process offline** (`commit_overlay` free function) stays path-based for the CLI one-shot. When the caller already has a `WriteOverlay` (library / tests), add `WriteOverlay::commit_offline` that enqueues with `kind: Offline` so it cannot overlap a live tick. Do **not** make the path-based CLI take a live mount’s gate (different process). | Spec says “offline enqueue”; the realistic overlap is in-process. Cross-process flock is documented residual. |
+| K9 | **In-process offline** (`commit_overlay` free function) stays path-based for the CLI one-shot. When the caller already has a `WriteOverlay` (library / tests), add `WriteOverlay::commit_offline` (`CommitKind::Offline`, same wait-for-Idle + discard-coalesced rule as OnExit) so it cannot overlap a live tick. Do **not** make the path-based CLI take a live mount’s gate (different process). Do **not** flip V-4 to `done` until `commit_offline` exists (sweep-1 nit). Cross-process flock stays residual. | Spec says “offline enqueue”; the realistic overlap is in-process. |
 | K10 | **ZIP stays offline full rebuild.** Live queue never accepts ZIP (`live_commit_is_supported` unchanged). `commit_overlay_zip` tests keep calling the free function. | Do not invent live ZIP. |
 | K11 | **V-2 / F-7 hook is a named function, not a schema.** `fn flip_visible_local(archive, tmp)` is today’s `NamedTempFile::persist`. Comment + `#[allow]`-free stub module note: F-7 replaces the last step with “upload immutable object, then publish V-2 pointer”. No JSON pointer, no `index_id` field, no IVF. | User spec: later uses V-2 pointer; do not invent it. |
 | K12 | **P2 overlay cookies are adjacent, not in scope.** Queue flip already bumps `commit_generation`. FUSE/NFS caches already sweep on that. Do not change `overlay_file_info` to a compact cookie in this PR. | User spec. |
@@ -117,45 +117,45 @@ The interval thread being single-threaded is **not** a coordinator:
 ```mermaid
 stateDiagram-v2
   [*] --> Idle
-  Idle --> Running: enqueue(non-empty job)
-  Running --> Idle: persist+flip ok, no coalesced
-  Running --> Idle: classify fail / empty re-validate / interval_disabled
-  Running --> Coalesced: enqueue while Running (latest snapshot)
-  Coalesced --> Running: previous job done, coalesced still non-empty
-  Running --> Idle: reopen fail (interval_disabled)
+  Idle --> Running: enqueue LiveIdle / LiveFull / OnExit / Offline
+  Running --> Idle: persist done and (no coalesced or kind was not LiveIdle)
+  Running --> Running: finish+promote: LiveIdle done and coalesced set
+  Running --> Idle: classify fail / empty collect / interval_disabled
 ```
 
-`Coalesced` holds **one** job (latest snapshot), not a queue of N splices. Two interval fires during a 60 s splice → one running persist + at most one follow-up snapshot.
+`coalesced` is a **side slot on `Running`**, not a state that stops persist. Two interval fires during a 60 s splice → one running persist + at most one follow-up **LiveIdle** after finish+promote. OnExit/Offline **discard** the slot (K3).
 
 ### Job record
 
 ```rust
 enum CommitKind {
-    /// `--commit-overlay-interval`: idle filter; forget only job paths.
+    /// `--commit-overlay-interval`: idle filter; forget only persisted paths.
     LiveIdle { idle_for: Duration },
     /// Full live persist + overlay reset (tests / explicit `commit_live`).
     LiveFull,
     /// On-exit: persist, no reopen, no overlay reset.
     OnExit,
-    /// In-process offline (`WriteOverlay::commit_offline`): format-specific
-    /// persist including earlier-frame zstd splice / ZIP rebuild. No reopen.
+    /// In-process offline (`WriteOverlay::commit_offline`): ZIP rebuild /
+    /// `commit_overlay_tar_zst` (earlier-frame splice allowed). No reopen.
     Offline,
 }
 
+/// Queue identity only. Persist plan is collected under commit_gate write.
 struct CommitJob {
-    /// `commit_generation` observed at enqueue (detect stale job if another
-    /// flip won — should not happen under single-writer, asserted in tests).
     generation: u64,
     kind: CommitKind,
-    deleted_paths: HashSet<String>,
-    /// `(rel, is_directory)` — same as `OverlayCommitPlan.append_entries`.
-    append_entries: Vec<(String, bool)>,
+}
+
+/// Optional coalesce hint (not the persist plan). Used to no-op identical
+/// LiveIdle ticks and to decide “run one more idle collect after this job”.
+struct LiveIdleHint {
+    generation: u64,
+    /// Path set from a *read-lock* peek; discarded at persist time.
+    names: HashSet<String>,
 }
 ```
 
-Do **not** store GNU `deletions_nul` / `appends_nul` on the job; rebuild those from the path lists when the executor calls `persist_by_format` (or keep `OverlayCommitPlan` crate-private and have the job own one). Prefer **one** `OverlayCommitPlan` inside the job so ZIP / GNU tar nul lists stay in sync.
-
-`OverlayCommitPlan` stays crate-private. The queue API is `enqueue_*` / `commit_live` wrappers, not a public mutation stream.
+`OverlayCommitPlan` stays crate-private and is built **only** under `commit_gate` write, immediately before `persist_by_format` / `commit_overlay_tar_zst` / `commit_overlay_zip`. GNU `deletions_nul` / `appends_nul` stay on that plan (do not rebuild from a stale hint). The queue API is `enqueue_*` / existing `commit_live*` wrappers, not a public mutation stream.
 
 ### Live interval sequence (target)
 
@@ -163,31 +163,29 @@ Do **not** store GNU `deletions_nul` / `appends_nul` on the job; rebuild those f
 sequenceDiagram
   participant T as interval thread
   participant Q as queue on WriteOverlay
-  participant C as classify
-  participant E as persist_by_format
+  participant E as collect + persist under write lock
   participant F as flip (persist rename + swap)
   participant R as FUSE/NFS overlay read
 
-  T->>Q: enqueue LiveIdle (collect plan, short read lock)
-  alt plan empty
-    Q-->>T: Ok(false)
-  else Q is Running
-    Q->>Q: Coalesced = latest plan
-    Q-->>T: Ok(false) no-op this fire
+  T->>Q: enqueue LiveIdle (identity + optional name hint)
+  alt Q is Running
+    Q->>Q: coalesced = latest LiveIdle hint
+    Q-->>T: Ok(false) this fire
   else Idle
-    Q->>C: classify_tar_zst_path (live zstd only)
-    alt prefix-frame
-      C-->>T: Err(append-only); Idle; archive untouched
+    Q->>Q: Running = {LiveIdle, generation}
+    Q->>E: commit_gate.write()
+    E->>E: collect_overlay_commit_plan_from_conn (idle + parent retain)
+    alt plan empty
+      E-->>T: Ok(false)
+    else live zstd prefix-frame
+      E-->>T: Err(append-only); no sibling tmp
     else ok
-      Q->>Q: Running = job
-      Q->>E: commit_gate.write(); persist sibling tmp
       Note over R: lookup / OverlayFd / RO open ungated
-      E->>F: persist() + reopen + swap + gen++ + forget job paths
+      E->>E: persist_by_format (scan / find_last_n / classify / splice)
+      E->>F: persist() + reopen + swap + gen++ + forget collected paths
       F-->>T: Ok(true)
-      alt Coalesced set
-        Q->>Q: run coalesced as next job
-      end
     end
+    Q->>Q: finish+promote (one mutex): LiveIdle and coalesced? else Idle
   end
 ```
 
@@ -196,23 +194,24 @@ sequenceDiagram
 | | Interval | On-exit |
 |--|----------|---------|
 | Enqueue | `LiveIdle` | `OnExit` |
-| Idle filter | yes | no (whole overlay) |
-| If `Running` | coalesce | **wait** for `Running` (main thread joins / polls the queue), then one `OnExit` snapshot of whatever is **still** in the overlay |
-| Reopen / reset | yes / forget job paths | no / no |
+| Idle filter | yes (at **persist** collect, write lock) | no (whole overlay, fresh collect) |
+| If `Running` | set `coalesced` hint; this fire returns `Ok(false)` | **Wait until Idle with coalesced discarded** (K3). Then fresh collect of host files **still** present. Interval thread never waits on on-exit. |
+| After persist | forget **collected** paths (`forget_committed_overlay`) | **no** overlay reset (files stay on disk) |
+| Reopen | yes (interval) | no |
+| Next LiveIdle | finish+promote may run one more idle collect | coalesced **discarded** — must not splice the same still-present names |
 | `interval_disabled` | further interval jobs fail | `commit_atomic` already errors; keep that |
 
-SIGTERM during a long splice: interval thread finishes persist+forget; on-exit waits, then sees remaining hot files (or empty) and persists those without resetting. No second splice of the same settled names.
+SIGTERM during a long splice: interval thread finishes persist+forget; on-exit waits for Idle, discards any coalesced LiveIdle, then persists remaining hot / unforgotten files once. Settled names already forgotten by the interval job are not in the fresh collect.
 
 ### Fail-closed classify (live zstd)
 
-Reuse, do not fork:
+Reuse `persist_tar_zst_plan`, do not fork a second classify on the enqueue hint:
 
-- `find_last_n_tar_window` → `rewrite_window_start_uncomp`
-- For each path in `job.deleted_paths`: `classify_tar_zst_path`
+- Under write lock: collect plan → `scan` → `find_last_n_tar_window` → `classify_tar_zst_path` on that plan’s `deleted_paths`
 - `TarZstPathClass::OverlayOnly` / `LastWindow` only
 - Any earlier-frame → `earlier_frame_err`, **no** sibling tmp, **no** `persist()`
 
-Offline `CommitKind::Offline` on `.tar.zst` uses existing `commit_overlay_tar_zst` / `offline_tar_zst_from_idx` (prefix-frame delete **allowed**). The queue must not apply the live reject to `Offline`.
+`CommitKind::Offline` on `.tar.zst` must call existing `commit_overlay_tar_zst` / `offline_tar_zst_from_idx` (prefix-frame delete **allowed**). Never route Offline through live `persist_tar_zst_plan`.
 
 ### Immediate overlay reads (do not make these eventual)
 
@@ -278,14 +277,14 @@ Rules: drive shipped functions; generate payloads; name regressions `Regression:
 
 | Case | Layer | Assert |
 |------|--------|--------|
-| **Regression: two interval fires during a long splice** | compositing | Hold persist with a test hook / slow `reopen` **or** inject `Running` and call `commit_live_idle` twice. Second call `Ok(false)` or coalesce; **one** `persist()`; archive not truncated; prefix bytes `cmp` identical. |
-| Coalesce latest names | compositing | While `Running`, create a second idle file; after first job, coalesced job persists the new name once. |
-| Prefix-frame mutate fail-closed | compositing | Existing `live_commit_tar_zst_earlier_frame_delete_unchanged` + mixed append+delete still `Err`, archive unchanged. Queue must not write tmp first. |
-| Hot files stay | compositing | Existing `commit_live_idle` tests (open write fd / young mtime). Queue re-validate drops a file that went hot after enqueue. |
-| Overlay read during persist | compositing + fuse | `lookup` / RO `open_overlay_fd` / `cat` of an overlay file while a test persist holds the write lock returns overlay bytes (K7). Must not hang the test (timeout). |
+| **Regression: two interval fires during a long splice** | compositing | Hold persist with a test hook / slow `reopen` **or** inject `Running` and call `commit_live_idle` twice. Second call `Ok(false)`; **one** `persist()` during the first job; archive not truncated; prefix bytes `cmp` identical. |
+| Coalesce is another idle **collect**, not a stored path list | compositing | While `Running`, create a second idle file **and** a hot child under a dir. After finish+promote, persist uses write-lock collect: new idle name once; parent dir of the hot child **not** appended / not forgotten (`live_commit_idle_nested_hot_sibling_keeps_parent` stays green). |
+| Prefix-frame mutate fail-closed | compositing | Existing `live_commit_tar_zst_earlier_frame_delete_unchanged` + mixed append+delete still `Err`, archive unchanged. No sibling tmp on reject. |
+| Hot files stay | compositing | Existing `commit_live_idle` tests (open write fd / young mtime). Persist collect under write lock, not a filtered enqueue list. |
+| Overlay read during persist | **fuse** (not only compositing `lookup`) | Drive FUSE `open` (`has_file` → RO `open_overlay_fd` → NotFound fallthrough → `open_source_backend`). `cat` of an overlay file while persist holds the write lock returns overlay bytes and must not hang (timeout). Must not hit size-0 `Empty` (`overlay_file_info` / create-then-cat residual). |
 | Generation flip | fuse + nfs | Existing `overlay_commit_live_delete_shifts` stay green (generation bump after swap). |
 | ZIP / offline splice | compositing | `commit_overlay_zip` + `commit_overlay` (incl. earlier-frame delete, seek-table) stay green. |
-| On-exit after interval | compositing / bin | Interval persist then `commit_atomic`: no duplicate members; remaining hot files flushed once. |
+| **Regression: on-exit after interval does not splice twice** | compositing | Interval persist (forget settled names) then `commit_atomic` / OnExit: no duplicate TAR members; remaining hot files flushed once; coalesced LiveIdle discarded (sweep-1 B1). |
 | `interval_disabled` | compositing | Existing persist+reopen-fail: second tick skipped via `interval_disabled`, not `Ok(false)`. |
 | Empty second tick | compositing | Existing `Ok(false)` after forget. |
 
@@ -323,9 +322,11 @@ Add an AGENTS.md catalog row for the overlapping-interval regression in the impl
 - **Tests:** injected long persist; two `commit_live_idle`; readers never see truncated `.tar.zst`; on-exit waits then one snapshot. AGENTS.md catalog row.
 - **Docs:** one paragraph in [`docs/zstd-random-access.md`](../../zstd-random-access.md) / mount-options if operator-visible (“interval ticks coalesce; overlay reads stay live”).
 
-### PR 3 (optional, same release if small)
+### PR 3 — In-process offline enqueue (required to close V-4 “offline”, not optional for `done`)
 
-- `WriteOverlay::commit_offline` for in-process overlap with live ticks. CLI `commit_overlay` free function unchanged.
+- `WriteOverlay::commit_offline` (`CommitKind::Offline` → `commit_overlay_zip` / `commit_overlay_tar` / `commit_overlay_tar_zst`, **not** live `persist_tar_zst_plan`).
+- Wait-for-Idle + discard coalesced (same as OnExit). CLI `commit_overlay` free function unchanged.
+- Do not mark V-4 `done` in `vectorize-steal-patterns.md` until this lands.
 
 F-7 / V-2 are **not** PRs in this train.
 
@@ -335,7 +336,8 @@ F-7 / V-2 are **not** PRs in this train.
 
 | Risk | Severity | Mitigation |
 |------|----------|------------|
-| Coalesce persists a name the user deleted during `Running` | Medium | Re-validate plan under write lock before persist; missing host file → drop append; tombstone still in `deleted_paths` only if still deleted in DB |
+| Coalesce persists a name the user deleted during `Running` | Medium | Persist **re-collects** under write lock (K4); missing host file is not in `append_entries`; tombstone only if still `deleted=1` in DB |
+| OnExit + promote coalesced LiveIdle splices the same names twice | **High** | K3: discard coalesced on OnExit/Offline; wait for Idle; fresh collect. New regression test. |
 | Classify after tmp write | **High** | K5: classify first |
 | Double `persist()` tears `.tar.zst` | **High** | Single `Running`; persist only from executor; sibling tmp + rename |
 | Generation bump before swap | **High** | K8; existing shift tests |
@@ -377,7 +379,7 @@ This **plan-only** PR adds this file. Do not flip V-4 to `done`.
 
 1. **Dedicated executor thread vs inline (K2)?** Recommendation: inline + interval thread for v1. Revisit when F-7 upload must outlive unmount.
 2. **Cross-process flock?** Recommendation: residual. Document “do not `--commit-overlay` a file that is live-mounted”.
-3. **Public `commit_offline`?** Recommendation: only if an in-process test needs it; CLI stays on the free function.
+3. **Public `commit_offline`?** Required to close the V-4 “offline enqueue” checkbox (K9). CLI stays on the free function. Cross-process flock stays residual.
 
 ---
 
@@ -385,7 +387,7 @@ This **plan-only** PR adds this file. Do not flip V-4 to `done`.
 
 | Sweep | Result | Folded |
 |-------|--------|--------|
-| 1 | *pending* | |
+| 1 | **BLOCKED** (B1 on-exit+coalesce double persist; B2 persist must re-collect under write lock) | K3 rewritten (discard coalesced on OnExit/Offline; finish+promote one mutex transition; never persist a stored path list). K4 job = identity; persist = `collect_overlay_commit_plan_from_conn` under write lock (parent-dir retain). K5 classify stays inside persist after `find_last_n`. K9 `commit_offline` required to mark V-4 done. Tests: on-exit-after-interval no duplicate; FUSE `open` for K7; coalesce uses write-lock collect. Nits on mermaid / Offline persist path folded. |
 | 2 | *pending* | |
 | 3 | *pending* | |
 
