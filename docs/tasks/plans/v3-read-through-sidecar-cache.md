@@ -5,7 +5,7 @@
 | **ID** | V-3 |
 | **Parent** | [`docs/tasks/vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) |
 | **Date** | 2026-08-28 |
-| **Status** | Plan — skeptic-plan-review in progress |
+| **Status** | Plan — skeptic-plan-review **ACCEPT** (implement still blocked on V-2) |
 | **Effort** | L (implement); this document is plan-only |
 | **Ownership** | `ratarmount-index` (cache + keys) · `ratarmount` `remote_open.rs` (HTTP/OCI fill) · `ratarmount/src/factory.rs` `resolved_index` / `remote_index_setup` / nested durable (orchestrator unless the implement task owns factory) · not `ratarmount-compress` (seek maps already live in index + factory import) |
 | **Depends** | **V-2** immutable index + atomic root pointer (`index_id`, `etag`/`sha256`, `archive_tarstats`) |
@@ -250,11 +250,11 @@ V-3 identity is **not** closed by deleting one `if path_is_nonempty_file` in dis
 3. Miss / corrupt / tarstats fail: GET blob via locator, verify, `rename` into `sidecar-v3/`, set `opts.index_file_path` to **that** file.
 4. **Do not copy** pointer-backed installs into the URL-mangled `cache_dest`. Stop writing those files on the V-3 path.
 5. Bypass `apply_remote_index_discovery`’s nonempty-file skip **and** `fetch_oci_index_referrer`’s nonempty skip when a pointer is present (OCI is in v1 **only** for pointer-backed subjects; otherwise OCI stays on today’s `oci:{digest}` local file).
-6. **CAS / immutable:** a V-3 Sidecar file must never be opened writable. Default CLI is `write_index: true`. Factory `persist_*`, `store_zstd_blocks_in_index`, `store_bzip2_blocks_in_index`, `open_writable` for seek-map import, and AutoMount `try_store_nested_durable` **must not** target a V-3 path (WAL/shm next to the CAS file is also forbidden). When `index_file_path` is a V-3 file, treat that path as `read_only_index` for SQLite open. Locally produced seek maps / RNIB stay **in-process only** in v1 (same-process memo). Cross-process persistence of maps you just built is a V-2 republish, not a mutate of the cache. Optional writable sibling outside `sidecar-v3/` is **out of v1** and must not be consulted on remount when a pointer exists.
+6. **CAS / immutable:** a V-3 Sidecar file must never be opened writable **or unlinked**. Default CLI is `write_index: true`. `read_only_index` alone is not enough: TAR/ZIP `open_from_reader` → `SqliteIndex::create_writable` **`remove_file`s** an existing path (dir-writable is enough; chmod 0444 does not save it). When `index_file_path` is a V-3 file, live-Range must use `open_with_existing_index_from_reader` (and a ZIP warm equivalent), not `create_writable` / `create_writable_for_open`. Factory `persist_*`, `store_*_blocks_in_index`, `open_writable` (WAL/shm), and AutoMount `try_store_nested_durable` must not target a V-3 path. GET-count must assert no `-wal`/`-shm` beside the CAS file and unchanged bytes/`blob_sha256`. Locally produced seek maps / RNIB stay **in-process only** in v1. Cross-process persistence of maps you just built is a V-2 republish. Optional writable sibling outside `sidecar-v3/` is **out of v1** and must not be consulted on remount when a pointer exists.
 7. **No folder fallback:** pointer present + no successful V-3 install (GET fail, tarstats fail, both caps 0, corrupt) → `resolved_index` / `remote_index_setup` **must not** use `possible_index_paths` leftovers. Cold index or a throwaway tempfile only. `OpenOptions` has no such field today — add `skip_folder_index_fallback: bool` (name bikeshed-OK) set whenever a pointer was fetched. Factory honors it even if `index_file_path` is still `None`.
 8. When `opts.index_file_path` is already a V-3 cache path, `resolved_index` uses it and does not replace it with a URL-mangled candidate.
 
-**`--index-file http(s)://` (pointer-present):** do **not** wire `get_or_fill` inside `maybe_fetch_index_url` / `fetch_index_http` (those functions see only the index URL — a URL-only key). In `open_remote_input` (HTTP arm) or `remote_index_setup` (has archive label + explicit URL): if `explicit_url == blob_locator(pointer)` (string equality only; no “equivalent fetch”), `get_or_fill` and set `index_file_path` to the **local V-3 file** *before* `resolve_index_location` so `maybe_fetch_index_url` is not invoked. If the explicit URL does not equal the locator: treat as pointer-absent for that flag (legacy GET of the explicit URL, no V-3 write). Without a pointer: today’s full GET, no V-3 write.
+**`--index-file http(s)://` (pointer-present):** do **not** wire `get_or_fill` inside `maybe_fetch_index_url` / `fetch_index_http` (those functions see only the index URL — a URL-only key). In `open_remote_input` (HTTP arm) or `remote_index_setup` (has archive label + explicit URL): if `explicit_url == blob_locator(pointer)` (string equality only; no “equivalent fetch”), `get_or_fill` and set `index_file_path` to the **local V-3 file** *before* `resolve_index_location` so `maybe_fetch_index_url` is not invoked. On fill **failure**, leave `index_file_path` as `None` + `skip_folder_index_fallback` — do **not** leave the HTTP URL in `index_file_path` (that re-enters `resolve_index_location` → folder leftover). If the explicit URL does not equal the locator: treat as pointer-absent for that flag (legacy GET of the explicit URL, no V-3 write). Without a pointer: today’s full GET, no V-3 write.
 
 **Pointer absent (legacy G-2; default until publishers write pointers):**
 
@@ -421,6 +421,8 @@ Protocol: never skip sweep 1; fresh Task skeptic each sweep; fold blockers; cap 
 |-------|---------|-------------|
 | 1 | **REVISE** | §2.1 remount/`open_s3_like`/`--index-file`/OCI; §5.2 opaque etag + `blob_sha256` + pointer-required hits; §5.3 SeekMap/Rnib in-process only; §5.4–5.5 pointer-absent legacy + factory `resolved_index`; §5.7–5.9 / §6 / §8 call-site list |
 | 2 | **REVISE** | §5.3 memo types + unit test; §5.5 CAS/RO + `skip_folder_index_fallback` + leftover-miss; `--index-file` locator equality before `resolve_index_location`; §5.1 mtime; §5.9 rclone + auth must; §6 `write_index=true` GET-count |
-| 3 | _pending_ | |
+| 3 | **ACCEPT** | Nits folded as implement notes: `create_writable` unlink (§5.5.6), `--index-file` fill-fail must not re-enter `resolve_index_location` with the HTTP URL (§5.5) |
 
-**Final:** _pending_
+**Final: ACCEPT**
+
+Implement remains `IMPLEMENT BLOCKED ON V-2`. No further skeptic sweeps. Do not implement in this PR.
