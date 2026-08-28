@@ -128,8 +128,12 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 
 ### Parallel nested open pools
 
-- [ ] Per-worker string pool / arena during eager parallel nested open, then merge into parent pool
-- [ ] Avoid global pool lock contention without duplicating all strings forever
+- [x] Investigated (2026-08-28): eager FR-6 workers do not intern into a
+      parent StringPool. Reader = create_compact_only; warm import =
+      to_mem_index(); spool = private create_writable. No shared intern target.
+- Residual: cross-archive intern (RSS) is a different, gated item — see
+  docs/tasks/plans/p2-parallel-nested-pools.md Phase 1 / G1. Do not treat
+  G1 as a program that is expected to authorize merge.
 
 ### True SIMD (only on bulk)
 
