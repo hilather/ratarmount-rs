@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | **Implemented** (FUSE-only density + residual hardening; not V-4). SHA pending this PR’s implementation commit. Review: see [Skeptic review](#skeptic-review). |
+| **Status** | **Implemented** (FUSE-only density + residual hardening; not V-4). SHA `e860a90f91560b7ad7ac83e6a41a20483a3b20d0`. Review: see [Skeptic review](#skeptic-review). |
 | **Date** | 2026-08-28 |
 | **Source item** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Overlay / write path” |
 | **Related (do not implement)** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-4** (commit queue) |
