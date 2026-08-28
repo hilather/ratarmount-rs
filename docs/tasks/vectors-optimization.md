@@ -121,6 +121,8 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 - [ ] Stage build rows as SoA / batch binds before `insert_files_batch` (path TAR/ZIP/7z cold build)
 - [ ] Does not change on-disk SQLite shape; only peak during build
 
+Plan (not implemented): [`plans/p2-sqlite-bulk-staging.md`](plans/p2-sqlite-bulk-staging.md).
+
 ### Overlay / write path
 
 - [ ] Overlay file-info cache: compact cookie + size/mtime, not full `FileInfo` (watch size-0 / create residuals)
