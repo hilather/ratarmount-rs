@@ -13,6 +13,7 @@ thiserror.workspace = true
 log.workspace = true
 libc.workspace = true
 flate2 = "1"
+crc32fast = "1"
 bzip2 = { version = "0.5", features = ["static"] }
 lzma-sys = "0.1"
 aes = "0.8"

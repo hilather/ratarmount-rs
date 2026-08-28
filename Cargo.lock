@@ -2833,6 +2833,7 @@ dependencies = [
  "bzip2",
  "cbc 0.1.2",
  "cipher 0.4.4",
+ "crc32fast",
  "flate2",
  "libc",
  "log",
