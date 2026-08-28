@@ -2,7 +2,7 @@
 
 | Field | Value |
 |-------|--------|
-| **Status** | **Implemented** (FUSE-only density + residual hardening; not V-4). SHA `e860a90f91560b7ad7ac83e6a41a20483a3b20d0`. Review: see [Skeptic review](#skeptic-review). |
+| **Status** | **Implemented** (FUSE-only density + residual hardening; not V-4). Implementation SHA `e860a90f91560b7ad7ac83e6a41a20483a3b20d0`. Plan skeptic: ACCEPT. Implementation skeptic sweep 1: **ACCEPT**. |
 | **Date** | 2026-08-28 |
 | **Source item** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Overlay / write path” |
 | **Related (do not implement)** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-4** (commit queue) |
@@ -313,6 +313,20 @@ Protocol: never skip sweep 1; each sweep is a **fresh** skeptic (no prior review
 |-------|---------|------------------|
 | 1 | **REVISE** | (1) Defer NFS/export-core: `cached_lookup_fi` feeds `get_or_open` / `read_member` / size-0 empty cursor; no production `to_file_info`. (2) Existing `overlay_file_info` test is getattr + raw fd, not FUSE `open`; add production-open create→write→read test with a distinct filter. (3) Name export-core / 9P / SMB / SFTP as a third fat inode map; do not claim FUSE+NFS are the only caches. Nits: immutable `ino_for_path_with_fi` is not a cookie test; overlay lookup-miss fallback; `readdirplus` `.` uses `cached_fi`; never leave both Options `Some`; do not duplicate the AGENTS.md `overlay_file_info` row. |
 | 2 | **ACCEPT** | Nits folded as clarifications only (do not use `test_open_ro`; HTTP has no `InodeTable`; root may stay fat; `flags` unused / not an open key; `readdirplus` `.` is ~L879). No blockers. |
+| 3 | skipped | Cap unused — stopped at ACCEPT. |
+
+Final: **ACCEPT**.
+
+---
+
+## Implementation skeptic review
+
+Protocol: never skip sweep 1; each sweep is a **fresh** skeptic (no prior review context); fold blockers; cap **3** then **BLOCKED**. Stop at **ACCEPT** or **BLOCKED**.
+
+| Sweep | Verdict | Folded |
+|-------|---------|--------|
+| 1 | **ACCEPT** | No blockers. Nits only (cookie is write-only on the production path by design; no dedicated lookup-miss unit test; `overlay_commit_live_delete_shifts` still uses `overlay: None` and does not observe cookie clearing). |
+| 2 | skipped | Cap unused — stopped at ACCEPT. |
 | 3 | skipped | Cap unused — stopped at ACCEPT. |
 
 Final: **ACCEPT**.
