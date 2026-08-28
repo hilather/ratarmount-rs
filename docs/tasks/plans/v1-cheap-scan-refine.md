@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs |
 | **Date** | 2026-08-28 |
-| **Status** | Plan (skeptic review in progress — sweeps 1–2 folded, awaiting sweep 3) |
+| **Status** | **ACCEPT** (skeptic-plan-review: 3 sweeps; implement from this file) |
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-1** Cheap scan then refine (`partial`, M) |
 | **Pairs with** | [`vectors-optimization.md`](../vectors-optimization.md) P0 list/dirents residual; [`beyond-parity-roadmap.md`](../beyond-parity-roadmap.md) **F-3** overlay residual |
 | **Audience** | Implementers who already know `MountSource`, `MemIndex` / `EntrySoa`, F-3 locate, and `WriteOverlay` |
@@ -261,11 +261,13 @@ Use **`current_base()`**, not `self.base` (live commit `replace_base` swaps the 
 
 There is **one** `Arc<dyn Fn(&str) -> String>` built in `main.rs` (the SearchFn). **`Control.search_text` is that function** (same `Arc` as the socket). It does **not** also prefer `inner.search_cheap` and then call `on_search`. Dual owners are how overlay vanishes on the control file or TSV is last-wins’d twice.
 
+**Day-1 pin:** `main.rs` already builds the callback **before** wrapping Control. SearchFn must close over the **pre-Control** `Arc` (WriteOverlay or factory bundle) plus `overlay_arc`. Do **not** capture Control (chicken-egg / stack overflow). `Control.search_cheap` exists so trait callers/tests see the overlay; SearchFn step 2 calls the pre-Control source (or Control only in tests that construct `Control(overlay)` and call `search_text` via the shared Arc). `Control.search_cheap` **forwards to `inner`**, never to `search_text` / `on_search`.
+
 **SearchFn steps (this is the only locate pipeline for control + socket):**
 
 1. If pattern is `fts:` or the CLI `--fts` bit is set → **never** call `search_cheap` / `scan_glob`. SQL `MATCH` only. Then if `overlay_arc` is `Some`, overlay-merge onto those hit rows. Stop.
 2. Else `outer.search_cheap(pattern)` if `Some` → format TSV. **Stop.** (`WriteOverlay` already merged when base was `Some`. **Do not** apply `overlay_arc` again.)
-3. Else sidecar SQL (`search_existing_sidecar`). If that returns the error string `error: search requires an on-disk index`, emit that error and **do not** parse it as hits. **Do not** invent overlay-only-on-`[]` when there is no sidecar (compact-only Union / OCI / `:memory:` stay that error). Then, if `overlay_arc` is `Some` **and** sidecar returned **hit rows** (including empty `Ok([])` on a real sidecar), overlay-merge onto those rows.
+3. Else sidecar SQL (`search_existing_sidecar`). **Any** sidecar `Err` (missing sidecar, `:memory:`, or other) → emit `error: {e}` and **do not** overlay-merge. **Do not** invent overlay-only-on-`[]` when there is no sidecar (compact-only Union / OCI / `:memory:` stay that error). Then, if `overlay_arc` is `Some` **and** sidecar returned `Ok(hits)` (**including empty `Ok([])`** on a real sidecar), overlay-merge onto those rows.
 
 `WriteOverlay::search_cheap`: return `Some(merged)` **only if** `current_base().search_cheap` was `Some`. If base is `None`, return **`None`**.
 
@@ -277,7 +279,7 @@ Required test: `Control(WriteOverlay(base))` — **identical** TSV from `search_
 
 ### D5. `search_cheap` hook and forwards
 
-`CheapSearchHit` lives in **`ratarmount-core`** (`path`, `name`, `size`, `mtime`, `offsetheader: Option<i64>` — same as `SearchHit`, not `u64`). No cycle.
+`CheapSearchHit` lives in **`ratarmount-core`** (`path`, `name`, `size: i64`, `mtime`, `offsetheader: Option<i64>` — same as `SearchHit`). SoA `size` is `u64` (one cast). SoA `offsetheader < 0` is NULL (same as `mem.rs` today). No cycle (`ratarmount-index` already depends on core).
 
 **New inherent methods (name them so formats stay one-liners):**
 
@@ -295,7 +297,7 @@ If `pattern` has `fts:` prefix, **every** `search_cheap` impl (WriteOverlay, for
 | Impl | Behavior |
 |------|----------|
 | Default | `None` |
-| **SqliteIndex formats** (one-liner `self.index.search_cheap(pattern).ok()`) | TAR, ZIP, 7z, CPIO, AR, WARC, CAB, ISO, ASAR, XAR, libarchive, OGG, HTML, PDF |
+| **SqliteIndex formats** (one-liner `self.index.search_cheap(pattern).ok()`) | TAR, ZIP, 7z, CPIO, AR, WARC, CAB, ISO, ASAR, XAR, libarchive, OGG, HTML, PDF. `.ok()` maps `Err` → `None` → SearchFn step 3 (sidecar retry). **Not** `.unwrap_or_default()` (`Some([])` would be a full empty answer). |
 | EXT4 / FAT / SquashFS / Git / SQLAR / `SingleFile` / Dropbox | `None` (no `SqliteIndex`; sidecar or residual) |
 | `WriteOverlay` | [D4](#d4-overlay-merge-ownership) — **not** a forward |
 | **Forward set only** | FileVersionLayer, Prefix, AutoMount (parent catalog only), Transform, Control. Default `None` is the P0 bug class **for this set**. |
@@ -342,7 +344,7 @@ SQL `fullpath` in the SELECT for hits is acceptable. Do not rewrite glob SQL.
 `MemIndex::scan_glob`:
 
 - Walk dir shards / `dirs`: `(path_id, name_id, soa_idx)` for **every** version index, not `versions.last()` only. SQL `search_glob_like` emits one row per `files` row (`ORDER BY fullpath, offsetheader`, no DISTINCT). Last-only would drop GNU incremental / multi-offsetheader members that CLI find still prints. `.versions/*` paths stay omitted (path rule, D5) — that is not a “latest only” rule.
-- Skip `isgenerated` and dumpdir tombstone `linkname_id` (same as `catalog_filter_sql`).
+- Skip generated (SoA flag bit 2) and dumpdir tombstones by comparing `pool.get(linkname_id)` to the exact NUL-prefixed `"\0GNU.dumpdir.delete"` (`DUMPDIR_DELETE_LINKNAME` in `search.rs`). **Not** “any nonzero `linkname_id`” (that drops every symlink). Also skip empty names. Copy `catalog_filter_sql` (`search.rs` ~195–207). Twin of `search_skips_generated`.
 - Basename glob: match `pool.get(name_id)` `&str` — no `String` unless hit.
 - Full-path glob: reused buffer from PathTable segments; `clone` into `CheapSearchHit` on match only.
 - `DEFAULT_SEARCH_LIMIT`.
@@ -502,5 +504,6 @@ This **plan** file is not user-facing product docs.
 | 0 | author (pre-review) | draft | — |
 | 1 | fresh Task (2026-08-28) | **REVISE** | All 4 blockers + importants 5–15. |
 | 2 | fresh Task (2026-08-28) | **REVISE** | One exclusive SearchFn; `fts:` before `search_cheap`; OCI `None`; Prefix/Transform+`-w` residual; name `search_cheap`/`scan_glob` + else-SQL; all `soa_idx`; lock order + `current_base()`; forward set minus Union/Folder/OCI; no `overlay_file_info`; file≡socket tests. |
+| 3 | fresh Task (2026-08-28) | **ACCEPT** | Day-1 pins: SearchFn closes over pre-Control Arc; sidecar `Err` skips overlay-merge; `.ok()` not `.unwrap_or_default()`; dumpdir exact NUL string; `CheapSearchHit.size` is `i64`. |
 
-Sweep 3: **fresh** skeptic Task (never reuse sweep-1/2 context). Cap 3 then BLOCKED.
+Stop. Status is **ACCEPT**. Do not implement in this PR.
