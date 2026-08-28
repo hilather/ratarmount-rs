@@ -31,7 +31,7 @@ pub fn sha256_hex(data: &[u8]) -> String {
 ///
 /// Short reads are not an error: the digest covers bytes received, matching
 /// today's `read_to_end` then `Sha256::digest`. Never materializes a body `Vec`.
-pub fn sha256_hex_stream<R: Read>(reader: &mut R) -> std::io::Result<String> {
+pub fn sha256_hex_stream<R: Read + ?Sized>(reader: &mut R) -> std::io::Result<String> {
     let mut hasher = Sha256::new();
     let mut buf = [0u8; HASH_STREAM_CHUNK];
     loop {
@@ -45,7 +45,7 @@ pub fn sha256_hex_stream<R: Read>(reader: &mut R) -> std::io::Result<String> {
 }
 
 /// `read_exact` `window_len` bytes into `buf` and hash `&buf[..window_len]` only.
-pub(crate) fn sha256_hex_window<R: Read>(
+pub(crate) fn sha256_hex_window<R: Read + ?Sized>(
     reader: &mut R,
     buf: &mut [u8],
     window_len: usize,
@@ -344,7 +344,7 @@ mod tests {
         fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
             if buf.len() > HASH_STREAM_CHUNK {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                    std::io::ErrorKind::InvalidInput,
                     "read request larger than HASH_STREAM_CHUNK",
                 ));
             }

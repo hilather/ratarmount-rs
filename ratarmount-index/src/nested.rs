@@ -956,11 +956,11 @@ mod tests {
     use crate::hashing::sha256_hex;
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
-    #[test]
     fn patterned_body(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i % 251) as u8).collect()
     }
 
+    #[test]
     fn fingerprint_roundtrip_and_mismatch() {
         let body = b"hello nested body payload for fingerprinting!!";
         let mut c = Cursor::new(body.to_vec());
