@@ -437,7 +437,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("null.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
             idx.begin_write().unwrap();
             idx.with_conn(|conn| {
                 conn.execute(
@@ -460,6 +460,7 @@ mod tests {
             })
             .unwrap();
             idx.commit_write().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let idx = SqliteIndex::open_writable(&path).unwrap();
         let idx = idx.into_read_only().unwrap();

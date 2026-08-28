@@ -397,12 +397,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("patch.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
             idx.begin_write().unwrap();
             idx.insert_files_batch(&[file_row("prefix.txt", 0), file_row("old-suffix.txt", 1024)])
                 .unwrap();
             idx.store_versions("0.1.0").unwrap();
             idx.commit_write().unwrap();
+            idx.publish_tmp().unwrap();
         }
 
         let idx = SqliteIndex::open_writable(&path).unwrap();

@@ -704,8 +704,9 @@ mod tests {
         fs::write(&archive, &archive_bytes).unwrap();
         let idx_path = dir.path().join("sidecar.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
             idx.store_tarstats_for_path(&archive).unwrap();
+            idx.publish_tmp().unwrap();
         }
         let index_bytes = fs::read(&idx_path).unwrap();
         let folders = vec![dir.path().join("empty-index-folders")];

@@ -826,18 +826,26 @@ fn try_store_nested_durable(
         return;
     };
     match open_or_create_writable_index(ip) {
-        Ok(idx) => match idx.set_nested_index(key, fingerprint, format, blob) {
-            Ok(()) => eprintln!(
-                "nested durable index: stored {format} file table for {} ({} bytes) in {}",
-                key.member_path,
-                blob.len(),
-                ip.display()
-            ),
-            Err(e) => eprintln!(
-                "info: could not store nested durable index for {}: {e}",
-                key.member_path
-            ),
-        },
+        Ok(mut idx) => {
+            match idx.set_nested_index(key, fingerprint, format, blob) {
+                Ok(()) => eprintln!(
+                    "nested durable index: stored {format} file table for {} ({} bytes) in {}",
+                    key.member_path,
+                    blob.len(),
+                    ip.display()
+                ),
+                Err(e) => eprintln!(
+                    "info: could not store nested durable index for {}: {e}",
+                    key.member_path
+                ),
+            }
+            if let Err(e) = idx.publish_tmp() {
+                eprintln!(
+                    "info: could not publish nested durable index {}: {e}",
+                    ip.display()
+                );
+            }
+        }
         Err(e) => eprintln!(
             "info: could not open outer index {} to store nested durable: {e}",
             ip.display()
@@ -1917,7 +1925,7 @@ fn persist_gzip_index_blob(
     };
     let blob = gzip.export_seek_index_blob();
     match open_or_create_writable_index(ip) {
-        Ok(idx) => {
+        Ok(mut idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for gzip blob: {e}");
                 return;
@@ -1932,6 +1940,9 @@ fn persist_gzip_index_blob(
             }
             if let Err(e) = idx.store_tarstats_for_path(gzip.path()) {
                 eprintln!("info: could not store tarstats for gzip index: {e}");
+            }
+            if let Err(e) = idx.publish_tmp() {
+                eprintln!("info: could not publish gzip index {}: {e}", ip.display());
             }
         }
         Err(e) => eprintln!("info: could not open index to store gzip seek blob: {e}"),
@@ -2129,7 +2140,7 @@ fn persist_rapidgzip_index_blob(
         }
     };
     match open_or_create_writable_index(ip) {
-        Ok(idx) => {
+        Ok(mut idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for gzip blob: {e}");
                 return;
@@ -2144,6 +2155,12 @@ fn persist_rapidgzip_index_blob(
             }
             if let Err(e) = idx.store_tarstats_for_path(shared.path()) {
                 eprintln!("info: could not store tarstats for rapidgzip index: {e}");
+            }
+            if let Err(e) = idx.publish_tmp() {
+                eprintln!(
+                    "info: could not publish rapidgzip index {}: {e}",
+                    ip.display()
+                );
             }
         }
         Err(e) => eprintln!("info: could not open index to store rapidgzip GZIDX: {e}"),
@@ -2416,7 +2433,7 @@ fn store_zstd_blocks_in_index(
         return;
     };
     match open_or_create_writable_index(ip) {
-        Ok(idx) => {
+        Ok(mut idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for zstdblocks: {e}");
                 return;
@@ -2433,6 +2450,12 @@ fn store_zstd_blocks_in_index(
                 if let Err(e) = idx.store_tarstats_for_path(ap) {
                     eprintln!("info: could not store tarstats for zstdblocks index: {e}");
                 }
+            }
+            if let Err(e) = idx.publish_tmp() {
+                eprintln!(
+                    "info: could not publish zstdblocks index {}: {e}",
+                    ip.display()
+                );
             }
         }
         Err(e) => eprintln!("info: could not open index to store zstdblocks: {e}"),
@@ -2597,7 +2620,7 @@ fn store_bzip2_blocks_in_index(
         return;
     };
     match open_or_create_writable_index(ip) {
-        Ok(idx) => {
+        Ok(mut idx) => {
             if let Err(e) = idx.ensure_compression_tables() {
                 eprintln!("info: could not ensure compression tables for bzip2blocks: {e}");
                 return;
@@ -2614,6 +2637,12 @@ fn store_bzip2_blocks_in_index(
                 if let Err(e) = idx.store_tarstats_for_path(ap) {
                     eprintln!("info: could not store tarstats for bzip2blocks index: {e}");
                 }
+            }
+            if let Err(e) = idx.publish_tmp() {
+                eprintln!(
+                    "info: could not publish bzip2blocks index {}: {e}",
+                    ip.display()
+                );
             }
         }
         Err(e) => eprintln!("info: could not open index to store bzip2blocks: {e}"),
@@ -4436,6 +4465,54 @@ mod tests {
         assert!(try_load_zstd_blocks(Some(&missing), None, false).is_none());
         assert!(try_load_zstd_blocks(None, None, false).is_none());
         assert!(try_load_zstd_blocks(Some(&missing), None, true).is_none());
+    }
+
+    /// Regression: missing-path `store_zstd_blocks_in_index` publishes dest (WAL on
+    /// dest, not `{dest}.tmp.{pid}`). Drop without publish would unlink tmp.
+    #[test]
+    fn regression_store_zstd_blocks_in_index_missing_path_publishes_dest_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("plain.zst.index.sqlite");
+        assert!(!dest.exists());
+        let pid = std::process::id();
+        let tmp = {
+            let mut s = dest.as_os_str().to_os_string();
+            s.push(format!(".tmp.{pid}"));
+            PathBuf::from(s)
+        };
+        let tmp_wal = {
+            let mut s = tmp.as_os_str().to_os_string();
+            s.push("-wal");
+            PathBuf::from(s)
+        };
+        let dest_wal = {
+            let mut s = dest.as_os_str().to_os_string();
+            s.push("-wal");
+            PathBuf::from(s)
+        };
+        let opts = OpenOptions {
+            write_index: true,
+            ..Default::default()
+        };
+        store_zstd_blocks_in_index(&[(0, 0), (10, 100)], Some(&dest), None, &opts);
+        assert!(dest.exists(), "helper must leave a readable sibling");
+        assert!(!tmp.exists(), "tmp must be renamed onto dest");
+        assert!(
+            !tmp_wal.exists(),
+            "WAL must be named dest-wal, not dest.tmp.pid-wal"
+        );
+        for entry in std::fs::read_dir(dir.path()).unwrap() {
+            let name = entry.unwrap().file_name();
+            let name = name.to_string_lossy();
+            assert!(!name.contains(".tmp."), "leftover tmp companion {name}");
+        }
+        let idx = SqliteIndex::open_read_only(&dest).expect("open published dest");
+        assert_eq!(idx.get_zstd_blocks().unwrap(), vec![(0, 0), (10, 100)]);
+        assert!(
+            dest_wal.exists(),
+            "WAL companion is dest-wal (open of published dest), not tmp-wal"
+        );
+        assert!(!tmp_wal.exists());
     }
 
     #[test]
@@ -6285,9 +6362,11 @@ mod tests {
         let outer_idx = dir.path().join("outer-for-nested.index.sqlite");
         // Shell outer index (no outer files table required for nestedindexes).
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).expect("create outer index");
+            let mut idx =
+                SqliteIndex::create_writable(Some(&outer_idx)).expect("create outer index");
             idx.ensure_nested_indexes_table()
                 .expect("nestedindexes DDL");
+            idx.publish_tmp().expect("publish outer index");
             drop(idx);
         }
 
@@ -6382,8 +6461,9 @@ mod tests {
         let body_size = tar_bytes.len() as u64;
         let outer_idx = dir.path().join("outer-tar-nested.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
 
         let opener = open_nested_reader_fn(OpenOptions::default());
@@ -6449,8 +6529,9 @@ mod tests {
 
         let outer_idx = dir.path().join("outer-inv.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
         let ctx = NestedOpenContext {
@@ -6523,8 +6604,9 @@ mod tests {
         let body_size = zip_bytes.len() as u64;
         let outer_idx = dir.path().join("policy.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
 
@@ -6717,8 +6799,9 @@ mod tests {
         let body_size = sz_bytes.len() as u64;
         let outer_idx = dir.path().join("outer-7z-nested.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
         let ctx = NestedOpenContext {
@@ -6802,8 +6885,9 @@ mod tests {
         let body_size = cpio_bytes.len() as u64;
         let outer_idx = dir.path().join("outer-cpio-nested.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
         let ctx = NestedOpenContext {
@@ -6865,8 +6949,9 @@ mod tests {
         let body_size = ar_bytes.len() as u64;
         let outer_idx = dir.path().join("outer-ar-nested.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
         let ctx = NestedOpenContext {
@@ -6961,8 +7046,9 @@ mod tests {
 
         let outer_idx = dir.path().join("outer-7z-pol.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&outer_idx)).unwrap();
             idx.ensure_nested_indexes_table().unwrap();
+            idx.publish_tmp().unwrap();
         }
         let opener = open_nested_reader_fn(OpenOptions::default());
 

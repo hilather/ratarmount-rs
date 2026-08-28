@@ -409,6 +409,30 @@ pub struct SqliteIndex {
     mem_builder: Mutex<Option<MemIndexBuilder>>,
     /// Nested compact-only: no SQLite `files` rows; MemIndex is the sole file table.
     compact_only: bool,
+    /// Well-known dest while [`Self::path`] is `{dest}.tmp.{pid}`. `None` after
+    /// [`Self::publish_tmp`], for `:memory:`, compact-only, and in-place
+    /// [`Self::open_writable`]. Drop of an unpublished tmp unlinks tmp only.
+    publish_target: Option<PathBuf>,
+}
+
+/// Staging path for a cold writable build: `{dest}.tmp.{pid}` next to dest.
+fn writable_tmp_path(dest: &Path) -> PathBuf {
+    let mut s = dest.as_os_str().to_os_string();
+    s.push(format!(".tmp.{}", std::process::id()));
+    PathBuf::from(s)
+}
+
+fn sqlite_path_companion(db: &Path, suffix: &str) -> PathBuf {
+    let mut s = db.as_os_str().to_os_string();
+    s.push(suffix);
+    PathBuf::from(s)
+}
+
+fn unlink_sqlite_path_and_journals(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    let _ = std::fs::remove_file(sqlite_path_companion(path, "-wal"));
+    let _ = std::fs::remove_file(sqlite_path_companion(path, "-shm"));
+    let _ = std::fs::remove_file(sqlite_path_companion(path, "-journal"));
 }
 
 impl SqliteIndex {
@@ -435,6 +459,7 @@ impl SqliteIndex {
             mem: None,
             mem_builder: Mutex::new(None),
             compact_only: false,
+            publish_target: None,
         };
         idx.validate_loaded()?;
         // Load compact projection for archives with a manageable file count.
@@ -456,21 +481,27 @@ impl SqliteIndex {
     /// Applies Python-compatible bulk-build PRAGMAs (exclusive lock, memory temp,
     /// journal off, synchronous off) so cold index creation stays fast.
     ///
+    /// On-disk: opens `{dest}.tmp.{pid}` in dest's directory and does **not**
+    /// unlink dest. Inserts go to tmp until [`Self::publish_tmp`] /
+    /// [`Self::into_read_only`]. Drop of an unpublished tmp unlinks tmp and
+    /// leaves dest (stricter than the old `remove_file` dest at create).
+    ///
     /// Also starts a [`MemIndexBuilder`] so path/name strings are interned and
     /// compact rows are filled at insert time (no fat dual maps at seal).
     pub fn create_writable(path: Option<&Path>) -> Result<Self> {
-        let (conn, path_buf) = match path {
-            Some(p) => {
-                if let Some(parent) = p.parent() {
+        let (conn, path_buf, publish_target) = match path {
+            Some(dest) => {
+                if let Some(parent) = dest.parent() {
                     std::fs::create_dir_all(parent)?;
                 }
-                // Truncate any prior incomplete index so CREATE IF NOT EXISTS is clean.
-                if p.exists() {
-                    std::fs::remove_file(p)?;
+                // Concurrent readers keep dest's inode; do not remove_file dest.
+                let tmp = writable_tmp_path(dest);
+                if tmp.exists() {
+                    unlink_sqlite_path_and_journals(&tmp);
                 }
-                (Connection::open(p)?, Some(p.to_path_buf()))
+                (Connection::open(&tmp)?, Some(tmp), Some(dest.to_path_buf()))
             }
-            None => (Connection::open_in_memory()?, None),
+            None => (Connection::open_in_memory()?, None, None),
         };
         // Match Python `SQLiteIndex._open_sql_db` — large speedup for bulk inserts.
         conn.execute_batch(
@@ -492,6 +523,7 @@ impl SqliteIndex {
             mem: None,
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
             compact_only: false,
+            publish_target,
         })
     }
 
@@ -511,6 +543,7 @@ impl SqliteIndex {
             mem: None,
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
             compact_only: true,
+            publish_target: None,
         })
     }
 
@@ -744,6 +777,7 @@ impl SqliteIndex {
             mem: Some(mem),
             mem_builder: Mutex::new(None),
             compact_only: true,
+            publish_target: None,
         })
     }
 
@@ -962,6 +996,92 @@ impl SqliteIndex {
         })
     }
 
+    /// Publish a `{dest}.tmp.{pid}` cold build onto the well-known dest path.
+    ///
+    /// Close the tmp connection **without** WAL (WAL/shm names follow the path
+    /// passed to `Connection::open`, not the directory entry after `rename(2)`),
+    /// rename tmp → dest, set [`Self::path`] to dest, open dest, enable WAL, then
+    /// reopen dest read-only. No-op for `:memory:`, compact-only, in-place
+    /// [`Self::open_writable`], or an already-published index.
+    ///
+    /// Factory side-table writers call this **after** writes. [`Self::into_read_only`]
+    /// calls it when a publish target is set.
+    pub fn publish_tmp(&mut self) -> Result<()> {
+        if self.publish_target.is_none() || self.compact_only {
+            return Ok(());
+        }
+        if self.read_only {
+            self.publish_target = None;
+            return Ok(());
+        }
+        let dest = match self.publish_target.clone() {
+            Some(p) => p,
+            None => return Ok(()),
+        };
+        let tmp = match self.path.clone() {
+            Some(p) => p,
+            None => {
+                self.publish_target = None;
+                return Ok(());
+            }
+        };
+
+        self.finalize_build()?;
+        self.with_conn(|conn| {
+            // Drop intermediary tables so Python's completeness check accepts the index.
+            let _ = conn.execute_batch(
+                r#"
+                DROP TABLE IF EXISTS "filestmp";
+                DROP TABLE IF EXISTS "parentfolders";
+                "#,
+            );
+            Ok(())
+        })?;
+
+        // Close tmp (journal still OFF). Do not WAL the tmp name.
+        {
+            let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
+            *guard = Connection::open_in_memory()?;
+        }
+        {
+            let f = std::fs::File::open(&tmp)?;
+            f.sync_all()?;
+        }
+        std::fs::rename(&tmp, &dest)?;
+        self.publish_target = None;
+        self.path = Some(dest.clone());
+
+        {
+            let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
+            let conn = Connection::open(&dest)?;
+            conn.busy_timeout(std::time::Duration::from_secs(10))?;
+            conn.execute_batch(
+                r#"
+                PRAGMA temp_store = MEMORY;
+                PRAGMA journal_mode = WAL;
+                PRAGMA synchronous = NORMAL;
+                PRAGMA locking_mode = NORMAL;
+                "#,
+            )?;
+            // Force an unlock transition if EXCLUSIVE leaked across rename.
+            let _: i64 = conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
+            *guard = Connection::open_with_flags(
+                &dest,
+                OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )?;
+            guard.execute_batch(
+                r#"
+                PRAGMA query_only = ON;
+                PRAGMA temp_store = MEMORY;
+                PRAGMA cache_size = -65536;
+                PRAGMA mmap_size = 268435456;
+                "#,
+            )?;
+        }
+        self.read_only = true;
+        Ok(())
+    }
+
     /// Seal a writable build into a read-only mount index (keeps in-memory DBs alive).
     ///
     /// Prefer this over `drop` + `open_read_only` so `--index-file :memory:` works and
@@ -970,70 +1090,76 @@ impl SqliteIndex {
     /// Promotes the insert-time compact [`MemIndexBuilder`] to the hot MemIndex (string
     /// pool + compact rows) when the row count is within [`MEM_INDEX_MAX_FILES`].
     ///
-    /// On-disk indexes leave bulk-build `locking_mode=EXCLUSIVE` / `journal_mode=OFF` and
-    /// **reopen** as a true read-only connection. Otherwise the exclusive file lock is not
-    /// fully released until the connection is closed, and factory side-table writers
-    /// (`open_writable` for gzip/zstd/bzip2 blocks, `--index-minimum-file-count`) hit
-    /// `database is locked` while the mount still holds the index.
+    /// On-disk tmp builds call [`Self::publish_tmp`] (close tmp, rename, WAL dest).
+    /// In-place / `:memory:` indexes leave bulk-build `locking_mode=EXCLUSIVE` /
+    /// `journal_mode=OFF` and **reopen** as a true read-only connection. Otherwise
+    /// the exclusive file lock is not fully released until the connection is closed,
+    /// and factory side-table writers (`open_writable` for gzip/zstd/bzip2 blocks,
+    /// `--index-minimum-file-count`) hit `database is locked` while the mount still
+    /// holds the index.
     pub fn into_read_only(mut self) -> Result<Self> {
-        self.finalize_build()?;
-        if !self.read_only {
-            if !self.compact_only {
-                let path = self.path.clone();
-                self.with_conn(|conn| {
-                    // Drop intermediary tables so Python's completeness check accepts the index.
-                    let _ = conn.execute_batch(
-                        r#"
+        if self.publish_target.is_some() {
+            self.publish_tmp()?;
+        } else {
+            self.finalize_build()?;
+            if !self.read_only {
+                if !self.compact_only {
+                    let path = self.path.clone();
+                    self.with_conn(|conn| {
+                        // Drop intermediary tables so Python's completeness check accepts the index.
+                        let _ = conn.execute_batch(
+                            r#"
                     DROP TABLE IF EXISTS "filestmp";
                     DROP TABLE IF EXISTS "parentfolders";
                     "#,
-                    );
-                    // Exit bulk-build EXCLUSIVE + journal OFF. WAL allows concurrent RO
-                    // (mount) + RW (side tables) opens after we reopen below.
-                    let _ = conn.execute_batch(
-                        r#"
+                        );
+                        // Exit bulk-build EXCLUSIVE + journal OFF. WAL allows concurrent RO
+                        // (mount) + RW (side tables) opens after we reopen below.
+                        let _ = conn.execute_batch(
+                            r#"
                     PRAGMA journal_mode = WAL;
                     PRAGMA synchronous = NORMAL;
                     PRAGMA locking_mode = NORMAL;
                     "#,
-                    );
-                    // Force an unlock transition out of EXCLUSIVE (SQLite defers until unlock).
-                    let _: i64 =
-                        conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
-                    Ok(())
-                })?;
+                        );
+                        // Force an unlock transition out of EXCLUSIVE (SQLite defers until unlock).
+                        let _: i64 =
+                            conn.query_row(r#"SELECT COUNT(*) FROM "files""#, [], |r| r.get(0))?;
+                        Ok(())
+                    })?;
 
-                if let Some(ref p) = path {
-                    // Close the exclusive-era handle and reopen RO so no exclusive file
-                    // lock remains for factory open_writable / discard-index helpers.
-                    let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
-                    *guard = Connection::open_with_flags(
-                        p,
-                        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-                    )?;
-                    guard.execute_batch(
-                        r#"
+                    if let Some(ref p) = path {
+                        // Close the exclusive-era handle and reopen RO so no exclusive file
+                        // lock remains for factory open_writable / discard-index helpers.
+                        let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
+                        *guard = Connection::open_with_flags(
+                            p,
+                            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                        )?;
+                        guard.execute_batch(
+                            r#"
                     PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
                     PRAGMA cache_size = -65536;
                     PRAGMA mmap_size = 268435456;
                     "#,
-                    )?;
-                } else {
-                    // Pure :memory: — keep the same connection; no second openers.
-                    self.with_conn(|conn| {
-                        conn.execute_batch(
-                            r#"
+                        )?;
+                    } else {
+                        // Pure :memory: — keep the same connection; no second openers.
+                        self.with_conn(|conn| {
+                            conn.execute_batch(
+                                r#"
                     PRAGMA query_only = ON;
                     PRAGMA temp_store = MEMORY;
                     PRAGMA cache_size = -65536;
                     "#,
-                        )?;
-                        Ok(())
-                    })?;
+                            )?;
+                            Ok(())
+                        })?;
+                    }
                 }
+                self.read_only = true;
             }
-            self.read_only = true;
         }
         self.seal_mem_index()?;
         // Compact-only: never keep a SQLite files table as the file store.
@@ -1702,6 +1828,7 @@ impl SqliteIndex {
             // Existing DB: do not build MemIndex on write; open_read_only loads it.
             mem_builder: Mutex::new(None),
             compact_only: false,
+            publish_target: None,
         };
         idx.validate_loaded()?;
         Ok(idx)
@@ -2040,6 +2167,25 @@ impl SqliteIndex {
             }
             Ok(out)
         })
+    }
+}
+
+impl Drop for SqliteIndex {
+    fn drop(&mut self) {
+        if self.publish_target.take().is_none() {
+            return;
+        }
+        let Some(tmp) = self.path.take() else {
+            return;
+        };
+        // Close the tmp connection before unlink so SQLite is not writing an
+        // unlinked name; dest's inode is never removed here.
+        if let Ok(mut guard) = self.conn.lock() {
+            if let Ok(dummy) = Connection::open_in_memory() {
+                *guard = dummy;
+            }
+        }
+        unlink_sqlite_path_and_journals(&tmp);
     }
 }
 
@@ -2655,7 +2801,7 @@ mod tests {
         std::fs::write(&archive, b"old-content").unwrap();
         let idx_path = dir.path().join("a.tar.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
             idx.store_versions("0.1.0").unwrap();
             idx.store_tarstats_for_path(&archive).unwrap();
             let ts = idx.tarstats().unwrap().unwrap();
@@ -2665,6 +2811,7 @@ mod tests {
                 ts.full_sha256.is_some(),
                 "tiny archive should store full_sha256"
             );
+            idx.publish_tmp().unwrap();
         }
 
         let idx = SqliteIndex::open_read_only(&idx_path).unwrap();
@@ -2774,7 +2921,7 @@ mod tests {
     fn xattr_insert_list_get_roundtrip() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.index.sqlite");
-        let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+        let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
         idx.store_versions("0.1.0").unwrap();
 
         // Minimal files row so schema is realistic; xattrs only need offsetheader.
@@ -2809,6 +2956,7 @@ mod tests {
         assert!(idx.list_xattr_keys(999).unwrap().is_empty());
 
         // Reopen writable and ensure persistence.
+        idx.publish_tmp().unwrap();
         drop(idx);
         let idx2 = SqliteIndex::open_writable(&path).unwrap();
         assert_eq!(
@@ -2890,13 +3038,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("comp.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
             idx.store_versions("0.1.0").unwrap();
             idx.set_gzip_index_blob(b"persist-me").unwrap();
             idx.set_bzip2_blocks(&[(0, 0), (100, 50), (200, 120)])
                 .unwrap();
             idx.set_zstd_blocks(&[(1, 10), (2, 20)]).unwrap();
             idx.set_gztool_index_blob(b"gztool-blob").unwrap();
+            idx.publish_tmp().unwrap();
         }
 
         let idx = SqliteIndex::open_writable(&path).unwrap();
@@ -2965,8 +3114,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("ro.index.sqlite");
         {
-            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            let mut idx = SqliteIndex::create_writable(Some(&path)).unwrap();
             idx.store_versions("0.1.0").unwrap();
+            idx.publish_tmp().unwrap();
         }
         let ro = SqliteIndex::open_read_only(&path).unwrap();
         assert!(ro.set_gzip_index_blob(b"x").is_err());
@@ -3083,6 +3233,130 @@ mod tests {
         // B-119 path: row count via a third connection
         assert_eq!(index_file_row_count(&path).unwrap(), 1);
         drop(sealed);
+    }
+
+    fn named_file_row(name: &str) -> FileRow {
+        FileRow::new(
+            "",
+            name,
+            0,
+            512,
+            4,
+            0.0,
+            0o100644,
+            i64::from(b'0'),
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Regression: `-c` must not unlink dest; a live reader keeps snapshot N.
+    #[test]
+    fn regression_reader_survives_writer_full_build() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("snap.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
+            idx.begin_write().unwrap();
+            idx.insert_files_batch(&[named_file_row("old.txt")])
+                .unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.commit_write().unwrap();
+            let idx = idx.into_read_only().unwrap();
+            assert_eq!(idx.path(), Some(dest.as_path()));
+        }
+        let reader = SqliteIndex::open_read_only(&dest).unwrap();
+        let hits = reader
+            .search_query(&SearchQuery::glob("*.txt"))
+            .expect("reader search before rewrite");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/old.txt");
+
+        let writer = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        assert!(dest.exists(), "create_writable must not remove_file dest");
+        let tmp = writable_tmp_path(&dest);
+        assert!(tmp.exists(), "cold build writes dest.tmp.pid");
+        writer.begin_write().unwrap();
+        writer
+            .insert_files_batch(&[named_file_row("new.txt")])
+            .unwrap();
+        writer.store_versions("0.1.0").unwrap();
+        writer.commit_write().unwrap();
+
+        let mid = reader
+            .search_query(&SearchQuery::glob("*.txt"))
+            .expect("reader search mid-insert");
+        assert_eq!(mid.len(), 1);
+        assert_eq!(mid[0].path, "/old.txt");
+
+        let writer = writer.into_read_only().unwrap();
+        assert_eq!(writer.path(), Some(dest.as_path()));
+        assert!(!tmp.exists(), "publish renames tmp onto dest");
+        let tmp_wal = sqlite_path_companion(&tmp, "-wal");
+        assert!(
+            !tmp_wal.exists(),
+            "WAL must not follow the tmp name after publish"
+        );
+
+        let after = reader
+            .search_query(&SearchQuery::glob("*.txt"))
+            .expect("reader search after publish");
+        assert_eq!(after.len(), 1);
+        assert_eq!(
+            after[0].path, "/old.txt",
+            "open reader stays on inode N after rename"
+        );
+
+        drop(writer);
+        let fresh = SqliteIndex::open_read_only(&dest).unwrap();
+        let fresh_hits = fresh.search_query(&SearchQuery::glob("*.txt")).unwrap();
+        assert_eq!(fresh_hits.len(), 1);
+        assert_eq!(fresh_hits[0].path, "/new.txt");
+    }
+
+    /// Regression: Drop mid-insert unlinks tmp and leaves the previous well-known file.
+    #[test]
+    fn regression_drop_unpublished_tmp_leaves_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
+            idx.begin_write().unwrap();
+            idx.insert_files_batch(&[named_file_row("old.txt")])
+                .unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.commit_write().unwrap();
+            let _ = idx.into_read_only().unwrap();
+        }
+        let orig = std::fs::read(&dest).unwrap();
+        let tmp = writable_tmp_path(&dest);
+        {
+            let writer = SqliteIndex::create_writable(Some(&dest)).unwrap();
+            writer
+                .insert_files_batch(&[named_file_row("new.txt")])
+                .unwrap();
+            assert!(tmp.exists());
+            drop(writer);
+        }
+        assert!(!tmp.exists(), "Drop unpublished tmp unlinks tmp");
+        assert!(
+            !sqlite_path_companion(&tmp, "-wal").exists(),
+            "Drop unpublished tmp unlinks tmp-wal"
+        );
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            orig,
+            "failed -c must not replace a good sidecar"
+        );
+        let ro = SqliteIndex::open_read_only(&dest).unwrap();
+        let hits = ro.search_query(&SearchQuery::glob("*.txt")).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].path, "/old.txt");
     }
 
     /// Nested compact-only: no SQLite files table as file-table store.
