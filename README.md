@@ -32,8 +32,8 @@ cat mnt/file     # true random access — even inside compressed streams
 
 | | What you get |
 |---|---|
-| **~3.9× faster cold mounts** | Index + mount in a fraction of the Python baseline (~5.4× warm) |
-| **~6–8× lower peak RSS** | Typical **14–28 MiB** vs 110–350 MiB for Python ratarmount |
+| **~5.2× faster cold mounts** | Index + mount in a fraction of the Python baseline (~6.8× warm) |
+| **~4–6.5× lower peak RSS** | Typical **18–22 MiB** vs ~121 MiB for Python ratarmount |
 | **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
 | **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via archive `Link:` / http(s) sibling / OCI referrer on local miss; `--publish-index` |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
@@ -41,7 +41,7 @@ cat mnt/file     # true random access — even inside compressed streams
 
 > Prefer Python when you need rapidgzip-class throughput or the widest fsspec surface. Prefer **Rust** when mounts are frequent, memory is tight, or you want a static-friendly binary.
 
-Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) · harness: [benchmarks/compare-python-vs-rust.sh](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/compare-python-vs-rust.sh)
+Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) · harness: [benchmarks/compare-python-vs-rust.sh](benchmarks/compare-python-vs-rust.sh) · re-run: `BIG=1 ./benchmarks/compare-python-vs-rust.sh`
 
 ---
 
@@ -194,28 +194,33 @@ Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) 
 
 ## Performance at a glance
 
-Head-to-head vs Python ratarmount (geo-mean, 2026-08-15, v0.1.20). **Factor > 1 ⇒ Rust wins.**
+Head-to-head vs Python ratarmount 1.3.0 (geo-mean, 2026-08-27, v0.1.27, **BIG** suite: 640 MiB blob + `.tar.zst` / `.tar.lz4`). **Factor > 1 ⇒ Rust wins.** Full tables: [python-vs-rust-results.md](benchmarks/python-vs-rust-results.md).
 
 | Metric | Cold | Warm |
 |--------|-----:|-----:|
-| Mount time | **3.85×** | **5.43×** |
-| Peak RSS | **6.03×** | **8.53×** |
-| `find` walk | **1.45×** | **1.33×** |
-| Random `cat` | **1.14×** | 0.95× |
-| Sequential bandwidth | 0.97× | 0.73× |
+| Mount time | **5.21×** | **6.76×** |
+| Peak RSS | **4.34×** | **6.49×** |
+| Random `cat` | **2.84×** | **2.82×** |
+| Random 64 KiB pread | **7.72×** | **8.67×** |
+| Sequential bandwidth | **3.85×** | **3.16×** |
+| `find` walk | **1.26×** | **1.38×** |
 
 **Standouts on this host**
 
-- `small-100.tar.gz` — warm mount **8.8×** faster; warm RSS **~24×** lower (~14 MiB vs ~351 MiB)
-- `large-64m.tar` — random access **~4×** faster; sequential multi‑GiB/s
-- `empty-1k.tar` — cold mount **5.5×** faster; warm `find` **1.4×** faster than Python
+- `large-640m.tar` — sequential `cat` **~20×**; 64 KiB pread **~18×**
+- `large-640m.tar.zst` — sequential **~28×**; 64 KiB pread **~40–72×**
+- `large-640m.tar.lz4` — sequential **~53×**; 64 KiB pread is cheap in Rust (Python does not seek independent blocks)
+- Mount **~5–9×** faster and warm RSS **~6×** lower on almost every archive
+- Residual: Python still wins small `.tar.gz` `cat` (rapidgzip) and 640 MiB `.tar.zst` **cold** mount (**1.69×**)
 
-Rust leads hard on **mount cost**, **memory**, and uncompressed `find` / random `cat`. Python can still edge **gzip** random/`cat` (rapidgzip). Sequential geo-mean excludes a tiny nested-TAR member. Numbers are single-host directional benches — re-run the harness on your hardware. Three-way vs v0.1.19: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results-v0.1.19-vs-0.1.20.md).
+Multi‑GiB/s sequential numbers are FUSE + page cache (the blob fits in RAM), not disk speed. Single-host directional benches — re-run the harness on your hardware. Prior default-suite snapshot (v0.1.20): [python-vs-rust-results-2026-08-15.md](benchmarks/python-vs-rust-results-2026-08-15.md). Three-way vs v0.1.19: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](benchmarks/python-vs-rust-results-v0.1.19-vs-0.1.20.md).
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount
 cargo build --release
-./benchmarks/compare-python-vs-rust.sh
+BIG=1 ./benchmarks/compare-python-vs-rust.sh
+# → benchmarks/python-vs-rust-results-big.{csv,md}
+#    and copies to benchmarks/python-vs-rust-results.{csv,md} (published snapshot)
 ```
 
 ---
@@ -351,7 +356,8 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) | macOS FUSE / FSKit |
 | [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
 | [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
-| [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.20) |
+| [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.27 BIG suite) |
+| [benchmarks/python-vs-rust-results-big.md](benchmarks/python-vs-rust-results-big.md) | Named `BIG=1` output (same snapshot; re-run with `BIG=1`) |
 | [benchmarks/README.md](benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
 | [docs/phase12-dual-run.md](docs/phase12-dual-run.md) | Dual-run / crates.io notes |
 | [docs/tasks/beyond-parity-roadmap.md](docs/tasks/beyond-parity-roadmap.md) | Beyond-parity protocols, features, product bets |

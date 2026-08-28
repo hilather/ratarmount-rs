@@ -138,21 +138,40 @@ Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary with `gzip
 
 ## Head-to-head (Python vs Rust)
 
-Latest committed numbers: [python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results.md) (**2026-08-15**, ratarmount-rs **v0.1.20**). Three-way vs last release: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](https://github.com/hilather/ratarmount-rs/blob/v0.1.20/benchmarks/python-vs-rust-results-v0.1.19-vs-0.1.20.md).
+Latest committed numbers: [python-vs-rust-results.md](python-vs-rust-results.md) (**2026-08-27**, ratarmount-rs **v0.1.27**, `BIG=1` suite). Named BIG output: [python-vs-rust-results-big.md](python-vs-rust-results-big.md). Prior default-suite snapshot: [python-vs-rust-results-2026-08-15.md](python-vs-rust-results-2026-08-15.md). Three-way vs v0.1.19: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](python-vs-rust-results-v0.1.19-vs-0.1.20.md).
 
 ```bash
 export RATARMOUNT_PY_ROOT=../ratarmount   # sibling checkout with Python package
 cargo build --release
-# Optional: python -m venv benchmarks/.venv-py && pip install -e "$RATARMOUNT_PY_ROOT"
+# Optional: python -m venv benchmarks/.venv-py && pip install -e "$RATARMOUNT_PY_ROOT/core[gzip,bzip2,xz,zip,zstd]" -e "$RATARMOUNT_PY_ROOT" lz4
 ./benchmarks/compare-python-vs-rust.sh
 # → benchmarks/python-vs-rust-results.{csv,md}
 
 # Minimal fixture set (empty-1k + small-100{.tar,.tar.gz}) for gate CI:
 MICRO=1 ./benchmarks/compare-python-vs-rust.sh
 # → benchmarks/python-vs-rust-results-micro.{csv,md}
+
+# Default suite plus x10-of-medium blobs (640 MiB tar + multi-frame .tar.zst / independent-block .tar.lz4):
+BIG=1 ./benchmarks/compare-python-vs-rust.sh
+# → benchmarks/python-vs-rust-results-big.{csv,md}
+
+# Fixture builder only (no FUSE / no Python). Also used as a regression:
+PREPARE_ONLY=1 BIG=1 SKIP_PYTHON=1 ./benchmarks/compare-python-vs-rust.sh
+./benchmarks/test-compare-fixtures.sh
 ```
 
-Requires FUSE, a Python ratarmount install (or venv under `benchmarks/.venv-py`), and the usual system deps. The compare script sources `test-harness/env.sh` for portable unmount helpers.
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `MICRO` | `0` | `1` = empty-1k + small-100 `.tar`/`.tar.gz` only |
+| `BIG` | `0` | `1` = also `small-1000.tar` + `large-${LARGE_MIB}m.tar{,.zst,.lz4}` |
+| `LARGE_MIB` | `640` | Uncompressed BIG blob (10× the medium `large-64m`) |
+| `FRAME_MIB` | `4` | Independent zstd frame size for large `.tar.zst` |
+| `PREPARE_ONLY` | `0` | Build + verify fixtures, then exit |
+| `SKIP_PYTHON` | `0` | Skip Python tree / CLI (for `PREPARE_ONLY`) |
+
+The **default** (non-MICRO) suite already includes `small-100.tar.lz4` and seekable `large-64m.tar.zst` / `large-64m.tar.lz4`. Large zstd uses concatenated independent frames so both tools can seek; a single giant frame would full-decode. Large lz4 uses `-B7` (4 MiB independent blocks).
+
+Requires FUSE, a Python ratarmount install (or venv under `benchmarks/.venv-py`), and the usual system deps (`zstd`, `lz4`). The compare script sources `test-harness/env.sh` for portable unmount helpers.
 
 ## CI gates (`rust-gates.json`)
 

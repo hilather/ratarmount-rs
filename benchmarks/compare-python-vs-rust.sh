@@ -16,6 +16,14 @@
 #   PY_PYTHON           Python interpreter (default: benchmarks/.venv-py or python3)
 #   CSV_OUT / MD_OUT    result paths under benchmarks/
 #   MICRO=1             minimal fixture set for gate CI (empty-1k + small-100{.tar,.tar.gz})
+#   BIG=1               published suite: x10-of-medium (640 MiB) + tar.zst/tar.lz4;
+#                       writes python-vs-rust-results-big.{csv,md} and copies to
+#                       python-vs-rust-results.{csv,md} (the README snapshot)
+#   LARGE_MIB           BIG blob size in MiB (default: 640 = 10× large-64m)
+#   FRAME_MIB           zstd independent-frame size for large .tar.zst (default: 4)
+#   PREPARE_ONLY=1      build fixtures, verify names/frames, exit (no FUSE / no Python)
+#   SKIP_PYTHON=1       do not require a Python ratarmount tree (PREPARE_ONLY)
+#   SKIP_BUILD=1        do not cargo-build if RUST_BIN is missing (then fail unless PREPARE_ONLY)
 #   COMPARE_KEEP=1      keep workdir after run
 set -euo pipefail
 
@@ -26,6 +34,12 @@ source "$ROOT/test-harness/env.sh"
 PY_ROOT="${RATARMOUNT_PY_ROOT:-$ROOT/../ratarmount}"
 RUST_BIN="${RUST_BIN:-$ROOT/target/release/ratarmount}"
 MICRO="${MICRO:-0}"
+BIG="${BIG:-0}"
+LARGE_MIB="${LARGE_MIB:-640}"
+FRAME_MIB="${FRAME_MIB:-4}"
+PREPARE_ONLY="${PREPARE_ONLY:-0}"
+SKIP_PYTHON="${SKIP_PYTHON:-0}"
+SKIP_BUILD="${SKIP_BUILD:-0}"
 # Prefer local benchmark venv if present
 if [[ -x "$ROOT/benchmarks/.venv-py/bin/python" ]]; then
     PY_PYTHON="${PY_PYTHON:-$ROOT/benchmarks/.venv-py/bin/python}"
@@ -47,6 +61,9 @@ RESULTS="$WORKDIR/results/results.csv"
 if [[ "$MICRO" == "1" ]]; then
     MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results-micro.md}"
     CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results-micro.csv}"
+elif [[ "$BIG" == "1" ]]; then
+    MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results-big.md}"
+    CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results-big.csv}"
 else
     MD_OUT="${MD_OUT:-$ROOT/benchmarks/python-vs-rust-results.md}"
     CSV_OUT="${CSV_OUT:-$ROOT/benchmarks/python-vs-rust-results.csv}"
@@ -70,18 +87,57 @@ trap cleanup EXIT
 
 echoerr() { echo "$@" >&2; }
 
-if [[ ! -x "$RUST_BIN" ]]; then
+if [[ "$PREPARE_ONLY" != "1" && ! -x "$RUST_BIN" ]]; then
+    if [[ "$SKIP_BUILD" == "1" ]]; then
+        echoerr "Rust binary not found at $RUST_BIN (SKIP_BUILD=1)"
+        exit 1
+    fi
     echoerr "Building release binary..."
     (cd "$ROOT" && cargo build --release)
 fi
-if [[ ! -d "$PY_ROOT/ratarmount" ]]; then
+if [[ "$PREPARE_ONLY" != "1" && "$SKIP_PYTHON" != "1" && ! -d "$PY_ROOT/ratarmount" ]]; then
     echoerr "Python tree not found at $PY_ROOT"
     exit 1
 fi
 
+# Concatenated independent zstd frames so large .tar.zst stays seekable
+# (single-frame zstd of a 64+ MiB blob falls through to full-decode / tmp spool).
+zstd_multiframe() {
+    local src=$1 dest=$2 frame_bytes=$3
+    python3 - "$src" "$dest" "$frame_bytes" <<'PY'
+import subprocess, sys
+src, dest, frame = sys.argv[1], sys.argv[2], int(sys.argv[3])
+with open(src, "rb") as inf, open(dest, "wb") as out:
+    while True:
+        chunk = inf.read(frame)
+        if not chunk:
+            break
+        out.write(subprocess.run(
+            ["zstd", "-1", "-c"], input=chunk, stdout=subprocess.PIPE, check=True
+        ).stdout)
+PY
+}
+
+zstd_frame_count() {
+    python3 - "$1" <<'PY'
+import sys
+magic = b"\x28\xb5\x2f\xfd"
+data = open(sys.argv[1], "rb").read()
+n = data.count(magic)
+print(n)
+PY
+}
+
+lz4_compress() {
+    local src=$1 dest=$2
+    # -B7 = 4 MiB independent blocks (default independence) — cheap random access
+    lz4 -1 -B7 -f -q "$src" "$dest"
+}
+
 # ---- archive construction (mirrors mounting/bandwidth style fixtures) ----
 make_archives() {
     local d="$WORKDIR/data"
+    local frame_bytes=$((FRAME_MIB * 1048576))
     # B) many empty files (index-bound), 1k files in 10 folders — always
     local empty="$d/empty-1k"
     mkdir -p "$empty"
@@ -115,7 +171,7 @@ make_archives() {
         echoerr "WARN: nested-tar.tar missing under $PY_ROOT/tests (skipping)"
     fi
 
-    # D) single large file 64 MiB for sequential bandwidth
+    # D) single large file 64 MiB for sequential bandwidth (the "medium" blob)
     local large="$d/large-1"
     mkdir -p "$large"
     dd if=/dev/urandom of="$large/blob.bin" bs=1M count=64 status=none 2>/dev/null
@@ -124,13 +180,115 @@ make_archives() {
     # E) compressions of small-100 for codec comparison
     bzip2 -c -1 "$d/small-100.tar" > "$d/small-100.tar.bz2"
     xz -c -1 -T0 "$d/small-100.tar" > "$d/small-100.tar.xz" 2>/dev/null || xz -c -1 "$d/small-100.tar" > "$d/small-100.tar.xz"
-    # multi-frame zstd (seekable) via zstd -T0
+    # small payload: single-frame zstd is fine (well under the in-memory decode cap)
     zstd -f -1 -T0 -o "$d/small-100.tar.zst" "$d/small-100.tar" 2>/dev/null || zstd -f -1 -o "$d/small-100.tar.zst" "$d/small-100.tar"
+    if command -v lz4 >/dev/null 2>&1; then
+        lz4_compress "$d/small-100.tar" "$d/small-100.tar.lz4"
+    else
+        echoerr "WARN: lz4 not found (skipping small-100.tar.lz4)"
+    fi
 
     # F) zip of small files
     (cd "$small" && zip -qr "$d/small-100.zip" .)
 
+    # G) seekable compressions of the 64 MiB blob (multi-frame zstd / independent-block lz4)
+    if command -v zstd >/dev/null 2>&1; then
+        zstd_multiframe "$d/large-64m.tar" "$d/large-64m.tar.zst" "$frame_bytes"
+    else
+        echoerr "WARN: zstd not found (skipping large-64m.tar.zst)"
+    fi
+    if command -v lz4 >/dev/null 2>&1; then
+        lz4_compress "$d/large-64m.tar" "$d/large-64m.tar.lz4"
+    else
+        echoerr "WARN: lz4 not found (skipping large-64m.tar.lz4)"
+    fi
+
+    if [[ "$BIG" == "1" ]]; then
+        # H) x10 of small-100 file count: 1000 × 64 KiB (~64 MiB) — index + find scale
+        local small1k="$d/small-1000"
+        mkdir -p "$small1k"
+        python3 - "$small1k" <<'PY'
+import os, sys
+root = sys.argv[1]
+for i in range(1000):
+    with open(os.path.join(root, f"f{i:04d}.bin"), "wb") as fh:
+        fh.write(os.urandom(65536))
+PY
+        tar -C "$small1k" -cf "$d/small-1000.tar" .
+
+        # I) x10 of medium 64 MiB blob
+        local large_big="$d/large-big"
+        mkdir -p "$large_big"
+        dd if=/dev/urandom of="$large_big/blob.bin" bs=1M count="$LARGE_MIB" status=none 2>/dev/null
+        tar -C "$large_big" -cf "$d/large-${LARGE_MIB}m.tar" .
+        if command -v zstd >/dev/null 2>&1; then
+            zstd_multiframe "$d/large-${LARGE_MIB}m.tar" "$d/large-${LARGE_MIB}m.tar.zst" "$frame_bytes"
+        fi
+        if command -v lz4 >/dev/null 2>&1; then
+            lz4_compress "$d/large-${LARGE_MIB}m.tar" "$d/large-${LARGE_MIB}m.tar.lz4"
+        fi
+    fi
+
     ls -lah "$d" >&2
+}
+
+# Verify expected fixture names (and multi-frame zstd) then print PREPARE_OK lines.
+verify_fixtures() {
+    local d="$WORKDIR/data"
+    local missing=0
+    expect_file() {
+        local f=$1
+        if [[ -f "$d/$f" ]]; then
+            echoerr "PREPARE_OK $f $(stat -c %s "$d/$f")B"
+        else
+            echoerr "PREPARE_MISSING $f"
+            missing=1
+        fi
+    }
+    expect_file "empty-1k.tar"
+    expect_file "small-100.tar"
+    expect_file "small-100.tar.gz"
+    if [[ "$MICRO" != "1" ]]; then
+        expect_file "small-100.tar.bz2"
+        expect_file "small-100.tar.xz"
+        expect_file "small-100.tar.zst"
+        expect_file "small-100.zip"
+        expect_file "large-64m.tar"
+        if command -v lz4 >/dev/null 2>&1; then
+            expect_file "small-100.tar.lz4"
+            expect_file "large-64m.tar.lz4"
+        fi
+        if command -v zstd >/dev/null 2>&1; then
+            expect_file "large-64m.tar.zst"
+            local n
+            n=$(zstd_frame_count "$d/large-64m.tar.zst")
+            if [[ "$n" -ge 2 ]]; then
+                echoerr "PREPARE_OK large-64m.tar.zst frames=$n"
+            else
+                echoerr "PREPARE_FAIL large-64m.tar.zst frames=$n (want >=2)"
+                missing=1
+            fi
+        fi
+    fi
+    if [[ "$BIG" == "1" && "$MICRO" != "1" ]]; then
+        expect_file "small-1000.tar"
+        expect_file "large-${LARGE_MIB}m.tar"
+        if command -v lz4 >/dev/null 2>&1; then
+            expect_file "large-${LARGE_MIB}m.tar.lz4"
+        fi
+        if command -v zstd >/dev/null 2>&1; then
+            expect_file "large-${LARGE_MIB}m.tar.zst"
+            local nbig
+            nbig=$(zstd_frame_count "$d/large-${LARGE_MIB}m.tar.zst")
+            if [[ "$nbig" -ge 2 ]]; then
+                echoerr "PREPARE_OK large-${LARGE_MIB}m.tar.zst frames=$nbig"
+            else
+                echoerr "PREPARE_FAIL large-${LARGE_MIB}m.tar.zst frames=$nbig (want >=2)"
+                missing=1
+            fi
+        fi
+    fi
+    return "$missing"
 }
 
 wait_mount() {
@@ -287,31 +445,68 @@ measure_bandwidth() {
     echo "$tool;$scen;$arch;file_size_b;$size;B"
 }
 
+# 64 KiB preads at random offsets — real random access for large blobs
+# (full `cat` of a 640 MiB member is sequential bandwidth, not seeking).
+measure_random_pread() {
+    local mp=$1 tool=$2 arch=$3 scen=$4 relpath=$5
+    local n=${6:-15}
+    local f="$mp/$relpath"
+    if [[ ! -f "$f" ]]; then
+        f=$(find "$mp" -type f -printf '%s %p\n' 2>/dev/null | sort -n | tail -1 | cut -d' ' -f2-)
+    fi
+    if [[ -z "$f" || ! -f "$f" ]]; then
+        echo "$tool;$scen;$arch;rand_pread_64k_median_s;nan;s"
+        return
+    fi
+    local median
+    median=$(python3 - "$f" "$n" <<'PY'
+import os, random, sys, time
+path, n = sys.argv[1], int(sys.argv[2])
+size = os.path.getsize(path)
+chunk = 65536
+times = []
+with open(path, "rb") as fh:
+    for _ in range(n):
+        off = 0 if size <= chunk else random.randrange(0, size - chunk)
+        t0 = time.perf_counter()
+        fh.seek(off)
+        fh.read(chunk)
+        times.append(time.perf_counter() - t0)
+times.sort()
+print(f"{times[len(times)//2]:.6f}")
+PY
+)
+    echo "$tool;$scen;$arch;rand_pread_64k_median_s;$median;s"
+}
+
 run_suite_for_tool() {
     local tool=$1
     local cmd=$2
     local archive=$3
     local extra=${4:-}
     local bw_path=${5:-}
+    local rand_n=${6:-15}
 
     echoerr "=== $tool $(basename "$archive") ==="
 
     # cold
     if measure_mount "$tool" "$cmd" "$archive" "cold" "$extra"; then
-        measure_random_access "$_CUR_MP" "$tool" "$_CUR_ARCH" "cold" 15
+        measure_random_access "$_CUR_MP" "$tool" "$_CUR_ARCH" "cold" "$rand_n"
         measure_find "$_CUR_MP" "$tool" "$_CUR_ARCH" "cold"
         if [[ -n "$bw_path" ]]; then
             measure_bandwidth "$_CUR_MP" "$tool" "$_CUR_ARCH" "cold" "$bw_path"
+            measure_random_pread "$_CUR_MP" "$tool" "$_CUR_ARCH" "cold" "$bw_path" 15
         fi
         finish_mount_session
     fi
 
     # warm (reuse index)
     if measure_mount "$tool" "$cmd" "$archive" "warm" "$extra"; then
-        measure_random_access "$_CUR_MP" "$tool" "$_CUR_ARCH" "warm" 15
+        measure_random_access "$_CUR_MP" "$tool" "$_CUR_ARCH" "warm" "$rand_n"
         measure_find "$_CUR_MP" "$tool" "$_CUR_ARCH" "warm"
         if [[ -n "$bw_path" ]]; then
             measure_bandwidth "$_CUR_MP" "$tool" "$_CUR_ARCH" "warm" "$bw_path"
+            measure_random_pread "$_CUR_MP" "$tool" "$_CUR_ARCH" "warm" "$bw_path" 15
         fi
         finish_mount_session
     fi
@@ -320,6 +515,15 @@ run_suite_for_tool() {
 # ---- main ----
 echoerr "Preparing archives in $WORKDIR ..."
 make_archives
+
+if [[ "$PREPARE_ONLY" == "1" ]]; then
+    if verify_fixtures; then
+        echoerr "PREPARE_OK all expected fixtures"
+        exit 0
+    fi
+    echoerr "PREPARE_FAIL missing fixtures"
+    exit 1
+fi
 
 : > "$RESULTS"
 echo "tool;scenario;archive;metric;value;unit" >> "$RESULTS"
@@ -349,31 +553,43 @@ declare -a JOBS=()
 if [[ "$MICRO" == "1" ]]; then
     echoerr "MICRO=1: minimal fixture set (empty-1k, small-100.tar, small-100.tar.gz)"
     JOBS=(
-        # archive|extra_flags|bandwidth_relpath
-        "$D/empty-1k.tar|||"
-        "$D/small-100.tar|||f000.bin"
-        "$D/small-100.tar.gz|||f000.bin"
+        # archive|extra_flags|bandwidth_relpath|rand_n
+        "$D/empty-1k.tar||||"
+        "$D/small-100.tar||f000.bin|"
+        "$D/small-100.tar.gz||f000.bin|"
     )
 else
     JOBS=(
-        # archive|extra_flags|bandwidth_relpath
-        "$D/nested-tar.tar||-r|foo/fighter/ufo"
-        "$D/empty-1k.tar|||"
-        "$D/small-100.tar|||f000.bin"
-        "$D/large-64m.tar|||blob.bin"
-        "$D/small-100.tar.gz|||f000.bin"
-        "$D/small-100.tar.bz2|||f000.bin"
-        "$D/small-100.tar.xz|||f000.bin"
-        "$D/small-100.tar.zst|||f000.bin"
-        "$D/small-100.zip|||f000.bin"
+        # archive|extra_flags|bandwidth_relpath|rand_n
+        "$D/nested-tar.tar|-r|foo/fighter/ufo|"
+        "$D/empty-1k.tar||||"
+        "$D/small-100.tar||f000.bin|"
+        "$D/large-64m.tar||blob.bin|"
+        "$D/large-64m.tar.zst||blob.bin|"
+        "$D/large-64m.tar.lz4||blob.bin|"
+        "$D/small-100.tar.gz||f000.bin|"
+        "$D/small-100.tar.bz2||f000.bin|"
+        "$D/small-100.tar.xz||f000.bin|"
+        "$D/small-100.tar.zst||f000.bin|"
+        "$D/small-100.tar.lz4||f000.bin|"
+        "$D/small-100.zip||f000.bin|"
     )
+    if [[ "$BIG" == "1" ]]; then
+        echoerr "BIG=1: x10 fixtures (small-1000 + large-${LARGE_MIB}m.tar{,.zst,.lz4})"
+        JOBS+=(
+            "$D/small-1000.tar||f0000.bin|"
+            "$D/large-${LARGE_MIB}m.tar||blob.bin|3"
+            "$D/large-${LARGE_MIB}m.tar.zst||blob.bin|3"
+            "$D/large-${LARGE_MIB}m.tar.lz4||blob.bin|3"
+        )
+    fi
 fi
 
 for job in "${JOBS[@]}"; do
-    IFS='|' read -r arch extra bwpath <<<"$job"
+    IFS='|' read -r arch extra bwpath rand_n <<<"$job"
     [[ -f "$arch" ]] || { echoerr "skip missing $arch"; continue; }
-    run_suite_for_tool "python" "$WORKDIR/py-ratarmount" "$arch" "$extra" "$bwpath" | tee -a "$RESULTS"
-    run_suite_for_tool "rust" "$RUST_BIN" "$arch" "$extra" "$bwpath" | tee -a "$RESULTS"
+    run_suite_for_tool "python" "$WORKDIR/py-ratarmount" "$arch" "$extra" "$bwpath" "${rand_n:-15}" | tee -a "$RESULTS"
+    run_suite_for_tool "rust" "$RUST_BIN" "$arch" "$extra" "$bwpath" "${rand_n:-15}" | tee -a "$RESULTS"
 done
 
 cp "$RESULTS" "$CSV_OUT"
@@ -406,6 +622,7 @@ metrics_order = [
     ("mount_s", "Mount time"),
     ("mount_rss_kib", "Peak RSS"),
     ("rand_access_median_s", "Random cat (median)"),
+    ("rand_pread_64k_median_s", "Random 64KiB pread (median)"),
     ("find_s", "find walk"),
     ("bandwidth_mibs", "Seq. bandwidth"),
     ("seq_read_s", "Seq. read time"),
@@ -456,15 +673,23 @@ lines.append("# Python ratarmount vs Rust ratarmount-rs — benchmark comparison
 lines.append("")
 lines.append("Generated by `benchmarks/compare-python-vs-rust.sh`.")
 lines.append("")
+import datetime
+stamp = datetime.date.today().isoformat()
+lines.append(f"**Snapshot:** {stamp} · ratarmount-rs vs Python ratarmount (this host).")
+lines.append("")
+lines.append("**Regenerate published suite:** `BIG=1 ./benchmarks/compare-python-vs-rust.sh` (needs FUSE, `RATARMOUNT_PY_ROOT`, `zstd`, `lz4`).")
+lines.append("")
 lines.append("Methodology (aligned with upstream mounting/bandwidth benchmarks):")
 lines.append("")
 lines.append("- **Cold mount**: recreate index (`-c`), wall time until FUSE mount is usable.")
 lines.append("- **Warm mount**: reuse SQLite index, wall time until usable.")
-lines.append("- **Random access**: median of 15 `cat` timings on randomly chosen files.")
+lines.append("- **Random access**: median of N `cat` timings on randomly chosen files (N=15; N=3 on BIG blobs).")
+lines.append("- **Random 64KiB pread**: median of 15 `seek+read(64KiB)` on the bandwidth member (true random I/O on large blobs).")
 lines.append("- **find**: wall time of `find <mount>` (metadata storm).")
 lines.append("- **Bandwidth**: sequential `cat` of a large file, MiB/s.")
 lines.append("- Both tools run with `-f` (foreground FUSE) for comparable process measurement.")
 lines.append("- Peak RSS sampled from `/proc/<pid>/status` `VmHWM` after mount is ready.")
+lines.append("- Large `.tar.zst` is **multi-frame** (independent frames); large `.tar.lz4` uses 4 MiB independent blocks.")
 lines.append("")
 lines.append("**Relative** names the **winner** and by how much (never labels a loss as a Rust speedup).")
 lines.append("")
@@ -516,12 +741,65 @@ for metric, label in metrics_order:
             lines.append(f"| {label} | {scen} | {gm:.2f}× | {interp} |")
 
 lines.append("")
+
+# Highlight wins / losses (skip tiny nested-tar bandwidth which is a 10-byte member).
+WINS_THRESHOLD = 1.20
+rust_wins = []
+python_wins = []
+for metric, label in metrics_order:
+    hb = metric == "bandwidth_mibs"
+    for scen in scenarios:
+        for arch in archives:
+            if arch == "nested-tar.tar" and metric in ("bandwidth_mibs", "seq_read_s"):
+                continue
+            py = data.get((arch, scen, metric), {}).get("python")
+            rs = data.get((arch, scen, metric), {}).get("rust")
+            r = rust_advantage(py, rs, higher_better=hb)
+            if r is None:
+                continue
+            if r >= WINS_THRESHOLD:
+                rust_wins.append((r, arch, label, scen, py, rs, metric, hb))
+            elif r > 0 and (1.0 / r) >= WINS_THRESHOLD:
+                python_wins.append((1.0 / r, arch, label, scen, py, rs, metric, hb))
+
+rust_wins.sort(reverse=True)
+python_wins.sort(reverse=True)
+
+def win_rows(rows, winner):
+    out = []
+    out.append(f"| Archive | Metric | Scenario | Python | Rust | {winner} advantage |")
+    out.append("|---|---|---|---:|---:|---|")
+    for factor, arch, label, scen, py, rs, metric, hb in rows:
+        word = "better" if hb else ("lower" if metric == "mount_rss_kib" else "faster")
+        out.append(
+            f"| `{arch}` | {label} | {scen} | {fmt(py, metric)} | {fmt(rs, metric)} | **{factor:.2f}×** {word} |"
+        )
+    return out
+
+lines.append("## Where Rust is ahead (≥ 1.20×)")
+lines.append("")
+if rust_wins:
+    lines.extend(win_rows(rust_wins, "Rust"))
+else:
+    lines.append("No metric cleared the 1.20× threshold.")
+lines.append("")
+lines.append("## Where Python is ahead (≥ 1.20×)")
+lines.append("")
+if python_wins:
+    lines.extend(win_rows(python_wins, "Python"))
+else:
+    lines.append("No metric cleared the 1.20× threshold.")
+lines.append("")
 lines.append("## Notes / caveats")
 lines.append("")
 lines.append("- Values **below 1.0×** in the summary mean **Python is faster / better**, not a Rust win.")
-lines.append("- Compressed TAR (`.tar.gz`/`.bz2`/`.xz`/`.zst`): Rust uses seekable outer codecs (`SeekableBody` / multi-frame maps) for indexing+mount; plain single-file `.gz` etc. still materialize. Python uses rapidgzip / indexed codecs / block-parallel paths with true bit-block maps in some cases.")
+lines.append("- Compressed TAR (`.tar.gz`/`.bz2`/`.xz`/`.zst`/`.lz4`): Rust uses seekable outer codecs (`SeekableBody` / multi-frame maps / independent lz4 blocks) for indexing+mount; plain single-file `.gz` etc. still materialize. Python uses rapidgzip / indexed codecs / block-parallel paths with true bit-block maps in some cases.")
 lines.append("- Random access and find on uncompressed TAR/ZIP remain the fairest apples-to-apples metrics.")
+lines.append("- `rand_pread_64k` is the right random-I/O metric for `large-*` blobs; full `cat` of those members is sequential bandwidth.")
+lines.append("- Sequential-bandwidth geo-mean still includes tiny members when present; prefer `large-*` rows over `nested-tar.tar`.")
 lines.append("- Results are single-run wall times on this host; treat as directional, not formal publication numbers.")
+lines.append("- Multi‑GiB/s sequential numbers are FUSE + page cache when the blob fits in RAM, not a disk-speed claim.")
+lines.append("- Extreme `.tar.lz4` 64 KiB pread ratios mean Python is not using a cheap independent-block seek on the large member.")
 lines.append("")
 
 Path(md_path).write_text("\n".join(lines) + "\n")
@@ -530,4 +808,14 @@ PY
 
 echoerr "CSV: $CSV_OUT"
 echoerr "MD:  $MD_OUT"
+if [[ "$BIG" == "1" ]]; then
+    # Keep the well-known README snapshot in sync with the named BIG suite output.
+    if [[ "$CSV_OUT" != "$ROOT/benchmarks/python-vs-rust-results.csv" ]]; then
+        cp "$CSV_OUT" "$ROOT/benchmarks/python-vs-rust-results.csv"
+    fi
+    if [[ "$MD_OUT" != "$ROOT/benchmarks/python-vs-rust-results.md" ]]; then
+        cp "$MD_OUT" "$ROOT/benchmarks/python-vs-rust-results.md"
+    fi
+    echoerr "Published snapshot: $ROOT/benchmarks/python-vs-rust-results.md"
+fi
 cat "$MD_OUT"

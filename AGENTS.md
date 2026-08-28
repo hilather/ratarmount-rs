@@ -37,6 +37,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 
 | Symptom / fix | Commands |
 |---------------|----------|
+| BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
 | Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_invalid` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip_fail_rewinds_to_g3` · optional ISA-L: `--features gzip-rapidgzip-isal` (+ `libisal` / `ISAL_INSTALL_PREFIX`) |
