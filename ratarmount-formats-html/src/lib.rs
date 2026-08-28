@@ -12,7 +12,8 @@ use std::time::Instant;
 
 use base64::{engine::general_purpose::STANDARD as B64, Engine};
 use ratarmount_core::{
-    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use regex::Regex;
@@ -384,6 +385,13 @@ impl MountSource for HtmlMountSource {
                 })
                 .collect()
         })
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.index.search_cheap(pattern).ok()
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

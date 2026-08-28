@@ -245,6 +245,46 @@ impl InodeAttrCookie {
     }
 }
 
+/// What [`MountSource::list_with`] may materialize. Additive P0 leftover —
+/// cheap locate uses [`MountSource::search_cheap`], not this flag.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ListNeed {
+    /// Must not *require* [`FileInfo`]. Default chain still derives from
+    /// [`MountSource::list`] on backends that only implement `list()`.
+    Cheap,
+    /// Today's [`MountSource::list`].
+    FileInfo,
+}
+
+/// One locate hit. Path strings are allocated only for emitted rows.
+/// Never carries [`FileInfo`] — getattr/open stay the refine pass.
+#[derive(Clone, Debug, PartialEq)]
+pub struct CheapSearchHit {
+    /// Full catalog path (`/name` or `/dir/name`).
+    pub path: String,
+    /// Basename.
+    pub name: String,
+    pub size: i64,
+    pub mtime: f64,
+    pub offsetheader: Option<i64>,
+}
+
+impl CheapSearchHit {
+    /// TSV `path\tsize\tmtime` line including the trailing newline.
+    pub fn to_tsv_line(&self) -> String {
+        format!("{}\t{}\t{}\n", self.path, self.size, self.mtime)
+    }
+}
+
+/// TSV `path\tsize\tmtime` for locate hits (control / socket / find without hashes).
+pub fn format_cheap_hits_tsv(hits: &[CheapSearchHit]) -> String {
+    let mut out = String::new();
+    for h in hits {
+        out.push_str(&h.to_tsv_line());
+    }
+    out
+}
+
 /// Subset of POSIX `statvfs` fields used by FUSE.
 #[derive(Clone, Debug, Default)]
 pub struct StatFs {
@@ -341,6 +381,21 @@ impl<T: Read + Seek + Send> ArchiveRead for T {}
 pub trait MountSource: Send + Sync {
     fn list(&self, path: &str) -> Option<ListResult>;
 
+    /// Additive list selector. [`ListNeed::Cheap`] uses [`Self::list_dirents`]
+    /// as implemented (still fat on backends that only implement [`Self::list`]).
+    /// This is **not** the locate API — see [`Self::search_cheap`].
+    fn list_with(&self, path: &str, need: ListNeed) -> Option<ListResult> {
+        match need {
+            ListNeed::FileInfo => self.list(path),
+            ListNeed::Cheap => {
+                let dents = self.list_dirents(path)?;
+                Some(ListResult::Names(
+                    dents.into_iter().map(|d| d.name).collect(),
+                ))
+            }
+        }
+    }
+
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
         match self.list(path)? {
             ListResult::Names(names) => Some(ListModeResult::Names(names)),
@@ -376,6 +431,15 @@ pub trait MountSource: Send + Sync {
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo>;
+
+    /// Cheap catalog locate. `None` means “not implemented — caller may sidecar.”
+    /// `Some(v)` is the **full** answer (do not also sidecar-merge).
+    ///
+    /// Hits are [`CheapSearchHit`] — never [`FileInfo`]. `fts:` patterns must
+    /// return `None` (SQL `MATCH` only). Default is `None`.
+    fn search_cheap(&self, _pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        None
+    }
 
     fn open(&self, file_info: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>>;
 

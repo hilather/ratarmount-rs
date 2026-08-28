@@ -13,13 +13,17 @@ mod union;
 mod versioning;
 mod write_overlay;
 
+#[cfg(test)]
+mod search_cheap;
+
 pub use automount::{
     is_archive_filename, is_archive_filename_with, parse_recursive_extensions,
     strip_archive_extension, AutoMountLayer, AutoMountOptions, NestedOpenContext, OpenNestedFn,
     OpenNestedReaderFn, RecursiveExtSet,
 };
 pub use control::{
-    ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_NAME, CONTROL_DIR_PATH,
+    live_search_tsv, ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_NAME,
+    CONTROL_DIR_PATH,
 };
 pub use empty_archive::{
     classify_createable_archive, maybe_create_empty_write_archive, EmptyArchiveKind,

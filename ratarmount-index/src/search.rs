@@ -9,6 +9,7 @@
 //! binary. “Optional FTS5” means the table and `MATCH` query, not a second sqlite
 //! build. [`crate::INDEX_VERSION`] stays `"0.7.0"`; Python ignores unknown tables.
 
+use ratarmount_core::CheapSearchHit;
 use rusqlite::{params, Connection, Row};
 
 use crate::{table_exists, IndexError, Result, SqliteIndex};
@@ -20,7 +21,7 @@ pub const DEFAULT_SEARCH_LIMIT: usize = 10_000;
 pub(crate) const FILES_FTS_TABLE: &str = "files_fts";
 
 /// GNU dumpdir whiteout stored in `files.linkname` (formats-tar marker).
-const DUMPDIR_DELETE_LINKNAME: &str = "\0GNU.dumpdir.delete";
+pub(crate) const DUMPDIR_DELETE_LINKNAME: &str = "\0GNU.dumpdir.delete";
 
 const CREATE_FILES_FTS_SQL: &str = r#"
 CREATE VIRTUAL TABLE IF NOT EXISTS "files_fts" USING fts5(
@@ -155,6 +156,37 @@ impl SqliteIndex {
     /// Whether the additive `"files_fts"` table exists (FTS5 or otherwise).
     pub fn has_files_fts(&self) -> Result<bool> {
         self.with_conn(|conn| table_exists(conn, FILES_FTS_TABLE))
+    }
+
+    /// Cheap locate: SoA `scan_glob` when `mem` is present, else SQL `search_query`.
+    ///
+    /// `fts:` is not a SoA scan — returns [`IndexError::Invalid`] so format
+    /// one-liners map it to [`None`] (SearchFn step 1 / SQL `MATCH`).
+    /// Empty archive (`mem: None`) and huge catalogs (`n > MEM_INDEX_MAX_FILES`)
+    /// use SQL on this connection — do not treat missing mem as “no search.”
+    pub fn search_cheap(&self, pattern: &str) -> Result<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return Err(IndexError::Invalid(
+                "fts: is SQL MATCH only; search_cheap does not scan SoA".into(),
+            ));
+        }
+        if let Some(mem) = &self.mem {
+            return Ok(mem.scan_glob(pattern));
+        }
+        let hits = self.search_query(&SearchQuery::glob(pattern))?;
+        Ok(hits.into_iter().map(CheapSearchHit::from).collect())
+    }
+}
+
+impl From<SearchHit> for CheapSearchHit {
+    fn from(h: SearchHit) -> Self {
+        Self {
+            path: h.path,
+            name: h.name,
+            size: h.size,
+            mtime: h.mtime,
+            offsetheader: h.offsetheader,
+        }
     }
 }
 
@@ -336,8 +368,192 @@ fn fill_hit_hashes(conn: &Connection, hits: &mut [SearchHit]) -> Result<()> {
     Ok(())
 }
 
+/// Whether `pattern` matches `fullpath` / `name` with SQL GLOB (or LIKE) rules.
+///
+/// Same predicates as [`search_glob_like`]: `**` → `*`, `/` ⇒ full-path, LIKE
+/// when the pattern uses `%`/`_` and no glob metacharacters. Not SMB glob.
+pub fn locate_pattern_matches(pattern: &str, fullpath: &str, name: &str) -> bool {
+    if pattern.is_empty() {
+        return false;
+    }
+    let glob = collapse_globstars(pattern);
+    let use_like = is_like_pattern(&glob);
+    let full_path = glob.contains('/');
+    let bound = if full_path && !glob.starts_with('/') {
+        format!("/{glob}")
+    } else {
+        glob
+    };
+    if full_path {
+        if use_like {
+            sql_like_match(fullpath, &bound)
+        } else {
+            sql_glob_match(fullpath, &bound)
+        }
+    } else if use_like {
+        sql_like_match(name, &bound)
+    } else {
+        sql_glob_match(name, &bound)
+    }
+}
+
+/// SQLite `GLOB` (case-sensitive): `*` any sequence, `?` one character, `[abc]`.
+pub fn sql_glob_match(text: &str, pattern: &str) -> bool {
+    glob_match_slices(
+        &text.chars().collect::<Vec<_>>(),
+        &pattern.chars().collect::<Vec<_>>(),
+    )
+}
+
+fn glob_match_slices(text: &[char], pat: &[char]) -> bool {
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+    while ti < text.len() {
+        if pi < pat.len() && pat[pi] == '*' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+            continue;
+        }
+        if pi < pat.len() && char_class_or_q(text[ti], pat, &mut pi) {
+            ti += 1;
+            continue;
+        }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + 1;
+            continue;
+        }
+        return false;
+    }
+    while pi < pat.len() && pat[pi] == '*' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
+/// Advance `pi` past one pattern atom that must match `ch`. `?` or literal or `[...]`.
+fn char_class_or_q(ch: char, pat: &[char], pi: &mut usize) -> bool {
+    if *pi >= pat.len() {
+        return false;
+    }
+    if pat[*pi] == '?' {
+        *pi += 1;
+        return true;
+    }
+    if pat[*pi] == '[' {
+        return match_char_class(ch, pat, pi);
+    }
+    if pat[*pi] == ch {
+        *pi += 1;
+        return true;
+    }
+    false
+}
+
+fn match_char_class(ch: char, pat: &[char], pi: &mut usize) -> bool {
+    // pat[*pi] == '['
+    let start = *pi + 1;
+    let mut j = start;
+    let mut found_close = None;
+    while j < pat.len() {
+        if pat[j] == ']' && j > start {
+            found_close = Some(j);
+            break;
+        }
+        j += 1;
+    }
+    let Some(close) = found_close else {
+        // Unclosed `[` is a literal.
+        let ok = pat[*pi] == ch;
+        *pi += 1;
+        return ok;
+    };
+    let inner = &pat[start..close];
+    let (negate, body) = if inner.first() == Some(&'!') || inner.first() == Some(&'^') {
+        (true, &inner[1..])
+    } else {
+        (false, inner)
+    };
+    let mut matched = false;
+    let mut k = 0usize;
+    while k < body.len() {
+        if k + 2 < body.len() && body[k + 1] == '-' {
+            let lo = body[k];
+            let hi = body[k + 2];
+            if ch >= lo && ch <= hi {
+                matched = true;
+                break;
+            }
+            k += 3;
+        } else {
+            if body[k] == ch {
+                matched = true;
+                break;
+            }
+            k += 1;
+        }
+    }
+    *pi = close + 1;
+    if negate {
+        !matched
+    } else {
+        matched
+    }
+}
+
+/// SQLite `LIKE` (ASCII case-insensitive): `%` any sequence, `_` one character.
+pub fn sql_like_match(text: &str, pattern: &str) -> bool {
+    like_match_slices(
+        &text.chars().map(ascii_lower).collect::<Vec<_>>(),
+        &pattern.chars().map(ascii_lower).collect::<Vec<_>>(),
+    )
+}
+
+fn ascii_lower(c: char) -> char {
+    if c.is_ascii_uppercase() {
+        c.to_ascii_lowercase()
+    } else {
+        c
+    }
+}
+
+fn like_match_slices(text: &[char], pat: &[char]) -> bool {
+    let mut ti = 0usize;
+    let mut pi = 0usize;
+    let mut star_pi: Option<usize> = None;
+    let mut star_ti: usize = 0;
+    while ti < text.len() {
+        if pi < pat.len() && pat[pi] == '%' {
+            star_pi = Some(pi);
+            star_ti = ti;
+            pi += 1;
+            continue;
+        }
+        if pi < pat.len() && (pat[pi] == '_' || pat[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+            continue;
+        }
+        if let Some(sp) = star_pi {
+            star_ti += 1;
+            ti = star_ti;
+            pi = sp + 1;
+            continue;
+        }
+        return false;
+    }
+    while pi < pat.len() && pat[pi] == '%' {
+        pi += 1;
+    }
+    pi == pat.len()
+}
+
 /// `**` (and longer star runs) → a single `*` (GLOB has no recursive glob).
-fn collapse_globstars(pattern: &str) -> String {
+pub(crate) fn collapse_globstars(pattern: &str) -> String {
     let mut out = String::with_capacity(pattern.len());
     let mut chars = pattern.chars().peekable();
     while let Some(c) = chars.next() {
@@ -650,5 +866,82 @@ mod tests {
         assert_eq!(hit_paths(&hits), vec!["/plain.fits", "/null.fits"]);
         assert_eq!(hits[0].offsetheader, Some(512));
         assert_eq!(hits[1].offsetheader, None);
+    }
+
+    fn cheap_paths(hits: &[CheapSearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    /// Regression: SQL locate does not build FileInfo (`mem` stays None).
+    #[test]
+    fn search_query_no_mem_no_fileinfo() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        seed_catalog(&idx);
+        assert!(
+            !idx.has_mem_index(),
+            "writable build leaves mem: None until seal"
+        );
+        let hits = idx.search("*.fits").unwrap();
+        assert_eq!(hit_paths(&hits), vec!["/a.fits", "/dir/b.fits"]);
+        assert!(!idx.has_mem_index(), "search_query must not load MemIndex");
+        let cheap = idx.search_cheap("*.fits").unwrap();
+        assert_eq!(cheap_paths(&cheap), vec!["/a.fits", "/dir/b.fits"]);
+        assert!(!idx.has_mem_index());
+    }
+
+    /// Regression: compact-only SQL locate stays empty; SoA scan_glob hits.
+    #[test]
+    fn scan_glob_compact() {
+        let idx = SqliteIndex::create_compact_only().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "a.fits", 0, false),
+            file_row("/dir", "b.fits", 512, false),
+            file_row("", "readme.txt", 1024, false),
+        ])
+        .unwrap();
+        let idx = idx.into_read_only().unwrap();
+        assert!(idx.is_compact_only());
+        assert!(idx.has_mem_index());
+        assert!(
+            idx.search("*.fits").unwrap().is_empty(),
+            "search_query compact-only stays empty for SQL/CLI"
+        );
+        let hits = idx.search_cheap("*.fits").unwrap();
+        assert_eq!(cheap_paths(&hits), vec!["/a.fits", "/dir/b.fits"]);
+    }
+
+    /// Regression: two offsetheaders, same catalog path — SoA hit count == SQL.
+    #[test]
+    fn scan_glob_two_offsetheader_equals_sql() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("/dir", "a.fits", 0, false),
+            file_row("/dir", "a.fits", 512, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+        let sql = idx.search("*.fits").unwrap();
+        assert_eq!(sql.len(), 2);
+        let idx = idx.into_read_only().unwrap();
+        assert!(idx.has_mem_index());
+        let soa = idx.search_cheap("*.fits").unwrap();
+        assert_eq!(soa.len(), sql.len());
+        assert_eq!(cheap_paths(&soa), hit_paths(&sql));
+        assert_eq!(soa[0].offsetheader, sql[0].offsetheader);
+        assert_eq!(soa[1].offsetheader, sql[1].offsetheader);
+    }
+
+    /// Regression: `fts:` never enters SoA scan (SqliteIndex returns Err → None).
+    #[test]
+    fn search_cheap_fts_prefix_is_none() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        seed_catalog(&idx);
+        let idx = idx.into_read_only().unwrap();
+        let err = idx.search_cheap("fts:fits").unwrap_err();
+        assert!(
+            err.to_string().contains("fts:"),
+            "fts: must not scan SoA, got {err}"
+        );
     }
 }

@@ -11,8 +11,8 @@ use std::io::{self, Cursor};
 use std::sync::Arc;
 
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
-    MountSource, UserData, S_IFDIR, S_IFMT, S_IFREG,
+    create_root_file_info, format_cheap_hits_tsv, normpath, CheapDirent, CheapSearchHit, FileInfo,
+    ListModeResult, ListResult, MountSource, UserData, S_IFDIR, S_IFMT, S_IFREG,
 };
 
 /// Directory name at the mount root (hidden, leading dot).
@@ -39,6 +39,45 @@ const SEARCH_DIR_PATH: &str = "/.ratarmount-control/search";
 
 /// Glob locate callback: pattern → TSV (or an `error:` line).
 pub type OnSearch = Arc<dyn Fn(&str) -> String + Send + Sync>;
+
+/// Exclusive locate pipeline for control file ≡ socket (V-1 SearchFn).
+///
+/// 1. `fts:` → sidecar SQL only, then optional overlay-merge. Never `search_cheap`.
+/// 2. `source.search_cheap` if `Some` → TSV and stop (overlay already merged).
+/// 3. Else sidecar. `Err` → `error:` and no overlay-merge. `Ok` (including `[]`)
+///    + overlay → last-wins merge.
+pub fn live_search_tsv(
+    source: &dyn MountSource,
+    overlay: Option<&crate::WriteOverlay>,
+    pattern: &str,
+    sidecar: impl Fn(&str) -> Result<Vec<CheapSearchHit>, String>,
+) -> String {
+    if pattern.starts_with("fts:") {
+        return sidecar_then_overlay(overlay, pattern, sidecar);
+    }
+    if let Some(hits) = source.search_cheap(pattern) {
+        return format_cheap_hits_tsv(&hits);
+    }
+    sidecar_then_overlay(overlay, pattern, sidecar)
+}
+
+fn sidecar_then_overlay(
+    overlay: Option<&crate::WriteOverlay>,
+    pattern: &str,
+    sidecar: impl Fn(&str) -> Result<Vec<CheapSearchHit>, String>,
+) -> String {
+    match sidecar(pattern) {
+        Ok(hits) => {
+            let hits = if let Some(ov) = overlay {
+                ov.merge_search_hits(hits, pattern)
+            } else {
+                hits
+            };
+            format_cheap_hits_tsv(&hits)
+        }
+        Err(e) => format!("error: {e}\n"),
+    }
+}
 
 /// Options for [`ControlFolderMountSource`].
 #[derive(Clone, Default)]
@@ -210,18 +249,14 @@ impl ControlFolderMountSource {
             None => s.push_str("mounted\n"),
         }
         s.push_str(&format!("pid {}\n", std::process::id()));
-        if let Some(listing) = self.inner.list("/") {
-            let names: Vec<String> = match listing {
-                ListResult::Names(n) => n,
-                ListResult::Infos(m) => m.into_keys().collect(),
-            };
+        if let Some(dents) = self.inner.list_dirents("/") {
             s.push_str("root:\n");
-            for name in names.iter().take(128) {
+            for d in dents.iter().take(128) {
                 // Avoid advertising our own control dir twice if inner had one.
-                if name == CONTROL_DIR_NAME {
+                if d.name == CONTROL_DIR_NAME {
                     continue;
                 }
-                s.push_str(&format!("  {name}\n"));
+                s.push_str(&format!("  {}\n", d.name));
             }
         }
         s
@@ -422,6 +457,13 @@ impl MountSource for ControlFolderMountSource {
             });
         }
         Some(dents)
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.inner.search_cheap(pattern)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {

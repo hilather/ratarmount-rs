@@ -1133,9 +1133,15 @@ fn main() {
         let mp = fuse_mp.as_ref().expect("control requires FUSE mp");
         let stop = Arc::clone(&control_stop);
         let mp_ctrl = mp.clone();
-        let on_search = find::tsv_search_callback(inputs[0].clone(), open_opts.clone());
+        let pre_control = Arc::clone(&bundle.source);
+        let on_search = find::live_search_callback(
+            Arc::clone(&pre_control),
+            overlay_arc.clone(),
+            inputs[0].clone(),
+            open_opts.clone(),
+        );
         bundle.source = Arc::new(ControlFolderMountSource::new(
-            Arc::clone(&bundle.source),
+            pre_control,
             ControlFolderOptions::enabled()
                 .with_label(mp.display().to_string())
                 .with_on_unmount(Arc::new(move || {
@@ -3463,6 +3469,14 @@ mod find_cli_tests {
         let a = parse_args_from(["ratarmount", "--no-mount", "find"]).expect("parse");
         assert!(!a.find);
         assert_eq!(a.paths, vec![PathBuf::from("find")]);
+    }
+
+    #[test]
+    fn find_flag_rejects_write_overlay() {
+        let a = parse_args_from(["ratarmount", "find", "-w", "/tmp/ov", "*.fits", "a.tar"])
+            .expect("parse");
+        let err = find_cli_error(&a).expect("error");
+        assert!(err.contains("-w") || err.contains("write-overlay"), "{err}");
     }
 
     #[test]

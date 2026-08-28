@@ -6,7 +6,8 @@ use std::io;
 use std::sync::Arc;
 
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource,
+    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
+    ListResult, MountSource,
 };
 
 /// Wrap `inner` so all content is reachable under `prefix`.
@@ -90,6 +91,13 @@ impl MountSource for PrefixMountSource {
         }
         let inner_path = self.strip(&path)?;
         self.inner.list_dirents(&inner_path)
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.inner.search_cheap(pattern)
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {

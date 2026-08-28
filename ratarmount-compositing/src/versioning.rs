@@ -7,7 +7,8 @@ use std::io;
 use std::sync::Arc;
 
 use ratarmount_core::{
-    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    UserData,
 };
 
 const VERSIONS_SUFFIX: &str = ".versions";
@@ -118,6 +119,13 @@ impl MountSource for FileVersionLayer {
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
         ))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.inner.search_cheap(pattern)
     }
 
     /// Forward cheap dirents from the inner source. Versions-folder listings

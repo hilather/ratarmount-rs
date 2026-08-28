@@ -30,7 +30,7 @@ pub use location::{
     resolve_index_location, sibling_index_candidates, sibling_index_url, IndexLocation,
     INDEX_LINK_REL, INDEX_MEDIA_TYPE, MEMORY_INDEX,
 };
-pub use search::{SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
+pub use search::{locate_pattern_matches, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

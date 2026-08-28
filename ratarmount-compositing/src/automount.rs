@@ -12,8 +12,8 @@ use std::sync::{Arc, Mutex};
 
 use log::debug;
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
-    MountSource, UserData,
+    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
+    ListResult, MountSource, UserData,
 };
 use regex::Regex;
 use tempfile::NamedTempFile;
@@ -642,10 +642,12 @@ impl AutoMountLayer {
         let mounted = self.mounted.lock().expect("automount mutex");
         let (mp, rest) = mounted.find_mounted_in(path);
         let src = Self::source_at_locked(&self.root, &mounted, mp);
-        match src.list(&rest)? {
-            ListResult::Infos(m) => Some(m.into_keys().collect()),
-            ListResult::Names(n) => Some(n),
-        }
+        Some(
+            src.list_dirents(&rest)?
+                .into_iter()
+                .map(|d| d.name)
+                .collect(),
+        )
     }
 
     fn is_dir_raw(&self, path: &str) -> bool {
@@ -1174,6 +1176,13 @@ impl MountSource for AutoMountLayer {
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
         ))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.root.search_cheap(pattern)
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

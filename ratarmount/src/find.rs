@@ -10,7 +10,8 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_core::OpenOptions;
+use ratarmount_compositing::{live_search_tsv, WriteOverlay};
+use ratarmount_core::{CheapSearchHit, MountSource, OpenOptions};
 use ratarmount_index::{
     fill_content_hashes, resolve_index_location, SearchHit, SearchQuery, SqliteIndex, MEMORY_INDEX,
 };
@@ -73,10 +74,12 @@ pub fn search_existing_sidecar(
     query_index(&idx, archive, pattern, loc)
 }
 
-/// Callback for [`ratarmount_compositing::ControlFolderOptions::with_on_search`].
+/// Sidecar-only SearchFn (no overlay / SoA). Live mounts use [`live_search_callback`].
 ///
-/// Glob only (control `search/<pattern>`). `:memory:` / missing sidecar → the
-/// stable error line `error: search requires an on-disk index`.
+/// Glob only. `:memory:` / missing sidecar → `error: search requires an on-disk index`.
+/// Kept for tests and callers that have no `MountSource`; the bin uses
+/// [`live_search_callback`] for control/socket.
+#[allow(dead_code)]
 pub fn tsv_search_callback(
     archive: PathBuf,
     open_opts: OpenOptions,
@@ -86,6 +89,27 @@ pub fn tsv_search_callback(
             Ok(hits) => format_hits_tsv(&hits, false),
             Err(e) => format!("error: {e}\n"),
         }
+    })
+}
+
+/// One SearchFn for control file ≡ socket. Closes over the pre-Control source
+/// plus optional overlay (steps in [`live_search_tsv`]).
+pub fn live_search_callback(
+    source: Arc<dyn MountSource>,
+    overlay: Option<Arc<WriteOverlay>>,
+    archive: PathBuf,
+    open_opts: OpenOptions,
+) -> Arc<dyn Fn(&str) -> String + Send + Sync> {
+    Arc::new(move |pattern: &str| {
+        live_search_tsv(source.as_ref(), overlay.as_deref(), pattern, |pat| {
+            search_existing_sidecar(
+                archive.as_path(),
+                pat,
+                &open_opts,
+                &LocateOptions::default(),
+            )
+            .map(|hits| hits.into_iter().map(CheapSearchHit::from).collect())
+        })
     })
 }
 
@@ -482,5 +506,37 @@ mod tests {
             .map(|l| l.split('\t').next().unwrap_or(""))
             .collect();
         assert_eq!(names, vec!["/a.txt", "/z.txt"], "control TSV={tsv:?}");
+    }
+
+    /// Regression: sidecar-only callback still formats TSV (control tests are not enough).
+    #[test]
+    fn tsv_search_callback_sidecar_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        write_fits_tar(&archive);
+        let opts = find_opts(dir.path());
+        let _ = locate_hits(&archive, "*.fits", &opts, &LocateOptions::default()).expect("index");
+        let cb = tsv_search_callback(archive, opts);
+        let tsv = cb("*.fits");
+        assert!(tsv.contains("/a.fits\t4\t"), "{tsv}");
+        assert!(!tsv.starts_with("error:"), "{tsv}");
+    }
+
+    /// Regression: warm sidecar find keeps mem: None (do not load MemIndex).
+    #[test]
+    fn find_glob_warm_sidecar_mem_stays_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        write_fits_tar(&archive);
+        let opts = find_opts(dir.path());
+        let _ = locate_hits(&archive, "*.fits", &opts, &LocateOptions::default()).expect("index");
+        let idx = open_existing_sidecar(&archive, &opts).expect("warm sidecar");
+        assert!(
+            !idx.has_mem_index(),
+            "open_writable / find must keep mem: None"
+        );
+        let hits = idx.search("*.fits").unwrap();
+        assert_eq!(hit_paths(&hits), vec!["/a.fits", "/dir/b.fits"]);
+        assert!(!idx.has_mem_index());
     }
 }

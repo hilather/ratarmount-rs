@@ -35,7 +35,7 @@ Systems patterns inspired by Cloudflare Vectorize (cheap scan + refine, snapshot
 - [x] Keep/extend `list_mode` (and similar) as the cheap API; fat `FileInfo` only at getattr/open boundaries
 - [x] Regression: large flat directory readdir RSS + timing vs fat map materialization
 
-Residual: `list()` still builds a fat map for callers that need full `FileInfo`. TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides.
+Residual: `list()` still builds a fat map for callers that need full `FileInfo`. Additive [`ListNeed`] (`list_with`) lets name-only walks ask for Cheap vs FileInfo without changing `list()`’s signature — V-1 leftover, **not** the locate API (`search_cheap`). TAR `list_dirents` filters GNU dumpdir tombstones via `IndexDirent.linkname` (no `FileInfo`). Default `MountSource::list_dirents` derives from `list_mode` with `size = 0` unless a backend overrides.
 
 Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer), the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF), **and** EXT4 / FAT / SquashFS / Git / SQLAR / `SingleFileMountSource` / Dropbox. Union folder-cache **build** walks `list_dirents` (fat `list()` only when dirents have `mode == 0`). `--union-resolve-symlinks` `list_dirents` merges cheap dirents then resolves `S_IFLNK` winners via `lookup` (not a fat `list()` map). Control `status` dirent size is a placeholder 0 (getattr/open recompute).
 
