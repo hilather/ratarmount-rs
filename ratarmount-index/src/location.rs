@@ -641,6 +641,17 @@ fn index_temp_dir() -> Option<PathBuf> {
 }
 
 fn fetch_index_http(url: &str) -> Result<PathBuf> {
+    fetch_index_http_with_etag(url, None)
+}
+
+/// Whole-GET a sidecar URL through the V-3 XDG LRU (URL-first; etag revalidation only).
+fn fetch_index_http_with_etag(url: &str, pointer_etag: Option<&str>) -> Result<PathBuf> {
+    let cache = crate::MetaCache::from_env();
+    let identity = crate::cache_identity("http", url);
+    cache.get_or_fetch_path_with_etag(&identity, pointer_etag, || fetch_index_http_uncached(url))
+}
+
+fn fetch_index_http_uncached(url: &str) -> Result<(PathBuf, Option<String>)> {
     debug!("fetching remote index from {url}");
     let resp = ureq::get(url)
         .set("User-Agent", USER_AGENT)
@@ -650,6 +661,11 @@ fn fetch_index_http(url: &str) -> Result<PathBuf> {
     if !(200..300).contains(&status) {
         return Err(IndexError::Remote(format!("HTTP {status} for {url}")));
     }
+    let etag = resp
+        .header("ETag")
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
 
     let mut builder = tempfile::Builder::new();
     builder
@@ -670,7 +686,7 @@ fn fetch_index_http(url: &str) -> Result<PathBuf> {
         .keep()
         .map_err(|e| IndexError::Io(e.error))?;
     debug!("remote index {url} -> {} ({n} bytes)", path.display());
-    Ok(path)
+    Ok((path, etag))
 }
 
 /// Resolve where to load/create the index.
@@ -981,8 +997,67 @@ mod tests {
         assert_eq!(got, body);
         assert!(*mock.hits.lock().unwrap() >= 1);
 
-        // Cleanup kept tempfile.
+        // Cleanup kept tempfile / XDG blob.
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Regression: remount of a well-known sidecar (no `.ptr`) is a V-3 cache
+    /// hit — extra sidecar GET count is 0. Returned path opens read-only.
+    #[test]
+    fn maybe_fetch_http_remount_well_known_sidecar_cache_hit() {
+        let tmp = tempfile::tempdir().unwrap();
+        let src = tmp.path().join("real.sqlite");
+        crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+        let body = std::fs::read(&src).unwrap();
+        let mock = MockHttp::spawn(body.clone());
+        let url = mock.url("/a.tar.zst.index.sqlite");
+        let p1 = maybe_fetch_index_url(&url).unwrap();
+        let hits1 = *mock.hits.lock().unwrap();
+        assert!(hits1 >= 1);
+        assert!(p1.is_file());
+        let p2 = maybe_fetch_index_url(&url).unwrap();
+        let hits2 = *mock.hits.lock().unwrap();
+        assert_eq!(
+            hits2, hits1,
+            "second fetch must not GET the sidecar again (no .ptr required)"
+        );
+        assert_eq!(std::fs::read(&p2).unwrap(), body);
+        assert!(crate::is_meta_cache_path(&p2), "{}", p2.display());
+        crate::SqliteIndex::open_read_only(&p2).unwrap();
+        let _ = std::fs::remove_file(&p1);
+        if p2 != p1 {
+            let _ = std::fs::remove_file(&p2);
+        }
+    }
+
+    /// Regression: corrupting the cached blob forces exactly one refetch.
+    #[test]
+    fn maybe_fetch_http_corrupt_cache_refetches() {
+        let body = b"SQLite format 3\0ok-sidecar".to_vec();
+        let mock = MockHttp::spawn(body.clone());
+        let url = mock.url("/c.index.sqlite");
+        let p1 = maybe_fetch_index_url(&url).unwrap();
+        std::fs::write(&p1, b"truncated").unwrap();
+        let hits1 = *mock.hits.lock().unwrap();
+        let p2 = maybe_fetch_index_url(&url).unwrap();
+        let hits2 = *mock.hits.lock().unwrap();
+        assert_eq!(hits2, hits1 + 1, "corrupt cache must refetch once");
+        assert_eq!(std::fs::read(&p2).unwrap(), body);
+        let _ = std::fs::remove_file(&p2);
+    }
+
+    /// Regression: `file://` sidecars skip the XDG LRU.
+    #[test]
+    fn maybe_fetch_file_url_skips_meta_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = dir.path().join("t.index.sqlite");
+        std::fs::write(&idx, b"SQLite format 3\0").unwrap();
+        let via = maybe_fetch_index_url(&format!("file://{}", idx.display())).unwrap();
+        assert_eq!(via, idx);
+        assert!(
+            !crate::is_meta_cache_path(&via),
+            "file:// must not be stored in meta-v3"
+        );
     }
 
     #[test]

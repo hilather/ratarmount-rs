@@ -242,6 +242,8 @@ Publish: `--publish-index` copies the sidecar next to the archive; `--publish-in
 
 Hash members (`--hashes` exists for TAR/ZIP/7z). Cache decompressed chunks by hash across mounts. Nested Debian sources, OCI layers, and unioned backup tars share gzip/zstd windows. This is nydus chunk-dedup without a new format. Cache dir: XDG cache, size cap, skip on `:memory:` indexes.
 
+Distinct from V-3 (`$XDG_CACHE_HOME/ratarmount/meta-v3/`), which caches whole **sidecar downloads** (SQLite blobs ≤ 64 MiB), not member payloads.
+
 ### G-4 — Snapshot browser
 
 restic / borg / kopia / ZFS send already store trees of archives or content-addressed packs. A MountSource that walks a restic pack index or a ZFS snapshot send-stream gives browse-the-backup-without-restore. Adjacent users, same random-access problem. Start with **restic** (documented index JSON) before borg/kopia/ZFS.

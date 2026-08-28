@@ -12,6 +12,7 @@
 #   ./benchmarks/compare-vector-wave.sh
 #   OLD_BIN=... NEW_BIN=... N_FILES=8000 RUNS=3 ./benchmarks/compare-vector-wave.sh
 #   VECTOR_MICRO=1 SKIP_FUSE=1 ./benchmarks/compare-vector-wave.sh
+#   VECTOR_REMOTE=1 ./benchmarks/compare-vector-wave.sh   # local HTTP sidecar GET count
 #
 # Env:
 #   OLD_BIN / NEW_BIN   binaries (NEW defaults to target/release/ratarmount)
@@ -19,6 +20,7 @@
 #   SKIP_BUILD=1        do not cargo-build NEW if missing
 #   SKIP_FUSE=1         skip overlay + offset-order extract + control search
 #   VECTOR_MICRO=1      tiny fixtures (harness smoke)
+#   VECTOR_REMOTE=1     fake HTTP remount; sidecar download count (V-3)
 #   N_FILES             many-file TAR size (default 8000; 80 in MICRO)
 #   RUNS                samples per metric, median (default 3; 1 in MICRO)
 set -euo pipefail
@@ -32,6 +34,7 @@ fi
 source "$ROOT/test-harness/env.sh"
 
 VECTOR_MICRO="${VECTOR_MICRO:-0}"
+VECTOR_REMOTE="${VECTOR_REMOTE:-0}"
 SKIP_FUSE="${SKIP_FUSE:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 OLD_REF="${OLD_REF:-v0.1.27}"
@@ -520,6 +523,122 @@ PY
     done
 fi
 
+if [[ "$VECTOR_REMOTE" == "1" ]]; then
+    echoerr "=== V-3 remote sidecar GET count (local HTTP, VECTOR_REMOTE=1) ==="
+    RDIR="$WORKDIR/remote-http"
+    mkdir -p "$RDIR/www"
+    make_tiny_tar "$RDIR/www/a.tar"
+    "$NEW_BIN" --no-mount --index-file "$RDIR/www/a.tar.index.sqlite" \
+        --index-minimum-file-count 0 "$RDIR/www/a.tar" >/dev/null
+    PORTFILE="$RDIR/port"
+    COUNTFILE="$RDIR/sidecar-gets"
+    : >"$COUNTFILE"
+    python3 - "$RDIR/www" "$PORTFILE" "$COUNTFILE" <<'PY' &
+import os, sys
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+root, portfile, countfile = sys.argv[1], sys.argv[2], sys.argv[3]
+
+class H(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self._send(True)
+
+    def do_GET(self):
+        self._send(False)
+
+    def _send(self, head_only):
+        path = self.path.split("?", 1)[0]
+        is_index = path.endswith(".index.sqlite") and ".index.sqlite." not in path
+        if ".index.sqlite." in path:
+            self.send_error(404)
+            return
+        rel = path.lstrip("/")
+        fp = os.path.join(root, rel)
+        if not os.path.isfile(fp):
+            self.send_error(404)
+            return
+        data = open(fp, "rb").read()
+        if is_index and not head_only:
+            with open(countfile, "a") as fh:
+                fh.write("1\n")
+        rng = self.headers.get("Range")
+        start, end = 0, len(data) - 1
+        status = 200
+        if rng and rng.startswith("bytes="):
+            spec = rng.split("=", 1)[1]
+            a, _, b = spec.partition("-")
+            try:
+                start = int(a) if a else 0
+                end = int(b) if b else len(data) - 1
+            except ValueError:
+                start, end = 0, len(data) - 1
+            end = min(end, len(data) - 1)
+            if start <= end:
+                status = 206
+        slice_ = data[start : end + 1]
+        self.send_response(status)
+        self.send_header("Content-Length", str(len(slice_)))
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Connection", "close")
+        if status == 206:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{len(data)}")
+        self.end_headers()
+        if not head_only:
+            self.wfile.write(slice_)
+
+    def log_message(self, fmt, *args):
+        return
+
+httpd = HTTPServer(("127.0.0.1", 0), H)
+with open(portfile, "w") as fh:
+    fh.write(str(httpd.server_address[1]))
+httpd.serve_forever()
+PY
+    HTTP_PID=$!
+    for _ in $(seq 1 50); do
+        [[ -s "$PORTFILE" ]] && break
+        sleep 0.05
+    done
+    if [[ ! -s "$PORTFILE" ]]; then
+        echoerr "skip: VECTOR_REMOTE HTTP fixture failed to bind"
+        kill "$HTTP_PID" 2>/dev/null || true
+    else
+        RPORT=$(cat "$PORTFILE")
+        sidecar_get_count() { wc -l <"$COUNTFILE" | tr -d ' '; }
+        for pair in "old:$OLD_BIN" "new:$NEW_BIN"; do
+            IFS=':' read -r tool bin <<<"$pair"
+            xdg="$RDIR/xdg-$tool"
+            folders="$RDIR/idx-$tool"
+            mkdir -p "$xdg" "$folders"
+            url="http://127.0.0.1:${RPORT}/a.tar"
+            before=$(sidecar_get_count)
+            if ! env XDG_CACHE_HOME="$xdg" "$bin" --no-mount \
+                --index-folders "$folders" --index-minimum-file-count 0 \
+                "$url" >/dev/null 2>"$RDIR/$tool.first.err"; then
+                echoerr "VECTOR_REMOTE first mount failed for $tool: $(head -1 "$RDIR/$tool.first.err")"
+                emit "$tool" "remote_sidecar_second_get" "count" "nan" "n" | tee -a "$CSV_OUT"
+                continue
+            fi
+            # Drop local well-known copy so the second open cannot short-circuit.
+            find "$folders" "$xdg/ratarmount" -name '*.index.sqlite' -delete 2>/dev/null || true
+            after_first=$(sidecar_get_count)
+            if ! env XDG_CACHE_HOME="$xdg" "$bin" --no-mount \
+                --index-folders "$folders" --index-minimum-file-count 0 \
+                "$url" >/dev/null 2>"$RDIR/$tool.second.err"; then
+                echoerr "VECTOR_REMOTE second mount failed for $tool: $(head -1 "$RDIR/$tool.second.err")"
+                emit "$tool" "remote_sidecar_second_get" "count" "nan" "n" | tee -a "$CSV_OUT"
+                continue
+            fi
+            after_second=$(sidecar_get_count)
+            delta=$((after_second - after_first))
+            echoerr "$tool sidecar GET: first=$((after_first - before)) second=$delta"
+            emit "$tool" "remote_sidecar_second_get" "count" "$delta" "n" | tee -a "$CSV_OUT"
+        done
+        kill "$HTTP_PID" 2>/dev/null || true
+        wait "$HTTP_PID" 2>/dev/null || true
+    fi
+fi
+
 python3 - "$CSV_OUT" "$MD_OUT" "$OLD_VER" "$NEW_VER" "$N_FILES" <<'PY'
 import csv, math, sys
 from collections import defaultdict
@@ -574,6 +693,7 @@ lines.append("- `find_glob` / `find_star` — V-1 CLI locate (streaming SQL)")
 lines.append("- `control_search` — V-1 live `search/<glob>`")
 lines.append("- `extract_*_order` — V-5 name-order vs offset-order sequential cat")
 lines.append("- `overlay_getattr` — P2 overlay inode cookies after create")
+lines.append("- `remote_sidecar_second_get` — V-3 XDG LRU (VECTOR_REMOTE=1; 0 extra sidecar GETs)")
 lines.append("")
 lines.append("| Scenario | Metric | Old | New | Relative |")
 lines.append("|----------|--------|-----|-----|----------|")

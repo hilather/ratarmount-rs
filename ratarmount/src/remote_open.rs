@@ -10,9 +10,9 @@ use std::sync::Arc;
 use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
-    check_tarstats_matches_remote, hash_hex, maybe_fetch_index_url, parse_link_describedby,
-    resolve_index_location, sha256_hex_stream, sibling_index_candidates, SqliteIndex,
-    TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
+    check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file, is_meta_cache_path,
+    maybe_fetch_index_url, parse_link_describedby, resolve_index_location, sha256_hex_stream,
+    sibling_index_candidates, SqliteIndex, TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
 use super::{open_from_live_range, open_path};
@@ -146,18 +146,18 @@ fn try_install_remote_index(
         Ok(Some(s)) => s,
         Ok(None) => {
             log::warn!("remote index missing tarstats; not using sidecar");
-            let _ = std::fs::remove_file(&fetched);
+            drop_fetched_sidecar(&fetched);
             return false;
         }
         Err(e) => {
             log::debug!("remote index open failed: {e}");
-            let _ = std::fs::remove_file(&fetched);
+            drop_fetched_sidecar(&fetched);
             return false;
         }
     };
     if let Err(e) = check_tarstats_matches_remote(&stored, archive_size, prefix, suffix, full) {
         log::warn!("remote archive fingerprint mismatch ({e}); cold index");
-        let _ = std::fs::remove_file(&fetched);
+        drop_fetched_sidecar(&fetched);
         return false;
     }
     let dest = match cache_dest {
@@ -169,7 +169,11 @@ fn try_install_remote_index(
             }
             match std::fs::copy(&fetched, d) {
                 Ok(_) => {
-                    let _ = std::fs::remove_file(&fetched);
+                    // Keep the V-3 XDG blob so a remount without the local
+                    // well-known copy (and without `.ptr`) still cache-hits.
+                    if !is_meta_cache_path(&fetched) {
+                        let _ = std::fs::remove_file(&fetched);
+                    }
                     d.to_path_buf()
                 }
                 Err(_) => fetched,
@@ -179,6 +183,14 @@ fn try_install_remote_index(
     };
     opts.index_file_path = Some(dest);
     true
+}
+
+fn drop_fetched_sidecar(fetched: &Path) {
+    if is_meta_cache_path(fetched) {
+        invalidate_meta_cache_file(fetched);
+    } else {
+        let _ = std::fs::remove_file(fetched);
+    }
 }
 
 fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Option<String>) {
@@ -806,5 +818,243 @@ mod tests {
             .expect("Link describedby must install a sidecar");
         assert!(got.is_file(), "{}", got.display());
         assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+    }
+
+    static REMOTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct SidecarHttp {
+        url: String,
+        sidecar_gets: Arc<std::sync::Mutex<usize>>,
+        _join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl SidecarHttp {
+        fn spawn(archive_body: Vec<u8>, index_body: Vec<u8>) -> Self {
+            use std::io::{BufRead, BufReader, Write as IoWrite};
+            use std::net::TcpListener;
+            use std::thread;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let sidecar_gets = Arc::new(std::sync::Mutex::new(0usize));
+            let gets_c = Arc::clone(&sidecar_gets);
+            let join = thread::spawn(move || {
+                listener.set_nonblocking(false).ok();
+                for stream in listener.incoming().take(64) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut range_hdr: Option<String> = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.strip_prefix("Range:") {
+                            range_hdr = Some(v.trim().to_string());
+                        }
+                    }
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let is_head = request_line.starts_with("HEAD ");
+                    let is_compressed_index = path.contains(".index.sqlite.");
+                    let is_index = path.ends_with(".index.sqlite") && !is_compressed_index;
+                    if is_compressed_index {
+                        let hdr = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                        let _ = stream.write_all(hdr.as_bytes());
+                        continue;
+                    }
+                    if is_index && !is_head {
+                        *gets_c.lock().unwrap() += 1;
+                    }
+                    let body: &[u8] = if is_index { &index_body } else { &archive_body };
+                    let mut range_off: Option<(usize, usize)> = None;
+                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                        let parts: Vec<&str> = r.splitn(2, '-').collect();
+                        if parts.len() == 2 {
+                            let start: usize = parts[0].parse().unwrap_or(0);
+                            let end: usize = if parts[1].is_empty() {
+                                body.len().saturating_sub(1)
+                            } else {
+                                parts[1]
+                                    .parse()
+                                    .unwrap_or(0)
+                                    .min(body.len().saturating_sub(1))
+                            };
+                            if start < body.len() && start <= end {
+                                range_off = Some((start, end));
+                            }
+                        }
+                    }
+                    let slice = match range_off {
+                        Some((s, e)) => &body[s..=e],
+                        None => body,
+                    };
+                    let status = if range_off.is_some() {
+                        "206 Partial Content"
+                    } else {
+                        "200 OK"
+                    };
+                    let mut hdr = format!(
+                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+                        slice.len()
+                    );
+                    if let Some((start, end)) = range_off {
+                        hdr.push_str(&format!(
+                            "Content-Range: bytes {start}-{end}/{}\r\n",
+                            body.len()
+                        ));
+                    }
+                    hdr.push_str("\r\n");
+                    let _ = stream.write_all(hdr.as_bytes());
+                    if !is_head {
+                        let _ = stream.write_all(slice);
+                    }
+                }
+            });
+            Self {
+                url: format!("http://{addr}/archive.tar"),
+                sidecar_gets,
+                _join: Some(join),
+            }
+        }
+
+        fn sidecar_gets(&self) -> usize {
+            *self.sidecar_gets.lock().unwrap()
+        }
+    }
+
+    fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
+        let _g = REMOTE_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_cap = std::env::var_os(ratarmount_index::META_CACHE_BYTES_ENV);
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV);
+        let r = f();
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match old_cap {
+            Some(v) => std::env::set_var(ratarmount_index::META_CACHE_BYTES_ENV, v),
+            None => std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV),
+        }
+        r
+    }
+
+    /// Regression: remount of a published well-known sidecar (no `.ptr`) does
+    /// zero extra sidecar downloads after the local folder copy is gone.
+    #[test]
+    fn apply_remote_index_well_known_sidecar_cache_hit() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'A'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let idx_path = dir.path().join("sidecar.sqlite");
+            {
+                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+                idx.store_tarstats_for_path(&archive).unwrap();
+            }
+            let index_bytes = fs::read(&idx_path).unwrap();
+            let folders = vec![dir.path().join("empty-index-folders")];
+            fs::create_dir_all(&folders[0]).unwrap();
+
+            let http = SidecarHttp::spawn(archive_bytes.clone(), index_bytes.clone());
+            let mut opts = OpenOptions {
+                index_folders: folders.clone(),
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(
+                &http.url,
+                &mut opts,
+                false,
+                archive_bytes.len() as u64,
+                None,
+            );
+            let first = opts
+                .index_file_path
+                .take()
+                .expect("well-known sibling must install a sidecar");
+            assert!(first.is_file(), "{}", first.display());
+            let gets1 = http.sidecar_gets();
+            assert!(gets1 >= 1, "first remount must GET the sidecar");
+
+            // Drop the local well-known copy so the second discovery cannot
+            // `path_is_nonempty_file` short-circuit. No `.ptr` is published.
+            let _ = fs::remove_file(&first);
+            apply_remote_index_discovery(
+                &http.url,
+                &mut opts,
+                false,
+                archive_bytes.len() as u64,
+                None,
+            );
+            let second = opts
+                .index_file_path
+                .as_ref()
+                .expect("V-3 cache hit must reinstall without .ptr");
+            assert!(second.is_file(), "{}", second.display());
+            assert_eq!(
+                http.sidecar_gets(),
+                gets1,
+                "second remount must not GET the sidecar again"
+            );
+        });
+    }
+
+    /// Regression: local `path_is_nonempty_file` still skips network (no double-cache).
+    #[test]
+    fn apply_remote_index_local_copy_skips_network() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'B'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let idx_path = dir.path().join("sidecar.sqlite");
+            {
+                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+                idx.store_tarstats_for_path(&archive).unwrap();
+            }
+            let index_bytes = fs::read(&idx_path).unwrap();
+            let folders = vec![dir.path().join("idx-folders")];
+            fs::create_dir_all(&folders[0]).unwrap();
+
+            let http = SidecarHttp::spawn(archive_bytes.clone(), index_bytes.clone());
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(
+                &http.url,
+                &mut opts,
+                false,
+                archive_bytes.len() as u64,
+                None,
+            );
+            assert!(opts.index_file_path.as_ref().unwrap().is_file());
+            let gets1 = http.sidecar_gets();
+            opts.index_file_path = None;
+            apply_remote_index_discovery(
+                &http.url,
+                &mut opts,
+                false,
+                archive_bytes.len() as u64,
+                None,
+            );
+            assert_eq!(
+                http.sidecar_gets(),
+                gets1,
+                "local nonempty sidecar must skip remote GET"
+            );
+        });
     }
 }

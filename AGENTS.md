@@ -137,6 +137,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Socket `search` | `cargo test -p ratarmount --bin ratarmount control_search_socket` |
 | FTS5 path + hashes | `cargo test -p ratarmount-index --lib search_fts5` (default `cargo test -p ratarmount-index --lib`, no extra features) |
 | Inbound HEAD **archive** `Link: describedby` → fetch | `cargo test -p ratarmount-index --lib link_describedby_archive_head` · `cargo test -p ratarmount --bin ratarmount apply_remote_index_discovery_follows_archive_link` |
+| Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount --bin ratarmount apply_remote_index` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |

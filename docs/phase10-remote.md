@@ -31,6 +31,8 @@ Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_g
 
 Order: explicit `--index-file` → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) `{url}.index.sqlite` (+ compressed suffixes) → OCI 1.1 referrer **on local miss**. Fail-open. Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. No S3/GCS/Azure sibling GET. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy; `aws s3 cp` for object stores).
 
+Whole sidecar GETs ≤ 64 MiB are stored in `$XDG_CACHE_HOME/ratarmount/meta-v3/` (V-3; cap `RATARMOUNT_META_CACHE_BYTES`, default 256 MiB, `=0` disables). Lookup is URL-first so a remount without `.ptr` still hits. Not archive `HttpRangeFile` paging and not G-3 member bodies. `file://` / `:memory:` / a nonempty local folder candidate skip the download. HPC home-quota: set `XDG_CACHE_HOME` to scratch.
+
 ### HTTP(S) Basic authentication (FR-2 / [#157](https://github.com/mxmlnkn/ratarmount/issues/157))
 
 `Authorization: Basic …` is sent on HEAD, full GET, and Range GETs when credentials are available.

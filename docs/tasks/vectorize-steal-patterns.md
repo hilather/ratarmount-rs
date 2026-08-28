@@ -113,21 +113,18 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - Local sibling index discovery; OCI `{digest}` cache then referrer (G-2).
 - G-3 **content-addressed member cache** is `todo` (decompressed chunks by hash). Different layer — payload, not metadata I/O.
 
-**Still open:**
+**Still open / landed:**
 
-- [ ] Process-local LRU (XDG cache dir, size cap) keyed by `(backend, url/etag, range)` for:
-  - SQLite sidecar pages / whole sidecar when small
-  - gzip/zstd/bz2 seek-map blobs (`zstdblocks`, `bzip2blocks`, RGZI/GZIDX)
-  - outer `nestedindexes` RNIB blobs
-- [ ] Revalidate with ETag / tarstats; miss → Range GET → fill cache → serve.
-- [ ] Skip on `file://` and `:memory:` indexes.
-- [ ] Do **not** cache uncompressed member bodies here (that is G-3).
-- [ ] Regression: second mount of `s3://…/a.tar.zst` with published index does not Range-GET the sidecar again; corrupting the cached blob fails closed to refetch.
-- [ ] Bench: cold vs warm remote mount wall + GET count (harness can fake HTTP).
+- [x] Process-local LRU (`$XDG_CACHE_HOME/ratarmount/meta-v3/`, `RATARMOUNT_META_CACHE_BYTES` default 256 MiB, `=0` disables) keyed by canonical **backend+url** (etag is a header, **not** the lookup key) for whole SQLite sidecar downloads ≤ 64 MiB (`fetch_index_http`). A remount without `.ptr` still hits.
+- [ ] SQLite page / Range pager over index URLs; standalone RGZI/GZIDX **files** next to the archive (sidecar-internal `zstdblocks` / `bzip2blocks` / `nestedindexes` come along with the blob)
+- [x] Skip on `file://` and `:memory:` indexes (and local `path_is_nonempty_file`).
+- [x] Do **not** cache uncompressed member bodies here (that is G-3, still `todo`).
+- [x] Regression: second fake-HTTP remount of a well-known sidecar does not GET again; corrupting the cached blob fails closed to refetch; pointer etag mismatch GETs once.
+- [x] Bench: `VECTOR_REMOTE=1 ./benchmarks/compare-vector-wave.sh` local HTTP fixture (sidecar GET count).
 
 **Why it pays:** Remote-first is already the product story. Density work made local `find` cheap; remote mounts still die on metadata RTT. This is the Vectorize Cache→R2 split with ANN removed.
 
-**Depends:** V-2 etag/id in the pointer so cache keys stay stable across republish. Complements G-3 (payload) and F-9 (producer makes maps small).
+**Depends:** V-2 pointer etag is optional revalidation only (cache key is URL-first). Complements G-3 (payload) and F-9 (producer makes maps small).
 
 ---
 

@@ -15,6 +15,7 @@ mod dirent_order;
 mod hashing;
 mod location;
 mod mem;
+mod meta_cache;
 mod nested;
 mod patch;
 mod search;
@@ -29,6 +30,10 @@ pub use location::{
     maybe_fetch_index_url, parse_index_folders, parse_link_describedby, possible_index_paths,
     resolve_index_location, sibling_index_candidates, sibling_index_url, IndexLocation,
     INDEX_LINK_REL, INDEX_MEDIA_TYPE, MEMORY_INDEX,
+};
+pub use meta_cache::{
+    cache_identity, invalidate_meta_cache_file, is_meta_cache_path, MetaCache,
+    META_CACHE_BYTES_DEFAULT, META_CACHE_BYTES_ENV, META_SIDECAR_WHOLE_MAX,
 };
 pub use search::{locate_pattern_matches, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
