@@ -8,8 +8,8 @@
 use std::io::{Read, Seek, SeekFrom};
 
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
+use crate::hashing::sha256_hex_window;
 use crate::mem::{MemIndex, MemIndexBuilder};
 use crate::{FileRow, IndexError, Result};
 
@@ -95,37 +95,34 @@ impl NestedBodyFingerprint {
     ) -> std::io::Result<Self> {
         let sample = NESTED_FINGERPRINT_SAMPLE as u64;
         let prefix_len = sample.min(body_size) as usize;
-        let mut prefix = vec![0u8; prefix_len];
+        let mut buf = [0u8; NESTED_FINGERPRINT_SAMPLE];
         reader.seek(SeekFrom::Start(0))?;
-        reader.read_exact(&mut prefix)?;
+        let prefix_sha256 = sha256_hex_window(reader, &mut buf, prefix_len)?;
 
-        let suffix = if body_size > sample {
-            let mut buf = vec![0u8; NESTED_FINGERPRINT_SAMPLE];
+        // Small body: suffix/mid hex equal prefix (same bytes). Do not clone the window.
+        let suffix_sha256 = if body_size > sample {
             reader.seek(SeekFrom::Start(body_size - sample))?;
-            reader.read_exact(&mut buf)?;
-            buf
+            sha256_hex_window(reader, &mut buf, NESTED_FINGERPRINT_SAMPLE)?
         } else {
-            prefix.clone()
+            prefix_sha256.clone()
         };
 
         // Mid sample catches same-size edits far from head/tail (ZIP local data, etc.).
-        let mid = if body_size > sample * 2 {
+        let mid_sha256 = if body_size > sample * 2 {
             let mid_start = body_size / 2;
-            let take = sample.min(body_size - mid_start);
-            let mut buf = vec![0u8; take as usize];
+            let take = sample.min(body_size - mid_start) as usize;
             reader.seek(SeekFrom::Start(mid_start))?;
-            reader.read_exact(&mut buf)?;
-            buf
+            sha256_hex_window(reader, &mut buf, take)?
         } else {
-            prefix.clone()
+            prefix_sha256.clone()
         };
         reader.seek(SeekFrom::Start(0))?;
 
         Ok(Self {
             body_size,
-            prefix_sha256: hex_sha256(&prefix),
-            suffix_sha256: hex_sha256(&suffix),
-            mid_sha256: hex_sha256(&mid),
+            prefix_sha256,
+            suffix_sha256,
+            mid_sha256,
         })
     }
 
@@ -139,15 +136,13 @@ impl NestedBodyFingerprint {
     ) -> std::io::Result<Self> {
         let sample = NESTED_FINGERPRINT_SAMPLE as u64;
         let prefix_len = sample.min(body_size) as usize;
-        let mut prefix = vec![0u8; prefix_len];
+        let mut buf = [0u8; NESTED_FINGERPRINT_SAMPLE];
         reader.seek(SeekFrom::Start(0))?;
-        if prefix_len > 0 {
-            reader.read_exact(&mut prefix)?;
-        }
+        let prefix_sha256 = sha256_hex_window(reader, &mut buf, prefix_len)?;
         reader.seek(SeekFrom::Start(0))?;
         Ok(Self {
             body_size,
-            prefix_sha256: hex_sha256(&prefix),
+            prefix_sha256,
             suffix_sha256: String::new(),
             mid_sha256: String::new(),
         })
@@ -162,12 +157,6 @@ impl NestedBodyFingerprint {
                 || other.mid_sha256.is_empty()
                 || self.mid_sha256 == other.mid_sha256)
     }
-}
-
-fn hex_sha256(data: &[u8]) -> String {
-    let mut h = Sha256::new();
-    h.update(data);
-    format!("{:x}", h.finalize())
 }
 
 /// Serializable file row (mirrors [`FileRow`] for nested blobs).
@@ -964,9 +953,14 @@ mod binfmt {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hashing::sha256_hex;
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
     #[test]
+    fn patterned_body(n: usize) -> Vec<u8> {
+        (0..n).map(|i| (i % 251) as u8).collect()
+    }
+
     fn fingerprint_roundtrip_and_mismatch() {
         let body = b"hello nested body payload for fingerprinting!!";
         let mut c = Cursor::new(body.to_vec());
@@ -1046,6 +1040,142 @@ mod tests {
             "cheap path still samples mid/tail: {:?}",
             cheap.seeks
         );
+    }
+
+    /// Regression: seekable fingerprint reads only the three windows (no body-sized `Vec`).
+    #[test]
+    fn regression_fingerprint_large_body_byte_budget() {
+        struct Budget {
+            data: Vec<u8>,
+            pos: u64,
+            bytes_read: usize,
+            seeks: Vec<u64>,
+        }
+        impl Read for Budget {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                let start = self.pos as usize;
+                if start >= self.data.len() {
+                    return Ok(0);
+                }
+                // Short reads so a full-buffer `read_exact(4096)` still works,
+                // while a mistaken body-sized slurp is counted.
+                let n = buf.len().min(self.data.len() - start).min(1024);
+                buf[..n].copy_from_slice(&self.data[start..start + n]);
+                self.pos += n as u64;
+                self.bytes_read += n;
+                Ok(n)
+            }
+        }
+        impl Seek for Budget {
+            fn seek(&mut self, from: SeekFrom) -> std::io::Result<u64> {
+                let new = match from {
+                    SeekFrom::Start(o) => o as i64,
+                    SeekFrom::End(o) => self.data.len() as i64 + o,
+                    SeekFrom::Current(o) => self.pos as i64 + o,
+                };
+                assert!(new >= 0);
+                self.pos = new as u64;
+                self.seeks.push(self.pos);
+                Ok(self.pos)
+            }
+        }
+
+        let sample = NESTED_FINGERPRINT_SAMPLE;
+        let body = patterned_body(1024 * 1024);
+        let body_size = body.len() as u64;
+        let mid_start = body_size / 2;
+        let tail_start = body_size - sample as u64;
+        let mut log = Budget {
+            data: body.clone(),
+            pos: 0,
+            bytes_read: 0,
+            seeks: Vec::new(),
+        };
+        let fp = NestedBodyFingerprint::from_seekable_body(&mut log, body_size).unwrap();
+        assert!(
+            log.bytes_read <= 3 * sample,
+            "read {} payload bytes, want ≤ {}",
+            log.bytes_read,
+            3 * sample
+        );
+        assert!(
+            log.seeks
+                .iter()
+                .all(|&p| p == 0 || p == mid_start || p == tail_start),
+            "seeks must be 0 / mid / tail / rewind only: {:?}",
+            log.seeks
+        );
+        assert_eq!(fp.prefix_sha256, sha256_hex(&body[..sample]));
+        assert_eq!(fp.suffix_sha256, sha256_hex(&body[tail_start as usize..]));
+        assert_eq!(
+            fp.mid_sha256,
+            sha256_hex(&body[mid_start as usize..mid_start as usize + sample])
+        );
+        assert_eq!(log.pos, 0, "must rewind to 0");
+    }
+
+    /// Regression: small / 4096 / 8192 boundaries hash `&buf[..window_len]` only.
+    #[test]
+    fn regression_fingerprint_small_and_boundary_bodies() {
+        let sample = NESTED_FINGERPRINT_SAMPLE;
+        // < 4096 and == 4096: prefix is the whole body; suffix == mid == prefix.
+        for n in [1usize, 100, sample - 1, sample] {
+            let body = patterned_body(n);
+            let mut c = Cursor::new(body.clone());
+            let fp = NestedBodyFingerprint::from_seekable_body(&mut c, n as u64).unwrap();
+            let whole = sha256_hex(&body);
+            assert_eq!(fp.prefix_sha256, whole, "n={n} prefix");
+            assert_eq!(fp.suffix_sha256, whole, "n={n} suffix==prefix");
+            assert_eq!(fp.mid_sha256, whole, "n={n} mid==prefix");
+            assert_eq!(c.position(), 0);
+        }
+
+        // == 8192: mid is still prefix (body_size ≤ 2 * sample); tail is last 4096.
+        let body = patterned_body(2 * sample);
+        let mut c = Cursor::new(body.clone());
+        let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body.len() as u64).unwrap();
+        let prefix = sha256_hex(&body[..sample]);
+        let suffix = sha256_hex(&body[sample..]);
+        assert_eq!(fp.prefix_sha256, prefix);
+        assert_eq!(fp.suffix_sha256, suffix);
+        assert_eq!(fp.mid_sha256, prefix, "mid stays prefix at 2 * sample");
+        assert_ne!(suffix, prefix, "precondition: tail window differs");
+        assert_eq!(c.position(), 0);
+
+        // > 8192: three distinct windows.
+        let body = patterned_body(2 * sample + 1);
+        let mut c = Cursor::new(body.clone());
+        let fp = NestedBodyFingerprint::from_seekable_body(&mut c, body.len() as u64).unwrap();
+        let prefix = sha256_hex(&body[..sample]);
+        let suffix = sha256_hex(&body[body.len() - sample..]);
+        let mid_start = body.len() / 2;
+        let mid = sha256_hex(&body[mid_start..mid_start + sample]);
+        assert_eq!(fp.prefix_sha256, prefix);
+        assert_eq!(fp.suffix_sha256, suffix);
+        assert_eq!(fp.mid_sha256, mid);
+        assert_ne!(fp.prefix_sha256, fp.suffix_sha256);
+        assert_ne!(fp.prefix_sha256, fp.mid_sha256);
+        assert_ne!(fp.suffix_sha256, fp.mid_sha256);
+        assert_eq!(c.position(), 0);
+    }
+
+    /// Regression: seekable empty hashes sha256(""); head-only empty leaves suffix/mid blank.
+    #[test]
+    fn regression_fingerprint_empty_seekable_vs_head_only() {
+        let empty = sha256_hex(b"");
+        let mut c = Cursor::new(Vec::<u8>::new());
+        let seekable = NestedBodyFingerprint::from_seekable_body(&mut c, 0).unwrap();
+        assert_eq!(seekable.prefix_sha256, empty);
+        assert_eq!(seekable.suffix_sha256, empty);
+        assert_eq!(seekable.mid_sha256, empty);
+        assert_eq!(c.position(), 0);
+
+        let mut c = Cursor::new(Vec::<u8>::new());
+        let head = NestedBodyFingerprint::from_head_only(&mut c, 0).unwrap();
+        assert_eq!(head.prefix_sha256, empty);
+        assert!(head.suffix_sha256.is_empty());
+        assert!(head.mid_sha256.is_empty());
+        assert_eq!(c.position(), 0);
     }
 
     #[test]

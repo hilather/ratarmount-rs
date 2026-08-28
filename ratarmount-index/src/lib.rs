@@ -19,8 +19,8 @@ mod patch;
 mod search;
 
 pub use hashing::{
-    compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm,
-    SUPPORTED_HASH_ALGORITHMS,
+    compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
+    sha256_hex_stream, HASH_STREAM_CHUNK, SUPPORTED_HASH_ALGORITHMS,
 };
 pub use location::{
     default_index_folders, default_index_path, expand_user, is_index_url, materialize_index_file,
@@ -234,45 +234,34 @@ pub fn tar_stats_from_metadata(meta: &std::fs::Metadata) -> TarStats {
 
 /// SHA-256 hex of the first and last up-to-[`TARSTATS_SAMPLE_BYTES`] of `path`.
 pub fn archive_edge_hashes(path: &Path) -> Result<(String, String)> {
-    use sha2::{Digest, Sha256};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Seek, SeekFrom};
 
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
+    let mut buf = [0u8; TARSTATS_SAMPLE_BYTES];
+    let prefix_len = TARSTATS_SAMPLE_BYTES.min(len as usize);
+    let prefix_hex = hashing::sha256_hex_window(&mut f, &mut buf, prefix_len)?;
 
-    let mut prefix = vec![0u8; TARSTATS_SAMPLE_BYTES.min(len as usize)];
-    if !prefix.is_empty() {
-        f.read_exact(&mut prefix)?;
-    }
-    let prefix_hex = format!("{:x}", Sha256::digest(&prefix));
-
-    let suffix_hex = if len == 0 {
-        prefix_hex.clone()
-    } else if len as usize <= TARSTATS_SAMPLE_BYTES {
-        // Entire file already in prefix.
+    let suffix_hex = if len == 0 || len as usize <= TARSTATS_SAMPLE_BYTES {
         prefix_hex.clone()
     } else {
-        let mut suffix = vec![0u8; TARSTATS_SAMPLE_BYTES];
         f.seek(SeekFrom::End(-(TARSTATS_SAMPLE_BYTES as i64)))?;
-        f.read_exact(&mut suffix)?;
-        format!("{:x}", Sha256::digest(&suffix))
+        hashing::sha256_hex_window(&mut f, &mut buf, TARSTATS_SAMPLE_BYTES)?
     };
     Ok((prefix_hex, suffix_hex))
 }
 
 /// Full-file SHA-256 when `path` is at most [`TARSTATS_FULL_HASH_MAX`] bytes.
+///
+/// Streams until EOF (no second size cap, no file-sized `Vec`). Policy cap is
+/// the `st_size` gate only — do not change [`TARSTATS_FULL_HASH_MAX`].
 pub fn archive_full_hash(path: &Path) -> Result<Option<String>> {
-    use sha2::{Digest, Sha256};
-    use std::io::Read;
-
     let mut f = std::fs::File::open(path)?;
     let len = f.metadata()?.len();
     if len > TARSTATS_FULL_HASH_MAX {
         return Ok(None);
     }
-    let mut buf = Vec::with_capacity(len as usize);
-    f.read_to_end(&mut buf)?;
-    Ok(Some(format!("{:x}", Sha256::digest(&buf))))
+    Ok(Some(hashing::sha256_hex_stream(&mut f)?))
 }
 
 /// Full fingerprint: metadata + content samples (edges; full hash when small).
@@ -2290,6 +2279,79 @@ mod tests {
         assert_eq!(f.st_size, 10);
         assert_eq!(f.st_mtime, 1);
         assert_eq!(f.st_mtime_ns, None);
+    }
+
+    /// Regression: `archive_full_hash` streams; policy cap unchanged; digest matches one-shot.
+    #[test]
+    fn regression_archive_full_hash_streams_empty_small_and_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let empty = dir.path().join("empty.bin");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            archive_full_hash(&empty).unwrap().as_deref(),
+            hash_hex("sha256", b"").as_deref()
+        );
+
+        let small = dir.path().join("small.bin");
+        std::fs::write(&small, b"abc").unwrap();
+        assert_eq!(
+            archive_full_hash(&small).unwrap().as_deref(),
+            hash_hex("sha256", b"abc").as_deref()
+        );
+
+        let at_cap = dir.path().join("at_cap.bin");
+        let cap_bytes = vec![0x5Au8; TARSTATS_FULL_HASH_MAX as usize];
+        std::fs::write(&at_cap, &cap_bytes).unwrap();
+        assert_eq!(
+            archive_full_hash(&at_cap).unwrap().as_deref(),
+            hash_hex("sha256", &cap_bytes).as_deref()
+        );
+
+        let over = dir.path().join("over.bin");
+        std::fs::write(&over, vec![0u8; TARSTATS_FULL_HASH_MAX as usize + 1]).unwrap();
+        assert_eq!(archive_full_hash(&over).unwrap(), None);
+    }
+
+    /// Regression: edge hashes use exact window lengths (0-byte / 1-byte / ≤512 / >512).
+    #[test]
+    fn regression_archive_edge_hashes_exact_windows() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let empty = dir.path().join("e.bin");
+        std::fs::write(&empty, b"").unwrap();
+        let (p, s) = archive_edge_hashes(&empty).unwrap();
+        let empty_hex = hash_hex("sha256", b"").unwrap();
+        assert_eq!(p, empty_hex);
+        assert_eq!(s, empty_hex);
+
+        let one = dir.path().join("one.bin");
+        std::fs::write(&one, b"Z").unwrap();
+        let (p, s) = archive_edge_hashes(&one).unwrap();
+        let one_hex = hash_hex("sha256", b"Z").unwrap();
+        assert_eq!(p, one_hex);
+        assert_eq!(s, one_hex);
+
+        let small = dir.path().join("le512.bin");
+        let small_bytes = vec![0x11u8; 512];
+        std::fs::write(&small, &small_bytes).unwrap();
+        let (p, s) = archive_edge_hashes(&small).unwrap();
+        let small_hex = hash_hex("sha256", &small_bytes).unwrap();
+        assert_eq!(p, small_hex);
+        assert_eq!(s, p);
+
+        let big = dir.path().join("gt512.bin");
+        let mut big_bytes = vec![0x22u8; 800];
+        for (i, b) in big_bytes.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        std::fs::write(&big, &big_bytes).unwrap();
+        let (p, s) = archive_edge_hashes(&big).unwrap();
+        assert_eq!(p, hash_hex("sha256", &big_bytes[..512]).unwrap());
+        assert_eq!(
+            s,
+            hash_hex("sha256", &big_bytes[big_bytes.len() - 512..]).unwrap()
+        );
+        assert_ne!(p, s);
     }
 
     /// Regression: warm index must not be trusted when archive size/mtime/content no longer match tarstats.
