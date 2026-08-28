@@ -31,7 +31,7 @@ Nested and factory fingerprinting already sample windows. The missing work is **
 | Tarstats edges | `archive_edge_hashes` | First/last **512** (`TARSTATS_SAMPLE_BYTES`). Heap `Vec` of 512. |
 | Tarstats full hash | `archive_full_hash` | When `st_size ≤ TARSTATS_FULL_HASH_MAX` (**256 KiB**), **`read_to_end` into a `Vec`** then one-shot SHA-256. Policy **requires** a full-file digest; it does **not** require a full-file `Vec`. |
 | Content-hash fill | `ratarmount-index/src/hashing.rs` `compute_hashes_limited` / `fill_content_hashes` | Already streams into `MultiHasher`. Leftover: **`vec![0u8; 1 MiB]` allocated per member**. |
-| Remote tarstats | `ratarmount/src/remote_open.rs` `http_fingerprint` / `oci_fingerprint` | Edges via 512-byte Range / prefix read. Full hash when `size ≤ 256 KiB`: HTTP `fetch_http_range_bytes(0, size-1)` → `Vec`; OCI `read_to_end`. |
+| Remote tarstats | `ratarmount/src/remote_open.rs` `http_fingerprint` / `oci_fingerprint` | Edges via 512-byte Range / prefix read. Full hash when `size ≤ 256 KiB`: HTTP `fetch_http_range_bytes(0, size-1)` → `Vec` (**accepts HTTP 200 and `read_to_end`s the response**, not `end-start+1`); OCI `seek(0)` then **`read_to_end` of the blob** (not a `size`-capped read). |
 
 Existing regressions that **must stay green** (run filters separately; `cargo test` does not treat `|` as OR):
 
@@ -53,7 +53,7 @@ Honest leftover (do not claim “nested still slurps multi-GB bodies” — it d
 2. **Nested constructors** heap-allocate 1–3 window `Vec`s and `prefix.clone()` for small-body suffix/mid. Windows are already bounded; the P2 bullet asks for **fixed buffers**.
 3. **`compute_hashes_limited`** already streams, but the 1 MiB scratch buffer is oversized and is allocated **once per hashed member** during `--hashes` / `fill_content_hashes`.
 
-ZIP `decode_plain_member_from_file` and 7z `read_member_bytes_io` still slurp **decoded payloads** before hashing. That is **inflate/decode**, not this item.
+ZIP `decode_plain_member_from_file` (STORE `read_file_range_at` **and** Deflate `read_to_end`) and 7z `read_member_bytes_io` still slurp **member payloads** before hashing. STORE is a full-member `Vec` closer to the content-hash bullet than inflate is; it stays a **labeled residual** (payload open path, not tarstats/nested windows). 7z folder decode is the same residual class.
 
 ---
 
@@ -68,8 +68,8 @@ Add small helpers next to existing hash code (prefer `hashing.rs`, used by `nest
 | Helper | Behavior |
 |--------|----------|
 | `sha256_hex(data: &[u8]) -> String` | Collapse `nested::hex_sha256` and the one-shot SHA-256 in `archive_edge_hashes` / `hash_hex("sha256", …)`. Hex lowercase, same as today. |
-| `sha256_hex_stream(reader, max_bytes) -> io::Result<String>` | Read at most `max_bytes` into a **fixed chunk** (`HASH_STREAM_CHUNK`, see below), `Sha256::update` each chunk, return hex. Never `read_to_end`. |
-| Window fill | `read_exact` into a caller-supplied `&mut [u8]` (stack `[u8; N]`). |
+| `sha256_hex_stream(reader) -> io::Result<String>` | Stream **until EOF** (`n == 0`), `Sha256::update` each chunk, return hex. **Stop-on-short**: hash what was read (same as today’s `read_to_end`). Never `read_to_end` into a `Vec`. **Do not** fail when `bytes_read != expected_len` — that would turn a short local file into `IndexError::Io` via `check_tarstats_matches_archive` (`?` on `archive_full_hash`) instead of a digest / `Mismatch`. No `max_bytes` cap on the helper itself. |
+| Window fill | `read_exact` into a caller-supplied `&mut [u8]` **sliced to the window length** (`&mut buf[..prefix_len]`). Never `read_exact` the full 4096 when `prefix_len < NESTED_FINGERPRINT_SAMPLE`. Hash `&buf[..prefix_len]` only — hashing the whole `[u8; 4096]` with trailing zeros **changes the digest**. |
 
 `HASH_STREAM_CHUNK`: **64 KiB** (`64 * 1024`). Small enough to be a fixed scratch pad; large enough that `--hashes` on multi-MiB TAR members is not a syscall storm. Must be a named `pub(crate)` / `pub` const so tests can assert “no request larger than chunk” if they wrap `Read`.
 
@@ -80,16 +80,16 @@ Do **not** put `[u8; TARSTATS_FULL_HASH_MAX]` (256 KiB) on the stack.
 Rewrite `from_seekable_body` / `from_head_only`:
 
 - One stack buffer `[u8; NESTED_FINGERPRINT_SAMPLE]` (4096). If `NESTED_FINGERPRINT_SAMPLE` is ever raised above ~64 KiB, switch that const to a reused heap buffer of **exactly** the sample size — never `body_size`.
-- Hash each window immediately; do **not** `prefix.clone()` for suffix/mid. Small body (`body_size ≤ sample`): suffix hex **equals** prefix hex (same bytes). Small-mid (`body_size ≤ 2 * sample`): mid hex **equals** prefix hex. Preserve those equalities — today’s `hex_sha256(&prefix.clone())` depends on them.
-- `from_head_only`: still empty suffix/mid strings (not a hash of empty / prefix). Empty body: prefix of length 0, same hex as today (`sha256("")`).
-- Always rewind to 0. Seek set unchanged (head / `body_size - sample` / `body_size / 2`).
+- Hash each window immediately; do **not** `prefix.clone()` for suffix/mid. Small body (`body_size ≤ sample`): suffix hex **equals** prefix hex (same bytes). Small-mid (`body_size ≤ 2 * sample`): mid hex **equals** prefix hex. Preserve those equalities — today’s `hex_sha256(&prefix.clone())` depends on them. In-place hash of `&buf[..len]` does **not** change the digest; hashing uninitialized / zero tail of the stack array **does**.
+- `from_head_only`: still empty suffix/mid strings (not a hash of empty / prefix). Empty body (`body_size == 0`): prefix is `sha256("")`. **Seekable** empty body today always `read_exact`s a 0-length prefix (`nested.rs` ~L98–100; std returns `Ok(())`); suffix and mid are **`sha256("")`**, not empty strings. `matches()` treats empty mid as legacy-OK but **suffix is exact** — do not write empty suffix on the seekable path.
+- `from_head_only` and `archive_edge_hashes` already guard `prefix_len == 0`; `from_seekable_body` does not. Either keep the 0-length `read_exact` or skip it; both are `Ok`. Always rewind to 0. Seek set unchanged (head / `body_size - sample` / `body_size / 2`).
 
 **No API / schema change.** `matches()`, blob encode, and factory `fingerprint_nested_body` stay as-is.
 
 ### 3. Tarstats: edges stay 512; full hash streams
 
 - `archive_edge_hashes`: stack `[u8; TARSTATS_SAMPLE_BYTES]`. Same first/last 512 policy.
-- `archive_full_hash`: if `len > TARSTATS_FULL_HASH_MAX` → `Ok(None)` (unchanged). Else `sha256_hex_stream` of the whole file. **Do not** change `TARSTATS_FULL_HASH_MAX`. Digests must match today’s `Sha256::digest(&buf)` of the slurp.
+- `archive_full_hash`: if `len > TARSTATS_FULL_HASH_MAX` → `Ok(None)` (unchanged). Else open the file and `sha256_hex_stream` **until EOF** (no second size cap). **Do not** change `TARSTATS_FULL_HASH_MAX`. Digests must match today’s `Sha256::digest(&buf)` of the slurp.
 
 ### 4. Content-hash fill: fixed hasher scratch
 
@@ -101,9 +101,9 @@ Rewrite `from_seekable_body` / `from_head_only`:
 
 `http_fingerprint` / `oci_fingerprint` full-hash arms are the same policy as `archive_full_hash`.
 
-- **OCI:** after prefix/suffix samples, `seek(0)` + `sha256_hex_stream(&mut blob, size)` instead of `read_to_end`.
-- **HTTP:** `fetch_http_range_bytes` always returns a `Vec` today and is **only** used for these fingerprints. Smallest correct options (pick one, prefer A):
-  - **A.** Add `hash_http_range_sha256(url, start, end_inclusive)` in `ratarmount-remote` that streams the ureq body into SHA-256 (fixed chunk). Use it for the **full-hash** Range (`0 .. size-1` when `size ≤ 256 KiB`). Edges may keep the 512-byte `Vec`.
+- **OCI:** after the existing `size ≤ TARSTATS_FULL_HASH_MAX` gate, `seek(0)` + `sha256_hex_stream(&mut blob)` **until EOF**. Do **not** pass `size` as a read cap — today’s full hash is `read_to_end` after `seek(0)`, so a blob whose length ≠ catalog `size` would change `full_sha256` if capped.
+- **HTTP:** `fetch_http_range_bytes` is **only** used for these fingerprints. It accepts status 200 **and** `read_to_end`s the body (not `end-start+1`). If the server ignores `Range`, a length-capped stream changes the fingerprint. Smallest correct options (pick one, prefer A):
+  - **A.** Add `hash_http_range_sha256(url, start, end_inclusive)` in `ratarmount-remote` that sends the same Range header, then streams the ureq body **to EOF** into SHA-256 (fixed chunk). Use it for the **full-hash** GET when `size ≤ 256 KiB`. Edges may keep the 512-byte `Vec`. Owner is `remote_open.rs` + `ratarmount-remote` (not factory).
   - **B.** Keep fetching the ≤256 KiB `Vec` for HTTP only; document as residual (network already paid; cap is policy). Do **not** leave OCI `read_to_end` if A or local stream is done.
 
 Do not change `check_tarstats_matches_remote` rules.
@@ -114,7 +114,7 @@ Do not change `check_tarstats_matches_remote` rules.
 
 | Out | Why |
 |-----|-----|
-| ZIP `decode_plain_member_from_file` / sequential `ZipFile` slurp | Deflate/store **payload** decode. Separate from metadata-window fingerprints. Sequential ZIP already streams into `compute_hashes_limited`; parallel path still materializes decoded bytes — residual. |
+| ZIP `decode_plain_member_from_file` / sequential `ZipFile` slurp | Member **payload** (STORE range `Vec` **and** Deflate inflate). Sequential ZIP already streams into `compute_hashes_limited`; parallel path still materializes decoded / stored bytes — **labeled residual**. |
 | 7z `read_member_bytes_io` then `Cursor::new(&bytes)` | Folder decode / solid unpack. Backlog: “Not solid-decode / full-inflate payload work.” |
 | Full-content nested hash for multi-GB members | Documented residual in `embedded-nested-archives.md`. Same-size edits outside the three windows can still miss. |
 | Changing `NESTED_FINGERPRINT_SAMPLE`, `TARSTATS_SAMPLE_BYTES`, `TARSTATS_FULL_HASH_MAX` | Policy knobs. This item is allocation, not sensitivity. |
@@ -134,10 +134,10 @@ Lowest layer first (`ratarmount-index`). Name new tests with `Regression:` + sym
 |------|--------|
 | Nested large body byte budget | Custom `Read+Seek` over ≥ 1 MiB. `from_seekable_body` **reads ≤ `3 * NESTED_FINGERPRINT_SAMPLE`** payload bytes and never seeks except 0 / mid / tail / rewind. Digests equal a control that hashes the same three slices. |
 | Nested small body policy | Body `< 4096`: prefix hex == SHA-256 of the **entire** body; suffix hex == prefix hex; mid hex == prefix hex. |
-| Nested empty body | `body_size == 0`: prefix is SHA-256 of empty; no panic on `read_exact` of 0. |
+| Nested empty body | `from_seekable_body` with `body_size == 0`: prefix **and** suffix **and** mid are `sha256("")` (not empty strings). `from_head_only` empty: prefix `sha256("")`, suffix/mid empty strings. No panic. |
 | Head-only unchanged | Existing `regression_head_only_fingerprint_does_not_seek_mid_tail` stays; empty suffix/mid. |
 | Factory progressive | Existing `regression_progressive_nested_fingerprint_skips_mid_tail` stays. |
-| `archive_full_hash` stream == slurp | Temp file of `TARSTATS_FULL_HASH_MAX` bytes (and one smaller, one empty). Digest equals `hash_hex("sha256", &bytes)`. File of `TARSTATS_FULL_HASH_MAX + 1` → `None`. |
+| `archive_full_hash` / `sha256_hex_stream` no slurp | Digest equals `hash_hex("sha256", &bytes)` for empty / small / `TARSTATS_FULL_HASH_MAX`. File of `TARSTATS_FULL_HASH_MAX + 1` → `None`. **Also** wrap `Read` so any `read` request `> HASH_STREAM_CHUNK` fails — digest-only tests stay green if someone keeps `read_to_end`. You cannot unit-test “no `Vec`” without a custom allocator; the chunk-size wrapper is the enforceable stand-in. |
 | `archive_edge_hashes` | First/last 512 of a file `> 512` match one-shot hashes of those slices; file `≤ 512` suffix == prefix. |
 | `compute_hashes_limited` multi-chunk | Payload **larger than `HASH_STREAM_CHUNK`**. Streamed `(crc32, sha256)` equals `hash_hex` of the full slice. Existing `stream_matches_one_shot` / `fill_content_hashes_from_temp_archive` stay. |
 | Tarstats warm reject | Existing `check_tarstats_matches_archive_rejects_size_or_mtime_mismatch` still sees `full_sha256` on tiny archives and still mismatches same-size edits. |
@@ -191,8 +191,9 @@ One commit is enough if tests + the AGENTS.md row travel with the code.
 
 ## Risk notes for the implementer
 
-- **Digest drift:** stream vs slurp must be bit-identical (lowercase hex, full `max_bytes`, stop on EOF). Test empty, 1 byte, `sample`, `sample+1`, `2*sample`, `TARSTATS_FULL_HASH_MAX`.
-- **`read_exact` vs short `Read`:** keep `read_exact` on windows (today’s contract). Stream helper should treat unexpected EOF like today’s `read_to_end` (hash what was read) **or** fail — pick one and test; prefer **fail** if `bytes_read != max_bytes && max_bytes == file_len` after a full-hash of a local file (local files should be exact). For `compute_hashes_limited`, today’s loop already stops on `n == 0` (best-effort short members) — **do not** tighten that.
+- **Digest drift:** stream vs slurp must be bit-identical (lowercase hex). Test empty, 1 byte, `sample`, `sample+1`, `2*sample`, `TARSTATS_FULL_HASH_MAX`.
+- **EOF policy (locked):** `sha256_hex_stream` and `compute_hashes_limited` **stop on `n == 0` and hash what was read**. Do **not** fail-closed on short local full-hash. Keep `read_exact` on **windows** (today’s nested/edge contract).
+- **Window slice:** always hash `&buf[..window_len]`. Zero-padded stack tails are a silent digest break.
 - **Progressive path:** never add mid/tail seeks when `!seek_is_cheap`.
 - **Factory ownership:** leave `ratarmount/src/factory.rs` alone unless a compile break forces a one-line import. Orchestrator owns factory glue.
 - **MSRV 1.74:** no edition-2024 / `std` APIs newer than the workspace rust-version.
@@ -214,4 +215,12 @@ One commit is enough if tests + the AGENTS.md row travel with the code.
 
 ## Skeptic review log
 
-*(Filled by skeptic-plan-review sweeps. Do not skip sweep 1.)*
+### Sweep 1 (2026-08-28) — VERDICT: ACCEPT (nits folded)
+
+Fresh Task skeptic. Picture of current code accepted. Nits were factual implementer traps; folded before sweep 2:
+
+1. Lock `sha256_hex_stream` to stop-on-`n==0` (hash what was read). Dropped “prefer fail if short” (would turn short files into `IndexError::Io` on warm tarstats).
+2. OCI full hash is `read_to_end` after `seek(0)`, not `size`-capped. HTTP Range helper accepts 200 and slurps the response body; option A must stream to EOF.
+3. Digest-only `archive_full_hash` tests would stay green with `read_to_end`. Require a `Read` wrapper that rejects `read` requests `> HASH_STREAM_CHUNK`.
+4. Seekable empty body: suffix/mid are `sha256("")`, not empty strings. Window fill must slice to `prefix_len`.
+5. Parallel ZIP STORE `read_file_range_at` labeled as residual (full-member `Vec`, payload path).
