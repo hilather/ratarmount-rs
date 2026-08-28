@@ -4,7 +4,7 @@
 |-------|--------|
 | **Item** | [`vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-5** (todo, S–M) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft plan (skeptic sweep 1 folded; sweep 2 pending) |
+| **Status** | Draft plan (sweeps 1–2 folded; sweep 3 pending) |
 | **Implements** | Opt-in catalog / locate order by `offsetheader` so sequential readers hit nearby archive bytes |
 | **Does not implement** | k-means, IVF centroid files, ANN, cosine clustering, default `ls` sort change |
 | **Ownership** | `ratarmount-index` + `ratarmount` find CLI. TAR crate for the seek-count + dumpdir regressions. **Do not** change `factory.rs` glue. |
@@ -22,9 +22,9 @@ Today sequential consumers walk **path / name order**:
 
 - `ratarmount find` / control `search` SQL is `ORDER BY fullpath, "offsetheader"` then `LIMIT` (`DEFAULT_SEARCH_LIMIT` = 10_000).
 - Cheap readdir for the SQL fallback collapses into `BTreeMap<String, IndexDirent>` and returns **lexicographic name order**.
-- MemIndex `list_dirents` walks `BTreeMap<u32, Vec<u32>>` (**interned name-id order**, not UTF-8 name order) and keeps `versions.last()` (newest).
+- MemIndex `list_dirents` walks `BTreeMap<u32, Vec<u32>>` (**interned name-id order**, not UTF-8) and keeps `versions.last()` (newest). Intern-id equals **insert/parse order** on the builder / `insert_files_batch` → `into_read_only` path. Warm remount via `load_mem_index` interns in `ORDER BY path, name, offsetheader` — that path is already UTF-8. Do not claim typical remount `ls -f` is pack order. Changing mem iteration to UTF-8 still changes builder / compact-only `ls -f`; that remains out of scope.
 - GNU `ls` sorts names itself. `ls -f`, `find` over a mount, and `cp -R` follow FUSE readdir order (`list_dirents` as-is).
-- NFSv3/v4 readdir **re-sorts children by fileid**. Fileids are assigned lazily on first visit (`id_for_path`). The **first** readdir of a directory therefore allocates sequential fileids in `list_dirents` order, then sorts those ids — so the first listing **is** `list_dirents` order. Later listings stay in that allocation order. Changing default `list_dirents` **would** change first-NFS-readdir order. Do not treat NFS as immune.
+- NFSv3/v4 readdir **re-sorts children by fileid**. Fileids are assigned lazily on first visit (`id_for_path`). The first readdir **with no prior child LOOKUPs** therefore allocates sequential fileids in `list_dirents` order, then sorts those ids — so that listing **is** `list_dirents` order. A LOOKUP of `z` before READDIR already breaks that. Changing default `list_dirents` **would** change first-NFS-readdir-with-no-prior-child-ids. Do not treat NFS as immune.
 - FUSE `--readahead` amortizes short reads **inside one open member**, not across readdir.
 
 On HDD and on remote Range GET (V-3), a name-order restore of a TAR whose members were appended, concatenated, or packed in ZIP local-header / 7z pack order pays backward seeks / extra GETs.
@@ -106,7 +106,17 @@ On HDD and on remote Range GET (V-3), a name-order restore of a TAR whose member
 
 ### 3.3 MemIndex `list_dirents`
 
-`DirEntries.names` is `BTreeMap<u32, Vec<u32>>`. Iteration is by **name id**, newest = `versions.last()` after versions are sorted by `soa.offsetheader`. Cookie carries `soa.offsetheader[i]` (`-1` if none). Same newest-wins set; order is not UTF-8 and not offset. After `into_read_only()`, `SqliteIndex::list_dirents` prefers `self.mem` — warm FUSE `ls -f` is intern-id order.
+`DirEntries.names` is `BTreeMap<u32, Vec<u32>>`. Iteration is by **name id**, newest = `versions.last()` after versions are sorted by `soa.offsetheader`. Cookie carries `soa.offsetheader[i]` (`-1` if none). Same newest-wins set; order is not UTF-8 and not offset.
+
+How `self.mem` gets built (do not mix these in tests):
+
+| Path | How names are interned | Default `list_dirents` order |
+|------|------------------------|------------------------------|
+| `insert_files_batch` then `into_read_only()` | Insert / parse order | Intern-id (insert `z` then `a` → `z`, `a`) |
+| `create_writable` + **raw SQL** + `into_read_only()` | `mem_builder` empty; `seal_mem_index` does **not** `load_mem_index`; `self.mem` stays `None` | SQL UTF-8 (this is how `regression_null_offsetheader` “seals” today — `FileRow` cannot express NULL) |
+| Warm remount: `open_writable` → `load_mem_index` | SQL `ORDER BY path, name, offsetheader` | Intern-id **equals UTF-8** |
+
+Intern-id pin tests **must** use `insert_files_batch` (`z` then `a`) → `into_read_only()`. Do **not** use raw SQL for that pin. A sealed-mem **NULL** offset-order case, if required: file-backed index + raw SQL NULL + **drop** + `open_writable` + `into_read_only` (`load_mem_index`, NULL → `-1`). `create_writable` + raw SQL + `into_read_only` does **not** project mem.
 
 ### 3.4 TAR / ZIP / 7z `MountSource::list_dirents`
 
@@ -161,21 +171,26 @@ v1 locality is **find + index helpers**, not NFS/FUSE readdir. Do not “fix” 
 
 ### 4.1 One Rust comparator (source of truth)
 
-Do **not** rely on SQLite `NULLS LAST` for correctness (mem path has no SQL; dialect footgun). After the existing newest-wins collapse, sort in Rust:
+Do **not** rely on SQLite `NULLS LAST` for correctness (mem path has no SQL; dialect footgun). After the existing newest-wins collapse, sort in Rust.
+
+**One shared function** in `ratarmount-index` (find/search must call it; do not write a second `SearchHit` sort that `unwrap_or(0)`):
 
 ```text
+fn cmp_offset_then_name(...)  // used by list_dirents_ordered, flatten, search
 NULL / cookie.offsetheader < 0  →  last
 else                            →  offsetheader ASC
 tie                             →  UTF-8 name ASC  (SearchHit: fullpath ASC)
 still tied (two NULL oh, same fullpath — PK allows it)
-                                →  stable input order (do not shuffle)
+                                →  stable input order
 ```
+
+Use `slice::sort` / `sort_by`, **not** `sort_unstable_by`.
 
 **Forbidden:** `COALESCE(offsetheader, 0)`, `unwrap_or(0)`, `row.get::<_, i64>(offsetheader)` on a nullable column, fat `row_to_file_info`’s `.max(0)`.
 
 ### 4.2 Index API (lowest layer)
 
-Keep `SqliteIndex::list_dirents` / `MemIndex::list_dirents` **byte-identical** (SQL UTF-8 / mem intern-id order, NULL → `-1`, no error, `isgenerated` kept, empty names skipped).
+Do **not edit** the bodies of `SqliteIndex::list_dirents` or `MemIndex::list_dirents`. Those two functions already differ in default order (SQL UTF-8 vs mem intern-id). “Unchanged” means each backend keeps **its** current function; `DirentOrder::Name` equals **that** function on that backend. NULL → `-1`, no error, `isgenerated` kept, empty names skipped.
 
 Add:
 
@@ -212,8 +227,10 @@ Algorithm (must match walking every directory’s `list_dirents` then TAR dumpdi
 
 1. For each `(path, name)`, take the newest-wins row **including** dumpdir tombstones — same collapse as `list_dirents` / `versions.last()` (max oh; NULL last / never 0).
 2. Drop the name if the winner’s `linkname` is `\0GNU.dumpdir.delete`.
-3. Drop generated winners, directories, and symlinks (payload-only extract list).
-4. Sort survivors with §4.1 (`path`/`name` as the name key).
+3. Keep **payload** members only: `(mode & S_IFMT) == S_IFREG`, not dumpdir-tombstone, not generated, **not typeflag `'1'` hardlinks** (`S_IFREG` + nonempty `linkname` — open seeks to the **target**, which is an earlier offset and would inject backward seeks). Dirs and `'2'` symlinks are dropped. Dumpdir `D` meta rows may be excluded; if included they must still obey newest-then-filter. Devices/fifos as `S_IFREG` with empty linkname stay (rare).
+4. **Global** sort of the surviving rows with §4.1 (`path`/`name` as the name key).
+
+**Forbidden as flatten:** concatenate per-directory `list_dirents_ordered(..., OffsetHeader)` in directory-name / intern-id / walk order. That is not a global offset sort (interleaved dirs keep intra-dir runs and still seek backward).
 
 Prefer sealed MemIndex (every dir, `versions.last()`, then steps 2–4) when `self.mem` is present; otherwise one SQL scan + the **same** Rust collapse (BTreeMap or equivalent), **not** “filter tombstones then MAX(offsetheader)”.
 
@@ -227,17 +244,19 @@ Find-argv only, boolean, same strip style as `--fts`:
 ratarmount find --offset-order '*.fits' archive.tar
 ```
 
-Wiring (copy `find_fts` exactly):
+Wiring (copy **boolean `--fts`**, not value-taking `--hashes`):
 
+- Expand `strip_find_only_flags` to return `(Vec, find_fts, find_hashes, find_offset_order)` (or an equivalent extra bool). Exact token `--offset-order`, **no value**.
 - `Args.find_offset_order: bool` with `#[arg(skip)]` — **not** a clap `#[arg]`.
-- `strip_find_only_flags` recognizes the exact token `--offset-order` (no value).
+- In the `if args.find` block (~`main.rs` `LocateOptions { fts, include_hashes, fill_hashes }`), set `offset_order` **only** from `args.find_offset_order`.
 - `LocateOptions.offset_order` / `SearchQuery.offset_order` default **false**.
-- `SearchQuery::glob` / `fts` set `offset_order: false`.
-- Control `tsv_search_callback` keeps `LocateOptions::default()` (path order).
+- `SearchQuery::glob` / `fts` constructors stay `offset_order: false`.
+- `query_index` must set `SearchQuery.offset_order` from `loc.offset_order` **after** `..SearchQuery::glob(pattern)` / `fts(...)` (the `..` reset would otherwise drop the flag).
+- Control `tsv_search_callback` keeps `LocateOptions::default()` (path order). Do not thread the flag through control.
 
 **LIMIT (not alternatives — pick this one):**
 
-Membership, filters, hashes, and `LIMIT` stay **exactly** today’s query (`ORDER BY fullpath, offsetheader LIMIT n`). `--offset-order` **only re-sorts** that `Vec` with §4.1. A 10_001st path-order hit is still dropped. Do **not** change SQL `ORDER BY` so that LIMIT becomes offset-order top-N.
+Membership, filters, hashes, and `LIMIT` stay **exactly** today’s query (`ORDER BY fullpath, offsetheader LIMIT n`) for **both glob and FTS**. `--offset-order` **only re-sorts** that `Vec` with the shared §4.1 function. A 10_001st path-order hit is still dropped. Do **not** change SQL `ORDER BY` so that LIMIT becomes offset-order top-N.
 
 Default find TSV order stays `fullpath, offsetheader`.
 
@@ -279,19 +298,21 @@ Layer: index unit first, then find CLI, then flatten + fake-reader restore. Name
 | Test | Crate | Asserts |
 |------|--------|---------|
 | SQL (unsealed) default `list_dirents` is UTF-8 | `ratarmount-index` | `a.txt` before `z.txt` even if `z` has a lower `offsetheader` |
-| Sealed mem default `list_dirents` is **intern-id**, not UTF-8 | `ratarmount-index` | Insert `z` then `a`; after `into_read_only()`, listing is `z` then `a` (today’s order). Do **not** sort mem by name to make this pass |
-| `DirentOrder::Name` equals `list_dirents()` | `ratarmount-index` | On **both** unsealed SQL and sealed mem |
-| `list_dirents_ordered(..., OffsetHeader)` is offset ASC, name tie-break | `ratarmount-index` | `z` (oh=100) before `a` (oh=500) on **both** SQL and sealed mem |
+| Builder-sealed mem default is **intern-id**, not UTF-8 | `ratarmount-index` | **`insert_files_batch`** (`z` then `a`) → `into_read_only()` → listing is `z` then `a`. Do **not** use raw SQL (that path never builds mem). Do **not** sort mem by name to make this pass |
+| `DirentOrder::Name` equals `list_dirents()` | `ratarmount-index` | On unsealed SQL **and** builder-sealed mem (each equals **that** backend’s `list_dirents`) |
+| `list_dirents_ordered(..., OffsetHeader)` is offset ASC, name tie-break | `ratarmount-index` | `z` (oh=100) before `a` (oh=500) on unsealed SQL and builder-sealed mem |
 | Offset-order membership equals default `list_dirents` | `ratarmount-index` | Same names / cookies; includes `isgenerated` if present; only order differs |
-| **Regression: NULL `offsetheader` still lists on offset-order path** | `ratarmount-index` | Foreign NULL row present; cookie `< 0`; not treated as 0; sorts **after** real offsets; default `list_dirents` + `regression_null_offsetheader` still pass |
+| **Regression: NULL `offsetheader` still lists on offset-order path** | `ratarmount-index` | Foreign NULL row present; cookie `< 0`; not treated as 0; sorts **after** real offsets; default `list_dirents` + `regression_null_offsetheader` still pass. SQL path: raw insert (same as today’s regression). Optional mem-NULL: file-backed + drop + `open_writable` + `into_read_only` (`load_mem_index`); not `create_writable`+raw+seal |
 | Newest-wins unchanged | `ratarmount-index` | Two rows same name, oh=100 and oh=500 → one dirent, cookie 500, in both orders |
+| Newest-wins NULL vs `0` | `ratarmount-index` | Same `(path,name)`, NULL + `oh=0` → one dirent, cookie **`0`** (not `< 0`). `COALESCE`/`unwrap_or(0)` only collides here |
 | **Regression: dumpdir newest-then-filter** | `ratarmount-formats-tar` or index with dumpdir linkname | Live `oh=100` + tombstone `oh=500` → flatten and TAR-filtered offset list **omit** the name (must not resurrect `oh=100`) |
+| Shared comparator + NULL find hit | `ratarmount-index` search | Search uses the same `cmp_offset_then_name`; a raw-SQL NULL `offsetheader` hit sorts **after** real offsets ( `FileRow` cannot express NULL) |
 | Find default TSV order unchanged | `ratarmount` (`find.rs`) | Existing `find_glob` paths stay `/a.fits` then `/dir/b.fits` when those match path order |
-| Find `--offset-order` TSV follows `offsetheader` | `ratarmount` | Unique-name archive packed `z` then `a`; default find `a` then `z`; flag emits `z` then `a` |
-| Find `--offset-order` does not change LIMIT membership | `ratarmount-index` search | Three rows; path order A,B,C; offset order C,A,B; `limit=2` + offset_order → **A,B** re-sorted by offset, not C+A |
+| **Regression: find `--offset-order` TSV follows `offsetheader` (CLI path)** | `ratarmount` bin | Must exercise **`find::run` after `parse_args_from`** or `CARGO_BIN_EXE_ratarmount find --offset-order …` — **not** only `locate_hits` with a hand-built `LocateOptions`. Unique-name archive packed `z` then `a`; default find `a` then `z`; flag emits `z` then `a` |
+| Find `--offset-order` does not change LIMIT membership | `ratarmount-index` search | Glob **and** FTS: three rows; path order A,B,C; offset order C,A,B; `limit=2` + offset_order → **A,B** re-sorted by offset, not C+A |
 | **Regression: find `--offset-order` does not steal PATTERN/ARCHIVE** | `ratarmount` bin | Mirror `find_flag_fts_*`; also `--fts --offset-order '*.fits' a.tar`; `ratarmount --offset-order a.tar mnt` is unrecognized |
 | Control / socket TSV order unchanged | `ratarmount` / compositing | When `SearchQuery.offset_order` exists, `tsv_search_callback` / socket `search` still path-order |
-| **Regression: offset-ordered restore does fewer backward seeks than name order** | `ratarmount-formats-tar` | Uses **`list_visible_files_by_offset`**, not find. Counting seek wrapper; N≥32 unique-name members **name-shuffled vs archive order**; offset list → 0 (or strictly fewer) backward `SeekFrom::Start` than the same set in name order |
+| **Regression: offset-ordered restore has zero backward seeks** | `ratarmount-formats-tar` | Uses **`list_visible_files_by_offset`**, not find. N≥32 unique payload files in **≥2 directories**, packed so archive order **interleaves** dirs (e.g. `z/m00`, `a/m00`, `z/m01`, `a/m01`, …) and basenames are shuffled vs offset. Offset list: **zero** backward `SeekFrom::Start` (Start whose offset is strictly less than the previous Start; the first Start is not backward). Name-order control on the **same set**: **≥1** backward Start (fixture is actually shuffled). Concatenating per-dir offset lists is **forbidden** and this fixture fails that bug |
 | FileVersionLayer `.versions` n≥2 | `ratarmount-compositing` | Listing `["1","2"]`; existing `file_version_layer_list_dirents_*` stay green |
 
 Skip policy: if `tar` is missing, the archive-build test `eprintln!("skip: …")` and **still** run the pure index / fake-seek unit tests.
@@ -331,9 +352,9 @@ This plan-only PR: this file + a pointer from V-5 “Still open” + the F-9 sen
 
 ## 7. Implementation sketch (for the later code PR)
 
-1. `ratarmount-index`: comparator + `DirentOrder` + `list_dirents_ordered` as `sort(list_dirents)` + `list_visible_files_by_offset` + tests (NULL, newest-wins, dumpdir order, default SQL vs mem, LIMIT).
-2. `SearchQuery.offset_order` default false; Rust sort **after** today’s glob/FTS collect + LIMIT. Do not change SQL `ORDER BY`.
-3. `ratarmount` find: `#[arg(skip)]` + strip `--offset-order` like `--fts`; clap-steal + TSV order tests; control stays default.
+1. `ratarmount-index`: shared `cmp_offset_then_name` (`sort`/`sort_by`) + `DirentOrder` + `list_dirents_ordered` as `sort(list_dirents)` + `list_visible_files_by_offset` (global, hardlinks excluded) + tests (NULL, newest-wins including NULL vs 0, dumpdir, builder-sealed intern-id, LIMIT glob+FTS).
+2. `SearchQuery.offset_order` default false; Rust sort with the **same** comparator **after** today’s glob/FTS collect + LIMIT. Do not change SQL `ORDER BY`.
+3. `ratarmount` find: expand `strip_find_only_flags`; `#[arg(skip)]`; set `LocateOptions.offset_order` in the `if args.find` block; `query_index` writes `SearchQuery.offset_order` after `..glob`/`fts`; CLI-path TSV test; control stays default.
 4. TAR seek-count regression on the flatten helper + dumpdir newest-then-filter.
 5. FileVersionLayer n≥2 listing pin (compositing test only).
 6. Docs + AGENTS.md row.
@@ -355,7 +376,10 @@ Do not wire FUSE, NFS, overlay, or FileVersionLayer production code.
 | `--offset-order PATTERN` parsed as optional value | `#[arg(skip)]` + boolean find-argv strip only |
 | Find lists old versions; restore cats stale bytes | Flag re-orders hits; flatten helper is newest-wins for extract |
 | Sealed-mem UTF-8 “fix” changes warm `ls -f` | `Name` == today’s `list_dirents`; sealed test pins intern-id |
-| First NFS readdir follows `list_dirents` | Do not change default order; residual §9.1 |
+| First NFS readdir (no prior child ids) follows `list_dirents` | Do not change default order; residual §9.1 |
+| Per-dir offset concat looks “strictly fewer” seeks | Interleaved multi-dir fixture + **zero** backward on flatten |
+| Find TSV unit test without CLI wire | CLI-path TSV regression; `query_index` after `..glob` |
+| Raw-SQL “seal” used for intern-id pin | `insert_files_batch` only; raw SQL does not build mem |
 | 7z solid: offset order does not avoid prefix-from-0 inflate | Locality is pack-offset order; existing 7z sequential tests stay the contract |
 
 ---
@@ -367,7 +391,7 @@ Do not wire FUSE, NFS, overlay, or FileVersionLayer production code.
 3. Overlay names in offset-aware extract (overlay has no archive offset; copy those last or first).
 4. F-9 rewriter (separate roadmap item); this plan only constrains member order.
 5. ZIP/7z seek-count / shared-pack tie tests.
-6. **10k-member restore** as written in V-5 still-open: bench / `#[ignore]` / env-gated, **not** a default-CI gate. v1 gate is N≥32 unique-name shuffled TAR (§5). 32 catches a name-sort bug; 10k is operator-scale story.
+6. **10k-member restore** as originally written in V-5 still-open: bench / `#[ignore]` / env-gated, **not** a default-CI gate. v1 gate is interleaved multi-dir N≥32 (§5). 10k is operator-scale story.
 
 ---
 
@@ -378,7 +402,7 @@ v1 is done when:
 - Default `list_dirents` is unchanged on **both** unsealed SQL (UTF-8) and sealed mem (intern-id); FUSE/NFS production paths untouched.
 - `find --offset-order` re-sorts today’s hit set (same LIMIT membership) and is NULL-safe / clap-steal-safe.
 - `list_dirents_ordered(..., OffsetHeader)` is `sort(list_dirents)`.
-- `list_visible_files_by_offset` is shipped; dumpdir is newest-then-filter; seek-count regression uses this helper.
+- `list_visible_files_by_offset` is shipped; dumpdir is newest-then-filter; seek-count uses this helper on an interleaved multi-dir fixture: flatten has **zero** backward seeks; name-order control has ≥1.
 - No k-means / ANN / catalog split.
 - `regression_null_offsetheader` and FileVersionLayer cheap-readdir tests stay green.
 
@@ -402,6 +426,18 @@ Must-fix folded:
 
 Should-fix folded: NFS first-readdir = `list_dirents` via lazy fileids; 10k → residual §9.6; `.versions` n≥2 pin; flatten = payload members; §5.5 refs → §9; control `offset_order` false; clap `#[arg(skip)]` + combo cases; `isgenerated` kept on list API; TAR-only seek test; no fat `.max(0)`; F-9 pointer already present; stable order for two NULL oh.
 
-### Sweep 2
+### Sweep 2 — CHANGES_REQUIRED (folded)
+
+Skeptic: Task `bc-c260ff83-15d3-56a1-9a71-96ef6191e098`.
+
+Must-fix folded:
+
+1. Seek fixture: ≥2 dirs, interleaved pack order; flatten → **zero** backward Start; name-order control → ≥1; per-dir concat forbidden.
+2. Find CLI fully wired (`strip_find_only_flags`, `if args.find`, `query_index` after `..glob`/`fts`); TSV order test is CLI path, not hand-built `LocateOptions`.
+3. Intern-id pin = `insert_files_batch` → `into_read_only` only; do not claim `load_mem_index` remount is intern-id ≠ UTF-8; raw SQL + seal does not build mem.
+
+Should-fix folded: hardlink `'1'` excluded from flatten; shared comparator + NULL search hit; NULL vs `oh=0` newest-wins → cookie 0; FTS+LIMIT test; `sort` not `sort_unstable`; do not edit the two `list_dirents` bodies; NFS “no prior child ids”.
+
+### Sweep 3
 
 _(pending)_
