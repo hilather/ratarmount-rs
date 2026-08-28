@@ -4,7 +4,7 @@
 |-------|--------|
 | **Author** | ratarmount-rs (plan-only; skeptic-reviewed) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft — awaiting skeptic sweep 1 |
+| **Status** | Draft — sweep 1 ACCEPT (nits folded); awaiting fresh sweep 2 |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) P2 “Parallel nested open pools” |
 | **Scope** | Investigate the eager parallel nested-open path vs compact `StringPool`. Decide whether a per-worker arena + parent-pool merge is justified. If not, close the item as already-isolated. If yes, specify a RAM-only merge that does **not** change the durable nested blob. |
 | **Out of this train** | Durable `nestedindexes` / RNIB encoding; intra-archive parallel ZIP/TAR fill; AutoMount `PathIntern` redesign; parent `SharedArchiveIo` mutex; SIMD; lazy (`-l`) sequential mount |
@@ -15,22 +15,25 @@ This document is **plan-only**. It does not implement merge, intern, or AutoMoun
 
 ## Verdict in one paragraph
 
-**There is no global / parent `StringPool` on today’s eager parallel nested-open path.** Each nested archive already builds a private compact `StringPool` inside its own `SqliteIndex::create_compact_only()` → `MemIndexBuilder`. Workers do not intern member names through a shared lock. Implementing “per-worker arena, then merge into parent” would **create** a shared pool the tree does not have, then pay remap / lifetime / ZIP–7z `Arc` identity cost to undo a lock that does not exist.
+**There is no shared intern target / parent-pool argument on today’s eager parallel nested-open path.** Nested compact indexes that use `StringPool` each **own** a private `pool: StringPool` (`MemIndex` / `MemIndexBuilder` by value). Workers do not intern member names into a parent handle. The outer archive may have its own sealed `MemIndex.pool`; nothing passes that object into nested builders. Implementing “per-worker arena, then merge into parent” would **create** a shared pool the tree does not have, then pay remap / lifetime / ZIP–7z `Arc` identity cost to undo a lock that does not exist.
 
 **Recommended disposition:** treat the lock-contention reading of P2 as **N/A (already isolated)**. Do **not** add a parent-pool merge in the default implementation train. Lock that finding with invariant tests + a backlog rewrite so the next agent does not implement a merge from the two-line bullet. A **gated** cross-archive intern (RSS only) is specified below and stays **out of the default train** until a named measurement fails.
 
 ---
 
-## Spec (source bullets)
+## Spec
 
-From [`vectors-optimization.md`](../vectors-optimization.md) P2:
+**Backlog bullets** (the P2 subsection in [`vectors-optimization.md`](../vectors-optimization.md) — only these two lines):
 
 1. Per-worker string pool / arena during eager parallel nested open, then merge into parent pool.
 2. Avoid global pool lock contention without duplicating all strings forever.
-3. Nested compact `StringPool` already exists; **investigate** the parallel nested open path.
-4. **Not** a durable-blob change.
 
-Bullet 3 is the binding instruction. The first two bullets describe an architecture (shared parent pool + worker arenas) that the investigation shows was **never built**.
+**This plan’s charter** (task prompt / Done-section context — not extra P2 bullets):
+
+- Nested compact `StringPool` already exists; **investigate** the parallel nested open path.
+- **Not** a durable-blob change.
+
+The two backlog bullets describe an architecture (shared parent pool + worker arenas) that the investigation shows was **never built**. The close-out of the lock-contention reading stands on findings F1–F3, not on treating “investigate” as a third backlog bullet.
 
 ---
 
@@ -41,7 +44,9 @@ Bullet 3 is the binding instruction. The first two bullets describe an architect
 | Compact `StringPool` | `ratarmount-index/src/mem.rs` | Byte slab + `(start,len)` spans; build `HashMap` then seal to FNV-1a + binary search; `intern()` keeps `Arc<str>` identity for ZIP/7z sidecars |
 | `MemIndex` / `MemIndexBuilder` | same | Each index **owns** `pool: StringPool` by value. `finish()` seals. No `Arc<StringPool>`, no parent handle |
 | Nested live table | `SqliteIndex::create_compact_only` (`ratarmount-index/src/lib.rs`) | In-process MemIndex only; `mem_builder: Mutex<Option<MemIndexBuilder>>` is **per index instance** |
-| Factory nested open | `ratarmount/src/factory.rs` `open_nested_reader_fn` | Forces `index_compact_only = true` so each nested ZIP/TAR/7z/… gets a **new** compact index |
+| Factory nested **reader** | `ratarmount/src/factory.rs` `open_nested_reader_fn` | Forces `index_compact_only = true` so each nested ZIP/TAR/7z/CPIO/AR/… compact index is **new** |
+| Factory nested **spool** | `open_nested_fn` | Does **not** set `index_compact_only`. Writes `{path}.index.sqlite` via `create_writable` — still a **private** `MemIndexBuilder` on that index |
+| Durable warm import | `SqliteIndex::create_compact_from_nested_blob` | `to_mem_index()` → fresh private sealed pool; `mem_builder` is `None` (no intern-during-build) |
 | ZIP/7z name share | `intern_during_build` | Locks **that** index’s `mem_builder` while filling **one** archive sequentially |
 | Durable blob | `ratarmount-index/src/nested.rs` | RNIB v2 columnar `DurableFileRow` **owned strings**. `to_mem_index()` builds a **fresh** private pool. Export rematerializes `FileRow` strings from the slab |
 | FR-6 parallel open | `AutoMountLayer::mount_archives_batch` (`ratarmount-compositing/src/automount.rs`) | Same-directory ≥2 archives + `parallel_nested_threads ≠ 1` → `std::thread::scope` workers call `try_mount_file`. Lazy ignores the cap |
@@ -71,27 +76,40 @@ try_mount_file
   ├─ lookup_raw → parent.lookup                         // holds mounted mutex
   ├─ mounted.lock: find_mounted_in + source_at_locked   // brief
   ├─ parent.open(member)                                // may take parent I/O mutex
-  ├─ open_nested_reader_fn → format open
-  │     SqliteIndex::create_compact_only()              // NEW private StringPool
+  ├─ prefer open_nested_reader_fn → format open
+  │     create_compact_only() or create_compact_from_nested_blob()
   │     insert_files_batch / intern_during_build        // that index’s mem_builder Mutex
   │     finish() / seal
-  │     optional nestedindexes export (FileRows, not pool ids)
+  │     optional try_store_nested_durable → outer set_nested_index
+  ├─ else temp spool → open_nested_fn(path)
+  │     create_writable({path}.index.sqlite)            // private builder, not compact-only
+  │     ISO/FAT/EXT4/SquashFS/Git/SQLAR/… may have no StringPool
   └─ mounted.lock: PathIntern.intern(key) + insert      // mount-point string only
 ```
 
-Parallelism is **one thread per sibling archive**, not parallel fill of one archive’s member list.
+Parallelism is **one thread per sibling archive**, not parallel fill of one archive’s member list. Isolation holds on reader, warm-import, and spool branches: each open still gets its own builder or its own `to_mem_index()` pool. Formats without a compact `StringPool` are not a parent-pool intern path either.
 
-### Finding F1 — no parent `StringPool`
+### Finding F1 — no parent-pool **argument** / shared intern target
 
-`MemIndex` and `MemIndexBuilder` each store `pool: StringPool` by value. Nothing in AutoMount, factory nested open, or `DurableNestedBlob::to_mem_index` passes a parent pool into a nested builder. Grep for a shared/global `StringPool` on the nested path is empty.
+The **outer** TAR/ZIP/7z mount may already have a sealed `MemIndex.pool`. What does not exist is a handle that nested builders intern into. `MemIndex` and `MemIndexBuilder` each store `pool: StringPool` by value. `MemIndexBuilder::new()` takes no parent pool. AutoMount, `open_nested_reader_fn`, `open_nested_fn`, and `DurableNestedBlob::to_mem_index` do not pass a shared `StringPool` in.
 
-Workers cannot contend on a parent-pool lock because that object does not exist.
+Workers cannot contend on a parent-pool intern lock because that shared intern target does not exist.
 
-### Finding F2 — per-archive isolation already matches “per-worker arena”
+### Finding F2 — per-open isolation already matches “per-worker arena”
 
-`open_nested_reader_fn` clones `OpenOptions` and sets `index_compact_only = true`. Each successful nested open constructs `SqliteIndex::create_compact_only()` → `MemIndexBuilder::new()` → private slab. When the worker returns `Arc<dyn MountSource>`, that source **keeps** its sealed `MemIndex` for the life of the mount. There is no post-open “merge into parent” step.
+Three nested-open branches, all isolated:
 
-This already satisfies “do not intern member names through a global lock” **and** “do not duplicate one archive’s strings into a second live store.” The worker slab **is** the live store.
+| Branch | Index construction | `StringPool` |
+|--------|--------------------|--------------|
+| Reader (`open_nested_reader_fn`) | `index_compact_only = true` → `create_compact_only()` | New private builder/slab |
+| Warm import | `create_compact_from_nested_blob` → `to_mem_index()` | New private sealed pool; no `mem_builder` intern |
+| Temp spool (`open_nested_fn`) | `create_writable({path}.index.sqlite)` | Private builder on that SQLite index (not compact-only) |
+
+When the worker returns `Arc<dyn MountSource>`, that source **keeps** its own sealed (or path-index) table. There is no post-open “merge into parent” step.
+
+ISO/FAT/EXT4/SquashFS/Git/SQLAR and other image backends may have **no** `StringPool` at all. They still do not intern member names into a parent pool.
+
+This already satisfies “do not intern member names through a global lock.” On the compact reader/import path, the worker slab **is** the live store (no second live copy of that archive’s strings).
 
 ### Finding F3 — locks that *do* exist (and are not this item)
 
@@ -101,6 +119,7 @@ This already satisfies “do not intern member names through a global lock” **
 | Batch `work` / `results` `Mutex` | Queue + mount-point `String`s | No | No |
 | `SqliteIndex.mem_builder` | One archive’s builder + `intern_during_build` | Yes, **inside that archive only**, sequential ZIP/7z/`insert_files_batch` | No — not cross-worker |
 | Parent `Arc<Mutex<Box<dyn SeekRead>>>` | Member I/O on ZIP/7z/ISO/… | No (payload) | No — explicit non-goal of the vector track |
+| Outer SQLite via `try_store_nested_durable` / `set_nested_index` | Parallel workers writing `nestedindexes` blobs to the **same** outer index file | No (blob bytes, not intern) | No — file/conn contention; do not “fix” as a pool lock |
 
 `lookup_raw` holds `mounted` for the whole `parent.lookup`. That can serialize metadata lookups during a parallel batch. It is **not** string-intern of member names. Do not “fix” it under this P2 title.
 
@@ -163,7 +182,9 @@ Phase 1 is **forbidden** unless all of the following are true on a documented fi
 2. **Absolute size:** \( \sum \mathrm{slab\_bytes}_i - \mathrm{slab\_bytes}_{\cup} \ge 1\,\mathrm{MiB} \) on that fixture (not “32 copies of a 3-file tar”).
 3. **Share of `-r` RSS:** the duplicate slab is not in the noise versus member-body / decompress RSS on the same fixture (if opening the bodies dominates, merge will not move `#179`).
 
-**Expected default:** G1 does **not** fail on heterogeneous nested trees. It *can* fail on “32 identical `usr/lib` trees in one folder.” That case is still usually body-RSS-dominated. Phase 1 stays gated.
+**Expected default:** G1 does **not** fail on heterogeneous nested trees. It *can* fail on “32 identical `usr/lib` trees in one folder.” That case is still usually body-RSS-dominated. The 1 MiB floor plus “not in the noise vs body RSS” (`#179`) will fail almost every real fixture. **G1 is a stop sign, not a live measurement program that is expected to authorize Phase 1.** G1.3 is intentionally unquantified (no single `%` of RSS is honest across codecs); if a later spike needs a number, that spike picks one on a named fixture.
+
+There is **no** public `slab_bytes()` today (`unique_count()` only). Any G1.2 measurement would need a test-only accessor; do not add it in Phase 0 unless someone is actually running G1.
 
 A unit-level **overlap calculator** (two `MemIndex`es from identical `FileRow`s → report \(\sum U_i\) vs \(U_{\cup}\)) may land in Phase 0 as a helper; it does **not** by itself authorize Phase 1.
 
@@ -228,7 +249,7 @@ Authorized only after G1. Still plan-only here.
 3. Remap every pool id in:
    - `EntrySoa` `linkname_id` (and any future name-id column)
    - `PathTable.seg_ids`
-   - `DirEntries.names` keys (`HashMap<u32, Vec<u32>>`)
+   - `DirEntries.names` keys in **`MemIndex.dirs` and every `MemIndex.shards[i]`** (sharded dirs store the same map)
    - builder `by_key_oh` if merge happens before `finish` (prefer **after** seal: fewer maps)
 4. Drop worker slabs after remap so strings are not live in two stores.
 5. Parent pool lives on `AutoMountLayer` (or a small `Arc<Mutex<StringPool>>` **only during merge**, then `Arc<StringPool>` read-only). After merge, nested `MemIndex` must **not** own a second slab.
@@ -239,13 +260,15 @@ Authorized only after G1. Still plan-only here.
 - **Do not intern during parse through the parent lock.** That would re-create the fictional P2 problem. Merge is post-build.
 - **ZIP/7z:** after `rebind_pool`, re-run sidecar name attach via `lookup_pooled_string` / `intern` on the **parent** so `Arc::ptr_eq` holds again. Test with the existing ZIP/7z pool-share unit tests plus a two-archive merge.
 - **Unmount:** parent slab does not shrink. Document: unique strings from a dropped nested mount remain until AutoMount drop. Acceptable only because eager `-r` already retains all nested sources.
-- **`factory.rs`:** only if AutoMount must pass a merge hook into `open_nested_reader`. Prefer merge **above** factory: AutoMount receives finished `Arc<dyn MountSource>` and cannot see `MemIndex` today. **This is a Phase 1 blocker:** `MountSource` has no pool-rebind hook. Implementing Phase 1 therefore requires either (a) a compositing-visible compact-index handle, or (b) merge inside each format crate before the `Arc<dyn MountSource>` is sealed — which is **per archive**, not a parent. Honest implication: **a true parent merge cannot be done from AutoMount without a new trait or downcast.** Phase 0 does not need this. Phase 1 must add a narrow trait (e.g. `CompactIndexMerge`) **or** be rejected as infeasible at the `MountSource` boundary.
+- **Injection point:** `try_mount_file` stores `Arc<dyn MountSource>`. `MountSource` has no `as_any` / downcast / pool / `MemIndex` hook. A parent merge **after** open is not a small `StringPool` patch. Spike options (pick one, do not sneak all in):
+  1. New narrow trait or downcast on `MountSource` (e.g. `CompactIndexMerge`) — compositing-visible.
+  2. Carry a merge target on **`NestedOpenContext`** (it already carries `outer_index_path` / `write_nested_index`) into factory **before** the `Arc<dyn MountSource>` is sealed — still factory-owned glue; orchestrator territory.
+  3. Merge inside each format crate before seal — **per archive**, not a parent; does not satisfy cross-archive intern.
+  Phase 0 needs none of these. Phase 1 must spike (1) vs (2) first; reject if neither is smaller than the RSS win.
 
 ### Phase 1 feasibility note (pre-called)
 
-`try_mount_file` stores `Arc<dyn MountSource>`. The sealed `StringPool` is inside `SqliteIndexedTar` / format wrappers, not on the trait. A parent merge that AutoMount runs **after** open is **not** a small `StringPool` patch; it is a new capability on the mount-source boundary. That cost is another reason Phase 1 stays gated and is **not** the default train.
-
-If G1 ever fails, the first Phase 1 spike is: **can we rebind without a new trait?** If no, the spike document is the next plan; do not sneak a trait into a “pool merge” PR.
+If G1 ever fails, the first Phase 1 spike is: **can we rebind without a new trait, or only via `NestedOpenContext`?** If neither is acceptable, the spike document is the next plan; do not sneak a trait into a “pool merge” PR.
 
 ---
 
@@ -333,8 +356,8 @@ Process: sweep 1 is mandatory; each sweep is a **fresh** skeptic; fold blockers 
 
 | Sweep | Verdict | Blockers folded |
 |-------|---------|-----------------|
-| 1 | *(pending)* | |
-| 2 | | |
+| 1 | **ACCEPT** (no blockers). Nits folded: spec vs charter; F1 “no parent argument”; F2 reader/import/spool; F3 outer `set_nested_index`; G1 as stop-sign + no `slab_bytes()`; Phase 1 `shards` + `NestedOpenContext` injection. | None (nits only) |
+| 2 | *(pending — fresh skeptic)* | |
 | 3 | | |
 
-**Final:** *(pending)*
+**Final:** *(pending sweep 2)*
