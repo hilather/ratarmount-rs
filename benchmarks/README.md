@@ -136,6 +136,33 @@ Multi-tool compare with a **single** Rust build (not a fair zlib↔ISA-L A/B —
 
 Requires FUSE, Python ratarmount (`RATARMOUNT_PY_ROOT`), and a binary with `gzip-rapidgzip` (optionally `gzip-rapidgzip-isal`).
 
+## Vector-wave (Rust old vs new)
+
+Paths the FUSE `cat`/`find` BIG suite does **not** exercise: CLI locate, control
+`search/<glob>`, offset-order extract, cold `--no-mount` index RSS, `--hashes`,
+write-overlay getattr, nested `-c -r`.
+
+```bash
+# Default: build/reuse v0.1.27 as OLD, target/release as NEW
+./benchmarks/compare-vector-wave.sh
+# → benchmarks/vector-wave-results/results-*.{csv,md}  (gitignored)
+
+OLD_BIN=/path/to/ratarmount-0.1.27 NEW_BIN=target/release/ratarmount \
+  N_FILES=8000 RUNS=3 ./benchmarks/compare-vector-wave.sh
+
+VECTOR_MICRO=1 SKIP_FUSE=1 ./benchmarks/compare-vector-wave.sh
+./benchmarks/test-compare-vector-wave.sh
+```
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `OLD_BIN` | worktree-build `OLD_REF` | Pre-vector binary |
+| `NEW_BIN` | `target/release/ratarmount` | Binary under test |
+| `OLD_REF` | `v0.1.27` | Git ref when `OLD_BIN` is unset |
+| `N_FILES` | `8000` | Many-file TAR for index + find |
+| `SKIP_FUSE` | `0` | `1` = decode/index/find only |
+| `VECTOR_MICRO` | `0` | Tiny fixtures + `RUNS=1` |
+
 ## Head-to-head (Python vs Rust)
 
 Latest committed numbers: [python-vs-rust-results.md](python-vs-rust-results.md) (**2026-08-27**, ratarmount-rs **v0.1.27**, `BIG=1` suite). Named BIG output: [python-vs-rust-results-big.md](python-vs-rust-results-big.md). Prior default-suite snapshot: [python-vs-rust-results-2026-08-15.md](python-vs-rust-results-2026-08-15.md). Three-way vs v0.1.19: [python-vs-rust-results-v0.1.19-vs-0.1.20.md](python-vs-rust-results-v0.1.19-vs-0.1.20.md).

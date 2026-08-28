@@ -38,6 +38,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Symptom / fix | Commands |
 |---------------|----------|
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
+| Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Fixture smoke dies without Python/binary (#9) | `./benchmarks/test-compare-prepare-env.sh` · `./benchmarks/test-compare-fixtures.sh` |
 | Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |

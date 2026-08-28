@@ -13,5 +13,6 @@ benchmarks/.venv-py/
 benchmarks/gzip-backend-results/
 benchmarks/fuse-kernel-results/
 benchmarks/nested-durable-results/
+benchmarks/vector-wave-results/
 *.log
 .cargo-cache/
