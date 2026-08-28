@@ -5,7 +5,7 @@
 | **Status** | Plan only — **do not implement in this PR** |
 | **Backlog** | [`docs/tasks/vectors-optimization.md`](../vectors-optimization.md) § P2 “Hash / fingerprint fixed windows” |
 | **Date** | 2026-08-28 |
-| **Skeptic review** | Sweep results appended below. Stop at ACCEPT or BLOCKED (cap 3). |
+| **Skeptic review** | **ACCEPT** after 3/3 sweeps (nits folded on 1–2; sweep 3 clean). Do not implement in this PR. |
 
 ---
 
@@ -214,6 +214,10 @@ One commit is enough if tests + the AGENTS.md row travel with the code.
 ---
 
 ## Skeptic review log
+
+### Sweep 3 (2026-08-28) — VERDICT: ACCEPT
+
+Fresh Task skeptic (final). No blockers. Current code matches every lock; plan is implementable as written without digest, schema, or progressive-path breaks. **Stop.** Do not implement on this branch.
 
 ### Sweep 2 (2026-08-28) — VERDICT: ACCEPT (nits folded)
 
