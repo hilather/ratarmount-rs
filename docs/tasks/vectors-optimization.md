@@ -125,8 +125,10 @@ Implemented as allocation-shape only (same windows / digests / progressive head-
 
 ### Overlay / write path
 
-- [ ] Overlay file-info cache: compact cookie + size/mtime, not full `FileInfo` (watch size-0 / create residuals)
-- [ ] Regression: create then cat empty overlay file
+- [x] Overlay file-info cache: compact cookie + size/mtime, not full `FileInfo` (watch size-0 / create residuals)
+- [x] Regression: create then cat empty overlay file
+
+Residual: FUSE overlay child inodes store `InodeAttrCookie` only. NFS and export-core (9P/SMB/SFTP) inode maps are still fat `FileInfo`. Not V-4 (commit queue).
 
 ### Parallel nested open pools
 

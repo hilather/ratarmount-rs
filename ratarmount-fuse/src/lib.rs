@@ -15,7 +15,7 @@ use fuser::{
 use libc::{EACCES, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::debug;
 use ratarmount_compositing::WriteOverlay;
-use ratarmount_core::{CheapDirent, FileInfo, MountSource};
+use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
 
 /// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
@@ -304,8 +304,14 @@ enum OpenBackend {
 
 struct InodeEntry {
     path: String,
-    /// Cached FileInfo to avoid SQLite on every getattr.
+    /// Fat FileInfo cache. Immutable mounts only (and overlay root).
+    /// Overlay child inodes store [`InodeAttrCookie`] instead.
     file_info: Option<FileInfo>,
+    /// Compact getattr scalars on overlay child inodes. Not served as
+    /// getattr/open truth — those paths re-lookup. Cleared by the generation
+    /// sweep. Never `Some` together with `file_info` on a child overlay inode.
+    #[allow(dead_code)] // density store; production must not reconstruct FileInfo
+    cookie: Option<InodeAttrCookie>,
 }
 
 struct DirCacheEntry {
@@ -326,8 +332,9 @@ pub struct RatarmountFs {
     next_fh: AtomicU64,
     dir_cache: Mutex<HashMap<String, DirCacheEntry>>,
     /// Last seen `MountSource::content_generation`. Live overlay commit replaces
-    /// the base archive (member offsets shift); cached FileInfo and dirents are
-    /// then stale — same contract as NFS `ReaderLru::sweep_if_generation_advanced`.
+    /// the base archive (member offsets shift); cached FileInfo, overlay cookies,
+    /// and dirents are then stale — same contract as NFS
+    /// `ReaderLru::sweep_if_generation_advanced`.
     source_generation: AtomicU64,
 }
 
@@ -352,6 +359,7 @@ impl RatarmountFs {
             InodeEntry {
                 path: "/".into(),
                 file_info: Some(ratarmount_core::create_root_file_info()),
+                cookie: None,
             },
         );
         path_to_ino.insert("/".into(), FUSE_ROOT_ID);
@@ -381,21 +389,47 @@ impl RatarmountFs {
             // carry a fresher size after overlay create/write).
             if let Some(fi) = fi {
                 if let Some(ent) = self.inodes.lock().unwrap().get_mut(&ino) {
-                    ent.file_info = Some(fi);
+                    self.write_inode_cache(ent, ino, fi);
                 }
             }
             return ino;
         }
         let ino = self.next_ino.fetch_add(1, Ordering::Relaxed);
         p2i.insert(path.to_string(), ino);
+        let (file_info, cookie) = self.inode_cache_from_fi(ino, fi);
         self.inodes.lock().unwrap().insert(
             ino,
             InodeEntry {
                 path: path.to_string(),
-                file_info: fi,
+                file_info,
+                cookie,
             },
         );
         ino
+    }
+
+    /// Overlay child inodes store a cookie only. Root and immutable mounts keep
+    /// a fat [`FileInfo`].
+    fn overlay_stores_cookie(&self, ino: u64) -> bool {
+        self.overlay.is_some() && ino != FUSE_ROOT_ID
+    }
+
+    fn inode_cache_from_fi(
+        &self,
+        ino: u64,
+        fi: Option<FileInfo>,
+    ) -> (Option<FileInfo>, Option<InodeAttrCookie>) {
+        if self.overlay_stores_cookie(ino) {
+            (None, fi.as_ref().map(InodeAttrCookie::from_file_info))
+        } else {
+            (fi, None)
+        }
+    }
+
+    fn write_inode_cache(&self, ent: &mut InodeEntry, ino: u64, fi: FileInfo) {
+        let (file_info, cookie) = self.inode_cache_from_fi(ino, Some(fi));
+        ent.file_info = file_info;
+        ent.cookie = cookie;
     }
 
     fn path_for_ino(&self, ino: u64) -> Option<String> {
@@ -414,9 +448,15 @@ impl RatarmountFs {
             .and_then(|e| e.file_info.clone())
     }
 
+    /// Overlay cookie only. Immutable mounts leave this unused.
+    #[cfg(test)]
+    fn cached_cookie(&self, ino: u64) -> Option<InodeAttrCookie> {
+        self.inodes.lock().unwrap().get(&ino).and_then(|e| e.cookie)
+    }
+
     fn store_fi(&self, ino: u64, fi: FileInfo) {
         if let Some(ent) = self.inodes.lock().unwrap().get_mut(&ino) {
-            ent.file_info = Some(fi);
+            self.write_inode_cache(ent, ino, fi);
         }
     }
 
@@ -495,6 +535,7 @@ impl RatarmountFs {
 
     /// FileInfo for `open`. Immutable mounts reuse the lookup/getattr cache;
     /// overlay always re-looks up so create(size 0) → write is visible.
+    /// Overlay lookup miss → `None` (do not serve a cookie / create-time size 0).
     fn file_info_for_open(&self, ino: u64, path: &str) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
         if self.overlay.is_some() {
@@ -502,7 +543,7 @@ impl RatarmountFs {
                 self.store_fi(ino, fi.clone());
                 return Some(fi);
             }
-            return self.cached_fi(ino);
+            return None;
         }
         if let Some(c) = self.cached_fi(ino) {
             return Some(c);
@@ -512,14 +553,16 @@ impl RatarmountFs {
         Some(fi)
     }
 
-    /// Drop cached FileInfos and dirents when a live overlay commit swapped the
-    /// base archive. `fetch_max` never regresses under concurrent sweeps.
+    /// Drop cached FileInfos, overlay cookies, and dirents when a live overlay
+    /// commit swapped the base archive. `fetch_max` never regresses under
+    /// concurrent sweeps.
     fn sweep_if_generation_advanced(&self) {
         let gen = self.source.content_generation();
         let prev = self.source_generation.fetch_max(gen, Ordering::SeqCst);
         if prev < gen {
             for ent in self.inodes.lock().unwrap().values_mut() {
                 ent.file_info = None;
+                ent.cookie = None;
             }
             self.dir_cache.lock().unwrap().clear();
         }
@@ -698,7 +741,8 @@ impl RatarmountFs {
     /// Resolve `FileInfo` for an inode.
     ///
     /// With a write overlay, always re-lookup so size/mtime after create/write
-    /// match the on-disk overlay file (cache may still hold create-time size 0).
+    /// match the on-disk overlay file (cookie is not getattr truth).
+    /// Overlay lookup miss → `None` (do not serve a cookie).
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
         let path = self.path_for_ino(ino)?;
@@ -712,6 +756,7 @@ impl RatarmountFs {
                 self.store_fi(ino, fi.clone());
                 return Some(fi);
             }
+            return None;
         }
         if let Some(fi) = self.cached_fi(ino) {
             return Some(fi);
@@ -719,6 +764,58 @@ impl RatarmountFs {
         let fi = self.source.lookup(&path, 0)?;
         self.store_fi(ino, fi.clone());
         Some(fi)
+    }
+
+    /// Production `open` (overlay `has_file` → [`OpenBackend::OverlayFd`]).
+    ///
+    /// Never chooses [`OpenBackend::Empty`] from a cached size 0 when the
+    /// overlay has a host file. Overlay getattr/open still re-lookup.
+    fn open_inode(&self, ino: u64, flags: i32) -> Result<(u64, u32), i32> {
+        let path = self.path_for_ino(ino).ok_or(ENOENT)?;
+        let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        // Writes always go to the overlay; reads of files that exist in the overlay
+        // must also use the overlay FD (not the base archive). Previously RO open
+        // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
+        if let Some(ov) = &self.overlay {
+            if write || ov.has_file(&path) {
+                match ov.open_overlay_fd(&path, flags) {
+                    Ok(fd) => {
+                        if let Some(fi) = self.source.lookup(&path, 0) {
+                            self.store_fi(ino, fi);
+                        }
+                        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+                        self.handles
+                            .lock()
+                            .unwrap()
+                            .insert(fh, OpenBackend::OverlayFd(fd));
+                        // Do not KEEP_CACHE: size changes after write.
+                        return Ok((fh, 0));
+                    }
+                    Err(e) => {
+                        if write {
+                            debug!("overlay open: {e}");
+                            return Err(EIO);
+                        }
+                        // RO open of non-overlay path: fall through to base source.
+                        debug!("overlay open (read fallthrough): {e}");
+                    }
+                }
+            }
+        } else if write {
+            return Err(EROFS);
+        }
+
+        let fi = self.file_info_for_open(ino, &path).ok_or(ENOENT)?;
+        let fh = self.open_source_backend(path, fi)?;
+        Ok((fh, fuser::consts::FOPEN_KEEP_CACHE))
+    }
+
+    #[cfg(test)]
+    fn test_fh_is_overlay_fd(&self, fh: u64) -> bool {
+        matches!(
+            self.handles.lock().unwrap().get(&fh),
+            Some(OpenBackend::OverlayFd(_))
+        )
     }
 }
 
@@ -920,56 +1017,8 @@ impl Filesystem for RatarmountFs {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        let Some(path) = self.path_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
-        // Writes always go to the overlay; reads of files that exist in the overlay
-        // must also use the overlay FD (not the base archive). Previously RO open
-        // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
-        if let Some(ov) = &self.overlay {
-            if write || ov.has_file(&path) {
-                match ov.open_overlay_fd(&path, flags) {
-                    Ok(fd) => {
-                        if let Some(fi) = self.source.lookup(&path, 0) {
-                            self.store_fi(ino, fi);
-                        }
-                        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                        self.handles
-                            .lock()
-                            .unwrap()
-                            .insert(fh, OpenBackend::OverlayFd(fd));
-                        // Do not KEEP_CACHE: size changes after write.
-                        reply.opened(fh, 0);
-                        return;
-                    }
-                    Err(e) => {
-                        if write {
-                            debug!("overlay open: {e}");
-                            reply.error(EIO);
-                            return;
-                        }
-                        // RO open of non-overlay path: fall through to base source.
-                        debug!("overlay open (read fallthrough): {e}");
-                    }
-                }
-            }
-        } else if write {
-            reply.error(EROFS);
-            return;
-        }
-
-        let Some(fi) = self.file_info_for_open(ino, &path) else {
-            reply.error(ENOENT);
-            return;
-        };
-
-        match self.open_source_backend(path, fi) {
-            Ok(fh) => {
-                // Allow kernel page cache of archive member data.
-                reply.opened(fh, fuser::consts::FOPEN_KEEP_CACHE);
-            }
+        match self.open_inode(ino, flags) {
+            Ok((fh, open_flags)) => reply.opened(fh, open_flags),
             Err(e) => {
                 debug!("open error kind={e}");
                 reply.error(e);
@@ -1671,9 +1720,13 @@ mod tests {
             OVERLAY_ATTR_TTL,
             "writable overlay must not pin long kernel attr TTL"
         );
-        // After refresh, inode cache must hold the fresh size (not stuck at create-time 0).
-        let cached = fs.cached_fi(ino).expect("cached after refresh");
+        // After refresh, overlay inode stores a cookie (not a fat FileInfo).
+        let cached = fs.cached_cookie(ino).expect("cached cookie after refresh");
         assert_eq!(cached.size, b"hello-overlay-payload".len() as u64);
+        assert!(
+            fs.cached_fi(ino).is_none(),
+            "overlay child must not keep a fat FileInfo beside the cookie"
+        );
         assert!(ov.has_file("/new.txt"));
         let rfd = ov
             .open_overlay_fd("/new.txt", libc::O_RDONLY)
@@ -1682,6 +1735,115 @@ mod tests {
         let mut buf = Vec::new();
         std::io::Read::read_to_end(&mut rf, &mut buf).unwrap();
         assert_eq!(buf, b"hello-overlay-payload");
+    }
+
+    /// Regression: write-then-cat empty when open skipped OverlayFd.
+    ///
+    /// Goes through production [`RatarmountFs::open_inode`] (`has_file` →
+    /// OverlayFd). Do not use [`RatarmountFs::test_open_ro`] — that helper
+    /// skips `has_file` and goes `file_info_for_open` + `open_source_backend`.
+    #[test]
+    fn overlay_open_after_create_write() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fd = ov.create_file("/new.txt", 0o644).expect("create");
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.write_all(b"hello-overlay-payload").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        assert!(
+            ov.has_file("/new.txt"),
+            "production open must take the has_file → OverlayFd branch"
+        );
+        let ino = fs.ino_for_path("/new.txt");
+        let (fh, _) = fs.open_inode(ino, libc::O_RDONLY).expect("production open");
+        assert!(
+            fs.test_fh_is_overlay_fd(fh),
+            "has_file must open OverlayFd, not Empty/Source"
+        );
+        let buf = fs.read_handle(fh, 0, 64).expect("read");
+        assert_eq!(
+            buf, b"hello-overlay-payload",
+            "write-then-cat must not return empty"
+        );
+        assert_ne!(buf, b"", "payload must not be empty after write");
+    }
+
+    /// Opposite polarity of the size-0 cache bug: create with no write, then
+    /// production open/read must return "".
+    #[test]
+    fn overlay_open_after_create_reads_empty() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fd = ov.create_file("/empty.txt", 0o644).expect("create");
+        drop(unsafe { std::fs::File::from_raw_fd(fd) });
+
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        assert!(ov.has_file("/empty.txt"));
+        let ino = fs.ino_for_path("/empty.txt");
+        let (fh, _) = fs.open_inode(ino, libc::O_RDONLY).expect("production open");
+        assert!(
+            fs.test_fh_is_overlay_fd(fh),
+            "never-written overlay file still opens OverlayFd"
+        );
+        let buf = fs.read_handle(fh, 0, 64).expect("read");
+        assert_eq!(buf, b"", "never-written overlay file must read empty");
+    }
+
+    /// After overlay lookup/store, the inode holds a cookie only — not a fat
+    /// FileInfo (and never both `Some`).
+    #[test]
+    fn overlay_store_cookie_without_file_info() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::io::Write;
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fd = ov.create_file("/cookie.txt", 0o644).expect("create");
+        let mut f = unsafe { std::fs::File::from_raw_fd(fd) };
+        f.write_all(b"payload").unwrap();
+        f.sync_all().unwrap();
+        drop(f);
+
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let looked = fs.source.lookup("/cookie.txt", 0).expect("lookup");
+        let ino = fs.ino_for_path_with_fi("/cookie.txt", Some(looked.clone()));
+        assert!(
+            fs.cached_cookie(ino).is_some(),
+            "overlay store must write a cookie"
+        );
+        assert!(
+            fs.cached_fi(ino).is_none(),
+            "overlay child must not keep fat FileInfo"
+        );
+        assert_eq!(
+            fs.cached_cookie(ino).unwrap().size,
+            looked.size,
+            "cookie size must match the lookup FileInfo"
+        );
+        assert_eq!(fs.cached_cookie(ino).unwrap().size, b"payload".len() as u64);
     }
 
     /// Live backing store whose member offsets shift when an earlier member is
