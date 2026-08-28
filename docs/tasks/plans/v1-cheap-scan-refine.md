@@ -43,7 +43,7 @@ This is the same toolbox as P0 density. The remaining tax is leftover `list()` c
 | Hydrate `FileInfo` on locate (scan **or** hits) | Emit type is `SearchHit` / `CheapSearchHit` |
 | Lift CLI `find` + `-w` in v1 | Overlay context is the live mount; see [D4](#d4-overlay-merge-ownership) |
 | Recurse AutoMount nested children in locate | Matches today’s sidecar of `inputs[0]` only; see [D5](#d5-search_cheap-hook-and-forwards) |
-| Forward `search_cheap` through `OciImageMountSource` / Union / Folder | Image-correct locate is overlayfs merge, not a forward; see [D5](#d5-search_cheap-hook-and-forwards) |
+| Forward `search_cheap` through `OciImageMountSource` / Union | Image-correct locate is overlayfs merge, not a forward; see [D5](#d5-search_cheap-hook-and-forwards). Folder is a host-tree walk residual. |
 | Rewrite Prefix/Transform hit paths or invent Transform inverse | Overlay last-wins on those stacks is residual; see [D4](#d4-overlay-merge-ownership) |
 | Tracker / D-Bus / mount `--index-fts` / write-then-read `echo pat > search` | F-3 residuals, not V-1 |
 | V-2 snapshot pointer, V-3 remote cache, V-4 commit queue, V-5 offset-order list | Separate items |
@@ -303,9 +303,9 @@ If `pattern` has `fts:` prefix, **every** `search_cheap` impl (WriteOverlay, for
 | **Forward set only** | FileVersionLayer, Prefix, AutoMount (parent catalog only), Transform, Control. Default `None` is the P0 bug class **for this set**. |
 | Union | `None` (SearchFn sidecar of `inputs[0]` + `overlay_arc`) |
 | **`OciImageMountSource`** | **`None` in v1** — same sentence as Union. It **is** the layer union (`oci_whiteout.rs`); forwarding `layers[0]` or `layers.last()` is a **wrong catalog** (`.wh.*` stay in SQL; other layers missing) and `Some` would block SearchFn sidecar. Image-correct locate is overlayfs merge of layer hits — not this train. `inputs[0]` is the URL string, not `oci:{digest}`; today’s callback already errors “on-disk index.” |
-| Folder / remote folder | `None` |
+| Folder / remote folder | Folder: host-tree glob via `read_dir` + `symlink_metadata` (no `list()`; no recurse `S_IFLNK` dirs; `DEFAULT_SEARCH_LIMIT`). Remote folder stays `None`. |
 
-**Do not** implement Union-catalog locate or a Folder tree walk because a bold “every `list_dirents` wrapper” sentence told you to.
+**Do not** implement Union-catalog locate because a bold “every `list_dirents` wrapper” sentence told you to. Folder host-tree glob is a later residual (PR 7).
 
 **Hit path identity:** TSV paths stay **catalog paths** (today’s sidecar). Wrappers in the forward set **forward without rewriting**. Combined with D4 residual: `--prefix` / `--transform` + `-w` last-wins is **not** guaranteed.
 
@@ -367,7 +367,7 @@ SQL `fullpath` in the SELECT for hits is acceptable. Do not rewrite glob SQL.
 - Offset-order find (V-5).
 - Prefix/Transform rewriting locate paths to mount paths (those stacks + `-w` last-wins stay residual).
 - AutoMount nested-child locate.
-- `OciImageMountSource` / Union catalog merge / Folder tree walk as `search_cheap`.
+- `OciImageMountSource` / Union catalog merge as `search_cheap` (Folder host-tree glob shipped).
 - Overlay-only-on-`[]` when there is no sidecar (keep `search requires an on-disk index`).
 
 ---
@@ -424,7 +424,7 @@ No `docs/embedded-nested-archives.md`.
 | Unify find onto MemIndex | Forbidden (D1). Warm find must keep `mem: None`. |
 | `search_cheap` `Some` overlay-only when base is `None` | Forbidden (D4). Drops the catalog. |
 | `search_cheap` `None` whenever overlay exists | Overlay never appears on unwired formats unless SearchFn step 3 runs. |
-| Forgotten wrapper forward | Tests on the **forward set only** (Transform, Prefix, Control, FileVersionLayer, AutoMount parent). Not OCI/Union/Folder. |
+| Forgotten wrapper forward | Tests on the **forward set only** (Transform, Prefix, Control, FileVersionLayer, AutoMount parent). Not OCI/Union (Folder host-tree glob is a later residual). |
 | Call `overlay_file_info` from locate | **Forbidden** — that hydrates `FileInfo`. `symlink_metadata` size/mtime on hits only. |
 | Forward OCI `search_cheap` | **Forbidden** — wrong catalog; keep `None`. |
 | Dual locate owners (`search_text` prefer + SearchFn) | **Forbidden** — one `Arc`. |

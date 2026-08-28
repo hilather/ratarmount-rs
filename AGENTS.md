@@ -146,6 +146,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Offset-order restore / find walks name order | `cargo test -p ratarmount-index --lib dirent_order` · `cargo test -p ratarmount --bin ratarmount find_offset_order` · `cargo test -p ratarmount-formats-tar --lib regression_offset_order_seeks` |
 | Locate fat `FileInfo` on large catalog; overlay last-wins missing on control search | `cargo test -p ratarmount-index --lib scan_glob` · `cargo test -p ratarmount-compositing --lib search_cheap` · `find_glob` · `control_search` · `search_fts5` |
 | Torn sidecar during `-c` (tmp+rename / dest unlinked at create) | `cargo test -p ratarmount-index --lib regression_reader_survives` · `cargo test -p ratarmount-index --lib regression_drop_unpublished` · `cargo test -p ratarmount --bin ratarmount regression_store_zstd_blocks_in_index_missing_path` |
+| Folder live glob without fat `list()` / symlink-to-`/etc` TSV leak | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `folder_globs`, `folder_limit`) |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

@@ -151,7 +151,7 @@ The 0.7.x catalog is the locate index. Shipped:
 
 Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent a new storage engine.
 
-**Residual:** overlay last-wins is live control/socket only (V-1); CLI `find` stays sidecar-only and still rejects `-w`. Union / OCI / `--prefix` / `--transform` + `-w` last-wins is not guaranteed. No Tracker/D-Bus; no mount `--index-fts`; no FUSE write-then-read `echo pat > search`; rusqlite `fts5` is always compiled in (Cargo unification; workspace rusqlite 0.32 has no `fts5` feature, bundled sqlite still enables `SQLITE_ENABLE_FTS5`).
+**Residual:** overlay last-wins is live control/socket only (V-1); CLI `find` stays sidecar-only and still rejects `-w`. Folder live glob is a host-tree `read_dir` (no fat `list()`). Union / OCI / `--prefix` / `--transform` + `-w` last-wins is not guaranteed. No Tracker/D-Bus; no mount `--index-fts`; no FUSE write-then-read `echo pat > search`; rusqlite `fts5` is always compiled in (Cargo unification; workspace rusqlite 0.32 has no `fts5` feature, bundled sqlite still enables `SQLITE_ENABLE_FTS5`).
 
 ### F-4 — OCI image mount — `done`
 

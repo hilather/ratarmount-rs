@@ -8,13 +8,14 @@ use ratarmount_core::{
     format_cheap_hits_tsv, CheapDirent, CheapSearchHit, FileInfo, ListResult, MountSource,
 };
 use ratarmount_formats_zip::ZipMountSource;
-use ratarmount_index::locate_pattern_matches;
+use ratarmount_index::{locate_pattern_matches, DEFAULT_SEARCH_LIMIT};
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
 use crate::control::{
     live_search_tsv, ControlFolderMountSource, ControlFolderOptions, CONTROL_DIR_PATH,
 };
+use crate::folder::FolderMountSource;
 use crate::oci_whiteout::OciImageMountSource;
 use crate::prefix::PrefixMountSource;
 use crate::transform::TransformMountSource;
@@ -557,6 +558,90 @@ fn search_cheap_wrapper_forwards_parent_only() {
     );
     let ahits = am.search_cheap("*.fits").expect("automount parent");
     assert!(ahits.iter().any(|h| h.path == "/a.fits"));
+}
+
+/// Regression: Folder glob walks the host tree without `list()` / FileInfo.
+#[test]
+fn search_cheap_folder_globs_host() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.fits"), b"fits").unwrap();
+    std::fs::create_dir(dir.path().join("nested")).unwrap();
+    std::fs::write(dir.path().join("nested").join("b.fits"), b"fits2").unwrap();
+    std::fs::write(dir.path().join("readme.txt"), b"hello").unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("leaked.fits"), b"nope").unwrap();
+    std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+    std::os::unix::fs::symlink("/etc", dir.path().join("etc")).unwrap();
+
+    let src = FolderMountSource::new(dir.path()).unwrap();
+    let counted = ListCallCounter {
+        inner: Arc::new(src) as Arc<dyn MountSource>,
+        list_calls: AtomicUsize::new(0),
+    };
+
+    assert!(
+        counted.search_cheap("fts:fits").is_none(),
+        "fts: must stay None"
+    );
+
+    let hits = counted.search_cheap("*.fits").expect("Folder Some");
+    assert_eq!(
+        counted.list_calls.load(Ordering::SeqCst),
+        0,
+        "Folder search_cheap must not call list()"
+    );
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&"/a.fits"), "{paths:?}");
+    assert!(paths.contains(&"/nested/b.fits"), "{paths:?}");
+    assert!(!paths.contains(&"/readme.txt"), "{paths:?}");
+    assert!(
+        !paths.iter().any(|p| p.contains("leaked")),
+        "must not recurse S_IFLNK dir: {paths:?}"
+    );
+    assert_eq!(hits.iter().find(|h| h.path == "/a.fits").unwrap().size, 4);
+
+    let tsv = live_search_tsv(&counted, None, "*", sidecar_err());
+    assert!(
+        !tsv.contains("/etc/"),
+        "symlink-to-/etc must be absent from TSV: {tsv}"
+    );
+    assert!(
+        !tsv.contains("leaked.fits"),
+        "escaped host tree must be absent from TSV: {tsv}"
+    );
+    assert!(tsv.contains("/a.fits\t"), "{tsv}");
+    assert_eq!(
+        counted.list_calls.load(Ordering::SeqCst),
+        0,
+        "live TSV must not call list()"
+    );
+}
+
+/// Regression: Folder `*` truncates at DEFAULT_SEARCH_LIMIT (no fat list()).
+#[test]
+fn search_cheap_folder_limit_cap() {
+    let dir = tempfile::tempdir().unwrap();
+    let n = DEFAULT_SEARCH_LIMIT + 1;
+    for i in 0..n {
+        std::fs::write(dir.path().join(format!("n{i}.dat")), b"x").unwrap();
+    }
+    let src = FolderMountSource::new(dir.path()).unwrap();
+    let counted = ListCallCounter {
+        inner: Arc::new(src) as Arc<dyn MountSource>,
+        list_calls: AtomicUsize::new(0),
+    };
+    let hits = counted.search_cheap("*").expect("Folder Some");
+    assert_eq!(
+        counted.list_calls.load(Ordering::SeqCst),
+        0,
+        "limit walk must not call list()"
+    );
+    assert_eq!(
+        hits.len(),
+        DEFAULT_SEARCH_LIMIT,
+        "dense folder * must cap at DEFAULT_SEARCH_LIMIT"
+    );
 }
 
 /// Regression: Union and OCI stay None (not layer-0 / `.wh.` names).
