@@ -155,9 +155,11 @@ MICRO=1 ./benchmarks/compare-python-vs-rust.sh
 BIG=1 ./benchmarks/compare-python-vs-rust.sh
 # → benchmarks/python-vs-rust-results-big.{csv,md}
 
-# Fixture builder only (no FUSE / no Python). Also used as a regression:
+# Fixture builder only (no FUSE / no Python / no prebuilt binary). Also a regression:
 PREPARE_ONLY=1 BIG=1 SKIP_PYTHON=1 ./benchmarks/compare-python-vs-rust.sh
 ./benchmarks/test-compare-fixtures.sh
+# Env-gate regression (flagless / SKIP_PYTHON-only still error via env.sh):
+./benchmarks/test-compare-prepare-env.sh
 ```
 
 | Variable | Default | Meaning |
