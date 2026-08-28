@@ -63,6 +63,9 @@ pub struct SearchQuery<'a> {
     pub include_hashes: bool,
     /// Maximum rows (default [`DEFAULT_SEARCH_LIMIT`]).
     pub limit: usize,
+    /// Re-sort today's path-order `LIMIT` set by [`crate::cmp_offset_then_name`].
+    /// Does not change membership. Default find / control search stay path order.
+    pub offset_order: bool,
 }
 
 impl<'a> SearchQuery<'a> {
@@ -73,6 +76,7 @@ impl<'a> SearchQuery<'a> {
             fts: false,
             include_hashes: false,
             limit: DEFAULT_SEARCH_LIMIT,
+            offset_order: false,
         }
     }
 
@@ -84,6 +88,7 @@ impl<'a> SearchQuery<'a> {
             fts: true,
             include_hashes: false,
             limit: DEFAULT_SEARCH_LIMIT,
+            offset_order: false,
         }
     }
 }
@@ -123,6 +128,11 @@ impl SqliteIndex {
             };
             if q.include_hashes {
                 fill_hit_hashes(conn, &mut hits)?;
+            }
+            if q.offset_order {
+                hits.sort_by(|a, b| {
+                    crate::cmp_offset_then_name(a.offsetheader, &a.path, b.offsetheader, &b.path)
+                });
             }
             Ok(hits)
         })
@@ -555,5 +565,90 @@ mod tests {
         assert_eq!(collapse_globstars("**/*.fits"), "*/*.fits");
         assert_eq!(collapse_globstars("*.fits"), "*.fits");
         assert_eq!(collapse_globstars("***"), "*");
+    }
+
+    /// Regression: `--offset-order` re-sorts today's path-order LIMIT set only.
+    /// Path order A,B,C; offset order C,A,B; `limit=2` + offset_order → A,B.
+    #[test]
+    fn dirent_order_limit_membership_glob_and_fts() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "a.fits", 200, false),
+            file_row("", "b.fits", 300, false),
+            file_row("", "c.fits", 100, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+
+        let path = idx.search("*.fits").unwrap();
+        assert_eq!(hit_paths(&path), vec!["/a.fits", "/b.fits", "/c.fits"]);
+
+        let offset = idx
+            .search_query(&SearchQuery {
+                offset_order: true,
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(hit_paths(&offset), vec!["/c.fits", "/a.fits", "/b.fits"]);
+
+        let limited = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                offset_order: true,
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(
+            hit_paths(&limited),
+            vec!["/a.fits", "/b.fits"],
+            "LIMIT stays path-order membership; then re-sort (not C+A)"
+        );
+
+        idx.ensure_fts5().unwrap();
+        let fts_limited = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                offset_order: true,
+                ..SearchQuery::fts("fits")
+            })
+            .unwrap();
+        assert_eq!(
+            hit_paths(&fts_limited),
+            vec!["/a.fits", "/b.fits"],
+            "FTS LIMIT stays path-order membership"
+        );
+    }
+
+    /// Regression: shared comparator; raw-SQL NULL `offsetheader` hit sorts last.
+    #[test]
+    fn dirent_order_null_search_hit_sorts_last() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'null.fits', NULL, 0, 3, 1.0, 33188, 0, '',
+                           0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        idx.insert_files_batch(&[file_row("", "plain.fits", 512, false)])
+            .unwrap();
+        idx.commit_write().unwrap();
+
+        let hits = idx
+            .search_query(&SearchQuery {
+                offset_order: true,
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(hit_paths(&hits), vec!["/plain.fits", "/null.fits"]);
+        assert_eq!(hits[0].offsetheader, Some(512));
+        assert_eq!(hits[1].offsetheader, None);
     }
 }

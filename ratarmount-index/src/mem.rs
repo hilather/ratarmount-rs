@@ -689,6 +689,56 @@ impl MemIndex {
         }
     }
 
+    /// Newest-wins row per `(path, name)` across every directory (`versions.last()`).
+    ///
+    /// Includes dumpdir tombstones and generated rows so callers can apply the
+    /// same newest-then-filter rules as mount APIs. Empty names are skipped.
+    pub(crate) fn newest_dirents(&self) -> Vec<(String, IndexDirent)> {
+        let mut out = Vec::new();
+        for pid in self.all_path_ids() {
+            let path_str = self.paths.flat_string_for_export(&self.pool, pid);
+            let Some(de) = self.dir_entries(pid) else {
+                continue;
+            };
+            for (&nid, versions) in &de.names {
+                let Some(&idx) = versions.last() else {
+                    continue;
+                };
+                let i = idx as usize;
+                let name = self.pool.get(nid).to_string();
+                if name.is_empty() {
+                    continue;
+                }
+                out.push((
+                    path_str.clone(),
+                    IndexDirent {
+                        name,
+                        mode: self.soa.mode[i],
+                        size: self.soa.size[i],
+                        linkname: self.pool.get(self.soa.linkname_id[i]).to_string(),
+                        cookie: self.soa.open_cookie(idx),
+                    },
+                ));
+            }
+        }
+        out
+    }
+
+    fn all_path_ids(&self) -> Vec<u32> {
+        if let Some(shards) = &self.shards {
+            let mut ids = Vec::new();
+            for sh in shards {
+                ids.extend(sh.keys().copied());
+            }
+            ids.sort_unstable();
+            ids
+        } else {
+            let mut ids: Vec<u32> = self.dirs.keys().copied().collect();
+            ids.sort_unstable();
+            ids
+        }
+    }
+
     /// Export every version as [`FileRow`]s for durable nested index blobs.
     pub fn export_file_rows(&self) -> Vec<FileRow> {
         let mut rows = Vec::with_capacity(self.count as usize);

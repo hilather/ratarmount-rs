@@ -382,4 +382,84 @@ mod tests {
             "version entries advertise read-only regular-file mode"
         );
     }
+
+    /// Two versions of one file: `.versions` lists `1` then `2`, not archive-offset order.
+    #[test]
+    fn file_version_layer_list_dirents_n_ge_2_is_version_number_order() {
+        struct TwoVersions;
+
+        impl MountSource for TwoVersions {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path == "/" {
+                    Some(ListResult::Names(vec!["f".into()]))
+                } else {
+                    None
+                }
+            }
+            fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+                if path == "/" {
+                    Some(vec![CheapDirent {
+                        name: "f".into(),
+                        mode: ratarmount_core::S_IFREG | 0o644,
+                        size: 2,
+                    }])
+                } else {
+                    None
+                }
+            }
+            fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+                if path == "/" {
+                    return Some(ratarmount_core::create_root_file_info());
+                }
+                if path != "/f" {
+                    return None;
+                }
+                Some(FileInfo {
+                    size: if file_version <= 1 { 1 } else { 2 },
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                })
+            }
+            fn versions(&self, path: &str) -> u32 {
+                if path == "/f" {
+                    2
+                } else {
+                    0
+                }
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Ok(Box::new(io::Cursor::new(vec![b'x'])))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+
+        let layer = FileVersionLayer::new(Arc::new(TwoVersions) as Arc<dyn MountSource>);
+        let root = layer.list_dirents("/").expect("root");
+        assert_eq!(
+            root.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
+            vec!["f"],
+            "plain directory stays inner list_dirents order"
+        );
+        let vdents = layer
+            .list_dirents("/f.versions")
+            .expect("n>=2 versions dirents");
+        let names: Vec<&str> = vdents.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["1", "2"],
+            "versions folder is 1..=n, not offset order of the two versions"
+        );
+        assert_eq!(vdents[0].mode, ratarmount_core::S_IFREG | 0o444);
+        assert_eq!(vdents[1].mode, ratarmount_core::S_IFREG | 0o444);
+    }
 }

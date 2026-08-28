@@ -1,7 +1,9 @@
 //! `ratarmount find PATTERN ARCHIVE` — locate over the 0.7.x catalog (F-3).
 //!
 //! No FUSE. Default query is glob/LIKE; `--fts` (find-argv only) uses FTS5 MATCH.
-//! Stdout is TSV `path\tsize\tmtime` (optional hash columns when `--hashes` is set).
+//! `--offset-order` (find-argv only) re-sorts today's path-order LIMIT set by
+//! `offsetheader`. Stdout is TSV `path\tsize\tmtime` (optional hash columns
+//! when `--hashes` is set).
 
 use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -22,6 +24,8 @@ pub struct LocateOptions<'a> {
     pub include_hashes: bool,
     /// Fill `user.hash.*` xattrs before searching (find `--hashes ALGO`).
     pub fill_hashes: &'a [String],
+    /// Re-sort today's path-order LIMIT set by `offsetheader` (find `--offset-order`).
+    pub offset_order: bool,
 }
 
 /// TSV `path\tsize\tmtime` plus optional `key=value` hash columns.
@@ -119,12 +123,14 @@ fn query_index(
         idx.ensure_fts5().map_err(|e| e.to_string())?;
         let q = SearchQuery {
             include_hashes: loc.include_hashes,
+            offset_order: loc.offset_order,
             ..SearchQuery::fts(pattern)
         };
         idx.search_query(&q).map_err(|e| e.to_string())
     } else {
         let q = SearchQuery {
             include_hashes: loc.include_hashes,
+            offset_order: loc.offset_order,
             ..SearchQuery::glob(pattern)
         };
         idx.search_query(&q).map_err(|e| e.to_string())
@@ -397,5 +403,84 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    fn write_za_tar(path: &Path) {
+        let z = b"zzzz";
+        let a = b"aaaa";
+        let members = [member("z.txt", z, 1), member("a.txt", a, 2)];
+        let mut out = Vec::new();
+        write_ustar_members(&mut out, &members).unwrap();
+        write_tar_eof(&mut out).unwrap();
+        std::fs::write(path, out).unwrap();
+    }
+
+    /// Regression: find `--offset-order` TSV follows `offsetheader` (CLI path).
+    #[test]
+    fn find_offset_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("za.tar");
+        write_za_tar(&archive);
+        let opts = find_opts(dir.path());
+
+        let default =
+            locate_hits(&archive, "*", &opts, &LocateOptions::default()).expect("default");
+        assert_eq!(hit_paths(&default), vec!["/a.txt", "/z.txt"]);
+
+        let Some(bin) = ratarmount_bin() else {
+            eprintln!("skip: ratarmount binary not built next to test exe (API order still ran)");
+            return;
+        };
+
+        let out = Command::new(&bin)
+            .args(["find", "--offset-order", "*", archive.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn find --offset-order");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "find --offset-order exit {:?}: {stderr} {stdout}",
+            out.status.code()
+        );
+        let names: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains('\t'))
+            .map(|l| l.split('\t').next().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["/z.txt", "/a.txt"], "stdout={stdout:?}");
+
+        let out = Command::new(&bin)
+            .args(["find", "*", archive.to_str().unwrap()])
+            .current_dir(dir.path())
+            .output()
+            .expect("spawn find");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let names: Vec<&str> = stdout
+            .lines()
+            .filter(|l| l.contains('\t'))
+            .map(|l| l.split('\t').next().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["/a.txt", "/z.txt"], "default stdout={stdout:?}");
+    }
+
+    /// Control / socket TSV stays path order when `SearchQuery.offset_order` exists.
+    #[test]
+    fn control_search_stays_path_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("za.tar");
+        write_za_tar(&archive);
+        let opts = find_opts(dir.path());
+        locate_hits(&archive, "*", &opts, &LocateOptions::default()).expect("index");
+
+        let cb = tsv_search_callback(archive.clone(), opts);
+        let tsv = cb("*");
+        let names: Vec<&str> = tsv
+            .lines()
+            .filter(|l| l.contains('\t'))
+            .map(|l| l.split('\t').next().unwrap_or(""))
+            .collect();
+        assert_eq!(names, vec!["/a.txt", "/z.txt"], "control TSV={tsv:?}");
     }
 }

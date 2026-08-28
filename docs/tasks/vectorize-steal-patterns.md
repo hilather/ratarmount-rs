@@ -38,7 +38,7 @@ Useful overlap is how they structure I/O and consistency, not how they score cos
 | V-2 | Immutable versioned index + atomic root pointer | `partial` | M | G-2 publishes a blob; readers can still see a half-written sidecar during `-c` | index + remote + CLI |
 | V-3 | Read-through cache in front of object storage | `todo` | L | Remote FUSE stalls on cold Range GET of index pages and seek maps; Cache-in-front-of-R2 is the highest-leverage steal | remote + compress + index |
 | V-4 | WAL as coordinator, executor does the heavy write | `partial` | M | Interval / on-exit commit already splices last zstd frame; live ticks vs prefix-frame mutate need a single-writer queue | compositing + formats-tar |
-| V-5 | Cluster by locality (offset order, not cosine) | `todo` | S–M | Sequential extract / `tar tv` / NFS readahead walk path order today, not archive order | index + formats-tar/zip/7z |
+| V-5 | Cluster by locality (offset order, not cosine) | `done` | S–M | Sequential extract / `tar tv` / NFS readahead walk path order today, not archive order | index + formats-tar/zip/7z |
 
 Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unblocks shared remotes) → **V-3** (remote cache; needs V-2 etag) → **V-4** (commit queue) → **V-5** (optional; F-9 producer helps).
 
@@ -170,10 +170,12 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Still open:**
 
-- [ ] Optional `list_dirents` / extract helper that yields dirents sorted by `offsetheader` (CLI flag or control file; default stays name order for `ls`).
-- [ ] `find` output option: offset order for restore pipelines.
-- [ ] Document that F-9 `--repack-seekable` should also keep members in offset order (already true for tar-in-order).
-- [ ] Regression: restore of a 10k-member TAR via offset-ordered list does fewer backward seeks than name order (can count `pread` offsets in a fake reader).
+Implementation: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) (v1 landed; default `ls` unchanged).
+
+- [x] Optional `list_dirents` / extract helper that yields dirents sorted by `offsetheader` (CLI flag or control file; default stays name order for `ls`).
+- [x] `find` output option: offset order for restore pipelines.
+- [x] Document that F-9 `--repack-seekable` should also keep members in offset order (already true for tar-in-order).
+- [x] Regression: restore via offset-ordered flatten does **zero** backward seeks vs name order on an interleaved multi-dir fixture (CI: N≥32; 10k-member bench is residual — see [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) §9.6).
 
 **Why it pays:** Small win locally; large win on HDD and on remote Range (V-3) where backward seeks are extra GETs. This is IVF’s “put nearby items in one file” with “nearby” redefined.
 
