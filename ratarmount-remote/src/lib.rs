@@ -70,6 +70,7 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use log::debug;
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::Url;
@@ -781,6 +782,42 @@ pub fn fetch_http_range_bytes(url: &str, start: u64, end_inclusive: u64) -> Resu
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Inclusive Range GET of `url`, streaming the body to EOF as SHA-256 hex.
+///
+/// `end_inclusive` is written into the `Range` header only. The response body
+/// is hashed until `n == 0` (same as [`fetch_http_range_bytes`] `read_to_end`).
+/// Status set matches that helper: `206` or `200..300`. Do not cap the read at
+/// `end-start+1` or `Content-Length` (HTTP 200 / ignored Range would change
+/// fingerprints).
+pub fn hash_http_range_sha256(url: &str, start: u64, end_inclusive: u64) -> Result<String> {
+    let loc = parse_http_url(url)?;
+    let range = format!("bytes={start}-{end_inclusive}");
+    let resp = apply_http_auth(
+        ureq::get(loc.url.as_str())
+            .set("User-Agent", USER_AGENT)
+            .set("Range", &range),
+        loc.auth.as_ref(),
+        loc.cookie.as_deref(),
+    )
+    .call()
+    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    let status = resp.status();
+    if status != 206 && !(200..300).contains(&status) {
+        return Err(http_status_err(status, loc.url.as_str()));
+    }
+    let mut reader = resp.into_reader();
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 /// Full GET download to a tempfile (works without Range support).

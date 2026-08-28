@@ -17,6 +17,45 @@ use crate::{IndexError, Result, SqliteIndex};
 /// Algorithms implemented by this crate (Python CLI names).
 pub const SUPPORTED_HASH_ALGORITHMS: &[&str] = &["crc32", "md5", "sha1", "sha256"];
 
+/// Scratch size for streaming SHA-256 / content-hash fill (64 KiB).
+pub const HASH_STREAM_CHUNK: usize = 64 * 1024;
+
+/// Lowercase hex SHA-256 of `data` (same as [`hash_hex`] `"sha256"`).
+pub fn sha256_hex(data: &[u8]) -> String {
+    let mut h = Sha256::new();
+    h.update(data);
+    format!("{:x}", h.finalize())
+}
+
+/// Stream `reader` until EOF (`n == 0`), hashing whatever was read (no `max_bytes`).
+///
+/// Short reads are not an error: the digest covers bytes received, matching
+/// today's `read_to_end` then `Sha256::digest`. Never materializes a body `Vec`.
+pub fn sha256_hex_stream<R: Read + ?Sized>(reader: &mut R) -> std::io::Result<String> {
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; HASH_STREAM_CHUNK];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// `read_exact` `window_len` bytes into `buf` and hash `&buf[..window_len]` only.
+pub(crate) fn sha256_hex_window<R: Read + ?Sized>(
+    reader: &mut R,
+    buf: &mut [u8],
+    window_len: usize,
+) -> std::io::Result<String> {
+    if window_len > 0 {
+        reader.read_exact(&mut buf[..window_len])?;
+    }
+    Ok(sha256_hex(&buf[..window_len]))
+}
+
 /// Normalize a user/CLI algorithm name to a canonical supported name.
 pub fn normalize_algorithm(name: &str) -> Option<&'static str> {
     // Accept Python-style underscores (`sha_256`) and hyphens (`sha-256`).
@@ -49,11 +88,7 @@ pub fn hash_hex(algorithm: &str, data: &[u8]) -> Option<String> {
             h.update(data);
             format!("{:x}", h.finalize())
         }
-        "sha256" => {
-            let mut h = Sha256::new();
-            h.update(data);
-            format!("{:x}", h.finalize())
-        }
+        "sha256" => sha256_hex(data),
         _ => return None,
     })
 }
@@ -157,7 +192,7 @@ pub fn compute_hashes_limited<R: Read>(
         return Ok(Vec::new());
     }
     let mut remaining = size;
-    let mut buf = vec![0u8; 1024 * 1024];
+    let mut buf = [0u8; HASH_STREAM_CHUNK];
     while remaining > 0 {
         let want = std::cmp::min(remaining as usize, buf.len());
         let n = reader.read(&mut buf[..want])?;
@@ -298,5 +333,61 @@ mod tests {
         assert_eq!(streamed.len(), 2);
         assert_eq!(streamed[0].1, hash_hex("crc32", data).unwrap());
         assert_eq!(streamed[1].1, hash_hex("sha256", data).unwrap());
+    }
+
+    /// Rejects `read` requests larger than [`HASH_STREAM_CHUNK`].
+    struct ChunkCapped<R> {
+        inner: R,
+    }
+
+    impl<R: Read> Read for ChunkCapped<R> {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if buf.len() > HASH_STREAM_CHUNK {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "read request larger than HASH_STREAM_CHUNK",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    /// Regression: `sha256_hex_stream` hashes until EOF in ≤64 KiB reads (no body `Vec`).
+    #[test]
+    fn regression_archive_full_hash_stream_rejects_oversize_read() {
+        let payload: Vec<u8> = (0..(HASH_STREAM_CHUNK + 4096))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let expected = hash_hex("sha256", &payload).unwrap();
+        let mut capped = ChunkCapped {
+            inner: std::io::Cursor::new(payload.clone()),
+        };
+        let got = sha256_hex_stream(&mut capped).unwrap();
+        assert_eq!(got, expected);
+        assert_eq!(sha256_hex(b""), hash_hex("sha256", b"").unwrap());
+        let mut empty = std::io::Cursor::new(&b""[..]);
+        assert_eq!(sha256_hex_stream(&mut empty).unwrap(), sha256_hex(b""));
+    }
+
+    /// Regression: `compute_hashes_limited` multi-chunk equals one-shot; does not hash past `size`.
+    #[test]
+    fn regression_compute_hashes_limited_multi_chunk() {
+        let mut payload: Vec<u8> = (0..(HASH_STREAM_CHUNK + 200))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let size = payload.len() as u64;
+        payload.extend_from_slice(&[0xFF; 1024]);
+        let member = &payload[..size as usize];
+        let mut cursor = std::io::Cursor::new(&payload);
+        let streamed =
+            compute_hashes_limited(&mut cursor, size, &["crc32".into(), "sha256".into()]).unwrap();
+        assert_eq!(streamed.len(), 2);
+        assert_eq!(streamed[0].1, hash_hex("crc32", member).unwrap());
+        assert_eq!(streamed[1].1, hash_hex("sha256", member).unwrap());
+        assert_ne!(
+            streamed[1].1,
+            hash_hex("sha256", &payload).unwrap(),
+            "must not hash past the TAR member size"
+        );
     }
 }

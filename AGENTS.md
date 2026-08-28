@@ -137,6 +137,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
 | Publish local sidecar | `cargo test -p ratarmount --bin ratarmount publish_index` · `publish_index_flag` clap-steal |
+| Fingerprint / tarstats full-hash slurps body `Vec` | `cargo test -p ratarmount-index --lib fingerprint` · `cargo test -p ratarmount-index --lib archive_full_hash` · `cargo test -p ratarmount-index --lib compute_hashes` · keep `regression_head_only` + `regression_progressive_nested_fingerprint` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

@@ -11,8 +11,8 @@ use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     check_tarstats_matches_remote, hash_hex, maybe_fetch_index_url, parse_link_describedby,
-    resolve_index_location, sibling_index_candidates, SqliteIndex, TARSTATS_FULL_HASH_MAX,
-    TARSTATS_SAMPLE_BYTES,
+    resolve_index_location, sha256_hex_stream, sibling_index_candidates, SqliteIndex,
+    TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
 use super::{open_from_live_range, open_path};
@@ -200,9 +200,7 @@ fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Op
             .and_then(|b| hash_hex("sha256", &b))
     };
     let full = if size <= TARSTATS_FULL_HASH_MAX {
-        ratarmount_remote::fetch_http_range_bytes(url, 0, size.saturating_sub(1))
-            .ok()
-            .and_then(|b| hash_hex("sha256", &b))
+        ratarmount_remote::hash_http_range_sha256(url, 0, size.saturating_sub(1)).ok()
     } else {
         None
     };
@@ -236,12 +234,7 @@ fn oci_fingerprint(
     };
     let full = if size <= TARSTATS_FULL_HASH_MAX {
         if blob.seek(SeekFrom::Start(0)).is_ok() {
-            let mut all = Vec::new();
-            if blob.read_to_end(&mut all).is_ok() {
-                hash_hex("sha256", &all)
-            } else {
-                None
-            }
+            sha256_hex_stream(&mut blob).ok()
         } else {
             None
         }

@@ -113,8 +113,10 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 
 ### Hash / fingerprint fixed windows
 
-- [ ] Nested (and similar) fingerprints: fixed head/mid/tail buffers only — no full-body `Vec` unless policy requires
-- [ ] Content-hash fill: stream into fixed hasher state; same pattern as tarstats edge samples
+- [x] Nested (and similar) fingerprints: fixed head/mid/tail buffers only — no full-body `Vec` unless policy requires
+- [x] Content-hash fill: stream into fixed hasher state; same pattern as tarstats edge samples
+
+Implemented as allocation-shape only (same windows / digests / progressive head-only): [`plans/p2-fingerprint-windows.md`](plans/p2-fingerprint-windows.md). Residual: ZIP STORE/`read_file_range_at` + Deflate slurp, 7z `read_member_bytes_io` (payload paths, not tarstats/nested windows).
 
 ### SQLite bulk insert staging
 
