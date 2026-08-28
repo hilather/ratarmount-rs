@@ -3542,6 +3542,7 @@ sys.stdout.buffer.write(packed)
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("nested.7z");
         if !write_sample_7z(&archive, "a/b/hello.txt", b"hello\n") {
+            eprintln!("skip: 7z CLI not available or failed to create fixture");
             return;
         }
         let idx_path = dir.path().join("nested.7z.index.sqlite");
