@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 
 use ratarmount_compositing::{
     classify_createable_archive, maybe_create_empty_write_archive, patch_sidecar_if_present,
-    sidecar_path_for_patch, EmptyArchiveKind, EmptyCreateOutcome, WriteOverlay,
+    sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind, EmptyCreateOutcome,
+    OverlayError, WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
@@ -146,17 +147,25 @@ pub fn spawn_interval_commits(
                 return;
             }
             let ov = Arc::clone(&overlay);
-            match overlay.commit_live_idle(&archive, interval, |p| {
+            match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
                 if let Some(window) = ov.last_patch_window() {
                     patch_sidecar_if_present(p, &window, &opts)?;
                 }
-                reopen_live_archive(p, &opts).map_err(ratarmount_compositing::OverlayError::Msg)
+                reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
             }) {
-                Ok(true) => log::info!(
+                Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
                     archive.display()
                 ),
-                Ok(false) => log::debug!("interval overlay commit: nothing idle to do"),
+                Ok(CommitOutcome::Nothing) => {
+                    log::debug!("interval overlay commit: nothing idle to do")
+                }
+                Ok(CommitOutcome::Coalesced) => {
+                    log::debug!("interval overlay commit coalesced (persist already in flight)")
+                }
+                Ok(CommitOutcome::Disabled) => {
+                    log::debug!("interval overlay commit skipped (remount required)")
+                }
                 Err(e) => log::error!("interval overlay commit failed: {e}"),
             }
         })
@@ -179,7 +188,13 @@ pub fn apply_live_commit(
             })
             .map_err(|e| e.to_string())
     } else {
-        let did = overlay.commit_atomic(archive).map_err(|e| e.to_string())?;
+        let did = match overlay.enqueue_commit(archive, CommitKind::OnExit, |_| {
+            Err(OverlayError::Msg("on-exit persist does not reopen".into()))
+        }) {
+            Ok(CommitOutcome::DidWork) => true,
+            Ok(_) => false,
+            Err(e) => return Err(e.to_string()),
+        };
         if did {
             if let Some(window) = overlay.last_patch_window() {
                 patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
@@ -539,6 +554,104 @@ mod tests {
             remount.read(&pfi, prefix.len(), 0).expect("read prefix"),
             prefix
         );
+    }
+
+    /// Regression: apply_live_commit (on-exit) waits for an in-flight interval
+    /// persist then commit_atomic remaining — same plan is not spliced twice.
+    #[test]
+    fn overlay_commit_on_exit_waits_for_interval_inflight() {
+        let dir = tempfile::tempdir().unwrap();
+        let extra = b"on-exit-wait\n";
+        let archive = dir.path().join("a.tar.zst");
+        write_tiny_tar_zst(&archive);
+        let overlay_dir = dir.path().join("ov");
+        std::fs::create_dir_all(&overlay_dir).unwrap();
+        let body = open_seekable_zstd_with_threads(&archive, 1).expect("open zstd");
+        let base = SqliteIndexedTar::create_index_body(
+            &archive,
+            body,
+            None,
+            &OpenOptions {
+                index_in_memory: true,
+                ..OpenOptions::default()
+            },
+            env!("CARGO_PKG_VERSION"),
+        )
+        .expect("index");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &overlay_dir).unwrap(),
+        );
+        std::fs::write(overlay_dir.join("new.bin"), extra).unwrap();
+        // Backdate so the interval idle filter includes the new file.
+        {
+            use std::os::unix::ffi::OsStrExt;
+            let path = overlay_dir.join("new.bin");
+            let ts = std::time::SystemTime::now()
+                .checked_sub(Duration::from_secs(30))
+                .unwrap();
+            let d = ts.duration_since(std::time::UNIX_EPOCH).unwrap();
+            let spec = libc::timespec {
+                tv_sec: d.as_secs() as libc::time_t,
+                tv_nsec: d.subsec_nanos() as libc::c_long,
+            };
+            let times = [spec, spec];
+            let c = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+            assert_eq!(
+                unsafe {
+                    libc::utimensat(
+                        libc::AT_FDCWD,
+                        c.as_ptr(),
+                        times.as_ptr(),
+                        libc::AT_SYMLINK_NOFOLLOW,
+                    )
+                },
+                0
+            );
+        }
+        ov.set_persist_delay_for_test(Duration::from_millis(300));
+
+        let archive_t = archive.clone();
+        let ov_t = Arc::clone(&ov);
+        let interval = thread::spawn(move || {
+            ov_t.enqueue_commit(
+                &archive_t,
+                CommitKind::IntervalIdle(Duration::from_secs(10)),
+                |p| {
+                    reopen_live_archive(
+                        p,
+                        &OpenOptions {
+                            index_in_memory: true,
+                            ..OpenOptions::default()
+                        },
+                    )
+                    .map_err(OverlayError::Msg)
+                },
+            )
+        });
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) {
+            if ov.persist_inflight_for_test() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ov.persist_inflight_for_test(),
+            "interval never set inflight"
+        );
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let did = apply_live_commit(&ov, &archive, false, &opts).expect("on-exit");
+        assert!(
+            !did,
+            "on-exit must not splice again after interval committed the plan"
+        );
+        let interval = interval.join().expect("interval thread").expect("interval");
+        assert_eq!(interval, CommitOutcome::DidWork);
+        assert!(!overlay_dir.join("new.bin").exists());
     }
 
     #[test]

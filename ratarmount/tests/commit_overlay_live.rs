@@ -397,6 +397,87 @@ fn commit_overlay_on_exit_sigterm_tar_zst_cmp() {
     );
 }
 
+/// Regression: interval + on-exit must not splice the same overlay file twice.
+#[test]
+fn commit_overlay_interval_on_exit_no_duplicate() {
+    let dir = tempfile::tempdir().unwrap();
+    let expected_new = dir.path().join("expected-new.bin");
+    fs::write(&expected_new, format!("p-coal-{}\n", std::process::id())).unwrap();
+    let old = b"keep-zst\n";
+    let last = b"last-frame\n";
+    let zst = write_split_tar_zst(dir.path(), &[("old.txt", old)], &[("last.txt", last)]);
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args([
+            "--commit-overlay-interval",
+            "1s",
+            "--commit-overlay-on-exit",
+            "--index-file",
+            ":memory:",
+        ])
+        .arg(&zst)
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn ratarmount");
+
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(8)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("new.bin"), fs::read(&expected_new).unwrap()).unwrap();
+
+    // SIGTERM immediately: on-exit must flush the still-hot file even if the
+    // interval tick is in flight or skipped it as unsettled.
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let status = child.wait().expect("wait");
+    assert!(
+        status.success() || status.code() == Some(0) || status.code().is_none(),
+        "SIGTERM exit: {status:?} log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+
+    let dest_tar = dir.path().join("decoded.tar");
+    decode_tar_zst_to_tar(&zst, &dest_tar);
+    let listing = tar_list(&dest_tar);
+    let n = listing
+        .lines()
+        .filter(|l| l.trim_end_matches('/') == "new.bin")
+        .count();
+    assert_eq!(n, 1, "interval+on-exit duplicated members: {listing}");
+
+    let extract = dir.path().join("ex");
+    fs::create_dir_all(&extract).unwrap();
+    assert!(
+        Command::new("tar")
+            .args(["-xf"])
+            .arg(&dest_tar)
+            .arg("-C")
+            .arg(&extract)
+            .status()
+            .unwrap()
+            .success(),
+        "tar -xf decoded"
+    );
+    assert_eq!(fs::read(extract.join("old.txt")).unwrap(), old);
+    assert_eq!(fs::read(extract.join("last.txt")).unwrap(), last);
+    assert_eq!(
+        fs::read(extract.join("new.bin")).unwrap(),
+        fs::read(&expected_new).unwrap()
+    );
+}
+
 /// Regression: on-exit splice must patch the sibling sidecar so the next
 /// remount without `-c` is warm (tarstats match; no prefix-frame decode).
 #[test]

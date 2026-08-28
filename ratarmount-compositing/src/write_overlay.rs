@@ -9,8 +9,8 @@ use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::time::{Duration, Instant, SystemTime};
 
 use bzip2::write::BzEncoder;
 use flate2::write::GzEncoder;
@@ -65,6 +65,31 @@ pub enum OverlayError {
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
 
+/// Live overlay persist job (V-4). Interval and on-exit only.
+///
+/// CLI [`commit_overlay`] is the prefix-rewrite escape hatch and must **not**
+/// go through this queue. F-7 write-through will reuse the same live queue
+/// later (do not implement F-7 here).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitKind {
+    /// Interval tick: persist overlay files idle for at least this long.
+    IntervalIdle(Duration),
+    /// SIGTERM/unmount: wait for an in-flight persist, then [`WriteOverlay::commit_atomic`]
+    /// remaining files (no reopen).
+    OnExit,
+}
+
+/// Result of [`WriteOverlay::enqueue_commit`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommitOutcome {
+    DidWork,
+    /// A live persist is already in flight; this tick did not start another splice.
+    Coalesced,
+    Nothing,
+    /// [`WriteOverlay::interval_disabled`] — remount required; no persist.
+    Disabled,
+}
+
 /// Where an archive mutation invalidated the 0.7.x file table.
 ///
 /// Persist stashes this on [`WriteOverlay`]; interval closures already capture
@@ -105,6 +130,14 @@ pub struct WriteOverlay {
     encoding: String,
     /// Last successful persist window for incremental sidecar patch (F-2).
     last_patch_window: Mutex<Option<IndexPatchWindow>>,
+    /// Live commit coordinator (V-4). Separate from `commit_gate` (writers vs
+    /// persist). Interval/on-exit set this before `commit_live_inner`.
+    commit_inflight: AtomicBool,
+    commit_wait: Mutex<()>,
+    commit_cv: Condvar,
+    last_persist_duration: Mutex<Duration>,
+    /// Test-only: sleep after taking the inflight flag (injected long persist).
+    persist_delay: Mutex<Option<Duration>>,
 }
 
 impl WriteOverlay {
@@ -137,6 +170,11 @@ impl WriteOverlay {
             write_fds: Mutex::new(HashMap::new()),
             encoding: "utf-8".into(),
             last_patch_window: Mutex::new(None),
+            commit_inflight: AtomicBool::new(false),
+            commit_wait: Mutex::new(()),
+            commit_cv: Condvar::new(),
+            last_persist_duration: Mutex::new(Duration::ZERO),
+            persist_delay: Mutex::new(None),
         })
     }
 
@@ -838,6 +876,133 @@ impl WriteOverlay {
             }
         }
         self.commit_live_inner(archive, Some(idle_for), reopen)
+    }
+
+    /// Enqueue a **live** persist (V-4). `CommitKind::{IntervalIdle, OnExit}` only.
+    ///
+    /// Overlay `create`/`write` stay on `commit_gate.read()`. Inflight is a
+    /// separate flag — do not hold the writer-visible gate from enqueue until
+    /// unmount. CLI [`commit_overlay`] stays off this path. F-7 will reuse
+    /// this live queue later.
+    pub fn enqueue_commit(
+        &self,
+        archive: &Path,
+        kind: CommitKind,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<CommitOutcome> {
+        match kind {
+            CommitKind::IntervalIdle(idle_for) => {
+                self.enqueue_interval_idle(archive, idle_for, reopen)
+            }
+            CommitKind::OnExit => {
+                // On-exit is persist-only (`commit_atomic`); interval owns reopen.
+                drop(reopen);
+                self.enqueue_on_exit(archive)
+            }
+        }
+    }
+
+    fn enqueue_interval_idle(
+        &self,
+        archive: &Path,
+        idle_for: Duration,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<CommitOutcome> {
+        if self.interval_disabled() {
+            return Ok(CommitOutcome::Disabled);
+        }
+        let Some(_guard) = InFlightGuard::try_begin(self) else {
+            log::debug!("interval overlay commit coalesced (persist already in flight)");
+            return Ok(CommitOutcome::Coalesced);
+        };
+        self.apply_test_persist_delay();
+        let start = Instant::now();
+        let result = self.commit_live_idle(archive, idle_for, reopen);
+        self.record_persist_duration(start.elapsed());
+        match result {
+            Ok(true) => Ok(CommitOutcome::DidWork),
+            Ok(false) => Ok(CommitOutcome::Nothing),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn enqueue_on_exit(&self, archive: &Path) -> Result<CommitOutcome> {
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
+        let timeout = on_exit_wait_timeout(self.last_persist_duration());
+        if !self.wait_inflight_cleared(timeout) {
+            log::error!(
+                "on-exit overlay commit timed out waiting for in-flight persist; \
+                 attempting final flush"
+            );
+        }
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
+        // If interval is still in flight after a timeout, do not steal inflight;
+        // `commit_atomic` serializes on `commit_gate` and is the user's last flush.
+        let _guard = InFlightGuard::try_begin(self);
+        match self.commit_atomic(archive) {
+            Ok(true) => Ok(CommitOutcome::DidWork),
+            Ok(false) => Ok(CommitOutcome::Nothing),
+            Err(e) => Err(e),
+        }
+    }
+
+    fn last_persist_duration(&self) -> Duration {
+        *self
+            .last_persist_duration
+            .lock()
+            .expect("overlay persist duration")
+    }
+
+    fn record_persist_duration(&self, elapsed: Duration) {
+        *self
+            .last_persist_duration
+            .lock()
+            .expect("overlay persist duration") = elapsed;
+    }
+
+    fn apply_test_persist_delay(&self) {
+        let delay = *self.persist_delay.lock().expect("overlay persist delay");
+        if let Some(d) = delay {
+            if !d.is_zero() {
+                std::thread::sleep(d);
+            }
+        }
+    }
+
+    fn wait_inflight_cleared(&self, timeout: Duration) -> bool {
+        let mut g = self.commit_wait.lock().expect("overlay commit wait");
+        let deadline = Instant::now() + timeout;
+        while self.commit_inflight.load(Ordering::SeqCst) {
+            let now = Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            let (guard, wait_res) = self
+                .commit_cv
+                .wait_timeout(g, deadline.saturating_duration_since(now))
+                .expect("overlay commit wait");
+            g = guard;
+            if wait_res.timed_out() && self.commit_inflight.load(Ordering::SeqCst) {
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Injected long persist for V-4 coalesce tests.
+    #[doc(hidden)]
+    pub fn set_persist_delay_for_test(&self, delay: Duration) {
+        *self.persist_delay.lock().expect("overlay persist delay") = Some(delay);
+    }
+
+    /// Whether a live persist currently holds the V-4 inflight flag.
+    #[doc(hidden)]
+    pub fn persist_inflight_for_test(&self) -> bool {
+        self.commit_inflight.load(Ordering::SeqCst)
     }
 
     fn commit_live_inner(
@@ -1713,6 +1878,10 @@ impl Default for CommitOverlayOptions {
 /// 3. Apply format-specific commit
 ///
 /// Returns `Ok(true)` if changes were committed, `Ok(false)` if nothing to do or canceled.
+///
+/// Offline prefix-rewrite escape hatch (including earlier-frame `.tar.zst`
+/// delete). **Not** a V-4 live-queue job — do not route this through
+/// [`WriteOverlay::enqueue_commit`].
 pub fn commit_overlay(
     write_overlay: impl AsRef<Path>,
     archive_file: impl AsRef<Path>,
@@ -2573,6 +2742,40 @@ fn detect_live_commit_format(archive: &Path) -> Result<CompressionFormat> {
 
 fn interval_disabled_err() -> OverlayError {
     OverlayError::Msg("live overlay commit disabled after reopen failure; remount required".into())
+}
+
+/// On-exit wait: 2× last persist duration, at least 60s (fail-closed flush, not skip).
+const ON_EXIT_WAIT_MIN: Duration = Duration::from_secs(60);
+
+fn on_exit_wait_timeout(last_persist: Duration) -> Duration {
+    last_persist.saturating_mul(2).max(ON_EXIT_WAIT_MIN)
+}
+
+/// Sets `commit_inflight` for the lifetime of a live persist; clears + notifies on drop.
+struct InFlightGuard<'a> {
+    overlay: &'a WriteOverlay,
+}
+
+impl<'a> InFlightGuard<'a> {
+    fn try_begin(overlay: &'a WriteOverlay) -> Option<Self> {
+        overlay
+            .commit_inflight
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .ok()
+            .map(|_| Self { overlay })
+    }
+}
+
+impl Drop for InFlightGuard<'_> {
+    fn drop(&mut self) {
+        self.overlay.commit_inflight.store(false, Ordering::SeqCst);
+        let _g = self
+            .overlay
+            .commit_wait
+            .lock()
+            .expect("overlay commit wait");
+        self.overlay.commit_cv.notify_all();
+    }
 }
 
 /// `.tar.zst` / `.tzst` / `.tar.zstd` only — not `.taz`.
@@ -5174,6 +5377,165 @@ mod tests {
             Ok(false) => {}
             other => panic!("second tick must not persist leftover dir, got {other:?}"),
         }
+    }
+
+    fn wait_inflight(ov: &WriteOverlay, timeout: Duration) {
+        let start = Instant::now();
+        while start.elapsed() < timeout {
+            if ov.persist_inflight_for_test() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!("inflight flag never set within {timeout:?}");
+    }
+
+    fn zstd_magic_ok(bytes: &[u8]) -> bool {
+        bytes.len() >= 4 && bytes[..4] == [0x28, 0xB5, 0x2F, 0xFD]
+    }
+
+    /// Regression: two interval fires during injected long persist → second Coalesced.
+    #[test]
+    fn overlay_commit_queue_second_interval_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("q-coal-seed");
+        let extra = generated_payload("q-coal-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(overlay_with_base(
+            open_tar_zst_base(&archive, false),
+            &overlay,
+        ));
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        set_mtime_age(&overlay.join("new.txt"), Duration::from_secs(30));
+        ov.set_persist_delay_for_test(Duration::from_millis(400));
+
+        let archive_t = archive.clone();
+        let ov_t = Arc::clone(&ov);
+        let first = std::thread::spawn(move || {
+            ov_t.enqueue_commit(
+                &archive_t,
+                CommitKind::IntervalIdle(Duration::from_secs(10)),
+                |p| reopen_tar_zst(p, false),
+            )
+        });
+        wait_inflight(&ov, Duration::from_secs(2));
+        let during = fs::read(&archive).unwrap();
+        assert!(
+            zstd_magic_ok(&during),
+            "readers must not see a truncated .tar.zst mid-persist"
+        );
+
+        let second = ov
+            .enqueue_commit(
+                &archive,
+                CommitKind::IntervalIdle(Duration::from_secs(10)),
+                |_| panic!("second interval tick must not start persist"),
+            )
+            .expect("coalesce");
+        assert_eq!(second, CommitOutcome::Coalesced);
+
+        let first = first
+            .join()
+            .expect("first tick thread")
+            .expect("first tick");
+        assert_eq!(first, CommitOutcome::DidWork);
+        assert!(!ov.persist_inflight_for_test());
+        assert!(!overlay.join("new.txt").exists());
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+        let after = fs::read(&archive).unwrap();
+        assert!(zstd_magic_ok(&after));
+    }
+
+    /// Regression: on-exit waits for inflight interval then one commit_atomic
+    /// of remaining files (same plan is not spliced twice).
+    #[test]
+    fn overlay_commit_queue_on_exit_waits_then_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("q-wait-seed");
+        let extra = generated_payload("q-wait-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(overlay_with_base(
+            open_tar_zst_base(&archive, false),
+            &overlay,
+        ));
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        set_mtime_age(&overlay.join("new.txt"), Duration::from_secs(30));
+        ov.set_persist_delay_for_test(Duration::from_millis(300));
+
+        let archive_t = archive.clone();
+        let ov_t = Arc::clone(&ov);
+        let interval = std::thread::spawn(move || {
+            ov_t.enqueue_commit(
+                &archive_t,
+                CommitKind::IntervalIdle(Duration::from_secs(10)),
+                |p| reopen_tar_zst(p, false),
+            )
+        });
+        wait_inflight(&ov, Duration::from_secs(2));
+
+        let on_exit = ov
+            .enqueue_commit(&archive, CommitKind::OnExit, |_| {
+                panic!("on-exit must not reopen")
+            })
+            .expect("on-exit");
+        assert_eq!(
+            on_exit,
+            CommitOutcome::Nothing,
+            "interval already committed the idle plan; on-exit must not splice again"
+        );
+        let interval = interval.join().expect("interval thread").expect("interval");
+        assert_eq!(interval, CommitOutcome::DidWork);
+
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+        assert_eq!(read_member(src.as_ref(), "/seed.txt"), seed);
+        let names = src.list("/").expect("list");
+        let n = match names {
+            ListResult::Infos(m) => m.keys().filter(|k| *k == "new.txt").count(),
+            ListResult::Names(v) => v.iter().filter(|k| *k == "new.txt").count(),
+        };
+        assert_eq!(n, 1, "member must appear once after interval+on-exit");
+    }
+
+    /// Regression: live prefix-frame delete still fail-closed via enqueue.
+    #[test]
+    fn overlay_commit_queue_prefix_frame_delete_fail_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("q-ef-prefix");
+        let last = generated_payload("q-ef-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("old.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/old.txt").expect("unlink prefix member");
+        let err = ov
+            .enqueue_commit(
+                &archive,
+                CommitKind::IntervalIdle(Duration::from_secs(10)),
+                |p| reopen_tar_zst(p, false),
+            )
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert!(err.contains("/old.txt"), "{err}");
+        assert!(err.contains("--commit-overlay"), "{err}");
+        assert_eq!(
+            fs::read(&archive).unwrap(),
+            before,
+            "archive must be unchanged"
+        );
     }
 
     /// Regression: FileVersionLayer wrap (factory default); same name in both frames.

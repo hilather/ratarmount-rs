@@ -139,7 +139,7 @@ Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-
 
 Acceptance: remount after last-frame splice does **not** rescan prefix frames; patched `files` equals a full `create_index_body`; `check_tarstats` still detects a replaced archive.
 
-**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild.
+**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild. Live interval vs on-exit splices are coalesced (V-4 `enqueue_commit`; second interval tick `Coalesced`; on-exit waits then one `commit_atomic`). Live prefix-frame mutate stays fail-closed; offline `--commit-overlay` remains the prefix-rewrite escape hatch (not a live-queue job). F-7 write-through should reuse that live queue.
 
 ### F-3 — SQLite FTS5 / locate — `done`
 
@@ -171,7 +171,7 @@ Split if needed: Homebrew formula first (S), WinFsp (L), Intel tarball when a ru
 
 ### F-7 — Write-through / commit-to-remote
 
-Overlay commit currently mutates a **local** tar/zip. `s3://bucket/a.tar.zst` + `-w` + interval commit should multipart-upload the spliced object (or a sidecar delta). Depends on F-2 unless we accept full-object PUT of the sibling tmp (works, expensive).
+Overlay commit currently mutates a **local** tar/zip. `s3://bucket/a.tar.zst` + `-w` + interval commit should multipart-upload the spliced object (or a sidecar delta). Depends on F-2 unless we accept full-object PUT of the sibling tmp (works, expensive). Reuse the V-4 live commit queue (`enqueue_commit` IntervalIdle/OnExit); do not put offline `commit_overlay()` on that executor.
 
 ### F-8 — Block and disk-image family
 

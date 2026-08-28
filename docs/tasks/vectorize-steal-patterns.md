@@ -37,7 +37,7 @@ Useful overlap is how they structure I/O and consistency, not how they score cos
 | V-1 | Cheap scan, then refine | `done` | M | CLI find / FTS stay streaming SQL; live control/socket / compact-only scan SoA + pool ids; overlay last-wins on control/socket | index + compositing + CLI |
 | V-2 | Immutable versioned index + atomic root pointer | `partial` | M | G-2 publishes a blob; readers can still see a half-written sidecar during `-c` | index + remote + CLI |
 | V-3 | Read-through cache in front of object storage | `todo` | L | Remote FUSE stalls on cold Range GET of index pages and seek maps; Cache-in-front-of-R2 is the highest-leverage steal | remote + compress + index |
-| V-4 | WAL as coordinator, executor does the heavy write | `partial` | M | Interval / on-exit commit already splices last zstd frame; live ticks vs prefix-frame mutate need a single-writer queue | compositing + formats-tar |
+| V-4 | WAL as coordinator, executor does the heavy write | `partial` | M | Live interval/on-exit queue coalesces overlapping splices; F-7 write-through still reuses that queue later | compositing + formats-tar |
 | V-5 | Cluster by locality (offset order, not cosine) | `done` | S–M | Sequential extract / `tar tv` / NFS readahead walk path order today, not archive order | index + formats-tar/zip/7z |
 
 Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unblocks shared remotes) → **V-3** (remote cache; needs V-2 etag) → **V-4** (commit queue) → **V-5** (optional; F-9 producer helps).
@@ -144,14 +144,17 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - Live ticks reject prefix-frame `.tar.zst` mutate; offline splice is the escape hatch.
 - Gzip commit stays rejected; ZIP is full rebuild.
 
+**Shipped (live queue — IntervalIdle / OnExit only):**
+
+- [x] Single-writer live commit queue: `WriteOverlay::enqueue_commit(CommitKind::{IntervalIdle, OnExit})`. A second interval tick while inflight is `Coalesced` (does not start another `persist_by_format`). On-exit waits for inflight (2× last persist, min 60s) then one `commit_atomic` of remaining files; timeout logs error and still flushes.
+- [x] Job record is lightweight (overlay plan + `commit_generation`); executor still does last-frame splice / uncompressed `tar --append` / sidecar patch, then local `rename`.
+- [x] Hot files (open write fd, younger than interval) stay in the overlay.
+- [x] Prefix-frame mutate stays fail-closed via `classify_tar_zst_path` / `earlier_frame_err`. CLI `commit_overlay()` is **not** a queue job (offline prefix-rewrite escape hatch).
+- [x] Regression: two interval fires during an injected long persist → second `Coalesced`; readers never see a truncated `.tar.zst`; live prefix-frame delete still `earlier_frame_err`; `overlay_commit_live*` / `overlay_commit_live_delete_shifts` stay green.
+
 **Still open:**
 
-- [ ] Single-writer commit queue: interval/on-exit/offline enqueue one job; a second tick no-ops or coalesces instead of overlapping splices.
-- [ ] Job record is lightweight (overlay file list + generation), not the spliced bytes. Executor performs splice / ZIP rebuild / sidecar patch, then the coordinator flips “visible archive + index” (local `rename`, later F-7 remote multipart).
-- [ ] Hot files (open for write, younger than interval) stay in the overlay — already specified; keep that invariant in the queue.
-- [ ] Prefix-frame mutate: queue must fail closed the same way live ticks do; do not start an executor that would rewrite the prefix under a reader.
-- [ ] Regression: two interval fires during a long splice; readers never see a truncated `.tar.zst`; NFS/FUSE `overlay_commit_live_delete_shifts` stays green.
-- [ ] Later: F-7 write-through uses the same queue (executor uploads, coordinator publishes pointer from V-2).
+- [ ] Later: F-7 write-through uses the same live queue (executor uploads, coordinator publishes pointer from V-2). Do not put Offline `commit_overlay()` on this executor.
 
 **Why it pays:** The residual that hurts operators is concurrent commit vs open readers, not missing Durable Objects. Coordinator + one executor is the portable part. Do not add Queues/DOs.
 
@@ -205,7 +208,7 @@ Implementation: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-loca
 - V-1: `FileInfo` count 0 on a synthetic 200k SoA `scan_glob`; SQL `search_query` keeps `mem: None`. Not a 200k on-disk TAR `find` RSS test.
 - V-2: two processes, `-c` in one, `cat` in the other; pointer flip is atomic; `check_tarstats` still fires on replaced archive.
 - V-3: fake HTTP Range server; GET count on remount with cached sidecar + seek map.
-- V-4: overlapping interval commits; existing `overlay_commit_live*` / `commit_overlay` tests stay green.
+- V-4: two interval fires during injected long persist → second `Coalesced`; on-exit waits then one `commit_atomic`; live prefix-frame still `earlier_frame_err`; existing `overlay_commit_live*` / `commit_overlay` tests stay green.
 - V-5: pread offset monotonicity on offset-ordered restore vs name-ordered.
 
 Every behavior change needs a regression test in the same PR (see root `AGENTS.md`).
