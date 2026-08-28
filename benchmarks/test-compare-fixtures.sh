@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Regression: compare-python-vs-rust fixture builder emits tar.lz4, multi-frame
-# tar.zst, and the BIG x10 blob without needing FUSE or Python ratarmount.
+# tar.zst, and the BIG x10 blob without needing FUSE, Python ratarmount, or a
+# prebuilt binary (issue #9). Env-gate predicates: test-compare-prepare-env.sh.
 #
 #   ./benchmarks/test-compare-fixtures.sh
 set -euo pipefail

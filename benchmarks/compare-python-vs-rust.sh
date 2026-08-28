@@ -28,6 +28,24 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# PREPARE_ONLY fixture builds do not need Python ratarmount or a compiled binary.
+# env.sh otherwise requires both before this script honors PREPARE_ONLY (#9).
+# Same *placement* as compare-gzip-isal-ab.sh; different predicates — do not treat
+# SKIP_PYTHON=1 or SKIP_BUILD=1 alone as rust-only / no-binary, and do not dummy
+# RATARMOUNT_CMD on a full run (even with RATARMOUNT_ALLOW_NO_PY=1).
+if [[ "${PREPARE_ONLY:-0}" == "1" ]]; then
+    export RATARMOUNT_ALLOW_NO_PY=1
+    if [[ -z "${RATARMOUNT_CMD:-}" ]]; then
+        # Mirror env.sh: prefer an existing binary; dummy only when none exists.
+        if [[ -x "$ROOT/target/release/ratarmount" ]]; then
+            export RATARMOUNT_CMD="$ROOT/target/release/ratarmount"
+        elif [[ -x "$ROOT/target/debug/ratarmount" ]]; then
+            export RATARMOUNT_CMD="$ROOT/target/debug/ratarmount"
+        else
+            export RATARMOUNT_CMD=/bin/true
+        fi
+    fi
+fi
 # Portable unmount / mount helpers (Linux + macOS)
 # shellcheck source=../test-harness/env.sh
 source "$ROOT/test-harness/env.sh"
