@@ -7,6 +7,8 @@
 
 “Vector tricks” here means **dense columns, interning, and avoid fat per-entry structs** (and only secondarily true SIMD on bulk buffers).
 
+Systems patterns inspired by Cloudflare Vectorize (cheap scan + refine, snapshot index, remote read-through cache, commit coordinator, offset locality) live in [`vectorize-steal-patterns.md`](vectorize-steal-patterns.md). That file is **not** SIMD and **not** embedding IVF/PQ.
+
 ---
 
 ## Done (baseline)
@@ -38,6 +40,8 @@ Residual: `list()` still builds a fat map for callers that need full `FileInfo`.
 Cheap `list_dirents` now also lands on compositing wrappers on the live FUSE path (Prefix, Union default B-4, AutoMount, WriteOverlay, Control, Folder, Transform, FileVersionLayer), the remaining `SqliteIndex` format crates (CPIO/AR/WARC/CAB/ISO/ASAR/XAR/libarchive/OGG/HTML/PDF), **and** EXT4 / FAT / SquashFS / Git / SQLAR / `SingleFileMountSource` / Dropbox. Union folder-cache **build** walks `list_dirents` (fat `list()` only when dirents have `mode == 0`). `--union-resolve-symlinks` `list_dirents` merges cheap dirents then resolves `S_IFLNK` winners via `lookup` (not a fat `list()` map). Control `status` dirent size is a placeholder 0 (getattr/open recompute).
 
 HTTP/S3/SSH/SMB/WebDAV are **not** MountSources (download → factory archive); no `list_dirents` to add. Residual: FR-10 `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir. FUSE crate tests cover the fat-map skip. 2026-08-15 default-suite (v0.1.20 vs Python 1.3.0): `find` geo-mean **1.45× / 1.33×** (cold/warm); uncompressed random `cat` **1.14×** cold / **0.95×** warm. Gzip random/seq still favor Python. Filling real dirent sizes does **not** close that geo-mean (gzip nested still dominates). Expanded 2026-08-27 BIG suite (640 MiB + `.tar.zst`/`.tar.lz4`): `find` **1.26× / 1.38×**, seq. bandwidth **3.85× / 3.16×** — see [python-vs-rust-results.md](../../benchmarks/python-vs-rust-results.md).
+
+Follow-on (cheap `find` / control search without fat maps): [`vectorize-steal-patterns.md`](vectorize-steal-patterns.md) **V-1**.
 
 ### ZIP member sidecar density
 
@@ -142,6 +146,7 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 | Full Deflate member inflate cost | Payload; cache helps reuse, not first inflate size |
 | Durable save-then-free during **cold** nested build | Peak still needs full compact table to export |
 | SIMD on every single-name `lookup` | Overhead dominates short strings |
+| IVF / PQ / ANN from Vectorize | Wrong domain — see [`vectorize-steal-patterns.md`](vectorize-steal-patterns.md) non-goals |
 
 ---
 
@@ -155,6 +160,7 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 6. 7z open-side SoA / entry map  
 7. AutoMount / union key interning  
 8. P2 items as needed  
+9. Systems patterns V-1..V-5 in [`vectorize-steal-patterns.md`](vectorize-steal-patterns.md) (not density)
 
 ---
 
@@ -169,3 +175,4 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 - Nested compact model: [`docs/embedded-nested-archives.md`](../embedded-nested-archives.md)  
 - Nested durable: outer `nestedindexes` + factory open path  
 - Code: `ratarmount-index/src/mem.rs`, format sidecars (ZIP/7z), `ratarmount-fuse` readahead/list  
+- Vectorize systems steal (not SIMD): [`vectorize-steal-patterns.md`](vectorize-steal-patterns.md)
