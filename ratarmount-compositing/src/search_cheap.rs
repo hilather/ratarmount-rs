@@ -48,6 +48,28 @@ impl CheapBase {
             ],
         }
     }
+
+    /// Two GNU-incremental rows, same catalog path, different offsetheader.
+    fn two_offsetheader() -> Self {
+        Self {
+            hits: vec![
+                CheapSearchHit {
+                    path: "/a.fits".into(),
+                    name: "a.fits".into(),
+                    size: 4,
+                    mtime: 1.0,
+                    offsetheader: Some(0),
+                },
+                CheapSearchHit {
+                    path: "/a.fits".into(),
+                    name: "a.fits".into(),
+                    size: 8,
+                    mtime: 2.0,
+                    offsetheader: Some(512),
+                },
+            ],
+        }
+    }
 }
 
 impl MountSource for CheapBase {
@@ -266,6 +288,43 @@ fn search_cheap_overlay_cow_replace_no_duplicate() {
     let hits = ov.search_cheap("*.fits").expect("Some");
     let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
     assert_eq!(a.len(), 1, "duplicate TSV: {hits:?}");
+    assert_eq!(a[0].size, 14);
+}
+
+/// Regression: empty overlay keeps every base offsetheader (D7, not last-only).
+#[test]
+fn search_cheap_overlay_keeps_two_offsetheader_when_empty() {
+    let dir = tempfile::tempdir().unwrap();
+    let ov = WriteOverlay::new(
+        Arc::new(CheapBase::two_offsetheader()) as Arc<dyn MountSource>,
+        dir.path(),
+    )
+    .unwrap();
+    let hits = ov.search_cheap("*.fits").expect("Some");
+    let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
+    assert_eq!(
+        a.len(),
+        2,
+        "empty overlay must keep both versions: {hits:?}"
+    );
+    assert_eq!(a[0].offsetheader, Some(0));
+    assert_eq!(a[1].offsetheader, Some(512));
+}
+
+/// Regression: overlay host last-wins collapses same-path versions to one TSV row.
+#[test]
+fn search_cheap_overlay_cow_collapses_two_offsetheader() {
+    let dir = tempfile::tempdir().unwrap();
+    let ov = WriteOverlay::new(
+        Arc::new(CheapBase::two_offsetheader()) as Arc<dyn MountSource>,
+        dir.path(),
+    )
+    .unwrap();
+    ov.ensure_modifiable("/a.fits").unwrap();
+    std::fs::write(ov.root().join("a.fits"), b"replaced-bytes").unwrap();
+    let hits = ov.search_cheap("*.fits").expect("Some");
+    let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
+    assert_eq!(a.len(), 1, "COW last-wins one row: {hits:?}");
     assert_eq!(a[0].size, 14);
 }
 

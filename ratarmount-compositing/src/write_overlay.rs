@@ -326,9 +326,11 @@ impl WriteOverlay {
 
     /// Last-wins overlay merge onto catalog locate hits (no [`FileInfo`]).
     ///
-    /// Drops tombstoned paths, overrides same-path host files (COW/replace),
-    /// and appends overlay creates that match `pattern`. `fts:` only overrides
-    /// or drops existing hit rows (no host glob of the `fts:` prefix).
+    /// Starts from **all** base rows (every `offsetheader` / GNU incremental
+    /// version). Drops tombstoned paths. An overlay host file at a path
+    /// replaces every base row for that path with one last-wins hit (COW /
+    /// replace / create). `fts:` only overrides or drops existing hit rows
+    /// (no host glob of the `fts:` prefix).
     pub fn merge_search_hits(
         &self,
         base: Vec<CheapSearchHit>,
@@ -336,34 +338,37 @@ impl WriteOverlay {
     ) -> Vec<CheapSearchHit> {
         let fts = pattern.starts_with("fts:");
         let tombstones = self.load_tombstone_paths();
-        let mut by_path: BTreeMap<String, CheapSearchHit> = BTreeMap::new();
-        let mut seen_path: HashSet<String> = HashSet::new();
-        let mut out: Vec<CheapSearchHit> = Vec::new();
-        for hit in base {
-            if tombstones.contains(&hit.path) {
-                continue;
-            }
-            if fts {
+        let mut out: Vec<CheapSearchHit> = base
+            .into_iter()
+            .filter(|hit| !tombstones.contains(&hit.path))
+            .collect();
+        if fts {
+            let mut seen_path: HashSet<String> = HashSet::new();
+            let mut fts_out = Vec::new();
+            for hit in out {
                 if let Some(ov) = self.overlay_cheap_hit(&hit.path) {
                     if seen_path.insert(hit.path.clone()) {
-                        out.push(ov);
+                        fts_out.push(ov);
                     }
                     continue;
                 }
-                out.push(hit);
-                continue;
+                fts_out.push(hit);
             }
-            by_path.insert(hit.path.clone(), hit);
+            fts_out.truncate(DEFAULT_SEARCH_LIMIT);
+            return fts_out;
         }
-        if !fts {
-            self.walk_overlay_host("/", &self.root, pattern, &tombstones, &mut by_path);
-            out.extend(by_path.into_values());
-            out.sort_by(|a, b| {
-                a.path
-                    .cmp(&b.path)
-                    .then(a.offsetheader.cmp(&b.offsetheader))
-            });
+        let mut overlay_by_path: BTreeMap<String, CheapSearchHit> = BTreeMap::new();
+        self.walk_overlay_host("/", &self.root, pattern, &tombstones, &mut overlay_by_path);
+        if !overlay_by_path.is_empty() {
+            let overlay_paths: HashSet<String> = overlay_by_path.keys().cloned().collect();
+            out.retain(|h| !overlay_paths.contains(&h.path));
+            out.extend(overlay_by_path.into_values());
         }
+        out.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.offsetheader.cmp(&b.offsetheader))
+        });
         out.truncate(DEFAULT_SEARCH_LIMIT);
         out
     }
