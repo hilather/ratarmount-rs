@@ -1118,9 +1118,20 @@ fn uncompressed_patch_window(
     let mut window_start = 0u64;
     let mut offsets_shifted = false;
     if !plan.deleted_paths.is_empty() {
-        if let Some(min_oh) = min_deleted_offsetheader(base, &plan.deleted_paths) {
-            window_start = min_oh;
-            offsets_shifted = true;
+        match classify_deleted_offsetheaders(base, &plan.deleted_paths) {
+            DeletedOffsetClass::From(min_oh) => {
+                window_start = min_oh;
+                offsets_shifted = true;
+            }
+            // AutoMount (and similar wrappers) can hide TAR userdata, so a real
+            // archive delete looks unclassifiable. GNU tar --delete still
+            // removes the member. Patching from EOF would keep the stale
+            // sidecar row (ghost file / wrong bytes on warm remount).
+            DeletedOffsetClass::Unclassified => {
+                window_start = 0;
+                offsets_shifted = true;
+            }
+            DeletedOffsetClass::None => {}
         }
     }
     let eof = {
@@ -1141,20 +1152,42 @@ fn uncompressed_patch_window(
     })
 }
 
-fn min_deleted_offsetheader(base: &dyn MountSource, deleted: &HashSet<String>) -> Option<u64> {
+/// How deleted overlay paths map onto TAR `offsetheader`s in `base`.
+enum DeletedOffsetClass {
+    /// Overlay-only names (replace of a file that is not in the archive).
+    None,
+    /// Earliest classified archive `offsetheader`.
+    From(u64),
+    /// At least one path exists in `base` but has no TAR `offsetheader`.
+    Unclassified,
+}
+
+fn classify_deleted_offsetheaders(
+    base: &dyn MountSource,
+    deleted: &HashSet<String>,
+) -> DeletedOffsetClass {
     let mut min_oh: Option<u64> = None;
+    let mut unclassified = false;
     for path in deleted {
-        let Ok(ohs) = all_tar_offsetheaders(base, path) else {
-            continue;
-        };
-        for oh in ohs {
-            min_oh = Some(match min_oh {
-                Some(m) => m.min(oh),
-                None => oh,
-            });
+        match all_tar_offsetheaders(base, path) {
+            Ok(ohs) => {
+                for oh in ohs {
+                    min_oh = Some(match min_oh {
+                        Some(m) => m.min(oh),
+                        None => oh,
+                    });
+                }
+            }
+            Err(_) => unclassified = true,
         }
     }
-    min_oh
+    if unclassified {
+        DeletedOffsetClass::Unclassified
+    } else if let Some(oh) = min_oh {
+        DeletedOffsetClass::From(oh)
+    } else {
+        DeletedOffsetClass::None
+    }
 }
 
 impl MountSource for WriteOverlay {
@@ -4200,6 +4233,153 @@ mod tests {
             .filter(|l| l.trim_end_matches('/') == "new.txt")
             .count();
         assert_eq!(new_count2, 1, "second tick must not duplicate: {text2}");
+    }
+
+    /// Base that lists `gone.txt` but strips TAR userdata (AutoMount nested
+    /// archive, foreign sidecar, or any wrapper that hides `offsetheader`).
+    struct NoTarOffsetheaderBase;
+
+    impl MountSource for NoTarOffsetheaderBase {
+        fn list(&self, _path: &str) -> Option<ListResult> {
+            Some(ListResult::Infos(Default::default()))
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(create_root_file_info());
+            }
+            if path == "/gone.txt" || path == "gone.txt" {
+                return Some(FileInfo {
+                    size: 9,
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                });
+            }
+            None
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "no-tar-oh base"))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    struct TarOffsetheaderBase {
+        gone_oh: u64,
+    }
+
+    impl MountSource for TarOffsetheaderBase {
+        fn list(&self, _path: &str) -> Option<ListResult> {
+            Some(ListResult::Infos(Default::default()))
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(create_root_file_info());
+            }
+            if path == "/gone.txt" || path == "gone.txt" {
+                return Some(tar_fi_at(self.gone_oh));
+            }
+            None
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "tar-oh base"))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    fn two_member_tar(dir: &Path) -> (PathBuf, u64, u64) {
+        let keep = b"keep-body";
+        let gone = b"gone-body";
+        let bytes = pack_tar(&[ustar_file("keep.txt", keep), ustar_file("gone.txt", gone)]);
+        let archive = dir.join("a.tar");
+        fs::write(&archive, &bytes).unwrap();
+        let eof = {
+            let mut f = File::open(&archive).unwrap();
+            find_last_tar_eof(&mut f, 0).unwrap().unwrap_or(0)
+        };
+        let gone_oh = 512 + pad512_for_test(keep.len() as u64);
+        (archive, eof, gone_oh)
+    }
+
+    fn pad512_for_test(n: u64) -> u64 {
+        n.div_ceil(512) * 512
+    }
+
+    /// Regression: unclassified delete + append must not patch from EOF only.
+    ///
+    /// Symptom: AutoMount (or any wrapper that hides TAR userdata) made
+    /// `min_deleted_offsetheader` skip a real archive delete; the append
+    /// branch then set `window_start = EOF`. GNU tar `--delete` still
+    /// removed the member, so the sidecar kept a ghost row.
+    #[test]
+    fn regression_unclassified_delete_plus_append_does_not_patch_from_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, eof, gone_oh) = two_member_tar(dir.path());
+        assert!(gone_oh > 0 && gone_oh < eof, "gone_oh={gone_oh} eof={eof}");
+
+        let plan = OverlayCommitPlan {
+            deletions_nul: Vec::new(),
+            appends_nul: Vec::new(),
+            deleted_paths: ["gone.txt".into()].into_iter().collect(),
+            append_entries: vec![("new.txt".into(), false)],
+        };
+        let window =
+            uncompressed_patch_window(&archive, &NoTarOffsetheaderBase, &plan).expect("window");
+        assert!(
+            window.offsets_shifted,
+            "unclassified archive delete must force a suffix rewrite"
+        );
+        assert_eq!(
+            window.window_start, 0,
+            "must full-reparse, not EOF {eof} (gone lived at {gone_oh})"
+        );
+        assert_ne!(
+            window.window_start, eof,
+            "EOF-only patch would leave gone.txt in the sidecar"
+        );
+    }
+
+    #[test]
+    fn classified_delete_plus_append_still_starts_at_min_offsetheader() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, eof, gone_oh) = two_member_tar(dir.path());
+        let plan = OverlayCommitPlan {
+            deletions_nul: Vec::new(),
+            appends_nul: Vec::new(),
+            deleted_paths: ["gone.txt".into()].into_iter().collect(),
+            append_entries: vec![("new.txt".into(), false)],
+        };
+        let window = uncompressed_patch_window(&archive, &TarOffsetheaderBase { gone_oh }, &plan)
+            .expect("window");
+        assert!(window.offsets_shifted);
+        assert_eq!(window.window_start, gone_oh);
+        assert_ne!(window.window_start, eof);
+        assert_ne!(window.window_start, 0);
+    }
+
+    #[test]
+    fn overlay_only_replace_plus_append_still_starts_at_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let (archive, eof, _) = two_member_tar(dir.path());
+        let plan = OverlayCommitPlan {
+            deletions_nul: Vec::new(),
+            appends_nul: Vec::new(),
+            deleted_paths: ["brand-new.txt".into()].into_iter().collect(),
+            append_entries: vec![("brand-new.txt".into(), false)],
+        };
+        let window =
+            uncompressed_patch_window(&archive, &NoTarOffsetheaderBase, &plan).expect("window");
+        assert!(!window.offsets_shifted);
+        assert_eq!(
+            window.window_start, eof,
+            "overlay-only add must still patch from pre-append EOF"
+        );
     }
 
     /// Regression: GNU `tar --append` patch window is `find_last_tar_eof`, not

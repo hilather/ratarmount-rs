@@ -119,6 +119,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Last-frame splice remount rescans prefix | `cargo test -p ratarmount-formats-tar --lib regression_incremental_last_frame_no_prefix_seek` |
 | Incremental `files` ≠ full `create_index_body` | `cargo test -p ratarmount-formats-tar --lib regression_incremental_equals_full_index` |
 | On-exit persist leaves stale sidecar (remount full-parses) | `cargo test -p ratarmount --test commit_overlay_live on_exit_remount` · `cargo test -p ratarmount --bin ratarmount -- live_commit_on_exit_remount` |
+| Live uncompressed TAR sidecar patch from EOF after unclassified delete (ghost member) | `cargo test -p ratarmount-compositing --lib regression_unclassified_delete` |
 | Interval reopen | `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount --bin ratarmount -- live_commit` |
 | Pre-splice `zstdblocks` used for suffix parse | `cargo test -p ratarmount-formats-tar --lib regression_incremental_zstdblocks_fresh` |
 | GNU `--append` from `pre_size` misses members | `cargo test -p ratarmount-formats-tar --lib regression_incremental_append_eof` |
