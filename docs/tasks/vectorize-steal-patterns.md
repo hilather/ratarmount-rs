@@ -125,6 +125,8 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Depends:** V-2 etag/id in the pointer so cache keys stay stable across republish. Complements G-3 (payload) and F-9 (producer makes maps small).
 
+**Plan:** [`plans/v3-read-through-sidecar-cache.md`](plans/v3-read-through-sidecar-cache.md) (plan-only; implement blocked until V-2 pointer lands).
+
 ---
 
 ## V-4 — WAL as coordinator; executor does the heavy write
