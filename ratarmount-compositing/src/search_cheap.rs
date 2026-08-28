@@ -96,8 +96,9 @@ impl MountSource for CheapBase {
                 .collect(),
         )
     }
-    fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        Err(io::Error::new(io::ErrorKind::NotFound, "cheap base"))
+    fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        // COW tests call ensure_modifiable, which copies the base body, then overwrite.
+        Ok(Box::new(std::io::Cursor::new(vec![0u8; fi.size as usize])))
     }
     fn is_immutable(&self) -> bool {
         true
@@ -493,7 +494,7 @@ fn search_cheap_wrapper_forwards_parent_only() {
     let am = AutoMountLayer::new(
         Arc::clone(&zip),
         1,
-        Arc::new(|_: &std::path::Path| Err(io::Error::new(io::ErrorKind::Other, "no nested"))),
+        Arc::new(|_: &std::path::Path| Err(io::Error::other("no nested"))),
     );
     let ahits = am.search_cheap("*.fits").expect("automount parent");
     assert!(ahits.iter().any(|h| h.path == "/a.fits"));
@@ -554,7 +555,7 @@ fn search_cheap_automount_names_no_list() {
     let _am = AutoMountLayer::new(
         Arc::clone(&counted) as Arc<dyn MountSource>,
         1,
-        Arc::new(|_: &std::path::Path| Err(io::Error::new(io::ErrorKind::Other, "no nested"))),
+        Arc::new(|_: &std::path::Path| Err(io::Error::other("no nested"))),
     );
     assert_eq!(
         counted.list_calls.load(Ordering::SeqCst),

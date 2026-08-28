@@ -74,10 +74,12 @@ pub fn search_existing_sidecar(
     query_index(&idx, archive, pattern, loc)
 }
 
-/// Callback for [`ratarmount_compositing::ControlFolderOptions::with_on_search`].
+/// Sidecar-only SearchFn (no overlay / SoA). Live mounts use [`live_search_callback`].
 ///
-/// Glob only (control `search/<pattern>`). `:memory:` / missing sidecar → the
-/// stable error line `error: search requires an on-disk index`.
+/// Glob only. `:memory:` / missing sidecar → `error: search requires an on-disk index`.
+/// Kept for tests and callers that have no `MountSource`; the bin uses
+/// [`live_search_callback`] for control/socket.
+#[allow(dead_code)]
 pub fn tsv_search_callback(
     archive: PathBuf,
     open_opts: OpenOptions,
