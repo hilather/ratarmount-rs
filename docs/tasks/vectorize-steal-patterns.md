@@ -34,7 +34,7 @@ Useful overlap is how they structure I/O and consistency, not how they score cos
 
 | ID | Pattern | Status | Effort | Why it is useful here | Ownership |
 |----|---------|--------|--------|-----------------------|-----------|
-| V-1 | Cheap scan, then refine | `partial` | M | `find` / readdir / control search still pay fat maps on some paths; getattr/open is the refine pass | index + fuse + compositing |
+| V-1 | Cheap scan, then refine | `done` | M | CLI find / FTS stay streaming SQL; live control/socket / compact-only scan SoA + pool ids; overlay last-wins on control/socket | index + compositing + CLI |
 | V-2 | Immutable versioned index + atomic root pointer | `partial` | M | G-2 publishes a blob; readers can still see a half-written sidecar during `-c` | index + remote + CLI |
 | V-3 | Read-through cache in front of object storage | `todo` | L | Remote FUSE stalls on cold Range GET of index pages and seek maps; Cache-in-front-of-R2 is the highest-leverage steal | remote + compress + index |
 | V-4 | WAL as coordinator, executor does the heavy write | `partial` | M | Interval / on-exit commit already splices last zstd frame; live ticks vs prefix-frame mutate need a single-writer queue | compositing + formats-tar |
@@ -56,12 +56,15 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - Metadata path: `list_dirents` from string pool + `EntrySoa` without `BTreeMap<String, FileInfo>`. Fat `FileInfo` only at getattr / open. Documented in [`vectors-optimization.md`](vectors-optimization.md) P0.
 - `ratarmount find` + `/.ratarmount-control/search/` + socket `search` (F-3) walk the 0.7.x catalog.
 
-**Still open:**
+**Shipped (rewritten — do not read the old “find stays on SoA” wording):**
 
-- [ ] `find` / control `search` / FTS hit list stay on SoA columns + pool ids; allocate `String` paths only for emitted rows.
-- [ ] `list()` callers that still force a fat map on the live FUSE path (residual in vectors-optimization P0) get a typed “need FileInfo” flag instead of the default.
-- [ ] Overlay-only names (F-3 residual) participate in cheap search without merging a second fat catalog.
-- [ ] Regression: `find '*.fits'` RSS + wall on a 200k-member TAR vs materializing every `FileInfo`; control `search` same.
+- [x] CLI `find` / FTS stay streaming SQL over `files` / `files_fts`. Allocate path strings only for emitted `SearchHit`s. Do **not** load `MemIndex` to answer sidecar `find`.
+- [x] Live control/socket / compact-only walk SoA columns + pool ids (`search_cheap` / `MemIndex::scan_glob`). Hits are `SearchHit` / `CheapSearchHit`. `FileInfo` is getattr/open only.
+- [x] Overlay last-wins on `-w` control/socket (creates, COW/replace, tombstones) via one SearchFn. CLI `find` still rejects `-w`.
+- [x] Additive `ListNeed` (P0 leftover). It is **not** what makes search cheap.
+- [x] Regression: `FileInfo` construction count is 0 on a synthetic 200k SoA `scan_glob` (not a 200k on-disk TAR `find` RSS test).
+
+**Residual:** Union / OCI / Folder `search_cheap` stay `None`. `--prefix` / `--transform` + `-w` last-wins is not guaranteed (catalog paths, no Transform inverse). Compact-only CLI find without a sidecar stays empty / “on-disk index.”
 
 **Why it pays:** BIG-suite `find` is already ~1.3× Python; the remaining tax is path materialization and fat maps, not cosine math. Same toolbox as P0 density — do not invent an ANN layer.
 
@@ -199,7 +202,7 @@ Implementation: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-loca
 
 ## Verification
 
-- V-1: RSS + wall of `ratarmount find` / control `search` on large flat TAR (reuse density benches).
+- V-1: `FileInfo` count 0 on a synthetic 200k SoA `scan_glob`; SQL `search_query` keeps `mem: None`. Not a 200k on-disk TAR `find` RSS test.
 - V-2: two processes, `-c` in one, `cat` in the other; pointer flip is atomic; `check_tarstats` still fires on replaced archive.
 - V-3: fake HTTP Range server; GET count on remount with cached sidecar + seek map.
 - V-4: overlapping interval commits; existing `overlay_commit_live*` / `commit_overlay` tests stay green.

@@ -8,7 +8,8 @@ use std::io;
 use std::sync::{Arc, Mutex};
 
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource,
+    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
+    ListResult, MountSource,
 };
 use regex::Regex;
 
@@ -257,6 +258,13 @@ impl MountSource for TransformMountSource {
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
         ))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.inner.search_cheap(pattern)
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

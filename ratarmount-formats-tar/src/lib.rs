@@ -25,8 +25,8 @@ use ratarmount_compress::{
     FileSegment, SeekRead, SeekableBody, SegmentedFile, SharedSeekableGzip, StenciledFile,
 };
 use ratarmount_core::{
-    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
-    SQLiteIndexedTarUserData, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{FileRowSoa, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
@@ -796,6 +796,13 @@ impl MountSource for SqliteIndexedTar {
                 })
                 .collect(),
         )
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.index.search_cheap(pattern).ok()
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

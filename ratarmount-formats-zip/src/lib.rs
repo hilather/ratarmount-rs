@@ -59,8 +59,8 @@ use ratarmount_compress::{
     check_for_split_file_in_folder, materialize_joined_parts, SeekRead, SharedArchiveFile,
 };
 use ratarmount_core::{
-    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
-    SQLiteIndexedTarUserData, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{compute_hashes_limited, FileRowSoa, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
@@ -1216,6 +1216,13 @@ impl MountSource for ZipMountSource {
                 })
                 .collect()
         })
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.index.search_cheap(pattern).ok()
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

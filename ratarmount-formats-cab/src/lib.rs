@@ -44,8 +44,8 @@ use std::time::Instant;
 use flate2::{Decompress, FlushDecompress, Status};
 use ratarmount_compress::{SeekRead, StenciledFile};
 use ratarmount_core::{
-    normpath, CheapDirent, FileInfo, ListModeResult, ListResult, MountSource, OpenOptions,
-    SQLiteIndexedTarUserData, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{IndexError, SqliteIndex};
 use thiserror::Error;
@@ -543,6 +543,13 @@ impl MountSource for CabMountSource {
                 })
                 .collect()
         })
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        self.index.search_cheap(pattern).ok()
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

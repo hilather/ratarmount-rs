@@ -21,15 +21,16 @@ use ratarmount_compress::{
     splice_zstd_last_frames_replace, CompressionFormat, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, FileInfo, ListModeResult, ListResult,
-    MountSource, OpenOptions, UserData,
+    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
+    ListResult, MountSource, OpenOptions, UserData,
 };
 use ratarmount_formats_tar::{
     find_last_tar_eof, rewrite_tar_suffix, window_has_member_boundary, RewriteTarSuffix,
     SqliteIndexedTar, UstarMember, UstarPayload,
 };
 use ratarmount_index::{
-    fill_content_hashes, resolve_index_location, IndexLocation, SqliteIndex, MEMORY_INDEX,
+    fill_content_hashes, locate_pattern_matches, resolve_index_location, IndexLocation,
+    SqliteIndex, DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -321,6 +322,159 @@ impl WriteOverlay {
             .open(&real)?;
         io::copy(&mut src, &mut dst)?;
         Ok(())
+    }
+
+    /// Last-wins overlay merge onto catalog locate hits (no [`FileInfo`]).
+    ///
+    /// Drops tombstoned paths, overrides same-path host files (COW/replace),
+    /// and appends overlay creates that match `pattern`. `fts:` only overrides
+    /// or drops existing hit rows (no host glob of the `fts:` prefix).
+    pub fn merge_search_hits(
+        &self,
+        base: Vec<CheapSearchHit>,
+        pattern: &str,
+    ) -> Vec<CheapSearchHit> {
+        let fts = pattern.starts_with("fts:");
+        let tombstones = self.load_tombstone_paths();
+        let mut by_path: BTreeMap<String, CheapSearchHit> = BTreeMap::new();
+        let mut seen_path: HashSet<String> = HashSet::new();
+        let mut out: Vec<CheapSearchHit> = Vec::new();
+        for hit in base {
+            if tombstones.contains(&hit.path) {
+                continue;
+            }
+            if fts {
+                if let Some(ov) = self.overlay_cheap_hit(&hit.path) {
+                    if seen_path.insert(hit.path.clone()) {
+                        out.push(ov);
+                    }
+                    continue;
+                }
+                out.push(hit);
+                continue;
+            }
+            by_path.insert(hit.path.clone(), hit);
+        }
+        if !fts {
+            self.walk_overlay_host("/", &self.root, pattern, &tombstones, &mut by_path);
+            out.extend(by_path.into_values());
+            out.sort_by(|a, b| {
+                a.path
+                    .cmp(&b.path)
+                    .then(a.offsetheader.cmp(&b.offsetheader))
+            });
+        }
+        out.truncate(DEFAULT_SEARCH_LIMIT);
+        out
+    }
+
+    fn load_tombstone_paths(&self) -> HashSet<String> {
+        let db = self.db.lock().expect("overlay db");
+        let mut stmt = match db.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#) {
+            Ok(s) => s,
+            Err(_) => return HashSet::new(),
+        };
+        let rows = stmt
+            .query_map([], |r| {
+                let folder: String = r.get(0)?;
+                let name: String = r.get(1)?;
+                Ok((folder, name))
+            })
+            .into_iter()
+            .flatten()
+            .filter_map(|r| r.ok());
+        let mut out = HashSet::new();
+        for (folder, name) in rows {
+            if folder.is_empty() || folder == "/" {
+                out.insert(format!("/{name}"));
+            } else {
+                out.insert(format!("{folder}/{name}"));
+            }
+        }
+        out
+    }
+
+    /// `symlink_metadata` size/mtime on an overlay host path — never [`FileInfo`].
+    fn overlay_cheap_hit(&self, mount_path: &str) -> Option<CheapSearchHit> {
+        let real = self.realpath(mount_path);
+        self.ensure_under_root(&real).ok()?;
+        let name = mount_path.rsplit('/').next().unwrap_or("").to_string();
+        if name.is_empty() || name.starts_with(HIDDEN_DB) {
+            return None;
+        }
+        let meta = fs::symlink_metadata(&real).ok()?;
+        Some(CheapSearchHit {
+            path: if mount_path.starts_with('/') {
+                mount_path.to_string()
+            } else {
+                format!("/{mount_path}")
+            },
+            name,
+            size: meta.len() as i64,
+            mtime: meta.mtime() as f64,
+            offsetheader: None,
+        })
+    }
+
+    fn walk_overlay_host(
+        &self,
+        mount_dir: &str,
+        host_dir: &Path,
+        pattern: &str,
+        tombstones: &HashSet<String>,
+        by_path: &mut BTreeMap<String, CheapSearchHit>,
+    ) {
+        if self.ensure_under_root(host_dir).is_err() {
+            return;
+        }
+        let meta = match fs::symlink_metadata(host_dir) {
+            Ok(m) => m,
+            Err(_) => return,
+        };
+        if meta.file_type().is_symlink() {
+            return;
+        }
+        if !meta.is_dir() {
+            return;
+        }
+        let rd = match fs::read_dir(host_dir) {
+            Ok(rd) => rd,
+            Err(_) => return,
+        };
+        for ent in rd.flatten() {
+            let name = ent.file_name().to_string_lossy().into_owned();
+            if name.starts_with(HIDDEN_DB) {
+                continue;
+            }
+            let child_mount = join(mount_dir, &name);
+            if tombstones.contains(&child_mount) {
+                continue;
+            }
+            let child_host = host_dir.join(&name);
+            if self.ensure_under_root(&child_host).is_err() {
+                continue;
+            }
+            let child_meta = match fs::symlink_metadata(&child_host) {
+                Ok(m) => m,
+                Err(_) => continue,
+            };
+            if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink() {
+                self.walk_overlay_host(&child_mount, &child_host, pattern, tombstones, by_path);
+                continue;
+            }
+            if locate_pattern_matches(pattern, &child_mount, &name) {
+                by_path.insert(
+                    child_mount.clone(),
+                    CheapSearchHit {
+                        path: child_mount,
+                        name,
+                        size: child_meta.len() as i64,
+                        mtime: child_meta.mtime() as f64,
+                        offsetheader: None,
+                    },
+                );
+            }
+        }
     }
 
     /// True when the overlay root has a real file (or symlink) for this path.
@@ -1262,6 +1416,14 @@ impl MountSource for WriteOverlay {
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
         ))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        let base_hits = self.current_base().search_cheap(pattern)?;
+        Some(self.merge_search_hits(base_hits, pattern))
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {

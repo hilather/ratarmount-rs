@@ -7,8 +7,17 @@
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use ratarmount_core::{FileInfo, SQLiteIndexedTarUserData, UserData};
+#[cfg(test)]
+use std::cell::Cell;
 
+#[cfg(test)]
+thread_local! {
+    static TO_FILE_INFO_COUNT: Cell<u64> = Cell::new(0);
+}
+
+use ratarmount_core::{CheapSearchHit, FileInfo, SQLiteIndexedTarUserData, UserData};
+
+use crate::search::{locate_pattern_matches, DEFAULT_SEARCH_LIMIT, DUMPDIR_DELETE_LINKNAME};
 use crate::FileRow;
 
 /// When directory count exceeds this, entries are stored under hashed shards
@@ -436,6 +445,8 @@ impl EntrySoa {
     }
 
     fn to_file_info(&self, pool: &StringPool, idx: u32) -> FileInfo {
+        #[cfg(test)]
+        TO_FILE_INFO_COUNT.with(|c| c.set(c.get() + 1));
         let i = idx as usize;
         let f = self.flags[i];
         let oh = self.offsetheader[i];
@@ -663,6 +674,97 @@ impl MemIndex {
     pub fn list_mode(&self, dir: &str) -> Option<BTreeMap<String, u32>> {
         let dents = self.list_dirents(dir)?;
         Some(dents.into_iter().map(|d| (d.name, d.mode)).collect())
+    }
+
+    /// Catalog-wide glob locate over SoA + pool ids (no [`FileInfo`]).
+    ///
+    /// Walks every version index (not `versions.last()` only). Skips generated
+    /// rows, GNU dumpdir tombstones, and empty names. Path strings are cloned
+    /// only for emitted hits. Cap is [`DEFAULT_SEARCH_LIMIT`].
+    pub fn scan_glob(&self, pattern: &str) -> Vec<CheapSearchHit> {
+        if pattern.is_empty() || pattern.starts_with("fts:") {
+            return Vec::new();
+        }
+        let mut hits = Vec::new();
+        let mut path_buf = String::new();
+        self.for_each_dir(|path_id, de| {
+            if hits.len() >= DEFAULT_SEARCH_LIMIT {
+                return;
+            }
+            for (&nid, versions) in &de.names {
+                if hits.len() >= DEFAULT_SEARCH_LIMIT {
+                    break;
+                }
+                let name = self.pool.get(nid);
+                if name.is_empty() {
+                    continue;
+                }
+                for &soa_idx in versions {
+                    if hits.len() >= DEFAULT_SEARCH_LIMIT {
+                        break;
+                    }
+                    let i = soa_idx as usize;
+                    if self.soa.flags[i] & 4 != 0 {
+                        continue;
+                    }
+                    let link = self.pool.get(self.soa.linkname_id[i]);
+                    if link == DUMPDIR_DELETE_LINKNAME {
+                        continue;
+                    }
+                    self.write_fullpath(&mut path_buf, path_id, name);
+                    if locate_pattern_matches(pattern, &path_buf, name) {
+                        let oh = self.soa.offsetheader[i];
+                        hits.push(CheapSearchHit {
+                            path: path_buf.clone(),
+                            name: name.to_string(),
+                            size: self.soa.size[i] as i64,
+                            mtime: self.soa.mtime[i],
+                            offsetheader: if oh < 0 { None } else { Some(oh) },
+                        });
+                    }
+                }
+            }
+        });
+        hits.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.offsetheader.cmp(&b.offsetheader))
+        });
+        hits.truncate(DEFAULT_SEARCH_LIMIT);
+        hits
+    }
+
+    fn write_fullpath(&self, buf: &mut String, path_id: u32, name: &str) {
+        buf.clear();
+        let segs = self.paths.segs(path_id);
+        if segs.is_empty() {
+            buf.push('/');
+            buf.push_str(name);
+            return;
+        }
+        buf.push('/');
+        for (i, &sid) in segs.iter().enumerate() {
+            if i > 0 {
+                buf.push('/');
+            }
+            buf.push_str(self.pool.get(sid));
+        }
+        buf.push('/');
+        buf.push_str(name);
+    }
+
+    fn for_each_dir(&self, mut f: impl FnMut(u32, &DirEntries)) {
+        if let Some(shards) = &self.shards {
+            for sh in shards {
+                for (&pid, de) in sh {
+                    f(pid, de);
+                }
+            }
+        } else {
+            for (&pid, de) in &self.dirs {
+                f(pid, de);
+            }
+        }
     }
 
     /// Stream name / mode / size / open cookie from the pool + SoA (no [`FileInfo`]).
@@ -1212,5 +1314,170 @@ mod tests {
                 .expect("lookup_open_cookie");
             assert_eq!(d.cookie, cookie, "cookie {}", d.name);
         }
+    }
+
+    fn take_to_file_info_count() -> u64 {
+        TO_FILE_INFO_COUNT.with(|c| c.replace(0))
+    }
+
+    fn cheap_paths(hits: &[CheapSearchHit]) -> Vec<&str> {
+        hits.iter().map(|h| h.path.as_str()).collect()
+    }
+
+    fn generated_row(path: &str, name: &str, oh: i64) -> FileRow {
+        FileRow::new(
+            path,
+            name,
+            oh,
+            oh + 32,
+            4,
+            1.0,
+            0o100644,
+            0,
+            "",
+            0,
+            0,
+            false,
+            false,
+            true,
+            0,
+        )
+    }
+
+    fn dumpdir_row(name: &str, oh: i64) -> FileRow {
+        FileRow::new(
+            "",
+            name,
+            oh,
+            oh + 32,
+            0,
+            1.0,
+            0o100644,
+            0,
+            DUMPDIR_DELETE_LINKNAME,
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        )
+    }
+
+    /// Regression: SoA `scan_glob` matches SQL GLOB twins without `FileInfo`.
+    #[test]
+    fn scan_glob_twins_search_glob() {
+        let mut b = MemIndexBuilder::new();
+        b.push_row(&row("", "a.fits", 0));
+        b.push_row(&row("/dir", "b.fits", 512));
+        b.push_row(&row("", "readme.txt", 1024));
+        b.push_row(&row("/dir", "nested.txt", 1536));
+        let mem = b.finish();
+        let _ = take_to_file_info_count();
+
+        let hits = mem.scan_glob("*.fits");
+        assert_eq!(
+            take_to_file_info_count(),
+            0,
+            "scan_glob must not build FileInfo"
+        );
+        let paths: Vec<&str> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert_eq!(paths, vec!["/a.fits", "/dir/b.fits"]);
+        assert_eq!(hits[0].name, "a.fits");
+        assert_eq!(hits[0].size, 4);
+        assert_eq!(hits[0].mtime, 1.0);
+        assert_eq!(hits[0].offsetheader, Some(0));
+
+        let dir = mem.scan_glob("/dir/*");
+        assert_eq!(cheap_paths(&dir), vec!["/dir/b.fits", "/dir/nested.txt"]);
+
+        let rel = mem.scan_glob("dir/*.fits");
+        assert_eq!(cheap_paths(&rel), vec!["/dir/b.fits"]);
+
+        let exact = mem.scan_glob("readme.txt");
+        assert_eq!(cheap_paths(&exact), vec!["/readme.txt"]);
+
+        let stars = mem.scan_glob("**/*.fits");
+        assert_eq!(
+            cheap_paths(&stars),
+            vec!["/dir/b.fits"],
+            "** collapses to *; slash means full-path GLOB /*/*.fits"
+        );
+
+        let like = mem.scan_glob("%.txt");
+        assert_eq!(cheap_paths(&like), vec!["/dir/nested.txt", "/readme.txt"]);
+
+        assert!(mem.scan_glob("nope").is_empty());
+        assert!(mem.scan_glob("").is_empty());
+        assert!(mem.scan_glob("fts:fits").is_empty());
+    }
+
+    /// Regression: generated parents and dumpdir tombstones are not SoA locate hits.
+    #[test]
+    fn scan_glob_skips_generated() {
+        let mut b = MemIndexBuilder::new();
+        b.push_row(&row("", "keep.fits", 0));
+        b.push_row(&generated_row("", "ghost.fits", 512));
+        b.push_row(&dumpdir_row("deleted.fits", 1024));
+        let mem = b.finish();
+        let hits = mem.scan_glob("*.fits");
+        assert_eq!(cheap_paths(&hits), vec!["/keep.fits"]);
+    }
+
+    /// Regression: two offsetheaders, same catalog path — SoA emits both rows.
+    #[test]
+    fn scan_glob_two_offsetheader_same_path() {
+        let mut b = MemIndexBuilder::new();
+        b.push_row(&row("/dir", "a.fits", 0));
+        b.push_row(&row("/dir", "a.fits", 512));
+        let mem = b.finish();
+        let hits = mem.scan_glob("*.fits");
+        assert_eq!(hits.len(), 2, "every version index, not last-only");
+        assert_eq!(hits[0].offsetheader, Some(0));
+        assert_eq!(hits[1].offsetheader, Some(512));
+        assert_eq!(hits[0].path, "/dir/a.fits");
+        assert_eq!(hits[1].path, "/dir/a.fits");
+    }
+
+    /// Regression: locate `*.fits` on a 200k-row synthetic SoA builds 0 FileInfo.
+    #[test]
+    fn scan_glob_200k_synthetic_no_fileinfo() {
+        let n: u32 = 200_000;
+        let mut b = MemIndexBuilder::new();
+        for i in 0..n {
+            let name = if i % 100 == 0 {
+                format!("f{i}.fits")
+            } else {
+                format!("f{i}.dat")
+            };
+            b.push_row(&row("", &name, i64::from(i) * 512));
+        }
+        let mem = b.finish();
+        let _ = take_to_file_info_count();
+
+        let hits = mem.scan_glob("*.fits");
+        assert_eq!(
+            take_to_file_info_count(),
+            0,
+            "scan_glob FileInfo-count must be 0"
+        );
+        assert_eq!(hits.len(), 2_000, "1% of 200k are *.fits");
+        assert!(hits.iter().all(|h| h.path.ends_with(".fits")));
+
+        let dense = mem.scan_glob("*");
+        assert_eq!(take_to_file_info_count(), 0);
+        assert_eq!(
+            dense.len(),
+            DEFAULT_SEARCH_LIMIT,
+            "dense * still 0 FileInfo; cap at DEFAULT_SEARCH_LIMIT"
+        );
+
+        let listed = mem.list("/").expect("fat list");
+        assert_eq!(
+            take_to_file_info_count(),
+            u64::from(n),
+            "fat list() FileInfo count == N"
+        );
+        assert_eq!(listed.len(), n as usize);
     }
 }
