@@ -4,10 +4,10 @@
 |-------|--------|
 | **Item** | [`docs/tasks/vectorize-steal-patterns.md`](../vectorize-steal-patterns.md) **V-2** (partial, M) |
 | **Date** | 2026-08-28 |
-| **Status** | Draft plan — **do not implement from this file until skeptic review ends ACCEPT** |
+| **Status** | **BLOCKED** (skeptic cap 3; sweep 3 was REVISE). Last findings folded; not re-reviewed. **Do not implement.** |
 | **Steal** | Cloudflare Vectorize *systems* pattern only: immutable snapshot objects + atomic root pointer. **Not** IVF, PQ, ANN, centroid files, or a split of the 0.7.x `files` table |
 | **Pairs with** | G-2 portable index (`done`), V-3 read-through cache (`todo`, needs this etag/id), V-4 WAL coordinator (`partial`, later flips this pointer), F-2 incremental sidecar patch |
-| **Ownership** | `ratarmount-index` (pointer types + flip/open helpers) · `ratarmount` factory/CLI (`-c`, `--publish-index`, `--index-id`) · `ratarmount-http` (serve pointer + current blob) · compositing F-2 persist is a **consumer** of the flip helper, not a second pointer format |
+| **Ownership** | `ratarmount-index` (pointer types + flip/`open_for_snapshot_copy`) · `ratarmount` factory/CLI/`find.rs` (`-c`, `--publish-index`, `--index-id`) · `ratarmount-http` (per-GET pointer→blob) · compositing + `overlay_commit.rs` consume the flip helper (not a second pointer format) |
 
 ---
 
@@ -176,7 +176,7 @@ One digest field. User spec is `{schema, index_id, etag/sha256, created, optiona
 | Field | Required | Role |
 |-------|----------|------|
 | `schema` | yes | Constant `ratarmount.index.pointer.v1`. Reject unknown. |
-| `index_id` | yes | **Generation** id. Format `{unix_ms}-{16 lowercase hex}` from `SystemTime` + 8 random bytes (or `sha2` of pid+time+path). **No `ulid` / `uuid` crate.** Unique per flip even if bytes match a previous `-c`. V-4 jobs and `--index-id` bind here. |
+| `index_id` | yes | **Generation** id. Format `{unix_ms}-{16 lowercase hex}` from `SystemTime` + **8 random bytes** (hex). **No `ulid` / `uuid` crate. No sha2-of-pid variant.** Unique per flip even if bytes match a previous `-c`. V-4 jobs and `--index-id` bind here. |
 | `etag` | yes | **Only** digest field: `sha256:` + 64 lowercase hex of the sealed, checkpointed blob. V-3 cache key. If a legacy/extra `sha256` key appears, **fail closed** unless it equals `etag` with the prefix stripped (hex case-insensitive). Do not write `sha256` on new pointers. |
 | `created` | yes | RFC 3339 UTC. |
 | `previous_id` | no | Prior `index_id`. Omitted on first snapshot. keep-last-K walk. |
@@ -246,11 +246,11 @@ Two synthesizers: CAS on pointer bytes. If CAS loses, re-read and follow the tab
 |---------|-------|-----|
 | `-c` / `clear_index_cache` / failed warm + rebuild | `create_writable` unlinks conventional | Allocate unpublished tmp/versioned path; format crates write **there**; flip once |
 | First cold index | Create at conventional | Same: build off to the side, flip |
-| F-2 `patch_sidecar_if_present` (interval + on-exit) | `open_writable` + in-place txn | Sequence below. On-exit: flip, do **not** reopen in-process. Interval: `overlay_commit.rs` `reopen_live_archive` + `sidecar_path_for_patch` must open **pointer `blob` / `ResolvedIndex.location`**, not `resolve_index_location(..., false)` conventional. `replace_base` `MountSource` catalog fd = N+1. Never `Connection::open` conventional. |
+| F-2 `patch_sidecar_if_present` (interval + on-exit) | `open_writable` + in-place txn | Sequence below. On-exit: flip, do **not** reopen in-process. Interval: `reopen_live_archive` + `sidecar_path_for_patch` open **pointer `blob` / `ResolvedIndex.location`**. `replace_base` catalog fd = N+1. **Writers** never `create_writable` / `open_writable` conventional (Goal 2). Readers may still RO-open conventional when there is **no** pointer. |
 | ZIP `--commit-overlay` remount rebuild | `create_writable(conventional)` after failed warm | Same flip path as cold rebuild |
 | `--publish-index` / `--publish-index-to` | Atomic copy of live path | Copy **current snapshot bytes**. Rehash; **refuse** to write a dest pointer whose `etag` ≠ digest of bytes copied. Dest conventional is SQLite magic, not JSON. Still no S3 PUT |
 | `--index-minimum-file-count` | `remove_file` after side tables | Count on **unpublished tmp before flip**. Below minimum: delete tmp, do **not** write pointer/conventional. If a prior pointer exists, treat as “absent”: remove pointer + old conventional (versioned N may stay until keep-last-K). Never flip then discard |
-| `--hashes` after open (`main.rs`) | `open_writable` published path | Either run on unpublished tmp **before** flip (preferred when hashes were requested at open), or generation-changing COW (`VACUUM INTO` + hash + flip). **Forbidden** on the published filename |
+| `--hashes` after open (`main.rs` ~851–914) | `open_writable` after `build_mount_source_ex` | When `--hashes` is on `OpenOptions` at open, fill on the unpublished blob **before the one flip** (same-generation step 5). The `main.rs` after-open `open_writable` becomes a **no-op / delete**. **No** second flip / COW for the same mount open. **Forbidden** on the published filename |
 | V-4 executor finish (later) | n/a | Same `flip_local_pointer`; CAS `expected_previous_id` |
 
 ### Same-generation enrichment (unpublished tmp only)
@@ -259,7 +259,7 @@ Today `open_path_impl` resolves, opens the format, persists side tables, discard
 
 **Required factory sequence** (do not flip inside `open_path` before AutoMount):
 
-1. Allocate `index_id` + unpublished `location` (`versioned_blob_path` or `.tmp`).
+1. Allocate `index_id` + unpublished `location` = **final** `versioned_blob_path` (not a `.tmp` that will be renamed after open).
 2. `open_path` / a `MountBundle` **returns `ResolvedIndex`** (unpublished). Do **not** set `OpenOptions.index_file_path` to the conventional name. That field is **not** the live catalog path.
 3. Pass `location` into every format `create_writable_for_open`.
 4. Persist gzip / rapidgzip / zstd / bzip2 on **tmp**.
@@ -267,9 +267,11 @@ Today `open_path_impl` resolves, opens the format, persists side tables, discard
 6. `--index-minimum-file-count`: count on tmp; maybe abort (no flip, no AutoMount persist).
 7. Thread `location` into `apply_compositing` — **do not re-resolve** mid-build. Eager `-r` nested stores on **tmp**.
 8. Checkpoint, hash, **flip once after the eager scan**.
-9. After flip: `write_nested_index = false` (interior mutability on `AutoMountOptions` / layer). Lazy `-l` must not persist.
+9. Nested persist flag (no “interior mutability” on `AutoMountOptions` — it is a plain `Clone` struct copied into `AutoMountLayer` then `Arc<dyn MountSource>`; flipping the options bool after `apply_compositing` is a no-op):
+   - **Lazy (`-l`)** ⇒ `write_nested_index: false` **at `AutoMountOptions` construction**. All nested opens are post-flip; v1 skip.
+   - **Eager** ⇒ `write_nested_index: true` **only for** `new_with_openers` → `scan_and_mount` (`automount.rs` ~528–531), which finishes **before** flip. Do not persist after `scan_and_mount` returns.
 
-Do **not** flip after `files` and again after RGZI. Flip-before-eager makes `try_store_nested_durable` hit a published blob or the conventional create path (`create_writable` unlinks `{archive}.index.sqlite`) while the real blob is elsewhere; the post-flip conventional copy would wipe those `nestedindexes`.
+Do **not** flip after `files` and again after RGZI. Flip-before-eager makes `try_store_nested_durable` hit a published blob or the conventional create path while the real blob is elsewhere; the post-flip conventional copy would wipe those `nestedindexes`.
 
 ### After flip (forbidden vs skip)
 
@@ -296,14 +298,14 @@ Do **not** flip after `files` and again after RGZI. Flip-before-eager makes `try
 All new files in the **same directory** as the destination pointer (POSIX `rename` atomic).
 
 1. Allocate `index_id`.
-2. Build into unpublished `{stem}.index.{id}.tmp` (or `NamedTempFile` in that parent). **Do not** unlink `{archive}.index.sqlite` first. **Do not** reuse the conventional filename.
+2. **Unpublished location is the final versioned filename** `{stem}.index.{id}.sqlite` (same path AutoMount and format crates will keep open). **Do not** rename the blob after any connection has opened it (WAL is per path; rename-after-open is the in-process hardlink case). **Do not** unlink `{archive}.index.sqlite` first. **Do not** reuse the conventional filename. Crash-before-pointer may leave an orphan `{id}.sqlite` not on the `previous_id` chain; keep-last-K / next `-c` may unlink orphans not named by the current pointer.
 3. Insert `files`, seal (`finalize_build` / drop `filestmp` / `parentfolders`).
 4. Same-filename side tables + eager nested + optional hashes on that unpublished file.
 5. `PRAGMA wal_checkpoint(TRUNCATE); PRAGMA journal_mode = DELETE;` (or OFF). Close writers. Assert no `{path}-wal` / `{path}-shm` (or 0-byte unlinked).
 6. `fsync` file + parent dir (best-effort; log if unsupported).
 7. SHA-256 → `etag`.
-8. `rename` tmp → `{stem}.index.{index_id}.sqlite`.
-9. Write pointer JSON to a tempfile in the same dir, fsync, `rename` onto `{stem}.index.pointer.json`. **This is the commit.**
+8. Blob is already at `{stem}.index.{index_id}.sqlite` (no post-open rename).
+9. Write pointer JSON to a tempfile in the same dir, fsync, `rename` onto `{stem}.index.pointer.json`. **This is the commit.** Pointer rename and conventional copy are the only post-open replaces.
 10. Atomic **copy** onto conventional `.index.sqlite` (G-2). Failure here is not a lost commit; repair table pointer-wins + copy.
 11. keep-last-K: walk `previous_id`; unlink versioned files beyond K **only after** `sha256(conventional) == pointer.etag`. **Never** unlink the `index_id` named by the current pointer. `K=0` means **no previous** versioned files; the **current** `blob` name always remains.
 
@@ -346,9 +348,12 @@ Blob-export `Link` on `GET /.ratarmount-control/index.sqlite` is **not** inbound
 
 ## HTTP export
 
-**Pick one algorithm:** every `GET` / Range of `/.ratarmount-control/index.sqlite` **re-reads the pointer** and opens `blob` after `etag` verify. Do **not** serve the conventional copy. Do **not** capture `HttpOptions.index_sidecar` once at startup as the only path (`main.rs` ~917 / ~1350–1356 today). `handle_index_sidecar` today `metadata` then later `File::open` (`handler.rs` ~1324–1398) — a captured conventional path + tempfile `persist` can mix sizes across a flip.
+HTTP follows **Goal 2** (do not reuse “never conventional” for readers):
 
-Tests: Range mid-flip does not mix N/N+1 `Content-Length`; interval commit + `--http` serves N+1 bytes.
+- **Valid pointer:** every GET/Range **re-reads the pointer** and opens `blob` after `etag` verify. Never the conventional copy.
+- **No pointer:** serve conventional **RO** (`--http --no-recreate-index` on a Python/legacy sidecar must not 404).
+
+Do **not** capture `HttpOptions.index_sidecar` once at startup as the only path when a pointer exists (`main.rs` ~917 / ~1350–1356 today). Tests: Range mid-flip does not mix N/N+1 sizes; interval + `--http` with a pointer serves N+1.
 
 Add `GET /.ratarmount-control/index.pointer` (JSON, new media type). Inbound clients still parse **archive** HEAD, not tree export. Leave blob `Link` as today.
 
@@ -397,7 +402,7 @@ ResolvedIndex {
 - `flip_local_pointer(...) -> Result<IndexPointer>`
 - `repair_index_pointer(...)` implements the repair table
 
-`create_writable`: unpublished tmp/versioned paths only. **Refuse** if `path` is a `possible_index_paths` conventional candidate or the conventional sibling of an existing pointer (prevents leaked factory paths from today’s unlink). Test: conventional inode unchanged until the post-flip copy.
+`create_writable`: **allowlist**, not a folder-aware denylist (the function only sees a path). Accept only `{stem}.index.{id}.sqlite` where `id` matches `{unix_ms}-{16 hex}`. Refuse `*.index.sqlite` (no id), `--index-file custom.db`, and any other stable name — pointer present or not. First cold create still uses a versioned id name, not conventional. Test: `create_writable("archive.tar.index.sqlite")` errors and does not `remove_file`.
 
 `resolve_index_location` today returns `IndexLocation`. **Slice 2 migrates every caller** (do not leave these on conventional after a pointer exists):
 
@@ -412,9 +417,11 @@ ResolvedIndex {
 | `--hashes` after mount | `main.rs` ~876 | `open_writable` |
 | `resolved_on_disk_index` / publish / HTTP sidecar | `main.rs` ~917, ~1324, ~1350 | captured path |
 
-Either change `resolve_index_location` to return `ResolvedIndex` or add `resolve_index_v2` and switch all of the above in slice 2. Do **not** set `OpenOptions.index_file_path` to conventional after a pointer exists.
+Add **`resolve_index_v2` → `ResolvedIndex`**. Keep `resolve_index_location` / `IndexLocation` for slice-1 factory. Slice 2 switches every caller in the table above. Do **not** set `OpenOptions.index_file_path` to conventional after a pointer exists.
 
-Factory (orchestrator-owned `factory.rs`) follows the numbered sequence in **Same-generation enrichment** (return `ResolvedIndex` / `MountBundle`; flip **after** eager AutoMount).
+`MountBundle` **already exists** (`factory.rs` ~3117–3121: `{ source, _remotes }`; returned by `build_mount_source_ex`). **Extend that struct** with `ResolvedIndex`. `open_path` stays an `Arc<dyn MountSource>` opener unless a slice-2 caller needs the bundle.
+
+Factory (orchestrator-owned `factory.rs`) follows the numbered sequence in **Same-generation enrichment** (flip **after** eager AutoMount).
 
 **Slice 1** (`ratarmount-index` types + flip + `open_for_snapshot_copy` + tests) is mergeable **without** product behavior only if factory still opens conventional. The two-process `-c` catalog test is **deferred to slice 2**. Slice 1 must not claim the torn-read bug is fixed.
 
@@ -434,10 +441,11 @@ Name/doc with `Regression:` and the symptom.
 | `ratarmount-index` | tarstats | Flip then replace archive → `check_tarstats_matches_archive` still `Mismatch` |
 | `ratarmount-index` | keep-last-K | Third flip with `K=2` deletes oldest versioned file, not current. `K=0` leaves current `blob` on disk |
 | `ratarmount-index` | discard-minimum | Below-threshold tmp is deleted; no pointer written; prior pointer removed |
-| `ratarmount` factory / bin | two processes | Mount A holds a **catalog** lookup (path exists / size from index) while B `-c`; A’s catalog rows unchanged. Remount sees N+1 if archive unchanged |
+| `ratarmount` factory / bin | two processes | **A is pointer-bound** (prior V-2 pointer, or default `write_index` that synthesized one) and opened `ResolvedIndex.location`. A holds a **catalog** lookup while B `-c`; A’s catalog rows unchanged. Remount sees N+1 if archive unchanged. A `--no-recreate-index` **without** a pointer is the Goal 2 residual and is **out of scope** for this test (foreign Python `-c` only) |
 | `ratarmount` bin | `--index-id` clap-steal | `num_args = 1` |
 | `ratarmount` bin | `--publish-index` | Dest `.index.sqlite` is SQLite magic; dest pointer `etag` == digest of dest bytes; refuse if they would diverge |
 | `ratarmount` bin | `find` | `open_read_only` only; `{published}-wal` does not appear |
+| `ratarmount-index` | `open_for_snapshot_copy` | `VACUUM INTO` succeeds on this helper and **fails** on `open_read_only` (`query_only`) |
 | F-2 | `patch_sidecar_if_present` | New `index_id`; filename N still has old suffix rows. Source is `open_for_snapshot_copy` (not `open_read_only`). Existing `regression_incremental_*` / `live_commit*` stay green |
 | F-2 | interval reopen | Replacement index path equals N+1; conventional is not `Connection::open`’d |
 | HTTP | pointer GET + Range | New path Content-Type; `index_content_type` still sqlite; Range mid-flip does not mix sizes; interval + `--http` serves N+1 |
@@ -467,7 +475,7 @@ No nested/tmp matrix change unless factory open/spool behavior changes (it shoul
 ## Risks / residuals (not open product questions)
 
 1. **Lazy nested after flip** — v1 skip persist. Follow-up: batched COW-flip (V-4-shaped), not per-open.
-2. **F-2 `VACUUM INTO` cost** — full sidecar copy then suffix patch. Still cheaper than `create_index_body` of the prefix. No `backup` feature.
+2. **F-2 `VACUUM INTO` cost** — full sidecar copy then suffix patch. Still cheaper than `create_index_body` of the prefix. No `backup` feature. Source must be `open_for_snapshot_copy` (not `open_read_only` / `query_only`).
 3. **WAL leftovers** — checkpoint + journal DELETE mandatory; tested.
 4. **G-2 conventional copy lag** — pointer is commit; repair recopies.
 5. **MSRV 1.74** — no ULID crate; `sha2` already in `ratarmount-index`.
@@ -477,8 +485,8 @@ No nested/tmp matrix change unless factory open/spool behavior changes (it shoul
 
 ## Suggested implementation slices (after ACCEPT)
 
-1. `ratarmount-index`: pointer types, `ResolvedIndex`, `flip_local_pointer`, `open_for_snapshot_copy`, `create_writable` refuse conventional, repair, tests. Factory unchanged → **do not** claim torn-read fixed.
-2. Factory `MountBundle` + flip **after** eager AutoMount. Migrate every `resolve_index_location` caller. Two-process catalog regression. `try_load_*` / `find.rs` RO. `--hashes` before flip.
+1. `ratarmount-index`: pointer types, `ResolvedIndex`, `resolve_index_v2`, `flip_local_pointer`, `open_for_snapshot_copy` (+ VACUUM vs `query_only` test), `create_writable` **allowlist**, repair, tests. Factory unchanged → **do not** claim torn-read fixed.
+2. Extend existing `MountBundle` with `ResolvedIndex`. Flip **after** eager AutoMount. `write_nested_index` false for lazy at construction. Migrate every listed caller to `resolve_index_v2`. Two-process catalog test (A pointer-bound). `find.rs` RO. `--hashes` before flip; delete `main.rs` after-open writable.
 3. F-2 `VACUUM INTO` via `open_for_snapshot_copy` + flip. `reopen_live_archive` / `sidecar_path_for_patch` on blob N+1.
 4. CLI `--index-id` / `--index-keep-snapshots` + `--publish-index` pointer + clap-steal.
 5. HTTP pointer GET + docs + AGENTS.md row + steal-patterns `created`.
@@ -510,6 +518,6 @@ Run new filters **separately** (`cargo test` does not treat `|` as OR).
 |-------|-------|---------|-------------|
 | 1 | bc-28264c67 | **REVISE** (14 findings) | WAL-per-path: V-2 opens versioned filename only; no hardlinks; two-process test is catalog rows not `cat`. Post-flip mutation forbidden; lazy nested skip; publish rehash. F-2 = `VACUUM INTO` only (no `fs::copy`, no backup feature). Repair table (foreign Python vs pointer-wins). `K=0` keeps current blob. Writer table: hashes, rapidgzip, `try_load_*` RO, ZIP rebuild, discard-before-flip. `possible_pointer_paths` + same-dir `blob` names. No ULID crate. Pointer fetch helper; blob `Link` not inbound. One `ResolvedIndex` API; not `OpenOptions`. Single `etag` field; `created`; steal-patterns rename in landing PR. `INDEX_VERSION` echo-only. `patch.rs` citation fixed to ~27–30. |
 | 2 | bc-82260cee | **REVISE** (9 major, 2 nits) | `open_for_snapshot_copy` (no `query_only`); factory flip **after** eager AutoMount + thread `ResolvedIndex` (no mid-build re-resolve); `find.rs` all RO; `reopen_live_archive` / `sidecar_path_for_patch` / HTTP per-GET pointer→blob; repair: prune after conventional matches, synthesize copy-first, foreign only if pointer blob tarstats fail; Goal 2 exception for no-pointer + `!write_index`; `index_path_stem` longest-first + `--index-file custom.db` + XDG leading `_`; list every `resolve_index_location` caller for slice 2; `create_writable` refuse conventional; lazy `-l` tests + README. |
-| 3 | (pending) | | |
+| 3 | bc-e8edb5d5 | **REVISE** (6 major, 3 nits) | Folded: lazy `write_nested_index: false` at construction (no AutoMountOptions interior mut); `--hashes` only before the one flip; HTTP follows Goal 2 (no-pointer ⇒ conventional RO); two-process test A is pointer-bound; `create_writable` allowlist `{stem}.index.{id}.sqlite` only; unpublished path is final versioned name (no post-open blob rename); extend existing `MountBundle`; `resolve_index_v2`; `index_id` = time + 8 random bytes; VACUUM helper unit test. |
 
-**Plan verdict:** sweep 2 folded; awaiting sweep 3 (cap). Target: **ACCEPT** or **BLOCKED**.
+**Plan verdict: BLOCKED** — sweep 3 did not ACCEPT; review cap is 3 (no fourth skeptic). Last majors were folded into the text above but **not** re-reviewed. Do not implement from this PR until a later review ACCEPTs.
