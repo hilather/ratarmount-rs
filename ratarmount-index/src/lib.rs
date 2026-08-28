@@ -3363,7 +3363,7 @@ mod tests {
     /// Regression: fat `FileRow` window / ZIP 1-row insert — SoA flush must match
     /// `insert_files_batch` SQL (including `type`) and REPLACE / empty-name split.
     #[test]
-    fn regression_soa_batch_matches_file_row_sql_and_replace() {
+    fn regression_insert_files_batch_soa_matches_file_row_sql_and_replace() {
         let rows = sample_logical_rows();
         let idx_a = SqliteIndex::create_writable(None).unwrap();
         idx_a.begin_write().unwrap();
@@ -3426,7 +3426,7 @@ mod tests {
 
     /// Regression: fat `FileRow` window / ZIP 1-row insert — compact_only skips SQL.
     #[test]
-    fn regression_soa_compact_only_skips_sql() {
+    fn regression_insert_files_batch_soa_compact_only_skips_sql() {
         let opts = OpenOptions {
             index_compact_only: true,
             ..OpenOptions::default()
@@ -3460,7 +3460,7 @@ mod tests {
     }
 
     #[test]
-    fn soa_interns_identical_full_path_ids() {
+    fn insert_files_batch_soa_interns_identical_full_path_ids() {
         let mut soa = FileRowSoa::with_capacity(2);
         soa.push(
             "/same/full/path",
@@ -3505,7 +3505,7 @@ mod tests {
 
     /// Regression: fat `FileRow` window / ZIP 1-row insert — clear resets the window pool.
     #[test]
-    fn regression_soa_clear_drops_window_pool() {
+    fn regression_insert_files_batch_soa_clear_drops_window_pool() {
         let mut soa = FileRowSoa::with_capacity(2);
         soa.push(
             "/old/path",
@@ -3630,7 +3630,7 @@ mod tests {
     }
 
     #[test]
-    fn regression_soa_open_writable_sql_only() {
+    fn regression_insert_files_batch_soa_open_writable_sql_only() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("side.sqlite");
         {
