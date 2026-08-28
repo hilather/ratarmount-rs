@@ -126,6 +126,8 @@ Residual (API-only): Python/SQLite `zstdblocks` / `bzip2blocks` and `GzipSeekInd
 - [ ] Overlay file-info cache: compact cookie + size/mtime, not full `FileInfo` (watch size-0 / create residuals)
 - [ ] Regression: create then cat empty overlay file
 
+Plan (not implemented): [`plans/p2-overlay-cookies.md`](plans/p2-overlay-cookies.md). V-4 commit queue is out of that plan.
+
 ### Parallel nested open pools
 
 - [ ] Per-worker string pool / arena during eager parallel nested open, then merge into parent pool
