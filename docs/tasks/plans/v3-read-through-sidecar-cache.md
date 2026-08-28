@@ -7,7 +7,7 @@
 | **Date** | 2026-08-28 |
 | **Status** | Plan — skeptic-plan-review in progress |
 | **Effort** | L (implement); this document is plan-only |
-| **Ownership** | `ratarmount-index` (cache + keys) · `ratarmount` `remote_open.rs` (HTTP/OCI fill) · `ratarmount-compress` (seek-map populate) · factory glue is orchestrator unless the implement task owns `factory.rs` |
+| **Ownership** | `ratarmount-index` (cache + keys) · `ratarmount` `remote_open.rs` (HTTP/OCI fill) · `ratarmount/src/factory.rs` `resolved_index` / `remote_index_setup` / nested durable (orchestrator unless the implement task owns factory) · not `ratarmount-compress` (seek maps already live in index + factory import) |
 | **Depends** | **V-2** immutable index + atomic root pointer (`index_id`, `etag`/`sha256`, `archive_tarstats`) |
 | **Not** | Cloudflare Durable Objects / Queues / colo Cache · G-3 payload / uncompressed member-body cache · SQLite-over-HTTP VFS in v1 |
 
@@ -35,13 +35,16 @@ FUSE cannot hide a 100 ms RTT per 4 KiB if someone later pages a remote SQLi
 
 | Piece | Location | Behavior today |
 |-------|----------|----------------|
-| Discovery order | `ratarmount/src/remote_open.rs` `apply_remote_index_discovery` | Skip if `-c` / `clear_index_cache` / `:memory:` / explicit `--index-file`. Else `resolve_index_location` → if that path is a nonempty file, **return** (no HEAD, no sibling GET). Else HTTP `Link: rel="describedby"` on archive HEAD → `sibling_index_candidates` → OCI referrer on local miss. **No S3/GCS/Azure sibling GET** (G-2 residual). |
-| HTTP GET | `ratarmount-index/src/location.rs` `fetch_index_http` | `ureq::get` full body → kept tempfile (`RATARMOUNT_INDEX_TMPDIR` or std temp). **No `ETag` / `If-None-Match` / Range.** User-Agent `ratarmount-rs/0.1`. **No Basic/Cookie** (auth is on `ratarmount-remote` archive probes only). |
+| Discovery order | `ratarmount/src/remote_open.rs` `apply_remote_index_discovery` | Skip if `-c` / `clear_index_cache` / `:memory:` / explicit `--index-file` (`opts.index_file_path.is_some()`). Else `resolve_index_location` → if that path is a nonempty file, **return without setting `index_file_path`**. Else HTTP `Link: rel="describedby"` on archive HEAD → `sibling_index_candidates` → OCI referrer on local miss. |
+| Remount hit (actual) | `factory.rs` `remote_index_setup` → `resolved_index` → `resolve_index_location` | After discovery returns, live-Range open still resolves the URL-mangled folder candidate (`possible_index_paths`: `'/'` → `'_'`). **This is the remount warm path**, not only the discovery short-circuit. `check_tarstats_matches_archive` is a **no-op** when `archive_path` is a URL label (`!exists`). Seek-map import (`try_load_zstd_blocks` / gzip blob) uses the same no-op. |
+| Explicit `--index-file http(s)://` | `main.rs` → `OpenOptions.index_file_path` raw URL; `resolve_index_location` → `maybe_fetch_index_url` | Discovery **returns immediately** (explicit path set). Every process full-GETs. No pointer, no V-3, no auth. |
+| Object-store open | `open_s3_like` (`s3://` / `gs://` / `az://` / `ftp://` / `ipfs://`) | **Never calls** `apply_remote_index_discovery`. G-2 residual is not only “no sibling GET” — discovery is not invoked. |
+| HTTP GET | `ratarmount-index/src/location.rs` `fetch_index_http` | `ureq::get` full body → kept tempfile (`RATARMOUNT_INDEX_TMPDIR` or std temp). **No `ETag` / `If-None-Match` / Range.** User-Agent `ratarmount-rs/0.1`. **No Basic/Cookie** (`probe_http` already sends them; `ratarmount-index` must not depend on `ratarmount-remote` — inject the fetch). |
 | Materialize | `maybe_fetch_index_url` / `materialize_index_file` | `file://` → local path (no copy unless compressed). `http(s)://` → download. gzip/xz/zstd/bzip2 sidecar → decompress to a second tempfile; require `SQLite format 3\0`. |
-| Install | `try_install_remote_index` | Open RO → `tarstats()` required (missing → delete fetch, fail-open). `check_tarstats_matches_remote` → copy into `cache_dest` (first folder candidate) → set `opts.index_file_path`. |
+| Install | `try_install_remote_index` | Open RO → `tarstats()` required (missing → delete fetch, fail-open). `check_tarstats_matches_remote` → copy into URL-mangled `cache_dest` (first folder candidate) → set `opts.index_file_path`. |
 | Probe | `ratarmount-remote` `HttpProbe` | `content_length`, `accept_ranges`, `link`. **No ETag field.** |
-| OCI | `fetch_oci_index_referrer` | Nonempty local path → skip registry. Else Referrers API → blob GET to tempfile. Subject digest is content identity for the **layer**, not a V-2 `index_id`. |
-| Tests | `apply_remote_index_discovery_follows_archive_link` | Fake TCP server; asserts sidecar install. **No GET-count / remount cache assertion.** |
+| OCI | `fetch_oci_index_referrer` | Nonempty local path → skip registry (`return Ok(None)`). Else Referrers API → blob GET to tempfile. Subject digest is the **layer**, not a V-2 `index_id`. This skip is independent of the HTTP `path_is_nonempty_file` short-circuit. |
+| Tests | `apply_remote_index_discovery_follows_archive_link` | Fake TCP server; asserts sidecar install. **No GET-count / remount cache assertion.** Lives under `ratarmount` **bin** tests (`--bin ratarmount`), not `--lib` (crate has no `[lib]`). |
 
 `is_index_url` is `http(s)://` or `file://` only. `sibling_index_url` is http(s) only. `:memory:` is `IndexLocation::Memory` / `MEMORY_INDEX`.
 
@@ -168,52 +171,52 @@ Write: temp file in the same directory + `rename`. Partial files are not entries
 SidecarCacheKey {
   kind: Sidecar | SeekMap { table } | Rnib { member_storage_key },
   index_id: String,          // V-2
-  etag: String,              // V-2 etag/sha256 (lowercase hex if sha256)
+  etag: String,              // V-2 etag field — treat as **opaque** (do not sniff sha256 vs HTTP ETag)
   tarstats_fp: String,       // canonical: st_size + prefix + suffix + full (empty if absent)
   range: Option<(u64, u64)>, // v1: None == whole object
 }
 ```
 
-`table` for seek maps is one of `zstdblocks` | `bzip2blocks` | `gzipindexes` | `gzipindex` | `gztoolindex`.
-
-On-disk filename is a **hash of the key** (sha256 of a stable encoded tuple), not a URL. A sidecar URL / OCI digest is stored in the entry **manifest** for miss-fill and debug logs only.
+On-disk **Sidecar** filename is a hash of `(kind, index_id, etag, tarstats_fp, range)`, not a URL. Entry **manifest** stores locator + **`blob_sha256` always computed** over the SQLite image (compare this on hit; do not assume `etag == sha256`). SeekMap/Rnib kinds are in-process only and do not need a filename.
 
 Same URL + new `index_id`/`etag` → different key → miss → fetch new blob. Old entry ages out via LRU. That is the V-2 payoff.
 
 URL-only collision test is mandatory: two pointers that share a locator string and differ in `etag` must not share a file.
 
+**V-3 `Sidecar` disk hits require a V-2 pointer.** No pointer → do not enter this key space (legacy path, §5.5).
+
 ### 5.3 Object kinds and fill
 
-**Network fill in v1 is sidecar-only** (HTTP GET / OCI blob GET / future V-2 object-store GET). Seek-map and RNIB entries are **derived** after a verified sidecar is open. They are not independently fetched from the network on `main`, and V-3 must not invent sibling URLs for them.
+**Network fill in v1 is sidecar-only** (HTTP GET / OCI blob GET / future V-2 object-store GET via `open_s3_like`, not discovery-only). Seek-map and RNIB are **not** independently fetched. V-3 must not invent sibling URLs for them.
+
+**Decision (sweep 1):** SeekMap / Rnib are **in-process only**, populated while the pointer is still in hand (discovery / explicit-URL install). They are a mount-lifetime LRU so a second `cat` / nested open in the **same process** does not re-query SQLite. They are **not** written to XDG.
+
+`try_load_nested_durable` / `try_load_zstd_blocks` / gzip-blob import **stay on today’s SQLite read**. `NestedOpenContext` has no `index_id` / `etag`; do **not** consult a disk `Rnib` key before opening the outer sidecar, and do **not** plumb new context fields in v1. Reuse `SqliteIndex::get_zstd_blocks` / `get_nested_index` / `NestedMemberKey::storage_key` — do not invent a new on-disk pair encoding.
 
 ```mermaid
 flowchart TD
   A[remote open] --> B{file:// or :memory: or -c?}
   B -->|yes| Z[existing path / no cache]
-  B -->|no| C[V-2 fetch pointer]
-  C --> D[lookup Sidecar key]
-  D -->|hit + checksum OK| E[install index_file_path]
+  B -->|no| C{V-2 pointer?}
+  C -->|absent| L[legacy URL-folder warm open §5.5]
+  C -->|present| D[lookup Sidecar key]
+  D -->|hit + blob_sha256 OK| E[set index_file_path to V-3 file]
   D -->|miss or corrupt| F[GET blob via locator]
   F --> G[check_tarstats_matches_remote]
   G -->|fail| H[cold index / fail-open]
   G -->|ok| I[fill Sidecar entry + rename]
   I --> E
   E --> J[open SQLite]
-  J --> K[extract seek maps + RNIB into LRU]
+  J --> K[optional in-process SeekMap/Rnib memo]
 ```
 
-| Kind | Value stored | Populate |
-|------|--------------|----------|
-| `Sidecar` | Exact sidecar bytes after decompress (SQLite image) **or** the compressed wire bytes plus a codec tag — pick **decompressed SQLite** so remount does not re-decompress | After `try_install_remote_index` would succeed |
-| `SeekMap` | Table payload: blob bytes for gzip* / gztool; canonical encoding of `(blockoffset, dataoffset)` pairs for zstd/bzip2 | After RO open of the installed sidecar |
-| `Rnib` | `nestedindexes.blob` bytes + fingerprint columns needed to accept/reject | Same open; one entry per `member_key` |
+| Kind | Persistence | Value | Populate |
+|------|-------------|-------|----------|
+| `Sidecar` | XDG + in-process | Decompressed SQLite image | Pointer-backed fill only |
+| `SeekMap` | In-process only | Reuse `get_zstd_blocks` / gzip blob bytes already in the open sidecar | Optional memo after RO open; not a remount identity |
+| `Rnib` | In-process only | `get_nested_index` result | Optional memo; nested open still reads outer SQLite |
 
-Extraction is best-effort: missing tables → no extra entries. Nested open (`try_load_nested_durable`) may consult the in-process/on-disk `Rnib` kind **before** opening the outer SQLite if the outer path is only needed for that blob. If the RNIB cache misses, fall through to today’s SQLite read.
-
-**Whole sidecar when small** is v1 for every sidecar we fetch (typical indexes are far under the 256 MiB cap). If a sidecar is larger than the remaining cap, either:
-
-- evict LRU until it fits, or
-- skip disk fill and keep a process-only mapping of the existing tempfile
+**Whole sidecar when small** is v1 for every pointer-backed sidecar we fetch (typical indexes are far under the 256 MiB cap). If a sidecar is larger than the remaining cap, either evict LRU until it fits, or skip disk fill and keep the existing tempfile process-only.
 
 Do not Range-slice a SQLite file in v1. `range` stays `None`.
 
@@ -221,42 +224,64 @@ Do not Range-slice a SQLite file in v1. `range` stays `None`.
 
 ### 5.4 Skip rules (hard)
 
-Do not **read or write** the V-3 cache when any of:
+Do not **read or write** the V-3 **Sidecar** disk cache when any of:
 
+- No V-2 pointer for this archive (legacy; §5.5)
 - Index spec is `:memory:` / `opts.index_in_memory`
-- Index spec is `file://` or a local filesystem path (including `maybe_fetch_index_url` after `file://` strip)
+- Index spec is `file://` or a local filesystem path that was **not** produced by a V-3 fill (including `maybe_fetch_index_url` after `file://` strip). After a pointer-backed install, `index_file_path` **is** a local V-3 file — that is a hit artifact, not a skip.
 - `opts.clear_index_cache` / `-c`
-- Archive input is not a remote discovery path (plain local file open)
-- Cache disabled (`RATARMOUNT_SIDECAR_CACHE_BYTES=0` and mem cap 0)
+- Cache disabled (`RATARMOUNT_SIDECAR_CACHE_BYTES=0` **and** mem cap 0). GET-count remount tests **must not** set the disk cap to 0.
 
-`file://` archives that still discover an **http(s)** `--index-file` **may** cache that remote index (the skip is on the **index source**, not the archive scheme). Local `--index-file /path` never fills.
+**`--index-file http(s)://`:** cache **only** when a V-2 pointer exists for the archive and the explicit URL is the pointer’s blob locator (or an equivalent fetch of that `index_id`). Discovery today returns early when `index_file_path.is_some()` — implement must **wire this path** (`resolve_index_location` / `maybe_fetch_index_url`), not only `apply_remote_index_discovery`. Without a pointer: legacy full GET every process; **no** V-3 fill (retracts an earlier “may cache” exception). Local `--index-file /path` never fills.
 
-### 5.5 Revalidation and fail-closed
+### 5.5 Revalidation, remount sites, pointer-absent policy
 
-1. Always fetch/parse the V-2 pointer when discovery runs (small object). Pointer miss → today’s fail-open discovery (Link / sibling) **without** treating a URL-named XDG file as a hit.
-2. Cache lookup uses pointer identity. Hit with matching on-disk checksum (sha256 of file == `etag` when etag is a sha256; otherwise store `sha256` alongside and compare).
-3. Still run `check_tarstats_matches_remote` against the **live archive** on first use of a hit in a process (pointer already carries `archive_tarstats`; a replaced archive must not keep a matching `index_id` if V-2 writers refresh tarstats — if they do not, this check is the backstop).
-4. Checksum mismatch, truncated file, or SQLite magic fail → `remove_file` + miss + refetch. Never serve a corrupt sidecar.
-5. **Remove or bypass** `path_is_nonempty_file` as a sufficient skip for remote URLs. That short-circuit is the stale-URL bug V-3 exists to close.
+V-3 identity is **not** closed by deleting one `if path_is_nonempty_file` in discovery. Remount hits today:
+
+| Site | File | What it does |
+|------|------|----------------|
+| Discovery short-circuit | `apply_remote_index_discovery` | Nonempty folder candidate → return; **`index_file_path` stays `None`** |
+| Factory resolve | `remote_index_setup` → `resolved_index` → `resolve_index_location` | Opens the URL-mangled `--index-folders` file for the URL label |
+| OCI referrer skip | `fetch_oci_index_referrer` | Nonempty local → skip registry |
+| Seek-map import | factory `try_load_*` | Trusts that sidecar; tarstats no-op on URL labels |
+
+**Pointer present (V-3 path):**
+
+1. Fetch/parse the V-2 pointer (small object). Lookup `Sidecar` by `(index_id, etag, tarstats_fp)`.
+2. Hit: compare stored `blob_sha256` to a fresh hash of the file; SQLite magic required. Then `check_tarstats_matches_remote` against the **live archive**.
+3. Miss / corrupt / tarstats fail: GET blob via locator, verify, `rename` into `sidecar-v3/`, set `opts.index_file_path` to **that** file.
+4. **Do not copy** pointer-backed installs into the URL-mangled `cache_dest`. Stop writing those files on the V-3 path so factory cannot treat them as identity.
+5. Bypass `apply_remote_index_discovery`’s nonempty-file skip **and** `fetch_oci_index_referrer`’s nonempty skip when a pointer is present (OCI is in v1 **only** for pointer-backed subjects; otherwise OCI stays on today’s `oci:{digest}` local file).
+6. Factory: when `opts.index_file_path` is already a V-3 cache path, `resolved_index` must use it and **must not** replace it with a URL-mangled folder candidate. Add a test that a leftover URL-named file with different bytes is ignored when the pointer etag matches the V-3 entry.
+
+**Pointer absent (legacy G-2; default until publishers write pointers):**
+
+- Keep today’s URL-folder warm open (`resolve_index_location` + `try_install_remote_index` `cache_dest` copy).
+- **Stale-URL risk remains documented.** Do not claim the parent “0 sidecar GETs + fail-closed on republish” bar on this path.
+- Pointer-less remotes **never** enter the V-3 GET-count test.
+- Fail-open Link/sibling GET still runs when the URL-file is missing.
+
+**Fail-closed (pointer path only):** checksum mismatch, truncate, or bad magic → `remove_file` + miss + refetch. Never serve a corrupt V-3 sidecar.
 
 ### 5.6 G-3 boundary (payload)
 
-The cache module exposes only the three kinds above. There is no `MemberBody` / `RangeWindow` kind. Callers in `factory.rs` / compress must not write decompressed member bytes into this LRU.
+The cache module exposes only the three kinds above. There is no `MemberBody` / `RangeWindow` kind. Callers must not write decompressed member bytes into this LRU.
 
-G3-A’s decoded-window LRU on `SeekableGzipReader` stays. V-3 stores **checkpoint blobs and offset maps**, which are indexes into compressed streams, not plaintext.
+G3-A’s decoded-window LRU on `SeekableGzipReader` stays (payload). Optional in-process SeekMap/Rnib memos are **indexes** (offset maps / RNIB / RGZI blobs), not plaintext members.
 
 ### 5.7 Module placement
 
 | New / change | Crate | Notes |
 |--------------|-------|--------|
-| `sidecar_cache.rs` | `ratarmount-index` | Key, encode/decode, disk LRU, checksum, skip predicates. **No** `ureq` if avoidable — fill is injected. |
-| `fetch_index_http` | `ratarmount-index` | After V-2: optional `If-None-Match` when etag is an HTTP ETag; still not the identity by itself. |
-| `apply_remote_index_discovery` / `try_fetch_http_index` / `try_install_remote_index` | `ratarmount/src/remote_open.rs` | Pointer → lookup → fill. Orchestrator-owned glue. |
-| `HttpProbe.etag` | `ratarmount-remote` | Optional; useful for logs / V-2 HTTP etag. Not sufficient as a sole key. |
-| Seek-map extract | factory + existing import helpers | After sidecar install |
-| RNIB extract / optional pre-SQLite get | `factory.rs` `try_load_nested_durable` | Keep fingerprint check identical |
+| `sidecar_cache.rs` | `ratarmount-index` | Key, encode/decode, disk LRU, `blob_sha256`, skip predicates. **No** `ureq` / **no** `ratarmount-remote` dep — fill is injected. |
+| Pointer-backed fill | `remote_open.rs` `apply_remote_index_discovery` / `try_fetch_http_index` / `try_install_remote_index` | Pointer → get_or_fill → set `index_file_path` to V-3 file. No URL-mangled `cache_dest` copy. |
+| Explicit `--index-file http(s)` | `resolve_index_location` / `maybe_fetch_index_url` (called from factory, not discovery) | Wire get_or_fill when pointer exists; else legacy GET. |
+| Factory remount | `factory.rs` `resolved_index` / `remote_index_setup` | Honor V-3 `index_file_path`; do not replace with URL-mangled candidate. |
+| OCI skip | `ratarmount-remote` `fetch_oci_index_referrer` | Bypass nonempty local skip when pointer present. |
+| Future S3/GCS/Azure | `open_s3_like` | Not discovery. When V-2 adds object-store pointer+blob GET, call `get_or_fill` from this arm. |
+| `HttpProbe.etag` | `ratarmount-remote` | Optional log aid. Not a sole key. Auth for sidecar GET lives here or in an injected fetcher — not in the cache module. |
 
-Do **not** add a new workspace crate for v1. Do **not** put cache logic in `ratarmount-remote` (that crate is Range/listing). Do **not** use Cloudflare types or a queue.
+Do **not** add a new workspace crate for v1. Do **not** put cache logic in `ratarmount-remote` (Range/listing). Do **not** change `try_load_nested_durable` to a disk RNIB lookup. Do **not** use Cloudflare types or a queue.
 
 ### 5.8 Concurrency
 
@@ -266,7 +291,7 @@ Do **not** add a new workspace crate for v1. Do **not** put cache logic in `rata
 
 Fill functions receive the same URL/locator discovery already uses. HTTP Basic/Cookie must apply to **sidecar GET** if they apply to the archive (today `fetch_index_http` does not send them — implement should fix that in the same train if V-2’s pointer/blob GET goes through `ratarmount-remote`; do not leave unauthenticated index GET next to an authenticated archive). Cache files are the blob bytes only.
 
-S3/GCS/Azure: no fill in v1. When V-2 adds pointer+blob GET for those schemes, call the same `SidecarCache::get_or_fill`. The parent’s “second mount of `s3://…`” regression is **then** in scope, not before.
+S3/GCS/Azure: no fill in v1. `open_s3_like` does not call discovery today. When V-2 adds pointer+blob GET, wire `get_or_fill` **inside `open_s3_like`** (and the `s3://` / `gs://` / `az://` arms), not by hoping discovery runs. Do **not** flip V-3 to `done` on HTTP-only. The parent’s `s3://…` remount regression is then in scope, not before.
 
 ---
 
@@ -279,12 +304,14 @@ Name tests `Regression:` + symptom. Prefer `ratarmount-index` unit tests for key
 | URL-only collision | index unit | Same locator, different `etag` → different files; putting B must not return A’s bytes |
 | Skip `file://` | index unit | `put`/`get` on `file://` or local path is a no-op (no XDG write) |
 | Skip `:memory:` | index unit | no-op |
+| No pointer → no V-3 file | index / bin | Pointer-absent remount may still warm-open a URL-mangled file; **no** `sidecar-v3/` write |
 | Corrupt fail-closed | index unit | Flip a byte in the sidecar file → next `get` is miss; fill closure runs |
-| Tarstats mismatch | index / remote_open | Pointer etag matches but live archive fingerprint does not → do not install cache hit; cold path |
-| HTTP remount GET count | `remote_open` fake TCP (extend `apply_remote_index_discovery_follows_archive_link`) | First mount: ≥1 GET of sidecar body. Second mount same pointer: **0** sidecar body GETs. Pointer HEAD/GET allowed. |
-| HTTP remount after pointer flip | same harness | New `index_id`/`etag` → sidecar GET happens; old entry not returned |
-| RNIB extract | index or factory | After fill, `Rnib` kind get returns the same bytes as `nestedindexes.blob` |
-| Seek-map extract | index or factory | `zstdblocks` pairs round-trip from cache kind |
+| Tarstats mismatch | index / bin | Pointer etag matches but live archive fingerprint does not → do not install cache hit; cold path |
+| HTTP remount GET count | `--bin ratarmount` fake TCP **with a pointer** | First mount: ≥1 GET of sidecar body. Second mount same pointer: **0** sidecar body GETs. Pointer HEAD/GET allowed. Disk cap must not be 0. |
+| HTTP remount after pointer flip | same harness | New `index_id`/`etag` → sidecar GET; old entry not returned |
+| Leftover URL-file ignored | bin | Stale URL-mangled folder file with wrong bytes is not used when pointer + V-3 entry exist |
+| Explicit `--index-file http` | bin | With pointer: second process does not re-GET sidecar body. Without pointer: no V-3 write |
+| Factory does not clobber V-3 path | factory / bin | `remote_index_setup` keeps `index_file_path` pointing at the V-3 file |
 | No payload kind | index unit | API has no member-body insert (compile-time / no public fn) |
 | Cap eviction | index unit | Tiny cap + two sidecars → older file gone |
 
@@ -297,6 +324,8 @@ Bench (optional in implement PR, required before anyone claims a remote-mount wi
 ```text
 | Remote sidecar remount re-GETs / stale URL cache | `cargo test -p ratarmount-index --lib sidecar_cache` · `cargo test -p ratarmount --bin ratarmount apply_remote_index` |
 ```
+
+(`ratarmount` has no `[lib]`; do not use `cargo test -p ratarmount --lib`.)
 
 ---
 
@@ -318,13 +347,13 @@ This plan PR adds **this file** and a pointer from the V-3 section. It does **no
 | Phase | Work | Exit |
 |-------|------|------|
 | 0 | Confirm V-2 pointer type is on the branch; map fields into `SidecarCacheKey` | If missing → stop (blocked) |
-| 1 | `sidecar_cache.rs` + unit tests (key, skip, corrupt, cap) | `cargo test -p ratarmount-index --lib sidecar_cache` |
-| 2 | Wire discovery: pointer → get_or_fill → `try_install_remote_index`; delete URL-file short-circuit | HTTP remount GET-count test green |
-| 3 | Extract seek-map + RNIB kinds; optional nested durable get | extract tests green |
-| 4 | Auth on sidecar GET if still missing; `HttpProbe.etag` optional | existing HTTP cookie/basic tests still green |
-| 5 | Docs + AGENTS.md catalog row | fmt/clippy/test |
+| 1 | `sidecar_cache.rs` + unit tests (key, skip, corrupt, cap, no-pointer no-write) | `cargo test -p ratarmount-index --lib sidecar_cache` |
+| 2 | Wire **all** fill sites: discovery, `--index-file http(s)`, OCI skip bypass, factory `resolved_index` / `remote_index_setup`; stop URL-mangled `cache_dest` on pointer path | HTTP remount GET-count + leftover URL-file + factory-clobber tests green |
+| 3 | Optional in-process SeekMap/Rnib memo only; do not change nested durable disk path | existing `nested_durable` / zstdblocks tests stay green |
+| 4 | Inject authenticated sidecar GET (do not add `ratarmount-remote` to index); `HttpProbe.etag` optional | existing HTTP cookie/basic tests stay green |
+| 5 | Docs + AGENTS.md catalog row. Do not mark V-3 `done` until `open_s3_like` is wired or the parent S3 row is explicitly residual | fmt/clippy/test |
 
-Do not ship Phase 2 without Phase 1 tests. Do not ship without the remount GET-count test.
+Do not ship Phase 2 without Phase 1 tests. Do not ship without the pointer-backed remount GET-count test.
 
 ---
 
@@ -340,7 +369,11 @@ Do not ship Phase 2 without Phase 1 tests. Do not ship without the remount GET-c
 | Confusing V-3 with G-3 | No payload kind; docs sentence |
 | S3 regression copied from parent TODO | HTTP first; S3 when V-2 fetch exists |
 | `fetch_index_http` unauthenticated | Fix in Phase 4 of the same implement train |
-| Double cache (folder candidate + V-3) | Discovery must not accept URL-only folder files |
+| Double cache (folder candidate + V-3) | Pointer path: no URL-mangled `cache_dest`; factory must not clobber V-3 `index_file_path` |
+| Pointer-absent remount still stale | Documented legacy; V-3 GET-count tests require a pointer; do not call V-3 `done` on that path |
+| `--index-file http` bypasses discovery | Phase 2 wires `maybe_fetch_index_url` / `resolve_index_location` |
+| OCI nonempty skip survives HTTP-only fix | Phase 2 bypasses `fetch_oci_index_referrer` skip when pointer present |
+| S3 never calls discovery | Residual until `open_s3_like` + V-2 object-store GET |
 
 ---
 
@@ -350,11 +383,11 @@ Do not ship Phase 2 without Phase 1 tests. Do not ship without the remount GET-c
 cargo fmt --all
 cargo clippy -p ratarmount-index -p ratarmount-remote -p ratarmount --all-targets -- -D warnings
 cargo test -p ratarmount-index --lib sidecar_cache
-cargo test -p ratarmount --lib apply_remote_index
 cargo test -p ratarmount --bin ratarmount apply_remote_index
-# existing discovery / tarstats must stay green:
+# existing discovery / tarstats / nested durable must stay green:
 cargo test -p ratarmount-index --lib check_tarstats
 cargo test -p ratarmount --bin ratarmount apply_remote_index_discovery_follows_archive_link
+cargo test -p ratarmount --bin ratarmount nested_durable
 ```
 
 Plan-only PR: no code gates beyond markdown existing in-tree.
@@ -369,7 +402,7 @@ IMPLEMENT BLOCKED ON V-2
 
 Current `main` has no `IndexPointer`, no `index_id`, no atomic root pointer object. V-3 keys and revalidation are specified against that pointer. Landing the cache on URL-or-HTTP-ETag-only would recreate the stale-sidecar bug this item is meant to close.
 
-This **plan** can still ACCEPT: implementers know the gate, the skip rules, the three kinds, the GET-count test, and the G-3 / DO / VFS non-goals.
+This **plan** can ACCEPT once skeptic review agrees the remount sites, pointer-absent policy, and in-process-only derived kinds are specified (sweep 1 folds). Implementers must not guess factory vs discovery, must not cache without a pointer, and must not treat HTTP-only as V-3 `done`.
 
 ---
 
@@ -379,8 +412,8 @@ Protocol: never skip sweep 1; fresh Task skeptic each sweep; fold blockers; cap 
 
 | Sweep | Verdict | Folded into |
 |-------|---------|-------------|
-| 1 | _pending_ | |
-| 2 | | |
+| 1 | **REVISE** | §2.1 remount/`open_s3_like`/`--index-file`/OCI; §5.2 opaque etag + `blob_sha256` + pointer-required hits; §5.3 SeekMap/Rnib in-process only; §5.4–5.5 pointer-absent legacy + factory `resolved_index`; §5.7–5.9 / §6 / §8 call-site list |
+| 2 | _pending_ | |
 | 3 | | |
 
 **Final:** _pending_
