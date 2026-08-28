@@ -181,6 +181,7 @@ Implementation: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-loca
 - [x] `find` output option: offset order for restore pipelines.
 - [x] Document that F-9 `--repack-seekable` should also keep members in offset order (already true for tar-in-order).
 - [x] Regression: restore via offset-ordered flatten does **zero** backward seeks vs name order on an interleaved multi-dir fixture (CI: N≥32; 10k-member bench is residual — see [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) §9.6).
+- [x] ZIP local-header + 7z pack-offset seek-count tests (zero backward `SeekFrom::Start` on flatten vs ≥1 on name order; 7z shared-pack name tie-break; skip if `7z` CLI missing plus synthetic table) — [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-locality.md) §9.5.
 
 **Why it pays:** Small win locally; large win on HDD and on remote Range (V-3) where backward seeks are extra GETs. This is IVF’s “put nearby items in one file” with “nearby” redefined.
 

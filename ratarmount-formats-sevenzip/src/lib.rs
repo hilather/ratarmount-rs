@@ -3580,4 +3580,201 @@ sys.stdout.buffer.write(packed)
         );
         assert!(idx.sql_files_type("/a", "b", 0).unwrap().is_some());
     }
+
+    fn backward_start_count(starts: &[u64]) -> usize {
+        starts.windows(2).filter(|w| w[1] < w[0]).count()
+    }
+
+    fn visible_fullpath(path: &str, name: &str) -> String {
+        if path.is_empty() || path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{path}/{name}")
+        }
+    }
+
+    fn payload_file_row(
+        path: &str,
+        name: &str,
+        pack: i64,
+        unpack: i64,
+    ) -> ratarmount_index::FileRow {
+        ratarmount_index::FileRow::new(
+            path, name, pack, unpack, 4, 1.0, 0o100644, 0, "", 0, 0, false, false, false, 0,
+        )
+    }
+
+    /// Regression: 7z shared pack offset ties break by UTF-8 name; synthetic flatten
+    /// has zero backward `SeekFrom::Start` vs name-order ≥1 (no 7z CLI).
+    #[test]
+    fn regression_offset_order_shared_pack_name_tie_break() {
+        const N_PER_DIR: usize = 16;
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        let mut rows = Vec::with_capacity(N_PER_DIR * 2 + 2);
+        for i in 0..N_PER_DIR {
+            let oh_z = (i as i64) * 200;
+            let oh_a = oh_z + 100;
+            rows.push(payload_file_row("/z", &format!("m{i:02}"), oh_z, 0));
+            rows.push(payload_file_row("/a", &format!("m{i:02}"), oh_a, 0));
+        }
+        // Insert z.txt first so intern-id would be z-then-a; flatten must still be a then z.
+        rows.push(payload_file_row("/solid", "z.txt", 9999, 0));
+        rows.push(payload_file_row("/solid", "a.txt", 9999, 8));
+        idx.insert_files_batch(&rows).unwrap();
+        idx.commit_write().unwrap();
+
+        let flat = idx.list_visible_files_by_offset().unwrap();
+        assert_eq!(flat.len(), N_PER_DIR * 2 + 2);
+        assert_eq!(visible_fullpath(&flat[0].path, &flat[0].name), "/z/m00");
+        assert_eq!(visible_fullpath(&flat[1].path, &flat[1].name), "/a/m00");
+
+        let solid: Vec<_> = flat.iter().filter(|m| m.path == "/solid").collect();
+        assert_eq!(solid.len(), 2);
+        assert_eq!(
+            (solid[0].name.as_str(), solid[1].name.as_str()),
+            ("a.txt", "z.txt"),
+            "shared pack offset must tie-break by UTF-8 name, got {:?}",
+            solid.iter().map(|m| m.name.as_str()).collect::<Vec<_>>()
+        );
+        assert_eq!(solid[0].cookie.offsetheader, 9999);
+        assert_eq!(solid[1].cookie.offsetheader, 9999);
+
+        let offset_starts: Vec<u64> = flat.iter().map(|m| m.cookie.offsetheader as u64).collect();
+        assert_eq!(
+            backward_start_count(&offset_starts),
+            0,
+            "flatten must have zero backward pack-offset Start, starts={offset_starts:?}"
+        );
+
+        let mut by_name = flat.clone();
+        by_name.sort_by(|a, b| {
+            visible_fullpath(&a.path, &a.name).cmp(&visible_fullpath(&b.path, &b.name))
+        });
+        let name_starts: Vec<u64> = by_name
+            .iter()
+            .map(|m| m.cookie.offsetheader as u64)
+            .collect();
+        assert!(
+            backward_start_count(&name_starts) >= 1,
+            "name-order control must have ≥1 backward Start (fixture shuffled), starts={name_starts:?}"
+        );
+    }
+
+    /// Regression: offset-ordered 7z flatten has zero backward pack-offset seeks.
+    ///
+    /// Interleaved multi-dir pack (`z/m00`, `a/m00`, …) via non-solid Copy. Flatten
+    /// must walk pack-offset order (zero backward `SeekFrom::Start`). Name-order on
+    /// the same set has ≥1 backward Start. Skip if `7z`/`7za` is missing.
+    #[test]
+    fn regression_offset_order_seeks() {
+        const N_PER_DIR: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let sevenz = ["7z", "7za"]
+            .into_iter()
+            .find(|c| std::process::Command::new(c).arg("--help").output().is_ok());
+        let Some(sevenz) = sevenz else {
+            eprintln!("skip: 7z/7za unavailable for offset-order flatten fixture");
+            return;
+        };
+
+        std::fs::create_dir_all(dir.path().join("a")).unwrap();
+        std::fs::create_dir_all(dir.path().join("z")).unwrap();
+        let mut members: Vec<String> = Vec::with_capacity(N_PER_DIR * 2);
+        for i in 0..N_PER_DIR {
+            let z = format!("z/m{i:02}");
+            let a = format!("a/m{i:02}");
+            std::fs::write(dir.path().join(&z), vec![b'z'; 8 + i]).unwrap();
+            std::fs::write(dir.path().join(&a), vec![b'a'; 8 + i]).unwrap();
+            members.push(z);
+            members.push(a);
+        }
+        let archive = dir.path().join("interleaved.7z");
+        let mut cmd = std::process::Command::new(sevenz);
+        cmd.args(["a", "-t7z", "-m0=Copy", "-ms=off"])
+            .arg(&archive)
+            .current_dir(dir.path());
+        for m in &members {
+            cmd.arg(m);
+        }
+        let out = cmd.output().expect("run 7z");
+        if !out.status.success() || !archive.exists() {
+            eprintln!(
+                "skip: 7z create failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let bytes = std::fs::read(&archive).unwrap();
+        let idx_path = dir.path().join("interleaved.7z.index.sqlite");
+        let opts = OpenOptions {
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let m = SevenZipMountSource::open(&archive, Some(&idx_path), &opts, "0.1.0", true)
+            .expect("index interleaved 7z");
+        drop(m);
+
+        let idx = SqliteIndex::open_read_only(&idx_path).expect("reopen sidecar");
+        let flat = idx.list_visible_files_by_offset().expect("flatten");
+        assert!(
+            flat.len() >= 32,
+            "flatten must include all payload files, got {}",
+            flat.len()
+        );
+
+        struct StartLog {
+            inner: Cursor<Vec<u8>>,
+            starts: Vec<u64>,
+        }
+        impl Seek for StartLog {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                if let SeekFrom::Start(n) = from {
+                    self.starts.push(n);
+                }
+                self.inner.seek(from)
+            }
+        }
+
+        let mut offset_reader = StartLog {
+            inner: Cursor::new(bytes.clone()),
+            starts: Vec::new(),
+        };
+        for mem in &flat {
+            assert!(
+                mem.cookie.offsetheader >= 0,
+                "7z pack offsetheader must be non-negative"
+            );
+            offset_reader
+                .seek(SeekFrom::Start(mem.cookie.offsetheader as u64))
+                .unwrap();
+        }
+        let offset_back = backward_start_count(&offset_reader.starts);
+        assert_eq!(
+            offset_back, 0,
+            "flatten must have zero backward pack-offset Start, starts={:?}",
+            offset_reader.starts
+        );
+
+        let mut by_name = flat.clone();
+        by_name.sort_by(|a, b| {
+            visible_fullpath(&a.path, &a.name).cmp(&visible_fullpath(&b.path, &b.name))
+        });
+        let mut name_reader = StartLog {
+            inner: Cursor::new(bytes),
+            starts: Vec::new(),
+        };
+        for mem in &by_name {
+            name_reader
+                .seek(SeekFrom::Start(mem.cookie.offsetheader as u64))
+                .unwrap();
+        }
+        let name_back = backward_start_count(&name_reader.starts);
+        assert!(
+            name_back >= 1,
+            "name-order control must have ≥1 backward Start (fixture shuffled), starts={:?}",
+            name_reader.starts
+        );
+    }
 }

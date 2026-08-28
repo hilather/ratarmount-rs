@@ -390,7 +390,7 @@ Do not wire FUSE, NFS, overlay, or FileVersionLayer production code.
 2. Control `search` / socket TSV offset order (second path or `order=` in the pattern).
 3. Overlay names in offset-aware extract (overlay has no archive offset; copy those last or first).
 4. F-9 rewriter (separate roadmap item); this plan only constrains member order.
-5. ZIP/7z seek-count / shared-pack tie tests.
+5. [x] ZIP/7z seek-count / shared-pack tie tests (`regression_offset_order_seeks` in zip + sevenzip; 7z CLI skip + `regression_offset_order_shared_pack_name_tie_break` synthetic table).
 6. **10k-member restore** as originally written in V-5 still-open: bench / `#[ignore]` / env-gated, **not** a default-CI gate. v1 gate is interleaved multi-dir N≥32 (§5). 10k is operator-scale story.
 
 ---

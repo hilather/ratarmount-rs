@@ -3380,4 +3380,116 @@ mod tests {
         assert_eq!(idx.sql_files_type("", "a", 0).unwrap(), Some(0));
         assert_eq!(idx.sql_files_type("/a", "b", 0).unwrap(), Some(0));
     }
+
+    fn backward_start_count(starts: &[u64]) -> usize {
+        starts.windows(2).filter(|w| w[1] < w[0]).count()
+    }
+
+    fn visible_fullpath(path: &str, name: &str) -> String {
+        if path.is_empty() || path == "/" {
+            format!("/{name}")
+        } else {
+            format!("{path}/{name}")
+        }
+    }
+
+    struct StartLog {
+        inner: io::Cursor<Vec<u8>>,
+        starts: Vec<u64>,
+    }
+    impl Seek for StartLog {
+        fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+            if let SeekFrom::Start(n) = from {
+                self.starts.push(n);
+            }
+            self.inner.seek(from)
+        }
+    }
+
+    /// Regression: offset-ordered ZIP flatten has zero backward local-header seeks.
+    ///
+    /// Interleaved multi-dir pack (`z/m00`, `a/m00`, …). Flatten must walk local-header
+    /// order (zero backward `SeekFrom::Start`). Name-order on the same set has ≥1
+    /// backward Start. Concatenating per-dir offset lists fails this fixture.
+    #[test]
+    fn regression_offset_order_seeks() {
+        const N_PER_DIR: usize = 16;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("interleaved.zip");
+        {
+            let file = File::create(&archive).unwrap();
+            let mut zw = ZipWriter::new(file);
+            let opts = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+            for i in 0..N_PER_DIR {
+                zw.start_file(format!("z/m{i:02}"), opts).unwrap();
+                zw.write_all(&vec![b'z'; 8 + i]).unwrap();
+                zw.start_file(format!("a/m{i:02}"), opts).unwrap();
+                zw.write_all(&vec![b'a'; 8 + i]).unwrap();
+            }
+            zw.finish().unwrap();
+        }
+        let bytes = std::fs::read(&archive).unwrap();
+        let index_path = dir.path().join("interleaved.zip.index.sqlite");
+        let opts = OpenOptions {
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let src = ZipMountSource::open(&archive, Some(&index_path), &opts, "test", true)
+            .expect("index interleaved zip");
+        drop(src);
+
+        let idx = SqliteIndex::open_read_only(&index_path).expect("reopen sidecar");
+        let flat = idx.list_visible_files_by_offset().expect("flatten");
+        assert!(
+            flat.len() >= 32,
+            "flatten must include all payload files, got {}",
+            flat.len()
+        );
+        assert_eq!(
+            visible_fullpath(&flat[0].path, &flat[0].name),
+            "/z/m00",
+            "flatten must start at first packed member, not per-dir concat"
+        );
+        assert_eq!(visible_fullpath(&flat[1].path, &flat[1].name), "/a/m00");
+
+        let mut offset_reader = StartLog {
+            inner: io::Cursor::new(bytes.clone()),
+            starts: Vec::new(),
+        };
+        for mem in &flat {
+            assert!(
+                mem.cookie.offsetheader >= 0,
+                "ZIP local-header offsetheader must be non-negative"
+            );
+            offset_reader
+                .seek(SeekFrom::Start(mem.cookie.offsetheader as u64))
+                .unwrap();
+        }
+        let offset_back = backward_start_count(&offset_reader.starts);
+        assert_eq!(
+            offset_back, 0,
+            "flatten must have zero backward local-header Start, starts={:?}",
+            offset_reader.starts
+        );
+
+        let mut by_name = flat.clone();
+        by_name.sort_by(|a, b| {
+            visible_fullpath(&a.path, &a.name).cmp(&visible_fullpath(&b.path, &b.name))
+        });
+        let mut name_reader = StartLog {
+            inner: io::Cursor::new(bytes),
+            starts: Vec::new(),
+        };
+        for mem in &by_name {
+            name_reader
+                .seek(SeekFrom::Start(mem.cookie.offsetheader as u64))
+                .unwrap();
+        }
+        let name_back = backward_start_count(&name_reader.starts);
+        assert!(
+            name_back >= 1,
+            "name-order control must have ≥1 backward Start (fixture shuffled), starts={:?}",
+            name_reader.starts
+        );
+    }
 }
