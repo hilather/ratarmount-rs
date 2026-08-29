@@ -257,12 +257,12 @@ struct Args {
     #[arg(long = "index-file")]
     index_file: Option<String>,
 
-    /// Bind this mount to an immutable sidecar snapshot. HEX is sha256 of the
-    /// SQLite blob (64 hex). Looks up `{archive}.index.{HEX}.sqlite`, else the
-    /// well-known blob named by `{archive}.index.ptr`. Required value
-    /// (`num_args = 1`); do not use `num_args = 0..=1` (that steals ARCHIVE).
-    /// Unknown id or tarstats mismatch exits 2 (no silent well-known fallback).
-    /// Resolved here to `--index-file` (not `OpenOptions::index_id`).
+    /// Bind this mount to an immutable sidecar snapshot. HEX is the sha256 of
+    /// the SQLite blob (64 hex). Looks up `{archive}.index.{HEX}.sqlite`, else
+    /// the well-known sidecar if its sha256 matches. Unknown id or tarstats
+    /// mismatch exits 2 (no silent well-known fallback).
+    // Required value (`num_args = 1`); do not use `num_args = 0..=1` (steals ARCHIVE).
+    // Resolved here to `opts.index_file_path` (not `OpenOptions::index_id`).
     #[arg(long = "index-id", value_name = "HEX", num_args = 1)]
     index_id: Option<String>,
 
@@ -605,6 +605,17 @@ fn find_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+fn index_id_cli_error(args: &Args) -> Option<&'static str> {
+    args.index_id.as_ref()?;
+    if args.recreate_index {
+        return Some("--index-id cannot be combined with -c / --recreate-index");
+    }
+    if args.hashes.is_some() {
+        return Some("--index-id cannot be combined with --hashes");
+    }
+    None
+}
+
 fn main() {
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
@@ -623,6 +634,10 @@ fn main() {
         std::process::exit(2);
     }
     if let Some(msg) = find_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
+    if let Some(msg) = index_id_cli_error(&args) {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
@@ -788,8 +803,8 @@ fn main() {
         index_compact_only: false,
         index_folders,
         clear_index_cache: args.recreate_index && !args.no_recreate_index,
-        write_index: !args.no_recreate_index,
-        read_only_index: args.no_recreate_index,
+        write_index: !args.no_recreate_index && args.index_id.is_none(),
+        read_only_index: args.no_recreate_index || args.index_id.is_some(),
         gzip_seek_point_spacing: (args.gzip_seek_point_spacing_mib * 1024.0 * 1024.0) as u64,
         recursion_depth: if args.recursion_depth == 0 {
             // Python: -r alone means infinite; we map to deep default in automount (32)
@@ -3073,7 +3088,7 @@ mod nfs_cli_tests {
 
 #[cfg(test)]
 mod export_cli_tests {
-    use super::{export_incompatible_with_no_mount, Args};
+    use super::{export_incompatible_with_no_mount, index_id_cli_error, Args};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -3172,6 +3187,36 @@ mod export_cli_tests {
         .expect("parse");
         assert!(a.index_id.is_some());
         assert_eq!(archive_paths(&a), vec![PathBuf::from("testdata.tar.gz")]);
+        assert!(index_id_cli_error(&a).is_none());
+    }
+
+    #[test]
+    fn index_id_refuses_recreate_index() {
+        let hex = "a".repeat(64);
+        let a =
+            Args::try_parse_from(["ratarmount", "--index-id", &hex, "-c", "a.tar"]).expect("parse");
+        assert_eq!(
+            index_id_cli_error(&a),
+            Some("--index-id cannot be combined with -c / --recreate-index")
+        );
+    }
+
+    #[test]
+    fn index_id_refuses_hashes_fill() {
+        let hex = "a".repeat(64);
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--index-id",
+            &hex,
+            "--hashes",
+            "sha256",
+            "a.tar",
+        ])
+        .expect("parse");
+        assert_eq!(
+            index_id_cli_error(&a),
+            Some("--index-id cannot be combined with --hashes")
+        );
     }
 
     #[test]

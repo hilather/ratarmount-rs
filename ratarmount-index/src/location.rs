@@ -77,8 +77,8 @@ pub const INDEX_POINTER_SCHEMA: &str = "ratarmount.index.pointer.v1";
 /// `index_id` / `etag_sha256` are lowercase hex SHA-256 of the SQLite blob (never uuid).
 pub const INDEX_ID_HEX_LEN: usize = 64;
 
-/// Keep-last-K extra sidecar copies when a pointer is actually written (well-known + one
-/// previous `{archive}.index.{old_id}.sqlite`). V-2a-only installs stay K=1 (no extra copy).
+/// Number of `{archive}.index.{id}.sqlite` pins kept when a pointer is written
+/// (current pin + previous when `K=2`). V-2a-only installs stay K=1 (no extra copy).
 pub const INDEX_POINTER_KEEP_LAST: usize = 2;
 
 /// Immutable snapshot pointer (`{archive}.index.ptr`). Additional discovery candidate;
@@ -229,42 +229,36 @@ pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()>
     Ok(())
 }
 
-/// Resolve `--index-id HEX` to a local SQLite path (snapshot file, else well-known if
-/// the pointer names that id). Unknown id is an error — no silent well-known fallback.
+/// Resolve `--index-id HEX` to a local SQLite path.
+///
+/// Snapshot `{archive}.index.{id}.sqlite` and the well-known sidecar are accepted
+/// only when their **streaming** SHA-256 equals `id`. A stale pointer that still
+/// names `id` after `-c` replaced well-known is **not** enough — missing snapshot
+/// is unknown id (exit 2), not a silent well-known bind of generation N+1.
 pub fn resolve_index_id_path(archive: &Path, index_id: &str) -> Result<PathBuf> {
     let id = parse_index_id(index_id)?;
     let snapshot = index_id_path(archive, &id)?;
     if path_is_usable_existing_index(&snapshot) {
-        return Ok(snapshot);
-    }
-    let ptr_path = index_pointer_path(archive);
-    match load_index_pointer(&ptr_path) {
-        Ok(Some(ptr)) if parse_index_id(&ptr.index_id).ok().as_deref() == Some(id.as_str()) => {
-            let well_known = default_index_path(archive);
-            if path_is_usable_existing_index(&well_known) {
-                return Ok(well_known);
-            }
-            Err(IndexError::Invalid(format!(
-                "index_id {id} is named by {} but {} is missing",
-                ptr_path.display(),
-                well_known.display()
-            )))
+        let got = sha256_file_hex(&snapshot)?;
+        if got == id {
+            return Ok(snapshot);
         }
-        Ok(Some(ptr)) => Err(IndexError::Invalid(format!(
-            "unknown index_id {id} (pointer names {}; no {})",
-            ptr.index_id,
+        return Err(IndexError::Invalid(format!(
+            "index snapshot {} sha256 {got} != requested {id}",
             snapshot.display()
-        ))),
-        Ok(None) => Err(IndexError::Invalid(format!(
-            "unknown index_id {id} (no {} and no {})",
-            snapshot.display(),
-            ptr_path.display()
-        ))),
-        Err(e) => Err(IndexError::Invalid(format!(
-            "unknown index_id {id} (invalid {}: {e})",
-            ptr_path.display()
-        ))),
+        )));
     }
+    let well_known = default_index_path(archive);
+    if path_is_usable_existing_index(&well_known) {
+        let got = sha256_file_hex(&well_known)?;
+        if got == id {
+            return Ok(well_known);
+        }
+    }
+    Err(IndexError::Invalid(format!(
+        "unknown index_id {id} (no matching {} and well-known is not that blob)",
+        snapshot.display()
+    )))
 }
 
 /// Resolve `--index-id` and refuse when stored tarstats no longer match `archive`.
@@ -275,16 +269,14 @@ pub fn bind_local_index_id(archive: &Path, index_id: &str) -> Result<PathBuf> {
     Ok(path)
 }
 
-/// Hardlink (else copy) `well_known` to `{archive}.index.{old_id}.sqlite`.
+/// Hardlink (else atomic copy) `well_known` to `{archive}.index.{id}.sqlite`.
 ///
-/// Uses `old_id` from an existing pointer — does **not** SHA-256 the sidecar.
-/// No-op when `old_id` is invalid, the snapshot already exists, or `well_known` is missing.
-pub fn snapshot_index_id(
-    archive: &Path,
-    well_known: &Path,
-    old_id: &str,
-) -> Result<Option<PathBuf>> {
-    let id = match parse_index_id(old_id) {
+/// `id` is the already-known pin name (pointer `index_id` / sha256 of the blob
+/// being published) — this does **not** invent an id by hashing a sidecar on `-c`.
+/// An existing dest whose streaming SHA-256 is not `id` is replaced (leftover
+/// nonempty truncated file is not success). Copy uses tmp+rename.
+pub fn snapshot_index_id(archive: &Path, well_known: &Path, id: &str) -> Result<Option<PathBuf>> {
+    let id = match parse_index_id(id) {
         Ok(id) => id,
         Err(_) => return Ok(None),
     };
@@ -296,7 +288,10 @@ pub fn snapshot_index_id(
         return Ok(None);
     }
     if path_is_usable_existing_index(&dest) {
-        return Ok(Some(dest));
+        let got = sha256_file_hex(&dest)?;
+        if got == id {
+            return Ok(Some(dest));
+        }
     }
     if let Some(parent) = dest.parent() {
         if !parent.as_os_str().is_empty() {
@@ -306,31 +301,49 @@ pub fn snapshot_index_id(
     match std::fs::hard_link(well_known, &dest) {
         Ok(()) => Ok(Some(dest)),
         Err(_) => {
-            std::fs::copy(well_known, &dest)?;
+            atomic_copy_file(well_known, &dest)?;
+            let got = sha256_file_hex(&dest)?;
+            if got != id {
+                let _ = std::fs::remove_file(&dest);
+                return Err(IndexError::Invalid(format!(
+                    "index snapshot {} sha256 {got} != {id} after copy",
+                    dest.display()
+                )));
+            }
             Ok(Some(dest))
         }
     }
 }
 
-/// Unlink `{archive}.index.{hex}.sqlite` snapshots other than `keep_id` (K=2 extra copies).
-pub fn prune_index_snapshots(archive: &Path, keep_id: &str) -> Result<()> {
-    let keep = parse_index_id(keep_id)?;
+/// Unlink `{archive}.index.{hex}.sqlite` pins not in `keep_ids` (capped at
+/// [`INDEX_POINTER_KEEP_LAST`], first ids win).
+pub fn prune_index_snapshots(archive: &Path, keep_ids: &[&str]) -> Result<()> {
+    let mut keep = Vec::new();
+    for s in keep_ids {
+        if let Ok(id) = parse_index_id(s) {
+            if !keep.contains(&id) {
+                keep.push(id);
+            }
+        }
+        if keep.len() >= INDEX_POINTER_KEEP_LAST {
+            break;
+        }
+    }
     for (id, path) in list_index_id_snapshots(archive) {
-        if id != keep {
+        if !keep.contains(&id) {
             let _ = std::fs::remove_file(&path);
         }
     }
     Ok(())
 }
 
-/// Snapshot `well_known` from an existing pointer (if any), write a new pointer for `blob`,
-/// then keep-last-K=2 (unlink extras). `well_known` must still hold the **previous** blob
-/// when `old_id != sha256(blob)` — callers snapshot **before** replacing dest.
+/// Write a new pointer for `blob` and pin `{archive}.index.{new_id}.sqlite`
+/// (hardlink of `blob` after it holds the published bytes). Keep-last-K uses
+/// [`INDEX_POINTER_KEEP_LAST`] (current pin + previous pointer id).
 pub fn publish_index_pointer(
     archive: &Path,
     blob: &Path,
     tarstats_archive: Option<&Path>,
-    snapshot_well_known: Option<&Path>,
 ) -> Result<IndexPointer> {
     let ptr_path = index_pointer_path(archive);
     let new_id = sha256_file_hex(blob)?;
@@ -342,17 +355,40 @@ pub fn publish_index_pointer(
             None
         }
     };
+    snapshot_index_id(archive, blob, &new_id)?;
+    let mut keep: Vec<&str> = vec![new_id.as_str()];
     if let Some(ref old) = old_id {
-        if old != &new_id {
-            if let Some(wk) = snapshot_well_known {
-                snapshot_index_id(archive, wk, old)?;
-            }
-            prune_index_snapshots(archive, old)?;
+        if old.as_str() != new_id.as_str() {
+            keep.push(old.as_str());
         }
     }
+    prune_index_snapshots(archive, &keep)?;
     let ptr = IndexPointer::for_blob(blob, tarstats_archive)?;
     store_index_pointer_atomic(&ptr_path, &ptr)?;
     Ok(ptr)
+}
+
+fn atomic_copy_file(src: &Path, dest: &Path) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".ratarmount-index-snap-").suffix(".tmp");
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match parent {
+        Some(p) => builder.tempfile_in(p)?,
+        None => builder.tempfile_in(".")?,
+    };
+    {
+        let mut in_f = File::open(src)?;
+        std::io::copy(&mut in_f, &mut tmp)?;
+        tmp.flush()?;
+        tmp.as_file().sync_all()?;
+    }
+    tmp.persist(dest).map_err(|e| IndexError::Io(e.error))?;
+    Ok(())
 }
 
 fn sha256_file_hex(path: &Path) -> Result<String> {
@@ -1952,15 +1988,15 @@ mod tests {
         let blob_n = b"SQLite format 3\0snapshot-N";
         std::fs::write(&well_known, blob_n).unwrap();
         let id_n = hex_id(blob_n);
-        publish_index_pointer(&archive, &well_known, Some(&archive), None).unwrap();
+        publish_index_pointer(&archive, &well_known, Some(&archive)).unwrap();
 
         let blob_np1 = b"SQLite format 3\0snapshot-N+1-bytes";
         let np1 = dir.path().join("np1.sqlite");
         std::fs::write(&np1, blob_np1).unwrap();
-        // Snapshot N (hardlink) **before** replacing dest. Rename (not in-place
-        // write) so the snapshot inode stays N when dest becomes N+1.
-        publish_index_pointer(&archive, &np1, Some(&archive), Some(&well_known)).unwrap();
+        // Pin of N is a hardlink of well-known. Rename (not in-place write)
+        // so the pin inode stays N when dest becomes N+1 (`-c` tmp+rename).
         std::fs::rename(&np1, &well_known).unwrap();
+        publish_index_pointer(&archive, &well_known, Some(&archive)).unwrap();
         let id_np1 = hex_id(blob_np1);
 
         let snap_n = index_id_path(&archive, &id_n).unwrap();
@@ -1971,11 +2007,76 @@ mod tests {
         let resolved_n = resolve_index_id_path(&archive, &id_n).unwrap();
         assert_eq!(resolved_n, snap_n);
         let resolved_np1 = resolve_index_id_path(&archive, &id_np1).unwrap();
-        assert_eq!(resolved_np1, well_known);
+        let np1_bytes = std::fs::read(&resolved_np1).unwrap();
+        assert_eq!(np1_bytes, blob_np1);
+        assert_eq!(hex_id(&np1_bytes), id_np1);
 
         let err = resolve_index_id_path(&archive, &"b".repeat(64)).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("unknown") || msg.contains("index_id"), "{msg}");
+    }
+
+    /// Regression: stale pointer naming N after well-known is N+1 must not bind N+1.
+    #[test]
+    fn resolve_index_id_stale_pointer_without_snapshot_refuses_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"a").unwrap();
+        let well_known = default_index_path(&archive);
+        let blob_n = b"SQLite format 3\0gen-N";
+        std::fs::write(&well_known, blob_n).unwrap();
+        let id_n = hex_id(blob_n);
+        let ptr = IndexPointer::for_blob(&well_known, Some(&archive)).unwrap();
+        store_index_pointer_atomic(&index_pointer_path(&archive), &ptr).unwrap();
+        assert_eq!(ptr.index_id, id_n);
+
+        let blob_np1 = b"SQLite format 3\0gen-N+1-xxxx";
+        let np1 = dir.path().join("np1.sqlite");
+        std::fs::write(&np1, blob_np1).unwrap();
+        std::fs::rename(&np1, &well_known).unwrap();
+        assert_eq!(std::fs::read(&well_known).unwrap(), blob_np1);
+
+        let err = resolve_index_id_path(&archive, &id_n).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown") || msg.contains("index_id") || msg.contains("not that blob"),
+            "{msg}"
+        );
+        assert_ne!(hex_id(&std::fs::read(&well_known).unwrap()), id_n);
+    }
+
+    /// Regression: leftover nonempty snapshot with the wrong SHA is replaced, not kept.
+    #[test]
+    fn snapshot_index_id_replaces_wrong_sha_leftover() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let well_known = default_index_path(&archive);
+        let blob_n = b"SQLite format 3\0good-pin-bytes";
+        std::fs::write(&well_known, blob_n).unwrap();
+        let id_n = hex_id(blob_n);
+        let dest = index_id_path(&archive, &id_n).unwrap();
+        std::fs::write(&dest, b"SQLite format 3\0truncated").unwrap();
+        assert_ne!(hex_id(&std::fs::read(&dest).unwrap()), id_n);
+
+        let got = snapshot_index_id(&archive, &well_known, &id_n)
+            .unwrap()
+            .expect("pin");
+        assert_eq!(got, dest);
+        assert_eq!(std::fs::read(&dest).unwrap(), blob_n);
+        assert_eq!(hex_id(&std::fs::read(&dest).unwrap()), id_n);
+    }
+
+    /// Regression: `--index-id` must not bind a leftover snapshot whose SHA is not the id.
+    #[test]
+    fn resolve_index_id_refuses_wrong_sha_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let id_n = hex_id(b"SQLite format 3\0wanted");
+        let dest = index_id_path(&archive, &id_n).unwrap();
+        std::fs::write(&dest, b"SQLite format 3\0not-the-id").unwrap();
+        let err = resolve_index_id_path(&archive, &id_n).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("sha256") || msg.contains("!="), "{msg}");
     }
 
     /// Regression: `--index-id` tarstats mismatch refuses (no silent well-known fallback).
@@ -1995,7 +2096,7 @@ mod tests {
             let bytes = std::fs::read(&idx_path).unwrap();
             hex_id(&bytes)
         };
-        publish_index_pointer(&archive, &idx_path, Some(&archive), None).unwrap();
+        publish_index_pointer(&archive, &idx_path, Some(&archive)).unwrap();
         bind_local_index_id(&archive, &id).expect("matching archive");
 
         std::fs::write(&archive, b"new-content-longer").unwrap();

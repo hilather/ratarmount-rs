@@ -8,8 +8,8 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use ratarmount_index::{
-    archive_base_from_index_path, default_index_path, index_pointer_path, load_index_pointer,
-    parse_index_id, publish_index_pointer, snapshot_index_id, INDEX_MEDIA_TYPE,
+    archive_base_from_index_path, default_index_path, index_pointer_path, publish_index_pointer,
+    INDEX_MEDIA_TYPE,
 };
 
 pub struct PublishIndexOpts<'a> {
@@ -39,19 +39,12 @@ pub fn publish_index(opts: PublishIndexOpts<'_>) -> Result<PathBuf, String> {
                 dest.display()
             ));
         }
-        // Snapshot dest (previous blob) using old_id from the existing pointer
-        // before replace. Do not SHA-256 the sidecar to invent an id.
-        if dest.exists() {
-            if let Ok(Some(old)) = load_index_pointer(&index_pointer_path(&base)) {
-                if let Ok(old_id) = parse_index_id(&old.index_id) {
-                    let _ = snapshot_index_id(&base, &dest, &old_id);
-                }
-            }
-        }
         atomic_copy(opts.sidecar, &dest)
             .map_err(|e| format!("publish-index {}: {e}", dest.display()))?;
     }
-    publish_index_pointer(&base, &dest, Some(opts.archive), None).map_err(|e| {
+    // Pin dest as `{base}.index.{new_id}.sqlite` (hardlink after dest holds the
+    // published bytes) so dest==sidecar + later `-c` still keeps generation N.
+    publish_index_pointer(&base, &dest, Some(opts.archive)).map_err(|e| {
         format!(
             "publish-index pointer {}: {e}",
             index_pointer_path(&base).display()
@@ -195,10 +188,51 @@ mod tests {
             ratarmount_index::resolve_index_id_path(&base, &id_n).unwrap(),
             snap
         );
+        let resolved_np1 = ratarmount_index::resolve_index_id_path(&base, &id_np1).unwrap();
+        assert_eq!(fs::read(&resolved_np1).unwrap(), blob_np1);
+    }
+
+    /// Regression: dest==sidecar `--publish-index` pins N so remount `--index-id` of N
+    /// still works after well-known is rebuilt to N+1 (`-c` tmp+rename).
+    #[test]
+    fn publish_index_dest_eq_sidecar_keep_last_k_across_rebuild() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, b"archive-bytes").unwrap();
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        let blob_n = b"SQLite format 3\0sidecar-N";
+        fs::write(&sidecar, blob_n).unwrap();
+        publish_index(PublishIndexOpts {
+            archive: &archive,
+            sidecar: &sidecar,
+            dest: None,
+            no_recreate_index: false,
+        })
+        .unwrap();
+        let id_n = ratarmount_index::sha256_hex(blob_n);
+
+        let blob_np1 = b"SQLite format 3\0sidecar-N+1";
+        let np1 = dir.path().join("np1.tmp");
+        fs::write(&np1, blob_np1).unwrap();
+        fs::rename(&np1, &sidecar).unwrap();
+        publish_index(PublishIndexOpts {
+            archive: &archive,
+            sidecar: &sidecar,
+            dest: None,
+            no_recreate_index: false,
+        })
+        .unwrap();
+
+        let snap = ratarmount_index::index_id_path(&archive, &id_n).unwrap();
+        assert!(snap.is_file(), "dest==sidecar must pin index.{{id}}.sqlite");
+        assert_eq!(fs::read(&snap).unwrap(), blob_n);
         assert_eq!(
-            ratarmount_index::resolve_index_id_path(&base, &id_np1).unwrap(),
-            dest
+            ratarmount_index::resolve_index_id_path(&archive, &id_n).unwrap(),
+            snap
         );
+        let id_np1 = ratarmount_index::sha256_hex(blob_np1);
+        let resolved_np1 = ratarmount_index::resolve_index_id_path(&archive, &id_np1).unwrap();
+        assert_eq!(fs::read(&resolved_np1).unwrap(), blob_np1);
     }
 
     #[test]
