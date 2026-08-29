@@ -757,13 +757,31 @@ fn search_cheap_union_merges_all_sources() {
         paths.contains(&"/only-zip.fits"),
         "later source unique missing: {paths:?}"
     );
+    let tar_a = tar
+        .search_cheap("*.fits")
+        .unwrap()
+        .into_iter()
+        .find(|h| h.path == "/a.fits")
+        .expect("tar a.fits");
+    let zip_a = zip
+        .search_cheap("*.fits")
+        .unwrap()
+        .into_iter()
+        .find(|h| h.path == "/a.fits")
+        .expect("zip a.fits");
     let a: Vec<_> = hits.iter().filter(|h| h.path == "/a.fits").collect();
     assert!(!a.is_empty(), "overlapping name dropped: {hits:?}");
-    if a.len() == 1 {
-        assert_eq!(
-            a[0].size, 9,
-            "same path+offsetheader: later ZIP must win: {a:?}"
-        );
+    let later = a
+        .iter()
+        .find(|h| h.offsetheader == zip_a.offsetheader)
+        .unwrap_or_else(|| panic!("later ZIP path+oh missing: {a:?}"));
+    assert_eq!(
+        later.size, zip_a.size,
+        "later ZIP must win colliding key {:?}: {a:?}",
+        zip_a.offsetheader
+    );
+    if tar_a.offsetheader == zip_a.offsetheader {
+        assert_eq!(a.len(), 1, "same path+oh must collapse: {a:?}");
     }
 
     let early = Arc::new(FileInfoSpy {
@@ -812,13 +830,74 @@ fn search_cheap_union_merges_all_sources() {
 fn search_cheap_union_empty_catalog_contributes() {
     let empty = Arc::new(CheapBase::empty()) as Arc<dyn MountSource>;
     let fits = Arc::new(CheapBase::fits()) as Arc<dyn MountSource>;
-    let union = UnionMountSource::new(vec![empty, fits]);
-    let hits = union
+    for (label, sources) in [
+        (
+            "empty then fits",
+            vec![Arc::clone(&empty), Arc::clone(&fits)],
+        ),
+        (
+            "fits then empty",
+            vec![Arc::clone(&fits), Arc::clone(&empty)],
+        ),
+    ] {
+        let union = UnionMountSource::new(sources);
+        let hits = union
+            .search_cheap("*.fits")
+            .unwrap_or_else(|| panic!("{label}: empty catalog must contribute"));
+        let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&"/a.fits"), "{label}: {paths:?}");
+        assert!(paths.contains(&"/dir/b.fits"), "{label}: {paths:?}");
+    }
+    let both_empty = UnionMountSource::new(vec![Arc::clone(&empty), empty]);
+    let hits = both_empty
         .search_cheap("*.fits")
-        .expect("empty catalog contributes");
-    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
-    assert!(paths.contains(&"/a.fits"), "{paths:?}");
-    assert!(paths.contains(&"/dir/b.fits"), "{paths:?}");
+        .expect("two empty catalogs still Some");
+    assert!(hits.is_empty(), "two empties: {hits:?}");
+}
+
+/// Regression: Union truncates the merged catalog at DEFAULT_SEARCH_LIMIT.
+#[test]
+fn search_cheap_union_limit_cap() {
+    let left_n = DEFAULT_SEARCH_LIMIT / 2;
+    let right_n = DEFAULT_SEARCH_LIMIT + 1 - left_n;
+    let left = Arc::new(FileInfoSpy {
+        inner: CheapBase {
+            hits: (0..left_n)
+                .map(|i| hit(&format!("/l{i}.dat"), &format!("l{i}.dat"), 1, 1.0))
+                .collect(),
+        },
+        list_calls: AtomicUsize::new(0),
+        lookup_calls: AtomicUsize::new(0),
+    });
+    let right = Arc::new(FileInfoSpy {
+        inner: CheapBase {
+            hits: (0..right_n)
+                .map(|i| hit(&format!("/r{i}.dat"), &format!("r{i}.dat"), 1, 1.0))
+                .collect(),
+        },
+        list_calls: AtomicUsize::new(0),
+        lookup_calls: AtomicUsize::new(0),
+    });
+    let union = UnionMountSource::new(vec![
+        Arc::clone(&left) as Arc<dyn MountSource>,
+        Arc::clone(&right) as Arc<dyn MountSource>,
+    ]);
+    let hits = union.search_cheap("*").expect("Union Some");
+    assert_eq!(
+        hits.len(),
+        DEFAULT_SEARCH_LIMIT,
+        "merged unique keys must cap at DEFAULT_SEARCH_LIMIT"
+    );
+    assert_eq!(
+        left.list_calls.load(Ordering::SeqCst) + right.list_calls.load(Ordering::SeqCst),
+        0,
+        "limit merge must not call list()"
+    );
+    assert_eq!(
+        left.lookup_calls.load(Ordering::SeqCst) + right.lookup_calls.load(Ordering::SeqCst),
+        0,
+        "FileInfo count 0: no lookup / no B-4"
+    );
 }
 
 /// Regression: any source `None` (Folder-without-impl) → Union `None`.
