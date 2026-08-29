@@ -8,8 +8,8 @@ use std::path::PathBuf;
 use tempfile::NamedTempFile;
 
 use crate::{
-    fetch_azure_to_temp, fetch_gcs_to_temp, fetch_s3_to_temp, remote_url_scheme, RemoteError,
-    Result,
+    fetch_azure_bytes_capped, fetch_azure_to_temp, fetch_gcs_bytes_capped, fetch_gcs_to_temp,
+    fetch_s3_bytes_capped, fetch_s3_to_temp, remote_url_scheme, RemoteError, Result,
 };
 
 /// True for `s3://` / `gs://` / `az://` / `azure://` archive URLs.
@@ -25,6 +25,25 @@ pub fn is_object_store_archive_url(url: &str) -> bool {
 pub fn fetch_index_sibling_to_temp(url: &str) -> Result<PathBuf> {
     let (tmp, _) = fetch_object_store_to_temp(url)?;
     keep_tempfile(tmp)
+}
+
+/// Full GET of at most `max_bytes` (no Range). Errors if the body is larger.
+///
+/// Pointer JSON uses this so a cache-miss remount cannot slurp an unbounded object,
+/// including on Range-ignoring gateways.
+pub fn fetch_index_sibling_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let s = url.trim();
+    if s.starts_with("s3://") {
+        fetch_s3_bytes_capped(s, max_bytes)
+    } else if s.starts_with("gs://") {
+        fetch_gcs_bytes_capped(s, max_bytes)
+    } else if s.starts_with("az://") || s.starts_with("azure://") {
+        fetch_azure_bytes_capped(s, max_bytes)
+    } else {
+        Err(RemoteError::UnsupportedScheme(
+            remote_url_scheme(s).unwrap_or_else(|| s.to_string()),
+        ))
+    }
 }
 
 fn fetch_object_store_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
@@ -262,5 +281,30 @@ mod tests {
             err.contains("404") || err.contains("NoSuchKey") || err.contains("GetObject"),
             "{err}"
         );
+    }
+
+    /// Regression: pointer GET is a capped full GET (`take`), not a 64 KiB Range
+    /// that misses short 206 and slurps on HTTP 200.
+    #[test]
+    fn fetch_s3_pointer_bytes_capped_rejects_oversize() {
+        let small = b"{\"schema\":\"ptr\"}".to_vec();
+        let huge = vec![b'x'; 80 * 1024];
+        let mut objects = HashMap::new();
+        objects.insert("data/a.tar.index.ptr".into(), small.clone());
+        objects.insert("data/huge.index.ptr".into(), huge);
+        let mock = MockS3Map::spawn(objects);
+
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ANONYMOUS", "1");
+        _g.set("AWS_ENDPOINT_URL", &mock.base_url);
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+
+        let got = fetch_index_sibling_bytes_capped("s3://bucket/data/a.tar.index.ptr", 64 * 1024)
+            .unwrap();
+        assert_eq!(got, small);
+        let err = fetch_index_sibling_bytes_capped("s3://bucket/data/huge.index.ptr", 64 * 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "{err}");
     }
 }

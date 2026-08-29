@@ -674,6 +674,25 @@ pub fn fetch_s3_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     fetch_s3_location_to_temp(&loc)
 }
 
+/// Full GetObject of at most `max_bytes` (no Range). Errors if the body is larger.
+pub(crate) fn fetch_s3_bytes_capped(url_str: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let loc = parse_s3_url(url_str)?;
+    let (source, resp) = s3_get_object(&loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_status_error(source, status, &loc, &body));
+    }
+    let buf = crate::read_at_most(&mut resp.into_reader(), max_bytes)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(RemoteError::S3(format!(
+            "body exceeds {max_bytes} bytes for s3://{}/{}",
+            loc.bucket, loc.key
+        )));
+    }
+    Ok(buf)
+}
+
 /// Download a parsed location, preferring Range chunks for large objects.
 pub fn fetch_s3_location_to_temp(loc: &S3Location) -> Result<(NamedTempFile, u64)> {
     fetch_s3_location_to_temp_prefer_range(loc, None)

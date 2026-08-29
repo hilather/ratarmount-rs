@@ -77,6 +77,7 @@ use tempfile::NamedTempFile;
 use thiserror::Error;
 use url::Url;
 
+pub(crate) use azure::fetch_azure_bytes_capped;
 pub use dropbox::{
     dropbox_api_arg, dropbox_download_url, dropbox_list_ttl_secs, dropbox_path_is_folder,
     dropbox_rpc_base, fetch_dropbox_location_to_temp, fetch_dropbox_location_to_temp_prefer_range,
@@ -86,7 +87,11 @@ pub use dropbox::{
     DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_LIST_TTL_SECS, DEFAULT_DROPBOX_RANGE_THRESHOLD,
     DEFAULT_DROPBOX_RPC_BASE,
 };
-pub use index_sibling::{fetch_index_sibling_to_temp, is_object_store_archive_url};
+pub(crate) use gcs::fetch_gcs_bytes_capped;
+pub use index_sibling::{
+    fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
+};
+pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
@@ -845,14 +850,17 @@ pub fn fetch_http_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
     if !(200..300).contains(&status) {
         return Err(http_status_err(status, loc.url.as_str()));
     }
-    let mut buf = Vec::new();
-    let n = io::copy(
-        &mut resp.into_reader().take(max_bytes.saturating_add(1)),
-        &mut buf,
-    )?;
-    if n > max_bytes {
+    let buf = read_at_most(&mut resp.into_reader(), max_bytes)?;
+    if buf.len() as u64 > max_bytes {
         return Err(RemoteError::Http(format!("body exceeds {max_bytes} bytes")));
     }
+    Ok(buf)
+}
+
+/// Read at most `max_bytes + 1` so the caller can detect overflow without a full slurp.
+pub(crate) fn read_at_most(reader: &mut impl Read, max_bytes: u64) -> io::Result<Vec<u8>> {
+    let mut buf = Vec::new();
+    io::copy(&mut reader.take(max_bytes.saturating_add(1)), &mut buf)?;
     Ok(buf)
 }
 

@@ -293,48 +293,16 @@ fn fetch_object_store_pointer(
 }
 
 fn fetch_object_store_pointer_bytes(url: &str) -> std::result::Result<Vec<u8>, PointerErr> {
-    let end = INDEX_POINTER_MAX_BYTES.saturating_sub(1);
-    let ranged = if url.starts_with("s3://") {
-        ratarmount_remote::fetch_s3_range_bytes(url, 0, end)
-    } else if url.starts_with("gs://") {
-        ratarmount_remote::fetch_gcs_range_bytes(url, 0, end)
-    } else if url.starts_with("az://") || url.starts_with("azure://") {
-        ratarmount_remote::fetch_azure_range_bytes(url, 0, end)
-    } else {
-        Err(ratarmount_remote::RemoteError::UnsupportedScheme(
-            url.to_string(),
-        ))
-    };
-    match ranged {
-        Ok(b) => {
-            if b.len() as u64 >= INDEX_POINTER_MAX_BYTES {
-                return Err(PointerErr::Invalid("pointer body too large".into()));
-            }
-            Ok(b)
+    ratarmount_remote::fetch_index_sibling_bytes_capped(url, INDEX_POINTER_MAX_BYTES).map_err(|e| {
+        let msg = e.to_string();
+        if pointer_err_is_miss(&msg) {
+            PointerErr::Miss(msg)
+        } else if msg.contains("exceeds") {
+            PointerErr::Invalid(msg)
+        } else {
+            PointerErr::Miss(msg)
         }
-        Err(e) => {
-            let msg = e.to_string();
-            if pointer_err_is_miss(&msg) {
-                return Err(PointerErr::Miss(msg));
-            }
-            let path = ratarmount_remote::fetch_index_sibling_to_temp(url).map_err(|e2| {
-                let m = e2.to_string();
-                if pointer_err_is_miss(&m) {
-                    PointerErr::Miss(m)
-                } else {
-                    PointerErr::Invalid(m)
-                }
-            })?;
-            let n = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            if n > INDEX_POINTER_MAX_BYTES {
-                let _ = std::fs::remove_file(&path);
-                return Err(PointerErr::Invalid("pointer body too large".into()));
-            }
-            let bytes = std::fs::read(&path);
-            let _ = std::fs::remove_file(&path);
-            bytes.map_err(|e| PointerErr::Invalid(e.to_string()))
-        }
-    }
+    })
 }
 
 fn keep_http_index_temp(tmp: tempfile::NamedTempFile) -> std::result::Result<PathBuf, String> {

@@ -744,6 +744,25 @@ fn fetch_azure_full_get(loc: &AzureLocation) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Full GetBlob of at most `max_bytes` (no Range). Errors if the body is larger.
+pub(crate) fn fetch_azure_bytes_capped(url_str: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let loc = parse_azure_url(url_str)?;
+    let (source, resp) = azure_get_blob(&loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(azure_status_error(source, status, &loc, &body));
+    }
+    let buf = crate::read_at_most(&mut resp.into_reader(), max_bytes)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(azure_err(format!(
+            "body exceeds {max_bytes} bytes for az://{}/{}",
+            loc.container, loc.blob
+        )));
+    }
+    Ok(buf)
+}
+
 /// Download `az://container/blob` to a tempfile (GET only).
 pub fn fetch_azure_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_azure_url(url_str)?;

@@ -714,6 +714,25 @@ fn fetch_gcs_full_get(loc: &GcsLocation) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
+/// Full GetObject of at most `max_bytes` (no Range). Errors if the body is larger.
+pub(crate) fn fetch_gcs_bytes_capped(url_str: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let loc = parse_gcs_url(url_str)?;
+    let (source, resp) = gcs_get_object(&loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(gcs_status_error(source, status, &loc, &body));
+    }
+    let buf = crate::read_at_most(&mut resp.into_reader(), max_bytes)?;
+    if buf.len() as u64 > max_bytes {
+        return Err(gcs_err(format!(
+            "body exceeds {max_bytes} bytes for gs://{}/{}",
+            loc.bucket, loc.object
+        )));
+    }
+    Ok(buf)
+}
+
 /// Download `gs://bucket/object` to a tempfile (GET only).
 pub fn fetch_gcs_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     let loc = parse_gcs_url(url_str)?;
