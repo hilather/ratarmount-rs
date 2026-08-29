@@ -146,11 +146,11 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Shipped (live queue — IntervalIdle / OnExit only):**
 
-- [x] Single-writer live commit queue: `WriteOverlay::enqueue_commit(CommitKind::{IntervalIdle, OnExit})`. A second interval tick while inflight is `Coalesced` (does not start another `persist_by_format`). On-exit waits for inflight (2× last persist, min 60s) then one `commit_atomic` of remaining files; timeout logs error and still flushes.
-- [x] Job record is lightweight (overlay plan + `commit_generation`); executor still does last-frame splice / uncompressed `tar --append` / sidecar patch, then local `rename`.
+- [x] Single-writer live commit queue: `WriteOverlay::enqueue_commit(CommitKind::{IntervalIdle, OnExit})`. A second interval tick while inflight is `Coalesced` (does not start another `persist_by_format`). On-exit waits for inflight (2× last **DidWork** persist, min 60s); timeout logs then waits until inflight clears before one `commit_atomic` of remaining files.
+- [x] Coordinator is inflight CAS + condvar. On-exit re-walks the overlay after wait (no queued plan/`commit_generation` snapshot). Executor still does last-frame splice / uncompressed `tar --append` / sidecar patch, then local `rename`.
 - [x] Hot files (open write fd, younger than interval) stay in the overlay.
 - [x] Prefix-frame mutate stays fail-closed via `classify_tar_zst_path` / `earlier_frame_err`. CLI `commit_overlay()` is **not** a queue job (offline prefix-rewrite escape hatch).
-- [x] Regression: two interval fires during an injected long persist → second `Coalesced`; readers never see a truncated `.tar.zst`; live prefix-frame delete still `earlier_frame_err`; `overlay_commit_live*` / `overlay_commit_live_delete_shifts` stay green.
+- [x] Regression: two interval fires during an injected long persist → second `Coalesced`; on-exit remaining-hot after wait; timeout still waits inflight (no double-append); live prefix-frame delete still `earlier_frame_err`; persist is sibling-tmp + atomic replace; `overlay_commit_live*` / `overlay_commit_live_delete_shifts` stay green.
 
 **Still open:**
 
@@ -208,7 +208,7 @@ Implementation: [`plans/v5-offset-order-locality.md`](plans/v5-offset-order-loca
 - V-1: `FileInfo` count 0 on a synthetic 200k SoA `scan_glob`; SQL `search_query` keeps `mem: None`. Not a 200k on-disk TAR `find` RSS test.
 - V-2: two processes, `-c` in one, `cat` in the other; pointer flip is atomic; `check_tarstats` still fires on replaced archive.
 - V-3: fake HTTP Range server; GET count on remount with cached sidecar + seek map.
-- V-4: two interval fires during injected long persist → second `Coalesced`; on-exit waits then one `commit_atomic`; live prefix-frame still `earlier_frame_err`; existing `overlay_commit_live*` / `commit_overlay` tests stay green.
+- V-4: two interval fires during injected long persist → second `Coalesced`; on-exit waits then one `commit_atomic` of remaining files; timeout does not splice while interval is inflight; live prefix-frame still `earlier_frame_err`; existing `overlay_commit_live*` / `commit_overlay` tests stay green.
 - V-5: pread offset monotonicity on offset-ordered restore vs name-ordered.
 
 Every behavior change needs a regression test in the same PR (see root `AGENTS.md`).

@@ -139,7 +139,7 @@ Last-frame `.tar.zst` splice and uncompressed GNU `tar --append` **patch the on-
 
 Acceptance: remount after last-frame splice does **not** rescan prefix frames; patched `files` equals a full `create_index_body`; `check_tarstats` still detects a replaced archive.
 
-**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild. Live interval vs on-exit splices are coalesced (V-4 `enqueue_commit`; second interval tick `Coalesced`; on-exit waits then one `commit_atomic`). Live prefix-frame mutate stays fail-closed; offline `--commit-overlay` remains the prefix-rewrite escape hatch (not a live-queue job). F-7 write-through should reuse that live queue.
+**Residual:** mid-member opaque prefix with no valid header (persist fail-closed); GNU incremental dumpdir across the window; prefix global PAX `g`; single-frame `.tar.zst` = full rebuild; `:memory:` / discarded sidecar → full rebuild (no `copy_prefix_from`); persist still **copies** the compressed prefix; ZIP incremental commit still full rebuild. Live interval vs on-exit splices are coalesced (V-4 `enqueue_commit`; second interval tick `Coalesced`; on-exit waits for inflight then one `commit_atomic` of remaining files; timeout does not splice while interval is still inflight). Live prefix-frame mutate stays fail-closed; offline `--commit-overlay` remains the prefix-rewrite escape hatch (not a live-queue job). F-7 write-through should reuse that live queue.
 
 ### F-3 — SQLite FTS5 / locate — `done`
 

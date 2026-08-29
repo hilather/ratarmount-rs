@@ -179,6 +179,9 @@ pub fn apply_live_commit(
     opts: &OpenOptions,
 ) -> Result<bool, String> {
     if reopen_and_reset {
+        // Unused by spawn_interval_commits (IntervalIdle) and on-exit (OnExit).
+        // persist-all + reopen is neither idle-only nor persist-only, so it is
+        // not a CommitKind. Direct `commit_live` is not coalesced (NFS tests).
         overlay
             .commit_live(archive, |p| {
                 if let Some(window) = overlay.last_patch_window() {
@@ -652,6 +655,21 @@ mod tests {
         let interval = interval.join().expect("interval thread").expect("interval");
         assert_eq!(interval, CommitOutcome::DidWork);
         assert!(!overlay_dir.join("new.bin").exists());
+
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        let mut src = std::fs::File::open(&archive).unwrap();
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        ratarmount_compress::decode_zstd_frames_to(&mut src, &map, 0, tmp.as_file_mut()).unwrap();
+        let listing = std::process::Command::new("tar")
+            .args(["-tf"])
+            .arg(tmp.path())
+            .output()
+            .expect("tar -tf");
+        let n = String::from_utf8_lossy(&listing.stdout)
+            .lines()
+            .filter(|l| l.trim_end_matches('/') == "new.bin")
+            .count();
+        assert_eq!(n, 1, "new.bin must appear once after interval+on-exit");
     }
 
     #[test]
