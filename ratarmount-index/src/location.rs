@@ -7,9 +7,11 @@
 //! family** (`v1`). Inner [`crate::INDEX_VERSION`] (`"0.7.0"`) is the `files` schema.
 //! Those are not the same string and this is **not** SOCI / eStargz / nydus zTOC.
 //! Inbound clients parse RFC 8288 `Link: rel="describedby"` on HEAD of the
-//! **archive** URL ([`parse_link_describedby`]) and try http(s) sibling URLs
-//! ([`sibling_index_candidates`]). Local folder order in [`resolve_index_location`]
-//! is unchanged (`oci:{digest}` cache stays first among folder candidates).
+//! **archive** URL ([`parse_link_describedby`]) and try sibling URLs
+//! ([`sibling_index_pointer_url`], [`sibling_index_candidates`],
+//! [`object_store_sibling_index_candidates`]). Local folder order in
+//! [`resolve_index_location`] is unchanged (`oci:{digest}` cache stays first
+//! among folder candidates).
 
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -189,6 +191,14 @@ pub fn parse_index_id(s: &str) -> Result<String> {
     Ok(t)
 }
 
+/// Parse pointer JSON (remote GET body). Schema / id mismatch → `Err`.
+pub fn parse_index_pointer_json(s: &str) -> Result<IndexPointer> {
+    let ptr: IndexPointer =
+        serde_json::from_str(s).map_err(|e| IndexError::Invalid(format!("index pointer: {e}")))?;
+    ptr.validate()?;
+    Ok(ptr)
+}
+
 /// Load `{archive}.index.ptr`. Missing file → `Ok(None)`. Invalid schema / id → `Err`.
 pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
     let mut f = match File::open(path) {
@@ -198,10 +208,9 @@ pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
     };
     let mut s = String::new();
     f.read_to_string(&mut s)?;
-    let ptr: IndexPointer = serde_json::from_str(&s)
-        .map_err(|e| IndexError::Invalid(format!("index pointer {}: {e}", path.display())))?;
-    ptr.validate()?;
-    Ok(Some(ptr))
+    parse_index_pointer_json(&s)
+        .map(Some)
+        .map_err(|e| IndexError::Invalid(format!("index pointer {}: {e}", path.display())))
 }
 
 /// Atomically replace `path` with pretty-printed pointer JSON (tmp + rename).
@@ -457,7 +466,7 @@ fn civil_from_unix_days(days: i64) -> (i32, u8, u8) {
     (y as i32, m as u8, d as u8)
 }
 
-/// Compressed sidecar suffixes tried after `{url}.index.sqlite` (http(s) only).
+/// Compressed sidecar suffixes tried after `{url}.index.sqlite`.
 const SIBLING_COMPRESSED_SUFFIXES: &[&str] = &[".gz", ".zst", ".xz", ".bz2"];
 
 const USER_AGENT: &str = "ratarmount-rs/0.1";
@@ -569,8 +578,9 @@ pub fn is_index_url(s: &str) -> bool {
 
 /// Sibling index URL convention for a remote archive: `archive_url + ".index.sqlite"`.
 ///
-/// Returns `None` when `archive_url` is not `http(s)://`. No S3/GCS/Azure sibling
-/// GET in v1; compressed suffixes are listed by [`sibling_index_candidates`].
+/// Returns `None` when `archive_url` is not `http(s)://`. Object-store well-known
+/// keys use [`object_store_sibling_index_candidates`]. Compressed suffixes are
+/// listed by [`sibling_index_candidates`].
 pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     let s = archive_url.trim();
     if s.starts_with("http://") || s.starts_with("https://") {
@@ -580,18 +590,75 @@ pub fn sibling_index_url(archive_url: &str) -> Option<String> {
     }
 }
 
-/// http(s) sibling index URLs: uncompressed [`sibling_index_url`] then `.gz` /
-/// `.zst` / `.xz` / `.bz2`. Empty for `s3://`, `file://`, and local paths.
-pub fn sibling_index_candidates(archive_url: &str) -> Vec<String> {
-    let Some(base) = sibling_index_url(archive_url) else {
-        return Vec::new();
-    };
+fn with_compressed_suffixes(base: String) -> Vec<String> {
     let mut out = Vec::with_capacity(1 + SIBLING_COMPRESSED_SUFFIXES.len());
     out.push(base.clone());
     for suf in SIBLING_COMPRESSED_SUFFIXES {
         out.push(format!("{base}{suf}"));
     }
     out
+}
+
+fn remote_index_sibling_url(s: &str) -> bool {
+    s.starts_with("http://")
+        || s.starts_with("https://")
+        || s.starts_with("s3://")
+        || s.starts_with("gs://")
+        || s.starts_with("az://")
+        || s.starts_with("azure://")
+}
+
+/// `{archive_url}.index.ptr` for http(s) and S3/GCS/Azure. Additional candidate
+/// (not a replacement for the well-known SQLite blob).
+pub fn sibling_index_pointer_url(archive_url: &str) -> Option<String> {
+    let s = archive_url.trim();
+    if remote_index_sibling_url(s) {
+        Some(format!("{s}.index.ptr"))
+    } else {
+        None
+    }
+}
+
+/// `{archive_url}.index.{64hex}.sqlite`. Rejects uuid / path-escape ids.
+pub fn sibling_index_id_url(archive_url: &str, index_id: &str) -> Option<String> {
+    let id = parse_index_id(index_id).ok()?;
+    let s = archive_url.trim();
+    if remote_index_sibling_url(s) {
+        Some(format!("{s}.index.{id}.sqlite"))
+    } else {
+        None
+    }
+}
+
+/// Immutable blob URL then `.gz` / `.zst` / `.xz` / `.bz2`.
+pub fn sibling_index_id_candidates(archive_url: &str, index_id: &str) -> Vec<String> {
+    match sibling_index_id_url(archive_url, index_id) {
+        Some(base) => with_compressed_suffixes(base),
+        None => Vec::new(),
+    }
+}
+
+/// http(s) sibling index URLs: uncompressed [`sibling_index_url`] then `.gz` /
+/// `.zst` / `.xz` / `.bz2`. Empty for `s3://`, `file://`, and local paths.
+pub fn sibling_index_candidates(archive_url: &str) -> Vec<String> {
+    let Some(base) = sibling_index_url(archive_url) else {
+        return Vec::new();
+    };
+    with_compressed_suffixes(base)
+}
+
+/// Well-known `{url}.index.sqlite` (+ compressed) for S3/GCS/Azure. Empty for
+/// http(s) (those use [`sibling_index_candidates`]) and local paths.
+pub fn object_store_sibling_index_candidates(archive_url: &str) -> Vec<String> {
+    let s = archive_url.trim();
+    if !(s.starts_with("s3://")
+        || s.starts_with("gs://")
+        || s.starts_with("az://")
+        || s.starts_with("azure://"))
+    {
+        return Vec::new();
+    }
+    with_compressed_suffixes(format!("{s}.index.sqlite"))
 }
 
 /// Parse RFC 8288 `Link` header value(s) from HEAD of an **archive** URL.
@@ -1374,6 +1441,72 @@ mod tests {
         assert!(sibling_index_candidates("s3://bucket/key").is_empty());
         assert!(sibling_index_candidates("file:///tmp/a.tar").is_empty());
         assert!(sibling_index_candidates("/local/a.tar").is_empty());
+    }
+
+    #[test]
+    fn sibling_index_pointer_and_id_urls_http_and_object_store() {
+        let id = "a".repeat(INDEX_ID_HEX_LEN);
+        assert_eq!(
+            sibling_index_pointer_url("http://host/path/a.tar").as_deref(),
+            Some("http://host/path/a.tar.index.ptr")
+        );
+        assert_eq!(
+            sibling_index_pointer_url("s3://bucket/key.tar").as_deref(),
+            Some("s3://bucket/key.tar.index.ptr")
+        );
+        assert_eq!(
+            sibling_index_pointer_url("gs://b/o.bin").as_deref(),
+            Some("gs://b/o.bin.index.ptr")
+        );
+        assert_eq!(
+            sibling_index_pointer_url("az://c/blob").as_deref(),
+            Some("az://c/blob.index.ptr")
+        );
+        assert_eq!(
+            sibling_index_pointer_url("azure://c/blob").as_deref(),
+            Some("azure://c/blob.index.ptr")
+        );
+        assert!(sibling_index_pointer_url("/local/a.tar").is_none());
+        assert!(sibling_index_pointer_url("file:///tmp/a.tar").is_none());
+
+        assert_eq!(
+            sibling_index_id_url("s3://bucket/key.tar", &id),
+            Some(format!("s3://bucket/key.tar.index.{id}.sqlite"))
+        );
+        assert!(sibling_index_id_url("s3://bucket/key.tar", "not-hex").is_none());
+        assert!(sibling_index_id_url("s3://bucket/key.tar", "../escape").is_none());
+        let cands = sibling_index_id_candidates("https://h/a.tar", &id);
+        assert_eq!(cands[0], format!("https://h/a.tar.index.{id}.sqlite"));
+        assert!(cands.iter().any(|u| u.ends_with(".sqlite.gz")));
+
+        let store = object_store_sibling_index_candidates("s3://bucket/key.tar");
+        assert_eq!(store[0], "s3://bucket/key.tar.index.sqlite");
+        assert!(store.iter().any(|u| u.ends_with(".index.sqlite.gz")));
+        assert!(object_store_sibling_index_candidates("http://h/a.tar").is_empty());
+        assert!(object_store_sibling_index_candidates("/local/a.tar").is_empty());
+    }
+
+    #[test]
+    fn parse_index_pointer_json_rejects_schema_and_uuid() {
+        let err = parse_index_pointer_json("{}").unwrap_err().to_string();
+        assert!(err.contains("index pointer"), "{err}");
+        let uuid = serde_json::json!({
+            "schema": INDEX_POINTER_SCHEMA,
+            "index_id": "550e8400-e29b-41d4-a716-446655440000",
+            "etag_sha256": "550e8400-e29b-41d4-a716-446655440000",
+            "generated_at": "2026-01-01T00:00:00Z",
+        });
+        assert!(parse_index_pointer_json(&uuid.to_string()).is_err());
+        let bad_schema = serde_json::json!({
+            "schema": "not.a.pointer",
+            "index_id": "a".repeat(INDEX_ID_HEX_LEN),
+            "etag_sha256": "a".repeat(INDEX_ID_HEX_LEN),
+            "generated_at": "2026-01-01T00:00:00Z",
+        });
+        let err = parse_index_pointer_json(&bad_schema.to_string())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("schema"), "{err}");
     }
 
     #[test]

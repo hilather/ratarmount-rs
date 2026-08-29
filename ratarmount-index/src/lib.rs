@@ -29,11 +29,13 @@ pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,
     expand_user, index_id_path, index_pointer_path, index_pointer_path_for_index_file,
     is_index_url, load_index_pointer, materialize_index_file, maybe_fetch_index_url,
-    parse_index_folders, parse_index_id, parse_link_describedby, possible_index_paths,
-    prune_index_snapshots, publish_index_pointer, resolve_index_id_path, resolve_index_location,
-    sibling_index_candidates, sibling_index_url, snapshot_index_id, store_index_pointer_atomic,
-    IndexLocation, IndexPointer, INDEX_ID_HEX_LEN, INDEX_LINK_REL, INDEX_MEDIA_TYPE,
-    INDEX_POINTER_KEEP_LAST, INDEX_POINTER_SCHEMA, MEMORY_INDEX,
+    object_store_sibling_index_candidates, parse_index_folders, parse_index_id,
+    parse_index_pointer_json, parse_link_describedby, possible_index_paths, prune_index_snapshots,
+    publish_index_pointer, resolve_index_id_path, resolve_index_location, sibling_index_candidates,
+    sibling_index_id_candidates, sibling_index_id_url, sibling_index_pointer_url,
+    sibling_index_url, snapshot_index_id, store_index_pointer_atomic, IndexLocation, IndexPointer,
+    INDEX_ID_HEX_LEN, INDEX_LINK_REL, INDEX_MEDIA_TYPE, INDEX_POINTER_KEEP_LAST,
+    INDEX_POINTER_SCHEMA, MEMORY_INDEX,
 };
 pub use meta_cache::{
     cache_identity, invalidate_meta_cache_file, invalidate_meta_cache_identity, is_meta_cache_path,

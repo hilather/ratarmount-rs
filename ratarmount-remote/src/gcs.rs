@@ -30,7 +30,7 @@
 //!
 //! Factory `gs://` dispatch is a later PR. R2/MinIO remain S3 (`AWS_ENDPOINT_URL`).
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -39,6 +39,7 @@ use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use log::debug;
 use ratarmount_core::{ArchiveRead, MountSource};
 use sha1::Sha1;
+use tempfile::NamedTempFile;
 use url::Url;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -711,6 +712,64 @@ fn fetch_gcs_full_get(loc: &GcsLocation) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Download `gs://bucket/object` to a tempfile (GET only).
+pub fn fetch_gcs_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
+    let loc = parse_gcs_url(url_str)?;
+    fetch_gcs_location_to_temp(&loc)
+}
+
+fn fetch_gcs_location_to_temp(loc: &GcsLocation) -> Result<(NamedTempFile, u64)> {
+    let (source, resp) = gcs_get_object(loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(gcs_status_error(source, status, loc, &body));
+    }
+    let mut reader = resp.into_reader();
+    let mut tmp = NamedTempFile::new()?;
+    let n = io::copy(&mut reader, &mut tmp)?;
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok((tmp, n))
+}
+
+/// Inclusive byte range GET (`start..=end_inclusive`). Expects HTTP 206.
+pub fn fetch_gcs_range_bytes(url_str: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
+    let loc = parse_gcs_url(url_str)?;
+    if end_inclusive < start {
+        return Err(gcs_err(format!(
+            "invalid range {start}-{end_inclusive} for gs://{}/{}",
+            loc.bucket, loc.object
+        )));
+    }
+    let expected = end_inclusive - start + 1;
+    let (source, resp) = gcs_get_object(&loc, Some((start, end_inclusive)))?;
+    let status = resp.status();
+    if status == 206 {
+        let mut reader = resp.into_reader();
+        let mut bytes = Vec::with_capacity(expected as usize);
+        reader.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected {
+            return Err(gcs_err(format!(
+                "range bytes={start}-{end_inclusive} for gs://{}/{} returned {} bytes, expected {expected}",
+                loc.bucket,
+                loc.object,
+                bytes.len()
+            )));
+        }
+        return Ok(bytes);
+    }
+    if status == 200 {
+        let _ = resp.into_string();
+        return Err(gcs_err(format!(
+            "HTTP 200 (Range ignored) GetObject gs://{}/{} bytes={start}-{end_inclusive}",
+            loc.bucket, loc.object
+        )));
+    }
+    let body = resp.into_string().unwrap_or_default();
+    Err(gcs_status_error(source, status, &loc, &body))
 }
 
 /// Seekable GCS reader using live Range GETs on the XML path-style API.
@@ -1829,6 +1888,26 @@ c8kyOVCJusup7SdkiG+QF64=
             0,
             "anonymous Range must not send Authorization"
         );
+    }
+
+    #[test]
+    fn anonymous_fetch_gcs_to_temp() {
+        let payload = b"gcs-index-sibling-bytes".to_vec();
+        let mock = MockGcs::spawn(MockMode::Object {
+            body: payload.clone(),
+            require_auth: false,
+            honor_range: true,
+        });
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("RATARMOUNT_GCS_ANONYMOUS", "1");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+
+        let (mut tmp, size) = fetch_gcs_to_temp("gs://public/path/obj.bin").unwrap();
+        assert_eq!(size, payload.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
     }
 
     #[test]

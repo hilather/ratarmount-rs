@@ -26,7 +26,7 @@
 //! `AZURE_STORAGE_ACCOUNT` is required for non-anonymous (and to form the host
 //! unless [`AZURE_ENDPOINT_ENV`] is set). R2/MinIO remain S3.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -34,6 +34,7 @@ use hmac::{Hmac, Mac};
 use log::debug;
 use ratarmount_core::{ArchiveRead, MountSource};
 use sha2::Sha256;
+use tempfile::NamedTempFile;
 use url::Url;
 
 use crate::folder::{RemoteDirent, RemoteFolderMountSource, RemoteListing};
@@ -741,6 +742,64 @@ fn fetch_azure_full_get(loc: &AzureLocation) -> Result<Vec<u8>> {
     let mut buf = Vec::new();
     reader.read_to_end(&mut buf)?;
     Ok(buf)
+}
+
+/// Download `az://container/blob` to a tempfile (GET only).
+pub fn fetch_azure_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
+    let loc = parse_azure_url(url_str)?;
+    fetch_azure_location_to_temp(&loc)
+}
+
+fn fetch_azure_location_to_temp(loc: &AzureLocation) -> Result<(NamedTempFile, u64)> {
+    let (source, resp) = azure_get_blob(loc, None)?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(azure_status_error(source, status, loc, &body));
+    }
+    let mut reader = resp.into_reader();
+    let mut tmp = NamedTempFile::new()?;
+    let n = io::copy(&mut reader, &mut tmp)?;
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok((tmp, n))
+}
+
+/// Inclusive byte range GET (`start..=end_inclusive`). Expects HTTP 206.
+pub fn fetch_azure_range_bytes(url_str: &str, start: u64, end_inclusive: u64) -> Result<Vec<u8>> {
+    let loc = parse_azure_url(url_str)?;
+    if end_inclusive < start {
+        return Err(azure_err(format!(
+            "invalid range {start}-{end_inclusive} for az://{}/{}",
+            loc.container, loc.blob
+        )));
+    }
+    let expected = end_inclusive - start + 1;
+    let (source, resp) = azure_get_blob(&loc, Some((start, end_inclusive)))?;
+    let status = resp.status();
+    if status == 206 {
+        let mut reader = resp.into_reader();
+        let mut bytes = Vec::with_capacity(expected as usize);
+        reader.read_to_end(&mut bytes)?;
+        if bytes.len() as u64 != expected {
+            return Err(azure_err(format!(
+                "range bytes={start}-{end_inclusive} for az://{}/{} returned {} bytes, expected {expected}",
+                loc.container,
+                loc.blob,
+                bytes.len()
+            )));
+        }
+        return Ok(bytes);
+    }
+    if status == 200 {
+        let _ = resp.into_string();
+        return Err(azure_err(format!(
+            "HTTP 200 (Range ignored) GetBlob az://{}/{} bytes={start}-{end_inclusive}",
+            loc.container, loc.blob
+        )));
+    }
+    let body = resp.into_string().unwrap_or_default();
+    Err(azure_status_error(source, status, &loc, &body))
 }
 
 /// Seekable Azure Blob reader using live Range GETs.
@@ -1701,6 +1760,26 @@ mod tests {
         f.read_exact(&mut got).unwrap();
         assert_eq!(got, &body[..16]);
         assert_eq!(mock.auth_headers.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn anonymous_fetch_azure_to_temp() {
+        let payload = b"azure-index-sibling-bytes".to_vec();
+        let mock = MockAzure::spawn(MockMode::Object {
+            body: payload.clone(),
+            require_auth: false,
+        });
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ANON_ENV, "1");
+        _g.set(AZURE_ACCOUNT_ENV, "pub");
+        _g.set(AZURE_ENDPOINT_ENV, &mock.base_url);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+
+        let (mut tmp, size) = fetch_azure_to_temp("az://ctr/obj.bin").unwrap();
+        assert_eq!(size, payload.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
     }
 
     const PAGE1: &str = r#"<?xml version="1.0" encoding="utf-8"?>

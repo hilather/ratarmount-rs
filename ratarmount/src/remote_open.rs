@@ -11,16 +11,19 @@ use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
-    invalidate_meta_cache_identity, is_meta_cache_path, maybe_fetch_index_url,
+    invalidate_meta_cache_identity, is_meta_cache_path, materialize_index_file,
+    maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_pointer_json,
     parse_link_describedby, resolve_index_location, sha256_hex_stream, sibling_index_candidates,
-    SqliteIndex, TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
+    sibling_index_id_candidates, sibling_index_pointer_url, SqliteIndex, TARSTATS_FULL_HASH_MAX,
+    TARSTATS_SAMPLE_BYTES,
 };
 
 use super::{open_from_live_range, open_path};
 
 /// K12: explicit `--index-file` / local folder candidates (including `oci:{digest}`
-/// cache) then HTTP `Link` on archive HEAD, http(s) sibling GET, OCI referrer on
-/// local miss. Fail-open. No S3 sibling GET. Wrong-size sidecar is not used.
+/// cache) then GET `{url}.index.ptr` + immutable blob, HTTP `Link` on archive HEAD,
+/// http(s) well-known sibling GET, S3/GCS/Azure well-known sibling GET, OCI
+/// referrer on local miss. Fail-open. Pointer/blob/tarstats failure continues.
 fn apply_remote_index_discovery(
     input: &str,
     opts: &mut OpenOptions,
@@ -47,6 +50,9 @@ fn apply_remote_index_discovery(
     let cache_dest = loc.as_path().map(Path::to_path_buf);
 
     if input.starts_with("http://") || input.starts_with("https://") {
+        if try_http_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
+            return;
+        }
         match ratarmount_remote::probe_http(input) {
             Ok(probe) => {
                 if let Some(header) = probe.link.as_deref() {
@@ -72,6 +78,20 @@ fn apply_remote_index_discovery(
                 }
             }
             Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
+        }
+        return;
+    }
+
+    if ratarmount_remote::is_object_store_archive_url(input) {
+        if try_object_store_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
+            return;
+        }
+        for cand in object_store_sibling_index_candidates(input) {
+            if try_fetch_object_store_index(opts, &cand, archive_size, input, cache_dest.as_deref())
+            {
+                return;
+            }
+            log::debug!("index sibling unusable: {cand}");
         }
         return;
     }
@@ -107,6 +127,84 @@ fn path_is_nonempty_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn try_http_pointer_then_blob(
+    opts: &mut OpenOptions,
+    archive_url: &str,
+    archive_size: u64,
+    cache_dest: Option<&Path>,
+) -> bool {
+    let Some(ptr_url) = sibling_index_pointer_url(archive_url) else {
+        return false;
+    };
+    match fetch_http_pointer(&ptr_url) {
+        Ok(ptr) => {
+            for cand in sibling_index_id_candidates(archive_url, &ptr.index_id) {
+                if try_fetch_http_index(opts, &cand, archive_size, archive_url, cache_dest) {
+                    return true;
+                }
+            }
+            log::warn!(
+                "index pointer blob unusable for {}; continue discovery",
+                ptr.index_id
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("index pointer GET {ptr_url}: {e}; continue discovery");
+            false
+        }
+    }
+}
+
+fn fetch_http_pointer(url: &str) -> std::result::Result<ratarmount_index::IndexPointer, String> {
+    let (mut tmp, n) = ratarmount_remote::fetch_http_to_temp(url).map_err(|e| e.to_string())?;
+    if n == 0 {
+        return Err("empty pointer body".into());
+    }
+    let mut s = String::new();
+    tmp.read_to_string(&mut s).map_err(|e| e.to_string())?;
+    parse_index_pointer_json(&s).map_err(|e| e.to_string())
+}
+
+fn try_object_store_pointer_then_blob(
+    opts: &mut OpenOptions,
+    archive_url: &str,
+    archive_size: u64,
+    cache_dest: Option<&Path>,
+) -> bool {
+    let Some(ptr_url) = sibling_index_pointer_url(archive_url) else {
+        return false;
+    };
+    match fetch_object_store_pointer(&ptr_url) {
+        Ok(ptr) => {
+            for cand in sibling_index_id_candidates(archive_url, &ptr.index_id) {
+                if try_fetch_object_store_index(opts, &cand, archive_size, archive_url, cache_dest)
+                {
+                    return true;
+                }
+            }
+            log::warn!(
+                "index pointer blob unusable for {}; continue discovery",
+                ptr.index_id
+            );
+            false
+        }
+        Err(e) => {
+            log::warn!("index pointer GET {ptr_url}: {e}; continue discovery");
+            false
+        }
+    }
+}
+
+fn fetch_object_store_pointer(
+    url: &str,
+) -> std::result::Result<ratarmount_index::IndexPointer, String> {
+    let path = ratarmount_remote::fetch_index_sibling_to_temp(url).map_err(|e| e.to_string())?;
+    let s = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    parse_index_pointer_json(&s.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+}
+
 fn try_fetch_http_index(
     opts: &mut OpenOptions,
     index_url: &str,
@@ -132,6 +230,41 @@ fn try_fetch_http_index(
                 invalidate_meta_cache_identity("http", index_url);
             }
             ok
+        }
+        Err(e) => {
+            log::debug!("index fetch {index_url}: {e}");
+            false
+        }
+    }
+}
+
+fn try_fetch_object_store_index(
+    opts: &mut OpenOptions,
+    index_url: &str,
+    archive_size: u64,
+    archive_url: &str,
+    cache_dest: Option<&Path>,
+) -> bool {
+    match ratarmount_remote::fetch_index_sibling_to_temp(index_url) {
+        Ok(path) => {
+            let path = match materialize_index_file(&path) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("index materialize {index_url}: {e}");
+                    let _ = std::fs::remove_file(&path);
+                    return false;
+                }
+            };
+            let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
+            try_install_remote_index(
+                opts,
+                path,
+                archive_size,
+                prefix.as_deref(),
+                suffix.as_deref(),
+                full.as_deref(),
+                cache_dest,
+            )
         }
         Err(e) => {
             log::debug!("index fetch {index_url}: {e}");
@@ -220,6 +353,42 @@ fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Op
     };
     let full = if size <= TARSTATS_FULL_HASH_MAX {
         ratarmount_remote::hash_http_range_sha256(url, 0, size.saturating_sub(1)).ok()
+    } else {
+        None
+    };
+    (prefix, suffix, full)
+}
+
+fn object_store_fingerprint(
+    url: &str,
+    size: u64,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if size == 0 {
+        return (None, None, None);
+    }
+    let fetch = |start: u64, end: u64| -> Option<Vec<u8>> {
+        if url.starts_with("s3://") {
+            ratarmount_remote::fetch_s3_range_bytes(url, start, end).ok()
+        } else if url.starts_with("gs://") {
+            ratarmount_remote::fetch_gcs_range_bytes(url, start, end).ok()
+        } else if url.starts_with("az://") || url.starts_with("azure://") {
+            ratarmount_remote::fetch_azure_range_bytes(url, start, end).ok()
+        } else {
+            None
+        }
+    };
+    let prefix_end = (TARSTATS_SAMPLE_BYTES as u64)
+        .saturating_sub(1)
+        .min(size.saturating_sub(1));
+    let prefix = fetch(0, prefix_end).and_then(|b| hash_hex("sha256", &b));
+    let suffix = if size as usize <= TARSTATS_SAMPLE_BYTES {
+        prefix.clone()
+    } else {
+        let start = size.saturating_sub(TARSTATS_SAMPLE_BYTES as u64);
+        fetch(start, size.saturating_sub(1)).and_then(|b| hash_hex("sha256", &b))
+    };
+    let full = if size <= TARSTATS_FULL_HASH_MAX {
+        fetch(0, size.saturating_sub(1)).and_then(|b| hash_hex("sha256", &b))
     } else {
         None
     };
@@ -433,21 +602,27 @@ where
         Ok(range) if range.live_ranges() => {
             let len = range.body_len();
             eprintln!("{transport}: {input} ({len} bytes, live Range)");
-            match open_from_live_range(range, len, input, opts, recreate, transport, || {
+            let mut opts = opts.clone();
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            match open_from_live_range(range, len, input, &opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
                 None => {
                     eprintln!("info: {transport} format unsupported for {input}; materializing");
-                    materialize_remote_input(input, opts, recreate, remotes)
+                    materialize_remote_input(input, &opts, recreate, remotes)
                 }
             }
         }
-        Ok(_) => {
+        Ok(range) => {
+            let len = range.body_len();
             eprintln!(
                 "info: {transport} unavailable for {input} (full body buffered); materializing"
             );
-            materialize_remote_input(input, opts, recreate, remotes)
+            let mut opts = opts.clone();
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            drop(range);
+            materialize_remote_input(input, &opts, recreate, remotes)
         }
         Err(e) => {
             eprintln!("info: {transport} open failed for {input}: {e}; materializing");
@@ -729,266 +904,502 @@ mod tests {
         assert_eq!(buf, b"hello-oci-layer\n");
     }
 
-    /// Regression: inbound HEAD of an **archive** URL with `Link: describedby`
-    /// fetches the sidecar when local folder candidates miss.
-    #[test]
-    fn apply_remote_index_discovery_follows_archive_link() {
-        with_isolated_xdg(|| {
-            use ratarmount_index::{SqliteIndex, INDEX_LINK_REL, INDEX_MEDIA_TYPE};
-            use std::io::{BufRead, BufReader, Write as IoWrite};
-            use std::net::TcpListener;
-            use std::thread;
+    fn make_sidecar_for(archive: &Path) -> Vec<u8> {
+        let dir = archive.parent().unwrap();
+        let idx_path = dir.join(format!(
+            "{}.sidecar.sqlite",
+            archive.file_name().unwrap().to_string_lossy()
+        ));
+        {
+            let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            idx.store_tarstats_for_path(archive).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        fs::read(&idx_path).unwrap()
+    }
 
-            let dir = tempfile::tempdir().unwrap();
-            let archive = dir.path().join("archive.tar");
-            let archive_bytes = vec![b'A'; 1024];
-            fs::write(&archive, &archive_bytes).unwrap();
-            let idx_path = dir.path().join("sidecar.sqlite");
-            {
-                let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
-                idx.store_tarstats_for_path(&archive).unwrap();
-                idx.publish_tmp().unwrap();
-            }
-            let index_bytes = fs::read(&idx_path).unwrap();
-            let folders = vec![dir.path().join("empty-index-folders")];
-            fs::create_dir_all(&folders[0]).unwrap();
+    fn pointer_json_for_blob(blob: &[u8]) -> Vec<u8> {
+        use ratarmount_index::{INDEX_ID_HEX_LEN, INDEX_POINTER_SCHEMA};
+        let id = ratarmount_index::sha256_hex(blob);
+        assert_eq!(id.len(), INDEX_ID_HEX_LEN);
+        format!(
+            r#"{{"schema":"{INDEX_POINTER_SCHEMA}","index_id":"{id}","etag_sha256":"{id}","generated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .into_bytes()
+    }
 
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let archive_body = archive_bytes.clone();
-            let index_body = index_bytes.clone();
-            let join = thread::spawn(move || {
-                listener.set_nonblocking(false).ok();
-                for stream in listener.incoming().take(32) {
-                    let Ok(mut stream) = stream else { continue };
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).is_err() {
-                        continue;
+    struct IndexHttp {
+        addr: std::net::SocketAddr,
+        gets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _join: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_index_http(
+        archive_path: &str,
+        archive_bytes: Vec<u8>,
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        link_on_archive: Option<String>,
+    ) -> IndexHttp {
+        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gets = Arc::new(Mutex::new(Vec::new()));
+        let gets_c = Arc::clone(&gets);
+        let archive_path = archive_path.to_string();
+        let join = thread::spawn(move || {
+            listener.set_nonblocking(false).ok();
+            for stream in listener.incoming().take(64) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut range_hdr: Option<String> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
                     }
-                    let mut range_hdr: Option<String> = None;
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_err() {
-                            break;
-                        }
-                        if line == "\r\n" || line == "\n" || line.is_empty() {
-                            break;
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Range:") {
+                        range_hdr = Some(v.trim().to_string());
+                    }
+                }
+                let path = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("")
+                    .split('?')
+                    .next()
+                    .unwrap_or("")
+                    .to_string();
+                {
+                    gets_c.lock().unwrap().push(path.clone());
+                }
+                let is_head = request_line.starts_with("HEAD ");
+                let is_archive = path == archive_path;
+                let body: &[u8] = if is_archive {
+                    &archive_bytes
+                } else if let Some(b) = objects.get(&path) {
+                    b
+                } else {
+                    let msg = b"not found";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    if !is_head {
+                        let _ = stream.write_all(msg);
+                    }
+                    continue;
+                };
+                let body_owned = body.to_vec();
+                let mut range_off: Option<(usize, usize)> = None;
+                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                    let parts: Vec<&str> = r.splitn(2, '-').collect();
+                    if parts.len() == 2 {
+                        let start: usize = parts[0].parse().unwrap_or(0);
+                        let end: usize = if parts[1].is_empty() {
+                            body_owned.len().saturating_sub(1)
+                        } else {
+                            parts[1]
+                                .parse()
+                                .unwrap_or(0)
+                                .min(body_owned.len().saturating_sub(1))
+                        };
+                        if start < body_owned.len() && start <= end {
+                            range_off = Some((start, end));
                         }
                     }
-                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
-                    let is_head = request_line.starts_with("HEAD ");
-                    let is_index = path.contains("index.sqlite");
-                    let body: &[u8] = if is_index { &index_body } else { &archive_body };
-                    let mut range_off: Option<(usize, usize)> = None;
-                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
-                        let parts: Vec<&str> = r.splitn(2, '-').collect();
-                        if parts.len() == 2 {
-                            let start: usize = parts[0].parse().unwrap_or(0);
-                            let end: usize = if parts[1].is_empty() {
-                                body.len().saturating_sub(1)
-                            } else {
-                                parts[1]
-                                    .parse()
-                                    .unwrap_or(0)
-                                    .min(body.len().saturating_sub(1))
-                            };
-                            if start < body.len() && start <= end {
-                                range_off = Some((start, end));
-                            }
-                        }
-                    }
-                    let slice = match range_off {
-                        Some((s, e)) => &body[s..=e],
-                        None => body,
-                    };
-                    let status = if range_off.is_some() {
-                        "206 Partial Content"
-                    } else {
-                        "200 OK"
-                    };
-                    let mut hdr = format!(
+                }
+                let slice = match range_off {
+                    Some((s, e)) => &body_owned[s..=e],
+                    None => body_owned.as_slice(),
+                };
+                let status = if range_off.is_some() {
+                    "206 Partial Content"
+                } else {
+                    "200 OK"
+                };
+                let mut hdr = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
                     slice.len()
                 );
-                    if let Some((start, end)) = range_off {
-                        hdr.push_str(&format!(
-                            "Content-Range: bytes {start}-{end}/{}\r\n",
-                            body.len()
-                        ));
-                    }
-                    if !is_index {
-                        hdr.push_str(&format!(
-                        "Link: </archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\"\r\n"
+                if let Some((start, end)) = range_off {
+                    hdr.push_str(&format!(
+                        "Content-Range: bytes {start}-{end}/{}\r\n",
+                        body_owned.len()
                     ));
-                    }
-                    hdr.push_str("\r\n");
-                    let _ = stream.write_all(hdr.as_bytes());
-                    if !is_head {
-                        let _ = stream.write_all(slice);
+                }
+                if is_archive {
+                    if let Some(ref link) = link_on_archive {
+                        hdr.push_str(&format!("Link: {link}\r\n"));
                     }
                 }
-            });
-
-            let url = format!("http://{addr}/archive.tar");
-            let mut opts = OpenOptions {
-                index_folders: folders,
-                write_index: false,
-                ..OpenOptions::default()
-            };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
-            drop(join);
-            let got = opts
-                .index_file_path
-                .as_ref()
-                .expect("Link describedby must install a sidecar");
-            assert!(got.is_file(), "{}", got.display());
-            assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+                hdr.push_str("\r\n");
+                let _ = stream.write_all(hdr.as_bytes());
+                if !is_head {
+                    let _ = stream.write_all(slice);
+                }
+            }
         });
+        IndexHttp {
+            addr,
+            gets,
+            _join: join,
+        }
     }
 
-    struct SidecarHttp {
-        url: String,
-        sidecar_gets: Arc<std::sync::Mutex<usize>>,
-        _join: Option<std::thread::JoinHandle<()>>,
+    fn empty_index_folders(dir: &Path) -> Vec<PathBuf> {
+        let folders = vec![dir.join("empty-index-folders")];
+        fs::create_dir_all(&folders[0]).unwrap();
+        folders
     }
 
-    impl SidecarHttp {
-        fn spawn(archive_body: Vec<u8>, index_body: Vec<u8>) -> Self {
-            Self::spawn_inner(archive_body, index_body, None)
-        }
+    fn well_known_get_logged(gets: &[String], archive_path: &str) -> bool {
+        let well = format!("{archive_path}.index.sqlite");
+        gets.iter()
+            .any(|g| g == &well || g.starts_with(&format!("{well}.")))
+    }
 
-        fn spawn_gzip(archive_body: Vec<u8>, gzip_index: Vec<u8>) -> Self {
-            Self::spawn_inner(archive_body, Vec::new(), Some(gzip_index))
-        }
+    /// Regression: inbound HEAD of an **archive** URL with `Link: describedby`
+    /// fetches the sidecar when local folder candidates miss (pointer 404 continues).
+    #[test]
+    fn apply_remote_index_discovery_follows_archive_link() {
+        use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
 
-        fn spawn_inner(
-            archive_body: Vec<u8>,
-            index_body: Vec<u8>,
-            gzip_index: Option<Vec<u8>>,
-        ) -> Self {
-            use std::io::{BufRead, BufReader, Write as IoWrite};
-            use std::net::TcpListener;
-            use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let archive_bytes = vec![b'A'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let folders = empty_index_folders(dir.path());
+        let link = format!(
+            "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, Some(link));
 
-            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-            let addr = listener.local_addr().unwrap();
-            let sidecar_gets = Arc::new(std::sync::Mutex::new(0usize));
-            let gets_c = Arc::clone(&sidecar_gets);
-            let join = thread::spawn(move || {
-                listener.set_nonblocking(false).ok();
-                for stream in listener.incoming().take(64) {
-                    let Ok(mut stream) = stream else { continue };
-                    let mut reader = BufReader::new(stream.try_clone().unwrap());
-                    let mut request_line = String::new();
-                    if reader.read_line(&mut request_line).is_err() {
-                        continue;
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("Link describedby must install a sidecar");
+        assert!(got.is_file(), "{}", got.display());
+        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+        let gets = http.gets.lock().unwrap().clone();
+        assert!(
+            gets.iter().any(|g| g.ends_with(".index.ptr")),
+            "pointer is an additional candidate (404 continues); gets={gets:?}"
+        );
+    }
+
+    /// Regression: pointer + blob + tarstats success skips well-known GET.
+    #[test]
+    fn apply_remote_index_discovery_pointer_blob_skips_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let archive_bytes = vec![b'B'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.ptr".into(), ptr);
+        objects.insert(
+            format!("/archive.tar.index.{id}.sqlite"),
+            index_bytes.clone(),
+        );
+        objects.insert(
+            "/archive.tar.index.sqlite".into(),
+            b"SQLite format 3\0must-not-fetch".to_vec(),
+        );
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None);
+
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("pointer blob must install a sidecar");
+        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+        let gets = http.gets.lock().unwrap().clone();
+        assert!(
+            !well_known_get_logged(&gets, "/archive.tar"),
+            "well-known GET must be skipped on pointer+blob+tarstats hit; gets={gets:?}"
+        );
+    }
+
+    /// Regression: pointer 404 still finds describedby.
+    #[test]
+    fn apply_remote_index_discovery_pointer_404_falls_back_describedby() {
+        use ratarmount_index::{INDEX_LINK_REL, INDEX_MEDIA_TYPE};
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("archive.tar");
+        let archive_bytes = vec![b'C'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let folders = empty_index_folders(dir.path());
+        let link = format!(
+            "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
+        );
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, Some(link));
+
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        assert!(
+            opts.index_file_path.is_some(),
+            "describedby must still install after pointer 404"
+        );
+    }
+
+    /// Regression: pointer blob tarstats mismatch continues to well-known sibling.
+    #[test]
+    fn apply_remote_index_discovery_pointer_tarstats_fail_falls_back_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.tar");
+        let bad = dir.path().join("bad.tar");
+        let archive_bytes = vec![b'D'; 1024];
+        fs::write(&good, &archive_bytes).unwrap();
+        fs::write(&bad, vec![b'X'; 64]).unwrap();
+        let good_idx = make_sidecar_for(&good);
+        let bad_idx = make_sidecar_for(&bad);
+        let bad_id = ratarmount_index::sha256_hex(&bad_idx);
+        let ptr = pointer_json_for_blob(&bad_idx);
+        let folders = empty_index_folders(dir.path());
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.ptr".into(), ptr);
+        objects.insert(format!("/archive.tar.index.{bad_id}.sqlite"), bad_idx);
+        objects.insert("/archive.tar.index.sqlite".into(), good_idx.clone());
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None);
+
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("well-known must install after pointer tarstats fail");
+        assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
+        let gets = http.gets.lock().unwrap().clone();
+        assert!(
+            well_known_get_logged(&gets, "/archive.tar"),
+            "well-known GET after tarstats fail; gets={gets:?}"
+        );
+    }
+
+    /// Regression: S3 pointer + blob + tarstats success skips well-known GET.
+    #[test]
+    fn apply_remote_index_discovery_s3_pointer_blob_skips_well_known() {
+        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
+
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let archive_bytes = vec![b'S'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes.clone());
+        objects.insert("data/a.tar.index.ptr".into(), ptr);
+        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes.clone());
+        objects.insert(
+            "data/a.tar.index.sqlite".into(),
+            b"SQLite format 3\0s3-well-known".to_vec(),
+        );
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let gets = Arc::new(Mutex::new(Vec::new()));
+        let gets_c = Arc::clone(&gets);
+        let join = thread::spawn(move || {
+            for stream in listener.incoming().take(64) {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() {
+                    continue;
+                }
+                let mut range_hdr: Option<String> = None;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
                     }
-                    let mut range_hdr: Option<String> = None;
-                    loop {
-                        let mut line = String::new();
-                        if reader.read_line(&mut line).is_err() {
-                            break;
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                    if let Some(v) = line.strip_prefix("Range:") {
+                        range_hdr = Some(v.trim().to_string());
+                    }
+                }
+                let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                let key = path
+                    .trim_start_matches('/')
+                    .split_once('/')
+                    .map(|(_, k)| k.split('?').next().unwrap_or(k).to_string())
+                    .unwrap_or_default();
+                gets_c.lock().unwrap().push(key.clone());
+                let Some(body) = objects.get(&key) else {
+                    let msg = b"NoSuchKey";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    continue;
+                };
+                let mut range_off = None;
+                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                    let parts: Vec<&str> = r.splitn(2, '-').collect();
+                    if parts.len() == 2 {
+                        let start: usize = parts[0].parse().unwrap_or(0);
+                        let end: usize = if parts[1].is_empty() {
+                            body.len().saturating_sub(1)
+                        } else {
+                            parts[1]
+                                .parse()
+                                .unwrap_or(0)
+                                .min(body.len().saturating_sub(1))
+                        };
+                        if start < body.len() && start <= end {
+                            range_off = Some((start, end));
                         }
-                        if line == "\r\n" || line == "\n" || line.is_empty() {
-                            break;
-                        }
-                        if let Some(v) = line.strip_prefix("Range:") {
-                            range_hdr = Some(v.trim().to_string());
-                        }
                     }
-                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
-                    let is_head = request_line.starts_with("HEAD ");
-                    let is_gz = path.ends_with(".index.sqlite.gz");
-                    let is_plain =
-                        path.ends_with(".index.sqlite") && !path.contains(".index.sqlite.");
-                    let compressed = path.contains(".index.sqlite.");
-                    let reject = if gzip_index.is_some() {
-                        is_plain || (compressed && !is_gz)
-                    } else {
-                        compressed
-                    };
-                    if reject {
-                        let hdr = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-                        let _ = stream.write_all(hdr.as_bytes());
-                        continue;
-                    }
-                    let is_index = if gzip_index.is_some() {
-                        is_gz
-                    } else {
-                        is_plain
-                    };
-                    if is_index && !is_head {
-                        *gets_c.lock().unwrap() += 1;
-                    }
-                    let body: &[u8] = if is_gz {
-                        gzip_index.as_deref().unwrap_or(&index_body)
-                    } else if is_plain {
-                        &index_body
-                    } else {
-                        &archive_body
-                    };
-                    let mut range_off: Option<(usize, usize)> = None;
-                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
-                        let parts: Vec<&str> = r.splitn(2, '-').collect();
-                        if parts.len() == 2 {
-                            let start: usize = parts[0].parse().unwrap_or(0);
-                            let end: usize = if parts[1].is_empty() {
-                                body.len().saturating_sub(1)
-                            } else {
-                                parts[1]
-                                    .parse()
-                                    .unwrap_or(0)
-                                    .min(body.len().saturating_sub(1))
-                            };
-                            if start < body.len() && start <= end {
-                                range_off = Some((start, end));
-                            }
-                        }
-                    }
-                    let slice = match range_off {
-                        Some((s, e)) => &body[s..=e],
-                        None => body,
-                    };
-                    let status = if range_off.is_some() {
-                        "206 Partial Content"
-                    } else {
-                        "200 OK"
-                    };
-                    let mut hdr = format!(
-                        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
+                }
+                let slice = match range_off {
+                    Some((s, e)) => &body[s..=e],
+                    None => body.as_slice(),
+                };
+                if let Some((s, e)) = range_off {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {s}-{e}/{}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        body.len(),
                         slice.len()
                     );
-                    if let Some((start, end)) = range_off {
-                        hdr.push_str(&format!(
-                            "Content-Range: bytes {start}-{end}/{}\r\n",
-                            body.len()
-                        ));
-                    }
-                    hdr.push_str("\r\n");
-                    let _ = stream.write_all(hdr.as_bytes());
-                    if !is_head {
-                        let _ = stream.write_all(slice);
-                    }
+                } else {
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                        slice.len()
+                    );
                 }
-            });
-            Self {
-                url: format!("http://{addr}/archive.tar"),
-                sidecar_gets,
-                _join: Some(join),
+                let _ = stream.write_all(slice);
             }
+        });
+
+        let _g = EnvGuard::acquire(&[
+            "AWS_ACCESS_KEY_ID",
+            "AWS_SECRET_ACCESS_KEY",
+            "AWS_SESSION_TOKEN",
+            "AWS_REGION",
+            "AWS_DEFAULT_REGION",
+            "AWS_ENDPOINT_URL",
+            "S3_ENDPOINT_URL",
+            "AWS_ANONYMOUS",
+            "RATARMOUNT_S3_ANONYMOUS",
+            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+            "RATARMOUNT_IMDS_BASE",
+        ]);
+        _g.set("AWS_ANONYMOUS", "1");
+        _g.set("AWS_ENDPOINT_URL", &format!("http://{addr}"));
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+
+        let url = "s3://bucket/data/a.tar";
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("S3 pointer blob must install a sidecar");
+        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+        let logged = gets.lock().unwrap().clone();
+        assert!(
+            !logged.iter().any(|k| k == "data/a.tar.index.sqlite"),
+            "S3 well-known GET must be skipped; gets={logged:?}"
+        );
+    }
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn acquire(keys: &[&str]) -> Self {
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            Self { saved }
         }
 
-        fn sidecar_gets(&self) -> usize {
-            *self.sidecar_gets.lock().unwrap()
+        fn set(&self, key: &str, val: &str) {
+            std::env::set_var(key, val);
         }
     }
 
-    /// Regression: remount of a published well-known sidecar (no `.ptr`) does
-    /// zero extra sidecar downloads after the local folder copy is gone.
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
     #[test]
     fn apply_remote_index_well_known_sidecar_cache_hit() {
         with_isolated_xdg(|| {
@@ -1144,4 +1555,5 @@ mod tests {
             );
         });
     }
+
 }

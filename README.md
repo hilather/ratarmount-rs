@@ -35,7 +35,7 @@ cat mnt/file     # true random access — even inside compressed streams
 | **~5.2× faster cold mounts** | Index + mount in a fraction of the Python baseline (~6.8× warm) |
 | **~4–6.5× lower peak RSS** | Typical **18–22 MiB** vs ~121 MiB for Python ratarmount |
 | **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
-| **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via archive `Link:` / http(s) sibling / OCI referrer on local miss; `--publish-index` always writes `{archive}.index.ptr`; remount a previous snapshot with `--index-id HEX` |
+| **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via `{url}.index.ptr` + `{url}.index.{id}.sqlite`, archive `Link:`, http(s)/S3/GCS/Azure well-known sibling, OCI referrer on local miss; `--publish-index` always writes `{archive}.index.ptr`; remount a previous snapshot with `--index-id HEX` |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
 | **Remote-first** | `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
 
@@ -187,7 +187,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 
 ### Remote backends
 
-`file://` · `http(s)://` (Range + Basic/Cookie auth; autoindex folders; archive `Link: describedby` / sibling `.index.sqlite`) · `s3://` (SigV4 / IMDS / anonymous; prefix folders; no sibling index GET/PUT in v1) · `gs://` (GOOG1 HMAC) · `az://` · `ftp://` / `ftps://` (REST + LIST/MLSD folders; implicit :990 residual) · `ssh://` / `sftp://` (SFTP `readdir` folders) · WebDAV (Depth-1 collections) · SMB (`smbclient`) · Dropbox · `oci://` / `docker://` / `ghcr://` (overlayfs layer union; `oci:{digest}` cache then OCI 1.1 referrer) · `ipfs://` / `ipns://` · `rclone://remote:path` · `rclone+remote:path`
+`file://` · `http(s)://` (Range + Basic/Cookie auth; autoindex folders; `{url}.index.ptr` then `{url}.index.{id}.sqlite`, archive `Link: describedby`, well-known sibling `.index.sqlite`) · `s3://` (SigV4 / IMDS / anonymous; prefix folders; sibling pointer/blob/well-known **GET**, no PUT) · `gs://` (GOOG1 HMAC; same sibling GET) · `az://` (same sibling GET) · `ftp://` / `ftps://` (REST + LIST/MLSD folders; implicit :990 residual) · `ssh://` / `sftp://` (SFTP `readdir` folders) · WebDAV (Depth-1 collections) · SMB (`smbclient`) · Dropbox · `oci://` / `docker://` / `ghcr://` (overlayfs layer union; `oci:{digest}` cache then OCI 1.1 referrer) · `ipfs://` / `ipns://` · `rclone://remote:path` · `rclone+remote:path`
 
 Remote sidecar **downloads** (whole SQLite blob ≤ 64 MiB, not archive Range I/O) are cached under `$XDG_CACHE_HOME/ratarmount/meta-v3/` (default `~/.cache/...`). Cap: `RATARMOUNT_META_CACHE_BYTES` (default 256 MiB; `=0` disables). Lookup is the sidecar URL — a remount does not need `.ptr`. HPC home-quota: point `XDG_CACHE_HOME` at scratch. `file://` / `:memory:` / an already-local sidecar are not stored again. This is **not** a payload/member cache (G-3).
 

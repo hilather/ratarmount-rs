@@ -25,6 +25,7 @@
 //! - other schemes → clear "not yet" errors
 
 mod dropbox;
+mod index_sibling;
 mod s3;
 mod smb;
 mod ssh;
@@ -40,12 +41,13 @@ pub use ftp::{
 };
 mod gcs;
 pub use gcs::{
-    open_gcs_folder, open_gcs_range, parse_gcs_url, GcsListing, GcsLocation, GcsRangeFile,
+    fetch_gcs_range_bytes, fetch_gcs_to_temp, open_gcs_folder, open_gcs_range, parse_gcs_url,
+    GcsListing, GcsLocation, GcsRangeFile,
 };
 mod azure;
 pub use azure::{
-    open_azure_folder, open_azure_range, parse_azure_url, AzureListing, AzureLocation,
-    AzureRangeFile,
+    fetch_azure_range_bytes, fetch_azure_to_temp, open_azure_folder, open_azure_range,
+    parse_azure_url, AzureListing, AzureLocation, AzureRangeFile,
 };
 mod rclone;
 pub use rclone::{
@@ -84,6 +86,7 @@ pub use dropbox::{
     DEFAULT_DROPBOX_DOWNLOAD_URL, DEFAULT_DROPBOX_LIST_TTL_SECS, DEFAULT_DROPBOX_RANGE_THRESHOLD,
     DEFAULT_DROPBOX_RPC_BASE,
 };
+pub use index_sibling::{fetch_index_sibling_to_temp, is_object_store_archive_url};
 pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,

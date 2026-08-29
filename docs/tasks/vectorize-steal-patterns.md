@@ -83,7 +83,7 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 **What we already have (G-2 `done`):**
 
 - Media type `application/vnd.ratarmount.index.v1+sqlite`, inner `INDEX_VERSION` 0.7.0.
-- Discovery: `--index-file` → local candidates → HTTP `Link: rel="describedby"` → sibling GET → OCI 1.1 referrer on local miss.
+- Discovery: `--index-file` → local candidates → GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` → well-known sibling GET (http(s) + S3/GCS/Azure) → OCI 1.1 referrer on local miss.
 - `--publish-index` / `--publish-index-to PATH`; HTTP `GET /.ratarmount-control/index.sqlite`.
 - `check_tarstats_matches_remote` after fetch.
 
@@ -92,7 +92,7 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - [x] **V-2a** local tmp+rename: `create_writable(Some(dest))` opens `{dest}.tmp.{pid}` (journal OFF, dest not unlinked). `publish_tmp` / `into_read_only` close tmp (no WAL) → rename → `self.path = dest` → open dest → WAL. Drop unpublished tmp leaves dest (stricter than old `remove_file` dest at create). Factory side-table helpers call `publish_tmp()` after writes. Pointer flip is V-2b.
 - [x] **V-2b** root pointer object separate from the SQLite blob: `{schema, index_id, etag/sha256, generated_at, archive_tarstats}` in `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256(blob) 64 hex). `--publish-index` always writes it (including dest==sidecar). `--index-id HEX` pre-resolves to `opts.index_file_path`.
 - [x] Keep-last-K=2 local snapshots when a pointer is written (`{archive}.index.{old_id}.sqlite` from the existing pointer id; no extra copy until then). Remount `--index-id` of N while N+1 is well-known. `-c` still publishes the well-known SQLite blob (V-2a); pointer flip is `--publish-index`.
-- [ ] Shared remote index: do not PUT the live `.index.sqlite` in place (G-2 residual: no S3/GCS/Azure sibling GET/PUT in v1). Pointer + immutable key `index.{id}.sqlite` is the way to add that without torn reads (V-2c GET).
+- [x] Shared remote index **GET** (V-2c): S3/GCS/Azure/HTTP sibling GET of `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known. Pointer/blob/tarstats failure continues describedby → well-known → OCI. **PUT** of pointer/blob is F-7 (`aws s3 cp` until then).
 - [x] Regression (V-2a): reader `open_read_only` + `search_query` survives writer `create_writable`+inserts+`into_read_only`; drop mid-insert leaves dest; `check_tarstats` still rejects a replaced archive. Pointer-era remount `--index-id` (V-2b): clap-steal; dest==sidecar writes `.ptr`; tarstats mismatch refuses.
 
 **Why it pays:** Unlocks safe `--publish-index` on NFS/S3 and remount-during-rebuild. SQLite’s own WAL is per-connection, not a cross-process object-store commit. Vectorize’s root PUT is the portable part.
