@@ -1440,7 +1440,18 @@ fn base_is_flatten_payload(ov: &WriteOverlay, path: &str) -> bool {
     if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG || !fi.linkname.is_empty() {
         return false;
     }
-    !matches!(fi.userdata.last(), Some(UserData::Tar(t)) if t.isgenerated)
+    // `userdata.last()` is the current layer (FileVersionLayer / AutoMount tag),
+    // not Tar — same scan as automount / union / live-commit (K1).
+    let generated = fi
+        .userdata
+        .iter()
+        .rev()
+        .find_map(|u| match u {
+            UserData::Tar(t) => Some(t.isgenerated),
+            _ => None,
+        })
+        .unwrap_or(false);
+    !generated
 }
 
 /// Existing on-disk sidecar persist may patch. Never created here (`:memory:` → `None`).
@@ -4406,6 +4417,48 @@ mod tests {
         out
     }
 
+    /// Forwards to `inner` except `/gen.txt`, a generated `S_IFREG` (not a flatten payload).
+    struct WithGeneratedReg {
+        inner: Arc<dyn MountSource>,
+    }
+
+    impl MountSource for WithGeneratedReg {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.inner.list(path)
+        }
+        fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+            if normpath(path) == "/gen.txt" {
+                return Some(FileInfo {
+                    size: 1,
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                        offset: 0,
+                        offsetheader: Some(0),
+                        istar: true,
+                        issparse: false,
+                        isgenerated: true,
+                        recursiondepth: 0,
+                    })],
+                });
+            }
+            self.inner.lookup(path, file_version)
+        }
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            buffering: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.inner.open(file_info, buffering)
+        }
+        fn is_immutable(&self) -> bool {
+            self.inner.is_immutable()
+        }
+    }
+
     /// Regression: overlay create is visible after catalog flatten members.
     /// Catalog flatten stays overlay-free; COW of a catalog path is not overlay-only.
     #[test]
@@ -4443,21 +4496,34 @@ mod tests {
 
         let overlay = dir.path().join("ov");
         fs::create_dir_all(&overlay).unwrap();
-        let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
+        // Default CLI stack is FileVersionLayer then WriteOverlay; last userdata
+        // is `versionlayer:file`, not Tar.
+        let stacked = crate::FileVersionLayer::new(Arc::new(WithGeneratedReg {
+            inner: Arc::new(tar) as Arc<dyn MountSource>,
+        }));
+        let ov = WriteOverlay::new(Arc::new(stacked) as Arc<dyn MountSource>, &overlay).unwrap();
+        let z_fi = ov.current_base().lookup("/z.txt", 0).expect("z.txt");
+        assert!(
+            matches!(z_fi.userdata.last(), Some(UserData::Other(s)) if s == "versionlayer:file"),
+            "FileVersionLayer must own last userdata: {:?}",
+            z_fi.userdata.last()
+        );
         overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
         overlay_write_bytes(&ov, "/ov/nested.bin", b"nested-only\n");
         overlay_write_bytes(&ov, "/z.txt", b"cow-replace\n");
         overlay_write_bytes(&ov, "/link.txt", b"was-symlink\n");
+        overlay_write_bytes(&ov, "/gen.txt", b"was-generated\n");
 
         let ov_names = overlay_only_names(&ov);
         assert_eq!(
             ov_names,
             vec![
+                "/gen.txt".to_string(),
                 "/link.txt".to_string(),
                 "/new.txt".to_string(),
                 "/ov/nested.bin".to_string()
             ],
-            "creates + overlay file replacing a catalog symlink; COW of /z.txt excluded: {ov_names:?}"
+            "creates + symlink replace + generated S_IFREG; COW of /z.txt excluded: {ov_names:?}"
         );
         assert!(
             !ov_names.iter().any(|p| p == "/z.txt" || p == "/a.txt"),
@@ -4475,6 +4541,7 @@ mod tests {
             vec![
                 "/z.txt".to_string(),
                 "/a.txt".to_string(),
+                "/gen.txt".to_string(),
                 "/link.txt".to_string(),
                 "/new.txt".to_string(),
                 "/ov/nested.bin".to_string(),
@@ -4484,6 +4551,7 @@ mod tests {
         assert!(ov.has_file("/new.txt"));
         assert!(ov.has_file("/ov/nested.bin"));
         assert!(ov.has_file("/link.txt"));
+        assert!(ov.has_file("/gen.txt"));
     }
 
     /// Regression: restore loop must not SeekFrom::Start to cookie.offset on overlay names.
