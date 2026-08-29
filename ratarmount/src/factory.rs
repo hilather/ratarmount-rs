@@ -4468,23 +4468,12 @@ mod tests {
     }
 
     /// Regression: missing-path `store_zstd_blocks_in_index` publishes dest (WAL on
-    /// dest, not `{dest}.tmp.{pid}`). Drop without publish would unlink tmp.
+    /// dest, not `{dest}.tmp.{pid}.{seq}`). Drop without publish would unlink tmp.
     #[test]
     fn regression_store_zstd_blocks_in_index_missing_path_publishes_dest_wal() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("plain.zst.index.sqlite");
         assert!(!dest.exists());
-        let pid = std::process::id();
-        let tmp = {
-            let mut s = dest.as_os_str().to_os_string();
-            s.push(format!(".tmp.{pid}"));
-            PathBuf::from(s)
-        };
-        let tmp_wal = {
-            let mut s = tmp.as_os_str().to_os_string();
-            s.push("-wal");
-            PathBuf::from(s)
-        };
         let dest_wal = {
             let mut s = dest.as_os_str().to_os_string();
             s.push("-wal");
@@ -4496,11 +4485,6 @@ mod tests {
         };
         store_zstd_blocks_in_index(&[(0, 0), (10, 100)], Some(&dest), None, &opts);
         assert!(dest.exists(), "helper must leave a readable sibling");
-        assert!(!tmp.exists(), "tmp must be renamed onto dest");
-        assert!(
-            !tmp_wal.exists(),
-            "WAL must be named dest-wal, not dest.tmp.pid-wal"
-        );
         for entry in std::fs::read_dir(dir.path()).unwrap() {
             let name = entry.unwrap().file_name();
             let name = name.to_string_lossy();
@@ -4512,7 +4496,6 @@ mod tests {
             dest_wal.exists(),
             "WAL companion is dest-wal (open of published dest), not tmp-wal"
         );
-        assert!(!tmp_wal.exists());
     }
 
     #[test]

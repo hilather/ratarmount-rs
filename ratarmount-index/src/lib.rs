@@ -34,6 +34,7 @@ pub use search::{locate_pattern_matches, SearchHit, SearchQuery, DEFAULT_SEARCH_
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use ratarmount_core::{
@@ -415,10 +416,15 @@ pub struct SqliteIndex {
     publish_target: Option<PathBuf>,
 }
 
-/// Staging path for a cold writable build: `{dest}.tmp.{pid}` next to dest.
+/// Monotonic suffix so two [`SqliteIndex::create_writable`] calls in one process
+/// do not share `{dest}.tmp.{pid}`.
+static WRITABLE_TMP_SEQ: AtomicU32 = AtomicU32::new(0);
+
+/// Staging path for a cold writable build: `{dest}.tmp.{pid}.{seq}` next to dest.
 fn writable_tmp_path(dest: &Path) -> PathBuf {
+    let seq = WRITABLE_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let mut s = dest.as_os_str().to_os_string();
-    s.push(format!(".tmp.{}", std::process::id()));
+    s.push(format!(".tmp.{}.{}", std::process::id(), seq));
     PathBuf::from(s)
 }
 
@@ -428,11 +434,69 @@ fn sqlite_path_companion(db: &Path, suffix: &str) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn unlink_sqlite_path_and_journals(path: &Path) {
-    let _ = std::fs::remove_file(path);
+/// Unlink path-keyed SQLite journals only — never the database file itself.
+fn unlink_sqlite_journals(path: &Path) {
     let _ = std::fs::remove_file(sqlite_path_companion(path, "-wal"));
     let _ = std::fs::remove_file(sqlite_path_companion(path, "-shm"));
     let _ = std::fs::remove_file(sqlite_path_companion(path, "-journal"));
+}
+
+fn unlink_sqlite_path_and_journals(path: &Path) {
+    let _ = std::fs::remove_file(path);
+    unlink_sqlite_journals(path);
+}
+
+fn pid_is_alive(pid: u32) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        Path::new(&format!("/proc/{pid}")).exists()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        true
+    }
+}
+
+/// `{pid}` or `{pid}.{seq}` after `{dest}.tmp.`. Rejects `-wal` / `-shm` suffixes.
+fn parse_writable_tmp_pid(rest: &str) -> Option<u32> {
+    let mut parts = rest.split('.');
+    let pid = parts.next()?.parse().ok()?;
+    match parts.next() {
+        None => Some(pid),
+        Some(seq) if seq.parse::<u32>().is_ok() && parts.next().is_none() => Some(pid),
+        _ => None,
+    }
+}
+
+/// Best-effort unlink of `{dest}.tmp.*` whose pid is this process (stale seq) or
+/// a dead pid. Never unlinks a live other-pid tmp.
+fn reap_stale_writable_tmps(dest: &Path) {
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    let parent = parent.unwrap_or_else(|| Path::new("."));
+    let Some(name) = dest.file_name() else {
+        return;
+    };
+    let mut prefix = name.to_os_string();
+    prefix.push(".tmp.");
+    let prefix = prefix.to_string_lossy().into_owned();
+    let Ok(rd) = std::fs::read_dir(parent) else {
+        return;
+    };
+    let self_pid = std::process::id();
+    for ent in rd.flatten() {
+        let fname = ent.file_name();
+        let fname = fname.to_string_lossy();
+        let Some(rest) = fname.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(pid) = parse_writable_tmp_pid(rest) else {
+            continue;
+        };
+        if pid == self_pid || !pid_is_alive(pid) {
+            unlink_sqlite_path_and_journals(&ent.path());
+        }
+    }
 }
 
 impl SqliteIndex {
@@ -481,7 +545,7 @@ impl SqliteIndex {
     /// Applies Python-compatible bulk-build PRAGMAs (exclusive lock, memory temp,
     /// journal off, synchronous off) so cold index creation stays fast.
     ///
-    /// On-disk: opens `{dest}.tmp.{pid}` in dest's directory and does **not**
+    /// On-disk: opens `{dest}.tmp.{pid}.{seq}` in dest's directory and does **not**
     /// unlink dest. Inserts go to tmp until [`Self::publish_tmp`] /
     /// [`Self::into_read_only`]. Drop of an unpublished tmp unlinks tmp and
     /// leaves dest (stricter than the old `remove_file` dest at create).
@@ -495,10 +559,8 @@ impl SqliteIndex {
                     std::fs::create_dir_all(parent)?;
                 }
                 // Concurrent readers keep dest's inode; do not remove_file dest.
+                reap_stale_writable_tmps(dest);
                 let tmp = writable_tmp_path(dest);
-                if tmp.exists() {
-                    unlink_sqlite_path_and_journals(&tmp);
-                }
                 (Connection::open(&tmp)?, Some(tmp), Some(dest.to_path_buf()))
             }
             None => (Connection::open_in_memory()?, None, None),
@@ -1050,6 +1112,10 @@ impl SqliteIndex {
         std::fs::rename(&tmp, &dest)?;
         self.publish_target = None;
         self.path = Some(dest.clone());
+        // WAL/shm names follow dest's path, not inode. A live reader still holds
+        // snapshot N's companions under those names; unlink names (not dest) so
+        // the next WAL open creates N+1 companions instead of replaying N.
+        unlink_sqlite_journals(&dest);
 
         {
             let mut guard = self.conn.lock().expect("sqlite mutex poisoned");
@@ -3255,44 +3321,87 @@ mod tests {
         )
     }
 
+    fn catalog_rows(prefix: &str, n: usize) -> Vec<FileRow> {
+        (0..n)
+            .map(|i| {
+                FileRow::new(
+                    "",
+                    format!("{prefix}-{i:04}.txt"),
+                    i as i64 * 512,
+                    i as i64 * 512 + 32,
+                    4,
+                    0.0,
+                    0o100644,
+                    i64::from(b'0'),
+                    "",
+                    0,
+                    0,
+                    false,
+                    false,
+                    false,
+                    0,
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(unix)]
+    fn file_ino(path: &Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt;
+        std::fs::metadata(path).ok().map(|m| m.ino())
+    }
+
     /// Regression: `-c` must not unlink dest; a live reader keeps snapshot N.
+    /// Dest-wal/shm inodes must change so WAL on dest does not replay N.
     #[test]
     fn regression_reader_survives_writer_full_build() {
         let dir = tempfile::tempdir().unwrap();
         let dest = dir.path().join("snap.index.sqlite");
+        #[cfg(unix)]
+        let dest_wal = sqlite_path_companion(&dest, "-wal");
+        #[cfg(unix)]
+        let dest_shm = sqlite_path_companion(&dest, "-shm");
+        const N: usize = 512;
         {
             let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
             idx.begin_write().unwrap();
-            idx.insert_files_batch(&[named_file_row("old.txt")])
-                .unwrap();
+            idx.insert_files_batch(&catalog_rows("old", N)).unwrap();
             idx.store_versions("0.1.0").unwrap();
             idx.commit_write().unwrap();
             let idx = idx.into_read_only().unwrap();
             assert_eq!(idx.path(), Some(dest.as_path()));
         }
         let reader = SqliteIndex::open_read_only(&dest).unwrap();
+        reader
+            .with_conn(|conn| {
+                conn.execute_batch("PRAGMA cache_size = 1; PRAGMA mmap_size = 0;")?;
+                Ok(())
+            })
+            .unwrap();
         let hits = reader
-            .search_query(&SearchQuery::glob("*.txt"))
+            .search_query(&SearchQuery::glob("old-*.txt"))
             .expect("reader search before rewrite");
-        assert_eq!(hits.len(), 1);
-        assert_eq!(hits[0].path, "/old.txt");
+        assert_eq!(hits.len(), N);
+
+        #[cfg(unix)]
+        let wal_ino_before = file_ino(&dest_wal);
+        #[cfg(unix)]
+        let shm_ino_before = file_ino(&dest_shm);
 
         let writer = SqliteIndex::create_writable(Some(&dest)).unwrap();
         assert!(dest.exists(), "create_writable must not remove_file dest");
-        let tmp = writable_tmp_path(&dest);
-        assert!(tmp.exists(), "cold build writes dest.tmp.pid");
+        let tmp = writer.path().expect("tmp path").to_path_buf();
+        assert_ne!(tmp, dest, "cold build writes dest.tmp.pid.seq");
+        assert!(tmp.exists(), "cold build writes dest.tmp.pid.seq");
         writer.begin_write().unwrap();
-        writer
-            .insert_files_batch(&[named_file_row("new.txt")])
-            .unwrap();
+        writer.insert_files_batch(&catalog_rows("new", N)).unwrap();
         writer.store_versions("0.1.0").unwrap();
         writer.commit_write().unwrap();
 
         let mid = reader
-            .search_query(&SearchQuery::glob("*.txt"))
+            .search_query(&SearchQuery::glob("old-*.txt"))
             .expect("reader search mid-insert");
-        assert_eq!(mid.len(), 1);
-        assert_eq!(mid[0].path, "/old.txt");
+        assert_eq!(mid.len(), N);
 
         let writer = writer.into_read_only().unwrap();
         assert_eq!(writer.path(), Some(dest.as_path()));
@@ -3303,20 +3412,42 @@ mod tests {
             "WAL must not follow the tmp name after publish"
         );
 
+        #[cfg(unix)]
+        {
+            let wal_ino_after = file_ino(&dest_wal);
+            assert_ne!(
+                wal_ino_before, wal_ino_after,
+                "publish must unlink dest-wal then recreate, not reuse snapshot N"
+            );
+            if shm_ino_before.is_some() {
+                assert_ne!(
+                    shm_ino_before,
+                    file_ino(&dest_shm),
+                    "publish must not reuse snapshot N dest-shm"
+                );
+            }
+        }
+
         let after = reader
-            .search_query(&SearchQuery::glob("*.txt"))
+            .search_query(&SearchQuery::glob("old-*.txt"))
             .expect("reader search after publish");
-        assert_eq!(after.len(), 1);
-        assert_eq!(
-            after[0].path, "/old.txt",
-            "open reader stays on inode N after rename"
+        assert_eq!(after.len(), N, "open reader stays on inode N after rename");
+        assert!(
+            reader
+                .search_query(&SearchQuery::glob("new-*.txt"))
+                .unwrap()
+                .is_empty(),
+            "reader must not see the tmp/N+1 catalog"
         );
 
         drop(writer);
         let fresh = SqliteIndex::open_read_only(&dest).unwrap();
-        let fresh_hits = fresh.search_query(&SearchQuery::glob("*.txt")).unwrap();
-        assert_eq!(fresh_hits.len(), 1);
-        assert_eq!(fresh_hits[0].path, "/new.txt");
+        let fresh_hits = fresh.search_query(&SearchQuery::glob("new-*.txt")).unwrap();
+        assert_eq!(fresh_hits.len(), N);
+        assert!(fresh
+            .search_query(&SearchQuery::glob("old-*.txt"))
+            .unwrap()
+            .is_empty());
     }
 
     /// Regression: Drop mid-insert unlinks tmp and leaves the previous well-known file.
@@ -3334,9 +3465,10 @@ mod tests {
             let _ = idx.into_read_only().unwrap();
         }
         let orig = std::fs::read(&dest).unwrap();
-        let tmp = writable_tmp_path(&dest);
+        let tmp;
         {
             let writer = SqliteIndex::create_writable(Some(&dest)).unwrap();
+            tmp = writer.path().expect("tmp path").to_path_buf();
             writer
                 .insert_files_batch(&[named_file_row("new.txt")])
                 .unwrap();
@@ -3357,6 +3489,59 @@ mod tests {
         let hits = ro.search_query(&SearchQuery::glob("*.txt")).unwrap();
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].path, "/old.txt");
+    }
+
+    #[test]
+    fn regression_writable_tmp_paths_are_unique_in_process() {
+        let dest = Path::new("/tmp/x.index.sqlite");
+        let a = writable_tmp_path(dest);
+        let b = writable_tmp_path(dest);
+        assert_ne!(a, b);
+        assert!(a
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(&format!(".tmp.{}", std::process::id())));
+        assert_eq!(parse_writable_tmp_pid("12"), Some(12));
+        assert_eq!(parse_writable_tmp_pid("12.3"), Some(12));
+        assert_eq!(parse_writable_tmp_pid("12.3-wal"), None);
+        assert_eq!(parse_writable_tmp_pid("12-wal"), None);
+    }
+
+    #[test]
+    fn regression_create_writable_reaps_same_pid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.index.sqlite");
+        let leftover = writable_tmp_path(&dest);
+        std::fs::write(&leftover, b"stale-tmp").unwrap();
+        let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        assert!(
+            !leftover.exists(),
+            "same-pid leftover tmp must be reaped before a new staging file"
+        );
+        let live = idx.path().unwrap().to_path_buf();
+        assert!(live.exists());
+        assert_ne!(live, leftover);
+        drop(idx);
+        assert!(!live.exists());
+        assert!(!dest.exists(), "unpublished tmp must not replace dest");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_create_writable_reaps_dead_pid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.index.sqlite");
+        let mut orphan = dest.as_os_str().to_os_string();
+        orphan.push(".tmp.4294967295");
+        let orphan = PathBuf::from(orphan);
+        std::fs::write(&orphan, b"dead-pid-tmp").unwrap();
+        let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        assert!(
+            !orphan.exists(),
+            "dead-pid dest.tmp.* leftover must be reaped"
+        );
+        drop(idx);
     }
 
     /// Nested compact-only: no SQLite files table as file-table store.
