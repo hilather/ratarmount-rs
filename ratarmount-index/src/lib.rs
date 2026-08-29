@@ -469,8 +469,41 @@ fn parse_writable_tmp_pid(rest: &str) -> Option<u32> {
     }
 }
 
-/// Best-effort unlink of `{dest}.tmp.*` whose pid is this process (stale seq) or
-/// a dead pid. Never unlinks a live other-pid tmp.
+/// Whether this process still has `path` open (a live [`SqliteIndex`] tmp).
+/// Fail-closed: if fds cannot be inspected, treat as held.
+fn path_held_by_this_process(path: &Path) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let Ok(rd) = std::fs::read_dir("/proc/self/fd") else {
+            return true;
+        };
+        for ent in rd.flatten() {
+            let Ok(link) = std::fs::read_link(ent.path()) else {
+                continue;
+            };
+            if link == target || link == *path {
+                return true;
+            }
+            if let Ok(canon) = std::fs::canonicalize(&link) {
+                if canon == target {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        true
+    }
+}
+
+/// Best-effort unlink of disconnected `{dest}.tmp.*` leftovers (dead pid, or
+/// same-pid with no open fd). Never unlinks a live tmp held by this or another
+/// process. Unique `{pid}.{seq}` names mean a second in-process writer does not
+/// need to steal the first's file; Drop already unlinks unpublished tmp.
 fn reap_stale_writable_tmps(dest: &Path) {
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let parent = parent.unwrap_or_else(|| Path::new("."));
@@ -493,8 +526,14 @@ fn reap_stale_writable_tmps(dest: &Path) {
         let Some(pid) = parse_writable_tmp_pid(rest) else {
             continue;
         };
-        if pid == self_pid || !pid_is_alive(pid) {
-            unlink_sqlite_path_and_journals(&ent.path());
+        let path = ent.path();
+        if pid == self_pid {
+            if path_held_by_this_process(&path) {
+                continue;
+            }
+            unlink_sqlite_path_and_journals(&path);
+        } else if !pid_is_alive(pid) {
+            unlink_sqlite_path_and_journals(&path);
         }
     }
 }
@@ -3508,6 +3547,7 @@ mod tests {
         assert_eq!(parse_writable_tmp_pid("12-wal"), None);
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn regression_create_writable_reaps_same_pid_tmp() {
         let dir = tempfile::tempdir().unwrap();
@@ -3517,7 +3557,7 @@ mod tests {
         let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
         assert!(
             !leftover.exists(),
-            "same-pid leftover tmp must be reaped before a new staging file"
+            "disconnected same-pid leftover tmp must be reaped"
         );
         let live = idx.path().unwrap().to_path_buf();
         assert!(live.exists());
@@ -3525,6 +3565,31 @@ mod tests {
         drop(idx);
         assert!(!live.exists());
         assert!(!dest.exists(), "unpublished tmp must not replace dest");
+    }
+
+    /// Regression: a second in-process `create_writable` must not unlink a live
+    /// same-pid staging file (unique seq is not enough if reap deletes by pid).
+    #[test]
+    fn regression_create_writable_does_not_reap_live_same_pid_tmp() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.index.sqlite");
+        let first = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        first
+            .insert_files_batch(&[named_file_row("held.txt")])
+            .unwrap();
+        let first_tmp = first.path().expect("tmp path").to_path_buf();
+        assert!(first_tmp.exists());
+        let second = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        assert!(first_tmp.exists(), "live same-pid tmp must not be reaped");
+        let second_tmp = second.path().expect("tmp path").to_path_buf();
+        assert_ne!(first_tmp, second_tmp);
+        drop(second);
+        assert!(
+            first_tmp.exists(),
+            "dropping the second writer leaves the first tmp"
+        );
+        drop(first);
+        assert!(!first_tmp.exists());
     }
 
     #[cfg(target_os = "linux")]
