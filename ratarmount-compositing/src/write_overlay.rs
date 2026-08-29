@@ -470,57 +470,26 @@ impl WriteOverlay {
         tombstones: &HashSet<String>,
         by_path: &mut BTreeMap<String, CheapSearchHit>,
     ) {
-        if self.ensure_under_root(host_dir).is_err() {
-            return;
-        }
-        let meta = match fs::symlink_metadata(host_dir) {
-            Ok(m) => m,
-            Err(_) => return,
-        };
-        if meta.file_type().is_symlink() {
-            return;
-        }
-        if !meta.is_dir() {
-            return;
-        }
-        let rd = match fs::read_dir(host_dir) {
-            Ok(rd) => rd,
-            Err(_) => return,
-        };
-        for ent in rd.flatten() {
-            let name = ent.file_name().to_string_lossy().into_owned();
-            if name.starts_with(HIDDEN_DB) {
-                continue;
-            }
-            let child_mount = join(mount_dir, &name);
-            if tombstones.contains(&child_mount) {
-                continue;
-            }
-            let child_host = host_dir.join(&name);
-            if self.ensure_under_root(&child_host).is_err() {
-                continue;
-            }
-            let child_meta = match fs::symlink_metadata(&child_host) {
-                Ok(m) => m,
-                Err(_) => continue,
-            };
-            if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink() {
-                self.walk_overlay_host(&child_mount, &child_host, pattern, tombstones, by_path);
-                continue;
-            }
-            if locate_pattern_matches(pattern, &child_mount, &name) {
-                by_path.insert(
-                    child_mount.clone(),
-                    CheapSearchHit {
-                        path: child_mount,
-                        name,
-                        size: child_meta.len() as i64,
-                        mtime: child_meta.mtime() as f64,
-                        offsetheader: None,
-                    },
-                );
-            }
-        }
+        for_each_overlay_host_non_dir(
+            self,
+            mount_dir,
+            host_dir,
+            tombstones,
+            &mut |child_mount, name, child_meta| {
+                if locate_pattern_matches(pattern, &child_mount, &name) {
+                    by_path.insert(
+                        child_mount.clone(),
+                        CheapSearchHit {
+                            path: child_mount,
+                            name,
+                            size: child_meta.len() as i64,
+                            mtime: child_meta.mtime() as f64,
+                            offsetheader: None,
+                        },
+                    );
+                }
+            },
+        );
     }
 
     /// True when the overlay root has a real file (or symlink) for this path.
@@ -529,17 +498,7 @@ impl WriteOverlay {
         real.is_file() || real.is_symlink()
     }
 
-    /// Overlay host regular files that are not catalog members.
-    ///
-    /// Offset-aware extract concatenates these after
-    /// [`ratarmount_index::SqliteIndex::list_visible_files_by_offset`]. Catalog
-    /// flatten stays overlay-free. These paths have no archive `offsetheader`;
-    /// open them via [`Self::has_file`] / overlay fd. Do not invent a dummy
-    /// [`ratarmount_index::CompactOpenCookie`] (`offsetheader = -1` would
-    /// `SeekFrom::Start` the base at garbage).
-    ///
-    /// Skips the hidden overlay DB, directories, tombstones, COW/replace of a
-    /// base path, and symlink-to-dir walks.
+    /// See [`overlay_only_names()`].
     pub fn overlay_only_names(&self) -> Vec<String> {
         overlay_only_names(self)
     }
@@ -1396,26 +1355,42 @@ impl WriteOverlay {
     }
 }
 
-/// Overlay host regular files that are not catalog members.
+/// Overlay host regular files that are not catalog flatten payloads.
 ///
 /// Concatenate after [`ratarmount_index::SqliteIndex::list_visible_files_by_offset`]
-/// for offset-aware extract. Catalog flatten stays overlay-free. Open via
-/// [`WriteOverlay::has_file`] / overlay fd — never a dummy
-/// [`ratarmount_index::CompactOpenCookie`].
+/// and open via [`WriteOverlay::has_file`] / overlay fd. No archive offset.
 pub fn overlay_only_names(ov: &WriteOverlay) -> Vec<String> {
     let tombstones = ov.load_tombstone_paths();
     let mut names = Vec::new();
-    collect_overlay_only_names(ov, "/", &ov.root, &tombstones, &mut names);
+    for_each_overlay_host_non_dir(
+        ov,
+        "/",
+        &ov.root,
+        &tombstones,
+        &mut |child_mount, _, meta| {
+            if !meta.file_type().is_file() {
+                return;
+            }
+            // Only flatten payloads (S_IFREG, empty linkname, not generated) already
+            // have an archive offset. A regular overlay file that replaces a
+            // symlink / hardlink / generated dir is overlay-only.
+            if base_is_flatten_payload(ov, &child_mount) {
+                return;
+            }
+            names.push(child_mount);
+        },
+    );
     names.sort();
     names
 }
 
-fn collect_overlay_only_names(
+/// Same host walk as live search: confinement, no symlink-dir recurse, skip DB / tombstones.
+fn for_each_overlay_host_non_dir(
     ov: &WriteOverlay,
     mount_dir: &str,
     host_dir: &Path,
     tombstones: &HashSet<String>,
-    out: &mut Vec<String>,
+    visit: &mut dyn FnMut(String, String, fs::Metadata),
 ) {
     if ov.ensure_under_root(host_dir).is_err() {
         return;
@@ -1448,20 +1423,24 @@ fn collect_overlay_only_names(
             Ok(m) => m,
             Err(_) => continue,
         };
-        let ft = child_meta.file_type();
-        if ft.is_dir() && !ft.is_symlink() {
-            collect_overlay_only_names(ov, &child_mount, &child_host, tombstones, out);
+        if child_meta.file_type().is_dir() && !child_meta.file_type().is_symlink() {
+            for_each_overlay_host_non_dir(ov, &child_mount, &child_host, tombstones, visit);
             continue;
         }
-        if !ft.is_file() {
-            continue;
-        }
-        // COW / replace of a catalog member already has an archive offset.
-        if ov.current_base().exists(&child_mount) {
-            continue;
-        }
-        out.push(child_mount);
+        visit(child_mount, name, child_meta);
     }
+}
+
+/// Flatten payload: `S_IFREG`, empty `linkname`, not generated. Matches
+/// `list_visible_files_by_offset` membership without using `SqliteIndex`.
+fn base_is_flatten_payload(ov: &WriteOverlay, path: &str) -> bool {
+    let Some(fi) = ov.current_base().lookup(path, 0) else {
+        return false;
+    };
+    if fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG || !fi.linkname.is_empty() {
+        return false;
+    }
+    !matches!(fi.userdata.last(), Some(UserData::Tar(t)) if t.isgenerated)
 }
 
 /// Existing on-disk sidecar persist may patch. Never created here (`:memory:` → `None`).
@@ -4417,6 +4396,14 @@ mod tests {
             let mut f = unsafe { File::from_raw_fd(fd) };
             f.write_all(bytes).unwrap();
         }
+        ov.release_write_fd(fd);
+    }
+
+    /// Documented extract order: catalog flatten, then overlay-only names.
+    fn concat_catalog_then_overlay(catalog: &[String], overlay: &[String]) -> Vec<String> {
+        let mut out = catalog.to_vec();
+        out.extend(overlay.iter().cloned());
+        out
     }
 
     /// Regression: overlay create is visible after catalog flatten members.
@@ -4426,7 +4413,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let z = b"z-payload\n";
         let a = b"a-payload\n";
-        let bytes = pack_tar(&[ustar_file("z.txt", z), ustar_file("a.txt", a)]);
+        let bytes = pack_tar(&[
+            ustar_file("z.txt", z),
+            ustar_file("a.txt", a),
+            ustar_symlink("link.txt", "a.txt"),
+        ]);
         let opts = ratarmount_core::OpenOptions {
             index_in_memory: true,
             ..ratarmount_core::OpenOptions::default()
@@ -4447,7 +4438,7 @@ mod tests {
         assert_eq!(
             catalog_paths,
             vec!["/z.txt".to_string(), "/a.txt".to_string()],
-            "offset flatten is archive order, not name order"
+            "offset flatten is archive order, not name order; symlink is not a payload"
         );
 
         let overlay = dir.path().join("ov");
@@ -4456,33 +4447,43 @@ mod tests {
         overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
         overlay_write_bytes(&ov, "/ov/nested.bin", b"nested-only\n");
         overlay_write_bytes(&ov, "/z.txt", b"cow-replace\n");
+        overlay_write_bytes(&ov, "/link.txt", b"was-symlink\n");
 
         let ov_names = overlay_only_names(&ov);
         assert_eq!(
             ov_names,
-            vec!["/new.txt".to_string(), "/ov/nested.bin".to_string()],
-            "creates only; COW of /z.txt is not overlay-only: {ov_names:?}"
+            vec![
+                "/link.txt".to_string(),
+                "/new.txt".to_string(),
+                "/ov/nested.bin".to_string()
+            ],
+            "creates + overlay file replacing a catalog symlink; COW of /z.txt excluded: {ov_names:?}"
         );
         assert!(
             !ov_names.iter().any(|p| p == "/z.txt" || p == "/a.txt"),
-            "catalog members must not appear in overlay_only_names: {ov_names:?}"
+            "catalog flatten payloads must not appear in overlay_only_names: {ov_names:?}"
         );
         assert!(
             !catalog_paths
                 .iter()
-                .any(|p| p == "/new.txt" || p == "/ov/nested.bin"),
+                .any(|p| { p == "/new.txt" || p == "/ov/nested.bin" || p == "/link.txt" }),
             "catalog flatten must stay overlay-free: {catalog_paths:?}"
         );
 
-        let mut combined = catalog_paths;
-        combined.extend(ov_names.clone());
         assert_eq!(
-            &combined[combined.len() - ov_names.len()..],
-            ov_names.as_slice(),
+            concat_catalog_then_overlay(&catalog_paths, &ov_names),
+            vec![
+                "/z.txt".to_string(),
+                "/a.txt".to_string(),
+                "/link.txt".to_string(),
+                "/new.txt".to_string(),
+                "/ov/nested.bin".to_string(),
+            ],
             "overlay-only host paths listed last"
         );
         assert!(ov.has_file("/new.txt"));
         assert!(ov.has_file("/ov/nested.bin"));
+        assert!(ov.has_file("/link.txt"));
     }
 
     /// Regression: restore loop must not SeekFrom::Start to cookie.offset on overlay names.
@@ -4529,6 +4530,8 @@ mod tests {
         fs::create_dir_all(&overlay).unwrap();
         let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
         overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
+        let ov_names = overlay_only_names(&ov);
+        assert_eq!(ov_names, vec!["/new.txt".to_string()]);
 
         let mut reader = StartLog {
             inner: std::io::Cursor::new(bytes),
@@ -4546,7 +4549,7 @@ mod tests {
             reader.starts
         );
 
-        for virt in overlay_only_names(&ov) {
+        for virt in ov_names {
             assert!(
                 ov.has_file(&virt),
                 "overlay-only {virt} must open via has_file / overlay fd"
@@ -4951,6 +4954,17 @@ mod tests {
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
+    }
+
+    fn ustar_symlink<'a>(path: &'a str, target: &'a str) -> UstarMember<'a> {
+        UstarMember {
+            path,
+            payload: UstarPayload::Symlink { target },
+            mode: 0o777,
             uid: 0,
             gid: 0,
             mtime: 0,
