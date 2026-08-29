@@ -59,10 +59,11 @@ impl RatarmountSftp {
         reader_slots: usize,
         overlay: Option<Arc<WriteOverlay>>,
     ) -> Self {
+        let overlay_set = overlay.is_some();
         Self {
             source,
             overlay,
-            inodes: Arc::new(InodeTable::new()),
+            inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
             readers: Arc::new(ReaderLru::new(reader_slots)),
             readahead_bytes,
         }
@@ -98,6 +99,8 @@ impl RatarmountSftp {
             return Ok(fi);
         }
         let id = self.inodes.id_for_path(&path);
+        // Overlay sizes change after create/write/truncate — do not trust cache.
+        // Overlay children store cookies, not FileInfo; cached_lookup_fi is None.
         if self.overlay.is_none() {
             if let Some(fi) = self.inodes.cached_lookup_fi(id) {
                 return Ok(fi);
@@ -127,6 +130,7 @@ impl RatarmountSftp {
         if is_dir_mode(fi.mode) {
             return Err(libc::EISDIR);
         }
+        // Size-0 empty reply uses the re-lookup FileInfo, never a cookie.
         if fi.size == 0 || offset >= fi.size || len == 0 {
             return Ok(Vec::new());
         }

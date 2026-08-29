@@ -39,10 +39,11 @@ impl Ratarmount9p {
         reader_slots: usize,
         overlay: Option<Arc<WriteOverlay>>,
     ) -> Self {
+        let overlay_set = overlay.is_some();
         Self {
             source,
             overlay,
-            inodes: Arc::new(InodeTable::new()),
+            inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
             readers: Arc::new(ReaderLru::new(reader_slots)),
             readahead_bytes,
         }
@@ -68,6 +69,8 @@ impl Ratarmount9p {
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
+        // Overlay sizes change after create/write/truncate — do not trust cache.
+        // Overlay children store cookies, not FileInfo; cached_lookup_fi is None.
         if self.overlay.is_none() {
             if let Some(fi) = self.inodes.cached_lookup_fi(id) {
                 return Ok(fi);
@@ -135,6 +138,7 @@ impl Ratarmount9p {
         if is_dir_mode(fi.mode) {
             return Err(libc::EISDIR);
         }
+        // Size-0 empty reply uses the re-lookup FileInfo, never a cookie.
         if fi.size == 0 || offset >= fi.size || count == 0 {
             return Ok(Vec::new());
         }
@@ -554,6 +558,56 @@ mod tests {
         assert_eq!(
             fs.require_write_open(libc::O_WRONLY as u32).unwrap_err(),
             libc::EROFS
+        );
+    }
+
+    fn overlay_fs() -> (tempfile::TempDir, Ratarmount9p) {
+        let td = tempfile::tempdir().unwrap();
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyFs) as Arc<dyn MountSource>, td.path())
+                .expect("overlay"),
+        );
+        let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov));
+        (td, fs)
+    }
+
+    /// Regression: write-then-cat empty when 9P READ used a stale size-0
+    /// inode cache instead of re-lookup. Production path is `read`.
+    #[test]
+    fn overlay_open_after_create_write() {
+        let (_td, fs) = overlay_fs();
+        let (id, _) = fs.lcreate(ROOT_FILEID, "new.txt", 0o644).expect("create");
+        assert_eq!(fs.getattr(id).expect("getattr after create").size, 0);
+        fs.write(id, 0, b"hello-overlay-payload").expect("write");
+        assert!(
+            fs.inodes.cached_lookup_fi(id).is_none(),
+            "overlay child must not keep a fat FileInfo"
+        );
+        let buf = fs.read(id, 0, 64).expect("read");
+        assert_eq!(
+            buf, b"hello-overlay-payload",
+            "write-then-cat must not return empty"
+        );
+        assert_ne!(buf, b"", "payload must not be empty after write");
+        assert_eq!(
+            fs.getattr(id).expect("getattr after write").size,
+            b"hello-overlay-payload".len() as u64
+        );
+        assert!(fs.inodes.cached_lookup_fi(id).is_none());
+    }
+
+    /// Opposite polarity of the size-0 cache bug: create with no write, then
+    /// 9P READ must return "".
+    #[test]
+    fn overlay_open_after_create_reads_empty() {
+        let (_td, fs) = overlay_fs();
+        let (id, _) = fs.lcreate(ROOT_FILEID, "empty.txt", 0o644).expect("create");
+        assert_eq!(fs.getattr(id).expect("getattr").size, 0);
+        let buf = fs.read(id, 0, 64).expect("read");
+        assert_eq!(buf, b"", "never-written overlay file must read empty");
+        assert!(
+            fs.inodes.cached_lookup_fi(id).is_none(),
+            "overlay child must not keep a fat FileInfo"
         );
     }
 }

@@ -37,10 +37,11 @@ impl RatarmountSmb {
         reader_slots: usize,
         overlay: Option<Arc<WriteOverlay>>,
     ) -> Self {
+        let overlay_set = overlay.is_some();
         Self {
             source,
             overlay,
-            inodes: Arc::new(InodeTable::new()),
+            inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
             readers: Arc::new(ReaderLru::new(reader_slots)),
             readahead_bytes,
         }
@@ -69,6 +70,8 @@ impl RatarmountSmb {
             self.inodes.store_lookup_fi(id, fi.clone());
             return Ok(fi);
         }
+        // Overlay sizes change after create/write/truncate — do not trust cache.
+        // Overlay children store cookies, not FileInfo; cached_lookup_fi is None.
         if self.overlay.is_none() {
             if let Some(fi) = self.inodes.cached_lookup_fi(id) {
                 return Ok(fi);
@@ -191,6 +194,7 @@ impl RatarmountSmb {
         if is_dir_mode(fi.mode) {
             return Err(smb2::STATUS_FILE_IS_A_DIRECTORY);
         }
+        // Size-0 empty reply uses the re-lookup FileInfo, never a cookie.
         if fi.size == 0 || offset >= fi.size || count == 0 {
             return Ok(Vec::new());
         }
