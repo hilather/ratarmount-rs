@@ -10,6 +10,7 @@
 use std::fs::{self, File};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::debug;
@@ -28,6 +29,8 @@ pub const META_CACHE_BYTES_DEFAULT: u64 = 256 * 1024 * 1024;
 
 const META_V3_DIRNAME: &str = "meta-v3";
 
+static PART_SEQ: AtomicU64 = AtomicU64::new(0);
+
 /// XDG LRU of whole sidecar files keyed by canonical backend+url.
 pub struct MetaCache {
     dir: PathBuf,
@@ -40,6 +43,9 @@ struct MetaHeader {
     #[serde(default)]
     etag: String,
     len: u64,
+    /// Hex SHA-256 of the blob bytes (fail-closed on same-length tears).
+    #[serde(default)]
+    sha256: String,
     fetched_at: u64,
     #[serde(default)]
     last_hit: u64,
@@ -140,10 +146,18 @@ impl MetaCache {
                 return None;
             }
         };
-        if meta.len() != hdr.len || hdr.len == 0 {
-            debug!("V-3 meta cache corrupt {key} (len mismatch or empty)");
+        if meta.len() != hdr.len || hdr.len == 0 || hdr.sha256.is_empty() {
+            debug!("V-3 meta cache corrupt {key} (len mismatch, empty, or missing sha256)");
             self.invalidate_key(key);
             return None;
+        }
+        match blob_sha256(&blob) {
+            Ok(got) if got == hdr.sha256 => {}
+            _ => {
+                debug!("V-3 meta cache corrupt {key} (sha256 mismatch)");
+                self.invalidate_key(key);
+                return None;
+            }
         }
         if let Some(etag) = pointer_etag {
             if hdr.etag != etag {
@@ -175,24 +189,44 @@ impl MetaCache {
         self.evict_until(budget.saturating_sub(len), Some(key))?;
         let dest = self.blob_path(key);
         if src != dest.as_path() {
-            let part = self.dir.join(format!("{key}.part"));
-            fs::copy(src, &part)?;
+            let seq = PART_SEQ.fetch_add(1, Ordering::Relaxed);
+            let part = self
+                .dir
+                .join(format!("{key}.{}.{seq}.part", std::process::id()));
+            if let Err(e) = fs::copy(src, &part) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
+            }
             if let Ok(f) = File::open(&part) {
                 let _ = f.sync_all();
             }
-            fs::rename(&part, &dest)?;
-            if !path_is_under(&self.dir, src) {
-                let _ = fs::remove_file(src);
+            if let Err(e) = fs::rename(&part, &dest) {
+                let _ = fs::remove_file(&part);
+                return Err(e);
             }
         }
+        let sha256 = match blob_sha256(&dest) {
+            Ok(h) => h,
+            Err(e) => {
+                self.invalidate_key(key);
+                return Err(e);
+            }
+        };
         let now = unix_now();
         let hdr = MetaHeader {
             etag: etag.unwrap_or("").to_string(),
             len,
+            sha256,
             fetched_at: now,
             last_hit: now,
         };
-        self.write_header(key, &hdr)?;
+        if let Err(e) = self.write_header(key, &hdr) {
+            self.invalidate_key(key);
+            return Err(e);
+        }
+        if src != dest.as_path() && !path_is_under(&self.dir, src) {
+            let _ = fs::remove_file(src);
+        }
         debug!(
             "V-3 meta cache store {key} -> {} ({len} bytes)",
             dest.display()
@@ -245,8 +279,15 @@ impl MetaCache {
     fn invalidate_key(&self, key: &str) {
         let _ = fs::remove_file(self.blob_path(key));
         let _ = fs::remove_file(self.hdr_path(key));
-        let _ = fs::remove_file(self.dir.join(format!("{key}.part")));
-        let _ = fs::remove_file(self.dir.join(format!("{key}.hdr.part")));
+        if let Ok(iter) = fs::read_dir(&self.dir) {
+            for ent in iter.flatten() {
+                let name = ent.file_name();
+                let n = name.to_string_lossy();
+                if n.starts_with(key) && n.ends_with(".part") {
+                    let _ = fs::remove_file(ent.path());
+                }
+            }
+        }
     }
 
     fn evict_until(&self, max_used: u64, keep: Option<&str>) -> io::Result<()> {
@@ -329,11 +370,23 @@ pub fn invalidate_meta_cache_file(path: &Path) {
         let _ = fs::remove_file(path);
         return;
     }
-    let _ = fs::remove_file(path);
     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-        let hdr = meta_v3_dir().join(format!("{name}.hdr"));
-        let _ = fs::remove_file(hdr);
+        MetaCache::from_env().invalidate_key(name);
+    } else {
+        let _ = fs::remove_file(path);
     }
+}
+
+/// Drop the LRU entry for `backend|url` (wire blob, even after decompress).
+pub fn invalidate_meta_cache_identity(backend: &str, url: &str) {
+    let identity = cache_identity(backend, url);
+    let key = sha256_hex(identity.as_bytes());
+    MetaCache::from_env().invalidate_key(&key);
+}
+
+fn blob_sha256(path: &Path) -> io::Result<String> {
+    let mut f = File::open(path)?;
+    crate::sha256_hex_stream(&mut f)
 }
 
 fn identity_url(backend_url: &str) -> &str {
@@ -414,6 +467,9 @@ fn meta_v3_dir() -> PathBuf {
         .join("ratarmount")
         .join(META_V3_DIRNAME)
 }
+
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 fn path_is_under(root: &Path, path: &Path) -> bool {
     if path.starts_with(root) {
@@ -529,6 +585,51 @@ mod tests {
         let p2 = cache.get_or_fetch_path(&id, None, fetch).unwrap();
         assert_eq!(fetches.load(Ordering::SeqCst), 2);
         assert_eq!(fs::read(&p2).unwrap(), b"SQLite format 3\0ok");
+    }
+
+    /// Regression: same-length torn blob fails closed via header sha256.
+    #[test]
+    fn same_length_tear_refetches() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        let fetches = AtomicUsize::new(0);
+        let body = b"SQLite format 3\0ok-sidecar";
+        let fetch = || {
+            fetches.fetch_add(1, Ordering::SeqCst);
+            let p = dir
+                .path()
+                .join(format!("t{}", fetches.load(Ordering::SeqCst)));
+            fs::write(&p, body).unwrap();
+            Ok::<_, io::Error>(p)
+        };
+        let id = cache_identity("http", "http://h/torn.sqlite");
+        let p1 = cache.get_or_fetch_path(&id, None, fetch).unwrap();
+        let tear = vec![b'x'; body.len()];
+        fs::write(&p1, &tear).unwrap();
+        let p2 = cache.get_or_fetch_path(&id, None, fetch).unwrap();
+        assert_eq!(fetches.load(Ordering::SeqCst), 2);
+        assert_eq!(fs::read(&p2).unwrap(), body);
+    }
+
+    /// Regression: fetch tempfile is not unlinked until the header is durable.
+    #[test]
+    fn install_keeps_src_if_header_write_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path());
+        fs::create_dir_all(&cache.dir).unwrap();
+        let id = cache_identity("http", "http://h/hdrfail");
+        let key = crate::sha256_hex(id.as_bytes());
+        fs::create_dir(cache.dir.join(format!("{key}.hdr"))).unwrap();
+        let src = dir.path().join("keep-me");
+        fs::write(&src, b"SQLite format 3\0xx").unwrap();
+        let p = cache
+            .get_or_fetch_path(&id, None, || Ok::<_, io::Error>(src.clone()))
+            .unwrap();
+        assert_eq!(p, src);
+        assert!(
+            src.is_file(),
+            "must not delete fetch tempfile before header is durable"
+        );
     }
 
     #[test]

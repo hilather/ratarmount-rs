@@ -451,21 +451,30 @@ pub fn maybe_fetch_index_url(index_spec: &str) -> Result<PathBuf> {
     }
 
     // Python strips a single `file://` prefix when `count('://') == 1`.
-    let local = if let Some(rest) = s.strip_prefix("file://") {
-        if !rest.contains("://") {
+    let (local, http_url) = if let Some(rest) = s.strip_prefix("file://") {
+        let p = if !rest.contains("://") {
             expand_user(Path::new(rest))
         } else {
             // Chained URL not supported without fsspec; treat as opaque local-ish path.
             expand_user(Path::new(s))
-        }
+        };
+        (p, None)
     } else if s.starts_with("http://") || s.starts_with("https://") {
-        fetch_index_http(s)?
+        (fetch_index_http(s)?, Some(s))
     } else {
         // Non-URL local path (including Windows-ish schemes we do not handle specially).
-        expand_user(Path::new(s))
+        (expand_user(Path::new(s)), None)
     };
 
-    materialize_index_file(&local)
+    match materialize_index_file(&local) {
+        Ok(p) => Ok(p),
+        Err(err) => {
+            if let Some(url) = http_url {
+                crate::invalidate_meta_cache_identity("http", url);
+            }
+            Err(err)
+        }
+    }
 }
 
 /// Ensure `path` is an on-disk SQLite index file, decompressing if needed.
@@ -640,15 +649,12 @@ fn index_temp_dir() -> Option<PathBuf> {
         .map(PathBuf::from)
 }
 
+/// Whole-GET a sidecar URL through the V-3 XDG LRU (URL-first).
+/// Pointer etag revalidation is `MetaCache` API; V-2b wires it from `.ptr`.
 fn fetch_index_http(url: &str) -> Result<PathBuf> {
-    fetch_index_http_with_etag(url, None)
-}
-
-/// Whole-GET a sidecar URL through the V-3 XDG LRU (URL-first; etag revalidation only).
-fn fetch_index_http_with_etag(url: &str, pointer_etag: Option<&str>) -> Result<PathBuf> {
     let cache = crate::MetaCache::from_env();
     let identity = crate::cache_identity("http", url);
-    cache.get_or_fetch_path_with_etag(&identity, pointer_etag, || fetch_index_http_uncached(url))
+    cache.get_or_fetch_path_with_etag(&identity, None, || fetch_index_http_uncached(url))
 }
 
 fn fetch_index_http_uncached(url: &str) -> Result<(PathBuf, Option<String>)> {
@@ -882,6 +888,25 @@ mod tests {
         }
     }
 
+    fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
+        let _g = crate::meta_cache::ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_cap = std::env::var_os(crate::META_CACHE_BYTES_ENV);
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::remove_var(crate::META_CACHE_BYTES_ENV);
+        let r = f();
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match old_cap {
+            Some(v) => std::env::set_var(crate::META_CACHE_BYTES_ENV, v),
+            None => std::env::remove_var(crate::META_CACHE_BYTES_ENV),
+        }
+        r
+    }
+
     #[test]
     fn parse_comma_and_json() {
         let v = parse_index_folders(",~/.foo");
@@ -986,64 +1011,70 @@ mod tests {
 
     #[test]
     fn maybe_fetch_http_downloads_to_temp() {
-        // Fake SQLite header (enough for path materialization tests).
-        let body = b"SQLite format 3\0rest-of-fake-index".to_vec();
-        let mock = MockHttp::spawn(body.clone());
-        let url = mock.url("/archive.tar.index.sqlite");
+        with_isolated_xdg(|| {
+            // Fake SQLite header (enough for path materialization tests).
+            let body = b"SQLite format 3\0rest-of-fake-index".to_vec();
+            let mock = MockHttp::spawn(body.clone());
+            let url = mock.url("/archive.tar.index.sqlite");
 
-        let path = maybe_fetch_index_url(&url).unwrap();
-        assert!(path.is_file());
-        let got = std::fs::read(&path).unwrap();
-        assert_eq!(got, body);
-        assert!(*mock.hits.lock().unwrap() >= 1);
+            let path = maybe_fetch_index_url(&url).unwrap();
+            assert!(path.is_file());
+            let got = std::fs::read(&path).unwrap();
+            assert_eq!(got, body);
+            assert!(*mock.hits.lock().unwrap() >= 1);
 
-        // Cleanup kept tempfile / XDG blob.
-        let _ = std::fs::remove_file(&path);
+            // Cleanup kept tempfile / XDG blob.
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     /// Regression: remount of a well-known sidecar (no `.ptr`) is a V-3 cache
     /// hit — extra sidecar GET count is 0. Returned path opens read-only.
     #[test]
     fn maybe_fetch_http_remount_well_known_sidecar_cache_hit() {
-        let tmp = tempfile::tempdir().unwrap();
-        let src = tmp.path().join("real.sqlite");
-        crate::SqliteIndex::create_writable(Some(&src)).unwrap();
-        let body = std::fs::read(&src).unwrap();
-        let mock = MockHttp::spawn(body.clone());
-        let url = mock.url("/a.tar.zst.index.sqlite");
-        let p1 = maybe_fetch_index_url(&url).unwrap();
-        let hits1 = *mock.hits.lock().unwrap();
-        assert!(hits1 >= 1);
-        assert!(p1.is_file());
-        let p2 = maybe_fetch_index_url(&url).unwrap();
-        let hits2 = *mock.hits.lock().unwrap();
-        assert_eq!(
-            hits2, hits1,
-            "second fetch must not GET the sidecar again (no .ptr required)"
-        );
-        assert_eq!(std::fs::read(&p2).unwrap(), body);
-        assert!(crate::is_meta_cache_path(&p2), "{}", p2.display());
-        crate::SqliteIndex::open_read_only(&p2).unwrap();
-        let _ = std::fs::remove_file(&p1);
-        if p2 != p1 {
-            let _ = std::fs::remove_file(&p2);
-        }
+        with_isolated_xdg(|| {
+            let tmp = tempfile::tempdir().unwrap();
+            let src = tmp.path().join("real.sqlite");
+            crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+            let body = std::fs::read(&src).unwrap();
+            let mock = MockHttp::spawn(body.clone());
+            let url = mock.url("/a.tar.zst.index.sqlite");
+            let p1 = maybe_fetch_index_url(&url).unwrap();
+            let hits1 = *mock.hits.lock().unwrap();
+            assert!(hits1 >= 1);
+            assert!(p1.is_file());
+            let p2 = maybe_fetch_index_url(&url).unwrap();
+            let hits2 = *mock.hits.lock().unwrap();
+            assert_eq!(
+                hits2, hits1,
+                "second fetch must not GET the sidecar again (no .ptr required)"
+            );
+            assert_eq!(std::fs::read(&p2).unwrap(), body);
+            assert!(crate::is_meta_cache_path(&p2), "{}", p2.display());
+            crate::SqliteIndex::open_read_only(&p2).unwrap();
+            let _ = std::fs::remove_file(&p1);
+            if p2 != p1 {
+                let _ = std::fs::remove_file(&p2);
+            }
+        });
     }
 
     /// Regression: corrupting the cached blob forces exactly one refetch.
     #[test]
     fn maybe_fetch_http_corrupt_cache_refetches() {
-        let body = b"SQLite format 3\0ok-sidecar".to_vec();
-        let mock = MockHttp::spawn(body.clone());
-        let url = mock.url("/c.index.sqlite");
-        let p1 = maybe_fetch_index_url(&url).unwrap();
-        std::fs::write(&p1, b"truncated").unwrap();
-        let hits1 = *mock.hits.lock().unwrap();
-        let p2 = maybe_fetch_index_url(&url).unwrap();
-        let hits2 = *mock.hits.lock().unwrap();
-        assert_eq!(hits2, hits1 + 1, "corrupt cache must refetch once");
-        assert_eq!(std::fs::read(&p2).unwrap(), body);
-        let _ = std::fs::remove_file(&p2);
+        with_isolated_xdg(|| {
+            let body = b"SQLite format 3\0ok-sidecar".to_vec();
+            let mock = MockHttp::spawn(body.clone());
+            let url = mock.url("/c.index.sqlite");
+            let p1 = maybe_fetch_index_url(&url).unwrap();
+            std::fs::write(&p1, b"truncated").unwrap();
+            let hits1 = *mock.hits.lock().unwrap();
+            let p2 = maybe_fetch_index_url(&url).unwrap();
+            let hits2 = *mock.hits.lock().unwrap();
+            assert_eq!(hits2, hits1 + 1, "corrupt cache must refetch once");
+            assert_eq!(std::fs::read(&p2).unwrap(), body);
+            let _ = std::fs::remove_file(&p2);
+        });
     }
 
     /// Regression: `file://` sidecars skip the XDG LRU.
@@ -1062,33 +1093,37 @@ mod tests {
 
     #[test]
     fn maybe_fetch_http_empty_body() {
-        let mock = MockHttp::spawn(Vec::new());
-        let url = mock.url("/empty.index.sqlite");
-        let path = maybe_fetch_index_url(&url).unwrap();
-        assert!(path.is_file());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
-        let _ = std::fs::remove_file(&path);
+        with_isolated_xdg(|| {
+            let mock = MockHttp::spawn(Vec::new());
+            let url = mock.url("/empty.index.sqlite");
+            let path = maybe_fetch_index_url(&url).unwrap();
+            assert!(path.is_file());
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     #[test]
     fn resolve_index_location_materializes_http_explicit() {
-        let body = b"SQLite format 3\0".to_vec();
-        let mock = MockHttp::spawn(body.clone());
-        let url = mock.url("/idx.sqlite");
+        with_isolated_xdg(|| {
+            let body = b"SQLite format 3\0".to_vec();
+            let mock = MockHttp::spawn(body.clone());
+            let url = mock.url("/idx.sqlite");
 
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        std::fs::write(&archive, b"x").unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("a.tar");
+            std::fs::write(&archive, b"x").unwrap();
 
-        let loc = resolve_index_location(&archive, Some(&url), &[PathBuf::new()], false);
-        match loc {
-            IndexLocation::Path(p) => {
-                assert!(p.is_file());
-                assert_eq!(std::fs::read(&p).unwrap(), body);
-                let _ = std::fs::remove_file(&p);
+            let loc = resolve_index_location(&archive, Some(&url), &[PathBuf::new()], false);
+            match loc {
+                IndexLocation::Path(p) => {
+                    assert!(p.is_file());
+                    assert_eq!(std::fs::read(&p).unwrap(), body);
+                    let _ = std::fs::remove_file(&p);
+                }
+                IndexLocation::Memory => panic!("expected materialized path"),
             }
-            IndexLocation::Memory => panic!("expected materialized path"),
-        }
+        });
     }
 
     #[test]
@@ -1116,15 +1151,17 @@ mod tests {
 
     #[test]
     fn sibling_then_fetch() {
-        let body = b"SQLite format 3\0sibling".to_vec();
-        let mock = MockHttp::spawn(body.clone());
-        let archive_url = mock.url("/data/bundle.tar");
-        let idx_url = sibling_index_url(&archive_url).unwrap();
-        assert!(idx_url.ends_with("/data/bundle.tar.index.sqlite"));
-        // Mock serves any path with the same body; fetch sibling URL.
-        let path = maybe_fetch_index_url(&idx_url).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), body);
-        let _ = std::fs::remove_file(&path);
+        with_isolated_xdg(|| {
+            let body = b"SQLite format 3\0sibling".to_vec();
+            let mock = MockHttp::spawn(body.clone());
+            let archive_url = mock.url("/data/bundle.tar");
+            let idx_url = sibling_index_url(&archive_url).unwrap();
+            assert!(idx_url.ends_with("/data/bundle.tar.index.sqlite"));
+            // Mock serves any path with the same body; fetch sibling URL.
+            let path = maybe_fetch_index_url(&idx_url).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            let _ = std::fs::remove_file(&path);
+        });
     }
 
     #[test]
@@ -1287,18 +1324,43 @@ mod tests {
 
     #[test]
     fn maybe_fetch_http_gzip_index() {
-        let body = tiny_sqlite_bytes();
-        let dir = tempfile::tempdir().unwrap();
-        let gz_path = dir.path().join("remote.gz");
-        write_gzip(&gz_path, &body);
-        let gz_bytes = std::fs::read(&gz_path).unwrap();
+        with_isolated_xdg(|| {
+            let body = tiny_sqlite_bytes();
+            let dir = tempfile::tempdir().unwrap();
+            let gz_path = dir.path().join("remote.gz");
+            write_gzip(&gz_path, &body);
+            let gz_bytes = std::fs::read(&gz_path).unwrap();
 
-        let mock = MockHttp::spawn(gz_bytes);
-        let url = mock.url("/archive.tar.index.sqlite.gz");
-        let out = maybe_fetch_index_url(&url).unwrap();
-        assert_sqlite_magic(&out);
-        assert_eq!(std::fs::read(&out).unwrap(), body);
-        let _ = std::fs::remove_file(&out);
+            let mock = MockHttp::spawn(gz_bytes);
+            let url = mock.url("/archive.tar.index.sqlite.gz");
+            let out = maybe_fetch_index_url(&url).unwrap();
+            assert_sqlite_magic(&out);
+            assert_eq!(std::fs::read(&out).unwrap(), body);
+            let _ = std::fs::remove_file(&out);
+        });
+    }
+
+    /// Regression: a cached compressed sidecar that fails to materialize is
+    /// dropped so the next fetch GETs again (not a sticky XDG gzip blob).
+    #[test]
+    fn maybe_fetch_http_gzip_bad_payload_invalidates_and_refetches() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let gz = dir.path().join("bad.gz");
+            write_gzip(&gz, b"this is not a sqlite database");
+            let gz_bytes = std::fs::read(&gz).unwrap();
+            let mock = MockHttp::spawn(gz_bytes);
+            let url = mock.url("/archive.tar.index.sqlite.gz");
+            assert!(maybe_fetch_index_url(&url).is_err());
+            let hits1 = *mock.hits.lock().unwrap();
+            assert!(hits1 >= 1);
+            assert!(maybe_fetch_index_url(&url).is_err());
+            assert_eq!(
+                *mock.hits.lock().unwrap(),
+                hits1 + 1,
+                "failed gzip materialize must invalidate and refetch"
+            );
+        });
     }
 
     #[test]
@@ -1395,58 +1457,63 @@ mod tests {
     /// `Link: rel="describedby"` to the portable index blob (not SOCI).
     #[test]
     fn link_describedby_archive_head() {
-        let body = tiny_sqlite_bytes();
-        let link = format!(
+        with_isolated_xdg(|| {
+            let body = tiny_sqlite_bytes();
+            let link = format!(
             "</archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\""
         );
-        let mock = MockHttp::spawn_with_extra_headers(body.clone(), vec![("Link".into(), link)]);
-        let archive_url = mock.url("/archive.tar");
+            let mock =
+                MockHttp::spawn_with_extra_headers(body.clone(), vec![("Link".into(), link)]);
+            let archive_url = mock.url("/archive.tar");
 
-        let resp = ureq::head(&archive_url)
-            .set("User-Agent", USER_AGENT)
-            .call()
-            .unwrap();
-        let header = resp.header("Link").expect("archive HEAD must expose Link");
-        let idx_url =
-            parse_link_describedby(header, &archive_url).expect("describedby http(s) index URL");
-        assert!(idx_url.starts_with("http://"));
-        assert_eq!(idx_url, mock.url("/archive.tar.index.sqlite"));
+            let resp = ureq::head(&archive_url)
+                .set("User-Agent", USER_AGENT)
+                .call()
+                .unwrap();
+            let header = resp.header("Link").expect("archive HEAD must expose Link");
+            let idx_url = parse_link_describedby(header, &archive_url)
+                .expect("describedby http(s) index URL");
+            assert!(idx_url.starts_with("http://"));
+            assert_eq!(idx_url, mock.url("/archive.tar.index.sqlite"));
 
-        let path = maybe_fetch_index_url(&idx_url).unwrap();
-        assert_eq!(std::fs::read(&path).unwrap(), body);
-        let _ = std::fs::remove_file(&path);
-        assert!(*mock.hits.lock().unwrap() >= 2);
+            let path = maybe_fetch_index_url(&idx_url).unwrap();
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            let _ = std::fs::remove_file(&path);
+            assert!(*mock.hits.lock().unwrap() >= 2);
+        });
     }
 
     /// Regression: http(s) sibling auto-fetch tries uncompressed + compressed
     /// suffixes; S3/file URLs are not candidates.
     #[test]
     fn sibling_candidates_fetch() {
-        let body = tiny_sqlite_bytes();
-        let dir = tempfile::tempdir().unwrap();
-        let gz_path = dir.path().join("sib.gz");
-        write_gzip(&gz_path, &body);
-        let gz_bytes = std::fs::read(&gz_path).unwrap();
+        with_isolated_xdg(|| {
+            let body = tiny_sqlite_bytes();
+            let dir = tempfile::tempdir().unwrap();
+            let gz_path = dir.path().join("sib.gz");
+            write_gzip(&gz_path, &body);
+            let gz_bytes = std::fs::read(&gz_path).unwrap();
 
-        let mock = MockHttp::spawn(gz_bytes);
-        let archive_url = mock.url("/data/bundle.tar");
-        let cands = sibling_index_candidates(&archive_url);
-        assert_eq!(
-            cands.first().map(String::as_str),
-            sibling_index_url(&archive_url).as_deref()
-        );
-        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.gz")));
-        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.zst")));
-        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.xz")));
-        assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.bz2")));
-        assert_eq!(cands.len(), 5);
-        assert!(sibling_index_candidates("s3://bucket/key").is_empty());
-        assert!(sibling_index_candidates("file:///tmp/a.tar").is_empty());
+            let mock = MockHttp::spawn(gz_bytes);
+            let archive_url = mock.url("/data/bundle.tar");
+            let cands = sibling_index_candidates(&archive_url);
+            assert_eq!(
+                cands.first().map(String::as_str),
+                sibling_index_url(&archive_url).as_deref()
+            );
+            assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.gz")));
+            assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.zst")));
+            assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.xz")));
+            assert!(cands.iter().any(|u| u.ends_with(".index.sqlite.bz2")));
+            assert_eq!(cands.len(), 5);
+            assert!(sibling_index_candidates("s3://bucket/key").is_empty());
+            assert!(sibling_index_candidates("file:///tmp/a.tar").is_empty());
 
-        let gz = cands.iter().find(|u| u.ends_with(".gz")).unwrap();
-        let path = maybe_fetch_index_url(gz).unwrap();
-        assert_sqlite_magic(&path);
-        assert_eq!(std::fs::read(&path).unwrap(), body);
-        let _ = std::fs::remove_file(&path);
+            let gz = cands.iter().find(|u| u.ends_with(".gz")).unwrap();
+            let path = maybe_fetch_index_url(gz).unwrap();
+            assert_sqlite_magic(&path);
+            assert_eq!(std::fs::read(&path).unwrap(), body);
+            let _ = std::fs::remove_file(&path);
+        });
     }
 }

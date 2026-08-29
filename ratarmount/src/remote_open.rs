@@ -10,9 +10,10 @@ use std::sync::Arc;
 use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
-    check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file, is_meta_cache_path,
-    maybe_fetch_index_url, parse_link_describedby, resolve_index_location, sha256_hex_stream,
-    sibling_index_candidates, SqliteIndex, TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
+    check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
+    invalidate_meta_cache_identity, is_meta_cache_path, maybe_fetch_index_url,
+    parse_link_describedby, resolve_index_location, sha256_hex_stream, sibling_index_candidates,
+    SqliteIndex, TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
 use super::{open_from_live_range, open_path};
@@ -116,7 +117,7 @@ fn try_fetch_http_index(
     match maybe_fetch_index_url(index_url) {
         Ok(path) => {
             let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
-            try_install_remote_index(
+            let ok = try_install_remote_index(
                 opts,
                 path,
                 archive_size,
@@ -124,7 +125,13 @@ fn try_fetch_http_index(
                 suffix.as_deref(),
                 full.as_deref(),
                 cache_dest,
-            )
+            );
+            if !ok {
+                // Wire blob may be gzip/zstd in meta-v3 while `path` is a
+                // decompressed tempfile — invalidate by URL, not opened path.
+                invalidate_meta_cache_identity("http", index_url);
+            }
+            ok
         }
         Err(e) => {
             log::debug!("index fetch {index_url}: {e}");
@@ -636,6 +643,27 @@ mod tests {
         );
     }
 
+    static REMOTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
+        let _g = REMOTE_ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        let old_cap = std::env::var_os(ratarmount_index::META_CACHE_BYTES_ENV);
+        std::env::set_var("XDG_CACHE_HOME", dir.path());
+        std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV);
+        let r = f();
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match old_cap {
+            Some(v) => std::env::set_var(ratarmount_index::META_CACHE_BYTES_ENV, v),
+            None => std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV),
+        }
+        r
+    }
+
     #[test]
     fn oci_image_mount_source_new_unions_folder_layers() {
         let dir = tempfile::tempdir().unwrap();
@@ -705,122 +733,122 @@ mod tests {
     /// fetches the sidecar when local folder candidates miss.
     #[test]
     fn apply_remote_index_discovery_follows_archive_link() {
-        use ratarmount_index::{SqliteIndex, INDEX_LINK_REL, INDEX_MEDIA_TYPE};
-        use std::io::{BufRead, BufReader, Write as IoWrite};
-        use std::net::TcpListener;
-        use std::thread;
+        with_isolated_xdg(|| {
+            use ratarmount_index::{SqliteIndex, INDEX_LINK_REL, INDEX_MEDIA_TYPE};
+            use std::io::{BufRead, BufReader, Write as IoWrite};
+            use std::net::TcpListener;
+            use std::thread;
 
-        let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("archive.tar");
-        let archive_bytes = vec![b'A'; 1024];
-        fs::write(&archive, &archive_bytes).unwrap();
-        let idx_path = dir.path().join("sidecar.sqlite");
-        {
-            let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
-            idx.store_tarstats_for_path(&archive).unwrap();
-            idx.publish_tmp().unwrap();
-        }
-        let index_bytes = fs::read(&idx_path).unwrap();
-        let folders = vec![dir.path().join("empty-index-folders")];
-        fs::create_dir_all(&folders[0]).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'A'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let idx_path = dir.path().join("sidecar.sqlite");
+            {
+                let mut idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+                idx.store_tarstats_for_path(&archive).unwrap();
+                idx.publish_tmp().unwrap();
+            }
+            let index_bytes = fs::read(&idx_path).unwrap();
+            let folders = vec![dir.path().join("empty-index-folders")];
+            fs::create_dir_all(&folders[0]).unwrap();
 
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let archive_body = archive_bytes.clone();
-        let index_body = index_bytes.clone();
-        let join = thread::spawn(move || {
-            listener.set_nonblocking(false).ok();
-            for stream in listener.incoming().take(32) {
-                let Ok(mut stream) = stream else { continue };
-                let mut reader = BufReader::new(stream.try_clone().unwrap());
-                let mut request_line = String::new();
-                if reader.read_line(&mut request_line).is_err() {
-                    continue;
-                }
-                let mut range_hdr: Option<String> = None;
-                loop {
-                    let mut line = String::new();
-                    if reader.read_line(&mut line).is_err() {
-                        break;
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let archive_body = archive_bytes.clone();
+            let index_body = index_bytes.clone();
+            let join = thread::spawn(move || {
+                listener.set_nonblocking(false).ok();
+                for stream in listener.incoming().take(32) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
                     }
-                    if line == "\r\n" || line == "\n" || line.is_empty() {
-                        break;
-                    }
-                    if let Some(v) = line.strip_prefix("Range:") {
-                        range_hdr = Some(v.trim().to_string());
-                    }
-                }
-                let path = request_line.split_whitespace().nth(1).unwrap_or("");
-                let is_head = request_line.starts_with("HEAD ");
-                let is_index = path.contains("index.sqlite");
-                let body: &[u8] = if is_index { &index_body } else { &archive_body };
-                let mut range_off: Option<(usize, usize)> = None;
-                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
-                    let parts: Vec<&str> = r.splitn(2, '-').collect();
-                    if parts.len() == 2 {
-                        let start: usize = parts[0].parse().unwrap_or(0);
-                        let end: usize = if parts[1].is_empty() {
-                            body.len().saturating_sub(1)
-                        } else {
-                            parts[1]
-                                .parse()
-                                .unwrap_or(0)
-                                .min(body.len().saturating_sub(1))
-                        };
-                        if start < body.len() && start <= end {
-                            range_off = Some((start, end));
+                    let mut range_hdr: Option<String> = None;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        if let Some(v) = line.strip_prefix("Range:") {
+                            range_hdr = Some(v.trim().to_string());
                         }
                     }
-                }
-                let slice = match range_off {
-                    Some((s, e)) => &body[s..=e],
-                    None => body,
-                };
-                let status = if range_off.is_some() {
-                    "206 Partial Content"
-                } else {
-                    "200 OK"
-                };
-                let mut hdr = format!(
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let is_head = request_line.starts_with("HEAD ");
+                    let is_index = path.contains("index.sqlite");
+                    let body: &[u8] = if is_index { &index_body } else { &archive_body };
+                    let mut range_off: Option<(usize, usize)> = None;
+                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                        let parts: Vec<&str> = r.splitn(2, '-').collect();
+                        if parts.len() == 2 {
+                            let start: usize = parts[0].parse().unwrap_or(0);
+                            let end: usize = if parts[1].is_empty() {
+                                body.len().saturating_sub(1)
+                            } else {
+                                parts[1]
+                                    .parse()
+                                    .unwrap_or(0)
+                                    .min(body.len().saturating_sub(1))
+                            };
+                            if start < body.len() && start <= end {
+                                range_off = Some((start, end));
+                            }
+                        }
+                    }
+                    let slice = match range_off {
+                        Some((s, e)) => &body[s..=e],
+                        None => body,
+                    };
+                    let status = if range_off.is_some() {
+                        "206 Partial Content"
+                    } else {
+                        "200 OK"
+                    };
+                    let mut hdr = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n",
                     slice.len()
                 );
-                if let Some((start, end)) = range_off {
-                    hdr.push_str(&format!(
-                        "Content-Range: bytes {start}-{end}/{}\r\n",
-                        body.len()
-                    ));
-                }
-                if !is_index {
-                    hdr.push_str(&format!(
+                    if let Some((start, end)) = range_off {
+                        hdr.push_str(&format!(
+                            "Content-Range: bytes {start}-{end}/{}\r\n",
+                            body.len()
+                        ));
+                    }
+                    if !is_index {
+                        hdr.push_str(&format!(
                         "Link: </archive.tar.index.sqlite>; rel=\"{INDEX_LINK_REL}\"; type=\"{INDEX_MEDIA_TYPE}\"\r\n"
                     ));
+                    }
+                    hdr.push_str("\r\n");
+                    let _ = stream.write_all(hdr.as_bytes());
+                    if !is_head {
+                        let _ = stream.write_all(slice);
+                    }
                 }
-                hdr.push_str("\r\n");
-                let _ = stream.write_all(hdr.as_bytes());
-                if !is_head {
-                    let _ = stream.write_all(slice);
-                }
-            }
+            });
+
+            let url = format!("http://{addr}/archive.tar");
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            drop(join);
+            let got = opts
+                .index_file_path
+                .as_ref()
+                .expect("Link describedby must install a sidecar");
+            assert!(got.is_file(), "{}", got.display());
+            assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
         });
-
-        let url = format!("http://{addr}/archive.tar");
-        let mut opts = OpenOptions {
-            index_folders: folders,
-            write_index: false,
-            ..OpenOptions::default()
-        };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
-        drop(join);
-        let got = opts
-            .index_file_path
-            .as_ref()
-            .expect("Link describedby must install a sidecar");
-        assert!(got.is_file(), "{}", got.display());
-        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
     }
-
-    static REMOTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct SidecarHttp {
         url: String,
@@ -830,6 +858,18 @@ mod tests {
 
     impl SidecarHttp {
         fn spawn(archive_body: Vec<u8>, index_body: Vec<u8>) -> Self {
+            Self::spawn_inner(archive_body, index_body, None)
+        }
+
+        fn spawn_gzip(archive_body: Vec<u8>, gzip_index: Vec<u8>) -> Self {
+            Self::spawn_inner(archive_body, Vec::new(), Some(gzip_index))
+        }
+
+        fn spawn_inner(
+            archive_body: Vec<u8>,
+            index_body: Vec<u8>,
+            gzip_index: Option<Vec<u8>>,
+        ) -> Self {
             use std::io::{BufRead, BufReader, Write as IoWrite};
             use std::net::TcpListener;
             use std::thread;
@@ -862,17 +902,35 @@ mod tests {
                     }
                     let path = request_line.split_whitespace().nth(1).unwrap_or("");
                     let is_head = request_line.starts_with("HEAD ");
-                    let is_compressed_index = path.contains(".index.sqlite.");
-                    let is_index = path.ends_with(".index.sqlite") && !is_compressed_index;
-                    if is_compressed_index {
+                    let is_gz = path.ends_with(".index.sqlite.gz");
+                    let is_plain =
+                        path.ends_with(".index.sqlite") && !path.contains(".index.sqlite.");
+                    let compressed = path.contains(".index.sqlite.");
+                    let reject = if gzip_index.is_some() {
+                        is_plain || (compressed && !is_gz)
+                    } else {
+                        compressed
+                    };
+                    if reject {
                         let hdr = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
                         let _ = stream.write_all(hdr.as_bytes());
                         continue;
                     }
+                    let is_index = if gzip_index.is_some() {
+                        is_gz
+                    } else {
+                        is_plain
+                    };
                     if is_index && !is_head {
                         *gets_c.lock().unwrap() += 1;
                     }
-                    let body: &[u8] = if is_index { &index_body } else { &archive_body };
+                    let body: &[u8] = if is_gz {
+                        gzip_index.as_deref().unwrap_or(&index_body)
+                    } else if is_plain {
+                        &index_body
+                    } else {
+                        &archive_body
+                    };
                     let mut range_off: Option<(usize, usize)> = None;
                     if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
                         let parts: Vec<&str> = r.splitn(2, '-').collect();
@@ -927,25 +985,6 @@ mod tests {
         fn sidecar_gets(&self) -> usize {
             *self.sidecar_gets.lock().unwrap()
         }
-    }
-
-    fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
-        let _g = REMOTE_ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
-        let old_cap = std::env::var_os(ratarmount_index::META_CACHE_BYTES_ENV);
-        std::env::set_var("XDG_CACHE_HOME", dir.path());
-        std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV);
-        let r = f();
-        match old_xdg {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
-        match old_cap {
-            Some(v) => std::env::set_var(ratarmount_index::META_CACHE_BYTES_ENV, v),
-            None => std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV),
-        }
-        r
     }
 
     /// Regression: remount of a published well-known sidecar (no `.ptr`) does
@@ -1054,6 +1093,54 @@ mod tests {
                 http.sidecar_gets(),
                 gets1,
                 "local nonempty sidecar must skip remote GET"
+            );
+        });
+    }
+
+    /// Regression: gzip sibling tarstats mismatch must drop the XDG wire blob
+    /// so the next discovery GETs again (not a sticky decompressed-temp miss).
+    #[test]
+    fn apply_remote_index_gzip_tarstats_mismatch_refetches() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'C'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let idx_path = dir.path().join("sidecar.sqlite");
+            {
+                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+                idx.store_tarstats_for_path(&archive).unwrap();
+            }
+            let gz = Command::new("gzip")
+                .arg("-c")
+                .arg(&idx_path)
+                .output()
+                .expect("spawn gzip");
+            if !gz.status.success() {
+                eprintln!("skip: gzip CLI unavailable");
+                return;
+            }
+            let folders = vec![dir.path().join("idx-folders")];
+            fs::create_dir_all(&folders[0]).unwrap();
+            let http = SidecarHttp::spawn_gzip(archive_bytes.clone(), gz.stdout);
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            // Wrong archive size → tarstats fail after decompress.
+            apply_remote_index_discovery(&http.url, &mut opts, false, 2048, None);
+            assert!(
+                opts.index_file_path.is_none(),
+                "mismatched gzip sidecar must not install"
+            );
+            let gets1 = http.sidecar_gets();
+            assert!(gets1 >= 1, "first discovery must GET the gzip sidecar");
+            apply_remote_index_discovery(&http.url, &mut opts, false, 2048, None);
+            assert_eq!(
+                http.sidecar_gets(),
+                gets1 + 1,
+                "gzip tarstats fail must invalidate XDG and GET again"
             );
         });
     }

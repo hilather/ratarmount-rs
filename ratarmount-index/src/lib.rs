@@ -32,8 +32,8 @@ pub use location::{
     INDEX_LINK_REL, INDEX_MEDIA_TYPE, MEMORY_INDEX,
 };
 pub use meta_cache::{
-    cache_identity, invalidate_meta_cache_file, is_meta_cache_path, MetaCache,
-    META_CACHE_BYTES_DEFAULT, META_CACHE_BYTES_ENV, META_SIDECAR_WHOLE_MAX,
+    cache_identity, invalidate_meta_cache_file, invalidate_meta_cache_identity, is_meta_cache_path,
+    MetaCache, META_CACHE_BYTES_DEFAULT, META_CACHE_BYTES_ENV, META_SIDECAR_WHOLE_MAX,
 };
 pub use search::{locate_pattern_matches, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
