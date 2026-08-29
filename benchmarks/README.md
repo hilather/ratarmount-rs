@@ -146,6 +146,8 @@ write-overlay getattr, nested `-c -r`.
 # Default: build/reuse v0.1.27 as OLD, target/release as NEW
 ./benchmarks/compare-vector-wave.sh
 # → benchmarks/vector-wave-results/results-*.{csv,md}  (gitignored)
+# Snapshots: vector-wave-v0.1.27-vs-0.1.28.md · vector-wave-v0.1.28-vs-0.1.29.md
+# v0.1.29 vs 0.1.28: OLD_REF=v0.1.28 VECTOR_REMOTE=1 ./benchmarks/compare-vector-wave.sh
 
 OLD_BIN=/path/to/ratarmount-0.1.27 NEW_BIN=target/release/ratarmount \
   N_FILES=8000 RUNS=3 ./benchmarks/compare-vector-wave.sh
