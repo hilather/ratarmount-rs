@@ -35,7 +35,7 @@ cat mnt/file     # true random access — even inside compressed streams
 | **~5.2× faster cold mounts** | Index + mount in a fraction of the Python baseline (~6.8× warm) |
 | **~4–6.5× lower peak RSS** | Typical **18–22 MiB** vs ~121 MiB for Python ratarmount |
 | **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
-| **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via archive `Link:` / http(s) sibling / OCI referrer on local miss; `--publish-index` |
+| **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via archive `Link:` / http(s) sibling / OCI referrer on local miss; `--publish-index` always writes `{archive}.index.ptr`; remount a previous snapshot with `--index-id HEX` |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
 | **Remote-first** | `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
 

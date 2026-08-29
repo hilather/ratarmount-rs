@@ -68,7 +68,8 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--union-mount-cache-timeout` | yes | yes (seconds) | `[x]` |
 | `--union-resolve-symlinks` | no (issue #160) | **added** (opt-in multi-hop resolve within winning source; B-4 dir>symlink unchanged; cheap `list_dirents` + per-symlink `lookup`, not fat `list()`) | `~` Rust-only FR-10: `lookup(join(listed_path, name))` may leave `S_IFLNK` on path-keyed archives listed through a symlink-to-dir |
 | `--index-file` / `:memory:` / folders | yes | yes | `[x]` |
-| `--publish-index` / `--publish-index-to PATH` | no | **added** (boolean + required-value dest; local copy of 0.7.x sidecar; no S3 PUT; OCI referrer PUT residual) | `[x]` Rust-only |
+| `--index-id HEX` | no | **added** (required value; `{archive}.index.{sha256}.sqlite` or pointer-named well-known blob; tarstats mismatch / unknown id exit 2) | `[x]` Rust-only |
+| `--publish-index` / `--publish-index-to PATH` | no | **added** (boolean + required-value dest; local copy of 0.7.x sidecar; always writes `{archive}.index.ptr`; keep-last-K=2 snapshots when a pointer exists; no S3 PUT; OCI referrer PUT residual) | `[x]` Rust-only |
 | Remote/compressed index URL | yes | yes (`http(s)://` / `file://` + gzip/xz/zstd/bz2 decompress; auto `Link: describedby` on archive HEAD + http(s) sibling; OCI referrer on local `oci:{digest}` miss) | `[x]` |
 | `--verify-mtime` | yes | yes | `[x]` |
 | `--force-folder-index` | yes | accepted (folders still live) | `~` |

@@ -19,8 +19,8 @@ use ratarmount_fuse::{
     clamp_readahead, mount_blocking, parse_byte_size, unmount, RECOMMENDED_READAHEAD_BYTES,
 };
 use ratarmount_index::{
-    default_index_folders, fill_content_hashes, parse_index_folders, resolve_index_location,
-    SqliteIndex, MEMORY_INDEX,
+    bind_local_index_id, default_index_folders, fill_content_hashes, parse_index_folders,
+    resolve_index_location, SqliteIndex, MEMORY_INDEX,
 };
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -256,6 +256,15 @@ struct Args {
     /// Explicit index file path, or `:memory:` for an in-memory index
     #[arg(long = "index-file")]
     index_file: Option<String>,
+
+    /// Bind this mount to an immutable sidecar snapshot. HEX is sha256 of the
+    /// SQLite blob (64 hex). Looks up `{archive}.index.{HEX}.sqlite`, else the
+    /// well-known blob named by `{archive}.index.ptr`. Required value
+    /// (`num_args = 1`); do not use `num_args = 0..=1` (that steals ARCHIVE).
+    /// Unknown id or tarstats mismatch exits 2 (no silent well-known fallback).
+    /// Resolved here to `--index-file` (not `OpenOptions::index_id`).
+    #[arg(long = "index-id", value_name = "HEX", num_args = 1)]
+    index_id: Option<String>,
 
     /// Comma-separated or JSON list of folders for `.index.sqlite` files.
     /// Empty entry = next to the archive. Default: ,$XDG_CACHE_HOME/ratarmount,~/.ratarmount
@@ -706,11 +715,30 @@ fn main() {
         }
     }
 
-    let (index_in_memory, index_file_path) = match args.index_file.as_deref() {
+    let (index_in_memory, mut index_file_path) = match args.index_file.as_deref() {
         Some(s) if s.trim() == MEMORY_INDEX => (true, None),
         Some(s) => (false, Some(PathBuf::from(s))),
         None => (false, None),
     };
+
+    if let Some(ref hex) = args.index_id {
+        if index_in_memory {
+            eprintln!("error: --index-id cannot be combined with --index-file :memory:");
+            std::process::exit(2);
+        }
+        let archive = if args.find {
+            &args.paths[1]
+        } else {
+            &inputs[0]
+        };
+        match bind_local_index_id(archive, hex) {
+            Ok(p) => index_file_path = Some(p),
+            Err(e) => {
+                eprintln!("error: --index-id: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
 
     let index_folders = match &args.index_folders {
         Some(s) => parse_index_folders(s),
@@ -2225,7 +2253,7 @@ fn print_features() {
         "  remote: http,https,file,s3,gs,az,ftp,ftps,ssh,sftp,webdav,smb,dropbox,oci,docker,ipfs,rclone"
     );
     println!(
-        "  index: --index-file, --index-folders, :memory:, --publish-index / --publish-index-to"
+        "  index: --index-file, --index-id, --index-folders, :memory:, --publish-index / --publish-index-to"
     );
     println!(
         "  control: --control-interface (unix socket + in-FS search/<pattern>); ratarmount find PATTERN ARCHIVE"
@@ -3111,6 +3139,39 @@ mod export_cli_tests {
             msg.contains("publish-index-to") || msg.contains("required") || msg.contains("value"),
             "{msg}"
         );
+    }
+
+    /// Regression: `--index-id HEX` is `num_args = 1` (not `0..=1`).
+    #[test]
+    fn index_id_required_value_does_not_steal_archive() {
+        let hex = "a".repeat(64);
+        let a = Args::try_parse_from(["ratarmount", "--index-id", &hex, "a.tar"]).expect("parse");
+        assert_eq!(a.index_id.as_deref(), Some(hex.as_str()));
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    #[test]
+    fn index_id_without_value_is_clap_error() {
+        let err = Args::try_parse_from(["ratarmount", "--index-id"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("index-id") || msg.contains("required") || msg.contains("value"),
+            "{msg}"
+        );
+    }
+
+    /// Regression: `--index-id HEX ARCHIVE` must not treat HEX as ARCHIVE.
+    #[test]
+    fn index_id_flag_does_not_steal_archive() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--index-id",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "testdata.tar.gz",
+        ])
+        .expect("parse");
+        assert!(a.index_id.is_some());
+        assert_eq!(archive_paths(&a), vec![PathBuf::from("testdata.tar.gz")]);
     }
 
     #[test]

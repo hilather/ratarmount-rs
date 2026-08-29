@@ -89,11 +89,10 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 **Still open:**
 
 - [x] **V-2a** local tmp+rename: `create_writable(Some(dest))` opens `{dest}.tmp.{pid}` (journal OFF, dest not unlinked). `publish_tmp` / `into_read_only` close tmp (no WAL) → rename → `self.path = dest` → open dest → WAL. Drop unpublished tmp leaves dest (stricter than old `remove_file` dest at create). Factory side-table helpers call `publish_tmp()` after writes. Pointer flip is V-2b.
-- [ ] Root pointer object separate from the SQLite blob: `{schema, index_id, etag/sha256, generated_at, archive_tarstats}`. Readers bind to `index_id`; writer publishes blob N+1 then replaces the pointer.
-- [ ] `-c` writes a new sidecar then flips the pointer (V-2b). Open mounts keep the mmap/connection to N (V-2a dest inode).
-- [ ] Shared remote index: do not PUT the live `.index.sqlite` in place (G-2 residual: no S3/GCS/Azure sibling GET/PUT in v1). Pointer + immutable key `index.{id}.sqlite` is the way to add that without torn reads.
-- [ ] Optional keep-last-K snapshots (local only first). Not D1 Time Travel; just “remount --index-id” after a bad `-c`.
-- [x] Regression (V-2a): reader `open_read_only` + `search_query` survives writer `create_writable`+inserts+`into_read_only`; drop mid-insert leaves dest; `check_tarstats` still rejects a replaced archive. Pointer-era remount `--index-id` is V-2b.
+- [x] **V-2b** root pointer object separate from the SQLite blob: `{schema, index_id, etag/sha256, generated_at, archive_tarstats}` in `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256(blob) 64 hex). `--publish-index` always writes it (including dest==sidecar). `--index-id HEX` pre-resolves to `opts.index_file_path`.
+- [x] Keep-last-K=2 local snapshots when a pointer is written (`{archive}.index.{old_id}.sqlite` from the existing pointer id; no extra copy until then). Remount `--index-id` of N while N+1 is well-known. `-c` still publishes the well-known SQLite blob (V-2a); pointer flip is `--publish-index`.
+- [ ] Shared remote index: do not PUT the live `.index.sqlite` in place (G-2 residual: no S3/GCS/Azure sibling GET/PUT in v1). Pointer + immutable key `index.{id}.sqlite` is the way to add that without torn reads (V-2c GET).
+- [x] Regression (V-2a): reader `open_read_only` + `search_query` survives writer `create_writable`+inserts+`into_read_only`; drop mid-insert leaves dest; `check_tarstats` still rejects a replaced archive. Pointer-era remount `--index-id` (V-2b): clap-steal; dest==sidecar writes `.ptr`; tarstats mismatch refuses.
 
 **Why it pays:** Unlocks safe `--publish-index` on NFS/S3 and remount-during-rebuild. SQLite’s own WAL is per-connection, not a cross-process object-store commit. Vectorize’s root PUT is the portable part.
 

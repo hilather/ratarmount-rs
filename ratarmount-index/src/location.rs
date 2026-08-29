@@ -14,10 +14,14 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::{debug, warn};
+use serde::{Deserialize, Serialize};
 
-use crate::{IndexError, Result};
+use crate::{
+    parse_tarstats_json, serialize_tarstats, tar_stats_from_path, IndexError, Result, TarStats,
+};
 
 /// SQLite database header magic (16 bytes including trailing NUL).
 const SQLITE_MAGIC: &[u8] = b"SQLite format 3\0";
@@ -65,6 +69,357 @@ pub const INDEX_MEDIA_TYPE: &str = "application/vnd.ratarmount.index.v1+sqlite";
 /// Clients parse `Link` on the **archive** URL. `--http` tree export is not an
 /// archive server; outbound `Link` on `index.sqlite` is not inbound discovery.
 pub const INDEX_LINK_REL: &str = "describedby";
+
+/// Sibling of the well-known SQLite blob (`{archive}.index.ptr`). Not [`crate::INDEX_VERSION`].
+/// Not SOCI.
+pub const INDEX_POINTER_SCHEMA: &str = "ratarmount.index.pointer.v1";
+
+/// `index_id` / `etag_sha256` are lowercase hex SHA-256 of the SQLite blob (never uuid).
+pub const INDEX_ID_HEX_LEN: usize = 64;
+
+/// Keep-last-K extra sidecar copies when a pointer is actually written (well-known + one
+/// previous `{archive}.index.{old_id}.sqlite`). V-2a-only installs stay K=1 (no extra copy).
+pub const INDEX_POINTER_KEEP_LAST: usize = 2;
+
+/// Immutable snapshot pointer (`{archive}.index.ptr`). Additional discovery candidate;
+/// the well-known `{archive}.index.sqlite` stays a real 0.7.x SQLite blob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IndexPointer {
+    pub schema: String,
+    /// Lowercase hex SHA-256 of the SQLite blob — 64 hex, never uuid.
+    pub index_id: String,
+    /// Identical to [`Self::index_id`].
+    pub etag_sha256: String,
+    /// RFC 3339 UTC timestamp.
+    pub generated_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive_tarstats: Option<serde_json::Value>,
+}
+
+impl IndexPointer {
+    /// Fingerprint `blob` (streaming SHA-256) and optional archive tarstats.
+    pub fn for_blob(blob: &Path, archive: Option<&Path>) -> Result<Self> {
+        let index_id = sha256_file_hex(blob)?;
+        let archive_tarstats = match archive {
+            Some(p) if p.is_file() => match tar_stats_from_path(p) {
+                Ok(stats) => serde_json::from_str(&serialize_tarstats(&stats)).ok(),
+                Err(e) => {
+                    warn!(
+                        "index pointer: could not fingerprint archive {}: {e}",
+                        p.display()
+                    );
+                    None
+                }
+            },
+            _ => None,
+        };
+        Ok(Self {
+            schema: INDEX_POINTER_SCHEMA.to_string(),
+            etag_sha256: index_id.clone(),
+            index_id,
+            generated_at: rfc3339_utc_now(),
+            archive_tarstats,
+        })
+    }
+
+    /// Schema + 64-hex `index_id` (path-escape / uuid rejected).
+    pub fn validate(&self) -> Result<()> {
+        if self.schema != INDEX_POINTER_SCHEMA {
+            return Err(IndexError::Invalid(format!(
+                "index pointer schema {:?} (expected {INDEX_POINTER_SCHEMA})",
+                self.schema
+            )));
+        }
+        let id = parse_index_id(&self.index_id)?;
+        let etag = parse_index_id(&self.etag_sha256)?;
+        if id != etag {
+            return Err(IndexError::Invalid(
+                "index pointer etag_sha256 must equal index_id".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Parsed archive fingerprint when present and well-formed.
+    pub fn tarstats(&self) -> Option<TarStats> {
+        let v = self.archive_tarstats.as_ref()?;
+        parse_tarstats_json(&v.to_string()).ok()
+    }
+}
+
+/// `{archive}.index.ptr` (sibling of `{archive}.index.sqlite`, not `{well_known}.ptr`).
+pub fn index_pointer_path(archive: &Path) -> PathBuf {
+    let mut s = archive.as_os_str().to_os_string();
+    s.push(".index.ptr");
+    PathBuf::from(s)
+}
+
+/// Treat `index_file` as `{base}.index.sqlite` when it uses that suffix.
+pub fn archive_base_from_index_path(index_file: &Path) -> PathBuf {
+    let s = index_file.as_os_str().to_string_lossy();
+    match s.strip_suffix(".index.sqlite") {
+        Some(base) => PathBuf::from(base),
+        None => index_file.to_path_buf(),
+    }
+}
+
+/// Pointer sibling of an index blob (`foo.index.sqlite` → `foo.index.ptr`).
+pub fn index_pointer_path_for_index_file(index_file: &Path) -> PathBuf {
+    index_pointer_path(&archive_base_from_index_path(index_file))
+}
+
+/// `{archive}.index.{64hex}.sqlite`. Rejects uuid / path-escape (`index_id` must be 64 hex).
+pub fn index_id_path(archive: &Path, index_id: &str) -> Result<PathBuf> {
+    let id = parse_index_id(index_id)?;
+    let mut s = archive.as_os_str().to_os_string();
+    s.push(".index.");
+    s.push(id.as_str());
+    s.push(".sqlite");
+    Ok(PathBuf::from(s))
+}
+
+/// Lowercase 64-hex SHA-256 id. Rejects uuid and path components.
+pub fn parse_index_id(s: &str) -> Result<String> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.len() != INDEX_ID_HEX_LEN || !t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(IndexError::Invalid(format!(
+            "index_id must be {INDEX_ID_HEX_LEN} lowercase hex sha256(blob), not {s:?}"
+        )));
+    }
+    Ok(t)
+}
+
+/// Load `{archive}.index.ptr`. Missing file → `Ok(None)`. Invalid schema / id → `Err`.
+pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
+    let mut f = match File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut s = String::new();
+    f.read_to_string(&mut s)?;
+    let ptr: IndexPointer = serde_json::from_str(&s)
+        .map_err(|e| IndexError::Invalid(format!("index pointer {}: {e}", path.display())))?;
+    ptr.validate()?;
+    Ok(Some(ptr))
+}
+
+/// Atomically replace `path` with pretty-printed pointer JSON (tmp + rename).
+pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()> {
+    ptr.validate()?;
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let json = serde_json::to_vec_pretty(ptr)
+        .map_err(|e| IndexError::Invalid(format!("serialize index pointer: {e}")))?;
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(".ratarmount-index-ptr-").suffix(".tmp");
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    let mut tmp = match parent {
+        Some(p) => builder.tempfile_in(p)?,
+        None => builder.tempfile_in(".")?,
+    };
+    tmp.write_all(&json)?;
+    tmp.write_all(b"\n")?;
+    tmp.flush()?;
+    tmp.as_file().sync_all()?;
+    tmp.persist(path).map_err(|e| IndexError::Io(e.error))?;
+    Ok(())
+}
+
+/// Resolve `--index-id HEX` to a local SQLite path (snapshot file, else well-known if
+/// the pointer names that id). Unknown id is an error — no silent well-known fallback.
+pub fn resolve_index_id_path(archive: &Path, index_id: &str) -> Result<PathBuf> {
+    let id = parse_index_id(index_id)?;
+    let snapshot = index_id_path(archive, &id)?;
+    if path_is_usable_existing_index(&snapshot) {
+        return Ok(snapshot);
+    }
+    let ptr_path = index_pointer_path(archive);
+    match load_index_pointer(&ptr_path) {
+        Ok(Some(ptr)) if parse_index_id(&ptr.index_id).ok().as_deref() == Some(id.as_str()) => {
+            let well_known = default_index_path(archive);
+            if path_is_usable_existing_index(&well_known) {
+                return Ok(well_known);
+            }
+            Err(IndexError::Invalid(format!(
+                "index_id {id} is named by {} but {} is missing",
+                ptr_path.display(),
+                well_known.display()
+            )))
+        }
+        Ok(Some(ptr)) => Err(IndexError::Invalid(format!(
+            "unknown index_id {id} (pointer names {}; no {})",
+            ptr.index_id,
+            snapshot.display()
+        ))),
+        Ok(None) => Err(IndexError::Invalid(format!(
+            "unknown index_id {id} (no {} and no {})",
+            snapshot.display(),
+            ptr_path.display()
+        ))),
+        Err(e) => Err(IndexError::Invalid(format!(
+            "unknown index_id {id} (invalid {}: {e})",
+            ptr_path.display()
+        ))),
+    }
+}
+
+/// Resolve `--index-id` and refuse when stored tarstats no longer match `archive`.
+pub fn bind_local_index_id(archive: &Path, index_id: &str) -> Result<PathBuf> {
+    let path = resolve_index_id_path(archive, index_id)?;
+    let idx = crate::SqliteIndex::open_read_only(&path)?;
+    idx.check_tarstats_matches_archive(archive)?;
+    Ok(path)
+}
+
+/// Hardlink (else copy) `well_known` to `{archive}.index.{old_id}.sqlite`.
+///
+/// Uses `old_id` from an existing pointer — does **not** SHA-256 the sidecar.
+/// No-op when `old_id` is invalid, the snapshot already exists, or `well_known` is missing.
+pub fn snapshot_index_id(
+    archive: &Path,
+    well_known: &Path,
+    old_id: &str,
+) -> Result<Option<PathBuf>> {
+    let id = match parse_index_id(old_id) {
+        Ok(id) => id,
+        Err(_) => return Ok(None),
+    };
+    if !path_is_usable_existing_index(well_known) {
+        return Ok(None);
+    }
+    let dest = index_id_path(archive, &id)?;
+    if dest == well_known {
+        return Ok(None);
+    }
+    if path_is_usable_existing_index(&dest) {
+        return Ok(Some(dest));
+    }
+    if let Some(parent) = dest.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    match std::fs::hard_link(well_known, &dest) {
+        Ok(()) => Ok(Some(dest)),
+        Err(_) => {
+            std::fs::copy(well_known, &dest)?;
+            Ok(Some(dest))
+        }
+    }
+}
+
+/// Unlink `{archive}.index.{hex}.sqlite` snapshots other than `keep_id` (K=2 extra copies).
+pub fn prune_index_snapshots(archive: &Path, keep_id: &str) -> Result<()> {
+    let keep = parse_index_id(keep_id)?;
+    for (id, path) in list_index_id_snapshots(archive) {
+        if id != keep {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
+    Ok(())
+}
+
+/// Snapshot `well_known` from an existing pointer (if any), write a new pointer for `blob`,
+/// then keep-last-K=2 (unlink extras). `well_known` must still hold the **previous** blob
+/// when `old_id != sha256(blob)` — callers snapshot **before** replacing dest.
+pub fn publish_index_pointer(
+    archive: &Path,
+    blob: &Path,
+    tarstats_archive: Option<&Path>,
+    snapshot_well_known: Option<&Path>,
+) -> Result<IndexPointer> {
+    let ptr_path = index_pointer_path(archive);
+    let new_id = sha256_file_hex(blob)?;
+    let old_id = match load_index_pointer(&ptr_path) {
+        Ok(Some(old)) => parse_index_id(&old.index_id).ok(),
+        Ok(None) => None,
+        Err(e) => {
+            warn!("ignoring invalid index pointer {}: {e}", ptr_path.display());
+            None
+        }
+    };
+    if let Some(ref old) = old_id {
+        if old != &new_id {
+            if let Some(wk) = snapshot_well_known {
+                snapshot_index_id(archive, wk, old)?;
+            }
+            prune_index_snapshots(archive, old)?;
+        }
+    }
+    let ptr = IndexPointer::for_blob(blob, tarstats_archive)?;
+    store_index_pointer_atomic(&ptr_path, &ptr)?;
+    Ok(ptr)
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    crate::hashing::sha256_hex_stream(&mut f).map_err(IndexError::from)
+}
+
+fn list_index_id_snapshots(archive: &Path) -> Vec<(String, PathBuf)> {
+    let parent = match archive.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    let Some(name) = archive.file_name() else {
+        return Vec::new();
+    };
+    let prefix = format!("{}.index.", name.to_string_lossy());
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(&parent) else {
+        return out;
+    };
+    for ent in entries.flatten() {
+        let fname = ent.file_name();
+        let fname = fname.to_string_lossy();
+        let Some(rest) = fname.strip_prefix(&prefix) else {
+            continue;
+        };
+        let Some(hex) = rest.strip_suffix(".sqlite") else {
+            continue;
+        };
+        if parse_index_id(hex).is_ok() {
+            out.push((hex.to_ascii_lowercase(), parent.join(ent.file_name())));
+        }
+    }
+    out
+}
+
+fn rfc3339_utc_now() -> String {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format_rfc3339_utc(dur.as_secs())
+}
+
+/// Civil date from Unix day count (Howard Hinnant `civil_from_days`).
+fn format_rfc3339_utc(unix_secs: u64) -> String {
+    let days = (unix_secs / 86_400) as i64;
+    let tod = unix_secs % 86_400;
+    let hour = tod / 3600;
+    let min = (tod % 3600) / 60;
+    let sec = tod % 60;
+    let (y, m, d) = civil_from_unix_days(days);
+    format!("{y:04}-{m:02}-{d:02}T{hour:02}:{min:02}:{sec:02}Z")
+}
+
+fn civil_from_unix_days(days: i64) -> (i32, u8, u8) {
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u32;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    (y as i32, m as u8, d as u8)
+}
 
 /// Compressed sidecar suffixes tried after `{url}.index.sqlite` (http(s) only).
 const SIBLING_COMPRESSED_SUFFIXES: &[&str] = &[".gz", ".zst", ".xz", ".bz2"];
@@ -1515,5 +1870,157 @@ mod tests {
             assert_eq!(std::fs::read(&path).unwrap(), body);
             let _ = std::fs::remove_file(&path);
         });
+    }
+
+    fn hex_id(blob: &[u8]) -> String {
+        crate::sha256_hex(blob)
+    }
+
+    /// Regression: pointer JSON is schema v1, id is sha256(blob) 64 hex, store is rename-atomic.
+    #[test]
+    fn index_pointer_store_load_atomic() {
+        assert_eq!(INDEX_POINTER_KEEP_LAST, 2);
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let blob = dir.path().join("a.tar.index.sqlite");
+        std::fs::write(&archive, b"archive-bytes").unwrap();
+        let payload = b"SQLite format 3\0pointer-blob";
+        std::fs::write(&blob, payload).unwrap();
+
+        let ptr_path = index_pointer_path(&archive);
+        assert_eq!(ptr_path, index_pointer_path_for_index_file(&blob));
+        assert!(ptr_path.to_string_lossy().ends_with("a.tar.index.ptr"));
+        assert!(!ptr_path.to_string_lossy().ends_with(".index.sqlite.ptr"));
+
+        let ptr = IndexPointer::for_blob(&blob, Some(&archive)).unwrap();
+        assert_eq!(ptr.schema, INDEX_POINTER_SCHEMA);
+        assert_eq!(ptr.index_id, hex_id(payload));
+        assert_eq!(ptr.etag_sha256, ptr.index_id);
+        assert_eq!(ptr.index_id.len(), INDEX_ID_HEX_LEN);
+        assert!(ptr.generated_at.ends_with('Z') && ptr.generated_at.contains('T'));
+        store_index_pointer_atomic(&ptr_path, &ptr).unwrap();
+        assert!(ptr_path.is_file());
+        let loaded = load_index_pointer(&ptr_path).unwrap().expect("ptr");
+        assert_eq!(loaded.index_id, ptr.index_id);
+        assert_eq!(loaded.schema, INDEX_POINTER_SCHEMA);
+        assert!(loaded.tarstats().is_some());
+
+        // Second store replaces in place (rename); no leftover tmp.
+        let ptr2 = IndexPointer::for_blob(&blob, Some(&archive)).unwrap();
+        store_index_pointer_atomic(&ptr_path, &ptr2).unwrap();
+        let loaded2 = load_index_pointer(&ptr_path).unwrap().unwrap();
+        assert_eq!(loaded2.index_id, ptr.index_id);
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains(".ratarmount-index-ptr-")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "atomic store left tmp files: {leftovers:?}"
+        );
+    }
+
+    #[test]
+    fn parse_index_id_rejects_uuid_and_path_escape() {
+        assert!(parse_index_id("not-hex").is_err());
+        assert!(parse_index_id("550e8400-e29b-41d4-a716-446655440000").is_err());
+        assert!(parse_index_id("../".repeat(16).as_str()).is_err());
+        assert!(parse_index_id(&"a".repeat(64)).is_ok());
+        assert!(parse_index_id(&"A".repeat(64)).is_ok()); // normalized
+        assert_eq!(parse_index_id(&"A".repeat(64)).unwrap(), "a".repeat(64));
+    }
+
+    #[test]
+    fn format_rfc3339_unix_epoch() {
+        assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(format_rfc3339_utc(1_704_067_200), "2024-01-01T00:00:00Z");
+    }
+
+    /// Regression: remount `--index-id` of N while N+1 is well-known (keep-last-K=2).
+    #[test]
+    fn resolve_index_id_keeps_previous_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"a").unwrap();
+        let well_known = default_index_path(&archive);
+
+        let blob_n = b"SQLite format 3\0snapshot-N";
+        std::fs::write(&well_known, blob_n).unwrap();
+        let id_n = hex_id(blob_n);
+        publish_index_pointer(&archive, &well_known, Some(&archive), None).unwrap();
+
+        let blob_np1 = b"SQLite format 3\0snapshot-N+1-bytes";
+        let np1 = dir.path().join("np1.sqlite");
+        std::fs::write(&np1, blob_np1).unwrap();
+        // Snapshot N (hardlink) **before** replacing dest. Rename (not in-place
+        // write) so the snapshot inode stays N when dest becomes N+1.
+        publish_index_pointer(&archive, &np1, Some(&archive), Some(&well_known)).unwrap();
+        std::fs::rename(&np1, &well_known).unwrap();
+        let id_np1 = hex_id(blob_np1);
+
+        let snap_n = index_id_path(&archive, &id_n).unwrap();
+        assert!(snap_n.is_file(), "K=2 must keep index.{{old_id}}.sqlite");
+        assert_eq!(std::fs::read(&snap_n).unwrap(), blob_n);
+        assert_eq!(std::fs::read(&well_known).unwrap(), blob_np1);
+
+        let resolved_n = resolve_index_id_path(&archive, &id_n).unwrap();
+        assert_eq!(resolved_n, snap_n);
+        let resolved_np1 = resolve_index_id_path(&archive, &id_np1).unwrap();
+        assert_eq!(resolved_np1, well_known);
+
+        let err = resolve_index_id_path(&archive, &"b".repeat(64)).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("unknown") || msg.contains("index_id"), "{msg}");
+    }
+
+    /// Regression: `--index-id` tarstats mismatch refuses (no silent well-known fallback).
+    #[test]
+    fn bind_local_index_id_tarstats_mismatch_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"old-content").unwrap();
+        let idx_path = default_index_path(&archive);
+        {
+            let mut idx = crate::SqliteIndex::create_writable(Some(&idx_path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_tarstats_for_path(&archive).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        let id = {
+            let bytes = std::fs::read(&idx_path).unwrap();
+            hex_id(&bytes)
+        };
+        publish_index_pointer(&archive, &idx_path, Some(&archive), None).unwrap();
+        bind_local_index_id(&archive, &id).expect("matching archive");
+
+        std::fs::write(&archive, b"new-content-longer").unwrap();
+        let err = bind_local_index_id(&archive, &id).expect_err("mismatch");
+        assert!(
+            matches!(err, IndexError::Mismatch(_))
+                || err.to_string().contains("mismatch")
+                || err.to_string().contains("size"),
+            "expected tarstats refuse, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn load_index_pointer_rejects_wrong_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("a.tar.index.ptr");
+        std::fs::write(
+            &path,
+            r#"{"schema":"nope","index_id":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","etag_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","generated_at":"1970-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let err = load_index_pointer(&path).unwrap_err();
+        assert!(err.to_string().contains("schema"), "{err}");
+        assert!(load_index_pointer(&dir.path().join("missing.ptr"))
+            .unwrap()
+            .is_none());
     }
 }

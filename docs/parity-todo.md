@@ -100,6 +100,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SQLite index 0.7.x schema | yes | yes | `[x]` |
 | Cross-open Py↔Rust index (TAR core) | yes | yes + gzip/zstd/bzip2 side tables; factory auto-imports on open (FR-9) | `[x]` / `~` decoder import of Python blobs |
 | `--index-file` / `:memory:` | yes | yes | `[x]` |
+| `--index-id HEX` / `{archive}.index.ptr` | no | **added** (`--publish-index` writes pointer + keep-last-K=2; `--index-id` binds a snapshot) | `[x]` Rust-only |
 | `--index-folders` / XDG cache | yes | yes (CSV/JSON + defaults) | `[x]` |
 | Index file hashes / xattrs | yes | `--hashes` + FUSE xattrs for TAR/ZIP/7z; TAR PAX LIBARCHIVE/SCHILY FS xattrs | `[x]` / `~` solid 7z shared key; other formats |
 | `--use-backend` selection | yes | reorders format probe (last flag highest) | `[x]` |
