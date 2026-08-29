@@ -151,6 +151,8 @@ OLD_BIN=/path/to/ratarmount-0.1.27 NEW_BIN=target/release/ratarmount \
   N_FILES=8000 RUNS=3 ./benchmarks/compare-vector-wave.sh
 
 VECTOR_MICRO=1 SKIP_FUSE=1 ./benchmarks/compare-vector-wave.sh
+# Operator-scale 10k restore (not default CI). Overlay-only names are last.
+N_RESTORE=10000 ./benchmarks/compare-vector-wave.sh
 ./benchmarks/test-compare-vector-wave.sh
 ```
 
@@ -160,6 +162,7 @@ VECTOR_MICRO=1 SKIP_FUSE=1 ./benchmarks/compare-vector-wave.sh
 | `NEW_BIN` | `target/release/ratarmount` | Binary under test |
 | `OLD_REF` | `v0.1.27` | Git ref when `OLD_BIN` is unset |
 | `N_FILES` | `8000` | Many-file TAR for index + find |
+| `N_RESTORE` | `SHUF_FILES` (2000; 40 in MICRO) | Offset-order extract catalog size. `10000` is env-gated, not default CI |
 | `SKIP_FUSE` | `0` | `1` = decode/index/find only |
 | `VECTOR_MICRO` | `0` | Tiny fixtures + `RUNS=1` |
 

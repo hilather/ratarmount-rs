@@ -13,6 +13,7 @@
 #   OLD_BIN=... NEW_BIN=... N_FILES=8000 RUNS=3 ./benchmarks/compare-vector-wave.sh
 #   VECTOR_MICRO=1 SKIP_FUSE=1 ./benchmarks/compare-vector-wave.sh
 #   VECTOR_REMOTE=1 ./benchmarks/compare-vector-wave.sh   # local HTTP sidecar GET count
+#   N_RESTORE=10000 ./benchmarks/compare-vector-wave.sh   # 10k extract; not default CI
 #
 # Env:
 #   OLD_BIN / NEW_BIN   binaries (NEW defaults to target/release/ratarmount)
@@ -22,6 +23,9 @@
 #   VECTOR_MICRO=1      tiny fixtures (harness smoke)
 #   VECTOR_REMOTE=1     fake HTTP remount; sidecar download count (V-3)
 #   N_FILES             many-file TAR size (default 8000; 80 in MICRO)
+#   N_RESTORE           shuffled extract catalog size (default: SHUF_FILES).
+#                       Operator-scale 10k: N_RESTORE=10000 — not default CI.
+#                       Overlay-only host paths are concatenated after catalog flatten.
 #   RUNS                samples per metric, median (default 3; 1 in MICRO)
 set -euo pipefail
 
@@ -68,6 +72,12 @@ mkdir -p "$WORKDIR/data" "$WORKDIR/mnt" "$WORKDIR/idx"
 KEEP_WORK="${KEEP_WORK:-0}"
 
 echoerr() { echo "$@" >&2; }
+
+# Env-gated 10k restore (V-5 §9.6). Unset keeps SHUF_FILES; not default CI.
+if [[ -n "${N_RESTORE:-}" ]]; then
+    SHUF_FILES="$N_RESTORE"
+    echoerr "N_RESTORE=$N_RESTORE (offset-order extract catalog size; not default CI)"
+fi
 
 cleanup() {
     for mp in "$WORKDIR"/mnt-*; do
@@ -455,8 +465,10 @@ if [[ "$SKIP_FUSE" != "1" ]]; then
         finish_mount
     done
 
-    echoerr "=== V-5 name-order vs offset-order sequential cat ==="
-    # Lists from NEW find (old may lack --offset-order).
+    echoerr "=== V-5 name-order vs offset-order sequential cat (overlay-only last) ==="
+    # Lists from NEW find (old may lack --offset-order). Catalog flatten stays
+    # overlay-free; overlay-only host paths are concatenated last (opened via
+    # overlay fd / has_file, never a dummy catalog cookie).
     "$NEW_BIN" --index-file "$WORKDIR/idx/shuf.new.sqlite" --no-mount \
         --index-minimum-file-count 0 "$D/shuf.tar" >/dev/null
     cp "$WORKDIR/idx/shuf.new.sqlite" "$D/shuf.tar.index.sqlite"
@@ -469,14 +481,30 @@ if [[ "$SKIP_FUSE" != "1" ]]; then
     "$OLD_BIN" --index-file "$WORKDIR/idx/shuf.old.sqlite" --no-mount \
         --index-minimum-file-count 0 "$D/shuf.tar" >/dev/null
 
+    # Overlay-only names (no archive offset) listed last after catalog flatten.
+    : >"$WORKDIR/list-overlay-only.tsv"
+    for i in 0 1; do
+        printf '/ovonly/extra%03d.txt\n' "$i" >>"$WORKDIR/list-overlay-only.tsv"
+    done
+    cat "$WORKDIR/list-name.tsv" "$WORKDIR/list-overlay-only.tsv" \
+        >"$WORKDIR/list-name-plus-ov.tsv"
+    cat "$WORKDIR/list-offset.tsv" "$WORKDIR/list-overlay-only.tsv" \
+        >"$WORKDIR/list-offset-plus-ov.tsv"
+
     for pair in "old:$OLD_BIN:$WORKDIR/idx/shuf.old.sqlite" "new:$NEW_BIN:$WORKDIR/idx/shuf.new.sqlite"; do
         IFS=':' read -r tool bin sidecar <<<"$pair"
-        mount_bg "$bin" "$D/shuf.tar" "" "$sidecar" || continue
+        ov="$WORKDIR/ov-extract-$tool"
+        rm -rf "$ov"
+        mkdir -p "$ov/ovonly"
+        for i in 0 1; do
+            printf 'overlay-only-%s\n' "$i" >"$ov/ovonly/$(printf 'extra%03d.txt' "$i")"
+        done
+        mount_bg "$bin" "$D/shuf.tar" "-w $ov" "$sidecar" || continue
         for order in name offset; do
             samples=()
             for i in $(seq 1 "$RUNS"); do
                 start=$(date +%s.%N)
-                extract_in_order "$_CUR_MP" "$WORKDIR/list-${order}.tsv" >/dev/null
+                extract_in_order "$_CUR_MP" "$WORKDIR/list-${order}-plus-ov.tsv" >/dev/null
                 end=$(date +%s.%N)
                 samples+=("$(python3 -c "print(f'{float(\"$end\")-float(\"$start\"):.6f}')")")
             done
@@ -691,7 +719,7 @@ lines.append("- `cold_index_hashes` — P2 fingerprint windows (`--hashes sha256
 lines.append("- `cold_nested_r` — nested `-c -r --no-mount`")
 lines.append("- `find_glob` / `find_star` — V-1 CLI locate (streaming SQL)")
 lines.append("- `control_search` — V-1 live `search/<glob>`")
-lines.append("- `extract_*_order` — V-5 name-order vs offset-order sequential cat")
+lines.append("- `extract_*_order` — V-5 name-order vs offset-order sequential cat (overlay-only names last)")
 lines.append("- `overlay_getattr` — P2 overlay inode cookies after create")
 lines.append("- `remote_sidecar_second_get` — V-3 XDG LRU (VECTOR_REMOTE=1; 0 extra sidecar GETs)")
 lines.append("")

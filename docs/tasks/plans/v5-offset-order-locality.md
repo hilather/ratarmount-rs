@@ -388,10 +388,10 @@ Do not wire FUSE, NFS, overlay, or FileVersionLayer production code.
 
 1. FUSE/NFS mount option to emit readdir in offset order (`ls -f` / `find` over the mount). Would need FUSE cookie = stable identity (not listing index) and NFS fileids allocated in offset order — a different project. First NFS readdir today follows `list_dirents` via lazy fileids.
 2. Control `search` / socket TSV offset order (second path or `order=` in the pattern).
-3. Overlay names in offset-aware extract (overlay has no archive offset; copy those last or first).
+3. Overlay names in offset-aware extract — **done** (`overlay_only_names`; catalog flatten stays overlay-free; overlay-only host paths listed last; open via `has_file` / overlay fd; no dummy `CompactOpenCookie`).
 4. F-9 rewriter (separate roadmap item); this plan only constrains member order.
 5. [x] ZIP/7z seek-count / shared-pack tie tests (`regression_offset_order_seeks` in zip + sevenzip; 7z CLI skip + `regression_offset_order_shared_pack_name_tie_break` synthetic table).
-6. **10k-member restore** as originally written in V-5 still-open: bench / `#[ignore]` / env-gated, **not** a default-CI gate. v1 gate is interleaved multi-dir N≥32 (§5). 10k is operator-scale story.
+6. **10k-member restore** — **done** as harness: `N_RESTORE=10000 ./benchmarks/compare-vector-wave.sh` (env-gated, **not** default CI). v1 gate stays interleaved multi-dir N≥32 (§5).
 
 ---
 

@@ -529,6 +529,21 @@ impl WriteOverlay {
         real.is_file() || real.is_symlink()
     }
 
+    /// Overlay host regular files that are not catalog members.
+    ///
+    /// Offset-aware extract concatenates these after
+    /// [`ratarmount_index::SqliteIndex::list_visible_files_by_offset`]. Catalog
+    /// flatten stays overlay-free. These paths have no archive `offsetheader`;
+    /// open them via [`Self::has_file`] / overlay fd. Do not invent a dummy
+    /// [`ratarmount_index::CompactOpenCookie`] (`offsetheader = -1` would
+    /// `SeekFrom::Start` the base at garbage).
+    ///
+    /// Skips the hidden overlay DB, directories, tombstones, COW/replace of a
+    /// base path, and symlink-to-dir walks.
+    pub fn overlay_only_names(&self) -> Vec<String> {
+        overlay_only_names(self)
+    }
+
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let fd = self.create_file_inner(path, mode)?;
@@ -1378,6 +1393,74 @@ impl WriteOverlay {
             gid: meta.gid(),
             userdata: vec![UserData::Other(format!("overlay:{path}"))],
         })
+    }
+}
+
+/// Overlay host regular files that are not catalog members.
+///
+/// Concatenate after [`ratarmount_index::SqliteIndex::list_visible_files_by_offset`]
+/// for offset-aware extract. Catalog flatten stays overlay-free. Open via
+/// [`WriteOverlay::has_file`] / overlay fd — never a dummy
+/// [`ratarmount_index::CompactOpenCookie`].
+pub fn overlay_only_names(ov: &WriteOverlay) -> Vec<String> {
+    let tombstones = ov.load_tombstone_paths();
+    let mut names = Vec::new();
+    collect_overlay_only_names(ov, "/", &ov.root, &tombstones, &mut names);
+    names.sort();
+    names
+}
+
+fn collect_overlay_only_names(
+    ov: &WriteOverlay,
+    mount_dir: &str,
+    host_dir: &Path,
+    tombstones: &HashSet<String>,
+    out: &mut Vec<String>,
+) {
+    if ov.ensure_under_root(host_dir).is_err() {
+        return;
+    }
+    let meta = match fs::symlink_metadata(host_dir) {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    if meta.file_type().is_symlink() || !meta.is_dir() {
+        return;
+    }
+    let rd = match fs::read_dir(host_dir) {
+        Ok(rd) => rd,
+        Err(_) => return,
+    };
+    for ent in rd.flatten() {
+        let name = ent.file_name().to_string_lossy().into_owned();
+        if name.starts_with(HIDDEN_DB) {
+            continue;
+        }
+        let child_mount = join(mount_dir, &name);
+        if tombstones.contains(&child_mount) {
+            continue;
+        }
+        let child_host = host_dir.join(&name);
+        if ov.ensure_under_root(&child_host).is_err() {
+            continue;
+        }
+        let child_meta = match fs::symlink_metadata(&child_host) {
+            Ok(m) => m,
+            Err(_) => continue,
+        };
+        let ft = child_meta.file_type();
+        if ft.is_dir() && !ft.is_symlink() {
+            collect_overlay_only_names(ov, &child_mount, &child_host, tombstones, out);
+            continue;
+        }
+        if !ft.is_file() {
+            continue;
+        }
+        // COW / replace of a catalog member already has an archive offset.
+        if ov.current_base().exists(&child_mount) {
+            continue;
+        }
+        out.push(child_mount);
     }
 }
 
@@ -4316,6 +4399,175 @@ mod tests {
             0,
             "create-then-list must not report leftover base size {}",
             a.len()
+        );
+    }
+
+    fn catalog_member_path(m: &ratarmount_index::VisibleMember) -> String {
+        if m.path.is_empty() || m.path == "/" {
+            format!("/{}", m.name)
+        } else {
+            format!("{}/{}", m.path, m.name)
+        }
+    }
+
+    fn overlay_write_bytes(ov: &WriteOverlay, path: &str, bytes: &[u8]) {
+        let fd = ov.create_file(path, 0o644).expect("create");
+        {
+            use std::os::unix::io::FromRawFd;
+            let mut f = unsafe { File::from_raw_fd(fd) };
+            f.write_all(bytes).unwrap();
+        }
+    }
+
+    /// Regression: overlay create is visible after catalog flatten members.
+    /// Catalog flatten stays overlay-free; COW of a catalog path is not overlay-only.
+    #[test]
+    fn regression_overlay_only_names_listed_after_catalog_flatten() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = b"z-payload\n";
+        let a = b"a-payload\n";
+        let bytes = pack_tar(&[ustar_file("z.txt", z), ustar_file("a.txt", a)]);
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let tar = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(bytes),
+            Path::new("overlay-extract.tar"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("index tar");
+        let catalog = tar
+            .index()
+            .list_visible_files_by_offset()
+            .expect("flatten stays overlay-free");
+        let catalog_paths: Vec<String> = catalog.iter().map(catalog_member_path).collect();
+        assert_eq!(
+            catalog_paths,
+            vec!["/z.txt".to_string(), "/a.txt".to_string()],
+            "offset flatten is archive order, not name order"
+        );
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
+        overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
+        overlay_write_bytes(&ov, "/ov/nested.bin", b"nested-only\n");
+        overlay_write_bytes(&ov, "/z.txt", b"cow-replace\n");
+
+        let ov_names = overlay_only_names(&ov);
+        assert_eq!(
+            ov_names,
+            vec!["/new.txt".to_string(), "/ov/nested.bin".to_string()],
+            "creates only; COW of /z.txt is not overlay-only: {ov_names:?}"
+        );
+        assert!(
+            !ov_names.iter().any(|p| p == "/z.txt" || p == "/a.txt"),
+            "catalog members must not appear in overlay_only_names: {ov_names:?}"
+        );
+        assert!(
+            !catalog_paths
+                .iter()
+                .any(|p| p == "/new.txt" || p == "/ov/nested.bin"),
+            "catalog flatten must stay overlay-free: {catalog_paths:?}"
+        );
+
+        let mut combined = catalog_paths;
+        combined.extend(ov_names.clone());
+        assert_eq!(
+            &combined[combined.len() - ov_names.len()..],
+            ov_names.as_slice(),
+            "overlay-only host paths listed last"
+        );
+        assert!(ov.has_file("/new.txt"));
+        assert!(ov.has_file("/ov/nested.bin"));
+    }
+
+    /// Regression: restore loop must not SeekFrom::Start to cookie.offset on overlay names.
+    /// Dummy CompactOpenCookie (offsetheader = -1) would seek the base at garbage.
+    #[test]
+    fn regression_overlay_only_restore_does_not_seek_cookie_offset() {
+        let dir = tempfile::tempdir().unwrap();
+        let z = b"z-payload\n";
+        let a = b"a-payload\n";
+        let bytes = pack_tar(&[ustar_file("z.txt", z), ustar_file("a.txt", a)]);
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let tar = SqliteIndexedTar::create_index_from_reader(
+            std::io::Cursor::new(bytes.clone()),
+            Path::new("overlay-restore.tar"),
+            None,
+            &opts,
+            "test",
+        )
+        .expect("index tar");
+        let catalog = tar.index().list_visible_files_by_offset().expect("flatten");
+
+        struct StartLog {
+            inner: std::io::Cursor<Vec<u8>>,
+            starts: Vec<u64>,
+        }
+        impl Read for StartLog {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                self.inner.read(buf)
+            }
+        }
+        impl Seek for StartLog {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                if let SeekFrom::Start(n) = from {
+                    self.starts.push(n);
+                }
+                self.inner.seek(from)
+            }
+        }
+
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(Arc::new(tar) as Arc<dyn MountSource>, &overlay).unwrap();
+        overlay_write_bytes(&ov, "/new.txt", b"overlay-create\n");
+
+        let mut reader = StartLog {
+            inner: std::io::Cursor::new(bytes),
+            starts: Vec::new(),
+        };
+        for mem in &catalog {
+            reader.seek(SeekFrom::Start(mem.cookie.offset)).unwrap();
+            let mut buf = vec![0u8; mem.cookie.size as usize];
+            reader.read_exact(&mut buf).unwrap();
+        }
+        let catalog_starts = reader.starts.len();
+        assert!(
+            catalog_starts >= 2,
+            "catalog restore seeks: {:?}",
+            reader.starts
+        );
+
+        for virt in overlay_only_names(&ov) {
+            assert!(
+                ov.has_file(&virt),
+                "overlay-only {virt} must open via has_file / overlay fd"
+            );
+            let fi = ov.lookup(&virt, 0).expect("overlay lookup");
+            match fi.userdata.last() {
+                Some(UserData::Other(s)) if s.starts_with("overlay:") => {}
+                other => {
+                    panic!("overlay-only must not carry a catalog CompactOpenCookie: {other:?}")
+                }
+            }
+            let mut r = ov.open(&fi, 0).expect("overlay fd");
+            let mut body = Vec::new();
+            r.read_to_end(&mut body).unwrap();
+            assert_eq!(body, b"overlay-create\n");
+        }
+        assert_eq!(
+            reader.starts.len(),
+            catalog_starts,
+            "overlay names must not SeekFrom::Start cookie.offset, starts={:?}",
+            reader.starts
         );
     }
 
