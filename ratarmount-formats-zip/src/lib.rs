@@ -3440,8 +3440,9 @@ mod tests {
 
         let idx = SqliteIndex::open_read_only(&index_path).expect("reopen sidecar");
         let flat = idx.list_visible_files_by_offset().expect("flatten");
-        assert!(
-            flat.len() >= 32,
+        assert_eq!(
+            flat.len(),
+            32,
             "flatten must include all payload files, got {}",
             flat.len()
         );
@@ -3461,9 +3462,23 @@ mod tests {
                 mem.cookie.offsetheader >= 0,
                 "ZIP local-header offsetheader must be non-negative"
             );
-            offset_reader
-                .seek(SeekFrom::Start(mem.cookie.offsetheader as u64))
-                .unwrap();
+            let oh = mem.cookie.offsetheader as u64;
+            assert!(
+                oh + 4 <= bytes.len() as u64,
+                "local-header {oh} must lie inside the archive (len={})",
+                bytes.len()
+            );
+            assert_eq!(
+                &bytes[oh as usize..oh as usize + 4],
+                b"PK\x03\x04",
+                "offsetheader must point at a ZIP local-file header"
+            );
+            assert!(
+                mem.cookie.offset < bytes.len() as u64,
+                "data_start {} must lie inside the archive",
+                mem.cookie.offset
+            );
+            offset_reader.seek(SeekFrom::Start(oh)).unwrap();
         }
         let offset_back = backward_start_count(&offset_reader.starts);
         assert_eq!(

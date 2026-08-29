@@ -273,9 +273,9 @@ Do **not** add `--sort=offset` as an optional-value flag (value can steal the pa
 
 No `MountSource` change. Format crates keep mapping `list_dirents()` → today’s `CheapDirent` order.
 
-The seek-count regression is **TAR-only** in v1: `list_visible_files_by_offset` + a counting `Read+Seek` wrapper on member opens (or archive `SeekFrom::Start`). ZIP/7z crate tests are residual.
+The seek-count regression is **TAR-only** in v1: `list_visible_files_by_offset` + a counting `Read+Seek` wrapper on member opens (or archive `SeekFrom::Start`). ZIP/7z crate tests were residual §9.5 and have landed (`regression_offset_order_seeks` in zip + sevenzip; 7z CLI skip + synthetic shared-pack tie-break).
 
-7z shared pack offset: documented; if a later PR adds a 7z test, assert name tie-break and no extra backward seek versus name order. Solid prefix-from-0 inflate is unchanged (existing 7z sequential tests).
+7z shared pack offset: name tie-break is covered by `regression_offset_order_shared_pack_name_tie_break`. Solid prefix-from-0 inflate is unchanged (existing 7z sequential tests).
 
 ### 4.5 FileVersionLayer / overlay
 
