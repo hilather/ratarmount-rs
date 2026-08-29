@@ -1347,7 +1347,9 @@ mod tests {
     }
 
     fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
-        let _g = crate::meta_cache::ENV_LOCK.lock().unwrap();
+        let _g = crate::meta_cache::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let old_xdg = std::env::var_os("XDG_CACHE_HOME");
         let old_cap = std::env::var_os(crate::META_CACHE_BYTES_ENV);
@@ -1559,7 +1561,10 @@ mod tests {
         with_isolated_xdg(|| {
             let tmp = tempfile::tempdir().unwrap();
             let src = tmp.path().join("real.sqlite");
-            crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+            {
+                let mut idx = crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+                idx.publish_tmp().unwrap();
+            }
             let body = std::fs::read(&src).unwrap();
             let mock = MockHttp::spawn(body.clone());
             let url = mock.url("/a.tar.zst.index.sqlite");

@@ -10,12 +10,12 @@ use std::sync::Arc;
 use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
-    check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
+    cache_identity, check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
     invalidate_meta_cache_identity, is_meta_cache_path, materialize_index_file,
-    maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_pointer_json,
-    parse_link_describedby, resolve_index_location, sha256_hex_stream, sibling_index_candidates,
-    sibling_index_id_candidates, sibling_index_pointer_url, SqliteIndex, TARSTATS_FULL_HASH_MAX,
-    TARSTATS_SAMPLE_BYTES,
+    object_store_sibling_index_candidates, parse_index_pointer_json, parse_link_describedby,
+    resolve_index_location, sha256_hex_stream, sibling_index_candidates,
+    sibling_index_id_candidates, sibling_index_pointer_url, MetaCache, SqliteIndex,
+    TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
 use super::{open_from_live_range, open_path};
@@ -334,6 +334,18 @@ fn blob_matches_index_id(path: &Path, expected: &str) -> bool {
     }
 }
 
+fn fetch_http_index_wire(index_url: &str) -> std::io::Result<PathBuf> {
+    let (tmp, n) = ratarmount_remote::fetch_http_to_temp(index_url)
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
+    if n == 0 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "empty body",
+        ));
+    }
+    keep_http_index_temp(tmp).map_err(std::io::Error::other)
+}
+
 fn try_fetch_http_index(
     opts: &mut OpenOptions,
     index_url: &str,
@@ -342,48 +354,52 @@ fn try_fetch_http_index(
     cache_dest: Option<&Path>,
     expected_id: Option<&str>,
 ) -> bool {
-    match ratarmount_remote::fetch_http_to_temp(index_url) {
-        Ok((tmp, n)) => {
-            if n == 0 {
-                log::debug!("index fetch {}: empty body", redact_remote_url(index_url));
-                return false;
-            }
-            let path = match keep_http_index_temp(tmp).and_then(materialize_fetched_index) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
-                    return false;
-                }
-            };
-            if let Some(id) = expected_id {
-                if !blob_matches_index_id(&path, id) {
-                    log::warn!("index blob sha256 != pointer {id}; continue discovery");
-                    let _ = std::fs::remove_file(&path);
-                    return false;
-                }
-            }
-            let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
-            let ok = try_install_remote_index(
-                opts,
-                path,
-                archive_size,
-                prefix.as_deref(),
-                suffix.as_deref(),
-                full.as_deref(),
-                cache_dest,
-            );
-            if !ok {
-                // Wire blob may be gzip/zstd in meta-v3 while `path` is a
-                // decompressed tempfile — invalidate by URL, not opened path.
-                invalidate_meta_cache_identity("http", index_url);
-            }
-            ok
-        }
+    let cache = MetaCache::from_env();
+    let identity = cache_identity("http", index_url);
+    let wire = match cache.get_or_fetch_path(&identity, None, || fetch_http_index_wire(index_url)) {
+        Ok(p) => p,
         Err(e) => {
             log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
-            false
+            return false;
+        }
+    };
+    let path = match materialize_index_file(&wire) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+            invalidate_meta_cache_identity("http", index_url);
+            if !is_meta_cache_path(&wire) {
+                let _ = std::fs::remove_file(&wire);
+            }
+            return false;
+        }
+    };
+    if let Some(id) = expected_id {
+        if !blob_matches_index_id(&path, id) {
+            log::warn!("index blob sha256 != pointer {id}; continue discovery");
+            invalidate_meta_cache_identity("http", index_url);
+            if !is_meta_cache_path(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+            return false;
         }
     }
+    let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
+    let ok = try_install_remote_index(
+        opts,
+        path,
+        archive_size,
+        prefix.as_deref(),
+        suffix.as_deref(),
+        full.as_deref(),
+        cache_dest,
+    );
+    if !ok {
+        // Wire blob may be gzip/zstd in meta-v3 while `path` is a
+        // decompressed tempfile — invalidate by URL, not opened path.
+        invalidate_meta_cache_identity("http", index_url);
+    }
+    ok
 }
 
 fn try_fetch_object_store_index(
@@ -1013,7 +1029,7 @@ mod tests {
     static REMOTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn with_isolated_xdg<R>(f: impl FnOnce() -> R) -> R {
-        let _g = REMOTE_ENV_LOCK.lock().unwrap();
+        let _g = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let old_xdg = std::env::var_os("XDG_CACHE_HOME");
         let old_cap = std::env::var_os(ratarmount_index::META_CACHE_BYTES_ENV);
@@ -1815,6 +1831,14 @@ mod tests {
             }
         }
     }
+    fn well_known_sqlite_gets(gets: &[String], archive_path: &str) -> usize {
+        let well = format!("{archive_path}.index.sqlite");
+        gets.iter()
+            .filter(|g| *g == &well || g.starts_with(&format!("{well}.")))
+            .count()
+    }
+
+    /// Regression: remount of a well-known sidecar (no `.ptr`) hits the XDG LRU.
     #[test]
     fn apply_remote_index_well_known_sidecar_cache_hit() {
         with_isolated_xdg(|| {
@@ -1822,56 +1846,41 @@ mod tests {
             let archive = dir.path().join("archive.tar");
             let archive_bytes = vec![b'A'; 1024];
             fs::write(&archive, &archive_bytes).unwrap();
-            let idx_path = dir.path().join("sidecar.sqlite");
-            {
-                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
-                idx.store_tarstats_for_path(&archive).unwrap();
-            }
-            let index_bytes = fs::read(&idx_path).unwrap();
-            let folders = vec![dir.path().join("empty-index-folders")];
-            fs::create_dir_all(&folders[0]).unwrap();
-
-            let http = SidecarHttp::spawn(archive_bytes.clone(), index_bytes.clone());
+            let index_bytes = make_sidecar_for(&archive);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
             let mut opts = OpenOptions {
-                index_folders: folders.clone(),
+                index_folders: folders,
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(
-                &http.url,
-                &mut opts,
-                false,
-                archive_bytes.len() as u64,
-                None,
-            );
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
             let first = opts
                 .index_file_path
                 .take()
                 .expect("well-known sibling must install a sidecar");
             assert!(first.is_file(), "{}", first.display());
-            let gets1 = http.sidecar_gets();
+            let gets1 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             assert!(gets1 >= 1, "first remount must GET the sidecar");
 
             // Drop the local well-known copy so the second discovery cannot
             // `path_is_nonempty_file` short-circuit. No `.ptr` is published.
             let _ = fs::remove_file(&first);
-            apply_remote_index_discovery(
-                &http.url,
-                &mut opts,
-                false,
-                archive_bytes.len() as u64,
-                None,
-            );
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
             let second = opts
                 .index_file_path
                 .as_ref()
                 .expect("V-3 cache hit must reinstall without .ptr");
             assert!(second.is_file(), "{}", second.display());
+            let gets2 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             assert_eq!(
-                http.sidecar_gets(),
-                gets1,
+                gets2, gets1,
                 "second remount must not GET the sidecar again"
             );
+            drop(http._join);
         });
     }
 
@@ -1883,43 +1892,25 @@ mod tests {
             let archive = dir.path().join("archive.tar");
             let archive_bytes = vec![b'B'; 1024];
             fs::write(&archive, &archive_bytes).unwrap();
-            let idx_path = dir.path().join("sidecar.sqlite");
-            {
-                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
-                idx.store_tarstats_for_path(&archive).unwrap();
-            }
-            let index_bytes = fs::read(&idx_path).unwrap();
-            let folders = vec![dir.path().join("idx-folders")];
-            fs::create_dir_all(&folders[0]).unwrap();
-
-            let http = SidecarHttp::spawn(archive_bytes.clone(), index_bytes.clone());
+            let index_bytes = make_sidecar_for(&archive);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
             let mut opts = OpenOptions {
                 index_folders: folders,
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(
-                &http.url,
-                &mut opts,
-                false,
-                archive_bytes.len() as u64,
-                None,
-            );
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
             assert!(opts.index_file_path.as_ref().unwrap().is_file());
-            let gets1 = http.sidecar_gets();
+            let gets1 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             opts.index_file_path = None;
-            apply_remote_index_discovery(
-                &http.url,
-                &mut opts,
-                false,
-                archive_bytes.len() as u64,
-                None,
-            );
-            assert_eq!(
-                http.sidecar_gets(),
-                gets1,
-                "local nonempty sidecar must skip remote GET"
-            );
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            let gets2 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
+            assert_eq!(gets2, gets1, "local nonempty sidecar must skip remote GET");
+            drop(http._join);
         });
     }
 
@@ -1932,43 +1923,48 @@ mod tests {
             let archive = dir.path().join("archive.tar");
             let archive_bytes = vec![b'C'; 1024];
             fs::write(&archive, &archive_bytes).unwrap();
-            let idx_path = dir.path().join("sidecar.sqlite");
-            {
-                let idx = SqliteIndex::create_writable(Some(&idx_path)).unwrap();
-                idx.store_tarstats_for_path(&archive).unwrap();
-            }
+            let index_bytes = make_sidecar_for(&archive);
+            let gz_path = dir.path().join("sidecar.sqlite.gz");
+            fs::write(&gz_path, &index_bytes).unwrap();
             let gz = Command::new("gzip")
                 .arg("-c")
-                .arg(&idx_path)
+                .arg(&gz_path)
                 .output()
                 .expect("spawn gzip");
             if !gz.status.success() {
                 eprintln!("skip: gzip CLI unavailable");
                 return;
             }
-            let folders = vec![dir.path().join("idx-folders")];
-            fs::create_dir_all(&folders[0]).unwrap();
-            let http = SidecarHttp::spawn_gzip(archive_bytes.clone(), gz.stdout);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite.gz".into(), gz.stdout);
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
             let mut opts = OpenOptions {
                 index_folders: folders,
                 write_index: false,
                 ..OpenOptions::default()
             };
             // Wrong archive size → tarstats fail after decompress.
-            apply_remote_index_discovery(&http.url, &mut opts, false, 2048, None);
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
             assert!(
                 opts.index_file_path.is_none(),
                 "mismatched gzip sidecar must not install"
             );
-            let gets1 = http.sidecar_gets();
+            let gz_gets = |gets: &[String]| {
+                gets.iter()
+                    .filter(|g| g.starts_with("/archive.tar.index.sqlite.gz"))
+                    .count()
+            };
+            let gets1 = gz_gets(&http.gets.lock().unwrap());
             assert!(gets1 >= 1, "first discovery must GET the gzip sidecar");
-            apply_remote_index_discovery(&http.url, &mut opts, false, 2048, None);
-            assert_eq!(
-                http.sidecar_gets(),
-                gets1 + 1,
-                "gzip tarstats fail must invalidate XDG and GET again"
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
+            let gets2 = gz_gets(&http.gets.lock().unwrap());
+            assert!(
+                gets2 > gets1,
+                "gzip tarstats fail must invalidate XDG and GET again (got {gets1} then {gets2})"
             );
+            drop(http._join);
         });
     }
-
 }

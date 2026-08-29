@@ -753,7 +753,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let src = dir.path().join("real.sqlite");
         {
-            crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+            let mut idx = crate::SqliteIndex::create_writable(Some(&src)).unwrap();
+            idx.publish_tmp().unwrap();
         }
         let body = fs::read(&src).unwrap();
         let cache = cache_in(dir.path());

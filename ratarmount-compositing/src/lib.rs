@@ -38,6 +38,5 @@ pub use versioning::FileVersionLayer;
 pub use write_overlay::{
     commit_overlay, live_commit_is_supported, name_suggests_tar_zst, overlay_only_names,
     patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome,
-    CommitOverlayOptions, IndexPatchWindow,
-    OverlayError, WriteOverlay, HIDDEN_DB,
+    CommitOverlayOptions, IndexPatchWindow, OverlayError, WriteOverlay, HIDDEN_DB,
 };
