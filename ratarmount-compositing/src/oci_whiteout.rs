@@ -193,22 +193,19 @@ impl MountSource for OciImageMountSource {
         if pattern.starts_with("fts:") {
             return None;
         }
-        // Overlayfs locate: per-layer search_cheap, None if any layer is None
-        // (`Some([])` contributes). Walk top → bottom; drop whiteouts / opaque
-        // children via existing helpers. Never emit `.wh.*`. Never layers[0]
-        // alone. Do not recurse overlay_list_dirents (fat / can miss hits).
+        // `.wh..wh..opq` misses `*.fits`; do not recurse overlay_list_dirents
+        // (fat / misses non-dirent hits). Marker scan uses the same 10k locate
+        // cap; huge delete layers may miss late whiteouts vs lookup.
         let mut hidden: HashSet<String> = HashSet::new();
         let mut opaque_dirs: HashSet<String> = HashSet::new();
         let mut seen_paths: HashSet<String> = HashSet::new();
         let mut out: Vec<CheapSearchHit> = Vec::new();
         for layer in self.layers.iter().rev() {
             let hits = layer.search_cheap(pattern)?;
-            // Whiteouts / opaque markers often miss the user glob (`.wh..wh..opq`
-            // vs `*.fits`). A second cheap scan is not overlay_list_dirents.
             let extra_wh = if pattern == ".wh.*" {
                 Vec::new()
             } else {
-                layer.search_cheap(".wh.*").unwrap_or_default()
+                layer.search_cheap(".wh.*")?
             };
             let mut layer_paths: HashSet<String> = HashSet::new();
             for h in &hits {

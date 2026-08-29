@@ -209,6 +209,19 @@ impl MountSource for NoneBase {
 struct ListCallCounter {
     inner: Arc<dyn MountSource>,
     list_calls: AtomicUsize,
+    dirent_calls: AtomicUsize,
+    lookup_calls: AtomicUsize,
+}
+
+impl ListCallCounter {
+    fn new(inner: Arc<dyn MountSource>) -> Self {
+        Self {
+            inner,
+            list_calls: AtomicUsize::new(0),
+            dirent_calls: AtomicUsize::new(0),
+            lookup_calls: AtomicUsize::new(0),
+        }
+    }
 }
 
 impl MountSource for ListCallCounter {
@@ -217,9 +230,11 @@ impl MountSource for ListCallCounter {
         self.inner.list(path)
     }
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        self.dirent_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_dirents(path)
     }
     fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
+        self.lookup_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.lookup(path, v)
     }
     fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
@@ -649,10 +664,7 @@ fn search_cheap_folder_globs_host() {
     std::os::unix::fs::symlink("/etc", dir.path().join("etc")).unwrap();
 
     let src = FolderMountSource::new(dir.path()).unwrap();
-    let counted = ListCallCounter {
-        inner: Arc::new(src) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    };
+    let counted = ListCallCounter::new(Arc::new(src) as Arc<dyn MountSource>);
 
     assert!(
         counted.search_cheap("fts:fits").is_none(),
@@ -701,10 +713,7 @@ fn search_cheap_folder_limit_cap() {
         std::fs::write(dir.path().join(format!("n{i}.dat")), b"x").unwrap();
     }
     let src = FolderMountSource::new(dir.path()).unwrap();
-    let counted = ListCallCounter {
-        inner: Arc::new(src) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    };
+    let counted = ListCallCounter::new(Arc::new(src) as Arc<dyn MountSource>);
     let hits = counted.search_cheap("*").expect("Folder Some");
     assert_eq!(
         counted.list_calls.load(Ordering::SeqCst),
@@ -958,14 +967,12 @@ fn search_cheap_oci_applies_whiteouts() {
             ("dir/upper.fits", b"from-upper-dir".as_slice()),
         ],
     );
-    let lower = Arc::new(ListCallCounter {
-        inner: Arc::new(open_tar(&lower_path)) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    });
-    let upper = Arc::new(ListCallCounter {
-        inner: Arc::new(open_tar(&upper_path)) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    });
+    let lower = Arc::new(ListCallCounter::new(
+        Arc::new(open_tar(&lower_path)) as Arc<dyn MountSource>
+    ));
+    let upper = Arc::new(ListCallCounter::new(
+        Arc::new(open_tar(&upper_path)) as Arc<dyn MountSource>
+    ));
     let oci = OciImageMountSource::new(vec![
         Arc::clone(&lower) as Arc<dyn MountSource>,
         Arc::clone(&upper) as Arc<dyn MountSource>,
@@ -1028,6 +1035,16 @@ fn search_cheap_oci_applies_whiteouts() {
         0,
         "OCI search_cheap must not recurse overlay_list / list()"
     );
+    assert_eq!(
+        lower.dirent_calls.load(Ordering::SeqCst) + upper.dirent_calls.load(Ordering::SeqCst),
+        0,
+        "must not recurse overlay_list_dirents"
+    );
+    assert_eq!(
+        lower.lookup_calls.load(Ordering::SeqCst) + upper.lookup_calls.load(Ordering::SeqCst),
+        0,
+        "FileInfo count 0: no lookup"
+    );
 }
 
 /// Regression: any layer `None` → OCI `None` (do not drop to layers[0]).
@@ -1036,22 +1053,102 @@ fn search_cheap_oci_none_if_any_layer_none() {
     let dir = tempfile::tempdir().unwrap();
     let zip_path = dir.path().join("a.zip");
     write_fits_zip(&zip_path);
-    let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
-    let none = Arc::new(NoneBase) as Arc<dyn MountSource>;
-    let oci = OciImageMountSource::new(vec![zip, none]);
+    let zip = || Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
+    let none = || Arc::new(NoneBase) as Arc<dyn MountSource>;
+    let top_none = OciImageMountSource::new(vec![zip(), none()]);
+    assert!(
+        top_none.search_cheap("*.fits").is_none(),
+        "top layer None must not drop to layers[0]"
+    );
+    let bottom_none = OciImageMountSource::new(vec![none(), zip()]);
+    assert!(
+        bottom_none.search_cheap("*.fits").is_none(),
+        "bottom layer None must not drop to layers.last()"
+    );
+}
+
+/// Regression: `Some([])` is a contributing catalog, not `None`.
+#[test]
+fn search_cheap_oci_empty_catalog_contributes() {
+    let empty = Arc::new(CheapBase::empty()) as Arc<dyn MountSource>;
+    let fits = Arc::new(CheapBase::fits()) as Arc<dyn MountSource>;
+    let oci = OciImageMountSource::new(vec![empty, fits]);
+    let hits = oci
+        .search_cheap("*.fits")
+        .expect("empty catalog contributes");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(paths.contains(&"/a.fits"), "{paths:?}");
+    assert!(paths.contains(&"/dir/b.fits"), "{paths:?}");
+}
+
+/// Regression: overlapping path keeps the higher layer's size (not layers[0]).
+#[test]
+fn search_cheap_oci_higher_layer_wins_overlap() {
+    let lower = Arc::new(ListCallCounter::new(
+        Arc::new(CheapBase::fits()) as Arc<dyn MountSource>
+    ));
+    let upper = Arc::new(ListCallCounter::new(Arc::new(CheapBase {
+        hits: vec![hit("/a.fits", "a.fits", 99, 9.0)],
+    }) as Arc<dyn MountSource>));
+    let oci = OciImageMountSource::new(vec![
+        Arc::clone(&lower) as Arc<dyn MountSource>,
+        Arc::clone(&upper) as Arc<dyn MountSource>,
+    ]);
+    let hits = oci.search_cheap("*.fits").expect("OCI Some");
+    let a = hits.iter().find(|h| h.path == "/a.fits").expect("a.fits");
+    assert_eq!(a.size, 99, "higher layer must win overlap: {hits:?}");
+    assert!(
+        hits.iter().any(|h| h.path == "/dir/b.fits"),
+        "lower unique missing: {hits:?}"
+    );
+    assert_eq!(lower.list_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(lower.dirent_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(lower.lookup_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(upper.list_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(upper.dirent_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(upper.lookup_calls.load(Ordering::SeqCst), 0);
+}
+
+/// Regression: extra `.wh.*` scan `None` fail-closes (do not leak hidden names).
+#[test]
+fn search_cheap_oci_none_if_any_wh_scan() {
+    struct WhScanNone(CheapBase);
+    impl MountSource for WhScanNone {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.0.list(path)
+        }
+        fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
+            self.0.lookup(path, v)
+        }
+        fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+            if pattern == ".wh.*" {
+                return None;
+            }
+            self.0.search_cheap(pattern)
+        }
+        fn open(&self, fi: &FileInfo, b: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.0.open(fi, b)
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+    let oci = OciImageMountSource::new(vec![
+        Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
+        Arc::new(WhScanNone(CheapBase::fits())) as Arc<dyn MountSource>,
+    ]);
     assert!(
         oci.search_cheap("*.fits").is_none(),
-        "any layer None must not drop to layers[0]"
+        "`.wh.*` None must not leak hidden names"
     );
 }
 
 /// Regression: status_text uses list_dirents (counted list() stays 0).
 #[test]
 fn search_cheap_status_text_no_list() {
-    let counted = Arc::new(ListCallCounter {
-        inner: Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    });
+    let counted = Arc::new(ListCallCounter::new(
+        Arc::new(CheapBase::fits()) as Arc<dyn MountSource>
+    ));
     let ctrl = ControlFolderMountSource::new(
         Arc::clone(&counted) as Arc<dyn MountSource>,
         ControlFolderOptions::enabled(),
@@ -1072,10 +1169,9 @@ fn search_cheap_status_text_no_list() {
 /// Regression: AutoMount list_names_no_lazy uses list_dirents.
 #[test]
 fn search_cheap_automount_names_no_list() {
-    let counted = Arc::new(ListCallCounter {
-        inner: Arc::new(CheapBase::fits()) as Arc<dyn MountSource>,
-        list_calls: AtomicUsize::new(0),
-    });
+    let counted = Arc::new(ListCallCounter::new(
+        Arc::new(CheapBase::fits()) as Arc<dyn MountSource>
+    ));
     let _am = AutoMountLayer::new(
         Arc::clone(&counted) as Arc<dyn MountSource>,
         1,
