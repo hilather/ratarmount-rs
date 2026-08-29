@@ -155,6 +155,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Torn sidecar during `-c` (tmp+rename / dest unlinked at create) | `cargo test -p ratarmount-index --lib regression_reader_survives` · `cargo test -p ratarmount-index --lib regression_drop_unpublished` · `cargo test -p ratarmount --bin ratarmount regression_store_zstd_blocks_in_index_missing_path` |
 | Folder live glob without fat `list()` / symlink-to-`/etc` TSV leak | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `folder_globs`, `folder_limit`) |
 | Union locate forwards `sources[0]` / drops later catalog | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `union_merges`, `union_empty`, `union_none_if_any`, `union_limit`) |
+| OCI locate forwards `layers[0]` / emits `.wh.*` / misses whiteouts | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `oci_applies_whiteouts`, `oci_none_if_any`) |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

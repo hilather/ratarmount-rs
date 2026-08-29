@@ -151,11 +151,11 @@ The 0.7.x catalog is the locate index. Shipped:
 
 Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent a new storage engine.
 
-**Residual:** overlay last-wins is live control/socket only (V-1); CLI `find` stays sidecar-only and still rejects `-w`. Folder live glob is a host-tree `read_dir` (no fat `list()`). Union catalog merge is path+`offsetheader` (later source wins that key; `None` if any source is `None`). OCI / `--prefix` / `--transform` + `-w` last-wins is not guaranteed. No Tracker/D-Bus; no mount `--index-fts`; no FUSE write-then-read `echo pat > search`; rusqlite `fts5` is always compiled in (Cargo unification; workspace rusqlite 0.32 has no `fts5` feature, bundled sqlite still enables `SQLITE_ENABLE_FTS5`).
+**Residual:** overlay last-wins is live control/socket only (V-1); CLI `find` stays sidecar-only and still rejects `-w`. Folder live glob is a host-tree `read_dir` (no fat `list()`). Union catalog merge is path+`offsetheader` (later source wins that key; `None` if any source is `None`). OCI overlayfs locate is per-layer `search_cheap` (whiteouts / opaque; never `.wh.*` / `layers[0]`; `None` if any layer is `None`). `--prefix` / `--transform` + `-w` last-wins is not guaranteed. No Tracker/D-Bus; no mount `--index-fts`; no FUSE write-then-read `echo pat > search`; rusqlite `fts5` is always compiled in (Cargo unification; workspace rusqlite 0.32 has no `fts5` feature, bundled sqlite still enables `SQLITE_ENABLE_FTS5`).
 
 ### F-4 — OCI image mount — `done`
 
-`ratarmount oci://ghcr.io/org/img:tag mnt/` fetches the manifest, unions layer tars, Range-GETs file blobs, and reuses the SQLite index as a SOCI-style zTOC. Whiteouts + opaque dirs for a correct rootfs. P-1 is the scheme; this is the union. Factory wired in PR-12.
+`ratarmount oci://ghcr.io/org/img:tag mnt/` fetches the manifest, unions layer tars, Range-GETs file blobs, and reuses the SQLite index as a SOCI-style zTOC. Whiteouts + opaque dirs for a correct rootfs. Live locate (`search_cheap`) is the same overlayfs walk (not `layers[0]`; never emits `.wh.*`). P-1 is the scheme; this is the union. Factory wired in PR-12.
 
 **Residual:** same as P-1 (eStargz/SOCI/nydus, config JSON, referrer).
 

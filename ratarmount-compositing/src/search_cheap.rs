@@ -932,18 +932,116 @@ fn search_cheap_union_folder_and_zip_merges() {
     assert!(paths.contains(&"/a.fits"), "{paths:?}");
 }
 
-/// Regression: OCI stays None (not layer-0 / `.wh.` names).
+/// Regression: OCI locate is overlayfs across layers, not `layers[0]`.
+/// Whiteout hides a lower file; opaque dir hides lower children; `.wh.*`
+/// never appears in TSV. `fts:` stays None.
 #[test]
-fn search_cheap_oci_stay_none() {
-    let zip_dir = tempfile::tempdir().unwrap();
-    let zip_path = zip_dir.path().join("a.zip");
+fn search_cheap_oci_applies_whiteouts() {
+    let dir = tempfile::tempdir().unwrap();
+    let lower_path = dir.path().join("lower.tar");
+    write_fits_tar(
+        &lower_path,
+        &[
+            ("a.fits", b"hide-me".as_slice()),
+            ("hello.fits", b"from-lower".as_slice()),
+            ("dir/lower.fits", b"opaque-hidden".as_slice()),
+            ("only-lower.fits", b"bottom-unique".as_slice()),
+        ],
+    );
+    let upper_path = dir.path().join("upper.tar");
+    write_fits_tar(
+        &upper_path,
+        &[
+            (".wh.a.fits", b"".as_slice()),
+            ("world.fits", b"from-upper".as_slice()),
+            ("dir/.wh..wh..opq", b"".as_slice()),
+            ("dir/upper.fits", b"from-upper-dir".as_slice()),
+        ],
+    );
+    let lower = Arc::new(ListCallCounter {
+        inner: Arc::new(open_tar(&lower_path)) as Arc<dyn MountSource>,
+        list_calls: AtomicUsize::new(0),
+    });
+    let upper = Arc::new(ListCallCounter {
+        inner: Arc::new(open_tar(&upper_path)) as Arc<dyn MountSource>,
+        list_calls: AtomicUsize::new(0),
+    });
+    let oci = OciImageMountSource::new(vec![
+        Arc::clone(&lower) as Arc<dyn MountSource>,
+        Arc::clone(&upper) as Arc<dyn MountSource>,
+    ]);
+
+    assert!(
+        oci.search_cheap("fts:fits").is_none(),
+        "fts: must stay None"
+    );
+
+    let hits = oci.search_cheap("*.fits").expect("OCI Some");
+    let paths: Vec<_> = hits.iter().map(|h| h.path.as_str()).collect();
+    assert!(
+        paths.contains(&"/world.fits"),
+        "must not forward layers[0] only: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/hello.fits") && paths.contains(&"/only-lower.fits"),
+        "lower unique missing (not top-only): {paths:?}"
+    );
+    assert!(
+        paths.contains(&"/dir/upper.fits"),
+        "upper opaque-dir child missing: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"/a.fits"),
+        "whiteout must hide lower file: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"/dir/lower.fits"),
+        "opaque dir must hide lower children: {paths:?}"
+    );
+    assert!(
+        paths
+            .iter()
+            .all(|p| !p.split('/').any(|c| c.starts_with(".wh."))),
+        ".wh. leaked into hits: {paths:?}"
+    );
+
+    let tsv = live_search_tsv(&oci, None, "*", sidecar_err());
+    let tsv_paths = tsv_paths(&tsv);
+    assert!(
+        tsv_paths
+            .iter()
+            .all(|p| !p.split('/').any(|c| c.starts_with(".wh."))),
+        "no .wh. in TSV: {tsv}"
+    );
+    assert!(tsv_paths.contains(&"/world.fits"), "{tsv}");
+    assert!(tsv_paths.contains(&"/hello.fits"), "{tsv}");
+    assert!(
+        !tsv_paths.contains(&"/a.fits"),
+        "whiteout leaked into TSV: {tsv}"
+    );
+    assert!(
+        !tsv_paths.contains(&"/dir/lower.fits"),
+        "opaque child leaked into TSV: {tsv}"
+    );
+    assert_eq!(
+        lower.list_calls.load(Ordering::SeqCst) + upper.list_calls.load(Ordering::SeqCst),
+        0,
+        "OCI search_cheap must not recurse overlay_list / list()"
+    );
+}
+
+/// Regression: any layer `None` → OCI `None` (do not drop to layers[0]).
+#[test]
+fn search_cheap_oci_none_if_any_layer_none() {
+    let dir = tempfile::tempdir().unwrap();
+    let zip_path = dir.path().join("a.zip");
     write_fits_zip(&zip_path);
     let zip = Arc::new(open_zip(&zip_path)) as Arc<dyn MountSource>;
-    let oci = OciImageMountSource::new(vec![zip]);
-    let oci_hits = oci.search_cheap("*.fits");
+    let none = Arc::new(NoneBase) as Arc<dyn MountSource>;
+    let oci = OciImageMountSource::new(vec![zip, none]);
     assert!(
-        oci_hits.is_none(),
-        "OCI must stay None, not emit layer/`.wh.` hits: {oci_hits:?}"
+        oci.search_cheap("*.fits").is_none(),
+        "any layer None must not drop to layers[0]"
     );
 }
 

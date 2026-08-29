@@ -13,9 +13,10 @@ use std::io;
 use std::sync::Arc;
 
 use ratarmount_core::{
-    create_root_file_info, is_dir_mode, normpath, CheapDirent, FileInfo, ListModeResult,
-    ListResult, MountSource, UserData,
+    create_root_file_info, is_dir_mode, normpath, CheapDirent, CheapSearchHit, FileInfo,
+    ListModeResult, ListResult, MountSource, UserData,
 };
+use ratarmount_index::DEFAULT_SEARCH_LIMIT;
 
 const WHITEOUT_PREFIX: &str = ".wh.";
 /// Overlayfs opaque-directory marker (do not merge lower children).
@@ -188,6 +189,54 @@ impl MountSource for OciImageMountSource {
         ))
     }
 
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        // Overlayfs locate: per-layer search_cheap, None if any layer is None
+        // (`Some([])` contributes). Walk top → bottom; drop whiteouts / opaque
+        // children via existing helpers. Never emit `.wh.*`. Never layers[0]
+        // alone. Do not recurse overlay_list_dirents (fat / can miss hits).
+        let mut hidden: HashSet<String> = HashSet::new();
+        let mut opaque_dirs: HashSet<String> = HashSet::new();
+        let mut seen_paths: HashSet<String> = HashSet::new();
+        let mut out: Vec<CheapSearchHit> = Vec::new();
+        for layer in self.layers.iter().rev() {
+            let hits = layer.search_cheap(pattern)?;
+            // Whiteouts / opaque markers often miss the user glob (`.wh..wh..opq`
+            // vs `*.fits`). A second cheap scan is not overlay_list_dirents.
+            let extra_wh = if pattern == ".wh.*" {
+                Vec::new()
+            } else {
+                layer.search_cheap(".wh.*").unwrap_or_default()
+            };
+            let mut layer_paths: HashSet<String> = HashSet::new();
+            for h in &hits {
+                if path_has_whiteout_component(&h.path) {
+                    continue;
+                }
+                if seen_paths.contains(&h.path)
+                    || path_hidden_or_opaque(&h.path, &hidden, &opaque_dirs)
+                {
+                    continue;
+                }
+                out.push(h.clone());
+                layer_paths.insert(h.path.clone());
+            }
+            seen_paths.extend(layer_paths);
+            for h in hits.iter().chain(extra_wh.iter()) {
+                record_overlay_marker(&h.path, &h.name, &mut hidden, &mut opaque_dirs);
+            }
+        }
+        out.sort_by(|a, b| {
+            a.path
+                .cmp(&b.path)
+                .then(a.offsetheader.cmp(&b.offsetheader))
+        });
+        out.truncate(DEFAULT_SEARCH_LIMIT);
+        Some(out)
+    }
+
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
         let path = normpath(path);
         if path == "/" {
@@ -307,6 +356,52 @@ fn whiteout_target(name: &str) -> Option<&str> {
     }
     name.strip_prefix(WHITEOUT_PREFIX)
         .filter(|s| !s.is_empty() && *s != "..wh..opq")
+}
+
+fn path_has_whiteout_component(path: &str) -> bool {
+    path.split('/').any(is_whiteout_name)
+}
+
+fn parent_path(path: &str) -> &str {
+    match path.rsplit_once('/') {
+        None | Some(("", _)) => "/",
+        Some((p, _)) => p,
+    }
+}
+
+fn path_hidden_or_opaque(
+    path: &str,
+    hidden: &HashSet<String>,
+    opaque_dirs: &HashSet<String>,
+) -> bool {
+    if hidden.contains(path) {
+        return true;
+    }
+    let mut p = parent_path(path);
+    loop {
+        if hidden.contains(p) || opaque_dirs.contains(p) {
+            return true;
+        }
+        if p == "/" {
+            return false;
+        }
+        p = parent_path(p);
+    }
+}
+
+fn record_overlay_marker(
+    path: &str,
+    name: &str,
+    hidden: &mut HashSet<String>,
+    opaque_dirs: &mut HashSet<String>,
+) {
+    if name == OPAQUE_WHITEOUT {
+        opaque_dirs.insert(parent_path(path).to_string());
+        return;
+    }
+    if let Some(orig) = whiteout_target(name) {
+        hidden.insert(join(parent_path(path), orig));
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {
