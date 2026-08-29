@@ -48,10 +48,11 @@ impl RatarmountNfs4 {
         readahead_bytes: usize,
         overlay: Option<Arc<WriteOverlay>>,
     ) -> Self {
+        let overlay_set = overlay.is_some();
         Self {
             source,
             overlay,
-            inodes: Arc::new(InodeTable::new()),
+            inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
             readers: Arc::new(ReaderLru::with_idle_ttl(
                 DEFAULT_READER_SLOTS,
                 READER_IDLE_TTL,
@@ -430,8 +431,12 @@ fn read_member(
     // A live overlay commit invalidates every cached FileInfo at once (base
     // member offsets shift) — sweep before trusting the cache for the check.
     readers.sweep_if_generation_advanced(source, inodes);
+    // Overlay cookies are not FileInfo. Do not reconstruct; re-lookup so a
+    // stale size-0 cookie cannot make this READ return EOF.
     let fi_check = if path == "/" {
         ratarmount_core::create_root_file_info()
+    } else if inodes.stores_overlay_cookies() {
+        source.lookup(&path, 0).ok_or(FsError::Stale)?
     } else if let Some(c) = inodes.cached_lookup_fi(id) {
         c
     } else {
@@ -1187,6 +1192,85 @@ mod tests {
         assert!(names.contains(&"new.txt"), "{names:?}");
         assert!(names.contains(&"sub"), "{names:?}");
         assert!(names.contains(&"keep"), "{names:?}");
+    }
+
+    /// Regression: write-then-cat empty when NFSv4 READ used a stale size-0
+    /// inode cache instead of re-lookup.
+    #[test]
+    fn v4_overlay_open_after_create_write() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        let created = nfs
+            .create_sync(1, "new.txt", file_create())
+            .expect("create");
+        assert_eq!(created.attrs.size, 0);
+        nfs.write_sync(created.handle, 0, b"hello-overlay-payload")
+            .expect("write");
+        assert!(
+            nfs.inodes.cached_lookup_fi(created.handle).is_none(),
+            "overlay child must not keep a fat FileInfo"
+        );
+        let data = nfs.read_sync(created.handle, 0, 64).expect("read");
+        assert_eq!(
+            &data.data[..],
+            b"hello-overlay-payload",
+            "write-then-cat must not return empty"
+        );
+        assert_ne!(&data.data[..], b"");
+        assert!(data.eof);
+        let cached = nfs
+            .inodes
+            .cached_cookie(created.handle)
+            .expect("cookie after read");
+        assert_eq!(cached.size, b"hello-overlay-payload".len() as u64);
+        assert!(nfs.inodes.cached_lookup_fi(created.handle).is_none());
+    }
+
+    /// Opposite polarity of the size-0 cache bug: create with no write, then
+    /// NFSv4 READ must return "".
+    #[test]
+    fn v4_overlay_open_after_create_reads_empty() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        let created = nfs
+            .create_sync(1, "empty.txt", file_create())
+            .expect("create");
+        assert_eq!(created.attrs.size, 0);
+        let data = nfs.read_sync(created.handle, 0, 64).expect("read");
+        assert_eq!(
+            &data.data[..],
+            b"",
+            "never-written overlay file must read empty"
+        );
+        assert!(data.eof);
+        assert!(
+            nfs.inodes.cached_lookup_fi(created.handle).is_none(),
+            "overlay child must not keep a fat FileInfo"
+        );
+    }
+
+    /// After overlay lookup/store, the inode holds a cookie only — not a fat
+    /// FileInfo. getattr still re-looks up.
+    #[test]
+    fn v4_overlay_store_cookie_without_file_info() {
+        let (_td, nfs) = overlay_export(Synth::new());
+        let created = nfs
+            .create_sync(1, "cookie.txt", file_create())
+            .expect("create");
+        nfs.write_sync(created.handle, 0, b"payload")
+            .expect("write");
+        let got = nfs.getattr_sync(created.handle).expect("getattr");
+        assert_eq!(got.size, b"payload".len() as u64);
+        assert!(
+            nfs.inodes.cached_cookie(created.handle).is_some(),
+            "overlay store must write a cookie"
+        );
+        assert!(
+            nfs.inodes.cached_lookup_fi(created.handle).is_none(),
+            "overlay child must not keep fat FileInfo (no to_file_info)"
+        );
+        assert_eq!(
+            nfs.inodes.cached_cookie(created.handle).unwrap().size,
+            b"payload".len() as u64
+        );
     }
 
     #[test]

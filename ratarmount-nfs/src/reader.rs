@@ -205,9 +205,9 @@ impl ReaderLru {
         }
     }
 
-    /// Drop all slots + cached inode FileInfos when the source's content
-    /// generation advanced (live overlay commit). `fetch_max` never regresses
-    /// under concurrent sweeps.
+    /// Drop all slots + cached inode FileInfos / overlay cookies when the
+    /// source's content generation advanced (live overlay commit). `fetch_max`
+    /// never regresses under concurrent sweeps.
     pub(crate) fn sweep_if_generation_advanced(
         &self,
         source: &dyn MountSource,
@@ -249,8 +249,14 @@ impl ReaderLru {
         let path = inodes
             .path_for_id(id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stale fileid"))?;
+        // Overlay tables store cookies, not FileInfo. Never reconstruct from a
+        // cookie (size-0 empty cursor / missing TAR userdata). Always re-lookup.
         let fi = if path == "/" {
             ratarmount_core::create_root_file_info()
+        } else if inodes.stores_overlay_cookies() {
+            source
+                .lookup(&path, 0)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "stale fileid"))?
         } else if let Some(c) = inodes.cached_lookup_fi(id) {
             // Overlay-tagged cache is stale after live commit wipes the folder.
             if fi_is_overlay_tagged(&c) {
@@ -572,5 +578,45 @@ mod tests {
         assert!(!lru.contains(id));
         lru.get_or_open(&src, &inodes, id).expect("reopen pinned");
         assert_eq!(src.opens(), 2);
+    }
+
+    /// Regression: overlay cookie size 0 must not open an empty cursor when
+    /// lookup reports a nonzero size (write-then-cat). Production never
+    /// reconstructs FileInfo from the cookie.
+    #[test]
+    fn get_or_open_overlay_cookie_size_zero_does_not_empty_cursor() {
+        let lru = ReaderLru::new(8);
+        let inodes = InodeTable::with_overlay(true);
+        let id = inodes.id_for_path("/blob");
+        inodes.store_lookup_fi(
+            id,
+            FileInfo {
+                size: 0,
+                mtime: 0.0,
+                mode: 0o100644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![],
+            },
+        );
+        assert!(
+            inodes.cached_lookup_fi(id).is_none(),
+            "overlay store must not leave a fat FileInfo"
+        );
+        assert_eq!(inodes.cached_cookie(id).unwrap().size, 0);
+        let src = CountingSource::new(true);
+        let (fi, _) = lru.get_or_open(&src, &inodes, id).expect("open");
+        assert_eq!(fi.size, 4, "must re-lookup, not trust cookie size 0");
+        assert_eq!(
+            src.opens(),
+            1,
+            "size-0 cookie must not skip source.open (empty cursor)"
+        );
+        assert!(
+            inodes.cached_lookup_fi(id).is_none(),
+            "re-store after overlay lookup still cookie-only"
+        );
+        assert_eq!(inodes.cached_cookie(id).unwrap().size, 4);
     }
 }

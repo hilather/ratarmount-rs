@@ -1,18 +1,28 @@
 //! Path ↔ fileid map. Never stores cheap readdir `FileInfo`.
+//!
+//! Overlay child inodes keep [`InodeAttrCookie`] (no heap `linkname` /
+//! `userdata`). [`InodeTable::cached_lookup_fi`] is clone-only — never
+//! reconstruct a `FileInfo` from a cookie.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 
-use ratarmount_core::{create_root_file_info, normpath, FileInfo};
+use ratarmount_core::{create_root_file_info, normpath, FileInfo, InodeAttrCookie};
 
 /// nfsserve / FUSE root id. Fileid 0 is reserved.
 pub const ROOT_FILEID: u64 = 1;
 
 struct InodeEntry {
     path: String,
-    /// Only `source.lookup` / `create_root_file_info` — never cheap dirents.
+    /// Fat FileInfo cache. Immutable mounts only (and overlay root).
+    /// Overlay child inodes store [`InodeAttrCookie`] instead.
     file_info: Option<FileInfo>,
+    /// Compact getattr scalars on overlay child inodes. Not served as
+    /// getattr/open truth — those paths re-lookup. Cleared by the generation
+    /// sweep. Never `Some` together with `file_info` on a child overlay inode.
+    #[allow(dead_code)] // density store; production must not reconstruct FileInfo
+    cookie: Option<InodeAttrCookie>,
 }
 
 /// Lazy path → fileid table for one NFS export process.
@@ -20,10 +30,18 @@ pub struct InodeTable {
     inodes: Mutex<HashMap<u64, InodeEntry>>,
     path_to_id: Mutex<HashMap<String, u64>>,
     next_id: AtomicU64,
+    /// When set, child `store_lookup_fi` writes a cookie and leaves
+    /// `file_info = None` so [`Self::cached_lookup_fi`] cannot feed a stale
+    /// size-0 empty cursor.
+    overlay: bool,
 }
 
 impl InodeTable {
     pub fn new() -> Self {
+        Self::with_overlay(false)
+    }
+
+    pub fn with_overlay(overlay: bool) -> Self {
         let mut inodes = HashMap::new();
         let mut path_to_id = HashMap::new();
         inodes.insert(
@@ -31,6 +49,7 @@ impl InodeTable {
             InodeEntry {
                 path: "/".into(),
                 file_info: Some(create_root_file_info()),
+                cookie: None,
             },
         );
         path_to_id.insert("/".into(), ROOT_FILEID);
@@ -41,7 +60,17 @@ impl InodeTable {
             // reserves cookie values 1 and 2 (Linux injects `.` / `..`), so
             // never hand those ids out.
             next_id: AtomicU64::new(ROOT_FILEID + 2),
+            overlay,
         }
+    }
+
+    /// Overlay tables skip the fat `FileInfo` cache on every child inode.
+    pub(crate) fn stores_overlay_cookies(&self) -> bool {
+        self.overlay
+    }
+
+    fn overlay_stores_cookie(&self, id: u64) -> bool {
+        self.overlay && id != ROOT_FILEID
     }
 
     pub fn id_if_present(&self, path: &str) -> Option<u64> {
@@ -67,6 +96,7 @@ impl InodeTable {
             InodeEntry {
                 path,
                 file_info: None,
+                cookie: None,
             },
         );
         id
@@ -80,7 +110,7 @@ impl InodeTable {
             .map(|e| e.path.clone())
     }
 
-    /// Cached lookup-sourced `FileInfo` only.
+    /// Cached lookup-sourced `FileInfo` only. Never reconstructs from a cookie.
     pub fn cached_lookup_fi(&self, id: u64) -> Option<FileInfo> {
         self.inodes
             .lock()
@@ -89,24 +119,44 @@ impl InodeTable {
             .and_then(|e| e.file_info.clone())
     }
 
+    /// Overlay cookie only. Immutable mounts leave this unused.
+    #[cfg(test)]
+    pub(crate) fn cached_cookie(&self, id: u64) -> Option<InodeAttrCookie> {
+        self.inodes
+            .lock()
+            .expect("inode map")
+            .get(&id)
+            .and_then(|e| e.cookie)
+    }
+
     pub fn store_lookup_fi(&self, id: u64, fi: FileInfo) {
         if let Some(ent) = self.inodes.lock().expect("inode map").get_mut(&id) {
-            ent.file_info = Some(fi);
+            if self.overlay_stores_cookie(id) {
+                ent.cookie = Some(InodeAttrCookie::from_file_info(&fi));
+                ent.file_info = None;
+            } else {
+                ent.file_info = Some(fi);
+                ent.cookie = None;
+            }
         }
     }
 
-    /// Drop cached lookup `FileInfo` so the next getattr/read re-looks up.
+    /// Drop cached lookup `FileInfo` and overlay cookie so the next
+    /// getattr/read re-looks up.
     pub fn clear_lookup_fi(&self, id: u64) {
         if let Some(ent) = self.inodes.lock().expect("inode map").get_mut(&id) {
             ent.file_info = None;
+            ent.cookie = None;
         }
     }
 
-    /// Drop every cached lookup `FileInfo` (live overlay commit may have
-    /// shifted base member offsets, invalidating all of them at once).
+    /// Drop every cached lookup `FileInfo` and overlay cookie (live overlay
+    /// commit may have shifted base member offsets, invalidating all of
+    /// them at once).
     pub fn clear_all_lookup_fi(&self) {
         for ent in self.inodes.lock().expect("inode map").values_mut() {
             ent.file_info = None;
+            ent.cookie = None;
         }
     }
 
@@ -120,6 +170,7 @@ impl InodeTable {
                 p2i.remove(&new_path);
                 if let Some(ent) = inodes.get_mut(&old_dest) {
                     ent.file_info = None;
+                    ent.cookie = None;
                     ent.path = format!("\0stale-{old_dest}");
                 }
             }
@@ -128,6 +179,7 @@ impl InodeTable {
             p2i.remove(&ent.path);
             ent.path = new_path.clone();
             ent.file_info = None;
+            ent.cookie = None;
         }
         p2i.insert(new_path, id);
     }
@@ -172,5 +224,65 @@ mod tests {
             },
         );
         assert_eq!(t.cached_lookup_fi(a).unwrap().size, 3);
+        assert!(
+            t.cached_cookie(a).is_none(),
+            "immutable mounts keep fat FileInfo, not a cookie"
+        );
+    }
+
+    fn sample_fi(size: u64) -> FileInfo {
+        FileInfo {
+            size,
+            mtime: 1.5,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            linkname: "ignored".into(),
+            uid: 7,
+            gid: 9,
+            userdata: vec![ratarmount_core::UserData::Other("overlay:/x".into())],
+        }
+    }
+
+    /// After overlay store, the inode holds a cookie only — not a fat FileInfo
+    /// (and never both `Some`). `cached_lookup_fi` must not reconstruct.
+    #[test]
+    fn overlay_store_cookie_without_file_info() {
+        let t = InodeTable::with_overlay(true);
+        let id = t.id_for_path("/cookie.txt");
+        let fi = sample_fi(7);
+        t.store_lookup_fi(id, fi.clone());
+        assert!(
+            t.cached_cookie(id).is_some(),
+            "overlay store must write a cookie"
+        );
+        assert!(
+            t.cached_lookup_fi(id).is_none(),
+            "overlay child must not keep fat FileInfo (no to_file_info)"
+        );
+        let c = t.cached_cookie(id).unwrap();
+        assert_eq!(c.size, fi.size);
+        assert_eq!(c.mtime, fi.mtime);
+        assert_eq!(c.mode, fi.mode);
+        assert_eq!(c.uid, fi.uid);
+        assert_eq!(c.gid, fi.gid);
+        assert_eq!(t.cached_lookup_fi(ROOT_FILEID).unwrap().size, 0);
+        assert!(
+            t.cached_cookie(ROOT_FILEID).is_none(),
+            "overlay root stays fat FileInfo"
+        );
+    }
+
+    /// Generation sweep / mutate must drop cookies the same way as FileInfo.
+    #[test]
+    fn overlay_clear_lookup_drops_cookie() {
+        let t = InodeTable::with_overlay(true);
+        let id = t.id_for_path("/a");
+        t.store_lookup_fi(id, sample_fi(4));
+        assert!(t.cached_cookie(id).is_some());
+        t.clear_lookup_fi(id);
+        assert!(t.cached_cookie(id).is_none());
+        t.store_lookup_fi(id, sample_fi(4));
+        t.clear_all_lookup_fi();
+        assert!(t.cached_cookie(id).is_none());
+        assert!(t.cached_lookup_fi(id).is_none());
     }
 }
