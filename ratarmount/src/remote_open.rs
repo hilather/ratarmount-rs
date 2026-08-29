@@ -57,24 +57,31 @@ fn apply_remote_index_discovery(
             Ok(probe) => {
                 if let Some(header) = probe.link.as_deref() {
                     if let Some(url) = parse_link_describedby(header, input) {
-                        log::debug!("index Link describedby={url}");
+                        log::debug!("index Link describedby={}", redact_remote_url(&url));
                         if try_fetch_http_index(
                             opts,
                             &url,
                             archive_size,
                             input,
                             cache_dest.as_deref(),
+                            None,
                         ) {
                             return;
                         }
                     }
                 }
                 for cand in sibling_index_candidates(input) {
-                    if try_fetch_http_index(opts, &cand, archive_size, input, cache_dest.as_deref())
-                    {
+                    if try_fetch_http_index(
+                        opts,
+                        &cand,
+                        archive_size,
+                        input,
+                        cache_dest.as_deref(),
+                        None,
+                    ) {
                         return;
                     }
-                    log::debug!("index sibling unusable: {cand}");
+                    log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
                 }
             }
             Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
@@ -87,11 +94,17 @@ fn apply_remote_index_discovery(
             return;
         }
         for cand in object_store_sibling_index_candidates(input) {
-            if try_fetch_object_store_index(opts, &cand, archive_size, input, cache_dest.as_deref())
-            {
+            if try_fetch_object_store_index(
+                opts,
+                &cand,
+                archive_size,
+                input,
+                cache_dest.as_deref(),
+                None,
+            ) {
                 return;
             }
-            log::debug!("index sibling unusable: {cand}");
+            log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
         }
         return;
     }
@@ -127,6 +140,52 @@ fn path_is_nonempty_file(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// `{url}.index.ptr` is JSON; reject unbounded GETs on a cache-miss remount.
+const INDEX_POINTER_MAX_BYTES: u64 = 64 * 1024;
+
+enum PointerErr {
+    /// 404 / empty / NoSuchKey — common when no pointer was published.
+    Miss(String),
+    /// Schema / id / oversized body — attacker-controlled or corrupt pointer.
+    Invalid(String),
+}
+
+fn redact_remote_url(s: &str) -> String {
+    let Some((scheme, rest)) = s.split_once("://") else {
+        return s.to_string();
+    };
+    let Some(at) = rest.find('@') else {
+        return s.to_string();
+    };
+    let userinfo = &rest[..at];
+    let hostpart = &rest[at + 1..];
+    if let Some((user, _)) = userinfo.split_once(':') {
+        format!("{scheme}://{user}:***@{hostpart}")
+    } else {
+        s.to_string()
+    }
+}
+
+fn pointer_err_is_miss(msg: &str) -> bool {
+    let l = msg.to_ascii_lowercase();
+    l.contains("404")
+        || l.contains("nosuchkey")
+        || l.contains("not found")
+        || l.contains("empty pointer")
+}
+
+fn log_pointer_err(url: &str, err: PointerErr) {
+    let url = redact_remote_url(url);
+    match err {
+        PointerErr::Miss(e) => {
+            log::debug!("index pointer GET {url}: {e}; continue discovery");
+        }
+        PointerErr::Invalid(e) => {
+            log::warn!("index pointer GET {url}: {e}; continue discovery");
+        }
+    }
+}
+
 fn try_http_pointer_then_blob(
     opts: &mut OpenOptions,
     archive_url: &str,
@@ -139,7 +198,14 @@ fn try_http_pointer_then_blob(
     match fetch_http_pointer(&ptr_url) {
         Ok(ptr) => {
             for cand in sibling_index_id_candidates(archive_url, &ptr.index_id) {
-                if try_fetch_http_index(opts, &cand, archive_size, archive_url, cache_dest) {
+                if try_fetch_http_index(
+                    opts,
+                    &cand,
+                    archive_size,
+                    archive_url,
+                    cache_dest,
+                    Some(&ptr.index_id),
+                ) {
                     return true;
                 }
             }
@@ -150,20 +216,32 @@ fn try_http_pointer_then_blob(
             false
         }
         Err(e) => {
-            log::warn!("index pointer GET {ptr_url}: {e}; continue discovery");
+            log_pointer_err(&ptr_url, e);
             false
         }
     }
 }
 
-fn fetch_http_pointer(url: &str) -> std::result::Result<ratarmount_index::IndexPointer, String> {
-    let (mut tmp, n) = ratarmount_remote::fetch_http_to_temp(url).map_err(|e| e.to_string())?;
-    if n == 0 {
-        return Err("empty pointer body".into());
+fn fetch_http_pointer(
+    url: &str,
+) -> std::result::Result<ratarmount_index::IndexPointer, PointerErr> {
+    let bytes =
+        ratarmount_remote::fetch_http_bytes_capped(url, INDEX_POINTER_MAX_BYTES).map_err(|e| {
+            let msg = e.to_string();
+            if pointer_err_is_miss(&msg) {
+                PointerErr::Miss(msg)
+            } else if msg.contains("exceeds") {
+                PointerErr::Invalid(msg)
+            } else {
+                PointerErr::Miss(msg)
+            }
+        })?;
+    if bytes.is_empty() {
+        return Err(PointerErr::Miss("empty pointer body".into()));
     }
-    let mut s = String::new();
-    tmp.read_to_string(&mut s).map_err(|e| e.to_string())?;
-    parse_index_pointer_json(&s).map_err(|e| e.to_string())
+    let s = String::from_utf8(bytes)
+        .map_err(|e| PointerErr::Invalid(format!("pointer is not utf-8: {e}")))?;
+    parse_index_pointer_json(&s).map_err(|e| PointerErr::Invalid(e.to_string()))
 }
 
 fn try_object_store_pointer_then_blob(
@@ -178,8 +256,14 @@ fn try_object_store_pointer_then_blob(
     match fetch_object_store_pointer(&ptr_url) {
         Ok(ptr) => {
             for cand in sibling_index_id_candidates(archive_url, &ptr.index_id) {
-                if try_fetch_object_store_index(opts, &cand, archive_size, archive_url, cache_dest)
-                {
+                if try_fetch_object_store_index(
+                    opts,
+                    &cand,
+                    archive_size,
+                    archive_url,
+                    cache_dest,
+                    Some(&ptr.index_id),
+                ) {
                     return true;
                 }
             }
@@ -190,7 +274,7 @@ fn try_object_store_pointer_then_blob(
             false
         }
         Err(e) => {
-            log::warn!("index pointer GET {ptr_url}: {e}; continue discovery");
+            log_pointer_err(&ptr_url, e);
             false
         }
     }
@@ -198,11 +282,88 @@ fn try_object_store_pointer_then_blob(
 
 fn fetch_object_store_pointer(
     url: &str,
-) -> std::result::Result<ratarmount_index::IndexPointer, String> {
-    let path = ratarmount_remote::fetch_index_sibling_to_temp(url).map_err(|e| e.to_string())?;
-    let s = std::fs::read_to_string(&path);
-    let _ = std::fs::remove_file(&path);
-    parse_index_pointer_json(&s.map_err(|e| e.to_string())?).map_err(|e| e.to_string())
+) -> std::result::Result<ratarmount_index::IndexPointer, PointerErr> {
+    let bytes = fetch_object_store_pointer_bytes(url)?;
+    if bytes.is_empty() {
+        return Err(PointerErr::Miss("empty pointer body".into()));
+    }
+    let s = String::from_utf8(bytes)
+        .map_err(|e| PointerErr::Invalid(format!("pointer is not utf-8: {e}")))?;
+    parse_index_pointer_json(&s).map_err(|e| PointerErr::Invalid(e.to_string()))
+}
+
+fn fetch_object_store_pointer_bytes(url: &str) -> std::result::Result<Vec<u8>, PointerErr> {
+    let end = INDEX_POINTER_MAX_BYTES.saturating_sub(1);
+    let ranged = if url.starts_with("s3://") {
+        ratarmount_remote::fetch_s3_range_bytes(url, 0, end)
+    } else if url.starts_with("gs://") {
+        ratarmount_remote::fetch_gcs_range_bytes(url, 0, end)
+    } else if url.starts_with("az://") || url.starts_with("azure://") {
+        ratarmount_remote::fetch_azure_range_bytes(url, 0, end)
+    } else {
+        Err(ratarmount_remote::RemoteError::UnsupportedScheme(
+            url.to_string(),
+        ))
+    };
+    match ranged {
+        Ok(b) => {
+            if b.len() as u64 >= INDEX_POINTER_MAX_BYTES {
+                return Err(PointerErr::Invalid("pointer body too large".into()));
+            }
+            Ok(b)
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            if pointer_err_is_miss(&msg) {
+                return Err(PointerErr::Miss(msg));
+            }
+            let path = ratarmount_remote::fetch_index_sibling_to_temp(url).map_err(|e2| {
+                let m = e2.to_string();
+                if pointer_err_is_miss(&m) {
+                    PointerErr::Miss(m)
+                } else {
+                    PointerErr::Invalid(m)
+                }
+            })?;
+            let n = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+            if n > INDEX_POINTER_MAX_BYTES {
+                let _ = std::fs::remove_file(&path);
+                return Err(PointerErr::Invalid("pointer body too large".into()));
+            }
+            let bytes = std::fs::read(&path);
+            let _ = std::fs::remove_file(&path);
+            bytes.map_err(|e| PointerErr::Invalid(e.to_string()))
+        }
+    }
+}
+
+fn keep_http_index_temp(tmp: tempfile::NamedTempFile) -> std::result::Result<PathBuf, String> {
+    tmp.into_temp_path().keep().map_err(|e| e.error.to_string())
+}
+
+fn materialize_fetched_index(path: PathBuf) -> std::result::Result<PathBuf, String> {
+    match materialize_index_file(&path) {
+        Ok(p) => {
+            if p != path {
+                let _ = std::fs::remove_file(&path);
+            }
+            Ok(p)
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            Err(e.to_string())
+        }
+    }
+}
+
+fn blob_matches_index_id(path: &Path, expected: &str) -> bool {
+    let Ok(mut f) = std::fs::File::open(path) else {
+        return false;
+    };
+    match sha256_hex_stream(&mut f) {
+        Ok(got) => got.eq_ignore_ascii_case(expected),
+        Err(_) => false,
+    }
 }
 
 fn try_fetch_http_index(
@@ -211,9 +372,28 @@ fn try_fetch_http_index(
     archive_size: u64,
     archive_url: &str,
     cache_dest: Option<&Path>,
+    expected_id: Option<&str>,
 ) -> bool {
-    match maybe_fetch_index_url(index_url) {
-        Ok(path) => {
+    match ratarmount_remote::fetch_http_to_temp(index_url) {
+        Ok((tmp, n)) => {
+            if n == 0 {
+                log::debug!("index fetch {}: empty body", redact_remote_url(index_url));
+                return false;
+            }
+            let path = match keep_http_index_temp(tmp).and_then(materialize_fetched_index) {
+                Ok(p) => p,
+                Err(e) => {
+                    log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
+                    return false;
+                }
+            };
+            if let Some(id) = expected_id {
+                if !blob_matches_index_id(&path, id) {
+                    log::warn!("index blob sha256 != pointer {id}; continue discovery");
+                    let _ = std::fs::remove_file(&path);
+                    return false;
+                }
+            }
             let (prefix, suffix, full) = http_fingerprint(archive_url, archive_size);
             let ok = try_install_remote_index(
                 opts,
@@ -232,7 +412,7 @@ fn try_fetch_http_index(
             ok
         }
         Err(e) => {
-            log::debug!("index fetch {index_url}: {e}");
+            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
             false
         }
     }
@@ -244,17 +424,24 @@ fn try_fetch_object_store_index(
     archive_size: u64,
     archive_url: &str,
     cache_dest: Option<&Path>,
+    expected_id: Option<&str>,
 ) -> bool {
     match ratarmount_remote::fetch_index_sibling_to_temp(index_url) {
         Ok(path) => {
-            let path = match materialize_index_file(&path) {
+            let path = match materialize_fetched_index(path) {
                 Ok(p) => p,
                 Err(e) => {
-                    log::debug!("index materialize {index_url}: {e}");
-                    let _ = std::fs::remove_file(&path);
+                    log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
                     return false;
                 }
             };
+            if let Some(id) = expected_id {
+                if !blob_matches_index_id(&path, id) {
+                    log::warn!("index blob sha256 != pointer {id}; continue discovery");
+                    let _ = std::fs::remove_file(&path);
+                    return false;
+                }
+            }
             let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
             try_install_remote_index(
                 opts,
@@ -267,7 +454,7 @@ fn try_fetch_object_store_index(
             )
         }
         Err(e) => {
-            log::debug!("index fetch {index_url}: {e}");
+            log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
             false
         }
     }
@@ -392,7 +579,44 @@ fn object_store_fingerprint(
     } else {
         None
     };
+    if prefix.is_none() && size <= TARSTATS_FULL_HASH_MAX {
+        if let Some(bytes) = object_store_full_bytes(url, size) {
+            let prefix_n = TARSTATS_SAMPLE_BYTES.min(bytes.len());
+            let prefix = hash_hex("sha256", &bytes[..prefix_n]);
+            let suffix = if bytes.len() <= TARSTATS_SAMPLE_BYTES {
+                prefix.clone()
+            } else {
+                hash_hex(
+                    "sha256",
+                    &bytes[bytes.len().saturating_sub(TARSTATS_SAMPLE_BYTES)..],
+                )
+            };
+            let full = hash_hex("sha256", &bytes);
+            return (prefix, suffix, full);
+        }
+    }
     (prefix, suffix, full)
+}
+
+fn object_store_full_bytes(url: &str, size: u64) -> Option<Vec<u8>> {
+    if size == 0 || size > TARSTATS_FULL_HASH_MAX {
+        return None;
+    }
+    let (mut tmp, n) = if url.starts_with("s3://") {
+        ratarmount_remote::fetch_s3_to_temp(url).ok()?
+    } else if url.starts_with("gs://") {
+        ratarmount_remote::fetch_gcs_to_temp(url).ok()?
+    } else if url.starts_with("az://") || url.starts_with("azure://") {
+        ratarmount_remote::fetch_azure_to_temp(url).ok()?
+    } else {
+        return None;
+    };
+    if n != size {
+        return None;
+    }
+    let mut buf = Vec::with_capacity(n as usize);
+    tmp.read_to_end(&mut buf).ok()?;
+    Some(buf)
 }
 
 fn oci_fingerprint(
@@ -939,6 +1163,7 @@ mod tests {
         archive_bytes: Vec<u8>,
         objects: std::collections::HashMap<String, Vec<u8>>,
         link_on_archive: Option<String>,
+        require_cookie: Option<String>,
     ) -> IndexHttp {
         use std::io::{BufRead, BufReader, Write as IoWrite};
         use std::net::TcpListener;
@@ -960,6 +1185,7 @@ mod tests {
                     continue;
                 }
                 let mut range_hdr: Option<String> = None;
+                let mut cookie_hdr: Option<String> = None;
                 loop {
                     let mut line = String::new();
                     if reader.read_line(&mut line).is_err() {
@@ -970,6 +1196,21 @@ mod tests {
                     }
                     if let Some(v) = line.strip_prefix("Range:") {
                         range_hdr = Some(v.trim().to_string());
+                    }
+                    if let Some(v) = line.strip_prefix("Cookie:") {
+                        cookie_hdr = Some(v.trim().to_string());
+                    }
+                }
+                if let Some(ref want) = require_cookie {
+                    if cookie_hdr.as_deref() != Some(want.as_str()) {
+                        let msg = b"Unauthorized";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 401 Unauthorized\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            msg.len()
+                        );
+                        let _ = stream.write_all(msg);
+                        continue;
                     }
                 }
                 let path = request_line
@@ -1087,7 +1328,13 @@ mod tests {
         );
         let mut objects = std::collections::HashMap::new();
         objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
-        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, Some(link));
+        let http = spawn_index_http(
+            "/archive.tar",
+            archive_bytes.clone(),
+            objects,
+            Some(link),
+            None,
+        );
 
         let url = format!("http://{}/archive.tar", http.addr);
         let mut opts = OpenOptions {
@@ -1131,7 +1378,7 @@ mod tests {
             "/archive.tar.index.sqlite".into(),
             b"SQLite format 3\0must-not-fetch".to_vec(),
         );
-        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None);
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
 
         let url = format!("http://{}/archive.tar", http.addr);
         let mut opts = OpenOptions {
@@ -1169,7 +1416,13 @@ mod tests {
         );
         let mut objects = std::collections::HashMap::new();
         objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
-        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, Some(link));
+        let http = spawn_index_http(
+            "/archive.tar",
+            archive_bytes.clone(),
+            objects,
+            Some(link),
+            None,
+        );
 
         let url = format!("http://{}/archive.tar", http.addr);
         let mut opts = OpenOptions {
@@ -1203,7 +1456,7 @@ mod tests {
         objects.insert("/archive.tar.index.ptr".into(), ptr);
         objects.insert(format!("/archive.tar.index.{bad_id}.sqlite"), bad_idx);
         objects.insert("/archive.tar.index.sqlite".into(), good_idx.clone());
-        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None);
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
 
         let url = format!("http://{}/archive.tar", http.addr);
         let mut opts = OpenOptions {
@@ -1225,31 +1478,116 @@ mod tests {
         );
     }
 
-    /// Regression: S3 pointer + blob + tarstats success skips well-known GET.
+    /// Regression: HTTP pointer + blob use the authenticated client (Cookie).
     #[test]
-    fn apply_remote_index_discovery_s3_pointer_blob_skips_well_known() {
-        use std::io::{BufRead, BufReader, Write as IoWrite};
-        use std::net::TcpListener;
-        use std::sync::{Arc, Mutex};
-        use std::thread;
-
+    fn apply_remote_index_discovery_http_cookie_pointer_and_blob() {
         let dir = tempfile::tempdir().unwrap();
-        let archive = dir.path().join("a.tar");
-        let archive_bytes = vec![b'S'; 1024];
+        let archive = dir.path().join("archive.tar");
+        let archive_bytes = vec![b'K'; 1024];
         fs::write(&archive, &archive_bytes).unwrap();
         let index_bytes = make_sidecar_for(&archive);
         let id = ratarmount_index::sha256_hex(&index_bytes);
         let ptr = pointer_json_for_blob(&index_bytes);
         let folders = empty_index_folders(dir.path());
-
         let mut objects = std::collections::HashMap::new();
-        objects.insert("data/a.tar".into(), archive_bytes.clone());
-        objects.insert("data/a.tar.index.ptr".into(), ptr);
-        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes.clone());
+        objects.insert("/archive.tar.index.ptr".into(), ptr);
         objects.insert(
-            "data/a.tar.index.sqlite".into(),
-            b"SQLite format 3\0s3-well-known".to_vec(),
+            format!("/archive.tar.index.{id}.sqlite"),
+            index_bytes.clone(),
         );
+        let cookie = "session=index-secret";
+        let http = spawn_index_http(
+            "/archive.tar",
+            archive_bytes.clone(),
+            objects,
+            None,
+            Some(cookie.into()),
+        );
+        let _g = EnvGuard::acquire(&[
+            ratarmount_remote::HTTP_COOKIE_ENV,
+            ratarmount_remote::HTTP_COOKIE_FILE_ENV,
+        ]);
+        _g.set(ratarmount_remote::HTTP_COOKIE_ENV, cookie);
+
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        assert!(
+            opts.index_file_path.is_some(),
+            "cookie-gated pointer+blob must install"
+        );
+    }
+
+    /// Regression: pointer blob sha256 ≠ index_id continues to well-known.
+    #[test]
+    fn apply_remote_index_discovery_pointer_blob_id_mismatch_falls_back_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.tar");
+        let other = dir.path().join("other.tar");
+        let archive_bytes = vec![b'M'; 1024];
+        fs::write(&good, &archive_bytes).unwrap();
+        fs::write(&other, vec![b'Y'; 64]).unwrap();
+        let good_idx = make_sidecar_for(&good);
+        let other_idx = make_sidecar_for(&other);
+        let fake_id = "a".repeat(64);
+        let ptr = format!(
+            r#"{{"schema":"{}","index_id":"{fake_id}","etag_sha256":"{fake_id}","generated_at":"2026-01-01T00:00:00Z"}}"#,
+            ratarmount_index::INDEX_POINTER_SCHEMA
+        )
+        .into_bytes();
+        let folders = empty_index_folders(dir.path());
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("/archive.tar.index.ptr".into(), ptr);
+        objects.insert(format!("/archive.tar.index.{fake_id}.sqlite"), other_idx);
+        objects.insert("/archive.tar.index.sqlite".into(), good_idx.clone());
+        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+
+        let url = format!("http://{}/archive.tar", http.addr);
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(http._join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("well-known after blob id mismatch");
+        assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
+    }
+
+    #[test]
+    fn redact_remote_url_strips_userinfo_password() {
+        assert_eq!(
+            redact_remote_url("https://user:secret@host/a.tar.index.ptr"),
+            "https://user:***@host/a.tar.index.ptr"
+        );
+        assert_eq!(
+            redact_remote_url("s3://bucket/key.index.ptr"),
+            "s3://bucket/key.index.ptr"
+        );
+    }
+
+    struct S3Index {
+        addr: std::net::SocketAddr,
+        gets: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        _join: std::thread::JoinHandle<()>,
+    }
+
+    fn spawn_s3_index(
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        honor_range: bool,
+    ) -> S3Index {
+        use std::io::{BufRead, BufReader, Write as IoWrite};
+        use std::net::TcpListener;
+        use std::sync::{Arc, Mutex};
+        use std::thread;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1294,20 +1632,22 @@ mod tests {
                     continue;
                 };
                 let mut range_off = None;
-                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
-                    let parts: Vec<&str> = r.splitn(2, '-').collect();
-                    if parts.len() == 2 {
-                        let start: usize = parts[0].parse().unwrap_or(0);
-                        let end: usize = if parts[1].is_empty() {
-                            body.len().saturating_sub(1)
-                        } else {
-                            parts[1]
-                                .parse()
-                                .unwrap_or(0)
-                                .min(body.len().saturating_sub(1))
-                        };
-                        if start < body.len() && start <= end {
-                            range_off = Some((start, end));
+                if honor_range {
+                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                        let parts: Vec<&str> = r.splitn(2, '-').collect();
+                        if parts.len() == 2 {
+                            let start: usize = parts[0].parse().unwrap_or(0);
+                            let end: usize = if parts[1].is_empty() {
+                                body.len().saturating_sub(1)
+                            } else {
+                                parts[1]
+                                    .parse()
+                                    .unwrap_or(0)
+                                    .min(body.len().saturating_sub(1))
+                            };
+                            if start < body.len() && start <= end {
+                                range_off = Some((start, end));
+                            }
                         }
                     }
                 }
@@ -1332,24 +1672,58 @@ mod tests {
                 let _ = stream.write_all(slice);
             }
         });
+        S3Index {
+            addr,
+            gets,
+            _join: join,
+        }
+    }
 
-        let _g = EnvGuard::acquire(&[
-            "AWS_ACCESS_KEY_ID",
-            "AWS_SECRET_ACCESS_KEY",
-            "AWS_SESSION_TOKEN",
-            "AWS_REGION",
-            "AWS_DEFAULT_REGION",
-            "AWS_ENDPOINT_URL",
-            "S3_ENDPOINT_URL",
-            "AWS_ANONYMOUS",
-            "RATARMOUNT_S3_ANONYMOUS",
-            "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
-            "AWS_CONTAINER_CREDENTIALS_FULL_URI",
-            "RATARMOUNT_IMDS_BASE",
-        ]);
-        _g.set("AWS_ANONYMOUS", "1");
-        _g.set("AWS_ENDPOINT_URL", &format!("http://{addr}"));
-        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+    const AWS_TEST_ENV: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ENDPOINT_URL",
+        "S3_ENDPOINT_URL",
+        "AWS_ANONYMOUS",
+        "RATARMOUNT_S3_ANONYMOUS",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "RATARMOUNT_IMDS_BASE",
+    ];
+
+    fn bind_anon_s3(endpoint: &str) -> EnvGuard {
+        let g = EnvGuard::acquire(AWS_TEST_ENV);
+        g.set("AWS_ANONYMOUS", "1");
+        g.set("AWS_ENDPOINT_URL", endpoint);
+        g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        g
+    }
+
+    /// Regression: S3 pointer + blob + tarstats success skips well-known GET.
+    #[test]
+    fn apply_remote_index_discovery_s3_pointer_blob_skips_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let archive_bytes = vec![b'S'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes.clone());
+        objects.insert("data/a.tar.index.ptr".into(), ptr);
+        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes.clone());
+        objects.insert(
+            "data/a.tar.index.sqlite".into(),
+            b"SQLite format 3\0s3-well-known".to_vec(),
+        );
+        let s3 = spawn_s3_index(objects, true);
+        let _g = bind_anon_s3(&format!("http://{}", s3.addr));
 
         let url = "s3://bucket/data/a.tar";
         let mut opts = OpenOptions {
@@ -1358,31 +1732,104 @@ mod tests {
             ..OpenOptions::default()
         };
         apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
-        drop(join);
+        drop(s3._join);
         let got = opts
             .index_file_path
             .as_ref()
             .expect("S3 pointer blob must install a sidecar");
         assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
-        let logged = gets.lock().unwrap().clone();
+        let logged = s3.gets.lock().unwrap().clone();
         assert!(
             !logged.iter().any(|k| k == "data/a.tar.index.sqlite"),
             "S3 well-known GET must be skipped; gets={logged:?}"
         );
     }
 
+    /// Regression: S3 pointer 404 still installs well-known `{url}.index.sqlite`.
+    #[test]
+    fn apply_remote_index_discovery_s3_pointer_404_falls_back_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let archive_bytes = vec![b'W'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let folders = empty_index_folders(dir.path());
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes.clone());
+        objects.insert("data/a.tar.index.sqlite".into(), index_bytes.clone());
+        let s3 = spawn_s3_index(objects, true);
+        let _g = bind_anon_s3(&format!("http://{}", s3.addr));
+
+        let url = "s3://bucket/data/a.tar";
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(s3._join);
+        let got = opts
+            .index_file_path
+            .as_ref()
+            .expect("S3 well-known must install after pointer 404");
+        assert_eq!(fs::metadata(got).unwrap().len(), index_bytes.len() as u64);
+        let logged = s3.gets.lock().unwrap().clone();
+        assert!(
+            logged.iter().any(|k| k == "data/a.tar.index.sqlite"),
+            "well-known GET after pointer 404; gets={logged:?}"
+        );
+    }
+
+    /// Regression: Range-ignored S3 still fingerprints via full GET when size is small.
+    #[test]
+    fn apply_remote_index_discovery_s3_range_ignored_full_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let archive_bytes = vec![b'R'; 1024];
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes.clone());
+        objects.insert("data/a.tar.index.ptr".into(), ptr);
+        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes.clone());
+        let s3 = spawn_s3_index(objects, false);
+        let _g = bind_anon_s3(&format!("http://{}", s3.addr));
+
+        let url = "s3://bucket/data/a.tar";
+        let mut opts = OpenOptions {
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        drop(s3._join);
+        assert!(
+            opts.index_file_path.is_some(),
+            "pointer blob must install when Range is ignored (full GET hash)"
+        );
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
+            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let mut saved = Vec::new();
             for &k in keys {
                 saved.push((k.to_string(), std::env::var(k).ok()));
                 std::env::remove_var(k);
             }
-            Self { saved }
+            Self { saved, _lock: lock }
         }
 
         fn set(&self, key: &str, val: &str) {

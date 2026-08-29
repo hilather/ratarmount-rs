@@ -829,6 +829,33 @@ pub fn fetch_http_to_temp(url: &str) -> Result<(NamedTempFile, u64)> {
     fetch_http_full_get(&loc)
 }
 
+/// GET at most `max_bytes`. Errors if the body is larger or the status is not 2xx.
+///
+/// Used for `{url}.index.ptr` so a cache-miss mount cannot slurp an unbounded object.
+pub fn fetch_http_bytes_capped(url: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    let loc = parse_http_url(url)?;
+    let resp = apply_http_auth(
+        ureq::get(loc.url.as_str()).set("User-Agent", USER_AGENT),
+        loc.auth.as_ref(),
+        loc.cookie.as_deref(),
+    )
+    .call()
+    .map_err(|e| map_ureq_http_error(e, loc.url.as_str()))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        return Err(http_status_err(status, loc.url.as_str()));
+    }
+    let mut buf = Vec::new();
+    let n = io::copy(
+        &mut resp.into_reader().take(max_bytes.saturating_add(1)),
+        &mut buf,
+    )?;
+    if n > max_bytes {
+        return Err(RemoteError::Http(format!("body exceeds {max_bytes} bytes")));
+    }
+    Ok(buf)
+}
+
 /// Download via sequential Range GETs when supported; otherwise full GET.
 ///
 /// Used by [`resolve_to_local`] so the factory materialization path benefits without
@@ -1723,6 +1750,24 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn fetch_http_bytes_capped_rejects_oversize() {
+        let body = vec![b'x'; 64];
+        let mock = MockHttp::spawn(MockConfig {
+            body: body.clone(),
+            accept_ranges: false,
+            honor_range: false,
+            head_rejects: false,
+            require_basic: None,
+            require_cookie: None,
+        });
+        let url = mock.url("/ptr");
+        let got = fetch_http_bytes_capped(&url, 64).unwrap();
+        assert_eq!(got, body);
+        let err = fetch_http_bytes_capped(&url, 16).unwrap_err().to_string();
+        assert!(err.contains("exceeds"), "{err}");
     }
 
     #[test]
