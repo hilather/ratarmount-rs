@@ -43,8 +43,20 @@ fn apply_remote_index_discovery(
     let loc = resolve_index_location(Path::new(input), None, &opts.index_folders, false);
     if let Some(p) = loc.as_path() {
         if path_is_nonempty_file(p) {
-            log::debug!("local index cache hit; skip remote discovery ({input})");
-            return;
+            // `resolved_index` later reuses this path. URL-label warm open
+            // (`check_tarstats_matches_archive`) is a no-op, so a replaced
+            // remote object would otherwise keep a stale catalog.
+            if cached_remote_index_is_stale(p, input, archive_size) {
+                log::warn!(
+                    "local index cache stale for {}; dropping {}",
+                    redact_remote_url(input),
+                    p.display()
+                );
+                let _ = std::fs::remove_file(p);
+            } else {
+                log::debug!("local index cache hit; skip remote discovery ({input})");
+                return;
+            }
         }
     }
     let cache_dest = loc.as_path().map(Path::to_path_buf);
@@ -138,6 +150,47 @@ fn path_is_nonempty_file(path: &Path) -> bool {
     std::fs::metadata(path)
         .map(|m| m.is_file() && m.len() > 0)
         .unwrap_or(false)
+}
+
+/// True when a local folder sidecar must not be trusted for this remount.
+///
+/// Size mismatch is confirmed without extra GETs. Content hashes are checked
+/// when prefix/suffix/full fingerprints can be fetched; a fetch failure with
+/// matching size is **not** treated as stale (fail-open, same as today).
+fn cached_remote_index_is_stale(path: &Path, archive_url: &str, archive_size: u64) -> bool {
+    let stored = match SqliteIndex::open_read_only(path).and_then(|idx| idx.tarstats()) {
+        Ok(Some(s)) => s,
+        Ok(None) => return true,
+        Err(_) => return true,
+    };
+    if stored.st_size != archive_size {
+        return true;
+    }
+    let (prefix, suffix, full) = remote_archive_fingerprint(archive_url, archive_size);
+    if prefix.is_none() && suffix.is_none() && full.is_none() {
+        return false;
+    }
+    check_tarstats_matches_remote(
+        &stored,
+        archive_size,
+        prefix.as_deref(),
+        suffix.as_deref(),
+        full.as_deref(),
+    )
+    .is_err()
+}
+
+fn remote_archive_fingerprint(
+    url: &str,
+    size: u64,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if url.starts_with("http://") || url.starts_with("https://") {
+        http_fingerprint(url, size)
+    } else if ratarmount_remote::is_object_store_archive_url(url) {
+        object_store_fingerprint(url, size)
+    } else {
+        (None, None, None)
+    }
 }
 
 /// `{url}.index.ptr` is JSON; reject unbounded GETs on a cache-miss remount.
@@ -1912,6 +1965,105 @@ mod tests {
             assert_eq!(gets2, gets1, "local nonempty sidecar must skip remote GET");
             drop(http._join);
         });
+    }
+
+    /// Regression: remount after a remote replace must not trust a local
+    /// cached sidecar. URL-label `check_tarstats_matches_archive` is a no-op,
+    /// so skipping discovery used to serve the previous catalog.
+    #[test]
+    fn apply_remote_index_local_copy_rejects_replaced_archive() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'R'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let index_bytes = make_sidecar_for(&archive);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
+            let mut opts = OpenOptions {
+                index_folders: folders.clone(),
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            let first = opts
+                .index_file_path
+                .take()
+                .expect("first remount must install a sidecar");
+            assert!(first.is_file(), "{}", first.display());
+
+            // Publisher replaced the object (new size). Local copy must not win.
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
+            assert!(
+                opts.index_file_path.is_none(),
+                "stale local sidecar must not be reused after archive replace"
+            );
+            assert!(
+                !path_is_nonempty_file(&first),
+                "stale local sidecar must be dropped so factory cannot warm-open it"
+            );
+            drop(http._join);
+        });
+    }
+
+    /// Regression: same-size in-place replace must not reuse a hashed sidecar.
+    #[test]
+    fn apply_remote_index_local_copy_rejects_same_size_replace() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive_a = dir.path().join("a.tar");
+            let archive_b = dir.path().join("b.tar");
+            fs::write(&archive_a, vec![b'A'; 1024]).unwrap();
+            fs::write(&archive_b, vec![b'B'; 1024]).unwrap();
+            let stale = make_sidecar_for(&archive_a);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), stale.clone());
+            let http = spawn_index_http("/archive.tar", vec![b'B'; 1024], objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
+            let loc = resolve_index_location(Path::new(&url), None, &folders, false);
+            let dest = loc.as_path().expect("folder candidate");
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(dest, &stale).unwrap();
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, 1024, None);
+            assert!(
+                opts.index_file_path.is_none(),
+                "same-size replace must not reuse hashed sidecar"
+            );
+            assert!(
+                !path_is_nonempty_file(dest),
+                "hash-mismatched local sidecar must be dropped"
+            );
+            drop(http._join);
+        });
+    }
+
+    /// Regression: size mismatch is stale without contacting the archive.
+    #[test]
+    fn cached_remote_index_is_stale_size_mismatch_without_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, vec![b'X'; 1024]).unwrap();
+        let sidecar = dir.path().join("idx.sqlite");
+        fs::write(&sidecar, make_sidecar_for(&archive)).unwrap();
+        assert!(
+            cached_remote_index_is_stale(&sidecar, "http://127.0.0.1:1/a.tar", 2048),
+            "size mismatch must be stale even if fingerprint GETs fail"
+        );
+        assert!(
+            !cached_remote_index_is_stale(&sidecar, "http://127.0.0.1:1/a.tar", 1024),
+            "matching size + failed fingerprint must fail-open (not stale)"
+        );
     }
 
     /// Regression: gzip sibling tarstats mismatch must drop the XDG wire blob
