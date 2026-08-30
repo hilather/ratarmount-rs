@@ -21,7 +21,7 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 | `read_range` / `extract_to` | **implemented** (fill-loop + 64 KiB copy; no slurp) | G1.4 / G1.5 |
 | `Session::find` | **implemented** (SQL `FindAfter` keyset; CLI first page still 10_000) | G3 |
 | `IndexJob::run` | **implemented** (Always rebuild; cancel never `publish_tmp`) | G2 |
-| `resolve_index` | not implemented — Sibling still uses factory `resolve_index_location` | G4 / PR6 |
+| `resolve_index` | **implemented** (`SiblingNotWritable`; no auto `local-index-v1`; CliCompat still `:memory:`) | G4 / PR6 |
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
 | Format crates (TAR/ZIP/7z/… including libarchive/git) | default `formats` feature (full L2 set factory `use`s) | PR2 |
 | `OpenOptions` Debug | passwords printed as `[redacted N]` | G5.2 / PR3 |
@@ -131,7 +131,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
 
-**Landed (G1.1–G1.7 / G2 / G3):** `open`, `open_with_job`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `find`, `Drop`, `IndexJob::run`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
+**Landed (G1.1–G1.7 / G2 / G3 / G4.1/G4.2):** `open`, `open_with_job`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `find`, `Drop`, `IndexJob::run`, `resolve_index`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set. `IndexPolicy::Sibling` never falls back to `:memory:`.
 
 **`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
 
@@ -141,7 +141,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
-**Not in this slice:** `resolve_index` / `SiblingNotWritable`.
+**Not in this slice:** `local-index-v1` (`IndexPolicy::UserCache`) is PR7.
 
 ```rust
 impl Session {
@@ -223,13 +223,25 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | Policy | Where the 0.7.x sidecar lives |
 |--------|-------------------------------|
 | `Sibling` | `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else `{archive}.index.sqlite`. Parent not writable and no usable file → **`SiblingNotWritable`**. No auto-fallback to user cache or `:memory:`. |
-| `UserCache` | `local-index-v1/` for local paths; `meta-v3/` for remote URL after sibling GET miss |
+| `UserCache` | `local-index-v1/` (PR7). This slice returns `Internal` and does **not** write `meta-v3`. |
 | `Explicit` | `OpenRequest.explicit_index` |
 | `Memory` | `:memory:` — tests / `RGUI_FAKE` only; GUI settings must not persist this |
 | `Temp` | Platform temp, unlinked on `Session` drop **and** on failed `open` (RAII guard). Unix pid dir is `0700`. Stale-pid sweep waits for G4. Confirm in UI. **Not** the fallback when sibling fails. |
 | `CliCompat` | Today’s CLI/Python folder order, including `:memory:` last resort. Not a GUI policy id. |
 
-`resolve_index` (G4 / PR6) is new. Existing `resolve_index_location` stays the Python/CLI helper. **This slice does not implement `SiblingNotWritable`.** `IndexPolicy::Sibling` / `UserCache` / `CliCompat` still call factory `resolve_index_location`. `Recreate::Never` never falls back to `:memory:` (missing sidecar → `NotFound`; tarstats mismatch → `CorruptIndex`). Do not treat factory’s CLI `:memory:` last resort as the GUI unwritable-sibling policy — that lands in PR6.
+`resolve_index` (G4) is the embedder helper. Existing `resolve_index_location` stays the Python/CLI helper (`CliCompat` last-resort `:memory:` unchanged). `Session::open` and `IndexJob::run` call `resolve_index` for every policy. Factory `resolved_index` keeps `IndexPolicy::CliCompat` so CLI/Python still fall back to `:memory:`. `Recreate::Never` never falls back to `:memory:` (missing sidecar → `NotFound`; tarstats mismatch → `CorruptIndex`).
+
+```rust
+pub fn resolve_index(
+    archive: &Path,
+    policy: IndexPolicy,
+    explicit_index: Option<&Path>,
+    extra_dirs: &[PathBuf],
+    recreate: bool,
+) -> Result<IndexLocation, Error>;
+```
+
+`IndexPolicy::UserCache` errors with `Internal` until `local-index-v1` (PR7). It does **not** write `meta-v3`.
 
 ## `local-index-v1` ≠ `meta-v3`
 

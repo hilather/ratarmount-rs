@@ -3,26 +3,22 @@
 #[cfg(test)]
 use std::cell::Cell;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
 use ratarmount_core::{
     is_dir_mode, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick, MountSource,
     OpenOptions, UserData,
 };
-use ratarmount_index::{
-    resolve_index_location, IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE,
-};
+use ratarmount_index::{IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE};
 use secrecy::ExposeSecret;
 
 use crate::factory::{self, CompositingOptions, MountBundle};
+use crate::resolve::resolve_index;
 use crate::types::{DirCursor, DirEnt, DirPage, IndexPolicy, OpenRequest, Recreate, SourceSpec};
 use crate::Error;
 
 /// Default `list_dirents_page` limit when the caller passes `0`.
 pub const DEFAULT_DIR_PAGE: u32 = 200;
-
-static TEMP_INDEX_SEQ: AtomicU32 = AtomicU32::new(1);
 
 #[cfg(test)]
 thread_local! {
@@ -106,8 +102,9 @@ impl CatalogLoc {
 impl Session {
     /// Blocking. Embedders that need a job id run this on a worker thread.
     ///
-    /// SiblingNotWritable is PR6; do not add a Session `:memory:` fallback.
-    /// [`Recreate::Never`] never builds and never falls back to `:memory:`.
+    /// [`IndexPolicy::Sibling`] + unwritable parent → [`Error::SiblingNotWritable`]
+    /// (never `:memory:`). [`Recreate::Never`] never builds and never falls back
+    /// to `:memory:`.
     pub fn open(req: OpenRequest) -> Result<Self, Error> {
         Self::open_with_job(req, &IndexBuildHooks::default())
     }
@@ -131,41 +128,38 @@ impl Session {
             .unwrap_or_default();
         let had_passwords = !passwords.is_empty();
 
-        let mut loc = CatalogLoc::None;
-        let mut temp_guard: Option<TempSqliteGuard> = None;
-        let (index_in_memory, index_file_path, index_folders) = match &req.index {
-            IndexPolicy::Memory => {
-                loc = CatalogLoc::Memory;
-                (true, None, Vec::new())
+        let recreate_flag = matches!(req.recreate, Recreate::Always);
+        let archive_path = match &req.source {
+            SourceSpec::Path(p) => p.clone(),
+            SourceSpec::Url(url) => PathBuf::from(url),
+        };
+        let resolved = resolve_index(
+            &archive_path,
+            req.index,
+            req.explicit_index.as_deref(),
+            &req.extra_dirs,
+            recreate_flag,
+        )?;
+        if matches!(req.index, IndexPolicy::Sibling) && resolved.is_memory() {
+            return Err(Error::Internal(
+                "IndexPolicy::Sibling must not use :memory:".into(),
+            ));
+        }
+
+        let (loc, mut temp_guard, index_in_memory, index_file_path) = match (req.index, resolved) {
+            (IndexPolicy::Temp, IndexLocation::Path(p)) => (
+                CatalogLoc::Temp(p.clone()),
+                Some(TempSqliteGuard::new(p.clone())),
+                false,
+                Some(p),
+            ),
+            (IndexPolicy::Temp, IndexLocation::Memory) => {
+                return Err(Error::Internal(
+                    "IndexPolicy::Temp must not use :memory:".into(),
+                ));
             }
-            IndexPolicy::Explicit => {
-                let p = req
-                    .explicit_index
-                    .clone()
-                    .ok_or_else(|| Error::Internal("explicit_index required".into()))?;
-                loc = CatalogLoc::Path(p.clone());
-                (false, Some(p), Vec::new())
-            }
-            IndexPolicy::Temp => {
-                let p = temp_index_path();
-                if let Some(parent) = p.parent() {
-                    std::fs::create_dir_all(parent).map_err(|e| Error::Internal(e.to_string()))?;
-                    #[cfg(unix)]
-                    {
-                        use std::os::unix::fs::PermissionsExt;
-                        let _ = std::fs::set_permissions(
-                            parent,
-                            std::fs::Permissions::from_mode(0o700),
-                        );
-                    }
-                }
-                loc = CatalogLoc::Temp(p.clone());
-                temp_guard = Some(TempSqliteGuard::new(p.clone()));
-                (false, Some(p), Vec::new())
-            }
-            IndexPolicy::Sibling | IndexPolicy::UserCache | IndexPolicy::CliCompat => {
-                (false, None, req.extra_dirs.clone())
-            }
+            (_, IndexLocation::Memory) => (CatalogLoc::Memory, None, true, None),
+            (_, IndexLocation::Path(p)) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
         };
 
         let options = OpenOptions {
@@ -177,22 +171,11 @@ impl Session {
             read_only_index,
             index_in_memory,
             index_file_path,
-            index_folders,
+            index_folders: Vec::new(),
             index_build: hooks.clone(),
             ..OpenOptions::default()
         };
 
-        let recreate_flag = matches!(req.recreate, Recreate::Always);
-        let archive_path = match &req.source {
-            SourceSpec::Path(p) => p.clone(),
-            SourceSpec::Url(url) => PathBuf::from(url),
-        };
-        if matches!(
-            req.index,
-            IndexPolicy::Sibling | IndexPolicy::UserCache | IndexPolicy::CliCompat
-        ) {
-            loc = loc_from_resolve(&archive_path, &options, recreate_flag);
-        }
         if matches!(req.recreate, Recreate::Never) {
             check_recreate_never(&archive_path, &loc)?;
         }
@@ -350,6 +333,11 @@ impl Session {
     }
 
     #[cfg(test)]
+    pub(crate) fn index_is_memory(&self) -> bool {
+        matches!(self.loc, CatalogLoc::Memory)
+    }
+
+    #[cfg(test)]
     pub(crate) fn from_local_source(src: Arc<dyn MountSource>) -> Self {
         Self {
             source: OpenedSource::Local(src),
@@ -406,38 +394,12 @@ impl MountSource for StubMount {
     }
 }
 
-fn temp_index_path() -> PathBuf {
-    let seq = TEMP_INDEX_SEQ.fetch_add(1, Ordering::Relaxed);
-    std::env::temp_dir()
-        .join(format!("ratarmount-session-{}", std::process::id()))
-        .join(format!("index-{seq}.sqlite"))
-}
-
 fn unlink_sqlite(path: &Path) {
     let _ = std::fs::remove_file(path);
     let p = path.as_os_str().to_string_lossy();
     let _ = std::fs::remove_file(format!("{p}-wal"));
     let _ = std::fs::remove_file(format!("{p}-shm"));
     let _ = std::fs::remove_file(format!("{p}-journal"));
-}
-
-fn loc_from_resolve(archive: &Path, options: &OpenOptions, recreate: bool) -> CatalogLoc {
-    if options.index_in_memory {
-        return CatalogLoc::Memory;
-    }
-    let explicit = options
-        .index_file_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    match resolve_index_location(
-        archive,
-        explicit.as_deref(),
-        &options.index_folders,
-        recreate || options.clear_index_cache,
-    ) {
-        IndexLocation::Memory => CatalogLoc::Memory,
-        IndexLocation::Path(p) => CatalogLoc::Path(p),
-    }
 }
 
 /// `Recreate::Never`: missing sidecar → NotFound; tarstats mismatch → CorruptIndex.
@@ -579,6 +541,7 @@ mod tests {
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
     use ratarmount_index::IndexError;
     use std::io::Write;
+    use std::sync::atomic::Ordering;
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
@@ -924,7 +887,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tar = dir.path().join("tmp.tar");
         write_tar(&tar, &[member_file("a.txt", b"hi")]);
-        let seq = TEMP_INDEX_SEQ.load(Ordering::Relaxed);
+        let seq = crate::resolve::TEMP_INDEX_SEQ.load(Ordering::Relaxed);
         let session = Session::open(OpenRequest {
             source: SourceSpec::Path(tar),
             index: IndexPolicy::Temp,
@@ -967,7 +930,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let tar = dir.path().join("fail.tar");
         write_tar(&tar, &[member_file("a.txt", b"hi")]);
-        let seq = TEMP_INDEX_SEQ.load(Ordering::Relaxed);
+        let seq = crate::resolve::TEMP_INDEX_SEQ.load(Ordering::Relaxed);
         INJECT_CATALOG_OPEN_ERR.with(|c| c.set(true));
         let err = Session::open(OpenRequest {
             source: SourceSpec::Path(tar),

@@ -18,6 +18,7 @@ pub enum IndexPolicy {
     /// `{archive}.index.sqlite`. Not writable → [`crate::Error::SiblingNotWritable`].
     Sibling,
     /// `local-index-v1/` (local file://) or `meta-v3/` (remote URL after sibling GET miss).
+    /// Not implemented yet (`resolve_index` returns [`crate::Error::Internal`]).
     UserCache,
     /// Caller-chosen file ([`OpenRequest::explicit_index`]).
     Explicit,

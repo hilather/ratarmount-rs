@@ -170,6 +170,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Extract cancel mid-copy unlinks truncated dest | `cargo test -p ratarmount-session --lib extract_to_cancel_unlinks_partial` |
 | Recreate::Never missing sidecar / tarstats mismatch / no rebuild | `cargo test -p ratarmount-session --lib recreate_never` |
 | Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
+| Sibling unwritable parent → SiblingNotWritable (no `:memory:`) | `cargo test -p ratarmount-index --lib sibling_not_writable` · `cargo test -p ratarmount-session --lib resolve_sibling` |
+| CliCompat still `:memory:` last resort | `cargo test -p ratarmount-index --lib resolve_index_location_unwritable` · `cargo test -p ratarmount-session --lib resolve_clicompat` |
 | IndexJob progress < 4 events / 1k TAR as sole proof | `cargo test -p ratarmount-session --lib index_job_progress_events` · `cargo test -p ratarmount-index --lib regression_index_build_hooks_progress_ticks` |
 | IndexJob cancel at ~50% leaves dest sidecar valid; tmp gone | `cargo test -p ratarmount-session --lib index_job_cancel` · `cargo test -p ratarmount-index --lib regression_cancel_does_not_publish_tmp` |
 | IndexJob sidecar opens with factory/CLI path (G7.1) | `cargo test -p ratarmount-session --lib index_job_g7_factory_opens_job_sidecar` |

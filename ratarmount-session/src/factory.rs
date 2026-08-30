@@ -48,9 +48,9 @@ use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
 use ratarmount_index::{
-    discard_index_file_if_below_minimum, resolve_index_location, DurableNestedBlob, IndexLocation,
-    NestedBodyFingerprint, NestedMemberKey, SqliteIndex, NESTED_FORMAT_AR, NESTED_FORMAT_CPIO,
-    NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
+    discard_index_file_if_below_minimum, DurableNestedBlob, IndexLocation, NestedBodyFingerprint,
+    NestedMemberKey, SqliteIndex, NESTED_FORMAT_AR, NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP,
+    NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
 };
 
 #[path = "remote_open.rs"]
@@ -1480,16 +1480,16 @@ fn resolved_index(path: &Path, options: &OpenOptions, recreate: bool) -> IndexLo
     if options.index_in_memory {
         return IndexLocation::Memory;
     }
-    let explicit = options
-        .index_file_path
-        .as_ref()
-        .map(|p| p.to_string_lossy().into_owned());
-    resolve_index_location(
+    // CLI factory: CliCompat → resolve_index_location `:memory:` last resort.
+    // Embedders use Session::open → resolve_index(Sibling) which errors instead.
+    crate::resolve::resolve_index(
         path,
-        explicit.as_deref(),
+        crate::IndexPolicy::CliCompat,
+        options.index_file_path.as_deref(),
         &options.index_folders,
         recreate || options.clear_index_cache,
     )
+    .unwrap_or(IndexLocation::Memory)
 }
 
 fn index_arg(loc: &IndexLocation) -> Option<&Path> {

@@ -1153,6 +1153,93 @@ fn fetch_index_http_uncached(url: &str) -> Result<(PathBuf, Option<String>)> {
     Ok((path, etag))
 }
 
+/// First usable existing candidate (unless `recreate`), else first creatable path.
+///
+/// Shared by [`resolve_index_location`] (Python `:memory:` last resort) and
+/// session `resolve_index` (Sibling errors instead of memory).
+pub fn pick_index_path(archive: &Path, folders: &[PathBuf], recreate: bool) -> Option<PathBuf> {
+    let candidates = possible_index_paths(archive, folders);
+    if !recreate {
+        for p in &candidates {
+            if let Some(mp) = try_materialize_existing_index(p) {
+                return Some(mp);
+            }
+        }
+    }
+    for p in &candidates {
+        if path_can_create_index(p) {
+            return Some(p.clone());
+        }
+    }
+    None
+}
+
+/// Local sibling sidecars: pointer snapshot then well-known `{archive}.index.sqlite`.
+pub fn local_sibling_index_candidates(archive: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let ptr_path = index_pointer_path(archive);
+    match load_index_pointer(&ptr_path) {
+        Ok(Some(ptr)) => {
+            if let Ok(snap) = index_id_path(archive, &ptr.index_id) {
+                out.push(snap);
+            }
+        }
+        Ok(None) => {}
+        Err(e) => {
+            warn!("ignoring invalid index pointer {}: {e}", ptr_path.display());
+        }
+    }
+    out.push(default_index_path(archive));
+    out
+}
+
+/// Parent directory of the well-known sibling sidecar (`{archive}.index.sqlite`).
+pub fn sibling_parent_dir(archive: &Path) -> PathBuf {
+    match archive.parent() {
+        Some(p) if !p.as_os_str().is_empty() => p.to_path_buf(),
+        _ => PathBuf::from("."),
+    }
+}
+
+/// Sibling-policy location: never `:memory:`.
+///
+/// Existing pointer snapshot, then well-known sidecar, then existing files in
+/// non-empty `extra_dirs`. If none exist, return the well-known path when its
+/// parent is writable. Otherwise `Err(parent)` — session maps this to
+/// `SiblingNotWritable`. Does **not** create under `extra_dirs` or `local-index-v1`.
+pub fn resolve_sibling_index_location(
+    archive: &Path,
+    extra_dirs: &[PathBuf],
+    recreate: bool,
+) -> std::result::Result<IndexLocation, PathBuf> {
+    if !recreate {
+        for p in local_sibling_index_candidates(archive) {
+            if let Some(mp) = try_materialize_existing_index(&p) {
+                return Ok(IndexLocation::Path(mp));
+            }
+        }
+        let extras: Vec<PathBuf> = extra_dirs
+            .iter()
+            .filter(|d| !d.as_os_str().is_empty())
+            .cloned()
+            .collect();
+        if !extras.is_empty() {
+            let candidates = possible_index_paths(archive, &extras);
+            for p in &candidates {
+                if let Some(mp) = try_materialize_existing_index(p) {
+                    return Ok(IndexLocation::Path(mp));
+                }
+            }
+        }
+    }
+
+    let well_known = default_index_path(archive);
+    if path_can_create_index(&well_known) {
+        return Ok(IndexLocation::Path(well_known));
+    }
+    Err(sibling_parent_dir(archive))
+}
+
 /// Resolve where to load/create the index.
 ///
 /// * `explicit` — from `--index-file` (`None`, `":memory:"`, path string, or `http(s)://` / `file://` URL).
@@ -1167,6 +1254,9 @@ fn fetch_index_http_uncached(url: &str) -> Result<(PathBuf, Option<String>)> {
 /// Local folder candidate order is unchanged (G-2 K12): next-to-archive / `oci:{digest}`
 /// cache names stay first among [`possible_index_paths`]. HTTP `Link` / sibling GET /
 /// OCI referrers are applied by callers **after** this function on a local miss.
+///
+/// Last resort is [`IndexLocation::Memory`] (Python/CLI `CliCompat` parity). Session
+/// embedders use [`resolve_sibling_index_location`] which errors instead of memory.
 pub fn resolve_index_location(
     archive: &Path,
     explicit: Option<&str>,
@@ -1205,43 +1295,39 @@ pub fn resolve_index_location(
     } else {
         folders.to_vec()
     };
-    let candidates = possible_index_paths(archive, &folders);
-
-    if !recreate {
-        for p in &candidates {
-            if path_is_usable_existing_index(p) {
-                match materialize_index_file(p) {
-                    Ok(mp) => return IndexLocation::Path(mp),
-                    Err(err) => {
-                        warn!(
-                            "could not materialize existing index {}: {err}",
-                            p.display()
-                        );
-                        // try next candidate
-                    }
-                }
-            }
-        }
+    match pick_index_path(archive, &folders, recreate) {
+        Some(p) => IndexLocation::Path(p),
+        // Last resort: memory (matches Python when no writable location exists).
+        None => IndexLocation::Memory,
     }
-
-    for p in &candidates {
-        if path_can_create_index(p) {
-            return IndexLocation::Path(p.clone());
-        }
-    }
-
-    // Last resort: memory (matches Python when no writable location exists).
-    IndexLocation::Memory
 }
 
-fn path_is_usable_existing_index(path: &Path) -> bool {
+fn try_materialize_existing_index(path: &Path) -> Option<PathBuf> {
+    if !path_is_usable_existing_index(path) {
+        return None;
+    }
+    match materialize_index_file(path) {
+        Ok(mp) => Some(mp),
+        Err(err) => {
+            warn!(
+                "could not materialize existing index {}: {err}",
+                path.display()
+            );
+            None
+        }
+    }
+}
+
+/// Non-empty regular file (warm sidecar candidate).
+pub fn path_is_usable_existing_index(path: &Path) -> bool {
     match std::fs::metadata(path) {
         Ok(m) => m.is_file() && m.len() > 0,
         Err(_) => false,
     }
 }
 
-fn path_can_create_index(path: &Path) -> bool {
+/// Parent of `path` exists (or can be created) and passes [`test_writable_dir`].
+pub fn path_can_create_index(path: &Path) -> bool {
     if let Some(parent) = path.parent() {
         if parent.as_os_str().is_empty() {
             // relative path in cwd
@@ -1255,7 +1341,8 @@ fn path_can_create_index(path: &Path) -> bool {
     test_writable_dir(Path::new("."))
 }
 
-fn test_writable_dir(dir: &Path) -> bool {
+/// Probe whether `dir` allows creating a new file (unlink the probe afterwards).
+pub fn test_writable_dir(dir: &Path) -> bool {
     let probe = dir.join(format!(".ratarmount-write-test-{}", std::process::id()));
     match std::fs::OpenOptions::new()
         .write(true)
@@ -1382,6 +1469,75 @@ mod tests {
     fn memory_explicit() {
         let loc = resolve_index_location(Path::new("/tmp/a.tar"), Some(":memory:"), &[], false);
         assert_eq!(loc, IndexLocation::Memory);
+    }
+
+    /// Regression: Sibling + unwritable parent + no sidecar → parent path, not `:memory:`.
+    #[test]
+    fn sibling_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let archive = blocker.join("a.tar");
+        let extra = tempfile::tempdir().unwrap();
+        let err = resolve_sibling_index_location(&archive, &[extra.path().to_path_buf()], false)
+            .expect_err("unwritable sibling parent must not fall back");
+        assert_eq!(err, blocker);
+        assert!(pick_index_path(&archive, &[PathBuf::new()], true).is_none());
+    }
+
+    /// Regression: CliCompat / Python last resort stays `:memory:` when nothing is writable.
+    #[test]
+    fn resolve_index_location_unwritable_falls_back_to_memory() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"x").unwrap();
+        let loc = resolve_index_location(&archive, None, &[blocker], true);
+        assert_eq!(loc, IndexLocation::Memory);
+    }
+
+    #[test]
+    fn sibling_writable_plans_well_known() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"x").unwrap();
+        let loc = resolve_sibling_index_location(&archive, &[], true).unwrap();
+        assert_eq!(loc, IndexLocation::Path(default_index_path(&archive)));
+    }
+
+    #[test]
+    fn sibling_existing_file_used_when_parent_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        std::fs::write(&archive, b"x").unwrap();
+        let idx = default_index_path(&archive);
+        std::fs::write(&idx, b"SQLite format 3\0existing").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let orig = std::fs::metadata(dir.path()).unwrap().permissions();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let loc = resolve_sibling_index_location(&archive, &[], false);
+            let _ = std::fs::set_permissions(dir.path(), orig);
+            match loc {
+                Ok(IndexLocation::Path(p)) => assert_eq!(p, idx),
+                Ok(IndexLocation::Memory) => panic!("existing sibling must not become :memory:"),
+                Err(_) => {
+                    // Root can still write 0555 dirs; existing file should still win.
+                    if test_writable_dir(dir.path()) {
+                        eprintln!("skip: parent still writable (root?)");
+                    } else {
+                        panic!("existing sibling sidecar must be returned");
+                    }
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let loc = resolve_sibling_index_location(&archive, &[], false).unwrap();
+            assert_eq!(loc, IndexLocation::Path(idx));
+        }
     }
 
     #[test]

@@ -18,7 +18,6 @@ pub mod factory;
 mod index_job;
 mod locate;
 mod read;
-#[allow(dead_code)]
 mod resolve;
 mod session;
 mod types;
@@ -29,6 +28,7 @@ pub use locate::{query_index, split_fts_pattern, DEFAULT_FIND_PAGE};
 pub use ratarmount_core::{IndexBuildHooks, IndexBuildTick};
 pub use ratarmount_index::IndexLocation;
 pub use read::RangeReader;
+pub use resolve::resolve_index;
 pub use session::Session;
 pub use types::{
     DirCursor, DirEnt, DirPage, ExtractProgress, ExtractRequest, FindCursor, FindOpts, FindPage,
