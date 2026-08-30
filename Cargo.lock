@@ -3049,6 +3049,7 @@ dependencies = [
  "ratarmount-formats-warc",
  "ratarmount-formats-xar",
  "ratarmount-formats-zip",
+ "ratarmount-http",
  "ratarmount-index",
  "ratarmount-remote",
  "rusqlite",

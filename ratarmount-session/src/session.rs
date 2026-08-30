@@ -337,6 +337,19 @@ impl Session {
             .map(|fi| dirent_from_file_info(path, &fi)))
     }
 
+    /// Start the HTTP Range server (CLI `--http`). Feature `http-export`.
+    ///
+    /// Default bind is [`crate::DEFAULT_HTTP_BIND`] (`127.0.0.1:20491`).
+    /// Path-backed sidecars are served at `/.ratarmount-control/index.sqlite`.
+    #[cfg(feature = "http-export")]
+    pub fn start_http(&self, bind: std::net::SocketAddr) -> Result<crate::HttpHandle, Error> {
+        crate::http::spawn(
+            Arc::clone(self.source.source()),
+            self.loc.path().map(Path::to_path_buf),
+            bind,
+        )
+    }
+
     pub(crate) fn mount_source(&self) -> &dyn MountSource {
         self.source.source().as_ref()
     }

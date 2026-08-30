@@ -17,6 +17,8 @@
 mod error;
 mod extract;
 pub mod factory;
+#[cfg(feature = "http-export")]
+mod http;
 mod index_job;
 mod locate;
 mod read;
@@ -25,6 +27,8 @@ mod session;
 mod types;
 
 pub use error::Error;
+#[cfg(feature = "http-export")]
+pub use http::{HttpHandle, DEFAULT_HTTP_BIND};
 pub use index_job::IndexJob;
 pub use locate::{query_index, split_fts_pattern, DEFAULT_FIND_PAGE};
 pub use ratarmount_core::{IndexBuildHooks, IndexBuildTick};

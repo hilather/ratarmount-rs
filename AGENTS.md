@@ -182,6 +182,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | IndexJob Temp Drop unlinks the returned sidecar | `cargo test -p ratarmount-session --lib index_job_temp_sidecar_survives_run` |
 | Nested flatten/AutoMount cancel publishes over dest | `cargo test -p ratarmount-session --lib index_job_cancel_nested_flatten_keeps_dest` |
 | Session not `Send` / L2 probe order reorder | `cargo test -p ratarmount-session --lib session_send` · `cargo test -p ratarmount-session --lib ordered_format_backends` |
+| Session HTTP Range (`http-export`) | `cargo test -p ratarmount-session --features http-export --lib http::` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

@@ -257,7 +257,7 @@ flowchart LR
 | Crate | Role |
 |-------|------|
 | `ratarmount` | CLI binary |
-| `ratarmount-session` | In-process Session API for embedders (**no FUSE**) |
+| `ratarmount-session` | In-process Session API for embedders (**no FUSE**; optional `http-export`) |
 | `ratarmount-core` | `MountSource` trait & options |
 | `ratarmount-index` | SQLite 0.7.x index |
 | `ratarmount-fuse` | `fuser` low-level filesystem |

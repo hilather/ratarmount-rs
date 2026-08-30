@@ -50,6 +50,8 @@ warc = ["dep:ratarmount-formats-warc"]
 xar = ["dep:ratarmount-formats-xar"]
 gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
+# Off by default: default session graph must not pull HTTP (K10 / G0.3a).
+http-export = ["dep:ratarmount-http"]
 
 [dependencies]
 ratarmount-core.workspace = true
@@ -65,6 +67,7 @@ ratarmount-formats-sevenzip.workspace = true
 ratarmount-compress.workspace = true
 ratarmount-compositing.workspace = true
 ratarmount-remote.workspace = true
+ratarmount-http = { workspace = true, optional = true }
 ratarmount-formats-ar = { workspace = true, optional = true }
 ratarmount-formats-asar = { workspace = true, optional = true }
 ratarmount-formats-cab = { workspace = true, optional = true }

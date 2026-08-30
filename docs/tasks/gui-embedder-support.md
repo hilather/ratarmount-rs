@@ -1044,7 +1044,7 @@ CI (G6.1): best-effort `windows-lib` on `windows-2022`: `cargo check -p ratarmou
 
 Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`.
 
-G5.4: `Session::start_http` wraps `ratarmount_http::spawn_http_thread` with `HttpOptions { index_sidecar: session.index_path(), .. }`. Stop via existing `ExportStop`. GUI “Share via HTTP” uses this when compiled; else spawns CLI. **Deferred after G1/G2/G4.**
+G5.4: `Session::start_http` wraps `ratarmount_http::spawn_http_thread` with `HttpOptions { index_sidecar: session catalog path, .. }`. Stop via existing `ExportStop` on `HttpHandle`. GUI “Share via HTTP” uses this when compiled; else spawns CLI.
 
 G5.5: `examples/session-list.rs` — open a TAR, print first page of `/`, exit. No FUSE.
 
@@ -1274,7 +1274,7 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 | **G5.1** | `Session` is `Send` | S | **landed (PR9)** — `session_is_send_sync_shared_via_arc` + `session_send_across_thread` |
 | **G5.2** | Passwords: `secrecy` on boundary; skip `Debug` on `OpenOptions.passwords` (**PR3**) | S | **landed (PR3)** — `OpenOptions` Debug prints `passwords: [redacted N]` |
 | **G5.3** | After W2: cfg-gate factory `FormatBackend` / `use` lines; *then* default may shrink to TAR/ZIP/7z; no fuse/nfs/smb/http. Until then default = all L2 (PR2 compile) | M | **landed (PR9)** — optional L2 features; `--no-default-features` = TAR/ZIP/7z; in-tree default still `formats-all`; probe order unchanged |
-| **G5.4** | Optional `http-export`: start/stop `--http` on a Session | M | proposed |
+| **G5.4** | Optional `http-export`: start/stop `--http` on a Session | M | **landed (PR10)** — `Session::start_http` wraps `spawn_http_thread`; default bind `127.0.0.1:20491` |
 | **G5.5** | `examples/session-list.rs` | S | **landed (PR9)** |
 | **G5.6** | `docs/crates-io-policy.md` L3.5 embedder note | S | **landed (PR9)** |
 

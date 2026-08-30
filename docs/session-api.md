@@ -25,6 +25,7 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
 | Format crates (TAR/ZIP/7z always; other L2 via `formats-all`) | default `formats-all`; `--no-default-features` = TAR/ZIP/7z | G5.3 / PR9 |
 | `OpenOptions` Debug | passwords printed as `[redacted N]` | G5.2 / PR3 |
+| `Session::start_http` | **implemented** (`http-export` feature; wraps `spawn_http_thread`; default bind `127.0.0.1:20491`) | G5.4 |
 
 `cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
 
@@ -143,6 +144,8 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 **Not in this slice:** optional L2 feature split, `http-export`, and Windows library compile (PR9–PR11).
 
+**`start_http` (feature `http-export`):** wraps `ratarmount_http::spawn_http_thread` with `HttpOptions { index_sidecar: session catalog path, .. }` (same as CLI `--http`). Default bind is `127.0.0.1:20491`. Stop via the returned `HttpHandle` (`ExportStop` + join). Off by default so the embedder graph does not pull HTTP.
+
 ```rust
 impl Session {
     /// Blocking. May build an index when `recreate` requires it.
@@ -173,10 +176,14 @@ impl Session {
     ) -> Result<(), Error>;
 
     pub fn find(&self, pattern: &str, opts: FindOpts) -> Result<FindPage, Error>;
+
+    /// Optional G5.4 (`http-export` feature).
+    #[cfg(feature = "http-export")]
+    pub fn start_http(&self, bind: SocketAddr) -> Result<HttpHandle, Error>;
 }
 ```
 
-There is no `IndexJob::start` / `Session::from_open` (napi-shaped). Optional `Session::start_http` is feature `http-export` (G5.4, after W2).
+There is no `IndexJob::start` / `Session::from_open` (napi-shaped). Optional `Session::start_http` is feature `http-export` (G5.4).
 
 Default `list_dirents_page` limit if 0 is passed: **200**. Engine cap `MAX_DIR_PAGE = 10_000`. Default `Session::find` limit if 0 is passed: **200** (`DEFAULT_FIND_PAGE`). CLI `find` first-page TSV stays **10_000**.
 
@@ -293,6 +300,6 @@ GUI v1 is **read-mostly**. Overlay write, live commit, and `--commit-overlay` ar
 
 This crate is the **supported embedder API** (`Session`). Archive factory glue (`open_path`, `build_mount_source_ex`, nested openers, remote URL open) lives here as **`pub mod factory`** so the CLI can share it without importing a FUSE binary crate. Embedders should use `Session`; `factory` is public for the CLI.
 
-TAR/ZIP/7z + compress + compositing + remote are **always** compiled. Other L2 is optional (`ar`, `asar`, `cab`, `cpio`, `ext4`, `fat`, `git`, `html`, `iso9660`, `libarchive`, `ogg`, `pdf`, `sqlar`, `squashfs`, `warc`, `xar`), bundled as **`formats-all`**. In-tree default is `formats-all` so the factory test matrix still runs; embedders who want the slim graph use `--no-default-features` (G5.3). Probe **order** of enabled backends is `DEFAULT_FORMAT_PROBE_ORDER` (do not reorder). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); later `http-export`.
+TAR/ZIP/7z + compress + compositing + remote are **always** compiled. Other L2 is optional (`ar`, `asar`, `cab`, `cpio`, `ext4`, `fat`, `git`, `html`, `iso9660`, `libarchive`, `ogg`, `pdf`, `sqlar`, `squashfs`, `warc`, `xar`), bundled as **`formats-all`**. In-tree default is `formats-all` so the factory test matrix still runs; embedders who want the slim graph use `--no-default-features` (G5.3). Probe **order** of enabled backends is `DEFAULT_FORMAT_PROBE_ORDER` (do not reorder). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); `http-export` (`Session::start_http`, default bind `127.0.0.1:20491`).
 
 Example: `cargo run -p ratarmount-session --example session-list -- archive.tar`.
