@@ -2093,7 +2093,9 @@ pub struct CommitOverlayOptions {
     pub debug: u8,
     /// TAR member-name encoding (`-e` / `--encoding`). Default `"utf-8"`.
     pub encoding: String,
-    /// Concatenated TAR (`-i` / `--ignore-zeros`). Default false.
+    /// Concatenated TAR (`-i` / `--ignore-zeros`) for GNU-tar / mount reopen.
+    /// Offline `.tar.zst` classification and sidecar patch always walk past
+    /// per-frame TAR EOF so later-frame deletes apply even when this is false.
     pub ignore_zeros: bool,
 }
 
@@ -2809,11 +2811,19 @@ fn commit_overlay_tar_zst(
 
     let map = scan_zstd_frames_path(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
     let body = open_seekable_zstd(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    // Always walk past per-frame TAR EOF. Mount `-i` only controls listing
+    // visibility; a tombstone for a later complete-TAR frame must still map
+    // to offsetheaders. With `ignore_zeros: false` those names look like
+    // overlay-only adds, the delete is skipped, and commit still returns
+    // success — then removing the overlay (as the success text suggests)
+    // undeletes the member. Pin GNU incremental off so a later-frame
+    // dumpdir does not flip classification.
     let index_opts = OpenOptions {
         write_index: false,
         index_in_memory: true,
         encoding: opts.encoding.clone(),
-        ignore_zeros: opts.ignore_zeros,
+        ignore_zeros: true,
+        gnu_incremental: Some(false),
         ..OpenOptions::default()
     };
     let base = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
@@ -2875,7 +2885,8 @@ fn commit_overlay_tar_zst(
     // Sibling only: do not create a sidecar; do not hunt XDG (K3 / offline).
     let patch_opts = OpenOptions {
         encoding: opts.encoding.clone(),
-        ignore_zeros: opts.ignore_zeros,
+        ignore_zeros: true,
+        gnu_incremental: Some(false),
         write_index: false,
         index_folders: vec![PathBuf::new()],
         ..OpenOptions::default()
@@ -4072,7 +4083,53 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/last.txt"), last);
     }
 
-    /// Regression: concatenated complete-TAR later-frame delete needs --ignore-zeros.
+    /// Regression: concatenated complete-TAR later-frame delete must apply
+    /// even when the caller omits `--ignore-zeros` (default offline CLI).
+    #[test]
+    fn commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-i0-prefix");
+        let last = generated_payload("off-i0-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.frames.len() >= 2);
+        let prefix_end = map.frames[1].compressed_offset as usize;
+        let prefix_bytes = before[..prefix_end].to_vec();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        ov.unlink("/last.txt")
+            .expect("unlink later complete-TAR frame");
+        drop(ov);
+
+        assert!(
+            commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"),
+            "offline commit without -i must still persist the later-frame delete"
+        );
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix complete-TAR frame must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, true);
+        assert!(
+            src.lookup("/last.txt", 0).is_none(),
+            "later-frame name must be gone after offline commit without -i"
+        );
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+    }
+
+    /// Regression: concatenated complete-TAR later-frame delete needs --ignore-zeros
+    /// only for the mount that created the tombstone, not for offline classification.
     #[test]
     fn commit_overlay_tar_zst_concatenated_delete_ignore_zeros() {
         let dir = tempfile::tempdir().unwrap();
@@ -4117,6 +4174,81 @@ mod tests {
             "later-frame name must be gone when classified with ignore_zeros"
         );
         assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+    }
+
+    /// Regression: offline later-frame delete must reinsert later complete-TAR
+    /// frames when patching a sibling sidecar (not stop at the first TAR EOF).
+    #[test]
+    fn commit_overlay_tar_zst_concatenated_delete_patches_sidecar_later_frame() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("off-i0-sc-prefix");
+        let mid = generated_payload("off-i0-sc-mid");
+        let last = generated_payload("off-i0-sc-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("mid.txt", &mid)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd(&archive).expect("open zstd");
+            let opts = OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            };
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &opts,
+                "test",
+            )
+            .expect("create sidecar");
+        }
+        assert!(sidecar.is_file(), "pre-existing sidecar");
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        ov.unlink("/mid.txt")
+            .expect("unlink middle complete-TAR frame");
+        drop(ov);
+
+        assert!(
+            commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"),
+            "offline commit without -i must persist the middle-frame delete"
+        );
+
+        let idx = ratarmount_index::SqliteIndex::open_read_only(&sidecar).expect("open patched");
+        idx.check_tarstats_matches_archive(&archive)
+            .expect("patched tarstats must match spliced archive");
+
+        let body = open_seekable_zstd(&archive).expect("fresh zstd");
+        let src = ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            },
+        )
+        .expect("warm-open patched sidecar");
+        assert!(
+            src.lookup("/mid.txt", 0).is_none(),
+            "middle-frame name must be gone from the patched sidecar"
+        );
+        assert_eq!(
+            read_member(&src, "/last.txt"),
+            last,
+            "later complete-TAR frame must be reinserted when patching with ignore_zeros"
+        );
+        assert_eq!(read_member(&src, "/prefix.txt"), prefix);
     }
 
     /// Regression: offline --commit-overlay must not create a sibling *.index.sqlite.
