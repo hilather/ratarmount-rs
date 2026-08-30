@@ -7,9 +7,7 @@ description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
 
 [features]
 default = ["formats"]
-# Same L2 set factory.rs `use`s today (ar, asar, cab, cpio, ext4, fat, git,
-# html, iso9660, libarchive, ogg, pdf, sevenzip, sqlar, squashfs, tar, warc,
-# xar, zip) + compress + compositing + remote. Not optional until G5.3.
+# factory.rs uses these crates unconditionally (no FormatBackend cfg yet).
 formats = [
   "dep:ratarmount-formats-tar",
   "dep:ratarmount-formats-zip",
