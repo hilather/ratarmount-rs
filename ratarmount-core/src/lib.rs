@@ -1,6 +1,7 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 use std::io::{self, Read, Seek};
 use std::path::PathBuf;
 
@@ -293,7 +294,7 @@ pub struct StatFs {
 }
 
 /// Options for opening archives (subset of Python `open_mount_source` kwargs).
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct OpenOptions {
     pub write_index: bool,
     pub clear_index_cache: bool,
@@ -369,6 +370,36 @@ impl OpenOptions {
     /// Thread count for a compression backend (`bzip2`, `gzip`, `zstd`, …).
     pub fn threads_for(&self, backend: &str) -> u32 {
         self.parallelization.threads_for(backend)
+    }
+}
+
+impl fmt::Debug for OpenOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpenOptions")
+            .field("write_index", &self.write_index)
+            .field("clear_index_cache", &self.clear_index_cache)
+            .field("index_file_path", &self.index_file_path)
+            .field("index_in_memory", &self.index_in_memory)
+            .field("index_compact_only", &self.index_compact_only)
+            .field("index_folders", &self.index_folders)
+            .field("verify_modification_time", &self.verify_modification_time)
+            .field("index_minimum_file_count", &self.index_minimum_file_count)
+            .field("recursive", &self.recursive)
+            .field("recursion_depth", &self.recursion_depth)
+            .field("ignore_zeros", &self.ignore_zeros)
+            .field("gnu_incremental", &self.gnu_incremental)
+            .field("parallelization", &self.parallelization)
+            .field("encoding", &self.encoding)
+            .field("gzip_seek_point_spacing", &self.gzip_seek_point_spacing)
+            .field(
+                "passwords",
+                &format_args!("[redacted {}]", self.passwords.len()),
+            )
+            .field("use_backends", &self.use_backends)
+            .field("read_only_index", &self.read_only_index)
+            .field("force_folder_index", &self.force_folder_index)
+            .field("hashes", &self.hashes)
+            .finish()
     }
 }
 
@@ -655,6 +686,27 @@ mod tests {
         };
         assert_eq!(opts.threads_for("bzip2"), 3);
         assert_eq!(opts.threads_for("zstd"), 2);
+    }
+
+    #[test]
+    fn open_options_debug_redacts_passwords() {
+        let opts = OpenOptions {
+            passwords: vec!["s3cret-bytes".into(), "also-secret".into()],
+            ..OpenOptions::default()
+        };
+        let debug = format!("{opts:?}");
+        assert!(
+            !debug.contains("s3cret-bytes"),
+            "password bytes leaked in Debug: {debug}"
+        );
+        assert!(
+            !debug.contains("also-secret"),
+            "password bytes leaked in Debug: {debug}"
+        );
+        assert!(
+            debug.contains("passwords: [redacted 2]"),
+            "expected redacted password count: {debug}"
+        );
     }
 
     /// Regression: default list_dirents derives from list_mode with size=0.

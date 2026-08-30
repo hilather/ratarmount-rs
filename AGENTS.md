@@ -156,6 +156,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Folder live glob without fat `list()` / symlink-to-`/etc` TSV leak | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `folder_globs`, `folder_limit`) |
 | Union locate forwards `sources[0]` / drops later catalog | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `union_merges`, `union_empty`, `union_none_if_any`, `union_limit`) |
 | OCI locate forwards `layers[0]` / emits `.wh.*` / misses whiteouts | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `oci_applies_whiteouts`, `oci_none_if_any`, `oci_empty`, `oci_higher_layer`) |
+| Session pages 1k-entry TAR (page size 50) | `cargo test -p ratarmount-session --lib list_dirents_page` |
+| Session catalog does not reprint harness line / second MemIndex | `cargo test -p ratarmount-session --lib catalog_open_silent` · `cargo test -p ratarmount-index --lib open_catalog_read_only` |
+| GNU incremental dumpdir name absent from page 1 | `cargo test -p ratarmount-session --lib list_dirents_page_dumpdir` · `cargo test -p ratarmount-index --lib list_dirents_page` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

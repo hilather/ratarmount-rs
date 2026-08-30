@@ -69,6 +69,24 @@ pub use nested::{
 /// Max `files` rows for which a full MemIndex projection is kept after seal/open.
 pub const MEM_INDEX_MAX_FILES: u64 = 500_000;
 
+/// Engine cap for [`SqliteIndex::list_dirents_page`] (`LIMIT`).
+pub const MAX_DIR_PAGE: u32 = 10_000;
+
+/// One newest-wins directory row from [`SqliteIndex::list_dirents_page`].
+///
+/// Unlike [`IndexDirent`], this includes `mtime` (additive SELECT; no schema bump).
+#[derive(Clone, Debug, PartialEq)]
+pub struct PagedDirent {
+    pub name: String,
+    pub size: u64,
+    pub mode: u32,
+    /// Unix seconds as stored (`files.mtime` REAL). `None` if the column is NULL.
+    pub mtime: Option<f64>,
+    /// Header offset; `-1` when SQL stored NULL.
+    pub offsetheader: i64,
+    pub linkname: String,
+}
+
 /// Must match Python `SQLiteIndex.__version__` (`files` schema).
 ///
 /// Distinct from [`INDEX_MEDIA_TYPE`] (`v1` blob family). Additive Rust-only
@@ -551,7 +569,25 @@ fn reap_stale_writable_tmps(dest: &Path) {
 
 impl SqliteIndex {
     /// Open an existing index file read-only (Phase 0).
+    ///
+    /// Prints the Python harness line and loads a compact [`MemIndex`] when the
+    /// row count is within [`MEM_INDEX_MAX_FILES`]. Session paging uses
+    /// [`Self::open_catalog_read_only`] instead.
     pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_inner(path, true, true)
+    }
+
+    /// SQL-only read-only catalog. No stdout. `mem` stays `None`. Still
+    /// [`Self::validate_loaded`].
+    pub fn open_catalog_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_read_only_inner(path, false, false)
+    }
+
+    fn open_read_only_inner(
+        path: impl AsRef<Path>,
+        announce: bool,
+        load_mem: bool,
+    ) -> Result<Self> {
         let path = path.as_ref();
         let conn = Connection::open_with_flags(
             path,
@@ -576,17 +612,20 @@ impl SqliteIndex {
             publish_target: None,
         };
         idx.validate_loaded()?;
-        // Load compact projection for archives with a manageable file count.
-        if let Ok(n) = idx.file_count_db() {
-            if n > 0 && n <= MEM_INDEX_MAX_FILES {
-                idx.mem = Some(idx.load_mem_index()?);
+        if load_mem {
+            if let Ok(n) = idx.file_count_db() {
+                if n > 0 && n <= MEM_INDEX_MAX_FILES {
+                    idx.mem = Some(idx.load_mem_index()?);
+                }
             }
         }
-        // Harness contract: Python prints this when logger level is WARNING+
-        println!(
-            "Successfully loaded offset dictionary from {}",
-            path.display()
-        );
+        if announce {
+            // Harness contract: Python prints this when logger level is WARNING+
+            println!(
+                "Successfully loaded offset dictionary from {}",
+                path.display()
+            );
+        }
         Ok(idx)
     }
 
@@ -1693,6 +1732,114 @@ impl SqliteIndex {
                 None
             })
         })
+    }
+
+    /// Keyset-paged newest-wins directory listing (dumpdir tombstones omitted).
+    ///
+    /// Does **not** change [`Self::list_dirents`] (FUSE still sees tombstones).
+    /// `limit` is capped at [`MAX_DIR_PAGE`]. `after_name` is exclusive (`name > after`).
+    ///
+    /// Returns `(page, next_name, total_hint)` where `next_name` is the last name
+    /// of a full page (pass as the next `after_name`) and `total_hint` is a cheap
+    /// COUNT of newest-wins names in this directory excluding dumpdir rows.
+    pub fn list_dirents_page(
+        &self,
+        path: &str,
+        after_name: Option<&str>,
+        limit: u32,
+    ) -> Result<(Vec<PagedDirent>, Option<String>, Option<u64>)> {
+        let path = query_normpath(path);
+        let dir = path.trim_end_matches('/').to_string();
+        let limit = limit.min(MAX_DIR_PAGE);
+        let after = after_name.unwrap_or("");
+        let dumpdir = crate::search::DUMPDIR_DELETE_LINKNAME;
+
+        let total_hint = if self.compact_only {
+            None
+        } else {
+            self.with_conn(|conn| {
+                let mut stmt = conn.prepare_cached(
+                    r#"
+                    WITH newest AS (
+                      SELECT name, linkname,
+                             ROW_NUMBER() OVER (
+                               PARTITION BY name
+                               ORDER BY COALESCE(offsetheader, -1) DESC, name
+                             ) AS rn
+                      FROM "files"
+                      WHERE "path" = ?1
+                        AND "name" != ''
+                    )
+                    SELECT COUNT(*) FROM newest
+                    WHERE rn = 1
+                      AND COALESCE(linkname, '') != ?2
+                    "#,
+                )?;
+                let n: i64 = stmt.query_row(params![dir, dumpdir], |r| r.get(0))?;
+                Ok(n.max(0) as u64)
+            })
+            .ok()
+        };
+
+        if limit == 0 {
+            return Ok((Vec::new(), None, total_hint));
+        }
+
+        if self.compact_only {
+            return Ok((Vec::new(), None, total_hint));
+        }
+
+        let fetch = i64::from(limit).saturating_add(1);
+        let mut rows = self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                r#"
+                WITH newest AS (
+                  SELECT name, size, mode, mtime, offsetheader, linkname,
+                         ROW_NUMBER() OVER (
+                           PARTITION BY name
+                           ORDER BY COALESCE(offsetheader, -1) DESC, name
+                         ) AS rn
+                  FROM "files"
+                  WHERE "path" = ?1
+                    AND "name" != ''
+                )
+                SELECT name, size, mode, mtime, offsetheader, linkname
+                FROM newest
+                WHERE rn = 1
+                  AND COALESCE(linkname, '') != ?2
+                  AND name > ?3
+                ORDER BY name
+                LIMIT ?4
+                "#,
+            )?;
+            let mut q = stmt.query(params![dir, dumpdir, after, fetch])?;
+            let mut out = Vec::new();
+            while let Some(row) = q.next()? {
+                let name: String = row.get(0)?;
+                let size: i64 = row.get(1).unwrap_or(0);
+                let mode: i64 = row.get(2).unwrap_or(0);
+                let mtime: Option<f64> = row.get(3)?;
+                let offsetheader: Option<i64> = row.get(4)?;
+                let linkname: String = row.get(5).unwrap_or_default();
+                out.push(PagedDirent {
+                    name,
+                    size: size.max(0) as u64,
+                    mode: mode as u32,
+                    mtime,
+                    offsetheader: offsetheader.unwrap_or(-1),
+                    linkname,
+                });
+            }
+            Ok(out)
+        })?;
+
+        let next_name = if rows.len() as u32 > limit {
+            rows.pop();
+            rows.last().map(|r| r.name.clone())
+        } else {
+            None
+        };
+        Ok((rows, next_name, total_hint))
     }
 
     /// Store version rows used by Python writers.
@@ -4251,5 +4398,170 @@ mod tests {
         idx.insert_files_batch_soa(&soa).unwrap();
         soa.clear();
         assert_eq!(idx.sql_files_type("/", "only.txt", 0).unwrap(), Some(8));
+    }
+
+    fn write_page_fixture(path: &Path) {
+        let idx = SqliteIndex::create_writable(Some(path)).unwrap();
+        idx.store_versions("0.1.0").unwrap();
+        idx.store_metadata_key_value("backendName", "SQLiteIndexedTar")
+            .unwrap();
+        let dumpdir = crate::search::DUMPDIR_DELETE_LINKNAME;
+        let mut rows = Vec::new();
+        for i in 0..30 {
+            rows.push(FileRow::new(
+                "",
+                format!("n{i:02}.txt"),
+                i as i64,
+                512 + i as i64,
+                4,
+                1_700_000_000.0 + i as f64,
+                0o100644,
+                i64::from(b'0'),
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            ));
+        }
+        // Newest-wins: same name, higher offsetheader should win.
+        rows.push(FileRow::new(
+            "",
+            "n00.txt",
+            100,
+            999,
+            99,
+            1_800_000_000.0,
+            0o100644,
+            i64::from(b'0'),
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        ));
+        rows.push(FileRow::new(
+            "",
+            "gone.txt",
+            500,
+            0,
+            0,
+            0.0,
+            0,
+            i64::from(b'D'),
+            dumpdir,
+            0,
+            0,
+            false,
+            false,
+            true,
+            0,
+        ));
+        idx.insert_files_batch(&rows).unwrap();
+        let _ = idx.into_read_only().unwrap();
+    }
+
+    /// Catalog RO open must not print the harness line and must not load MemIndex.
+    ///
+    /// libtest captures `println!`, so the silent-open assertion uses a child
+    /// of this test binary (`--nocapture`).
+    #[test]
+    fn open_catalog_read_only() {
+        if let Ok(p) = std::env::var("RATARMOUNT_OPEN_CATALOG_CHILD") {
+            let idx = SqliteIndex::open_catalog_read_only(p).expect("open_catalog_read_only");
+            assert!(!idx.has_mem_index(), "catalog mem must stay None");
+            assert!(idx.file_count_db().unwrap() < MEM_INDEX_MAX_FILES);
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cat.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&path)).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.store_metadata_key_value("backendName", "SQLiteIndexedTar")
+                .unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            let _ = idx.into_read_only().unwrap();
+        }
+        assert!(
+            std::fs::metadata(&path).unwrap().len() > 0,
+            "sidecar should exist"
+        );
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .env("RATARMOUNT_OPEN_CATALOG_CHILD", &path)
+            .args(["tests::open_catalog_read_only", "--exact", "--nocapture"])
+            .output()
+            .expect("spawn open_catalog_read_only child");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "child failed: stdout={stdout} stderr={stderr}"
+        );
+        assert!(
+            !stdout.contains("Successfully loaded offset dictionary"),
+            "catalog open must not print harness line: {stdout}"
+        );
+    }
+
+    /// Dumpdir tombstone absent; keyset pages; window SQL prepares.
+    #[test]
+    fn list_dirents_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("page.index.sqlite");
+        write_page_fixture(&path);
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+
+        let fuse = idx.list_dirents("/").unwrap().expect("fuse list");
+        assert!(
+            fuse.iter().any(|d| d.name == "gone.txt"),
+            "list_dirents must still return dumpdir tombstones"
+        );
+
+        let (page1, next, total) = idx.list_dirents_page("/", None, 10).unwrap();
+        assert!(
+            page1.iter().all(|d| d.name != "gone.txt"),
+            "dumpdir tombstone must be absent from page: {:?}",
+            page1.iter().map(|d| &d.name).collect::<Vec<_>>()
+        );
+        assert_eq!(page1.len(), 10);
+        assert_eq!(page1[0].name, "n00.txt");
+        assert_eq!(page1[0].size, 99, "newest-wins by offsetheader");
+        assert_eq!(page1[0].mtime, Some(1_800_000_000.0));
+        assert_eq!(page1[0].offsetheader, 100);
+        let next = next.expect("more pages");
+        assert_eq!(next, page1.last().unwrap().name);
+        let hint = total.expect("COUNT");
+        assert_eq!(hint, 30, "30 live names, dumpdir excluded");
+
+        let (page2, next2, _) = idx.list_dirents_page("/", Some(next.as_str()), 10).unwrap();
+        assert_eq!(page2.len(), 10);
+        let names1: Vec<_> = page1.iter().map(|d| d.name.as_str()).collect();
+        let names2: Vec<_> = page2.iter().map(|d| d.name.as_str()).collect();
+        for n in &names1 {
+            assert!(!names2.contains(n), "overlap {n}");
+        }
+        assert!(names2[0] > names1[names1.len() - 1]);
+        assert!(next2.is_some());
+
+        let (last, last_next, _) = idx
+            .list_dirents_page("/", Some(page2.last().unwrap().name.as_str()), 20)
+            .unwrap();
+        assert_eq!(last.len(), 10);
+        assert!(last_next.is_none());
+        let mut all: Vec<String> = names1
+            .into_iter()
+            .chain(names2)
+            .chain(last.iter().map(|d| d.name.as_str()))
+            .map(|s| s.to_string())
+            .collect();
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 30);
+        assert!(!all.iter().any(|n| n == "gone.txt"));
     }
 }

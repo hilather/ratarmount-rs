@@ -1231,13 +1231,13 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G1.1** | `Session::open(OpenRequest)` wrapping factory | M | proposed |
-| **G1.2** | `list_dirents_page(path, cursor, limit)` on SQLite keyset | M | proposed |
-| **G1.3** | `lookup(path) -> Option<DirEnt>` | S | proposed |
+| **G1.1** | `Session::open(OpenRequest)` wrapping factory | M | **landed (PR3)** |
+| **G1.2** | `list_dirents_page(path, cursor, limit)` on SQLite keyset | M | **landed (PR3)** |
+| **G1.3** | `lookup(path) -> Option<DirEnt>` | S | **landed (PR3)** |
 | **G1.4** | `read_range` → `impl Read + Send` with `max_len` | M | proposed |
 | **G1.5** | `extract_to` streaming to disk | M | proposed |
-| **G1.6** | `close` / `Drop` | S | proposed |
-| **G1.7** | Tests: 1k-entry TAR page size 50; extract 1 file; read 4 KiB from 100 MiB member | M | proposed |
+| **G1.6** | `close` / `Drop` | S | **landed (PR3)** |
+| **G1.7** | Tests: 1k-entry TAR page size 50; extract 1 file; read 4 KiB from 100 MiB member | M | **paging subset landed (PR3)**; extract / `read_range` remain PR4 |
 
 ### Phase G2 — Index build as a library
 
@@ -1272,7 +1272,7 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 | ID | Task | Effort | Status |
 |---|---|---|---|
 | **G5.1** | `Session` is `Send` | S | proposed |
-| **G5.2** | Passwords: `secrecy` on boundary; skip `Debug` on `OpenOptions.passwords` (**PR3**) | S | proposed |
+| **G5.2** | Passwords: `secrecy` on boundary; skip `Debug` on `OpenOptions.passwords` (**PR3**) | S | **landed (PR3)** — `OpenOptions` Debug prints `passwords: [redacted N]` |
 | **G5.3** | After W2: cfg-gate factory `FormatBackend` / `use` lines; *then* default may shrink to TAR/ZIP/7z; no fuse/nfs/smb/http. Until then default = all L2 (PR2 compile) | M | proposed |
 | **G5.4** | Optional `http-export`: start/stop `--http` on a Session | M | proposed |
 | **G5.5** | `examples/session-list.rs` | S | proposed |

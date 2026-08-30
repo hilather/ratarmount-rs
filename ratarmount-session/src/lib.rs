@@ -7,7 +7,7 @@
 //!
 //! Archive factory glue (`open_path`, `build_mount_source_ex`) lives in
 //! [`factory`] so the CLI can share it. Embedders should use [`Session`], not
-//! the factory module, once `Session::open` lands.
+//! the factory module.
 //!
 //! Contract: types, [`Error`] (no `Busy`), [`Session`] (no [`Clone`]; share via
 //! [`std::sync::Arc`]). See `docs/session-api.md`.

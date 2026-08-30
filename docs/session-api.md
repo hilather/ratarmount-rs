@@ -10,19 +10,21 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 
 | Surface | This crate today | Lands |
 |---------|------------------|-------|
-| Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **stubbed / compile** | G0.1 |
-| `Error` (no `Busy`) | **stubbed / compile** | G0.1 |
-| `Session` struct (`Send + Sync`, no `Clone`) | **stub** — private placeholder fields | G0.1; I/O in G1 |
+| Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **compile** | G0.1 |
+| `Error` (no `Busy`) | **compile** | G0.1 |
+| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `Drop`** | G1.1–G1.3 / G1.6 |
 | `IndexJob` unit struct | **stub** | G0.1; `run` in G2 |
 | `RangeReader` | **stub** (no `Read` yet) | G1.4 |
-| `Session::open` / `open_with_job` | not implemented | G1.1 / G2 |
-| `list_dirents_page` / `lookup` | not implemented | G1.2 / G1.3 |
+| `Session::open` | **implemented** (catalog via `open_catalog_read_only`) | G1.1 |
+| `open_with_job` | not implemented | G2 |
+| `list_dirents_page` / `lookup` | **implemented** (SQL keyset; no `list()` dump) | G1.2 / G1.3 |
 | `read_range` / `extract_to` | not implemented | G1.4 / G1.5 |
 | `Session::find` | not implemented | G3 |
 | `IndexJob::run` | not implemented | G2 |
-| `resolve_index` | not implemented | G4 |
+| `resolve_index` | not implemented — Sibling still uses factory `resolve_index_location` | G4 / PR6 |
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
 | Format crates (TAR/ZIP/7z/… including libarchive/git) | default `formats` feature (full L2 set factory `use`s) | PR2 |
+| `OpenOptions` Debug | passwords printed as `[redacted N]` | G5.2 / PR3 |
 
 `cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
 
@@ -125,9 +127,15 @@ One `Session` holds **one** `SourceSpec` (GUI v1 = one archive per window). Mult
 
 Passwords are `secrecy::SecretString` on this boundary only. They are **not** threaded through `OpenOptions.passwords: Vec<String>` in v1 (that field stays plaintext for ZIP/7z member decrypt). Never log secrets.
 
-## `Session` methods (later PRs)
+## `Session` methods
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
+
+**Landed (G1.1 / G1.2 / G1.3 / G1.6):** `open`, `list_dirents_page`, `lookup`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`).
+
+**`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
+
+**Not in this slice:** `read_range`, `extract_to`, `find`, `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
 
 ```rust
 impl Session {
@@ -205,7 +213,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | `Temp` | Platform temp, unlinked on `Session` drop. Confirm in UI. **Not** the fallback when sibling fails. |
 | `CliCompat` | Today’s CLI/Python folder order, including `:memory:` last resort. Not a GUI policy id. |
 
-`resolve_index` (G4) is new. Existing `resolve_index_location` stays the Python/CLI helper. Until G4, session must not ship `:memory:` as the unwritable-sibling fallback.
+`resolve_index` (G4 / PR6) is new. Existing `resolve_index_location` stays the Python/CLI helper. **This slice does not implement `SiblingNotWritable`.** `IndexPolicy::Sibling` / `UserCache` / `CliCompat` still call factory `resolve_index_location`. `Recreate::Never` never falls back to `:memory:` (missing sidecar → `NotFound`; tarstats mismatch → `CorruptIndex`). Do not treat factory’s CLI `:memory:` last resort as the GUI unwritable-sibling policy — that lands in PR6.
 
 ## `local-index-v1` ≠ `meta-v3`
 
@@ -251,6 +259,6 @@ GUI v1 is **read-mostly**. Overlay write, live commit, and `--commit-overlay` ar
 
 ## Feature graph
 
-This crate is the **supported embedder API** (`Session`). Archive factory glue (`open_path`, `build_mount_source_ex`, nested openers, remote URL open) lives here as **`pub mod factory`** so the CLI can share it without importing a FUSE binary crate. Embedders should use `Session` once `Session::open` lands (G1); `factory` is public for the CLI.
+This crate is the **supported embedder API** (`Session`). Archive factory glue (`open_path`, `build_mount_source_ex`, nested openers, remote URL open) lives here as **`pub mod factory`** so the CLI can share it without importing a FUSE binary crate. Embedders should use `Session`; `factory` is public for the CLI.
 
 Default `formats` is the full L2 set factory already `use`s (TAR/ZIP/7z plus ar/asar/cab/cpio/ext4/fat/git/html/iso9660/libarchive/ogg/pdf/sqlar/squashfs/warc/xar + compress + compositing + remote). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); later `http-export`.
