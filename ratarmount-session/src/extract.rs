@@ -4,20 +4,18 @@ use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use ratarmount_core::{is_dir_mode, is_lnk_mode, query_normpath, FileInfo, UserData};
+use ratarmount_core::{
+    is_dir_mode, is_lnk_mode, query_normpath, read_exact_or_short, FileInfo, UserData,
+};
 
-use crate::read::fill_read;
+use crate::read::map_member_io;
 use crate::types::{DirCursor, ExtractProgress, ExtractRequest, Overwrite};
 use crate::{Error, Session};
 
-/// Copy buffer size. Extract never slurps a member into one `Vec`.
 const COPY_BUF: usize = 64 * 1024;
 /// Progress / cancel check interval while copying a member.
 const PROGRESS_EVERY: u64 = 8 * 1024 * 1024;
-/// Extract-all catalog keyset page (not a fat flatten of the payload set).
 const EXTRACT_ALL_PAGE: u32 = 1024;
-
-const DUMPDIR_DELETE_LINKNAME: &str = "\0GNU.dumpdir.delete";
 
 impl Session {
     /// Stream members to `req.dest_dir`. `progress` may be called between
@@ -61,6 +59,7 @@ impl Session {
         if let Some(cat) = self.catalog() {
             let mut after_path: Option<String> = None;
             let mut after_oh: Option<i64> = None;
+            let mut prev_path: Option<String> = None;
             loop {
                 if cancelled(cancel) {
                     return Err(Error::Cancelled);
@@ -75,12 +74,18 @@ impl Session {
                     if cancelled(cancel) {
                         return Err(Error::Cancelled);
                     }
+                    if prev_path.as_deref() == Some(row.fullpath.as_str()) {
+                        continue;
+                    }
                     self.extract_one_named(&row.fullpath, req, progress, cancel, state)?;
+                    prev_path = Some(row.fullpath.clone());
                 }
                 if (page.len() as u32) < EXTRACT_ALL_PAGE {
                     break;
                 }
-                let last = page.last().expect("non-empty page");
+                let Some(last) = page.last() else {
+                    break;
+                };
                 after_path = Some(last.fullpath.clone());
                 after_oh = Some(last.offsetheader);
             }
@@ -103,7 +108,7 @@ impl Session {
         let Some(fi) = self.mount_source().lookup(&lookup_path, 0) else {
             return Err(Error::NotFound);
         };
-        if is_dumpdir(&fi) || is_generated(&fi) {
+        if is_generated(&fi) {
             state.files_done += 1;
             emit(progress, state, Some(member.to_string()));
             return Ok(());
@@ -180,27 +185,42 @@ fn copy_member(
 ) -> Result<(), Error> {
     let mut src = session.mount_source().open(fi, 0).map_err(map_member_io)?;
     let mut out = std::fs::File::create(dest).map_err(|e| map_dest_io(e, dest))?;
-    let mut buf = [0u8; COPY_BUF];
-    let mut since_progress = 0u64;
-    loop {
-        let n = fill_read(&mut src, &mut buf).map_err(map_member_io)?;
-        if n == 0 {
-            break;
-        }
-        out.write_all(&buf[..n]).map_err(|e| map_dest_io(e, dest))?;
-        state.bytes_out += n as u64;
-        since_progress += n as u64;
-        if since_progress >= PROGRESS_EVERY {
+    let copy_res: Result<(), Error> = (|| {
+        let mut buf = [0u8; COPY_BUF];
+        let mut since_progress = 0u64;
+        loop {
             if cancelled(cancel) {
                 return Err(Error::Cancelled);
             }
+            let n = read_exact_or_short(&mut src, &mut buf).map_err(map_member_io)?;
+            if n == 0 {
+                break;
+            }
+            out.write_all(&buf[..n]).map_err(|e| map_dest_io(e, dest))?;
+            state.bytes_out += n as u64;
+            since_progress += n as u64;
+            if since_progress >= PROGRESS_EVERY {
+                if cancelled(cancel) {
+                    return Err(Error::Cancelled);
+                }
+                emit(progress, state, Some(member.to_string()));
+                since_progress = 0;
+            }
+        }
+        Ok(())
+    })();
+    match copy_res {
+        Ok(()) => {
+            state.files_done += 1;
             emit(progress, state, Some(member.to_string()));
-            since_progress = 0;
+            Ok(())
+        }
+        Err(e) => {
+            drop(out);
+            let _ = std::fs::remove_file(dest);
+            Err(e)
         }
     }
-    state.files_done += 1;
-    emit(progress, state, Some(member.to_string()));
-    Ok(())
 }
 
 fn emit(
@@ -222,10 +242,6 @@ fn cancelled(cancel: Option<&AtomicBool>) -> bool {
     cancel.is_some_and(|c| c.load(Ordering::Relaxed))
 }
 
-fn is_dumpdir(fi: &FileInfo) -> bool {
-    fi.linkname == DUMPDIR_DELETE_LINKNAME
-}
-
 fn is_generated(fi: &FileInfo) -> bool {
     fi.userdata.iter().rev().any(|ud| match ud {
         UserData::Tar(t) => t.isgenerated,
@@ -233,17 +249,32 @@ fn is_generated(fi: &FileInfo) -> bool {
     })
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SymlinkAction {
+    /// Leave dest untouched (non-Unix skip, or Skip when dest exists).
+    SkipUnchanged,
+    Write,
+}
+
+fn symlink_action(unix: bool, dest_exists: bool, overwrite: Overwrite) -> SymlinkAction {
+    if !unix {
+        return SymlinkAction::SkipUnchanged;
+    }
+    if dest_exists && matches!(overwrite, Overwrite::Skip) {
+        return SymlinkAction::SkipUnchanged;
+    }
+    SymlinkAction::Write
+}
+
 fn extract_symlink(dest: &Path, target: &str, overwrite: Overwrite) -> Result<(), Error> {
-    if dest.exists() {
-        match overwrite {
-            Overwrite::Skip => return Ok(()),
-            Overwrite::Replace => {
-                std::fs::remove_file(dest).map_err(|e| map_dest_io(e, dest))?;
-            }
-        }
+    if symlink_action(cfg!(unix), dest.exists(), overwrite) == SymlinkAction::SkipUnchanged {
+        return Ok(());
     }
     #[cfg(unix)]
     {
+        if dest.exists() {
+            std::fs::remove_file(dest).map_err(|e| map_dest_io(e, dest))?;
+        }
         std::os::unix::fs::symlink(target, dest).map_err(|e| map_dest_io(e, dest))?;
         Ok(())
     }
@@ -307,14 +338,6 @@ fn map_dest_io(e: io::Error, dest: &Path) -> Error {
     match e.kind() {
         io::ErrorKind::PermissionDenied => Error::NotWritable(dest.to_path_buf()),
         io::ErrorKind::NotFound => Error::NotFound,
-        _ => Error::Internal(e.to_string()),
-    }
-}
-
-fn map_member_io(e: io::Error) -> Error {
-    match e.kind() {
-        io::ErrorKind::NotFound => Error::NotFound,
-        io::ErrorKind::PermissionDenied => Error::Internal(format!("permission denied: {e}")),
         _ => Error::Internal(e.to_string()),
     }
 }
@@ -522,5 +545,139 @@ mod tests {
             )
             .unwrap_err();
         assert!(matches!(err, Error::Cancelled));
+    }
+
+    /// Regression: cancel mid-copy unlinks the truncated dest (Skip must not keep a tail).
+    #[test]
+    fn extract_to_cancel_unlinks_partial() {
+        const BIG: u64 = 9 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("big.bin");
+        {
+            let f = std::fs::File::create(&payload).unwrap();
+            f.set_len(BIG).unwrap();
+        }
+        let tar = dir.path().join("big.tar");
+        {
+            let mut f = std::fs::File::create(&tar).unwrap();
+            write_ustar_members(
+                &mut f,
+                &[UstarMember {
+                    path: "big.bin",
+                    payload: UstarPayload::FileOnDisk {
+                        path: &payload,
+                        size: BIG,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+            write_tar_eof(&mut f).unwrap();
+            f.flush().unwrap();
+        }
+        let idx = dir.path().join("big.tar.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .unwrap();
+        let dest = dir.path().join("out");
+        let out_file = dest.join("big.bin");
+        let cancel = AtomicBool::new(false);
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/big.bin".into()],
+                    dest_dir: dest,
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                Some(&|p| {
+                    if p.bytes_out >= PROGRESS_EVERY {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }),
+                Some(&cancel),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert!(
+            !out_file.exists(),
+            "Cancelled copy must unlink dest, got exists={}",
+            out_file.exists()
+        );
+    }
+
+    #[test]
+    fn extract_symlink_replace_skips_dest_on_non_unix() {
+        assert_eq!(
+            symlink_action(false, true, Overwrite::Replace),
+            SymlinkAction::SkipUnchanged
+        );
+        assert_eq!(
+            symlink_action(false, false, Overwrite::Replace),
+            SymlinkAction::SkipUnchanged
+        );
+        assert_eq!(
+            symlink_action(true, true, Overwrite::Skip),
+            SymlinkAction::SkipUnchanged
+        );
+        assert_eq!(
+            symlink_action(true, true, Overwrite::Replace),
+            SymlinkAction::Write
+        );
+        assert_eq!(
+            symlink_action(true, false, Overwrite::Replace),
+            SymlinkAction::Write
+        );
+    }
+
+    #[test]
+    fn extract_to_encrypted_7z_is_bad_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("encrypted-hello.7z");
+        std::fs::write(
+            &archive,
+            include_bytes!("../../ratarmount-formats-sevenzip/testdata/encrypted-hello.7z"),
+        )
+        .unwrap();
+        let idx = dir.path().join("encrypted-hello.7z.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(archive),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("metadata-only 7z open");
+        let dest = dir.path().join("out");
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/secret.txt".into()],
+                    dest_dir: dest,
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::BadPassword),
+            "expected BadPassword, got {err:?}"
+        );
     }
 }

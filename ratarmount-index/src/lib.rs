@@ -1853,15 +1853,11 @@ impl SqliteIndex {
         Ok((rows, next_name, total_hint))
     }
 
-    /// Keyset page of extract-all payload members.
+    /// Keyset page of extract-all payload members (newest-wins per `fullpath`).
     ///
-    /// `ORDER BY fullpath, offsetheader` with
-    /// `AND (fullpath > ? OR (fullpath = ? AND COALESCE(offsetheader,-1) > ?))`.
-    /// Skips `isgenerated`, GNU dumpdir tombstones, and directories.
-    /// Does **not** call [`Self::list_visible_files_by_offset`] or [`Self::list`].
-    ///
-    /// `after_path` / `after_offsetheader` are exclusive (pass the last row of
-    /// the previous page). `None` starts at the beginning (`fullpath > ''`).
+    /// `ORDER BY fullpath` with exclusive `fullpath > ?`. Skips `isgenerated`,
+    /// GNU dumpdir tombstones, and directories. `after_offsetheader` is accepted
+    /// for the caller keyset but membership is one row per path.
     pub fn list_extract_payload_page(
         &self,
         after_path: Option<&str>,
@@ -1873,7 +1869,7 @@ impl SqliteIndex {
         }
         let dumpdir = crate::search::DUMPDIR_DELETE_LINKNAME;
         let after_fp = after_path.unwrap_or("");
-        let after_oh = after_offsetheader.unwrap_or(-1);
+        let _ = after_offsetheader;
         let limit_i64 = i64::from(limit.min(MAX_DIR_PAGE));
         self.with_conn(|conn| {
             let mut stmt = conn.prepare_cached(
@@ -1885,17 +1881,25 @@ impl SqliteIndex {
                         THEN '/' || "name"
                       ELSE "path" || '/' || "name"
                     END AS fullpath,
-                    "offsetheader" AS offsetheader
+                    "offsetheader" AS offsetheader,
+                    ROW_NUMBER() OVER (
+                      PARTITION BY CASE
+                        WHEN "path" IS NULL OR "path" = '' OR "path" = '/'
+                          THEN '/' || "name"
+                        ELSE "path" || '/' || "name"
+                      END
+                      ORDER BY COALESCE("offsetheader", -1) DESC
+                    ) AS rn
                   FROM "files"
                   WHERE COALESCE("isgenerated", 0) = 0
                     AND COALESCE("linkname", '') != ?1
                     AND "name" != ''
                     AND (COALESCE("mode", 0) & ?2) != ?3
                 )
-                WHERE fullpath > ?4
-                   OR (fullpath = ?4 AND COALESCE(offsetheader, -1) > ?5)
-                ORDER BY fullpath, offsetheader
-                LIMIT ?6
+                WHERE rn = 1
+                  AND fullpath > ?4
+                ORDER BY fullpath
+                LIMIT ?5
                 "#,
             )?;
             let mut q = stmt.query(params![
@@ -1903,7 +1907,6 @@ impl SqliteIndex {
                 i64::from(S_IFMT),
                 i64::from(S_IFDIR),
                 after_fp,
-                after_oh,
                 limit_i64,
             ])?;
             let mut out = Vec::new();
@@ -4740,5 +4743,16 @@ mod tests {
         );
         assert!(all.iter().any(|r| r.fullpath == "/n00.txt"));
         assert!(all.iter().any(|r| r.fullpath == "/nullonly.txt"));
+        let mut uniq: Vec<_> = all.iter().map(|r| r.fullpath.as_str()).collect();
+        uniq.sort();
+        uniq.dedup();
+        assert_eq!(
+            uniq.len(),
+            all.len(),
+            "newest-wins extract-all must not repeat fullpath"
+        );
+        let n00: Vec<_> = all.iter().filter(|r| r.fullpath == "/n00.txt").collect();
+        assert_eq!(n00.len(), 1);
+        assert_eq!(n00[0].offsetheader, 100, "higher offsetheader wins");
     }
 }

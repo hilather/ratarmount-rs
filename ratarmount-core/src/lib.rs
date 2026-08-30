@@ -540,7 +540,8 @@ pub trait MountSource: Send + Sync {
     fn close(&mut self) {}
 }
 
-fn read_exact_or_short(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
+/// Fill `buf` from `r`. A short `Read::read` is not EOF.
+pub fn read_exact_or_short(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
     let mut filled = 0;
     while filled < buf.len() {
         match r.read(&mut buf[filled..]) {
@@ -630,6 +631,24 @@ mod tests {
         assert_eq!(normpath("/foo/./bar"), "/foo/bar");
         assert_eq!(normpath("/"), "/");
         assert_eq!(normpath(""), "/");
+    }
+
+    #[test]
+    fn read_exact_or_short_assembles_one_byte_reads() {
+        struct OneByte(std::io::Cursor<&'static [u8]>);
+        impl Read for OneByte {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if buf.is_empty() {
+                    return Ok(0);
+                }
+                self.0.read(&mut buf[..1])
+            }
+        }
+        let mut r = OneByte(std::io::Cursor::new(b"abcd"));
+        let mut buf = [0u8; 4];
+        let n = read_exact_or_short(&mut r, &mut buf).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(&buf, b"abcd");
     }
 
     #[test]

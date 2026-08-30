@@ -2,14 +2,12 @@
 
 use std::io::{self, Read, Seek, SeekFrom};
 
-use ratarmount_core::ArchiveRead;
+use ratarmount_core::{query_normpath, read_exact_or_short, ArchiveRead};
 
 use crate::types::ReadRequest;
 use crate::{Error, Session};
 
 /// Seek + capped `Read + Send`. Never holds the member as `Vec<u8>`.
-///
-/// There is no `read_all`. Not `Sync`.
 pub struct RangeReader {
     inner: Box<dyn ArchiveRead>,
     remaining: u64,
@@ -24,20 +22,6 @@ impl RangeReader {
     }
 }
 
-/// Fill `buf` from `r`. A short `Read::read` is not EOF.
-pub(crate) fn fill_read(r: &mut dyn Read, buf: &mut [u8]) -> io::Result<usize> {
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match r.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(filled)
-}
-
 impl Read for RangeReader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
         if self.remaining == 0 || buf.is_empty() {
@@ -46,7 +30,7 @@ impl Read for RangeReader {
         let cap = usize::try_from(self.remaining)
             .unwrap_or(usize::MAX)
             .min(buf.len());
-        let n = fill_read(&mut self.inner, &mut buf[..cap])?;
+        let n = read_exact_or_short(&mut self.inner, &mut buf[..cap])?;
         self.remaining -= n as u64;
         Ok(n)
     }
@@ -55,12 +39,12 @@ impl Read for RangeReader {
 impl Session {
     /// Seek + bounded reader. Never returns the member as `Vec<u8>`.
     ///
-    /// Does not call [`ratarmount_core::MountSource::read`] (that allocates a
-    /// `Vec`). `max_len == 0` yields an empty reader after a successful lookup.
+    /// `max_len == 0` yields an empty reader after a successful lookup.
     pub fn read_range(&self, req: ReadRequest) -> Result<RangeReader, Error> {
+        let path = query_normpath(&req.path);
         let fi = self
             .mount_source()
-            .lookup(&req.path, 0)
+            .lookup(&path, 0)
             .ok_or(Error::NotFound)?;
         if req.max_len == 0 {
             return Ok(RangeReader::empty());
@@ -76,10 +60,18 @@ impl Session {
     }
 }
 
-fn map_member_io(e: io::Error) -> Error {
+/// `PermissionDenied` + "password" → [`Error::BadPassword`] (encrypted member open).
+pub(crate) fn map_member_io(e: io::Error) -> Error {
     match e.kind() {
         io::ErrorKind::NotFound => Error::NotFound,
-        io::ErrorKind::PermissionDenied => Error::Internal(format!("permission denied: {e}")),
+        io::ErrorKind::PermissionDenied => {
+            let msg = e.to_string();
+            if msg.to_ascii_lowercase().contains("password") {
+                Error::BadPassword
+            } else {
+                Error::Internal(format!("permission denied: {e}"))
+            }
+        }
         _ => Error::Internal(e.to_string()),
     }
 }
@@ -88,10 +80,11 @@ fn map_member_io(e: io::Error) -> Error {
 mod tests {
     use super::*;
     use crate::types::{IndexPolicy, OpenRequest, Recreate, SourceSpec};
+    use ratarmount_core::{FileInfo, MountSource, UserData, S_IFREG};
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
     use std::io::Write;
     use std::path::Path;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
@@ -203,13 +196,100 @@ mod tests {
         let mut z = Vec::new();
         empty.read_to_end(&mut z).unwrap();
         assert!(z.is_empty());
+
+        // Spy: MountSource::read would slurp; inner bytes must stay at max_len.
+        struct CountedZero {
+            pos: u64,
+            len: u64,
+            inner_bytes: Arc<AtomicU64>,
+        }
+        impl Read for CountedZero {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let left = self.len.saturating_sub(self.pos);
+                let n = usize::try_from(left).unwrap_or(usize::MAX).min(buf.len());
+                buf[..n].fill(0);
+                self.pos += n as u64;
+                self.inner_bytes.fetch_add(n as u64, Ordering::SeqCst);
+                Ok(n)
+            }
+        }
+        impl Seek for CountedZero {
+            fn seek(&mut self, from: SeekFrom) -> io::Result<u64> {
+                let next = match from {
+                    SeekFrom::Start(o) => o,
+                    SeekFrom::Current(d) => (self.pos as i64).saturating_add(d) as u64,
+                    SeekFrom::End(d) => (self.len as i64).saturating_add(d) as u64,
+                };
+                self.pos = next.min(self.len);
+                Ok(self.pos)
+            }
+        }
+        struct SpySrc {
+            len: u64,
+            inner_bytes: Arc<AtomicU64>,
+        }
+        impl MountSource for SpySrc {
+            fn list(&self, _path: &str) -> Option<ratarmount_core::ListResult> {
+                None
+            }
+            fn lookup(&self, path: &str, _file_version: i32) -> Option<FileInfo> {
+                if path != "/big.bin" {
+                    return None;
+                }
+                Some(FileInfo {
+                    size: self.len,
+                    mtime: 0.0,
+                    mode: S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![UserData::Other("spy".into())],
+                })
+            }
+            fn open(
+                &self,
+                _file_info: &FileInfo,
+                _buffering: i32,
+            ) -> io::Result<Box<dyn ArchiveRead>> {
+                Ok(Box::new(CountedZero {
+                    pos: 0,
+                    len: self.len,
+                    inner_bytes: Arc::clone(&self.inner_bytes),
+                }))
+            }
+            fn read(
+                &self,
+                _file_info: &FileInfo,
+                _size: usize,
+                _offset: u64,
+            ) -> io::Result<Vec<u8>> {
+                panic!("read_range must not call MountSource::read");
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let inner_bytes = Arc::new(AtomicU64::new(0));
+        let spy = Session::from_local_source(Arc::new(SpySrc {
+            len: BIG,
+            inner_bytes: Arc::clone(&inner_bytes),
+        }));
+        let mut r = spy
+            .read_range(ReadRequest {
+                path: "/big.bin".into(),
+                offset: 0,
+                max_len: CAP as u64,
+            })
+            .unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf.len(), CAP);
+        assert_eq!(inner_bytes.load(Ordering::SeqCst), CAP as u64);
     }
 
     /// Short inner `Read::read` is not EOF; fill-loop assembles the cap.
     #[test]
     fn read_range_fill_loop() {
-        use ratarmount_core::{FileInfo, MountSource, UserData, S_IFREG};
-
         struct OneByte(io::Cursor<Vec<u8>>);
         impl Read for OneByte {
             fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
@@ -300,5 +380,69 @@ mod tests {
             Ok(_) => panic!("expected NotFound"),
         };
         assert!(matches!(err, Error::NotFound));
+    }
+
+    #[test]
+    fn read_range_query_normpath() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = open_tar(dir.path(), "n.tar", &[member_file("a.txt", b"hi")]);
+        let mut r = session
+            .read_range(ReadRequest {
+                path: "a.txt".into(),
+                offset: 0,
+                max_len: 2,
+            })
+            .expect("unnormalized path");
+        let mut got = Vec::new();
+        r.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hi");
+    }
+
+    #[test]
+    fn map_member_io_password_is_bad_password() {
+        let e = io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "password required to open encrypted 7z member; pass --password / --password-file",
+        );
+        assert!(matches!(map_member_io(e), Error::BadPassword));
+        let other = io::Error::new(io::ErrorKind::PermissionDenied, "chmod 000");
+        assert!(matches!(map_member_io(other), Error::Internal(_)));
+    }
+
+    #[test]
+    fn read_range_encrypted_7z_is_bad_password() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("encrypted-hello.7z");
+        std::fs::write(
+            &archive,
+            include_bytes!("../../ratarmount-formats-sevenzip/testdata/encrypted-hello.7z"),
+        )
+        .unwrap();
+        let idx = dir.path().join("encrypted-hello.7z.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(archive),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("metadata-only 7z open");
+        let hit = session.lookup("/secret.txt").unwrap().expect("listed");
+        assert!(hit.size > 0);
+        let err = match session.read_range(ReadRequest {
+            path: "/secret.txt".into(),
+            offset: 0,
+            max_len: 16,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("encrypted member must not open without password"),
+        };
+        assert!(
+            matches!(err, Error::BadPassword),
+            "expected BadPassword, got {err:?}"
+        );
     }
 }
