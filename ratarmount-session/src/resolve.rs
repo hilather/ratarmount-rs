@@ -27,7 +27,8 @@ pub(crate) fn temp_index_path() -> PathBuf {
 /// and [`IndexPolicy::CliCompat`] last resort (Python parity).
 ///
 /// [`IndexPolicy::UserCache`] writes `{hex}.sqlite` under `local-index-v1/`
-/// (never `meta-v3/`). URL sources are left to remote discovery (`meta-v3`).
+/// (never `meta-v3/`, never CliCompat flattened XDG). URL sources pin the same
+/// dest so factory cannot pick `default_index_folders`.
 pub fn resolve_index(
     archive: &Path,
     policy: IndexPolicy,
@@ -84,7 +85,8 @@ mod tests {
     use crate::Session;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
     use ratarmount_index::{
-        default_index_path, is_local_index_cache_path, is_meta_cache_path, LOCAL_INDEX_DIR_ENV,
+        default_index_folders, default_index_path, is_local_index_cache_path, is_meta_cache_path,
+        possible_index_paths, LOCAL_INDEX_DIR_ENV,
     };
     use std::io::Write;
     use std::sync::Mutex;
@@ -374,33 +376,46 @@ mod tests {
         });
     }
 
-    /// Regression: scheme:// UserCache must not mkdir URL parents or write local-index-v1.
+    fn flattened_xdg_created(url: &Path) -> Option<PathBuf> {
+        possible_index_paths(url, &default_index_folders())
+            .into_iter()
+            .find(|p| {
+                let s = p.to_string_lossy();
+                (s.contains("http:__") || s.contains("https:__")) && p.exists()
+            })
+    }
+
+    /// Regression: UserCache URL pins `{hex}.sqlite`, not flattened XDG `http:__*`.
     #[test]
-    fn resolve_user_cache_url_does_not_write_local_index_or_mkdir() {
+    fn resolve_user_cache_url_does_not_write_flattened_xdg() {
         with_user_cache_env(|cache_dir| {
             let marker = format!("ratarmount-pr7-{}-url", std::process::id());
             let archive = PathBuf::from(format!("https://{marker}.example.invalid/a.tar"));
-            let err =
-                resolve_index(&archive, IndexPolicy::UserCache, None, &[], false).unwrap_err();
-            match err {
-                Error::Internal(msg) => {
-                    assert!(msg.contains("local-index-v1"), "{msg}");
-                    assert!(msg.contains("meta-v3"), "{msg}");
-                }
-                other => panic!("expected Internal for URL UserCache, got {other:?}"),
-            }
+            let loc = resolve_index(&archive, IndexPolicy::UserCache, None, &[], false)
+                .expect("UserCache URL must pin local-index-v1");
+            let idx = loc.as_path().expect("UserCache URL must be a path");
+            assert!(
+                idx.starts_with(cache_dir) && is_local_index_cache_path(idx),
+                "sidecar {} must live in local-index-v1 {}",
+                idx.display(),
+                cache_dir.display()
+            );
+            let name = idx.file_name().unwrap().to_string_lossy();
+            let hex = name.strip_suffix(".sqlite").unwrap_or("");
+            assert_eq!(hex.len(), 64, "{name}");
+            assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+            assert!(!name.contains("http"), "{name}");
             assert!(
                 !url_scheme_leak(&marker),
                 "resolve_index UserCache must not mkdir URL parents"
             );
             assert!(
-                std::fs::read_dir(cache_dir)
-                    .map(|it| it.count() == 0)
-                    .unwrap_or(true),
-                "URL UserCache must not write local-index-v1"
+                flattened_xdg_created(&archive).is_none(),
+                "must not write flattened XDG"
             );
 
             let url = format!("http://127.0.0.1:1/{marker}.example.invalid/a.tar");
+            let url_path = PathBuf::from(&url);
             let open_err = match Session::open(OpenRequest {
                 source: SourceSpec::Url(url),
                 index: IndexPolicy::UserCache,
@@ -422,11 +437,14 @@ mod tests {
                 !url_scheme_leak(&marker),
                 "Session::open UserCache must not mkdir URL parents"
             );
+            if let Some(p) = flattened_xdg_created(&url_path) {
+                let _ = std::fs::remove_file(&p);
+                panic!("UserCache must not write flattened XDG {}", p.display());
+            }
             assert!(
-                std::fs::read_dir(cache_dir)
-                    .map(|it| it.count() == 0)
-                    .unwrap_or(true),
-                "Session URL UserCache must not write local-index-v1"
+                !is_meta_cache_path(idx),
+                "UserCache URL dest must not be meta-v3: {}",
+                idx.display()
             );
         });
     }

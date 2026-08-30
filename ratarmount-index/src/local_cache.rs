@@ -16,9 +16,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use log::debug;
 use serde::{Deserialize, Serialize};
 
-use crate::location::{
-    looks_like_url_archive, path_is_usable_existing_index, possible_index_paths, IndexLocation,
-};
+use crate::location::{path_is_usable_existing_index, possible_index_paths, IndexLocation};
 use crate::sha256_hex;
 
 /// Env cap for the LRU directory. `0` disables writes. Default [`LOCAL_INDEX_CACHE_BYTES_DEFAULT`].
@@ -88,6 +86,8 @@ impl LocalIndexCache {
             return None;
         }
         self.touch(&key, &id);
+        // WHY: allocate evicts before the sqlite body exists; remounts must trim.
+        let _ = self.enforce_budget();
         debug!("local-index-v1 hit {key} -> {}", sqlite.display());
         Some(sqlite)
     }
@@ -200,6 +200,7 @@ impl LocalIndexCache {
             return Ok(());
         }
         entries.sort_by_key(|e| e.last_open_unix);
+        let mut remaining = entries.len();
         for e in entries {
             if used <= max_used {
                 break;
@@ -207,12 +208,17 @@ impl LocalIndexCache {
             if keep == Some(e.key.as_str()) {
                 continue;
             }
+            // Single entry larger than the cap stays (cannot get under otherwise).
+            if remaining <= 1 {
+                break;
+            }
             debug!(
                 "local-index-v1 evict {} ({} bytes, last_open_unix {})",
                 e.key, e.len, e.last_open_unix
             );
             self.invalidate_key(&e.key);
             used = used.saturating_sub(e.len);
+            remaining = remaining.saturating_sub(1);
         }
         Ok(())
     }
@@ -300,19 +306,22 @@ pub fn is_local_index_cache_path(path: &Path) -> bool {
 }
 
 /// Extra-dirs existing files, then a `local-index-v1` hit. Never sibling well-known.
+///
+/// URL archives use the same sha256 identity (path string, size/mtime/file_id 0
+/// when there is no local file) so UserCache does not fall through to the legacy
+/// flattened `$XDG_CACHE_HOME/ratarmount/*.index.sqlite` parent.
 pub fn find_existing_user_cache_index(archive: &Path, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
     if let Some(p) = find_existing_extra_dir_index(archive, extra_dirs) {
         return Some(p);
-    }
-    if looks_like_url_archive(archive) {
-        return None;
     }
     LocalIndexCache::from_env().lookup(archive)
 }
 
 /// User-cache create/load path. Never `:memory:`. Never `meta-v3/`.
 ///
-/// URL archives are not stored here (remote sidecar LRU is `meta-v3`).
+/// URL sources pin `{hex}.sqlite` here (identity is the URL string). Remote
+/// sidecar **downloads** still live in `meta-v3/`; discovery may copy a hit
+/// onto this dest. Never the CliCompat flattened XDG parent.
 pub fn resolve_user_cache_index_location(
     archive: &Path,
     extra_dirs: &[PathBuf],
@@ -323,11 +332,6 @@ pub fn resolve_user_cache_index_location(
             return Ok(IndexLocation::Path(p));
         }
     }
-    if looks_like_url_archive(archive) {
-        return Err(io::Error::other(
-            "IndexPolicy::UserCache for URL sources uses remote meta-v3 discovery, not local-index-v1",
-        ));
-    }
     let cache = LocalIndexCache::from_env();
     if !recreate {
         if let Some(p) = cache.lookup(archive) {
@@ -335,6 +339,14 @@ pub fn resolve_user_cache_index_location(
         }
     }
     cache.allocate(archive).map(IndexLocation::Path)
+}
+
+/// After factory `publish_tmp` of a UserCache sidecar, trim the LRU.
+pub fn enforce_local_index_budget_if_path(path: &Path) {
+    if !is_local_index_cache_path(path) {
+        return;
+    }
+    let _ = LocalIndexCache::from_env().enforce_budget();
 }
 
 fn find_existing_extra_dir_index(archive: &Path, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
@@ -740,19 +752,65 @@ mod tests {
         assert!(!cache.dir.exists());
     }
 
+    /// Regression: UserCache URL pins `{hex}.sqlite`, not flattened XDG `http:__*`.
     #[test]
-    fn local_index_resolve_user_cache_skips_url_and_meta_v3() {
-        let extra = tempfile::tempdir().unwrap();
-        let err = resolve_user_cache_index_location(
-            Path::new("https://example.invalid/a.tar"),
-            &[extra.path().to_path_buf()],
-            false,
-        )
-        .unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("local-index-v1"), "{msg}");
-        assert!(msg.contains("meta-v3"), "{msg}");
-        assert!(!Path::new("https:").exists(), "must not mkdir URL parents");
+    fn local_index_resolve_user_cache_url_pins_sha256_not_flattened() {
+        let _g = crate::meta_cache::ENV_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let cache_dir = tempfile::tempdir().unwrap();
+        let xdg = tempfile::tempdir().unwrap();
+        let old_dir = std::env::var_os(LOCAL_INDEX_DIR_ENV);
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var(LOCAL_INDEX_DIR_ENV, cache_dir.path());
+        std::env::set_var("XDG_CACHE_HOME", xdg.path());
+        let archive = Path::new("https://example.invalid/a.tar");
+        let loc = resolve_user_cache_index_location(archive, &[], false).unwrap();
+        let p = loc.as_path().unwrap().to_path_buf();
+        let name = p.file_name().unwrap().to_string_lossy().into_owned();
+        let flattened = possible_index_paths(archive, &[xdg.path().join("ratarmount")]);
+        let flattened_exists = flattened.iter().any(|f| f.exists());
+        let mkdir_https = Path::new("https:").exists();
+        match old_dir {
+            Some(v) => std::env::set_var(LOCAL_INDEX_DIR_ENV, v),
+            None => std::env::remove_var(LOCAL_INDEX_DIR_ENV),
+        }
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        assert!(p.starts_with(cache_dir.path()), "{}", p.display());
+        let hex = name.strip_suffix(".sqlite").unwrap_or("");
+        assert_eq!(hex.len(), 64, "{name}");
+        assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()), "{name}");
+        assert!(!name.contains("http"), "{name}");
+        assert!(
+            !flattened_exists,
+            "must not write flattened XDG {flattened:?}"
+        );
+        assert!(!mkdir_https, "must not mkdir URL parents");
+        assert!(!is_meta_cache_path(&p), "{}", p.display());
+    }
+
+    /// Regression: two published sqlites over the cap drop the oldest without a third key.
+    #[test]
+    fn local_index_cache_enforce_budget_after_publish_without_third_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), 4);
+        let a = write_archive(dir.path(), "a.tar", b"aaaa");
+        let b = write_archive(dir.path(), "b.tar", b"bbbb");
+        let pa = cache.allocate(&a).unwrap();
+        fs::write(&pa, b"aaaa").unwrap();
+        let pb = cache.allocate(&b).unwrap();
+        fs::write(&pb, b"bbbb").unwrap();
+        set_last_open(&cache, &pa, 100);
+        set_last_open(&cache, &pb, 1);
+        cache.lookup(&a).unwrap();
+        assert!(pa.is_file(), "newer a must survive lookup trim");
+        assert!(
+            !pb.is_file(),
+            "oldest b must be evicted on lookup without allocating a third key"
+        );
     }
 
     #[test]

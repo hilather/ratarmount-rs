@@ -10,8 +10,9 @@ use ratarmount_core::{
     OpenOptions, UserData,
 };
 use ratarmount_index::{
-    find_existing_sibling_index, find_existing_user_cache_index, looks_like_url_archive,
-    IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE,
+    enforce_local_index_budget_if_path, find_existing_sibling_index,
+    find_existing_user_cache_index, looks_like_url_archive, IndexError, IndexLocation, PagedDirent,
+    SqliteIndex, MAX_DIR_PAGE,
 };
 use secrecy::ExposeSecret;
 
@@ -107,8 +108,8 @@ impl Session {
     ///
     /// [`IndexPolicy::Sibling`] + unwritable parent → [`Error::SiblingNotWritable`]
     /// (never `:memory:`). [`IndexPolicy::UserCache`] stores `{hex}.sqlite` under
-    /// `local-index-v1/` (never `meta-v3/`). [`Recreate::Never`] never builds and
-    /// never falls back to `:memory:`.
+    /// `local-index-v1/` (never `meta-v3/`, never the flattened XDG parent).
+    /// [`Recreate::Never`] never builds and never falls back to `:memory:`.
     pub fn open(req: OpenRequest) -> Result<Self, Error> {
         Self::open_with_job(req, &IndexBuildHooks::default())
     }
@@ -157,12 +158,6 @@ impl Session {
             match find_existing_sibling_index(&archive_path, &req.extra_dirs) {
                 Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
                 // Leave index_file_path unset so remote sibling GET can run.
-                None => (CatalogLoc::None, None, false, None),
-            }
-        } else if req.index == IndexPolicy::UserCache && remote_archive {
-            match find_existing_user_cache_index(&archive_path, &req.extra_dirs) {
-                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
-                // Leave unbound so remote sibling GET can populate meta-v3.
                 None => (CatalogLoc::None, None, false, None),
             }
         } else {
@@ -244,6 +239,10 @@ impl Session {
         )
         .map_err(|e| map_factory_error(e, had_passwords, &archive_path))?;
         let source = OpenedSource::Bundle(bundle);
+        if let Some(p) = loc.path() {
+            // WHY: allocate evicts before the sqlite body exists; trim after publish.
+            enforce_local_index_budget_if_path(p);
+        }
 
         let catalog = open_catalog_if_path(&loc)?;
         if let Some(g) = &mut temp_guard {

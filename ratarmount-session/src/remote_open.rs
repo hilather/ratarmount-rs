@@ -11,9 +11,9 @@ use ratarmount_compositing::OciImageMountSource;
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     cache_identity, check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
-    invalidate_meta_cache_identity, is_meta_cache_path, materialize_index_file,
-    object_store_sibling_index_candidates, parse_index_pointer_json, parse_link_describedby,
-    resolve_index_location, sha256_hex_stream, sibling_index_candidates,
+    invalidate_meta_cache_identity, is_local_index_cache_path, is_meta_cache_path,
+    materialize_index_file, object_store_sibling_index_candidates, parse_index_pointer_json,
+    parse_link_describedby, resolve_index_location, sha256_hex_stream, sibling_index_candidates,
     sibling_index_id_candidates, sibling_index_pointer_url, MetaCache, SqliteIndex,
     TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
@@ -37,17 +37,27 @@ fn apply_remote_index_discovery(
     if recreate || opts.clear_index_cache || opts.index_in_memory {
         return;
     }
-    if opts.index_file_path.is_some() {
-        return;
-    }
-    let loc = resolve_index_location(Path::new(input), None, &opts.index_folders, false);
-    if let Some(p) = loc.as_path() {
+    let cache_dest = if let Some(p) = opts.index_file_path.as_ref() {
         if path_is_nonempty_file(p) {
-            log::debug!("local index cache hit; skip remote discovery ({input})");
             return;
         }
-    }
-    let cache_dest = loc.as_path().map(Path::to_path_buf);
+        // WHY: UserCache pins `{hex}.sqlite` so CliCompat cannot pick the
+        // legacy flattened `$XDG_CACHE_HOME/ratarmount/*.index.sqlite` parent.
+        // A missing v1 dest still GETs; CLI `--index-file` (not v1) skips discovery.
+        if !is_local_index_cache_path(p) {
+            return;
+        }
+        Some(p.clone())
+    } else {
+        let loc = resolve_index_location(Path::new(input), None, &opts.index_folders, false);
+        if let Some(p) = loc.as_path() {
+            if path_is_nonempty_file(p) {
+                log::debug!("local index cache hit; skip remote discovery ({input})");
+                return;
+            }
+        }
+        loc.as_path().map(Path::to_path_buf)
+    };
 
     if input.starts_with("http://") || input.starts_with("https://") {
         if try_http_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
@@ -1965,6 +1975,64 @@ mod tests {
                 "gzip tarstats fail must invalidate XDG and GET again (got {gets1} then {gets2})"
             );
             drop(http._join);
+        });
+    }
+
+    /// Regression: UserCache dest is `{hex}.sqlite` under local-index-v1, not flattened XDG.
+    #[test]
+    fn apply_remote_index_user_cache_dest_skips_flattened_xdg() {
+        with_isolated_xdg(|| {
+            let cache = tempfile::tempdir().unwrap();
+            let old_dir = std::env::var_os(ratarmount_index::LOCAL_INDEX_DIR_ENV);
+            std::env::set_var(ratarmount_index::LOCAL_INDEX_DIR_ENV, cache.path());
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'U'; 1024];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let index_bytes = make_sidecar_for(&archive);
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+            let url = format!("http://{}/archive.tar", http.addr);
+            let dest =
+                ratarmount_index::resolve_user_cache_index_location(Path::new(&url), &[], false)
+                    .unwrap()
+                    .as_path()
+                    .unwrap()
+                    .to_path_buf();
+            let mut opts = OpenOptions {
+                index_file_path: Some(dest.clone()),
+                index_folders: Vec::new(),
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            let got = opts.index_file_path.clone();
+            let flattened = ratarmount_index::possible_index_paths(
+                Path::new(&url),
+                &ratarmount_index::default_index_folders(),
+            );
+            let leaked = flattened.iter().find(|p| {
+                let s = p.to_string_lossy();
+                (s.contains("http:__") || s.contains("https:__")) && p.exists()
+            });
+            match old_dir {
+                Some(v) => std::env::set_var(ratarmount_index::LOCAL_INDEX_DIR_ENV, v),
+                None => std::env::remove_var(ratarmount_index::LOCAL_INDEX_DIR_ENV),
+            }
+            drop(http._join);
+            let got = got.expect("UserCache dest must still receive the sidecar");
+            assert_eq!(got, dest, "{}", got.display());
+            assert!(got.is_file(), "{}", got.display());
+            assert!(
+                ratarmount_index::is_local_index_cache_path(&got) || got.starts_with(cache.path()),
+                "{}",
+                got.display()
+            );
+            if let Some(p) = leaked {
+                let _ = fs::remove_file(p);
+                panic!("UserCache must not write flattened XDG {}", p.display());
+            }
         });
     }
 }

@@ -27,9 +27,9 @@ pub use hashing::{
     sha256_hex_stream, HASH_STREAM_CHUNK, SUPPORTED_HASH_ALGORITHMS,
 };
 pub use local_cache::{
-    find_existing_user_cache_index, is_local_index_cache_path, local_index_v1_dir,
-    resolve_user_cache_index_location, LocalIndexCache, LOCAL_INDEX_CACHE_BYTES_DEFAULT,
-    LOCAL_INDEX_CACHE_BYTES_ENV, LOCAL_INDEX_DIR_ENV,
+    enforce_local_index_budget_if_path, find_existing_user_cache_index, is_local_index_cache_path,
+    local_index_v1_dir, resolve_user_cache_index_location, LocalIndexCache,
+    LOCAL_INDEX_CACHE_BYTES_DEFAULT, LOCAL_INDEX_CACHE_BYTES_ENV, LOCAL_INDEX_DIR_ENV,
 };
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,

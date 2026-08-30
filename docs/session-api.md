@@ -223,7 +223,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | Policy | Where the 0.7.x sidecar lives |
 |--------|-------------------------------|
 | `Sibling` | `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else `{archive}.index.sqlite`. Parent not writable and no usable file → **`SiblingNotWritable`**. No auto-fallback to user cache or `:memory:`. `scheme://` sources are **not** local parents (`https://host` is not mkdir'd); `Session::open` leaves `index_file_path` unset so remote sibling GET can run. `Recreate::Never` + missing sidecar is **`NotFound`** even if the parent is unwritable. |
-| `UserCache` | `local-index-v1/` (`{sha256}.sqlite` + `{sha256}.json`, 2 GiB LRU). Extra dirs are load-only. URL sources stay unbound so remote sibling GET can fill `meta-v3`. Never writes local-archive indexes into `meta-v3`. |
+| `UserCache` | `local-index-v1/` (`{sha256}.sqlite` + `{sha256}.json`, 2 GiB LRU). Extra dirs are load-only. URL sources **pin** `{hex}.sqlite` (remote GET may copy a `meta-v3` hit onto it). Never flattened `$XDG_CACHE_HOME/ratarmount/*.index.sqlite`. Never writes local-archive indexes into `meta-v3`. |
 | `Explicit` | `OpenRequest.explicit_index` |
 | `Memory` | `:memory:` — tests / `RGUI_FAKE` only; GUI settings must not persist this |
 | `Temp` | Platform temp, unlinked on `Session` drop **and** on failed `open` (RAII guard). Unix pid dir is `0700`. Stale-pid sweep waits for G4. Confirm in UI. **Not** the fallback when sibling fails. |

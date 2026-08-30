@@ -17,8 +17,8 @@ pub enum IndexPolicy {
     /// `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else well-known
     /// `{archive}.index.sqlite`. Not writable → [`crate::Error::SiblingNotWritable`].
     Sibling,
-    /// `local-index-v1/` (local file://). Remote URL after sibling GET miss uses
-    /// `meta-v3/` (existing remote LRU). Never writes local sidecars into `meta-v3`.
+    /// `local-index-v1/` (`{sha256}.sqlite`). URL sources pin the same dest
+    /// (remote GET may copy a `meta-v3` hit onto it). Never flattened XDG.
     UserCache,
     /// Caller-chosen file ([`OpenRequest::explicit_index`]).
     Explicit,
