@@ -27,8 +27,9 @@ pub use hashing::{
 };
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,
-    expand_user, index_id_path, index_pointer_path, index_pointer_path_for_index_file,
-    is_index_url, load_index_pointer, local_sibling_index_candidates, materialize_index_file,
+    expand_user, find_existing_sibling_index, index_id_path, index_pointer_path,
+    index_pointer_path_for_index_file, is_index_url, load_index_pointer,
+    local_sibling_index_candidates, looks_like_url_archive, materialize_index_file,
     maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_folders,
     parse_index_id, parse_index_pointer_json, parse_link_describedby, path_can_create_index,
     path_is_usable_existing_index, pick_index_path, possible_index_paths, prune_index_snapshots,

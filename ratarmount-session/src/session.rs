@@ -9,7 +9,10 @@ use ratarmount_core::{
     is_dir_mode, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick, MountSource,
     OpenOptions, UserData,
 };
-use ratarmount_index::{IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE};
+use ratarmount_index::{
+    find_existing_sibling_index, looks_like_url_archive, IndexError, IndexLocation, PagedDirent,
+    SqliteIndex, MAX_DIR_PAGE,
+};
 use secrecy::ExposeSecret;
 
 use crate::factory::{self, CompositingOptions, MountBundle};
@@ -133,33 +136,51 @@ impl Session {
             SourceSpec::Path(p) => p.clone(),
             SourceSpec::Url(url) => PathBuf::from(url),
         };
-        let resolved = resolve_index(
-            &archive_path,
-            req.index,
-            req.explicit_index.as_deref(),
-            &req.extra_dirs,
-            recreate_flag,
-        )?;
-        if matches!(req.index, IndexPolicy::Sibling) && resolved.is_memory() {
-            return Err(Error::Internal(
-                "IndexPolicy::Sibling must not use :memory:".into(),
-            ));
-        }
+        let remote_archive =
+            matches!(&req.source, SourceSpec::Url(_)) || looks_like_url_archive(&archive_path);
 
-        let (loc, mut temp_guard, index_in_memory, index_file_path) = match (req.index, resolved) {
-            (IndexPolicy::Temp, IndexLocation::Path(p)) => (
-                CatalogLoc::Temp(p.clone()),
-                Some(TempSqliteGuard::new(p.clone())),
-                false,
-                Some(p),
-            ),
-            (IndexPolicy::Temp, IndexLocation::Memory) => {
+        let (loc, mut temp_guard, index_in_memory, index_file_path) = if req.index
+            == IndexPolicy::Sibling
+            && matches!(req.recreate, Recreate::Never)
+        {
+            match find_existing_sibling_index(&archive_path, &req.extra_dirs) {
+                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+                None => return Err(Error::NotFound),
+            }
+        } else if req.index == IndexPolicy::Sibling && remote_archive {
+            match find_existing_sibling_index(&archive_path, &req.extra_dirs) {
+                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+                // Leave index_file_path unset so remote sibling GET can run.
+                None => (CatalogLoc::None, None, false, None),
+            }
+        } else {
+            let resolved = resolve_index(
+                &archive_path,
+                req.index,
+                req.explicit_index.as_deref(),
+                &req.extra_dirs,
+                recreate_flag,
+            )?;
+            if matches!(req.index, IndexPolicy::Sibling) && resolved.is_memory() {
                 return Err(Error::Internal(
-                    "IndexPolicy::Temp must not use :memory:".into(),
+                    "IndexPolicy::Sibling must not use :memory:".into(),
                 ));
             }
-            (_, IndexLocation::Memory) => (CatalogLoc::Memory, None, true, None),
-            (_, IndexLocation::Path(p)) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+            match (req.index, resolved) {
+                (IndexPolicy::Temp, IndexLocation::Path(p)) => (
+                    CatalogLoc::Temp(p.clone()),
+                    Some(TempSqliteGuard::new(p.clone())),
+                    false,
+                    Some(p),
+                ),
+                (IndexPolicy::Temp, IndexLocation::Memory) => {
+                    return Err(Error::Internal(
+                        "IndexPolicy::Temp must not use :memory:".into(),
+                    ));
+                }
+                (_, IndexLocation::Memory) => (CatalogLoc::Memory, None, true, None),
+                (_, IndexLocation::Path(p)) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+            }
         };
 
         let options = OpenOptions {

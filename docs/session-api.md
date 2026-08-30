@@ -210,7 +210,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 
 | `Recreate` | Missing sidecar | tarstats mismatch |
 |------------|-----------------|-------------------|
-| `Never` | `NotFound` | `CorruptIndex` — never build, never `:memory:` |
+| `Never` | `NotFound` (including unwritable sibling parent) | `CorruptIndex` — never build, never `:memory:` |
 | `IfInvalid` | build (`IndexJob::run`) | build — **not** an error on `open` |
 | `Always` | build | build |
 
@@ -222,7 +222,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 
 | Policy | Where the 0.7.x sidecar lives |
 |--------|-------------------------------|
-| `Sibling` | `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else `{archive}.index.sqlite`. Parent not writable and no usable file → **`SiblingNotWritable`**. No auto-fallback to user cache or `:memory:`. |
+| `Sibling` | `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else `{archive}.index.sqlite`. Parent not writable and no usable file → **`SiblingNotWritable`**. No auto-fallback to user cache or `:memory:`. `scheme://` sources are **not** local parents (`https://host` is not mkdir'd); `Session::open` leaves `index_file_path` unset so remote sibling GET can run. `Recreate::Never` + missing sidecar is **`NotFound`** even if the parent is unwritable. |
 | `UserCache` | `local-index-v1/` (PR7). This slice returns `Internal` and does **not** write `meta-v3`. |
 | `Explicit` | `OpenRequest.explicit_index` |
 | `Memory` | `:memory:` — tests / `RGUI_FAKE` only; GUI settings must not persist this |

@@ -1174,6 +1174,13 @@ pub fn pick_index_path(archive: &Path, folders: &[PathBuf], recreate: bool) -> O
     None
 }
 
+/// True when `path` is a remote archive id (`scheme://…`), not a filesystem path.
+///
+/// Used so sibling create does not `create_dir_all("https://host")` in cwd.
+pub fn looks_like_url_archive(path: &Path) -> bool {
+    path.to_string_lossy().contains("://")
+}
+
 /// Local sibling sidecars: pointer snapshot then well-known `{archive}.index.sqlite`.
 pub fn local_sibling_index_candidates(archive: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -1201,11 +1208,37 @@ pub fn sibling_parent_dir(archive: &Path) -> PathBuf {
     }
 }
 
+/// Existing sibling pointer snapshot, well-known sidecar, then extra_dirs files.
+/// Never creates directories or probes writability.
+pub fn find_existing_sibling_index(archive: &Path, extra_dirs: &[PathBuf]) -> Option<PathBuf> {
+    for p in local_sibling_index_candidates(archive) {
+        if let Some(mp) = try_materialize_existing_index(&p) {
+            return Some(mp);
+        }
+    }
+    let extras: Vec<PathBuf> = extra_dirs
+        .iter()
+        .filter(|d| !d.as_os_str().is_empty())
+        .cloned()
+        .collect();
+    if extras.is_empty() {
+        return None;
+    }
+    let candidates = possible_index_paths(archive, &extras);
+    for p in &candidates {
+        if let Some(mp) = try_materialize_existing_index(p) {
+            return Some(mp);
+        }
+    }
+    None
+}
+
 /// Sibling-policy location: never `:memory:`.
 ///
 /// Existing pointer snapshot, then well-known sidecar, then existing files in
 /// non-empty `extra_dirs`. If none exist, return the well-known path when its
-/// parent is writable. Otherwise `Err(parent)` — session maps this to
+/// parent is writable. `scheme://` archives never mkdir; `Err(parent)` so
+/// callers can leave the sidecar unbound (remote sibling GET) or map to
 /// `SiblingNotWritable`. Does **not** create under `extra_dirs` or `local-index-v1`.
 pub fn resolve_sibling_index_location(
     archive: &Path,
@@ -1213,24 +1246,14 @@ pub fn resolve_sibling_index_location(
     recreate: bool,
 ) -> std::result::Result<IndexLocation, PathBuf> {
     if !recreate {
-        for p in local_sibling_index_candidates(archive) {
-            if let Some(mp) = try_materialize_existing_index(&p) {
-                return Ok(IndexLocation::Path(mp));
-            }
+        if let Some(p) = find_existing_sibling_index(archive, extra_dirs) {
+            return Ok(IndexLocation::Path(p));
         }
-        let extras: Vec<PathBuf> = extra_dirs
-            .iter()
-            .filter(|d| !d.as_os_str().is_empty())
-            .cloned()
-            .collect();
-        if !extras.is_empty() {
-            let candidates = possible_index_paths(archive, &extras);
-            for p in &candidates {
-                if let Some(mp) = try_materialize_existing_index(p) {
-                    return Ok(IndexLocation::Path(mp));
-                }
-            }
-        }
+    }
+
+    // Remote ids are not filesystem parents (`https://host` would mkdir in cwd).
+    if looks_like_url_archive(archive) {
+        return Err(sibling_parent_dir(archive));
     }
 
     let well_known = default_index_path(archive);
@@ -1327,8 +1350,16 @@ pub fn path_is_usable_existing_index(path: &Path) -> bool {
 }
 
 /// Parent of `path` exists (or can be created) and passes [`test_writable_dir`].
+///
+/// `scheme://` paths are never created (`https://host` is not a directory).
 pub fn path_can_create_index(path: &Path) -> bool {
+    if looks_like_url_archive(path) {
+        return false;
+    }
     if let Some(parent) = path.parent() {
+        if looks_like_url_archive(parent) {
+            return false;
+        }
         if parent.as_os_str().is_empty() {
             // relative path in cwd
             return test_writable_dir(Path::new("."));
@@ -1495,6 +1526,45 @@ mod tests {
         std::fs::write(&archive, b"x").unwrap();
         let loc = resolve_index_location(&archive, None, &[blocker], true);
         assert_eq!(loc, IndexLocation::Memory);
+    }
+
+    /// Regression: extra_dirs existing sidecar is used when the sibling parent is unwritable.
+    #[test]
+    fn sibling_existing_extra_dir_used_when_parent_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let archive = blocker.join("a.tar");
+        let extra = tempfile::tempdir().unwrap();
+        let extra_dir = extra.path().to_path_buf();
+        let cand = possible_index_paths(&archive, std::slice::from_ref(&extra_dir));
+        let idx = cand[0].clone();
+        if let Some(parent) = idx.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        std::fs::write(&idx, b"SQLite format 3\0extra").unwrap();
+        let loc = resolve_sibling_index_location(&archive, std::slice::from_ref(&extra_dir), false)
+            .expect("existing extra_dirs sidecar");
+        assert_eq!(loc, IndexLocation::Path(idx));
+    }
+
+    /// Regression: `scheme://` sibling create must not mkdir `https:` in cwd.
+    #[test]
+    fn sibling_url_does_not_mkdir_scheme_dirs() {
+        let marker = format!("ratarmount-pr6-{}-mkdir", std::process::id());
+        let archive = PathBuf::from(format!("https://{marker}.example.invalid/a.tar"));
+        let well_known = default_index_path(&archive);
+        assert!(!path_can_create_index(&well_known));
+        let err = resolve_sibling_index_location(&archive, &[], true)
+            .expect_err("URL sibling is not a local create path");
+        assert_eq!(err, sibling_parent_dir(&archive));
+        let leaked = Path::new("https:").join(format!("{marker}.example.invalid"));
+        assert!(
+            !leaked.exists(),
+            "must not mkdir URL-shaped parent {}",
+            leaked.display()
+        );
+        assert!(find_existing_sibling_index(&archive, &[]).is_none());
     }
 
     #[test]

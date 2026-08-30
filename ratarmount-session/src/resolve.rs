@@ -104,7 +104,7 @@ mod tests {
         f.flush().unwrap();
     }
 
-    fn sibling_req(tar: PathBuf) -> OpenRequest {
+    fn sibling_req_recreate(tar: PathBuf, recreate: Recreate) -> OpenRequest {
         OpenRequest {
             source: SourceSpec::Path(tar),
             index: IndexPolicy::Sibling,
@@ -113,8 +113,21 @@ mod tests {
             password: None,
             recursive: false,
             recursion_depth: None,
-            recreate: Recreate::IfInvalid,
+            recreate,
         }
+    }
+
+    fn sibling_req(tar: PathBuf) -> OpenRequest {
+        sibling_req_recreate(tar, Recreate::IfInvalid)
+    }
+
+    fn url_scheme_leak(marker: &str) -> bool {
+        Path::new("https:")
+            .join(format!("{marker}.example.invalid"))
+            .exists()
+            || Path::new("http:")
+                .join(format!("{marker}.example.invalid"))
+                .exists()
     }
 
     /// Regression: Sibling + unwritable parent → SiblingNotWritable, not `:memory:`.
@@ -252,21 +265,114 @@ mod tests {
 
     #[test]
     fn resolve_user_cache_does_not_write_meta_v3() {
-        let err = resolve_index(
-            Path::new("/tmp/a.tar"),
-            IndexPolicy::UserCache,
-            None,
-            &[],
-            false,
-        )
-        .unwrap_err();
+        let xdg = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("a.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let err = resolve_index(&tar, IndexPolicy::UserCache, None, &[], false).unwrap_err();
         match err {
             Error::Internal(msg) => {
                 assert!(msg.contains("local-index-v1"), "{msg}");
                 assert!(msg.contains("not meta-v3"), "{msg}");
             }
-            Error::NotWritable(_) => {}
-            other => panic!("expected Internal/NotWritable, got {other:?}"),
+            other => panic!("expected Internal, got {other:?}"),
         }
+        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
+        std::env::set_var("XDG_CACHE_HOME", xdg.path());
+        let open_err = match Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::UserCache,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        }) {
+            Err(e) => e,
+            Ok(_) => {
+                match &old_xdg {
+                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                    None => std::env::remove_var("XDG_CACHE_HOME"),
+                }
+                panic!("UserCache is not implemented");
+            }
+        };
+        match old_xdg {
+            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+            None => std::env::remove_var("XDG_CACHE_HOME"),
+        }
+        match open_err {
+            Error::Internal(msg) => {
+                assert!(msg.contains("local-index-v1"), "{msg}");
+                assert!(msg.contains("not meta-v3"), "{msg}");
+            }
+            other => panic!("expected Internal, got {other:?}"),
+        }
+        let meta_v3 = xdg.path().join("ratarmount").join("meta-v3");
+        assert!(
+            !meta_v3.exists()
+                || std::fs::read_dir(&meta_v3)
+                    .map(|it| it.count() == 0)
+                    .unwrap_or(true),
+            "UserCache must not write meta-v3: {}",
+            meta_v3.display()
+        );
+    }
+
+    /// Recreate::Never + missing sidecar is NotFound even if the sibling parent is unwritable.
+    #[test]
+    fn resolve_sibling_never_missing_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocker = dir.path().join("not-a-dir");
+        std::fs::write(&blocker, b"file").unwrap();
+        let archive = blocker.join("a.tar");
+        let err = match Session::open(sibling_req_recreate(archive, Recreate::Never)) {
+            Err(e) => e,
+            Ok(_) => panic!("Never + missing sidecar must not open"),
+        };
+        match err {
+            Error::NotFound => {}
+            other => panic!("expected NotFound, got {other:?}"),
+        }
+    }
+
+    /// Regression: scheme:// Sibling must not mkdir `https:` / skip remote discovery.
+    #[test]
+    fn resolve_sibling_url_does_not_mkdir() {
+        let marker = format!("ratarmount-pr6-{}-url", std::process::id());
+        let archive = PathBuf::from(format!("https://{marker}.example.invalid/a.tar"));
+        let err = resolve_index(&archive, IndexPolicy::Sibling, None, &[], false).unwrap_err();
+        match err {
+            Error::SiblingNotWritable(_) => {}
+            other => panic!("expected SiblingNotWritable for URL helper, got {other:?}"),
+        }
+        assert!(
+            !url_scheme_leak(&marker),
+            "resolve_index must not mkdir URL parents"
+        );
+
+        let url = format!("http://127.0.0.1:1/{marker}.example.invalid/a.tar");
+        let open_err = match Session::open(OpenRequest {
+            source: SourceSpec::Url(url),
+            index: IndexPolicy::Sibling,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("URL open should not succeed against 127.0.0.1:1"),
+        };
+        assert!(
+            !matches!(open_err, Error::SiblingNotWritable(_)),
+            "Session URL Sibling must not SNW; got {open_err:?}"
+        );
+        assert!(
+            !url_scheme_leak(&marker),
+            "Session::open must not mkdir URL parents"
+        );
     }
 }
