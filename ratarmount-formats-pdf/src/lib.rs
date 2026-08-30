@@ -1272,14 +1272,12 @@ fn ensure_parents(
 }
 
 fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
-    use std::os::unix::fs::MetadataExt;
+    if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
+        return Ok(());
+    }
     let meta = std::fs::metadata(path)?;
-    let json = format!(
-        "{{\"st_size\":{},\"st_mtime\":{},\"st_mtime_ns\":{}}}",
-        meta.size(),
-        meta.mtime(),
-        meta.mtime_nsec()
-    );
+    let json =
+        ratarmount_index::serialize_tarstats(&ratarmount_index::tar_stats_from_metadata(&meta));
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }

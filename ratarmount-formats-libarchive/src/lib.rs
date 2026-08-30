@@ -805,12 +805,12 @@ fn store_stats(index: &SqliteIndex, path: &Path) -> Result<()> {
     if path.is_file() && index.store_tarstats_for_path(path).is_ok() {
         return Ok(());
     }
-    use std::os::unix::fs::MetadataExt;
-    let (size, mtime, mtime_ns) = match std::fs::metadata(path) {
-        Ok(meta) => (meta.size(), meta.mtime(), meta.mtime_nsec()),
-        Err(_) => (0, 0, 0),
+    let json = match std::fs::metadata(path) {
+        Ok(meta) => {
+            ratarmount_index::serialize_tarstats(&ratarmount_index::tar_stats_from_metadata(&meta))
+        }
+        Err(_) => "{\"st_size\":0,\"st_mtime\":0,\"st_mtime_ns\":0}".into(),
     };
-    let json = format!("{{\"st_size\":{size},\"st_mtime\":{mtime},\"st_mtime_ns\":{mtime_ns}}}");
     index.store_metadata_key_value("tarstats", &json)?;
     Ok(())
 }

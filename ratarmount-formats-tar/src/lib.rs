@@ -3008,7 +3008,6 @@ impl SingleFileMountSource {
         materialised: Option<NamedTempFile>,
     ) -> io::Result<Self> {
         let meta = std::fs::metadata(&data_path)?;
-        use std::os::unix::fs::MetadataExt;
         Ok(Self {
             name,
             size,
@@ -3016,10 +3015,10 @@ impl SingleFileMountSource {
                 path: data_path,
                 _keep: materialised,
             },
-            mtime: meta.mtime() as f64,
+            mtime: ratarmount_core::metadata_mtime_secs(&meta) as f64,
             mode: ratarmount_core::S_IFREG | 0o644,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: ratarmount_core::effective_uid(),
+            gid: ratarmount_core::effective_gid(),
         })
     }
 
@@ -3034,8 +3033,8 @@ impl SingleFileMountSource {
             backend: SingleFileBackend::Body(body),
             mtime: 0.0,
             mode: ratarmount_core::S_IFREG | 0o644,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: ratarmount_core::effective_uid(),
+            gid: ratarmount_core::effective_gid(),
         })
     }
 
@@ -4921,6 +4920,8 @@ mod tests {
         let src = SingleFileMountSource::new("hello.txt".into(), path, size, None).unwrap();
         let fi = src.lookup("/hello.txt", 0).unwrap();
         assert_eq!(fi.size, 11);
+        assert_eq!(fi.uid, ratarmount_core::effective_uid());
+        assert_eq!(fi.gid, ratarmount_core::effective_gid());
         let mut r = src.open(&fi, 0).unwrap();
         let mut s = String::new();
         r.read_to_string(&mut s).unwrap();
@@ -4947,6 +4948,8 @@ mod tests {
         let fi = src.lookup("/payload.bin", 0).expect("lookup");
         assert_eq!(fi.size, dents[0].size);
         assert_eq!(fi.mode, dents[0].mode);
+        assert_eq!(fi.uid, ratarmount_core::effective_uid());
+        assert_eq!(fi.gid, ratarmount_core::effective_gid());
         assert!(src.list_dirents("/payload.bin").is_none());
     }
 
