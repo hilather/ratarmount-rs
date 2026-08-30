@@ -135,7 +135,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 **`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
 
-**`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes) unless `allow_unsafe_paths`. Extract-all (`members` empty) walks catalog keyset pages of 1024 (`ORDER BY fullpath, offsetheader`, `COALESCE` keyset); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points.
+**`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes) unless `allow_unsafe_paths`. Extract-all (`members` empty) walks catalog keyset pages of 1024 (newest-wins per `fullpath`, exclusive `fullpath > ?`); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points. Cancel or copy IO error unlinks the truncated dest.
 
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
@@ -234,7 +234,7 @@ Do not migrate `meta-v3` onto macOS Library/Caches. Env `RATARMOUNT_LOCAL_INDEX_
 - `read_range(path, offset, max_len)` returns `RangeReader: Read + Send` (not `Sync`) capped at `max_len`. `max_len == 0` → empty reader. There is no “read the rest of the file” sentinel.
 - Preview cap (64 MiB) is GUI-native; the engine just takes `max_len`.
 - Extract is a **streaming copy** (64 KiB buffer, loop until `Ok(0)`), not `read_range(0, size)` into a `Vec`.
-- Extract-all walks the catalog with a keyset, not `list()` / `list_visible_files_by_offset` dumped into a `Vec`.
+- Extract-all walks the catalog with a newest-wins `fullpath > ?` keyset (page 1024), not `list()` / `list_visible_files_by_offset` dumped into a `Vec`.
 - `extractPlan` (conflict sample) stays in the **GUI**, not engine v1.
 - Path escape (`..`, absolute, Windows prefixes) → `Error::PathEscape` unless `allow_unsafe_paths`.
 

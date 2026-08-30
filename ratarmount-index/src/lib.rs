@@ -90,7 +90,7 @@ pub struct PagedDirent {
 
 /// One payload row from [`SqliteIndex::list_extract_payload_page`].
 ///
-/// Ordered by reconstructed `fullpath`, then `offsetheader` (NULL as `-1`).
+/// Newest-wins per reconstructed `fullpath` (`ORDER BY fullpath`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ExtractPayloadRow {
     pub fullpath: String,
@@ -4691,7 +4691,7 @@ mod tests {
         );
     }
 
-    /// Extract-all keyset skips dumpdir/generated; pages by (fullpath, offsetheader).
+    /// Extract-all keyset skips dumpdir/generated; newest-wins `fullpath > ?`.
     #[test]
     fn list_extract_payload_page() {
         let dir = tempfile::tempdir().unwrap();

@@ -809,7 +809,7 @@ Extract algorithm:
 
 1. Resolve member list:
    - Explicit `members` → `WHERE` reconstructed fullpath `IN (…)` (or one lookup each); skip generated + dumpdir + directories unless the path itself is a dir (then `create_dir_all` only).
-   - **Extract-all** (`members` empty) + `catalog` present: **keyset SQL walk** over payload rows, page size **1024**: `ORDER BY fullpath, offsetheader` with `AND (fullpath > ? OR (fullpath = ? AND COALESCE(offsetheader,-1) > ?))`, skip `isgenerated`, dumpdir tombstones, and directories (`mode & S_IFMT != S_IFDIR` payload files only). **Do not** call `SqliteIndex::list_visible_files_by_offset` (that returns a `Vec` of the entire payload set — same fat-dump class as A4).
+   - **Extract-all** (`members` empty) + `catalog` present: **keyset SQL walk** over payload rows, page size **1024**: newest-wins per `fullpath` (`ROW_NUMBER` / `COALESCE(offsetheader,-1) DESC`), exclusive `fullpath > ?`, skip `isgenerated`, dumpdir tombstones, and directories (`mode & S_IFMT != S_IFDIR` payload files only). **Do not** call `SqliteIndex::list_visible_files_by_offset` (that returns a `Vec` of the entire payload set — same fat-dump class as A4).
    - No `catalog`: walk per-directory `list_dirents` pages (v1 residual; not 2M-flat).
 2. For each member: `lookup` → reject escape (`normpath`, then `dest_dir.join` canonicalized prefix check) → `open` → copy loop → `overwrite` skip/replace (never `ask` — UI-only).
 3. Directories: `create_dir_all`. Symlinks: `symlink` when the platform supports it; otherwise skip with a progress message (Windows residual, G6).
