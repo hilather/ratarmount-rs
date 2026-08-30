@@ -3051,6 +3051,7 @@ dependencies = [
  "ratarmount-formats-zip",
  "ratarmount-index",
  "ratarmount-remote",
+ "rusqlite",
  "secrecy",
  "tempfile",
  "thiserror",

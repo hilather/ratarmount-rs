@@ -176,6 +176,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | IndexJob cancel at ~50% leaves dest sidecar valid; tmp gone | `cargo test -p ratarmount-session --lib index_job_cancel` · `cargo test -p ratarmount-index --lib regression_cancel_does_not_publish_tmp` |
 | IndexJob sidecar opens with factory/CLI path (G7.1) | `cargo test -p ratarmount-session --lib index_job_g7_factory_opens_job_sidecar` |
 | Session::open of a CLI-written sidecar (G7.2) | `cargo test -p ratarmount-session --lib index_job_g7_session_opens_cli_sidecar` |
+| IndexJob sidecar not 0.7.x / Python 0.7.x cannot open | `cargo test -p ratarmount-session --lib index_job_sidecar_python_07` · `./test-harness/run-indexjob-python-interop.sh` |
 | Factory “cancelled” substring in a path maps to Cancelled | `cargo test -p ratarmount-session --lib map_factory_error_cancelled_in_path` |
 | IndexJob Temp Drop unlinks the returned sidecar | `cargo test -p ratarmount-session --lib index_job_temp_sidecar_survives_run` |
 | Nested flatten/AutoMount cancel publishes over dest | `cargo test -p ratarmount-session --lib index_job_cancel_nested_flatten_keeps_dest` |

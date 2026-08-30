@@ -35,7 +35,7 @@ mod tests {
     use crate::Session;
     use ratarmount_core::{IndexBuildTick, OpenOptions};
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
-    use ratarmount_index::{SqliteIndex, INDEX_VERSION};
+    use ratarmount_index::{SqliteIndex, CREATE_TABLES_SQL, INDEX_VERSION};
     use std::io::Write;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -179,6 +179,117 @@ mod tests {
         assert!(leftover.is_empty(), "tmp must be gone: {leftover:?}");
         let after = std::fs::read(&idx).unwrap();
         assert_eq!(before, after, "dest sidecar must stay the previous file");
+    }
+
+    /// Python 0.7.x `files` columns (`create-index-tables.sql`). Do not rewrite.
+    const FILES_COLUMNS_0_7: &[&str] = &[
+        "path",
+        "name",
+        "offsetheader",
+        "offset",
+        "size",
+        "mtime",
+        "mode",
+        "type",
+        "linkname",
+        "uid",
+        "gid",
+        "istar",
+        "issparse",
+        "isgenerated",
+        "recursiondepth",
+    ];
+
+    fn assert_python_07_sidecar_schema(idx: &Path) {
+        assert_eq!(INDEX_VERSION, "0.7.0", "INDEX_VERSION stays 0.7.x");
+        assert!(
+            CREATE_TABLES_SQL.contains(r#"CREATE TABLE IF NOT EXISTS "files""#),
+            "CREATE_TABLES_SQL must still define files"
+        );
+        for col in FILES_COLUMNS_0_7 {
+            let quoted = format!("\"{col}\"");
+            assert!(
+                CREATE_TABLES_SQL.contains(&quoted),
+                "CREATE_TABLES_SQL missing files column {col}"
+            );
+        }
+        assert!(
+            !CREATE_TABLES_SQL.contains("files_fts"),
+            "files_fts must stay out of the 0.7.x CREATE_TABLES_SQL"
+        );
+
+        let cat = SqliteIndex::open_catalog_read_only(idx).expect("open_catalog_read_only");
+        assert!(
+            cat.file_count().unwrap() >= 1,
+            "IndexJob sidecar must have files rows"
+        );
+        drop(cat);
+        let ro = SqliteIndex::open_read_only(idx).expect("open_read_only");
+        assert!(ro.file_count().unwrap() >= 1);
+        drop(ro);
+
+        let conn =
+            rusqlite::Connection::open_with_flags(idx, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                .expect("open sidecar with rusqlite");
+        let mut stmt = conn
+            .prepare("SELECT name FROM pragma_table_info('files') ORDER BY cid")
+            .expect("pragma_table_info(files)");
+        let cols: Vec<String> = stmt
+            .query_map([], |row| row.get(0))
+            .expect("files columns")
+            .map(|r| r.expect("column name"))
+            .collect();
+        assert_eq!(
+            cols.iter().map(String::as_str).collect::<Vec<_>>(),
+            FILES_COLUMNS_0_7,
+            "IndexJob files schema must match Python 0.7.x"
+        );
+        let version: String = conn
+            .query_row(
+                r#"SELECT version FROM "versions" WHERE name = 'index'"#,
+                [],
+                |row| row.get(0),
+            )
+            .expect("versions.index row");
+        assert_eq!(version, "0.7.0", "sidecar versions.index must be 0.7.0");
+    }
+
+    /// Regression: IndexJob sidecar is still Python ratarmount 0.7.x
+    /// (`INDEX_VERSION` and `files` columns). Always runs; Python listing is
+    /// `test-harness/run-indexjob-python-interop.sh`.
+    ///
+    /// Harness write: `RATARMOUNT_INDEXJOB_ARCHIVE` and `RATARMOUNT_INDEXJOB_INDEX`.
+    #[test]
+    fn index_job_sidecar_python_07_schema() {
+        let mut hold_dir = None;
+        let env_archive = std::env::var("RATARMOUNT_INDEXJOB_ARCHIVE");
+        let env_index = std::env::var("RATARMOUNT_INDEXJOB_INDEX");
+        let (archive, idx) = match (env_archive, env_index) {
+            (Ok(a), Ok(i)) => (PathBuf::from(a), PathBuf::from(i)),
+            (Err(_), Err(_)) => {
+                let dir = tempfile::tempdir().unwrap();
+                let tar = dir.path().join("g73.tar");
+                write_tar(&tar, &[member_file("bar", b"foo\n")]);
+                let idx = dir.path().join("g73.tar.index.sqlite");
+                hold_dir = Some(dir);
+                (tar, idx)
+            }
+            _ => panic!(
+                "set both RATARMOUNT_INDEXJOB_ARCHIVE and RATARMOUNT_INDEXJOB_INDEX, or neither"
+            ),
+        };
+        let _hold_dir = hold_dir;
+        assert!(archive.is_file(), "archive missing: {}", archive.display());
+        if idx.exists() {
+            std::fs::remove_file(&idx).expect("unlink previous sidecar");
+        }
+        let loc = IndexJob::run(
+            explicit_req(archive, idx.clone(), Recreate::Always),
+            IndexBuildHooks::default(),
+        )
+        .expect("IndexJob::run");
+        assert_eq!(loc, IndexLocation::Path(idx.clone()));
+        assert_python_07_sidecar_schema(&idx);
     }
 
     /// G7.1: sidecar written by IndexJob opens with factory (CLI-equivalent).

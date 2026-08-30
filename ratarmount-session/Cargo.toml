@@ -67,3 +67,4 @@ ratarmount-remote = { workspace = true, optional = true }
 
 [dev-dependencies]
 url = "2"
+rusqlite.workspace = true

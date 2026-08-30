@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Index interop goldens: Python builds SQLite index → Rust mounts with that index;
 # optionally reverse (Rust index → Python open if available).
+# IndexJob → Python 0.7.x listing is ./run-indexjob-python-interop.sh (TAR/ZIP/7z).
 #
 # Exit criteria (parity-todo P1): TAR + ZIP + 7z interop paths green.
 set -euo pipefail
@@ -235,6 +236,12 @@ for case in "${CASES[@]}"; do
 done
 
 run_reverse_tar
+
+# G7.3: sidecar written by IndexJob (or CLI -c fallback) still opens in Python.
+if ! "$SCRIPT_DIR/run-indexjob-python-interop.sh"; then
+    echo "  [FAIL] IndexJob → Python 0.7.x interop"
+    failed=1
+fi
 
 if [[ $failed -ne 0 ]]; then
     echo "Index interop FAILED"
