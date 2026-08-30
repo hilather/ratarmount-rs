@@ -112,6 +112,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Missing `.tar` / `.tar.zst` write mount create | `cargo test -p ratarmount-compositing --lib empty_archive` · `cargo test -p ratarmount-compositing --lib is_uncompressed_tar` · `cargo test -p ratarmount --test commit_overlay_live create_missing` · `cargo test -p ratarmount --bin ratarmount -- create_missing` |
 | Interval commit skips recently modified overlay files | `cargo test -p ratarmount-compositing --lib live_commit_idle` (open write fd must not persist/unlink) |
 | Interval commit unpins still-open write after NFS/protocol fd reuse | `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_fd_reuse` · `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse` |
+| Interval commit after overlay rename of an open write fd | `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_rename` |
 | Interval/on-exit overlay commits overlap splices (V-4 coalesce) | `cargo test -p ratarmount-compositing --lib overlay_commit_queue` · `cargo test -p ratarmount --bin ratarmount overlay_commit_on_exit_waits` · `cargo test -p ratarmount --test commit_overlay_live commit_overlay_interval_on_exit` |
 | NFS READ after live tar.zst overlay commit | `cargo test -p ratarmount-nfs --lib overlay_commit_live_tar_zst` |
 | NFSv4.1 RO adapter (lookup/read/readdir) | `cargo test -p ratarmount-nfs --features nfsv4 --lib v4_` |

@@ -124,6 +124,8 @@ pub struct WriteOverlay {
     /// Overlay FDs still open for write (FUSE keeps the fd until release).
     /// Interval settle must not persist/unlink these: later pwrite would hit
     /// an unlinked inode and the extra bytes would never reach the archive.
+    /// Busy matching uses `fstat` `(dev, ino)` so a rename of the open file
+    /// still skips the same host inode.
     write_fds: Mutex<HashMap<i32, String>>,
     /// TAR member-name encoding (`-e`); live `.tar.zst` persist. Default utf-8.
     encoding: String,
@@ -555,13 +557,31 @@ impl WriteOverlay {
         drop(file);
     }
 
-    fn write_open_hosts(&self) -> HashSet<PathBuf> {
-        self.write_fds
-            .lock()
-            .expect("overlay write fds")
-            .values()
-            .map(|p| self.realpath(p))
-            .collect()
+    /// Host `(dev, ino)` for each pinned write fd. `None` if any `fstat`
+    /// fails — caller must skip the idle tick (fail-closed).
+    ///
+    /// `fstat` while holding `write_fds` so a concurrent
+    /// [`Self::finish_owned_write_fd`] cannot close/reuse the number mid-scan.
+    /// Do not wrap the fd in `File` (that can close a still-pinned writer).
+    fn write_open_inodes(&self) -> Option<HashSet<(u64, u64)>> {
+        let guard = self.write_fds.lock().expect("overlay write fds");
+        #[cfg(not(unix))]
+        {
+            let _ = guard;
+            return Some(HashSet::new());
+        }
+        #[cfg(unix)]
+        {
+            let mut out = HashSet::new();
+            for &fd in guard.keys() {
+                let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+                if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    return None;
+                }
+                out.insert((st.st_dev as u64, st.st_ino as u64));
+            }
+            Some(out)
+        }
     }
 
     fn create_file_inner(&self, path: &str, mode: u32) -> Result<i32> {
@@ -891,7 +911,9 @@ impl WriteOverlay {
             let cutoff = SystemTime::now()
                 .checked_sub(idle_for)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
-            let busy = self.write_open_hosts();
+            let Some(busy) = self.write_open_inodes() else {
+                return Ok(false);
+            };
             let plan = {
                 let db = self.db.lock().expect("overlay db");
                 collect_overlay_commit_plan_from_conn(&self.root, Some(&db), Some(cutoff), &busy)?
@@ -1084,7 +1106,10 @@ impl WriteOverlay {
                 .unwrap_or(SystemTime::UNIX_EPOCH)
         });
         let busy = if cutoff.is_some() {
-            self.write_open_hosts()
+            match self.write_open_inodes() {
+                Some(b) => b,
+                None => return Ok(false),
+            }
         } else {
             HashSet::new()
         };
@@ -2167,7 +2192,7 @@ fn collect_overlay_commit_plan_from_conn(
     write_overlay: &Path,
     conn: Option<&Connection>,
     idle_cutoff: Option<SystemTime>,
-    busy_hosts: &HashSet<PathBuf>,
+    busy_inodes: &HashSet<(u64, u64)>,
 ) -> Result<OverlayCommitPlan> {
     let mut deletions_nul: Vec<u8> = Vec::new();
     let mut appends_nul: Vec<u8> = Vec::new();
@@ -2225,7 +2250,7 @@ fn collect_overlay_commit_plan_from_conn(
         }
         let norm = normalize_archive_rel_path(&rel);
         if let Some(cutoff) = idle_cutoff {
-            if !overlay_entry_is_idle(&full, cutoff, busy_hosts) {
+            if !overlay_entry_is_idle(&full, cutoff, busy_inodes) {
                 skipped.insert(norm);
                 continue;
             }
@@ -2268,12 +2293,32 @@ fn collect_overlay_commit_plan_from_conn(
     })
 }
 
-fn overlay_entry_is_idle(path: &Path, cutoff: SystemTime, busy_hosts: &HashSet<PathBuf>) -> bool {
-    if busy_hosts.contains(path) {
-        return false;
-    }
-    match fs::symlink_metadata(path).and_then(|m| m.modified()) {
-        Ok(mtime) => mtime <= cutoff,
+fn overlay_entry_is_idle(
+    path: &Path,
+    cutoff: SystemTime,
+    busy_inodes: &HashSet<(u64, u64)>,
+) -> bool {
+    // Identify open writers by (dev, ino), not overlay path. Rename of an
+    // open fd keeps the same inode; a path pin would miss the new name and
+    // persist/unlink a still-open file.
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if busy_inodes.contains(&(meta.dev(), meta.ino())) {
+                    return false;
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = busy_inodes;
+            }
+            match meta.modified() {
+                Ok(mtime) => mtime <= cutoff,
+                Err(_) => false,
+            }
+        }
         Err(_) => false,
     }
 }
@@ -5983,6 +6028,74 @@ mod tests {
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/keep.txt"), want);
         assert_eq!(read_member(src.as_ref(), "/proto.txt"), proto_bytes);
+    }
+
+    /// Regression: interval settle keyed the write-open pin by overlay path.
+    /// After `rename`, the host file moved but the pin still named the old
+    /// path, so a tick persisted and unlinked the renamed inode. Later
+    /// `pwrite` bytes hit the detached inode and never reached the archive.
+    ///
+    /// Overlay-only create (not a base member): no delete tombstone, so a
+    /// skipped tick is `Ok(false)`.
+    #[test]
+    fn live_commit_idle_skips_open_write_fd_after_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-rename-seed");
+        let first = generated_payload("idle-rename-first");
+        let second = generated_payload("idle-rename-second");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        let fd = ov.create_file("/open.txt", 0o644).expect("create");
+        let n = unsafe { libc::write(fd, first.as_ptr() as *const _, first.len()) };
+        assert_eq!(n as usize, first.len(), "first write");
+        ov.rename("/open.txt", "/renamed.txt")
+            .expect("rename open write fd");
+        set_mtime_age(&overlay.join("renamed.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(false) => {}
+            other => panic!("renamed open write fd must skip idle persist, got {other:?}"),
+        }
+        assert!(
+            overlay.join("renamed.txt").exists(),
+            "renamed open write fd must keep the overlay file"
+        );
+        assert!(
+            !overlay.join("open.txt").exists(),
+            "rename must have left the old overlay name"
+        );
+
+        let n = unsafe {
+            libc::pwrite(
+                fd,
+                second.as_ptr() as *const _,
+                second.len(),
+                first.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, second.len(), "second write after rename+tick");
+        ov.close_overlay_fd(fd);
+        set_mtime_age(&overlay.join("renamed.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after close"));
+        assert!(!overlay.join("renamed.txt").exists());
+
+        let mut want = first.clone();
+        want.extend_from_slice(&second);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/renamed.txt"), want);
+        assert!(
+            src.lookup("/open.txt", 0).is_none(),
+            "old name must not remain in the archive"
+        );
     }
 
     /// Regression: after the hot file settles, a later tick persists it once.
