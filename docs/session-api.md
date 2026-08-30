@@ -21,8 +21,8 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 | `Session::find` | not implemented | G3 |
 | `IndexJob::run` | not implemented | G2 |
 | `resolve_index` | not implemented | G4 |
-| Factory (`open_path`) | not in this crate | PR2 mechanical move |
-| Format crates (TAR/ZIP/7z/…) | **not** a `formats` feature yet (core+index only) | PR2 full L2 set |
+| Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
+| Format crates (TAR/ZIP/7z/… including libarchive/git) | default `formats` feature (full L2 set factory `use`s) | PR2 |
 
 `cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
 
@@ -251,4 +251,6 @@ GUI v1 is **read-mostly**. Overlay write, live commit, and `--commit-overlay` ar
 
 ## Feature graph
 
-This skeleton depends on `ratarmount-core` + `ratarmount-index` + `secrecy` + `thiserror` only. PR2 adds the full L2 format set factory already `use`s (not a TAR/ZIP/7z-only `formats` feature). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional later: `http-export`, `gzip-rapidgzip`.
+This crate is the **supported embedder API** (`Session`). Archive factory glue (`open_path`, `build_mount_source_ex`, nested openers, remote URL open) lives here as **`pub mod factory`** so the CLI can share it without importing a FUSE binary crate. Embedders should use `Session` once `Session::open` lands (G1); `factory` is public for the CLI.
+
+Default `formats` is the full L2 set factory already `use`s (TAR/ZIP/7z plus ar/asar/cab/cpio/ext4/fat/git/html/iso9660/libarchive/ogg/pdf/sqlar/squashfs/warc/xar + compress + compositing + remote). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); later `http-export`.

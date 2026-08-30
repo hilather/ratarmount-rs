@@ -25,7 +25,8 @@ use ratarmount_index::{
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-mod factory;
+use ratarmount_session::factory;
+
 mod find;
 mod overlay_commit;
 mod publish_index;
@@ -2857,7 +2858,7 @@ mod parallel_nested_cli_tests {
     #[test]
     fn compositing_options_receives_parallel_nested() {
         let args = Args::try_parse_from(["ratarmount", "--parallel-nested", "4"]).expect("parse");
-        let comp = crate::factory::CompositingOptions {
+        let comp = ratarmount_session::factory::CompositingOptions {
             recursive: true,
             lazy: false,
             file_versions: true,
@@ -2873,7 +2874,7 @@ mod parallel_nested_cli_tests {
         assert_eq!(comp.parallel_nested_threads, 4);
         // Default CompositingOptions matches AutoMountOptions auto (0).
         assert_eq!(
-            crate::factory::CompositingOptions::default().parallel_nested_threads,
+            ratarmount_session::factory::CompositingOptions::default().parallel_nested_threads,
             0
         );
     }

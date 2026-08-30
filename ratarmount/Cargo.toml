@@ -13,10 +13,18 @@ path = "src/main.rs"
 [features]
 default = []
 # Path-backed rapidgzip gzip backend (requires rustc ≥ 1.87). See docs/gzip-binding-decision.md.
-gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
+# Forward onto the session crate so factory `#[cfg(feature = "gzip-rapidgzip")]` compiles in.
+gzip-rapidgzip = [
+    "ratarmount-session/gzip-rapidgzip",
+    "ratarmount-compress/gzip-rapidgzip",
+]
 # rapidgzip + ISA-L sequential inflate (needs system/prefix libisal).
-# Enables this crate's `gzip-rapidgzip` cfg (factory/tests) plus compress ISA-L.
-gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
+# Enables this crate's `gzip-rapidgzip` cfg plus compress/session ISA-L.
+gzip-rapidgzip-isal = [
+    "gzip-rapidgzip",
+    "ratarmount-session/gzip-rapidgzip-isal",
+    "ratarmount-compress/gzip-rapidgzip-isal",
+]
 # NFSv4.1 via embednfs (requires rustc ≥ 1.88 / edition 2024). See docs/nfs-export.md.
 nfsv4 = ["ratarmount-nfs/nfsv4"]
 # SFTP export via russh (requires rustc ≥ 1.85). Default CI stays 1.74.
@@ -25,6 +33,7 @@ sftp-russh = ["ratarmount-sftp/sftp-russh"]
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true
+ratarmount-session.workspace = true
 ratarmount-formats-tar.workspace = true
 ratarmount-formats-zip.workspace = true
 ratarmount-formats-ar.workspace = true

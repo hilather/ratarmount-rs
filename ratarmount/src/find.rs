@@ -51,7 +51,7 @@ pub fn format_hits_tsv(hits: &[SearchHit], include_hashes: bool) -> String {
     out
 }
 
-/// Locate over `archive`'s on-disk sidecar, creating it via [`crate::factory::open_path`]
+/// Locate over `archive`'s on-disk sidecar, creating it via [`ratarmount_session::factory::open_path`]
 /// when missing or stale. `:memory:` indexes are rejected.
 pub fn locate_hits(
     archive: &Path,
@@ -229,7 +229,7 @@ fn open_index_for_find(archive: &Path, open_opts: &OpenOptions) -> Result<Sqlite
         // factory::open_path seals with a "Successfully loaded offset dictionary"
         // println (Python harness contract). Keep find stdout as TSV only.
         silence_stdout(|| {
-            crate::factory::open_path(archive, open_opts, open_opts.clear_index_cache)
+            ratarmount_session::factory::open_path(archive, open_opts, open_opts.clear_index_cache)
         })
         .map_err(|e| e.to_string())?;
         let loc = resolve_index_location(

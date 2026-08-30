@@ -1217,15 +1217,15 @@ Resolved in this draft (not questions): crate home = `ratarmount-session`; no sc
 
 ## G0–G7 task list
 
-Status remains **proposed** until the matching PR merges, except **G0.2 is decided** in this document (`ratarmount-session`) and **G0.1 is landing in this PR**. Effort key: **S** < 0.5d · **M** 0.5–2d · **L** multi-day.
+Status remains **proposed** until the matching PR merges, except **G0.2 is decided** in this document (`ratarmount-session`), **G0.1 landed in PR1**, and **PR2 / G0.3a is landing in this PR** (`factory` lives in `ratarmount-session`; `cargo tree -p ratarmount-session -i fuser` still finds no `fuser`). Effort key: **S** < 0.5d · **M** 0.5–2d · **L** multi-day.
 
 ### Phase G0 — Contract freeze
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G0.1** | Write `docs/session-api.md` from the API section above; list every type that crosses the GUI boundary | S | in progress (this PR) |
+| **G0.1** | Write `docs/session-api.md` from the API section above; list every type that crosses the GUI boundary | S | **landed** (PR1) |
 | **G0.2** | Crate home: **`ratarmount-session`** (not `ratarmount-core::session`) | S | **decided** |
-| **G0.3** | Split: (a) `cargo tree -p ratarmount-session -i fuser`; (b) Windows compile is G6, not claimed at freeze | M | proposed |
+| **G0.3** | Split: (a) `cargo tree -p ratarmount-session -i fuser`; (b) Windows compile is G6, not claimed at freeze | M | **G0.3a landing (PR2)** — tree still has no `fuser`; G0.3b/G6 remains proposed |
 
 ### Phase G1 — Session API
 
@@ -1344,6 +1344,7 @@ W2 is **not** unblocked until extract, capped `read_range`, IndexJob, and Siblin
 ### PR 2 — Mechanical factory extraction
 
 - **Title:** `Move archive factory glue into ratarmount-session.`
+- **Status:** **landing (this PR).** Factory + `remote_open` live in `ratarmount-session`; G0.3a still holds (`cargo tree -p ratarmount-session -i fuser` empty; no fuse/nfs/smb/http/9p/sftp on session default).
 - **Files:** `ratarmount/src/factory.rs` → `ratarmount-session/src/factory.rs`; keep `#[path = "remote_open.rs"]` (move `remote_open.rs` beside it); `ratarmount/src/main.rs` and `find.rs` imports (`crate::factory` → `ratarmount_session::factory`); both `Cargo.toml`; **binary feature forwarding** `gzip-rapidgzip` / `gzip-rapidgzip-isal`; `Cargo.lock`; **`AGENTS.md` catalog** every factory filter (`plain_gzip`, `nested_*`, `nested_durable_*`, rapidgzip, …) → `cargo test -p ratarmount-session --lib`
 - **Depends on:** PR 1
 - **Changes:** **Behavior-neutral. Zero signature changes.** Session `formats` default = **all L2 factory `use`s today** (including libarchive/git) so unmodified `factory.rs` compiles. No `IndexBuildHooks` yet (that is PR5). Nested matrix unchanged. Orchestrator still owns `DEFAULT_FORMAT_PROBE_ORDER` **in the relocated file**. Do **not** optionalize L2 here (G5.3 / PR9). `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings && cargo test --workspace`.

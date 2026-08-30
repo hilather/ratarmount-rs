@@ -2580,6 +2580,7 @@ dependencies = [
  "ratarmount-index",
  "ratarmount-nfs",
  "ratarmount-remote",
+ "ratarmount-session",
  "ratarmount-sftp",
  "ratarmount-smb",
  "tempfile",
@@ -3025,10 +3026,35 @@ dependencies = [
 name = "ratarmount-session"
 version = "0.1.29"
 dependencies = [
+ "log",
+ "ratarmount-compositing",
+ "ratarmount-compress",
  "ratarmount-core",
+ "ratarmount-formats-ar",
+ "ratarmount-formats-asar",
+ "ratarmount-formats-cab",
+ "ratarmount-formats-cpio",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
+ "ratarmount-formats-git",
+ "ratarmount-formats-html",
+ "ratarmount-formats-iso9660",
+ "ratarmount-formats-libarchive",
+ "ratarmount-formats-ogg",
+ "ratarmount-formats-pdf",
+ "ratarmount-formats-sevenzip",
+ "ratarmount-formats-sqlar",
+ "ratarmount-formats-squashfs",
+ "ratarmount-formats-tar",
+ "ratarmount-formats-warc",
+ "ratarmount-formats-xar",
+ "ratarmount-formats-zip",
  "ratarmount-index",
+ "ratarmount-remote",
  "secrecy",
+ "tempfile",
  "thiserror",
+ "url",
 ]
 
 [[package]]

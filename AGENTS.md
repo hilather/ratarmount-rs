@@ -40,12 +40,12 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | BIG fixture builder missing tar.lz4 / multi-frame zstd | `./benchmarks/test-compare-fixtures.sh` |
 | Vector-wave fixture builder missing catalog tars | `./benchmarks/test-compare-vector-wave.sh` |
 | Fixture smoke dies without Python/binary (#9) | `./benchmarks/test-compare-prepare-env.sh` · `./benchmarks/test-compare-fixtures.sh` |
-| Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount nested_large_plain_gzip` |
+| Truncated `.gz` / UnexpectedEof (FUSE short read = EOF) | `cargo test -p ratarmount-fuse --lib fill_read` · `cargo test -p ratarmount-compress --lib fuse_style` · `cargo test -p ratarmount-session --lib nested_large_plain_gzip` |
 | Nested gzip concurrent wrong/truncated data | `cargo test -p ratarmount-compress --lib shared_from_reader` · `cargo test -p ratarmount-compress --lib stenciled_fuse` |
-| Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_invalid` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip` · `cargo test -p ratarmount --features gzip-rapidgzip nested_plain_gzip_prefer_rapidgzip_fail_rewinds_to_g3` · optional ISA-L: `--features gzip-rapidgzip-isal` (+ `libisal` / `ISAL_INSTALL_PREFIX`) |
-| Plain `.gz` rapidgzip GZIDX shell create (no pre-existing index) | `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_plain_gzidx` · `cargo test -p ratarmount --features gzip-rapidgzip plain_gzip_rapidgzip_gzidx_skipped` · `cargo test -p ratarmount gzip_seek_index_format_label` |
+| Rapidgzip path backend (Tier D POC) | `cargo test -p ratarmount-compress --features gzip-rapidgzip --lib gzip_rapidgzip` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib plain_gzip_rapidgzip` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib plain_gzip_rapidgzip_invalid` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib plain_gzip_rapidgzip_gzidx` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib nested_plain_gzip_prefer_rapidgzip` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib nested_plain_gzip_prefer_rapidgzip_fail_rewinds_to_g3` · optional ISA-L: `--features gzip-rapidgzip-isal` (+ `libisal` / `ISAL_INSTALL_PREFIX`) |
+| Plain `.gz` rapidgzip GZIDX shell create (no pre-existing index) | `cargo test -p ratarmount-session --features gzip-rapidgzip --lib plain_gzip_rapidgzip_plain_gzidx` · `cargo test -p ratarmount-session --features gzip-rapidgzip --lib plain_gzip_rapidgzip_gzidx_skipped` · `cargo test -p ratarmount-session --lib gzip_seek_index_format_label` |
 | 7z mtimes Dec 31 1969 (FILETIME delta) | `cargo test -p ratarmount-formats-sevenzip --lib filetime` · `cargo test -p ratarmount-formats-sevenzip --lib mtime` |
-| Nested/non-solid 7z first `cat` minutes (LZMA2 prefix-from-0) | `cargo test -p ratarmount-formats-sevenzip --lib regression_sequential` · `cargo test -p ratarmount-formats-sevenzip --lib regression_independent_chunk` · `cargo test -p ratarmount-formats-sevenzip --lib regression_header_at_end` · `cargo test -p ratarmount-index --lib regression_head_only` · `cargo test -p ratarmount --bin ratarmount regression_progressive_nested_fingerprint` |
+| Nested/non-solid 7z first `cat` minutes (LZMA2 prefix-from-0) | `cargo test -p ratarmount-formats-sevenzip --lib regression_sequential` · `cargo test -p ratarmount-formats-sevenzip --lib regression_independent_chunk` · `cargo test -p ratarmount-formats-sevenzip --lib regression_header_at_end` · `cargo test -p ratarmount-index --lib regression_head_only` · `cargo test -p ratarmount-session --lib regression_progressive_nested_fingerprint` |
 | AES/BCJ 7z solid first `cat` minutes (pack slurp / full-folder) | `cargo test -p ratarmount-formats-sevenzip --lib regression_aes_lzma2` · `cargo test -p ratarmount-formats-sevenzip --lib regression_bcj_lzma2` · `cargo test -p ratarmount-formats-sevenzip --lib regression_aes_pack_not_slurped` · `cargo test -p ratarmount-formats-sevenzip --lib regression_encrypted_copy` |
 | Encrypted nested open → EACCES not EIO | `cargo test -p ratarmount-fuse --lib io_to_errno` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` (metadata-only PermissionDenied; password exact bytes; wrong pw fails open) |
 | 7z wrong password accepted on macOS (store+AES / warm index) | `cargo test -p ratarmount-formats-sevenzip --lib encrypted_wrong_password` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_store_aes` |
@@ -57,20 +57,20 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | 9P/SMB/SFTP overlay create then write then read payload (size-0 cookie) | `cargo test -p ratarmount-export-core --lib get_or_open_overlay_cookie` · `cargo test -p ratarmount-9p --lib overlay_open_after_create_write` |
 | 9P overlay empty create then cat "" | `cargo test -p ratarmount-9p --lib overlay_open_after_create_reads_empty` |
 | Sequential FUSE readahead window (`--readahead`, #180) | `cargo test -p ratarmount-fuse --lib readahead` |
-| Plain compress no `/tmp` spool (gz/zstd/bz2) | `cargo test -p ratarmount plain_gzip` · `cargo test -p ratarmount plain_zstd` · nested: `nested_plain_gzip` |
-| Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |
+| Plain compress no `/tmp` spool (gz/zstd/bz2) | `cargo test -p ratarmount-session --lib plain_gzip` · `cargo test -p ratarmount-session --lib plain_zstd` · nested: `cargo test -p ratarmount-session --lib nested_plain_gzip` |
+| Nested no-tmp openers (factory wiring) | `cargo test -p ratarmount-session --lib nested_` (CPIO/AR/WARC/ASAR/CAB/XAR/tar.gz/zip/7z) · crate `open_from_reader` tests for ISO/SQLAR/FAT |
 | Nested TAR via AutoMount reader | `cargo test -p ratarmount-compositing --lib automount_nested` |
-| Nested durable indexes (ZIP/TAR/7z structure+file table/CPIO/AR) | `cargo test -p ratarmount --bin ratarmount nested_durable` · `cargo test -p ratarmount-formats-sevenzip --lib durable_structure` · `cargo test -p ratarmount-index --lib nested` |
+| Nested durable indexes (ZIP/TAR/7z structure+file table/CPIO/AR) | `cargo test -p ratarmount-session --lib nested_durable` · `cargo test -p ratarmount-formats-sevenzip --lib durable_structure` · `cargo test -p ratarmount-index --lib nested` |
 | Nested compact pools are per-index (no parent StringPool lock) | `cargo test -p ratarmount-index --lib regression_nested_compact_pools_are_per_index` |
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
 | Offline `--commit-overlay` splice for `.tar.zst` (incl. earlier-frame delete) | `cargo test -p ratarmount-compositing --lib commit_overlay` |
-| Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount zstd_blocks` · `cargo test -p ratarmount bzip2_blocks` |
-| G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount gzip_rgzi` · `cargo test -p ratarmount plain_gzip_rgzi` · `cargo test -p ratarmount plain_gzip` |
+| Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount-session --lib zstd_blocks` · `cargo test -p ratarmount-session --lib bzip2_blocks` |
+| G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount-session --lib gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
-| Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
-| Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount nested_ext4` · `cargo test -p ratarmount nested_squashfs` · crate `open_from_reader` tests |
+| Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
+| Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
-| Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount nested_tar_` |
+| Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
 | ssh_config ProxyJump / Include | `cargo test -p ratarmount-remote --lib ssh` |
 | Dropbox cheap `list_dirents` | `cargo test -p ratarmount-remote --lib list_dirents` |
@@ -101,7 +101,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
 | SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
-| `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount --bin ratarmount docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
+| `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
 | SFTP non-loopback without authorized_keys file | `cargo test -p ratarmount-sftp --lib regression_non_loopback` |
 | NFS compositing pin (`member_seek_is_cheap`) | `cargo test -p ratarmount-compositing --lib file_version_layer_forwards` · `cargo test -p ratarmount-compositing --lib automount_forwards` |
 | NFS serve stop | `cargo test -p ratarmount-nfs --lib serve_stop` |
@@ -140,19 +140,19 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Control read-only `search/<pattern>` | `cargo test -p ratarmount-compositing --lib control_search` |
 | Socket `search` | `cargo test -p ratarmount --bin ratarmount control_search_socket` |
 | FTS5 path + hashes | `cargo test -p ratarmount-index --lib search_fts5` (default `cargo test -p ratarmount-index --lib`, no extra features) |
-| Inbound HEAD **archive** `Link: describedby` → fetch | `cargo test -p ratarmount-index --lib link_describedby_archive_head` · `cargo test -p ratarmount --bin ratarmount apply_remote_index_discovery_follows_archive_link` |
-| Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount --bin ratarmount apply_remote_index` |
-| Remote `{url}.index.ptr` then `{url}.index.{id}.sqlite` GET (HTTP/S3; 404/tarstats continue) | `cargo test -p ratarmount --bin ratarmount apply_remote_index` · `cargo test -p ratarmount-remote --lib fetch_s3_pointer` · `cargo test -p ratarmount-index --lib sibling_index_pointer` |
+| Inbound HEAD **archive** `Link: describedby` → fetch | `cargo test -p ratarmount-index --lib link_describedby_archive_head` · `cargo test -p ratarmount-session --lib apply_remote_index_discovery_follows_archive_link` |
+| Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount-session --lib apply_remote_index` |
+| Remote `{url}.index.ptr` then `{url}.index.{id}.sqlite` GET (HTTP/S3; 404/tarstats continue) | `cargo test -p ratarmount-session --lib apply_remote_index` · `cargo test -p ratarmount-remote --lib fetch_s3_pointer` · `cargo test -p ratarmount-index --lib sibling_index_pointer` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
 | Publish local sidecar | `cargo test -p ratarmount --bin ratarmount publish_index` · `publish_index_flag` clap-steal |
 | Immutable index pointer / `--index-id` (V-2b) | `cargo test -p ratarmount-index --lib index_pointer` · `cargo test -p ratarmount-index --lib bind_local_index_id` · `cargo test -p ratarmount --bin ratarmount publish_index` · `cargo test -p ratarmount --bin ratarmount index_id` |
-| Fingerprint / tarstats full-hash slurps body `Vec` | `cargo test -p ratarmount-index --lib fingerprint` · `cargo test -p ratarmount-index --lib archive_full_hash` · `cargo test -p ratarmount-index --lib compute_hashes` · keep `regression_head_only` + `regression_progressive_nested_fingerprint` |
+| Fingerprint / tarstats full-hash slurps body `Vec` | `cargo test -p ratarmount-index --lib fingerprint` · `cargo test -p ratarmount-index --lib archive_full_hash` · `cargo test -p ratarmount-index --lib compute_hashes` · keep `regression_head_only` + `cargo test -p ratarmount-session --lib regression_progressive_nested_fingerprint` |
 | Offset-order restore / find walks name order | `cargo test -p ratarmount-index --lib dirent_order` · `cargo test -p ratarmount --bin ratarmount find_offset_order` · `cargo test -p ratarmount-formats-tar --lib regression_offset_order_seeks` · `cargo test -p ratarmount-formats-zip --lib regression_offset_order_seeks` · `cargo test -p ratarmount-formats-sevenzip --lib regression_offset_order` |
 | Overlay-only extract after offset flatten (dummy cookie seeks) | `cargo test -p ratarmount-compositing --lib overlay_only` · `N_RESTORE=10000 ./benchmarks/compare-vector-wave.sh` (env-gated, not default CI) |
 | Locate fat `FileInfo` on large catalog; overlay last-wins missing on control search | `cargo test -p ratarmount-index --lib scan_glob` · `cargo test -p ratarmount-compositing --lib search_cheap` · `find_glob` · `control_search` · `search_fts5` |
-| Torn sidecar during `-c` (tmp+rename / dest unlinked at create) | `cargo test -p ratarmount-index --lib regression_reader_survives` · `cargo test -p ratarmount-index --lib regression_drop_unpublished` · `cargo test -p ratarmount --bin ratarmount regression_store_zstd_blocks_in_index_missing_path` |
+| Torn sidecar during `-c` (tmp+rename / dest unlinked at create) | `cargo test -p ratarmount-index --lib regression_reader_survives` · `cargo test -p ratarmount-index --lib regression_drop_unpublished` · `cargo test -p ratarmount-session --lib regression_store_zstd_blocks_in_index_missing_path` |
 | Folder live glob without fat `list()` / symlink-to-`/etc` TSV leak | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `folder_globs`, `folder_limit`) |
 | Union locate forwards `sources[0]` / drops later catalog | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `union_merges`, `union_empty`, `union_none_if_any`, `union_limit`) |
 | OCI locate forwards `layers[0]` / emits `.wh.*` / misses whiteouts | `cargo test -p ratarmount-compositing --lib search_cheap` (filters: `oci_applies_whiteouts`, `oci_none_if_any`, `oci_empty`, `oci_higher_layer`) |
@@ -161,7 +161,7 @@ When you fix a **new** production bug, **add a row** here and ship the test in t
 
 ## Workspace layout
 
-Rust workspace under `ratarmount-*` crates; binary is `ratarmount/`. Prefer non-overlapping crate ownership when parallelizing. Orchestrator owns `ratarmount/src/factory.rs` glue unless a task explicitly owns factory.
+Rust workspace under `ratarmount-*` crates; binary is `ratarmount/`. Prefer non-overlapping crate ownership when parallelizing. Orchestrator owns `ratarmount-session/src/factory.rs` glue unless a task explicitly owns factory.
 
 ## Subagents / parallel worktrees
 

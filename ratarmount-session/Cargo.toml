@@ -5,8 +5,67 @@ edition.workspace = true
 license.workspace = true
 description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
 
+[features]
+default = ["formats"]
+# Same L2 set factory.rs `use`s today (ar, asar, cab, cpio, ext4, fat, git,
+# html, iso9660, libarchive, ogg, pdf, sevenzip, sqlar, squashfs, tar, warc,
+# xar, zip) + compress + compositing + remote. Not optional until G5.3.
+formats = [
+  "dep:ratarmount-formats-tar",
+  "dep:ratarmount-formats-zip",
+  "dep:ratarmount-formats-sevenzip",
+  "dep:ratarmount-formats-ar",
+  "dep:ratarmount-formats-asar",
+  "dep:ratarmount-formats-cab",
+  "dep:ratarmount-formats-cpio",
+  "dep:ratarmount-formats-ext4",
+  "dep:ratarmount-formats-fat",
+  "dep:ratarmount-formats-git",
+  "dep:ratarmount-formats-html",
+  "dep:ratarmount-formats-iso9660",
+  "dep:ratarmount-formats-libarchive",
+  "dep:ratarmount-formats-ogg",
+  "dep:ratarmount-formats-pdf",
+  "dep:ratarmount-formats-sqlar",
+  "dep:ratarmount-formats-squashfs",
+  "dep:ratarmount-formats-warc",
+  "dep:ratarmount-formats-xar",
+  "dep:ratarmount-compress",
+  "dep:ratarmount-compositing",
+  "dep:ratarmount-remote",
+]
+gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
+gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
+
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true
 thiserror.workspace = true
 secrecy = "0.8"
+log.workspace = true
+tempfile.workspace = true
+ratarmount-formats-tar = { workspace = true, optional = true }
+ratarmount-formats-zip = { workspace = true, optional = true }
+ratarmount-formats-sevenzip = { workspace = true, optional = true }
+ratarmount-formats-ar = { workspace = true, optional = true }
+ratarmount-formats-asar = { workspace = true, optional = true }
+ratarmount-formats-cab = { workspace = true, optional = true }
+ratarmount-formats-cpio = { workspace = true, optional = true }
+ratarmount-formats-ext4 = { workspace = true, optional = true }
+ratarmount-formats-fat = { workspace = true, optional = true }
+ratarmount-formats-git = { workspace = true, optional = true }
+ratarmount-formats-html = { workspace = true, optional = true }
+ratarmount-formats-iso9660 = { workspace = true, optional = true }
+ratarmount-formats-libarchive = { workspace = true, optional = true }
+ratarmount-formats-ogg = { workspace = true, optional = true }
+ratarmount-formats-pdf = { workspace = true, optional = true }
+ratarmount-formats-sqlar = { workspace = true, optional = true }
+ratarmount-formats-squashfs = { workspace = true, optional = true }
+ratarmount-formats-warc = { workspace = true, optional = true }
+ratarmount-formats-xar = { workspace = true, optional = true }
+ratarmount-compress = { workspace = true, optional = true }
+ratarmount-compositing = { workspace = true, optional = true }
+ratarmount-remote = { workspace = true, optional = true }
+
+[dev-dependencies]
+url = "2"

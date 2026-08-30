@@ -5,12 +5,17 @@
 //! The default dependency graph of `ratarmount-session` has no `fuser`
 //! (`cargo tree -p ratarmount-session -i fuser` is empty).
 //!
+//! Archive factory glue (`open_path`, `build_mount_source_ex`) lives in
+//! [`factory`] so the CLI can share it. Embedders should use [`Session`], not
+//! the factory module, once `Session::open` lands.
+//!
 //! Contract: types, [`Error`] (no `Busy`), [`Session`] (no [`Clone`]; share via
 //! [`std::sync::Arc`]). See `docs/session-api.md`.
 
 mod error;
 #[allow(dead_code)]
 mod extract;
+pub mod factory;
 mod index_job;
 #[allow(dead_code)]
 mod locate;
@@ -132,6 +137,21 @@ mod tests {
         let session = Session::stub();
         let shared = Arc::new(session);
         let _clone = Arc::clone(&shared);
+    }
+
+    #[test]
+    fn factory_open_path_is_reachable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("no-such-archive.tar");
+        let err = match crate::factory::open_path(
+            &missing,
+            &ratarmount_core::OpenOptions::default(),
+            false,
+        ) {
+            Ok(_) => panic!("missing archive should not open"),
+            Err(e) => e,
+        };
+        assert!(!err.is_empty(), "open_path should report the missing path");
     }
 
     #[test]
