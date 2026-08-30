@@ -3,7 +3,9 @@
 //! This crate is the **supported embedder surface**. Do not import the
 //! `ratarmount` binary crate — that pulls FUSE, NFS, SMB, HTTP, 9P, and SFTP.
 //! The default dependency graph of `ratarmount-session` has no `fuser`
-//! (`cargo tree -p ratarmount-session -i fuser` is empty).
+//! (`cargo tree -p ratarmount-session -i fuser` is empty). TAR/ZIP/7z are
+//! always compiled; other L2 is `formats-all` (G5.3). `--no-default-features`
+//! drops libarchive/git/….
 //!
 //! Archive factory glue (`open_path`, `build_mount_source_ex`) lives in
 //! [`factory`] so the CLI can share it. Embedders should use [`Session`], not

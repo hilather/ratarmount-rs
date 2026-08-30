@@ -33,7 +33,9 @@ sftp-russh = ["ratarmount-sftp/sftp-russh"]
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-index.workspace = true
-ratarmount-session.workspace = true
+# CLI always wants the full factory matrix. Session default is formats-all
+# today; pin the feature so a later slim-default shrink does not drop L2 here.
+ratarmount-session = { workspace = true, features = ["formats-all"] }
 ratarmount-formats-tar.workspace = true
 ratarmount-formats-zip.workspace = true
 ratarmount-formats-ar.workspace = true

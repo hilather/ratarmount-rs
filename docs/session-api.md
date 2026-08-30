@@ -23,7 +23,7 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 | `IndexJob::run` | **implemented** (Always rebuild; cancel never `publish_tmp`) | G2 |
 | `resolve_index` | **implemented** (`SiblingNotWritable`; `UserCache` → `local-index-v1`; CliCompat still `:memory:`) | G4 / PR6–PR7 |
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
-| Format crates (TAR/ZIP/7z/… including libarchive/git) | default `formats` feature (full L2 set factory `use`s) | PR2 |
+| Format crates (TAR/ZIP/7z always; other L2 via `formats-all`) | default `formats-all`; `--no-default-features` = TAR/ZIP/7z | G5.3 / PR9 |
 | `OpenOptions` Debug | passwords printed as `[redacted N]` | G5.2 / PR3 |
 
 `cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
@@ -293,4 +293,6 @@ GUI v1 is **read-mostly**. Overlay write, live commit, and `--commit-overlay` ar
 
 This crate is the **supported embedder API** (`Session`). Archive factory glue (`open_path`, `build_mount_source_ex`, nested openers, remote URL open) lives here as **`pub mod factory`** so the CLI can share it without importing a FUSE binary crate. Embedders should use `Session`; `factory` is public for the CLI.
 
-Default `formats` is the full L2 set factory already `use`s (TAR/ZIP/7z plus ar/asar/cab/cpio/ext4/fat/git/html/iso9660/libarchive/ogg/pdf/sqlar/squashfs/warc/xar + compress + compositing + remote). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); later `http-export`.
+TAR/ZIP/7z + compress + compositing + remote are **always** compiled. Other L2 is optional (`ar`, `asar`, `cab`, `cpio`, `ext4`, `fat`, `git`, `html`, `iso9660`, `libarchive`, `ogg`, `pdf`, `sqlar`, `squashfs`, `warc`, `xar`), bundled as **`formats-all`**. In-tree default is `formats-all` so the factory test matrix still runs; embedders who want the slim graph use `--no-default-features` (G5.3). Probe **order** of enabled backends is `DEFAULT_FORMAT_PROBE_ORDER` (do not reorder). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional: `gzip-rapidgzip` (forwarded from the binary); later `http-export`.
+
+Example: `cargo run -p ratarmount-session --example session-list -- archive.tar`.

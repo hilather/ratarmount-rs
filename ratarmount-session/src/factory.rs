@@ -24,33 +24,54 @@ use ratarmount_compress::{
     GZIP_SEEK_INDEX_MAGIC, INDEXED_GZIP_INDEX_MAGIC,
 };
 use ratarmount_core::{MountSource, OpenOptions};
+// WHY: G5.3 — cfg-gate unused L2 so `--no-default-features` is TAR/ZIP/7z only
+// (no libarchive/git). Probe order of enabled backends is unchanged.
+#[cfg(feature = "ar")]
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
+#[cfg(feature = "asar")]
 use ratarmount_formats_asar::{looks_like_asar, AsarMountSource};
+#[cfg(feature = "cab")]
 use ratarmount_formats_cab::{looks_like_cab, CabError, CabMountSource};
+#[cfg(feature = "cpio")]
 use ratarmount_formats_cpio::{looks_like_cpio, CpioMountSource};
+#[cfg(feature = "ext4")]
 use ratarmount_formats_ext4::{looks_like_ext4, looks_like_ext4_reader, Ext4MountSource};
+#[cfg(feature = "fat")]
 use ratarmount_formats_fat::{looks_like_fat, looks_like_fat_reader, FatMountSource};
+#[cfg(feature = "git")]
 use ratarmount_formats_git::{looks_like_git, GitMountSource};
+#[cfg(feature = "html")]
 use ratarmount_formats_html::{looks_like_html, HtmlMountSource};
+#[cfg(feature = "iso9660")]
 use ratarmount_formats_iso9660::{looks_like_iso, Iso9660MountSource};
+#[cfg(feature = "libarchive")]
 use ratarmount_formats_libarchive::{
     looks_like_libarchive, try_open_lrzip_via_libarchive, LibarchiveMountSource,
 };
+#[cfg(feature = "ogg")]
 use ratarmount_formats_ogg::{looks_like_ogg, OggMountSource};
+#[cfg(feature = "pdf")]
 use ratarmount_formats_pdf::{looks_like_pdf, PdfMountSource};
 use ratarmount_formats_sevenzip::{looks_like_7z, SevenZipMountSource};
+#[cfg(feature = "sqlar")]
 use ratarmount_formats_sqlar::{looks_like_sqlar, SqlarMountSource};
+#[cfg(feature = "squashfs")]
 use ratarmount_formats_squashfs::{
     looks_like_squashfs, looks_like_squashfs_reader, SquashFsMountSource,
 };
 use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
+#[cfg(feature = "warc")]
 use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
+#[cfg(feature = "xar")]
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
+#[cfg(feature = "ar")]
+use ratarmount_index::NESTED_FORMAT_AR;
+#[cfg(feature = "cpio")]
+use ratarmount_index::NESTED_FORMAT_CPIO;
 use ratarmount_index::{
     discard_index_file_if_below_minimum, DurableNestedBlob, IndexLocation, NestedBodyFingerprint,
-    NestedMemberKey, SqliteIndex, NESTED_FORMAT_AR, NESTED_FORMAT_CPIO, NESTED_FORMAT_SEVENZIP,
-    NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
+    NestedMemberKey, SqliteIndex, NESTED_FORMAT_SEVENZIP, NESTED_FORMAT_TAR, NESTED_FORMAT_ZIP,
 };
 
 #[path = "remote_open.rs"]
@@ -67,42 +88,75 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
 enum FormatBackend {
     SevenZip,
     Zip,
+    #[cfg(feature = "asar")]
     Asar,
+    #[cfg(feature = "ar")]
     Ar,
+    #[cfg(feature = "cpio")]
     Cpio,
+    #[cfg(feature = "iso9660")]
     Iso,
+    #[cfg(feature = "warc")]
     Warc,
+    #[cfg(feature = "xar")]
     Xar,
+    #[cfg(feature = "cab")]
     Cab,
+    #[cfg(feature = "sqlar")]
     Sqlar,
+    #[cfg(feature = "squashfs")]
     SquashFs,
+    #[cfg(feature = "ext4")]
     Ext4,
+    #[cfg(feature = "fat")]
     Fat,
+    #[cfg(feature = "ogg")]
     Ogg,
+    #[cfg(feature = "pdf")]
     Pdf,
+    #[cfg(feature = "html")]
     Html,
+    #[cfg(feature = "libarchive")]
     Libarchive,
     Tar,
 }
 
 /// Default probe order when `--use-backend` is empty (historical fixed chain).
+///
+/// WHY: G5.3 omits disabled L2 via `#[cfg]`; remaining entries stay in this
+/// order (do not reorder enabled backends).
 const DEFAULT_FORMAT_PROBE_ORDER: &[FormatBackend] = &[
     FormatBackend::SevenZip,
     FormatBackend::Zip,
+    #[cfg(feature = "asar")]
     FormatBackend::Asar,
+    #[cfg(feature = "ar")]
     FormatBackend::Ar,
+    #[cfg(feature = "cpio")]
     FormatBackend::Cpio,
+    #[cfg(feature = "iso9660")]
     FormatBackend::Iso,
+    #[cfg(feature = "warc")]
     FormatBackend::Warc,
+    #[cfg(feature = "xar")]
     FormatBackend::Xar,
+    #[cfg(feature = "cab")]
     FormatBackend::Cab,
+    #[cfg(feature = "sqlar")]
     FormatBackend::Sqlar,
+    #[cfg(feature = "squashfs")]
     FormatBackend::SquashFs,
+    #[cfg(feature = "ext4")]
     FormatBackend::Ext4,
+    #[cfg(feature = "fat")]
     FormatBackend::Fat,
+    #[cfg(feature = "ogg")]
     FormatBackend::Ogg,
+    #[cfg(feature = "pdf")]
     FormatBackend::Pdf,
+    #[cfg(feature = "html")]
     FormatBackend::Html,
+    #[cfg(feature = "libarchive")]
     FormatBackend::Libarchive,
     FormatBackend::Tar,
 ];
@@ -125,22 +179,38 @@ fn parse_format_backend(name: &str) -> Option<FormatBackend> {
         | "bzip2" => FormatBackend::Tar,
         "zip" | "zipfile" => FormatBackend::Zip,
         "7z" | "sevenzip" | "py7zr" => FormatBackend::SevenZip,
+        #[cfg(feature = "libarchive")]
         "libarchive" => FormatBackend::Libarchive,
+        #[cfg(feature = "squashfs")]
         "squashfs" | "pysquashfsimage" => FormatBackend::SquashFs,
+        #[cfg(feature = "ext4")]
         "ext4" | "ext" => FormatBackend::Ext4,
+        #[cfg(feature = "fat")]
         "fat" | "fatfs" | "vfat" => FormatBackend::Fat,
+        #[cfg(feature = "ar")]
         "ar" => FormatBackend::Ar,
+        #[cfg(feature = "cpio")]
         "cpio" => FormatBackend::Cpio,
+        #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => FormatBackend::Iso,
+        #[cfg(feature = "warc")]
         "warc" => FormatBackend::Warc,
+        #[cfg(feature = "xar")]
         "xar" => FormatBackend::Xar,
+        #[cfg(feature = "cab")]
         "cab" => FormatBackend::Cab,
+        #[cfg(feature = "asar")]
         "asar" => FormatBackend::Asar,
+        #[cfg(feature = "sqlar")]
         "sqlar" => FormatBackend::Sqlar,
+        #[cfg(feature = "ogg")]
         "ogg" | "ogv" | "oga" => FormatBackend::Ogg,
+        #[cfg(feature = "pdf")]
         "pdf" => FormatBackend::Pdf,
+        #[cfg(feature = "html")]
         "html" | "htm" => FormatBackend::Html,
         // RAR/RPM have no dedicated Rust backend; prefer libarchive when requested.
+        #[cfg(feature = "libarchive")]
         "rar" | "rarfile" | "rpm" => FormatBackend::Libarchive,
         _ => return None,
     })
@@ -204,6 +274,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "asar")]
         FormatBackend::Asar => {
             if !looks_like_asar(path) {
                 return Ok(None);
@@ -213,6 +284,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "ar")]
         FormatBackend::Ar => {
             if !looks_like_ar(path) {
                 return Ok(None);
@@ -222,6 +294,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "cpio")]
         FormatBackend::Cpio => {
             if !looks_like_cpio(path) {
                 return Ok(None);
@@ -231,6 +304,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "iso9660")]
         FormatBackend::Iso => {
             if !looks_like_iso(path) {
                 return Ok(None);
@@ -240,6 +314,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "warc")]
         FormatBackend::Warc => {
             if !looks_like_warc(path) {
                 return Ok(None);
@@ -249,6 +324,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "xar")]
         FormatBackend::Xar => {
             if !looks_like_xar(path) {
                 return Ok(None);
@@ -258,12 +334,14 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "cab")]
         FormatBackend::Cab => {
             if !looks_like_cab(path) {
                 return Ok(None);
             }
             match CabMountSource::open(path, index_path, options, VERSION, recreate) {
                 Ok(s) => Ok(Some(Arc::new(s))),
+                #[cfg(feature = "libarchive")]
                 Err(CabError::UnsupportedCompression(_)) => Ok(Some(Arc::new(
                     LibarchiveMountSource::open(path, index_path, options, VERSION, recreate)
                         .map_err(|e| e.to_string())?,
@@ -271,6 +349,7 @@ fn try_open_format_backend(
                 Err(e) => Err(e.to_string()),
             }
         }
+        #[cfg(feature = "sqlar")]
         FormatBackend::Sqlar => {
             if !looks_like_sqlar(path) {
                 return Ok(None);
@@ -279,6 +358,7 @@ fn try_open_format_backend(
                 SqlarMountSource::open(path, options).map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "squashfs")]
         FormatBackend::SquashFs => {
             if !looks_like_squashfs(path) {
                 return Ok(None);
@@ -287,6 +367,7 @@ fn try_open_format_backend(
                 SquashFsMountSource::open(path).map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "ext4")]
         FormatBackend::Ext4 => {
             if !looks_like_ext4(path) {
                 return Ok(None);
@@ -295,6 +376,7 @@ fn try_open_format_backend(
                 Ext4MountSource::open(path).map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "fat")]
         FormatBackend::Fat => {
             if !looks_like_fat(path) {
                 return Ok(None);
@@ -303,6 +385,7 @@ fn try_open_format_backend(
                 FatMountSource::open(path).map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "ogg")]
         FormatBackend::Ogg => {
             if !looks_like_ogg(path) {
                 return Ok(None);
@@ -312,6 +395,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "pdf")]
         FormatBackend::Pdf => {
             if !looks_like_pdf(path) {
                 return Ok(None);
@@ -321,6 +405,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "html")]
         FormatBackend::Html => {
             if !looks_like_html(path) {
                 return Ok(None);
@@ -330,6 +415,7 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "libarchive")]
         FormatBackend::Libarchive => {
             if !looks_like_libarchive(path) {
                 return Ok(None);
@@ -419,20 +505,45 @@ mod split_open_tests {
         assert_eq!(order[1], FormatBackend::Zip);
         // Python aliases
         assert_eq!(parse_format_backend("py7zr"), Some(FormatBackend::SevenZip));
+        #[cfg(feature = "iso9660")]
         assert_eq!(parse_format_backend("iso9660"), Some(FormatBackend::Iso));
+        #[cfg(not(feature = "iso9660"))]
+        assert_eq!(parse_format_backend("iso9660"), None);
         assert_eq!(parse_format_backend("rapidgzip"), Some(FormatBackend::Tar));
+        #[cfg(feature = "squashfs")]
         assert_eq!(
             parse_format_backend("PySquashfsImage"),
             Some(FormatBackend::SquashFs)
         );
+        #[cfg(not(feature = "squashfs"))]
+        assert_eq!(parse_format_backend("PySquashfsImage"), None);
         assert_eq!(parse_format_backend("unknown-backend-xyz"), None);
     }
 
     #[test]
     fn ordered_format_backends_unknown_skipped() {
         let order = ordered_format_backends(&["nope".into(), "libarchive".into()]);
+        #[cfg(feature = "libarchive")]
         assert_eq!(order[0], FormatBackend::Libarchive);
+        #[cfg(not(feature = "libarchive"))]
+        assert_eq!(order[0], FormatBackend::SevenZip);
         assert!(!order.is_empty());
+    }
+
+    #[test]
+    fn ordered_format_backends_keeps_historical_enabled_sequence() {
+        // G5.3: disabled L2 is omitted; remaining backends stay in
+        // DEFAULT_FORMAT_PROBE_ORDER (7z → zip → … → tar).
+        let order = ordered_format_backends(&[]);
+        assert_eq!(order, DEFAULT_FORMAT_PROBE_ORDER.to_vec());
+        assert_eq!(order.first(), Some(&FormatBackend::SevenZip));
+        assert_eq!(order.last(), Some(&FormatBackend::Tar));
+        let zip = order.iter().position(|&b| b == FormatBackend::Zip).unwrap();
+        let tar = order.iter().position(|&b| b == FormatBackend::Tar).unwrap();
+        assert!(
+            zip < tar,
+            "zip must stay before tar in the historical chain"
+        );
     }
 
     #[test]
@@ -555,11 +666,13 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // Unix ar
+        #[cfg(feature = "ar")]
         if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
             return open_nested_ar_with_durable(reader, label, &opts, &ctx);
         }
 
         // XAR
+        #[cfg(feature = "xar")]
         if head.len() >= 4 && &head[..4] == b"xar!" {
             return map_nested_open("XAR", label, || {
                 XarMountSource::open_from_reader(reader, label, None, &opts, VERSION)
@@ -567,6 +680,7 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // CAB (MSCF); LZX returns UnsupportedCompression → AutoMount temp spool → libarchive
+        #[cfg(feature = "cab")]
         if head.len() >= 4 && &head[..4] == b"MSCF" {
             return map_nested_open("CAB", label, || {
                 CabMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
@@ -574,6 +688,7 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // Unencrypted SQLAR / SQLite header
+        #[cfg(feature = "sqlar")]
         if head.len() >= 16 && &head[..16] == b"SQLite format 3\0" {
             return map_nested_open("SQLAR", label, || {
                 SqlarMountSource::open_from_reader(reader, label, &opts)
@@ -581,11 +696,13 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // CPIO newc/crc/odc (ASCII) or binary magic
+        #[cfg(feature = "cpio")]
         if head_looks_like_cpio(head) {
             return open_nested_cpio_with_durable(reader, label, &opts, &ctx);
         }
 
         // WARC
+        #[cfg(feature = "warc")]
         if head.len() >= 5 && &head[..5] == b"WARC/" {
             return map_nested_open("WARC", label, || {
                 WarcMountSource::open_from_reader(reader, label, None, &opts, VERSION)
@@ -648,16 +765,20 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // ISO 9660: PVD at sector 16 (beyond first 512 bytes) — probe stream or name
-        let looks_iso = name_suggests_iso(label)
-            || ratarmount_formats_iso9660::looks_like_iso9660_reader(&mut reader);
-        let _ = reader.seek(SeekFrom::Start(0));
-        if looks_iso {
-            return map_nested_open("ISO9660", label, || {
-                Iso9660MountSource::open_from_reader(reader, label, None, &opts, VERSION)
-            });
+        #[cfg(feature = "iso9660")]
+        {
+            let looks_iso = name_suggests_iso(label)
+                || ratarmount_formats_iso9660::looks_like_iso9660_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_iso {
+                return map_nested_open("ISO9660", label, || {
+                    Iso9660MountSource::open_from_reader(reader, label, None, &opts, VERSION)
+                });
+            }
         }
 
         // ASAR: extension (header sniff needs full parse; name is the nested-open trigger)
+        #[cfg(feature = "asar")]
         if name_suggests_asar(label) {
             return map_nested_open("ASAR", label, || {
                 AsarMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
@@ -665,31 +786,37 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // WARC / CPIO by extension when magic was missed
+        #[cfg(feature = "warc")]
         if name_suggests_ext(label, &["warc"]) {
             return map_nested_open("WARC", label, || {
                 WarcMountSource::open_from_reader(reader, label, None, &opts, VERSION)
             });
         }
+        #[cfg(feature = "cpio")]
         if name_suggests_ext(label, &["cpio"]) {
             return map_nested_open("CPIO", label, || {
                 CpioMountSource::open_from_reader(reader, label, None, &opts, VERSION)
             });
         }
+        #[cfg(feature = "ar")]
         if name_suggests_ext(label, &["ar", "a"]) {
             return map_nested_open("AR", label, || {
                 ArMountSource::open_from_reader(reader, label, None, &opts, VERSION)
             });
         }
+        #[cfg(feature = "xar")]
         if name_suggests_ext(label, &["xar"]) {
             return map_nested_open("XAR", label, || {
                 XarMountSource::open_from_reader(reader, label, None, &opts, VERSION)
             });
         }
+        #[cfg(feature = "cab")]
         if name_suggests_ext(label, &["cab"]) {
             return map_nested_open("CAB", label, || {
                 CabMountSource::open_from_reader(reader, label, None, &opts, VERSION, true)
             });
         }
+        #[cfg(feature = "sqlar")]
         if name_suggests_ext(label, &["sqlar"]) {
             return map_nested_open("SQLAR", label, || {
                 SqlarMountSource::open_from_reader(reader, label, &opts)
@@ -697,33 +824,42 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         }
 
         // FAT image: boot-sector probe or name (`.img` only if probe matches — ISO checked above)
-        let looks_fat = name_suggests_ext(label, &["fat", "vfat", "fat12", "fat16", "fat32"])
-            || looks_like_fat_reader(&mut reader);
-        let _ = reader.seek(SeekFrom::Start(0));
-        if looks_fat {
-            return map_nested_open("FAT", label, || {
-                FatMountSource::open_from_reader(reader, label)
-            });
+        #[cfg(feature = "fat")]
+        {
+            let looks_fat = name_suggests_ext(label, &["fat", "vfat", "fat12", "fat16", "fat32"])
+                || looks_like_fat_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_fat {
+                return map_nested_open("FAT", label, || {
+                    FatMountSource::open_from_reader(reader, label)
+                });
+            }
         }
 
         // SquashFS: magic at 0 (or AppImage-style scan); classic LZMA fails → temp spool
-        let looks_sqfs = name_suggests_ext(label, &["squashfs", "sqfs", "snap"])
-            || looks_like_squashfs_reader(&mut reader);
-        let _ = reader.seek(SeekFrom::Start(0));
-        if looks_sqfs {
-            return map_nested_open("SquashFS", label, || {
-                SquashFsMountSource::open_from_reader(reader, label)
-            });
+        #[cfg(feature = "squashfs")]
+        {
+            let looks_sqfs = name_suggests_ext(label, &["squashfs", "sqfs", "snap"])
+                || looks_like_squashfs_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_sqfs {
+                return map_nested_open("SquashFS", label, || {
+                    SquashFsMountSource::open_from_reader(reader, label)
+                });
+            }
         }
 
         // EXT2/3/4: superblock magic @ 1024+0x38; pure fail → temp spool / debugfs path
-        let looks_ext4 = name_suggests_ext(label, &["ext2", "ext3", "ext4", "ext4img"])
-            || looks_like_ext4_reader(&mut reader);
-        let _ = reader.seek(SeekFrom::Start(0));
-        if looks_ext4 {
-            return map_nested_open("EXT4", label, || {
-                Ext4MountSource::open_from_reader(reader, label)
-            });
+        #[cfg(feature = "ext4")]
+        {
+            let looks_ext4 = name_suggests_ext(label, &["ext2", "ext3", "ext4", "ext4img"])
+                || looks_like_ext4_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_ext4 {
+                return map_nested_open("EXT4", label, || {
+                    Ext4MountSource::open_from_reader(reader, label)
+                });
+            }
         }
 
         log::debug!(
@@ -1031,6 +1167,7 @@ fn open_nested_7z_with_durable(
 }
 
 /// Nested CPIO: durable file table load/store.
+#[cfg(feature = "cpio")]
 fn open_nested_cpio_with_durable(
     mut reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
@@ -1088,6 +1225,7 @@ fn open_nested_cpio_with_durable(
 }
 
 /// Nested AR: durable file table load/store.
+#[cfg(feature = "ar")]
 fn open_nested_ar_with_durable(
     mut reader: Box<dyn ratarmount_core::ArchiveRead>,
     label: &Path,
@@ -1144,6 +1282,19 @@ fn open_nested_ar_with_durable(
     Ok(Arc::new(src) as Arc<dyn MountSource>)
 }
 
+#[cfg(any(
+    feature = "ar",
+    feature = "asar",
+    feature = "cab",
+    feature = "cpio",
+    feature = "ext4",
+    feature = "fat",
+    feature = "iso9660",
+    feature = "sqlar",
+    feature = "squashfs",
+    feature = "warc",
+    feature = "xar"
+))]
 fn map_nested_open<S, E>(
     kind: &str,
     label: &Path,
@@ -1167,6 +1318,7 @@ where
     })
 }
 
+#[cfg_attr(not(feature = "cpio"), allow(dead_code))]
 fn head_looks_like_cpio(head: &[u8]) -> bool {
     if head.len() >= 6 {
         let m6 = &head[..6];
@@ -1183,15 +1335,18 @@ fn head_looks_like_cpio(head: &[u8]) -> bool {
     false
 }
 
+#[cfg_attr(not(feature = "iso9660"), allow(dead_code))]
 fn name_suggests_iso(path: &Path) -> bool {
     // Do not treat bare `.img` as ISO — FAT images often use that suffix too.
     name_suggests_ext(path, &["iso", "iso9660", "cdr"])
 }
 
+#[cfg_attr(not(feature = "asar"), allow(dead_code))]
 fn name_suggests_asar(path: &Path) -> bool {
     name_suggests_ext(path, &["asar"])
 }
 
+#[allow(dead_code)]
 fn name_suggests_ext(path: &Path, exts: &[&str]) -> bool {
     let name = path
         .file_name()
@@ -1560,8 +1715,26 @@ fn open_split_set(
         || looks_like_tar(&tmp_path).unwrap_or(false)
         || looks_like_zip(&tmp_path)
         || looks_like_7z(&tmp_path)
-        || looks_like_ar(&tmp_path)
-        || looks_like_cpio(&tmp_path);
+        || {
+            #[cfg(feature = "ar")]
+            {
+                looks_like_ar(&tmp_path)
+            }
+            #[cfg(not(feature = "ar"))]
+            {
+                false
+            }
+        }
+        || {
+            #[cfg(feature = "cpio")]
+            {
+                looks_like_cpio(&tmp_path)
+            }
+            #[cfg(not(feature = "cpio"))]
+            {
+                false
+            }
+        };
 
     if !looks_archive {
         // Plain joined file → virtual name without split suffix (Python SingleFileMountSource).
@@ -1638,14 +1811,17 @@ fn open_path_impl(
     if path.is_dir() {
         // Git: bare repos / `.git` dirs (HEAD+objects, no nested `.git`), or force via env.
         // Normal worktrees keep FolderMountSource so the live working tree is shown.
-        let is_git_dir_or_bare = path.join("HEAD").is_file()
-            && path.join("objects").is_dir()
-            && !path.join(".git").exists();
-        let force_git = std::env::var_os("RATARMOUNT_FORCE_GIT").is_some();
-        if (is_git_dir_or_bare || force_git) && looks_like_git(path) {
-            return GitMountSource::open(path, None)
-                .map(|g| Arc::new(g) as Arc<dyn MountSource>)
-                .map_err(|e| e.to_string());
+        #[cfg(feature = "git")]
+        {
+            let is_git_dir_or_bare = path.join("HEAD").is_file()
+                && path.join("objects").is_dir()
+                && !path.join(".git").exists();
+            let force_git = std::env::var_os("RATARMOUNT_FORCE_GIT").is_some();
+            if (is_git_dir_or_bare || force_git) && looks_like_git(path) {
+                return GitMountSource::open(path, None)
+                    .map(|g| Arc::new(g) as Arc<dyn MountSource>)
+                    .map_err(|e| e.to_string());
+            }
         }
         return FolderMountSource::new(path)
             .map(|f| Arc::new(f) as Arc<dyn MountSource>)
@@ -1760,6 +1936,7 @@ fn open_lrzip(
                     &mut materialised,
                 )?));
             }
+            #[cfg(feature = "ext4")]
             if looks_like_ext4(&data_path) {
                 let keep = materialised
                     .take()
@@ -1780,6 +1957,7 @@ fn open_lrzip(
             )? {
                 return Ok(src);
             }
+            #[cfg(feature = "libarchive")]
             if looks_like_libarchive(&data_path) {
                 let keep = materialised
                     .take()
@@ -1802,6 +1980,7 @@ fn open_lrzip(
         }
         Err(cli_err) => {
             // Python keeps lrzip on libarchive only; filter_all includes lrzip when built-in.
+            #[cfg(feature = "libarchive")]
             match try_open_lrzip_via_libarchive(path, index_path, options, VERSION, recreate) {
                 Ok(src) => {
                     eprintln!(
@@ -1817,6 +1996,11 @@ fn open_lrzip(
                     path.display()
                 )),
             }
+            #[cfg(not(feature = "libarchive"))]
+            Err(format!(
+                "lrzip open failed for {}: CLI materialize: {cli_err}. Install `lrzip`/`lrunzip` on PATH.",
+                path.display()
+            ))
         }
     }
 }
@@ -2255,6 +2439,15 @@ fn open_gzip(
 }
 
 /// After compression materialize: prefer pure stencil ISO/WARC/XAR/CAB before libarchive.
+#[cfg_attr(
+    not(any(
+        feature = "iso9660",
+        feature = "warc",
+        feature = "xar",
+        feature = "cab"
+    )),
+    allow(unused_variables)
+)]
 fn try_stencil_archives_on_path(
     data_path: &Path,
     index_path: Option<&Path>,
@@ -2262,6 +2455,15 @@ fn try_stencil_archives_on_path(
     recreate: bool,
     materialised: &mut Option<tempfile::NamedTempFile>,
 ) -> Result<Option<Arc<dyn MountSource>>, String> {
+    #[cfg_attr(
+        not(any(
+            feature = "iso9660",
+            feature = "warc",
+            feature = "xar",
+            feature = "cab"
+        )),
+        allow(unused_variables)
+    )]
     let keep_path =
         |materialised: &mut Option<tempfile::NamedTempFile>| -> Result<PathBuf, String> {
             if let Some(tmp) = materialised.take() {
@@ -2271,6 +2473,7 @@ fn try_stencil_archives_on_path(
             }
         };
 
+    #[cfg(feature = "iso9660")]
     if looks_like_iso(data_path) {
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
@@ -2278,6 +2481,7 @@ fn try_stencil_archives_on_path(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "warc")]
     if looks_like_warc(data_path) {
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
@@ -2285,6 +2489,7 @@ fn try_stencil_archives_on_path(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "xar")]
     if looks_like_xar(data_path) {
         let keep = keep_path(materialised)?;
         return Ok(Some(Arc::new(
@@ -2292,10 +2497,12 @@ fn try_stencil_archives_on_path(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "cab")]
     if looks_like_cab(data_path) {
         let keep = keep_path(materialised)?;
         match CabMountSource::open(&keep, index_path, options, VERSION, recreate) {
             Ok(s) => return Ok(Some(Arc::new(s))),
+            #[cfg(feature = "libarchive")]
             Err(CabError::UnsupportedCompression(_)) => {
                 return Ok(Some(Arc::new(
                     LibarchiveMountSource::open(&keep, index_path, options, VERSION, recreate)
@@ -2827,7 +3034,14 @@ fn try_open_formats_from_seekable_body(
     options: &OpenOptions,
     recreate: bool,
 ) -> Result<Option<Arc<dyn MountSource>>, String> {
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::Read;
+    #[cfg(any(
+        feature = "iso9660",
+        feature = "fat",
+        feature = "squashfs",
+        feature = "ext4"
+    ))]
+    use std::io::{Seek, SeekFrom};
 
     let mut head = [0u8; 512];
     let n = {
@@ -2847,6 +3061,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // Unix ar
+    #[cfg(feature = "ar")]
     if head.len() >= 8 && &head[..8] == b"!<arch>\n" {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2855,6 +3070,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // XAR
+    #[cfg(feature = "xar")]
     if head.len() >= 4 && &head[..4] == b"xar!" {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2863,6 +3079,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // CAB (store/MSZIP; LZX → residual materialize + libarchive)
+    #[cfg(feature = "cab")]
     if head.len() >= 4 && &head[..4] == b"MSCF" {
         let r = open_reader()?;
         match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
@@ -2876,6 +3093,7 @@ fn try_open_formats_from_seekable_body(
         }
     }
     // SQLAR / SQLite
+    #[cfg(feature = "sqlar")]
     if head.len() >= 16 && &head[..16] == b"SQLite format 3\0" {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2883,6 +3101,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // CPIO
+    #[cfg(feature = "cpio")]
     if head_looks_like_cpio(head) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2891,6 +3110,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // WARC
+    #[cfg(feature = "warc")]
     if head.len() >= 5 && &head[..5] == b"WARC/" {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2918,6 +3138,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // ISO 9660: PVD at sector 16 or name
+    #[cfg(feature = "iso9660")]
     {
         let mut r = open_reader()?;
         let looks_iso = name_suggests_iso(label)
@@ -2931,6 +3152,7 @@ fn try_open_formats_from_seekable_body(
         }
     }
     // ASAR by name
+    #[cfg(feature = "asar")]
     if name_suggests_asar(label) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2939,6 +3161,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // Extension fallbacks (magic missed)
+    #[cfg(feature = "warc")]
     if name_suggests_ext(label, &["warc"]) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2946,6 +3169,7 @@ fn try_open_formats_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "cpio")]
     if name_suggests_ext(label, &["cpio"]) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2953,6 +3177,7 @@ fn try_open_formats_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "ar")]
     if name_suggests_ext(label, &["ar", "a"]) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2960,6 +3185,7 @@ fn try_open_formats_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "xar")]
     if name_suggests_ext(label, &["xar"]) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2967,6 +3193,7 @@ fn try_open_formats_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    #[cfg(feature = "cab")]
     if name_suggests_ext(label, &["cab"]) {
         let r = open_reader()?;
         match CabMountSource::open_from_reader(r, label, index_path, options, VERSION, recreate) {
@@ -2979,6 +3206,7 @@ fn try_open_formats_from_seekable_body(
             Err(e) => return Err(e.to_string()),
         }
     }
+    #[cfg(feature = "sqlar")]
     if name_suggests_ext(label, &["sqlar"]) {
         let r = open_reader()?;
         return Ok(Some(Arc::new(
@@ -2986,6 +3214,7 @@ fn try_open_formats_from_seekable_body(
         )));
     }
     // FAT image
+    #[cfg(feature = "fat")]
     {
         let mut r = open_reader()?;
         let looks_fat = name_suggests_ext(label, &["fat", "vfat", "fat12", "fat16", "fat32"])
@@ -2998,6 +3227,7 @@ fn try_open_formats_from_seekable_body(
         }
     }
     // SquashFS (in-process backhand; classic LZMA → Ok(None) → path materialize residual)
+    #[cfg(feature = "squashfs")]
     {
         let mut r = open_reader()?;
         let looks_sqfs = name_suggests_ext(label, &["squashfs", "sqfs", "snap"])
@@ -3017,6 +3247,7 @@ fn try_open_formats_from_seekable_body(
         }
     }
     // EXT2/3/4 (pure ext4-view shared stream; pure fail → Ok(None) → path materialize / debugfs)
+    #[cfg(feature = "ext4")]
     {
         let mut r = open_reader()?;
         let looks_ext4 = name_suggests_ext(label, &["ext2", "ext3", "ext4", "ext4img"])
@@ -3086,6 +3317,7 @@ fn materialize_seekable_body_for_path_backends(
     let mut tmp = tempfile::NamedTempFile::new().map_err(|e| e.to_string())?;
     std::io::copy(&mut reader, &mut tmp).map_err(|e| e.to_string())?;
     let data_path = tmp.path().to_path_buf();
+    #[cfg(feature = "ext4")]
     if looks_like_ext4(&data_path) {
         let keep = tmp
             .into_temp_path()
@@ -3095,6 +3327,7 @@ fn materialize_seekable_body_for_path_backends(
             Ext4MountSource::open(&keep).map_err(|e| e.to_string())?,
         ));
     }
+    #[cfg(feature = "squashfs")]
     if looks_like_squashfs(&data_path) {
         let keep = tmp
             .into_temp_path()
@@ -3104,6 +3337,7 @@ fn materialize_seekable_body_for_path_backends(
             SquashFsMountSource::open(&keep).map_err(|e| e.to_string())?,
         ));
     }
+    #[cfg(feature = "fat")]
     if looks_like_fat(&data_path) {
         let keep = tmp
             .into_temp_path()
@@ -3119,6 +3353,7 @@ fn materialize_seekable_body_for_path_backends(
     {
         return Ok(src);
     }
+    #[cfg(feature = "libarchive")]
     if looks_like_libarchive(&data_path) {
         let keep = materialised
             .take()
@@ -5874,6 +6109,7 @@ mod tests {
     }
 
     /// Minimal newc CPIO with one regular file and TRAILER (mirrors formats-cpio tests).
+    #[cfg(feature = "cpio")]
     fn build_newc_cpio(name: &str, data: &[u8], mode: u32) -> Vec<u8> {
         fn push_entry(out: &mut Vec<u8>, name: &str, data: &[u8], mode: u32) {
             let namesize = name.len() + 1;
@@ -5913,6 +6149,7 @@ mod tests {
     }
 
     /// Minimal SVR4/GNU `ar` with one regular member (name ends with `/`).
+    #[cfg(feature = "ar")]
     fn synthetic_ar(name: &str, payload: &[u8]) -> Vec<u8> {
         const HEADER_SIZE: usize = 60;
         let mut out = Vec::new();
@@ -5939,6 +6176,7 @@ mod tests {
     }
 
     /// Minimal WARC/1.0 with one `response` record.
+    #[cfg(feature = "warc")]
     fn synthetic_response_warc(uri: &str, payload: &[u8]) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(b"WARC/1.0\r\n");
@@ -5955,6 +6193,7 @@ mod tests {
     }
 
     /// Minimal Electron ASAR with flat files (concatenated payload; no serde_json dep).
+    #[cfg(feature = "asar")]
     fn build_minimal_asar(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut entries = Vec::new();
         let mut offset: u64 = 0;
@@ -5984,6 +6223,7 @@ mod tests {
         out
     }
 
+    #[cfg(feature = "cpio")]
     #[test]
     fn nested_cpio_from_cursor_via_opener() {
         // S_IFREG | 0644
@@ -6005,6 +6245,7 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[5..]);
     }
 
+    #[cfg(feature = "ar")]
     #[test]
     fn nested_ar_from_cursor_via_opener() {
         let payload = b"ar-RANDOM-seek-target-0123456789";
@@ -6024,6 +6265,7 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[3..]);
     }
 
+    #[cfg(feature = "warc")]
     #[test]
     fn nested_warc_from_cursor_via_opener() {
         let payload = b"warc-Hello-World-seek-mid";
@@ -6043,6 +6285,7 @@ mod tests {
         assert_eq!(mid.as_slice(), &payload[5..]);
     }
 
+    #[cfg(feature = "asar")]
     #[test]
     fn nested_asar_from_cursor_via_opener() {
         // ASAR nested open is name-triggered (no early magic); label must end in .asar.
@@ -6065,6 +6308,7 @@ mod tests {
     }
 
     /// Minimal store (uncompressed) CAB for factory magic detection (`MSCF`).
+    #[cfg(feature = "cab")]
     fn synthetic_store_cab(name: &str, payload: &[u8]) -> Vec<u8> {
         let name_bytes = name.as_bytes();
         let coff_files = 36u32 + 8;
@@ -6103,6 +6347,7 @@ mod tests {
     }
 
     /// Factory nested CAB (MSCF magic) — no-tmp open_from_reader wiring.
+    #[cfg(feature = "cab")]
     #[test]
     fn nested_cab_from_cursor_via_opener() {
         let payload = b"cab-store-SEEK-payload-xyz";
@@ -6124,6 +6369,7 @@ mod tests {
     }
 
     /// Factory nested EXT4 — no-tmp open_from_reader wiring (pure ext4-view).
+    #[cfg(feature = "ext4")]
     #[test]
     fn nested_ext4_from_cursor_via_opener() {
         use std::process::Command;
@@ -6196,6 +6442,7 @@ mod tests {
     }
 
     /// Factory nested SquashFS (hsqs magic) — no-tmp open_from_reader wiring (gzip image).
+    #[cfg(feature = "squashfs")]
     #[test]
     fn nested_squashfs_from_cursor_via_opener() {
         use std::process::Command;
@@ -6248,6 +6495,7 @@ mod tests {
     }
 
     /// CPIO embedded in store 7z: parent open + nested CPIO from_reader — no temp spool.
+    #[cfg(feature = "cpio")]
     #[test]
     fn nested_cpio_inside_store_7z_reader_random_read_no_tmp() {
         let dir = tempfile::tempdir().unwrap();
@@ -6892,6 +7140,7 @@ mod tests {
     }
 
     /// Regression: nested CPIO durable warm remount via shipped opener.
+    #[cfg(feature = "cpio")]
     #[test]
     fn nested_durable_cpio_warm_remount_via_opener() {
         let dir = tempfile::tempdir().unwrap();
@@ -6957,6 +7206,7 @@ mod tests {
     }
 
     /// Regression: nested AR durable warm remount via shipped opener.
+    #[cfg(feature = "ar")]
     #[test]
     fn nested_durable_ar_warm_remount_via_opener() {
         let dir = tempfile::tempdir().unwrap();

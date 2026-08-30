@@ -1037,10 +1037,10 @@ CI (G6.1): best-effort `windows-lib` on `windows-2022`: `cargo check -p ratarmou
 
 | Feature | Default | Pulls |
 |---------|---------|--------|
-| `formats` | yes | **PR1–PR8:** same L2 set as today’s `factory.rs` (all format crates, including libarchive/git) + compress + compositing + remote |
+| `formats` / `formats-all` | yes | **PR9:** TAR/ZIP/7z always on; other L2 is per-crate + `formats-all`. In-tree default still `formats-all`. `--no-default-features` = TAR/ZIP/7z (no libarchive/git). Probe order of enabled backends is `DEFAULT_FORMAT_PROBE_ORDER`. |
 | `http-export` | no | `ratarmount-http` (`spawn_http_thread` / `ExportStop`) |
 | `gzip-rapidgzip` | no | forwarded from binary onto session (PR2) |
-| G5.3 (PR9) | after W2 | cfg-gate `FormatBackend`; then default *may* shrink to TAR/ZIP/7z; `libarchive`/`git` optional |
+| G5.3 (PR9) | **landed** | cfg-gate `FormatBackend` / `use` lines; slim graph is `--no-default-features`; CLI pins `formats-all` |
 
 Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`.
 
@@ -1271,12 +1271,12 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G5.1** | `Session` is `Send` | S | proposed |
+| **G5.1** | `Session` is `Send` | S | **landed (PR9)** — `session_is_send_sync_shared_via_arc` + `session_send_across_thread` |
 | **G5.2** | Passwords: `secrecy` on boundary; skip `Debug` on `OpenOptions.passwords` (**PR3**) | S | **landed (PR3)** — `OpenOptions` Debug prints `passwords: [redacted N]` |
-| **G5.3** | After W2: cfg-gate factory `FormatBackend` / `use` lines; *then* default may shrink to TAR/ZIP/7z; no fuse/nfs/smb/http. Until then default = all L2 (PR2 compile) | M | proposed |
+| **G5.3** | After W2: cfg-gate factory `FormatBackend` / `use` lines; *then* default may shrink to TAR/ZIP/7z; no fuse/nfs/smb/http. Until then default = all L2 (PR2 compile) | M | **landed (PR9)** — optional L2 features; `--no-default-features` = TAR/ZIP/7z; in-tree default still `formats-all`; probe order unchanged |
 | **G5.4** | Optional `http-export`: start/stop `--http` on a Session | M | proposed |
-| **G5.5** | `examples/session-list.rs` | S | proposed |
-| **G5.6** | `docs/crates-io-policy.md` L3.5 embedder note | S | proposed |
+| **G5.5** | `examples/session-list.rs` | S | **landed (PR9)** |
+| **G5.6** | `docs/crates-io-policy.md` L3.5 embedder note | S | **landed (PR9)** |
 
 ### Phase G6 — Windows library path (no FUSE)
 

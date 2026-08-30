@@ -610,6 +610,21 @@ mod tests {
         .expect("Session::open")
     }
 
+    /// Regression: Session is Send — embedders move it onto a worker thread (G5.1).
+    #[test]
+    fn session_send_across_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = open_tar(dir.path(), "send.tar", &[member_file("a.txt", b"hi")]);
+        let handle = std::thread::spawn(move || {
+            session
+                .list_dirents_page("/", DirCursor::Start, 8)
+                .expect("list on worker")
+        });
+        let page = handle.join().expect("worker panicked");
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].name, "a.txt");
+    }
+
     /// 1000 ustar members, page size 50 → 20 pages, no overlap/skip.
     #[test]
     fn list_dirents_page() {

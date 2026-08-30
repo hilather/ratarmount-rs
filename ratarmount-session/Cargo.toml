@@ -6,32 +6,48 @@ license.workspace = true
 description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
 
 [features]
-default = ["formats"]
-# factory.rs uses these crates unconditionally (no FormatBackend cfg yet).
-formats = [
-  "dep:ratarmount-formats-tar",
-  "dep:ratarmount-formats-zip",
-  "dep:ratarmount-formats-sevenzip",
-  "dep:ratarmount-formats-ar",
-  "dep:ratarmount-formats-asar",
-  "dep:ratarmount-formats-cab",
-  "dep:ratarmount-formats-cpio",
-  "dep:ratarmount-formats-ext4",
-  "dep:ratarmount-formats-fat",
-  "dep:ratarmount-formats-git",
-  "dep:ratarmount-formats-html",
-  "dep:ratarmount-formats-iso9660",
-  "dep:ratarmount-formats-libarchive",
-  "dep:ratarmount-formats-ogg",
-  "dep:ratarmount-formats-pdf",
-  "dep:ratarmount-formats-sqlar",
-  "dep:ratarmount-formats-squashfs",
-  "dep:ratarmount-formats-warc",
-  "dep:ratarmount-formats-xar",
-  "dep:ratarmount-compress",
-  "dep:ratarmount-compositing",
-  "dep:ratarmount-remote",
+# TAR/ZIP/7z + compress + compositing + remote are always compiled.
+# Other L2 is cfg-gated in factory.rs so unused backends can drop off
+# (`--no-default-features` = slim embedder graph). Default keeps formats-all
+# so in-tree nested factory tests still run. Probe order of enabled backends
+# stays DEFAULT_FORMAT_PROBE_ORDER (do not reorder).
+default = ["formats-all"]
+# Historical PR1/PR2 name; alias so `default = ["formats"]` still means full L2.
+formats = ["formats-all"]
+formats-all = [
+  "ar",
+  "asar",
+  "cab",
+  "cpio",
+  "ext4",
+  "fat",
+  "git",
+  "html",
+  "iso9660",
+  "libarchive",
+  "ogg",
+  "pdf",
+  "sqlar",
+  "squashfs",
+  "warc",
+  "xar",
 ]
+ar = ["dep:ratarmount-formats-ar"]
+asar = ["dep:ratarmount-formats-asar"]
+cab = ["dep:ratarmount-formats-cab"]
+cpio = ["dep:ratarmount-formats-cpio"]
+ext4 = ["dep:ratarmount-formats-ext4"]
+fat = ["dep:ratarmount-formats-fat"]
+git = ["dep:ratarmount-formats-git"]
+html = ["dep:ratarmount-formats-html"]
+iso9660 = ["dep:ratarmount-formats-iso9660"]
+libarchive = ["dep:ratarmount-formats-libarchive"]
+ogg = ["dep:ratarmount-formats-ogg"]
+pdf = ["dep:ratarmount-formats-pdf"]
+sqlar = ["dep:ratarmount-formats-sqlar"]
+squashfs = ["dep:ratarmount-formats-squashfs"]
+warc = ["dep:ratarmount-formats-warc"]
+xar = ["dep:ratarmount-formats-xar"]
 gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
 
@@ -42,9 +58,13 @@ thiserror.workspace = true
 secrecy = "0.8"
 log.workspace = true
 tempfile.workspace = true
-ratarmount-formats-tar = { workspace = true, optional = true }
-ratarmount-formats-zip = { workspace = true, optional = true }
-ratarmount-formats-sevenzip = { workspace = true, optional = true }
+# Always-on L2: Session default graph is TAR/ZIP/7z (G5.3). Other formats are optional.
+ratarmount-formats-tar.workspace = true
+ratarmount-formats-zip.workspace = true
+ratarmount-formats-sevenzip.workspace = true
+ratarmount-compress.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-remote.workspace = true
 ratarmount-formats-ar = { workspace = true, optional = true }
 ratarmount-formats-asar = { workspace = true, optional = true }
 ratarmount-formats-cab = { workspace = true, optional = true }
@@ -61,9 +81,6 @@ ratarmount-formats-sqlar = { workspace = true, optional = true }
 ratarmount-formats-squashfs = { workspace = true, optional = true }
 ratarmount-formats-warc = { workspace = true, optional = true }
 ratarmount-formats-xar = { workspace = true, optional = true }
-ratarmount-compress = { workspace = true, optional = true }
-ratarmount-compositing = { workspace = true, optional = true }
-ratarmount-remote = { workspace = true, optional = true }
 
 [dev-dependencies]
 url = "2"

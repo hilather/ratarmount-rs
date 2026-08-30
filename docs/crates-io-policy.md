@@ -18,15 +18,17 @@ Related: [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/ma
 
 ## Crate classification
 
-### L3.5 — embedder session (not published in this slice)
+### L3.5 — embedder session (complete)
 
-`ratarmount-session` is the **supported in-process Session API** for GUI and other embedders (open / paged list / ranged read / extract / index job). It does **not** pull FUSE.
+`ratarmount-session` is the **supported in-process Session API** for GUI and other embedders (open / paged list / ranged read / extract / index job). It sits between L3 (formats/compose/remote) and L4 (fuse/nfs/http export). It does **not** pull FUSE.
 
 | Policy | Detail |
 |--------|--------|
-| **This slice** | **Do not publish** `ratarmount-session` on crates.io. GUI/embedders path-depend the workspace crate. First publish only after G1–G4 are stable (see [`docs/session-api.md`](session-api.md)). |
+| **Publish** | **Do not publish** on crates.io in this slice. GUI/embedders **path-depend**. First publish only after docs + semver for `Session` (see [`docs/session-api.md`](session-api.md)). Dual-run does **not** require crates.io. |
 | **Binary crate** | **Never** publish the `ratarmount` binary crate as the embedder surface. That crate unconditionally depends on fuse/nfs/smb/http/9p/sftp. |
 | **Layering** | Session sits on L0–L3 (`ratarmount-core`, `ratarmount-index`, formats, compress, compositing, remote). It is not L0 and must not be folded into `ratarmount-core`. |
+| **Default graph** | Always TAR/ZIP/7z + compress + compositing + remote. Other L2 is `formats-all` (and per-crate features). `--no-default-features` drops libarchive/git/… (G5.3). `cargo tree -p ratarmount-session -i fuser` is empty. |
+| **Example** | `ratarmount-session/examples/session-list.rs` — open a TAR, print the first page of `/`. |
 
 ### Binary-only (do not publish as a library)
 
@@ -46,7 +48,7 @@ Stable-ish building blocks for embedders. Publish only after docs + semver story
 | **L1 — codecs** | `ratarmount-compress` | Seekable gzip/bzip2/xz/zstd/… helpers |
 | **L2 — formats** | `ratarmount-formats-*` (tar, zip, ar, cpio, sevenzip, …) | Per-format MountSource backends |
 | **L3 — I/O & compose** | `ratarmount-remote`, `ratarmount-compositing` | URL backends; union/automount/overlay |
-| **L3.5 — embedder session** | `ratarmount-session` | Supported in-process **Session** API (no FUSE). GUI/embedders **path-depend**. **Not published** on crates.io in this slice. **Never** publish the `ratarmount` binary crate as the embedder surface. |
+| **L3.5 — embedder session** | `ratarmount-session` | Supported in-process **Session** API (no FUSE). First-class embedder of L0–L3; L4 export is opt-in on the binary only. GUI/embedders **path-depend**. **Not published** on crates.io in this slice. Slim graph: `--no-default-features` (TAR/ZIP/7z). Full factory matrix: `formats-all`. |
 | **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) + optional NFSv4.1 (`embednfs` 0.4.1, feature `nfsv4`, rustc ≥ 1.88) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. Linux/macOS packages compile `nfsv4`; default crates stay MSRV 1.74. |
 
 ### System / FFI caveats
@@ -78,7 +80,7 @@ Do **not** publish a crate at a version that does not match the Git tag used for
 ## What not to do
 
 - Do **not** publish `ratarmount` as a library crate that re-exports the whole stack solely to get a crates.io name — keep the binary product separate from embedder APIs. Embedders path-depend **`ratarmount-session`**.
-- Do **not** publish `ratarmount-session` in this slice (G0 contract freeze). GUI/embedders stay on path deps until a deliberate L3.5 publish.
+- Do **not** publish `ratarmount-session` in this slice (L3.5 documented; G0 contract freeze). GUI/embedders stay on path deps until a deliberate L3.5 publish.
 - Do **not** confuse **`ratarmount-fuse`** (library adapter) with the **`ratarmount`** binary; naming on crates.io must stay clear in descriptions.
 - Do **not** publish internal-only helpers without a supported API surface.
 - Do **not** yank patch releases for minor doc fixes; use the next patch.
