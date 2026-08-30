@@ -12,14 +12,14 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 |---------|------------------|-------|
 | Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **compile** | G0.1 |
 | `Error` (no `Busy`) | **compile** | G0.1 |
-| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `extract_to` / `Drop`** | G1.1–G1.6 |
+| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `extract_to` / `find` / `Drop`** | G1.1–G1.6 / G3 |
 | `IndexJob` unit struct | **stub** | G0.1; `run` in G2 |
 | `RangeReader` | **`Read + Send`** (capped; not `Sync`; no member `Vec`) | G1.4 |
 | `Session::open` | **implemented** (catalog via `open_catalog_read_only`) | G1.1 |
 | `open_with_job` | not implemented | G2 |
 | `list_dirents_page` / `lookup` | **implemented** (SQL keyset; no `list()` dump) | G1.2 / G1.3 |
 | `read_range` / `extract_to` | **implemented** (fill-loop + 64 KiB copy; no slurp) | G1.4 / G1.5 |
-| `Session::find` | not implemented | G3 |
+| `Session::find` | **implemented** (SQL `FindAfter` keyset; CLI first page still 10_000) | G3 |
 | `IndexJob::run` | not implemented | G2 |
 | `resolve_index` | not implemented — Sibling still uses factory `resolve_index_location` | G4 / PR6 |
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
@@ -131,15 +131,17 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
 
-**Landed (G1.1–G1.7):** `open`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
+**Landed (G1.1–G1.7 / G3):** `open`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `find`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
 
 **`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
 
 **`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes) unless `allow_unsafe_paths`. Extract-all (`members` empty) walks catalog keyset pages of 1024 (newest-wins per `fullpath`, exclusive `fullpath > ?`); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points. Cancel or copy IO error unlinks the truncated dest.
 
+**`find`:** exclusive `(fullpath, offsetheader)` keyset (`FindCursor` / `SearchQuery.after`); it does not newest-wins-collapse versions. `ensure_fts5` is opt-in (`FindOpts.fts` / `fts:`), never a side effect of `open`. CLI `ratarmount find` still prints the first page at `DEFAULT_SEARCH_LIMIT` (10_000) and keeps Unix `silence_stdout` in `ratarmount/src/find.rs`.
+
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
-**Not in this slice:** `find`, `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
+**Not in this slice:** `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
 
 ```rust
 impl Session {
@@ -176,7 +178,17 @@ impl Session {
 
 There is no `IndexJob::start` / `Session::from_open` (napi-shaped). Optional `Session::start_http` is feature `http-export` (G5.4, after W2).
 
-Default `list_dirents_page` limit if 0 is passed: **200**. Engine cap `MAX_DIR_PAGE = 10_000`.
+Default `list_dirents_page` limit if 0 is passed: **200**. Engine cap `MAX_DIR_PAGE = 10_000`. Default `Session::find` limit if 0 is passed: **200** (`DEFAULT_FIND_PAGE`). CLI `find` first-page TSV stays **10_000**.
+
+### Find (G3)
+
+`Session::find` shares `SearchQuery` with CLI `ratarmount find`:
+
+- Exclusive composite keyset `FindAfter { fullpath, offsetheader }` (`FindCursor::AfterPath`). Locate keeps every version (no newest-wins).
+- Prefers sidecar SQL. If there is no catalog and `search_cheap` is `Some`, page that `Vec` only (it is already the full answer). Do not merge sidecar + `search_cheap`.
+- `--offset-order` / `FindOpts.offset_order` re-sorts **that page** only.
+- `ensure_fts5` runs only when `FindOpts.fts` or the pattern has an `fts:` prefix — never as a side effect of `Session::open`.
+- Shared `query_index` lives in `ratarmount-session`. CLI argv + Unix `silence_stdout` wrapping `factory::open_path` stay in `ratarmount/src/find.rs`.
 
 ## Errors
 

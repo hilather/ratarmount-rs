@@ -13,8 +13,10 @@ use std::sync::Arc;
 use ratarmount_compositing::{live_search_tsv, WriteOverlay};
 use ratarmount_core::{CheapSearchHit, MountSource, OpenOptions};
 use ratarmount_index::{
-    fill_content_hashes, resolve_index_location, SearchHit, SearchQuery, SqliteIndex, MEMORY_INDEX,
+    fill_content_hashes, resolve_index_location, SearchHit, SearchQuery, SqliteIndex,
+    DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
 };
+use ratarmount_session::{query_index, split_fts_pattern};
 
 /// Options for a locate query (CLI `find` or control-plane glob).
 #[derive(Clone, Debug, Default)]
@@ -60,7 +62,7 @@ pub fn locate_hits(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_index_for_find(archive, open_opts)?;
-    query_index(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc)
 }
 
 /// Search an existing sidecar only (control plane / socket). Does not cold-index.
@@ -71,7 +73,7 @@ pub fn search_existing_sidecar(
     loc: &LocateOptions<'_>,
 ) -> Result<Vec<SearchHit>, String> {
     let idx = open_existing_sidecar(archive, open_opts)?;
-    query_index(&idx, archive, pattern, loc)
+    query_index_cli(&idx, archive, pattern, loc)
 }
 
 /// Sidecar-only SearchFn (no overlay / SoA). Live mounts use [`live_search_callback`].
@@ -133,7 +135,7 @@ pub fn run(archive: &Path, pattern: &str, open_opts: &OpenOptions, loc: &LocateO
     }
 }
 
-fn query_index(
+fn query_index_cli(
     idx: &SqliteIndex,
     archive: &Path,
     pattern: &str,
@@ -148,24 +150,21 @@ fn query_index(
         let q = SearchQuery {
             include_hashes: loc.include_hashes,
             offset_order: loc.offset_order,
+            after: None,
+            limit: DEFAULT_SEARCH_LIMIT,
             ..SearchQuery::fts(pattern)
         };
-        idx.search_query(&q).map_err(|e| e.to_string())
+        query_index(idx, &q)
     } else {
         let q = SearchQuery {
             include_hashes: loc.include_hashes,
             offset_order: loc.offset_order,
+            after: None,
+            limit: DEFAULT_SEARCH_LIMIT,
             ..SearchQuery::glob(pattern)
         };
-        idx.search_query(&q).map_err(|e| e.to_string())
+        query_index(idx, &q)
     }
-}
-
-fn split_fts_pattern(pattern: &str, force_fts: bool) -> (bool, &str) {
-    if let Some(rest) = pattern.strip_prefix("fts:") {
-        return (true, rest);
-    }
-    (force_fts, pattern)
 }
 
 fn memory_index_error() -> String {
@@ -538,5 +537,79 @@ mod tests {
         let hits = idx.search("*.fits").unwrap();
         assert_eq!(hit_paths(&hits), vec!["/a.fits", "/dir/b.fits"]);
         assert!(!idx.has_mem_index());
+    }
+
+    /// Regression: CLI first page stays 10_000; Session::find default page is 200.
+    #[test]
+    fn find_session_parity() {
+        use ratarmount_session::{
+            FindCursor, FindOpts, IndexPolicy, OpenRequest, Recreate, Session, SourceSpec,
+            DEFAULT_FIND_PAGE,
+        };
+
+        assert_eq!(DEFAULT_SEARCH_LIMIT, 10_000);
+        assert_eq!(DEFAULT_FIND_PAGE, 200);
+        let q = SearchQuery::glob("*.fits");
+        assert_eq!(q.limit, 10_000);
+        assert!(q.after.is_none());
+
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..250).map(|i| format!("f{i:03}.txt")).collect();
+        let payload = b"x";
+        let members: Vec<UstarMember<'_>> = names
+            .iter()
+            .map(|n| member(n.as_str(), payload, 1))
+            .collect();
+        let archive = dir.path().join("many.tar");
+        {
+            let mut out = Vec::new();
+            write_ustar_members(&mut out, &members).unwrap();
+            write_tar_eof(&mut out).unwrap();
+            std::fs::write(&archive, out).unwrap();
+        }
+        let opts = find_opts(dir.path());
+        let cli = locate_hits(&archive, "*.txt", &opts, &LocateOptions::default()).expect("cli");
+        assert_eq!(cli.len(), 250, "CLI first page limit is 10_000");
+
+        let idx = dir.path().join("many.tar.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(archive.clone()),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("session open");
+        let page = session
+            .find("*.txt", FindOpts::default())
+            .expect("session find");
+        assert_eq!(page.entries.len(), 200, "session limit 0 → 200");
+        assert!(
+            matches!(page.next_cursor, Some(FindCursor::AfterPath { .. })),
+            "session first page must have a next cursor"
+        );
+        let cli_paths: Vec<&str> = cli.iter().map(|h| h.path.as_str()).collect();
+        let sess_paths: Vec<&str> = page.entries.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(&cli_paths[..200], sess_paths.as_slice());
+
+        let rest = session
+            .find(
+                "*.txt",
+                FindOpts {
+                    cursor: page.next_cursor.unwrap(),
+                    ..FindOpts::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(rest.entries.len(), 50);
+        assert!(rest.next_cursor.is_none());
+        let all: Vec<&str> = sess_paths
+            .into_iter()
+            .chain(rest.entries.iter().map(|e| e.path.as_str()))
+            .collect();
+        assert_eq!(all, cli_paths);
     }
 }

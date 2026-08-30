@@ -40,6 +40,12 @@ const SQL_FULLPATH: &str = r#"CASE
     ELSE "path" || '/' || "name"
 END"#;
 
+/// Same as [`SQL_FULLPATH`] qualified for the FTS `files` alias `f`.
+const SQL_FULLPATH_F: &str = r#"CASE
+    WHEN f."path" IS NULL OR f."path" = '' OR f."path" = '/' THEN '/' || f."name"
+    ELSE f."path" || '/' || f."name"
+END"#;
+
 /// One catalog hit from [`SqliteIndex::search`] / [`SqliteIndex::search_fts`].
 #[derive(Clone, Debug, PartialEq)]
 pub struct SearchHit {
@@ -52,6 +58,15 @@ pub struct SearchHit {
     pub offsetheader: Option<i64>,
     /// `user.hash.*` xattrs as `(key, utf-8 value)` when [`SearchQuery::include_hashes`].
     pub hashes: Vec<(String, String)>,
+}
+
+/// Exclusive composite keyset for [`SearchQuery::after`].
+///
+/// Locate keeps every `(fullpath, offsetheader)` version — no newest-wins.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct FindAfter<'a> {
+    pub fullpath: &'a str,
+    pub offsetheader: Option<i64>,
 }
 
 /// Locate query. Glob/LIKE is the default; FTS5 `MATCH` is opt-in.
@@ -67,6 +82,8 @@ pub struct SearchQuery<'a> {
     /// Re-sort today's path-order `LIMIT` set by [`crate::cmp_offset_then_name`].
     /// Does not change membership. Default find / control search stay path order.
     pub offset_order: bool,
+    /// Exclusive `(fullpath, offsetheader)` keyset. `None` = first page.
+    pub after: Option<FindAfter<'a>>,
 }
 
 impl<'a> SearchQuery<'a> {
@@ -78,6 +95,7 @@ impl<'a> SearchQuery<'a> {
             include_hashes: false,
             limit: DEFAULT_SEARCH_LIMIT,
             offset_order: false,
+            after: None,
         }
     }
 
@@ -90,6 +108,7 @@ impl<'a> SearchQuery<'a> {
             include_hashes: false,
             limit: DEFAULT_SEARCH_LIMIT,
             offset_order: false,
+            after: None,
         }
     }
 }
@@ -123,9 +142,9 @@ impl SqliteIndex {
         }
         self.with_conn(|conn| {
             let mut hits = if q.fts {
-                search_fts_match(conn, q.pattern, q.limit)?
+                search_fts_match(conn, q.pattern, q.limit, q.after)?
             } else {
-                search_glob_like(conn, q.pattern, q.limit)?
+                search_glob_like(conn, q.pattern, q.limit, q.after)?
             };
             if q.include_hashes {
                 fill_hit_hashes(conn, &mut hits)?;
@@ -249,7 +268,29 @@ fn catalog_filter_sql(table: &str) -> String {
     )
 }
 
-fn search_glob_like(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<SearchHit>> {
+/// Exclusive keyset: `(fullpath, COALESCE(offsetheader,-1))` strictly after `after`.
+fn keyset_sql(fullpath_expr: &str, offset_expr: &str, after: bool) -> (String, u32) {
+    if after {
+        (
+            format!(
+                r#"AND (
+              {fullpath_expr} > ?3
+              OR ({fullpath_expr} = ?3 AND COALESCE({offset_expr}, -1) > COALESCE(?4, -1))
+            )"#
+            ),
+            5,
+        )
+    } else {
+        (String::new(), 3)
+    }
+}
+
+fn search_glob_like(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    after: Option<FindAfter<'_>>,
+) -> Result<Vec<SearchHit>> {
     let glob = collapse_globstars(pattern);
     let use_like = is_like_pattern(&glob);
     let full_path = glob.contains('/');
@@ -269,37 +310,38 @@ fn search_glob_like(conn: &Connection, pattern: &str, limit: usize) -> Result<Ve
     } else {
         r#""name" GLOB ?2"#.to_string()
     };
+    let (after_sql, limit_idx) = keyset_sql(SQL_FULLPATH, r#""offsetheader""#, after.is_some());
     let sql = format!(
         r#"
         SELECT {SQL_FULLPATH} AS fullpath, "name", "size", "mtime", "offsetheader"
         FROM "files"
         WHERE {filter}
           AND {pred}
+          {after_sql}
         ORDER BY fullpath, "offsetheader"
-        LIMIT ?3
+        LIMIT ?{limit_idx}
         "#,
         filter = catalog_filter_sql(""),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![DUMPDIR_DELETE_LINKNAME, bound, limit_i64(limit)],
-        row_to_hit,
-    )?;
-    collect_hits(rows)
+    collect_mapped_hits(&mut stmt, DUMPDIR_DELETE_LINKNAME, &bound, after, limit)
 }
 
-fn search_fts_match(conn: &Connection, pattern: &str, limit: usize) -> Result<Vec<SearchHit>> {
+fn search_fts_match(
+    conn: &Connection,
+    pattern: &str,
+    limit: usize,
+    after: Option<FindAfter<'_>>,
+) -> Result<Vec<SearchHit>> {
     if !table_exists(conn, FILES_FTS_TABLE)? {
         return Err(IndexError::Invalid(
             "files_fts is not present; call ensure_fts5".into(),
         ));
     }
+    let (after_sql, limit_idx) = keyset_sql(SQL_FULLPATH_F, r#"f."offsetheader""#, after.is_some());
     let sql = format!(
         r#"
-        SELECT CASE
-            WHEN f."path" IS NULL OR f."path" = '' OR f."path" = '/' THEN '/' || f."name"
-            ELSE f."path" || '/' || f."name"
-        END AS fullpath, f."name", f."size", f."mtime", f."offsetheader"
+        SELECT {SQL_FULLPATH_F} AS fullpath, f."name", f."size", f."mtime", f."offsetheader"
         FROM "files_fts"
         JOIN "files" f
           ON f."name" = "files_fts"."name"
@@ -307,17 +349,42 @@ fn search_fts_match(conn: &Connection, pattern: &str, limit: usize) -> Result<Ve
          AND f."offsetheader" IS "files_fts"."offsetheader"
         WHERE "files_fts" MATCH ?2
           AND {filter}
+          {after_sql}
         ORDER BY fullpath, f."offsetheader"
-        LIMIT ?3
+        LIMIT ?{limit_idx}
         "#,
         filter = catalog_filter_sql("f"),
     );
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(
-        params![DUMPDIR_DELETE_LINKNAME, pattern, limit_i64(limit)],
-        row_to_hit,
-    )?;
-    collect_hits(rows)
+    collect_mapped_hits(&mut stmt, DUMPDIR_DELETE_LINKNAME, pattern, after, limit)
+}
+
+fn collect_mapped_hits(
+    stmt: &mut rusqlite::Statement<'_>,
+    dumpdir: &str,
+    pattern: &str,
+    after: Option<FindAfter<'_>>,
+    limit: usize,
+) -> Result<Vec<SearchHit>> {
+    match after {
+        None => {
+            let rows = stmt.query_map(params![dumpdir, pattern, limit_i64(limit)], row_to_hit)?;
+            collect_hits(rows)
+        }
+        Some(a) => {
+            let rows = stmt.query_map(
+                params![
+                    dumpdir,
+                    pattern,
+                    a.fullpath,
+                    a.offsetheader,
+                    limit_i64(limit)
+                ],
+                row_to_hit,
+            )?;
+            collect_hits(rows)
+        }
+    }
 }
 
 fn row_to_hit(row: &Row<'_>) -> rusqlite::Result<SearchHit> {
@@ -943,5 +1010,174 @@ mod tests {
             err.to_string().contains("fts:"),
             "fts: must not scan SoA, got {err}"
         );
+    }
+
+    fn seed_duplicate_path(idx: &SqliteIndex) {
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "a.fits", 0, false),
+            file_row("", "dup.fits", 512, false),
+            file_row("", "dup.fits", 1024, false),
+            file_row("", "z.fits", 1536, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+    }
+
+    /// Regression: composite keyset keeps both versions of the same fullpath.
+    #[test]
+    fn search_query_after_keyset_keeps_duplicate_paths() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        seed_duplicate_path(&idx);
+
+        let all = idx.search("*.fits").unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|h| (h.path.as_str(), h.offsetheader))
+                .collect::<Vec<_>>(),
+            vec![
+                ("/a.fits", Some(0)),
+                ("/dup.fits", Some(512)),
+                ("/dup.fits", Some(1024)),
+                ("/z.fits", Some(1536)),
+            ]
+        );
+
+        let page1 = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                after: None,
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(
+            page1
+                .iter()
+                .map(|h| (h.path.as_str(), h.offsetheader))
+                .collect::<Vec<_>>(),
+            vec![("/a.fits", Some(0)), ("/dup.fits", Some(512))]
+        );
+
+        let page2 = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                after: Some(FindAfter {
+                    fullpath: "/dup.fits",
+                    offsetheader: Some(512),
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(
+            page2
+                .iter()
+                .map(|h| (h.path.as_str(), h.offsetheader))
+                .collect::<Vec<_>>(),
+            vec![("/dup.fits", Some(1024)), ("/z.fits", Some(1536))],
+            "same-path later offsetheader must not be skipped"
+        );
+    }
+
+    /// Regression: `after` is exclusive on `(fullpath, offsetheader)`.
+    #[test]
+    fn search_query_after_is_exclusive() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        seed_catalog(&idx);
+
+        let rest = idx
+            .search_query(&SearchQuery {
+                after: Some(FindAfter {
+                    fullpath: "/a.fits",
+                    offsetheader: Some(0),
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(hit_paths(&rest), vec!["/dir/b.fits"]);
+
+        let none = idx
+            .search_query(&SearchQuery {
+                after: Some(FindAfter {
+                    fullpath: "/dir/b.fits",
+                    offsetheader: Some(512),
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert!(none.is_empty());
+    }
+
+    /// Regression: `--offset-order` re-sorts the keyset page only.
+    #[test]
+    fn search_query_after_offset_order_resorts_page_only() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.insert_files_batch(&[
+            file_row("", "a.fits", 200, false),
+            file_row("", "b.fits", 300, false),
+            file_row("", "c.fits", 100, false),
+            file_row("", "d.fits", 50, false),
+        ])
+        .unwrap();
+        idx.commit_write().unwrap();
+
+        let page = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                offset_order: true,
+                after: Some(FindAfter {
+                    fullpath: "/a.fits",
+                    offsetheader: Some(200),
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(
+            hit_paths(&page),
+            vec!["/c.fits", "/b.fits"],
+            "membership is B,C in path order; offset re-sort of that page is C,B (not D)"
+        );
+    }
+
+    /// Regression: NULL offsetheader uses -1 sentinel in the keyset.
+    #[test]
+    fn search_query_after_null_offsetheader() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'null.fits', NULL, 0, 3, 1.0, 33188, 0, '',
+                           0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        idx.insert_files_batch(&[file_row("", "plain.fits", 512, false)])
+            .unwrap();
+        idx.commit_write().unwrap();
+
+        let first = idx
+            .search_query(&SearchQuery {
+                limit: 1,
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(hit_paths(&first), vec!["/null.fits"]);
+        assert_eq!(first[0].offsetheader, None);
+
+        let rest = idx
+            .search_query(&SearchQuery {
+                after: Some(FindAfter {
+                    fullpath: "/null.fits",
+                    offsetheader: None,
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert_eq!(hit_paths(&rest), vec!["/plain.fits"]);
     }
 }

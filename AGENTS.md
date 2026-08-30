@@ -137,6 +137,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Opaque prefix + later valid header | `cargo test -p ratarmount-formats-tar --lib regression_incremental_opaque_then_header` |
 | `find '*.fits'` without FUSE | `cargo test -p ratarmount --bin ratarmount find_glob` |
 | `find` clap steals archive / pattern | `cargo test -p ratarmount --bin ratarmount find_flag` |
+| Session::find composite keyset (duplicates per path) | `cargo test -p ratarmount-session --lib find_glob_pages_composite_keyset` · `cargo test -p ratarmount-index --lib search_query_after` |
+| CLI find first page limit 10_000 (session parity) | `cargo test -p ratarmount --bin ratarmount find_session_parity` |
+| ensure_fts5 not created on Session::open | `cargo test -p ratarmount-session --lib ensure_fts5_not_on_session_open` |
 | Control read-only `search/<pattern>` | `cargo test -p ratarmount-compositing --lib control_search` |
 | Socket `search` | `cargo test -p ratarmount --bin ratarmount control_search_socket` |
 | FTS5 path + hashes | `cargo test -p ratarmount-index --lib search_fts5` (default `cargo test -p ratarmount-index --lib`, no extra features) |

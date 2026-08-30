@@ -66,8 +66,9 @@ pub enum DirCursor {
 
 /// Opaque keyset for **locate**. Composite because `files` may hold multiple
 /// rows per full path (`ORDER BY fullpath, offsetheader`, no newest-wins).
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub enum FindCursor {
+    #[default]
     Start,
     /// Exclusive: `(fullpath, offsetheader)` lexicographic after this pair.
     AfterPath {
@@ -157,8 +158,8 @@ pub struct IndexProgress {
 }
 
 /// Locate options. `ensure_fts5` runs only when [`Self::fts`] is set, never as a
-/// side effect of open.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// side effect of open. [`Self::limit`] `0` means the session default page (200).
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct FindOpts {
     pub fts: bool,
     pub offset_order: bool,

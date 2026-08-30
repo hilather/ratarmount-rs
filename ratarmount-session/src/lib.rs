@@ -16,7 +16,6 @@ mod error;
 mod extract;
 pub mod factory;
 mod index_job;
-#[allow(dead_code)]
 mod locate;
 mod read;
 #[allow(dead_code)]
@@ -26,6 +25,7 @@ mod types;
 
 pub use error::Error;
 pub use index_job::IndexJob;
+pub use locate::{query_index, split_fts_pattern, DEFAULT_FIND_PAGE};
 pub use read::RangeReader;
 pub use session::Session;
 pub use types::{

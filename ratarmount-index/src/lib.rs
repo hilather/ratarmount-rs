@@ -41,7 +41,7 @@ pub use meta_cache::{
     cache_identity, invalidate_meta_cache_file, invalidate_meta_cache_identity, is_meta_cache_path,
     MetaCache, META_CACHE_BYTES_DEFAULT, META_CACHE_BYTES_ENV, META_SIDECAR_WHOLE_MAX,
 };
-pub use search::{locate_pattern_matches, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
+pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

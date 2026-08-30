@@ -55,19 +55,19 @@ impl Drop for TempSqliteGuard {
 /// Embedders share a session with [`std::sync::Arc`]. This type does **not**
 /// implement [`Clone`]. `Drop` is the close API (no `close(self)`).
 pub struct Session {
-    source: OpenedSource,
-    catalog: Option<SqliteIndex>,
-    loc: CatalogLoc,
+    pub(crate) source: OpenedSource,
+    pub(crate) catalog: Option<SqliteIndex>,
+    pub(crate) loc: CatalogLoc,
 }
 
-enum OpenedSource {
+pub(crate) enum OpenedSource {
     #[allow(dead_code)]
     Local(Arc<dyn MountSource>),
     Bundle(MountBundle),
 }
 
 impl OpenedSource {
-    fn source(&self) -> &Arc<dyn MountSource> {
+    pub(crate) fn source(&self) -> &Arc<dyn MountSource> {
         match self {
             Self::Local(s) => s,
             Self::Bundle(b) => &b.source,
@@ -83,7 +83,7 @@ impl OpenedSource {
 }
 
 /// Path or memory flag for the 0.7.x sidecar used as the paging catalog.
-enum CatalogLoc {
+pub(crate) enum CatalogLoc {
     None,
     Memory,
     Path(PathBuf),
@@ -92,7 +92,7 @@ enum CatalogLoc {
 }
 
 impl CatalogLoc {
-    fn path(&self) -> Option<&Path> {
+    pub(crate) fn path(&self) -> Option<&Path> {
         match self {
             Self::Path(p) | Self::Temp(p) => Some(p.as_path()),
             Self::None | Self::Memory => None,

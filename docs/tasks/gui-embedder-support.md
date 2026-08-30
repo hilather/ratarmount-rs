@@ -1253,9 +1253,9 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G3.1** | `Session::find` (glob + FTS + offset-order) | M | proposed |
-| **G3.2** | Paged find (`FindCursor` `(fullpath, offsetheader)` + limit) | S | proposed |
-| **G3.3** | Share `query_index` with CLI; binary keeps Unix `silence_stdout` / argv (`find.rs` split, no unix in session) | S | proposed |
+| **G3.1** | `Session::find` (glob + FTS + offset-order) | M | **done** |
+| **G3.2** | Paged find (`FindCursor` `(fullpath, offsetheader)` + limit) | S | **done** |
+| **G3.3** | Share `query_index` with CLI; binary keeps Unix `silence_stdout` / argv (`find.rs` split, no unix in session) | S | **done** |
 
 ### Phase G4 — Index location helpers
 
@@ -1390,6 +1390,7 @@ W2 is **not** unblocked until extract, capped `read_range`, IndexJob, and Siblin
 - **Files:** `ratarmount-index/src/search.rs` (`FindAfter`); `ratarmount-session/src/locate.rs`; **keep** `ratarmount/src/find.rs` argv + Unix silence; CLI parity test
 - **Depends on:** PR 3
 - **Changes:** `(fullpath, offsetheader)` keyset; CLI default limit stays 10_000; `ensure_fts5` still opt-in. No `std::os::unix` in session.
+- **Status:** **landed** (G3.1–G3.3).
 
 ### PR 9 — G5.1 + G5.2 remainder + G5.3 + G5.5 + G5.6: embedder polish
 
