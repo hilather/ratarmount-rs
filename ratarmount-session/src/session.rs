@@ -292,6 +292,14 @@ impl Session {
             .map(|fi| dirent_from_file_info(path, &fi)))
     }
 
+    pub(crate) fn mount_source(&self) -> &dyn MountSource {
+        self.source.source().as_ref()
+    }
+
+    pub(crate) fn catalog(&self) -> Option<&SqliteIndex> {
+        self.catalog.as_ref()
+    }
+
     #[cfg(test)]
     pub(crate) fn stub() -> Self {
         Self {
@@ -312,7 +320,7 @@ impl Session {
     }
 
     #[cfg(test)]
-    fn from_local_source(src: Arc<dyn MountSource>) -> Self {
+    pub(crate) fn from_local_source(src: Arc<dyn MountSource>) -> Self {
         Self {
             source: OpenedSource::Local(src),
             catalog: None,

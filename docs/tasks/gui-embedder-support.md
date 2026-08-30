@@ -1234,10 +1234,10 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 | **G1.1** | `Session::open(OpenRequest)` wrapping factory | M | **landed (PR3)** |
 | **G1.2** | `list_dirents_page(path, cursor, limit)` on SQLite keyset | M | **landed (PR3)** |
 | **G1.3** | `lookup(path) -> Option<DirEnt>` | S | **landed (PR3)** |
-| **G1.4** | `read_range` → `impl Read + Send` with `max_len` | M | proposed |
-| **G1.5** | `extract_to` streaming to disk | M | proposed |
+| **G1.4** | `read_range` → `impl Read + Send` with `max_len` | M | **landed (PR4)** |
+| **G1.5** | `extract_to` streaming to disk | M | **landed (PR4)** |
 | **G1.6** | `close` / `Drop` | S | **landed (PR3)** |
-| **G1.7** | Tests: 1k-entry TAR page size 50; extract 1 file; read 4 KiB from 100 MiB member | M | **paging subset landed (PR3)**; extract / `read_range` remain PR4 |
+| **G1.7** | Tests: 1k-entry TAR page size 50; extract 1 file; read 4 KiB from 100 MiB member | M | **landed (PR3 paging + PR4 extract / `read_range`)** |
 
 ### Phase G2 — Index build as a library
 

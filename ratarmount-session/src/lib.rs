@@ -13,7 +13,6 @@
 //! [`std::sync::Arc`]). See `docs/session-api.md`.
 
 mod error;
-#[allow(dead_code)]
 mod extract;
 pub mod factory;
 mod index_job;

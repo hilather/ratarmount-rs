@@ -159,6 +159,10 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Session pages 1k-entry TAR (page size 50) | `cargo test -p ratarmount-session --lib list_dirents_page` |
 | Session catalog does not reprint harness line / second MemIndex | `cargo test -p ratarmount-session --lib catalog_open_silent` · `cargo test -p ratarmount-index --lib open_catalog_read_only` |
 | GNU incremental dumpdir name absent from page 1 | `cargo test -p ratarmount-session --lib list_dirents_page_dumpdir` · `cargo test -p ratarmount-index --lib list_dirents_page` |
+| `read_range` 4 KiB from 100 MiB member (no full slurp) | `cargo test -p ratarmount-session --lib read_range_capped` |
+| Extract one member to disk | `cargo test -p ratarmount-session --lib extract_to` |
+| Extract path-escape reject (`../`, absolute) | `cargo test -p ratarmount-session --lib extract_to_path_escape` |
+| Extract-all keyset does not use list_visible_files_by_offset | `cargo test -p ratarmount-session --lib extract_all_keyset` · `cargo test -p ratarmount-index --lib list_extract_payload_page` |
 | Recreate::Never missing sidecar / tarstats mismatch / no rebuild | `cargo test -p ratarmount-session --lib recreate_never` |
 | Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
 

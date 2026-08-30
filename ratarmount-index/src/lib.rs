@@ -49,7 +49,8 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Mutex;
 
 use ratarmount_core::{
-    create_root_file_info, query_normpath, FileInfo, SQLiteIndexedTarUserData, UserData,
+    create_root_file_info, query_normpath, FileInfo, SQLiteIndexedTarUserData, UserData, S_IFDIR,
+    S_IFMT,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use thiserror::Error;
@@ -85,6 +86,16 @@ pub struct PagedDirent {
     /// Header offset; `-1` when SQL stored NULL.
     pub offsetheader: i64,
     pub linkname: String,
+}
+
+/// One payload row from [`SqliteIndex::list_extract_payload_page`].
+///
+/// Ordered by reconstructed `fullpath`, then `offsetheader` (NULL as `-1`).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExtractPayloadRow {
+    pub fullpath: String,
+    /// Header offset; `-1` when SQL stored NULL.
+    pub offsetheader: i64,
 }
 
 /// Must match Python `SQLiteIndex.__version__` (`files` schema).
@@ -1840,6 +1851,72 @@ impl SqliteIndex {
             None
         };
         Ok((rows, next_name, total_hint))
+    }
+
+    /// Keyset page of extract-all payload members.
+    ///
+    /// `ORDER BY fullpath, offsetheader` with
+    /// `AND (fullpath > ? OR (fullpath = ? AND COALESCE(offsetheader,-1) > ?))`.
+    /// Skips `isgenerated`, GNU dumpdir tombstones, and directories.
+    /// Does **not** call [`Self::list_visible_files_by_offset`] or [`Self::list`].
+    ///
+    /// `after_path` / `after_offsetheader` are exclusive (pass the last row of
+    /// the previous page). `None` starts at the beginning (`fullpath > ''`).
+    pub fn list_extract_payload_page(
+        &self,
+        after_path: Option<&str>,
+        after_offsetheader: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<ExtractPayloadRow>> {
+        if self.compact_only || limit == 0 {
+            return Ok(Vec::new());
+        }
+        let dumpdir = crate::search::DUMPDIR_DELETE_LINKNAME;
+        let after_fp = after_path.unwrap_or("");
+        let after_oh = after_offsetheader.unwrap_or(-1);
+        let limit_i64 = i64::from(limit.min(MAX_DIR_PAGE));
+        self.with_conn(|conn| {
+            let mut stmt = conn.prepare_cached(
+                r#"
+                SELECT fullpath, offsetheader FROM (
+                  SELECT
+                    CASE
+                      WHEN "path" IS NULL OR "path" = '' OR "path" = '/'
+                        THEN '/' || "name"
+                      ELSE "path" || '/' || "name"
+                    END AS fullpath,
+                    "offsetheader" AS offsetheader
+                  FROM "files"
+                  WHERE COALESCE("isgenerated", 0) = 0
+                    AND COALESCE("linkname", '') != ?1
+                    AND "name" != ''
+                    AND (COALESCE("mode", 0) & ?2) != ?3
+                )
+                WHERE fullpath > ?4
+                   OR (fullpath = ?4 AND COALESCE(offsetheader, -1) > ?5)
+                ORDER BY fullpath, offsetheader
+                LIMIT ?6
+                "#,
+            )?;
+            let mut q = stmt.query(params![
+                dumpdir,
+                i64::from(S_IFMT),
+                i64::from(S_IFDIR),
+                after_fp,
+                after_oh,
+                limit_i64,
+            ])?;
+            let mut out = Vec::new();
+            while let Some(row) = q.next()? {
+                let fullpath: String = row.get(0)?;
+                let offsetheader: Option<i64> = row.get(1)?;
+                out.push(ExtractPayloadRow {
+                    fullpath,
+                    offsetheader: offsetheader.unwrap_or(-1),
+                });
+            }
+            Ok(out)
+        })
     }
 
     /// Store version rows used by Python writers.
@@ -4609,5 +4686,59 @@ mod tests {
             nullonly.offsetheader, -1,
             "NULL-only offsetheader is the -1 sentinel"
         );
+    }
+
+    /// Extract-all keyset skips dumpdir/generated; pages by (fullpath, offsetheader).
+    #[test]
+    fn list_extract_payload_page() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("extract.index.sqlite");
+        write_page_fixture(&path);
+        let idx = SqliteIndex::open_catalog_read_only(&path).unwrap();
+        let page1 = idx.list_extract_payload_page(None, None, 10).unwrap();
+        assert_eq!(page1.len(), 10);
+        assert!(
+            page1.iter().all(|r| r.fullpath != "/gone.txt"),
+            "dumpdir/generated must be absent: {:?}",
+            page1.iter().map(|r| &r.fullpath).collect::<Vec<_>>()
+        );
+        let last = page1.last().unwrap();
+        let page2 = idx
+            .list_extract_payload_page(Some(&last.fullpath), Some(last.offsetheader), 10)
+            .unwrap();
+        assert!(!page2.is_empty());
+        for r in &page1 {
+            assert!(
+                !page2
+                    .iter()
+                    .any(|o| o.fullpath == r.fullpath && o.offsetheader == r.offsetheader),
+                "keyset overlap {:?}",
+                r.fullpath
+            );
+        }
+        let mut all = Vec::new();
+        let mut after_p: Option<String> = None;
+        let mut after_oh: Option<i64> = None;
+        loop {
+            let page = idx
+                .list_extract_payload_page(after_p.as_deref(), after_oh, 8)
+                .unwrap();
+            if page.is_empty() {
+                break;
+            }
+            let n = page.len();
+            after_p = page.last().map(|r| r.fullpath.clone());
+            after_oh = page.last().map(|r| r.offsetheader);
+            all.extend(page);
+            if n < 8 {
+                break;
+            }
+        }
+        assert!(
+            all.iter().all(|r| r.fullpath != "/gone.txt"),
+            "dumpdir must stay absent from extract-all"
+        );
+        assert!(all.iter().any(|r| r.fullpath == "/n00.txt"));
+        assert!(all.iter().any(|r| r.fullpath == "/nullonly.txt"));
     }
 }

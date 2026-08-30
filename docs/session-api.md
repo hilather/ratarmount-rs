@@ -12,13 +12,13 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 |---------|------------------|-------|
 | Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **compile** | G0.1 |
 | `Error` (no `Busy`) | **compile** | G0.1 |
-| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `Drop`** | G1.1–G1.3 / G1.6 |
+| `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `extract_to` / `Drop`** | G1.1–G1.6 |
 | `IndexJob` unit struct | **stub** | G0.1; `run` in G2 |
-| `RangeReader` | **stub** (no `Read` yet) | G1.4 |
+| `RangeReader` | **`Read + Send`** (capped; not `Sync`; no member `Vec`) | G1.4 |
 | `Session::open` | **implemented** (catalog via `open_catalog_read_only`) | G1.1 |
 | `open_with_job` | not implemented | G2 |
 | `list_dirents_page` / `lookup` | **implemented** (SQL keyset; no `list()` dump) | G1.2 / G1.3 |
-| `read_range` / `extract_to` | not implemented | G1.4 / G1.5 |
+| `read_range` / `extract_to` | **implemented** (fill-loop + 64 KiB copy; no slurp) | G1.4 / G1.5 |
 | `Session::find` | not implemented | G3 |
 | `IndexJob::run` | not implemented | G2 |
 | `resolve_index` | not implemented — Sibling still uses factory `resolve_index_location` | G4 / PR6 |
@@ -131,11 +131,15 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
 
-**Landed (G1.1 / G1.2 / G1.3 / G1.6):** `open`, `list_dirents_page`, `lookup`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
+**Landed (G1.1–G1.7):** `open`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
+
+**`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
+
+**`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes) unless `allow_unsafe_paths`. Extract-all (`members` empty) walks catalog keyset pages of 1024 (`ORDER BY fullpath, offsetheader`, `COALESCE` keyset); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points.
 
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
-**Not in this slice:** `read_range`, `extract_to`, `find`, `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
+**Not in this slice:** `find`, `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
 
 ```rust
 impl Session {
