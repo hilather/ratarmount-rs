@@ -165,7 +165,7 @@ pub struct FindOpts {
     pub offset_order: bool,
     pub include_hashes: bool,
     /// Algorithms to compute into `user.hash.*` before searching (CLI `--hashes`).
-    /// Empty = do not fill.
+    /// Empty = do not fill. Ignored by [`crate::Session::find`].
     pub fill_hashes: Vec<String>,
     pub limit: u32,
     pub cursor: FindCursor,

@@ -1,4 +1,4 @@
-//! Locate / `Session::find` helpers. No Unix fds.
+//! Catalog / cheap locate helpers for [`Session::find`].
 
 use ratarmount_core::CheapSearchHit;
 use ratarmount_index::{
@@ -9,7 +9,7 @@ use crate::session::Session;
 use crate::types::{DirEnt, FindCursor, FindOpts, FindPage};
 use crate::Error;
 
-/// Default `Session::find` page size when [`FindOpts::limit`] is 0 (GUI).
+/// Default `Session::find` page size when [`FindOpts::limit`] is 0.
 pub const DEFAULT_FIND_PAGE: u32 = 200;
 
 /// `fts:` prefix forces FTS5; otherwise [`force_fts`].
@@ -20,11 +20,7 @@ pub fn split_fts_pattern(pattern: &str, force_fts: bool) -> (bool, &str) {
     (force_fts, pattern)
 }
 
-/// Shared glob/FTS locate. Does not call [`SqliteIndex::ensure_fts5`].
-///
-/// CLI `find` uses [`SearchQuery::glob`] / [`SearchQuery::fts`] (limit
-/// [`ratarmount_index::DEFAULT_SEARCH_LIMIT`], `after: None`). Session paging
-/// sets `after` and a smaller `limit`.
+/// Thin [`SqliteIndex::search_query`] wrapper; does not call [`SqliteIndex::ensure_fts5`].
 pub fn query_index(idx: &SqliteIndex, q: &SearchQuery<'_>) -> Result<Vec<SearchHit>, String> {
     idx.search_query(q).map_err(|e| e.to_string())
 }
@@ -62,7 +58,9 @@ impl Session {
         let mut hits = if let Some(cat) = &self.catalog {
             find_catalog_hits(self, cat, &q, fts)?
         } else if fts {
-            Vec::new()
+            return Err(Error::Internal(
+                "files_fts is not present; call ensure_fts5".into(),
+            ));
         } else if let Some(cheap) = self.source.source().search_cheap(pat) {
             page_cheap_hits(cheap, q.after, fetch)
         } else {
@@ -110,7 +108,9 @@ fn find_catalog_hits(
         let w = SqliteIndex::open_writable(path).map_err(|e| Error::Internal(e.to_string()))?;
         w.ensure_fts5()
             .map_err(|e| Error::Internal(e.to_string()))?;
-        query_index(&w, q).map_err(Error::Internal)
+        let hits = query_index(&w, q).map_err(Error::Internal)?;
+        drop(w);
+        Ok(hits)
     } else {
         query_index(cat, q).map_err(Error::Internal)
     }
@@ -366,14 +366,122 @@ mod tests {
         let paths: Vec<&str> = page.entries.iter().map(|e| e.path.as_str()).collect();
         assert_eq!(paths, vec!["/a.fits"]);
         assert!(
-            session.catalog.as_ref().unwrap().has_files_fts().unwrap()
-                || session
-                    .loc
-                    .path()
-                    .and_then(|p| SqliteIndex::open_catalog_read_only(p).ok())
-                    .map(|c| c.has_files_fts().unwrap())
-                    .unwrap_or(false),
-            "FindOpts/fts: may create files_fts on the sidecar"
+            session.catalog.as_ref().unwrap().has_files_fts().unwrap(),
+            "live RO catalog must see files_fts after opt-in find (no reopen)"
         );
+        let again = session
+            .find("fts:fits", FindOpts::default())
+            .expect("second fts page uses existing files_fts");
+        assert_eq!(
+            again
+                .entries
+                .iter()
+                .map(|e| e.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/a.fits"]
+        );
+    }
+
+    /// Regression: FTS with no catalog is an error, not a successful empty page.
+    #[test]
+    fn find_fts_without_catalog_errors() {
+        let session = Session::stub();
+        let err = session
+            .find("fts:token", FindOpts::default())
+            .expect_err("FTS without catalog");
+        match err {
+            Error::Internal(msg) => assert!(
+                msg.contains("files_fts"),
+                "expected files_fts unavailable, got {msg}"
+            ),
+            other => panic!("expected Internal, got {other:?}"),
+        }
+        let err = session
+            .find(
+                "token",
+                FindOpts {
+                    fts: true,
+                    ..FindOpts::default()
+                },
+            )
+            .expect_err("FindOpts.fts without catalog");
+        assert!(matches!(err, Error::Internal(_)));
+    }
+
+    /// Regression: no-catalog search_cheap Some pages both offsetheaders for one path.
+    #[test]
+    fn find_cheap_pages_composite_keyset() {
+        use ratarmount_core::{ArchiveRead, CheapSearchHit, FileInfo, MountSource};
+        use std::sync::Arc;
+
+        struct CheapDupMount;
+        impl MountSource for CheapDupMount {
+            fn list(&self, _path: &str) -> Option<ratarmount_core::ListResult> {
+                None
+            }
+            fn lookup(&self, _path: &str, _file_version: i32) -> Option<FileInfo> {
+                None
+            }
+            fn open(
+                &self,
+                _file_info: &FileInfo,
+                _buffering: i32,
+            ) -> std::io::Result<Box<dyn ArchiveRead>> {
+                Err(std::io::Error::other("cheap-dup"))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+            fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+                if pattern.starts_with("fts:") {
+                    return None;
+                }
+                Some(vec![
+                    CheapSearchHit {
+                        path: "/dup.fits".into(),
+                        name: "dup.fits".into(),
+                        size: 1,
+                        mtime: 1.0,
+                        offsetheader: Some(512),
+                    },
+                    CheapSearchHit {
+                        path: "/dup.fits".into(),
+                        name: "dup.fits".into(),
+                        size: 2,
+                        mtime: 1.0,
+                        offsetheader: Some(1024),
+                    },
+                ])
+            }
+        }
+
+        let session = Session::from_local_source(Arc::new(CheapDupMount));
+        let first = session
+            .find(
+                "*.fits",
+                FindOpts {
+                    limit: 1,
+                    ..FindOpts::default()
+                },
+            )
+            .expect("cheap page 1");
+        assert_eq!(first.entries.len(), 1);
+        assert_eq!(first.entries[0].path, "/dup.fits");
+        assert_eq!(first.entries[0].archive_offset, Some(512));
+        let cursor = first.next_cursor.expect("next after first dup");
+        let second = session
+            .find(
+                "*.fits",
+                FindOpts {
+                    limit: 1,
+                    cursor,
+                    ..FindOpts::default()
+                },
+            )
+            .expect("cheap page 2");
+        assert_eq!(second.entries.len(), 1);
+        assert_eq!(second.entries[0].path, "/dup.fits");
+        assert_eq!(second.entries[0].archive_offset, Some(1024));
+        assert!(second.next_cursor.is_none());
     }
 }

@@ -318,7 +318,7 @@ fn search_glob_like(
         WHERE {filter}
           AND {pred}
           {after_sql}
-        ORDER BY fullpath, "offsetheader"
+        ORDER BY fullpath, COALESCE("offsetheader", -1)
         LIMIT ?{limit_idx}
         "#,
         filter = catalog_filter_sql(""),
@@ -350,7 +350,7 @@ fn search_fts_match(
         WHERE "files_fts" MATCH ?2
           AND {filter}
           {after_sql}
-        ORDER BY fullpath, f."offsetheader"
+        ORDER BY fullpath, COALESCE(f."offsetheader", -1)
         LIMIT ?{limit_idx}
         "#,
         filter = catalog_filter_sql("f"),
@@ -1179,5 +1179,88 @@ mod tests {
             })
             .unwrap();
         assert_eq!(hit_paths(&rest), vec!["/plain.fits"]);
+    }
+
+    /// Regression: FTS keyset keeps both MATCH hits for the same fullpath.
+    #[test]
+    fn search_query_after_fts_keeps_duplicate_paths() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        seed_duplicate_path(&idx);
+        idx.ensure_fts5().unwrap();
+
+        let page1 = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                after: None,
+                ..SearchQuery::fts("fits")
+            })
+            .unwrap();
+        assert_eq!(
+            page1
+                .iter()
+                .map(|h| (h.path.as_str(), h.offsetheader))
+                .collect::<Vec<_>>(),
+            vec![("/a.fits", Some(0)), ("/dup.fits", Some(512))]
+        );
+
+        let page2 = idx
+            .search_query(&SearchQuery {
+                limit: 2,
+                after: Some(FindAfter {
+                    fullpath: "/dup.fits",
+                    offsetheader: Some(512),
+                }),
+                ..SearchQuery::fts("fits")
+            })
+            .unwrap();
+        assert_eq!(
+            page2
+                .iter()
+                .map(|h| (h.path.as_str(), h.offsetheader))
+                .collect::<Vec<_>>(),
+            vec![("/dup.fits", Some(1024)), ("/z.fits", Some(1536))],
+            "FTS same-path later offsetheader must not be skipped"
+        );
+    }
+
+    /// Same fullpath SQL NULL and stored -1 share the COALESCE sentinel.
+    #[test]
+    fn search_query_after_null_and_minus_one_same_path() {
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.begin_write().unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'dup.fits', NULL, 0, 3, 1.0, 33188, 0, '',
+                           0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+        idx.insert_files_batch(&[file_row("", "dup.fits", -1, false)])
+            .unwrap();
+        idx.commit_write().unwrap();
+
+        let all = idx.search("*.fits").unwrap();
+        assert_eq!(all.len(), 2, "unpaged locate still emits both rows");
+        assert!(all.iter().any(|h| h.offsetheader.is_none()));
+        assert!(all.iter().any(|h| h.offsetheader == Some(-1)));
+
+        let rest = idx
+            .search_query(&SearchQuery {
+                after: Some(FindAfter {
+                    fullpath: "/dup.fits",
+                    offsetheader: None,
+                }),
+                ..SearchQuery::glob("*.fits")
+            })
+            .unwrap();
+        assert!(
+            rest.is_empty(),
+            "NULL and -1 are the same keyset sentinel; after None must not emit -1"
+        );
     }
 }
