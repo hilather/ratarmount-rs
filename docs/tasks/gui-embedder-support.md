@@ -1261,11 +1261,11 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G4.1** | `resolve_index` public, order in K8 / G4 section | M | proposed |
-| **G4.2** | `SiblingNotWritable` | S | proposed |
-| **G4.3** | `local-index-v1/` helper (not `meta-v3`) | S | proposed |
-| **G4.4** | LRU cap `RATARMOUNT_LOCAL_INDEX_CACHE_BYTES` default 2 GiB | M | proposed |
-| **G4.5** | Keep remote sidecars in `meta-v3` (256 MiB) | S | proposed |
+| **G4.1** | `resolve_index` public, order in K8 / G4 section | M | **landed (PR6)** |
+| **G4.2** | `SiblingNotWritable` | S | **landed (PR6)** |
+| **G4.3** | `local-index-v1/` helper (not `meta-v3`) | S | **landed (PR7)** — `ratarmount-index/src/local_cache.rs` |
+| **G4.4** | LRU cap `RATARMOUNT_LOCAL_INDEX_CACHE_BYTES` default 2 GiB | M | **landed (PR7)** |
+| **G4.5** | Keep remote sidecars in `meta-v3` (256 MiB) | S | **landed (PR7)** — UserCache never writes `meta-v3`; V-3 stays `xdg_cache_home()` |
 
 ### Phase G5 — Embedder ergonomics
 

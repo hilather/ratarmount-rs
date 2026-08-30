@@ -13,6 +13,7 @@
 
 mod dirent_order;
 mod hashing;
+mod local_cache;
 mod location;
 mod mem;
 mod meta_cache;
@@ -24,6 +25,11 @@ pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
 pub use hashing::{
     compute_hashes_limited, fill_content_hashes, hash_hex, normalize_algorithm, sha256_hex,
     sha256_hex_stream, HASH_STREAM_CHUNK, SUPPORTED_HASH_ALGORITHMS,
+};
+pub use local_cache::{
+    find_existing_user_cache_index, is_local_index_cache_path, local_index_v1_dir,
+    resolve_user_cache_index_location, LocalIndexCache, LOCAL_INDEX_CACHE_BYTES_DEFAULT,
+    LOCAL_INDEX_CACHE_BYTES_ENV, LOCAL_INDEX_DIR_ENV,
 };
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,

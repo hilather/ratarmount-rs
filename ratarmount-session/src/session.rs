@@ -10,8 +10,8 @@ use ratarmount_core::{
     OpenOptions, UserData,
 };
 use ratarmount_index::{
-    find_existing_sibling_index, looks_like_url_archive, IndexError, IndexLocation, PagedDirent,
-    SqliteIndex, MAX_DIR_PAGE,
+    find_existing_sibling_index, find_existing_user_cache_index, looks_like_url_archive,
+    IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE,
 };
 use secrecy::ExposeSecret;
 
@@ -106,8 +106,9 @@ impl Session {
     /// Blocking. Embedders that need a job id run this on a worker thread.
     ///
     /// [`IndexPolicy::Sibling`] + unwritable parent → [`Error::SiblingNotWritable`]
-    /// (never `:memory:`). [`Recreate::Never`] never builds and never falls back
-    /// to `:memory:`.
+    /// (never `:memory:`). [`IndexPolicy::UserCache`] stores `{hex}.sqlite` under
+    /// `local-index-v1/` (never `meta-v3/`). [`Recreate::Never`] never builds and
+    /// never falls back to `:memory:`.
     pub fn open(req: OpenRequest) -> Result<Self, Error> {
         Self::open_with_job(req, &IndexBuildHooks::default())
     }
@@ -147,10 +148,21 @@ impl Session {
                 Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
                 None => return Err(Error::NotFound),
             }
+        } else if req.index == IndexPolicy::UserCache && matches!(req.recreate, Recreate::Never) {
+            match find_existing_user_cache_index(&archive_path, &req.extra_dirs) {
+                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+                None => return Err(Error::NotFound),
+            }
         } else if req.index == IndexPolicy::Sibling && remote_archive {
             match find_existing_sibling_index(&archive_path, &req.extra_dirs) {
                 Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
                 // Leave index_file_path unset so remote sibling GET can run.
+                None => (CatalogLoc::None, None, false, None),
+            }
+        } else if req.index == IndexPolicy::UserCache && remote_archive {
+            match find_existing_user_cache_index(&archive_path, &req.extra_dirs) {
+                Some(p) => (CatalogLoc::Path(p.clone()), None, false, Some(p)),
+                // Leave unbound so remote sibling GET can populate meta-v3.
                 None => (CatalogLoc::None, None, false, None),
             }
         } else {

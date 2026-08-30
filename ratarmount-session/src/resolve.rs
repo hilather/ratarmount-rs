@@ -4,7 +4,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use ratarmount_index::{
-    materialize_index_file, resolve_index_location, resolve_sibling_index_location, IndexLocation,
+    materialize_index_file, resolve_index_location, resolve_sibling_index_location,
+    resolve_user_cache_index_location, IndexLocation,
 };
 
 use crate::types::IndexPolicy;
@@ -25,8 +26,8 @@ pub(crate) fn temp_index_path() -> PathBuf {
 /// [`Error::SiblingNotWritable`]. Never `:memory:` except [`IndexPolicy::Memory`]
 /// and [`IndexPolicy::CliCompat`] last resort (Python parity).
 ///
-/// [`IndexPolicy::UserCache`] (`local-index-v1`) is not implemented here; it
-/// errors rather than writing `meta-v3`.
+/// [`IndexPolicy::UserCache`] writes `{hex}.sqlite` under `local-index-v1/`
+/// (never `meta-v3/`). URL sources are left to remote discovery (`meta-v3`).
 pub fn resolve_index(
     archive: &Path,
     policy: IndexPolicy,
@@ -62,9 +63,8 @@ pub fn resolve_index(
         }
         IndexPolicy::Sibling => resolve_sibling_index_location(archive, extra_dirs, recreate)
             .map_err(Error::SiblingNotWritable),
-        IndexPolicy::UserCache => Err(Error::Internal(
-            "IndexPolicy::UserCache (local-index-v1) is not implemented; not meta-v3".into(),
-        )),
+        IndexPolicy::UserCache => resolve_user_cache_index_location(archive, extra_dirs, recreate)
+            .map_err(|e| Error::Internal(format!("local-index-v1: {e}; not meta-v3"))),
         IndexPolicy::CliCompat => {
             let explicit = explicit_index.map(|p| p.to_string_lossy().into_owned());
             Ok(resolve_index_location(
@@ -83,8 +83,11 @@ mod tests {
     use crate::types::{OpenRequest, Recreate, SourceSpec};
     use crate::Session;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
-    use ratarmount_index::default_index_path;
+    use ratarmount_index::{
+        default_index_path, is_local_index_cache_path, is_meta_cache_path, LOCAL_INDEX_DIR_ENV,
+    };
     use std::io::Write;
+    use std::sync::Mutex;
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
@@ -128,6 +131,36 @@ mod tests {
             || Path::new("http:")
                 .join(format!("{marker}.example.invalid"))
                 .exists()
+    }
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_user_cache_env<R>(f: impl FnOnce(&Path) -> R) -> R {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cache = tempfile::tempdir().unwrap();
+        let old_dir = std::env::var_os(LOCAL_INDEX_DIR_ENV);
+        // Only override local-index-v1. Do not touch XDG_CACHE_HOME — that
+        // races with remote meta-v3 tests in this same process.
+        std::env::set_var(LOCAL_INDEX_DIR_ENV, cache.path());
+        let r = f(cache.path());
+        match old_dir {
+            Some(v) => std::env::set_var(LOCAL_INDEX_DIR_ENV, v),
+            None => std::env::remove_var(LOCAL_INDEX_DIR_ENV),
+        }
+        r
+    }
+
+    fn user_cache_req(tar: PathBuf, recreate: Recreate) -> OpenRequest {
+        OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::UserCache,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate,
+        }
     }
 
     /// Regression: Sibling + unwritable parent → SiblingNotWritable, not `:memory:`.
@@ -263,61 +296,139 @@ mod tests {
         assert_eq!(hit.size, 2);
     }
 
+    /// Regression: UserCache writes `{hex}.sqlite`+`.json` under local-index-v1, not meta-v3.
     #[test]
-    fn resolve_user_cache_does_not_write_meta_v3() {
-        let xdg = tempfile::tempdir().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let tar = dir.path().join("a.tar");
-        write_tar(&tar, &[member_file("a.txt", b"hi")]);
-        let err = resolve_index(&tar, IndexPolicy::UserCache, None, &[], false).unwrap_err();
-        match err {
-            Error::Internal(msg) => {
-                assert!(msg.contains("local-index-v1"), "{msg}");
-                assert!(msg.contains("not meta-v3"), "{msg}");
+    fn resolve_user_cache_writes_local_index_v1_not_meta_v3() {
+        with_user_cache_env(|cache_dir| {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = dir.path().join("a.tar");
+            write_tar(&tar, &[member_file("a.txt", b"hi")]);
+            let loc = resolve_index(&tar, IndexPolicy::UserCache, None, &[], false).unwrap();
+            let idx = loc.as_path().expect("UserCache must be a path");
+            assert!(
+                idx.starts_with(cache_dir) && is_local_index_cache_path(idx),
+                "sidecar {} must live in local-index-v1 {}",
+                idx.display(),
+                cache_dir.display()
+            );
+            let name = idx.file_name().unwrap().to_string_lossy();
+            assert!(name.ends_with(".sqlite"), "{name}");
+            let hex = name.strip_suffix(".sqlite").unwrap();
+            assert_eq!(hex.len(), 64, "{hex}");
+            assert!(hex.bytes().all(|b| b.is_ascii_hexdigit()));
+            let json = cache_dir.join(format!("{hex}.json"));
+            assert!(json.is_file(), "{}", json.display());
+
+            let session = Session::open(user_cache_req(tar.clone(), Recreate::IfInvalid))
+                .expect("UserCache open");
+            assert_eq!(session.catalog_path(), Some(idx));
+            assert!(!session.index_is_memory());
+            assert!(session.lookup("/a.txt").unwrap().is_some());
+            assert!(
+                std::fs::metadata(idx).map(|m| m.len() > 0).unwrap_or(false),
+                "factory must publish sqlite at {}",
+                idx.display()
+            );
+            assert!(
+                !default_index_path(&tar).exists(),
+                "UserCache must not write a sibling sidecar"
+            );
+            assert!(
+                !is_meta_cache_path(idx),
+                "UserCache sidecar must not be meta-v3: {}",
+                idx.display()
+            );
+            assert!(
+                !idx.components().any(|c| c.as_os_str() == "meta-v3"),
+                "path must not be under meta-v3: {}",
+                idx.display()
+            );
+        });
+    }
+
+    /// Recreate::Never + missing user-cache sidecar is NotFound (no allocate, no meta-v3).
+    #[test]
+    fn resolve_user_cache_never_missing_is_not_found() {
+        with_user_cache_env(|cache_dir| {
+            let dir = tempfile::tempdir().unwrap();
+            let tar = dir.path().join("a.tar");
+            write_tar(&tar, &[member_file("a.txt", b"hi")]);
+            let err = match Session::open(user_cache_req(tar.clone(), Recreate::Never)) {
+                Err(e) => e,
+                Ok(_) => panic!("Never + missing user-cache sidecar must not open"),
+            };
+            match err {
+                Error::NotFound => {}
+                other => panic!("expected NotFound, got {other:?}"),
             }
-            other => panic!("expected Internal, got {other:?}"),
-        }
-        let old_xdg = std::env::var_os("XDG_CACHE_HOME");
-        std::env::set_var("XDG_CACHE_HOME", xdg.path());
-        let open_err = match Session::open(OpenRequest {
-            source: SourceSpec::Path(tar),
-            index: IndexPolicy::UserCache,
-            explicit_index: None,
-            extra_dirs: Vec::new(),
-            password: None,
-            recursive: false,
-            recursion_depth: None,
-            recreate: Recreate::IfInvalid,
-        }) {
-            Err(e) => e,
-            Ok(_) => {
-                match &old_xdg {
-                    Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                    None => std::env::remove_var("XDG_CACHE_HOME"),
-                }
-                panic!("UserCache is not implemented");
-            }
-        };
-        match old_xdg {
-            Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-            None => std::env::remove_var("XDG_CACHE_HOME"),
-        }
-        match open_err {
-            Error::Internal(msg) => {
-                assert!(msg.contains("local-index-v1"), "{msg}");
-                assert!(msg.contains("not meta-v3"), "{msg}");
-            }
-            other => panic!("expected Internal, got {other:?}"),
-        }
-        let meta_v3 = xdg.path().join("ratarmount").join("meta-v3");
-        assert!(
-            !meta_v3.exists()
-                || std::fs::read_dir(&meta_v3)
+            assert!(
+                !default_index_path(&tar).exists(),
+                "Never must not create a sibling"
+            );
+            assert!(
+                std::fs::read_dir(cache_dir)
                     .map(|it| it.count() == 0)
                     .unwrap_or(true),
-            "UserCache must not write meta-v3: {}",
-            meta_v3.display()
-        );
+                "Never must not allocate local-index-v1"
+            );
+        });
+    }
+
+    /// Regression: scheme:// UserCache must not mkdir URL parents or write local-index-v1.
+    #[test]
+    fn resolve_user_cache_url_does_not_write_local_index_or_mkdir() {
+        with_user_cache_env(|cache_dir| {
+            let marker = format!("ratarmount-pr7-{}-url", std::process::id());
+            let archive = PathBuf::from(format!("https://{marker}.example.invalid/a.tar"));
+            let err =
+                resolve_index(&archive, IndexPolicy::UserCache, None, &[], false).unwrap_err();
+            match err {
+                Error::Internal(msg) => {
+                    assert!(msg.contains("local-index-v1"), "{msg}");
+                    assert!(msg.contains("meta-v3"), "{msg}");
+                }
+                other => panic!("expected Internal for URL UserCache, got {other:?}"),
+            }
+            assert!(
+                !url_scheme_leak(&marker),
+                "resolve_index UserCache must not mkdir URL parents"
+            );
+            assert!(
+                std::fs::read_dir(cache_dir)
+                    .map(|it| it.count() == 0)
+                    .unwrap_or(true),
+                "URL UserCache must not write local-index-v1"
+            );
+
+            let url = format!("http://127.0.0.1:1/{marker}.example.invalid/a.tar");
+            let open_err = match Session::open(OpenRequest {
+                source: SourceSpec::Url(url),
+                index: IndexPolicy::UserCache,
+                explicit_index: None,
+                extra_dirs: Vec::new(),
+                password: None,
+                recursive: false,
+                recursion_depth: None,
+                recreate: Recreate::IfInvalid,
+            }) {
+                Err(e) => e,
+                Ok(_) => panic!("URL open should not succeed against 127.0.0.1:1"),
+            };
+            assert!(
+                !matches!(open_err, Error::SiblingNotWritable(_)),
+                "Session URL UserCache must not SNW; got {open_err:?}"
+            );
+            assert!(
+                !url_scheme_leak(&marker),
+                "Session::open UserCache must not mkdir URL parents"
+            );
+            assert!(
+                std::fs::read_dir(cache_dir)
+                    .map(|it| it.count() == 0)
+                    .unwrap_or(true),
+                "Session URL UserCache must not write local-index-v1"
+            );
+        });
     }
 
     /// Recreate::Never + missing sidecar is NotFound even if the sibling parent is unwritable.

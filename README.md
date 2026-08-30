@@ -191,6 +191,8 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 
 Remote sidecar **downloads** (whole SQLite blob ≤ 64 MiB, not archive Range I/O) are cached under `$XDG_CACHE_HOME/ratarmount/meta-v3/` (default `~/.cache/...`). Cap: `RATARMOUNT_META_CACHE_BYTES` (default 256 MiB; `=0` disables). Lookup is the sidecar URL — a remount does not need `.ptr`. HPC home-quota: point `XDG_CACHE_HOME` at scratch. `file://` / `:memory:` / an already-local sidecar are not stored again. This is **not** a payload/member cache (G-3).
 
+Local-archive **user-cache** indexes (`IndexPolicy::UserCache` / GUI “save in user cache”) live under `$XDG_CACHE_HOME/ratarmount/local-index-v1/` (macOS `~/Library/Caches/ratarmount/local-index-v1/` unless `XDG_CACHE_HOME` or `RATARMOUNT_LOCAL_INDEX_DIR` is set; Windows `%LOCALAPPDATA%\ratarmount\local-index-v1\`). Files are `{sha256}.sqlite` + `{sha256}.json`. Cap: `RATARMOUNT_LOCAL_INDEX_CACHE_BYTES` (default 2 GiB; `=0` disables). This is **not** `meta-v3/` — remote sidecar downloads stay in the 256 MiB V-3 LRU, and `meta-v3` is **not** migrated to macOS Library/Caches.
+
 Living matrices: [`docs/mount-options-parity.md`](docs/mount-options-parity.md) · [`docs/parity-todo.md`](docs/parity-todo.md) · [`docs/phase10-remote.md`](docs/phase10-remote.md) · [`docs/export.md`](docs/export.md)
 
 ---
