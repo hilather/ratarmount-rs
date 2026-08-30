@@ -1,0 +1,254 @@
+# Session API (`ratarmount-session`)
+
+In-process embedder contract for [ratarmount-rs](https://github.com/hilather/ratarmount-rs). Desktop GUIs and other hosts browse, search, preview, and extract archives **without FUSE** and **without importing the `ratarmount` binary crate**.
+
+This crate is the **supported embedder surface**. Path-depend it (`ratarmount-session = { path = "…" }`). It is **not** published on crates.io in this slice. Never treat the `ratarmount` binary crate as a library.
+
+Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), [`docs/crates-io-policy.md`](crates-io-policy.md) (L3.5).
+
+## Status (this slice)
+
+| Surface | This crate today | Lands |
+|---------|------------------|-------|
+| Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **stubbed / compile** | G0.1 |
+| `Error` (no `Busy`) | **stubbed / compile** | G0.1 |
+| `Session` struct (`Send + Sync`, no `Clone`) | **stub** — private placeholder fields | G0.1; I/O in G1 |
+| `IndexJob` unit struct | **stub** | G0.1; `run` in G2 |
+| `RangeReader` | **stub** (no `Read` yet) | G1.4 |
+| `Session::open` / `open_with_job` | not implemented | G1.1 / G2 |
+| `list_dirents_page` / `lookup` | not implemented | G1.2 / G1.3 |
+| `read_range` / `extract_to` | not implemented | G1.4 / G1.5 |
+| `Session::find` | not implemented | G3 |
+| `IndexJob::run` | not implemented | G2 |
+| `resolve_index` | not implemented | G4 |
+| Factory (`open_path`) | not in this crate | PR2 mechanical move |
+| Format crates (TAR/ZIP/7z/…) | **not** a `formats` feature yet (core+index only) | PR2 full L2 set |
+
+`cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
+
+SQLite sidecar schema stays **`INDEX_VERSION` `"0.7.0"`**. No IVF, no `--readdir-order`.
+
+## Types
+
+```rust
+pub enum SourceSpec { Path(PathBuf), Url(String) }
+
+pub enum IndexPolicy { Sibling, UserCache, Explicit, Memory, Temp, CliCompat }
+
+pub enum Recreate { Never, IfInvalid, Always }
+
+pub struct OpenRequest {
+    pub source: SourceSpec,
+    pub index: IndexPolicy,
+    pub explicit_index: Option<PathBuf>,  // required when index == Explicit
+    pub extra_dirs: Vec<PathBuf>,         // --index-folders extras, not implicit sibling ""
+    pub password: Option<secrecy::SecretString>,
+    pub recursive: bool,
+    pub recursion_depth: Option<i32>,
+    pub recreate: Recreate,
+}
+
+pub enum DirCursor { Start, AfterName { name: String } }
+
+pub enum FindCursor { Start, AfterPath { path: String, offsetheader: Option<i64> } }
+
+pub struct DirPage {
+    pub path: String,
+    pub entries: Vec<DirEnt>,
+    pub next_cursor: Option<DirCursor>,
+    pub total_hint: Option<u64>,  // cheap COUNT on SQLite; None for live FolderMountSource
+}
+
+pub struct DirEnt {
+    pub name: String,
+    pub path: String,                 // archive-relative, leading `/`, no trailing `/`
+    pub is_dir: bool,
+    pub size: u64,
+    pub mtime: Option<i64>,           // Unix seconds; None if the cheap row has no mtime
+    pub mode: u32,
+    pub archive_offset: Option<u64>,  // catalog hint only — do not fetch bytes with this
+}
+
+pub struct ReadRequest {
+    pub path: String,
+    pub offset: u64,
+    pub max_len: u64,  // hard cap; 0 → empty reader; no “read the rest” sentinel
+}
+
+pub enum Overwrite { Skip, Replace }
+
+pub struct ExtractRequest {
+    pub members: Vec<String>,  // empty = every payload member (catalog walk, not list() Vec)
+    pub dest_dir: PathBuf,
+    pub overwrite: Overwrite,
+    pub allow_unsafe_paths: bool,  // default false: reject `..`, absolute, Windows prefixes
+}
+
+pub struct ExtractProgress {
+    pub files_done: u64,
+    pub files_hint: Option<u64>,
+    pub bytes_out: u64,
+    pub current_path: Option<String>,
+}
+
+pub enum IndexPhase { Scan, Write, Fts, Finalize }
+
+pub struct IndexProgress {
+    pub phase: IndexPhase,
+    pub bytes_scanned: u64,
+    pub bytes_total_hint: Option<u64>,
+    pub entries: u64,
+    pub message: Option<String>,
+}
+
+pub struct FindOpts {
+    pub fts: bool,
+    pub offset_order: bool,
+    pub include_hashes: bool,
+    pub fill_hashes: Vec<String>,
+    pub limit: u32,
+    pub cursor: FindCursor,
+}
+
+pub struct FindPage {
+    pub pattern: String,
+    pub fts: bool,
+    pub entries: Vec<DirEnt>,
+    pub next_cursor: Option<FindCursor>,
+    pub total_hint: Option<u64>,
+}
+```
+
+`DirCursor` is for directory listing only. `find` uses `FindCursor`. Separate types so a directory cursor cannot be passed to locate. Do **not** put SQLite `rowid` on `DirEnt` or on the JS boundary. Napi opaque-encodes either cursor enum.
+
+One `Session` holds **one** `SourceSpec` (GUI v1 = one archive per window). Multi-input union stays CLI `build_mount_source_ex`.
+
+Passwords are `secrecy::SecretString` on this boundary only. They are **not** threaded through `OpenOptions.passwords: Vec<String>` in v1 (that field stays plaintext for ZIP/7z member decrypt). Never log secrets.
+
+## `Session` methods (later PRs)
+
+`Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
+
+```rust
+impl Session {
+    /// Blocking. May build an index when `recreate` requires it.
+    pub fn open(req: OpenRequest) -> Result<Self, Error>;
+
+    /// Same as `open` with progress/cancel hooks.
+    pub fn open_with_job(req: OpenRequest, hooks: &IndexBuildHooks) -> Result<Self, Error>;
+
+    pub fn list_dirents_page(
+        &self,
+        path: &str,
+        cursor: DirCursor,
+        limit: u32,
+    ) -> Result<DirPage, Error>;
+
+    pub fn lookup(&self, path: &str) -> Result<Option<DirEnt>, Error>;
+
+    /// Seek + bounded reader. Never returns the member as `Vec<u8>`.
+    pub fn read_range(&self, req: ReadRequest) -> Result<RangeReader, Error>;
+
+    /// Stream members to `dest_dir`. `progress` may be called between members
+    /// and every 8 MiB copied. `cancel` checked at those points.
+    pub fn extract_to(
+        &self,
+        req: ExtractRequest,
+        progress: Option<&dyn Fn(ExtractProgress)>,
+        cancel: Option<&AtomicBool>,
+    ) -> Result<(), Error>;
+
+    pub fn find(&self, pattern: &str, opts: FindOpts) -> Result<FindPage, Error>;
+}
+```
+
+There is no `IndexJob::start` / `Session::from_open` (napi-shaped). Optional `Session::start_http` is feature `http-export` (G5.4, after W2).
+
+Default `list_dirents_page` limit if 0 is passed: **200**. Engine cap `MAX_DIR_PAGE = 10_000`.
+
+## Errors
+
+```rust
+pub enum Error {
+    NotFound,
+    SiblingNotWritable(PathBuf),
+    NotWritable(PathBuf),
+    BadPassword,
+    UnsupportedFormat(String),
+    CorruptIndex(String),
+    Cancelled,
+    PathEscape(String),
+    Internal(String),
+}
+```
+
+Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use distinct `{pid}.{seq}` tmps and last `publish_tmp` wins. Napi may synthesize `Busy` when its handle table already has an in-flight job for that window (`retryable: true`). Engine retryable: `NotWritable`, `SiblingNotWritable`.
+
+| `Recreate` | Missing sidecar | tarstats mismatch |
+|------------|-----------------|-------------------|
+| `Never` | `NotFound` | `CorruptIndex` — never build, never `:memory:` |
+| `IfInvalid` | build (`IndexJob::run`) | build — **not** an error on `open` |
+| `Always` | build | build |
+
+`PermissionDenied` from `MountSource::open` maps to `BadPassword` **only** when passwords were supplied or the format already reported encryption. Other permission failures → `NotWritable` if a path is known, else `Internal`. Do not flatten to EIO.
+
+## Index policy
+
+`IndexPolicy` is the GUI `index.policy` mapping. Session default for GUI is **`Sibling`**. CLI maps today’s flags to **`CliCompat`** (Python last-resort `:memory:` stays there only).
+
+| Policy | Where the 0.7.x sidecar lives |
+|--------|-------------------------------|
+| `Sibling` | `{archive}.index.ptr` + `{archive}.index.{id}.sqlite`, else `{archive}.index.sqlite`. Parent not writable and no usable file → **`SiblingNotWritable`**. No auto-fallback to user cache or `:memory:`. |
+| `UserCache` | `local-index-v1/` for local paths; `meta-v3/` for remote URL after sibling GET miss |
+| `Explicit` | `OpenRequest.explicit_index` |
+| `Memory` | `:memory:` — tests / `RGUI_FAKE` only; GUI settings must not persist this |
+| `Temp` | Platform temp, unlinked on `Session` drop. Confirm in UI. **Not** the fallback when sibling fails. |
+| `CliCompat` | Today’s CLI/Python folder order, including `:memory:` last resort. Not a GUI policy id. |
+
+`resolve_index` (G4) is new. Existing `resolve_index_location` stays the Python/CLI helper. Until G4, session must not ship `:memory:` as the unwritable-sibling fallback.
+
+## `local-index-v1` ≠ `meta-v3`
+
+| Store | Role |
+|-------|------|
+| `local-index-v1/` | Local-archive index cache when policy is `UserCache` (Linux `$XDG_CACHE_HOME/ratarmount/local-index-v1/`, macOS `~/Library/Caches/ratarmount/local-index-v1/` unless XDG override, Windows `%LOCALAPPDATA%\ratarmount\local-index-v1\`) |
+| `meta-v3/` | **Remote sidecar download LRU only** (256 MiB, `RATARMOUNT_META_CACHE_BYTES`). Do not put local-archive indexes there. |
+
+Do not migrate `meta-v3` onto macOS Library/Caches. Env `RATARMOUNT_LOCAL_INDEX_DIR` / `RATARMOUNT_LOCAL_INDEX_CACHE_BYTES` (default 2 GiB) land with G4.
+
+## `read_range` / extract (no slurp)
+
+- **No `read_all`.** `MountSource::read` returns `Vec<u8>` and is **not** the embedder API.
+- `read_range(path, offset, max_len)` returns `RangeReader: Read + Send` (not `Sync`) capped at `max_len`. `max_len == 0` → empty reader. There is no “read the rest of the file” sentinel.
+- Preview cap (64 MiB) is GUI-native; the engine just takes `max_len`.
+- Extract is a **streaming copy** (64 KiB buffer, loop until `Ok(0)`), not `read_range(0, size)` into a `Vec`.
+- Extract-all walks the catalog with a keyset, not `list()` / `list_visible_files_by_offset` dumped into a `Vec`.
+- `extractPlan` (conflict sample) stays in the **GUI**, not engine v1.
+- Path escape (`..`, absolute, Windows prefixes) → `Error::PathEscape` unless `allow_unsafe_paths`.
+
+## `IndexJob` (blocking)
+
+Engine stays **blocking**. Napi owns threads / `job_id`.
+
+```rust
+pub struct IndexJob;
+
+impl IndexJob {
+    /// Cold build (`Recreate::Always` semantics). On success the sidecar is
+    /// published (tmp+rename). Caller then `Session::open` warm, or
+    /// `Session::open_with_job` does run+open internally.
+    pub fn run(req: OpenRequest, hooks: IndexBuildHooks) -> Result<IndexLocation, Error>;
+}
+```
+
+Cancel is cooperative. Cancel **never** `publish_tmp`; `Drop` unlinks `{dest}.tmp.{pid}.{seq}` and the previous sidecar stays valid (V-2a). CLI `--no-mount` control flow (hashes / `--publish-index` / `-w`) stays in `main.rs` — not folded into `IndexJob` in v1.
+
+Normal `IndexJob` does **not** create `files_fts`. FTS is opt-in (`FindOpts.fts` / `fts:` prefix).
+
+## Overlay / write
+
+GUI v1 is **read-mostly**. Overlay write, live commit, and `--commit-overlay` are out of Session v1.
+
+## Feature graph
+
+This skeleton depends on `ratarmount-core` + `ratarmount-index` + `secrecy` + `thiserror` only. PR2 adds the full L2 format set factory already `use`s (not a TAR/ZIP/7z-only `formats` feature). Session **must not** depend on `ratarmount-fuse`, `ratarmount-nfs`, `ratarmount-smb`, `ratarmount-9p`, or `ratarmount-sftp`. Optional later: `http-export`, `gzip-rapidgzip`.

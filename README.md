@@ -250,9 +250,12 @@ flowchart LR
   Remote --> Factory
 ```
 
+**In-process embedders** (desktop GUI, custom hosts) should depend on `ratarmount-session` and follow [`docs/session-api.md`](docs/session-api.md). Do **not** import the `ratarmount` binary crate.
+
 | Crate | Role |
 |-------|------|
 | `ratarmount` | CLI binary |
+| `ratarmount-session` | In-process Session API for embedders (**no FUSE**) |
 | `ratarmount-core` | `MountSource` trait & options |
 | `ratarmount-index` | SQLite 0.7.x index |
 | `ratarmount-fuse` | `fuser` low-level filesystem |
@@ -269,6 +272,7 @@ flowchart LR
 
 ```
 ratarmount/                 # CLI
+ratarmount-session/         # in-process Session API (embedders; no FUSE)
 ratarmount-core/            # MountSource trait, options
 ratarmount-index/           # SQLite 0.7.x
 ratarmount-fuse/            # fuser low-level FS
@@ -347,6 +351,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 
 | Document | Topic |
 |----------|--------|
+| [docs/session-api.md](docs/session-api.md) | In-process Session API for embedders (no FUSE) |
 | [docs/parity-todo.md](docs/parity-todo.md) | Full feature + test parity checklist |
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |

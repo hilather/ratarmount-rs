@@ -1,0 +1,12 @@
+[package]
+name = "ratarmount-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "In-process Session API for ratarmount-rs embedders (no FUSE)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-index.workspace = true
+thiserror.workspace = true
+secrecy = "0.8"

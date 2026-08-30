@@ -4,6 +4,7 @@ members = [
     "ratarmount",
     "ratarmount-core",
     "ratarmount-index",
+    "ratarmount-session",
     "ratarmount-fuse",
     "ratarmount-compress",
     "ratarmount-formats-tar",
@@ -46,6 +47,7 @@ rust-version = "1.74"
 [workspace.dependencies]
 ratarmount-core = { path = "ratarmount-core" }
 ratarmount-index = { path = "ratarmount-index" }
+ratarmount-session = { path = "ratarmount-session" }
 ratarmount-fuse = { path = "ratarmount-fuse" }
 ratarmount-compress = { path = "ratarmount-compress" }
 ratarmount-formats-tar = { path = "ratarmount-formats-tar" }
