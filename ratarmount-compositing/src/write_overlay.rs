@@ -2886,7 +2886,6 @@ fn commit_overlay_tar_zst(
     let patch_opts = OpenOptions {
         encoding: opts.encoding.clone(),
         ignore_zeros: true,
-        gnu_incremental: Some(false),
         write_index: false,
         index_folders: vec![PathBuf::new()],
         ..OpenOptions::default()
@@ -4214,13 +4213,13 @@ mod tests {
 
         let overlay = dir.path().join("ov");
         let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
-        ov.unlink("/mid.txt")
-            .expect("unlink middle complete-TAR frame");
+        ov.unlink("/prefix.txt")
+            .expect("unlink first complete-TAR frame");
         drop(ov);
 
         assert!(
             commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"),
-            "offline commit without -i must persist the middle-frame delete"
+            "offline commit without -i must persist the first-frame delete"
         );
 
         let idx = ratarmount_index::SqliteIndex::open_read_only(&sidecar).expect("open patched");
@@ -4234,21 +4233,25 @@ mod tests {
             &sidecar,
             OpenOptions {
                 ignore_zeros: true,
-                gnu_incremental: Some(false),
                 ..OpenOptions::default()
             },
         )
         .expect("warm-open patched sidecar");
         assert!(
-            src.lookup("/mid.txt", 0).is_none(),
-            "middle-frame name must be gone from the patched sidecar"
+            src.lookup("/prefix.txt", 0).is_none(),
+            "first-frame name must be gone from the patched sidecar"
+        );
+        assert_eq!(
+            read_member(&src, "/mid.txt"),
+            mid,
+            "next complete-TAR frame must be reinserted when patching with ignore_zeros"
         );
         assert_eq!(
             read_member(&src, "/last.txt"),
             last,
-            "later complete-TAR frame must be reinserted when patching with ignore_zeros"
+            "later complete-TAR frame after another kept EOF must be reinserted \
+             (ignore_zeros: false on the patch would stop after mid.txt)"
         );
-        assert_eq!(read_member(&src, "/prefix.txt"), prefix);
     }
 
     /// Regression: offline --commit-overlay must not create a sibling *.index.sqlite.
