@@ -197,7 +197,8 @@ impl Session {
             check_recreate_never(&archive_path, &loc)?;
         }
 
-        if will_cold_build(req.recreate, &archive_path, &loc) {
+        // Skip tarstats catalog open when nobody is listening (Session::open).
+        if hooks.on_progress.is_some() && will_cold_build(req.recreate, &archive_path, &loc) {
             let bytes_total_hint = match &req.source {
                 SourceSpec::Path(p) => std::fs::metadata(p).ok().map(|m| m.len()),
                 SourceSpec::Url(_) => None,

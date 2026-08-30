@@ -1066,7 +1066,13 @@ fn check_build_cancel(options: &OpenOptions) -> Result<()> {
     }
 }
 
-fn maybe_byte_tick(options: &OpenOptions, pos: u64, entries: u64, last_pos: &mut u64) {
+fn maybe_byte_tick(
+    options: &OpenOptions,
+    pos: u64,
+    entries: u64,
+    last_pos: &mut u64,
+    bytes_total_hint: Option<u64>,
+) {
     let bucket = pos / BUILD_TICK_BYTES;
     let last_bucket = *last_pos / BUILD_TICK_BYTES;
     if bucket > last_bucket {
@@ -1074,7 +1080,7 @@ fn maybe_byte_tick(options: &OpenOptions, pos: u64, entries: u64, last_pos: &mut
         options.index_build.emit(IndexBuildTick {
             phase: IndexBuildTick::PHASE_WRITE,
             bytes_scanned: pos,
-            bytes_total_hint: None,
+            bytes_total_hint,
             entries,
         });
     }
@@ -1539,6 +1545,7 @@ fn parse_tar_from<R: Read + Seek>(
 
     let mut flushed_entries: u64 = 0;
     let mut last_tick_pos: u64 = 0;
+    let bytes_total_hint = index.build_total_hint();
     let flush = |batch: &mut FileRowSoa, flushed: &mut u64| -> Result<()> {
         if !batch.is_empty() {
             let n = batch.len() as u64;
@@ -1563,6 +1570,7 @@ fn parse_tar_from<R: Read + Seek>(
             pos,
             flushed_entries + batch.len() as u64,
             &mut last_tick_pos,
+            bytes_total_hint,
         );
         reader.seek(SeekFrom::Start(pos))?;
         let n = reader.read(&mut header)?;
@@ -3182,6 +3190,63 @@ mod tests {
         assert_eq!(buf, "hello world\n");
         // Plain text member is not a nested TAR.
         assert!(m.list_nested_tar_members().unwrap().is_empty());
+    }
+
+    /// 8 MiB header-loop Write ticks must carry `set_build_total_hint`.
+    #[test]
+    fn index_build_byte_tick_carries_total_hint() {
+        use ratarmount_core::IndexBuildHooks;
+        use std::sync::Mutex;
+        let dir = tempfile::tempdir().unwrap();
+        let tar_path = dir.path().join("big.tar");
+        let payload = vec![0u8; 9 * 1024 * 1024];
+        {
+            let mut f = std::fs::File::create(&tar_path).unwrap();
+            write_ustar_members(
+                &mut f,
+                &[UstarMember {
+                    path: "big.bin",
+                    payload: UstarPayload::File { bytes: &payload },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+            write_tar_eof(&mut f).unwrap();
+        }
+        let archive_len = std::fs::metadata(&tar_path).unwrap().len();
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let ticks_cb = Arc::clone(&ticks);
+        let opts = OpenOptions {
+            index_build: IndexBuildHooks {
+                on_progress: Some(Arc::new(move |t: IndexBuildTick| {
+                    ticks_cb.lock().unwrap().push(t);
+                })),
+                cancel: None,
+            },
+            index_in_memory: true,
+            ..OpenOptions::default()
+        };
+        let mut mat = None;
+        SqliteIndexedTar::create_index(&tar_path, &tar_path, None, &opts, "0.1.0", &mut mat)
+            .expect("index");
+        let got = ticks.lock().unwrap().clone();
+        let writes: Vec<_> = got
+            .iter()
+            .filter(|t| t.phase == IndexBuildTick::PHASE_WRITE)
+            .collect();
+        assert!(
+            writes.iter().any(|t| t.bytes_scanned >= 8 * 1024 * 1024),
+            "expected an 8 MiB Write tick, got {got:?}"
+        );
+        assert!(
+            writes
+                .iter()
+                .all(|t| t.bytes_total_hint == Some(archive_len)),
+            "byte ticks must carry archive size hint {archive_len}: {got:?}"
+        );
     }
 
     /// Regression: open_with_existing_index rejects when archive size/mtime no longer match tarstats.

@@ -760,6 +760,14 @@ impl SqliteIndex {
             .unwrap_or_else(|p| p.into_inner()) = hint;
     }
 
+    /// Archive-size hint for header-loop Write ticks (TAR 8 MiB cadence).
+    pub fn build_total_hint(&self) -> Option<u64> {
+        *self
+            .build_bytes_total_hint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     fn build_cancelled(&self) -> Result<()> {
         let hooks = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
         if hooks.is_cancelled() {

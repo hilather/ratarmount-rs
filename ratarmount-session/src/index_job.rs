@@ -125,6 +125,12 @@ mod tests {
             writes >= 4,
             "2048/512 batches should yield ≥4 Write ticks, got {writes}: {got:?}"
         );
+        assert!(
+            got.iter()
+                .filter(|t| t.phase == IndexBuildTick::PHASE_WRITE)
+                .all(|t| t.bytes_total_hint.is_some()),
+            "Write ticks should carry Scan archive-size hint: {got:?}"
+        );
         assert_eq!(got.last().unwrap().phase, IndexBuildTick::PHASE_FINALIZE);
         assert!(
             got.last().unwrap().entries >= 2048,
