@@ -6035,8 +6035,8 @@ mod tests {
     /// path, so a tick persisted and unlinked the renamed inode. Later
     /// `pwrite` bytes hit the detached inode and never reached the archive.
     ///
-    /// Overlay-only create (not a base member): no delete tombstone, so a
-    /// skipped tick is `Ok(false)`.
+    /// Overlay-only create plus an unpinned sibling: same tick persists the
+    /// sibling (`Ok(true)`) and leaves the renamed writer on disk.
     #[test]
     fn live_commit_idle_skips_open_write_fd_after_rename() {
         let dir = tempfile::tempdir().unwrap();
