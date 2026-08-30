@@ -38,7 +38,7 @@ pub enum Recreate {
     Always,
 }
 
-/// Arguments to `Session::open` (method lands later).
+/// Arguments to `Session::open`.
 #[derive(Clone, Debug)]
 pub struct OpenRequest {
     pub source: SourceSpec,

@@ -5,9 +5,8 @@
 //! The default dependency graph of `ratarmount-session` has no `fuser`
 //! (`cargo tree -p ratarmount-session -i fuser` is empty).
 //!
-//! Types and [`Error`] are the contract freeze. I/O methods (`open`,
-//! `list_dirents_page`, `read_range`, `extract_to`, `find`), `IndexJob::run`,
-//! and `resolve_index` land in later PRs. See `docs/session-api.md`.
+//! Contract: types, [`Error`] (no `Busy`), [`Session`] (no [`Clone`]; share via
+//! [`std::sync::Arc`]). See `docs/session-api.md`.
 
 mod error;
 #[allow(dead_code)]
@@ -116,7 +115,12 @@ mod tests {
         };
         assert!(req.password.is_some());
         assert!(matches!(req.source, SourceSpec::Path(_)));
-        // Factory is not a module of this crate yet; OpenRequest must not need it.
+        let debug = format!("{req:?}");
+        assert!(!debug.contains("secret"), "{debug}");
+        assert!(
+            debug.contains("REDACTED") || debug.contains("Secret"),
+            "{debug}"
+        );
     }
 
     fn assert_send_sync<T: Send + Sync>() {}
