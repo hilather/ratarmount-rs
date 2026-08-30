@@ -204,8 +204,8 @@ impl GitMountSource {
             mtime: self.commit_time as f64,
             mode,
             linkname,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: ratarmount_core::effective_uid(),
+            gid: ratarmount_core::effective_gid(),
             userdata: vec![git_path_userdata(vpath)],
         })
     }

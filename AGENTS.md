@@ -95,6 +95,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 | Packages portable apt CDN reset (missing glibc2.31 amd64) | `./packaging/test-packages-apt-retries.sh` |
 | CI apt CDN hang cancels cold-index / FUSE allowlists | `./packaging/test-ci-apt-retries.sh` |
+| Windows session/index compile without FUSE (G6, no WinFsp) | `./packaging/test-windows-lib-ci.sh` · `cargo test -p ratarmount-core --lib effective_ids` · `cargo test -p ratarmount-core --lib metadata_helpers` · `cargo test -p ratarmount-index --lib tar_stats_from_metadata_uses_len` · `cargo test -p ratarmount-index --lib home_dir_prefers` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
 | HTTP/WebDAV/SMB/`--ninep`/`--sftp` clap steals archive | `cargo test -p ratarmount --bin ratarmount http_flag` · `cargo test -p ratarmount --bin ratarmount ninep_flag` · `cargo test -p ratarmount --bin ratarmount webdav_flag` · `cargo test -p ratarmount --bin ratarmount smb_flag` · `cargo test -p ratarmount --bin ratarmount sftp_flag` |

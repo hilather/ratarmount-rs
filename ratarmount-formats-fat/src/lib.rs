@@ -185,8 +185,8 @@ fn entry_to_file_info(name_path: &str, is_dir: bool, size: u64, mtime: f64) -> F
         mtime,
         mode,
         linkname: String::new(),
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
+        uid: ratarmount_core::effective_uid(),
+        gid: ratarmount_core::effective_gid(),
         userdata: vec![fat_path_userdata(name_path)],
     }
 }

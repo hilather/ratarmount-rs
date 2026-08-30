@@ -1282,9 +1282,9 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G6.1** | CI `cargo check -p ratarmount-session` for Windows (best-effort) | M | proposed |
-| **G6.2** | Cfg audit: core uid/gid, compositing `empty_archive`, tar `O_NOFOLLOW`, `MetadataExt`; UDS stays CLI; split `find.rs` first | M | proposed |
-| **G6.3** | NTFS: rely on SQLite exclusive/tmp+rename; document | M | proposed |
+| **G6.1** | CI `cargo check -p ratarmount-session` for Windows (best-effort) | M | **landed (PR11)** — `windows-lib` on `windows-2022`, `continue-on-error`; skip session check if pkg-config `archive` missing. Core+index check always runs. No WinFsp. |
+| **G6.2** | Cfg audit: core uid/gid, compositing `empty_archive`, tar `O_NOFOLLOW`, `MetadataExt`; UDS stays CLI; split `find.rs` first | M | **landed (PR11)** — portable `effective_uid`/`metadata_*`; `find.rs` Unix silence stays in the binary. Overlay raw fds Unix-only. |
+| **G6.3** | NTFS: rely on SQLite exclusive/tmp+rename; document | M | **landed (PR11)** — `locking_mode=EXCLUSIVE` comment; no `fs2`. `meta-v3` still `xdg_cache_home()`. |
 
 ### Phase G7 — Compatibility gates
 

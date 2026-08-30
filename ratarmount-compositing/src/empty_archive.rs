@@ -2,7 +2,6 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Write};
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::Path;
 
 use ratarmount_compress::{encode_zstd_frame_to, name_suggests_compressed_tar};
@@ -100,7 +99,12 @@ fn create_new_empty_archive(
     kind: EmptyArchiveKind,
 ) -> Result<EmptyCreateOutcome, OverlayError> {
     let mut opts = OpenOptions::new();
-    opts.write(true).create_new(true).mode(0o666);
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o666);
+    }
     match opts.open(path) {
         Ok(mut f) => {
             let wrote = write_empty_archive(&mut f, kind).and_then(|_| f.sync_all());
@@ -159,13 +163,23 @@ fn initialize_empty_archive(
 }
 
 /// Same as `OpenOptions::mode(0o666)`: umask applies (NamedTempFile is 0o600).
+/// WHY: `PermissionsExt` / `umask` are Unix-only; Windows keeps tempfile mode.
 fn apply_create_mode(file: &File) -> io::Result<()> {
-    let mask = unsafe {
-        let prev = libc::umask(0);
-        libc::umask(prev);
-        prev
-    };
-    file.set_permissions(fs::Permissions::from_mode(0o666 & !(mask as u32)))
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mask = unsafe {
+            let prev = libc::umask(0);
+            libc::umask(prev);
+            prev
+        };
+        file.set_permissions(fs::Permissions::from_mode(0o666 & !(mask as u32)))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = file;
+        Ok(())
+    }
 }
 
 fn write_empty_archive<W: Write>(out: &mut W, kind: EmptyArchiveKind) -> io::Result<()> {
@@ -199,7 +213,7 @@ mod tests {
     use ratarmount_compress::{
         decode_zstd_frames_to, detect_compression, scan_zstd_frames_path, CompressionFormat,
     };
-    use std::os::unix::fs::{symlink, FileTypeExt};
+    use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
     use std::sync::Barrier;
     use std::thread;
 

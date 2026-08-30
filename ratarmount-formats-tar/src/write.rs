@@ -968,11 +968,16 @@ fn write_member_body<W: Write>(out: &mut W, member: &UstarMember<'_>) -> io::Res
 }
 
 fn write_file_on_disk<W: Write>(out: &mut W, path: &Path, size: u64) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    // WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no nofollow bit
+    // (no WinFsp). Persist still opens the path the caller already confined.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    let f = opts.open(path)?;
     if size > 0 {
         let n = io::copy(&mut f.take(size), out)?;
         if n != size {
@@ -1257,22 +1262,26 @@ mod tests {
         let m = open_mem(bytes);
         assert_eq!(read_path(&m, "/copied.txt"), payload);
 
-        let link = dir.path().join("link.txt");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-        let sneaky = [UstarMember {
-            path: "escaped.txt",
-            payload: UstarPayload::FileOnDisk {
-                path: &link,
-                size: payload.len() as u64,
-            },
-            mode: 0o644,
-            uid: 0,
-            gid: 0,
-            mtime: 0,
-        }];
-        let mut out = Vec::new();
-        let err = write_ustar_members(&mut out, &sneaky).expect_err("symlink must not be followed");
-        assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        #[cfg(unix)]
+        {
+            let link = dir.path().join("link.txt");
+            std::os::unix::fs::symlink(&real, &link).unwrap();
+            let sneaky = [UstarMember {
+                path: "escaped.txt",
+                payload: UstarPayload::FileOnDisk {
+                    path: &link,
+                    size: payload.len() as u64,
+                },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }];
+            let mut out = Vec::new();
+            let err =
+                write_ustar_members(&mut out, &sneaky).expect_err("symlink must not be followed");
+            assert_eq!(err.raw_os_error(), Some(libc::ELOOP));
+        }
     }
 
     /// Regression: a mid-member opaque window with nonzero content fails

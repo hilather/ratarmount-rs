@@ -11,8 +11,9 @@ use std::io::{self, Cursor};
 use std::sync::Arc;
 
 use ratarmount_core::{
-    create_root_file_info, format_cheap_hits_tsv, normpath, CheapDirent, CheapSearchHit, FileInfo,
-    ListModeResult, ListResult, MountSource, UserData, S_IFDIR, S_IFMT, S_IFREG,
+    create_root_file_info, effective_gid, effective_uid, format_cheap_hits_tsv, normpath,
+    CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource, UserData,
+    S_IFDIR, S_IFMT, S_IFREG,
 };
 
 /// Directory name at the mount root (hidden, leading dot).
@@ -146,8 +147,8 @@ impl ControlFolderMountSource {
             mtime: 0.0,
             mode: S_IFDIR | 0o555,
             linkname: String::new(),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: effective_uid(),
+            gid: effective_gid(),
             userdata: vec![UserData::Other(TAG_DIR.into())],
         }
     }
@@ -158,8 +159,8 @@ impl ControlFolderMountSource {
             mtime: 0.0,
             mode: S_IFDIR | 0o555,
             linkname: String::new(),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: effective_uid(),
+            gid: effective_gid(),
             userdata: vec![UserData::Other(TAG_SEARCH_DIR.into())],
         }
     }
@@ -170,8 +171,8 @@ impl ControlFolderMountSource {
             mtime: 0.0,
             mode: S_IFREG | 0o444,
             linkname: String::new(),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: effective_uid(),
+            gid: effective_gid(),
             userdata: vec![UserData::Other(format!("{TAG_SEARCH_PREFIX}{pattern}"))],
         }
     }
@@ -196,8 +197,8 @@ impl ControlFolderMountSource {
             mtime: 0.0,
             mode,
             linkname: String::new(),
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: effective_uid(),
+            gid: effective_gid(),
             userdata: vec![UserData::Other(tag.into())],
         }
     }

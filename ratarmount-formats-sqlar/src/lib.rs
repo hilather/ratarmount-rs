@@ -280,8 +280,8 @@ impl SqlarMountSource {
             mtime: mtime as f64,
             mode: mode as u32,
             linkname,
-            uid: unsafe { libc::geteuid() },
-            gid: unsafe { libc::getegid() },
+            uid: ratarmount_core::effective_uid(),
+            gid: ratarmount_core::effective_gid(),
             userdata: vec![UserData::Other(format!("sqlar:{rowid}"))],
         }
     }

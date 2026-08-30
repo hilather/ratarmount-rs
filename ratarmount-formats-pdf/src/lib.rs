@@ -1072,10 +1072,7 @@ impl PdfMountSource {
         let images = gather_images(&doc);
 
         let mtime = std::fs::metadata(archive_path)
-            .map(|m| {
-                use std::os::unix::fs::MetadataExt;
-                m.mtime() as f64
-            })
+            .map(|m| ratarmount_core::metadata_mtime_secs(&m) as f64)
             .unwrap_or(0.0);
 
         let index = SqliteIndex::create_writable(None)?;

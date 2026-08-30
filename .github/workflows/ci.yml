@@ -363,3 +363,38 @@ jobs:
         run: |
           chmod +x test-harness/run-macos-smoke.sh
           ./test-harness/run-macos-smoke.sh
+
+  # G6.1: Windows library compile without FUSE / WinFsp. Not a merge gate.
+  # Must not be `needs:` of `check` or `fuse-harness` (those stay Linux-only).
+  # Default session still links libarchive until G5.3 — skip that step when
+  # pkg-config `archive` is missing.
+  windows-lib:
+    name: windows-lib (session check, best-effort)
+    runs-on: windows-2022
+    continue-on-error: true
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: "-Dwarnings"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-lib
+
+      - name: cargo check core + index
+        run: cargo check -p ratarmount-core -p ratarmount-index --all-targets
+
+      - name: cargo check session
+        shell: bash
+        run: |
+          set -euo pipefail
+          if ! command -v pkg-config >/dev/null 2>&1 \
+            || { ! pkg-config --exists libarchive && ! pkg-config --exists archive; }; then
+            echo "::notice::skip: pkg-config archive missing (G6.1 best-effort until G5.3)"
+            exit 0
+          fi
+          cargo check -p ratarmount-session --all-targets

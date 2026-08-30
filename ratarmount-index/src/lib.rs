@@ -273,13 +273,15 @@ pub fn parse_tarstats_json(json: &str) -> Result<TarStats> {
     })
 }
 
-/// Build [`TarStats`] from filesystem metadata (Unix `st_size` / `st_mtime`), without content samples.
+/// Build [`TarStats`] from filesystem metadata, without content samples.
+///
+/// `st_size` uses portable [`std::fs::Metadata::len`]. Unix mtime is
+/// `MetadataExt` (Python `st_mtime`); Windows uses [`SystemTime`].
 pub fn tar_stats_from_metadata(meta: &std::fs::Metadata) -> TarStats {
-    use std::os::unix::fs::MetadataExt;
     TarStats {
-        st_size: meta.size(),
-        st_mtime: meta.mtime(),
-        st_mtime_ns: Some(meta.mtime_nsec()),
+        st_size: meta.len(),
+        st_mtime: ratarmount_core::metadata_mtime_secs(meta),
+        st_mtime_ns: Some(ratarmount_core::metadata_mtime_nsec(meta)),
         prefix512_sha256: None,
         suffix512_sha256: None,
         full_sha256: None,
@@ -685,6 +687,8 @@ impl SqliteIndex {
             None => (Connection::open_in_memory()?, None, None),
         };
         // Match Python `SQLiteIndex._open_sql_db` — large speedup for bulk inserts.
+        // WHY: exclusive + tmp+rename is the publish lock; NTFS supports SQLite's
+        // lock (G6.3). Do not add fs2 unless two publish_tmp races corrupt dest.
         conn.execute_batch(
             r#"
             PRAGMA locking_mode = EXCLUSIVE;
@@ -3244,6 +3248,30 @@ mod tests {
             hash_hex("sha256", &big_bytes[big_bytes.len() - 512..]).unwrap()
         );
         assert_ne!(p, s);
+    }
+
+    /// Regression: tarstats size/mtime must not require unix MetadataExt.
+    #[test]
+    fn tar_stats_from_metadata_uses_len_and_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.bin");
+        std::fs::write(&archive, b"hello-stats").unwrap();
+        let meta = std::fs::metadata(&archive).unwrap();
+        let stats = tar_stats_from_metadata(&meta);
+        assert_eq!(stats.st_size, meta.len());
+        assert_eq!(stats.st_size, 11);
+        assert_eq!(stats.st_mtime, ratarmount_core::metadata_mtime_secs(&meta));
+        assert_eq!(
+            stats.st_mtime_ns,
+            Some(ratarmount_core::metadata_mtime_nsec(&meta))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(stats.st_mtime, meta.mtime());
+        }
+        assert!(stats.prefix512_sha256.is_none());
+        assert!(stats.full_sha256.is_none());
     }
 
     /// Regression: warm index must not be trusted when archive size/mtime/content no longer match tarstats.

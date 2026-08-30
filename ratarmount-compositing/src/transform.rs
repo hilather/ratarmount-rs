@@ -139,8 +139,8 @@ impl MountSource for TransformMountSource {
                         mtime: 0.0,
                         mode: ratarmount_core::S_IFDIR | 0o755,
                         linkname: String::new(),
-                        uid: unsafe { libc::geteuid() },
-                        gid: unsafe { libc::getegid() },
+                        uid: ratarmount_core::effective_uid(),
+                        gid: ratarmount_core::effective_gid(),
                         userdata: vec![],
                     },
                 );
@@ -290,8 +290,8 @@ impl MountSource for TransformMountSource {
                     mtime: 0.0,
                     mode: ratarmount_core::S_IFDIR | 0o755,
                     linkname: String::new(),
-                    uid: unsafe { libc::geteuid() },
-                    gid: unsafe { libc::getegid() },
+                    uid: ratarmount_core::effective_uid(),
+                    gid: ratarmount_core::effective_gid(),
                     userdata: vec![],
                 })
             } else {

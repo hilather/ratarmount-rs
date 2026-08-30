@@ -141,22 +141,147 @@ impl ParallelizationSpec {
 ///
 /// libc `mode_t` is `u32` on Linux but `u16` on macOS; mixing raw `libc::S_IFMT`
 /// with `u32` modes fails to compile on Darwin (`u32 & u16`). Always use these.
+///
+/// WHY: Windows libc has `S_IFMT`/`S_IFDIR`/`S_IFREG`/`S_IFCHR` but not
+/// `S_IFLNK`/`S_IFIFO`/`S_IFBLK`/`S_IFSOCK`. Keep POSIX numbers so archive
+/// mode bits stay identical across hosts (no WinFsp).
 #[allow(clippy::unnecessary_cast)] // mode_t width differs by OS
 pub const S_IFMT: u32 = libc::S_IFMT as u32;
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFDIR: u32 = libc::S_IFDIR as u32;
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFREG: u32 = libc::S_IFREG as u32;
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFLNK: u32 = libc::S_IFLNK as u32;
+#[cfg(not(unix))]
+pub const S_IFLNK: u32 = 0o12_0000;
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFIFO: u32 = libc::S_IFIFO as u32;
+#[cfg(not(unix))]
+pub const S_IFIFO: u32 = 0o1_0000;
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFCHR: u32 = libc::S_IFCHR as u32;
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFBLK: u32 = libc::S_IFBLK as u32;
+#[cfg(not(unix))]
+pub const S_IFBLK: u32 = 0o6_0000;
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
 pub const S_IFSOCK: u32 = libc::S_IFSOCK as u32;
+#[cfg(not(unix))]
+pub const S_IFSOCK: u32 = 0o14_0000;
+
+/// Effective uid for synthetic [`FileInfo`] (Windows: 0).
+#[inline]
+pub fn effective_uid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::geteuid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Effective gid for synthetic [`FileInfo`] (Windows: 0).
+#[inline]
+pub fn effective_gid() -> u32 {
+    #[cfg(unix)]
+    {
+        unsafe { libc::getegid() }
+    }
+    #[cfg(not(unix))]
+    {
+        0
+    }
+}
+
+/// Whole-second mtime. Unix: `MetadataExt::mtime` (Python `st_mtime`).
+/// Windows: `SystemTime` since epoch (`0` if unavailable / before epoch).
+pub fn metadata_mtime_secs(meta: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mtime()
+    }
+    #[cfg(not(unix))]
+    {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0)
+    }
+}
+
+/// Nanosecond component of mtime. Unix: `MetadataExt::mtime_nsec`.
+pub fn metadata_mtime_nsec(meta: &std::fs::Metadata) -> i64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mtime_nsec()
+    }
+    #[cfg(not(unix))]
+    {
+        meta.modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map(|d| i64::from(d.subsec_nanos()))
+            .unwrap_or(0)
+    }
+}
+
+/// Host uid. Windows: `0`.
+pub fn metadata_uid(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.uid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+/// Host gid. Windows: `0`.
+pub fn metadata_gid(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.gid()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        0
+    }
+}
+
+/// POSIX mode bits. Unix: `MetadataExt::mode`. Windows: type bits + 0644/0755.
+pub fn metadata_mode(meta: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.mode()
+    }
+    #[cfg(not(unix))]
+    {
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            S_IFLNK | 0o777
+        } else if ft.is_dir() {
+            S_IFDIR | 0o755
+        } else {
+            S_IFREG | 0o644
+        }
+    }
+}
 
 #[inline]
 pub fn is_dir_mode(mode: u32) -> bool {
@@ -618,8 +743,8 @@ pub fn create_root_file_info() -> FileInfo {
         mtime: 0.0,
         mode: S_IFDIR | 0o777,
         linkname: String::new(),
-        uid: unsafe { libc::geteuid() },
-        gid: unsafe { libc::getegid() },
+        uid: effective_uid(),
+        gid: effective_gid(),
         userdata: vec![UserData::Tar(SQLiteIndexedTarUserData {
             offset: 0,
             offsetheader: Some(0),
@@ -848,5 +973,66 @@ mod tests {
         assert_eq!(c.uid, 7);
         assert_eq!(c.gid, 9);
         assert_eq!(c.flags, 0, "flags stay unused; not an overlay/open key");
+    }
+
+    #[test]
+    fn effective_ids_and_root_file_info() {
+        let fi = create_root_file_info();
+        assert_eq!(fi.uid, effective_uid());
+        assert_eq!(fi.gid, effective_gid());
+        assert_eq!(fi.mode & S_IFMT, S_IFDIR);
+        #[cfg(not(unix))]
+        {
+            assert_eq!(effective_uid(), 0);
+            assert_eq!(effective_gid(), 0);
+        }
+        #[cfg(unix)]
+        unsafe {
+            assert_eq!(effective_uid(), libc::geteuid());
+            assert_eq!(effective_gid(), libc::getegid());
+        }
+    }
+
+    #[test]
+    fn s_if_bits_are_posix() {
+        assert_eq!(S_IFDIR, 0o4_0000);
+        assert_eq!(S_IFREG, 0o10_0000);
+        assert_eq!(S_IFLNK, 0o12_0000);
+        assert_eq!(S_IFMT, 0o17_0000);
+    }
+
+    /// Regression: Windows hosts have no geteuid; metadata helpers must not
+    /// use unix-only MetadataExt in portable code.
+    #[test]
+    fn metadata_helpers_from_temp_file() {
+        let p = std::env::temp_dir().join(format!(
+            "ratarmount-core-mtime-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&p, b"hi").unwrap();
+        let meta = std::fs::metadata(&p).unwrap();
+        let secs = metadata_mtime_secs(&meta);
+        assert!(secs >= 0);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(secs, meta.mtime());
+            assert_eq!(metadata_mtime_nsec(&meta), meta.mtime_nsec());
+            assert_eq!(metadata_uid(&meta), meta.uid());
+            assert_eq!(metadata_gid(&meta), meta.gid());
+            assert_eq!(metadata_mode(&meta), meta.mode());
+        }
+        #[cfg(not(unix))]
+        {
+            assert_eq!(metadata_uid(&meta), 0);
+            assert_eq!(metadata_gid(&meta), 0);
+            assert_eq!(metadata_mode(&meta) & S_IFMT, S_IFREG);
+        }
+        assert_eq!(meta.len(), 2);
+        let _ = std::fs::remove_file(&p);
     }
 }

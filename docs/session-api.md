@@ -29,6 +29,8 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 
 `cargo tree -p ratarmount-session -i fuser` is empty (G0.3a). Default features must **not** pull fuse, nfs, smb, http, 9p, or sftp.
 
+Windows (G6, no WinFsp): `ratarmount-core` / `ratarmount-index` compile without FUSE. Best-effort CI job `windows-lib` runs `cargo check -p ratarmount-session --all-targets` on `windows-2022` and is **not** a merge gate. Default `formats` still links libarchive until G5.3 — that job **skips** the session check when pkg-config `archive` is missing. Overlay raw fds / `O_NOFOLLOW` stay Unix; Windows opens without a nofollow bit. `meta-v3` stays `xdg_cache_home()` (`HOME` / `USERPROFILE` / `HOMEDRIVE+HOMEPATH` + `/.cache`).
+
 SQLite sidecar schema stays **`INDEX_VERSION` `"0.7.0"`**. No IVF, no `--readdir-order`.
 
 ## Types

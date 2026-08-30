@@ -529,7 +529,42 @@ pub fn expand_user(path: &Path) -> PathBuf {
 }
 
 fn home_dir() -> Option<PathBuf> {
-    std::env::var_os("HOME").map(PathBuf::from)
+    home_dir_from(
+        std::env::var_os("HOME").as_deref(),
+        std::env::var_os("USERPROFILE").as_deref(),
+        std::env::var_os("HOMEDRIVE").as_deref(),
+        std::env::var_os("HOMEPATH").as_deref(),
+    )
+}
+
+/// `HOME`, else `USERPROFILE`, else `HOMEDRIVE`+`HOMEPATH`. Empty values skip.
+///
+/// WHY: Windows has no `HOME` by default. `meta-v3` still uses
+/// [`xdg_cache_home`] (`$HOME/.cache`); do not migrate to Library/Caches.
+fn home_dir_from(
+    home: Option<&std::ffi::OsStr>,
+    userprofile: Option<&std::ffi::OsStr>,
+    homedrive: Option<&std::ffi::OsStr>,
+    homepath: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    if let Some(h) = home {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    if let Some(h) = userprofile {
+        if !h.is_empty() {
+            return Some(PathBuf::from(h));
+        }
+    }
+    match (homedrive, homepath) {
+        (Some(d), Some(p)) if !d.is_empty() && !p.is_empty() => {
+            let mut s = d.to_os_string();
+            s.push(p);
+            Some(PathBuf::from(s))
+        }
+        _ => None,
+    }
 }
 
 fn xdg_cache_home() -> Option<PathBuf> {
@@ -1391,10 +1426,47 @@ pub fn test_writable_dir(dir: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::ffi::OsStr;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
     use std::thread;
+
+    #[test]
+    fn home_dir_prefers_home_then_userprofile_then_homedrive_path() {
+        assert_eq!(
+            home_dir_from(
+                Some(OsStr::new("/home/u")),
+                Some(OsStr::new(r"C:\Users\u")),
+                None,
+                None
+            ),
+            Some(PathBuf::from("/home/u"))
+        );
+        assert_eq!(
+            home_dir_from(
+                Some(OsStr::new("")),
+                Some(OsStr::new(r"C:\Users\u")),
+                None,
+                None
+            ),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        assert_eq!(
+            home_dir_from(
+                None,
+                None,
+                Some(OsStr::new("C:")),
+                Some(OsStr::new(r"\Users\u"))
+            ),
+            Some(PathBuf::from(r"C:\Users\u"))
+        );
+        assert_eq!(home_dir_from(None, None, None, None), None);
+        assert_eq!(
+            home_dir_from(Some(OsStr::new("")), Some(OsStr::new("")), None, None),
+            None
+        );
+    }
 
     /// Minimal HTTP/1.1 mock serving a fixed body for GET (and HEAD).
     struct MockHttp {

@@ -76,6 +76,21 @@ struct ArchiveHandle {
 // libarchive archive is used under a mutex; mark Send.
 unsafe impl Send for ArchiveHandle {}
 
+fn path_to_cstring(path: &Path) -> Result<CString> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        CString::new(path.as_os_str().as_bytes()).map_err(|e| LaError::Msg(e.to_string()))
+    }
+    #[cfg(not(unix))]
+    {
+        let s = path
+            .to_str()
+            .ok_or_else(|| LaError::Msg("libarchive path is not valid UTF-8".into()))?;
+        CString::new(s).map_err(|e| LaError::Msg(e.to_string()))
+    }
+}
+
 impl ArchiveHandle {
     /// Python-style two-phase open: archive formats first, then raw + filters.
     fn open_path(path: &Path) -> Result<Self> {
@@ -101,9 +116,7 @@ impl ArchiveHandle {
                 raw: !allow_archives,
             };
             support_formats(h.ptr, allow_archives)?;
-            use std::os::unix::ffi::OsStrExt;
-            let cpath = CString::new(path.as_os_str().as_bytes())
-                .map_err(|e| LaError::Msg(e.to_string()))?;
+            let cpath = path_to_cstring(path)?;
             // block size 10k as python often uses st_blksize; 10240 is fine
             let r = archive_read_open_filename(h.ptr, cpath.as_ptr(), 10240);
             if r != ARCHIVE_OK && r != ARCHIVE_WARN {

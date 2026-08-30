@@ -4,8 +4,6 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
-use std::os::unix::io::FromRawFd;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -21,8 +19,9 @@ use ratarmount_compress::{
     splice_zstd_last_frames_replace, CompressionFormat, ZstdFrameMap, DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
-    ListResult, MountSource, OpenOptions, UserData,
+    create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    OpenOptions, UserData,
 };
 use ratarmount_formats_tar::{
     find_last_tar_eof, rewrite_tar_suffix, window_has_member_boundary, RewriteTarSuffix,
@@ -352,15 +351,13 @@ impl WriteOverlay {
             if let Some(parent) = real.parent() {
                 fs::create_dir_all(parent)?;
             }
-            std::os::unix::fs::symlink(&fi.linkname, &real)?;
+            overlay_symlink(Path::new(&fi.linkname), &real)?;
             return Ok(());
         }
         let mut src = self.current_base().open(&fi, 0)?;
-        let mut dst = FsOpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&real)?;
+        let mut opts = open_options_nofollow();
+        opts.write(true).create_new(true);
+        let mut dst = opts.open(&real)?;
         io::copy(&mut src, &mut dst)?;
         Ok(())
     }
@@ -457,7 +454,7 @@ impl WriteOverlay {
             },
             name,
             size: meta.len() as i64,
-            mtime: meta.mtime() as f64,
+            mtime: metadata_mtime_secs(&meta) as f64,
             offsetheader: None,
         })
     }
@@ -483,7 +480,7 @@ impl WriteOverlay {
                             path: child_mount,
                             name,
                             size: child_meta.len() as i64,
-                            mtime: child_meta.mtime() as f64,
+                            mtime: metadata_mtime_secs(&child_meta) as f64,
                             offsetheader: None,
                         },
                     );
@@ -528,7 +525,15 @@ impl WriteOverlay {
     /// Unregister a write-open pin and close `fd` (FUSE release / NFS create).
     pub fn close_overlay_fd(&self, fd: i32) {
         self.release_write_fd(fd);
-        let _ = unsafe { File::from_raw_fd(fd) };
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::FromRawFd;
+            let _ = unsafe { File::from_raw_fd(fd) };
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = fd;
+        }
     }
 
     fn write_open_hosts(&self) -> HashSet<PathBuf> {
@@ -541,72 +546,87 @@ impl WriteOverlay {
     }
 
     fn create_file_inner(&self, path: &str, mode: u32) -> Result<i32> {
-        self.ensure_parent(path)?;
-        let real = self.realpath(path);
-        self.ensure_under_root(&real)?;
-        if let Some(parent) = real.parent() {
-            self.ensure_under_root(parent)?;
-            fs::create_dir_all(parent)?;
+        #[cfg(not(unix))]
+        {
+            let _ = (self, path, mode);
+            return Err(overlay_fd_unsupported());
         }
-        let f = FsOpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(mode & 0o7777)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&real)?;
-        let fd = {
-            use std::os::unix::io::IntoRawFd;
-            f.into_raw_fd()
-        };
-        self.mark_present(path, mode | ratarmount_core::S_IFREG)?;
-        Ok(fd)
+        #[cfg(unix)]
+        {
+            self.ensure_parent(path)?;
+            let real = self.realpath(path);
+            self.ensure_under_root(&real)?;
+            if let Some(parent) = real.parent() {
+                self.ensure_under_root(parent)?;
+                fs::create_dir_all(parent)?;
+            }
+            let mut opts = open_options_nofollow();
+            opts.read(true).write(true).create(true).truncate(true);
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                opts.mode(mode & 0o7777);
+            }
+            let f = opts.open(&real)?;
+            let fd = {
+                use std::os::unix::io::IntoRawFd;
+                f.into_raw_fd()
+            };
+            self.mark_present(path, mode | ratarmount_core::S_IFREG)?;
+            Ok(fd)
+        }
     }
 
     pub fn open_overlay_fd(&self, path: &str, flags: i32) -> Result<i32> {
-        let _gate = self.commit_gate.read().expect("overlay commit gate");
-        self.ensure_modifiable(path)?;
-        let real = self.realpath(path);
-        self.ensure_under_root(&real)?;
-        // If still missing and write flags, create empty
-        if fs::symlink_metadata(&real).is_err()
-            && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
+        #[cfg(not(unix))]
         {
-            self.create_file_inner(path, 0o644)?;
+            let _ = (self, path, flags);
+            return Err(overlay_fd_unsupported());
         }
-        if fs::symlink_metadata(&real).is_err() {
-            return Err(OverlayError::Io(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no overlay file at {}", real.display()),
-            )));
-        }
-        // Never follow host symlinks out of the overlay folder.
-        let flags = flags | libc::O_NOFOLLOW;
-        let fd = unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) };
-        if fd < 0 {
-            return Err(OverlayError::Io(io::Error::last_os_error()));
-        }
-        // Double-check the opened path still resolves under the overlay root.
-        if let Ok(canon) = fs::canonicalize(&real) {
-            if !path_is_under(&self.root, &canon) {
-                let _ = unsafe { libc::close(fd) };
+        #[cfg(unix)]
+        {
+            let _gate = self.commit_gate.read().expect("overlay commit gate");
+            self.ensure_modifiable(path)?;
+            let real = self.realpath(path);
+            self.ensure_under_root(&real)?;
+            // If still missing and write flags, create empty
+            if fs::symlink_metadata(&real).is_err()
+                && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
+            {
+                self.create_file_inner(path, 0o644)?;
+            }
+            if fs::symlink_metadata(&real).is_err() {
                 return Err(OverlayError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "overlay open resolved outside overlay root",
+                    io::ErrorKind::NotFound,
+                    format!("no overlay file at {}", real.display()),
                 )));
             }
+            // Never follow host symlinks out of the overlay folder.
+            let flags = flags | libc::O_NOFOLLOW;
+            let fd = unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) };
+            if fd < 0 {
+                return Err(OverlayError::Io(io::Error::last_os_error()));
+            }
+            // Double-check the opened path still resolves under the overlay root.
+            if let Ok(canon) = fs::canonicalize(&real) {
+                if !path_is_under(&self.root, &canon) {
+                    let _ = unsafe { libc::close(fd) };
+                    return Err(OverlayError::Io(io::Error::new(
+                        io::ErrorKind::PermissionDenied,
+                        "overlay open resolved outside overlay root",
+                    )));
+                }
+            }
+            if (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
+                self.register_write_fd(fd, path);
+            }
+            let (folder, name) = Self::split(path);
+            let db = self.db.lock().expect("overlay db");
+            let _ = db.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            );
+            Ok(fd)
         }
-        if (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
-            self.register_write_fd(fd, path);
-        }
-        let (folder, name) = Self::split(path);
-        let db = self.db.lock().expect("overlay db");
-        let _ = db.execute(
-            r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-            params![folder, name],
-        );
-        Ok(fd)
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
@@ -615,7 +635,11 @@ impl WriteOverlay {
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         fs::create_dir_all(&real)?;
-        let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&real, fs::Permissions::from_mode(mode & 0o7777));
+        }
         self.mark_present(path, mode | ratarmount_core::S_IFDIR)?;
         Ok(())
     }
@@ -689,10 +713,9 @@ impl WriteOverlay {
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
-        let f = FsOpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&real)?;
+        let mut opts = open_options_nofollow();
+        opts.write(true);
+        let f = opts.open(&real)?;
         f.set_len(size)?;
         Ok(())
     }
@@ -718,7 +741,7 @@ impl WriteOverlay {
         if let Some(parent) = real.parent() {
             fs::create_dir_all(parent)?;
         }
-        std::os::unix::fs::symlink(target, &real)?;
+        overlay_symlink(Path::new(target), &real)?;
         self.mark_present(path, ratarmount_core::S_IFLNK | 0o777)?;
         Ok(())
     }
@@ -777,7 +800,7 @@ impl WriteOverlay {
         }
         fs::rename(&from_real, &to_real)?;
         self.mark_deleted(&from)?;
-        let mode = fs::symlink_metadata(&to_real)?.mode();
+        let mode = metadata_mode(&fs::symlink_metadata(&to_real)?);
         self.mark_present(&to, mode)?;
         Ok(())
     }
@@ -1345,11 +1368,11 @@ impl WriteOverlay {
         };
         Some(FileInfo {
             size: meta.len(),
-            mtime: meta.mtime() as f64,
-            mode: meta.mode(),
+            mtime: metadata_mtime_secs(&meta) as f64,
+            mode: metadata_mode(&meta),
             linkname,
-            uid: meta.uid(),
-            gid: meta.gid(),
+            uid: metadata_uid(&meta),
+            gid: metadata_gid(&meta),
             userdata: vec![UserData::Other(format!("overlay:{path}"))],
         })
     }
@@ -1735,11 +1758,9 @@ impl MountSource for WriteOverlay {
             if let Some(path) = s.strip_prefix("overlay:") {
                 let real = self.realpath(path);
                 self.ensure_under_root(&real)?;
-                match FsOpenOptions::new()
-                    .read(true)
-                    .custom_flags(libc::O_NOFOLLOW)
-                    .open(&real)
-                {
+                let mut opts = open_options_nofollow();
+                opts.read(true);
+                match opts.open(&real) {
                     Ok(f) => return Ok(Box::new(f)),
                     Err(e) if e.kind() == io::ErrorKind::NotFound => {
                         // Live commit wiped the overlay file; serve from the new base.
@@ -1915,10 +1936,10 @@ fn collect_ustar_pending_at(
     for (rel, is_dir) in append_entries {
         let host = overlay_host_path(overlay_root, rel);
         let meta = fs::symlink_metadata(&host)?;
-        let mode = meta.mode() & 0o7777;
-        let uid = meta.uid();
-        let gid = meta.gid();
-        let mtime = meta.mtime().max(0) as u64;
+        let mode = metadata_mode(&meta) & 0o7777;
+        let uid = metadata_uid(&meta);
+        let gid = metadata_gid(&meta);
+        let mtime = metadata_mtime_secs(&meta).max(0) as u64;
         let kind = if meta.file_type().is_symlink() {
             ensure_overlay_parent_confined(overlay_root, &host)?;
             let target = fs::read_link(&host)?;
@@ -1945,10 +1966,45 @@ fn collect_ustar_pending_at(
     Ok(out)
 }
 
+#[cfg(unix)]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
     std::ffi::CString::new(path.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))
+}
+
+/// WHY: O_NOFOLLOW is Unix-only; Windows OpenOptions has no equivalent bit.
+fn open_options_nofollow() -> FsOpenOptions {
+    let mut opts = FsOpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW);
+    }
+    opts
+}
+
+fn overlay_symlink(target: &Path, dest: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, dest)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (target, dest);
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "overlay symlinks require Unix",
+        ))
+    }
+}
+
+#[cfg(not(unix))]
+fn overlay_fd_unsupported() -> OverlayError {
+    OverlayError::Io(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "overlay raw fds require Unix",
+    ))
 }
 
 /// Options for [`commit_overlay`].

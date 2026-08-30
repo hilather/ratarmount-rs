@@ -2,12 +2,12 @@
 
 use std::fs::{self, File};
 use std::io;
-use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use ratarmount_core::{
-    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
-    ListResult, MountSource, UserData, S_IFDIR, S_IFLNK, S_IFMT,
+    create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    UserData, S_IFDIR, S_IFLNK, S_IFMT,
 };
 use ratarmount_index::{locate_pattern_matches, DEFAULT_SEARCH_LIMIT};
 
@@ -47,11 +47,11 @@ impl FolderMountSource {
         };
         Ok(FileInfo {
             size: meta.len(),
-            mtime: meta.mtime() as f64,
-            mode: meta.mode(),
+            mtime: metadata_mtime_secs(&meta) as f64,
+            mode: metadata_mode(&meta),
             linkname,
-            uid: meta.uid(),
-            gid: meta.gid(),
+            uid: metadata_uid(&meta),
+            gid: metadata_gid(&meta),
             userdata: vec![UserData::Other(virtual_path.to_string())],
         })
     }
@@ -87,10 +87,10 @@ impl FolderMountSource {
             Err(_) => return,
         };
         // Do not recurse S_IFLNK directories (would leak /etc via a planted link).
-        if meta.mode() & S_IFMT == S_IFLNK {
+        if metadata_mode(&meta) & S_IFMT == S_IFLNK {
             return;
         }
-        if meta.mode() & S_IFMT != S_IFDIR {
+        if metadata_mode(&meta) & S_IFMT != S_IFDIR {
             return;
         }
         match fs::canonicalize(host_dir) {
@@ -122,7 +122,7 @@ impl FolderMountSource {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            let ifmt = child_meta.mode() & S_IFMT;
+            let ifmt = metadata_mode(&child_meta) & S_IFMT;
             if ifmt == S_IFDIR {
                 self.walk_search(&child_mount, &child_host, pattern, hits);
                 continue;
@@ -134,7 +134,7 @@ impl FolderMountSource {
                 path: child_mount,
                 name,
                 size: child_meta.len() as i64,
-                mtime: child_meta.mtime() as f64,
+                mtime: metadata_mtime_secs(&child_meta) as f64,
                 offsetheader: None,
             });
         }
@@ -171,7 +171,7 @@ impl MountSource for FolderMountSource {
             if let Ok(meta) = fs::symlink_metadata(ent.path()) {
                 dents.push(CheapDirent {
                     name,
-                    mode: meta.mode(),
+                    mode: metadata_mode(&meta),
                     size: meta.len(),
                 });
             }
@@ -270,7 +270,7 @@ mod tests {
         for name in ["a.txt", "b.bin"] {
             let meta = fs::symlink_metadata(dir.path().join(name)).unwrap();
             let (mode, size) = by_name.get(name).copied().expect(name);
-            assert_eq!(mode, meta.mode(), "{name} mode");
+            assert_eq!(mode, metadata_mode(&meta), "{name} mode");
             assert_eq!(size, meta.len(), "{name} size");
         }
     }
