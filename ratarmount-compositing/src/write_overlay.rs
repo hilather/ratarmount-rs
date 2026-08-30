@@ -536,6 +536,25 @@ impl WriteOverlay {
         }
     }
 
+    /// Unregister the write pin, then drop `file` (closes the fd).
+    ///
+    /// Protocol WRITE helpers that wrap [`Self::open_overlay_fd`] /
+    /// [`Self::create_file`] in `File::from_raw_fd` must use this instead of
+    /// `drop(file)` then [`Self::release_write_fd`]. The pin map is keyed by
+    /// fd number. Closing first lets the kernel reuse that number for another
+    /// still-open overlay writer (FUSE create, a second WRITE). Unpinning the
+    /// stale number then drops the new pin; `--commit-overlay-interval` can
+    /// persist/unlink the still-open file and later pwrite bytes hit a
+    /// detached inode.
+    pub fn finish_owned_write_fd(&self, file: File) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            self.release_write_fd(file.as_raw_fd());
+        }
+        drop(file);
+    }
+
     fn write_open_hosts(&self) -> HashSet<PathBuf> {
         self.write_fds
             .lock()
@@ -5817,6 +5836,153 @@ mod tests {
         want.extend_from_slice(&second);
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/open.txt"), want);
+    }
+
+    /// Regression: NFS WRITE used to `drop(File)` (close) and then
+    /// `release_write_fd`. The pin map is keyed by fd number; the kernel can
+    /// reuse that number for a still-open FUSE writer. Interval settle would
+    /// persist/unlink the still-open file (later pwrite → detached inode).
+    #[test]
+    fn live_commit_idle_skips_open_write_fd_after_fd_reuse() {
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-reuse-seed");
+        let keep = generated_payload("idle-reuse-keep");
+        let nfs_bytes = generated_payload("idle-reuse-nfs");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+
+        let nfs_fd = ov
+            .open_overlay_fd("/nfs.txt", libc::O_RDWR | libc::O_CREAT)
+            .expect("nfs open");
+        let n = unsafe { libc::write(nfs_fd, nfs_bytes.as_ptr() as *const _, nfs_bytes.len()) };
+        assert_eq!(n as usize, nfs_bytes.len(), "nfs write");
+        let nfs_file = unsafe { std::fs::File::from_raw_fd(nfs_fd) };
+        ov.finish_owned_write_fd(nfs_file);
+
+        // Long-lived FUSE-style writer. If the OS reused `nfs_fd`, the pin
+        // must now belong to this file — not a stale closed number.
+        let keep_fd = ov.create_file("/keep.txt", 0o644).expect("keep create");
+        let n = unsafe { libc::write(keep_fd, keep.as_ptr() as *const _, keep.len()) };
+        assert_eq!(n as usize, keep.len(), "keep write");
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+        set_mtime_age(&overlay.join("nfs.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(_) => {}
+            Err(e) => panic!("idle tick after fd reuse: {e}"),
+        }
+        assert!(
+            overlay.join("keep.txt").exists(),
+            "still-open writer must stay in the overlay after a finished NFS \
+             WRITE reuses/closes another fd (keep_fd={keep_fd}, nfs_fd={nfs_fd})"
+        );
+
+        let extra = generated_payload("idle-reuse-extra");
+        let n = unsafe {
+            libc::pwrite(
+                keep_fd,
+                extra.as_ptr() as *const _,
+                extra.len(),
+                keep.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, extra.len(), "pwrite after skipped tick");
+        ov.close_overlay_fd(keep_fd);
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after keep close"));
+        assert!(!overlay.join("keep.txt").exists());
+
+        let mut want = keep.clone();
+        want.extend_from_slice(&extra);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), want);
+        assert_eq!(read_member(src.as_ref(), "/nfs.txt"), nfs_bytes);
+    }
+
+    /// Regression: SMB/SFTP/9P/WebDAV WRITE used to `drop(File)` (close) and
+    /// then `release_write_fd`. Same pin-map / fd-reuse class as NFS.
+    #[test]
+    fn live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse() {
+        use std::os::unix::io::FromRawFd;
+
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("idle-proto-seed");
+        let keep = generated_payload("idle-proto-keep");
+        let proto_bytes = generated_payload("idle-proto-write");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+
+        // Fixed sequence: unpin while the fd is still open, then close.
+        let proto_fd = ov
+            .open_overlay_fd("/proto.txt", libc::O_RDWR | libc::O_CREAT)
+            .expect("proto open");
+        let n = unsafe {
+            libc::write(
+                proto_fd,
+                proto_bytes.as_ptr() as *const _,
+                proto_bytes.len(),
+            )
+        };
+        assert_eq!(n as usize, proto_bytes.len(), "proto write");
+        let proto_file = unsafe { std::fs::File::from_raw_fd(proto_fd) };
+        ov.finish_owned_write_fd(proto_file);
+
+        let keep_fd = ov.create_file("/keep.txt", 0o644).expect("keep create");
+        let n = unsafe { libc::write(keep_fd, keep.as_ptr() as *const _, keep.len()) };
+        assert_eq!(n as usize, keep.len(), "keep write");
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+        set_mtime_age(&overlay.join("proto.txt"), Duration::from_secs(30));
+
+        match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+            reopen_tar_zst(p, false)
+        }) {
+            Ok(_) => {}
+            Err(e) => panic!("idle tick after protocol fd reuse: {e}"),
+        }
+        assert!(
+            overlay.join("keep.txt").exists(),
+            "still-open writer must stay in the overlay after a finished protocol \
+             WRITE reuses/closes another fd (keep_fd={keep_fd}, proto_fd={proto_fd})"
+        );
+
+        let extra = generated_payload("idle-proto-extra");
+        let n = unsafe {
+            libc::pwrite(
+                keep_fd,
+                extra.as_ptr() as *const _,
+                extra.len(),
+                keep.len() as i64,
+            )
+        };
+        assert_eq!(n as usize, extra.len(), "pwrite after skipped tick");
+        ov.close_overlay_fd(keep_fd);
+        set_mtime_age(&overlay.join("keep.txt"), Duration::from_secs(30));
+
+        assert!(ov
+            .commit_live_idle(&archive, Duration::from_secs(10), |p| reopen_tar_zst(
+                p, false
+            ))
+            .expect("idle tick after keep close"));
+        assert!(!overlay.join("keep.txt").exists());
+
+        let mut want = keep.clone();
+        want.extend_from_slice(&extra);
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/keep.txt"), want);
+        assert_eq!(read_member(src.as_ref(), "/proto.txt"), proto_bytes);
     }
 
     /// Regression: after the hot file settles, a later tick persists it once.
