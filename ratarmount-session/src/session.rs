@@ -1,5 +1,7 @@
 //! Blocking [`Session`] façade: `open`, listing, lookup, `Drop`.
 
+#[cfg(test)]
+use std::cell::Cell;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -18,6 +20,35 @@ use crate::Error;
 pub const DEFAULT_DIR_PAGE: u32 = 200;
 
 static TEMP_INDEX_SEQ: AtomicU32 = AtomicU32::new(1);
+
+#[cfg(test)]
+thread_local! {
+    #[allow(clippy::missing_const_for_thread_local)]
+    static INJECT_CATALOG_OPEN_ERR: Cell<bool> = Cell::new(false);
+}
+
+/// Unlinks a Temp sidecar unless [`Self::disarm`] is called after a successful open.
+struct TempSqliteGuard {
+    path: Option<PathBuf>,
+}
+
+impl TempSqliteGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for TempSqliteGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            unlink_sqlite(&p);
+        }
+    }
+}
 
 /// Blocking, `Send + Sync` façade over an archive.
 ///
@@ -72,9 +103,8 @@ impl CatalogLoc {
 impl Session {
     /// Blocking. Embedders that need a job id run this on a worker thread.
     ///
-    /// `SiblingNotWritable` is **not** implemented here (G4 / PR6). Sibling /
-    /// UserCache still go through factory `resolve_index_location` until then.
-    /// [`Recreate::Never`] never falls back to `:memory:`.
+    /// SiblingNotWritable is PR6; do not add a Session `:memory:` fallback.
+    /// [`Recreate::Never`] never builds and never falls back to `:memory:`.
     pub fn open(req: OpenRequest) -> Result<Self, Error> {
         let (clear_index_cache, write_index, read_only_index) = match req.recreate {
             Recreate::Always => (true, true, false),
@@ -89,6 +119,7 @@ impl Session {
         let had_passwords = !passwords.is_empty();
 
         let mut loc = CatalogLoc::None;
+        let mut temp_guard: Option<TempSqliteGuard> = None;
         let (index_in_memory, index_file_path, index_folders) = match &req.index {
             IndexPolicy::Memory => {
                 loc = CatalogLoc::Memory;
@@ -106,13 +137,19 @@ impl Session {
                 let p = temp_index_path();
                 if let Some(parent) = p.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| Error::Internal(e.to_string()))?;
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
                 }
                 loc = CatalogLoc::Temp(p.clone());
+                temp_guard = Some(TempSqliteGuard::new(p.clone()));
                 (false, Some(p), Vec::new())
             }
-            // Sibling / UserCache / CliCompat: factory `resolve_index_location`
-            // until PR6 (`resolve_index` + `SiblingNotWritable`). Do not add a
-            // Session-level `:memory:` fallback here.
             IndexPolicy::Sibling | IndexPolicy::UserCache | IndexPolicy::CliCompat => {
                 (false, None, req.extra_dirs.clone())
             }
@@ -146,9 +183,6 @@ impl Session {
             check_recreate_never(&archive_path, &loc)?;
         }
 
-        // Local paths still go through `open_path` inside `build_mount_source_ex`;
-        // URLs use `open_remote_input`. Compositing: recursive from request,
-        // lazy false, file_versions true (CLI default).
         let comp = CompositingOptions {
             recursive: req.recursive,
             lazy: false,
@@ -162,10 +196,13 @@ impl Session {
             recreate_flag,
             comp,
         )
-        .map_err(|e| map_factory_error(e, had_passwords))?;
+        .map_err(|e| map_factory_error(e, had_passwords, &archive_path))?;
         let source = OpenedSource::Bundle(bundle);
 
         let catalog = open_catalog_if_path(&loc)?;
+        if let Some(g) = &mut temp_guard {
+            g.disarm();
+        }
 
         Ok(Self {
             source,
@@ -268,6 +305,20 @@ impl Session {
     pub(crate) fn catalog_has_mem_index(&self) -> Option<bool> {
         self.catalog.as_ref().map(|c| c.has_mem_index())
     }
+
+    #[cfg(test)]
+    pub(crate) fn catalog_path(&self) -> Option<&Path> {
+        self.loc.path()
+    }
+
+    #[cfg(test)]
+    fn from_local_source(src: Arc<dyn MountSource>) -> Self {
+        Self {
+            source: OpenedSource::Local(src),
+            catalog: None,
+            loc: CatalogLoc::None,
+        }
+    }
 }
 
 impl Drop for Session {
@@ -362,6 +413,10 @@ fn check_recreate_never(archive: &Path, loc: &CatalogLoc) -> Result<(), Error> {
 }
 
 fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> {
+    #[cfg(test)]
+    if INJECT_CATALOG_OPEN_ERR.with(|c| c.replace(false)) {
+        return Err(Error::Internal("injected catalog open failure".into()));
+    }
     let Some(p) = loc.path() else {
         return Ok(None);
     };
@@ -373,12 +428,22 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
         .map_err(|e| Error::Internal(e.to_string()))
 }
 
-fn map_factory_error(msg: String, had_passwords: bool) -> Error {
+fn map_factory_error(msg: String, had_passwords: bool, archive: &Path) -> Error {
     let lower = msg.to_ascii_lowercase();
-    if lower.contains("not found") {
+    if lower.starts_with("not found") || lower.contains("not found:") {
         Error::NotFound
-    } else if had_passwords && (lower.contains("permission denied") || lower.contains("password")) {
+    } else if lower.contains("permission denied") || lower.contains("eacces") {
+        if had_passwords {
+            Error::BadPassword
+        } else {
+            Error::NotWritable(archive.to_path_buf())
+        }
+    } else if had_passwords && lower.contains("password") {
         Error::BadPassword
+    } else if lower.contains("corrupt") || lower.contains("mismatch") {
+        Error::CorruptIndex(msg)
+    } else if lower.contains("unsupported format") {
+        Error::UnsupportedFormat(msg)
     } else {
         Error::Internal(msg)
     }
@@ -666,5 +731,284 @@ mod tests {
             .matches("Successfully loaded offset dictionary")
             .count();
         assert_eq!(n, 1, "expected one harness line, got {n}: {stdout}");
+    }
+
+    fn never_req(tar: PathBuf, idx: PathBuf) -> OpenRequest {
+        OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::Never,
+        }
+    }
+
+    /// Recreate::Never + missing sidecar → NotFound; no sqlite created.
+    #[test]
+    fn recreate_never_missing_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("missing.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let idx = dir.path().join("missing.tar.index.sqlite");
+        let err = match Session::open(never_req(tar, idx.clone())) {
+            Err(e) => e,
+            Ok(_) => panic!("expected NotFound, open succeeded"),
+        };
+        assert!(
+            matches!(err, Error::NotFound),
+            "expected NotFound, got {err:?}"
+        );
+        assert!(
+            !idx.exists(),
+            "Never must not create a sidecar at {}",
+            idx.display()
+        );
+    }
+
+    /// Recreate::Never + tarstats mismatch → CorruptIndex; sidecar bytes unchanged.
+    #[test]
+    fn recreate_never_tarstats_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("stale.tar");
+        write_tar(&tar, &[member_file("a.txt", b"old")]);
+        let idx = dir.path().join("stale.tar.index.sqlite");
+        drop(
+            Session::open(OpenRequest {
+                source: SourceSpec::Path(tar.clone()),
+                index: IndexPolicy::Explicit,
+                explicit_index: Some(idx.clone()),
+                extra_dirs: Vec::new(),
+                password: None,
+                recursive: false,
+                recursion_depth: None,
+                recreate: Recreate::IfInvalid,
+            })
+            .expect("seed sidecar"),
+        );
+        let before = std::fs::read(&idx).unwrap();
+        write_tar(&tar, &[member_file("a.txt", b"new-payload-xxxx")]);
+        let err = match Session::open(never_req(tar, idx.clone())) {
+            Err(e) => e,
+            Ok(_) => panic!("expected CorruptIndex, open succeeded"),
+        };
+        assert!(
+            matches!(err, Error::CorruptIndex(_)),
+            "expected CorruptIndex, got {err:?}"
+        );
+        let after = std::fs::read(&idx).unwrap();
+        assert_eq!(before, after, "Never must not replace the sidecar");
+    }
+
+    /// Recreate::Never + backendName mismatch → CorruptIndex; no rebuild.
+    #[test]
+    fn recreate_never_backend_name_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("bn.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let idx = dir.path().join("bn.tar.index.sqlite");
+        drop(
+            Session::open(OpenRequest {
+                source: SourceSpec::Path(tar.clone()),
+                index: IndexPolicy::Explicit,
+                explicit_index: Some(idx.clone()),
+                extra_dirs: Vec::new(),
+                password: None,
+                recursive: false,
+                recursion_depth: None,
+                recreate: Recreate::IfInvalid,
+            })
+            .expect("seed sidecar"),
+        );
+        {
+            let w = SqliteIndex::open_writable(&idx).expect("writable sidecar");
+            w.store_metadata_key_value("backendName", "NotARealBackend")
+                .unwrap();
+        }
+        let before = std::fs::read(&idx).unwrap();
+        let err = match Session::open(never_req(tar, idx.clone())) {
+            Err(e) => e,
+            Ok(_) => panic!("expected CorruptIndex, open succeeded"),
+        };
+        assert!(
+            matches!(err, Error::CorruptIndex(_)),
+            "expected CorruptIndex, got {err:?}"
+        );
+        let after = std::fs::read(&idx).unwrap();
+        assert_eq!(
+            before, after,
+            "Never must not rebuild on backendName mismatch"
+        );
+    }
+
+    static TEMP_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn temp_sqlite_path(seq: u32) -> PathBuf {
+        std::env::temp_dir()
+            .join(format!("ratarmount-session-{}", std::process::id()))
+            .join(format!("index-{seq}.sqlite"))
+    }
+
+    /// Temp open+drop removes the sqlite and journals.
+    #[test]
+    fn index_policy_temp_drop_unlinks() {
+        let _g = TEMP_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("tmp.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let seq = TEMP_INDEX_SEQ.load(Ordering::Relaxed);
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Temp,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("Temp open");
+        let p = session
+            .catalog_path()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| temp_sqlite_path(seq));
+        assert!(
+            p.exists(),
+            "Temp sidecar should exist while Session is live"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Some(parent) = p.parent() {
+                let mode = std::fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+                assert_eq!(mode, 0o700, "Temp pid dir should be 0700");
+            }
+        }
+        drop(session);
+        assert!(!p.exists(), "Temp Drop must unlink {}", p.display());
+        let s = p.to_string_lossy();
+        assert!(!Path::new(&format!("{s}-wal")).exists());
+        assert!(!Path::new(&format!("{s}-shm")).exists());
+        assert!(!Path::new(&format!("{s}-journal")).exists());
+    }
+
+    /// Failed Temp open (catalog inject) must not leave index-*.sqlite.
+    #[test]
+    fn index_policy_temp_failed_open_unlinks() {
+        let _g = TEMP_TEST_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("fail.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let seq = TEMP_INDEX_SEQ.load(Ordering::Relaxed);
+        INJECT_CATALOG_OPEN_ERR.with(|c| c.set(true));
+        let err = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Temp,
+            explicit_index: None,
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        });
+        INJECT_CATALOG_OPEN_ERR.with(|c| c.set(false));
+        assert!(err.is_err(), "injected catalog failure should error");
+        let p = temp_sqlite_path(seq);
+        assert!(!p.exists(), "failed Temp open must unlink {}", p.display());
+    }
+
+    #[test]
+    fn session_drop_closes_unique_arc() {
+        use std::sync::atomic::AtomicBool;
+        struct CloseSpy {
+            closed: Arc<AtomicBool>,
+        }
+        impl MountSource for CloseSpy {
+            fn list(&self, _path: &str) -> Option<ratarmount_core::ListResult> {
+                None
+            }
+            fn lookup(&self, _path: &str, _file_version: i32) -> Option<FileInfo> {
+                None
+            }
+            fn open(
+                &self,
+                _file_info: &FileInfo,
+                _buffering: i32,
+            ) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Err(std::io::Error::other("spy"))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+            fn close(&mut self) {
+                self.closed.store(true, Ordering::SeqCst);
+            }
+        }
+        let closed = Arc::new(AtomicBool::new(false));
+        {
+            let session = Session::from_local_source(Arc::new(CloseSpy {
+                closed: Arc::clone(&closed),
+            }));
+            drop(session);
+        }
+        assert!(closed.load(Ordering::SeqCst), "unique Arc Drop must close");
+    }
+
+    #[test]
+    fn map_factory_error_permission_denied_without_password_is_not_writable() {
+        let e = map_factory_error(
+            "Permission denied (os error 13)".into(),
+            false,
+            Path::new("/a.tar"),
+        );
+        match e {
+            Error::NotWritable(p) => assert_eq!(p, Path::new("/a.tar")),
+            other => panic!("expected NotWritable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn map_factory_error_permission_denied_with_password_is_bad_password() {
+        let e = map_factory_error(
+            "Permission denied (os error 13)".into(),
+            true,
+            Path::new("/a.tar"),
+        );
+        assert!(matches!(e, Error::BadPassword));
+    }
+
+    #[test]
+    fn open_chmod_000_without_password_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("ro.tar");
+        write_tar(&tar, &[member_file("a.txt", b"hi")]);
+        let idx = dir.path().join("ro.tar.index.sqlite");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let err = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar.clone()),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&tar, std::fs::Permissions::from_mode(0o644));
+        }
+        match err {
+            Err(Error::NotWritable(p)) => assert_eq!(p, tar),
+            Ok(_) => eprintln!("skip: process can read chmod 000 archive (root?)"),
+            Err(e) => panic!("expected NotWritable, got {e:?}"),
+        }
     }
 }

@@ -159,6 +159,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Session pages 1k-entry TAR (page size 50) | `cargo test -p ratarmount-session --lib list_dirents_page` |
 | Session catalog does not reprint harness line / second MemIndex | `cargo test -p ratarmount-session --lib catalog_open_silent` · `cargo test -p ratarmount-index --lib open_catalog_read_only` |
 | GNU incremental dumpdir name absent from page 1 | `cargo test -p ratarmount-session --lib list_dirents_page_dumpdir` · `cargo test -p ratarmount-index --lib list_dirents_page` |
+| Recreate::Never missing sidecar / tarstats mismatch / no rebuild | `cargo test -p ratarmount-session --lib recreate_never` |
+| Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

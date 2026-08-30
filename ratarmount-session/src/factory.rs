@@ -1817,6 +1817,11 @@ fn open_lrzip(
     }
 }
 
+/// Session `Recreate::Never` / CLI `--no-recreate-index` must not replace a sidecar.
+fn refuse_index_rebuild(options: &OpenOptions) -> bool {
+    options.read_only_index
+}
+
 fn open_tar(
     archive_path: &Path,
     data_path: &Path,
@@ -1837,10 +1842,18 @@ fn open_tar(
                     materialised,
                 ) {
                     Ok(s) => return Ok(s),
-                    Err(e) => eprintln!("info: could not load index ({e}); rebuilding"),
+                    Err(e) => {
+                        if refuse_index_rebuild(options) {
+                            return Err(format!("corrupt or mismatched index: {e}"));
+                        }
+                        eprintln!("info: could not load index ({e}); rebuilding");
+                    }
                 }
             }
         }
+    }
+    if refuse_index_rebuild(options) {
+        return Err("corrupt or mismatched index: no usable sidecar".into());
     }
     SqliteIndexedTar::create_index(
         archive_path,
@@ -2309,10 +2322,18 @@ fn open_tar_gzip(
                     options.clone(),
                 ) {
                     Ok(s) => return Ok(s),
-                    Err(e) => eprintln!("info: could not load index ({e}); rebuilding"),
+                    Err(e) => {
+                        if refuse_index_rebuild(options) {
+                            return Err(format!("corrupt or mismatched index: {e}"));
+                        }
+                        eprintln!("info: could not load index ({e}); rebuilding");
+                    }
                 }
             }
         }
+    }
+    if refuse_index_rebuild(options) {
+        return Err("corrupt or mismatched index: no usable sidecar".into());
     }
     SqliteIndexedTar::create_index_gzip(archive_path, gzip, index_path, options, VERSION)
         .map_err(|e| e.to_string())
@@ -3133,10 +3154,18 @@ fn open_tar_body(
                     options.clone(),
                 ) {
                     Ok(s) => return Ok(s),
-                    Err(e) => eprintln!("info: could not load index ({e}); rebuilding"),
+                    Err(e) => {
+                        if refuse_index_rebuild(options) {
+                            return Err(format!("corrupt or mismatched index: {e}"));
+                        }
+                        eprintln!("info: could not load index ({e}); rebuilding");
+                    }
                 }
             }
         }
+    }
+    if refuse_index_rebuild(options) {
+        return Err("corrupt or mismatched index: no usable sidecar".into());
     }
     SqliteIndexedTar::create_index_body(archive_path, body, index_path, options, VERSION)
         .map_err(|e| e.to_string())

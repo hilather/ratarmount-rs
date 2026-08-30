@@ -131,7 +131,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
 
-**Landed (G1.1 / G1.2 / G1.3 / G1.6):** `open`, `list_dirents_page`, `lookup`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`).
+**Landed (G1.1 / G1.2 / G1.3 / G1.6):** `open`, `list_dirents_page`, `lookup`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
 
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
@@ -198,7 +198,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | `IfInvalid` | build (`IndexJob::run`) | build — **not** an error on `open` |
 | `Always` | build | build |
 
-`PermissionDenied` from `MountSource::open` maps to `BadPassword` **only** when passwords were supplied or the format already reported encryption. Other permission failures → `NotWritable` if a path is known, else `Internal`. Do not flatten to EIO.
+`PermissionDenied` from factory / `MountSource::open` maps to `BadPassword` **only** when passwords were supplied (or the error mentions password). Other permission failures → `NotWritable` with the archive path. Factory `not found:` → `NotFound`. Warm-index failure under `Recreate::Never` (`corrupt or mismatched index`) → `CorruptIndex`. Probe-miss `UnsupportedFormat` is only mapped when the message contains `unsupported format` (otherwise `Internal` — first-slice residual). Do not flatten to EIO.
 
 ## Index policy
 
@@ -210,7 +210,7 @@ Engine v1 **does not produce `Busy`**. Two `IndexJob`s on the same dest use dist
 | `UserCache` | `local-index-v1/` for local paths; `meta-v3/` for remote URL after sibling GET miss |
 | `Explicit` | `OpenRequest.explicit_index` |
 | `Memory` | `:memory:` — tests / `RGUI_FAKE` only; GUI settings must not persist this |
-| `Temp` | Platform temp, unlinked on `Session` drop. Confirm in UI. **Not** the fallback when sibling fails. |
+| `Temp` | Platform temp, unlinked on `Session` drop **and** on failed `open` (RAII guard). Unix pid dir is `0700`. Stale-pid sweep waits for G4. Confirm in UI. **Not** the fallback when sibling fails. |
 | `CliCompat` | Today’s CLI/Python folder order, including `:memory:` last resort. Not a GUI policy id. |
 
 `resolve_index` (G4 / PR6) is new. Existing `resolve_index_location` stays the Python/CLI helper. **This slice does not implement `SiblingNotWritable`.** `IndexPolicy::Sibling` / `UserCache` / `CliCompat` still call factory `resolve_index_location`. `Recreate::Never` never falls back to `:memory:` (missing sidecar → `NotFound`; tarstats mismatch → `CorruptIndex`). Do not treat factory’s CLI `:memory:` last resort as the GUI unwritable-sibling policy — that lands in PR6.

@@ -4461,7 +4461,43 @@ mod tests {
             true,
             0,
         ));
+        // NULL offsetheader (Python non-TAR) then a later non-NULL duplicate.
+        rows.push(FileRow::new(
+            "",
+            "nullwin.txt",
+            50,
+            0,
+            99,
+            0.0,
+            0o100644,
+            i64::from(b'0'),
+            "",
+            0,
+            0,
+            false,
+            false,
+            false,
+            0,
+        ));
         idx.insert_files_batch(&rows).unwrap();
+        idx.with_conn(|conn| {
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'nullwin.txt', NULL, 0, 1, 0, 33188, 48, '', 0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            conn.execute(
+                r#"INSERT INTO "files"
+                   (path, name, offsetheader, offset, size, mtime, mode, type, linkname,
+                    uid, gid, istar, issparse, isgenerated, recursiondepth)
+                   VALUES ('', 'nullonly.txt', NULL, 0, 3, 0, 33188, 48, '', 0, 0, 0, 0, 0, 0)"#,
+                [],
+            )?;
+            Ok(())
+        })
+        .unwrap();
         let _ = idx.into_read_only().unwrap();
     }
 
@@ -4536,7 +4572,7 @@ mod tests {
         let next = next.expect("more pages");
         assert_eq!(next, page1.last().unwrap().name);
         let hint = total.expect("COUNT");
-        assert_eq!(hint, 30, "30 live names, dumpdir excluded");
+        assert_eq!(hint, 32, "30 nXX + nullwin + nullonly, dumpdir excluded");
 
         let (page2, next2, _) = idx.list_dirents_page("/", Some(next.as_str()), 10).unwrap();
         assert_eq!(page2.len(), 10);
@@ -4551,7 +4587,7 @@ mod tests {
         let (last, last_next, _) = idx
             .list_dirents_page("/", Some(page2.last().unwrap().name.as_str()), 20)
             .unwrap();
-        assert_eq!(last.len(), 10);
+        assert_eq!(last.len(), 12);
         assert!(last_next.is_none());
         let mut all: Vec<String> = names1
             .into_iter()
@@ -4561,7 +4597,17 @@ mod tests {
             .collect();
         all.sort();
         all.dedup();
-        assert_eq!(all.len(), 30);
+        assert_eq!(all.len(), 32);
         assert!(!all.iter().any(|n| n == "gone.txt"));
+
+        let (full, _, _) = idx.list_dirents_page("/", None, 100).unwrap();
+        let nullwin = full.iter().find(|d| d.name == "nullwin.txt").unwrap();
+        assert_eq!(nullwin.size, 99, "non-NULL offsetheader wins over NULL");
+        assert_eq!(nullwin.offsetheader, 50);
+        let nullonly = full.iter().find(|d| d.name == "nullonly.txt").unwrap();
+        assert_eq!(
+            nullonly.offsetheader, -1,
+            "NULL-only offsetheader is the -1 sentinel"
+        );
     }
 }
