@@ -6043,6 +6043,7 @@ mod tests {
         let seed = generated_payload("idle-rename-seed");
         let first = generated_payload("idle-rename-first");
         let second = generated_payload("idle-rename-second");
+        let sibling = generated_payload("idle-rename-sibling");
         let archive = dir.path().join("a.tar.zst");
         write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
         let overlay = dir.path().join("ov");
@@ -6052,17 +6053,25 @@ mod tests {
         assert_eq!(n as usize, first.len(), "first write");
         ov.rename("/open.txt", "/renamed.txt")
             .expect("rename open write fd");
+        fs::write(overlay.join("sibling.txt"), &sibling).unwrap();
         set_mtime_age(&overlay.join("renamed.txt"), Duration::from_secs(30));
+        set_mtime_age(&overlay.join("sibling.txt"), Duration::from_secs(30));
 
         match ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
             reopen_tar_zst(p, false)
         }) {
-            Ok(false) => {}
-            other => panic!("renamed open write fd must skip idle persist, got {other:?}"),
+            Ok(true) => {}
+            other => panic!(
+                "idle tick must persist the unpinned sibling and skip the renamed writer, got {other:?}"
+            ),
         }
         assert!(
             overlay.join("renamed.txt").exists(),
             "renamed open write fd must keep the overlay file"
+        );
+        assert!(
+            !overlay.join("sibling.txt").exists(),
+            "unpinned idle sibling must leave the overlay (proves we did not fail-closed the whole tick)"
         );
         assert!(
             !overlay.join("open.txt").exists(),
@@ -6092,6 +6101,7 @@ mod tests {
         want.extend_from_slice(&second);
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/renamed.txt"), want);
+        assert_eq!(read_member(src.as_ref(), "/sibling.txt"), sibling);
         assert!(
             src.lookup("/open.txt", 0).is_none(),
             "old name must not remain in the archive"
