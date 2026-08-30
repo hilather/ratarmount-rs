@@ -853,6 +853,11 @@ impl ZipMountSource {
     ) -> Result<(SqliteIndex, ZipMemberTable)> {
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.set_build_hooks(options.index_build.clone());
+        let hint = match &stats {
+            StatsSource::Path(p) => std::fs::metadata(p).ok().map(|m| m.len()),
+            StatsSource::Synthetic(n) => Some(*n),
+        };
+        index.set_build_total_hint(hint);
         index.begin_write()?;
         let mut members = ZipMemberTable::with_capacity(archive.len());
         let mut generated_dirs: std::collections::BTreeSet<String> =
@@ -862,6 +867,9 @@ impl ZipMountSource {
         let mut batch = FileRowSoa::with_capacity(ZIP_BATCH_FLUSH);
 
         for i in 0..archive.len() {
+            if options.index_build.is_cancelled() {
+                return Err(IndexError::Cancelled.into());
+            }
             let zf = open_member(archive, i, password)?;
             let name_raw = zf.name().to_string();
             // Share name with compact index string pool when building.

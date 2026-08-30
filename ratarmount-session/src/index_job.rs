@@ -7,25 +7,23 @@ use crate::session::Session;
 use crate::types::{OpenRequest, Recreate};
 use crate::Error;
 
-/// Cold index-build handle. Engine stays blocking; the embedder owns threads /
-/// `job_id`.
-///
-/// There is no `IndexJob::start` / `Session::from_open`.
+/// Blocking cold-rebuild handle. Embedders that need a job id run this on a
+/// worker thread.
 pub struct IndexJob;
 
 impl IndexJob {
-    /// Cold build ([`Recreate::Always`] semantics). On success the sidecar is
-    /// published (tmp+rename). Caller then [`Session::open`] warm, or
-    /// [`Session::open_with_job`] does run+open internally.
+    /// Rebuild the sidecar for `req` ([`Recreate::Always`]). On success the
+    /// published location is returned and remains readable after `run` returns
+    /// (including [`crate::IndexPolicy::Temp`]).
     ///
-    /// Cancel never [`ratarmount_index::SqliteIndex::publish_tmp`]; Drop unlinks
-    /// tmp and the previous dest sidecar stays valid. Does **not** run CLI
-    /// `--hashes` / `--publish-index` / overlay wrap (`main.rs` keeps that tail).
+    /// Indexes the **outer** archive only (recursive AutoMount is not applied).
+    /// Cancel unlinks the unpublished tmp and leaves dest unchanged.
     pub fn run(req: OpenRequest, hooks: IndexBuildHooks) -> Result<IndexLocation, Error> {
         let mut req = req;
         req.recreate = Recreate::Always;
+        req.recursive = false;
         let session = Session::open_with_job(req, &hooks)?;
-        Ok(session.index_location())
+        Ok(session.into_index_location())
     }
 }
 
@@ -236,5 +234,121 @@ mod tests {
         let hit = session.lookup("/cli.txt").unwrap().expect("cli.txt");
         assert_eq!(hit.size, payload.len() as u64);
         assert_eq!(session.catalog_has_mem_index(), Some(false));
+    }
+
+    /// `IndexJob::run` + Temp leaves a readable sidecar at the returned path.
+    #[test]
+    fn index_job_temp_sidecar_survives_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("temp.tar");
+        write_tar(&tar, &[member_file("t.txt", b"tmp")]);
+        let loc = IndexJob::run(
+            OpenRequest {
+                source: SourceSpec::Path(tar),
+                index: IndexPolicy::Temp,
+                explicit_index: None,
+                extra_dirs: Vec::new(),
+                password: None,
+                recursive: false,
+                recursion_depth: None,
+                recreate: Recreate::Always,
+            },
+            IndexBuildHooks::default(),
+        )
+        .expect("IndexJob::run Temp");
+        let path = loc.as_path().expect("Temp job returns a path");
+        assert!(
+            path.exists(),
+            "Temp sidecar must survive IndexJob::run: {}",
+            path.display()
+        );
+        let cat = SqliteIndex::open_catalog_read_only(path).expect("open Temp sidecar");
+        assert!(cat.file_count().unwrap() >= 1);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Nested TAR flatten cancel must not publish over the previous dest.
+    #[test]
+    fn index_job_cancel_nested_flatten_keeps_dest() {
+        let dir = tempfile::tempdir().unwrap();
+        let names: Vec<String> = (0..2048).map(|i| format!("n{i:04}.txt")).collect();
+        let payload = b"x";
+        let inner_members: Vec<UstarMember<'_>> = names
+            .iter()
+            .map(|n| member_file(n.as_str(), payload))
+            .collect();
+        let mut inner = Vec::new();
+        write_ustar_members(&mut inner, &inner_members).unwrap();
+        write_tar_eof(&mut inner).unwrap();
+        let outer_members = [UstarMember {
+            path: "inner.tar",
+            payload: UstarPayload::File {
+                bytes: inner.as_slice(),
+            },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }];
+        let tar = dir.path().join("outer.tar");
+        write_tar(&tar, &outer_members);
+        let idx = dir.path().join("outer.tar.index.sqlite");
+        drop(
+            Session::open(explicit_req(tar.clone(), idx.clone(), Recreate::IfInvalid))
+                .expect("seed sidecar"),
+        );
+        let before = std::fs::read(&idx).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_cb = Arc::clone(&cancel);
+        let hooks = IndexBuildHooks {
+            on_progress: Some(Arc::new(move |t: IndexBuildTick| {
+                if t.phase == IndexBuildTick::PHASE_WRITE && t.entries >= 1024 {
+                    cancel_cb.store(true, Ordering::Relaxed);
+                }
+            })),
+            cancel: Some(Arc::clone(&cancel)),
+        };
+        let mut req = explicit_req(tar, idx.clone(), Recreate::Always);
+        req.recursive = true;
+        let err = IndexJob::run(req, hooks).expect_err("nested cancel");
+        assert!(
+            matches!(err, Error::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        let leftover = tmp_names(dir.path(), &idx);
+        assert!(leftover.is_empty(), "tmp must be gone: {leftover:?}");
+        let after = std::fs::read(&idx).unwrap();
+        assert_eq!(before, after, "dest must stay the previous sidecar");
+    }
+
+    /// Warm remount with hooks must not emit Scan (no SQLite rebuild).
+    #[test]
+    fn index_job_warm_open_emits_no_scan() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = dir.path().join("warm.tar");
+        write_tar(&tar, &[member_file("w.txt", b"hi")]);
+        let idx = dir.path().join("warm.tar.index.sqlite");
+        drop(
+            Session::open(explicit_req(tar.clone(), idx.clone(), Recreate::IfInvalid))
+                .expect("seed"),
+        );
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let ticks_cb = Arc::clone(&ticks);
+        let hooks = IndexBuildHooks {
+            on_progress: Some(Arc::new(move |t: IndexBuildTick| {
+                ticks_cb.lock().unwrap().push(t);
+            })),
+            cancel: None,
+        };
+        drop(
+            Session::open_with_job(explicit_req(tar, idx, Recreate::IfInvalid), &hooks)
+                .expect("warm open_with_job"),
+        );
+        let got = ticks.lock().unwrap().clone();
+        assert!(
+            got.is_empty(),
+            "warm IfInvalid must not emit Scan/Write/Finalize: {got:?}"
+        );
     }
 }

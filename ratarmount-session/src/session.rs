@@ -113,21 +113,11 @@ impl Session {
     }
 
     /// Same as [`Self::open`] with progress/cancel hooks copied onto
-    /// [`OpenOptions::index_build`].
+    /// [`OpenOptions::index_build`]. Scan ticks only when a cold build starts.
     pub fn open_with_job(req: OpenRequest, hooks: &IndexBuildHooks) -> Result<Self, Error> {
         if hooks.is_cancelled() {
             return Err(Error::Cancelled);
         }
-        let bytes_total_hint = match &req.source {
-            SourceSpec::Path(p) => std::fs::metadata(p).ok().map(|m| m.len()),
-            SourceSpec::Url(_) => None,
-        };
-        hooks.emit(IndexBuildTick {
-            phase: IndexBuildTick::PHASE_SCAN,
-            bytes_scanned: 0,
-            bytes_total_hint,
-            entries: 0,
-        });
 
         let (clear_index_cache, write_index, read_only_index) = match req.recreate {
             Recreate::Always => (true, true, false),
@@ -207,9 +197,24 @@ impl Session {
             check_recreate_never(&archive_path, &loc)?;
         }
 
+        if will_cold_build(req.recreate, &archive_path, &loc) {
+            let bytes_total_hint = match &req.source {
+                SourceSpec::Path(p) => std::fs::metadata(p).ok().map(|m| m.len()),
+                SourceSpec::Url(_) => None,
+            };
+            hooks.emit(IndexBuildTick {
+                phase: IndexBuildTick::PHASE_SCAN,
+                bytes_scanned: 0,
+                bytes_total_hint,
+                entries: 0,
+            });
+        }
+
         let comp = CompositingOptions {
             recursive: req.recursive,
-            lazy: false,
+            // Eager AutoMount indexes nested archives after outer `publish_tmp`.
+            // A cancellable open must not replace dest and then fail as Cancelled.
+            lazy: hooks.cancel.is_some(),
             file_versions: true,
             disable_union_mount: false,
             ..CompositingOptions::default()
@@ -352,9 +357,12 @@ impl Session {
         }
     }
 
-    pub(crate) fn index_location(&self) -> IndexLocation {
-        match &self.loc {
-            CatalogLoc::Path(p) | CatalogLoc::Temp(p) => IndexLocation::Path(p.clone()),
+    /// Consume the session and return the sidecar location without unlinking
+    /// [`IndexPolicy::Temp`] files ([`IndexJob::run`] keeps the published path).
+    pub(crate) fn into_index_location(mut self) -> IndexLocation {
+        let loc = std::mem::replace(&mut self.loc, CatalogLoc::None);
+        match loc {
+            CatalogLoc::Path(p) | CatalogLoc::Temp(p) => IndexLocation::Path(p),
             CatalogLoc::Memory | CatalogLoc::None => IndexLocation::Memory,
         }
     }
@@ -467,9 +475,24 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
         .map_err(|e| Error::Internal(e.to_string()))
 }
 
+fn will_cold_build(recreate: Recreate, archive: &Path, loc: &CatalogLoc) -> bool {
+    match recreate {
+        Recreate::Never => false,
+        Recreate::Always => true,
+        Recreate::IfInvalid => match loc.path() {
+            None => true,
+            Some(p) if !p.exists() => true,
+            Some(p) => match SqliteIndex::open_catalog_read_only(p) {
+                Ok(cat) => cat.check_tarstats_matches_archive(archive).is_err(),
+                Err(_) => true,
+            },
+        },
+    }
+}
+
 fn map_factory_error(msg: String, had_passwords: bool, archive: &Path) -> Error {
     let lower = msg.to_ascii_lowercase();
-    if lower == "cancelled" || lower.contains("cancelled") {
+    if msg == IndexError::Cancelled.to_string() {
         Error::Cancelled
     } else if lower.starts_with("not found") || lower.contains("not found:") {
         Error::NotFound
@@ -553,6 +576,7 @@ mod tests {
     use super::*;
     use crate::types::SourceSpec;
     use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
+    use ratarmount_index::IndexError;
     use std::io::Write;
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
@@ -1018,6 +1042,29 @@ mod tests {
             Path::new("/a.tar"),
         );
         assert!(matches!(e, Error::BadPassword));
+    }
+
+    #[test]
+    fn map_factory_error_cancelled_in_path_is_not_found() {
+        let e = map_factory_error(
+            "not found: /tmp/cancelled/foo.tar".into(),
+            false,
+            Path::new("/tmp/cancelled/foo.tar"),
+        );
+        assert!(
+            matches!(e, Error::NotFound),
+            "path token cancelled must not map to Cancelled, got {e:?}"
+        );
+    }
+
+    #[test]
+    fn map_factory_error_exact_cancelled() {
+        let e = map_factory_error(
+            IndexError::Cancelled.to_string(),
+            false,
+            Path::new("/a.tar"),
+        );
+        assert!(matches!(e, Error::Cancelled));
     }
 
     #[test]

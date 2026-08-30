@@ -252,22 +252,24 @@ Do not migrate `meta-v3` onto macOS Library/Caches. Env `RATARMOUNT_LOCAL_INDEX_
 
 ## `IndexJob` (blocking)
 
-Engine stays **blocking**. Napi owns threads / `job_id`.
+Engine stays **blocking**. Napi owns threads / `job_id`. There is no `IndexJob::start` / `Session::from_open`.
 
 ```rust
 pub struct IndexJob;
 
 impl IndexJob {
-    /// Cold build (`Recreate::Always` semantics). On success the sidecar is
-    /// published (tmp+rename). Caller then `Session::open` warm, or
-    /// `Session::open_with_job` does run+open internally.
+    /// Cold rebuild (`Recreate::Always`). On success the sidecar is published
+    /// (tmp+rename) and the returned location stays readable after `run`
+    /// returns (including `IndexPolicy::Temp`).
     pub fn run(req: OpenRequest, hooks: IndexBuildHooks) -> Result<IndexLocation, Error>;
 }
 ```
 
-Cancel is cooperative. Cancel **never** `publish_tmp`; `Drop` unlinks `{dest}.tmp.{pid}.{seq}` and the previous sidecar stays valid (V-2a). CLI `--no-mount` control flow (hashes / `--publish-index` / `-w`) stays in `main.rs` — not folded into `IndexJob` in v1.
+`IndexJob::run` rebuilds then returns the location. `Session::open_with_job` opens (and may rebuild) with the same hooks. Cancel is cooperative: it **never** `publish_tmp`; `Drop` of the unpublished writer unlinks `{dest}.tmp.{pid}.{seq}` and the previous sidecar stays valid (V-2a).
 
-Progress: one `Scan` at `open_with_job` start, one Write tick per `insert_files_batch_soa` (512 rows) and/or every 8 MiB of TAR `pos`, one `Finalize` before `publish_tmp`. `IndexBuildHooks` live on `OpenOptions.index_build`; TAR/ZIP/7z call `index.set_build_hooks` after `create_writable_for_open`.
+`run` indexes the **outer** archive only (it does not eager-AutoMount nested archives). Nested TAR flatten during the outer parse still honors cancel (fail-closed before publish). CLI `--no-mount` control flow (hashes / `--publish-index` / `-w`) stays in `main.rs` — not folded into `IndexJob` in v1.
+
+Progress: one `Scan` when a **cold** build actually starts (`Recreate::Always`, or `IfInvalid` with missing/mismatched sidecar) — not on warm remount. Then Write ticks per `insert_files_batch_soa` (512 rows) and/or every 8 MiB of TAR `pos`, and one `Finalize` before `publish_tmp`. `IndexBuildHooks` live on `OpenOptions.index_build`; `create_writable_for_open` installs them (TAR/ZIP/7z also set the one-liner after create).
 
 Normal `IndexJob` does **not** create `files_fts`. FTS is opt-in (`FindOpts.fts` / `fts:` prefix).
 

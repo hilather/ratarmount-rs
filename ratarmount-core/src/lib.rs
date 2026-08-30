@@ -295,10 +295,9 @@ pub struct StatFs {
     pub namemax: u64,
 }
 
-/// Cooperative progress/cancel for a cold index build (G2).
+/// Progress and cooperative cancel for a cold index build.
 ///
-/// Tiny L0 type so format crates do not grow a second observer trait. Empty
-/// [`Default`] is a no-op (CLI `--no-mount` without an embedder).
+/// Empty [`Default`] is a no-op.
 #[derive(Clone, Default)]
 pub struct IndexBuildHooks {
     pub on_progress: Option<Arc<dyn Fn(IndexBuildTick) + Send + Sync>>,
@@ -333,7 +332,7 @@ impl fmt::Debug for IndexBuildHooks {
 /// One index-build progress event. `phase`: 0 Scan, 1 Write, 2 Fts, 3 Finalize.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct IndexBuildTick {
-    /// 0 = Scan, 1 = Write, 2 = Fts, 3 = Finalize (session maps to `IndexPhase`).
+    /// 0 = Scan, 1 = Write, 2 = Fts, 3 = Finalize.
     pub phase: u8,
     pub bytes_scanned: u64,
     pub bytes_total_hint: Option<u64>,

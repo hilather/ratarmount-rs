@@ -476,6 +476,7 @@ impl SqliteIndexedTar {
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.set_build_hooks(options.index_build.clone());
+        index.set_build_total_hint(Some(size));
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(&mut reader, &index, options)?;
 
@@ -604,6 +605,11 @@ impl SqliteIndexedTar {
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.set_build_hooks(options.index_build.clone());
+        let size_hint = std::fs::metadata(&archive_path)
+            .or_else(|_| std::fs::metadata(&data_path))
+            .ok()
+            .map(|m| m.len());
+        index.set_build_total_hint(size_hint);
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(reader, &index, options)?;
 
@@ -615,11 +621,7 @@ impl SqliteIndexedTar {
         )?;
         // Nested / virtual labels (e.g. `inner.tar.gz` inside a 7z) are not real
         // host paths — use label-safe stats (path metadata when present).
-        let size_hint = std::fs::metadata(&archive_path)
-            .or_else(|_| std::fs::metadata(&data_path))
-            .map(|m| m.len())
-            .unwrap_or(0);
-        store_tarstats_for_label(&index, &archive_path, size_hint)?;
+        store_tarstats_for_label(&index, &archive_path, size_hint.unwrap_or(0))?;
         store_arguments(&index, options)?;
         index.commit_write()?;
 
@@ -1949,6 +1951,9 @@ fn flatten_nested_tars<R: Read + Seek>(
         ) {
             Ok(()) => {}
             Err(e) => {
+                if matches!(&e, TarError::Index(IndexError::Cancelled)) {
+                    return Err(e);
+                }
                 // Nested content may not be a valid TAR despite magic/name; keep side-list only.
                 log::debug!("skip flatten of nested TAR {}: {e}", pending.member.path);
                 continue;
@@ -2074,6 +2079,7 @@ fn walk_tar_region<R: Read + Seek>(
     let mut pax_header_start: Option<u64> = None;
 
     loop {
+        check_build_cancel(options)?;
         if pos + BLOCK_SIZE > region_end {
             break;
         }

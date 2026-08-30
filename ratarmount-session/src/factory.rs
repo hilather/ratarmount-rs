@@ -489,6 +489,9 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
         opts.index_file_path = None;
         opts.index_in_memory = false;
         opts.clear_index_cache = true;
+        // Nested AutoMount must not share the outer job cancel: outer
+        // `publish_tmp` already ran before compositing.
+        opts.index_build.cancel = None;
         // Always rebuild nested indexes next to the materialised file.
         let mut idx = path.as_os_str().to_os_string();
         idx.push(".index.sqlite");
@@ -527,6 +530,7 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
         opts.index_in_memory = false;
         opts.index_compact_only = true;
         opts.clear_index_cache = true;
+        opts.index_build.cancel = None;
 
         let mut magic = [0u8; 512];
         let n = reader.read(&mut magic).map_err(std::io::Error::other)?;

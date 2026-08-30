@@ -376,6 +376,9 @@ impl SevenZipMountSource {
             archive_path.display()
         );
         let t0 = Instant::now();
+        if options.index_build.is_cancelled() {
+            return Err(IndexError::Cancelled.into());
+        }
 
         // Parse once (encoded-header decompress uses no password typically).
         let mut archive = parse::parse_7z_archive(&mut reader, |folder, packed| {
@@ -414,12 +417,16 @@ impl SevenZipMountSource {
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
         index.set_build_hooks(options.index_build.clone());
+        index.set_build_total_hint(std::fs::metadata(archive_path).ok().map(|m| m.len()));
         index.begin_write()?;
 
         let mut batch = FileRowSoa::with_capacity(512);
         let mut generated = std::collections::BTreeSet::new();
 
         for (entry_index, entry) in archive.files.iter().enumerate() {
+            if options.index_build.is_cancelled() {
+                return Err(IndexError::Cancelled.into());
+            }
             let mut full = entry.path.trim_end_matches('/').to_string();
             if full.is_empty() && entry.is_dir {
                 continue;

@@ -459,6 +459,7 @@ pub struct SqliteIndex {
     build_hooks: Mutex<IndexBuildHooks>,
     build_entries: AtomicU64,
     build_bytes_scanned: AtomicU64,
+    build_bytes_total_hint: Mutex<Option<u64>>,
 }
 
 /// Monotonic suffix so two [`SqliteIndex::create_writable`] calls in one process
@@ -629,6 +630,7 @@ impl SqliteIndex {
             build_hooks: Mutex::new(IndexBuildHooks::default()),
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
+            build_bytes_total_hint: Mutex::new(None),
         };
         idx.validate_loaded()?;
         if load_mem {
@@ -697,6 +699,7 @@ impl SqliteIndex {
             build_hooks: Mutex::new(IndexBuildHooks::default()),
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
+            build_bytes_total_hint: Mutex::new(None),
         })
     }
 
@@ -720,6 +723,7 @@ impl SqliteIndex {
             build_hooks: Mutex::new(IndexBuildHooks::default()),
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
+            build_bytes_total_hint: Mutex::new(None),
         })
     }
 
@@ -729,23 +733,31 @@ impl SqliteIndex {
         index_path: Option<&Path>,
         options: &OpenOptions,
     ) -> Result<Self> {
-        if options.index_compact_only {
-            return Self::create_compact_only();
-        }
-        if options.index_in_memory {
-            return Self::create_writable(None);
-        }
-        if let Some(p) = index_path {
-            return Self::create_writable(Some(p));
-        }
-        Self::create_writable(None)
+        let idx = if options.index_compact_only {
+            Self::create_compact_only()?
+        } else if options.index_in_memory {
+            Self::create_writable(None)?
+        } else if let Some(p) = index_path {
+            Self::create_writable(Some(p))?
+        } else {
+            Self::create_writable(None)?
+        };
+        idx.set_build_hooks(options.index_build.clone());
+        Ok(idx)
     }
 
-    /// Install progress/cancel hooks for a cold build. Called by formats after
-    /// [`Self::create_writable`] / [`Self::create_writable_for_open`].
+    /// Install progress/cancel hooks for a cold build.
     pub fn set_build_hooks(&self, hooks: IndexBuildHooks) {
         let mut guard = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
         *guard = hooks;
+    }
+
+    /// Archive-size hint copied onto later Write/Finalize ticks.
+    pub fn set_build_total_hint(&self, hint: Option<u64>) {
+        *self
+            .build_bytes_total_hint
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = hint;
     }
 
     fn build_cancelled(&self) -> Result<()> {
@@ -760,11 +772,21 @@ impl SqliteIndex {
     fn emit_build_tick(&self, phase: u8) {
         let entries = self.build_entries.load(Ordering::Relaxed);
         let bytes_scanned = self.build_bytes_scanned.load(Ordering::Relaxed);
-        let hooks = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
+        let bytes_total_hint = {
+            let g = self
+                .build_bytes_total_hint
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            *g
+        };
+        let hooks = {
+            let g = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
+            g.clone()
+        };
         hooks.emit(IndexBuildTick {
             phase,
             bytes_scanned,
-            bytes_total_hint: None,
+            bytes_total_hint,
             entries,
         });
     }
@@ -985,6 +1007,7 @@ impl SqliteIndex {
             build_hooks: Mutex::new(IndexBuildHooks::default()),
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
+            build_bytes_total_hint: Mutex::new(None),
         })
     }
 
@@ -2241,6 +2264,7 @@ impl SqliteIndex {
             build_hooks: Mutex::new(IndexBuildHooks::default()),
             build_entries: AtomicU64::new(0),
             build_bytes_scanned: AtomicU64::new(0),
+            build_bytes_total_hint: Mutex::new(None),
         };
         idx.validate_loaded()?;
         Ok(idx)
