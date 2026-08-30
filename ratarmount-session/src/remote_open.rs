@@ -14,7 +14,7 @@ use ratarmount_index::{
     invalidate_meta_cache_identity, is_local_index_cache_path, is_meta_cache_path,
     materialize_index_file, object_store_sibling_index_candidates, parse_index_pointer_json,
     parse_link_describedby, resolve_index_location, sha256_hex_stream, sibling_index_candidates,
-    sibling_index_id_candidates, sibling_index_pointer_url, MetaCache, SqliteIndex,
+    sibling_index_id_candidates, sibling_index_pointer_url, MetaCache, SqliteIndex, TarStats,
     TARSTATS_FULL_HASH_MAX, TARSTATS_SAMPLE_BYTES,
 };
 
@@ -33,9 +33,9 @@ fn apply_remote_index_discovery(
         &ratarmount_remote::OciLocation,
         &ratarmount_remote::OciLayer,
     )>,
-) {
+) -> Result<(), String> {
     if recreate || opts.clear_index_cache || opts.index_in_memory {
-        return;
+        return Ok(());
     }
     let cache_dest = if let Some(p) = opts.index_file_path.as_ref() {
         if path_is_nonempty_file(p) {
@@ -44,19 +44,19 @@ fn apply_remote_index_discovery(
             // tarstats: URL-label `check_tarstats_matches_archive` is a no-op.
             if is_local_index_cache_path(p) {
                 let layer = oci.map(|(_, l)| l);
-                if drop_stale_local_cache(p, input, archive_size, layer) {
+                if drop_stale_local_cache(p, input, archive_size, layer, opts.read_only_index)? {
                     // deleted; continue discovery into this dest
                 } else {
-                    return;
+                    return Ok(());
                 }
             } else {
-                return;
+                return Ok(());
             }
         } else if !is_local_index_cache_path(p) {
             // WHY: UserCache pins `{hex}.sqlite` so CliCompat cannot pick the
             // legacy flattened `$XDG_CACHE_HOME/ratarmount/*.index.sqlite` parent.
             // A missing v1 dest still GETs; CLI `--index-file` (not v1) skips discovery.
-            return;
+            return Ok(());
         }
         Some(p.clone())
     } else {
@@ -64,11 +64,11 @@ fn apply_remote_index_discovery(
         if let Some(p) = loc.as_path() {
             if path_is_nonempty_file(p) {
                 let layer = oci.map(|(_, l)| l);
-                if drop_stale_local_cache(p, input, archive_size, layer) {
+                if drop_stale_local_cache(p, input, archive_size, layer, opts.read_only_index)? {
                     // deleted; continue discovery
                 } else {
                     log::debug!("local index cache hit; skip remote discovery ({input})");
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -77,7 +77,7 @@ fn apply_remote_index_discovery(
 
     if input.starts_with("http://") || input.starts_with("https://") {
         if try_http_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
-            return;
+            return Ok(());
         }
         match ratarmount_remote::probe_http(input) {
             Ok(probe) => {
@@ -92,7 +92,7 @@ fn apply_remote_index_discovery(
                             cache_dest.as_deref(),
                             None,
                         ) {
-                            return;
+                            return Ok(());
                         }
                     }
                 }
@@ -105,19 +105,19 @@ fn apply_remote_index_discovery(
                         cache_dest.as_deref(),
                         None,
                     ) {
-                        return;
+                        return Ok(());
                     }
                     log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
                 }
             }
             Err(e) => log::debug!("archive HEAD for index discovery failed: {e}"),
         }
-        return;
+        return Ok(());
     }
 
     if ratarmount_remote::is_object_store_archive_url(input) {
         if try_object_store_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
-            return;
+            return Ok(());
         }
         for cand in object_store_sibling_index_candidates(input) {
             if try_fetch_object_store_index(
@@ -128,11 +128,11 @@ fn apply_remote_index_discovery(
                 cache_dest.as_deref(),
                 None,
             ) {
-                return;
+                return Ok(());
             }
             log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
         }
-        return;
+        return Ok(());
     }
 
     if let Some((oloc, layer)) = oci {
@@ -158,6 +158,7 @@ fn apply_remote_index_discovery(
             Err(e) => log::debug!("OCI referrer miss: {e}"),
         }
     }
+    Ok(())
 }
 
 fn path_is_nonempty_file(path: &Path) -> bool {
@@ -170,17 +171,26 @@ fn path_is_nonempty_file(path: &Path) -> bool {
 ///
 /// Size mismatch is confirmed without extra GETs. Content hashes are checked
 /// when prefix/suffix/full fingerprints can be fetched; a fetch failure with
-/// matching size is **not** treated as stale (fail-open).
+/// matching size is **not** treated as stale (fail-open). A fetched window
+/// that mismatches is stale even if another window could not be fetched.
 fn cached_remote_index_is_stale(
     path: &Path,
     archive_url: &str,
     archive_size: u64,
     oci: Option<&ratarmount_remote::OciLayer>,
 ) -> bool {
+    let stored = match SqliteIndex::open_read_only(path).and_then(|idx| idx.tarstats()) {
+        Ok(Some(s)) => s,
+        Ok(None) | Err(_) => return true,
+    };
+    if stored.st_size != archive_size {
+        return true;
+    }
     let (prefix, suffix, full) = remote_archive_fingerprint(archive_url, archive_size, oci);
-    cached_remote_index_is_stale_fps(path, archive_size, prefix, suffix, full)
+    cached_remote_index_is_stale_stored(&stored, archive_size, prefix, suffix, full)
 }
 
+#[cfg(test)]
 fn cached_remote_index_is_stale_fps(
     path: &Path,
     archive_size: u64,
@@ -192,6 +202,20 @@ fn cached_remote_index_is_stale_fps(
         Ok(Some(s)) => s,
         Ok(None) | Err(_) => return true,
     };
+    cached_remote_index_is_stale_stored(&stored, archive_size, prefix, suffix, full)
+}
+
+fn tarstats_hex_eq_local(a: &str, b: &str) -> bool {
+    a.trim().eq_ignore_ascii_case(b.trim())
+}
+
+fn cached_remote_index_is_stale_stored(
+    stored: &TarStats,
+    archive_size: u64,
+    prefix: Option<String>,
+    suffix: Option<String>,
+    full: Option<String>,
+) -> bool {
     if stored.st_size != archive_size {
         return true;
     }
@@ -204,25 +228,27 @@ fn cached_remote_index_is_stale_fps(
     // delete a valid cache.
     let use_full =
         stored.full_sha256.is_some() && (archive_size <= TARSTATS_FULL_HASH_MAX || full.is_some());
-    if use_full && full.is_none() {
-        return false;
+    if use_full {
+        return match (stored.full_sha256.as_deref(), full.as_deref()) {
+            (Some(_), None) => false,
+            (Some(want), Some(got)) => !tarstats_hex_eq_local(want, got),
+            (None, _) => false,
+        };
     }
-    if !use_full {
-        if stored.prefix512_sha256.is_some() && prefix.is_none() {
-            return false;
-        }
-        if stored.suffix512_sha256.is_some() && suffix.is_none() {
-            return false;
+    // Compare every fetched window. Unavailable windows must not *create* a
+    // mismatch, and must not *erase* a mismatch we already have.
+    let mut mismatch = false;
+    if let (Some(want), Some(got)) = (stored.prefix512_sha256.as_deref(), prefix.as_deref()) {
+        if !tarstats_hex_eq_local(want, got) {
+            mismatch = true;
         }
     }
-    check_tarstats_matches_remote(
-        &stored,
-        archive_size,
-        prefix.as_deref(),
-        suffix.as_deref(),
-        full.as_deref(),
-    )
-    .is_err()
+    if let (Some(want), Some(got)) = (stored.suffix512_sha256.as_deref(), suffix.as_deref()) {
+        if !tarstats_hex_eq_local(want, got) {
+            mismatch = true;
+        }
+    }
+    mismatch
 }
 
 fn remote_archive_fingerprint(
@@ -242,16 +268,26 @@ fn remote_archive_fingerprint(
     }
 }
 
-/// Delete a confirmed-stale local cache hit. Returns true when the file was
-/// treated as stale (caller should continue discovery).
+/// Delete a confirmed-stale local cache hit. Returns `Ok(true)` when the file
+/// was treated as stale (caller should continue discovery).
+///
+/// `Recreate::Never` / `--no-recreate-index` (`read_only_index`) must not
+/// unlink the only sidecar: fail the open and leave the file.
 fn drop_stale_local_cache(
     path: &Path,
     archive_url: &str,
     archive_size: u64,
     oci: Option<&ratarmount_remote::OciLayer>,
-) -> bool {
+    read_only_index: bool,
+) -> Result<bool, String> {
     if !cached_remote_index_is_stale(path, archive_url, archive_size, oci) {
-        return false;
+        return Ok(false);
+    }
+    if read_only_index {
+        return Err(format!(
+            "cached sidecar is stale for replaced remote archive (Recreate::Never): {}",
+            path.display()
+        ));
     }
     log::warn!(
         "local index cache stale for {}; dropping {}",
@@ -259,7 +295,7 @@ fn drop_stale_local_cache(
         path.display()
     );
     drop_fetched_sidecar(path);
-    true
+    Ok(true)
 }
 
 /// `{url}.index.ptr` is JSON; reject unbounded GETs on a cache-miss remount.
@@ -626,6 +662,32 @@ fn drop_fetched_sidecar(fetched: &Path) {
     }
 }
 
+/// Hash a Range GET body as a tarstats window.
+///
+/// Exact `expected` length (HTTP 206) hashes the body as-is. HTTP 200 /
+/// ignored Range that returns the full archive extracts `[start..=end]`.
+/// Any other length is `None` (fail-open) so a gateway that ignores Range
+/// cannot turn a valid sidecar into a confirmed mismatch.
+fn hash_http_range_window(
+    buf: &[u8],
+    start: u64,
+    end_inclusive: u64,
+    archive_size: u64,
+) -> Option<String> {
+    let expected = end_inclusive.saturating_sub(start).saturating_add(1);
+    if buf.len() as u64 == expected {
+        return hash_hex("sha256", buf);
+    }
+    if buf.len() as u64 == archive_size {
+        let start_us = usize::try_from(start).ok()?;
+        let end_ex = usize::try_from(end_inclusive.checked_add(1)?).ok()?;
+        if start_us < end_ex && end_ex <= buf.len() {
+            return hash_hex("sha256", &buf[start_us..end_ex]);
+        }
+    }
+    None
+}
+
 fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Option<String>) {
     if size == 0 {
         return (None, None, None);
@@ -635,14 +697,14 @@ fn http_fingerprint(url: &str, size: u64) -> (Option<String>, Option<String>, Op
         .min(size.saturating_sub(1));
     let prefix = ratarmount_remote::fetch_http_range_bytes(url, 0, prefix_end)
         .ok()
-        .and_then(|b| hash_hex("sha256", &b));
+        .and_then(|b| hash_http_range_window(&b, 0, prefix_end, size));
     let suffix = if size as usize <= TARSTATS_SAMPLE_BYTES {
         prefix.clone()
     } else {
         let start = size.saturating_sub(TARSTATS_SAMPLE_BYTES as u64);
         ratarmount_remote::fetch_http_range_bytes(url, start, size.saturating_sub(1))
             .ok()
-            .and_then(|b| hash_hex("sha256", &b))
+            .and_then(|b| hash_http_range_window(&b, start, size.saturating_sub(1), size))
     };
     let full = if size <= TARSTATS_FULL_HASH_MAX {
         ratarmount_remote::hash_http_range_sha256(url, 0, size.saturating_sub(1)).ok()
@@ -886,7 +948,7 @@ pub(super) fn open_remote_input(
         RemoteAccess::Http(RemoteHttp::Range(range)) => {
             let len = range.len();
             let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
             let input_owned = input.to_string();
             match open_from_live_range(range, len, input, &opts, recreate, "HTTP Range", || {
                 // Buffered fallback is still Read+Seek-usable for rebuild.
@@ -900,7 +962,7 @@ pub(super) fn open_remote_input(
             let path = remote.path().to_path_buf();
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
             let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
             remotes.push(remote);
             let src = open_path(&path, &opts, recreate)?;
             Ok((path, src))
@@ -933,7 +995,7 @@ where
             let len = range.body_len();
             eprintln!("{transport}: {input} ({len} bytes, live Range)");
             let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
             match open_from_live_range(range, len, input, &opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
@@ -950,7 +1012,7 @@ where
                 "info: {transport} unavailable for {input} (full body buffered); materializing"
             );
             let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None);
+            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
             drop(range);
             materialize_remote_input(input, &opts, recreate, remotes)
         }
@@ -1016,7 +1078,7 @@ fn open_oci_image(
             recreate,
             layer.size,
             Some((&image.location, layer)),
-        );
+        )?;
         let body = layer.open_blob().map_err(|e| e.to_string())?;
         let reopen_layer = layer.clone();
         match open_from_live_range(
@@ -1271,6 +1333,32 @@ mod tests {
         link_on_archive: Option<String>,
         require_cookie: Option<String>,
     ) -> IndexHttp {
+        spawn_index_http_cfg(
+            archive_path,
+            archive_bytes,
+            objects,
+            link_on_archive,
+            require_cookie,
+            false,
+        )
+    }
+
+    fn spawn_index_http_ignore_range(
+        archive_path: &str,
+        archive_bytes: Vec<u8>,
+        objects: std::collections::HashMap<String, Vec<u8>>,
+    ) -> IndexHttp {
+        spawn_index_http_cfg(archive_path, archive_bytes, objects, None, None, true)
+    }
+
+    fn spawn_index_http_cfg(
+        archive_path: &str,
+        archive_bytes: Vec<u8>,
+        objects: std::collections::HashMap<String, Vec<u8>>,
+        link_on_archive: Option<String>,
+        require_cookie: Option<String>,
+        ignore_range: bool,
+    ) -> IndexHttp {
         use std::io::{BufRead, BufReader, Write as IoWrite};
         use std::net::TcpListener;
         use std::sync::{Arc, Mutex};
@@ -1350,20 +1438,22 @@ mod tests {
                 };
                 let body_owned = body.to_vec();
                 let mut range_off: Option<(usize, usize)> = None;
-                if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
-                    let parts: Vec<&str> = r.splitn(2, '-').collect();
-                    if parts.len() == 2 {
-                        let start: usize = parts[0].parse().unwrap_or(0);
-                        let end: usize = if parts[1].is_empty() {
-                            body_owned.len().saturating_sub(1)
-                        } else {
-                            parts[1]
-                                .parse()
-                                .unwrap_or(0)
-                                .min(body_owned.len().saturating_sub(1))
-                        };
-                        if start < body_owned.len() && start <= end {
-                            range_off = Some((start, end));
+                if !ignore_range {
+                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                        let parts: Vec<&str> = r.splitn(2, '-').collect();
+                        if parts.len() == 2 {
+                            let start: usize = parts[0].parse().unwrap_or(0);
+                            let end: usize = if parts[1].is_empty() {
+                                body_owned.len().saturating_sub(1)
+                            } else {
+                                parts[1]
+                                    .parse()
+                                    .unwrap_or(0)
+                                    .min(body_owned.len().saturating_sub(1))
+                            };
+                            if start < body_owned.len() && start <= end {
+                                range_off = Some((start, end));
+                            }
                         }
                     }
                 }
@@ -1448,7 +1538,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(http._join);
         let got = opts
             .index_file_path
@@ -1492,7 +1583,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(http._join);
         let got = opts
             .index_file_path
@@ -1536,7 +1628,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(http._join);
         assert!(
             opts.index_file_path.is_some(),
@@ -1571,7 +1664,8 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             drop(http._join);
             let got = opts
                 .index_file_path
@@ -1623,7 +1717,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(http._join);
         assert!(
             opts.index_file_path.is_some(),
@@ -1661,7 +1756,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(http._join);
         let got = opts
             .index_file_path
@@ -1839,7 +1935,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(s3._join);
         let got = opts
             .index_file_path
@@ -1875,7 +1972,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(s3._join);
         let got = opts
             .index_file_path
@@ -1914,7 +2012,8 @@ mod tests {
             write_index: false,
             ..OpenOptions::default()
         };
-        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None);
+        apply_remote_index_discovery(url, &mut opts, false, archive_bytes.len() as u64, None)
+            .unwrap();
         drop(s3._join);
         assert!(
             opts.index_file_path.is_some(),
@@ -1981,7 +2080,8 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             let first = opts
                 .index_file_path
                 .take()
@@ -1993,7 +2093,8 @@ mod tests {
             // Drop the local well-known copy so the second discovery cannot
             // `path_is_nonempty_file` short-circuit. No `.ptr` is published.
             let _ = fs::remove_file(&first);
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             let second = opts
                 .index_file_path
                 .as_ref()
@@ -2027,11 +2128,13 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             assert!(opts.index_file_path.as_ref().unwrap().is_file());
             let gets1 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             opts.index_file_path = None;
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             let gets2 = well_known_sqlite_gets(&http.gets.lock().unwrap(), "/archive.tar");
             assert_eq!(gets2, gets1, "local nonempty sidecar must skip remote GET");
             drop(http._join);
@@ -2059,7 +2162,8 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             let first = opts
                 .index_file_path
                 .take()
@@ -2067,7 +2171,7 @@ mod tests {
             assert!(first.is_file(), "{}", first.display());
 
             // Publisher replaced the object (new size). Local copy must not win.
-            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None).unwrap();
             assert!(
                 opts.index_file_path.is_none(),
                 "stale local sidecar must not be reused after archive replace"
@@ -2106,7 +2210,7 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, 1024, None);
+            apply_remote_index_discovery(&url, &mut opts, false, 1024, None).unwrap();
             assert!(
                 opts.index_file_path.is_none(),
                 "same-size replace must not reuse hashed sidecar"
@@ -2135,6 +2239,136 @@ mod tests {
             !cached_remote_index_is_stale(&sidecar, "http://127.0.0.1:1/a.tar", 1024, None),
             "matching size + failed fingerprint must fail-open (not stale)"
         );
+    }
+
+    /// Regression: HTTP 200 / ignored Range must hash the requested window,
+    /// not the whole body (that would false-stale a valid >256 KiB sidecar).
+    #[test]
+    fn hash_http_range_window_exact_and_full_body() {
+        let window = vec![0x11u8; TARSTATS_SAMPLE_BYTES];
+        let mut full = vec![0x11u8; TARSTATS_SAMPLE_BYTES];
+        full.resize(TARSTATS_SAMPLE_BYTES + 64 * 1024, 0x22);
+        let archive_size = full.len() as u64;
+        let exact =
+            hash_http_range_window(&window, 0, TARSTATS_SAMPLE_BYTES as u64 - 1, archive_size)
+                .expect("exact window");
+        let extracted =
+            hash_http_range_window(&full, 0, TARSTATS_SAMPLE_BYTES as u64 - 1, archive_size)
+                .expect("full-body extract");
+        assert_eq!(exact, extracted);
+        assert_ne!(
+            Some(extracted.as_str()),
+            hash_hex("sha256", &full).as_deref(),
+            "must not hash the whole ignored-Range body as the prefix window"
+        );
+        assert!(
+            hash_http_range_window(
+                &[0x33; 16],
+                0,
+                TARSTATS_SAMPLE_BYTES as u64 - 1,
+                archive_size
+            )
+            .is_none(),
+            "wrong length must fail-open"
+        );
+    }
+
+    /// Regression: a fetched prefix mismatch is confirmed-stale even when
+    /// suffix/full could not be fetched (large archive, use_full is false).
+    #[test]
+    fn cached_remote_index_is_stale_prefix_mismatch_suffix_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        fs::write(&archive, vec![b'Z'; TARSTATS_FULL_HASH_MAX as usize + 1]).unwrap();
+        let sidecar = dir.path().join("idx.sqlite");
+        fs::write(&sidecar, make_sidecar_for(&archive)).unwrap();
+        let size = TARSTATS_FULL_HASH_MAX + 1;
+        assert!(
+            cached_remote_index_is_stale_fps(&sidecar, size, Some("aa".into()), None, None),
+            "prefix mismatch must be stale even if suffix/full are unavailable"
+        );
+        assert!(
+            !cached_remote_index_is_stale_fps(&sidecar, size, None, None, None),
+            "matching size + no fingerprints must fail-open"
+        );
+    }
+
+    /// Regression: Recreate::Never must not unlink the only sidecar.
+    #[test]
+    fn apply_remote_index_read_only_stale_leaves_sidecar() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            fs::write(&archive, vec![b'N'; 1024]).unwrap();
+            let stale = make_sidecar_for(&archive);
+            let folders = empty_index_folders(dir.path());
+            let loc = resolve_index_location(
+                Path::new("http://127.0.0.1:1/a.tar"),
+                None,
+                &folders,
+                false,
+            );
+            let dest = loc.as_path().expect("folder candidate");
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(dest, &stale).unwrap();
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                read_only_index: true,
+                ..OpenOptions::default()
+            };
+            let err = apply_remote_index_discovery(
+                "http://127.0.0.1:1/a.tar",
+                &mut opts,
+                false,
+                2048,
+                None,
+            )
+            .expect_err("Never + stale must fail the open");
+            assert!(err.contains("Recreate::Never"), "{err}");
+            assert!(
+                path_is_nonempty_file(dest),
+                "Never must leave the stale sidecar on disk"
+            );
+        });
+    }
+
+    /// Regression: Range-ignoring HTTP must not drop a matching large sidecar.
+    #[test]
+    fn apply_remote_index_local_copy_keeps_match_when_range_ignored() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("archive.tar");
+            let archive_bytes = vec![b'L'; TARSTATS_FULL_HASH_MAX as usize + 4096];
+            fs::write(&archive, &archive_bytes).unwrap();
+            let index_bytes = make_sidecar_for(&archive);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.sqlite".into(), index_bytes.clone());
+            let http =
+                spawn_index_http_ignore_range("/archive.tar", archive_bytes.clone(), objects);
+            let url = format!("http://{}/archive.tar", http.addr);
+            let loc = resolve_index_location(Path::new(&url), None, &folders, false);
+            let dest = loc.as_path().expect("folder candidate");
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            fs::write(dest, &index_bytes).unwrap();
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
+            assert!(
+                path_is_nonempty_file(dest),
+                "matching sidecar must survive HTTP 200 / ignored Range"
+            );
+            drop(http._join);
+        });
     }
 
     /// Regression: a stored full hash compared to None is fail-open, not stale.
@@ -2191,7 +2425,8 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery("http://127.0.0.1:1/a.tar", &mut opts, false, 2048, None);
+            apply_remote_index_discovery("http://127.0.0.1:1/a.tar", &mut opts, false, 2048, None)
+                .unwrap();
             match old_dir {
                 Some(v) => std::env::set_var(ratarmount_index::LOCAL_INDEX_DIR_ENV, v),
                 None => std::env::remove_var(ratarmount_index::LOCAL_INDEX_DIR_ENV),
@@ -2242,7 +2477,7 @@ mod tests {
                 ..OpenOptions::default()
             };
             // Wrong archive size → tarstats fail after decompress.
-            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None).unwrap();
             assert!(
                 opts.index_file_path.is_none(),
                 "mismatched gzip sidecar must not install"
@@ -2254,7 +2489,7 @@ mod tests {
             };
             let gets1 = gz_gets(&http.gets.lock().unwrap());
             assert!(gets1 >= 1, "first discovery must GET the gzip sidecar");
-            apply_remote_index_discovery(&url, &mut opts, false, 2048, None);
+            apply_remote_index_discovery(&url, &mut opts, false, 2048, None).unwrap();
             let gets2 = gz_gets(&http.gets.lock().unwrap());
             assert!(
                 gets2 > gets1,
@@ -2292,7 +2527,8 @@ mod tests {
                 write_index: false,
                 ..OpenOptions::default()
             };
-            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None)
+                .unwrap();
             let got = opts.index_file_path.clone();
             let flattened = ratarmount_index::possible_index_paths(
                 Path::new(&url),
