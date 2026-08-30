@@ -1435,41 +1435,43 @@ mod tests {
     /// Regression: pointer blob tarstats mismatch continues to well-known sibling.
     #[test]
     fn apply_remote_index_discovery_pointer_tarstats_fail_falls_back_well_known() {
-        let dir = tempfile::tempdir().unwrap();
-        let good = dir.path().join("good.tar");
-        let bad = dir.path().join("bad.tar");
-        let archive_bytes = vec![b'D'; 1024];
-        fs::write(&good, &archive_bytes).unwrap();
-        fs::write(&bad, vec![b'X'; 64]).unwrap();
-        let good_idx = make_sidecar_for(&good);
-        let bad_idx = make_sidecar_for(&bad);
-        let bad_id = ratarmount_index::sha256_hex(&bad_idx);
-        let ptr = pointer_json_for_blob(&bad_idx);
-        let folders = empty_index_folders(dir.path());
-        let mut objects = std::collections::HashMap::new();
-        objects.insert("/archive.tar.index.ptr".into(), ptr);
-        objects.insert(format!("/archive.tar.index.{bad_id}.sqlite"), bad_idx);
-        objects.insert("/archive.tar.index.sqlite".into(), good_idx.clone());
-        let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let good = dir.path().join("good.tar");
+            let bad = dir.path().join("bad.tar");
+            let archive_bytes = vec![b'D'; 1024];
+            fs::write(&good, &archive_bytes).unwrap();
+            fs::write(&bad, vec![b'X'; 64]).unwrap();
+            let good_idx = make_sidecar_for(&good);
+            let bad_idx = make_sidecar_for(&bad);
+            let bad_id = ratarmount_index::sha256_hex(&bad_idx);
+            let ptr = pointer_json_for_blob(&bad_idx);
+            let folders = empty_index_folders(dir.path());
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("/archive.tar.index.ptr".into(), ptr);
+            objects.insert(format!("/archive.tar.index.{bad_id}.sqlite"), bad_idx);
+            objects.insert("/archive.tar.index.sqlite".into(), good_idx.clone());
+            let http = spawn_index_http("/archive.tar", archive_bytes.clone(), objects, None, None);
 
-        let url = format!("http://{}/archive.tar", http.addr);
-        let mut opts = OpenOptions {
-            index_folders: folders,
-            write_index: false,
-            ..OpenOptions::default()
-        };
-        apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
-        drop(http._join);
-        let got = opts
-            .index_file_path
-            .as_ref()
-            .expect("well-known must install after pointer tarstats fail");
-        assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
-        let gets = http.gets.lock().unwrap().clone();
-        assert!(
-            well_known_get_logged(&gets, "/archive.tar"),
-            "well-known GET after tarstats fail; gets={gets:?}"
-        );
+            let url = format!("http://{}/archive.tar", http.addr);
+            let mut opts = OpenOptions {
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            apply_remote_index_discovery(&url, &mut opts, false, archive_bytes.len() as u64, None);
+            drop(http._join);
+            let got = opts
+                .index_file_path
+                .as_ref()
+                .expect("well-known must install after pointer tarstats fail");
+            assert_eq!(fs::metadata(got).unwrap().len(), good_idx.len() as u64);
+            let gets = http.gets.lock().unwrap().clone();
+            assert!(
+                well_known_get_logged(&gets, "/archive.tar"),
+                "well-known GET after tarstats fail; gets={gets:?}"
+            );
+        });
     }
 
     /// Regression: HTTP pointer + blob use the authenticated client (Cookie).

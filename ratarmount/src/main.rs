@@ -838,6 +838,7 @@ fn main() {
                     .collect()
             })
             .unwrap_or_default(),
+        index_build: Default::default(),
     };
 
     if args.force_folder_index {

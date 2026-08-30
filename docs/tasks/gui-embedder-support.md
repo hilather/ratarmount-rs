@@ -5,7 +5,7 @@
 | **Author** | Grok (design) |
 | **Date** | 2026-08-29 |
 | **Status** | Accepted |
-| **Engine version** | ratarmount-rs **0.1.29** |
+| **Engine version** | ratarmount-rs **0.1.30** |
 | **Consumer** | [`ratarmount-rs-gui`](https://github.com/hilather/ratarmount-rs-gui) (GPUIX desktop explorer) |
 | **Canonical path** | [`docs/tasks/gui-embedder-support.md`](gui-embedder-support.md) |
 | **Related** | [`docs/crates-io-policy.md`](../crates-io-policy.md), [`docs/session-api.md`](../session-api.md) (G0.1), GUI `docs/architecture/01-architecture.md`, `02-index-storage.md`, `05-napi-contract.md` |
