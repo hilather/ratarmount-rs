@@ -13,14 +13,14 @@ Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), 
 | Types (`SourceSpec`, `OpenRequest`, `DirCursor`, `FindCursor`, `DirEnt`, …) | **compile** | G0.1 |
 | `Error` (no `Busy`) | **compile** | G0.1 |
 | `Session` (`Send + Sync`, no `Clone`) | **`open` / `list_dirents_page` / `lookup` / `read_range` / `extract_to` / `find` / `Drop`** | G1.1–G1.6 / G3 |
-| `IndexJob` unit struct | **stub** | G0.1; `run` in G2 |
+| `IndexJob` | **`run` (blocking)** | G2 |
 | `RangeReader` | **`Read + Send`** (capped; not `Sync`; no member `Vec`) | G1.4 |
 | `Session::open` | **implemented** (catalog via `open_catalog_read_only`) | G1.1 |
-| `open_with_job` | not implemented | G2 |
+| `open_with_job` | **implemented** (`OpenOptions.index_build` hooks) | G2 |
 | `list_dirents_page` / `lookup` | **implemented** (SQL keyset; no `list()` dump) | G1.2 / G1.3 |
 | `read_range` / `extract_to` | **implemented** (fill-loop + 64 KiB copy; no slurp) | G1.4 / G1.5 |
 | `Session::find` | **implemented** (SQL `FindAfter` keyset; CLI first page still 10_000) | G3 |
-| `IndexJob::run` | not implemented | G2 |
+| `IndexJob::run` | **implemented** (Always rebuild; cancel never `publish_tmp`) | G2 |
 | `resolve_index` | not implemented — Sibling still uses factory `resolve_index_location` | G4 / PR6 |
 | Factory (`open_path`, `build_mount_source_ex`) | **`pub mod factory`** (CLI share; Session remains the embedder API) | PR2 |
 | Format crates (TAR/ZIP/7z/… including libarchive/git) | default `formats` feature (full L2 set factory `use`s) | PR2 |
@@ -131,7 +131,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 `Session` is a blocking, `Send + Sync` façade. Embedders that need a job id run it on a worker thread. **Do not `Clone` a session** — use `Arc<Session>`. `Drop` is the close API; there is no `close(self)`. Napi `close(sessionId)` drops the handle-table `Arc`.
 
-**Landed (G1.1–G1.7 / G3):** `open`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `find`, `Drop`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
+**Landed (G1.1–G1.7 / G2 / G3):** `open`, `open_with_job`, `list_dirents_page`, `lookup`, `read_range`, `extract_to`, `find`, `Drop`, `IndexJob::run`. Catalog is a second SQL-only `SqliteIndex` (`open_catalog_read_only`: no harness `println`, no second `MemIndex`) when the sidecar is a path-backed 0.7.x file. Compact-only / `:memory:` / Folder fall back to per-directory `MountSource::list_dirents` (never `list()`). `Recreate::Never` preflights missing/tarstats and TAR factory will not `create_index` when `read_only_index` is set.
 
 **`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
 
@@ -141,7 +141,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 **`Drop`:** if this session holds the unique `Arc` to the mount source, `MountSource::close` runs. The catalog RO connection is dropped (no `publish_tmp`). `IndexPolicy::Temp` unlinks the temp sqlite.
 
-**Not in this slice:** `IndexJob::run`, `open_with_job`, `resolve_index` / `SiblingNotWritable`.
+**Not in this slice:** `resolve_index` / `SiblingNotWritable`.
 
 ```rust
 impl Session {
@@ -266,6 +266,8 @@ impl IndexJob {
 ```
 
 Cancel is cooperative. Cancel **never** `publish_tmp`; `Drop` unlinks `{dest}.tmp.{pid}.{seq}` and the previous sidecar stays valid (V-2a). CLI `--no-mount` control flow (hashes / `--publish-index` / `-w`) stays in `main.rs` — not folded into `IndexJob` in v1.
+
+Progress: one `Scan` at `open_with_job` start, one Write tick per `insert_files_batch_soa` (512 rows) and/or every 8 MiB of TAR `pos`, one `Finalize` before `publish_tmp`. `IndexBuildHooks` live on `OpenOptions.index_build`; TAR/ZIP/7z call `index.set_build_hooks` after `create_writable_for_open`.
 
 Normal `IndexJob` does **not** create `files_fts`. FTS is opt-in (`FindOpts.fts` / `fts:` prefix).
 

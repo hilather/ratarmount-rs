@@ -1243,11 +1243,11 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G2.1** | Index-build guts as `IndexJob::run`; `--no-mount` control flow stays in `main.rs` (hashes/publish/overlay not in the job) | M | proposed |
-| **G2.2** | Progress callback / channel of `IndexProgress` | M | proposed |
-| **G2.3** | Cooperative cancel; tmp+rename fail-closed | M | proposed |
-| **G2.4** | `Recreate::IfInvalid` via tarstats | S | proposed |
-| **G2.5** | Test: cancel at 50%, dest sidecar valid | M | proposed |
+| **G2.1** | Index-build guts as `IndexJob::run`; `--no-mount` control flow stays in `main.rs` (hashes/publish/overlay not in the job) | M | **landed (PR5)** |
+| **G2.2** | Progress callback / channel of `IndexProgress` | M | **landed (PR5)** — `IndexBuildHooks` / `IndexBuildTick` on `OpenOptions` |
+| **G2.3** | Cooperative cancel; tmp+rename fail-closed | M | **landed (PR5)** — `IndexError::Cancelled`; never `publish_tmp` |
+| **G2.4** | `Recreate::IfInvalid` via tarstats | S | **landed (PR3 factory + PR5 `IndexJob` Always)** |
+| **G2.5** | Test: cancel at 50%, dest sidecar valid | M | **landed (PR5)** — `index_job_cancel` + ≥2048 progress |
 
 ### Phase G3 — Find / FTS
 
@@ -1290,8 +1290,8 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G7.1** | Index written by `IndexJob` mounts with CLI | S | proposed |
-| **G7.2** | Index written by CLI opened by `Session::open` | S | proposed |
+| **G7.1** | Index written by `IndexJob` mounts with CLI | S | **landed (PR5)** — in-process `factory::open_path` |
+| **G7.2** | Index written by CLI opened by `Session::open` | S | **landed (PR5)** — `Recreate::Never` of factory sidecar |
 | **G7.3** | Python 0.7.x sidecar still opens (TAR/ZIP/7z) | M | proposed |
 
 ### Acceptance (engine ready for GUI W2)
@@ -1369,6 +1369,7 @@ W2 is **not** unblocked until extract, capped `read_range`, IndexJob, and Siblin
 - **Files:** `ratarmount-core` `IndexBuildHooks` on `OpenOptions`; `ratarmount-index` `set_build_hooks` + `IndexError::Cancelled` + cancel check at `insert_files_batch_soa`; TAR header loop one-line + byte ticks; format `set_build_hooks` after `create_writable`; `IndexJob::run` / `Session::open_with_job`; G2.5 (≥2048 members or stub observer) + **G7.1/G7.2**
 - **Depends on:** PR 3 (can land immediately after PR4 or in parallel once PR3 is in, but W2 waits for both PR4 and PR5)
 - **Changes:** Blocking `run` only. `--no-mount` **control flow stays in `main.rs`** (hashes/publish/overlay still wrap the build). Cancel never `publish_tmp`. Progress ≥ 4 events on the G2.5 fixture — not the 1k TAR.
+- **Status:** **landed**
 
 ### PR 6 — G4.1 + G4.2: `resolve_index` + `SiblingNotWritable` (**W2**)
 

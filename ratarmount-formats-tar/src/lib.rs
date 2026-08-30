@@ -25,8 +25,8 @@ use ratarmount_compress::{
     FileSegment, SeekRead, SeekableBody, SegmentedFile, SharedSeekableGzip, StenciledFile,
 };
 use ratarmount_core::{
-    normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
-    OpenOptions, SQLiteIndexedTarUserData, UserData,
+    normpath, CheapDirent, CheapSearchHit, FileInfo, IndexBuildTick, ListModeResult, ListResult,
+    MountSource, OpenOptions, SQLiteIndexedTarUserData, UserData,
 };
 use ratarmount_index::{FileRowSoa, IndexError, SqliteIndex};
 use tempfile::NamedTempFile;
@@ -475,6 +475,7 @@ impl SqliteIndexedTar {
         let t0 = Instant::now();
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        index.set_build_hooks(options.index_build.clone());
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(&mut reader, &index, options)?;
 
@@ -602,6 +603,7 @@ impl SqliteIndexedTar {
         let t0 = Instant::now();
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        index.set_build_hooks(options.index_build.clone());
         index.begin_write()?;
         let is_gnu_incremental = parse_tar_into_index(reader, &index, options)?;
 
@@ -1051,6 +1053,30 @@ fn store_arguments(index: &SqliteIndex, options: &OpenOptions) -> Result<()> {
 
 /// Flush threshold for batched SQLite inserts during TAR parse.
 const BATCH_FLUSH: usize = 512;
+/// Write-tick cadence for [`OpenOptions::index_build`] during the header loop.
+const BUILD_TICK_BYTES: u64 = 8 * 1024 * 1024;
+
+fn check_build_cancel(options: &OpenOptions) -> Result<()> {
+    if options.index_build.is_cancelled() {
+        Err(IndexError::Cancelled.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn maybe_byte_tick(options: &OpenOptions, pos: u64, entries: u64, last_pos: &mut u64) {
+    let bucket = pos / BUILD_TICK_BYTES;
+    let last_bucket = *last_pos / BUILD_TICK_BYTES;
+    if bucket > last_bucket {
+        *last_pos = pos;
+        options.index_build.emit(IndexBuildTick {
+            phase: IndexBuildTick::PHASE_WRITE,
+            bytes_scanned: pos,
+            bytes_total_hint: None,
+            entries,
+        });
+    }
+}
 
 fn pad512(n: u64) -> u64 {
     n.div_ceil(BLOCK_SIZE) * BLOCK_SIZE
@@ -1509,9 +1535,13 @@ fn parse_tar_from<R: Read + Seek>(
     let mut dumpdir_state: std::collections::HashMap<String, std::collections::HashSet<String>> =
         std::collections::HashMap::new();
 
-    let flush = |batch: &mut FileRowSoa| -> Result<()> {
+    let mut flushed_entries: u64 = 0;
+    let mut last_tick_pos: u64 = 0;
+    let flush = |batch: &mut FileRowSoa, flushed: &mut u64| -> Result<()> {
         if !batch.is_empty() {
+            let n = batch.len() as u64;
             index.insert_files_batch_soa(batch)?;
+            *flushed += n;
             batch.clear();
         }
         Ok(())
@@ -1525,6 +1555,13 @@ fn parse_tar_from<R: Read + Seek>(
     };
 
     loop {
+        check_build_cancel(options)?;
+        maybe_byte_tick(
+            options,
+            pos,
+            flushed_entries + batch.len() as u64,
+            &mut last_tick_pos,
+        );
         reader.seek(SeekFrom::Start(pos))?;
         let n = reader.read(&mut header)?;
         if n == 0 {
@@ -1790,7 +1827,7 @@ fn parse_tar_from<R: Read + Seek>(
             push_xattr_rows(&mut xattr_batch, member_header_start, &member_fs_xattrs);
         }
         if batch.len() >= BATCH_FLUSH {
-            flush(&mut batch)?;
+            flush(&mut batch, &mut flushed_entries)?;
         }
         if xattr_batch.len() >= BATCH_FLUSH {
             flush_xattrs(&mut xattr_batch)?;
@@ -1810,7 +1847,7 @@ fn parse_tar_from<R: Read + Seek>(
         let _ = mtime; // used
     }
 
-    flush(&mut batch)?;
+    flush(&mut batch, &mut flushed_entries)?;
     flush_xattrs(&mut xattr_batch)?;
 
     // Keep prefix nested TAR side-list (data offset < parse start). Suffix

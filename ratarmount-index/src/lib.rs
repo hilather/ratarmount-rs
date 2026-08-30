@@ -45,12 +45,12 @@ pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFA
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use ratarmount_core::{
-    create_root_file_info, query_normpath, FileInfo, SQLiteIndexedTarUserData, UserData, S_IFDIR,
-    S_IFMT,
+    create_root_file_info, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick,
+    SQLiteIndexedTarUserData, UserData, S_IFDIR, S_IFMT,
 };
 use rusqlite::{params, Connection, OpenFlags, OptionalExtension, Row};
 use thiserror::Error;
@@ -177,6 +177,8 @@ pub enum IndexError {
     Remote(String),
     #[error("index is not open")]
     NotOpen,
+    #[error("cancelled")]
+    Cancelled,
 }
 
 pub type Result<T> = std::result::Result<T, IndexError>;
@@ -454,6 +456,9 @@ pub struct SqliteIndex {
     /// [`Self::publish_tmp`], for `:memory:`, compact-only, and in-place
     /// [`Self::open_writable`]. Drop of an unpublished tmp unlinks tmp only.
     publish_target: Option<PathBuf>,
+    build_hooks: Mutex<IndexBuildHooks>,
+    build_entries: AtomicU64,
+    build_bytes_scanned: AtomicU64,
 }
 
 /// Monotonic suffix so two [`SqliteIndex::create_writable`] calls in one process
@@ -621,6 +626,9 @@ impl SqliteIndex {
             mem_builder: Mutex::new(None),
             compact_only: false,
             publish_target: None,
+            build_hooks: Mutex::new(IndexBuildHooks::default()),
+            build_entries: AtomicU64::new(0),
+            build_bytes_scanned: AtomicU64::new(0),
         };
         idx.validate_loaded()?;
         if load_mem {
@@ -686,6 +694,9 @@ impl SqliteIndex {
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
             compact_only: false,
             publish_target,
+            build_hooks: Mutex::new(IndexBuildHooks::default()),
+            build_entries: AtomicU64::new(0),
+            build_bytes_scanned: AtomicU64::new(0),
         })
     }
 
@@ -706,6 +717,9 @@ impl SqliteIndex {
             mem_builder: Mutex::new(Some(MemIndexBuilder::new())),
             compact_only: true,
             publish_target: None,
+            build_hooks: Mutex::new(IndexBuildHooks::default()),
+            build_entries: AtomicU64::new(0),
+            build_bytes_scanned: AtomicU64::new(0),
         })
     }
 
@@ -725,6 +739,34 @@ impl SqliteIndex {
             return Self::create_writable(Some(p));
         }
         Self::create_writable(None)
+    }
+
+    /// Install progress/cancel hooks for a cold build. Called by formats after
+    /// [`Self::create_writable`] / [`Self::create_writable_for_open`].
+    pub fn set_build_hooks(&self, hooks: IndexBuildHooks) {
+        let mut guard = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
+        *guard = hooks;
+    }
+
+    fn build_cancelled(&self) -> Result<()> {
+        let hooks = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
+        if hooks.is_cancelled() {
+            Err(IndexError::Cancelled)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn emit_build_tick(&self, phase: u8) {
+        let entries = self.build_entries.load(Ordering::Relaxed);
+        let bytes_scanned = self.build_bytes_scanned.load(Ordering::Relaxed);
+        let hooks = self.build_hooks.lock().unwrap_or_else(|p| p.into_inner());
+        hooks.emit(IndexBuildTick {
+            phase,
+            bytes_scanned,
+            bytes_total_hint: None,
+            entries,
+        });
     }
 
     fn file_count_db(&self) -> Result<u64> {
@@ -940,6 +982,9 @@ impl SqliteIndex {
             mem_builder: Mutex::new(None),
             compact_only: true,
             publish_target: None,
+            build_hooks: Mutex::new(IndexBuildHooks::default()),
+            build_entries: AtomicU64::new(0),
+            build_bytes_scanned: AtomicU64::new(0),
         })
     }
 
@@ -1172,6 +1217,7 @@ impl SqliteIndex {
         if self.publish_target.is_none() || self.compact_only {
             return Ok(());
         }
+        self.build_cancelled()?;
         if self.read_only {
             self.publish_target = None;
             return Ok(());
@@ -1188,6 +1234,7 @@ impl SqliteIndex {
             }
         };
 
+        self.emit_build_tick(IndexBuildTick::PHASE_FINALIZE);
         self.finalize_build()?;
         self.with_conn(|conn| {
             // Drop intermediary tables so Python's completeness check accepts the index.
@@ -1264,9 +1311,11 @@ impl SqliteIndex {
     /// `--index-minimum-file-count`) hit `database is locked` while the mount still
     /// holds the index.
     pub fn into_read_only(mut self) -> Result<Self> {
+        self.build_cancelled()?;
         if self.publish_target.is_some() {
             self.publish_tmp()?;
         } else {
+            self.emit_build_tick(IndexBuildTick::PHASE_FINALIZE);
             self.finalize_build()?;
             if !self.read_only {
                 if !self.compact_only {
@@ -2100,7 +2149,12 @@ impl SqliteIndex {
     /// Does **not** clear `rows` — callers must [`FileRowSoa::clear`] after each flush
     /// so the window pool stays *O(512)*. Reconstructs one [`FileRow`] at a time only
     /// for [`MemIndexBuilder::push_row`]. Does not allocate a temporary `Vec<FileRow>`.
+    ///
+    /// Checks [`IndexBuildHooks::cancel`] at the start. Cancel never reaches
+    /// [`Self::publish_tmp`] (Drop unlinks tmp). Emits a Write tick when the
+    /// window is non-empty.
     pub fn insert_files_batch_soa(&self, rows: &FileRowSoa) -> Result<()> {
+        self.build_cancelled()?;
         if rows.is_empty() {
             return Ok(());
         }
@@ -2141,6 +2195,18 @@ impl SqliteIndex {
                 }
             }
         }
+        let n = rows.len() as u64;
+        self.build_entries.fetch_add(n, Ordering::Relaxed);
+        if let Some(&oh) = rows.offsetheader.last() {
+            if oh >= 0 {
+                let b = oh as u64;
+                let prev = self.build_bytes_scanned.load(Ordering::Relaxed);
+                if b > prev {
+                    self.build_bytes_scanned.store(b, Ordering::Relaxed);
+                }
+            }
+        }
+        self.emit_build_tick(IndexBuildTick::PHASE_WRITE);
         Ok(())
     }
 
@@ -2172,6 +2238,9 @@ impl SqliteIndex {
             mem_builder: Mutex::new(None),
             compact_only: false,
             publish_target: None,
+            build_hooks: Mutex::new(IndexBuildHooks::default()),
+            build_entries: AtomicU64::new(0),
+            build_bytes_scanned: AtomicU64::new(0),
         };
         idx.validate_loaded()?;
         Ok(idx)
@@ -4754,5 +4823,116 @@ mod tests {
         let n00: Vec<_> = all.iter().filter(|r| r.fullpath == "/n00.txt").collect();
         assert_eq!(n00.len(), 1);
         assert_eq!(n00[0].offsetheader, 100, "higher offsetheader wins");
+    }
+
+    fn soa_window(start: usize, n: usize) -> FileRowSoa {
+        let mut soa = FileRowSoa::with_capacity(n);
+        for i in 0..n {
+            let k = start + i;
+            soa.push(
+                "/",
+                &format!("f{k:04}.txt"),
+                (k as i64) * 1024,
+                (k as i64) * 1024 + 512,
+                1,
+                0.0,
+                0o100644,
+                i64::from(b'0'),
+                "",
+                0,
+                0,
+                false,
+                false,
+                false,
+                0,
+            );
+        }
+        soa
+    }
+
+    /// Regression: injected hooks see start (optional), N batch Write ticks, Finalize.
+    #[test]
+    fn regression_index_build_hooks_progress_ticks() {
+        use std::sync::{Arc, Mutex};
+        let ticks = Arc::new(Mutex::new(Vec::new()));
+        let ticks_cb = Arc::clone(&ticks);
+        let hooks = IndexBuildHooks {
+            on_progress: Some(Arc::new(move |t: IndexBuildTick| {
+                ticks_cb.lock().unwrap().push(t);
+            })),
+            cancel: None,
+        };
+        let idx = SqliteIndex::create_writable(None).unwrap();
+        idx.set_build_hooks(hooks);
+        idx.begin_write().unwrap();
+        for i in 0..4 {
+            let soa = soa_window(i * 512, 512);
+            idx.insert_files_batch_soa(&soa).unwrap();
+        }
+        idx.store_versions("0.1.0").unwrap();
+        idx.commit_write().unwrap();
+        let _ = idx.into_read_only().unwrap();
+        let got = ticks.lock().unwrap().clone();
+        assert!(
+            got.len() >= 4,
+            "G2.5: need ≥4 events (4 Write + Finalize), got {got:?}"
+        );
+        let writes = got
+            .iter()
+            .filter(|t| t.phase == IndexBuildTick::PHASE_WRITE)
+            .count();
+        assert_eq!(writes, 4, "one Write tick per 512-row batch: {got:?}");
+        assert_eq!(got.last().unwrap().phase, IndexBuildTick::PHASE_FINALIZE);
+        assert_eq!(got.last().unwrap().entries, 2048);
+    }
+
+    /// Regression: cancel at insert_files_batch_soa start never publishes tmp.
+    #[test]
+    fn regression_cancel_does_not_publish_tmp() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("keep.index.sqlite");
+        {
+            let idx = SqliteIndex::create_writable(Some(&dest)).unwrap();
+            idx.begin_write().unwrap();
+            idx.insert_files_batch(&[one_file_row()]).unwrap();
+            idx.store_versions("0.1.0").unwrap();
+            idx.commit_write().unwrap();
+            let _ = idx.into_read_only().unwrap();
+        }
+        let before = std::fs::read(&dest).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let hooks = IndexBuildHooks {
+            on_progress: None,
+            cancel: Some(Arc::clone(&cancel)),
+        };
+        let writer = SqliteIndex::create_writable(Some(&dest)).unwrap();
+        writer.set_build_hooks(hooks);
+        let tmp = writer.path().expect("tmp").to_path_buf();
+        assert!(tmp.exists());
+        writer.begin_write().unwrap();
+        let first = soa_window(0, 512);
+        writer.insert_files_batch_soa(&first).unwrap();
+        cancel.store(true, Ordering::Relaxed);
+        let second = soa_window(512, 512);
+        let err = writer
+            .insert_files_batch_soa(&second)
+            .expect_err("cancel must fail the next batch");
+        assert!(
+            matches!(err, IndexError::Cancelled),
+            "expected Cancelled, got {err:?}"
+        );
+        drop(writer);
+        assert!(!tmp.exists(), "Drop must unlink unpublished tmp");
+        let leftover: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp."))
+            .collect();
+        assert!(leftover.is_empty(), "tmp leftovers: {leftover:?}");
+        let after = std::fs::read(&dest).unwrap();
+        assert_eq!(before, after, "dest sidecar must stay the previous file");
     }
 }

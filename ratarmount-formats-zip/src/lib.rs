@@ -852,6 +852,7 @@ impl ZipMountSource {
         options: &OpenOptions,
     ) -> Result<(SqliteIndex, ZipMemberTable)> {
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        index.set_build_hooks(options.index_build.clone());
         index.begin_write()?;
         let mut members = ZipMemberTable::with_capacity(archive.len());
         let mut generated_dirs: std::collections::BTreeSet<String> =

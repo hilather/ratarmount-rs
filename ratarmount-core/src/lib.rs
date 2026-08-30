@@ -4,6 +4,8 @@ use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read, Seek};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 
 /// Per-backend decompression thread matrix (Python `-P` / `--parallelization`).
 ///
@@ -293,6 +295,58 @@ pub struct StatFs {
     pub namemax: u64,
 }
 
+/// Cooperative progress/cancel for a cold index build (G2).
+///
+/// Tiny L0 type so format crates do not grow a second observer trait. Empty
+/// [`Default`] is a no-op (CLI `--no-mount` without an embedder).
+#[derive(Clone, Default)]
+pub struct IndexBuildHooks {
+    pub on_progress: Option<Arc<dyn Fn(IndexBuildTick) + Send + Sync>>,
+    pub cancel: Option<Arc<AtomicBool>>,
+}
+
+impl IndexBuildHooks {
+    /// True when the cooperative cancel flag is set.
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel
+            .as_ref()
+            .is_some_and(|c| c.load(Ordering::Relaxed))
+    }
+
+    /// Invoke [`Self::on_progress`] when present.
+    pub fn emit(&self, tick: IndexBuildTick) {
+        if let Some(cb) = &self.on_progress {
+            cb(tick);
+        }
+    }
+}
+
+impl fmt::Debug for IndexBuildHooks {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("IndexBuildHooks")
+            .field("on_progress", &self.on_progress.as_ref().map(|_| "<fn>"))
+            .field("cancel", &self.cancel)
+            .finish()
+    }
+}
+
+/// One index-build progress event. `phase`: 0 Scan, 1 Write, 2 Fts, 3 Finalize.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct IndexBuildTick {
+    /// 0 = Scan, 1 = Write, 2 = Fts, 3 = Finalize (session maps to `IndexPhase`).
+    pub phase: u8,
+    pub bytes_scanned: u64,
+    pub bytes_total_hint: Option<u64>,
+    pub entries: u64,
+}
+
+impl IndexBuildTick {
+    pub const PHASE_SCAN: u8 = 0;
+    pub const PHASE_WRITE: u8 = 1;
+    pub const PHASE_FTS: u8 = 2;
+    pub const PHASE_FINALIZE: u8 = 3;
+}
+
 /// Options for opening archives (subset of Python `open_mount_source` kwargs).
 #[derive(Clone)]
 pub struct OpenOptions {
@@ -336,6 +390,8 @@ pub struct OpenOptions {
     /// Content hash algorithms to compute and store as index xattrs (`--hashes`).
     /// Values match Python CLI names, e.g. `crc32`, `md5`, `sha1`, `sha256`.
     pub hashes: Vec<String>,
+    /// Progress/cancel for a cold SQLite index build. Empty = no-op.
+    pub index_build: IndexBuildHooks,
 }
 
 impl Default for OpenOptions {
@@ -362,6 +418,7 @@ impl Default for OpenOptions {
             read_only_index: false,
             force_folder_index: false,
             hashes: Vec::new(),
+            index_build: IndexBuildHooks::default(),
         }
     }
 }
@@ -399,6 +456,7 @@ impl fmt::Debug for OpenOptions {
             .field("read_only_index", &self.read_only_index)
             .field("force_folder_index", &self.force_folder_index)
             .field("hashes", &self.hashes)
+            .field("index_build", &self.index_build)
             .finish()
     }
 }

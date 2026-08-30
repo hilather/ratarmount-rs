@@ -413,6 +413,7 @@ impl SevenZipMountSource {
         }
 
         let index = SqliteIndex::create_writable_for_open(index_path, options)?;
+        index.set_build_hooks(options.index_build.clone());
         index.begin_write()?;
 
         let mut batch = FileRowSoa::with_capacity(512);

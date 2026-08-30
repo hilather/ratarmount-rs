@@ -157,6 +157,25 @@ pub struct IndexProgress {
     pub message: Option<String>,
 }
 
+impl IndexProgress {
+    /// Map a core [`ratarmount_core::IndexBuildTick`] (u8 phase) onto [`IndexPhase`].
+    pub fn from_tick(tick: ratarmount_core::IndexBuildTick) -> Self {
+        Self {
+            phase: match tick.phase {
+                0 => IndexPhase::Scan,
+                1 => IndexPhase::Write,
+                2 => IndexPhase::Fts,
+                3 => IndexPhase::Finalize,
+                _ => IndexPhase::Write,
+            },
+            bytes_scanned: tick.bytes_scanned,
+            bytes_total_hint: tick.bytes_total_hint,
+            entries: tick.entries,
+            message: None,
+        }
+    }
+}
+
 /// Locate options. `ensure_fts5` runs only when [`Self::fts`] is set, never as a
 /// side effect of open. [`Self::limit`] `0` means the session default page (200).
 #[derive(Clone, Debug, PartialEq, Eq, Default)]

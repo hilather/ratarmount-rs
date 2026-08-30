@@ -6,7 +6,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-use ratarmount_core::{is_dir_mode, query_normpath, FileInfo, MountSource, OpenOptions, UserData};
+use ratarmount_core::{
+    is_dir_mode, query_normpath, FileInfo, IndexBuildHooks, IndexBuildTick, MountSource,
+    OpenOptions, UserData,
+};
 use ratarmount_index::{
     resolve_index_location, IndexError, IndexLocation, PagedDirent, SqliteIndex, MAX_DIR_PAGE,
 };
@@ -106,6 +109,26 @@ impl Session {
     /// SiblingNotWritable is PR6; do not add a Session `:memory:` fallback.
     /// [`Recreate::Never`] never builds and never falls back to `:memory:`.
     pub fn open(req: OpenRequest) -> Result<Self, Error> {
+        Self::open_with_job(req, &IndexBuildHooks::default())
+    }
+
+    /// Same as [`Self::open`] with progress/cancel hooks copied onto
+    /// [`OpenOptions::index_build`].
+    pub fn open_with_job(req: OpenRequest, hooks: &IndexBuildHooks) -> Result<Self, Error> {
+        if hooks.is_cancelled() {
+            return Err(Error::Cancelled);
+        }
+        let bytes_total_hint = match &req.source {
+            SourceSpec::Path(p) => std::fs::metadata(p).ok().map(|m| m.len()),
+            SourceSpec::Url(_) => None,
+        };
+        hooks.emit(IndexBuildTick {
+            phase: IndexBuildTick::PHASE_SCAN,
+            bytes_scanned: 0,
+            bytes_total_hint,
+            entries: 0,
+        });
+
         let (clear_index_cache, write_index, read_only_index) = match req.recreate {
             Recreate::Always => (true, true, false),
             Recreate::IfInvalid => (false, true, false),
@@ -165,6 +188,7 @@ impl Session {
             index_in_memory,
             index_file_path,
             index_folders,
+            index_build: hooks.clone(),
             ..OpenOptions::default()
         };
 
@@ -327,6 +351,13 @@ impl Session {
             loc: CatalogLoc::None,
         }
     }
+
+    pub(crate) fn index_location(&self) -> IndexLocation {
+        match &self.loc {
+            CatalogLoc::Path(p) | CatalogLoc::Temp(p) => IndexLocation::Path(p.clone()),
+            CatalogLoc::Memory | CatalogLoc::None => IndexLocation::Memory,
+        }
+    }
 }
 
 impl Drop for Session {
@@ -438,7 +469,9 @@ fn open_catalog_if_path(loc: &CatalogLoc) -> Result<Option<SqliteIndex>, Error> 
 
 fn map_factory_error(msg: String, had_passwords: bool, archive: &Path) -> Error {
     let lower = msg.to_ascii_lowercase();
-    if lower.starts_with("not found") || lower.contains("not found:") {
+    if lower == "cancelled" || lower.contains("cancelled") {
+        Error::Cancelled
+    } else if lower.starts_with("not found") || lower.contains("not found:") {
         Error::NotFound
     } else if lower.contains("permission denied") || lower.contains("eacces") {
         if had_passwords {
