@@ -172,9 +172,10 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Encrypted 7z member `read_range` / `extract_to` is BadPassword | `cargo test -p ratarmount-session --lib read_range_encrypted_7z` · `cargo test -p ratarmount-session --lib extract_to_encrypted_7z` |
 | Extract one member to disk | `cargo test -p ratarmount-session --lib extract_to` |
 | Extract path-escape reject (`../`, absolute) | `cargo test -p ratarmount-session --lib extract_to_path_escape` |
+| Extract writes through dest-dir / dest symlink out of dest_dir | `cargo test -p ratarmount-session --lib extract_to_path_escape_via_dest_dir_symlink` · `cargo test -p ratarmount-session --lib extract_to_path_escape_via_prior_archive_symlink` · `cargo test -p ratarmount-session --lib extract_to_replace_unlinks_dest_symlink` · `cargo test -p ratarmount-session --lib extract_to_skip_does_not_follow_dangling_dest_symlink` |
 | Extract-all keyset does not use list_visible_files_by_offset | `cargo test -p ratarmount-session --lib extract_all_keyset` · `cargo test -p ratarmount-index --lib list_extract_payload_page` |
 | Extract cancel mid-copy unlinks truncated dest | `cargo test -p ratarmount-session --lib extract_to_cancel_unlinks_partial` |
-| Extract Replace+cancel destroys pre-existing dest (`File::create` then unlink) | `cargo test -p ratarmount-session --lib extract_to_replace_cancel_preserves_existing` |
+| Extract Replace+cancel destroys pre-existing dest (`File::create` then unlink) | `cargo test -p ratarmount-session --lib extract_to_replace_cancel_preserves_existing` · `cargo test -p ratarmount-session --lib extract_to_replace_cancel_preserves_dest_symlink` |
 | Recreate::Never missing sidecar / tarstats mismatch / no rebuild | `cargo test -p ratarmount-session --lib recreate_never` |
 | Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
 | Sibling unwritable parent → SiblingNotWritable (no `:memory:`) | `cargo test -p ratarmount-index --lib sibling_not_writable` · `cargo test -p ratarmount-session --lib resolve_sibling` |

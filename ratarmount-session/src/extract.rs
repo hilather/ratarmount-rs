@@ -104,6 +104,9 @@ impl Session {
         state: &mut ExtractState,
     ) -> Result<(), Error> {
         let dest = dest_path_for_member(&req.dest_dir, member, req.allow_unsafe_paths)?;
+        if !req.allow_unsafe_paths {
+            ensure_no_intermediate_symlink(&req.dest_dir, &dest, member)?;
+        }
         emit(progress, state, Some(member.to_string()));
         let lookup_path = query_normpath(member);
         let Some(fi) = self.mount_source().lookup(&lookup_path, 0) else {
@@ -115,6 +118,9 @@ impl Session {
             return Ok(());
         }
         if is_dir_mode(fi.mode) {
+            if !req.allow_unsafe_paths && dest_is_symlink(&dest)? {
+                return Err(Error::PathEscape(member.to_string()));
+            }
             std::fs::create_dir_all(&dest).map_err(|e| map_dest_io(e, &dest))?;
             state.files_done += 1;
             emit(progress, state, Some(member.to_string()));
@@ -129,7 +135,7 @@ impl Session {
             emit(progress, state, Some(member.to_string()));
             return Ok(());
         }
-        if matches!(req.overwrite, Overwrite::Skip) && dest.exists() {
+        if matches!(req.overwrite, Overwrite::Skip) && dest_exists_nofollow(&dest)? {
             state.files_done += 1;
             emit(progress, state, Some(member.to_string()));
             return Ok(());
@@ -187,7 +193,8 @@ fn copy_member(
     let mut src = session.mount_source().open(fi, 0).map_err(map_member_io)?;
     // Write to a sibling tmp, then rename. File::create(dest) would truncate an
     // existing file immediately; cancel / member IO then unlinked that dest and
-    // destroyed the pre-existing contents.
+    // destroyed the pre-existing contents. persist_extract_tmp replaces a dest
+    // symlink (nofollow) only after the copy succeeds.
     let (mut out, tmp) = create_extract_tmp(dest)?;
     let copy_res: Result<(), Error> = (|| {
         let mut buf = [0u8; COPY_BUF];
@@ -394,6 +401,48 @@ fn looks_windows_prefix(p: &str) -> bool {
     b.len() >= 2 && b[1] == b':' && b[0].is_ascii_alphabetic()
 }
 
+/// Refuse `dest_dir/a/b` when `dest_dir/a` is a symlink (tar-slip).
+///
+/// `File::create` and `create_dir_all` follow intermediate dest-dir
+/// components, so a crafted archive (`escape` → `../outside`, then
+/// `escape/pwned.txt`) would write outside `dest_dir`.
+fn ensure_no_intermediate_symlink(dest_dir: &Path, dest: &Path, member: &str) -> Result<(), Error> {
+    let rel = dest
+        .strip_prefix(dest_dir)
+        .map_err(|_| Error::PathEscape(member.to_string()))?;
+    let mut cur = dest_dir.to_path_buf();
+    let comps: Vec<_> = rel.components().collect();
+    for (i, c) in comps.iter().enumerate() {
+        let Component::Normal(s) = c else {
+            return Err(Error::PathEscape(member.to_string()));
+        };
+        cur.push(s);
+        if i + 1 == comps.len() {
+            break;
+        }
+        if dest_is_symlink(&cur)? {
+            return Err(Error::PathEscape(member.to_string()));
+        }
+    }
+    Ok(())
+}
+
+fn dest_is_symlink(path: &Path) -> Result<bool, Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_symlink()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(map_dest_io(e, path)),
+    }
+}
+
+fn dest_exists_nofollow(path: &Path) -> Result<bool, Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(map_dest_io(e, path)),
+    }
+}
+
 fn map_dest_io(e: io::Error, dest: &Path) -> Error {
     match e.kind() {
         io::ErrorKind::PermissionDenied => Error::NotWritable(dest.to_path_buf()),
@@ -505,6 +554,208 @@ mod tests {
             )
             .unwrap();
         assert_eq!(std::fs::read(dest.join("a.txt")).unwrap(), b"x");
+    }
+
+    fn member_symlink<'a>(path: &'a str, target: &'a str) -> UstarMember<'a> {
+        UstarMember {
+            path,
+            payload: UstarPayload::Symlink { target },
+            mode: 0o777,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        }
+    }
+
+    /// Regression: extract must not write through a dest-dir symlink out of dest_dir.
+    ///
+    /// `File::create` / `create_dir_all` follow `dest/escape` when it is a
+    /// leftover (or previously extracted) symlink. Same class as a crafted
+    /// archive that plants `escape` → `../outside` then `escape/pwned.txt`.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_path_escape_via_dest_dir_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("pwned.txt");
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink(&outside, dest.join("escape")).unwrap();
+        let session = open_tar(
+            dir.path(),
+            "slip.tar",
+            &[member_file("escape/pwned.txt", b"pwned")],
+        );
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/escape/pwned.txt".into()],
+                    dest_dir: dest,
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PathEscape(ref s) if s.contains("pwned")),
+            "expected PathEscape for escape/pwned.txt, got {err:?}"
+        );
+        assert!(
+            !victim.exists(),
+            "must not write through dest-dir symlink to {}",
+            victim.display()
+        );
+    }
+
+    /// Two-step slip: extract a symlink-only archive, then a file under that name.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_path_escape_via_prior_archive_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let victim = outside.join("pwned.txt");
+        let dest = dir.path().join("out");
+        let link_session = open_tar(
+            dir.path(),
+            "link.tar",
+            &[member_symlink("escape", "../outside")],
+        );
+        link_session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/escape".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .expect("extract symlink");
+        assert!(
+            dest.join("escape").is_symlink(),
+            "first extract must plant dest/escape symlink"
+        );
+        let file_session = open_tar(
+            dir.path(),
+            "file.tar",
+            &[member_file("escape/pwned.txt", b"pwned")],
+        );
+        let err = file_session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/escape/pwned.txt".into()],
+                    dest_dir: dest,
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::PathEscape(_)),
+            "expected PathEscape, got {err:?}"
+        );
+        assert!(!victim.exists(), "must not write {}", victim.display());
+    }
+
+    /// Regression: Replace must unlink a dest symlink, not follow it.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_replace_unlinks_dest_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, b"keep-me").unwrap();
+        let session = open_tar(dir.path(), "one.tar", &[member_file("hello.txt", b"hello")]);
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink(&victim, dest.join("hello.txt")).unwrap();
+        session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/hello.txt".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .expect("replace dest symlink");
+        assert_eq!(std::fs::read(dest.join("hello.txt")).unwrap(), b"hello");
+        assert_eq!(std::fs::read(&victim).unwrap(), b"keep-me");
+        assert!(
+            !std::fs::symlink_metadata(dest.join("hello.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Replace must swap the dest symlink for a regular file"
+        );
+    }
+
+    /// Regression: Skip must not follow a dangling dest symlink and create the target.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_skip_does_not_follow_dangling_dest_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim.txt");
+        let session = open_tar(dir.path(), "one.tar", &[member_file("hello.txt", b"hello")]);
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        std::os::unix::fs::symlink(&victim, dest.join("hello.txt")).unwrap();
+        session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/hello.txt".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Skip,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .expect("skip dangling dest symlink");
+        assert!(
+            !victim.exists(),
+            "Skip must not File::create through a dangling dest symlink"
+        );
+        assert!(
+            std::fs::symlink_metadata(dest.join("hello.txt"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "dangling dest symlink must stay"
+        );
+    }
+
+    #[test]
+    fn ensure_no_intermediate_symlink_rejects_parent_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let dest_dir = dir.path().join("out");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        let mid = dest_dir.join("escape");
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&outside, &mid).unwrap();
+            let dest = dest_dir.join("escape").join("pwned.txt");
+            let err = ensure_no_intermediate_symlink(&dest_dir, &dest, "escape/pwned.txt")
+                .expect_err("intermediate symlink");
+            assert!(matches!(err, Error::PathEscape(ref s) if s == "escape/pwned.txt"));
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = (outside, mid);
+            let dest = dest_dir.join("safe").join("a.txt");
+            ensure_no_intermediate_symlink(&dest_dir, &dest, "safe/a.txt")
+                .expect("missing parents are ok");
+        }
     }
 
     /// Extract-all uses catalog keyset pages, not `list_visible_files_by_offset`.
@@ -751,6 +1002,104 @@ mod tests {
             std::fs::read(&out_file).unwrap(),
             original,
             "Replace+cancel must leave the pre-existing dest intact"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_string_lossy().contains(".extract-") && n.to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "cancel must unlink the extract tmp, leftover {leftovers:?}"
+        );
+    }
+
+    /// Regression: Replace + cancel must not unlink a dest symlink or its victim.
+    ///
+    /// Pre-copy `remove_file(dest)` (#34) plus cancel would drop the symlink
+    /// before persist. Tmp+rename must leave the dest dentry and victim intact.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_replace_cancel_preserves_dest_symlink() {
+        const BIG: u64 = 9 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("big.bin");
+        {
+            let f = std::fs::File::create(&payload).unwrap();
+            f.set_len(BIG).unwrap();
+        }
+        let tar = dir.path().join("big.tar");
+        {
+            let mut f = std::fs::File::create(&tar).unwrap();
+            write_ustar_members(
+                &mut f,
+                &[UstarMember {
+                    path: "big.bin",
+                    payload: UstarPayload::FileOnDisk {
+                        path: &payload,
+                        size: BIG,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+            write_tar_eof(&mut f).unwrap();
+            f.flush().unwrap();
+        }
+        let idx = dir.path().join("big.tar.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let victim = dir.path().join("victim.txt");
+        let original = b"keep-symlink-victim";
+        std::fs::write(&victim, original).unwrap();
+        let out_file = dest.join("big.bin");
+        std::os::unix::fs::symlink(&victim, &out_file).unwrap();
+        let cancel = AtomicBool::new(false);
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/big.bin".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                Some(&|p| {
+                    if p.bytes_out >= PROGRESS_EVERY {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }),
+                Some(&cancel),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert!(
+            std::fs::symlink_metadata(&out_file)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "Replace+cancel must leave the dest symlink in place"
+        );
+        assert_eq!(
+            std::fs::read(&victim).unwrap(),
+            original,
+            "Replace+cancel must not follow or truncate the dest symlink victim"
         );
         let leftovers: Vec<_> = std::fs::read_dir(&dest)
             .unwrap()
