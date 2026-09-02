@@ -1,8 +1,9 @@
 //! Streaming extract (`Session::extract_to`).
 
+use std::fs::OpenOptions;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use ratarmount_core::{
     is_dir_mode, is_lnk_mode, query_normpath, read_exact_or_short, FileInfo, UserData,
@@ -184,7 +185,10 @@ fn copy_member(
     member: &str,
 ) -> Result<(), Error> {
     let mut src = session.mount_source().open(fi, 0).map_err(map_member_io)?;
-    let mut out = std::fs::File::create(dest).map_err(|e| map_dest_io(e, dest))?;
+    // Write to a sibling tmp, then rename. File::create(dest) would truncate an
+    // existing file immediately; cancel / member IO then unlinked that dest and
+    // destroyed the pre-existing contents.
+    let (mut out, tmp) = create_extract_tmp(dest)?;
     let copy_res: Result<(), Error> = (|| {
         let mut buf = [0u8; COPY_BUF];
         let mut since_progress = 0u64;
@@ -207,20 +211,76 @@ fn copy_member(
                 since_progress = 0;
             }
         }
+        out.flush().map_err(|e| map_dest_io(e, dest))?;
         Ok(())
     })();
+    drop(out);
     match copy_res {
         Ok(()) => {
+            persist_extract_tmp(&tmp, dest)?;
             state.files_done += 1;
             emit(progress, state, Some(member.to_string()));
             Ok(())
         }
         Err(e) => {
-            drop(out);
-            let _ = std::fs::remove_file(dest);
+            let _ = std::fs::remove_file(&tmp);
             Err(e)
         }
     }
+}
+
+/// Sibling of `dest` so `rename` stays on the same filesystem.
+fn create_extract_tmp(dest: &Path) -> Result<(std::fs::File, PathBuf), Error> {
+    static SEQ: AtomicU64 = AtomicU64::new(1);
+    let parent = dest
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let stem = dest
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "extract".into());
+    for _ in 0..32 {
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+        let tmp = parent.join(format!(".{stem}.extract-{seq}.tmp"));
+        match OpenOptions::new().write(true).create_new(true).open(&tmp) {
+            Ok(f) => return Ok((f, tmp)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(map_dest_io(e, dest)),
+        }
+    }
+    Err(Error::Internal(format!(
+        "could not allocate extract temp next to {}",
+        dest.display()
+    )))
+}
+
+/// Atomically replace `dest` with a completed tmp. Dest is removed only after
+/// the copy succeeded (Windows cannot `rename` over an existing file).
+fn persist_extract_tmp(tmp: &Path, dest: &Path) -> Result<(), Error> {
+    match std::fs::rename(tmp, dest) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if !dest_exists(dest) {
+                let _ = std::fs::remove_file(tmp);
+                return Err(map_dest_io(e, dest));
+            }
+            // Copy is complete; replacing dest is now the remaining risk.
+            if let Err(rm) = std::fs::remove_file(dest) {
+                let _ = std::fs::remove_file(tmp);
+                return Err(map_dest_io(rm, dest));
+            }
+            if let Err(rn) = std::fs::rename(tmp, dest) {
+                let _ = std::fs::remove_file(tmp);
+                return Err(map_dest_io(rn, dest));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn dest_exists(path: &Path) -> bool {
+    std::fs::symlink_metadata(path).is_ok()
 }
 
 fn emit(
@@ -614,6 +674,95 @@ mod tests {
             !out_file.exists(),
             "Cancelled copy must unlink dest, got exists={}",
             out_file.exists()
+        );
+    }
+
+    /// Regression: Replace + cancel must not destroy a pre-existing dest.
+    ///
+    /// `File::create(dest)` truncated the live file; the error path then
+    /// `remove_file`d it. Cancel (or a later member read error) left the
+    /// caller with neither the new bytes nor the original file.
+    #[test]
+    fn extract_to_replace_cancel_preserves_existing() {
+        const BIG: u64 = 9 * 1024 * 1024;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = dir.path().join("big.bin");
+        {
+            let f = std::fs::File::create(&payload).unwrap();
+            f.set_len(BIG).unwrap();
+        }
+        let tar = dir.path().join("big.tar");
+        {
+            let mut f = std::fs::File::create(&tar).unwrap();
+            write_ustar_members(
+                &mut f,
+                &[UstarMember {
+                    path: "big.bin",
+                    payload: UstarPayload::FileOnDisk {
+                        path: &payload,
+                        size: BIG,
+                    },
+                    mode: 0o644,
+                    uid: 0,
+                    gid: 0,
+                    mtime: 0,
+                }],
+            )
+            .unwrap();
+            write_tar_eof(&mut f).unwrap();
+            f.flush().unwrap();
+        }
+        let idx = dir.path().join("big.tar.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .unwrap();
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("big.bin");
+        let original = b"keep-me-old-content";
+        std::fs::write(&out_file, original).unwrap();
+        let cancel = AtomicBool::new(false);
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/big.bin".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                Some(&|p| {
+                    if p.bytes_out >= PROGRESS_EVERY {
+                        cancel.store(true, Ordering::Relaxed);
+                    }
+                }),
+                Some(&cancel),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::Cancelled));
+        assert_eq!(
+            std::fs::read(&out_file).unwrap(),
+            original,
+            "Replace+cancel must leave the pre-existing dest intact"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_string_lossy().contains(".extract-") && n.to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "cancel must unlink the extract tmp, leftover {leftovers:?}"
         );
     }
 
