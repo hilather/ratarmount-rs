@@ -263,33 +263,61 @@ fn create_extract_tmp(dest: &Path) -> Result<(std::fs::File, PathBuf), Error> {
 }
 
 /// Atomically replace `dest` with a completed tmp. Dest is removed only after
-/// the copy succeeded (Windows cannot `rename` over an existing file).
+/// the copy succeeded, and only on Windows where `rename` cannot replace.
 fn persist_extract_tmp(tmp: &Path, dest: &Path) -> Result<(), Error> {
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
-        Err(e) => {
-            if !dest_exists_nofollow(dest)? {
-                let _ = std::fs::remove_file(tmp);
-                return Err(map_dest_io(e, dest));
-            }
-            if dest_is_dir_nofollow(dest)? {
-                let _ = std::fs::remove_file(tmp);
-                return Err(Error::Internal(format!(
-                    "refusing to replace directory {}",
-                    dest.display()
-                )));
-            }
-            // Copy is complete; replacing dest is now the remaining risk.
-            if let Err(rm) = std::fs::remove_file(dest) {
-                let _ = std::fs::remove_file(tmp);
-                return Err(map_dest_io(rm, dest));
-            }
-            if let Err(rn) = std::fs::rename(tmp, dest) {
-                // dest is already gone; keep tmp so the completed copy survives.
-                return Err(map_dest_io(rn, dest));
-            }
-            Ok(())
+        Err(e) => persist_extract_tmp_fallback(tmp, dest, e),
+    }
+}
+
+fn persist_extract_tmp_fallback(
+    tmp: &Path,
+    dest: &Path,
+    rename_err: io::Error,
+) -> Result<(), Error> {
+    match dest_is_dir_nofollow(dest) {
+        Ok(true) => {
+            let _ = std::fs::remove_file(tmp);
+            return Err(Error::Internal(format!(
+                "refusing to replace directory {}",
+                dest.display()
+            )));
         }
+        Ok(false) => {}
+        Err(stat) => {
+            let _ = std::fs::remove_file(tmp);
+            return Err(stat);
+        }
+    }
+
+    // Unix `rename` replaces a dest file/symlink atomically. A failed rename
+    // must not unlink dest (`EIO` / `EBUSY` / `EPERM` still leave dest intact).
+    #[cfg(windows)]
+    {
+        match dest_exists_nofollow(dest) {
+            Ok(true) => {
+                if let Err(rm) = std::fs::remove_file(dest) {
+                    let _ = std::fs::remove_file(tmp);
+                    return Err(map_dest_io(rm, dest));
+                }
+                if let Err(rn) = std::fs::rename(tmp, dest) {
+                    // dest is already gone; keep tmp so the completed copy survives.
+                    return Err(map_dest_io(rn, dest));
+                }
+                return Ok(());
+            }
+            Ok(false) | Err(_) => {
+                let _ = std::fs::remove_file(tmp);
+                return Err(map_dest_io(rename_err, dest));
+            }
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        let _ = std::fs::remove_file(tmp);
+        Err(map_dest_io(rename_err, dest))
     }
 }
 
