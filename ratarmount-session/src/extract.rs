@@ -268,9 +268,16 @@ fn persist_extract_tmp(tmp: &Path, dest: &Path) -> Result<(), Error> {
     match std::fs::rename(tmp, dest) {
         Ok(()) => Ok(()),
         Err(e) => {
-            if !dest_exists(dest) {
+            if !dest_exists_nofollow(dest)? {
                 let _ = std::fs::remove_file(tmp);
                 return Err(map_dest_io(e, dest));
+            }
+            if dest_is_dir_nofollow(dest)? {
+                let _ = std::fs::remove_file(tmp);
+                return Err(Error::Internal(format!(
+                    "refusing to replace directory {}",
+                    dest.display()
+                )));
             }
             // Copy is complete; replacing dest is now the remaining risk.
             if let Err(rm) = std::fs::remove_file(dest) {
@@ -278,7 +285,7 @@ fn persist_extract_tmp(tmp: &Path, dest: &Path) -> Result<(), Error> {
                 return Err(map_dest_io(rm, dest));
             }
             if let Err(rn) = std::fs::rename(tmp, dest) {
-                let _ = std::fs::remove_file(tmp);
+                // dest is already gone; keep tmp so the completed copy survives.
                 return Err(map_dest_io(rn, dest));
             }
             Ok(())
@@ -286,8 +293,12 @@ fn persist_extract_tmp(tmp: &Path, dest: &Path) -> Result<(), Error> {
     }
 }
 
-fn dest_exists(path: &Path) -> bool {
-    std::fs::symlink_metadata(path).is_ok()
+fn dest_is_dir_nofollow(path: &Path) -> Result<bool, Error> {
+    match std::fs::symlink_metadata(path) {
+        Ok(m) => Ok(m.file_type().is_dir()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(map_dest_io(e, path)),
+    }
 }
 
 fn emit(
@@ -695,6 +706,46 @@ mod tests {
                 .file_type()
                 .is_symlink(),
             "Replace must swap the dest symlink for a regular file"
+        );
+    }
+
+    /// Regression: Replace must not unlink a dest directory (or its children).
+    #[test]
+    fn extract_to_replace_refuses_dest_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let session = open_tar(dir.path(), "one.tar", &[member_file("hello.txt", b"hello")]);
+        let dest = dir.path().join("out");
+        let dest_dir = dest.join("hello.txt");
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        std::fs::write(dest_dir.join("child"), b"keep").unwrap();
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/hello.txt".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Internal(ref s) if s.contains("refusing to replace directory")),
+            "expected refuse-directory, got {err:?}"
+        );
+        assert_eq!(std::fs::read(dest_dir.join("child")).unwrap(), b"keep");
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_string_lossy().contains(".extract-") && n.to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "refuse-directory must unlink tmp, leftover {leftovers:?}"
         );
     }
 
