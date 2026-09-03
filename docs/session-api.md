@@ -86,7 +86,7 @@ pub struct ExtractRequest {
     pub members: Vec<String>,  // empty = every payload member (catalog walk, not list() Vec)
     pub dest_dir: PathBuf,
     pub overwrite: Overwrite,
-    pub allow_unsafe_paths: bool,  // default false: reject `..`, absolute, Windows prefixes
+    pub allow_unsafe_paths: bool,  // default false: reject `..`, absolute, Windows prefixes, dest-dir symlink
 }
 
 pub struct ExtractProgress {
@@ -138,7 +138,7 @@ Passwords are `secrecy::SecretString` on this boundary only. They are **not** th
 
 **`read_range`:** lookup + `MountSource::open` + seek + `RangeReader` (`Read + Send`, not `Sync`). Fill-loop on the inner `Read` (short read is not EOF). `max_len == 0` → empty reader. Does not call `MountSource::read` (that returns `Vec<u8>`).
 
-**`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes, or an intermediate dest-dir symlink) unless `allow_unsafe_paths`. Replace unlinks a dest symlink instead of following it; Skip treats a dest symlink (including dangling) as already present. Extract-all (`members` empty) walks catalog keyset pages of 1024 (newest-wins per `fullpath`, exclusive `fullpath > ?`); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points. Cancel or copy IO error unlinks the truncated dest.
+**`extract_to`:** 64 KiB streaming copy; `Overwrite::{Skip,Replace}`; path-escape reject (`..`, absolute, Windows prefixes, or an intermediate dest-dir symlink) unless `allow_unsafe_paths`. Replace unlinks a dest symlink instead of following it; Skip treats a dest symlink (including dangling) as already present. Replace refuses a dest directory. Extract-all (`members` empty) walks catalog keyset pages of 1024 (newest-wins per `fullpath`, exclusive `fullpath > ?`); does **not** call `list_visible_files_by_offset` or `list()`. Progress between members and every 8 MiB; cancel checked at those points. Members are copied to a sibling tmp and renamed onto dest; cancel or copy IO error unlinks only the tmp (a pre-existing dest is left intact). A first-time extract that is cancelled therefore leaves no dest file. Windows persist may unlink dest only after a successful copy, and only when `rename` cannot replace; a failed second rename keeps the tmp.
 
 **`find`:** exclusive `(fullpath, offsetheader)` keyset (`FindCursor` / `SearchQuery.after`); it does not newest-wins-collapse versions. `ensure_fts5` is opt-in (`FindOpts.fts` / `fts:`), never a side effect of `open`. CLI `ratarmount find` still prints the first page at `DEFAULT_SEARCH_LIMIT` (10_000) and keeps Unix `silence_stdout` in `ratarmount/src/find.rs`.
 
@@ -269,7 +269,7 @@ Do not migrate `meta-v3` onto macOS Library/Caches. Env `RATARMOUNT_LOCAL_INDEX_
 - Extract is a **streaming copy** (64 KiB buffer, loop until `Ok(0)`), not `read_range(0, size)` into a `Vec`.
 - Extract-all walks the catalog with a newest-wins `fullpath > ?` keyset (page 1024), not `list()` / `list_visible_files_by_offset` dumped into a `Vec`.
 - `extractPlan` (conflict sample) stays in the **GUI**, not engine v1.
-- Path escape (`..`, absolute, Windows prefixes) → `Error::PathEscape` unless `allow_unsafe_paths`.
+- Path escape (`..`, absolute, Windows prefixes, or an intermediate dest-dir symlink) → `Error::PathEscape` unless `allow_unsafe_paths`. Replace unlinks a dest symlink instead of following it; Skip treats a dest symlink as present. Cancel unlinks only the sibling tmp (pre-existing dest intact).
 
 ## `IndexJob` (blocking)
 
