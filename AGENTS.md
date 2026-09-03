@@ -65,6 +65,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | ZIP `--commit-overlay` rebuild (add/replace/delete) | `cargo test -p ratarmount-compositing --lib commit_overlay_zip` |
 | Offline `--commit-overlay` splice for `.tar.zst` (incl. earlier-frame delete) | `cargo test -p ratarmount-compositing --lib commit_overlay` |
 | Offline `.tar.zst` later-frame delete without `-i` (silent skip) | `cargo test -p ratarmount-compositing --lib commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros` · `cargo test -p ratarmount-compositing --lib commit_overlay_tar_zst_concatenated_delete_patches_sidecar_later_frame` |
+| Live `.tar.zst` later-frame delete remounted without `-i` (silent skip + forgotten tombstone) | `cargo test -p ratarmount-compositing --lib live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount-session --lib zstd_blocks` · `cargo test -p ratarmount-session --lib bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount-session --lib gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
