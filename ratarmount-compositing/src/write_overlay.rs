@@ -1251,13 +1251,19 @@ impl WriteOverlay {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let (from_idx, rewrite_window_start_uncomp) =
             find_last_n_tar_window(archive, &map, "live")?;
-        let base = self.current_base();
+        // Do not classify against `current_base()`: a remount without `-i`
+        // hides later complete-TAR frames, so those tombstones look
+        // overlay-only, the splice skips them, and interval cleanup
+        // forgets the delete (same class as offline #32).
         let mut last_window_deletes = HashSet::new();
-        for path in &plan.deleted_paths {
-            match classify_tar_zst_path(base.as_ref(), path, rewrite_window_start_uncomp)? {
-                TarZstPathClass::OverlayOnly => {}
-                TarZstPathClass::LastWindow => {
-                    last_window_deletes.insert(path.clone());
+        if !plan.deleted_paths.is_empty() {
+            let classify_base = tar_zst_full_frame_index(archive, self.encoding.as_str())?;
+            for path in &plan.deleted_paths {
+                match classify_tar_zst_path(&classify_base, path, rewrite_window_start_uncomp)? {
+                    TarZstPathClass::OverlayOnly => {}
+                    TarZstPathClass::LastWindow => {
+                        last_window_deletes.insert(path.clone());
+                    }
                 }
             }
         }
@@ -2094,8 +2100,9 @@ pub struct CommitOverlayOptions {
     /// TAR member-name encoding (`-e` / `--encoding`). Default `"utf-8"`.
     pub encoding: String,
     /// Concatenated TAR (`-i` / `--ignore-zeros`) for GNU-tar / mount reopen.
-    /// Offline `.tar.zst` classification and sidecar patch always walk past
-    /// per-frame TAR EOF so later-frame deletes apply even when this is false.
+    /// Offline and live `.tar.zst` delete classification (and offline sidecar
+    /// patch) always walk past per-frame TAR EOF so later-frame deletes apply
+    /// even when this is false.
     pub ignore_zeros: bool,
 }
 
@@ -2810,7 +2817,6 @@ fn commit_overlay_tar_zst(
     }
 
     let map = scan_zstd_frames_path(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
-    let body = open_seekable_zstd(tar_file).map_err(|e| OverlayError::Msg(e.to_string()))?;
     // Always walk past per-frame TAR EOF. Mount `-i` only controls listing
     // visibility; a tombstone for a later complete-TAR frame must still map
     // to offsetheaders. With `ignore_zeros: false` those names look like
@@ -2818,22 +2824,7 @@ fn commit_overlay_tar_zst(
     // success — then removing the overlay (as the success text suggests)
     // undeletes the member. Pin GNU incremental off so a later-frame
     // dumpdir does not flip classification.
-    let index_opts = OpenOptions {
-        write_index: false,
-        index_in_memory: true,
-        encoding: opts.encoding.clone(),
-        ignore_zeros: true,
-        gnu_incremental: Some(false),
-        ..OpenOptions::default()
-    };
-    let base = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
-        tar_file,
-        body,
-        None,
-        &index_opts,
-        env!("CARGO_PKG_VERSION"),
-    )
-    .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let base = tar_zst_full_frame_index(tar_file, opts.encoding.as_str())?;
 
     let mut rewrite_deletes = HashSet::new();
     let mut ohs = Vec::new();
@@ -3258,6 +3249,25 @@ fn offline_tar_zst_from_idx(archive: &Path, map: &ZstdFrameMap, min_oh: u64) -> 
     }
     debug_assert!(from_idx <= from_idx0);
     Ok(from_idx)
+}
+
+/// In-memory index that walks past per-frame TAR EOF.
+///
+/// Mount `-i` only controls listing visibility. Delete classification must
+/// still see later complete-TAR frames, or a tombstone looks overlay-only,
+/// the splice skips it, and a successful commit undeletes the member.
+fn tar_zst_full_frame_index(archive: &Path, encoding: &str) -> Result<SqliteIndexedTar> {
+    let body = open_seekable_zstd(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let index_opts = OpenOptions {
+        write_index: false,
+        index_in_memory: true,
+        encoding: encoding.to_string(),
+        ignore_zeros: true,
+        gnu_incremental: Some(false),
+        ..OpenOptions::default()
+    };
+    SqliteIndexedTar::create_index_body(archive, body, None, &index_opts, env!("CARGO_PKG_VERSION"))
+        .map_err(|e| OverlayError::Msg(e.to_string()))
 }
 
 fn classify_tar_zst_path(
@@ -6310,6 +6320,65 @@ mod tests {
             "base member must survive a skipped hot replace"
         );
         assert_eq!(read_member(&ov as &dyn MountSource, "/keep.txt"), newer);
+    }
+
+    /// Regression: live interval must persist a later complete-TAR-frame
+    /// delete after remount without `-i`.
+    ///
+    /// Tombstones survive in the overlay DB. `current_base()` after a default
+    /// remount does not see later-frame names, so classification used to skip
+    /// the delete, return success, and `forget_committed_overlay` dropped the
+    /// tombstone — the member reappeared on the next `-i` remount.
+    #[test]
+    fn live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("live-i0-prefix");
+        let last = generated_payload("live-i0-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_complete_tar_frames_zst(
+            &archive,
+            &[
+                pack_tar(&[ustar_file("prefix.txt", &prefix)]),
+                pack_tar(&[ustar_file("last.txt", &last)]),
+            ],
+        );
+        let before = fs::read(&archive).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.frames.len() >= 2);
+        let prefix_end = map.frames[1].compressed_offset as usize;
+        let prefix_bytes = before[..prefix_end].to_vec();
+
+        let overlay = dir.path().join("ov");
+        {
+            let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+            ov.unlink("/last.txt")
+                .expect("unlink later complete-TAR frame");
+        }
+
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        assert!(
+            ov.commit_live_idle(&archive, Duration::from_secs(10), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("live idle commit without -i must persist later-frame delete"),
+            "interval tick must persist the remounted tombstone"
+        );
+        let after = fs::read(&archive).unwrap();
+        assert_eq!(
+            &after[..prefix_end],
+            prefix_bytes.as_slice(),
+            "prefix complete-TAR frame must stay byte-identical"
+        );
+        let src = open_tar_zst_base(&archive, true);
+        assert!(
+            src.lookup("/last.txt", 0).is_none(),
+            "later-frame name must be gone after live commit without -i"
+        );
+        assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+        assert!(
+            ov.lookup("/last.txt", 0).is_none(),
+            "interval cleanup must not resurrect the forgotten tombstone"
+        );
     }
 
     /// Regression: delete tombstones are already settled and commit on an idle tick.
