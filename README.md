@@ -56,8 +56,10 @@ Grab the latest assets from **[Releases](https://github.com/hilather/ratarmount-
 tar xf ratarmount-*-linux-x86_64.tar.gz
 install -m 755 ratarmount ~/.local/bin/
 
-# macOS Apple Silicon — Homebrew tap cask (prebuilt tarball, not a source formula)
-brew install --cask https://raw.githubusercontent.com/hilather/ratarmount-rs/main/packaging/homebrew/Casks/ratarmount.rb
+# macOS Apple Silicon — Homebrew tap cask (from a clone; tap root is packaging/homebrew/)
+# Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
+brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+brew install --cask hilather/ratarmount/ratarmount
 ```
 
 See [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) for verification and package layout. macOS FUSE + cask: [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md).

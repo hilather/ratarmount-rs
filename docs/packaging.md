@@ -53,6 +53,9 @@ Use this when cutting a version so GitHub actually has installable packages:
 7. After the `macos-arm64` tarball is on the GitHub Release, bump
    [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb)
    `version` + `sha256` to match (Homebrew tap cask; not a source formula).
+   The cask is allowed to trail workspace `Cargo.toml` by one release until
+   that follow-up; [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh)
+   asserts URL/sha256 **format**, not lockstep.
 
 See also root [`AGENTS.md`](../AGENTS.md) section **Releases / package builds**.
 
@@ -109,8 +112,9 @@ sudo dnf install ./ratarmount-*.x86_64.rpm
 tar -xzf ratarmount-*-portable-glibc2.31-x86_64.tar.gz
 sudo install -m 755 ratarmount /usr/local/bin/
 
-# macOS Apple Silicon — Homebrew tap cask (prebuilt tarball, not a source formula)
-brew install --cask https://raw.githubusercontent.com/hilather/ratarmount-rs/main/packaging/homebrew/Casks/ratarmount.rb
+# macOS Apple Silicon — Homebrew tap cask (from a clone; tap root is packaging/homebrew/)
+brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+brew install --cask hilather/ratarmount/ratarmount
 ```
 
 ### Homebrew tap cask (macOS arm64)
@@ -121,7 +125,7 @@ v1 is a **cask** that unpacks the signed GitHub Release asset `ratarmount-<ver>-
 |-------|------|
 | Cask | [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) |
 | Tap root | [`packaging/homebrew/`](https://github.com/hilather/ratarmount-rs/tree/main/packaging/homebrew) (`Casks/` layout) |
-| Audit | [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) — static checks always; `brew audit --cask` when `brew` exists (**not** `--strict`) |
+| Audit | [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) — static checks always; `brew audit --cask` via a temporary local tap when `brew` exists (**not** `--strict`, not a path/URL cask) |
 
 URL pattern (matches this doc’s macOS tarball name):
 
@@ -129,7 +133,14 @@ URL pattern (matches this doc’s macOS tarball name):
 https://github.com/hilather/ratarmount-rs/releases/download/vVERSION/ratarmount-VERSION-macos-arm64.tar.gz
 ```
 
-When cutting a release, bump the cask `version` + `sha256` to the new `macos-arm64` asset (see `SHA256SUMS` on the GitHub Release). Caveats cover **macFUSE or FUSE-T** and runtime **libarchive** — same as [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) / `MACOS.txt`. Do not add formula build deps to the cask.
+Install (Homebrew forbids path/URL casks; always fully-qualified — homebrew/core has a Linux Python formula also named `ratarmount`):
+
+```bash
+brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+brew install --cask hilather/ratarmount/ratarmount
+```
+
+When cutting a release, bump the cask `version` + `sha256` **after** the `macos-arm64` asset exists (see `SHA256SUMS` on the GitHub Release). The cask may trail workspace `Cargo.toml` until that follow-up. Caveats cover **macFUSE or FUSE-T** and runtime **libarchive** — same as [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) / `MACOS.txt`. Do not add formula build deps to the cask.
 
 ### Cosign verification (release artifacts)
 

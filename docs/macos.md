@@ -164,12 +164,13 @@ v1 is a **cask** that unpacks the signed GitHub Release `macos-arm64` tarball. I
 Cask: [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) (tap root is [`packaging/homebrew/`](https://github.com/hilather/ratarmount-rs/tree/main/packaging/homebrew)).
 
 ```bash
-# Direct install of the tap-ready cask (Apple Silicon)
-brew install --cask https://raw.githubusercontent.com/hilather/ratarmount-rs/main/packaging/homebrew/Casks/ratarmount.rb
-
-# From a clone, packaging/homebrew/ is the tap root:
-#   brew install --cask ./packaging/homebrew/Casks/ratarmount.rb
+# From a clone of this repo (cwd = repo root). Homebrew forbids path/URL casks.
+# Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
+brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+brew install --cask hilather/ratarmount/ratarmount
 ```
+
+A published `hilather/homebrew-ratarmount` GitHub repo (Casks/ at the tap root) is the longer-term remote tap; Homebrew-core is out of v1.
 
 Cask **caveats** (not formula build deps) remind you to install **macFUSE or FUSE-T** and runtime **libarchive**. Then:
 
@@ -178,7 +179,7 @@ ratarmount archive.tar.gz mnt/
 ratarmount -u mnt/
 ```
 
-Regression: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) (`brew audit --cask` when `brew` exists; static checks always).
+Regression: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) (static checks always; `brew audit --cask` via a temporary local tap when `brew` exists).
 
 ### Manual tarball
 
