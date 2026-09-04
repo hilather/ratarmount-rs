@@ -180,7 +180,7 @@ ratarmount --print-features
 
 ### Archives & disk images
 
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
+TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 
 ### Seekable compression
 
@@ -321,7 +321,7 @@ Recursive mounts (`-r`) open nested members from a **seekable parent stream** wh
 | Nested member | Temp spool? |
 |---------------|:-----------:|
 | `.tar` / `.tar.gz` / `.zip` / `.7z` inside ZIP · TAR · 7z | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT | **No** |
+| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) | **No** |
 | SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
 | Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
 | CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |
@@ -341,7 +341,7 @@ On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and
 Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md):
 
 1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/rapidgzip-perf-batch.md), [binding decision](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer [`--repack-seekable`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) or multi-frame).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
+2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later).
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
 5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` / `rclone+` + F-1 prefix folders shipped (FTP LIST/MLSD; GCS GOOG1 HMAC). Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; implicit FTPS :990; rclone RC `--rc-serve`. [phase10-remote.md](docs/phase10-remote.md).

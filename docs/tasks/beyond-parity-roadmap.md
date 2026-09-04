@@ -119,7 +119,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
-| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `todo` | L | new `formats-*` crates |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
 | F-10 | **Library / FFI / `ratar://` replacement** | `todo` | L | core + PyO3 cdylib; crates.io policy already exists |
 
@@ -180,6 +180,8 @@ S3 **PUT primitive** is in `ratarmount-remote` (`put_s3_file`, multipart abort-o
 We already do EXT4 + FAT + ISO + SquashFS. Next users: mount this VM disk / Windows `install.wim` / macOS dmg without qemu-nbd. Guestfish/libguestfs is the competitor.
 
 Suggested order inside the family: exFAT, then NTFS (read-only), then UDF, then DMG, then WIM, then QCOW2/VHD/VMDK (block layer then partition + existing FAT/EXT4).
+
+**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. **Residual:** LVM, RAID, Btrfs; UDF/DMG/WIM/QCOW2/VHD/VMDK crates; factory `FormatBackend::Block` (orchestrator PR).
 
 ### F-9 — Producer: make archives seekable — `done`
 
