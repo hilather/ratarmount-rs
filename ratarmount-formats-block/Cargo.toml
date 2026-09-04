@@ -7,7 +7,6 @@ description = "GPT/MBR partition table mount source (p1/… via FAT/EXT4 offset 
 
 [dependencies]
 ratarmount-core.workspace = true
-ratarmount-compositing.workspace = true
 ratarmount-formats-fat.workspace = true
 ratarmount-formats-ext4.workspace = true
 thiserror.workspace = true

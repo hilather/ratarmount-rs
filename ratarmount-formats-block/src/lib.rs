@@ -1,40 +1,46 @@
 //! GPT/MBR partition-table mount source.
 //!
-//! Whole-disk images with a partition table are presented as:
+//! Whole-disk images with a partition table are presented as `/pN/` directories
+//! named by **table-slot encounter order** (including residual LVM/RAID/MSR
+//! numbers). Only partitions that open as FAT/EXT4 appear in the tree:
 //!
 //! ```text
-//! /p1/   # first filesystem partition
-//! /p2/
+//! /p1/   # first numbered slot that mounted (may skip residual p1)
+//! /p3/   # e.g. Windows GPT: EFI p1 + MSR p2 skipped + data p3
 //! ```
 //!
 //! Superfloppy FAT/EXT4 at offset **0** stays in those crates (factory probe
 //! order will try `Fat` / `Ext4` before `Block`). This crate only claims GPT
 //! (`EFI PART` at LBA 1) or an MBR with partitions that start after sector 0.
+//! Protective MBR (`0xEE`) without a GPT header is **not** claimed.
 //!
-//! Each `pN/` is a [`PrefixMountSource`] over FAT or EXT4
-//! [`open_from_reader_with_offset`] / [`open_with_offset`]. Nested no-tmp uses a
-//! mutex-shared `Read + Seek` body — no `NamedTempFile` spool.
+//! Each mounted `pN/` is FAT or EXT4 [`open_from_reader_with_offset`] /
+//! [`open_with_offset`]. Nested no-tmp uses a mutex-shared `Read + Seek` body —
+//! no `NamedTempFile` spool. A small in-crate tree presents `pN/` (not a
+//! compositing union) so a two-partition `disk.img` is not noisy.
 //!
 //! # Residual
 //!
 //! LVM, Linux RAID, Btrfs, swap, and unknown types that are not FAT/EXT4 are
-//! **not** mounted. exFAT/NTFS offset opens land when those crates exist.
-//! QCOW2/VHD/VMDK wrap this crate's [`BlockMountSource::open_from_reader`] on
-//! the raw virtual disk (no factory edits here).
+//! **not** mounted (they still consume `pN` numbers). exFAT/NTFS offset opens
+//! land when those crates exist. QCOW2/VHD/VMDK wrap this crate's
+//! [`BlockMountSource::open_from_reader`] on the raw virtual disk (no factory
+//! edits here).
 //!
 //! [`open_from_reader_with_offset`]: ratarmount_formats_fat::FatMountSource::open_from_reader_with_offset
 //! [`open_with_offset`]: ratarmount_formats_fat::FatMountSource::open_with_offset
 
 mod table;
 
+use std::collections::BTreeMap;
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use ratarmount_compositing::{PrefixMountSource, UnionMountSource};
 use ratarmount_core::{
-    CheapDirent, CheapSearchHit, FileInfo, ListModeResult, ListResult, MountSource,
+    create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
+    ListResult, MountSource,
 };
 use ratarmount_formats_ext4::{looks_like_ext4_at, looks_like_ext4_reader_at, Ext4MountSource};
 use ratarmount_formats_fat::{looks_like_fat_at, looks_like_fat_reader_at, FatMountSource};
@@ -42,9 +48,10 @@ use thiserror::Error;
 
 pub use table::{
     gpt_guid, gpt_signature_at, gpt_type_efi, gpt_type_linux_fs, gpt_type_linux_lvm,
-    gpt_type_microsoft_basic, mbr_has_usable_partition, mbr_is_protective_gpt,
-    parse_partition_table, Partition, PartitionKind, PartitionScheme, DEFAULT_SECTOR_SIZE,
-    MBR_TYPE_EXTENDED, MBR_TYPE_EXTENDED_LBA, MBR_TYPE_GPT_PROTECTIVE, MBR_TYPE_LINUX_LVM,
+    gpt_type_microsoft_basic, gpt_type_ms_reserved, mbr_has_usable_partition,
+    mbr_is_protective_gpt, parse_partition_table, Partition, PartitionKind, PartitionScheme,
+    DEFAULT_SECTOR_SIZE, MBR_TYPE_EXTENDED, MBR_TYPE_EXTENDED_LBA, MBR_TYPE_GPT_PROTECTIVE,
+    MBR_TYPE_LINUX_LVM,
 };
 
 pub const BACKEND_NAME: &str = "BlockMountSource";
@@ -124,9 +131,150 @@ impl Seek for SharedSeekReader {
     }
 }
 
-/// Partitioned disk image as a union of `pN/` filesystem mounts.
+fn part_dir_info() -> FileInfo {
+    FileInfo {
+        size: 0,
+        mtime: 0.0,
+        mode: ratarmount_core::S_IFDIR | 0o755,
+        linkname: String::new(),
+        uid: ratarmount_core::effective_uid(),
+        gid: ratarmount_core::effective_gid(),
+        userdata: vec![],
+    }
+}
+
+/// `/pN` → (`pN`, `/`); `/pN/foo` → (`pN`, `/foo`).
+fn split_part(path: &str) -> Option<(String, String)> {
+    let path = normpath(path);
+    if path == "/" {
+        return None;
+    }
+    let rest = path.trim_start_matches('/');
+    match rest.split_once('/') {
+        Some((name, tail)) => Some((name.to_string(), format!("/{tail}"))),
+        None => Some((rest.to_string(), "/".into())),
+    }
+}
+
+/// In-crate `pN/` tree (avoids compositing union folder-cache `warn!`).
+struct PartitionTree {
+    mounts: Vec<(String, Arc<dyn MountSource>)>,
+}
+
+impl PartitionTree {
+    fn find(&self, name: &str) -> Option<&Arc<dyn MountSource>> {
+        self.mounts.iter().find(|(n, _)| n == name).map(|(_, s)| s)
+    }
+}
+
+impl MountSource for PartitionTree {
+    fn list(&self, path: &str) -> Option<ListResult> {
+        let path = normpath(path);
+        if path == "/" {
+            let mut map = BTreeMap::new();
+            for (name, _) in &self.mounts {
+                map.insert(name.clone(), part_dir_info());
+            }
+            return Some(ListResult::Infos(map));
+        }
+        let (name, inner) = split_part(&path)?;
+        self.find(&name)?.list(&inner)
+    }
+
+    fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        let path = normpath(path);
+        if path == "/" {
+            return Some(
+                self.mounts
+                    .iter()
+                    .map(|(name, _)| CheapDirent {
+                        name: name.clone(),
+                        mode: ratarmount_core::S_IFDIR | 0o755,
+                        size: 0,
+                    })
+                    .collect(),
+            );
+        }
+        let (name, inner) = split_part(&path)?;
+        self.find(&name)?.list_dirents(&inner)
+    }
+
+    fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        let dents = self.list_dirents(path)?;
+        Some(ListModeResult::Modes(
+            dents.into_iter().map(|d| (d.name, d.mode)).collect(),
+        ))
+    }
+
+    fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+        let path = normpath(path);
+        if path == "/" {
+            return Some(create_root_file_info());
+        }
+        let (name, inner) = split_part(&path)?;
+        if inner == "/" {
+            return self.find(&name).map(|_| part_dir_info());
+        }
+        self.find(&name)?.lookup(&inner, file_version)
+    }
+
+    fn open(
+        &self,
+        file_info: &FileInfo,
+        buffering: i32,
+    ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        let mut last = io::Error::new(io::ErrorKind::NotFound, "no partition source could open");
+        for (_, src) in &self.mounts {
+            match src.open(file_info, buffering) {
+                Ok(r) => return Ok(r),
+                Err(e) => last = e,
+            }
+        }
+        Err(last)
+    }
+
+    fn versions(&self, path: &str) -> u32 {
+        let path = normpath(path);
+        if path == "/" {
+            return 1;
+        }
+        let Some((name, inner)) = split_part(&path) else {
+            return 0;
+        };
+        self.find(&name).map(|s| s.versions(&inner)).unwrap_or(0)
+    }
+
+    fn is_immutable(&self) -> bool {
+        self.mounts.iter().all(|(_, s)| s.is_immutable())
+    }
+
+    fn content_generation(&self) -> u64 {
+        self.mounts.iter().fold(0u64, |acc, (_, s)| {
+            acc.saturating_add(s.content_generation())
+        })
+    }
+
+    fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
+        self.mounts
+            .iter()
+            .all(|(_, s)| s.member_seek_is_cheap(file_info))
+    }
+
+    fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
+        if pattern.starts_with("fts:") {
+            return None;
+        }
+        let mut out = Vec::new();
+        for (_, src) in &self.mounts {
+            out.extend(src.search_cheap(pattern)?);
+        }
+        Some(out)
+    }
+}
+
+/// Partitioned disk image as a tree of `pN/` filesystem mounts.
 pub struct BlockMountSource {
-    inner: UnionMountSource,
+    inner: PartitionTree,
     partitions: Vec<Partition>,
     /// Diagnostic label (path or nested member name).
     #[allow(dead_code)]
@@ -147,17 +295,17 @@ impl BlockMountSource {
         let partitions = parse_partition_table(&mut file)?;
         drop(file);
 
-        let mut sources: Vec<Arc<dyn MountSource>> = Vec::new();
+        let mut mounts: Vec<(String, Arc<dyn MountSource>)> = Vec::new();
         for part in &partitions {
             if let Some(fs) = try_open_fs_path(path, part) {
-                sources.push(Arc::new(PrefixMountSource::new(&part.dir_name(), fs)));
+                mounts.push((part.dir_name(), fs));
             }
         }
-        if sources.is_empty() {
+        if mounts.is_empty() {
             return Err(no_fs_error(&partitions, path.display()));
         }
         Ok(Self {
-            inner: UnionMountSource::new(sources),
+            inner: PartitionTree { mounts },
             partitions,
             archive_label: path.to_path_buf(),
         })
@@ -188,17 +336,17 @@ impl BlockMountSource {
         let shared: Arc<Mutex<Box<dyn SeekRead>>> =
             Arc::new(Mutex::new(Box::new(reader) as Box<dyn SeekRead>));
 
-        let mut sources: Vec<Arc<dyn MountSource>> = Vec::new();
+        let mut mounts: Vec<(String, Arc<dyn MountSource>)> = Vec::new();
         for part in &partitions {
             if let Some(fs) = try_open_fs_shared(SharedSeekReader::new(Arc::clone(&shared)), part) {
-                sources.push(Arc::new(PrefixMountSource::new(&part.dir_name(), fs)));
+                mounts.push((part.dir_name(), fs));
             }
         }
-        if sources.is_empty() {
+        if mounts.is_empty() {
             return Err(no_fs_error(&partitions, archive_label.display()));
         }
         Ok(Self {
-            inner: UnionMountSource::new(sources),
+            inner: PartitionTree { mounts },
             partitions,
             archive_label,
         })
@@ -308,12 +456,7 @@ pub fn looks_like_block_reader<R: Read + Seek>(reader: &mut R) -> bool {
     if looks_like_fat_reader_at(reader, 0) || looks_like_ext4_reader_at(reader, 0) {
         return false;
     }
-    match mbr_has_usable_partition(reader) {
-        Ok(true) => return true,
-        Ok(false) => {}
-        Err(_) => return false,
-    }
-    mbr_is_protective_gpt(reader).unwrap_or(false)
+    mbr_has_usable_partition(reader).unwrap_or(false)
 }
 
 impl MountSource for BlockMountSource {
@@ -641,5 +784,167 @@ mod tests {
         assert_eq!(d.size, fi.size);
         assert_eq!(d.mode, fi.mode);
         assert_eq!(d.size, payload.len() as u64);
+    }
+
+    /// Regression: protective MBR without `EFI PART` must not steal later backends.
+    #[test]
+    fn looks_like_block_false_on_protective_mbr_without_gpt() {
+        let mut img = vec![0u8; 512];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        img[446 + 4] = MBR_TYPE_GPT_PROTECTIVE;
+        img[446 + 8..446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        img[446 + 12..446 + 16].copy_from_slice(&u32::MAX.to_le_bytes());
+        assert!(mbr_is_protective_gpt(&mut Cursor::new(&img)).unwrap());
+        assert!(!looks_like_block_reader(&mut Cursor::new(&img)));
+    }
+
+    fn mbr_two_fat(fat1: &[u8], lba1: u32, fat2: &[u8], lba2: u32) -> Vec<u8> {
+        let s1 = fat1.len().div_ceil(512) as u32;
+        let s2 = fat2.len().div_ceil(512) as u32;
+        let end = (lba2 as usize + fat2.len().div_ceil(512)) * 512;
+        let mut img = vec![0u8; end.max(lba1 as usize * 512 + fat1.len())];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        img[446 + 4] = 0x0C;
+        img[446 + 8..446 + 12].copy_from_slice(&lba1.to_le_bytes());
+        img[446 + 12..446 + 16].copy_from_slice(&s1.to_le_bytes());
+        img[446 + 16 + 4] = 0x0C;
+        img[446 + 16 + 8..446 + 16 + 12].copy_from_slice(&lba2.to_le_bytes());
+        img[446 + 16 + 12..446 + 16 + 16].copy_from_slice(&s2.to_le_bytes());
+        let o1 = lba1 as usize * 512;
+        img[o1..o1 + fat1.len()].copy_from_slice(fat1);
+        let o2 = lba2 as usize * 512;
+        img[o2..o2 + fat2.len()].copy_from_slice(fat2);
+        img
+    }
+
+    /// Regression: two mountable FAT partitions list `/p1` and `/p2` with distinct payloads.
+    #[test]
+    fn mbr_two_fat_p1_p2_open_from_reader() {
+        let a = b"payload-one";
+        let b = b"payload-two";
+        let fat1 = fat_volume("a.txt", a);
+        let fat2 = fat_volume("b.txt", b);
+        let lba1 = 8u32;
+        let lba2 = lba1 + fat1.len().div_ceil(512) as u32;
+        let img = mbr_two_fat(&fat1, lba1, &fat2, lba2);
+        let m = BlockMountSource::open_from_reader(Cursor::new(img), "two.img").expect("open");
+        let root = m.list_dirents("/").expect("root");
+        find_name(&root, "p1");
+        find_name(&root, "p2");
+        let fi1 = m.lookup("/p1/a.txt", 0).expect("p1/a.txt");
+        let fi2 = m.lookup("/p2/b.txt", 0).expect("p2/b.txt");
+        let mut g1 = Vec::new();
+        m.open(&fi1, 0).unwrap().read_to_end(&mut g1).unwrap();
+        let mut g2 = Vec::new();
+        m.open(&fi2, 0).unwrap().read_to_end(&mut g2).unwrap();
+        assert_eq!(g1, a);
+        assert_eq!(g2, b);
+        assert!(m.lookup("/p1/b.txt", 0).is_none());
+        assert!(m.lookup("/p2/a.txt", 0).is_none());
+    }
+
+    /// Regression: EBR logical FAT is mounted as sequential `p1/`.
+    #[test]
+    fn ebr_logical_fat_p1_listing() {
+        let payload = b"logical-fat";
+        let fat = fat_volume("hello.txt", payload);
+        let ext_start = 8u32;
+        let fat_lba = ext_start + 1;
+        let fat_sectors = fat.len().div_ceil(512) as u32;
+        let mut img = vec![0u8; (fat_lba as usize + fat_sectors as usize) * 512];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        img[446 + 4] = MBR_TYPE_EXTENDED_LBA;
+        img[446 + 8..446 + 12].copy_from_slice(&ext_start.to_le_bytes());
+        img[446 + 12..446 + 16].copy_from_slice(&(fat_sectors + 1).to_le_bytes());
+        let ebr = ext_start as usize * 512;
+        img[ebr + 510] = 0x55;
+        img[ebr + 511] = 0xAA;
+        img[ebr + 446 + 4] = 0x0C;
+        img[ebr + 446 + 8..ebr + 446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        img[ebr + 446 + 12..ebr + 446 + 16].copy_from_slice(&fat_sectors.to_le_bytes());
+        let fat_off = fat_lba as usize * 512;
+        img[fat_off..fat_off + fat.len()].copy_from_slice(&fat);
+
+        let m = BlockMountSource::open_from_reader(Cursor::new(img), "ebr.img").expect("ebr open");
+        assert_eq!(m.partitions()[0].start_lba, u64::from(fat_lba));
+        let fi = m.lookup("/p1/hello.txt", 0).expect("logical p1 file");
+        let mut got = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    fn any_ext4_bytes() -> Option<Vec<u8>> {
+        let root = std::env::var("RATARMOUNT_PY_ROOT")
+            .unwrap_or_else(|_| "/home/mbrewer/projects/ratarmount".into());
+        let bz2 = PathBuf::from(&root).join("tests/nested-tar-1M.ext4.bz2");
+        if bz2.exists() {
+            let dir = tempfile::tempdir().ok()?;
+            let img = dir.path().join("x.ext4");
+            let status = std::process::Command::new("bzip2")
+                .args(["-dc"])
+                .arg(&bz2)
+                .stdout(File::create(&img).ok()?)
+                .status()
+                .ok()?;
+            if status.success() {
+                return std::fs::read(&img).ok();
+            }
+        }
+        let mke2fs = ["/usr/sbin/mke2fs", "/sbin/mke2fs"]
+            .iter()
+            .map(PathBuf::from)
+            .find(|p| p.is_file())
+            .or_else(|| {
+                std::env::var_os("PATH").and_then(|path| {
+                    std::env::split_paths(&path)
+                        .map(|d| d.join("mke2fs"))
+                        .find(|p| p.is_file())
+                })
+            })?;
+        let dir = tempfile::tempdir().ok()?;
+        let seed = dir.path().join("seed");
+        std::fs::create_dir_all(seed.join("foo")).ok()?;
+        std::fs::write(seed.join("foo/hello.txt"), b"ext4-in-mbr").ok()?;
+        let img = dir.path().join("min.ext4");
+        File::create(&img).ok()?.set_len(1024 * 1024).ok()?;
+        let status = std::process::Command::new(mke2fs)
+            .args(["-t", "ext4", "-F", "-q", "-d"])
+            .arg(&seed)
+            .arg(&img)
+            .status()
+            .ok()?;
+        if !status.success() {
+            eprintln!("skip: mke2fs failed");
+            return None;
+        }
+        std::fs::read(&img).ok()
+    }
+
+    /// EXT4 `open_*_with_offset` via MBR `p1/` when a fixture or mke2fs exists.
+    #[test]
+    fn mbr_ext4_p1_skip_if_missing() {
+        let Some(ext) = any_ext4_bytes() else {
+            eprintln!("skip: no EXT4 fixture / mke2fs");
+            return;
+        };
+        let start_lba = 8u32;
+        let start_off = start_lba as usize * 512;
+        let sectors = ext.len().div_ceil(512) as u32;
+        let mut img = vec![0u8; start_off + ext.len()];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        img[446 + 4] = 0x83;
+        img[446 + 8..446 + 12].copy_from_slice(&start_lba.to_le_bytes());
+        img[446 + 12..446 + 16].copy_from_slice(&sectors.to_le_bytes());
+        img[start_off..start_off + ext.len()].copy_from_slice(&ext);
+        let m = BlockMountSource::open_from_reader(Cursor::new(img), "ext4.img")
+            .expect("MBR+EXT4 open");
+        assert_eq!(m.partitions()[0].kind, PartitionKind::LinuxFs);
+        assert!(m.lookup("/p1", 0).is_some());
+        let root = m.list_dirents("/p1").expect("ext4 p1");
+        assert!(!root.is_empty(), "EXT4 p1 should list at least one dirent");
     }
 }
