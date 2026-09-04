@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Regression: F-5 Homebrew v1 is a tap *cask* for the signed macos-arm64
 # GitHub Release tarball (K17). Not a source formula. Homebrew forbids
-# path/URL casks; docs must use a local tap + fully-qualified token.
+# path/URL casks; docs must use brew tap-new + copy (packaging/homebrew/
+# is not a git repo). Fully-qualified token.
 #
 # Static checks always run so Linux CI / agents can validate the cask without
 # Homebrew. When brew exists, audit via a temporary local tap (not a filesystem
@@ -124,12 +125,14 @@ else
   pass 'does not invoke brew audit --strict'
 fi
 
-# Homebrew forbids casks from file paths and raw URLs (HOMEBREW_FORBID_PACKAGES_FROM_PATHS).
+# Homebrew forbids path/URL casks. packaging/homebrew/ is not a git repo, so
+# two-arg `brew tap user/name packaging/homebrew` cannot work.
 DOC_FILES=(
   "$ROOT/README.md"
   "$ROOT/docs/macos.md"
   "$ROOT/docs/packaging.md"
 )
+INSTALL_SH="$ROOT/packaging/homebrew/install.sh"
 for f in "${DOC_FILES[@]}"; do
   if grep -nE 'raw\.githubusercontent\.com' "$f" >/dev/null; then
     fail "$(basename "$f") must not document a raw.githubusercontent.com cask URL"
@@ -146,13 +149,38 @@ for f in "${DOC_FILES[@]}"; do
   else
     pass "$(basename "$f") has no https cask install"
   fi
-  if grep -qF 'brew tap hilather/ratarmount' "$f" \
-    && grep -qF 'brew install --cask hilather/ratarmount/ratarmount' "$f"; then
-    pass "$(basename "$f") documents fully-qualified tap install"
+  if grep -nE 'brew tap hilather/ratarmount[[:space:]]+"\$\(pwd\)/packaging/homebrew"' "$f" >/dev/null \
+    || grep -nE 'brew tap hilather/ratarmount[[:space:]]+packaging/homebrew' "$f" >/dev/null; then
+    fail "$(basename "$f") must not brew tap packaging/homebrew (not a git repo)"
   else
-    fail "$(basename "$f") must document: brew tap hilather/ratarmount … and brew install --cask hilather/ratarmount/ratarmount"
+    pass "$(basename "$f") does not git-tap packaging/homebrew"
+  fi
+  if grep -qF 'brew tap-new hilather/ratarmount' "$f" \
+    && grep -qF 'brew --repo hilather/ratarmount' "$f" \
+    && grep -qF 'brew install --cask hilather/ratarmount/ratarmount' "$f"; then
+    pass "$(basename "$f") documents tap-new + copy + fully-qualified install"
+  else
+    fail "$(basename "$f") must document brew tap-new, brew --repo copy, and brew install --cask hilather/ratarmount/ratarmount"
   fi
 done
+
+if [[ ! -x "$INSTALL_SH" ]]; then
+  fail "packaging/homebrew/install.sh must exist and be executable"
+else
+  pass "packaging/homebrew/install.sh is executable"
+fi
+if grep -qF 'brew tap-new' "$INSTALL_SH" \
+  && grep -qF 'brew --repo' "$INSTALL_SH" \
+  && grep -qF 'brew install --cask "${TAP}/ratarmount"' "$INSTALL_SH"; then
+  pass "install.sh uses tap-new + copy + fully-qualified install"
+else
+  fail "install.sh must brew tap-new, copy into brew --repo, and brew install --cask"
+fi
+if grep -nE 'brew tap \$\{TAP\}[[:space:]]+"\$ROOT/packaging/homebrew"|brew tap hilather/ratarmount[[:space:]]+"\$\(pwd\)/packaging/homebrew"' "$INSTALL_SH" >/dev/null; then
+  fail "install.sh must not brew tap packaging/homebrew as a git remote"
+else
+  pass "install.sh does not git-tap packaging/homebrew"
+fi
 
 if [[ "$fail" -ne 0 ]]; then
   echo "FAIL: Homebrew cask static checks" >&2
@@ -166,35 +194,36 @@ if ! command -v brew >/dev/null 2>&1; then
   exit 0
 fi
 
-# Audit via a temporary local tap. Do not `brew audit --cask /path/to.rb`
-# (HOMEBREW_FORBID_PACKAGES_FROM_PATHS rejects path casks).
+# Audit the same way the docs install: brew tap-new + copy into Casks/.
+# Do not `brew audit --cask /path/to.rb` (HOMEBREW_FORBID_PACKAGES_FROM_PATHS)
+# and do not `brew tap user/name packaging/homebrew` (not a git repo).
 TAP="ratarmount-cask-ci/ratarmount"
-TAP_SRC="$(mktemp -d)"
 cleanup_tap() {
   brew untap "$TAP" >/dev/null 2>&1 || true
-  rm -rf "$TAP_SRC"
 }
 trap cleanup_tap EXIT
+brew untap "$TAP" >/dev/null 2>&1 || true
 
-cp -a "$ROOT/packaging/homebrew/." "$TAP_SRC/"
-if [[ ! -d "$TAP_SRC/.git" ]]; then
-  git -C "$TAP_SRC" init -q
-  git -C "$TAP_SRC" add Casks
-  git -C "$TAP_SRC" -c user.email="cask-ci@example.invalid" -c user.name="cask-ci" commit -qm "tap"
-fi
-
-echo "==> brew tap ${TAP} ${TAP_SRC}"
-if ! brew tap "$TAP" "$TAP_SRC"; then
-  echo "skip: brew tap of local packaging/homebrew failed (static checks passed)" >&2
+echo "==> brew tap-new ${TAP}"
+if ! brew tap-new "$TAP"; then
+  if [[ "$(uname -s)" == "Darwin" ]]; then
+    echo "FAIL: brew tap-new ${TAP} on Darwin" >&2
+    exit 1
+  fi
+  echo "skip: brew tap-new failed on $(uname -s) (static checks passed)" >&2
   exit 0
 fi
 
+repo="$(brew --repo "$TAP")"
+mkdir -p "$repo/Casks"
+cp "$CASK" "$repo/Casks/ratarmount.rb"
+
 echo "==> brew audit --cask ${TAP}/ratarmount"
 if brew audit --cask "${TAP}/ratarmount"; then
-  echo "OK: brew audit --cask via local tap"
+  echo "OK: brew audit --cask via tap-new"
 elif [[ "$(uname -s)" != "Darwin" ]]; then
   echo "skip: brew audit --cask of macos-only cask on $(uname -s) (static checks passed)" >&2
 else
-  echo "FAIL: brew audit --cask via local tap" >&2
+  echo "FAIL: brew audit --cask via tap-new" >&2
   exit 1
 fi

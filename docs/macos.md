@@ -164,13 +164,16 @@ v1 is a **cask** that unpacks the signed GitHub Release `macos-arm64` tarball. I
 Cask: [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) (tap root is [`packaging/homebrew/`](https://github.com/hilather/ratarmount-rs/tree/main/packaging/homebrew)).
 
 ```bash
-# From a clone of this repo (cwd = repo root). Homebrew forbids path/URL casks.
+# From a clone of this repo (cwd = repo root). Homebrew forbids path/URL casks,
+# and packaging/homebrew/ is not a git repository (so `brew tap … that path` fails).
 # Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
-brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+# or: ./packaging/homebrew/install.sh
+brew tap-new hilather/ratarmount
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```
 
-A published `hilather/homebrew-ratarmount` GitHub repo (Casks/ at the tap root) is the longer-term remote tap; Homebrew-core is out of v1.
+No-clone path: extract the signed GitHub Release `macos-arm64` tarball (section “Manual tarball”). A published `hilather/homebrew-ratarmount` GitHub repo (Casks/ at the tap root) is the longer-term remote tap; Homebrew-core is out of v1.
 
 Cask **caveats** (not formula build deps) remind you to install **macFUSE or FUSE-T** and runtime **libarchive**. Then:
 
