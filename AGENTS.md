@@ -72,6 +72,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Already-seekable zstd copy does not change bytes | `cargo test -p ratarmount-compress --lib repack_already_seekable` |
 | `IN == OUT` already seekable (`DidNothing`) | `cargo test -p ratarmount-compress --lib repack_inplace_did_nothing` |
 | Multi-frame without table gets a footer; `kind` is `zstd-seek-table` | `cargo test -p ratarmount-compress --lib repack_appends_seek_table` |
+| Repack seek-table cSize ignores skippable gaps between frames | `cargo test -p ratarmount-compress --lib repack_appends_seek_table_skippable_gaps` |
 | Frame > u32 copies bytes, omits table; `--repack-force` recompresses | `cargo test -p ratarmount-compress --lib repack_drops_table_when_u32_overflow` |
 | Gzip sidecar RGZI via `export_seek_index_blob` round-trips import | `cargo test -p ratarmount-compress --lib repack_gzip_rgzi_sidecar` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |

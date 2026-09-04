@@ -8,6 +8,9 @@ use std::fs::File;
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
+#[cfg(test)]
+use std::cell::Cell;
+
 use flate2::read::MultiGzDecoder;
 use log::warn;
 
@@ -60,6 +63,8 @@ pub enum RepackOutcome {
     Recompressed {
         frames: usize,
         uncompressed: u64,
+        /// False if a recompressed frame exceeded `u32` and the footer was omitted.
+        wrote_seek_table: bool,
     },
     WroteGzipSidecar {
         points: usize,
@@ -71,14 +76,17 @@ pub enum RepackOutcome {
 /// v1 codecs: uncompressed, gzip, zstd. Other formats return
 /// [`CompressError::Unsupported`].
 pub fn repack_seekable(input: &Path, output: &Path, opts: &RepackOptions) -> Result<RepackOutcome> {
-    if opts.frame_size == 0 {
+    if opts.frame_size == 0 || opts.frame_size > u64::from(u32::MAX) {
         return Err(CompressError::Msg(
-            "repack frame size must be greater than 0".into(),
+            "repack frame size must be between 1 and u32::MAX".into(),
         ));
     }
     let format = detect_compression(input)?;
     if opts.keep_gzip && format != CompressionFormat::Gzip {
         return Err(CompressError::Msg("keep_gzip requires a gzip input".into()));
+    }
+    if opts.write_gzidx && !opts.keep_gzip {
+        return Err(CompressError::Msg("write_gzidx requires keep_gzip".into()));
     }
     match format {
         CompressionFormat::Gzip if opts.keep_gzip => write_gzip_sidecar(input, output, opts),
@@ -113,18 +121,39 @@ fn unsupported_format(format: CompressionFormat) -> &'static str {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ZstdPlan {
+    CopySeekable,
+    AppendOrCopy,
+    Recompress,
+}
+
+fn zstd_plan(map: &ZstdFrameMap, force: bool) -> ZstdPlan {
+    if force {
+        return ZstdPlan::Recompress;
+    }
+    if map.seek_table.is_some() {
+        return ZstdPlan::CopySeekable;
+    }
+    if map.frames.len() > 1 {
+        return ZstdPlan::AppendOrCopy;
+    }
+    ZstdPlan::Recompress
+}
+
 fn repack_zstd(input: &Path, output: &Path, opts: &RepackOptions) -> Result<RepackOutcome> {
     if !opts.force {
         let map = scan_zstd_frames_path(input)?;
-        if map.seek_table.is_some() {
-            if paths_are_same(input, output) {
-                return Ok(RepackOutcome::DidNothing);
+        match zstd_plan(&map, false) {
+            ZstdPlan::CopySeekable => {
+                if paths_are_same(input, output) {
+                    return Ok(RepackOutcome::DidNothing);
+                }
+                copy_file_sync(input, output)?;
+                return Ok(RepackOutcome::CopiedExistingSeekable);
             }
-            copy_file_sync(input, output)?;
-            return Ok(RepackOutcome::CopiedExistingSeekable);
-        }
-        if map.frames.len() > 1 {
-            return append_or_copy_zstd(input, output, &map);
+            ZstdPlan::AppendOrCopy => return append_or_copy_zstd(input, output, &map),
+            ZstdPlan::Recompress => {}
         }
     }
     let file = File::open(input)?;
@@ -165,19 +194,32 @@ fn append_or_copy_zstd(input: &Path, output: &Path, map: &ZstdFrameMap) -> Resul
 }
 
 fn maybe_build_seek_table(frames: &[ZstdFrameInfo]) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    if FORCE_SEEK_TABLE_OVERFLOW.with(Cell::get) {
+        warn!("dropping zstd seek table: frame size exceeds u32");
+        return None;
+    }
     let entries = try_seek_table_entries(frames)?;
     Some(build_seek_table_skippable(&entries))
 }
 
+/// Seek-table `cSize` is the compressed-offset span (includes skippable gaps),
+/// matching live-commit `maybe_rebuild_seek_table`.
 fn try_seek_table_entries(frames: &[ZstdFrameInfo]) -> Option<Vec<(u32, u32)>> {
     let mut entries = Vec::with_capacity(frames.len());
     for (i, f) in frames.iter().enumerate() {
-        let c = match u32::try_from(f.compressed_size) {
-            Ok(v) => v,
-            Err(_) => {
+        let c_raw = if i + 1 < frames.len() {
+            frames[i + 1]
+                .compressed_offset
+                .checked_sub(frames[i].compressed_offset)
+        } else {
+            Some(f.compressed_size)
+        };
+        let c = match c_raw.and_then(|n| u32::try_from(n).ok()) {
+            Some(v) => v,
+            None => {
                 warn!(
-                    "dropping zstd seek table: frame size exceeds u32 (frame {i} compressed {})",
-                    f.compressed_size
+                    "dropping zstd seek table: frame size exceeds u32 (frame {i} compressed span)"
                 );
                 return None;
             }
@@ -197,12 +239,20 @@ fn try_seek_table_entries(frames: &[ZstdFrameInfo]) -> Option<Vec<(u32, u32)>> {
     Some(entries)
 }
 
+#[cfg(test)]
+thread_local! {
+    // `const { Cell::new(false) }` needs rustc 1.79; workspace MSRV is 1.74.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static FORCE_SEEK_TABLE_OVERFLOW: Cell<bool> = Cell::new(false);
+}
+
 fn recompress_to_zstd<R: Read>(
     mut src: R,
     output: &Path,
     opts: &RepackOptions,
 ) -> Result<RepackOutcome> {
     let mut entries: Vec<(u64, u64)> = Vec::new();
+    let mut wrote_seek_table = true;
     write_output_tmp(output, |dst| {
         loop {
             let mut first = [0u8; 1];
@@ -235,6 +285,7 @@ fn recompress_to_zstd<R: Read>(
         }
         if overflow {
             warn!("dropping zstd seek table: frame size exceeds u32");
+            wrote_seek_table = false;
         } else {
             dst.write_all(&build_seek_table_skippable(&table_entries))?;
         }
@@ -244,6 +295,7 @@ fn recompress_to_zstd<R: Read>(
     Ok(RepackOutcome::Recompressed {
         frames: entries.len(),
         uncompressed,
+        wrote_seek_table,
     })
 }
 
@@ -252,12 +304,14 @@ fn write_gzip_sidecar(input: &Path, output: &Path, opts: &RepackOptions) -> Resu
         copy_file_sync(input, output)?;
     }
     let gzip = SeekableGzip::open(output, DEFAULT_GZIP_SEEK_SPACING)?;
-    let rgzi = gzip.export_seek_index_blob();
-    std::fs::write(sidecar_path(output, "rgzi"), rgzi)?;
+    write_bytes_tmp(
+        &sidecar_path(output, "rgzi"),
+        &gzip.export_seek_index_blob(),
+    )?;
     if opts.write_gzidx {
-        std::fs::write(
-            sidecar_path(output, "gzidx"),
-            gzip.export_indexed_gzip_blob(),
+        write_bytes_tmp(
+            &sidecar_path(output, "gzidx"),
+            &gzip.export_indexed_gzip_blob(),
         )?;
     }
     Ok(RepackOutcome::WroteGzipSidecar {
@@ -293,6 +347,13 @@ fn copy_file_sync(input: &Path, output: &Path) -> Result<()> {
     write_output_tmp(output, |dst| {
         let mut src = File::open(input)?;
         io::copy(&mut src, dst)?;
+        Ok(())
+    })
+}
+
+fn write_bytes_tmp(path: &Path, bytes: &[u8]) -> Result<()> {
+    write_output_tmp(path, |dst| {
+        dst.write_all(bytes)?;
         Ok(())
     })
 }
@@ -392,6 +453,26 @@ mod tests {
         }
     }
 
+    fn skippable_frame(payload: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(8 + payload.len());
+        out.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        out.extend_from_slice(&(payload.len() as u32).to_le_bytes());
+        out.extend_from_slice(payload);
+        out
+    }
+
+    fn with_forced_seek_table_overflow<T>(f: impl FnOnce() -> T) -> T {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                FORCE_SEEK_TABLE_OVERFLOW.with(|c| c.set(false));
+            }
+        }
+        FORCE_SEEK_TABLE_OVERFLOW.with(|c| c.set(true));
+        let _reset = Reset;
+        f()
+    }
+
     /// Regression: already-seekable zstd is copied byte-for-byte (no recompress).
     #[test]
     fn repack_already_seekable() {
@@ -467,6 +548,50 @@ mod tests {
         assert_eq!(got, b"hello world!!!!second frame payload");
     }
 
+    /// Regression: skippable gaps must be folded into seek-table cSize (offset deltas).
+    #[test]
+    fn repack_appends_seek_table_skippable_gaps() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("gapped.zst");
+        let output = dir.path().join("seekable.zst");
+        let p0 = b"hello world!!!!";
+        let p1 = b"second frame payload";
+        let f0 = encode_zstd_frame(p0, 3).unwrap();
+        let f1 = encode_zstd_frame(p1, 3).unwrap();
+        let skip = skippable_frame(b"skip-meta-padding!!");
+        let mut payload = f0.clone();
+        payload.extend_from_slice(&skip);
+        payload.extend_from_slice(&f1);
+        std::fs::write(&input, &payload).unwrap();
+
+        let before = scan_zstd_frames_path(&input).unwrap();
+        assert_eq!(before.frames.len(), 2);
+        assert!(before.seek_table.is_none());
+        assert!(
+            before.frames[1].compressed_offset > before.frames[0].compressed_size,
+            "fixture must have a skippable gap between data frames"
+        );
+
+        let outcome = repack_seekable(&input, &output, &tiny_opts()).unwrap();
+        assert_eq!(outcome, RepackOutcome::AppendedSeekTable);
+
+        let after = scan_zstd_frames_path(&output).unwrap();
+        assert!(after.seek_table.is_some());
+        assert_eq!(
+            after.frames[0].compressed_size,
+            before.frames[1].compressed_offset - before.frames[0].compressed_offset,
+            "cSize must be the offset span, not the data-frame compressed_size"
+        );
+
+        let body = open_seekable_zstd(&output).unwrap();
+        assert_eq!(body.kind(), "zstd-seek-table");
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        let mut expected = p0.to_vec();
+        expected.extend_from_slice(p1);
+        assert_eq!(got, expected);
+    }
+
     /// Regression: frame size > u32 copies frames and omits a lying seek table.
     #[test]
     fn repack_drops_table_when_u32_overflow() {
@@ -487,6 +612,41 @@ mod tests {
         }];
         assert!(try_seek_table_entries(&too_plain).is_none());
 
+        let gapped = [
+            ZstdFrameInfo {
+                compressed_offset: 0,
+                uncompressed_offset: 0,
+                compressed_size: 100,
+                uncompressed_size: 10,
+            },
+            ZstdFrameInfo {
+                compressed_offset: 150,
+                uncompressed_offset: 10,
+                compressed_size: 20,
+                uncompressed_size: 5,
+            },
+        ];
+        assert_eq!(
+            try_seek_table_entries(&gapped).unwrap(),
+            vec![(150, 10), (20, 5)],
+            "cSize is the offset delta, not compressed_size"
+        );
+        let span_overflow = [
+            ZstdFrameInfo {
+                compressed_offset: 0,
+                uncompressed_offset: 0,
+                compressed_size: 10,
+                uncompressed_size: 10,
+            },
+            ZstdFrameInfo {
+                compressed_offset: u32::MAX as u64 + 1,
+                uncompressed_offset: 10,
+                compressed_size: 20,
+                uncompressed_size: 5,
+            },
+        ];
+        assert!(try_seek_table_entries(&span_overflow).is_none());
+
         let dir = tempfile::tempdir().unwrap();
         let input = dir.path().join("mf.zst");
         let output = dir.path().join("copied.zst");
@@ -495,12 +655,30 @@ mod tests {
         let mut map = scan_zstd_frames_path(&input).unwrap();
         assert_eq!(map.frames.len(), 2);
         map.frames[0].uncompressed_size = u32::MAX as u64 + 1;
+        assert_eq!(zstd_plan(&map, false), ZstdPlan::AppendOrCopy);
+        assert_eq!(zstd_plan(&map, true), ZstdPlan::Recompress);
 
         let outcome = append_or_copy_zstd(&input, &output, &map).unwrap();
         assert_eq!(outcome, RepackOutcome::CopiedWithoutSeekTable);
         let out_bytes = std::fs::read(&output).unwrap();
         assert_eq!(out_bytes, payload);
         assert!(!has_seek_table_footer(&out_bytes));
+
+        let hooked = dir.path().join("hooked.zst");
+        let hooked_out = with_forced_seek_table_overflow(|| {
+            repack_seekable(&input, &hooked, &tiny_opts()).unwrap()
+        });
+        assert_eq!(hooked_out, RepackOutcome::CopiedWithoutSeekTable);
+        assert!(!has_seek_table_footer(&std::fs::read(&hooked).unwrap()));
+
+        let too_big = RepackOptions {
+            frame_size: u64::from(u32::MAX) + 1,
+            ..tiny_opts()
+        };
+        let err = repack_seekable(&input, &dir.path().join("big.zst"), &too_big)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("u32::MAX"), "{err}");
 
         let force = RepackOptions {
             force: true,
@@ -512,9 +690,11 @@ mod tests {
             RepackOutcome::Recompressed {
                 frames,
                 uncompressed,
+                wrote_seek_table,
             } => {
                 assert!(frames >= 2, "force must split into frame_size windows");
                 assert_eq!(uncompressed, (2 * b"chunk-A-payload!!".len()) as u64);
+                assert!(wrote_seek_table);
             }
             other => panic!("expected Recompressed, got {other:?}"),
         }
@@ -564,6 +744,48 @@ mod tests {
 
         let gzidx = std::fs::read(sidecar_path(&output, "gzidx")).unwrap();
         assert!(gzidx.starts_with(INDEXED_GZIP_INDEX_MAGIC));
+
+        let err = repack_seekable(
+            &input,
+            &dir.path().join("no-keep.gz"),
+            &RepackOptions {
+                write_gzidx: true,
+                keep_gzip: false,
+                ..tiny_opts()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("write_gzidx requires keep_gzip"), "{err}");
+    }
+
+    /// Regression: gzip without keep_gzip transcodes to framed zstd + seek table.
+    #[test]
+    fn repack_gzip_transcodes_to_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        let output = dir.path().join("out.zst");
+        let plain = b"abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+        std::fs::write(&input, encode_gz(plain)).unwrap();
+
+        let outcome = repack_seekable(&input, &output, &tiny_opts()).unwrap();
+        match outcome {
+            RepackOutcome::Recompressed {
+                frames,
+                uncompressed,
+                wrote_seek_table,
+            } => {
+                assert!(frames >= 2);
+                assert_eq!(uncompressed, plain.len() as u64);
+                assert!(wrote_seek_table);
+            }
+            other => panic!("expected Recompressed, got {other:?}"),
+        }
+        let body = open_seekable_zstd(&output).unwrap();
+        assert_eq!(body.kind(), "zstd-seek-table");
+        let mut got = Vec::new();
+        body.open_reader().unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, plain);
     }
 
     /// Regression: single-frame zstd must recompress into framed zstd + seek table.
@@ -583,9 +805,11 @@ mod tests {
             RepackOutcome::Recompressed {
                 frames,
                 uncompressed,
+                wrote_seek_table,
             } => {
                 assert!(frames >= 2);
                 assert_eq!(uncompressed, plain.len() as u64);
+                assert!(wrote_seek_table);
             }
             other => panic!("expected Recompressed, got {other:?}"),
         }
