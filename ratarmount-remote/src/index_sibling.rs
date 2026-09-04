@@ -5,9 +5,11 @@
 //! (F-7 primitive; live overlay commit and CLI `--publish-index` wiring are later).
 //! GCS/Azure PUT is residual.
 
-use std::io::Write;
+use std::fs::File;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::{
@@ -114,7 +116,40 @@ fn validate_s3_index_pointer(pointer: &S3IndexPointer) -> Result<String> {
             "index pointer JSON index_id must equal pointer.index_id".into(),
         ));
     }
+    let etag = v.get("etag_sha256").and_then(|x| x.as_str()).unwrap_or("");
+    let etag = parse_index_id(etag)?;
+    if etag != id {
+        return Err(RemoteError::S3(
+            "index pointer etag_sha256 must equal index_id".into(),
+        ));
+    }
+    let generated_at = v.get("generated_at").and_then(|x| x.as_str()).unwrap_or("");
+    if generated_at.is_empty() {
+        return Err(RemoteError::S3(
+            "index pointer generated_at is required".into(),
+        ));
+    }
     Ok(id)
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn leftover_blob_err(blob_url: &str, e: impl std::fmt::Display) -> RemoteError {
+    RemoteError::S3(format!(
+        "pointer PUT failed after blob PUT of {blob_url} (leftover blob not deleted): {e}"
+    ))
 }
 
 /// PUT the immutable sqlite blob, then `{url}.index.ptr`. Never pointer-first.
@@ -140,20 +175,25 @@ pub fn publish_index_to_s3(
             sqlite_path.display()
         )));
     }
+    let digest = sha256_file_hex(sqlite_path)?;
+    if digest != id {
+        return Err(RemoteError::S3(format!(
+            "publish_index_to_s3: sqlite sha256 {digest} != index_id {id}"
+        )));
+    }
     let blob_url = format!("{archive}.index.{id}.sqlite");
     let ptr_url = format!("{archive}.index.ptr");
     crate::s3::put_s3_file(&blob_url, sqlite_path, INDEX_MEDIA_TYPE)?;
-    let mut tmp = NamedTempFile::new()?;
-    tmp.write_all(&pointer.json)?;
+    let mut tmp = NamedTempFile::new().map_err(|e| leftover_blob_err(&blob_url, e))?;
+    tmp.write_all(&pointer.json)
+        .map_err(|e| leftover_blob_err(&blob_url, e))?;
     if !pointer.json.ends_with(b"\n") {
-        tmp.write_all(b"\n")?;
+        tmp.write_all(b"\n")
+            .map_err(|e| leftover_blob_err(&blob_url, e))?;
     }
-    tmp.flush()?;
-    if let Err(e) = crate::s3::put_s3_file(&ptr_url, tmp.path(), "application/json") {
-        return Err(RemoteError::S3(format!(
-            "pointer PUT failed after blob PUT of {blob_url} (leftover blob not deleted): {e}"
-        )));
-    }
+    tmp.flush().map_err(|e| leftover_blob_err(&blob_url, e))?;
+    crate::s3::put_s3_file(&ptr_url, tmp.path(), "application/json")
+        .map_err(|e| leftover_blob_err(&blob_url, e))?;
     Ok(())
 }
 
@@ -576,6 +616,61 @@ mod tests {
         assert!(
             !objects.contains_key("data/a.tar.index.ptr"),
             "pointer must not be stored on 500"
+        );
+    }
+
+    #[test]
+    fn leftover_blob_err_names_url() {
+        let err = leftover_blob_err("s3://b/a.tar.index.aa.sqlite", "disk full").to_string();
+        assert!(
+            err.contains("leftover blob not deleted")
+                && err.contains("s3://b/a.tar.index.aa.sqlite")
+                && err.contains("disk full"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: pointer JSON that GET `parse_index_pointer_json` would reject.
+    #[test]
+    fn s3_publish_index_rejects_etag_mismatch() {
+        let blob = b"SQLite format 3\0etag";
+        let id = sha256_hex_bytes(blob);
+        let other = "b".repeat(64);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let json = format!(
+            r#"{{"schema":"{INDEX_POINTER_SCHEMA}","index_id":"{id}","etag_sha256":"{other}","generated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .into_bytes();
+        let err = publish_index_to_s3(
+            "s3://bucket/data/a.tar",
+            tmp.path(),
+            &S3IndexPointer { index_id: id, json },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("etag_sha256"), "got: {err}");
+    }
+
+    /// Regression: blob URL index_id must be sha256 of the sqlite bytes.
+    #[test]
+    fn s3_publish_index_rejects_blob_hash_mismatch() {
+        let blob = b"SQLite format 3\0hash-mismatch";
+        let wrong = "a".repeat(64);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let pointer = S3IndexPointer {
+            index_id: wrong.clone(),
+            json: pointer_json(&wrong),
+        };
+        let err = publish_index_to_s3("s3://bucket/data/a.tar", tmp.path(), &pointer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sha256") && err.contains("index_id"),
+            "got: {err}"
         );
     }
 }

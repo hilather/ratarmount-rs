@@ -1707,6 +1707,16 @@ fn s3_write_status_error(
     ))
 }
 
+/// Write agent: never follow 301/302/303 (ureq would retry those as GET).
+/// 307 re-sign is residual.
+fn s3_write_agent() -> ureq::Agent {
+    use std::sync::OnceLock;
+    static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
+    AGENT
+        .get_or_init(|| ureq::AgentBuilder::new().redirects(0).build())
+        .clone()
+}
+
 fn response_etag(resp: &ureq::Response) -> String {
     resp.header("etag")
         .or_else(|| resp.header("ETag"))
@@ -1811,7 +1821,8 @@ fn s3_write_send(req: S3WriteReq<'_>) -> Result<(CredSource, ureq::Response)> {
         creds.access_key
     );
 
-    let mut req = ureq::request(method, &url)
+    let mut req = s3_write_agent()
+        .request(method, &url)
         .set("User-Agent", USER_AGENT)
         .set("Authorization", &authorization)
         .set("x-amz-content-sha256", payload_hash)
@@ -1832,6 +1843,11 @@ fn s3_write_send(req: S3WriteReq<'_>) -> Result<(CredSource, ureq::Response)> {
         S3WriteBody::Reader(r) => req.send(r),
     };
     match resp {
+        Ok(r) if (300..400).contains(&r.status()) => {
+            let code = r.status();
+            let body = r.into_string().unwrap_or_default();
+            Err(s3_write_status_error(source, code, loc, op, &body))
+        }
         Ok(r) => Ok((source, r)),
         Err(ureq::Error::Status(code, r)) => {
             let body = r.into_string().unwrap_or_default();
@@ -1905,7 +1921,7 @@ impl Drop for MultipartAbortGuard<'_> {
             return;
         }
         match s3_abort_multipart_upload(self.loc, &self.upload_id) {
-            Ok(()) => error!(
+            Ok(()) => debug!(
                 "aborted multipart upload {} for s3://{}/{}",
                 self.upload_id, self.loc.bucket, self.loc.key
             ),
@@ -3040,6 +3056,8 @@ mod tests {
         /// Fail `UploadPart` with this 1-based part number (HTTP 500).
         UploadPart(u32),
         Create,
+        /// PUT/POST 302 to a GET 200 — write path must not treat this as success.
+        Redirect302,
     }
 
     /// Path-style mock that accepts PutObject + multipart (create/part/complete/abort).
@@ -3132,6 +3150,20 @@ mod tests {
                             msg.len()
                         );
                         let _ = stream.write_all(msg);
+                        continue;
+                    }
+                    if matches!(fail, WriteFail::Redirect302) {
+                        if method == "GET" {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nETag: \"redirected\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            continue;
+                        }
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 302 Found\r\nLocation: /bucket/redirect-ok\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
                         continue;
                     }
                     if matches!(fail, WriteFail::Create)
@@ -3444,6 +3476,34 @@ mod tests {
         assert!(
             mock.objects.lock().unwrap().is_empty(),
             "probe must not leave an object"
+        );
+    }
+
+    /// Regression: 301/302/303 must not become a GET 200 success for PutObject.
+    #[test]
+    fn s3_put_does_not_follow_302() {
+        let mock = MockS3Write::spawn_fail(WriteFail::Redirect302);
+        let _g = env_signed_put(&mock);
+        let tmp = write_temp(b"no-redirect-put");
+        let err = put_s3_file(
+            "s3://bucket/redir.bin",
+            tmp.path(),
+            "application/octet-stream",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("302") || err.contains("redirect"),
+            "got: {err}"
+        );
+        let log = mock.log.lock().unwrap();
+        assert!(
+            !log.iter().any(|l| l.starts_with("GET ")),
+            "write must not follow 302 as GET; log={log:?}"
+        );
+        assert!(
+            mock.objects.lock().unwrap().is_empty(),
+            "302 PUT must not store an object"
         );
     }
 
