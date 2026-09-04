@@ -199,6 +199,7 @@ fn copy_member(
     let copy_res: Result<(), Error> = (|| {
         let mut buf = [0u8; COPY_BUF];
         let mut since_progress = 0u64;
+        let mut copied = 0u64;
         loop {
             if cancelled(cancel) {
                 return Err(Error::Cancelled);
@@ -208,6 +209,7 @@ fn copy_member(
                 break;
             }
             out.write_all(&buf[..n]).map_err(|e| map_dest_io(e, dest))?;
+            copied += n as u64;
             state.bytes_out += n as u64;
             since_progress += n as u64;
             if since_progress >= PROGRESS_EVERY {
@@ -219,6 +221,15 @@ fn copy_member(
             }
         }
         out.flush().map_err(|e| map_dest_io(e, dest))?;
+        // StenciledFile / truncated archives hit EOF without error when the
+        // body is shorter than FileInfo.size. Persist would install a short
+        // dest and return Ok(()) — silent truncation.
+        if copied != fi.size {
+            return Err(Error::Internal(format!(
+                "member {member} ended after {copied} bytes, expected {}",
+                fi.size
+            )));
+        }
         Ok(())
     })();
     drop(out);
@@ -552,6 +563,86 @@ mod tests {
             .expect("extract_to");
         let got = std::fs::read(dest.join("hello.txt")).unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// Regression: truncated TAR member extract must not persist a short dest.
+    ///
+    /// TAR indexes `size` from the ustar header and does not slurp the body.
+    /// `StenciledFile` then returns EOF when the archive ends early, and the
+    /// copy loop treated `n == 0` as success — `Ok(())` with a short file.
+    #[test]
+    fn extract_to_short_member() {
+        const HEADER_SIZE: u64 = 1000;
+        const AVAILABLE: u64 = 100;
+        let dir = tempfile::tempdir().unwrap();
+        let payload = vec![b'x'; HEADER_SIZE as usize];
+        let tar = dir.path().join("short.tar");
+        write_tar(&tar, &[member_file("trunc.bin", &payload)]);
+        // Keep a valid header (size=1000) but drop most of the body so open()
+        // hits EOF after AVAILABLE bytes.
+        {
+            let keep = 512 + AVAILABLE;
+            let f = std::fs::OpenOptions::new().write(true).open(&tar).unwrap();
+            f.set_len(keep).unwrap();
+        }
+        let idx = dir.path().join("short.tar.index.sqlite");
+        let session = Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("Session::open of header-size > body TAR");
+        let ent = session
+            .lookup("/trunc.bin")
+            .expect("indexed member")
+            .expect("trunc.bin present");
+        assert_eq!(
+            ent.size, HEADER_SIZE,
+            "index must keep the ustar size so extract can detect the short body"
+        );
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("trunc.bin");
+        let original = b"keep-preexisting";
+        std::fs::write(&out_file, original).unwrap();
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/trunc.bin".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Internal(ref s) if s.contains("ended after") && s.contains("1000")),
+            "expected short-member Internal, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&out_file).unwrap(),
+            original,
+            "short member must not persist over a pre-existing dest"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_string_lossy().contains(".extract-") && n.to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "short member must unlink the extract tmp, leftover {leftovers:?}"
+        );
     }
 
     /// Regression: extract rejects `../` and absolute member paths.
