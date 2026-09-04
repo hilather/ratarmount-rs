@@ -52,20 +52,12 @@ Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](benchmarks
 Grab the latest assets from **[Releases](https://github.com/hilather/ratarmount-rs/releases)** — Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs, plus **macOS arm64**, all cosign-signed.
 
 ```bash
-# Example: portable Linux tarball (no clone)
+# Example: portable Linux tarball
 tar xf ratarmount-*-linux-x86_64.tar.gz
 install -m 755 ratarmount ~/.local/bin/
 
-# macOS Apple Silicon — GitHub Release tarball (no clone)
-# tar xf ratarmount-*-macos-arm64.tar.gz && install -m 755 ratarmount-*/ratarmount ~/.local/bin/
-
-# macOS Apple Silicon — Homebrew tap cask (needs a clone; packaging/homebrew is not a git repo)
-# Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
-# or: ./packaging/homebrew/install.sh
-brew tap-new hilather/ratarmount
-mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
-cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
-brew install --cask hilather/ratarmount/ratarmount
+# macOS Apple Silicon — Homebrew tap cask (prebuilt tarball, not a source formula)
+brew install --cask https://raw.githubusercontent.com/hilather/ratarmount-rs/main/packaging/homebrew/Casks/ratarmount.rb
 ```
 
 See [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) for verification and package layout. macOS FUSE + cask: [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md).
@@ -133,12 +125,6 @@ ratarmount --password secret encrypted.7z mnt/
 # Index only (no FUSE)
 ratarmount --no-mount -c archive.tar
 
-# Make a single-frame / gzip archive randomly accessible (multi-frame zstd + seek table)
-ratarmount --repack-seekable big.tar.gz big.tar.zst
-# Gzip sidecar instead of transcode (helpers before the flag or after IN OUT):
-ratarmount --repack-keep-gzip --repack-seekable in.gz out.gz   # writes out.gz.rgzi
-# Exclusive with --nfs / -w / a FUSE mountpoint. Local files only.
-
 # Locate without FUSE (TSV path, size, mtime). Quote globs. `--fts` / `--offset-order` are find-only.
 ratarmount find '*.fits' archive.tar
 ratarmount find --fts fits archive.tar.gz
@@ -180,11 +166,7 @@ ratarmount --print-features
 
 ### Archives & disk images
 
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · UDIF DMG (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · WIM (uncompressed + XPRESS, first image; LZX/LZMS residual; factory wire later) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · QCOW2 v2/v3 (zlib clusters; local backing; factory later) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · VHD/VHDX (crate; wraps GPT/MBR; factory later) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
-TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · VMDK (KDMV sparse; ESXi/compressed residual; crate only) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
+TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 
 ### Seekable compression
 
@@ -201,7 +183,6 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` (read-only `search/<pattern>` glob locate; quote globs). Live `-w` control/socket last-wins overlay creates/COW/tombstones; CLI `find` stays sidecar SQL and rejects `-w`. `ratarmount find '*.fits' ARCHIVE` (no FUSE; `--fts` / `--offset-order` are find-argv only) |
-| Seekable producer | `--repack-seekable IN OUT` writes multi-frame zstd + official seek table (default 8 MiB frames; `num_args = 2`; IN OUT must immediately follow the flag). Already-seekable inputs are copied. Helpers (`--repack-keep-gzip` → `OUT.rgzi`; `--repack-gzidx`; `--repack-force`) go **before** `--repack-seekable` or **after** IN OUT. Local files only; exclusive with export / `-w` / a FUSE mountpoint. [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
@@ -325,11 +306,7 @@ Recursive mounts (`-r`) open nested members from a **seekable parent stream** wh
 | Nested member | Temp spool? |
 |---------------|:-----------:|
 | `.tar` / `.tar.gz` / `.zip` / `.7z` inside ZIP · TAR · 7z | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · UDIF DMG (crate; inner FAT/ISO) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · WIM (crate; LZX/LZMS residual) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · QCOW2 (crate) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · VHD/VHDX (crate) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · VMDK (KDMV sparse, crate) | **No** |
+| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT | **No** |
 | SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
 | Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
 | CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |
@@ -348,12 +325,8 @@ On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and
 
 Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md):
 
-1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/rapidgzip-perf-batch.md), [binding decision](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer [`--repack-seekable`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) or multi-frame).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); UDIF DMG crate mounts inner FAT/ISO (HFS+/APFS/encrypted residual; factory wire later).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); WIM LZX/LZMS / WIMBoot / later images (uncompressed + XPRESS crate; factory wire later).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); QCOW2 crate maps guest clusters then the block crate (zstd clusters / HTTP backing residual; factory wire later).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); VHD/VHDX crate (differencing residual; factory later).
-2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); VMDK KDMV sparse crate (compressed/ESXi residual; factory wire later).
+1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md), [binding decision](docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
+2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
 5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` / `rclone+` + F-1 prefix folders shipped (FTP LIST/MLSD; GCS GOOG1 HMAC). Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; implicit FTPS :990; rclone RC `--rc-serve`. [phase10-remote.md](docs/phase10-remote.md).
@@ -387,7 +360,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/parity-todo.md](docs/parity-todo.md) | Full feature + test parity checklist |
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
-| [docs/zstd-random-access.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) | Zstd seek-table & `--repack-seekable` producer |
+| [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table & producer recipes |
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
 | [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
