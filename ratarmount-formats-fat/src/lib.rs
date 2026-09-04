@@ -6,12 +6,25 @@
 //! # Nested archives (AutoMount / `open_from_reader`)
 //!
 //! Nested FAT members can be opened without `/tmp` when the outer archive yields a
-//! seekable stream: [`FatMountSource::open_from_reader`] validates the image and
+//! seekable stream: [`FatMountSource::open_from_reader`] (and
+//! [`FatMountSource::open_from_reader_with_offset`]) validates the image and
 //! retains a mutex-shared `Read + Seek` body. Each list/lookup/open reopens fatfs
 //! over that shared handle (`FileSystem` is not `Sync`). No `NamedTempFile` spool.
 //!
 //! The image is **not** fully loaded into RAM — only the outer member body (if any)
 //! remains whatever the parent archive already produced (Cursor / stencil / etc.).
+//!
+//! ## Partitioned images
+//!
+//! Superfloppy / whole-volume images use offset **0** ([`FatMountSource::open`] /
+//! [`FatMountSource::open_from_reader`]). Partitioned disks pass the FAT boot-sector
+//! byte offset via [`FatMountSource::open_with_offset`] /
+//! [`FatMountSource::open_from_reader_with_offset`]. Nested no-tmp is unchanged at
+//! offset 0.
+//!
+//! Boot-sector detection ([`looks_like_fat`] / [`looks_like_fat_at`] /
+//! [`looks_like_fat_reader`] / [`looks_like_fat_reader_at`]) is independent of the
+//! reader backend.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -42,50 +55,87 @@ impl<T: Read + Seek + Send> SeekRead for T {}
 /// Where FAT image bytes live (path re-open vs nested shared stream).
 enum FatBackend {
     /// On-disk image: `File::open` per fatfs session.
-    Path(PathBuf),
+    Path {
+        path: PathBuf,
+        partition_offset: u64,
+    },
     /// Nested / stream open: mutex-shared `Read + Seek` (no temp spool, no full RAM copy).
-    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
+    Shared {
+        shared: Arc<Mutex<Box<dyn SeekRead>>>,
+        partition_offset: u64,
+    },
 }
 
 /// Read-only disk wrapper that satisfies fatfs's `Read + Write + Seek` bound
 /// without mutating the image (writes are discarded).
+///
+/// `partition_offset` is the byte start of the FAT boot sector in the backing
+/// store (0 for a superfloppy). fatfs sees a volume that starts at logical 0.
 struct RoDisk {
     inner: RoDiskInner,
+    partition_offset: u64,
+    /// Logical position within the FAT volume (0 = boot sector).
+    pos: u64,
 }
 
 enum RoDiskInner {
     File(File),
-    Shared {
-        shared: Arc<Mutex<Box<dyn SeekRead>>>,
-        pos: u64,
-    },
+    Shared(Arc<Mutex<Box<dyn SeekRead>>>),
 }
 
 impl RoDisk {
-    fn from_file(file: File) -> Self {
+    fn from_file(file: File, partition_offset: u64) -> Self {
         Self {
             inner: RoDiskInner::File(file),
+            partition_offset,
+            pos: 0,
         }
     }
 
-    fn from_shared(shared: Arc<Mutex<Box<dyn SeekRead>>>) -> Self {
+    fn from_shared(shared: Arc<Mutex<Box<dyn SeekRead>>>, partition_offset: u64) -> Self {
         Self {
-            inner: RoDiskInner::Shared { shared, pos: 0 },
+            inner: RoDiskInner::Shared(shared),
+            partition_offset,
+            pos: 0,
+        }
+    }
+
+    fn physical_pos(&self) -> io::Result<u64> {
+        self.partition_offset
+            .checked_add(self.pos)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))
+    }
+
+    fn physical_len(&mut self) -> io::Result<u64> {
+        match &mut self.inner {
+            RoDiskInner::File(f) => Ok(f.metadata()?.len()),
+            RoDiskInner::Shared(shared) => {
+                let mut guard = shared
+                    .lock()
+                    .map_err(|_| io::Error::other("shared FAT reader poisoned"))?;
+                guard.seek(SeekFrom::End(0))
+            }
         }
     }
 }
 
 impl Read for RoDisk {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let phys = self.physical_pos()?;
         match &mut self.inner {
-            RoDiskInner::File(f) => f.read(buf),
-            RoDiskInner::Shared { shared, pos } => {
+            RoDiskInner::File(f) => {
+                f.seek(SeekFrom::Start(phys))?;
+                let n = f.read(buf)?;
+                self.pos += n as u64;
+                Ok(n)
+            }
+            RoDiskInner::Shared(shared) => {
                 let mut guard = shared
                     .lock()
                     .map_err(|_| io::Error::other("shared FAT reader poisoned"))?;
-                guard.seek(SeekFrom::Start(*pos))?;
+                guard.seek(SeekFrom::Start(phys))?;
                 let n = guard.read(buf)?;
-                *pos += n as u64;
+                self.pos += n as u64;
                 Ok(n)
             }
         }
@@ -103,33 +153,22 @@ impl Write for RoDisk {
 
 impl Seek for RoDisk {
     fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
-        match &mut self.inner {
-            RoDiskInner::File(f) => f.seek(pos),
-            RoDiskInner::Shared {
-                shared,
-                pos: cur_pos,
-            } => {
-                let new = match pos {
-                    SeekFrom::Start(o) => o as i64,
-                    SeekFrom::Current(o) => *cur_pos as i64 + o,
-                    SeekFrom::End(o) => {
-                        let mut guard = shared
-                            .lock()
-                            .map_err(|_| io::Error::other("shared FAT reader poisoned"))?;
-                        let end = guard.seek(SeekFrom::End(0))? as i64;
-                        end + o
-                    }
-                };
-                if new < 0 {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        "seek before start",
-                    ));
-                }
-                *cur_pos = new as u64;
-                Ok(*cur_pos)
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+            SeekFrom::End(o) => {
+                let phys_end = self.physical_len()? as i64;
+                phys_end - self.partition_offset as i64 + o
             }
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
         }
+        self.pos = new as u64;
+        Ok(self.pos)
     }
 }
 
@@ -223,24 +262,38 @@ pub struct FatMountSource {
 }
 
 impl FatMountSource {
+    /// Open a FAT image at partition offset 0 (superfloppy).
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_offset(path, 0)
+    }
+
+    /// Open a FAT image; `partition_offset` is the byte start of the FAT boot
+    /// sector (useful for whole-disk images with a partition table).
+    pub fn open_with_offset(path: impl AsRef<Path>, partition_offset: u64) -> Result<Self> {
         let path = path.as_ref();
-        if !looks_like_fat(path) {
+        if !looks_like_fat_at(path, partition_offset) {
             return Err(FatError::Msg(format!(
-                "{} is not a FAT12/16/32 image",
+                "{} is not a FAT12/16/32 image (boot sector not found at offset {partition_offset})",
                 path.display()
             )));
         }
         // Validate we can open with fatfs (FileSystem is !Sync, so we reopen per op).
         {
             let file = File::open(path)?;
-            let _fs = FileSystem::new(RoDisk::from_file(file), FsOptions::new()).map_err(|e| {
-                FatError::Msg(format!("failed to open FAT image {}: {e}", path.display()))
-            })?;
+            let _fs = FileSystem::new(RoDisk::from_file(file, partition_offset), FsOptions::new())
+                .map_err(|e| {
+                    FatError::Msg(format!(
+                        "failed to open FAT image {} at offset {partition_offset}: {e}",
+                        path.display()
+                    ))
+                })?;
         }
         Ok(Self {
             archive_path: path.to_path_buf(),
-            backend: FatBackend::Path(path.to_path_buf()),
+            backend: FatBackend::Path {
+                path: path.to_path_buf(),
+                partition_offset,
+            },
         })
     }
 
@@ -252,6 +305,7 @@ impl FatMountSource {
     /// method (the parent may already hold a `Cursor` or stencil).
     ///
     /// `archive_label` is used for diagnostics only (may be a nested member name).
+    /// Superfloppy / nested no-tmp uses offset 0.
     ///
     /// # Residual / factory
     ///
@@ -263,12 +317,26 @@ impl FatMountSource {
     where
         R: Read + Seek + Send + 'static,
     {
+        Self::open_from_reader_with_offset(reader, archive_label, 0)
+    }
+
+    /// Like [`Self::open_from_reader`], with a FAT boot-sector byte offset.
+    ///
+    /// Success path never writes `/tmp`. Nested AutoMount at offset 0 is unchanged.
+    pub fn open_from_reader_with_offset<R>(
+        reader: R,
+        archive_label: impl AsRef<Path>,
+        partition_offset: u64,
+    ) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
         let archive_path = archive_label.as_ref().to_path_buf();
         let mut reader = reader;
         reader.seek(SeekFrom::Start(0))?;
-        if !looks_like_fat_reader(&mut reader) {
+        if !looks_like_fat_reader_at(&mut reader, partition_offset) {
             return Err(FatError::Msg(format!(
-                "{} is not a FAT12/16/32 image",
+                "{} is not a FAT12/16/32 image (boot sector not found at offset {partition_offset})",
                 archive_path.display()
             )));
         }
@@ -279,10 +347,10 @@ impl FatMountSource {
         let shared: Arc<Mutex<Box<dyn SeekRead>>> =
             Arc::new(Mutex::new(Box::new(reader) as Box<dyn SeekRead>));
         {
-            let disk = RoDisk::from_shared(Arc::clone(&shared));
+            let disk = RoDisk::from_shared(Arc::clone(&shared), partition_offset);
             let _fs = FileSystem::new(disk, FsOptions::new()).map_err(|e| {
                 FatError::Msg(format!(
-                    "failed to open FAT image {}: {e}",
+                    "failed to open FAT image {} at offset {partition_offset}: {e}",
                     archive_path.display()
                 ))
             })?;
@@ -294,22 +362,31 @@ impl FatMountSource {
 
         Ok(Self {
             archive_path,
-            backend: FatBackend::Shared(shared),
+            backend: FatBackend::Shared {
+                shared,
+                partition_offset,
+            },
         })
     }
 
     /// Open a fresh FileSystem for this call (fatfs FileSystem is not Sync).
     fn with_fs<R>(&self, f: impl FnOnce(&FileSystem<RoDisk>) -> Result<R>) -> Result<R> {
         let disk = match &self.backend {
-            FatBackend::Path(path) => {
+            FatBackend::Path {
+                path,
+                partition_offset,
+            } => {
                 let file = File::open(path)?;
-                RoDisk::from_file(file)
+                RoDisk::from_file(file, *partition_offset)
             }
-            FatBackend::Shared(shared) => RoDisk::from_shared(Arc::clone(shared)),
+            FatBackend::Shared {
+                shared,
+                partition_offset,
+            } => RoDisk::from_shared(Arc::clone(shared), *partition_offset),
         };
         let label = match &self.backend {
-            FatBackend::Path(p) => p.display().to_string(),
-            FatBackend::Shared(_) => self.archive_path.display().to_string(),
+            FatBackend::Path { path, .. } => path.display().to_string(),
+            FatBackend::Shared { .. } => self.archive_path.display().to_string(),
         };
         let fs = FileSystem::new(disk, FsOptions::new())
             .map_err(|e| FatError::Msg(format!("failed to open FAT image {label}: {e}")))?;
@@ -482,20 +559,36 @@ impl MountSource for FatMountSource {
 
 /// Detect FAT via boot-sector 0x55AA signature + "FAT" type string or fat* extension.
 pub fn looks_like_fat(path: &Path) -> bool {
+    looks_like_fat_at(path, 0)
+}
+
+/// Detect a FAT boot sector at `partition_offset`.
+///
+/// Also returns true if the path extension is `.fat` / `.fat12` / `.fat16` /
+/// `.fat32` / `.vfat` (extension fallback preserved for convenience when magic
+/// is not yet readable, matching the previous detector behavior).
+pub fn looks_like_fat_at(path: &Path, partition_offset: u64) -> bool {
     if let Ok(mut f) = File::open(path) {
-        if looks_like_fat_reader(&mut f) {
+        if looks_like_fat_reader_at(&mut f, partition_offset) {
             return true;
         }
     }
     fat_extension(path)
 }
 
-/// Boot-sector probe for nested streams (does not use filename).
+/// Boot-sector probe for nested streams (does not use filename). Superfloppy offset 0.
 ///
 /// Leaves the reader at an unspecified position; callers should seek to 0 after.
 pub fn looks_like_fat_reader<R: Read + Seek>(reader: &mut R) -> bool {
+    looks_like_fat_reader_at(reader, 0)
+}
+
+/// Boot-sector probe at `partition_offset` on a seekable stream (does not use filename).
+///
+/// Leaves the reader at an unspecified position; callers should seek to 0 after.
+pub fn looks_like_fat_reader_at<R: Read + Seek>(reader: &mut R, partition_offset: u64) -> bool {
     let mut boot = [0u8; 512];
-    if reader.seek(SeekFrom::Start(0)).is_err() {
+    if reader.seek(SeekFrom::Start(partition_offset)).is_err() {
         return false;
     }
     if reader.read_exact(&mut boot).is_err() {
@@ -685,5 +778,153 @@ mod tests {
         assert_eq!(d.mode, fi.mode);
         assert_eq!(d.size, payload.len() as u64);
         assert_ne!(d.size, 0);
+    }
+
+    const OFFSET_PREFIX: usize = 8192;
+
+    fn padded_fat_bytes(name: &str, payload: &[u8]) -> Vec<u8> {
+        let inner = fat_image_with_file(name, payload);
+        let mut padded = vec![0u8; OFFSET_PREFIX];
+        padded.extend_from_slice(&inner);
+        padded
+    }
+
+    /// Regression: superfloppy `open_with_offset(..., 0)` matches `open`.
+    #[test]
+    fn open_with_offset_zero_matches_open() {
+        let payload = b"hello-offset-zero";
+        let bytes = fat_image_with_file("hello.txt", payload);
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("superfloppy.img");
+        std::fs::write(&img, &bytes).unwrap();
+
+        let via_open = FatMountSource::open(&img).expect("open");
+        let via_offset = FatMountSource::open_with_offset(&img, 0).expect("open_with_offset 0");
+        let a = via_open.lookup("/hello.txt", 0).expect("open lookup");
+        let b = via_offset.lookup("/hello.txt", 0).expect("offset-0 lookup");
+        assert_eq!(a.size, b.size);
+        assert_eq!(a.size, payload.len() as u64);
+
+        let mut data_a = Vec::new();
+        via_open
+            .open(&a, 0)
+            .unwrap()
+            .read_to_end(&mut data_a)
+            .unwrap();
+        let mut data_b = Vec::new();
+        via_offset
+            .open(&b, 0)
+            .unwrap()
+            .read_to_end(&mut data_b)
+            .unwrap();
+        assert_eq!(data_a, data_b);
+        assert_eq!(data_a, payload);
+    }
+
+    /// Regression: wrong partition offset is not a FAT boot sector.
+    #[test]
+    fn open_with_offset_rejects_bad_offset() {
+        let bytes = padded_fat_bytes("hello.txt", b"payload");
+        let dir = tempfile::tempdir().unwrap();
+        // No `.fat` extension so extension fallback cannot mask a bad offset.
+        let img = dir.path().join("disk.img");
+        std::fs::write(&img, &bytes).unwrap();
+
+        let err = FatMountSource::open_with_offset(&img, 4096)
+            .err()
+            .expect("expected open failure at bad offset");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not a FAT") || msg.contains("failed to open"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    /// Regression: FAT partition at a non-zero byte offset (MBR/GPT prefix).
+    #[test]
+    fn looks_like_fat_at_respects_offset() {
+        let payload = b"hello-fat-offset";
+        let bytes = padded_fat_bytes("hello.txt", payload);
+        let dir = tempfile::tempdir().unwrap();
+        let padded = dir.path().join("padded.img");
+        std::fs::write(&padded, &bytes).unwrap();
+
+        assert!(!looks_like_fat_at(&padded, 0));
+        assert!(looks_like_fat_at(&padded, OFFSET_PREFIX as u64));
+        assert!(!looks_like_fat_reader_at(&mut Cursor::new(&bytes), 0));
+        assert!(looks_like_fat_reader_at(
+            &mut Cursor::new(&bytes),
+            OFFSET_PREFIX as u64
+        ));
+
+        let m = FatMountSource::open_with_offset(&padded, OFFSET_PREFIX as u64)
+            .expect("open at offset");
+        let fi = m.lookup("/hello.txt", 0).expect("hello via offset");
+        assert_eq!(fi.size, payload.len() as u64);
+        let mut s = String::new();
+        m.open(&fi, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s.as_bytes(), payload);
+    }
+
+    /// Regression: nested no-tmp `open_from_reader_with_offset` on a padded image.
+    #[test]
+    fn open_from_reader_with_offset_padded() {
+        let payload = b"nested-offset-fat";
+        let padded = padded_fat_bytes("hello.txt", payload);
+
+        assert!(!looks_like_fat_reader_at(&mut Cursor::new(&padded), 0));
+        assert!(looks_like_fat_reader_at(
+            &mut Cursor::new(&padded),
+            OFFSET_PREFIX as u64
+        ));
+
+        let err = FatMountSource::open_from_reader(Cursor::new(padded.clone()), "padded.img")
+            .err()
+            .expect("offset-0 open_from_reader must fail on padded image");
+        assert!(
+            err.to_string().contains("not a FAT"),
+            "unexpected error: {err}"
+        );
+
+        let m = FatMountSource::open_from_reader_with_offset(
+            Cursor::new(padded),
+            "padded-nested.img",
+            OFFSET_PREFIX as u64,
+        )
+        .expect("open_from_reader_with_offset");
+        let fi = m.lookup("/hello.txt", 0).expect("hello via reader offset");
+        assert_eq!(fi.size, payload.len() as u64);
+        let mut s = String::new();
+        m.open(&fi, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s.as_bytes(), payload);
+
+        let dents = m.list_dirents("/").expect("dirents");
+        assert!(dents
+            .iter()
+            .any(|d| d.name.eq_ignore_ascii_case("hello.txt")));
+    }
+
+    /// Regression: `open_from_reader_with_offset(..., 0)` is nested no-tmp superfloppy.
+    #[test]
+    fn open_from_reader_with_offset_zero_matches_open_from_reader() {
+        let payload = b"no-tmp-offset-zero";
+        let bytes = fat_image_with_file("hello.txt", payload);
+
+        let a = FatMountSource::open_from_reader(Cursor::new(bytes.clone()), "a.fat")
+            .expect("open_from_reader");
+        let b = FatMountSource::open_from_reader_with_offset(Cursor::new(bytes), "b.fat", 0)
+            .expect("open_from_reader_with_offset 0");
+
+        let fi_a = a.lookup("/hello.txt", 0).expect("a");
+        let fi_b = b.lookup("/hello.txt", 0).expect("b");
+        assert_eq!(fi_a.size, fi_b.size);
+        assert_eq!(fi_a.size, payload.len() as u64);
+
+        let mut data_a = Vec::new();
+        a.open(&fi_a, 0).unwrap().read_to_end(&mut data_a).unwrap();
+        let mut data_b = Vec::new();
+        b.open(&fi_b, 0).unwrap().read_to_end(&mut data_b).unwrap();
+        assert_eq!(data_a, data_b);
+        assert_eq!(data_a, payload);
     }
 }

@@ -145,7 +145,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **XAR** | `xar!` / `.xar` | `XarMountSource::open_from_reader` | Store: stencil; gzip/zlib heap: inflate to RAM |
 | **CAB** (store/MSZIP) | `MSCF` / `.cab` | `CabMountSource::open_from_reader` | Store stencil / MSZIP folder decompress in RAM |
 | **SQLAR** (unencrypted) | SQLite magic / `.sqlar` | `SqlarMountSource::open_from_reader` | Full DB in RAM (`sqlite3_deserialize`); no `/tmp` |
-| **FAT** | boot probe / `.fat*` | `FatMountSource::open_from_reader` | Shared seek body (no full-image copy) |
+| **FAT** | boot probe / `.fat*` | `FatMountSource::open_from_reader` (superfloppy offset 0); partitioned images use `open_from_reader_with_offset` | Shared seek body (no full-image copy); nested no-tmp at offset 0 unchanged |
 | **SquashFS** (none/gzip/zstd/lz4/lzo/xz) | `hsqs`/`sqsh` magic (or AppImage scan) / `.squashfs`/`.sqfs`/`.snap` | `SquashFsMountSource::open_from_reader` | **Yes** — in-process backhand; **no** `/tmp` |
 | **SquashFS classic LZMA** | same magic | open_from_reader **errors** | **Temp spool** → path `open` / `unsquashfs` residual |
 | **EXT2/3/4** | superblock `0xEF53` @ 1024+0x38 / `.ext2`/`.ext3`/`.ext4` | `Ext4MountSource::open_from_reader` | **Yes** — pure ext4-view shared stream; pure fail → temp spool + path/`debugfs` |
