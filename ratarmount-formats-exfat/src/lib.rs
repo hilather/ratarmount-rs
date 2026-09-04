@@ -73,17 +73,6 @@ struct Boot {
     root_cluster: u32,
 }
 
-enum ExfatBackend {
-    Path {
-        path: PathBuf,
-        partition_offset: u64,
-    },
-    Shared {
-        shared: Arc<Mutex<Box<dyn SeekRead>>>,
-        partition_offset: u64,
-    },
-}
-
 #[derive(Clone, Debug)]
 struct DirEntry {
     name: String,
@@ -99,7 +88,8 @@ pub struct ExfatMountSource {
     /// Host path or virtual label (nested member name / URL).
     #[allow(dead_code)]
     archive_path: PathBuf,
-    backend: ExfatBackend,
+    shared: Arc<Mutex<Box<dyn SeekRead>>>,
+    partition_offset: u64,
     boot: Boot,
 }
 
@@ -118,20 +108,13 @@ impl ExfatMountSource {
                 path.display()
             )));
         }
-        let mut file = File::open(path)?;
-        let boot = read_boot(&mut file, partition_offset).map_err(|e| {
+        // One fd for the mount lifetime (list/open must not reopen per cluster).
+        let file = File::open(path)?;
+        Self::from_reader(file, path.to_path_buf(), partition_offset).map_err(|e| {
             ExfatError::Msg(format!(
                 "failed to open exFAT image {}: {e}",
                 path.display()
             ))
-        })?;
-        Ok(Self {
-            archive_path: path.to_path_buf(),
-            backend: ExfatBackend::Path {
-                path: path.to_path_buf(),
-                partition_offset,
-            },
-            boot,
         })
     }
 
@@ -178,53 +161,35 @@ impl ExfatMountSource {
             )));
         }
         reader.seek(SeekFrom::Start(0))?;
-        let boot = read_boot(&mut reader, partition_offset).map_err(|e| {
-            ExfatError::Msg(format!(
-                "failed to open exFAT image {}: {e}",
-                archive_path.display()
-            ))
-        })?;
+        Self::from_reader(reader, archive_path, partition_offset)
+    }
+
+    fn from_reader<R>(mut reader: R, archive_path: PathBuf, partition_offset: u64) -> Result<Self>
+    where
+        R: Read + Seek + Send + 'static,
+    {
+        let boot = read_boot(&mut reader, partition_offset)?;
         let shared: Arc<Mutex<Box<dyn SeekRead>>> =
             Arc::new(Mutex::new(Box::new(reader) as Box<dyn SeekRead>));
         Ok(Self {
             archive_path,
-            backend: ExfatBackend::Shared {
-                shared,
-                partition_offset,
-            },
+            shared,
+            partition_offset,
             boot,
         })
     }
 
-    fn partition_offset(&self) -> u64 {
-        match &self.backend {
-            ExfatBackend::Path {
-                partition_offset, ..
-            }
-            | ExfatBackend::Shared {
-                partition_offset, ..
-            } => *partition_offset,
-        }
-    }
-
     fn with_reader<T>(&self, f: impl FnOnce(&mut dyn SeekRead) -> Result<T>) -> Result<T> {
-        match &self.backend {
-            ExfatBackend::Path { path, .. } => {
-                let mut file = File::open(path)?;
-                f(&mut file)
-            }
-            ExfatBackend::Shared { shared, .. } => {
-                let mut guard = shared
-                    .lock()
-                    .map_err(|_| ExfatError::Msg("shared exFAT reader poisoned".into()))?;
-                f(&mut **guard)
-            }
-        }
+        let mut guard = self
+            .shared
+            .lock()
+            .map_err(|_| ExfatError::Msg("shared exFAT reader poisoned".into()))?;
+        f(&mut **guard)
     }
 
     fn read_exact_at(&self, rel: u64, buf: &mut [u8]) -> Result<()> {
         let abs = self
-            .partition_offset()
+            .partition_offset
             .checked_add(rel)
             .ok_or_else(|| ExfatError::Msg("offset overflow".into()))?;
         self.with_reader(|r| {
@@ -245,9 +210,18 @@ impl ExfatMountSource {
         Ok(u32::from_le_bytes(buf))
     }
 
+    /// Last valid cluster number (`cluster_count + 1`; heap is clusters 2..=last).
+    fn last_cluster(&self) -> u32 {
+        self.boot.cluster_count.saturating_add(1)
+    }
+
+    fn cluster_in_heap(&self, cluster: u32) -> bool {
+        cluster >= 2 && cluster <= self.last_cluster()
+    }
+
     fn cluster_rel_offset(&self, cluster: u32) -> Result<u64> {
-        if cluster < 2 {
-            return Err(ExfatError::Msg(format!("invalid cluster {cluster}")));
+        if !self.cluster_in_heap(cluster) {
+            return Err(ExfatError::Msg(format!("cluster {cluster} past heap")));
         }
         let idx = u64::from(cluster - 2);
         let rel = idx
@@ -261,12 +235,11 @@ impl ExfatMountSource {
         let mut clusters = Vec::new();
         let mut seen = HashSet::new();
         let mut cur = first;
-        let max = self.boot.cluster_count.saturating_add(2);
         while (2..FAT_EOC).contains(&cur) {
             if cur == FAT_BAD {
                 return Err(ExfatError::Msg("bad cluster in FAT chain".into()));
             }
-            if cur >= max {
+            if !self.cluster_in_heap(cur) {
                 return Err(ExfatError::Msg(format!("cluster {cur} past heap")));
             }
             if !seen.insert(cur) {
@@ -284,32 +257,54 @@ impl ExfatMountSource {
         Ok(clusters)
     }
 
+    /// Contiguous (`NoFatChain`) or FAT-chained cluster list.
+    ///
+    /// `data_length` is the on-disk Stream Extension length (must fit in the
+    /// heap). `bytes_to_read` sizes the returned vec (`min` with `data_length`)
+    /// so a 12-byte `open` cannot allocate a terabyte-scale cluster list.
     fn cluster_list(
         &self,
         first: u32,
         no_fat_chain: bool,
         data_length: Option<u64>,
+        bytes_to_read: Option<u64>,
     ) -> Result<Vec<u32>> {
         if first < 2 {
             return Ok(Vec::new());
         }
-        if no_fat_chain {
-            let len = data_length.unwrap_or(self.boot.cluster_size);
-            let n = len.div_ceil(self.boot.cluster_size).max(1);
-            let n =
-                usize::try_from(n).map_err(|_| ExfatError::Msg("cluster count overflow".into()))?;
-            let mut out = Vec::with_capacity(n);
-            for i in 0..n {
-                let i = u32::try_from(i).map_err(|_| ExfatError::Msg("cluster overflow".into()))?;
-                let c = first
-                    .checked_add(i)
-                    .ok_or_else(|| ExfatError::Msg("cluster overflow".into()))?;
-                out.push(c);
-            }
-            Ok(out)
-        } else {
-            self.follow_fat(first)
+        if !no_fat_chain {
+            return self.follow_fat(first);
         }
+        if !self.cluster_in_heap(first) {
+            return Err(ExfatError::Msg(format!("cluster {first} past heap")));
+        }
+        let declared = data_length.unwrap_or(self.boot.cluster_size);
+        let remaining = u64::from(self.last_cluster().saturating_sub(first).saturating_add(1));
+        let n_declared = declared.div_ceil(self.boot.cluster_size).max(1);
+        if n_declared > remaining {
+            return Err(ExfatError::Msg(format!(
+                "NoFatChain cluster walk past heap (first={first}, data_length={declared})"
+            )));
+        }
+        let to_read = bytes_to_read.unwrap_or(declared).min(declared);
+        let n_read = to_read
+            .div_ceil(self.boot.cluster_size)
+            .max(1)
+            .min(n_declared);
+        let n = usize::try_from(n_read)
+            .map_err(|_| ExfatError::Msg("cluster count overflow".into()))?;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let i = u32::try_from(i).map_err(|_| ExfatError::Msg("cluster overflow".into()))?;
+            let c = first
+                .checked_add(i)
+                .ok_or_else(|| ExfatError::Msg("cluster overflow".into()))?;
+            if !self.cluster_in_heap(c) {
+                return Err(ExfatError::Msg(format!("cluster {c} past heap")));
+            }
+            out.push(c);
+        }
+        Ok(out)
     }
 
     fn read_clusters(&self, clusters: &[u32], max_bytes: u64) -> Result<Vec<u8>> {
@@ -339,7 +334,7 @@ impl ExfatMountSource {
         no_fat_chain: bool,
         data_length: Option<u64>,
     ) -> Result<Vec<u8>> {
-        let clusters = self.cluster_list(first, no_fat_chain, data_length)?;
+        let clusters = self.cluster_list(first, no_fat_chain, data_length, data_length)?;
         if clusters.is_empty() {
             return Ok(Vec::new());
         }
@@ -456,7 +451,12 @@ impl ExfatMountSource {
                     return Ok(Vec::new());
                 }
                 let clusters = self
-                    .cluster_list(e.first_cluster, e.no_fat_chain, Some(e.data_length))
+                    .cluster_list(
+                        e.first_cluster,
+                        e.no_fat_chain,
+                        Some(e.data_length),
+                        Some(e.size),
+                    )
                     .map_err(|err| io::Error::other(err.to_string()))?;
                 self.read_clusters(&clusters, e.size)
                     .map_err(|err| io::Error::other(err.to_string()))
@@ -846,6 +846,24 @@ mod tests {
         data_len: u64,
         no_fat_chain: bool,
     ) -> Vec<[u8; 32]> {
+        file_set_lens(
+            name,
+            is_dir,
+            first_cluster,
+            data_len,
+            data_len,
+            no_fat_chain,
+        )
+    }
+
+    fn file_set_lens(
+        name: &str,
+        is_dir: bool,
+        first_cluster: u32,
+        valid_len: u64,
+        data_len: u64,
+        no_fat_chain: bool,
+    ) -> Vec<[u8; 32]> {
         let utf16: Vec<u16> = name.encode_utf16().collect();
         let mut name_ents = Vec::new();
         for chunk in utf16.chunks(15) {
@@ -874,7 +892,7 @@ mod tests {
         stream[0] = ENTRY_STREAM;
         stream[1] = 0x01 | if no_fat_chain { FLAG_NO_FAT_CHAIN } else { 0 };
         stream[3] = utf16.len() as u8;
-        write_u64(&mut stream, 8, data_len);
+        write_u64(&mut stream, 8, valid_len);
         write_u32(&mut stream, 20, first_cluster);
         write_u64(&mut stream, 24, data_len);
 
@@ -883,23 +901,31 @@ mod tests {
         out
     }
 
-    /// Minimal valid-enough volume: hello.txt, foo/ufo, FAT-chained big.bin.
+    const SYNTH_BPS: u32 = 512;
+    const SYNTH_VOLUME_SECTORS: u32 = 2048;
+    const SYNTH_CLUSTER_COUNT: u32 = 2008;
+    const SYNTH_PAD_BYTE: u8 = 0xAB;
+    const SYNTH_PAD_LEN: usize = 8192;
+
+    /// Minimal valid-enough volume: hello.txt, foo/ufo, FAT-chained big.bin,
+    /// plus crafted NoFatChain overflow entries. Distinctive pad after the heap
+    /// so a past-heap cluster walk would leak `SYNTH_PAD_BYTE`s.
     fn synthetic_exfat_image() -> Vec<u8> {
-        const BPS: u32 = 512;
-        const VOLUME_SECTORS: u32 = 2048;
         const FAT_OFFSET: u32 = 24;
         const FAT_LENGTH: u32 = 16;
         const HEAP_OFFSET: u32 = 40;
-        const CLUSTER_COUNT: u32 = 2008;
         const ROOT: u32 = 4;
+        let bps = SYNTH_BPS;
+        let volume_sectors = SYNTH_VOLUME_SECTORS;
+        let cluster_count = SYNTH_CLUSTER_COUNT;
 
-        let mut img = vec![0u8; (VOLUME_SECTORS * BPS) as usize];
+        let mut img = vec![0u8; (volume_sectors * bps) as usize];
         let mut boot = synthetic_boot_sector();
-        write_u64(&mut boot, 0x48, u64::from(VOLUME_SECTORS));
+        write_u64(&mut boot, 0x48, u64::from(volume_sectors));
         write_u32(&mut boot, 0x50, FAT_OFFSET);
         write_u32(&mut boot, 0x54, FAT_LENGTH);
         write_u32(&mut boot, 0x58, HEAP_OFFSET);
-        write_u32(&mut boot, 0x5C, CLUSTER_COUNT);
+        write_u32(&mut boot, 0x5C, cluster_count);
         write_u32(&mut boot, 0x60, ROOT);
         write_u32(&mut boot, 0x64, 0x1234_5678);
         boot[0x68] = 0x00;
@@ -909,7 +935,7 @@ mod tests {
         img[..512].copy_from_slice(&boot);
         img[12 * 512..13 * 512].copy_from_slice(&boot);
 
-        let fat_off = (FAT_OFFSET * BPS) as usize;
+        let fat_off = (FAT_OFFSET * bps) as usize;
         let put_fat = |img: &mut [u8], cluster: u32, val: u32| {
             let o = fat_off + cluster as usize * 4;
             img[o..o + 4].copy_from_slice(&val.to_le_bytes());
@@ -921,7 +947,7 @@ mod tests {
             put_fat(&mut img, c, next);
         }
 
-        let cluster_off = |c: u32| (HEAP_OFFSET * BPS) as usize + (c as usize - 2) * BPS as usize;
+        let cluster_off = |c: u32| (HEAP_OFFSET * bps) as usize + (c as usize - 2) * bps as usize;
         img[cluster_off(2)] = 0xFF;
 
         let hello = b"hello-exfat\n";
@@ -930,8 +956,19 @@ mod tests {
 
         let mut root = Vec::new();
         root.extend(file_set("hello.txt", false, 6, hello.len() as u64, true));
-        root.extend(file_set("foo", true, 5, u64::from(BPS), true));
+        root.extend(file_set("foo", true, 5, u64::from(bps), true));
         root.extend(file_set("big.bin", false, 8, big.len() as u64, false));
+        // Last heap cluster; DataLength covers two clusters → past cluster_count.
+        let last = cluster_count + 1;
+        root.extend(file_set(
+            "overflow.bin",
+            false,
+            last,
+            u64::from(bps) * 2,
+            true,
+        ));
+        // Declared DataLength would allocate ~2^31 cluster ids without a cap.
+        root.extend(file_set_lens("huge.bin", false, 6, 12, 1 << 40, true));
         let mut off = cluster_off(4);
         for e in &root {
             img[off..off + 32].copy_from_slice(e);
@@ -949,6 +986,7 @@ mod tests {
         img[cluster_off(7)..cluster_off(7) + ufo.len()].copy_from_slice(ufo);
         img[cluster_off(8)..cluster_off(8) + 512].copy_from_slice(&big[..512]);
         img[cluster_off(9)..cluster_off(9) + 100].copy_from_slice(&big[512..]);
+        img.extend(vec![SYNTH_PAD_BYTE; SYNTH_PAD_LEN]);
         img
     }
 
@@ -1015,6 +1053,17 @@ mod tests {
         );
     }
 
+    /// MustBeZero at 11..64 is the discriminator when OEM is spoofed as `"EXFAT   "`.
+    #[test]
+    fn looks_like_exfat_false_on_exfat_oem_with_fat_bpb() {
+        let mut boot = synthetic_boot_sector();
+        boot[11..13].copy_from_slice(&512u16.to_le_bytes());
+        boot[13] = 8;
+        boot[16] = 2;
+        assert!(!boot_sector_looks_like_exfat(&boot));
+        assert!(!looks_like_exfat_reader(&mut Cursor::new(boot)));
+    }
+
     #[test]
     fn open_from_reader_rejects_bad_magic() {
         let err = ExfatMountSource::open_from_reader(Cursor::new(b"not-an-exfat-image!!!!"), "bad")
@@ -1072,6 +1121,49 @@ mod tests {
         assert_eq!(data, expect);
     }
 
+    fn open_must_not_leak_pad(m: &ExfatMountSource, path: &str) {
+        let fi = m.lookup(path, 0).expect("dirent present");
+        match m.open(&fi, 0) {
+            Ok(mut r) => {
+                let mut data = Vec::new();
+                r.read_to_end(&mut data).unwrap();
+                panic!(
+                    "{path} should error on past-heap NoFatChain; got {} bytes (pad leaked: {})",
+                    data.len(),
+                    data.contains(&SYNTH_PAD_BYTE)
+                );
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("past heap") || msg.contains("NoFatChain"),
+                    "unexpected error for {path}: {msg}"
+                );
+            }
+        }
+    }
+
+    /// Regression: NoFatChain DataLength past cluster_count must not read heap pad.
+    #[test]
+    fn no_fat_chain_over_length_errors_without_reading_pad() {
+        let bytes = synthetic_exfat_image();
+        assert!(bytes[bytes.len() - SYNTH_PAD_LEN..]
+            .iter()
+            .all(|&b| b == SYNTH_PAD_BYTE));
+        let m = ExfatMountSource::open_from_reader(Cursor::new(bytes), "overflow.exfat")
+            .expect("open_from_reader");
+        open_must_not_leak_pad(&m, "/overflow.bin");
+    }
+
+    /// Regression: huge declared DataLength must not allocate a terabyte-scale cluster vec.
+    #[test]
+    fn no_fat_chain_huge_data_length_does_not_allocate() {
+        let bytes = synthetic_exfat_image();
+        let m = ExfatMountSource::open_from_reader(Cursor::new(bytes), "huge.exfat")
+            .expect("open_from_reader");
+        open_must_not_leak_pad(&m, "/huge.bin");
+    }
+
     #[test]
     fn open_from_reader_matches_path_open() {
         let bytes = synthetic_exfat_image();
@@ -1102,6 +1194,16 @@ mod tests {
             .unwrap();
         assert_eq!(path_data, reader_data);
         assert_eq!(path_data, b"iriya\n");
+
+        // Path open keeps one fd for the mount (two-cluster FAT chain).
+        let path_big = path_src.lookup("/big.bin", 0).expect("path big.bin");
+        let mut big_data = Vec::new();
+        path_src
+            .open(&path_big, 0)
+            .unwrap()
+            .read_to_end(&mut big_data)
+            .unwrap();
+        assert_eq!(big_data.len(), 612);
     }
 
     /// Regression: cheap readdirplus sizes.
