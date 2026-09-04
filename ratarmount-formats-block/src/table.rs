@@ -18,6 +18,10 @@ const MBR_ENTRY_COUNT: usize = 4;
 const GPT_SIG: &[u8; 8] = b"EFI PART";
 const GPT_HEADER_MIN: u32 = 92;
 const MAX_GPT_ENTRIES: u32 = 256;
+/// UEFI: `SizeOfPartitionEntry` is `128 × 2^n`; 128 is typical, 4096 is a hard cap.
+const MAX_GPT_ENTRY_SIZE: u32 = 4096;
+/// 256 × 128 — reject crafted headers before `vec![0; array_len]`.
+const MAX_GPT_ARRAY_BYTES: usize = 32 * 1024;
 const MAX_EBR_LOGICAL: usize = 64;
 
 /// Protective MBR partition type (`0xEE`).
@@ -71,7 +75,9 @@ impl PartitionKind {
 /// One MBR slot, GPT entry, or logical (EBR) partition.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Partition {
-    /// 1-based `pN` directory name (encounter order of non-empty entries).
+    /// 1-based `pN` name: encounter order of non-empty table slots (including
+    /// residual LVM/RAID/swap/MSR). Empty (all-zero GPT type) is not numbered.
+    /// Only mounted filesystems appear under `/pN/` in the tree.
     pub number: u32,
     pub start_lba: u64,
     pub lba_count: u64,
@@ -375,7 +381,8 @@ fn gpt_type_linux_swap() -> [u8; 16] {
     )
 }
 
-fn gpt_type_ms_reserved() -> [u8; 16] {
+/// Microsoft reserved (`E3C9E316-0B5C-4DB8-817D-F92DF00215AE`).
+pub fn gpt_type_ms_reserved() -> [u8; 16] {
     gpt_guid(
         0xE3C9_E316,
         0x0B5C,
@@ -468,16 +475,29 @@ fn parse_gpt<R: Read + Seek>(reader: &mut R, sector_size: u32) -> Result<Vec<Par
     let part_lba = le_u64(&hdr, 72);
     let part_count = le_u32(&hdr, 80);
     let part_entry_size = le_u32(&hdr, 84);
-    if part_entry_size < 128 {
+    // Cap before multiply: a crafted SizeOfPartitionEntry of ~4 GiB × 256 entries
+    // would OOM (or panic on 32-bit saturating_mul + slice) the FUSE/NFS process.
+    // `% 128` not `is_multiple_of` — that method is rustc 1.87+ (MSRV 1.74).
+    #[allow(clippy::manual_is_multiple_of)]
+    if !(128..=MAX_GPT_ENTRY_SIZE).contains(&part_entry_size) || part_entry_size % 128 != 0 {
         return Err(BlockError::Msg(format!(
-            "GPT partition entry size {part_entry_size} < 128"
+            "GPT partition entry size {part_entry_size} is not 128..={MAX_GPT_ENTRY_SIZE} \
+             and a multiple of 128"
         )));
     }
-    let count = part_count.min(MAX_GPT_ENTRIES);
-    let array_len = (count as usize).saturating_mul(part_entry_size as usize);
-    if array_len == 0 {
-        return Err(BlockError::Msg("GPT partition array is empty".into()));
-    }
+    let entry_size = part_entry_size as usize;
+    let max_by_bytes = MAX_GPT_ARRAY_BYTES / entry_size;
+    let count = (part_count as usize)
+        .min(MAX_GPT_ENTRIES as usize)
+        .min(max_by_bytes);
+    let array_len = count
+        .checked_mul(entry_size)
+        .filter(|&n| n > 0 && n <= MAX_GPT_ARRAY_BYTES)
+        .ok_or_else(|| {
+            BlockError::Msg(format!(
+                "GPT partition array too large (count={part_count} entry_size={part_entry_size})"
+            ))
+        })?;
     let mut array = vec![0u8; array_len];
     let array_off = part_lba.saturating_mul(ss);
     reader.seek(SeekFrom::Start(array_off))?;
@@ -511,9 +531,6 @@ fn parse_gpt<R: Read + Seek>(reader: &mut R, sector_size: u32) -> Result<Vec<Par
             continue;
         }
         let kind = kind_from_gpt_type(&type_guid);
-        if kind == PartitionKind::Reserved {
-            continue;
-        }
         out.push(Partition {
             number,
             start_lba,
@@ -593,9 +610,75 @@ mod tests {
         assert!(parts[0].kind.is_mount_residual());
     }
 
+    /// Regression: MSR is numbered like LVM (Windows GPT data is p3, not p2).
+    #[test]
+    fn parse_gpt_msr_then_data_numbers_p2() {
+        let img = gpt_fixture_entries(&[
+            (gpt_type_ms_reserved(), 34, 40),
+            (gpt_type_microsoft_basic(), 41, 100),
+        ]);
+        let parts = parse_partition_table(&mut Cursor::new(&img)).unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].kind, PartitionKind::Reserved);
+        assert_eq!(parts[0].dir_name(), "p1");
+        assert!(parts[0].kind.is_mount_residual());
+        assert_eq!(parts[1].kind, PartitionKind::NtfsExfat);
+        assert_eq!(parts[1].dir_name(), "p2");
+    }
+
+    /// Regression: crafted SizeOfPartitionEntry must Err, not OOM/panic.
+    #[test]
+    fn parse_gpt_rejects_huge_entry_size() {
+        let mut img = vec![0u8; 1024];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        img[446 + 4] = MBR_TYPE_GPT_PROTECTIVE;
+        img[512..520].copy_from_slice(GPT_SIG);
+        img[512 + 12..512 + 16].copy_from_slice(&92u32.to_le_bytes());
+        img[512 + 80..512 + 84].copy_from_slice(&128u32.to_le_bytes());
+        img[512 + 84..512 + 88].copy_from_slice(&0xFFFF_0000u32.to_le_bytes());
+        let err = parse_partition_table(&mut Cursor::new(&img))
+            .expect_err("huge SizeOfPartitionEntry must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("entry size") || msg.contains("array"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// Regression: EBR logical partition LBA is EBR LBA + relative start.
+    #[test]
+    fn parse_ebr_logical_start_lba() {
+        let mut img = vec![0u8; 20 * 512];
+        img[510] = 0x55;
+        img[511] = 0xAA;
+        // Primary slot 0: extended LBA starting at 8.
+        img[446 + 4] = MBR_TYPE_EXTENDED_LBA;
+        img[446 + 8..446 + 12].copy_from_slice(&8u32.to_le_bytes());
+        img[446 + 12..446 + 16].copy_from_slice(&10u32.to_le_bytes());
+        // EBR at LBA 8: logical FAT, start relative +1 → absolute LBA 9.
+        let ebr = 8 * 512;
+        img[ebr + 510] = 0x55;
+        img[ebr + 511] = 0xAA;
+        img[ebr + 446 + 4] = 0x0C;
+        img[ebr + 446 + 8..ebr + 446 + 12].copy_from_slice(&1u32.to_le_bytes());
+        img[ebr + 446 + 12..ebr + 446 + 16].copy_from_slice(&4u32.to_le_bytes());
+        let parts = parse_partition_table(&mut Cursor::new(&img)).unwrap();
+        assert_eq!(parts.len(), 1);
+        assert_eq!(parts[0].start_lba, 9);
+        assert_eq!(parts[0].lba_count, 4);
+        assert_eq!(parts[0].kind, PartitionKind::Fat);
+        assert_eq!(parts[0].dir_name(), "p1");
+    }
+
     fn gpt_fixture(start_lba: u64, last_lba: u64, type_guid: [u8; 16]) -> Vec<u8> {
+        gpt_fixture_entries(&[(type_guid, start_lba, last_lba)])
+    }
+
+    fn gpt_fixture_entries(entries: &[([u8; 16], u64, u64)]) -> Vec<u8> {
         const SS: usize = 512;
-        let backup_lba = last_lba + 33;
+        let last_used = entries.iter().map(|e| e.2).max().unwrap_or(34);
+        let backup_lba = last_used + 33;
         let mut img = vec![0u8; (backup_lba as usize + 1) * SS];
         img[510] = 0x55;
         img[511] = 0xAA;
@@ -605,10 +688,13 @@ mod tests {
             .copy_from_slice(&(backup_lba as u32).saturating_sub(1).to_le_bytes());
 
         let entry_off = 2 * SS;
-        img[entry_off..entry_off + 16].copy_from_slice(&type_guid);
-        img[entry_off + 16..entry_off + 32].copy_from_slice(&[1u8; 16]);
-        img[entry_off + 32..entry_off + 40].copy_from_slice(&start_lba.to_le_bytes());
-        img[entry_off + 40..entry_off + 48].copy_from_slice(&last_lba.to_le_bytes());
+        for (i, &(type_guid, start_lba, last_lba)) in entries.iter().enumerate() {
+            let off = entry_off + i * 128;
+            img[off..off + 16].copy_from_slice(&type_guid);
+            img[off + 16..off + 32].copy_from_slice(&[1u8; 16]);
+            img[off + 32..off + 40].copy_from_slice(&start_lba.to_le_bytes());
+            img[off + 40..off + 48].copy_from_slice(&last_lba.to_le_bytes());
+        }
         let array_crc = crc32fast::hash(&img[entry_off..entry_off + 128 * 128]);
 
         let mut hdr = [0u8; 92];
