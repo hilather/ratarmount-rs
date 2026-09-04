@@ -34,7 +34,7 @@ cat mnt/file     # true random access — even inside compressed streams
 |---|---|
 | **~5.2× faster cold mounts** | Index + mount in a fraction of the Python baseline (~6.8× warm) |
 | **~4–6.5× lower peak RSS** | Typical **18–22 MiB** vs ~121 MiB for Python ratarmount |
-| **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 |
+| **One binary** | No interpreter, no wheel hell — deb / rpm / portable tarballs / macOS arm64 (Homebrew tap cask) |
 | **Shared SQLite index** | Interoperable 0.7.x schema with upstream for TAR / ZIP / 7z. Portable blob media type `application/vnd.ratarmount.index.v1+sqlite` (not SOCI); auto-discover via `{url}.index.ptr` + `{url}.index.{id}.sqlite`, archive `Link:`, http(s)/S3/GCS/Azure well-known sibling, OCI referrer on local miss; `--publish-index` always writes `{archive}.index.ptr`; remount a previous snapshot with `--index-id HEX` |
 | **Nested without `/tmp`** | Most embedded archives open from the parent stream — no spool |
 | **Remote-first** | `http(s)`, S3, GCS, Azure, FTP, SSH, OCI, IPFS, rclone, WebDAV, SMB, Dropbox |
@@ -55,9 +55,12 @@ Grab the latest assets from **[Releases](https://github.com/hilather/ratarmount-
 # Example: portable Linux tarball
 tar xf ratarmount-*-linux-x86_64.tar.gz
 install -m 755 ratarmount ~/.local/bin/
+
+# macOS Apple Silicon — Homebrew tap cask (prebuilt tarball, not a source formula)
+brew install --cask https://raw.githubusercontent.com/hilather/ratarmount-rs/main/packaging/homebrew/Casks/ratarmount.rb
 ```
 
-See [`docs/packaging.md`](docs/packaging.md) for verification and package layout.
+See [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) for verification and package layout. macOS FUSE + cask: [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md).
 
 ### From source
 
@@ -327,7 +330,7 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
 5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `oci://` / `ipfs://` / `rclone://` / `rclone+` + F-1 prefix folders shipped (FTP LIST/MLSD; GCS GOOG1 HMAC). Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; implicit FTPS :990; rclone RC `--rc-serve`. [phase10-remote.md](docs/phase10-remote.md).
-6. **Platforms** — macOS is **first-class on Apple Silicon** (signed `macos-arm64` tarball on tags; [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)). Intel package deferred (no GHA Intel runner). Homebrew formula later.
+6. **Platforms** — macOS is **first-class on Apple Silicon** (signed `macos-arm64` tarball on tags; [Homebrew tap cask](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb); [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md)). Intel package deferred (no GHA Intel runner). WinFsp / Homebrew-core residual (F-5 `partial`).
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 8. **Other exports** — HTTP GET/HEAD `done`; WebDAV class 2 `done` (mux residual; Finder/Explorer not in CI); SMB **encrypt / 3.1.1 / Finder residual** (signing + NTLMv2 when password set); 9P TCP `done` (virtio residual); SFTP `done` (password env + `--sftp-subsystem`; needs `--features sftp-russh` — packages enable it; default CI does not). No `serve` subcommand. [export.md](docs/export.md).
 
