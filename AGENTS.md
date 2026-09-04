@@ -68,6 +68,12 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Live `.tar.zst` later-frame delete remounted without `-i` (silent skip + forgotten tombstone) | `cargo test -p ratarmount-compositing --lib live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount-session --lib zstd_blocks` · `cargo test -p ratarmount-session --lib bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount-session --lib gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip` |
+| Single-frame `.zst` still full-decode after “repack” | `cargo test -p ratarmount-compress --lib repack_seekable` |
+| Already-seekable zstd copy does not change bytes | `cargo test -p ratarmount-compress --lib repack_already_seekable` |
+| `IN == OUT` already seekable (`DidNothing`) | `cargo test -p ratarmount-compress --lib repack_inplace_did_nothing` |
+| Multi-frame without table gets a footer; `kind` is `zstd-seek-table` | `cargo test -p ratarmount-compress --lib repack_appends_seek_table` |
+| Frame > u32 copies bytes, omits table; `--repack-force` recompresses | `cargo test -p ratarmount-compress --lib repack_drops_table_when_u32_overflow` |
+| Gzip sidecar RGZI via `export_seek_index_blob` round-trips import | `cargo test -p ratarmount-compress --lib repack_gzip_rgzi_sidecar` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
