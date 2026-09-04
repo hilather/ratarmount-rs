@@ -222,4 +222,4 @@ Every behavior change needs a regression test in the same PR (see root `AGENTS.m
 - Member cache: G-3 (payload; not V-3)
 - Incremental commit: F-2, [`tar-zst-live-commit-design.md`](tar-zst-live-commit-design.md)
 - Remote I/O: [`docs/phase10-remote.md`](../phase10-remote.md)
-- Producer: F-9 `--repack-seekable`
+- Producer: F-9 `--repack-seekable` (CLI + engine landed; keeps TAR offset order)

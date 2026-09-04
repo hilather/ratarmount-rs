@@ -133,6 +133,11 @@ ratarmount --password secret encrypted.7z mnt/
 # Index only (no FUSE)
 ratarmount --no-mount -c archive.tar
 
+# Make a single-frame / gzip archive randomly accessible (multi-frame zstd + seek table)
+ratarmount --repack-seekable big.tar.gz big.tar.zst
+# Gzip sidecar instead of transcode: --repack-keep-gzip in.gz out.gz  (writes out.gz.rgzi)
+# Exclusive with --nfs / -w / a FUSE mountpoint. Local files only.
+
 # Locate without FUSE (TSV path, size, mtime). Quote globs. `--fts` / `--offset-order` are find-only.
 ratarmount find '*.fits' archive.tar
 ratarmount find --fts fits archive.tar.gz
@@ -191,6 +196,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` (read-only `search/<pattern>` glob locate; quote globs). Live `-w` control/socket last-wins overlay creates/COW/tombstones; CLI `find` stays sidecar SQL and rejects `-w`. `ratarmount find '*.fits' ARCHIVE` (no FUSE; `--fts` / `--offset-order` are find-argv only) |
+| Seekable producer | `--repack-seekable IN OUT` writes multi-frame zstd + official seek table (default 8 MiB frames; `num_args = 2`). Already-seekable inputs are copied. `--repack-keep-gzip` writes `OUT.rgzi`; `--repack-gzidx` adds Python GZIDX; `--repack-force` splits oversized frames. Local files only; exclusive with export / `-w` / a FUSE mountpoint. [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
@@ -333,7 +339,7 @@ On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and
 
 Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-feature-requests.md`](docs/tasks/upstream-feature-requests.md):
 
-1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](docs/tasks/rapidgzip-perf-batch.md), [binding decision](docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer multi-frame/seekable — [zstd guide](docs/zstd-random-access.md)).
+1. **Codec depth** — rapidgzip-class gzip throughput (opt-in Tier D path POC; residual vs default G3 + Python — [perf batch](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/rapidgzip-perf-batch.md), [binding decision](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md)); exotic xz filters; single-frame zstd full decode (prefer [`--repack-seekable`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) or multi-frame).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces.
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
@@ -368,7 +374,7 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [docs/parity-todo.md](docs/parity-todo.md) | Full feature + test parity checklist |
 | [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
 | [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
-| [docs/zstd-random-access.md](docs/zstd-random-access.md) | Zstd seek-table & producer recipes |
+| [docs/zstd-random-access.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) | Zstd seek-table & `--repack-seekable` producer |
 | [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
 | [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
