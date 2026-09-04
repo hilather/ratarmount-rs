@@ -2718,6 +2718,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-exfat"
+version = "0.1.30"
+dependencies = [
+ "ratarmount-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-ext4"
 version = "0.1.30"
 dependencies = [
