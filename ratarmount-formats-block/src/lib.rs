@@ -40,7 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use ratarmount_core::{
     create_root_file_info, normpath, CheapDirent, CheapSearchHit, FileInfo, ListModeResult,
-    ListResult, MountSource,
+    ListResult, MountSource, UserData,
 };
 use ratarmount_formats_ext4::{looks_like_ext4_at, looks_like_ext4_reader_at, Ext4MountSource};
 use ratarmount_formats_fat::{looks_like_fat_at, looks_like_fat_reader_at, FatMountSource};
@@ -143,6 +143,31 @@ fn part_dir_info() -> FileInfo {
     }
 }
 
+const BLOCK_TAG: &str = "block:";
+
+fn tag_part(mut fi: FileInfo, part: &str) -> FileInfo {
+    fi.userdata
+        .push(UserData::Other(format!("{BLOCK_TAG}{part}")));
+    fi
+}
+
+fn part_from_info(fi: &FileInfo) -> Option<&str> {
+    fi.userdata.iter().rev().find_map(|u| match u {
+        UserData::Other(s) if s.starts_with(BLOCK_TAG) => Some(&s[BLOCK_TAG.len()..]),
+        _ => None,
+    })
+}
+
+fn untag_part(file_info: &FileInfo) -> FileInfo {
+    let mut fi = file_info.clone();
+    if let Some(UserData::Other(s)) = fi.userdata.last() {
+        if s.starts_with(BLOCK_TAG) {
+            fi.userdata.pop();
+        }
+    }
+    fi
+}
+
 /// `/pN` → (`pN`, `/`); `/pN/foo` → (`pN`, `/foo`).
 fn split_part(path: &str) -> Option<(String, String)> {
     let path = normpath(path);
@@ -178,7 +203,14 @@ impl MountSource for PartitionTree {
             return Some(ListResult::Infos(map));
         }
         let (name, inner) = split_part(&path)?;
-        self.find(&name)?.list(&inner)
+        match self.find(&name)?.list(&inner)? {
+            ListResult::Infos(map) => Some(ListResult::Infos(
+                map.into_iter()
+                    .map(|(k, v)| (k, tag_part(v, &name)))
+                    .collect(),
+            )),
+            other => Some(other),
+        }
     }
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
@@ -215,7 +247,9 @@ impl MountSource for PartitionTree {
         if inner == "/" {
             return self.find(&name).map(|_| part_dir_info());
         }
-        self.find(&name)?.lookup(&inner, file_version)
+        self.find(&name)?
+            .lookup(&inner, file_version)
+            .map(|fi| tag_part(fi, &name))
     }
 
     fn open(
@@ -223,14 +257,19 @@ impl MountSource for PartitionTree {
         file_info: &FileInfo,
         buffering: i32,
     ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
-        let mut last = io::Error::new(io::ErrorKind::NotFound, "no partition source could open");
-        for (_, src) in &self.mounts {
-            match src.open(file_info, buffering) {
-                Ok(r) => return Ok(r),
-                Err(e) => last = e,
-            }
-        }
-        Err(last)
+        // FAT/EXT4 userdata is only the member path (`fat:/hello.txt`). Without a
+        // partition tag, walking mounts would serve p1 bytes for a p2 lookup of
+        // the same name.
+        let name = part_from_info(file_info).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "missing block partition userdata",
+            )
+        })?;
+        let src = self.find(name).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::NotFound, format!("unknown partition {name}"))
+        })?;
+        src.open(&untag_part(file_info), buffering)
     }
 
     fn versions(&self, path: &str) -> u32 {
@@ -255,9 +294,10 @@ impl MountSource for PartitionTree {
     }
 
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
-        self.mounts
-            .iter()
-            .all(|(_, s)| s.member_seek_is_cheap(file_info))
+        match part_from_info(file_info).and_then(|n| self.find(n)) {
+            Some(src) => src.member_seek_is_cheap(&untag_part(file_info)),
+            None => true,
+        }
     }
 
     fn search_cheap(&self, pattern: &str) -> Option<Vec<CheapSearchHit>> {
@@ -843,6 +883,45 @@ mod tests {
         assert_eq!(g2, b);
         assert!(m.lookup("/p1/b.txt", 0).is_none());
         assert!(m.lookup("/p2/a.txt", 0).is_none());
+    }
+
+    /// Regression: two FAT partitions both contain `hello.txt`; `open(p2/…)`
+    /// must not return p1 bytes (FAT userdata is only the member path).
+    #[test]
+    fn mbr_two_fat_same_name_open_uses_matching_partition() {
+        let a: &[u8] = b"hello-from-p1";
+        let b: &[u8] = b"hello-from-p2-different";
+        let fat1 = fat_volume("hello.txt", a);
+        let fat2 = fat_volume("hello.txt", b);
+        let lba1 = 8u32;
+        let lba2 = lba1 + fat1.len().div_ceil(512) as u32;
+        let img = mbr_two_fat(&fat1, lba1, &fat2, lba2);
+        let m = BlockMountSource::open_from_reader(Cursor::new(img), "same-name.img")
+            .expect("open two FAT");
+
+        let fi1 = m.lookup("/p1/hello.txt", 0).expect("p1 lookup");
+        let fi2 = m.lookup("/p2/hello.txt", 0).expect("p2 lookup");
+        let mut g1 = Vec::new();
+        m.open(&fi1, 0).unwrap().read_to_end(&mut g1).unwrap();
+        let mut g2 = Vec::new();
+        m.open(&fi2, 0).unwrap().read_to_end(&mut g2).unwrap();
+        assert_eq!(g1, a);
+        assert_eq!(g2, b);
+
+        // list() Infos must be tagged too (FUSE may open without a second lookup).
+        match m.list("/p2").expect("list p2") {
+            ListResult::Infos(map) => {
+                let fi = map
+                    .iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case("hello.txt"))
+                    .map(|(_, v)| v.clone())
+                    .expect("hello.txt in p2 list");
+                let mut got = Vec::new();
+                m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+                assert_eq!(got, b);
+            }
+            other => panic!("expected Infos, got {other:?}"),
+        }
     }
 
     /// Regression: EBR logical FAT is mounted as sequential `p1/`.
