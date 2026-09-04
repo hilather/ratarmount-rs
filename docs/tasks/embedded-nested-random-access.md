@@ -33,6 +33,7 @@
 | N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
 | N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | **SquashFS+FAT+EXT4 no-tmp** (pure) | SquashFS non-LZMA; FAT; EXT4 pure; residual pure-fail/debugfs |
+| N10 | GPT/MBR disk image from_reader | Partition table + FAT/EXT4 offset | **crate no-tmp** (`BlockMountSource::open_from_reader` → `pN/`) | factory nested wire later; LVM/RAID/Btrfs residual |
 | — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
 | — | 7z BCJ2 / multi-pack multi-GB solid progressive | full-folder residual | partial | deferred (AES+LZMA2 / native BCJ+LZMA2 progressive — [`sevenzip-random-access.md`](sevenzip-random-access.md)) |
 

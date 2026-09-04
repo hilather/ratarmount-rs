@@ -21,6 +21,9 @@ members = [
     "ratarmount-formats-squashfs",
     "ratarmount-formats-ext4",
     "ratarmount-formats-fat",
+    "ratarmount-formats-exfat",
+    "ratarmount-formats-ntfs",
+    "ratarmount-formats-block",
     "ratarmount-formats-asar",
     "ratarmount-formats-ogg",
     "ratarmount-formats-html",
@@ -38,7 +41,7 @@ members = [
 default-members = ["ratarmount"]
 
 [workspace.package]
-version = "0.1.33"
+version = "0.1.30"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/mxmlnkn/ratarmount-rs"
@@ -64,6 +67,9 @@ ratarmount-formats-sqlar = { path = "ratarmount-formats-sqlar" }
 ratarmount-formats-squashfs = { path = "ratarmount-formats-squashfs" }
 ratarmount-formats-ext4 = { path = "ratarmount-formats-ext4" }
 ratarmount-formats-fat = { path = "ratarmount-formats-fat" }
+ratarmount-formats-exfat = { path = "ratarmount-formats-exfat" }
+ratarmount-formats-ntfs = { path = "ratarmount-formats-ntfs" }
+ratarmount-formats-block = { path = "ratarmount-formats-block" }
 ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
 ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }

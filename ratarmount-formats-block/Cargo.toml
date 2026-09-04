@@ -1,0 +1,19 @@
+[package]
+name = "ratarmount-formats-block"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "GPT/MBR partition table mount source (p1/… via FAT/EXT4 offset opens)"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-compositing.workspace = true
+ratarmount-formats-fat.workspace = true
+ratarmount-formats-ext4.workspace = true
+thiserror.workspace = true
+log.workspace = true
+crc32fast = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+fatfs = "0.3"

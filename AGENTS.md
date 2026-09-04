@@ -66,16 +66,24 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Offline `--commit-overlay` splice for `.tar.zst` (incl. earlier-frame delete) | `cargo test -p ratarmount-compositing --lib commit_overlay` |
 | Offline `.tar.zst` later-frame delete without `-i` (silent skip) | `cargo test -p ratarmount-compositing --lib commit_overlay_tar_zst_concatenated_delete_without_ignore_zeros` · `cargo test -p ratarmount-compositing --lib commit_overlay_tar_zst_concatenated_delete_patches_sidecar_later_frame` |
 | Live `.tar.zst` later-frame delete remounted without `-i` (silent skip + forgotten tombstone) | `cargo test -p ratarmount-compositing --lib live_commit_idle_tar_zst_concatenated_delete_without_ignore_zeros` |
-| Live single-frame concatenated `.tar.zst` sidecar patch drops append after interior EOF | `cargo test -p ratarmount-compositing --lib live_commit_tar_zst_single_frame_concatenated_patches_sidecar` |
-| GNU tar `--delete` on concatenated uncompressed TAR drops later archives | `cargo test -p ratarmount-compositing --lib live_commit_uncompressed_tar_concatenated` · `cargo test -p ratarmount-compositing --lib commit_overlay_uncompressed_tar_concatenated` · `cargo test -p ratarmount-compositing --lib patch_sidecar_uncompressed_concatenated` |
-| Offline uncompressed `--commit-overlay` mutates archive on GNU tar `--delete` failure (Debian lseek EOVERFLOW) | `cargo test -p ratarmount-compositing --lib commit_overlay_uncompressed_tar_concatenated_delete_keeps_later_archive` |
-| Offline `--commit-overlay` drops later concatenated `.tar.bz2` / `.tar.xz` streams | `cargo test -p ratarmount-compress --lib materialize_bzip2_concatenated` · `cargo test -p ratarmount-compress --lib materialize_xz_concatenated` · `cargo test -p ratarmount-compositing --lib commit_overlay_tar_bz2_concatenated_delete` · `cargo test -p ratarmount-compositing --lib commit_overlay_tar_xz_concatenated_delete` |
 | Factory zstdblocks/bzip2blocks warm reimport (FR-9) | `cargo test -p ratarmount-session --lib zstd_blocks` · `cargo test -p ratarmount-session --lib bzip2_blocks` |
 | G3 RGZI warm remount (plain `.gz` + tar.gz write_index) | `cargo test -p ratarmount-session --lib gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip_rgzi` · `cargo test -p ratarmount-session --lib plain_gzip` |
+| Single-frame `.zst` still full-decode after “repack” | `cargo test -p ratarmount-compress --lib repack_seekable` |
+| Already-seekable zstd copy does not change bytes | `cargo test -p ratarmount-compress --lib repack_already_seekable` |
+| `IN == OUT` already seekable (`DidNothing`) | `cargo test -p ratarmount-compress --lib repack_inplace_did_nothing` |
+| Multi-frame without table gets a footer; `kind` is `zstd-seek-table` | `cargo test -p ratarmount-compress --lib repack_appends_seek_table` |
+| Repack seek-table cSize ignores skippable gaps between frames | `cargo test -p ratarmount-compress --lib repack_appends_seek_table_skippable_gaps` |
+| Frame > u32 copies bytes, omits table; `--repack-force` recompresses | `cargo test -p ratarmount-compress --lib repack_drops_table_when_u32_overflow` |
+| Gzip sidecar RGZI via `export_seek_index_blob` round-trips import | `cargo test -p ratarmount-compress --lib repack_gzip_rgzi_sidecar` |
+| Clap `--repack-seekable IN OUT` does not steal OUT as mountpoint | `cargo test -p ratarmount --bin ratarmount repack_seekable_flag` |
+| `--repack-seekable` + `--nfs` / `-w` / mountpoint exits 2 | `cargo test -p ratarmount --bin ratarmount repack_incompatible_with_export` |
+| tar → tar.zst keeps member offset order (zero backward flatten seeks) | `cargo test -p ratarmount --bin ratarmount repack_preserves_tar_offset_order` |
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
 | FAT partition offset (superfloppy 0 / padded image) | `cargo test -p ratarmount-formats-fat --lib offset` |
+| Nested exFAT no-tmp / OEM `"EXFAT   "` (F-8 crate) | `cargo test -p ratarmount-formats-exfat --lib` (always-on synthetic boot + volume; `mkfs_exfat` skip if no `mkfs.exfat`) |
+| GPT/MBR partition table `p1/` listing (synthetic MBR+FAT) | `cargo test -p ratarmount-formats-block --lib mbr_fat` · `cargo test -p ratarmount-formats-block --lib gpt_fat` · `cargo test -p ratarmount-formats-block --lib looks_like` |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
@@ -85,7 +93,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FileVersionLayer / TAR cheap readdir (no fat FileInfo map) | `cargo test -p ratarmount-compositing --lib file_version_layer_list_dirents` · `cargo test -p ratarmount-formats-tar --lib gnu_incremental_dumpdir_deletes` |
 | Compositing wrappers fat readdir | `cargo test -p ratarmount-compositing --lib list_dirents` |
 | Index formats missing readdirplus sizes | `cargo test -p ratarmount-formats-cpio --lib list_dirents` · `cargo test -p ratarmount-formats-ar --lib list_dirents` · `cargo test -p ratarmount-formats-warc --lib list_dirents` · `cargo test -p ratarmount-formats-cab --lib list_dirents` · `cargo test -p ratarmount-formats-iso9660 --lib list_dirents` · `cargo test -p ratarmount-formats-asar --lib list_dirents` · `cargo test -p ratarmount-formats-xar --lib list_dirents` · `cargo test -p ratarmount-formats-libarchive --lib list_dirents` · `cargo test -p ratarmount-formats-ogg --lib list_dirents` · `cargo test -p ratarmount-formats-html --lib list_dirents` · `cargo test -p ratarmount-formats-pdf --lib list_dirents` |
-| Image / Git / SQLAR / SingleFile cheap `list_dirents` | `cargo test -p ratarmount-formats-ext4 --lib list_dirents` · `cargo test -p ratarmount-formats-fat --lib list_dirents` · `cargo test -p ratarmount-formats-squashfs --lib list_dirents` · `cargo test -p ratarmount-formats-git --lib list_dirents` · `cargo test -p ratarmount-formats-sqlar --lib list_dirents` · `cargo test -p ratarmount-formats-tar --lib list_dirents` |
+| Image / Git / SQLAR / SingleFile cheap `list_dirents` | `cargo test -p ratarmount-formats-ext4 --lib list_dirents` · `cargo test -p ratarmount-formats-fat --lib list_dirents` · `cargo test -p ratarmount-formats-exfat --lib list_dirents` · `cargo test -p ratarmount-formats-block --lib list_dirents` · `cargo test -p ratarmount-formats-squashfs --lib list_dirents` · `cargo test -p ratarmount-formats-git --lib list_dirents` · `cargo test -p ratarmount-formats-sqlar --lib list_dirents` · `cargo test -p ratarmount-formats-tar --lib list_dirents` |
+| NTFS RO list/read / nested no-tmp / offset (F-8) | always-on: `cargo test -p ratarmount-formats-ntfs --lib looks_like` · `cargo test -p ratarmount-formats-ntfs --lib open_from_reader` · `cargo test -p ratarmount-formats-ntfs --lib filetime` · `cargo test -p ratarmount-formats-ntfs --lib compressed` (LZNT1 `Unsupported`); mkfs list/read/`list_dirents`/`open_with_offset` skip without `mkfs.ntfs` (not in default GHA) |
 | FUSE readlink extra lookup / FR-10 type mismatch | `cargo test -p ratarmount-fuse --lib readlink_uses_cached` · `cargo test -p ratarmount-fuse --lib readdirplus_dirent_type` |
 | AutoMount strip-ext duplicate dirent (dir `a/` + `a.tar` → two `a`) | `cargo test -p ratarmount-compositing --lib list_dirents_strip_ext_dir_archive_collision` |
 | readdirplus cached size-0 placeholder (control `status` cat empty 60s) | `cargo test -p ratarmount-fuse --lib readdirplus_placeholder_zero_size` |
@@ -100,18 +109,14 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | PAX `size=` member (≥ 8 GiB / zeroed ustar field) indexes as size 0 | `cargo test -p ratarmount-formats-tar --lib pax_size_keyword` |
 | Overlay rename loses symlinks / destination on COW failure; rmdir non-empty | `cargo test -p ratarmount-compositing --lib rename_base_symlink` · `cargo test -p ratarmount-compositing --lib rename_keeps_destination` · `cargo test -p ratarmount-compositing --lib rmdir_refuses` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
-| Workspace lock versions stale after version bump (#66) | `./packaging/test-workspace-lock-version.sh` |
+| Homebrew tap cask is a formula / path-URL install / missing sha256 | `./packaging/test-homebrew-cask.sh` |
 | Packages portable apt CDN reset (missing glibc2.31 amd64) | `./packaging/test-packages-apt-retries.sh` |
 | CI apt CDN hang cancels cold-index / FUSE allowlists | `./packaging/test-ci-apt-retries.sh` |
-| Windows session/index compile without FUSE (G6, no WinFsp); `windows_by_handle` E0658 on stable | `./packaging/test-windows-lib-ci.sh` · `cargo test -p ratarmount-index --lib regression_windows_file_id` · `cargo test -p ratarmount-index --lib regression_file_id` · `cargo test -p ratarmount-core --lib effective_ids` · `cargo test -p ratarmount-core --lib metadata_helpers` · `cargo test -p ratarmount-index --lib tar_stats_from_metadata_uses_len` · `cargo test -p ratarmount-index --lib home_dir_prefers` |
+| Windows session/index compile without FUSE (G6, no WinFsp) | `./packaging/test-windows-lib-ci.sh` · `cargo test -p ratarmount-core --lib effective_ids` · `cargo test -p ratarmount-core --lib metadata_helpers` · `cargo test -p ratarmount-index --lib tar_stats_from_metadata_uses_len` · `cargo test -p ratarmount-index --lib home_dir_prefers` |
 | NFS short-read / cheap-dirent empty `cat` | `cargo test -p ratarmount-nfs --lib fill_loops` · `cargo test -p ratarmount-nfs --lib readdir_size_zero` |
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
 | HTTP/WebDAV/SMB/`--ninep`/`--sftp` clap steals archive | `cargo test -p ratarmount --bin ratarmount http_flag` · `cargo test -p ratarmount --bin ratarmount ninep_flag` · `cargo test -p ratarmount --bin ratarmount webdav_flag` · `cargo test -p ratarmount --bin ratarmount smb_flag` · `cargo test -p ratarmount --bin ratarmount sftp_flag` |
-| `--repack-frame-size 1M` steals the next positional (`archive.tar`) | `cargo test -p ratarmount --bin ratarmount repack_seekable` |
-| Inbound SMB client must not send the export password (`RATARMOUNT_SMB_PASSWORD` / `RATARMOUNT_SMB_USER`); `smbclient_download_args` uses `RATARMOUNT_SMB_CLIENT_*` | `cargo test -p ratarmount-remote --lib smb_guest` · `cargo test -p ratarmount-remote --lib smbclient_ignores` · `cargo test -p ratarmount-session --lib smb_range_dispatch` |
 | HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
-| GCS service-account PUT reuses read_only ADC token (403) | `cargo test -p ratarmount-remote --lib gcs_put_jwt_scope` · `cargo test -p ratarmount-remote --lib gcs_put_file_streams` · `cargo test -p ratarmount-compositing --lib gs_publish_failure_is_not_labeled_s3` · `cargo test -p ratarmount --test commit_overlay_live gs_interval` |
-| Azure live commit signs PUT with the GET SharedKey helper (403) / failed block list forgets the overlay | `cargo test -p ratarmount-remote --lib shared_key` · `cargo test -p ratarmount-remote --lib azure_` · `cargo test -p ratarmount --test commit_overlay_live az_` |
 | SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
 | `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
@@ -124,7 +129,6 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Missing `.tar` / `.tar.zst` write mount create | `cargo test -p ratarmount-compositing --lib empty_archive` · `cargo test -p ratarmount-compositing --lib is_uncompressed_tar` · `cargo test -p ratarmount --test commit_overlay_live create_missing` · `cargo test -p ratarmount --bin ratarmount -- create_missing` |
 | Interval commit skips recently modified overlay files | `cargo test -p ratarmount-compositing --lib live_commit_idle` (open write fd must not persist/unlink) |
 | Interval commit unpins still-open write after NFS/protocol fd reuse | `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_fd_reuse` · `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_protocol_write_fd_reuse` |
-| Overlay `open_overlay_fd` O_CREAT leaks fd after interval wipe | `cargo test -p ratarmount-compositing --lib open_overlay_fd_create_does_not_leak` |
 | Interval commit after overlay rename of an open write fd | `cargo test -p ratarmount-compositing --lib live_commit_idle_skips_open_write_fd_after_rename` |
 | Interval/on-exit overlay commits overlap splices (V-4 coalesce) | `cargo test -p ratarmount-compositing --lib overlay_commit_queue` · `cargo test -p ratarmount --bin ratarmount overlay_commit_on_exit_waits` · `cargo test -p ratarmount --test commit_overlay_live commit_overlay_interval_on_exit` |
 | NFS READ after live tar.zst overlay commit | `cargo test -p ratarmount-nfs --lib overlay_commit_live_tar_zst` |
@@ -147,7 +151,6 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Incremental `files` ≠ full `create_index_body` | `cargo test -p ratarmount-formats-tar --lib regression_incremental_equals_full_index` |
 | On-exit persist leaves stale sidecar (remount full-parses) | `cargo test -p ratarmount --test commit_overlay_live on_exit_remount` · `cargo test -p ratarmount --bin ratarmount -- live_commit_on_exit_remount` |
 | Live uncompressed TAR sidecar patch from EOF after unclassified delete (ghost member) | `cargo test -p ratarmount-compositing --lib regression_unclassified_delete` |
-| S3 PUT lands then client times out; next tick must not splice again. Remote on-exit must not `wait_inflight_cleared(None)`. Sidecar stamp/pointer only after the file table matches the uploaded spool. Partial windows require prefix, suffix, and (when stored) full hashes; a matching object with a refused pointer forgets the overlay. | `cargo test -p ratarmount-compositing --lib remote_publish_timeout_after_landed_put` · `cargo test -p ratarmount-compositing --lib publish_refuses_partial_window_forgets` · `cargo test -p ratarmount-compositing --lib remote_on_exit_bounds_wait` · `cargo test -p ratarmount --bin ratarmount -- publish_refuses` · `cargo test -p ratarmount --test commit_overlay_live etag_mismatch_landed_put` |
 | Interval reopen | `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount --bin ratarmount -- live_commit` |
 | Pre-splice `zstdblocks` used for suffix parse | `cargo test -p ratarmount-formats-tar --lib regression_incremental_zstdblocks_fresh` |
 | GNU `--append` from `pre_size` misses members | `cargo test -p ratarmount-formats-tar --lib regression_incremental_append_eof` |
@@ -165,6 +168,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount-session --lib apply_remote_index` |
 | Local cached sidecar reused after remote archive replace (URL-label tarstats no-op) | `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_rejects` · `cargo test -p ratarmount-session --lib cached_remote_index_is_stale` · `cargo test -p ratarmount-session --lib hash_http_range_window` · `cargo test -p ratarmount-session --lib apply_remote_index_read_only_stale` · `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_keeps_match` |
 | Remote `{url}.index.ptr` then `{url}.index.{id}.sqlite` GET (HTTP/S3; 404/tarstats continue) | `cargo test -p ratarmount-session --lib apply_remote_index` · `cargo test -p ratarmount-remote --lib fetch_s3_pointer` · `cargo test -p ratarmount-index --lib sibling_index_pointer` |
+| S3 PutObject / multipart abort on error | `cargo test -p ratarmount-remote --lib s3_put` · `cargo test -p ratarmount-remote --lib s3_put_multipart` |
+| S3 V-2 pointer PUT blob-then-pointer / fail-closed leftover blob | `cargo test -p ratarmount-remote --lib s3_publish_index_blob_then_pointer` · `cargo test -p ratarmount-remote --lib s3_publish_index_fail_closed` |
+| S3 CreateMultipartUpload+abort write probe (F-7) | `cargo test -p ratarmount-remote --lib s3_multipart_create_abort_probe` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
@@ -190,8 +196,6 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Extract-all keyset does not use list_visible_files_by_offset | `cargo test -p ratarmount-session --lib extract_all_keyset` · `cargo test -p ratarmount-index --lib list_extract_payload_page` |
 | Extract cancel mid-copy unlinks truncated dest | `cargo test -p ratarmount-session --lib extract_to_cancel_unlinks_partial` |
 | Extract Replace+cancel destroys pre-existing dest (`File::create` then unlink) | `cargo test -p ratarmount-session --lib extract_to_replace_cancel_preserves_existing` · `cargo test -p ratarmount-session --lib extract_to_replace_cancel_preserves_dest_symlink` · `cargo test -p ratarmount-session --lib extract_to_replace_refuses_dest_directory` |
-| Extract Replace of a symlink member unlinks dest then `symlink()` fails | `cargo test -p ratarmount-session --lib extract_to_replace_failed_symlink_preserves_existing` |
-| TAR hardlink extract persists empty dest / Replace clobbers dest with 0 bytes | `cargo test -p ratarmount-session --lib extract_to_hardlink_copies_target` · `cargo test -p ratarmount-session --lib extract_to_hardlink_missing_target_preserves_existing` |
 | Recreate::Never missing sidecar / tarstats mismatch / no rebuild | `cargo test -p ratarmount-session --lib recreate_never` |
 | Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
 | Sibling unwritable parent → SiblingNotWritable (no `:memory:`) | `cargo test -p ratarmount-index --lib sibling_not_writable` · `cargo test -p ratarmount-session --lib resolve_sibling` |
@@ -260,8 +264,6 @@ Linux/macOS package scripts compile **`--features nfsv4,sftp-russh`** (`packagin
 
 1. Bump **workspace** `version` in root [`Cargo.toml`](Cargo.toml) (Packages resolve
    version from the tag + Cargo.toml — do **not** hardcode per-job `VERSION` envs).
-   Run `cargo check` and **commit the `Cargo.lock` rewrite** so workspace crate
-   versions match. Keep a trailing newline on `Cargo.toml`.
 2. Update README / docs version strings that mention the release tag (if any).
 3. `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
 4. `cargo test --workspace` (or full relevant crates when the release is large).
