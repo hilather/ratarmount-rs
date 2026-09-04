@@ -1,4 +1,4 @@
-//! S3 GetObject for `s3://bucket/key` (AWS SigV4 + ureq).
+//! S3 GetObject / PutObject for `s3://bucket/key` (AWS SigV4 + ureq).
 //!
 //! # Download paths
 //!
@@ -9,6 +9,14 @@
 //!   [`DEFAULT_S3_RANGE_THRESHOLD`], sequential Range GETs in
 //!   [`crate::HTTP_RANGE_CHUNK`] windows into a tempfile; else full GET
 //! - **Live Range I/O** — [`S3RangeFile`] / [`open_s3_range`] issues per-read Range GETs
+//!
+//! # Upload paths (F-7 primitive; no overlay commit here)
+//!
+//! - **PutObject** — single PUT when the file is ≤ [`S3_PUT_PART_THRESHOLD`]
+//! - **Multipart** — `CreateMultipartUpload` → sequential `UploadPart` (8 MiB) →
+//!   `CompleteMultipartUpload`. **Abort** on any error (Drop guard).
+//! - **Write probe** — [`s3_create_and_abort_multipart_upload`] (Create + Abort;
+//!   no leftover object). Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` is **GET-only**.
 //!
 //! Size discovery uses a `Range: bytes=0-0` probe (`Content-Range` total), matching
 //! the HTTP / Dropbox prefer-range patterns in this crate.
@@ -38,12 +46,14 @@
 //! | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
 //! | `RATARMOUNT_IMDS_BASE` / `AWS_EC2_METADATA_SERVICE_ENDPOINT` | Override IMDS base (tests) |
 
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use log::debug;
+use log::{debug, error};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 use url::Url;
@@ -1536,9 +1546,528 @@ pub fn s3_location_is_dir(loc: &S3Location) -> Result<bool> {
     Ok(has_child_prefix || has_child_key)
 }
 
+/// Single PutObject if the file is at most this size; otherwise multipart (8 MiB parts).
+pub const S3_PUT_PART_THRESHOLD: u64 = 8 * 1024 * 1024;
+/// Multipart `UploadPart` size (equals [`S3_PUT_PART_THRESHOLD`]).
+pub const S3_PUT_PART_SIZE: u64 = S3_PUT_PART_THRESHOLD;
+
+/// SigV4 streaming PUT/UploadPart: never hash the whole archive into a `Vec`.
+const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
+
+/// Result of [`put_s3_file`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct S3PutResult {
+    pub etag: String,
+    pub size: u64,
+}
+
+/// PutObject / multipart inputs. Body is always a path (never a `Vec` of the archive).
+#[derive(Debug, Clone)]
+pub struct S3PutObject {
+    pub loc: S3Location,
+    pub content_type: String,
+    pub body_path: PathBuf,
+}
+
+/// PUT `path` to `s3://bucket/key`. Single PutObject if `len ≤ 8 MiB`, else multipart.
+///
+/// Requires non-anonymous credentials. Multipart is aborted on any error.
+pub fn put_s3_file(url: &str, path: &Path, content_type: &str) -> Result<S3PutResult> {
+    let loc = parse_s3_url(url)?;
+    put_s3_location(&S3PutObject {
+        loc,
+        content_type: content_type.to_string(),
+        body_path: path.to_path_buf(),
+    })
+}
+
+/// PUT [`S3PutObject::body_path`] to [`S3PutObject::loc`].
+pub fn put_s3_location(obj: &S3PutObject) -> Result<S3PutResult> {
+    let meta = std::fs::metadata(&obj.body_path).map_err(|e| {
+        RemoteError::S3(format!(
+            "PutObject s3://{}/{}: {}: {e}",
+            obj.loc.bucket,
+            obj.loc.key,
+            obj.body_path.display()
+        ))
+    })?;
+    if !meta.is_file() {
+        return Err(RemoteError::S3(format!(
+            "PutObject s3://{}/{}: {} is not a file",
+            obj.loc.bucket,
+            obj.loc.key,
+            obj.body_path.display()
+        )));
+    }
+    let size = meta.len();
+    if size <= S3_PUT_PART_THRESHOLD {
+        put_s3_single(&obj.loc, &obj.body_path, &obj.content_type, size)
+    } else {
+        put_s3_multipart(&obj.loc, &obj.body_path, &obj.content_type, size)
+    }
+}
+
+/// F-7 startup write probe: `CreateMultipartUpload` then immediate `AbortMultipartUpload`.
+///
+/// Fail-closed on 403/404. Does not leave a `.ratarmount-write-probe` object.
+/// Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` is rejected (GET-only).
+pub fn s3_create_and_abort_multipart_upload(url: &str) -> Result<()> {
+    let loc = parse_s3_url(url)?;
+    let upload_id = s3_create_multipart_upload(&loc, "application/octet-stream")?;
+    s3_abort_multipart_upload(&loc, &upload_id)
+}
+
+/// `CreateMultipartUpload`; returns the `UploadId`.
+pub fn s3_create_multipart_upload(loc: &S3Location, content_type: &str) -> Result<String> {
+    let payload_hash = sha256_hex(b"");
+    let (source, resp) = s3_write_send(S3WriteReq {
+        method: "POST",
+        loc,
+        query: &[("uploads", "")],
+        content_type: Some(content_type),
+        payload_hash: &payload_hash,
+        content_length: Some(0),
+        op: "CreateMultipartUpload",
+        body: S3WriteBody::Bytes(&[]),
+    })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_write_status_error(
+            source,
+            status,
+            loc,
+            "CreateMultipartUpload",
+            &body,
+        ));
+    }
+    let body = resp
+        .into_string()
+        .map_err(|e| RemoteError::S3(e.to_string()))?;
+    xml_tag_text(&body, "uploadid")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RemoteError::S3(format!(
+                "CreateMultipartUpload s3://{}/{}: response missing UploadId",
+                loc.bucket, loc.key
+            ))
+        })
+}
+
+/// `AbortMultipartUpload` for `upload_id`.
+pub fn s3_abort_multipart_upload(loc: &S3Location, upload_id: &str) -> Result<()> {
+    let payload_hash = sha256_hex(b"");
+    let (source, resp) = s3_write_send(S3WriteReq {
+        method: "DELETE",
+        loc,
+        query: &[("uploadId", upload_id)],
+        content_type: None,
+        payload_hash: &payload_hash,
+        content_length: None,
+        op: "AbortMultipartUpload",
+        body: S3WriteBody::Call,
+    })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_write_status_error(
+            source,
+            status,
+            loc,
+            "AbortMultipartUpload",
+            &body,
+        ));
+    }
+    let _ = resp.into_string();
+    Ok(())
+}
+
+fn resolve_write_creds() -> Result<(CredSource, AwsCreds)> {
+    let auth = resolve_auth()?;
+    match auth.creds {
+        Some(creds) => Ok((auth.source, creds)),
+        None => Err(RemoteError::S3(
+            "S3 PUT requires non-anonymous AWS credentials; \
+             AWS_ANONYMOUS=1 / RATARMOUNT_S3_ANONYMOUS=1 is GET-only"
+                .into(),
+        )),
+    }
+}
+
+fn s3_write_status_error(
+    _source: CredSource,
+    status: u16,
+    loc: &S3Location,
+    kind: &str,
+    body: &str,
+) -> RemoteError {
+    RemoteError::S3(format!(
+        "{kind} HTTP {status} for s3://{}/{}: {body}",
+        loc.bucket, loc.key
+    ))
+}
+
+fn response_etag(resp: &ureq::Response) -> String {
+    resp.header("etag")
+        .or_else(|| resp.header("ETag"))
+        .unwrap_or("")
+        .trim()
+        .to_string()
+}
+
+enum S3WriteBody<'a> {
+    /// Bodyless `.call()` (AbortMultipartUpload DELETE).
+    Call,
+    Bytes(&'a [u8]),
+    Reader(Box<dyn Read + 'a>),
+}
+
+struct S3WriteReq<'a> {
+    method: &'a str,
+    loc: &'a S3Location,
+    query: &'a [(&'a str, &'a str)],
+    content_type: Option<&'a str>,
+    payload_hash: &'a str,
+    content_length: Option<u64>,
+    op: &'a str,
+    body: S3WriteBody<'a>,
+}
+
+fn s3_write_send(req: S3WriteReq<'_>) -> Result<(CredSource, ureq::Response)> {
+    let S3WriteReq {
+        method,
+        loc,
+        query,
+        content_type,
+        payload_hash,
+        content_length,
+        op,
+        body,
+    } = req;
+    let (source, creds) = resolve_write_creds()?;
+    let region = region();
+    let (host, uri_path, use_https) = s3_request_target(loc, &region);
+    let query_str = if query.is_empty() {
+        String::new()
+    } else {
+        s3_canonical_query(query)
+    };
+    let url = {
+        let base = if use_https {
+            format!("https://{host}{uri_path}")
+        } else {
+            format!("http://{host}{uri_path}")
+        };
+        if query_str.is_empty() {
+            base
+        } else {
+            format!("{base}?{query_str}")
+        }
+    };
+    debug!(
+        "s3 {method} {url} (auth={:?}, payload={payload_hash})",
+        source
+    );
+
+    let now = chrono::Utc::now();
+    let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+    let date_stamp = now.format("%Y%m%d").to_string();
+    let mut headers_to_sign: Vec<(&str, String)> = vec![
+        ("host", host.clone()),
+        ("x-amz-content-sha256", payload_hash.to_string()),
+        ("x-amz-date", amz_date.clone()),
+    ];
+    if let Some(ct) = content_type {
+        headers_to_sign.push(("content-type", ct.to_string()));
+    }
+    if let Some(token) = &creds.session_token {
+        headers_to_sign.push(("x-amz-security-token", token.clone()));
+    }
+    headers_to_sign.sort_by(|a, b| a.0.cmp(b.0));
+    let signed_headers = headers_to_sign
+        .iter()
+        .map(|(k, _)| *k)
+        .collect::<Vec<_>>()
+        .join(";");
+    let canonical_headers = headers_to_sign
+        .iter()
+        .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+        .collect::<String>();
+    let canonical_query = query_str;
+    let canonical_request = format!(
+        "{method}\n{uri_path}\n{canonical_query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+    );
+    let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+    let string_to_sign = format!(
+        "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+        sha256_hex(canonical_request.as_bytes())
+    );
+    let signature = hex::encode(hmac_sha256(
+        &signing_key(&creds.secret_key, &date_stamp, &region, "s3"),
+        string_to_sign.as_bytes(),
+    ));
+    let authorization = format!(
+        "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+        creds.access_key
+    );
+
+    let mut req = ureq::request(method, &url)
+        .set("User-Agent", USER_AGENT)
+        .set("Authorization", &authorization)
+        .set("x-amz-content-sha256", payload_hash)
+        .set("x-amz-date", &amz_date);
+    if let Some(ct) = content_type {
+        req = req.set("Content-Type", ct);
+    }
+    if let Some(len) = content_length {
+        // Required so ureq does not switch to chunked (S3 PutObject/UploadPart reject chunked).
+        req = req.set("Content-Length", &len.to_string());
+    }
+    if let Some(token) = &creds.session_token {
+        req = req.set("x-amz-security-token", token);
+    }
+    let resp = match body {
+        S3WriteBody::Call => req.call(),
+        S3WriteBody::Bytes(b) => req.send_bytes(b),
+        S3WriteBody::Reader(r) => req.send(r),
+    };
+    match resp {
+        Ok(r) => Ok((source, r)),
+        Err(ureq::Error::Status(code, r)) => {
+            let body = r.into_string().unwrap_or_default();
+            Err(s3_write_status_error(source, code, loc, op, &body))
+        }
+        Err(e) => Err(RemoteError::S3(format!(
+            "{op} s3://{}/{}: {e}",
+            loc.bucket, loc.key
+        ))),
+    }
+}
+
+fn put_s3_single(
+    loc: &S3Location,
+    path: &Path,
+    content_type: &str,
+    size: u64,
+) -> Result<S3PutResult> {
+    let file = File::open(path).map_err(|e| {
+        RemoteError::S3(format!(
+            "PutObject s3://{}/{}: {}: {e}",
+            loc.bucket,
+            loc.key,
+            path.display()
+        ))
+    })?;
+    let payload_hash = if size == 0 {
+        sha256_hex(b"")
+    } else {
+        UNSIGNED_PAYLOAD.to_string()
+    };
+    let (source, resp) = s3_write_send(S3WriteReq {
+        method: "PUT",
+        loc,
+        query: &[],
+        content_type: Some(content_type),
+        payload_hash: &payload_hash,
+        content_length: Some(size),
+        op: "PutObject",
+        body: S3WriteBody::Reader(Box::new(file)),
+    })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_write_status_error(
+            source,
+            status,
+            loc,
+            "PutObject",
+            &body,
+        ));
+    }
+    let etag = response_etag(&resp);
+    let _ = resp.into_string();
+    debug!(
+        "s3 PutObject s3://{}/{} -> {size} bytes etag={etag}",
+        loc.bucket, loc.key
+    );
+    Ok(S3PutResult { etag, size })
+}
+
+struct MultipartAbortGuard<'a> {
+    loc: &'a S3Location,
+    upload_id: String,
+    disarmed: bool,
+}
+
+impl Drop for MultipartAbortGuard<'_> {
+    fn drop(&mut self) {
+        if self.disarmed {
+            return;
+        }
+        match s3_abort_multipart_upload(self.loc, &self.upload_id) {
+            Ok(()) => error!(
+                "aborted multipart upload {} for s3://{}/{}",
+                self.upload_id, self.loc.bucket, self.loc.key
+            ),
+            Err(e) => error!(
+                "failed to abort multipart upload {} for s3://{}/{}: {e}",
+                self.upload_id, self.loc.bucket, self.loc.key
+            ),
+        }
+    }
+}
+
+fn put_s3_multipart(
+    loc: &S3Location,
+    path: &Path,
+    content_type: &str,
+    size: u64,
+) -> Result<S3PutResult> {
+    let upload_id = s3_create_multipart_upload(loc, content_type)?;
+    let mut guard = MultipartAbortGuard {
+        loc,
+        upload_id: upload_id.clone(),
+        disarmed: false,
+    };
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    let mut offset = 0u64;
+    let mut part_number = 1u32;
+    while offset < size {
+        let len = (size - offset).min(S3_PUT_PART_SIZE);
+        let etag = upload_s3_part(loc, &upload_id, part_number, path, offset, len)?;
+        parts.push((part_number, etag));
+        offset += len;
+        part_number = part_number.checked_add(1).ok_or_else(|| {
+            RemoteError::S3(format!(
+                "UploadPart s3://{}/{}: part number overflow",
+                loc.bucket, loc.key
+            ))
+        })?;
+    }
+    let etag = complete_s3_multipart(loc, &upload_id, &parts)?;
+    guard.disarmed = true;
+    debug!(
+        "s3 CompleteMultipartUpload s3://{}/{} -> {size} bytes etag={etag} parts={}",
+        loc.bucket,
+        loc.key,
+        parts.len()
+    );
+    Ok(S3PutResult { etag, size })
+}
+
+fn upload_s3_part(
+    loc: &S3Location,
+    upload_id: &str,
+    part_number: u32,
+    path: &Path,
+    offset: u64,
+    len: u64,
+) -> Result<String> {
+    let mut file = File::open(path).map_err(|e| {
+        RemoteError::S3(format!(
+            "UploadPart s3://{}/{}: {}: {e}",
+            loc.bucket,
+            loc.key,
+            path.display()
+        ))
+    })?;
+    file.seek(SeekFrom::Start(offset))?;
+    let part_n = part_number.to_string();
+    let (source, resp) = s3_write_send(S3WriteReq {
+        method: "PUT",
+        loc,
+        query: &[("partNumber", part_n.as_str()), ("uploadId", upload_id)],
+        content_type: Some("application/octet-stream"),
+        payload_hash: UNSIGNED_PAYLOAD,
+        content_length: Some(len),
+        op: "UploadPart",
+        body: S3WriteBody::Reader(Box::new(file.take(len))),
+    })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_write_status_error(
+            source,
+            status,
+            loc,
+            "UploadPart",
+            &body,
+        ));
+    }
+    let etag = response_etag(&resp);
+    let _ = resp.into_string();
+    if etag.is_empty() {
+        return Err(RemoteError::S3(format!(
+            "UploadPart s3://{}/{} part {part_number}: response missing ETag",
+            loc.bucket, loc.key
+        )));
+    }
+    Ok(etag)
+}
+
+fn complete_s3_multipart(
+    loc: &S3Location,
+    upload_id: &str,
+    parts: &[(u32, String)],
+) -> Result<String> {
+    let xml = complete_multipart_xml(parts);
+    let payload_hash = sha256_hex(xml.as_bytes());
+    let (source, resp) = s3_write_send(S3WriteReq {
+        method: "POST",
+        loc,
+        query: &[("uploadId", upload_id)],
+        content_type: Some("application/xml"),
+        payload_hash: &payload_hash,
+        content_length: Some(xml.len() as u64),
+        op: "CompleteMultipartUpload",
+        body: S3WriteBody::Bytes(xml.as_bytes()),
+    })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_write_status_error(
+            source,
+            status,
+            loc,
+            "CompleteMultipartUpload",
+            &body,
+        ));
+    }
+    let etag = response_etag(&resp);
+    let body = resp.into_string().unwrap_or_default();
+    if !etag.is_empty() {
+        return Ok(etag);
+    }
+    xml_tag_text(&body, "etag")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RemoteError::S3(format!(
+                "CompleteMultipartUpload s3://{}/{}: response missing ETag",
+                loc.bucket, loc.key
+            ))
+        })
+}
+
+fn complete_multipart_xml(parts: &[(u32, String)]) -> String {
+    let mut s = String::from("<CompleteMultipartUpload>");
+    for (n, etag) in parts {
+        let quoted = if etag.starts_with('"') {
+            etag.clone()
+        } else {
+            format!("\"{etag}\"")
+        };
+        s.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{quoted}</ETag></Part>"
+        ));
+    }
+    s.push_str("</CompleteMultipartUpload>");
+    s
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashMap;
     use std::io::{BufRead, BufReader, Read, Write as IoWrite};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2503,5 +3032,453 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid range"), "got: {err}");
+    }
+
+    #[derive(Clone, Copy)]
+    enum WriteFail {
+        None,
+        /// Fail `UploadPart` with this 1-based part number (HTTP 500).
+        UploadPart(u32),
+        Create,
+    }
+
+    /// Path-style mock that accepts PutObject + multipart (create/part/complete/abort).
+    struct MockS3Write {
+        base_url: String,
+        log: Arc<StdMutex<Vec<String>>>,
+        objects: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        aborted: Arc<StdMutex<Vec<String>>>,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockS3Write {
+        fn spawn() -> Self {
+            Self::spawn_fail(WriteFail::None)
+        }
+
+        fn spawn_fail(fail: WriteFail) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let log = Arc::new(StdMutex::new(Vec::new()));
+            let objects = Arc::new(StdMutex::new(HashMap::new()));
+            let aborted = Arc::new(StdMutex::new(Vec::new()));
+            let log_c = Arc::clone(&log);
+            let objects_c = Arc::clone(&objects);
+            let aborted_c = Arc::clone(&aborted);
+            type PartMap = HashMap<(String, u32), Vec<u8>>;
+            let parts: Arc<StdMutex<PartMap>> = Arc::new(StdMutex::new(HashMap::new()));
+            let parts_c = Arc::clone(&parts);
+            let next_upload = Arc::new(AtomicUsize::new(1));
+            let join = thread::spawn(move || {
+                for stream in listener.incoming().take(128) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut has_auth = false;
+                    let mut content_length: u64 = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if lower.starts_with("authorization:") {
+                            has_auth = true;
+                        }
+                        if let Some(rest) = lower.strip_prefix("content-length:") {
+                            content_length = rest.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let method = request_line.split_whitespace().next().unwrap_or("");
+                    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let (path, query) = match target.split_once('?') {
+                        Some((p, q)) => (p, q),
+                        None => (target, ""),
+                    };
+                    let key = path
+                        .trim_start_matches('/')
+                        .split_once('/')
+                        .map(|(_, k)| percent_decode_s3(k))
+                        .unwrap_or_default();
+                    let params = parse_query(query);
+                    {
+                        let mut lg = log_c.lock().unwrap();
+                        lg.push(format!(
+                            "{} {}{}",
+                            method,
+                            key,
+                            if query.is_empty() {
+                                String::new()
+                            } else {
+                                format!("?{query}")
+                            }
+                        ));
+                    }
+                    let mut body = vec![0u8; content_length.min(64 * 1024 * 1024) as usize];
+                    if !body.is_empty() && reader.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    if !has_auth {
+                        let msg = b"AccessDenied";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            msg.len()
+                        );
+                        let _ = stream.write_all(msg);
+                        continue;
+                    }
+                    if matches!(fail, WriteFail::Create)
+                        && method == "POST"
+                        && params.iter().any(|(k, _)| k == "uploads")
+                    {
+                        let msg = b"AccessDenied";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            msg.len()
+                        );
+                        let _ = stream.write_all(msg);
+                        continue;
+                    }
+                    if method == "POST" && params.iter().any(|(k, _)| k == "uploads") {
+                        let n = next_upload.fetch_add(1, Ordering::SeqCst);
+                        let upload_id = format!("mpu-test-{n}");
+                        let xml = format!(
+                            "<InitiateMultipartUploadResult><Bucket>bucket</Bucket>\
+                             <Key>{key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+                        );
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                            xml.len()
+                        );
+                        continue;
+                    }
+                    if method == "PUT" {
+                        if let Some(part) = params
+                            .iter()
+                            .find(|(k, _)| k == "partNumber")
+                            .and_then(|(_, v)| v.parse::<u32>().ok())
+                        {
+                            let upload_id = params
+                                .iter()
+                                .find(|(k, _)| k == "uploadId")
+                                .map(|(_, v)| v.as_str())
+                                .unwrap_or("");
+                            if let WriteFail::UploadPart(fail_n) = fail {
+                                if part == fail_n {
+                                    let msg = b"InternalError";
+                                    let _ = write!(
+                                        stream,
+                                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                        msg.len()
+                                    );
+                                    let _ = stream.write_all(msg);
+                                    continue;
+                                }
+                            }
+                            parts_c
+                                .lock()
+                                .unwrap()
+                                .insert((upload_id.to_string(), part), body);
+                            let etag = format!("\"part-{part}\"");
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            continue;
+                        }
+                        objects_c.lock().unwrap().insert(key, body.clone());
+                        let etag = format!("\"put-{}\"", body.len());
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+                    if method == "POST" {
+                        if let Some(upload_id) = params
+                            .iter()
+                            .find(|(k, _)| k == "uploadId")
+                            .map(|(_, v)| v.clone())
+                        {
+                            let mut held = parts_c.lock().unwrap();
+                            let mut nums: Vec<u32> = held
+                                .keys()
+                                .filter(|(id, _)| id == &upload_id)
+                                .map(|(_, n)| *n)
+                                .collect();
+                            nums.sort_unstable();
+                            let mut assembled = Vec::new();
+                            for n in nums {
+                                if let Some(p) = held.remove(&(upload_id.clone(), n)) {
+                                    assembled.extend_from_slice(&p);
+                                }
+                            }
+                            drop(held);
+                            let etag = format!("\"mpu-{}\"", assembled.len());
+                            objects_c.lock().unwrap().insert(key, assembled);
+                            let xml = format!(
+                                "<CompleteMultipartUploadResult><ETag>{etag}</ETag></CompleteMultipartUploadResult>"
+                            );
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nETag: {etag}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                                xml.len()
+                            );
+                            continue;
+                        }
+                    }
+                    if method == "DELETE" {
+                        if let Some(upload_id) = params
+                            .iter()
+                            .find(|(k, _)| k == "uploadId")
+                            .map(|(_, v)| v.clone())
+                        {
+                            let mut held = parts_c.lock().unwrap();
+                            held.retain(|(id, _), _| id != &upload_id);
+                            aborted_c.lock().unwrap().push(upload_id);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            continue;
+                        }
+                    }
+                    let msg = b"UnexpectedRequest";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                }
+            });
+            Self {
+                base_url,
+                log,
+                objects,
+                aborted,
+                _join: Some(join),
+            }
+        }
+    }
+
+    fn percent_decode_s3(s: &str) -> String {
+        let mut out = Vec::new();
+        let b = s.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'%' && i + 2 < b.len() {
+                if let Ok(v) =
+                    u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or(""), 16)
+                {
+                    out.push(v);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(b[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn parse_query(q: &str) -> Vec<(String, String)> {
+        if q.is_empty() {
+            return Vec::new();
+        }
+        q.split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once('=') {
+                Some((k, v)) => (percent_decode_s3(k), percent_decode_s3(v)),
+                None => (percent_decode_s3(p), String::new()),
+            })
+            .collect()
+    }
+
+    fn env_signed_put(mock: &MockS3Write) -> EnvGuard {
+        let g = EnvGuard::acquire(AWS_ENV_KEYS);
+        g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        g.set("AWS_ENDPOINT_URL", &mock.base_url);
+        g.set("AWS_REGION", "us-east-1");
+        g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        g
+    }
+
+    fn write_temp(bytes: &[u8]) -> tempfile::NamedTempFile {
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(bytes).unwrap();
+        tmp.flush().unwrap();
+        tmp
+    }
+
+    /// Regression: single PutObject for files at or under the 8 MiB threshold.
+    #[test]
+    fn s3_put_single_putobject() {
+        let mock = MockS3Write::spawn();
+        let _g = env_signed_put(&mock);
+        let payload = b"hello-put-object";
+        let tmp = write_temp(payload);
+        let got = put_s3_file(
+            "s3://bucket/path/obj.bin",
+            tmp.path(),
+            "application/octet-stream",
+        )
+        .unwrap();
+        assert_eq!(got.size, payload.len() as u64);
+        assert!(got.etag.contains("put-"), "etag={}", got.etag);
+        let objects = mock.objects.lock().unwrap();
+        assert_eq!(
+            objects.get("path/obj.bin").map(|v| v.as_slice()),
+            Some(&payload[..])
+        );
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("PUT path/obj.bin")),
+            "log={log:?}"
+        );
+        assert!(
+            !log.iter().any(|l| l.contains("uploads")),
+            "small PUT must not start multipart, log={log:?}"
+        );
+    }
+
+    /// Regression: objects above 8 MiB use CreateMultipartUpload + parts + complete.
+    #[test]
+    fn s3_put_multipart() {
+        let mock = MockS3Write::spawn();
+        let _g = env_signed_put(&mock);
+        let size = 9 * 1024 * 1024;
+        let payload: Vec<u8> = (0u8..=251).cycle().take(size).collect();
+        let tmp = write_temp(&payload);
+        let got = put_s3_file(
+            "s3://bucket/big.bin",
+            tmp.path(),
+            "application/octet-stream",
+        )
+        .unwrap();
+        assert_eq!(got.size, payload.len() as u64);
+        assert!(got.etag.contains("mpu-"), "etag={}", got.etag);
+        let objects = mock.objects.lock().unwrap();
+        assert_eq!(objects.get("big.bin").map(|v| v.len()), Some(payload.len()));
+        assert_eq!(
+            objects.get("big.bin").unwrap().as_slice(),
+            payload.as_slice()
+        );
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("POST") && l.contains("uploads")),
+            "log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("partNumber=1")),
+            "log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.contains("partNumber=2")),
+            "log={log:?}"
+        );
+        assert!(
+            mock.aborted.lock().unwrap().is_empty(),
+            "successful multipart must not abort"
+        );
+    }
+
+    /// Regression: UploadPart failure aborts the MPU (no leftover parts / no object).
+    #[test]
+    fn s3_put_multipart_aborts_on_error() {
+        let mock = MockS3Write::spawn_fail(WriteFail::UploadPart(2));
+        let _g = env_signed_put(&mock);
+        let size = 9 * 1024 * 1024;
+        let payload: Vec<u8> = (0u8..=180).cycle().take(size).collect();
+        let tmp = write_temp(&payload);
+        let err = put_s3_file(
+            "s3://bucket/fail.bin",
+            tmp.path(),
+            "application/octet-stream",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("UploadPart") && err.contains("500"),
+            "got: {err}"
+        );
+        assert!(
+            !mock.aborted.lock().unwrap().is_empty(),
+            "multipart must abort on part error"
+        );
+        assert!(
+            !mock.objects.lock().unwrap().contains_key("fail.bin"),
+            "failed MPU must not complete an object"
+        );
+    }
+
+    /// Regression: CreateMultipartUpload + Abort is the F-7 write probe (no leftover object).
+    #[test]
+    fn s3_multipart_create_abort_probe() {
+        let mock = MockS3Write::spawn();
+        let _g = env_signed_put(&mock);
+        s3_create_and_abort_multipart_upload("s3://bucket/a.tar.zst").unwrap();
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.contains("POST") && l.contains("uploads")),
+            "log={log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("DELETE") && l.contains("uploadId=")),
+            "log={log:?}"
+        );
+        assert!(!mock.aborted.lock().unwrap().is_empty());
+        assert!(
+            mock.objects.lock().unwrap().is_empty(),
+            "probe must not leave an object"
+        );
+    }
+
+    #[test]
+    fn s3_put_rejects_anonymous() {
+        let mock = MockS3Write::spawn();
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ANONYMOUS", "1");
+        _g.set("AWS_ENDPOINT_URL", &mock.base_url);
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        let tmp = write_temp(b"nope");
+        let err = put_s3_file("s3://bucket/k", tmp.path(), "application/octet-stream")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("non-anonymous") || err.contains("GET-only"),
+            "got: {err}"
+        );
+        assert!(
+            mock.log.lock().unwrap().is_empty(),
+            "anonymous PUT must not hit the endpoint"
+        );
+    }
+
+    #[test]
+    fn s3_multipart_create_abort_probe_fail_closed_403() {
+        let mock = MockS3Write::spawn_fail(WriteFail::Create);
+        let _g = env_signed_put(&mock);
+        let err = s3_create_and_abort_multipart_upload("s3://bucket/a.tar.zst")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("403") || err.contains("CreateMultipartUpload"),
+            "got: {err}"
+        );
+        assert!(mock.objects.lock().unwrap().is_empty());
     }
 }
