@@ -156,11 +156,12 @@ for f in "${DOC_FILES[@]}"; do
     pass "$(basename "$f") does not git-tap packaging/homebrew"
   fi
   if grep -qF 'brew tap-new hilather/ratarmount' "$f" \
+    && grep -qF 'mkdir -p "$(brew --repo hilather/ratarmount)/Casks"' "$f" \
     && grep -qF 'brew --repo hilather/ratarmount' "$f" \
     && grep -qF 'brew install --cask hilather/ratarmount/ratarmount' "$f"; then
-    pass "$(basename "$f") documents tap-new + copy + fully-qualified install"
+    pass "$(basename "$f") documents tap-new + mkdir Casks + copy + fully-qualified install"
   else
-    fail "$(basename "$f") must document brew tap-new, brew --repo copy, and brew install --cask hilather/ratarmount/ratarmount"
+    fail "$(basename "$f") must document brew tap-new, mkdir -p Casks, brew --repo copy, and brew install --cask hilather/ratarmount/ratarmount"
   fi
 done
 
@@ -170,11 +171,12 @@ else
   pass "packaging/homebrew/install.sh is executable"
 fi
 if grep -qF 'brew tap-new' "$INSTALL_SH" \
+  && grep -qF 'mkdir -p' "$INSTALL_SH" \
   && grep -qF 'brew --repo' "$INSTALL_SH" \
   && grep -qF 'brew install --cask "${TAP}/ratarmount"' "$INSTALL_SH"; then
-  pass "install.sh uses tap-new + copy + fully-qualified install"
+  pass "install.sh uses tap-new + mkdir Casks + copy + fully-qualified install"
 else
-  fail "install.sh must brew tap-new, copy into brew --repo, and brew install --cask"
+  fail "install.sh must brew tap-new, mkdir -p Casks, copy into brew --repo, and brew install --cask"
 fi
 if grep -nE 'brew tap \$\{TAP\}[[:space:]]+"\$ROOT/packaging/homebrew"|brew tap hilather/ratarmount[[:space:]]+"\$\(pwd\)/packaging/homebrew"' "$INSTALL_SH" >/dev/null; then
   fail "install.sh must not brew tap packaging/homebrew as a git remote"
