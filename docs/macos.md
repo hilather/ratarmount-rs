@@ -169,6 +169,7 @@ Cask: [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/rat
 # Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
 # or: ./packaging/homebrew/install.sh
 brew tap-new hilather/ratarmount
+mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
 cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```

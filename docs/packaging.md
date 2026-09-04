@@ -114,6 +114,7 @@ sudo install -m 755 ratarmount /usr/local/bin/
 
 # macOS Apple Silicon — Homebrew tap cask (needs a clone; not a git-tap of packaging/homebrew/)
 brew tap-new hilather/ratarmount
+mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
 cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 # or: ./packaging/homebrew/install.sh
@@ -139,6 +140,7 @@ Install from a clone (Homebrew forbids path/URL casks; `packaging/homebrew/` is 
 
 ```bash
 brew tap-new hilather/ratarmount
+mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
 cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```

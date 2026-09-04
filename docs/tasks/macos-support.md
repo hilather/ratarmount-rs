@@ -50,7 +50,7 @@ Document both in README; link against whichever `pkg-config fuse` (or fuse3) pro
   - `ratarmount-<ver>-macos-x86_64.tar.gz` (Intel) — **deferred** (no GHA Intel runner)
 - **Do not** ship a fat universal binary in v1 unless linking both arches is painless.
 - Dynamic link against system/Homebrew **libfuse** + **libarchive** (document `brew install libarchive macfuse` / `fuse-t`).
-- Homebrew tap **cask** (E1, shipped): unpacks the signed `macos-arm64` GitHub Release tarball. Not a source formula. Install from a clone: `brew tap-new hilather/ratarmount` then copy `packaging/homebrew/Casks/ratarmount.rb` into `$(brew --repo hilather/ratarmount)/Casks/` and `brew install --cask hilather/ratarmount/ratarmount` (or `./packaging/homebrew/install.sh`). Homebrew-core / `.pkg` installer later.
+- Homebrew tap **cask** (E1, shipped): unpacks the signed `macos-arm64` GitHub Release tarball. Not a source formula. Install from a clone: `brew tap-new hilather/ratarmount`, `mkdir -p "$(brew --repo hilather/ratarmount)/Casks"`, copy `packaging/homebrew/Casks/ratarmount.rb` into that dir, then `brew install --cask hilather/ratarmount/ratarmount` (or `./packaging/homebrew/install.sh`). Homebrew-core / `.pkg` installer later.
 
 ### Out of scope for first macOS milestone
 
