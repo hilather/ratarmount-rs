@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-ntfs"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "NTFS image mount source (read-only, pure Rust via ntfs)"
+# crates.io `ntfs` 0.4.0 declares rust-version 1.60 (workspace MSRV 1.74).
+# GitHub master has rust-version 1.83 — pin the published 0.4 line, do not
+# take an unpublished git rev that would need an nfsv4-style feature gate.
+
+[dependencies]
+ratarmount-core.workspace = true
+thiserror.workspace = true
+log.workspace = true
+ntfs = "0.4"
+
+[dev-dependencies]
+tempfile.workspace = true
