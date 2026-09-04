@@ -84,6 +84,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FAT partition offset (superfloppy 0 / padded image) | `cargo test -p ratarmount-formats-fat --lib offset` |
 | Nested exFAT no-tmp / OEM `"EXFAT   "` (F-8 crate) | `cargo test -p ratarmount-formats-exfat --lib` (always-on synthetic boot + volume; `mkfs_exfat` skip if no `mkfs.exfat`) |
 | GPT/MBR partition table `p1/` listing (synthetic MBR+FAT) | `cargo test -p ratarmount-formats-block --lib mbr_fat` · `cargo test -p ratarmount-formats-block --lib gpt_fat` · `cargo test -p ratarmount-formats-block --lib looks_like` |
+| GPT/MBR two FAT partitions same name serve p1 bytes for p2 | `cargo test -p ratarmount-formats-block --lib same_name` |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
