@@ -50,7 +50,7 @@ Document both in README; link against whichever `pkg-config fuse` (or fuse3) pro
   - `ratarmount-<ver>-macos-x86_64.tar.gz` (Intel) — **deferred** (no GHA Intel runner)
 - **Do not** ship a fat universal binary in v1 unless linking both arches is painless.
 - Dynamic link against system/Homebrew **libfuse** + **libarchive** (document `brew install libarchive macfuse` / `fuse-t`).
-- Homebrew tap **cask** (E1, shipped): unpacks the signed `macos-arm64` GitHub Release tarball. Not a source formula. Install: `brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"` then `brew install --cask hilather/ratarmount/ratarmount`. Homebrew-core / `.pkg` installer later.
+- Homebrew tap **cask** (E1, shipped): unpacks the signed `macos-arm64` GitHub Release tarball. Not a source formula. Install from a clone: `brew tap-new hilather/ratarmount` then copy `packaging/homebrew/Casks/ratarmount.rb` into `$(brew --repo hilather/ratarmount)/Casks/` and `brew install --cask hilather/ratarmount/ratarmount` (or `./packaging/homebrew/install.sh`). Homebrew-core / `.pkg` installer later.
 
 ### Out of scope for first macOS milestone
 
@@ -359,7 +359,8 @@ Defer intel matrix, Homebrew-core, and required FUSE smoke until arm64 is solid.
 | `packaging/build-macos-tarball.sh` | **new** |
 | `docs/macos.md`, `docs/packaging.md`, `README.md` | docs |
 | `packaging/homebrew/Casks/ratarmount.rb` | **E1** tap-ready cask (prebuilt tarball) |
-| `packaging/test-homebrew-cask.sh` | static cask checks + `brew audit --cask` via a temp local tap |
+| `packaging/homebrew/install.sh` | `brew tap-new` + copy (packaging/homebrew is not a git repo) |
+| `packaging/test-homebrew-cask.sh` | static cask checks + `brew audit --cask` via tap-new |
 
 ---
 

@@ -52,13 +52,18 @@ Full methodology and fixtures: [benchmarks/python-vs-rust-results.md](benchmarks
 Grab the latest assets from **[Releases](https://github.com/hilather/ratarmount-rs/releases)** — Linux `.deb` / Rocky `.rpm` / portable glibc 2.31 tarballs, plus **macOS arm64**, all cosign-signed.
 
 ```bash
-# Example: portable Linux tarball
+# Example: portable Linux tarball (no clone)
 tar xf ratarmount-*-linux-x86_64.tar.gz
 install -m 755 ratarmount ~/.local/bin/
 
-# macOS Apple Silicon — Homebrew tap cask (from a clone; tap root is packaging/homebrew/)
+# macOS Apple Silicon — GitHub Release tarball (no clone)
+# tar xf ratarmount-*-macos-arm64.tar.gz && install -m 755 ratarmount-*/ratarmount ~/.local/bin/
+
+# macOS Apple Silicon — Homebrew tap cask (needs a clone; packaging/homebrew is not a git repo)
 # Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
-brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+# or: ./packaging/homebrew/install.sh
+brew tap-new hilather/ratarmount
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```
 

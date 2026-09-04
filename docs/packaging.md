@@ -112,9 +112,11 @@ sudo dnf install ./ratarmount-*.x86_64.rpm
 tar -xzf ratarmount-*-portable-glibc2.31-x86_64.tar.gz
 sudo install -m 755 ratarmount /usr/local/bin/
 
-# macOS Apple Silicon — Homebrew tap cask (from a clone; tap root is packaging/homebrew/)
-brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+# macOS Apple Silicon — Homebrew tap cask (needs a clone; not a git-tap of packaging/homebrew/)
+brew tap-new hilather/ratarmount
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
+# or: ./packaging/homebrew/install.sh
 ```
 
 ### Homebrew tap cask (macOS arm64)
@@ -124,8 +126,8 @@ v1 is a **cask** that unpacks the signed GitHub Release asset `ratarmount-<ver>-
 | Piece | Path |
 |-------|------|
 | Cask | [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) |
-| Tap root | [`packaging/homebrew/`](https://github.com/hilather/ratarmount-rs/tree/main/packaging/homebrew) (`Casks/` layout) |
-| Audit | [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) — static checks always; `brew audit --cask` via a temporary local tap when `brew` exists (**not** `--strict`, not a path/URL cask) |
+| Tap helper | [`packaging/homebrew/install.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/install.sh) (`brew tap-new` + copy; `packaging/homebrew/` is not a git repo) |
+| Audit | [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) — static checks always; `brew audit --cask` via `tap-new` when `brew` exists (**not** `--strict`, not a path/URL cask) |
 
 URL pattern (matches this doc’s macOS tarball name):
 
@@ -133,10 +135,11 @@ URL pattern (matches this doc’s macOS tarball name):
 https://github.com/hilather/ratarmount-rs/releases/download/vVERSION/ratarmount-VERSION-macos-arm64.tar.gz
 ```
 
-Install (Homebrew forbids path/URL casks; always fully-qualified — homebrew/core has a Linux Python formula also named `ratarmount`):
+Install from a clone (Homebrew forbids path/URL casks; `packaging/homebrew/` is not a git repository so two-arg `brew tap` of that path fails; always fully-qualified — homebrew/core has a Linux Python formula also named `ratarmount`):
 
 ```bash
-brew tap hilather/ratarmount "$(pwd)/packaging/homebrew"
+brew tap-new hilather/ratarmount
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
 brew install --cask hilather/ratarmount/ratarmount
 ```
 
