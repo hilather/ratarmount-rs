@@ -21,6 +21,8 @@ Nested NTFS members open from any `Read + Seek` stream via `NtfsMountSource::ope
 | Topic | Behaviour |
 |-------|-----------|
 | **EFS** (encrypted files) | Listed; `open` returns `PermissionDenied`. No EFS decrypt. |
+| **LZNT1 compression** | Listed; `open` returns `Unsupported`. `ntfs` 0.4 does not decompress; v1 fail-closes instead of returning raw compression-unit bytes. |
+| **WOF / Compact OS** | Reparse + `WofCompressedData` unresolved. Unnamed `$DATA` is often empty (`cat` empty). Same residual class as junctions. |
 | **ADS** (named `$DATA` streams) | Not presented as files. Only the unnamed default data stream is listed/read. |
 | **Journal** | `$LogFile` is **not** replayed. Dirty volumes are mounted as on-disk. |
 | **Reparse / junctions / WSL symlinks** | Treated as ordinary files/dirs if they have a default `$DATA`; not resolved. |
@@ -32,4 +34,4 @@ Nested NTFS members open from any `Read + Seek` stream via `NtfsMountSource::ope
 cargo test -p ratarmount-formats-ntfs --lib
 ```
 
-Always-on unit tests cover boot-sector magic (including false on FAT32 / exFAT), FILETIME conversion, and reject-bad-magic `open_from_reader`. List/read/offset tests use `mkfs.ntfs` when present (`eprintln!("skip: …")` otherwise) and optionally `ntfscp` to add a user file.
+Always-on unit tests cover boot-sector magic (including false on FAT32 / exFAT), FILETIME conversion, reject-bad-magic `open_from_reader`, and LZNT1/EFS `open` error-kind mapping. List/read/path-offset/`list_dirents` tests use `mkfs.ntfs` when present (`eprintln!("skip: …")` otherwise) and optionally `ntfscp` to add a user file. Default GHA does not install `ntfsprogs`, so those four tests skip in `cargo test --workspace`.

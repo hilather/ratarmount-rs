@@ -12,7 +12,10 @@ description = "NTFS image mount source (read-only, pure Rust via ntfs)"
 ratarmount-core.workspace = true
 thiserror.workspace = true
 log.workspace = true
-ntfs = "0.4"
+# Exact pin: crates.io 0.4.0 is rust-version 1.60. GitHub master is still
+# versioned 0.4.0 but rust-version 1.83 — a caret `0.4` would break MSRV 1.74
+# on `cargo update` if a 0.4.1 from that tree is published.
+ntfs = "=0.4.0"
 
 [dev-dependencies]
 tempfile.workspace = true

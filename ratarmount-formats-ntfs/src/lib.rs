@@ -15,7 +15,11 @@
 //! # Residuals
 //!
 //! Encrypted EFS files list but `open` returns [`io::ErrorKind::PermissionDenied`].
-//! Alternate data streams are not presented as files (unnamed `$DATA` only).
+//! LZNT1-compressed `$DATA` lists but `open` returns [`io::ErrorKind::Unsupported`]
+//! (`ntfs` 0.4 does not decompress; returning raw compression units would be
+//! silent corruption). Alternate data streams are not presented as files
+//! (unnamed `$DATA` only). WOF / Compact OS reparse is unresolved (often an
+//! empty unnamed `$DATA`).
 //!
 //! # Partitioned images
 //!
@@ -229,6 +233,29 @@ fn map_ntfs<E: std::fmt::Display>(e: E) -> NtfsError {
     NtfsError::Msg(e.to_string())
 }
 
+/// Map crate errors from `open` / `read_file` to `io::ErrorKind`.
+/// LZNT1 is fail-closed (`Unsupported`); EFS is `PermissionDenied`.
+fn kind_for_read_msg(m: &str) -> io::ErrorKind {
+    if m.contains("LZNT1") || m.contains("compressed $DATA") {
+        io::ErrorKind::Unsupported
+    } else if m.contains("EFS") || m.contains("encrypted") {
+        io::ErrorKind::PermissionDenied
+    } else if m.contains("not found") {
+        io::ErrorKind::NotFound
+    } else if m.contains("directory") {
+        io::ErrorKind::IsADirectory
+    } else {
+        io::ErrorKind::Other
+    }
+}
+
+fn map_read_error(e: NtfsError) -> io::Error {
+    match e {
+        NtfsError::Io(io) => io,
+        NtfsError::Msg(m) => io::Error::new(kind_for_read_msg(&m), m),
+    }
+}
+
 fn ntfs_extension(path: &Path) -> bool {
     path.extension()
         .and_then(|e| e.to_str())
@@ -399,20 +426,7 @@ impl NtfsMountSource {
     fn read_file(&self, path: &str) -> io::Result<Vec<u8>> {
         let abs = abs_path(path);
         self.with_disk(|disk| read_unnamed_data(disk, &abs))
-            .map_err(|e| match e {
-                NtfsError::Io(io) => io,
-                NtfsError::Msg(m) => {
-                    if m.contains("EFS") || m.contains("encrypted") {
-                        io::Error::new(io::ErrorKind::PermissionDenied, m)
-                    } else if m.contains("not found") {
-                        io::Error::new(io::ErrorKind::NotFound, m)
-                    } else if m.contains("directory") {
-                        io::Error::new(io::ErrorKind::IsADirectory, m)
-                    } else {
-                        io::Error::other(m)
-                    }
-                }
-            })
+            .map_err(map_read_error)
     }
 }
 
@@ -575,12 +589,16 @@ fn read_unnamed_data(disk: &mut OffsetDisk, abs: &str) -> Result<Vec<u8>> {
         return Err(NtfsError::Msg(format!("{abs} is a directory")));
     }
     if let Ok(info) = file.info() {
-        if info
-            .file_attributes()
-            .contains(NtfsFileAttributeFlags::ENCRYPTED)
-        {
+        let attrs = info.file_attributes();
+        if attrs.contains(NtfsFileAttributeFlags::ENCRYPTED) {
             return Err(NtfsError::Msg(format!(
                 "NTFS EFS encrypted file {abs} (decrypt residual)"
+            )));
+        }
+        // File-level COMPRESSED on a non-directory: ntfs 0.4 has no LZNT1.
+        if attrs.contains(NtfsFileAttributeFlags::COMPRESSED) {
+            return Err(NtfsError::Msg(format!(
+                "NTFS LZNT1 compressed $DATA on {abs} (decompress residual)"
             )));
         }
     }
@@ -592,6 +610,13 @@ fn read_unnamed_data(disk: &mut OffsetDisk, abs: &str) -> Result<Vec<u8>> {
     if attr.flags().contains(ntfs::NtfsAttributeFlags::ENCRYPTED) {
         return Err(NtfsError::Msg(format!(
             "NTFS EFS encrypted $DATA on {abs} (decrypt residual)"
+        )));
+    }
+    // ntfs 0.4 concatenates compression units without LZNT1 — fail-closed
+    // rather than return raw bytes whose lookup size is uncompressed.
+    if attr.flags().contains(ntfs::NtfsAttributeFlags::COMPRESSED) {
+        return Err(NtfsError::Msg(format!(
+            "NTFS LZNT1 compressed $DATA on {abs} (decompress residual)"
         )));
     }
     let mut value = attr.value(disk).map_err(map_ntfs)?;
@@ -816,6 +841,24 @@ mod tests {
         );
     }
 
+    /// Regression: LZNT1 must fail-closed as Unsupported, not PermissionDenied / Other.
+    #[test]
+    fn compressed_data_maps_to_unsupported_not_permission_denied() {
+        let lz = map_read_error(NtfsError::Msg(
+            "NTFS LZNT1 compressed $DATA on /x (decompress residual)".into(),
+        ));
+        assert_eq!(lz.kind(), io::ErrorKind::Unsupported);
+        let efs = map_read_error(NtfsError::Msg(
+            "NTFS EFS encrypted file /x (decrypt residual)".into(),
+        ));
+        assert_eq!(efs.kind(), io::ErrorKind::PermissionDenied);
+        assert_ne!(
+            lz.kind(),
+            efs.kind(),
+            "compression must not share the EFS PermissionDenied mapping"
+        );
+    }
+
     #[test]
     fn open_from_reader_rejects_bad_magic() {
         let err = NtfsMountSource::open_from_reader(Cursor::new(vec![0u8; 4096]), "fake.img")
@@ -947,6 +990,60 @@ mod tests {
                 assert!(names.iter().any(|n| n == "$MFT" || n == "$Volume"));
             }
         }
+    }
+
+    #[test]
+    fn open_with_offset_padded_path() {
+        let Some((_dir, img)) = mkfs_ntfs_image() else {
+            eprintln!("skip: mkfs.ntfs not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        // `.img` so extension fallback cannot mask offset 0.
+        let padded = dir.path().join("padded.img");
+        let pad = 1024 * 1024usize;
+        {
+            let mut out = File::create(&padded).unwrap();
+            out.write_all(&vec![0u8; pad]).unwrap();
+            let mut src = File::open(&img).unwrap();
+            io::copy(&mut src, &mut out).unwrap();
+        }
+        assert!(!looks_like_ntfs_at(&padded, 0));
+        assert!(looks_like_ntfs_at(&padded, pad as u64));
+        let m = NtfsMountSource::open_with_offset(&padded, pad as u64)
+            .expect("open_with_offset at 1 MiB");
+        let root = m.list("/").expect("list / at path offset");
+        match root {
+            ListResult::Infos(map) => {
+                assert!(
+                    map.contains_key("$MFT") || map.contains_key("$Volume"),
+                    "expected metadata at 1 MiB path offset, got {:?}",
+                    map.keys().collect::<Vec<_>>()
+                );
+            }
+            ListResult::Names(names) => {
+                assert!(names.iter().any(|n| n == "$MFT" || n == "$Volume"));
+            }
+        }
+    }
+
+    #[test]
+    fn open_with_offset_rejects_bad_offset() {
+        let Some((_dir, img)) = mkfs_ntfs_image() else {
+            eprintln!("skip: mkfs.ntfs not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let renamed = dir.path().join("disk.img");
+        std::fs::copy(&img, &renamed).unwrap();
+        let err = NtfsMountSource::open_with_offset(&renamed, 4096)
+            .err()
+            .expect("expected open failure at bad offset");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not an NTFS") || msg.contains("failed to open"),
+            "unexpected error: {msg}"
+        );
     }
 
     /// Regression: cheap readdirplus sizes.
