@@ -10,7 +10,7 @@ Related:
 - Gap batches / residual queue: [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
 - Upstream FRs (readahead done, parallel nested open): [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md)
 - Packaging install paths & release procedure: [`docs/packaging.md`](packaging.md)
-- crates.io policy (no publish required for dual-run): [`docs/crates-io-policy.md`](crates-io-policy.md)
+- crates.io policy (no publish required for dual-run; F-10 dry-run is not a dual-run gate): [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md)
 
 ---
 
@@ -162,7 +162,7 @@ Docs can prepare text and mark readiness; ops actions stay open.
 | 1 | Residual gaps table current in this doc (incl. FR-5 done, FR-6 compositing done) | **docs-ready** `[x]` | docs |
 | 2 | Comparison / gaps summary for release notes (paste stub below + parity-todo) | **docs-ready** `[x]` | docs |
 | 3 | Install paths documented (binary, portable, deb/rpm, optional AppImage) | **docs-ready** `[x]` | [`packaging.md`](packaging.md) |
-| 4 | crates.io not required for dual-run binary ship | **docs-ready** `[x]` | [`crates-io-policy.md`](crates-io-policy.md) |
+| 4 | crates.io not required for dual-run binary ship | **docs-ready** `[x]` | [`crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (F-10 L0 dry-run exists; still not a dual-run gate) |
 | 5 | Dual-run model + binary naming (`ratarmount` / `ratarmount-py`) | **docs-ready** `[x]` | this doc |
 | 6 | Release notes body stub (operator message) paste-ready | **docs-ready** `[x]` | this doc § below |
 | 7 | Tag ratarmount-rs `v0.x` / dual-run section linking this doc | **ops-pending** `[ ]` | maintainer |
@@ -200,7 +200,7 @@ Follow the full packaging procedure — do not invent a second process:
 
 - Root [`AGENTS.md`](../AGENTS.md) § **Releases / package builds**
 - [`docs/packaging.md`](packaging.md) § **Agent / maintainer release procedure**
-- crates.io: **not required** for dual-run binary distribution — [`docs/crates-io-policy.md`](crates-io-policy.md)
+- crates.io: **not required** for dual-run binary distribution — [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md)
 
 Minimum:
 
@@ -234,7 +234,7 @@ Confirm under https://github.com/hilather/ratarmount-rs/releases that the tag ha
 | Cold-index | hard gate green (or documented waiver) |
 | GitHub Release assets | Linux packages present; macOS optional if Linux published |
 | Dual-run wording | Release notes say Rust recommended + Python fallback; **do not** claim 100% parity |
-| crates.io | No publish required ([`crates-io-policy.md`](crates-io-policy.md)) |
+| crates.io | No publish required ([`crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md); F-10 dry-run is not this gate) |
 
 ### 5. After announce
 
@@ -329,7 +329,8 @@ Living matrix: docs/parity-todo.md
 ### crates.io
 
 Library crates.io publish is **not** required to use this dual-run binary release.
-Policy: docs/crates-io-policy.md
+F-10 added a maintainer L0 dry-run ([`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh)); that is **not** a dual-run gate and does **not** live-publish (Q5=a).
+Policy: [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md)
 
 ### Links
 
