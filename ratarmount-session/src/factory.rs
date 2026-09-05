@@ -703,17 +703,15 @@ mod split_open_tests {
         );
     }
 
-    /// K7b: Udf immediately before Iso; Block after Fat/Exfat/Ntfs and before
-    /// Qcow2; existing names unmoved (Ogg, Pdf, Html, Libarchive, Tar last).
+    /// K7b locked sequence: Udf immediately before Iso; after Fat: Exfat, Ntfs,
+    /// Dmg, Wim, Block, Qcow2, Vhd, Vmdk; Ogg, Pdf, Html, Libarchive, Tar last.
     #[test]
     fn probe_order_f8() {
-        let order = DEFAULT_FORMAT_PROBE_ORDER;
-        let names: Vec<String> = order.iter().map(|b| format!("{b:?}")).collect();
-
         #[cfg(all(
             feature = "asar",
             feature = "ar",
             feature = "cpio",
+            feature = "udf",
             feature = "iso9660",
             feature = "warc",
             feature = "xar",
@@ -722,28 +720,33 @@ mod split_open_tests {
             feature = "squashfs",
             feature = "ext4",
             feature = "fat",
+            feature = "exfat",
+            feature = "ntfs",
+            feature = "dmg",
+            feature = "wim",
+            feature = "block",
+            feature = "qcow2",
+            feature = "vhd",
+            feature = "vmdk",
             feature = "ogg",
             feature = "pdf",
             feature = "html",
             feature = "libarchive"
         ))]
         {
-            let f8 = [
-                "Udf", "Exfat", "Ntfs", "Dmg", "Wim", "Block", "Qcow2", "Vhd", "Vmdk",
-            ];
-            let pre_f8: Vec<&str> = names
+            let names: Vec<String> = DEFAULT_FORMAT_PROBE_ORDER
                 .iter()
-                .map(String::as_str)
-                .filter(|n| !f8.contains(n))
+                .map(|b| format!("{b:?}"))
                 .collect();
             assert_eq!(
-                pre_f8,
+                names,
                 vec![
                     "SevenZip",
                     "Zip",
                     "Asar",
                     "Ar",
                     "Cpio",
+                    "Udf",
                     "Iso",
                     "Warc",
                     "Xar",
@@ -752,47 +755,20 @@ mod split_open_tests {
                     "SquashFs",
                     "Ext4",
                     "Fat",
+                    "Exfat",
+                    "Ntfs",
+                    "Dmg",
+                    "Wim",
+                    "Block",
+                    "Qcow2",
+                    "Vhd",
+                    "Vmdk",
                     "Ogg",
                     "Pdf",
                     "Html",
                     "Libarchive",
                     "Tar",
-                ],
-                "existing DEFAULT_FORMAT_PROBE_ORDER names must stay unmoved"
-            );
-            assert_eq!(
-                &names[names.len() - 5..],
-                ["Ogg", "Pdf", "Html", "Libarchive", "Tar"]
-            );
-        }
-
-        #[cfg(all(feature = "udf", feature = "iso9660"))]
-        {
-            let udf = pos(order, FormatBackend::Udf);
-            let iso = pos(order, FormatBackend::Iso);
-            assert_eq!(
-                udf + 1,
-                iso,
-                "Udf must be immediately before Iso; got {names:?}"
-            );
-        }
-
-        #[cfg(all(
-            feature = "fat",
-            feature = "exfat",
-            feature = "ntfs",
-            feature = "block",
-            feature = "qcow2"
-        ))]
-        {
-            let fat = pos(order, FormatBackend::Fat);
-            let exfat = pos(order, FormatBackend::Exfat);
-            let ntfs = pos(order, FormatBackend::Ntfs);
-            let block = pos(order, FormatBackend::Block);
-            let qcow2 = pos(order, FormatBackend::Qcow2);
-            assert!(
-                fat < exfat && exfat < ntfs && ntfs < block && block < qcow2,
-                "Block after Fat/Exfat/Ntfs and before Qcow2; got {names:?}"
+                ]
             );
         }
 
@@ -821,13 +797,6 @@ mod split_open_tests {
         }
         #[cfg(feature = "vmdk")]
         assert_eq!(parse_format_backend("vmdk"), Some(FormatBackend::Vmdk));
-    }
-
-    fn pos(order: &[FormatBackend], backend: FormatBackend) -> usize {
-        order
-            .iter()
-            .position(|&b| b == backend)
-            .unwrap_or_else(|| panic!("{backend:?} missing from DEFAULT_FORMAT_PROBE_ORDER"))
     }
 
     #[test]
@@ -1136,6 +1105,30 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             }
         }
 
+        // Superfloppy FS magics at offset 0 immediately after FAT (K7b), before Block.
+        #[cfg(feature = "exfat")]
+        {
+            let looks_exfat =
+                name_suggests_ext(label, &["exfat"]) || looks_like_exfat_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_exfat {
+                return map_nested_open("exFAT", label, || {
+                    ExfatMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "ntfs")]
+        {
+            let looks_ntfs =
+                name_suggests_ext(label, &["ntfs"]) || looks_like_ntfs_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_ntfs {
+                return map_nested_open("NTFS", label, || {
+                    NtfsMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+
         // SquashFS: magic at 0 (or AppImage-style scan); classic LZMA fails → temp spool
         #[cfg(feature = "squashfs")]
         {
@@ -1162,29 +1155,6 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             }
         }
 
-        // Superfloppy FS magics at offset 0 before GPT/MBR Block.
-        #[cfg(feature = "exfat")]
-        {
-            let looks_exfat =
-                name_suggests_ext(label, &["exfat"]) || looks_like_exfat_reader(&mut reader);
-            let _ = reader.seek(SeekFrom::Start(0));
-            if looks_exfat {
-                return map_nested_open("exFAT", label, || {
-                    ExfatMountSource::open_from_reader(reader, label)
-                });
-            }
-        }
-        #[cfg(feature = "ntfs")]
-        {
-            let looks_ntfs =
-                name_suggests_ext(label, &["ntfs"]) || looks_like_ntfs_reader(&mut reader);
-            let _ = reader.seek(SeekFrom::Start(0));
-            if looks_ntfs {
-                return map_nested_open("NTFS", label, || {
-                    NtfsMountSource::open_from_reader(reader, label)
-                });
-            }
-        }
         #[cfg(feature = "dmg")]
         {
             let looks_dmg =
@@ -1675,14 +1645,23 @@ fn open_nested_ar_with_durable(
 #[cfg(any(
     feature = "ar",
     feature = "asar",
+    feature = "block",
     feature = "cab",
     feature = "cpio",
+    feature = "dmg",
+    feature = "exfat",
     feature = "ext4",
     feature = "fat",
     feature = "iso9660",
+    feature = "ntfs",
+    feature = "qcow2",
     feature = "sqlar",
     feature = "squashfs",
+    feature = "udf",
+    feature = "vhd",
+    feature = "vmdk",
     feature = "warc",
+    feature = "wim",
     feature = "xar"
 ))]
 fn map_nested_open<S, E>(
@@ -7117,7 +7096,8 @@ mod tests {
         );
     }
 
-    /// Mixed ISO+UDF VRS: NSR02 present → factory probe selects Udf before Iso.
+    /// Mixed ISO+UDF VRS: NSR02 present → nested/seekable helpers try UDF first
+    /// and fail closed (no ISO fall-through) when UDF open rejects the image.
     #[cfg(all(feature = "udf", feature = "iso9660"))]
     #[test]
     fn nested_udf_before_iso_mixed_disc() {
@@ -7149,25 +7129,39 @@ mod tests {
             "CD001 at sector 16 must match ISO on mixed VRS"
         );
 
-        let mut first = None;
-        for &b in DEFAULT_FORMAT_PROBE_ORDER {
-            match b {
-                FormatBackend::Udf if looks_like_udf(&mixed) => {
-                    first = Some(FormatBackend::Udf);
-                    break;
-                }
-                FormatBackend::Iso if looks_like_iso(&mixed) => {
-                    first = Some(FormatBackend::Iso);
-                    break;
-                }
-                _ => {}
-            }
+        fn assert_udf_fail_closed(msg: &str, where_: &str) {
+            let lower = msg.to_ascii_lowercase();
+            assert!(
+                lower.contains("udf") || lower.contains("avdp"),
+                "{where_}: UDF must be tried first (fail closed); got {msg}"
+            );
+            assert!(
+                !lower.contains("iso9660"),
+                "{where_}: must not fall through to ISO; got {msg}"
+            );
         }
-        assert_eq!(
-            first,
-            Some(FormatBackend::Udf),
-            "factory probe must select Udf before Iso when NSR02/NSR03 is present"
-        );
+
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts.clone());
+        let nested_err = opener(
+            Box::new(std::io::Cursor::new(img.clone())),
+            Path::new("mixed.iso"),
+            NestedOpenContext::default(),
+        )
+        .err()
+        .expect("mixed NSR+CD001 without AVDP must not mount as ISO");
+        assert_udf_fail_closed(&nested_err.to_string(), "open_nested_reader_fn");
+
+        let body =
+            ratarmount_compress::DecodedBody::from_bytes(Path::new("mixed.iso"), "test", img);
+        let seekable_err =
+            try_open_formats_from_seekable_body(Path::new("mixed.iso"), body, None, &opts, true)
+                .err()
+                .expect("seekable-body mixed disc must fail closed, not return ISO");
+        assert_udf_fail_closed(&seekable_err, "try_open_formats_from_seekable_body");
 
         let iso_only = dir.path().join("cd001-only.iso");
         let mut only = vec![0u8; 18 * 2048];

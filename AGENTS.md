@@ -82,8 +82,10 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
 | F-8 factory probe order (Udf before Iso; Block after Fat/Exfat/Ntfs) | `cargo test -p ratarmount-session --lib probe_order_f8` |
+| Slim session graph `udf` without iso9660 still compiles `map_nested_open` | `cargo check -p ratarmount-session --no-default-features --features udf` |
 | Nested exFAT no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_exfat` |
 | Nested UDF no-tmp / mixed-disc Udf-before-Iso | `cargo test -p ratarmount-session --lib nested_udf` |
+| Nested NTFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ntfs` |
 | FAT partition offset (superfloppy 0 / padded image) | `cargo test -p ratarmount-formats-fat --lib offset` |
 | Nested exFAT no-tmp / OEM `"EXFAT   "` (F-8 crate) | `cargo test -p ratarmount-formats-exfat --lib` (always-on synthetic boot + volume; `mkfs_exfat` skip if no `mkfs.exfat`) |
 | GPT/MBR partition table `p1/` listing (synthetic MBR+FAT) | `cargo test -p ratarmount-formats-block --lib mbr_fat` · `cargo test -p ratarmount-formats-block --lib gpt_fat` · `cargo test -p ratarmount-formats-block --lib looks_like` |
