@@ -21,6 +21,7 @@ members = [
     "ratarmount-formats-squashfs",
     "ratarmount-formats-ext4",
     "ratarmount-formats-fat",
+    "ratarmount-formats-exfat",
     "ratarmount-formats-asar",
     "ratarmount-formats-ogg",
     "ratarmount-formats-html",
@@ -64,6 +65,7 @@ ratarmount-formats-sqlar = { path = "ratarmount-formats-sqlar" }
 ratarmount-formats-squashfs = { path = "ratarmount-formats-squashfs" }
 ratarmount-formats-ext4 = { path = "ratarmount-formats-ext4" }
 ratarmount-formats-fat = { path = "ratarmount-formats-fat" }
+ratarmount-formats-exfat = { path = "ratarmount-formats-exfat" }
 ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
 ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }
