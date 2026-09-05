@@ -1,0 +1,8 @@
+# Example autofs indirect map for read-only ratarmount FUSE stems.
+# Master (e.g. /etc/auto.master.d/ratarmount.autofs):
+#   /mnt/archives  /etc/auto.ratarmount  --timeout=300
+#
+# Key "dataset" mounts at /mnt/archives/dataset.
+# Credentials inherit the autofs environment — never put them on this line.
+
+dataset -fstype=fuse.ratarmount,ro,allow_other :s3://bucket/dataset.tar.zst

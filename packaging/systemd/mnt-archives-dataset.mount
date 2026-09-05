@@ -1,0 +1,25 @@
+# Example systemd .mount unit for a read-only ratarmount FUSE stem.
+# Copy to /etc/systemd/system/ and edit What=/Where=. The filename MUST be
+# systemd-escape -p of Where= (this file → /mnt/archives/dataset).
+#
+# Do not put AWS_* / RESTIC_* / passwords on What= or Options=. Use
+# EnvironmentFile= (0600) so the helper inherits credentials.
+#
+# v1 is RO. Do not convert this to ExecStart=ratarmount -f --no-mount
+# (that is export-only and is not a FUSE mount helper).
+
+[Unit]
+Description=ratarmount RO archive (s3 dataset)
+After=network-online.target
+Wants=network-online.target
+
+[Mount]
+What=s3://bucket/dataset.tar.zst
+Where=/mnt/archives/dataset
+Type=fuse.ratarmount
+Options=ro,allow_other,_netdev
+TimeoutSec=0
+# EnvironmentFile=-/etc/ratarmount/s3.env
+
+[Install]
+WantedBy=multi-user.target

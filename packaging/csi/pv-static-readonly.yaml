@@ -1,0 +1,45 @@
+# Spec-only static ReadOnlyMany volume. Credentials come from the Secret
+# referenced by nodePublishSecretRef (env), never from volumeAttributes.
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: ratarmount-dataset
+spec:
+  capacity:
+    storage: 1Gi
+  accessModes:
+    - ReadOnlyMany
+  persistentVolumeReclaimPolicy: Retain
+  storageClassName: ratarmount-ro
+  csi:
+    driver: ratarmount.csi.example
+    volumeHandle: s3://bucket/dataset.tar.zst
+    readOnly: true
+    nodePublishSecretRef:
+      name: ratarmount-s3
+      namespace: kube-system
+    volumeAttributes:
+      archive: s3://bucket/dataset.tar.zst
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ratarmount-dataset
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: ratarmount-ro
+  volumeName: ratarmount-dataset
+  resources:
+    requests:
+      storage: 1Gi
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: ratarmount-s3
+  namespace: kube-system
+type: Opaque
+stringData:
+  AWS_ACCESS_KEY_ID: REPLACE_ME
+  AWS_SECRET_ACCESS_KEY: REPLACE_ME
