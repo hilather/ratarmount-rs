@@ -45,6 +45,8 @@ const MAX_SLURP: u64 = 256 * 1024 * 1024;
 const MAX_DIR: u64 = 16 * 1024 * 1024;
 const MAX_INDIRECT: u32 = 8;
 const MAX_AD_HOPS: u32 = 128;
+/// Cap type-3 AD continuation bytes (4096 long_ad slots). Fail closed above this.
+const MAX_AD_CONTINUATION: u32 = 4096 * 16;
 
 const TAG_AVDP: u16 = 2;
 const TAG_PD: u16 = 5;
@@ -1009,6 +1011,11 @@ fn read_ad_bytes(
     start_lba: u32,
     len: u32,
 ) -> Result<Vec<u8>> {
+    if len > MAX_AD_CONTINUATION {
+        return Err(UdfError::Msg(format!(
+            "UDF allocation descriptor continuation too large ({len} bytes)"
+        )));
+    }
     if len == 0 {
         return Ok(Vec::new());
     }
@@ -1046,6 +1053,11 @@ fn collect_alloc_descs(
         match cont {
             None => return Ok(extents),
             Some((lba, len)) => {
+                if len > MAX_AD_CONTINUATION {
+                    return Err(UdfError::Msg(format!(
+                        "UDF allocation descriptor continuation too large ({len} bytes)"
+                    )));
+                }
                 cur = read_ad_bytes(read_part, lba, len)?;
             }
         }
@@ -1450,6 +1462,8 @@ mod tests {
         root_dir.extend(encode_fid_cs2("cs2.txt", 13, 0, 1, BS_U, false));
         root_dir.extend(encode_fid_cs2("P", 14, 0, 1, BS_U, true));
         root_dir.extend(encode_fid("cont.bin", 17, 0, false, false, 1, BS_U));
+        // Type-3 length 0x3FFFFFFF must fail closed (no ~1 GiB Vec).
+        root_dir.extend(encode_fid("huge.bin", 18, 0, false, false, 1, BS_U));
         // Unreadable child: ICB at empty LBA 99. list/list_dirents must skip it.
         root_dir.extend(encode_fid("bad", 99, 0, false, false, 1, BS_U));
         let root_fe = encode_fe_in_icb(true, &root_dir, 1, 1, BS);
@@ -1475,6 +1489,8 @@ mod tests {
         put_block(&mut img, 15, &ad_cont);
         put_block(&mut img, 16, cont);
         put_block(&mut img, 17, &cont_fe);
+        let huge_fe = encode_fe_short_ads(false, 1, &[(0x3FFF_FFFF, 3, 1)], 18, 1, BS);
+        put_block(&mut img, 18, &huge_fe);
 
         let mut avdp = vec![0u8; 512];
         write_u32(&mut avdp, 16, 16 * BS_U);
@@ -1916,6 +1932,34 @@ mod tests {
         let mut data = Vec::new();
         m.open(&cont, 0).unwrap().read_to_end(&mut data).unwrap();
         assert_eq!(data, b"type3-continued\n");
+    }
+
+    /// Regression: type-3 AD length 0x3FFFFFFF must not allocate a ~1 GiB Vec.
+    #[test]
+    fn type3_continuation_huge_len_fails_closed() {
+        let mut ads = [0u8; 8];
+        let raw = 0x3FFF_FFFF | (3u32 << 30);
+        ads[0..4].copy_from_slice(&raw.to_le_bytes());
+        ads[4..8].copy_from_slice(&1u32.to_le_bytes());
+        let mut reads = 0u32;
+        let err = collect_alloc_descs(&ads, AD_SHORT, &mut |_| {
+            reads += 1;
+            panic!("must not slurp a huge type-3 continuation");
+        })
+        .expect_err("huge type-3 must fail closed");
+        assert_eq!(reads, 0, "read_part must not run before the length cap");
+        assert!(
+            err.to_string().contains("too large"),
+            "unexpected error: {err}"
+        );
+
+        let bytes = synthetic_udf_image();
+        let m = UdfMountSource::open_from_reader(Cursor::new(bytes), "huge.udf")
+            .expect("open_from_reader");
+        assert!(
+            m.lookup("/huge.bin", 0).is_none(),
+            "oversized type-3 FE must not become a readable file"
+        );
     }
 
     /// Regression: one bad child ICB must not turn list() into None.
