@@ -70,7 +70,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`; Linux/macOS packages compile `nfsv4`; source `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes including rename/symlink) | `~` / Linux kernel client **verified** (privileged Docker loopback `test-harness/nfs-docker`, 2026-08-15; not default CI); no Kerberos/LAN/Windows; no v3/v4 mux; idle-TTL-not-CLOSE; embednfs macOS-first |
 | HTTP GET/HEAD export (`--http`) | no | yes (`127.0.0.1:20491`; Range 206; fill-loop) | `[x]` Rust-only |
 | WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE/COPY with `-w`; LOCK/UNLOCK; PROPPATCH; Basic env | `[x]` / mux residual |
-| SMB 2.0.2 export (`--smb`) | no | userspace 2.0.2 subset; guest `smbclient -N` unsigned; NTLMv2 + signing when password set | `~` encrypt / 3.1.1 / Finder residual |
+| SMB 2.0.2 / 3.1.1 export (`--smb`) | no | userspace subset; guest `smbclient -N` unsigned; NTLMv2 + signing when password set; 3.1.1 preauth + optional GCM/CCM encrypt | `~` Finder/leases residual |
 | 9P2000.L TCP (`--ninep`) | no | TCP `trans=tcp` port 20493; writes need `-w` | `[x]` / virtio residual |
 | SFTP export (`--sftp`) | no | TCP `:20222` + `--sftp-subsystem` stdio; password env; `--features sftp-russh` (packages on; default CI off; russh MSRV 1.85) | `[x]` / russh feature note |
 | Daemonize / foreground | yes | yes | `[x]` |

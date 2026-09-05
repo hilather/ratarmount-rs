@@ -70,9 +70,9 @@ curl -X PROPFIND -H 'Depth: 1' http://127.0.0.1:20492/
 | Basic | `RATARMOUNT_WEBDAV_USER` / `RATARMOUNT_WEBDAV_PASSWORD` when user is set; else none (localhost). Missing/wrong → 401 |
 | Residual | Same-port HTTP+WebDAV mux; Finder/Explorer not in CI |
 
-## SMB 2.0.2 (`--smb`) — P-2 `partial`
+## SMB 2.0.2 / 3.1.1 (`--smb`) — P-2 `partial`
 
-Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar. Password env requires signing.
+Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar (2.0.2 when the client offers it). Password env requires signing; a 3.1.1-only client also negotiates preauth and optional encryption.
 
 ```bash
 ratarmount --smb archive.tar.gz
@@ -84,10 +84,10 @@ smbclient //127.0.0.1/ratarmount -p 20445 -N -c 'get member -'
 |------|----------|
 | Ops | NEGOTIATE, SESSION_SETUP (guest or `RATARMOUNT_SMB_USER`/`RATARMOUNT_SMB_PASSWORD`), TREE_CONNECT, CREATE, READ, QUERY_DIRECTORY, CLOSE, QUERY_INFO |
 | Writes | CREATE-mkdir / WRITE / SET_INFO / DELETE only with `-w` |
-| Guest | Password unset: unsigned; `smbclient -N` is the bar. Username match only if `RATARMOUNT_SMB_USER` is set |
-| Password / signing | `RATARMOUNT_SMB_PASSWORD` set: NTLMv2 NT proof required; `SIGNING_REQUIRED`; HMAC-SHA256 on every request after SESSION_SETUP. Guest `-N` is off |
-| Encryption / SMB 3.1.1 | **Residual** |
-| Finder / Explorer | **Residual** (leases, create contexts; not a CI bar) |
+| Guest | Password unset: unsigned; `smbclient -N` is the bar. Username match only if `RATARMOUNT_SMB_USER` is set. Guest keeps 2.0.2 when offered; 3.1.1-only still unsigned (no encryption) |
+| Password / signing | `RATARMOUNT_SMB_PASSWORD` set: NTLMv2 NT proof required; `SIGNING_REQUIRED`; HMAC-SHA256 (2.0.2) or AES-CMAC (3.1.1) after SESSION_SETUP. Guest `-N` is off |
+| Encryption / SMB 3.1.1 | 3.1.1 preauth SHA-512 when that dialect is selected. AES-128-GCM (prefer) / CCM transform when the client offers an encryption context **and** a password is set. Guest encryption is residual |
+| Finder / Explorer | **Residual** (leases, create contexts; not a CI bar). P-2 stays `partial` until Finder |
 
 ## 9P2000.L TCP (`--ninep`) — P-7 `done`
 

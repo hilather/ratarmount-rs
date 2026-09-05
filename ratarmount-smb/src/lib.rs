@@ -1,4 +1,4 @@
-//! Userspace SMB 2.0.2 export of a [`ratarmount_core::MountSource`] (P-2).
+//! Userspace SMB 2.0.2 / 3.1.1 export of a [`ratarmount_core::MountSource`] (P-2).
 //!
 //! Listen on `127.0.0.1:20445` (unprivileged; well-known 445 needs root).
 //! Default share name is [`DEFAULT_SMB_SHARE`] (`ratarmount`).
@@ -12,11 +12,11 @@
 //! require a [`WriteOverlay`] (`-w`); otherwise those ops return
 //! `STATUS_ACCESS_DENIED`.
 //!
-//! **Residual: SMB encryption / 3.1.1 and Finder/Explorer.** The dialect is a
-//! 2.0.2 subset: NTLMv2 password verification and SMB 2.0.2 HMAC-SHA256
-//! signing when `RATARMOUNT_SMB_PASSWORD` is set (guest `smbclient -N` when
-//! unset). No encryption, no preauth 3.1.1. Packet tests stand in for
-//! auth+signing; Finder and Explorer are not a CI bar.
+//! **Residual: Finder/Explorer leases.** Guest `smbclient -N` is the unsigned
+//! 2.0.2 bar. When `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 is required and
+//! SMB 2.0.2 HMAC-SHA256 signing applies; a 3.1.1-only client also gets
+//! SHA-512 preauth and optional AES-128-GCM/CCM encryption. Packet tests
+//! stand in for preauth+encrypt; Finder and Explorer are not a CI bar.
 
 mod serve;
 mod smb2;

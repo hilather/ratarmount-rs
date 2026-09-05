@@ -149,6 +149,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Kernel NFS Docker (v3 + v4.1) | `./test-harness/nfs-docker/run.sh` (privileged Docker + real `mount -t nfs`; skip if docker/privileged unavailable; empty/wrong bytes = fail) |
 | Kernel NFS Docker overlay write | `./test-harness/nfs-docker/run.sh 3 write` · `./test-harness/nfs-docker/run.sh 4 write` |
 | SMB NTLM password / unsigned session | `cargo test -p ratarmount-smb --lib ntlm` · `cargo test -p ratarmount-smb --lib sign` |
+| SMB 3.1.1 preauth hash | `cargo test -p ratarmount-smb --lib preauth` |
+| SMB 3.1.1 encrypted READ (AES-128-GCM) | `cargo test -p ratarmount-smb --lib encrypted_read` · guest unencrypted: `cargo test -p ratarmount-smb --lib guest_311` |
 | WebDAV LOCK 423 / COPY / Basic | `cargo test -p ratarmount-http --lib lock` · `cargo test -p ratarmount-http --lib copy` · `cargo test -p ratarmount-http --lib basic` |
 | SFTP password policy / non-loopback | `cargo test -p ratarmount-sftp --lib password` · `cargo test -p ratarmount-sftp --features sftp-russh --lib password` |
 | GCS GOOG1 HMAC | `cargo test -p ratarmount-remote --lib goog1` · `cargo test -p ratarmount-remote --lib hmac` |

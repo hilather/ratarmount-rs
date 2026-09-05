@@ -1,4 +1,4 @@
-//! SMB 2.0.2 packet codec (Direct TCP) plus a tiny NTLMSSP/SPNEGO subset.
+//! SMB 2.0.2 / 3.1.1 packet codec (Direct TCP) plus a tiny NTLMSSP/SPNEGO subset.
 //!
 //! No crates.io SMB server compiled on workspace MSRV 1.74 without raising
 //! edition/rustc, so this module is the dialect.
@@ -9,7 +9,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use hmac::{Hmac, Mac};
 use md4::{Digest, Md4};
 use md5::Md5;
-use sha2::Sha256;
+use sha2::{Sha256, Sha512};
 
 // --- commands ---
 
@@ -42,10 +42,25 @@ pub const DIALECT_202: u16 = 0x0202;
 pub const DIALECT_210: u16 = 0x0210;
 pub const DIALECT_300: u16 = 0x0300;
 pub const DIALECT_302: u16 = 0x0302;
+pub const DIALECT_311: u16 = 0x0311;
 
 pub const NEGOTIATE_SIGNING_ENABLED: u16 = 0x0001;
 pub const NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
 pub const SESSION_FLAG_IS_GUEST: u16 = 0x0001;
+/// SMB 3.x: subsequent messages are SMB2 TRANSFORM_HEADER (encryption).
+pub const SESSION_FLAG_ENCRYPT_DATA: u16 = 0x0004;
+
+pub const SMB2_GLOBAL_CAP_ENCRYPTION: u32 = 0x0000_0040;
+pub const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
+pub const SMB2_ENCRYPTION_CAPABILITIES: u16 = 0x0002;
+pub const HASH_SHA512: u16 = 0x0001;
+pub const CIPHER_AES128_CCM: u16 = 0x0001;
+pub const CIPHER_AES128_GCM: u16 = 0x0002;
+pub const SMB2_SHAREFLAG_ENCRYPT_DATA: u32 = 0x0000_8000;
+
+pub const TRANSFORM_HEADER_LEN: usize = 52;
+pub const SMB2_TRANSFORM_FLAGS_ENCRYPTED: u16 = 0x0001;
+pub const PREAUTH_ZERO: [u8; 64] = [0u8; 64];
 pub const NTLMSSP_NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
 
 pub const SHARE_TYPE_DISK: u8 = 0x01;
@@ -347,6 +362,44 @@ pub(crate) fn smb2_verify_packet(msg: &[u8], session_key: &[u8; 16]) -> bool {
 
 /// Sign each compound part in place after [`stitch_compound`] (NextCommand already set).
 pub(crate) fn smb2_sign_compound(buf: &mut [u8], session_key: &[u8; 16]) {
+    sign_compound_with(buf, session_key, smb2_sign_packet);
+}
+
+/// AES-128-CMAC (SMB 3.x). Signature is the full 16-byte CMAC (not HMAC truncated).
+pub(crate) fn smb3_sign_packet(msg: &mut [u8], signing_key: &[u8; 16]) {
+    if msg.len() < SMB2_HEADER_LEN {
+        return;
+    }
+    let mut flags = u32::from_le_bytes(msg[16..20].try_into().unwrap_or([0; 4]));
+    flags |= SMB2_FLAGS_SIGNED;
+    msg[16..20].copy_from_slice(&flags.to_le_bytes());
+    msg[48..64].fill(0);
+    let sig = aes_cmac16(signing_key, msg);
+    msg[48..64].copy_from_slice(&sig);
+}
+
+pub(crate) fn smb3_verify_packet(msg: &[u8], signing_key: &[u8; 16]) -> bool {
+    if msg.len() < SMB2_HEADER_LEN {
+        return false;
+    }
+    let Ok(flags) = u32_at(msg, 16) else {
+        return false;
+    };
+    if flags & SMB2_FLAGS_SIGNED == 0 {
+        return false;
+    }
+    let got = &msg[48..64];
+    let mut tmp = msg.to_vec();
+    tmp[48..64].fill(0);
+    let computed = aes_cmac16(signing_key, &tmp);
+    ct_eq(&computed, got)
+}
+
+pub(crate) fn smb3_sign_compound(buf: &mut [u8], signing_key: &[u8; 16]) {
+    sign_compound_with(buf, signing_key, smb3_sign_packet);
+}
+
+fn sign_compound_with(buf: &mut [u8], key: &[u8; 16], sign: fn(&mut [u8], &[u8; 16])) {
     let mut off = 0usize;
     while off + SMB2_HEADER_LEN <= buf.len() {
         let next = u32_at(buf, off + 20).unwrap_or(0) as usize;
@@ -355,12 +408,21 @@ pub(crate) fn smb2_sign_compound(buf: &mut [u8], session_key: &[u8; 16]) {
         } else {
             off.saturating_add(next).min(buf.len())
         };
-        smb2_sign_packet(&mut buf[off..end], session_key);
+        sign(&mut buf[off..end], key);
         if next == 0 {
             break;
         }
         off = end;
     }
+}
+
+fn aes_cmac16(key: &[u8; 16], msg: &[u8]) -> [u8; 16] {
+    let mut mac = cmac::Cmac::<aes::Aes128>::new_from_slice(key).expect("AES-CMAC key");
+    mac.update(msg);
+    let bytes = mac.finalize().into_bytes();
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes[..16]);
+    out
 }
 
 /// Split a Direct-TCP payload into compound SMB2 messages (unpadded slices).
@@ -406,6 +468,10 @@ pub fn stitch_compound(packets: &[Vec<u8>]) -> Vec<u8> {
 
 pub fn is_smb1(buf: &[u8]) -> bool {
     buf.len() >= 4 && buf[0] == 0xff && &buf[1..4] == b"SMB"
+}
+
+pub fn is_smb2_transform(buf: &[u8]) -> bool {
+    buf.len() >= 4 && buf[0] == 0xfd && &buf[1..4] == b"SMB"
 }
 
 pub fn smb1_has_smb2_dialect(buf: &[u8]) -> bool {
@@ -470,7 +536,7 @@ pub fn encode_utf16le(s: &str) -> Vec<u8> {
 pub fn decode_utf16le(bytes: &[u8]) -> String {
     let even = bytes.len() & !1;
     // `as_chunks` is rustc 1.88+; workspace MSRV is 1.74.
-    #[allow(clippy::chunks_exact_to_as_chunks)]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let u: Vec<u16> = bytes[..even]
         .chunks_exact(2)
         .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -541,6 +607,15 @@ pub fn parse_negotiate_dialects(cmd: &[u8]) -> io::Result<Vec<u16>> {
 }
 
 pub fn pick_dialect(dialects: &[u16]) -> Option<u16> {
+    pick_dialect_prefer(dialects, false)
+}
+
+/// Guest keeps 2.0.2 when offered (unsigned v1 bar). Password sessions prefer 3.1.1
+/// so preauth + encryption can be negotiated.
+pub fn pick_dialect_prefer(dialects: &[u16], prefer_311: bool) -> Option<u16> {
+    if prefer_311 && dialects.contains(&DIALECT_311) {
+        return Some(DIALECT_311);
+    }
     if dialects.contains(&DIALECT_202) {
         Some(DIALECT_202)
     } else if dialects.contains(&DIALECT_210) {
@@ -549,19 +624,115 @@ pub fn pick_dialect(dialects: &[u16]) -> Option<u16> {
         Some(DIALECT_300)
     } else if dialects.contains(&DIALECT_302) {
         Some(DIALECT_302)
+    } else if dialects.contains(&DIALECT_311) {
+        Some(DIALECT_311)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct NegotiateParsed {
+    pub dialects: Vec<u16>,
+    pub contexts: Vec<(u16, Vec<u8>)>,
+}
+
+pub fn parse_negotiate(cmd: &[u8]) -> io::Result<NegotiateParsed> {
+    let dialects = parse_negotiate_dialects(cmd)?;
+    let body = cmd
+        .get(SMB2_HEADER_LEN..)
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "NEGOTIATE"))?;
+    let mut contexts = Vec::new();
+    if dialects.contains(&DIALECT_311) && body.len() >= 36 {
+        let ctx_off = u32_at(body, 28).unwrap_or(0) as usize;
+        let ctx_count = u16_at(body, 32).unwrap_or(0) as usize;
+        if ctx_count > 0 && ctx_off > 0 {
+            contexts = parse_negotiate_contexts(cmd, ctx_off, ctx_count)?;
+        }
+    }
+    Ok(NegotiateParsed { dialects, contexts })
+}
+
+fn parse_negotiate_contexts(
+    cmd: &[u8],
+    mut off: usize,
+    count: usize,
+) -> io::Result<Vec<(u16, Vec<u8>)>> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 8 > cmd.len() {
+            return Err(io::Error::new(
+                ErrorKind::UnexpectedEof,
+                "NEGOTIATE context",
+            ));
+        }
+        let ty = u16_at(cmd, off)?;
+        let dlen = u16_at(cmd, off + 2)? as usize;
+        let data = cmd
+            .get(off + 8..off + 8 + dlen)
+            .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "NEGOTIATE context data"))?
+            .to_vec();
+        out.push((ty, data));
+        let raw = 8 + dlen;
+        off = off.saturating_add((raw + 7) & !7);
+    }
+    Ok(out)
+}
+
+pub fn parse_encryption_ciphers(contexts: &[(u16, Vec<u8>)]) -> Vec<u16> {
+    for (ty, data) in contexts {
+        if *ty != SMB2_ENCRYPTION_CAPABILITIES || data.len() < 2 {
+            continue;
+        }
+        let n = u16::from_le_bytes(data[0..2].try_into().unwrap_or([0; 2])) as usize;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let o = 2 + i * 2;
+            if o + 2 <= data.len() {
+                out.push(u16::from_le_bytes(
+                    data[o..o + 2].try_into().unwrap_or([0; 2]),
+                ));
+            }
+        }
+        return out;
+    }
+    Vec::new()
+}
+
+pub fn has_preauth_context(contexts: &[(u16, Vec<u8>)]) -> bool {
+    contexts
+        .iter()
+        .any(|(ty, data)| *ty == SMB2_PREAUTH_INTEGRITY_CAPABILITIES && data.len() >= 4)
+}
+
+pub fn pick_cipher(ciphers: &[u16]) -> Option<u16> {
+    if ciphers.contains(&CIPHER_AES128_GCM) {
+        Some(CIPHER_AES128_GCM)
+    } else if ciphers.contains(&CIPHER_AES128_CCM) {
+        Some(CIPHER_AES128_CCM)
     } else {
         None
     }
 }
 
 pub fn encode_negotiate_response(dialect: u16, sec_buf: &[u8], security_mode: u16) -> Vec<u8> {
+    encode_negotiate_response_ex(dialect, sec_buf, security_mode, 0, &[])
+}
+
+pub fn encode_negotiate_response_ex(
+    dialect: u16,
+    sec_buf: &[u8],
+    security_mode: u16,
+    capabilities: u32,
+    contexts: &[Vec<u8>],
+) -> Vec<u8> {
     let mut b = vec![0u8; 64];
     b[0..2].copy_from_slice(&65u16.to_le_bytes());
     b[2..4].copy_from_slice(&security_mode.to_le_bytes());
     b[4..6].copy_from_slice(&dialect.to_le_bytes());
+    b[6..8].copy_from_slice(&(contexts.len() as u16).to_le_bytes());
     b[8..24].copy_from_slice(&SERVER_GUID);
-    // Capabilities: DFS=0, LEASING=0
-    b[24..28].copy_from_slice(&0u32.to_le_bytes());
+    b[24..28].copy_from_slice(&capabilities.to_le_bytes());
     b[28..32].copy_from_slice(&MAX_TRANSACT.to_le_bytes());
     b[32..36].copy_from_slice(&MAX_READ.to_le_bytes());
     b[36..40].copy_from_slice(&MAX_WRITE.to_le_bytes());
@@ -571,7 +742,250 @@ pub fn encode_negotiate_response(dialect: u16, sec_buf: &[u8], security_mode: u1
     b[56..58].copy_from_slice(&off.to_le_bytes());
     b[58..60].copy_from_slice(&(sec_buf.len() as u16).to_le_bytes());
     b.extend_from_slice(sec_buf);
+    if !contexts.is_empty() {
+        let pad = (8 - (b.len() % 8)) % 8;
+        b.resize(b.len() + pad, 0);
+        let ctx_off = (SMB2_HEADER_LEN + b.len()) as u32;
+        b[60..64].copy_from_slice(&ctx_off.to_le_bytes());
+        for ctx in contexts {
+            b.extend_from_slice(ctx);
+        }
+    }
     b
+}
+
+pub fn encode_negotiate_context(ty: u16, data: &[u8]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(8 + data.len() + 8);
+    b.extend_from_slice(&ty.to_le_bytes());
+    b.extend_from_slice(&(data.len() as u16).to_le_bytes());
+    b.extend_from_slice(&0u32.to_le_bytes());
+    b.extend_from_slice(data);
+    let pad = (8 - (b.len() % 8)) % 8;
+    b.resize(b.len() + pad, 0);
+    b
+}
+
+pub fn encode_preauth_context(salt: &[u8]) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4 + 2 + salt.len());
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&(salt.len() as u16).to_le_bytes());
+    data.extend_from_slice(&HASH_SHA512.to_le_bytes());
+    data.extend_from_slice(salt);
+    encode_negotiate_context(SMB2_PREAUTH_INTEGRITY_CAPABILITIES, &data)
+}
+
+pub fn encode_encryption_context(cipher: u16) -> Vec<u8> {
+    let mut data = Vec::with_capacity(4);
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&cipher.to_le_bytes());
+    encode_negotiate_context(SMB2_ENCRYPTION_CAPABILITIES, &data)
+}
+
+pub fn preauth_hash_update(current: &[u8; 64], message: &[u8]) -> [u8; 64] {
+    let mut h = Sha512::new();
+    h.update(current);
+    h.update(message);
+    let out = h.finalize();
+    let mut a = [0u8; 64];
+    a.copy_from_slice(&out);
+    a
+}
+
+/// SP800-108 counter KDF (HMAC-SHA256, r=32, L=out_len*8).
+/// `label_with_nul` includes the terminating NUL; the KDF appends the SP800-108
+/// separator `0x00` after it (MS-SMB2 3.1.4.2 double-NUL).
+pub fn smb3_kdf(ki: &[u8], label_with_nul: &[u8], context: &[u8], out_len: usize) -> Vec<u8> {
+    let l_bits = (out_len as u32).saturating_mul(8);
+    let mut msg = Vec::with_capacity(4 + label_with_nul.len() + 1 + context.len() + 4);
+    msg.extend_from_slice(&1u32.to_be_bytes());
+    msg.extend_from_slice(label_with_nul);
+    msg.push(0x00);
+    msg.extend_from_slice(context);
+    msg.extend_from_slice(&l_bits.to_be_bytes());
+    let mut mac = HmacSha256::new_from_slice(ki).expect("HMAC-SHA256 key");
+    mac.update(&msg);
+    let full = mac.finalize().into_bytes();
+    full[..out_len.min(full.len())].to_vec()
+}
+
+pub fn smb311_signing_key(session_key: &[u8; 16], preauth: &[u8; 64]) -> [u8; 16] {
+    let v = smb3_kdf(session_key, b"SMBSigningKey\0", preauth, 16);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// Client→server cipher key (server decrypts with this).
+pub fn smb311_c2s_key(session_key: &[u8; 16], preauth: &[u8; 64]) -> [u8; 16] {
+    let v = smb3_kdf(session_key, b"SMBC2SCipherKey\0", preauth, 16);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v);
+    out
+}
+
+/// Server→client cipher key (server encrypts with this).
+pub fn smb311_s2c_key(session_key: &[u8; 16], preauth: &[u8; 64]) -> [u8; 16] {
+    let v = smb3_kdf(session_key, b"SMBS2CCipherKey\0", preauth, 16);
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&v);
+    out
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SmbCipher {
+    Aes128Ccm,
+    Aes128Gcm,
+}
+
+impl SmbCipher {
+    pub fn from_id(id: u16) -> Option<Self> {
+        match id {
+            CIPHER_AES128_CCM => Some(Self::Aes128Ccm),
+            CIPHER_AES128_GCM => Some(Self::Aes128Gcm),
+            _ => None,
+        }
+    }
+
+    pub fn nonce_len(self) -> usize {
+        match self {
+            Self::Aes128Ccm => 11,
+            Self::Aes128Gcm => 12,
+        }
+    }
+}
+
+pub fn encrypt_transform(
+    plain: &[u8],
+    session_id: u64,
+    key: &[u8; 16],
+    cipher: SmbCipher,
+    nonce16: [u8; 16],
+) -> io::Result<Vec<u8>> {
+    let mut hdr = vec![0u8; TRANSFORM_HEADER_LEN];
+    hdr[0] = 0xfd;
+    hdr[1..4].copy_from_slice(b"SMB");
+    hdr[20..36].copy_from_slice(&nonce16);
+    hdr[36..40].copy_from_slice(&(plain.len() as u32).to_le_bytes());
+    hdr[42..44].copy_from_slice(&SMB2_TRANSFORM_FLAGS_ENCRYPTED.to_le_bytes());
+    hdr[44..52].copy_from_slice(&session_id.to_le_bytes());
+    let aad = hdr[20..52].to_vec();
+    let nlen = cipher.nonce_len();
+    let (ct, tag) = aead_encrypt(cipher, key, &nonce16[..nlen], &aad, plain)?;
+    hdr[4..20].copy_from_slice(&tag);
+    hdr.extend_from_slice(&ct);
+    Ok(hdr)
+}
+
+pub fn decrypt_transform(frame: &[u8], key: &[u8; 16], cipher: SmbCipher) -> io::Result<Vec<u8>> {
+    if frame.len() < TRANSFORM_HEADER_LEN || !is_smb2_transform(frame) {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "SMB2 TRANSFORM_HEADER",
+        ));
+    }
+    let flags = u16_at(frame, 42)?;
+    if flags & SMB2_TRANSFORM_FLAGS_ENCRYPTED == 0 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "TRANSFORM not encrypted",
+        ));
+    }
+    let orig = u32_at(frame, 36)? as usize;
+    let ct = frame
+        .get(TRANSFORM_HEADER_LEN..)
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "TRANSFORM ciphertext"))?;
+    if ct.len() != orig {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "TRANSFORM OriginalMessageSize",
+        ));
+    }
+    let mut tag = [0u8; 16];
+    tag.copy_from_slice(&frame[4..20]);
+    let aad = &frame[20..52];
+    let nlen = cipher.nonce_len();
+    aead_decrypt(cipher, key, &frame[20..20 + nlen], aad, ct, &tag)
+}
+
+fn aead_encrypt(
+    cipher: SmbCipher,
+    key: &[u8; 16],
+    nonce: &[u8],
+    aad: &[u8],
+    plain: &[u8],
+) -> io::Result<(Vec<u8>, [u8; 16])> {
+    match cipher {
+        SmbCipher::Aes128Gcm => {
+            use aes_gcm::aead::{AeadInPlace, KeyInit};
+            use aes_gcm::{Aes128Gcm, Nonce};
+            let c = Aes128Gcm::new_from_slice(key)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "AES-GCM key"))?;
+            let n = Nonce::from_slice(nonce);
+            let mut buf = plain.to_vec();
+            let tag = c
+                .encrypt_in_place_detached(n, aad, &mut buf)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "AES-GCM encrypt"))?;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&tag);
+            Ok((buf, t))
+        }
+        SmbCipher::Aes128Ccm => {
+            use aes::Aes128;
+            use ccm::aead::{generic_array::GenericArray, AeadInPlace, KeyInit};
+            use ccm::consts::{U11, U16};
+            use ccm::Ccm;
+            type Aes128Ccm = Ccm<Aes128, U16, U11>;
+            let c = Aes128Ccm::new_from_slice(key)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "AES-CCM key"))?;
+            let n = GenericArray::from_slice(nonce);
+            let mut buf = plain.to_vec();
+            let tag = c
+                .encrypt_in_place_detached(n, aad, &mut buf)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "AES-CCM encrypt"))?;
+            let mut t = [0u8; 16];
+            t.copy_from_slice(&tag);
+            Ok((buf, t))
+        }
+    }
+}
+
+fn aead_decrypt(
+    cipher: SmbCipher,
+    key: &[u8; 16],
+    nonce: &[u8],
+    aad: &[u8],
+    ct: &[u8],
+    tag: &[u8; 16],
+) -> io::Result<Vec<u8>> {
+    match cipher {
+        SmbCipher::Aes128Gcm => {
+            use aes_gcm::aead::{AeadInPlace, KeyInit};
+            use aes_gcm::{Aes128Gcm, Nonce, Tag};
+            let c = Aes128Gcm::new_from_slice(key)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "AES-GCM key"))?;
+            let n = Nonce::from_slice(nonce);
+            let mut buf = ct.to_vec();
+            let tag = Tag::from_slice(tag);
+            c.decrypt_in_place_detached(n, aad, &mut buf, tag)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "AES-GCM decrypt"))?;
+            Ok(buf)
+        }
+        SmbCipher::Aes128Ccm => {
+            use aes::Aes128;
+            use ccm::aead::{generic_array::GenericArray, AeadInPlace, KeyInit};
+            use ccm::consts::{U11, U16};
+            use ccm::Ccm;
+            type Aes128Ccm = Ccm<Aes128, U16, U11>;
+            let c = Aes128Ccm::new_from_slice(key)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidInput, "AES-CCM key"))?;
+            let n = GenericArray::from_slice(nonce);
+            let mut buf = ct.to_vec();
+            let tag = GenericArray::from_slice(tag);
+            c.decrypt_in_place_detached(n, aad, &mut buf, tag)
+                .map_err(|_| io::Error::new(ErrorKind::InvalidData, "AES-CCM decrypt"))?;
+            Ok(buf)
+        }
+    }
 }
 
 // --- session setup ---
@@ -627,10 +1041,15 @@ pub fn share_name_from_unc(path: &str) -> Option<String> {
     parts.next().map(|s| s.to_string())
 }
 
-pub fn encode_tree_connect_response(share_type: u8, maximal_access: u32) -> Vec<u8> {
+pub fn encode_tree_connect_response_flags(
+    share_type: u8,
+    share_flags: u32,
+    maximal_access: u32,
+) -> Vec<u8> {
     let mut b = vec![0u8; 16];
     b[0..2].copy_from_slice(&16u16.to_le_bytes());
     b[2] = share_type;
+    b[4..8].copy_from_slice(&share_flags.to_le_bytes());
     b[12..16].copy_from_slice(&maximal_access.to_le_bytes());
     b
 }
@@ -1709,8 +2128,70 @@ mod tests {
             pick_dialect(&[0x0311, DIALECT_202, DIALECT_210]),
             Some(DIALECT_202)
         );
-        assert_eq!(pick_dialect(&[0x0311]), None);
+        assert_eq!(pick_dialect(&[DIALECT_311]), Some(DIALECT_311));
         assert_eq!(pick_dialect(&[DIALECT_210]), Some(DIALECT_210));
+        assert_eq!(
+            pick_dialect_prefer(&[DIALECT_311, DIALECT_202], true),
+            Some(DIALECT_311)
+        );
+    }
+
+    /// Regression: SMB 3.1.1 preauth SHA-512 of a frozen NEGOTIATE request
+    /// (MS blog “SMB 3.1.1 Pre-authentication integrity in Windows 10”).
+    #[test]
+    fn preauth_hash_ms_negotiate_request() {
+        const REQ: &str = concat!(
+            "FE534D4240000100000000000000800000000000000000000100000000000000FFFE000000000000",
+            "00000000000000000000000000000000000000000000000024000500000000003F000000ECD86F32",
+            "6276024F9F7752B89BB33F3A70000000020000000202100200030203110300000100260000000000",
+            "010020000100FA49E6578F1F3A9F4CD3E9CC14A67AA884B3D05844E0E5A118225C15887F32FF0000",
+            "0200060000000000020002000100",
+        );
+        const HASH: &str = concat!(
+            "DD94EFC5321BB618A2E208BA8920D2F422992526947A409B5037DE1E0FE8C7362B8C47122594CDE0",
+            "CE26AA9DFC8BCDBDE0621957672623351A7540F1E54A0426",
+        );
+        let got = preauth_hash_update(&PREAUTH_ZERO, &unhex(REQ));
+        assert_eq!(got.as_slice(), unhex(HASH));
+    }
+
+    #[test]
+    fn transform_aes128_gcm_roundtrip() {
+        let key = [0x42u8; 16];
+        let mut nonce = [0u8; 16];
+        nonce[0] = 1;
+        let plain = encode_packet(
+            &Smb2Header {
+                credit_charge: 1,
+                status: 0,
+                command: SMB2_ECHO,
+                credits: 1,
+                flags: SMB2_FLAGS_SERVER_TO_REDIR,
+                next_command: 0,
+                message_id: 1,
+                process_id: 0xfeff,
+                tree_id: 1,
+                session_id: 7,
+            },
+            &encode_empty_sized(4, 4),
+        );
+        let wire = encrypt_transform(&plain, 7, &key, SmbCipher::Aes128Gcm, nonce).unwrap();
+        assert!(is_smb2_transform(&wire));
+        let back = decrypt_transform(&wire, &key, SmbCipher::Aes128Gcm).unwrap();
+        assert_eq!(back, plain);
+    }
+
+    #[test]
+    fn smb3_kdf_signing_and_cipher_keys_differ() {
+        let session = [0x11u8; 16];
+        let pre = [0x22u8; 64];
+        let sign = smb311_signing_key(&session, &pre);
+        let c2s = smb311_c2s_key(&session, &pre);
+        let s2c = smb311_s2c_key(&session, &pre);
+        assert_ne!(sign, c2s);
+        assert_ne!(c2s, s2c);
+        assert_ne!(sign, s2c);
+        assert_ne!(sign, session);
     }
 
     #[test]

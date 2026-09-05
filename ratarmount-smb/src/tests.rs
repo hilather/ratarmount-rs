@@ -212,6 +212,14 @@ struct SmbClient {
     tree_id: u32,
     process_id: u32,
     session_key: Option<[u8; 16]>,
+    dialect: u16,
+    preauth: [u8; 64],
+    signing_key: Option<[u8; 16]>,
+    c2s_key: Option<[u8; 16]>,
+    s2c_key: Option<[u8; 16]>,
+    cipher: Option<smb2::SmbCipher>,
+    encrypt_data: bool,
+    nonce_ctr: u64,
 }
 
 impl SmbClient {
@@ -241,6 +249,14 @@ impl SmbClient {
             tree_id: 0,
             process_id: 0xfeff,
             session_key: None,
+            dialect: 0,
+            preauth: smb2::PREAUTH_ZERO,
+            signing_key: None,
+            c2s_key: None,
+            s2c_key: None,
+            cipher: None,
+            encrypt_data: false,
+            nonce_ctr: 0,
         }
     }
 
@@ -276,15 +292,39 @@ impl SmbClient {
     }
 
     fn roundtrip_raw(&mut self, pkt: &[u8]) -> Vec<u8> {
+        let wire = if self.encrypt_data {
+            self.encrypt_out(pkt)
+        } else {
+            pkt.to_vec()
+        };
         self.stream
-            .write_all(&smb2::encode_nbss(pkt))
+            .write_all(&smb2::encode_nbss(&wire))
             .expect("smb write");
         let mut nb = [0u8; 4];
         self.stream.read_exact(&mut nb).expect("nbss hdr");
         let n = smb2::decode_nbss_len(nb).expect("nbss len");
         let mut buf = vec![0u8; n];
         self.stream.read_exact(&mut buf).expect("smb body");
-        buf
+        if smb2::is_smb2_transform(&buf) {
+            self.decrypt_in(&buf)
+        } else {
+            buf
+        }
+    }
+
+    fn encrypt_out(&mut self, pkt: &[u8]) -> Vec<u8> {
+        let key = self.c2s_key.expect("C2S key");
+        let cipher = self.cipher.expect("cipher");
+        self.nonce_ctr = self.nonce_ctr.saturating_add(1);
+        let mut nonce = [0u8; 16];
+        nonce[8..16].copy_from_slice(&self.nonce_ctr.to_le_bytes());
+        smb2::encrypt_transform(pkt, self.session_id, &key, cipher, nonce).expect("encrypt")
+    }
+
+    fn decrypt_in(&self, frame: &[u8]) -> Vec<u8> {
+        let key = self.s2c_key.expect("S2C key");
+        let cipher = self.cipher.expect("cipher");
+        smb2::decrypt_transform(frame, &key, cipher).expect("decrypt")
     }
 
     fn roundtrip(&mut self, pkt: &[u8]) -> (Smb2Header, Vec<u8>) {
@@ -309,6 +349,32 @@ impl SmbClient {
             "NEGOTIATE {:08x}",
             rh.status
         );
+        self.dialect = smb2::DIALECT_202;
+    }
+
+    /// SMB 3.1.1-only NEGOTIATE with preauth (+ optional encryption) contexts.
+    fn negotiate_311(&mut self, want_encrypt: bool) -> Vec<u8> {
+        let body = encode_negotiate_311_body(want_encrypt);
+        let h = self.hdr(smb2::SMB2_NEGOTIATE);
+        let req = smb2::encode_packet(&h, &body);
+        self.preauth = smb2::preauth_hash_update(&smb2::PREAUTH_ZERO, &req);
+        let resp = self.roundtrip_raw(&req);
+        let rh = smb2::parse_smb2_header(&resp).expect("hdr");
+        assert_eq!(
+            rh.status,
+            smb2::STATUS_SUCCESS,
+            "NEGOTIATE 3.1.1 {:08x}",
+            rh.status
+        );
+        let nbody = &resp[smb2::SMB2_HEADER_LEN..];
+        let dialect = u16::from_le_bytes(nbody[4..6].try_into().unwrap());
+        assert_eq!(dialect, smb2::DIALECT_311, "server must pick 3.1.1");
+        self.dialect = dialect;
+        self.preauth = smb2::preauth_hash_update(&self.preauth, &resp);
+        if want_encrypt {
+            self.cipher = Some(smb2::SmbCipher::Aes128Gcm);
+        }
+        resp
     }
 
     fn session_setup_guest(&mut self) {
@@ -341,7 +407,19 @@ impl SmbClient {
         body[14..16].copy_from_slice(&(sec.len() as u16).to_le_bytes());
         body.extend_from_slice(sec);
         let h = self.hdr(smb2::SMB2_SESSION_SETUP);
-        self.roundtrip_raw(&smb2::encode_packet(&h, &body))
+        let pkt = smb2::encode_packet(&h, &body);
+        if self.dialect == smb2::DIALECT_311 {
+            self.preauth = smb2::preauth_hash_update(&self.preauth, &pkt);
+        }
+        let buf = self.roundtrip_raw(&pkt);
+        if self.dialect == smb2::DIALECT_311 {
+            if let Ok(rh) = smb2::parse_smb2_header(&buf) {
+                if rh.status == smb2::STATUS_MORE_PROCESSING_REQUIRED {
+                    self.preauth = smb2::preauth_hash_update(&self.preauth, &buf);
+                }
+            }
+        }
+        buf
     }
 
     fn session_setup_sec(&mut self, sec: &[u8]) -> (Smb2Header, Vec<u8>) {
@@ -362,9 +440,13 @@ impl SmbClient {
         body.extend_from_slice(&path);
         let h = self.hdr(smb2::SMB2_TREE_CONNECT);
         let mut pkt = smb2::encode_packet(&h, &body);
-        if sign {
-            if let Some(key) = self.session_key {
-                smb2::smb2_sign_packet(&mut pkt, &key);
+        if sign && !self.encrypt_data {
+            if let Some(key) = self.signing_key.or(self.session_key) {
+                if self.dialect == smb2::DIALECT_311 {
+                    smb2::smb3_sign_packet(&mut pkt, &key);
+                } else {
+                    smb2::smb2_sign_packet(&mut pkt, &key);
+                }
             }
         }
         let (rh, body) = self.roundtrip(&pkt);
@@ -480,6 +562,38 @@ impl SmbClient {
         let buf = b.get(start..start + buf_len).unwrap_or(&[]);
         Ok(parse_names_info(buf))
     }
+}
+
+fn encode_negotiate_311_body(want_encrypt: bool) -> Vec<u8> {
+    let mut body = vec![0u8; 36];
+    body[0..2].copy_from_slice(&36u16.to_le_bytes());
+    body[2..4].copy_from_slice(&1u16.to_le_bytes());
+    body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    if want_encrypt {
+        body[8..12].copy_from_slice(&smb2::SMB2_GLOBAL_CAP_ENCRYPTION.to_le_bytes());
+    }
+    body.extend_from_slice(&smb2::DIALECT_311.to_le_bytes());
+    let pad = (8 - (body.len() % 8)) % 8;
+    body.resize(body.len() + pad, 0);
+    let ctx_off = (smb2::SMB2_HEADER_LEN + body.len()) as u32;
+    body[28..32].copy_from_slice(&ctx_off.to_le_bytes());
+    let salt = [0x11u8; 32];
+    let mut ctxs = smb2::encode_preauth_context(&salt);
+    let mut nctx = 1u16;
+    if want_encrypt {
+        let mut data = Vec::new();
+        data.extend_from_slice(&2u16.to_le_bytes());
+        data.extend_from_slice(&smb2::CIPHER_AES128_GCM.to_le_bytes());
+        data.extend_from_slice(&smb2::CIPHER_AES128_CCM.to_le_bytes());
+        ctxs.extend_from_slice(&smb2::encode_negotiate_context(
+            smb2::SMB2_ENCRYPTION_CAPABILITIES,
+            &data,
+        ));
+        nctx = 2;
+    }
+    body[32..34].copy_from_slice(&nctx.to_le_bytes());
+    body.extend_from_slice(&ctxs);
+    body
 }
 
 fn parse_names_info(buf: &[u8]) -> Vec<String> {
@@ -799,10 +913,23 @@ fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password:
     let rh = smb2::parse_smb2_header(&buf).expect("type3 hdr");
     if rh.status == smb2::STATUS_SUCCESS {
         c.session_key = Some(key);
-        assert!(
-            smb2::smb2_verify_packet(&buf, &key),
-            "Type3 SESSION_SETUP response must be signed"
-        );
+        if c.dialect == smb2::DIALECT_311 {
+            c.signing_key = Some(smb2::smb311_signing_key(&key, &c.preauth));
+            c.c2s_key = Some(smb2::smb311_c2s_key(&key, &c.preauth));
+            c.s2c_key = Some(smb2::smb311_s2c_key(&key, &c.preauth));
+            assert!(
+                smb2::smb3_verify_packet(&buf, &c.signing_key.unwrap()),
+                "Type3 SESSION_SETUP response must be AES-CMAC signed"
+            );
+            if c.cipher.is_some() {
+                c.encrypt_data = true;
+            }
+        } else {
+            assert!(
+                smb2::smb2_verify_packet(&buf, &key),
+                "Type3 SESSION_SETUP response must be signed"
+            );
+        }
     }
     rh.status
 }
@@ -915,4 +1042,119 @@ fn password_negotiate_signing_required() {
         mode,
         smb2::NEGOTIATE_SIGNING_ENABLED | smb2::NEGOTIATE_SIGNING_REQUIRED
     );
+}
+
+/// Regression: SMB 3.1.1 preauth hash of NEGOTIATE req+resp is SHA-512 chained.
+#[test]
+fn preauth_hash_negotiate_311_live() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let resp = c.negotiate_311(false);
+    assert_ne!(c.preauth, smb2::PREAUTH_ZERO);
+    let nbody = &resp[smb2::SMB2_HEADER_LEN..];
+    let ctx_count = u16::from_le_bytes(nbody[6..8].try_into().unwrap());
+    assert!(
+        ctx_count >= 1,
+        "3.1.1 NEGOTIATE response must include preauth context"
+    );
+    c.session_setup_guest();
+    c.tree_connect("ratarmount");
+}
+
+/// Regression: guest 3.1.1 READ stays unencrypted (guest path).
+#[test]
+fn guest_311_read_unencrypted() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    c.negotiate_311(false);
+    c.session_setup_guest();
+    c.tree_connect("ratarmount");
+    let fid = c
+        .create(
+            "hello.txt",
+            0x0012_0089,
+            smb2::FILE_OPEN,
+            smb2::FILE_NON_DIRECTORY_FILE,
+        )
+        .expect("open hello");
+    let h = c.hdr(smb2::SMB2_READ);
+    let mut body = vec![0u8; 48];
+    body[0..2].copy_from_slice(&49u16.to_le_bytes());
+    body[4..8].copy_from_slice(&64u32.to_le_bytes());
+    body[16..32].copy_from_slice(&fid);
+    let pkt = smb2::encode_packet(&h, &body);
+    c.stream
+        .write_all(&smb2::encode_nbss(&pkt))
+        .expect("smb write");
+    let mut nb = [0u8; 4];
+    c.stream.read_exact(&mut nb).expect("nbss hdr");
+    let n = smb2::decode_nbss_len(nb).expect("nbss len");
+    let mut buf = vec![0u8; n];
+    c.stream.read_exact(&mut buf).expect("smb body");
+    assert!(
+        !smb2::is_smb2_transform(&buf),
+        "guest 3.1.1 READ must not be TRANSFORM-encrypted"
+    );
+    let rh = smb2::parse_smb2_header(&buf).unwrap();
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+    let b = &buf[smb2::SMB2_HEADER_LEN..];
+    let data_off = b[2] as usize;
+    let data_len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+    let start = data_off.saturating_sub(smb2::SMB2_HEADER_LEN);
+    let got = b.get(start..start + data_len).unwrap_or(&[]).to_vec();
+    assert_eq!(got, b"hello smb\n");
+}
+
+/// Regression: password + 3.1.1 + GCM encrypts READ (TRANSFORM_HEADER).
+#[test]
+fn encrypted_read_aes128_gcm() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    c.negotiate_311(true);
+    assert_eq!(
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        smb2::STATUS_SUCCESS
+    );
+    assert!(c.encrypt_data, "SESSION_FLAG_ENCRYPT_DATA arms transform");
+    c.tree_connect("ratarmount");
+    let fid = c
+        .create(
+            "hello.txt",
+            0x0012_0089,
+            smb2::FILE_OPEN,
+            smb2::FILE_NON_DIRECTORY_FILE,
+        )
+        .expect("open hello");
+    let mut body = vec![0u8; 48];
+    body[0..2].copy_from_slice(&49u16.to_le_bytes());
+    body[4..8].copy_from_slice(&64u32.to_le_bytes());
+    body[16..32].copy_from_slice(&fid);
+    let h = c.hdr(smb2::SMB2_READ);
+    let pkt = smb2::encode_packet(&h, &body);
+    let wire = c.encrypt_out(&pkt);
+    assert!(smb2::is_smb2_transform(&wire), "client READ is TRANSFORM");
+    c.stream
+        .write_all(&smb2::encode_nbss(&wire))
+        .expect("smb write");
+    let mut nb = [0u8; 4];
+    c.stream.read_exact(&mut nb).expect("nbss hdr");
+    let n = smb2::decode_nbss_len(nb).expect("nbss len");
+    let mut buf = vec![0u8; n];
+    c.stream.read_exact(&mut buf).expect("smb body");
+    assert!(
+        smb2::is_smb2_transform(&buf),
+        "encrypted READ response must be TRANSFORM"
+    );
+    let inner = c.decrypt_in(&buf);
+    let rh = smb2::parse_smb2_header(&inner).unwrap();
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS, "READ {:08x}", rh.status);
+    let b = &inner[smb2::SMB2_HEADER_LEN..];
+    let data_off = b[2] as usize;
+    let data_len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+    let start = data_off.saturating_sub(smb2::SMB2_HEADER_LEN);
+    let got = b.get(start..start + data_len).unwrap_or(&[]).to_vec();
+    assert_eq!(got, b"hello smb\n");
 }
