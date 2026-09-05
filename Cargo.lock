@@ -3099,6 +3099,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-qcow2"
+version = "0.1.30"
+dependencies = [
+ "fatfs",
+ "flate2",
+ "log",
+ "ratarmount-core",
+ "ratarmount-formats-block",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-sevenzip"
 version = "0.1.30"
 dependencies = [

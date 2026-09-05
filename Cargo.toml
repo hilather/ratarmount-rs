@@ -27,6 +27,7 @@ members = [
     "ratarmount-formats-block",
     "ratarmount-formats-dmg",
     "ratarmount-formats-wim",
+    "ratarmount-formats-qcow2",
     "ratarmount-formats-asar",
     "ratarmount-formats-ogg",
     "ratarmount-formats-html",
@@ -76,6 +77,7 @@ ratarmount-formats-udf = { path = "ratarmount-formats-udf" }
 ratarmount-formats-block = { path = "ratarmount-formats-block" }
 ratarmount-formats-dmg = { path = "ratarmount-formats-dmg" }
 ratarmount-formats-wim = { path = "ratarmount-formats-wim" }
+ratarmount-formats-qcow2 = { path = "ratarmount-formats-qcow2" }
 ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
 ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }
