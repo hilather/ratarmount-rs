@@ -880,6 +880,10 @@ pub(super) fn open_remote_input(
         open_smb_range, resolve_access, RemoteAccess, RemoteHttp,
     };
 
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("restic") {
+        return open_restic_repo(input);
+    }
+
     if let Some(ms) = try_open_remote_folder_url(input)? {
         return Ok((PathBuf::from(input), ms));
     }
@@ -1088,6 +1092,13 @@ impl_live_range!(ratarmount_remote::AzureRangeFile);
 impl_live_range!(ratarmount_remote::FtpRangeFile);
 impl_live_range!(ratarmount_remote::SmbRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
+
+fn open_restic_repo(input: &str) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
+    let path = ratarmount_formats_restic::parse_restic_url(input).map_err(|e| e.to_string())?;
+    let src =
+        ratarmount_formats_restic::ResticMountSource::open(&path).map_err(|e| e.to_string())?;
+    Ok((path, Arc::new(src)))
+}
 
 fn is_oci_scheme(input: &str) -> bool {
     matches!(
@@ -1300,6 +1311,86 @@ mod tests {
             url::Url::parse("docker://ubuntu:24.04").is_err(),
             "precondition: WHATWG parse fails"
         );
+    }
+
+    /// Regression: `restic:/path` is remote (scheme-prefix, not a local colon name).
+    #[test]
+    fn restic_url_is_remote_not_local() {
+        assert!(ratarmount_remote::is_remote_url("restic:/var/x"));
+        assert_eq!(
+            ratarmount_remote::remote_url_scheme("restic:/var/x").as_deref(),
+            Some("restic")
+        );
+    }
+
+    /// Regression: S3 restic URLs are rejected (not silently accepted).
+    #[test]
+    fn restic_s3_residual_open_remote_input() {
+        let opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        let mut remotes = Vec::new();
+        for input in [
+            "restic://s3://bucket/repo",
+            "restic:s3://bucket/repo",
+            "restic:relative/path",
+        ] {
+            let err = match open_remote_input(input, &opts, false, &mut remotes) {
+                Err(e) => e,
+                Ok(_) => panic!("{input} must not open"),
+            };
+            if input.contains("s3") {
+                assert!(
+                    err.contains("S3 restic repos residual"),
+                    "{input} got {err}"
+                );
+            } else {
+                assert!(err.contains("absolute"), "{input} got {err}");
+            }
+        }
+    }
+
+    #[test]
+    fn restic_open_remote_input_lists_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let info =
+            ratarmount_formats_restic::write_synthetic_repo(dir.path(), b"session-restic-pw")
+                .unwrap();
+        let url = format!("restic:{}", dir.path().display());
+        let _g = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let old_pw = std::env::var_os("RESTIC_PASSWORD");
+        let old_file = std::env::var_os("RESTIC_PASSWORD_FILE");
+        std::env::set_var("RESTIC_PASSWORD", "session-restic-pw");
+        std::env::remove_var("RESTIC_PASSWORD_FILE");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        let mut remotes = Vec::new();
+        let result = open_remote_input(&url, &opts, false, &mut remotes);
+        match old_pw {
+            Some(v) => std::env::set_var("RESTIC_PASSWORD", v),
+            None => std::env::remove_var("RESTIC_PASSWORD"),
+        }
+        match old_file {
+            Some(v) => std::env::set_var("RESTIC_PASSWORD_FILE", v),
+            None => std::env::remove_var("RESTIC_PASSWORD_FILE"),
+        }
+        let (_path, src) = result.expect("open restic synthetic repo");
+        let dents = src.list_dirents("/snapshots").expect("list snapshots");
+        assert_eq!(dents.len(), 2, "expected two snapshots, got {dents:?}");
+        let short = &dents[0].name;
+        let fi = src
+            .lookup(&format!("/snapshots/{short}/hello.bin"), 0)
+            .expect("hello.bin");
+        assert_eq!(fi.size, 1024);
+        let mut r = src.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        std::io::Read::read_to_end(&mut r, &mut buf).unwrap();
+        assert_eq!(buf, info.file_bytes);
     }
 
     static REMOTE_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

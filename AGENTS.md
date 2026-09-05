@@ -139,6 +139,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | SMB LEASE_BREAK on conflicting open/write | `cargo test -p ratarmount-smb --lib lease_break` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
 | `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
+| restic URL parser (absolute / extra slash / S3 residual; not a local colon name) | `cargo test -p ratarmount-formats-restic --lib parse_restic` · `cargo test -p ratarmount-remote --lib restic` · `cargo test -p ratarmount-session --lib restic` |
+| restic snapshot browser (two snapshots, 1 KiB pack read, password Debug, v2 zstd fixture, RESTIC_PASSWORD_FILE) | `cargo test -p ratarmount-formats-restic --lib restic` · `cargo test -p ratarmount-session --lib restic_open` |
+| restic init+backup round-trip (skip-if-no-restic) | `cargo test -p ratarmount-formats-restic --lib restic_init` |
 | SFTP non-loopback without authorized_keys file | `cargo test -p ratarmount-sftp --lib regression_non_loopback` |
 | NFS compositing pin (`member_seek_is_cheap`) | `cargo test -p ratarmount-compositing --lib file_version_layer_forwards` · `cargo test -p ratarmount-compositing --lib automount_forwards` |
 | NFS serve stop | `cargo test -p ratarmount-nfs --lib serve_stop` |

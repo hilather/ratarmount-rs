@@ -2,7 +2,7 @@
 
 Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md). Status vs Python: [`parity-todo.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md).
 
-`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`.
+`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`. `restic:/abs/path` has no `://` and is still remote (not a local colon filename).
 
 ## Supported
 
@@ -21,11 +21,12 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`). Index: local `oci:{digest}` cache first, then OCI 1.1 referrers (`artifactType=application/vnd.ratarmount.index.v1+sqlite`) on miss; fail-open if Referrers API is missing (not SOCI; no tag-convention fallback) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
 | `rclone://remote:path` | argv `rclone cat --offset --count` + `lsjson` (one process per open). Slash alias `rclone://remote/path`. Plus-form `rclone+remote:path` / `rclone+remote://path` (no `://` required). Config stays in rclone |
+| `restic:/abs/path` | Local restic snapshot browser (`ResticMountSource`). Scheme-prefix (not WHATWG): `restic:/var/repo`, extra-slash `restic:///var/repo`. Relative `restic:path` errors. `restic://s3://bucket/repo` / `restic:s3://…` error (`S3 restic repos residual; use a local cache copy`). Password `RESTIC_PASSWORD` / `RESTIC_PASSWORD_FILE` (never logged). Session `open_remote_input` only — not `open_path`. Layout `/snapshots/<id>/`, `/latest`, `/ids/<full-id>/`. Guide: [restic.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md). borg/kopia residual |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
-Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder` / `open_smb_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
+Factory `open_remote_input` probes `restic:` first (local snapshot browser), then F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder` / `open_smb_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
 
 ### Portable index discovery (G-2)
 
@@ -245,6 +246,9 @@ ratarmount -f ipfs://bafyhash/path.tar mnt/
 #   cargo test -p ratarmount-session --lib remote_smb
 #   cargo test -p ratarmount-session --lib try_open_remote_folder_url
 #   cargo test -p ratarmount --bin ratarmount docker_ubuntu
+#   cargo test -p ratarmount-formats-restic --lib
+#   cargo test -p ratarmount-remote --lib restic
+#   cargo test -p ratarmount-session --lib restic
 # Optional live:
 # RATARMOUNT_TEST_S3_URL=s3://bucket/key.tar AWS_… ./test-harness/run-phase10-remote.sh
 # RATARMOUNT_TEST_SSH_URL=ssh://user@host//path/a.tar ./test-harness/run-phase10-remote.sh
