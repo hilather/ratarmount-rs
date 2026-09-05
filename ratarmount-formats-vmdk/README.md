@@ -14,15 +14,16 @@ Nested **monolithicSparse** members open from any `Read + Seek` stream via `Vmdk
 2. Parse the sparse header + grain directory; reject compressed / ESXi
 3. Present grain-mapped bytes to the block/FAT/EXT4 layer on the same stream
 
-**No `/tmp` / `NamedTempFile` for this path.** Descriptor-only files that name sibling extent files need `VmdkMountSource::open` (host path).
+**No `/tmp` / `NamedTempFile` for this path.** Descriptor-only files that name **relative sibling** extent files need `VmdkMountSource::open` (host path). Absolute extent paths (`/etc/passwd`, `C:\…`) and `..` are rejected.
 
 ## Residuals
 
 | Topic | Behaviour |
 |-------|-----------|
-| **Compressed grains** | `createType=streamOptimized` / header `FLAG_COMPRESS` — `open` errors. Not silent zeros. |
+| **Compressed grains** | `createType=streamOptimized` / header `FLAG_COMPRESS` / `compressAlgorithm ≠ 0` — `open` errors. Not silent zeros. `FLAG_MARKER` alone is **not** compression. |
 | **ESXi grain** | COWD `vmfsSparse`, `VMFSSPARSE`, SESparse — not claimed / not mounted. |
 | **Delta / snapshot** | `parentCID` ≠ `ffffffff` — residual. |
+| **Absolute extent files** | Descriptor names must be relative siblings of the `.vmdk`. |
 | Factory / AutoMount | Orchestrator must call `open_from_reader` from nested AutoMount (not this crate). |
 
 ## Tests

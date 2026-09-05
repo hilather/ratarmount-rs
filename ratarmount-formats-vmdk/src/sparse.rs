@@ -11,8 +11,10 @@ pub const SECTOR: u64 = 512;
 pub const SPARSE_MAGIC: u32 = 0x564d_444b;
 pub const COWD_MAGIC: u32 = 0x4457_4f43; // 'COWD' — ESXi vmfsSparse residual
 pub const FLAG_COMPRESS: u32 = 1 << 16;
+/// LBA/metadata markers (streamOptimized). Not compression; grain reads do not skip markers.
 pub const FLAG_MARKER: u32 = 1 << 17;
-/// qemu/libvmdk: GTE 1 is a zeroed grain when ZERO_GRAIN is set; treat as zeros always.
+/// qemu/libvmdk: GTE `1` is a zeroed grain **only** when this bit is set.
+pub const FLAG_ZERO_GRAIN: u32 = 1 << 2;
 const GTE_ZEROED: u32 = 1;
 const GD_AT_END: u64 = u64::MAX;
 
@@ -30,7 +32,12 @@ pub struct SparseHeader {
 
 impl SparseHeader {
     pub fn is_compressed(&self) -> bool {
-        self.flags & (FLAG_COMPRESS | FLAG_MARKER) != 0 || self.compress_algorithm != 0
+        // FLAG_MARKER is streamOptimized metadata, not deflate. Do not fold it in.
+        self.flags & FLAG_COMPRESS != 0 || self.compress_algorithm != 0
+    }
+
+    fn gte_is_hole(&self, gte: u32) -> bool {
+        gte == 0 || (gte == GTE_ZEROED && self.flags & FLAG_ZERO_GRAIN != 0)
     }
 
     pub fn grain_bytes(&self) -> u64 {
@@ -157,18 +164,18 @@ impl SparseExtent {
             let within = (pos % grain_bytes) as usize;
             let chunk = (want - done).min(grain_bytes as usize - within);
             let grain_idx = pos / grain_bytes;
-            match self.gte(grain_idx)? {
-                0 | GTE_ZEROED => buf[done..done + chunk].fill(0),
-                sector => {
-                    let file_off = sector as u64 * SECTOR + within as u64;
-                    let n = {
-                        let mut guard = lock_backend(&self.backend)?;
-                        guard.seek(SeekFrom::Start(file_off))?;
-                        read_at_most(&mut *guard, &mut buf[done..done + chunk])?
-                    };
-                    if n < chunk {
-                        buf[done + n..done + chunk].fill(0);
-                    }
+            let gte = self.gte(grain_idx)?;
+            if self.header.gte_is_hole(gte) {
+                buf[done..done + chunk].fill(0);
+            } else {
+                let file_off = gte as u64 * SECTOR + within as u64;
+                let n = {
+                    let mut guard = lock_backend(&self.backend)?;
+                    guard.seek(SeekFrom::Start(file_off))?;
+                    read_at_most(&mut *guard, &mut buf[done..done + chunk])?
+                };
+                if n < chunk {
+                    buf[done + n..done + chunk].fill(0);
                 }
             }
             done += chunk;
@@ -585,4 +592,58 @@ pub fn build_monolithic_sparse(raw: &[u8], grain_size_sectors: u64) -> Vec<u8> {
         img[off..off + grain.len()].copy_from_slice(&grain);
     }
     img
+}
+
+#[cfg(test)]
+fn poke_gte0(vmdk: &mut [u8], value: u32) {
+    let mut hdr = [0u8; 512];
+    hdr.copy_from_slice(&vmdk[..512]);
+    let header = parse_sparse_header(&hdr).expect("header");
+    let gd_off = (header.gd_offset * SECTOR) as usize;
+    let mut gt_sec = [0u8; 4];
+    gt_sec.copy_from_slice(&vmdk[gd_off..gd_off + 4]);
+    let gt_sector = u32::from_le_bytes(gt_sec);
+    let gte_off = (gt_sector as u64 * SECTOR) as usize;
+    vmdk[gte_off..gte_off + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// Regression: GTE 1 is a sector offset unless ZERO_GRAIN is set.
+    #[test]
+    fn sparse_gte_one_is_sector_without_zero_grain() {
+        let mut raw = vec![0u8; 8 * 512];
+        raw[0] = 0xAA;
+        let mut vmdk = build_monolithic_sparse(&raw, 8);
+        let flags = u32::from_le_bytes(vmdk[8..12].try_into().unwrap());
+        assert_eq!(flags & FLAG_ZERO_GRAIN, 0);
+        poke_gte0(&mut vmdk, GTE_ZEROED);
+        let backend = share_reader(Cursor::new(vmdk.clone()));
+        let (extent, _) = open_sparse_extent(backend).unwrap();
+        let mut got = [0u8; 4];
+        extent.read_at(0, &mut got).unwrap();
+        assert_eq!(
+            &got, b"# Di",
+            "GTE 1 without ZERO_GRAIN reads sector 1 (descriptor)"
+        );
+    }
+
+    /// Regression: GTE 1 is a hole when ZERO_GRAIN is set.
+    #[test]
+    fn sparse_gte_one_is_zero_with_zero_grain() {
+        let mut raw = vec![0u8; 8 * 512];
+        raw[0] = 0xAA;
+        let mut vmdk = build_monolithic_sparse(&raw, 8);
+        let flags = u32::from_le_bytes(vmdk[8..12].try_into().unwrap()) | FLAG_ZERO_GRAIN;
+        vmdk[8..12].copy_from_slice(&flags.to_le_bytes());
+        poke_gte0(&mut vmdk, GTE_ZEROED);
+        let backend = share_reader(Cursor::new(vmdk));
+        let (extent, _) = open_sparse_extent(backend).unwrap();
+        let mut got = [0xFFu8; 4];
+        extent.read_at(0, &mut got).unwrap();
+        assert_eq!(got, [0, 0, 0, 0]);
+    }
 }

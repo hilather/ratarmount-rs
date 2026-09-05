@@ -18,8 +18,9 @@
 //! # Residual
 //!
 //! Compressed grains (`streamOptimized` / `FLAG_COMPRESS`), ESXi COWD /
-//! VMFSSPARSE / SESparse, and delta disks (`parentCID` ≠ `ffffffff`) are
-//! rejected with a clear error. Factory probe order is a later orchestrator PR.
+//! VMFSSPARSE / SESparse, delta disks (`parentCID` ≠ `ffffffff`), and
+//! absolute / `..` extent filenames are rejected with a clear error.
+//! Factory probe order is a later orchestrator PR.
 
 mod descriptor;
 mod sparse;
@@ -38,9 +39,13 @@ use ratarmount_formats_fat::{looks_like_fat_reader, FatMountSource};
 use thiserror::Error;
 
 pub use descriptor::{parse_vmdk_descriptor, DescriptorExtent, ExtentKind, VmdkDescriptor};
-pub use sparse::{SECTOR, SPARSE_MAGIC};
+pub use sparse::{FLAG_COMPRESS, FLAG_MARKER, FLAG_ZERO_GRAIN, SECTOR, SPARSE_MAGIC};
 
 pub const BACKEND_NAME: &str = "VmdkMountSource";
+
+/// qemu-style cap for a **text** sidecar descriptor (not the KDMV file).
+/// Embedded descriptors are capped separately in `read_embedded_descriptor`.
+const MAX_SIDECAR_DESCRIPTOR_BYTES: u64 = 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum VmdkError {
@@ -177,7 +182,7 @@ fn open_disk_from_path(path: &Path) -> Result<sparse::VmdkDisk> {
         return open_kdmv_path(path);
     }
     if descriptor::looks_like_descriptor_text(&probe[..n]) {
-        let text = std::fs::read_to_string(path)?;
+        let text = read_sidecar_descriptor(path)?;
         let desc = parse_vmdk_descriptor(&text)?;
         return open_descriptor_path(path, &desc);
     }
@@ -278,25 +283,63 @@ fn open_flat_file(path: &Path, ext: &DescriptorExtent) -> Result<sparse::DiskExt
     )))
 }
 
-fn sibling_path(base: &Path, filename: Option<&str>) -> Result<PathBuf> {
-    let name =
-        filename.ok_or_else(|| VmdkError::Msg("VMDK extent is missing a filename".into()))?;
-    let p = Path::new(name);
-    if p.is_absolute() {
-        return reject_dotdot(p);
-    }
-    let dir = base.parent().unwrap_or(Path::new("."));
-    reject_dotdot(&dir.join(p))
-}
-
-fn reject_dotdot(path: &Path) -> Result<PathBuf> {
-    if path.components().any(|c| matches!(c, Component::ParentDir)) {
+/// Cap sidecar text so a crafted `# Disk DescriptorFile` prefix cannot slurp GiB.
+fn read_sidecar_descriptor(path: &Path) -> Result<String> {
+    let len = std::fs::metadata(path)?.len();
+    if len > MAX_SIDECAR_DESCRIPTOR_BYTES {
         return Err(VmdkError::Msg(format!(
-            "VMDK extent path {} must not contain '..'",
+            "{} is larger than {MAX_SIDECAR_DESCRIPTOR_BYTES} bytes; \
+             text VMDK descriptors are capped (refusing unbounded read)",
             path.display()
         )));
     }
-    Ok(path.to_path_buf())
+    let file = File::open(path)?;
+    let mut buf = Vec::new();
+    file.take(MAX_SIDECAR_DESCRIPTOR_BYTES)
+        .read_to_end(&mut buf)?;
+    String::from_utf8(buf).map_err(|e| {
+        VmdkError::Msg(format!(
+            "{} is not UTF-8 VMDK descriptor text: {e}",
+            path.display()
+        ))
+    })
+}
+
+/// v1: extent names are siblings under the descriptor directory.
+/// Absolute Unix/Windows paths and `..` are rejected (not trusted host paths).
+fn sibling_path(base: &Path, filename: Option<&str>) -> Result<PathBuf> {
+    let name =
+        filename.ok_or_else(|| VmdkError::Msg("VMDK extent is missing a filename".into()))?;
+    if extent_name_escapes(name) {
+        return Err(VmdkError::Msg(format!(
+            "VMDK extent path {name:?} must be a relative sibling (absolute / '..' residual)"
+        )));
+    }
+    let p = Path::new(name);
+    if p.components().any(|c| {
+        matches!(
+            c,
+            Component::ParentDir | Component::RootDir | Component::Prefix(_)
+        )
+    }) {
+        return Err(VmdkError::Msg(format!(
+            "VMDK extent path {name:?} must be a relative sibling (absolute / '..' residual)"
+        )));
+    }
+    let dir = base.parent().unwrap_or(Path::new("."));
+    Ok(dir.join(p))
+}
+
+fn extent_name_escapes(name: &str) -> bool {
+    let p = Path::new(name);
+    p.is_absolute() || looks_like_windows_absolute(name)
+}
+
+fn looks_like_windows_absolute(name: &str) -> bool {
+    let b = name.as_bytes();
+    (b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && (b[2] == b'\\' || b[2] == b'/'))
+        || name.starts_with("\\\\")
+        || name.starts_with("//")
 }
 
 fn reject_residual_descriptor(d: &VmdkDescriptor) -> Result<()> {
@@ -647,6 +690,21 @@ mod tests {
         );
     }
 
+    /// Regression: FLAG_MARKER alone is not compression (qemu treats it separately).
+    #[test]
+    fn residual_flag_marker_is_not_compressed() {
+        let payload = b"marker-not-compress";
+        let mut vmdk = build_monolithic_sparse(&mbr_wrap(&fat_volume("hello.txt", payload), 8), 8);
+        let flags = u32::from_le_bytes(vmdk[8..12].try_into().unwrap()) | sparse::FLAG_MARKER;
+        vmdk[8..12].copy_from_slice(&flags.to_le_bytes());
+        let m = VmdkMountSource::open_from_reader(Cursor::new(vmdk), "marker.vmdk")
+            .expect("FLAG_MARKER alone must not fail as compressed");
+        let fi = m.lookup("/p1/hello.txt", 0).expect("lookup");
+        let mut got = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
     /// Regression: COWD magic is ESXi residual, not a successful open.
     #[test]
     fn residual_esxi_cowd() {
@@ -715,6 +773,86 @@ mod tests {
             err.to_string().contains("sibling") || err.to_string().contains("monolithicSparse"),
             "unexpected: {err}"
         );
+    }
+
+    fn open_descriptor_naming(name: &str) -> Result<VmdkMountSource> {
+        let dir = tempfile::tempdir().unwrap();
+        let desc = format!(
+            "# Disk DescriptorFile\nversion=1\nCID=fffffffe\nparentCID=ffffffff\n\
+             createType=\"monolithicSparse\"\nRW 8 SPARSE \"{name}\"\n"
+        );
+        let desc_path = dir.path().join("disk.vmdk");
+        std::fs::write(&desc_path, desc).unwrap();
+        VmdkMountSource::open(&desc_path)
+    }
+
+    /// Regression: path-open of a text descriptor must not unbounded-slurp a huge file.
+    #[test]
+    fn descriptor_rejects_oversized_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("huge.vmdk");
+        let mut f = File::create(&path).unwrap();
+        f.write_all(
+            b"# Disk DescriptorFile\nversion=1\ncreateType=\"monolithicSparse\"\nRW 8 SPARSE \"d.vmdk\"\n",
+        )
+        .unwrap();
+        // Sparse hole: size is over the cap; body is not materialized.
+        f.set_len(MAX_SIDECAR_DESCRIPTOR_BYTES + 1).unwrap();
+        drop(f);
+        assert!(looks_like_vmdk(&path));
+        let err = VmdkMountSource::open(&path)
+            .err()
+            .expect("oversized sidecar must fail closed");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("larger") || msg.contains("capped"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// Regression: `..` in an extent name is rejected (not joined as a host path).
+    #[test]
+    fn sibling_path_rejects_dotdot() {
+        let err = open_descriptor_naming("../secret.vmdk")
+            .err()
+            .expect(".. must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("..") || msg.contains("sibling") || msg.contains("residual"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// Regression: Unix absolute extent names are not opened (`/etc/passwd`).
+    #[test]
+    fn sibling_path_rejects_absolute_unix() {
+        let err = open_descriptor_naming("/etc/passwd")
+            .err()
+            .expect("absolute must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("absolute") || msg.contains("sibling") || msg.contains("residual"),
+            "unexpected: {msg}"
+        );
+    }
+
+    /// Regression: Windows absolute / UNC extent names are rejected on Unix too.
+    #[test]
+    fn sibling_path_rejects_windows_absolute() {
+        for name in [
+            r"C:\Windows\x.vmdk",
+            r"C:/Windows/x.vmdk",
+            r"\\server\share\x.vmdk",
+        ] {
+            let err = open_descriptor_naming(name)
+                .err()
+                .unwrap_or_else(|| panic!("{name} must fail"));
+            let msg = err.to_string();
+            assert!(
+                msg.contains("absolute") || msg.contains("sibling") || msg.contains("residual"),
+                "{name}: {msg}"
+            );
+        }
     }
 
     /// Regression: unallocated grains read as zeros (true sparse hole).

@@ -93,6 +93,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | VHDX non-zero LogGuid mounted without replay | `cargo test -p ratarmount-formats-vhd --lib log_guid` |
 | Nested VMDK KDMV sparse no-tmp / descriptor parse (F-8 crate) | `cargo test -p ratarmount-formats-vmdk --lib looks_like` · `cargo test -p ratarmount-formats-vmdk --lib descriptor` · `cargo test -p ratarmount-formats-vmdk --lib sparse` · `cargo test -p ratarmount-formats-vmdk --lib open_from_reader` |
 | VMDK compressed / ESXi grain residual | `cargo test -p ratarmount-formats-vmdk --lib residual` |
+| VMDK sidecar descriptor larger than 1 MiB fails closed | `cargo test -p ratarmount-formats-vmdk --lib oversized_descriptor` |
+| VMDK extent `..` / absolute path rejected | `cargo test -p ratarmount-formats-vmdk --lib sibling_path` |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
