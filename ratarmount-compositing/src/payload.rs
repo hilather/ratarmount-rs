@@ -98,9 +98,10 @@ impl MountSource for PayloadCacheLayer {
         match self.cache.get_or_fill(&sha, file_info.size, || {
             self.inner.open(file_info, buffering)
         }) {
-            Ok(path) => {
-                File::open(path).map(|f| Box::new(f) as Box<dyn ratarmount_core::ArchiveRead>)
-            }
+            Ok(path) => match File::open(&path) {
+                Ok(f) => Ok(Box::new(f) as Box<dyn ratarmount_core::ArchiveRead>),
+                Err(_) => self.inner.open(file_info, buffering),
+            },
             Err(_) => self.inner.open(file_info, buffering),
         }
     }
@@ -144,7 +145,7 @@ impl MountSource for PayloadCacheLayer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::WriteOverlay;
+    use crate::{FileVersionLayer, WriteOverlay};
     use ratarmount_core::{create_root_file_info, CheapDirent};
     use ratarmount_index::sha256_hex;
     use std::collections::BTreeMap;
@@ -308,6 +309,44 @@ mod tests {
             inner.opens.load(Ordering::SeqCst),
             1,
             "second open must hit payload-v1"
+        );
+    }
+
+    /// Regression: `user.hash.sha256` survives FileVersionLayer into PayloadCacheLayer.
+    #[test]
+    fn payload_cache_hashes_survive_file_version_layer() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PayloadCache::with_dir(
+            dir.path().join("payload-v1"),
+            Some(4 * 1024 * 1024),
+            64 * 1024 * 1024,
+        );
+        let inner = Arc::new(HashedMem::new("a.txt", b"versioned-payload"));
+        let vers = FileVersionLayer::new(Arc::clone(&inner) as Arc<dyn MountSource>);
+        let layer = PayloadCacheLayer::new(Arc::new(vers) as _, cache);
+        let fi = layer.lookup("/a.txt", 0).unwrap();
+        assert!(
+            fi.userdata
+                .iter()
+                .any(|u| matches!(u, UserData::Other(s) if s == "versionlayer:file")),
+            "FileVersionLayer must tag lookup: {:?}",
+            fi.userdata
+        );
+        assert_eq!(
+            layer.get_xattr(&fi, SHA256_XATTR).as_deref(),
+            Some(inner.sha.as_bytes())
+        );
+        let mut buf = Vec::new();
+        layer.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"versioned-payload");
+        assert_eq!(inner.opens.load(Ordering::SeqCst), 1);
+        buf.clear();
+        layer.open(&fi, 0).unwrap().read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"versioned-payload");
+        assert_eq!(
+            inner.opens.load(Ordering::SeqCst),
+            1,
+            "second open through FileVersionLayer must hit payload-v1"
         );
     }
 

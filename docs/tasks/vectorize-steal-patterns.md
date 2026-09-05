@@ -113,7 +113,7 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - Range readers: HTTP, S3, GCS, Azure, SSH, OCI blob, IPFS gateway.
 - Remote folder listing TTL (`RATARMOUNT_REMOTE_LIST_TTL_SECS`, 30s).
 - Local sibling index discovery; OCI `{digest}` cache then referrer (G-2).
-- G-3 **content-addressed member cache** is `done` (`payload-v1/` sibling of `local-index-v1/` under `platform_cache_root()`; CDC residual). Different layer — payload, not metadata I/O. See [`beyond-parity-roadmap.md`](beyond-parity-roadmap.md) **G-3**.
+- G-3 **content-addressed member cache** is `done` (`payload-v1/` sibling of `local-index-v1/` under `platform_cache_root()`; CDC residual). Different layer — payload, not metadata I/O. See [beyond-parity-roadmap.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) **G-3**.
 
 **Still open / landed:**
 

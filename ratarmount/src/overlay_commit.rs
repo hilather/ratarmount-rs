@@ -11,9 +11,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use ratarmount_compositing::{
-    classify_createable_archive, maybe_create_empty_write_archive, patch_sidecar_if_present,
-    sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind, EmptyCreateOutcome,
-    OverlayError, WriteOverlay,
+    classify_createable_archive, maybe_create_empty_write_archive, maybe_wrap_payload_cache,
+    patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind,
+    EmptyCreateOutcome, OverlayError, WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
@@ -226,7 +226,12 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
                     o.clone(),
                     &mut materialised,
                 ) {
-                    Ok(tar) => return Ok(Arc::new(tar) as Arc<dyn MountSource>),
+                    Ok(tar) => {
+                        return Ok(maybe_wrap_payload_cache(
+                            Arc::new(tar) as Arc<dyn MountSource>,
+                            o.index_in_memory,
+                        ))
+                    }
                     Err(e) => {
                         log::info!("incremental reindex skipped ({e}); rebuilding");
                         o.index_in_memory = true;
@@ -243,7 +248,10 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
                 &mut materialised,
             )
             .map_err(|e| format!("reopen TAR after live commit: {e}"))?;
-            Ok(Arc::new(tar) as Arc<dyn MountSource>)
+            Ok(maybe_wrap_payload_cache(
+                Arc::new(tar) as Arc<dyn MountSource>,
+                o.index_in_memory,
+            ))
         }
         Ok(CompressionFormat::Zstd) => {
             // Fresh scan / seek table — do not go through factory::open_zstd
@@ -260,7 +268,12 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
                     idx,
                     o.clone(),
                 ) {
-                    Ok(tar) => return Ok(Arc::new(tar) as Arc<dyn MountSource>),
+                    Ok(tar) => {
+                        return Ok(maybe_wrap_payload_cache(
+                            Arc::new(tar) as Arc<dyn MountSource>,
+                            o.index_in_memory,
+                        ))
+                    }
                     Err(e) => {
                         log::info!("incremental reindex skipped ({e}); rebuilding");
                         o.index_in_memory = true;
@@ -275,7 +288,10 @@ fn reopen_live_archive(archive: &Path, opts: &OpenOptions) -> Result<Arc<dyn Mou
                 env!("CARGO_PKG_VERSION"),
             )
             .map_err(|e| format!("reopen .tar.zst after live commit: {e}"))?;
-            Ok(Arc::new(tar) as Arc<dyn MountSource>)
+            Ok(maybe_wrap_payload_cache(
+                Arc::new(tar) as Arc<dyn MountSource>,
+                o.index_in_memory,
+            ))
         }
         Ok(other) => Err(format!(
             "live overlay commit reopen supports uncompressed TAR and .tar.zst only (got {other:?})"

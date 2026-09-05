@@ -1120,7 +1120,7 @@ fn main() {
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
 
-    // G-3: under WriteOverlay so overlay files never hit payload-v1.
+    // Under WriteOverlay so overlay files never hit payload-v1.
     bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
     if let Some(w) = &args.write_overlay {
