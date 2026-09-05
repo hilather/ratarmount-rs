@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom};
 
-#[cfg(test)]
 use sha1::{Digest, Sha1};
 
 use crate::xpress;
@@ -140,12 +139,18 @@ pub fn parse_wim<R: Read + Seek>(reader: &mut R) -> Result<ParsedWim> {
     if blob_table.is_empty() {
         return Err(WimError::Msg("WIM blob table is empty".into()));
     }
-    let table_bytes = read_resource(reader, &blob_table, compression, chunk_size)?;
+    let table_bytes = read_resource(reader, &blob_table, compression, chunk_size, None)?;
     let (blobs, metadata) = parse_blob_table(&table_bytes)?;
     let meta_blob = metadata
         .first()
         .ok_or_else(|| WimError::Msg("WIM first image has no metadata resource".into()))?;
-    let meta = read_resource(reader, meta_blob, compression, chunk_size)?;
+    let meta = read_resource(
+        reader,
+        &meta_blob.res,
+        compression,
+        chunk_size,
+        Some(&meta_blob.hash),
+    )?;
     let (entries, children) = parse_metadata(&meta, &blobs)?;
     Ok(ParsedWim {
         compression,
@@ -168,7 +173,13 @@ pub fn read_blob<R: Read + Seek + ?Sized>(
         .blobs
         .get(hash)
         .ok_or_else(|| WimError::Msg("WIM blob hash not in lookup table".into()))?;
-    read_resource(reader, &blob.res, parsed.compression, parsed.chunk_size)
+    read_resource(
+        reader,
+        &blob.res,
+        parsed.compression,
+        parsed.chunk_size,
+        Some(hash),
+    )
 }
 
 fn read_reshdr(buf: &[u8]) -> ResHdr {
@@ -189,11 +200,24 @@ pub fn write_reshdr(buf: &mut [u8], res: &ResHdr) {
     buf[16..24].copy_from_slice(&res.uncompressed_size.to_le_bytes());
 }
 
-#[cfg(test)]
 pub fn sha1_bytes(data: &[u8]) -> [u8; 20] {
     let mut h = Sha1::new();
     h.update(data);
     h.finalize().into()
+}
+
+fn verify_sha1(data: &[u8], expected: Option<&[u8; 20]>) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    if expected.iter().all(|&b| b == 0) {
+        return Ok(());
+    }
+    let got = sha1_bytes(data);
+    if &got != expected {
+        return Err(WimError::Msg("WIM SHA-1 mismatch".into()));
+    }
+    Ok(())
 }
 
 pub fn filetime_to_unix(filetime: u64) -> f64 {
@@ -218,6 +242,7 @@ fn read_resource<R: Read + Seek + ?Sized>(
     res: &ResHdr,
     compression: Compression,
     chunk_size: u32,
+    expected_hash: Option<&[u8; 20]>,
 ) -> Result<Vec<u8>> {
     if res.flags & RES_SOLID != 0 {
         return Err(WimError::Msg(
@@ -239,6 +264,7 @@ fn read_resource<R: Read + Seek + ?Sized>(
             reader.seek(SeekFrom::Start(res.offset))?;
             reader.read_exact(&mut buf)?;
         }
+        verify_sha1(&buf, expected_hash)?;
         return Ok(buf);
     }
     if let Some(name) = compression.residual_name() {
@@ -252,7 +278,9 @@ fn read_resource<R: Read + Seek + ?Sized>(
         ));
     }
     let chunk = if chunk_size == 0 { 32768 } else { chunk_size };
-    read_xpress_resource(reader, res, chunk)
+    let buf = read_xpress_resource(reader, res, chunk)?;
+    verify_sha1(&buf, expected_hash)?;
+    Ok(buf)
 }
 
 fn read_xpress_resource<R: Read + Seek + ?Sized>(
@@ -317,7 +345,12 @@ fn read_xpress_resource<R: Read + Seek + ?Sized>(
     Ok(out)
 }
 
-type BlobTable = (HashMap<[u8; 20], Blob>, Vec<ResHdr>);
+struct MetaRes {
+    res: ResHdr,
+    hash: [u8; 20],
+}
+
+type BlobTable = (HashMap<[u8; 20], Blob>, Vec<MetaRes>);
 
 fn parse_blob_table(bytes: &[u8]) -> Result<BlobTable> {
     let mut blobs = HashMap::new();
@@ -332,7 +365,7 @@ fn parse_blob_table(bytes: &[u8]) -> Result<BlobTable> {
         let mut hash = [0u8; 20];
         hash.copy_from_slice(&e[30..50]);
         if res.flags & RES_METADATA != 0 {
-            metadata.push(res);
+            metadata.push(MetaRes { res, hash });
         } else if !hash.iter().all(|&b| b == 0) {
             blobs.insert(hash, Blob { res });
         }
