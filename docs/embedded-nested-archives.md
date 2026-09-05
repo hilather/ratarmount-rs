@@ -139,6 +139,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Index map (multi-block / multi-stream preferred); large single-block spills |
 | **CPIO** (newc/odc/bin) | `070701` / `070702` / `070707` / binary magic / `.cpio` | `CpioMountSource::open_from_reader` | **Yes** — stencil |
 | **AR** | `!<arch>\n` / `.ar` / `.a` | `ArMountSource::open_from_reader` | **Yes** — stencil |
+| **UDF** | VRS `NSR02`/`NSR03` from byte 32 KiB / `.udf` | `UdfMountSource::open_from_reader` | **Yes** — extent stencils (no full-image copy). Mixed ISO+UDF: factory probes UDF **before** ISO. **Residual:** 2.50 metadata partition |
 | **ISO 9660** | PVD `CD001` @ sector 16 / `.iso` | `Iso9660MountSource::open_from_reader` | **Yes** — extent stencils (no full-image RAM load) |
 | **WARC** | `WARC/` / `.warc` | `WarcMountSource::open_from_reader` | **Yes** — payload stencils |
 | **ASAR** | `.asar` name | `AsarMountSource::open_from_reader` | **Yes** — data-offset stencils |
@@ -146,12 +147,14 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **CAB** (store/MSZIP) | `MSCF` / `.cab` | `CabMountSource::open_from_reader` | Store stencil / MSZIP folder decompress in RAM |
 | **SQLAR** (unencrypted) | SQLite magic / `.sqlar` | `SqlarMountSource::open_from_reader` | Full DB in RAM (`sqlite3_deserialize`); no `/tmp` |
 | **FAT** | boot probe / `.fat*` | `FatMountSource::open_from_reader` (superfloppy offset 0); partitioned images use `open_from_reader_with_offset` | Shared seek body (no full-image copy); nested no-tmp at offset 0 unchanged |
-| **GPT/MBR disk image** | `EFI PART` @ LBA 1 / protective MBR `0xEE` / MBR `0x55AA` + partitions starting after LBA 0 | `BlockMountSource::open_from_reader` → `/p1/`… via FAT/EXT4 `open_*_with_offset` | Shared seek body (no full-image copy). Superfloppy FAT/EXT4 at offset 0 stays in those crates. **Residual:** LVM, RAID, Btrfs; exFAT/NTFS when those crates exist. Factory wiring is a later orchestrator PR |
-| **UDIF DMG** | `koly` trailer @ EOF-512 | `DmgMountSource::open_from_reader` → inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR | Shared seek body + last-chunk cache (no full-image copy). **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA. Factory wiring is a later orchestrator PR |
-| **WIM** | `MSWIM\0\0\0` / `.wim` | `WimMountSource::open_from_reader` | Shared seek body (no image spool). First image; uncompressed + XPRESS. **Residual:** LZX/LZMS `open` errors (not raw bytes); WIMBoot/delta/later images; 64 MiB resource cap; factory nested wire later |
-| **QCOW2** | `QFI\xfb` + version 2/3 | `Qcow2MountSource::open_from_reader` → guest map then block/FAT/EXT4 | Shared seek body (no full-image copy). Relative backing needs a real parent path. **Residual:** zstd clusters; HTTP/NBD backing. Factory wiring is a later orchestrator PR |
-| **VHD / VHDX** | `conectix` footer / `vhdxfile` @ 0 | `VhdMountSource::open_from_reader` → Block/FAT/EXT4 | Shared seek body (no full-image copy). Differencing / VHDX log replay residual. Factory nested wire later |
-| **VMDK** (hosted KDMV sparse) | `KDMV` magic / `# Disk DescriptorFile` | `VmdkMountSource::open_from_reader` → grain map → Block/FAT/EXT4 | Shared seek body (no full-image copy). Descriptor-only sibling extents need a host path. **Residual:** compressed `streamOptimized`, ESXi COWD/VMFSSPARSE/SESparse, delta `parentCID`. Factory wiring is a later orchestrator PR |
+| **exFAT** | OEM `"EXFAT   "` @ 3 + `0x55AA` / `.exfat` | `ExfatMountSource::open_from_reader` | Shared seek body (no full-image copy). Superfloppy offset 0 before GPT/MBR |
+| **NTFS** | OEM `"NTFS    "` @ 3 / `.ntfs` | `NtfsMountSource::open_from_reader` | Shared seek body (no full-image copy). **Residual:** LZNT1 `open` Unsupported; EFS PermissionDenied |
+| **GPT/MBR disk image** | `EFI PART` @ LBA 1 / protective MBR `0xEE` / MBR `0x55AA` + partitions starting after LBA 0 | `BlockMountSource::open_from_reader` → `/p1/`… via FAT/EXT4 `open_*_with_offset` | Shared seek body (no full-image copy). Superfloppy FAT/exFAT/NTFS at offset 0 stays in those crates. **Residual:** LVM, RAID, Btrfs |
+| **UDIF DMG** | `koly` trailer @ EOF-512 | `DmgMountSource::open_from_reader` → inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR | Shared seek body + last-chunk cache (no full-image copy). **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA |
+| **WIM** | `MSWIM\0\0\0` / `.wim` | `WimMountSource::open_from_reader` | Shared seek body (no image spool). First image; uncompressed + XPRESS. **Residual:** LZX/LZMS `open` errors (not raw bytes); WIMBoot/delta/later images; 64 MiB resource cap |
+| **QCOW2** | `QFI\xfb` + version 2/3 | `Qcow2MountSource::open_from_reader` → guest map then block/FAT/EXT4 | Shared seek body (no full-image copy). Relative backing needs a real parent path. **Residual:** zstd clusters; HTTP/NBD backing |
+| **VHD / VHDX** | `conectix` footer / `vhdxfile` @ 0 | `VhdMountSource::open_from_reader` → Block/FAT/EXT4 | Shared seek body (no full-image copy). Differencing / VHDX log replay residual |
+| **VMDK** (hosted KDMV sparse) | `KDMV` magic / `# Disk DescriptorFile` | `VmdkMountSource::open_from_reader` → grain map → Block/FAT/EXT4 | Shared seek body (no full-image copy). Descriptor-only sibling extents need a host path. **Residual:** compressed `streamOptimized`, ESXi COWD/VMFSSPARSE/SESparse, delta `parentCID` |
 | **SquashFS** (none/gzip/zstd/lz4/lzo/xz) | `hsqs`/`sqsh` magic (or AppImage scan) / `.squashfs`/`.sqfs`/`.snap` | `SquashFsMountSource::open_from_reader` | **Yes** — in-process backhand; **no** `/tmp` |
 | **SquashFS classic LZMA** | same magic | open_from_reader **errors** | **Temp spool** → path `open` / `unsquashfs` residual |
 | **EXT2/3/4** | superblock `0xEF53` @ 1024+0x38 / `.ext2`/`.ext3`/`.ext4` | `Ext4MountSource::open_from_reader` | **Yes** — pure ext4-view shared stream; pure fail → temp spool + path/`debugfs` |
@@ -176,10 +179,7 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **7z (store/copy)** | `.tar` / `.tar.gz` / `.zip` / `.7z` | **No** | Preferred outer packing for nested random I/O |
 | **7z (solid LZMA2 / AES+LZMA2 / native BCJ/Delta+LZMA2)** | same | **No disk**, may be **CPU-heavy** | Progressive prefix decode (BCJ/Delta sequential-from-0 + LRU; no dict-reset resume); not free for large solids |
 | **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for **BCJ2 / multi-pack / Deflate / BZip2** |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / WIM (uncompressed·XPRESS crate)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and WIM crate paths are no-tmp; factory nested wire is later. WIM LZX/LZMS `open` errors |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / QCOW2** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and QCOW2 crate paths are no-tmp; factory nested wire is later |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / VHD·VHDX** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and VHD crate paths are no-tmp; factory nested wire is later |
-| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / VMDK (KDMV sparse)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and VMDK crate paths are no-tmp; factory nested wire is later |
+| **CPIO / AR / ISO / UDF / WARC / ASAR / XAR / CAB store·MSZIP / FAT / exFAT / NTFS / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (`pN/`) / DMG / WIM / QCOW2 / VHD·VHDX / VMDK (KDMV sparse)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. Mixed ISO+UDF: UDF wins when NSR02/NSR03 is present. WIM LZX/LZMS `open` errors |
 | **SQLAR** unencrypted nested | nested | **No** (full image RAM) | deserialize; encrypted still path residual |
 | **CAB LZX / classic SquashFS LZMA / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; classic LZMA → unsquashfs path |
 
@@ -288,7 +288,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.tar.gz` in ZIP/TAR/7z | yes | yes (gzip seek) |
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
-| Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / GPT·MBR (`pN/`) / VHD·VHDX | yes | yes\* |
+| Nested CPIO / AR / ISO / UDF / WARC / ASAR / XAR / CAB store·MSZIP / FAT / exFAT / NTFS / GPT·MBR (`pN/`) / DMG / WIM / QCOW2 / VHD·VHDX / VMDK | yes | yes\* |
 | Nested SquashFS (none/gzip/zstd/lz4/lzo/xz) | yes | yes (backhand) |
 | Nested EXT2/3/4 (pure ext4-view) | yes | yes |
 | Nested unencrypted SQLAR | yes (no `/tmp`) | yes after full DB load in RAM |

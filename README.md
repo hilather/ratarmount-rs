@@ -192,6 +192,7 @@ TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) 
 TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · QCOW2 v2/v3 (zlib clusters; local backing; factory later) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · VHD/VHDX (crate; wraps GPT/MBR; factory later) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · VMDK (KDMV sparse; ESXi/compressed residual; crate only) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
+TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) · 7z (pack-offset + AES / BCJ2) · AR · CPIO · ISO 9660 · UDF (NSR02/NSR03; mixed-disc before ISO) · WARC · XAR · CAB · ASAR · SquashFS · EXT4 · FAT12/16/32 · exFAT · NTFS (read-only; LZNT1/EFS residual) · GPT/MBR disk images (`p1/`… via FAT/EXT4 offset; LVM residual) · UDIF DMG (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual) · WIM (uncompressed + XPRESS, first image; LZX/LZMS residual) · QCOW2 v2/v3 (zlib clusters; local backing; zstd residual) · VHD/VHDX (differencing residual) · VMDK (KDMV sparse; compressed/ESXi residual) · SQLAR · PDF · OGG · HTML · Git · long-tail via **libarchive** (RAR, LHA, …) · split `.001` joins · lrzip
 
 ### Seekable compression
 
@@ -338,11 +339,7 @@ Recursive mounts (`-r`) open nested members from a **seekable parent stream** wh
 | Nested member | Temp spool? |
 |---------------|:-----------:|
 | `.tar` / `.tar.gz` / `.zip` / `.7z` inside ZIP · TAR · 7z | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · UDIF DMG (crate; inner FAT/ISO) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · WIM (crate; LZX/LZMS residual) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · QCOW2 (crate) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · VHD/VHDX (crate) | **No** |
-| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · VMDK (KDMV sparse, crate) | **No** |
+| CPIO · AR · ISO · UDF · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · exFAT · NTFS · GPT/MBR (`pN/`) · UDIF DMG · WIM (LZX/LZMS residual) · QCOW2 · VHD/VHDX · VMDK (KDMV sparse) | **No** |
 | SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
 | Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
 | CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |
@@ -353,7 +350,7 @@ ratarmount -r -l big.deb mnt/            # large trees: lazy nested open
 RUST_LOG=debug ratarmount -r -d 2 …      # “nested reader” vs “temp spool” in logs
 ```
 
-On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and optionally **`--recursion-depth`**. Details: [`docs/embedded-nested-archives.md`](docs/embedded-nested-archives.md).
+On enormous packages (e.g. `linux-source-*.deb`), prefer **`-l` / `--lazy`** and optionally **`--recursion-depth`**. Details: [`docs/embedded-nested-archives.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md).
 
 ---
 
@@ -367,6 +364,7 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); QCOW2 crate maps guest clusters then the block crate (zstd clusters / HTTP backing residual; factory wire later).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); VHD/VHDX crate (differencing residual; factory later).
 2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR crate mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual; factory wire later); VMDK KDMV sparse crate (compressed/ESXi residual; factory wire later).
+2. **Formats** — pure classic SquashFS lzma; pure RAR; encrypted SQLAR without sqlcipher; residual PDF color spaces; GPT/MBR mounts FAT/EXT4 `pN/` (LVM/RAID/Btrfs residual); UDIF DMG inner FAT/ISO/exFAT/NTFS (HFS+/APFS/encrypted residual); WIM LZX/LZMS / WIMBoot / later images; QCOW2 zstd clusters / HTTP backing; VHD/VHDX differencing; VMDK compressed/ESXi grains; NTFS LZNT1/EFS.
 3. **7z solids** — AES+LZMA2 and native BCJ/Delta+LZMA2 large solids are progressive (BCJ/Delta is sequential-from-0 + LRU; no dict-reset resume). BCJ2 / multi-pack still full-folder. Progressive pure LZMA2 is bounded but not free.
 4. **Write paths** — ZIP `--commit-overlay` is full rebuild (residual encrypted/multi-part); compressed-TAR rename/write edges. A missing uncompressed `.tar` / `.tar.zst` is created as an empty write-mount base when `-w` is set. Live overlay commit accepts uncompressed TAR and `.tar.zst` (rewrites only the last zstd frame; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when the last frame is larger than 64 MiB uncompressed). `--commit-overlay-interval` persists files that have not been modified for `DURATION`. Gzip stays rejected. Offline `--commit-overlay` splices `.tar.zst` (last-window or rewrite from the affected frame through EOF, including earlier-frame delete). Live interval/on-exit still **rejects** prefix-frame mutate. Create-if-missing is uncompressed `.tar` only.
 5. **Remote** — HTTP Basic + Cookie env auth done; `ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/**ProxyJump**/**Include** done; `gs://` / `az://` / `ftp://` / `smb://` (live Range + F-1 folders) / `oci://` / `ipfs://` / `rclone://` / `rclone+` + F-1 prefix folders shipped (FTP LIST/MLSD; GCS GOOG1 HMAC); local **restic** snapshot browser (`restic:/abs/path`, [restic.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md)). Residual: full browser cookie jar; ssh_config **ProxyCommand** / **Match**; implicit FTPS :990; rclone RC `--rc-serve`; SMB 3.x / Kerberos / `smbclient` listing; S3 restic / borg / kopia. [phase10-remote.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md).
