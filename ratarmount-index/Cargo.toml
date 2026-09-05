@@ -3,6 +3,7 @@ name = "ratarmount-index"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "SQLite index 0.7.0 read/write for ratarmount-rs"
 
 [dependencies]

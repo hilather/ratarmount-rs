@@ -401,7 +401,8 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 | [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.27 BIG suite) |
 | [benchmarks/python-vs-rust-results-big.md](benchmarks/python-vs-rust-results-big.md) | Named `BIG=1` output (same snapshot; re-run with `BIG=1`) |
 | [benchmarks/README.md](benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
-| [docs/phase12-dual-run.md](docs/phase12-dual-run.md) | Dual-run / crates.io notes |
+| [docs/phase12-dual-run.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md) | Dual-run (crates.io **not** required) |
+| [docs/crates-io-policy.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) | crates.io policy (L0 dry-run only; no live publish) |
 | [docs/tasks/beyond-parity-roadmap.md](docs/tasks/beyond-parity-roadmap.md) | Beyond-parity protocols, features, product bets |
 
 ---

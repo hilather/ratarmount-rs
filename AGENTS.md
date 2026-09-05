@@ -114,6 +114,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Live `.tar.zst` commit truncates zero-tail members (zero-run EOF cut) | `cargo test -p ratarmount-formats-tar --lib rewrite_zero_tail` · `cargo test -p ratarmount-formats-tar --lib rewrite_mid_member_opaque_prefix` · `cargo test -p ratarmount-formats-tar --lib rewrite_all_zero_window` |
 | PAX `size=` member (≥ 8 GiB / zeroed ustar field) indexes as size 0 | `cargo test -p ratarmount-formats-tar --lib pax_size_keyword` |
 | Overlay rename loses symlinks / destination on COW failure; rmdir non-empty | `cargo test -p ratarmount-compositing --lib rename_base_symlink` · `cargo test -p ratarmount-compositing --lib rename_keeps_destination` · `cargo test -p ratarmount-compositing --lib rmdir_refuses` |
+| crates.io dry-run packages L0 without live publish (F-10 / Q5=a) | `./packaging/test-crates-io-dry-run.sh` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
 | Homebrew tap cask is a formula / path-URL install / missing sha256 | `./packaging/test-homebrew-cask.sh` |
 | mount.fuse.ratarmount helper puts secrets on argv / Type≠fuse.ratarmount | `./packaging/test-systemd-unit.sh` (skip systemd-analyze if no systemd; kubeconform skip-if-missing) |

@@ -3,6 +3,7 @@ name = "ratarmount-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 description = "MountSource trait and shared types for ratarmount-rs"
 
 [dependencies]
