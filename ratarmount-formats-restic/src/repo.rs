@@ -145,7 +145,7 @@ impl Repo {
         }
         let key = load_master_key(path, password)?;
         let cfg_plain = decrypt_repo_file(&key, &path.join("config"), MAX_CONFIG_FILE)?;
-        let cfg_json = decode_unpacked(&cfg_plain)?;
+        let cfg_json = decode_unpacked(&cfg_plain, MAX_CONFIG_FILE)?;
         let cfg: ConfigJson = serde_json::from_slice(&cfg_json)
             .map_err(|e| ResticError::Msg(format!("restic config: {e}")))?;
         if cfg.version != 1 && cfg.version != 2 {
@@ -198,7 +198,7 @@ impl Repo {
             }
         }
         let plain = self.read_blob(id)?;
-        let json = decode_unpacked(&plain)?;
+        let json = decode_unpacked(&plain, MAX_BLOB)?;
         let tree: TreeJson = serde_json::from_slice(&json)
             .map_err(|e| ResticError::Msg(format!("restic tree {id}: {e}")))?;
         let mut cache = self
@@ -226,12 +226,16 @@ impl Repo {
             if uncomp > MAX_BLOB {
                 return Err(ResticError::Msg("uncompressed blob exceeds cap".into()));
             }
-            plain = zstd::decode_all(plain.as_slice())
-                .map_err(|e| ResticError::Msg(format!("zstd blob {id}: {e}")))?;
-            if plain.len() as u64 != uncomp {
-                return Err(ResticError::Msg(format!(
-                    "blob {id} uncompressed length mismatch"
-                )));
+            if uncomp == 0 {
+                plain.clear();
+            } else {
+                // Cap at the index length (already ≤ MAX_BLOB), not decode_all.
+                plain = zstd_decode_capped(plain.as_slice(), uncomp)?;
+                if plain.len() as u64 != uncomp {
+                    return Err(ResticError::Msg(format!(
+                        "blob {id} uncompressed length mismatch"
+                    )));
+                }
             }
         }
         Ok(plain)
@@ -261,21 +265,22 @@ pub fn load_password_from_env() -> Result<Vec<u8>> {
         if meta.len() > MAX_PASSWORD_FILE {
             return Err(ResticError::Msg("RESTIC_PASSWORD_FILE too large".into()));
         }
-        let mut s = fs::read_to_string(&path)?;
-        if s.ends_with('\n') {
-            s.pop();
-            if s.ends_with('\r') {
-                s.pop();
-            }
-        }
-        if s.is_empty() {
+        let s = fs::read_to_string(&path)?;
+        // restic TrimRight(s, "\r\n") — all trailing CR/LF, not a single newline.
+        let trimmed = trim_restic_password_file(&s);
+        if trimmed.is_empty() {
             return Err(ResticError::Msg("RESTIC_PASSWORD_FILE is empty".into()));
         }
-        return Ok(s.into_bytes());
+        return Ok(trimmed.as_bytes().to_vec());
     }
     Err(ResticError::Msg(
         "restic password required (RESTIC_PASSWORD or RESTIC_PASSWORD_FILE)".into(),
     ))
+}
+
+/// Match restic `TrimRight(..., "\r\n")` (every trailing CR/LF).
+pub(crate) fn trim_restic_password_file(s: &str) -> &str {
+    s.trim_end_matches(['\n', '\r'])
 }
 
 fn load_master_key(root: &Path, password: &[u8]) -> Result<MasterKey> {
@@ -347,7 +352,7 @@ fn load_index(root: &Path, key: &MasterKey) -> Result<HashMap<String, BlobLoc>> 
     for path in files {
         let enc = read_capped(&path, MAX_INDEX_FILE)?;
         let plain = decrypt(key, &enc)?;
-        let json = decode_unpacked(&plain)?;
+        let json = decode_unpacked(&plain, MAX_INDEX_FILE)?;
         let idx = parse_index_json(&json)?;
         for pack in idx.packs {
             for blob in pack.blobs {
@@ -394,7 +399,7 @@ fn load_snapshots(root: &Path, key: &MasterKey) -> Result<Vec<SnapshotMeta>> {
         }
         let enc = read_capped(&path, MAX_SNAPSHOT_FILE)?;
         let plain = decrypt(key, &enc)?;
-        let json = decode_unpacked(&plain)?;
+        let json = decode_unpacked(&plain, MAX_SNAPSHOT_FILE)?;
         let snap: SnapshotJson = serde_json::from_slice(&json)
             .map_err(|e| ResticError::Msg(format!("restic snapshot {id}: {e}")))?;
         snaps.push(SnapshotMeta {
@@ -436,18 +441,52 @@ fn decrypt_repo_file(key: &MasterKey, path: &Path, cap: u64) -> Result<Vec<u8>> 
     decrypt(key, &enc)
 }
 
-fn decode_unpacked(plain: &[u8]) -> Result<Vec<u8>> {
+fn decode_unpacked(plain: &[u8], max: u64) -> Result<Vec<u8>> {
     if plain.is_empty() {
         return Err(ResticError::Msg("empty restic plaintext".into()));
     }
     match plain[0] {
-        b'{' | b'[' => Ok(plain.to_vec()),
-        2 => zstd::decode_all(&plain[1..])
-            .map_err(|e| ResticError::Msg(format!("zstd unpacked: {e}"))),
+        b'{' | b'[' => {
+            if plain.len() as u64 > max {
+                return Err(ResticError::Msg("unpacked JSON exceeds cap".into()));
+            }
+            Ok(plain.to_vec())
+        }
+        2 => {
+            if plain.len() == 1 {
+                return Err(ResticError::Msg("empty zstd unpacked payload".into()));
+            }
+            zstd_decode_capped(&plain[1..], max)
+        }
         v => Err(ResticError::Msg(format!(
             "unsupported restic encoding version {v}"
         ))),
     }
+}
+
+/// Streaming zstd decode that stops at `max` output bytes (no `decode_all`).
+pub(crate) fn zstd_decode_capped(src: &[u8], max: u64) -> Result<Vec<u8>> {
+    let max = usize::try_from(max).unwrap_or(usize::MAX);
+    let mut decoder =
+        zstd::Decoder::new(src).map_err(|e| ResticError::Msg(format!("zstd: {e}")))?;
+    let mut out = Vec::new();
+    let mut tmp = [0u8; 8192];
+    loop {
+        let n = decoder
+            .read(&mut tmp)
+            .map_err(|e| ResticError::Msg(format!("zstd: {e}")))?;
+        if n == 0 {
+            break;
+        }
+        let new_len = out.len().saturating_add(n);
+        if new_len > max {
+            return Err(ResticError::Msg(format!(
+                "zstd output exceeds {max} byte cap"
+            )));
+        }
+        out.extend_from_slice(&tmp[..n]);
+    }
+    Ok(out)
 }
 
 fn read_capped(path: &Path, cap: u64) -> Result<Vec<u8>> {
@@ -581,6 +620,50 @@ fn days_from_civil(y: i32, m: u32, d: u32) -> Option<i64> {
 
 /// Write a tiny v1 restic repo: two snapshots, one 1 KiB file `hello.bin`.
 pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo> {
+    write_synthetic_repo_version(dir, password, 1)
+}
+
+/// Same layout as [`write_synthetic_repo`] with restic v2 encoding:
+/// unpacked index/snapshot JSON is `0x02 || zstd(json)`; pack blobs are zstd
+/// with `uncompressed_length` in the index.
+pub fn write_synthetic_repo_v2(dir: &Path, password: &[u8]) -> Result<SyntheticRepo> {
+    write_synthetic_repo_version(dir, password, 2)
+}
+
+fn zstd_encode(plain: &[u8]) -> Result<Vec<u8>> {
+    zstd::encode_all(plain, 3).map_err(|e| ResticError::Msg(format!("zstd encode: {e}")))
+}
+
+fn seal_unpacked(master: &MasterKey, json: &[u8], version: u32, iv: &[u8; 16]) -> Result<Vec<u8>> {
+    let body = if version >= 2 {
+        let mut v = vec![2u8];
+        v.extend(zstd_encode(json)?);
+        v
+    } else {
+        json.to_vec()
+    };
+    Ok(encrypt(master, &body, iv))
+}
+
+fn seal_blob(
+    master: &MasterKey,
+    plain: &[u8],
+    version: u32,
+    iv: &[u8; 16],
+) -> Result<(Vec<u8>, Option<u64>)> {
+    let (to_enc, uncomp) = if version >= 2 {
+        (zstd_encode(plain)?, Some(plain.len() as u64))
+    } else {
+        (plain.to_vec(), None)
+    };
+    Ok((encrypt(master, &to_enc, iv), uncomp))
+}
+
+fn write_synthetic_repo_version(
+    dir: &Path,
+    password: &[u8],
+    version: u32,
+) -> Result<SyntheticRepo> {
     fs::create_dir_all(dir.join("keys"))?;
     fs::create_dir_all(dir.join("data"))?;
     fs::create_dir_all(dir.join("index"))?;
@@ -624,18 +707,19 @@ pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo
     fs::write(dir.join("keys").join(&key_id), &key_bytes)?;
 
     let cfg = serde_json::json!({
-        "version": 1,
+        "version": version,
         "id": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
         "chunker_polynomial": "25b468838dcb75",
     });
     iv[0] = 2;
+    // restic config is never zstd-wrapped.
     let cfg_enc = encrypt(&master, cfg.to_string().as_bytes(), &iv);
     fs::write(dir.join("config"), &cfg_enc)?;
 
     let payload = vec![0xABu8; 1024];
     let data_id = hex_encode(&sha256(&payload));
     iv[0] = 3;
-    let data_enc = encrypt(&master, &payload, &iv);
+    let (data_enc, data_uncomp) = seal_blob(&master, &payload, version, &iv)?;
 
     let tree = serde_json::json!({
         "nodes": [{
@@ -650,9 +734,8 @@ pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo
     let tree_bytes = serde_json::to_vec(&tree)?;
     let tree_id = hex_encode(&sha256(&tree_bytes));
     iv[0] = 4;
-    let tree_enc = encrypt(&master, &tree_bytes, &iv);
+    let (tree_enc, tree_uncomp) = seal_blob(&master, &tree_bytes, version, &iv)?;
 
-    // Two blobs in one pack (v1 allows mixed types).
     let mut pack = Vec::new();
     let data_off = 0u64;
     pack.extend_from_slice(&data_enc);
@@ -660,11 +743,19 @@ pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo
     pack.extend_from_slice(&tree_enc);
 
     let mut header = Vec::new();
-    header.push(0u8); // data
+    let data_type = if version >= 2 { 2u8 } else { 0u8 };
+    let tree_type = if version >= 2 { 3u8 } else { 1u8 };
+    header.push(data_type);
     header.extend_from_slice(&(data_enc.len() as u32).to_le_bytes());
+    if let Some(n) = data_uncomp {
+        header.extend_from_slice(&(n as u32).to_le_bytes());
+    }
     header.extend_from_slice(&sha256(&payload));
-    header.push(1u8); // tree
+    header.push(tree_type);
     header.extend_from_slice(&(tree_enc.len() as u32).to_le_bytes());
+    if let Some(n) = tree_uncomp {
+        header.extend_from_slice(&(n as u32).to_le_bytes());
+    }
     header.extend_from_slice(&sha256(&tree_bytes));
     iv[0] = 5;
     let header_enc = encrypt(&master, &header, &iv);
@@ -677,18 +768,31 @@ pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo
     fs::create_dir_all(&shard)?;
     fs::write(shard.join(&pack_id), &pack)?;
 
-    let index = serde_json::json!({
-        "supersedes": [],
-        "packs": [{
-            "id": pack_id,
-            "blobs": [
-                {"id": data_id, "type": "data", "offset": data_off, "length": data_enc.len()},
-                {"id": tree_id, "type": "tree", "offset": tree_off, "length": tree_enc.len()},
-            ]
-        }]
-    });
+    let index = if version >= 2 {
+        serde_json::json!({
+            "supersedes": [],
+            "packs": [{
+                "id": pack_id,
+                "blobs": [
+                    {"id": data_id, "type": "data", "offset": data_off, "length": data_enc.len(), "uncompressed_length": data_uncomp},
+                    {"id": tree_id, "type": "tree", "offset": tree_off, "length": tree_enc.len(), "uncompressed_length": tree_uncomp},
+                ]
+            }]
+        })
+    } else {
+        serde_json::json!({
+            "supersedes": [],
+            "packs": [{
+                "id": pack_id,
+                "blobs": [
+                    {"id": data_id, "type": "data", "offset": data_off, "length": data_enc.len()},
+                    {"id": tree_id, "type": "tree", "offset": tree_off, "length": tree_enc.len()},
+                ]
+            }]
+        })
+    };
     iv[0] = 6;
-    let index_enc = encrypt(&master, index.to_string().as_bytes(), &iv);
+    let index_enc = seal_unpacked(&master, index.to_string().as_bytes(), version, &iv)?;
     let index_id = hex_encode(&sha256(&index_enc));
     fs::write(dir.join("index").join(&index_id), &index_enc)?;
 
@@ -705,7 +809,7 @@ pub fn write_synthetic_repo(dir: &Path, password: &[u8]) -> Result<SyntheticRepo
             "username": "ratarmount",
         });
         iv[0] = 7 + i as u8;
-        let snap_enc = encrypt(&master, snap.to_string().as_bytes(), &iv);
+        let snap_enc = seal_unpacked(&master, snap.to_string().as_bytes(), version, &iv)?;
         let snap_id = hex_encode(&sha256(&snap_enc));
         fs::write(dir.join("snapshots").join(&snap_id), &snap_enc)?;
         snap_ids.push(snap_id);

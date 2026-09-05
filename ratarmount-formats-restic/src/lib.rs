@@ -26,7 +26,9 @@ mod crypto;
 mod repo;
 mod url;
 
-pub use repo::{parse_index_json, write_synthetic_repo, IndexFile, SyntheticRepo};
+pub use repo::{
+    parse_index_json, write_synthetic_repo, write_synthetic_repo_v2, IndexFile, SyntheticRepo,
+};
 pub use url::parse_restic_url;
 
 pub const BACKEND_NAME: &str = "ResticMountSource";
@@ -267,7 +269,7 @@ impl MountSource for ResticMountSource {
                 if let Some(latest) = self.repo.latest() {
                     map.insert(
                         "latest".into(),
-                        link_info(&format!("snapshots/{}", latest.short_id), self.mtime),
+                        link_info(&format!("snapshots/{}", latest.short_id), latest.unix),
                     );
                 }
                 Some(ListResult::Infos(map))
@@ -485,16 +487,31 @@ mod tests {
         }
         let dents = ms.list_dirents("/snapshots").unwrap();
         assert_eq!(dents.len(), 2);
+        // Second snapshot in the fixture is 2020-06-01 (newer than 2020-01-01).
+        let newer_full = &info.snapshot_ids[1];
+        let newer_short = dents
+            .iter()
+            .find(|d| newer_full.starts_with(&d.name))
+            .map(|d| d.name.clone())
+            .expect("newer snapshot short id");
         let latest = ms.lookup("/latest", 0).unwrap();
         assert_eq!(
             latest.mode & ratarmount_core::S_IFMT,
             ratarmount_core::S_IFLNK
         );
+        assert_eq!(latest.linkname, format!("snapshots/{newer_short}"));
+        let newer_unix = repo::rfc3339_to_unix("2020-06-01T00:00:00Z").unwrap();
         assert!(
-            latest.linkname.starts_with("snapshots/"),
-            "latest target {}",
-            latest.linkname
+            (latest.mtime - newer_unix).abs() < 0.5,
+            "lookup /latest mtime {} vs {newer_unix}",
+            latest.mtime
         );
+        let listed_latest = match ms.list("/").unwrap() {
+            ListResult::Infos(map) => map.get("latest").cloned().expect("list / has latest"),
+            _ => panic!("expected infos"),
+        };
+        assert_eq!(listed_latest.linkname, latest.linkname);
+        assert_eq!(listed_latest.mtime, latest.mtime);
         assert!(ms.lookup("/ids", 0).is_some());
         let ids = ms.list("/ids").unwrap();
         match ids {
@@ -528,6 +545,70 @@ mod tests {
         );
         assert!(d.contains("<redacted>"), "Debug should skip password: {d}");
         assert!(d.contains("ResticMountSource"));
+    }
+
+    #[test]
+    fn restic_password_file_trim_matches_restic_trim_right() {
+        assert_eq!(repo::trim_restic_password_file("secret\n\n\r\n"), "secret");
+        assert_eq!(repo::trim_restic_password_file("secret\r\n"), "secret");
+        assert_eq!(repo::trim_restic_password_file("secret"), "secret");
+    }
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn restic_password_file_opens_synthetic_repo() {
+        let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        write_synthetic_repo(dir.path(), PW).unwrap();
+        let pw_path = dir.path().join("pw.txt");
+        std::fs::write(&pw_path, b"test-restic-password-not-a-secret\n\n\r\n").unwrap();
+        let old_pw = std::env::var_os("RESTIC_PASSWORD");
+        let old_file = std::env::var_os("RESTIC_PASSWORD_FILE");
+        std::env::remove_var("RESTIC_PASSWORD");
+        std::env::set_var("RESTIC_PASSWORD_FILE", &pw_path);
+        let opened = ResticMountSource::open(dir.path());
+        match old_pw {
+            Some(v) => std::env::set_var("RESTIC_PASSWORD", v),
+            None => std::env::remove_var("RESTIC_PASSWORD"),
+        }
+        match old_file {
+            Some(v) => std::env::set_var("RESTIC_PASSWORD_FILE", v),
+            None => std::env::remove_var("RESTIC_PASSWORD_FILE"),
+        }
+        let ms = opened.expect("RESTIC_PASSWORD_FILE should open the synthetic repo");
+        let dents = ms.list_dirents("/snapshots").unwrap();
+        assert_eq!(dents.len(), 2);
+    }
+
+    #[test]
+    fn restic_v2_compressed_blob_and_unpacked_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let info = write_synthetic_repo_v2(dir.path(), PW).unwrap();
+        let ms = ResticMountSource::open_with_password(dir.path(), PW).unwrap();
+        let dents = ms.list_dirents("/snapshots").unwrap();
+        assert_eq!(dents.len(), 2);
+        let short = &dents[0].name;
+        let fi = ms
+            .lookup(&format!("/snapshots/{short}/hello.bin"), 0)
+            .expect("hello.bin via v2 zstd blob");
+        assert_eq!(fi.size, 1024);
+        let mut r = ms.open(&fi, 0).unwrap();
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, info.file_bytes);
+    }
+
+    #[test]
+    fn restic_zstd_decode_capped_rejects_oversize() {
+        let zeros = vec![0u8; 64 * 1024];
+        let enc = zstd::encode_all(zeros.as_slice(), 3).unwrap();
+        let err = repo::zstd_decode_capped(&enc, 1024)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("exceeds"), "expected cap error, got {err}");
+        let out = repo::zstd_decode_capped(&enc, 64 * 1024).unwrap();
+        assert_eq!(out.len(), 64 * 1024);
     }
 
     #[test]
