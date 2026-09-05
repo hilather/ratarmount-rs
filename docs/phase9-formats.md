@@ -30,6 +30,7 @@
 | WIM | `ratarmount-formats-wim` | First image; uncompressed + XPRESS. **Residual:** LZX/LZMS, WIMBoot, delta, later images; factory probe is a later orchestrator PR |
 | QCOW2 v2/v3 | `ratarmount-formats-qcow2` | Guest-cluster map (uncompressed + zlib deflate) then `BlockMountSource::open_from_reader`. Local backing only. **Residual:** zstd clusters, HTTP/NBD backing; factory probe later |
 | VHD / VHDX | `ratarmount-formats-vhd` | Fixed + dynamic VHD; VHDX fixed/sparse (no parent). Wraps `BlockMountSource` (`p1/`…) or superfloppy FAT/EXT4 at `/`. **Residual:** differencing, encrypted VHDX; factory probe later |
+| VMDK | `ratarmount-formats-vmdk` | Hosted KDMV sparse (`monolithicSparse` / descriptor + sibling SPARSE). Wraps Block (or superfloppy FAT/EXT4). **Residual:** compressed `streamOptimized`, ESXi COWD/VMFSSPARSE/SESparse, delta `parentCID`; factory probe later |
 
 ## Delivered (system libarchive FFI)
 
