@@ -91,11 +91,11 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | `gs://` / `az://` | yes (fsspec) | GCS XML Range + JSON list (ADC/IMDS/anonymous) + GOOG1 HMAC; Azure Range + List Blobs (SAS/SharedKey/MSI) | `[x]` |
 | `ftp://` / `ftps://` | yes | REST/SIZE Range or full RETR; explicit AUTH TLS (`suppaftp` rustls); LIST/MLSD folders | `[x]` / `~` implicit FTPS :990 |
 | `ssh://` / `sftp://` | yes | yes + SFTP `readdir` directory mounts | `[x]` / `~` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include done; residual ProxyCommand / Match |
-| SMB / WebDAV / Dropbox | yes | WebDAV file GET + **Depth-1 collections**; SMB `smbclient`; Dropbox folder (list TTL) + ranged content download | `[x]` / `~` inbound SMB still CLI |
+| SMB / WebDAV / Dropbox | yes | WebDAV file GET + **Depth-1 collections**; `smb://` live Range + F-1 folders (`smbclient` file fallback); Dropbox folder (list TTL) + ranged content download | `[x]` / `~` SMB 3.x / Kerberos / `smbclient` listing |
 | `oci://` / `docker://` | no | manifest + Bearer blob Range + overlayfs layer union | `[x]` Rust-only / eStargz residual |
 | `ipfs://` / `ipns://` | yes | gateway Range + UnixFS `IPFS_API` list (no embedded node) | `[x]` |
 | `rclone://remote:path` | yes (fsspec rclone) | argv `cat --offset` + `lsjson` folders; `rclone+remote:path` | `[x]` / `~` RC `--rc-serve` residual |
-| HTTP/S3/SSH/WebDAV **directory** mounts | yes (fsspec) | F-1 `RemoteFolderMountSource` (autoindex / ListObjects / `readdir` / PROPFIND / FTP LIST) | `[x]` |
+| HTTP/S3/SSH/WebDAV **directory** mounts | yes (fsspec) | F-1 `RemoteFolderMountSource` (autoindex / ListObjects / `readdir` / PROPFIND / FTP LIST / SMB QUERY_DIRECTORY) | `[x]` |
 | Remote/compressed **index** download | yes | http(s)/file:// + gzip/xz/zstd/bz2 index decompress | `[x]` |
 
 ### Index / CLI

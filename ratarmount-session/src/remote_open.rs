@@ -877,7 +877,7 @@ pub(super) fn open_remote_input(
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
     use ratarmount_remote::{
         open_azure_range, open_ftp_range, open_gcs_range, open_ipfs, open_rclone, open_s3_range,
-        resolve_access, RemoteAccess, RemoteHttp,
+        open_smb_range, resolve_access, RemoteAccess, RemoteHttp,
     };
 
     if let Some(ms) = try_open_remote_folder_url(input)? {
@@ -931,6 +931,17 @@ pub(super) fn open_remote_input(
             "FTP Range",
             open_ftp_range(input),
             || open_ftp_range(input),
+        );
+    }
+    if input.starts_with("smb://") {
+        return open_s3_like(
+            input,
+            opts,
+            recreate,
+            remotes,
+            "SMB Range",
+            open_smb_range(input),
+            || open_smb_range(input),
         );
     }
     if input.starts_with("ipfs://") || input.starts_with("ipns://") {
@@ -1075,6 +1086,7 @@ impl_live_range!(ratarmount_remote::S3RangeFile);
 impl_live_range!(ratarmount_remote::GcsRangeFile);
 impl_live_range!(ratarmount_remote::AzureRangeFile);
 impl_live_range!(ratarmount_remote::FtpRangeFile);
+impl_live_range!(ratarmount_remote::SmbRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
 
 fn is_oci_scheme(input: &str) -> bool {
@@ -1134,7 +1146,7 @@ fn open_oci_image(
 }
 
 /// F-1 (`s3` / `ssh` / `webdav` / `http`) plus later-scheme folder openers
-/// (`gs` / `az` / `rclone` / `ipfs` / `ftp` / `ftps`).
+/// (`gs` / `az` / `rclone` / `ipfs` / `ftp` / `ftps` / `smb`).
 ///
 /// Returns `Ok(None)` for other schemes and for file URLs of those schemes.
 fn try_open_remote_folder_url(input: &str) -> Result<Option<Arc<dyn MountSource>>, String> {
@@ -1148,6 +1160,7 @@ fn try_open_remote_folder_url(input: &str) -> Result<Option<Arc<dyn MountSource>
         "rclone" => ratarmount_remote::open_rclone_folder(input).map_err(|e| e.to_string()),
         "ipfs" | "ipns" => ratarmount_remote::open_ipfs_folder(input).map_err(|e| e.to_string()),
         "ftp" | "ftps" => ratarmount_remote::open_ftp_folder(input).map_err(|e| e.to_string()),
+        "smb" => ratarmount_remote::open_smb_folder(input).map_err(|e| e.to_string()),
         _ => Ok(None),
     }
 }
@@ -1201,7 +1214,6 @@ mod tests {
     fn try_open_remote_folder_url_ignores_non_folder_schemes() {
         for input in [
             "dropbox:///vault",
-            "smb://host/share/a.tar",
             "/local/path",
             "file:///tmp/x",
             "docker://ubuntu:24.04",
@@ -1224,6 +1236,56 @@ mod tests {
                 "{input} must hit the FTP folder arm (error), not Ok(None)"
             );
         }
+    }
+
+    /// Regression: `smb://` directory URLs dispatch to `open_smb_folder`
+    /// (file URLs still return `Ok(None)` from that opener; live QUERY_DIRECTORY is crate-tested).
+    #[test]
+    fn try_open_remote_folder_url_dispatches_smb_scheme() {
+        assert!(
+            try_open_remote_folder_url("smb://").is_err(),
+            "smb:// must hit the SMB folder arm (error), not Ok(None)"
+        );
+    }
+
+    /// Regression: `smb://` file URLs take the `open_s3_like` / `open_smb_range` arm.
+    /// Without a server the open errors (dispatch, not ignore-as-local).
+    #[test]
+    fn remote_smb_range_dispatches_scheme() {
+        let opts = OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        let mut remotes = Vec::new();
+        // Incomplete URL: `open_smb_range` parse-errors (no live server).
+        // `open_s3_like` is the same arm `open_remote_input` uses for `smb://`.
+        let err = match open_s3_like(
+            "smb://",
+            &opts,
+            false,
+            &mut remotes,
+            "SMB Range",
+            ratarmount_remote::open_smb_range("smb://"),
+            || ratarmount_remote::open_smb_range("smb://"),
+        ) {
+            Err(e) => e,
+            Ok(_) => panic!("smb:// without a server must not succeed as live Range"),
+        };
+        let l = err.to_ascii_lowercase();
+        assert!(
+            l.contains("smb") || l.contains("host") || l.contains("url") || l.contains("share"),
+            "expected SMB Range dispatch error, got: {err}"
+        );
+        let err = match open_remote_input("smb://", &opts, false, &mut remotes) {
+            Err(e) => e,
+            Ok(_) => panic!("smb:// without a server must not succeed"),
+        };
+        let l = err.to_ascii_lowercase();
+        assert!(
+            l.contains("smb") || l.contains("host") || l.contains("url") || l.contains("share"),
+            "smb:// must hit SMB folder/Range dispatch, got: {err}"
+        );
     }
 
     /// Regression: docker://ubuntu:24.04 is not a local path.

@@ -2,11 +2,11 @@
 
 How **recursive automount** (`-r` / `-l`) opens archives *inside* other archives, when **`/tmp` is used**, and which stacks support **true random member reads** without spooling the nested body to disk.
 
-This is the user-facing guide. Implementation / remaining work lives in [`tasks/embedded-nested-random-access.md`](tasks/embedded-nested-random-access.md).
+This is the user-facing guide. Implementation / remaining work lives in [`tasks/embedded-nested-random-access.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/embedded-nested-random-access.md).
 
 > **Maintainers / agents:** This document is the **canonical format × nested × temp matrix**.  
 > Update it in the **same change** as any nested open, materialize, or temp-spool behavior.  
-> See root [`AGENTS.md`](../AGENTS.md) and skill [`.grok/skills/format-support-matrices/SKILL.md`](../.grok/skills/format-support-matrices/SKILL.md).
+> See root [`AGENTS.md`](https://github.com/hilather/ratarmount-rs/blob/main/AGENTS.md) and skill [`.grok/skills/format-support-matrices/SKILL.md`](https://github.com/hilather/ratarmount-rs/blob/main/.grok/skills/format-support-matrices/SKILL.md).
 
 ---
 
@@ -222,6 +222,7 @@ Temp files are held for the life of that nested mount and removed when the neste
 | **Plain single-file** `.gz` / `.bz2` / `.zst` / `.xz` / lz4 / … | **No** — seekable body + `SingleFileMountSource::from_seekable_body` (or `open_from_reader` if payload is an archive) |
 | Residual: classic SquashFS lzma / some EXT4 / RAR / CAB LZX | May materialize or keep a path |
 | lrzip | CLI or libarchive materialize when needed |
+| `smb://` live Range (`open_smb_range` / `SmbRangeFile`) | **No** for TAR/ZIP/gzip/bzip2/xz/zstd via `open_from_live_range` (same as HTTP/S3). Dialect residual / unsupported format **materializes** (`smbclient` tempfile) |
 | Remote URL outside live Range codecs | Download / materialize |
 | Write overlay `:temp:` | Explicit temp overlay root (user-requested) |
 | Codec internal `DecodedBody` spill | Bodies larger than ~256 MiB may use an internal temp under the codec (not nested AutoMount spool) |
