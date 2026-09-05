@@ -2801,6 +2801,7 @@ dependencies = [
  "ratarmount-session",
  "ratarmount-sftp",
  "ratarmount-smb",
+ "rusqlite",
  "tempfile",
  "url",
 ]

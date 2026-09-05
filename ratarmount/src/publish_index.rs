@@ -1,7 +1,8 @@
 //! Copy a portable 0.7.x SQLite sidecar (`--publish-index` / `--publish-index-to`).
 //!
-//! Local copy + atomic replace. No S3 PUT in v1 (`aws s3 cp`). OCI referrer PUT
-//! is residual (discovery is referrer GET on local miss).
+//! Local copy + atomic replace. `s3://` archives PUT the sqlite blob then
+//! `{url}.index.ptr` (GCS/Azure PUT residual). OCI referrer PUT is residual
+//! (discovery is referrer GET on local miss).
 
 use std::fs;
 use std::io::{self, Write};
@@ -19,13 +20,17 @@ pub struct PublishIndexOpts<'a> {
     pub no_recreate_index: bool,
 }
 
-/// Copy `sidecar` to `dest` (or `{archive}.index.sqlite`).
+/// Copy `sidecar` to `dest` (or `{archive}.index.sqlite`). `s3://` also PUTs.
 pub fn publish_index(opts: PublishIndexOpts<'_>) -> Result<PathBuf, String> {
     if !opts.sidecar.is_file() {
         return Err(format!(
             "no on-disk index to publish ({})",
             opts.sidecar.display()
         ));
+    }
+    let archive_s = opts.archive.to_string_lossy();
+    if archive_s.starts_with("s3://") {
+        return publish_index_s3(opts, archive_s.as_ref());
     }
     let dest = match opts.dest {
         Some(p) => p.to_path_buf(),
@@ -62,6 +67,49 @@ pub fn publish_index(opts: PublishIndexOpts<'_>) -> Result<PathBuf, String> {
         );
     }
     Ok(dest)
+}
+
+fn publish_index_s3(opts: PublishIndexOpts<'_>, archive_url: &str) -> Result<PathBuf, String> {
+    let dest = opts.dest.map(|p| p.to_path_buf());
+    if let Some(ref dest) = dest {
+        if opts.no_recreate_index && dest.exists() {
+            return Err(format!(
+                "--no-recreate-index: refusing to overwrite {}",
+                dest.display()
+            ));
+        }
+        if dest != opts.sidecar {
+            atomic_copy(opts.sidecar, dest)
+                .map_err(|e| format!("publish-index {}: {e}", dest.display()))?;
+        }
+    }
+    let blob = dest.as_deref().unwrap_or(opts.sidecar);
+    // WAL rows must land in the main file before PutObject.
+    {
+        let conn = rusqlite::Connection::open(blob).map_err(|e| e.to_string())?;
+        conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(|e| e.to_string())?;
+    }
+    let ptr = ratarmount_index::IndexPointer::for_blob(blob, None)
+        .map_err(|e| format!("publish-index pointer: {e}"))?;
+    let json = format!(
+        "{{\n  \"schema\": \"{}\",\n  \"index_id\": \"{}\",\n  \"etag_sha256\": \"{}\",\n  \"generated_at\": \"{}\"\n}}\n",
+        ptr.schema, ptr.index_id, ptr.etag_sha256, ptr.generated_at
+    );
+    ratarmount_remote::publish_index_to_s3(
+        archive_url,
+        blob,
+        &ratarmount_remote::S3IndexPointer {
+            index_id: ptr.index_id,
+            json: json.into_bytes(),
+        },
+    )
+    .map_err(|e| format!("publish-index {archive_url}: {e}"))?;
+    let published = dest.unwrap_or_else(|| opts.sidecar.to_path_buf());
+    let bytes = fs::metadata(&published).map(|m| m.len()).unwrap_or(0);
+    log::info!("published index {archive_url} ({bytes} bytes, {INDEX_MEDIA_TYPE})");
+    eprintln!("published index {archive_url} ({bytes} bytes, {INDEX_MEDIA_TYPE})");
+    Ok(published)
 }
 
 fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {

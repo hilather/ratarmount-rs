@@ -154,7 +154,7 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 
 **Still open:**
 
-- [ ] Later: F-7 write-through uses the same live queue (executor uploads, coordinator publishes pointer from V-2). Do not put Offline `commit_overlay()` on this executor.
+- [x] F-7 write-through uses the same live queue (`set_after_persist` patch+PUT, then `open_live_remote`). Coordinator publishes pointer from V-2 after the archive PUT. Offline `commit_overlay()` is **not** a queue job (`s3://` exits 2). Residual: GCS/Azure PUT.
 
 **Why it pays:** The residual that hurts operators is concurrent commit vs open readers, not missing Durable Objects. Coordinator + one executor is the portable part. Do not add Queues/DOs.
 

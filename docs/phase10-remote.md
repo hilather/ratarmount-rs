@@ -10,7 +10,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 |--------|----------|
 | `file://` | Map to local path |
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite`, then `Link: rel="describedby"` on archive HEAD, then well-known `{url}.index.sqlite` (+ `.gz`/`.zst`/`.xz`/`.bz2`). Pointer/blob/tarstats failure continues |
-| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. **PUT primitive** (`put_s3_file` / multipart, abort on error; `publish_index_to_s3` blob-then-pointer). Anonymous is GET-only. Live overlay commit-to-remote is still F-7 |
+| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. **PUT** (`put_s3_file` / multipart, abort on error; `publish_index_to_s3` blob-then-pointer). Anonymous is GET-only. Live overlay commit (`-w` + `--commit-overlay-interval` / `--on-exit`) for TAR/ZST: write probe, persistent spool, multipart PUT, then blob+pointer; reopen is live Range. Offline `--commit-overlay` + `s3://` exits 2 |
 | `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Same sibling pointer/blob/well-known GET as S3 |
 | `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://`. Same sibling pointer/blob/well-known GET as S3 |
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
@@ -29,7 +29,7 @@ Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_g
 
 ### Portable index discovery (G-2)
 
-Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 **PUT** of the immutable blob then the pointer is the library primitive [`publish_index_to_s3`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/index_sibling.rs) (never pointer-first; pointer PUT failure after blob PUT does not claim success — leftover blob is not deleted). CLI `--publish-index` is still local-only (“No S3 PUT in v1”) until F-7 write-through. GCS/Azure PUT is residual. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
+Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 **PUT** of the immutable blob then the pointer is [`publish_index_to_s3`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/index_sibling.rs) (never pointer-first; pointer PUT failure after blob PUT does not claim success — leftover blob is not deleted). CLI `--publish-index` PUTs that blob-then-pointer for `s3://` archives. GCS/Azure PUT is residual. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
 
 Whole sidecar GETs ≤ 64 MiB are stored in `$XDG_CACHE_HOME/ratarmount/meta-v3/` (V-3; cap `RATARMOUNT_META_CACHE_BYTES`, default 256 MiB, `=0` disables). Lookup is URL-first so a remount without `.ptr` still hits. Not archive `HttpRangeFile` paging and not G-3 member bodies. `file://` / `:memory:` / a nonempty local folder candidate skip the download. HPC home-quota: set `XDG_CACHE_HOME` to scratch.
 
@@ -70,16 +70,18 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
 
 | Env | Purpose |
 |-----|---------|
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Required |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Required for PUT / live overlay commit (anonymous is GET-only) |
 | `AWS_SESSION_TOKEN` | Optional STS |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Default `us-east-1` |
 | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
+| `RATARMOUNT_S3_ANONYMOUS` / `AWS_ANONYMOUS` | Unsigned GET; live overlay commit exits 2 |
+| `RATARMOUNT_COMMIT_SPOOL_DIR` | Persistent F-7 live-commit mirror (default `$TMPDIR`) |
 
 `s3://bucket/prefix/` (trailing slash **or** no object at key + ListObjectsV2 children) mounts as a directory. `list_dirents` returns common prefixes as dirs and objects as files with sizes. Opening a `.tar` child uses `S3RangeFile` (no full-bucket download). Continuation tokens loop until empty; more than 100 000 keys is an error (not a silent truncate). Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30).
 
 ### S3 PUT (F-7 primitive)
 
-Library-only. Live overlay `s3://… -w --commit-overlay-interval` is still F-7 write-through (not wired). CLI `--publish-index` help stays “No S3 PUT in v1” until that PR.
+Live overlay `s3://… -w --commit-overlay-interval` / `--commit-overlay-on-exit` (uncompressed TAR or `.tar.zst`) GETs a persistent spool under `$RATARMOUNT_COMMIT_SPOOL_DIR` or `$TMPDIR/ratarmount-f7-{pid}/`, splices locally, multipart-PUTs the spool, then PUTs the patched sqlite blob and `{url}.index.ptr`. Startup write probe is `CreateMultipartUpload` + `AbortMultipartUpload` (fail-closed on 403/404; no leftover object). `RATARMOUNT_S3_ANONYMOUS=1` / missing keys exit 2. Reopen is live Range (`open_live_remote`). Offline `--commit-overlay` + `s3://` exits 2. CLI `--publish-index` PUTs blob-then-pointer for `s3://`.
 
 | API | Behavior |
 |-----|----------|
@@ -208,7 +210,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
 - rclone RC `--rc-serve` HTTP GET (`rclone+remote:path` **is** shipped)
 - OCI eStargz / SOCI / nydus / config JSON
-- Write-through / commit-to-remote live overlay (F-7). S3 **PUT primitive** (`put_s3_file` / `publish_index_to_s3`) is in; GCS/Azure PUT residual; CLI `--publish-index` still local-only
+- GCS/Azure PUT; offline `--commit-overlay` + `s3://`; create-if-missing on remote URLs (F-7 live `s3://` TAR/ZST interval/on-exit **is** shipped)
 
 ## Usage
 
