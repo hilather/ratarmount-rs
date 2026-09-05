@@ -792,6 +792,36 @@ impl MountSource for UnionMountSource {
         }
         true
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        if let Some(si) = self.source_from_info(file_info) {
+            if let Some(src) = self.sources.get(si) {
+                let mut fi = file_info.clone();
+                if let Some(UserData::Other(s)) = fi.userdata.last() {
+                    if s.starts_with("union:") {
+                        fi.userdata.pop();
+                    }
+                }
+                return src.list_xattr(&fi);
+            }
+        }
+        Vec::new()
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        if let Some(si) = self.source_from_info(file_info) {
+            if let Some(src) = self.sources.get(si) {
+                let mut fi = file_info.clone();
+                if let Some(UserData::Other(s)) = fi.userdata.last() {
+                    if s.starts_with("union:") {
+                        fi.userdata.pop();
+                    }
+                }
+                return src.get_xattr(&fi, key);
+            }
+        }
+        None
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {
