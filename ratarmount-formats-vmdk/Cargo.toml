@@ -12,7 +12,6 @@ ratarmount-formats-block.workspace = true
 ratarmount-formats-fat.workspace = true
 ratarmount-formats-ext4.workspace = true
 thiserror.workspace = true
-log.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

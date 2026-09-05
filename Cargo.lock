@@ -3186,6 +3186,7 @@ name = "ratarmount-formats-vhd"
  "fatfs",
  "log",
 name = "ratarmount-formats-vmdk"
+ "ratarmount-core",
  "ratarmount-formats-block",
  "ratarmount-formats-ext4",
  "ratarmount-formats-fat",
