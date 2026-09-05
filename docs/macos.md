@@ -1,7 +1,7 @@
 # macOS support
 
-**Status:** **first-class on Apple Silicon** (signed `macos-arm64` tarball on GitHub Release tags). Intel package **deferred** (no GHA Intel runner). Homebrew formula later (E1).  
-**Task list:** [docs/tasks/macos-support.md](tasks/macos-support.md)
+**Status:** **first-class on Apple Silicon** (signed `macos-arm64` tarball on GitHub Release tags; [Homebrew tap cask](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb)). Intel package **deferred** (no GHA Intel runner). Homebrew-core / WinFsp residual (F-5 `partial`).  
+**Task list:** [docs/tasks/macos-support.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/macos-support.md)
 
 ratarmount needs a **FUSE runtime** on macOS (there is no built-in `/dev/fuse` like Linux).  
 Install **one** of the backends below, then install or build `ratarmount`.
@@ -157,6 +157,36 @@ export PKG_CONFIG_PATH="$(brew --prefix libarchive)/lib/pkgconfig:${PKG_CONFIG_P
 
 ## 3. Install a release binary
 
+### Homebrew tap cask (Apple Silicon, recommended)
+
+v1 is a **cask** that unpacks the signed GitHub Release `macos-arm64` tarball. It is **not** a source formula (no `cargo` / `PKG_CONFIG_PATH`). Homebrew-core is out of v1.
+
+Cask: [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) (tap root is [`packaging/homebrew/`](https://github.com/hilather/ratarmount-rs/tree/main/packaging/homebrew)).
+
+```bash
+# From a clone of this repo (cwd = repo root). Homebrew forbids path/URL casks,
+# and packaging/homebrew/ is not a git repository (so `brew tap … that path` fails).
+# Fully-qualified: homebrew/core has a Linux Python formula also named ratarmount.
+# or: ./packaging/homebrew/install.sh
+brew tap-new hilather/ratarmount
+mkdir -p "$(brew --repo hilather/ratarmount)/Casks"
+cp packaging/homebrew/Casks/ratarmount.rb "$(brew --repo hilather/ratarmount)/Casks/"
+brew install --cask hilather/ratarmount/ratarmount
+```
+
+No-clone path: extract the signed GitHub Release `macos-arm64` tarball (section “Manual tarball”). A published `hilather/homebrew-ratarmount` GitHub repo (Casks/ at the tap root) is the longer-term remote tap; Homebrew-core is out of v1.
+
+Cask **caveats** (not formula build deps) remind you to install **macFUSE or FUSE-T** and runtime **libarchive**. Then:
+
+```bash
+ratarmount archive.tar.gz mnt/
+ratarmount -u mnt/
+```
+
+Regression: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh) (static checks always; `brew audit --cask` via a temporary local tap when `brew` exists).
+
+### Manual tarball
+
 From a GitHub Release asset (after CI packages land):
 
 ```bash
@@ -236,7 +266,8 @@ ratarmount -u mnt
 ## 7. CI / releases
 
 - **PR CI:** `macos-14` — clippy + `cargo test --workspace` (`.github/workflows/ci.yml`)  
-- **Tags:** `packages.yml` builds `ratarmount-<ver>-macos-arm64.tar.gz` (+ x86_64), cosign-signs, attaches to the GitHub Release  
+- **Tags:** `packages.yml` builds `ratarmount-<ver>-macos-arm64.tar.gz` (Intel deferred), cosign-signs, attaches to the GitHub Release
+- **Homebrew:** tap cask [`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb) pins that tarball + sha256; bump version/sha256 when cutting a release. Homebrew-core is out of v1.  
 
 ---
 
@@ -251,4 +282,4 @@ ratarmount -u mnt
 | Stuck mount | `diskutil unmount force mnt`; kill leftover `ratarmount` |
 | Finder empty / wrong name | `-o volname=Name`; FUSE-T may show a network-style volume |
 
-More design notes: [docs/tasks/macos-support.md](tasks/macos-support.md).
+More design notes: [docs/tasks/macos-support.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/macos-support.md).

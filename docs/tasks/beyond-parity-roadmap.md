@@ -116,7 +116,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-2 | **Incremental reindex** after `.tar.zst` splice / append-only TAR | `done` | L | index + formats-tar + compositing |
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
-| F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `todo` | L | fuse + packaging |
+| F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `todo` | L | new `formats-*` crates |
@@ -159,11 +159,11 @@ Upstream Python wishlist is locate/Tracker for disconnected media. Do not invent
 
 **Residual:** same as P-1 (eStargz/SOCI/nydus, config JSON, referrer).
 
-### F-5 — Windows (WinFsp) + Homebrew + macOS Intel
+### F-5 — Windows (WinFsp) + Homebrew + macOS Intel — `partial`
 
-One static binary is the Rust story. Without WinFsp/WinGet, NFS-on-Windows residuals stay theoretical. Homebrew is how macOS people install this. Intel macOS is smaller (no GHA Intel runner today) but the first-class Apple Silicon claim currently has a hole.
+Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release tarball ([`packaging/homebrew/Casks/ratarmount.rb`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/homebrew/Casks/ratarmount.rb)) with caveats for macFUSE/FUSE-T and runtime `libarchive`. Not a source formula; no `PKG_CONFIG_PATH`; Homebrew-core is out of v1. Audit: [`packaging/test-homebrew-cask.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-homebrew-cask.sh).
 
-Split if needed: Homebrew formula first (S), WinFsp (L), Intel tarball when a runner exists.
+**Residual:** WinFsp product FUSE; Intel tarball (no GHA Intel runner — do not re-add `macos-13`); Homebrew-core merge. `done` only if WinFsp + Intel also ship.
 
 ### F-6 — Pure-Rust SMB client
 
