@@ -78,6 +78,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | G3 hard GZIDX import / export polish (G3-D/E) | `cargo test -p ratarmount-compress --lib gzip_seek` (filters: `g3_d_`, `g3_e_`) |
 | Warm index after archive replace (tarstats size/mtime/content) | `cargo test -p ratarmount-session --lib warm_index_rebuilds` · `cargo test -p ratarmount-index --lib check_tarstats` · `cargo test -p ratarmount-formats-tar --lib warm_index` · `cargo test -p ratarmount-formats-zip --lib warm_index` · `cargo test -p ratarmount-formats-sevenzip --lib warm_index` |
 | Nested EXT4 / SquashFS no-tmp factory wire | `cargo test -p ratarmount-session --lib nested_ext4` · `cargo test -p ratarmount-session --lib nested_squashfs` · crate `open_from_reader` tests |
+| FAT partition offset (superfloppy 0 / padded image) | `cargo test -p ratarmount-formats-fat --lib offset` |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |
