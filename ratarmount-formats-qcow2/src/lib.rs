@@ -199,6 +199,25 @@ mod tests {
     const CLUSTER_BITS: u32 = 12;
     const QCOW_OFLAG_COPIED: u64 = 1 << 63;
     const QCOW_OFLAG_COMPRESSED: u64 = 1 << 62;
+    const QCOW_OFLAG_ZERO: u64 = 1;
+
+    /// Nested/HTTP-style reader: each `read` yields at most one byte.
+    struct OneByteReader<R> {
+        inner: R,
+    }
+    impl<R: Read> Read for OneByteReader<R> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if buf.is_empty() {
+                return Ok(0);
+            }
+            self.inner.read(&mut buf[..1])
+        }
+    }
+    impl<R: Seek> Seek for OneByteReader<R> {
+        fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+            self.inner.seek(pos)
+        }
+    }
 
     fn fat_volume(name: &str, payload: &[u8]) -> Vec<u8> {
         let mut storage = vec![0u8; FAT_BYTES];
@@ -317,6 +336,85 @@ mod tests {
         }
         for (off, blob) in host_blobs {
             img[off as usize..off as usize + blob.len()].copy_from_slice(&blob);
+        }
+        img
+    }
+
+    fn stamp_v3(img: &mut [u8]) {
+        img[4..8].copy_from_slice(&3u32.to_be_bytes());
+        img[100..104].copy_from_slice(&104u32.to_be_bytes());
+    }
+
+    /// QCOW2 v3 with `header_length` 104 wrapping the same guest as v2.
+    fn build_qcow2_v3(guest: &[u8]) -> Vec<u8> {
+        let mut img = build_qcow2(guest, None, false);
+        stamp_v3(&mut img);
+        img
+    }
+
+    /// One zlib cluster at an unaligned host offset; file ends at the last
+    /// occupied 512-byte sector (QEMU `qcow2_alloc_bytes` layout).
+    fn build_qcow2_unaligned_zlib(guest: &[u8]) -> Vec<u8> {
+        let cs = 1usize << CLUSTER_BITS;
+        assert_eq!(guest.len(), cs, "one guest cluster");
+        let l1_off = cs as u64;
+        let l2_off = 2 * cs as u64;
+        let host_offset = 3 * cs as u64 + 100; // 100 bytes into a sector
+        assert_ne!(host_offset & 511, 0);
+
+        let mut enc = DeflateEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(guest).expect("deflate");
+        let packed = enc.finish().expect("deflate finish");
+        let last_byte = host_offset + packed.len() as u64 - 1;
+        let last_sector_end = (last_byte & !511) + 512;
+        let additional = (last_sector_end - (host_offset & !511)) / 512 - 1;
+        let x = 62 - (CLUSTER_BITS - 8);
+        let l2_entry = host_offset | (additional << x) | QCOW_OFLAG_COMPRESSED | QCOW_OFLAG_COPIED;
+
+        let mut img = vec![0u8; last_sector_end as usize];
+        img[0..4].copy_from_slice(MAGIC);
+        img[4..8].copy_from_slice(&2u32.to_be_bytes());
+        img[20..24].copy_from_slice(&CLUSTER_BITS.to_be_bytes());
+        img[24..32].copy_from_slice(&(guest.len() as u64).to_be_bytes());
+        img[36..40].copy_from_slice(&1u32.to_be_bytes());
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        img[l1_off as usize..l1_off as usize + 8]
+            .copy_from_slice(&(l2_off | QCOW_OFLAG_COPIED).to_be_bytes());
+        img[l2_off as usize..l2_off as usize + 8].copy_from_slice(&l2_entry.to_be_bytes());
+        img[host_offset as usize..host_offset as usize + packed.len()].copy_from_slice(&packed);
+        img
+    }
+
+    /// Overlay whose L2 entries are explicit `QCOW_OFLAG_ZERO` (must not read backing).
+    fn build_qcow2_zero_clusters(guest_size: usize, backing: Option<&str>) -> Vec<u8> {
+        let cs = 1usize << CLUSTER_BITS;
+        let n_clusters = guest_size.div_ceil(cs).max(1);
+        let l2_entries = cs / 8;
+        let n_l2 = n_clusters.div_ceil(l2_entries).max(1);
+        let l1_off = cs as u64;
+        let first_l2 = 2 * cs as u64;
+        let file_size = first_l2 + n_l2 as u64 * cs as u64;
+        let mut img = vec![0u8; file_size as usize];
+        img[0..4].copy_from_slice(MAGIC);
+        img[4..8].copy_from_slice(&2u32.to_be_bytes());
+        if let Some(name) = backing {
+            img[8..16].copy_from_slice(&72u64.to_be_bytes());
+            img[16..20].copy_from_slice(&(name.len() as u32).to_be_bytes());
+            img[72..72 + name.len()].copy_from_slice(name.as_bytes());
+        }
+        img[20..24].copy_from_slice(&CLUSTER_BITS.to_be_bytes());
+        img[24..32].copy_from_slice(&(guest_size as u64).to_be_bytes());
+        img[36..40].copy_from_slice(&(n_l2 as u32).to_be_bytes());
+        img[40..48].copy_from_slice(&l1_off.to_be_bytes());
+        for i in 0..n_clusters {
+            let l2i = i / l2_entries;
+            let l2j = i % l2_entries;
+            let l2_off = first_l2 + l2i as u64 * cs as u64;
+            img[l1_off as usize + l2i * 8..l1_off as usize + l2i * 8 + 8]
+                .copy_from_slice(&(l2_off | QCOW_OFLAG_COPIED).to_be_bytes());
+            let e = QCOW_OFLAG_ZERO | QCOW_OFLAG_COPIED;
+            let o = l2_off as usize + l2j * 8;
+            img[o..o + 8].copy_from_slice(&e.to_be_bytes());
         }
         img
     }
@@ -445,6 +543,36 @@ mod tests {
         assert_eq!(got.as_bytes(), payload);
     }
 
+    /// Regression: short `Read::read` is not EOF; fill-loop still lists `p1/`.
+    #[test]
+    fn open_from_reader_one_byte_reads() {
+        let payload = b"one-byte-qcow2";
+        let img = build_qcow2(&mbr_wrap(&fat_volume("hello.txt", payload), 8), None, false);
+        let r = OneByteReader {
+            inner: Cursor::new(img),
+        };
+        let m = Qcow2MountSource::open_from_reader(r, "onebyte.qcow2")
+            .expect("open_from_reader one-byte");
+        let fi = m.lookup("/p1/hello.txt", 0).expect("p1/hello.txt");
+        let mut got = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    /// Regression: always-on synthetic v3 (header_length 104) MBR+FAT lists `p1/`.
+    #[test]
+    fn qcow2_v3_mbr_fat_p1_listing_and_read() {
+        let payload = b"hello-qcow2-v3";
+        let img = build_qcow2_v3(&mbr_wrap(&fat_volume("hello.txt", payload), 8));
+        assert!(looks_like_qcow2_reader(&mut Cursor::new(&img)));
+        let m = Qcow2MountSource::open_from_reader(Cursor::new(img), "v3.qcow2").expect("open v3");
+        assert_eq!(m.header().version, 3);
+        let fi = m.lookup("/p1/hello.txt", 0).expect("p1/hello.txt");
+        let mut got = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
     /// Regression: zlib (raw deflate) compressed clusters round-trip.
     #[test]
     fn zlib_compressed_clusters_read() {
@@ -456,6 +584,47 @@ mod tests {
         let mut got = Vec::new();
         m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
         assert_eq!(got, payload);
+    }
+
+    /// Regression: unaligned zlib host offset; file ends at last occupied sector.
+    #[test]
+    fn zlib_compressed_unaligned_host_offset() {
+        let guest = vec![b'Q'; 1 << CLUSTER_BITS];
+        let img = build_qcow2_unaligned_zlib(&guest);
+        assert_eq!(img.len() % 512, 0, "file ends on a sector boundary");
+        let mut disk = Qcow2VirtualDisk::open_from_reader(
+            Cursor::new(img),
+            Path::new("unaligned.qcow2"),
+            None,
+        )
+        .expect("open unaligned zlib");
+        let mut got = vec![0u8; guest.len()];
+        disk.read_exact(&mut got).expect("read_guest unaligned");
+        assert_eq!(got, guest);
+    }
+
+    /// Regression: v3 zstd `compression_type` fails at open, not as "no filesystem".
+    #[test]
+    fn zstd_rejected_at_open() {
+        let mut hdr = vec![0u8; 112];
+        hdr[0..4].copy_from_slice(MAGIC);
+        hdr[4..8].copy_from_slice(&3u32.to_be_bytes());
+        hdr[20..24].copy_from_slice(&16u32.to_be_bytes());
+        hdr[24..32].copy_from_slice(&(1u64 << 20).to_be_bytes());
+        hdr[36..40].copy_from_slice(&1u32.to_be_bytes());
+        hdr[40..48].copy_from_slice(&65536u64.to_be_bytes());
+        hdr[72..80].copy_from_slice(&(1u64 << 3).to_be_bytes()); // INCOMPAT_COMPRESSION_TYPE
+        hdr[100..104].copy_from_slice(&108u32.to_be_bytes());
+        hdr[104..108].copy_from_slice(&1u32.to_be_bytes()); // zstd
+        let err =
+            Qcow2VirtualDisk::open_from_reader(Cursor::new(hdr), Path::new("zstd.qcow2"), None)
+                .err()
+                .expect("zstd must fail at open");
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("zstd"),
+            "unexpected: {msg}"
+        );
     }
 
     /// Regression: superfloppy FAT at guest offset 0 mounts at `/` (not `p1/`).
@@ -492,6 +661,50 @@ mod tests {
             buf[4096..].iter().all(|&b| b == 0),
             "bytes past backing must be zero, got {:x?}",
             &buf[4096..4112]
+        );
+    }
+
+    /// Regression: `QCOW_OFLAG_ZERO` must not fall through to backing bytes.
+    #[test]
+    fn zero_flag_cluster_ignores_backing() {
+        let base_guest = vec![0xAAu8; 4096];
+        let base_img = build_qcow2(&base_guest, None, false);
+        let overlay = build_qcow2_zero_clusters(4096, Some("base.qcow2"));
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("base.qcow2"), &base_img).unwrap();
+        let overlay_path = dir.path().join("overlay.qcow2");
+        std::fs::write(&overlay_path, &overlay).unwrap();
+
+        let mut disk = Qcow2VirtualDisk::open_path(&overlay_path).expect("open zero overlay");
+        let mut buf = vec![0xFFu8; 4096];
+        disk.read_exact(&mut buf).expect("read zero cluster");
+        assert!(
+            buf.iter().all(|&b| b == 0),
+            "ZERO cluster must be zeros, not backing 0xAA"
+        );
+    }
+
+    /// Regression: qcow v1 backing is residual (not raw guest bytes).
+    #[test]
+    fn qcow_v1_backing_is_residual() {
+        let mut v1 = vec![0u8; 512];
+        v1[0..4].copy_from_slice(MAGIC);
+        v1[4..8].copy_from_slice(&1u32.to_be_bytes());
+        let overlay = build_qcow2(&vec![0u8; 4096], Some("base.qcow2"), false);
+
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("base.qcow2"), &v1).unwrap();
+        let overlay_path = dir.path().join("overlay.qcow2");
+        std::fs::write(&overlay_path, &overlay).unwrap();
+
+        let err = Qcow2VirtualDisk::open_path(&overlay_path)
+            .err()
+            .expect("v1 backing must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("v1") || msg.contains("version 1"),
+            "unexpected: {msg}"
         );
     }
 
