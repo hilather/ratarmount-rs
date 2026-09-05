@@ -27,6 +27,7 @@
 | FAT12/16/32 | `ratarmount-formats-fat` | Pure Rust via `fatfs` crate (in-process cluster reads) |
 | GPT/MBR disk images | `ratarmount-formats-block` | Parse GPT + MBR; union of `p1/`… via FAT/EXT4 `open_*_with_offset`. Superfloppy offset 0 stays FAT/EXT4. **Residual:** LVM, RAID, Btrfs; factory probe is a later orchestrator PR |
 | UDIF DMG | `ratarmount-formats-dmg` | `koly` + `blkx`/`mish`; raw/ADC/zlib/bzip2 inner disk; FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR via public APIs. **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; factory probe is a later orchestrator PR |
+| WIM | `ratarmount-formats-wim` | First image; uncompressed + XPRESS. **Residual:** LZX/LZMS, WIMBoot, delta, later images; factory probe is a later orchestrator PR |
 
 ## Delivered (system libarchive FFI)
 
