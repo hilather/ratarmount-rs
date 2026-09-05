@@ -6,10 +6,10 @@ Announce only after cutover gates below are green and residual gaps are accepted
 
 Related:
 
-- Living parity matrix: [`docs/parity-todo.md`](parity-todo.md)
-- Gap batches / residual queue: [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
-- Upstream FRs (readahead done, parallel nested open): [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md)
-- Packaging install paths & release procedure: [`docs/packaging.md`](packaging.md)
+- Living parity matrix: [`docs/parity-todo.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md)
+- Gap batches / residual queue: [`docs/tasks/gap-implementation-batch.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/gap-implementation-batch.md)
+- Upstream FRs (readahead done, parallel nested open): [`docs/tasks/upstream-feature-requests.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/upstream-feature-requests.md)
+- Packaging install paths & release procedure: [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md)
 - crates.io policy (no publish required for dual-run; F-10 dry-run is not a dual-run gate): [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md)
 
 ---
@@ -161,7 +161,7 @@ Docs can prepare text and mark readiness; ops actions stay open.
 |---|------|-----------|--------|
 | 1 | Residual gaps table current in this doc (incl. FR-5 done, FR-6 compositing done) | **docs-ready** `[x]` | docs |
 | 2 | Comparison / gaps summary for release notes (paste stub below + parity-todo) | **docs-ready** `[x]` | docs |
-| 3 | Install paths documented (binary, portable, deb/rpm, optional AppImage) | **docs-ready** `[x]` | [`packaging.md`](packaging.md) |
+| 3 | Install paths documented (binary, portable, deb/rpm, optional AppImage) | **docs-ready** `[x]` | [`packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) |
 | 4 | crates.io not required for dual-run binary ship | **docs-ready** `[x]` | [`crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (F-10 L0 dry-run exists; still not a dual-run gate) |
 | 5 | Dual-run model + binary naming (`ratarmount` / `ratarmount-py`) | **docs-ready** `[x]` | this doc |
 | 6 | Release notes body stub (operator message) paste-ready | **docs-ready** `[x]` | this doc § below |
@@ -198,8 +198,8 @@ Ordered steps for humans. **Do not treat this section as completed work** — no
 
 Follow the full packaging procedure — do not invent a second process:
 
-- Root [`AGENTS.md`](../AGENTS.md) § **Releases / package builds**
-- [`docs/packaging.md`](packaging.md) § **Agent / maintainer release procedure**
+- Root [`AGENTS.md`](https://github.com/hilather/ratarmount-rs/blob/main/AGENTS.md) § **Releases / package builds**
+- [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) § **Agent / maintainer release procedure**
 - crates.io: **not required** for dual-run binary distribution — [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md)
 
 Minimum:
@@ -334,9 +334,9 @@ Policy: [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/b
 
 ### Links
 
-- Dual-run / cutover: docs/phase12-dual-run.md
-- Packaging: docs/packaging.md
-- Parity: docs/parity-todo.md
+- Dual-run / cutover: https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md
+- Packaging: https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md
+- Parity: https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md
 ```
 
 ### One-line chat / social

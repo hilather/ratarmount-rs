@@ -31,6 +31,9 @@ done <"$0"
 
 CORE_TOML="$ROOT/ratarmount-core/Cargo.toml"
 INDEX_TOML="$ROOT/ratarmount-index/Cargo.toml"
+# Origin / docs / crates.io metadata. Do not inherit mxmlnkn/ratarmount-rs (404).
+WANT_REPO='https://github.com/hilather/ratarmount-rs'
+WANT_MSRV='1.74'
 
 check_l0_manifest() {
     local name="$1"
@@ -59,6 +62,11 @@ check_l0_manifest() {
     else
         fail "$toml must inherit workspace repository (crates.io metadata)"
     fi
+    if grep -qE '^rust-version\.workspace = true' "$toml"; then
+        pass "$name rust-version.workspace"
+    else
+        fail "$toml must inherit workspace rust-version (MSRV $WANT_MSRV)"
+    fi
     if grep -qE '^description = "' "$toml"; then
         pass "$name description"
     else
@@ -78,6 +86,20 @@ if grep -qE '^version = "' "$ROOT/Cargo.toml"; then
     pass "workspace version is set"
 else
     fail "root Cargo.toml missing workspace version"
+fi
+
+if grep -qE "^repository = \"${WANT_REPO}\"" "$ROOT/Cargo.toml"; then
+    pass "workspace repository is ${WANT_REPO}"
+else
+    fail "root Cargo.toml repository must be ${WANT_REPO} (not mxmlnkn; that URL 404s)"
+fi
+if grep -qE 'mxmlnkn/ratarmount-rs' "$ROOT/Cargo.toml"; then
+    fail "root Cargo.toml must not set repository to mxmlnkn/ratarmount-rs"
+fi
+if grep -qE "^rust-version = \"${WANT_MSRV}\"" "$ROOT/Cargo.toml"; then
+    pass "workspace rust-version is ${WANT_MSRV}"
+else
+    fail "root Cargo.toml rust-version must be ${WANT_MSRV}"
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -115,6 +137,36 @@ if echo "$index_list" | grep -qx 'create-index-tables.sql'; then
     pass "index package list includes create-index-tables.sql"
 else
     fail "cargo package -p ratarmount-index --list missing create-index-tables.sql"
+fi
+
+# Normalized .crate must inherit hilather + MSRV (not the 404 mxmlnkn URL).
+# `cargo package --no-verify` writes the .crate but does not extract it;
+# read Cargo.toml from the tarball so we do not grep a stale extract dir.
+ws_ver="$(grep -m1 '^version = "' "$ROOT/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+core_crate="$ROOT/target/package/ratarmount-core-${ws_ver}.crate"
+rm -f "$core_crate"
+cargo package -p ratarmount-core --allow-dirty --no-verify
+if [[ ! -f "$core_crate" ]]; then
+    fail "missing $core_crate"
+else
+    core_norm="$(tar -xOf "$core_crate" "ratarmount-core-${ws_ver}/Cargo.toml")"
+    if echo "$core_norm" | grep -qE "^repository = \"${WANT_REPO}\""; then
+        pass "packaged core repository is ${WANT_REPO}"
+    else
+        echo "note: packaged core repository/rust-version:" >&2
+        echo "$core_norm" | grep -E '^(repository|rust-version) ' >&2 || true
+        fail "packaged core Cargo.toml repository must be ${WANT_REPO}"
+    fi
+    if echo "$core_norm" | grep -q 'mxmlnkn/ratarmount-rs'; then
+        fail "packaged core Cargo.toml must not use mxmlnkn/ratarmount-rs"
+    else
+        pass "packaged core repository is not mxmlnkn/ratarmount-rs"
+    fi
+    if echo "$core_norm" | grep -qE "^rust-version = \"${WANT_MSRV}\""; then
+        pass "packaged core rust-version is ${WANT_MSRV}"
+    else
+        fail "packaged core Cargo.toml must set rust-version = \"${WANT_MSRV}\""
+    fi
 fi
 
 set +e
