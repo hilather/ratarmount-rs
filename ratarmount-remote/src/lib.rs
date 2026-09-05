@@ -20,7 +20,8 @@
 //!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
 //!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
-//! - `smb://` → download via Samba `smbclient` CLI when present
+//! - `smb://` → live Range via [`open_smb_range`] / [`SmbRangeFile`] (SMB 2.0.2 codec);
+//!   dialect residual falls back to Samba `smbclient` CLI when present (session factory wire later)
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
@@ -105,7 +106,8 @@ pub use s3::{
     DEFAULT_S3_RANGE_THRESHOLD, S3_PUT_PART_SIZE, S3_PUT_PART_THRESHOLD,
 };
 pub use smb::{
-    fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
+    fetch_smb_to_temp, find_smbclient, open_smb_range, parse_smb_url, smbclient_download_args,
+    SmbLocation, SmbRangeFile,
 };
 pub use smb2_client::{Smb2Client, Smb2Open};
 pub use ssh::{
