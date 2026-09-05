@@ -24,11 +24,12 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
 | SquashFS | yes | yes (backhand in-process; xz via xz2; unsquashfs for classic lzma) | `[x]` / `~` classic lzma fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
-| GPT/MBR partitioned disks | guestfish | crate `ratarmount-formats-block`: `/p1/`… via FAT/EXT4 offset; LVM residual; factory later | `~` crate only |
-| Apple UDIF `.dmg` | no | crate `ratarmount-formats-dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual**; factory later | `~` crate only |
-| QCOW2 | guestfish / qemu-nbd | crate `ratarmount-formats-qcow2`: v2/v3 zlib + local backing then block `pN/`; zstd/HTTP residual; factory later | `~` crate only |
-| VHD / VHDX | guestfish | crate `ratarmount-formats-vhd`: fixed+dynamic VHD, VHDX fixed; wraps block `pN/`; differencing residual; factory later | `~` crate only |
-| VMDK | guestfish | crate `ratarmount-formats-vmdk`: KDMV sparse → Block/FAT/EXT4; compressed/ESXi residual; factory later | `~` crate only |
+| GPT/MBR partitioned disks | guestfish | factory `Block` after FAT/exFAT/NTFS; `/p1/`… via FAT/EXT4 offset; LVM residual | `[x]` / `~` LVM/RAID/Btrfs |
+| Apple UDIF `.dmg` | no | factory `Dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual** | `[x]` / `~` HFS+/APFS |
+| QCOW2 | guestfish / qemu-nbd | factory `Qcow2`: v2/v3 zlib + local backing then block `pN/`; zstd/HTTP residual | `[x]` / `~` zstd/HTTP |
+| VHD / VHDX | guestfish | factory `Vhd`: fixed+dynamic VHD, VHDX fixed; wraps block `pN/`; differencing residual | `[x]` / `~` differencing |
+| VMDK | guestfish | factory `Vmdk`: KDMV sparse → Block/FAT/EXT4; compressed/ESXi residual | `[x]` / `~` compressed/ESXi |
+| exFAT / NTFS / UDF | guestfish | factory `Exfat`/`Ntfs`/`Udf` (Udf immediately before Iso); NTFS LZNT1/EFS residual | `[x]` / `~` LZNT1/EFS, UDF metadata partition |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG, CMYK, Indexed, ICCBased); OGG; HTML | `[x]` / `~` Separation/Lab residual |
@@ -54,7 +55,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA)/EXT4(pure) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
+| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/UDF/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/exFAT/NTFS/SquashFS(non-LZMA)/EXT4(pure)/GPT·MBR/DMG/WIM/QCOW2/VHD/VMDK + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes (missing uncompressed `.tar` / `.tar.zst` created as an empty archive) | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; `.tar.zst` splice including earlier-frame delete; ZIP full rebuild). Create-if-missing for uncompressed `.tar` only. Live interval still rejects prefix-frame mutate. | `[x]` TAR compressions + ZIP MVP / residual live earlier-frame |
 | Live `--commit-overlay-on-exit` / `--interval` | no | uncompressed TAR + `.tar.zst` last-frame rewrite (does not recompress the prefix; persist still copies the compressed prefix; on-disk sidecar patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB). Same create-if-missing as `-w`. Interval is a per-file settle time (idle host mtime ≥ `DURATION` and no open write fd), not a dump of every overlay file. Gzip stays rejected. | `[x]` Rust-only / residual earlier-frame delete |

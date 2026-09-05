@@ -117,10 +117,17 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | `ratarmount-remote` codec + Range + `SmbListing`; session `remote_open` wired |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
+| F-7 | **Write-through / commit-to-remote** | `partial` | L | compositing + CLI live `s3://` TAR/ZST; GCS/Azure PUT residual |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + QCOW2 crates + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + VHD/VHDX crates; remaining image crates + factory |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + exFAT/NTFS + VMDK (KDMV sparse) crates; remaining image crates + factory |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | Factory wired (Udf before Iso; Fat/Exfat/Ntfs before Block; Qcow2/Vhd/Vmdk after Block). Residuals: HFS+/APFS, LZX/LZMS, LVM/RAID/Btrfs, compressed VMDK grains, QCOW2 zstd/HTTP, VHD differencing |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
 | F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | session landed; L0 dry-run only (Q5=a); PyO3 residual |
 
@@ -128,9 +135,9 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 
 Today HTTP/S3/WebDAV/SSH mostly fetched **one archive**. Python fsspec mounts whole trees. Shipped: S3 `ListObjectsV2` prefixes (continuation loop, 100k cap), HTTP nginx/apache autoindex, WebDAV Depth-1 `PROPFIND`, SSH `readdir` as `RemoteFolderMountSource`s that AutoMount nested archives. Cheap `list_dirents` carry real sizes. Listing TTL 30s (`RATARMOUNT_REMOTE_LIST_TTL_SECS`).
 
-`try_open_remote_folder` is those four backends only. GCS/Azure/rclone/IPFS/FTP folders export `open_*_folder` from their modules (wired in factory PR-12 / CLI folder arm). Dropbox stays on its own type.
+`try_open_remote_folder` is those four backends only. GCS/Azure/rclone/IPFS/FTP/SMB folders export `open_*_folder` from their modules (wired in session `remote_open`; factory PR-12 / CLI folder arm for the earlier schemes). Dropbox stays on its own type.
 
-WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.md`](../phase10-remote.md) for Depth-1 collections.
+WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md) for Depth-1 collections.
 
 **Residual:** SPA HTML indexes; WebDAV Depth-infinity listing; user-facing S3 pagination UI; forcing Dropbox onto the trait.
 
@@ -166,15 +173,22 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 **Residual:** WinFsp product FUSE; Intel tarball (no GHA Intel runner — do not re-add `macos-13`); Homebrew-core merge. `done` only if WinFsp + Intel also ship.
 
-### F-6 — Pure-Rust SMB client
+### F-6 — Pure-Rust SMB client — `partial`
 
 `smbclient` CLI is a packaging and Windows-host tax. A Range reader plus directory list makes SMB first-class like S3, not a temp-file download. Recursive share listings are F-1 on this backend.
 
+**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Session `open_remote_input` wires `smb://` through `open_s3_like` (Range) and `try_open_remote_folder_url` (folders). Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
+
+**Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
+**Residual:** factory `smb://` live Range + folder probe (PR 4). `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
+**Residual:** `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
+
 ### F-7 — Write-through / commit-to-remote
+### F-7 — Write-through / commit-to-remote — `partial`
 
-Overlay commit currently mutates a **local** tar/zip. `s3://bucket/a.tar.zst` + `-w` + interval commit should multipart-upload the spliced object (or a sidecar delta). Depends on F-2 unless we accept full-object PUT of the sibling tmp (works, expensive). Reuse the V-4 live commit queue (`enqueue_commit` IntervalIdle/OnExit); do not put offline `commit_overlay()` on that executor.
+`s3://bucket/a.tar.zst` (or uncompressed TAR) + durable `-w` + `--commit-overlay-interval` / `--commit-overlay-on-exit` multipart-uploads the spliced spool and then the patched sqlite blob + `{url}.index.ptr`. Reuses the V-4 live queue (`enqueue_commit` IntervalIdle/OnExit). Offline `--commit-overlay` + `s3://` exits 2 (not on that executor). Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` / missing keys exit 2 before mount. Write probe is `CreateMultipartUpload` + immediate `AbortMultipartUpload`. Reopen is live Range (`open_live_remote`), not `File::open(spool)`. CLI `--publish-index` PUTs blob-then-pointer for `s3://` archives.
 
-S3 **PUT primitive** is in `ratarmount-remote` (`put_s3_file`, multipart abort-on-error, `s3_create_and_abort_multipart_upload` write probe, `publish_index_to_s3` blob-then-pointer). Live overlay spool / `open_live_remote` / CLI `--publish-index` S3 path are still this item.
+**Residual:** GCS `gs://` / Azure `az://` PUT; offline `s3://` commit; create-if-missing on remote URLs (K16 Unchanged).
 
 ### F-8 — Block and disk-image family
 
@@ -184,6 +198,12 @@ Suggested order inside the family: exFAT, then NTFS (read-only), then UDF, then 
 
 **Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-dmg` parses UDIF `koly` + raw/ADC/zlib/bzip2 chunks and mounts inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR via those crates’ public APIs (nested `open_from_reader` is no-tmp). **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; LVM, RAID, Btrfs; UDF/WIM/QCOW2/VHD/VMDK crates; factory `FormatBackend::Dmg` / `Block` (orchestrator PR). Do not claim HFS+ via an existing path.
 **Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-wim` mounts the first image (uncompressed + XPRESS; nested `open_from_reader` is no-tmp). **Residual:** LVM, RAID, Btrfs; UDF/DMG/QCOW2/VHD/VMDK crates; WIM LZX/LZMS, WIMBoot, delta, later images; factory `FormatBackend::Block` / `Wim` (orchestrator PR).
+**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-qcow2` maps QCOW2 v2/v3 guest clusters (uncompressed + zlib) then wraps the block crate; local backing files only. **Residual:** LVM, RAID, Btrfs; QCOW2 zstd clusters and HTTP/NBD backing; UDF/DMG/WIM/VHD/VMDK crates; factory `FormatBackend::Block` / `Qcow2` (orchestrator PR).
+**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-vhd` wraps that block API for fixed/dynamic VHD and fixed VHDX (nested no-tmp; differencing/encrypted residual). **Residual:** LVM, RAID, Btrfs; UDF/DMG/WIM/QCOW2/VMDK crates; factory `FormatBackend::Block` / `Vhd` (orchestrator PR).
+**Landed:** `ratarmount-formats-block` parses GPT + MBR and mounts FAT/EXT4 partitions as `/p1/`… via `open_*_with_offset` (nested `open_from_reader` is no-tmp). Superfloppy FAT at offset 0 stays in the FAT crate. `ratarmount-formats-vmdk` wraps that block layer for hosted **KDMV sparse** (`monolithicSparse` / descriptor + sibling extent); nested `open_from_reader` is no-tmp. **Residual:** LVM, RAID, Btrfs; compressed `streamOptimized` / ESXi COWD·VMFSSPARSE·SESparse / delta `parentCID`; UDF/DMG/WIM/QCOW2/VHD crates; factory `FormatBackend::Block` / `Vmdk` (orchestrator PR).
+**Landed:** Session factory `FormatBackend` + `formats-all` (K7b): `Udf` immediately before `Iso`; `Exfat`/`Ntfs`/`Dmg`/`Wim`/`Block`/`Qcow2`/`Vhd`/`Vmdk` after `Fat`; nested `open_from_reader` in `open_nested_reader_fn` and `try_open_formats_from_seekable_body`. Crates: GPT/MBR `p1/`… (FAT/EXT4 offset), exFAT, NTFS, UDF, UDIF DMG (inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR), WIM (first image, uncompressed + XPRESS), QCOW2 v2/v3 zlib + local backing, VHD/VHDX (no parent), VMDK KDMV sparse.
+
+**Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; WIM LZX/LZMS, WIMBoot, delta, later images; LVM, RAID, Btrfs; QCOW2 zstd clusters and HTTP/NBD backing; VHD/VHDX differencing / encrypted / log replay; compressed VMDK `streamOptimized` / ESXi COWD·VMFSSPARSE·SESparse / delta `parentCID`; NTFS LZNT1/EFS; UDF 2.50 metadata partition. Do not claim HFS+ via an existing path.
 
 ### F-9 — Producer: make archives seekable — `done`
 
@@ -247,7 +267,7 @@ Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolve
 
 Publish: `--publish-index` copies the sidecar next to the archive; `--publish-index-to PATH` is a required value. Both always write `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256 of the blob, 64 hex), including dest==sidecar. Keep-last-K=2 local snapshots (`{archive}.index.{old_id}.sqlite`) when a pointer is written. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
 
-**Residual:** SOCI / eStargz / nydus zTOC converter; CLI `--publish-index` / live overlay S3 PUT (F-7; library primitive landed); GCS/Azure PUT; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
+**Residual:** SOCI / eStargz / nydus zTOC converter; GCS/Azure PUT; offline `s3://` `--commit-overlay`; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
 ### G-3 — Content-addressed member cache — `done`
 
@@ -283,7 +303,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. ~~**F-9** `--repack-seekable`~~ — done (engine + CLI; ZIP/7z/bzip2/xz residual).
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
-9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / CLI+live S3 PUT (F-7; `publish_index_to_s3` primitive landed) / GCS/Azure PUT / FUSE blob / Hub referrers.
+9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known; S3 PUT blob-then-pointer + live `s3://` overlay commit). Residual SOCI / GCS/Azure PUT / offline `s3://` commit / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.

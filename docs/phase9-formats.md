@@ -25,12 +25,15 @@
 | SquashFS | `ratarmount-formats-squashfs` | In-process via `backhand` (gzip/zstd/lz4/lzo/xz via workspace `xz2`/none); classic LZMA → `unsquashfs` (backhand `xz`/`liblzma` left off to avoid linking conflict) |
 | EXT2/3/4 | `ratarmount-formats-ext4` | Superblock magic `0xEF53`; `debugfs rdump` → FolderMountSource |
 | FAT12/16/32 | `ratarmount-formats-fat` | Pure Rust via `fatfs` crate (in-process cluster reads) |
-| GPT/MBR disk images | `ratarmount-formats-block` | Parse GPT + MBR; union of `p1/`… via FAT/EXT4 `open_*_with_offset`. Superfloppy offset 0 stays FAT/EXT4. **Residual:** LVM, RAID, Btrfs; factory probe is a later orchestrator PR |
-| UDIF DMG | `ratarmount-formats-dmg` | `koly` + `blkx`/`mish`; raw/ADC/zlib/bzip2 inner disk; FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR via public APIs. **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA; factory probe is a later orchestrator PR |
-| WIM | `ratarmount-formats-wim` | First image; uncompressed + XPRESS. **Residual:** LZX/LZMS, WIMBoot, delta, later images; factory probe is a later orchestrator PR |
-| QCOW2 v2/v3 | `ratarmount-formats-qcow2` | Guest-cluster map (uncompressed + zlib deflate) then `BlockMountSource::open_from_reader`. Local backing only. **Residual:** zstd clusters, HTTP/NBD backing; factory probe later |
-| VHD / VHDX | `ratarmount-formats-vhd` | Fixed + dynamic VHD; VHDX fixed/sparse (no parent). Wraps `BlockMountSource` (`p1/`…) or superfloppy FAT/EXT4 at `/`. **Residual:** differencing, encrypted VHDX; factory probe later |
-| VMDK | `ratarmount-formats-vmdk` | Hosted KDMV sparse (`monolithicSparse` / descriptor + sibling SPARSE). Wraps Block (or superfloppy FAT/EXT4). **Residual:** compressed `streamOptimized`, ESXi COWD/VMFSSPARSE/SESparse, delta `parentCID`; factory probe later |
+| GPT/MBR disk images | `ratarmount-formats-block` | Parse GPT + MBR; union of `p1/`… via FAT/EXT4 `open_*_with_offset`. Superfloppy offset 0 stays FAT/EXT4. Factory `Block` after Fat/Exfat/Ntfs. **Residual:** LVM, RAID, Btrfs |
+| exFAT | `ratarmount-formats-exfat` | OEM `"EXFAT   "`; nested `open_from_reader` no-tmp. Factory `Exfat` after Fat |
+| NTFS | `ratarmount-formats-ntfs` | OEM `"NTFS    "`; nested no-tmp. **Residual:** LZNT1, EFS |
+| UDF | `ratarmount-formats-udf` | NSR02/NSR03 VRS; factory `Udf` immediately before `Iso` so mixed discs stay UDF-primary |
+| UDIF DMG | `ratarmount-formats-dmg` | `koly` + `blkx`/`mish`; raw/ADC/zlib/bzip2 inner disk; FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR via public APIs. Factory `Dmg`. **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA |
+| WIM | `ratarmount-formats-wim` | First image; uncompressed + XPRESS. Factory `Wim`. **Residual:** LZX/LZMS, WIMBoot, delta, later images |
+| QCOW2 v2/v3 | `ratarmount-formats-qcow2` | Guest-cluster map (uncompressed + zlib deflate) then `BlockMountSource::open_from_reader`. Local backing only. Factory `Qcow2` after Block. **Residual:** zstd clusters, HTTP/NBD backing |
+| VHD / VHDX | `ratarmount-formats-vhd` | Fixed + dynamic VHD; VHDX fixed/sparse (no parent). Wraps `BlockMountSource` (`p1/`…) or superfloppy FAT/EXT4 at `/`. Factory `Vhd`. **Residual:** differencing, encrypted VHDX |
+| VMDK | `ratarmount-formats-vmdk` | Hosted KDMV sparse (`monolithicSparse` / descriptor + sibling SPARSE). Wraps Block (or superfloppy FAT/EXT4). Factory `Vmdk`. **Residual:** compressed `streamOptimized`, ESXi COWD/VMFSSPARSE/SESparse, delta `parentCID` |
 
 ## Delivered (system libarchive FFI)
 
@@ -38,9 +41,9 @@
 |--------|-------|--------|
 | RAR, LHA, CAB LZX/Quantum, … | `ratarmount-formats-libarchive` | Sequential re-scan; fallback for unsupported custom codecs |
 
-Detection order (uncompressed): 7z → ZIP → ASAR → AR → CPIO → ISO → WARC → XAR → CAB → OGG → PDF → HTML → SQLAR → SquashFS → EXT4 → FAT → libarchive → TAR → single file.  
+Detection order (uncompressed): 7z → ZIP → ASAR → AR → CPIO → **UDF → ISO** → WARC → XAR → CAB → SQLAR → SquashFS → EXT4 → FAT → **exFAT → NTFS → DMG → WIM → GPT/MBR → QCOW2 → VHD → VMDK** → OGG → PDF → HTML → libarchive → TAR → single file.  
 Git: bare/`.git` dirs (worktrees need `RATARMOUNT_FORCE_GIT=1`).  
-Compressed outer streams materialize (or SeekableBody for TAR), then re-detect ISO/WARC/XAR/CAB/EXT4/FAT/libarchive/TAR.
+Compressed outer streams use SeekableBody `open_from_reader` (or residual materialize), then the same UDF-before-ISO / FS-before-Block order.
 
 ## Still open
 

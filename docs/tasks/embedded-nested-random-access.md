@@ -33,11 +33,11 @@
 | N7 | CPIO / AR from_reader | Stencil | path only | **no-tmp** nested |
 | N8 | ISO / WARC / XAR / ASAR from_reader | Extent / record stencil | path only | **no-tmp** nested |
 | N9 | SquashFS / EXT4 / FAT from_reader | FS/block RA | **SquashFS+FAT+EXT4 no-tmp** (pure) | SquashFS non-LZMA; FAT; EXT4 pure; residual pure-fail/debugfs |
-| N10 | GPT/MBR disk image from_reader | Partition table + FAT/EXT4 offset | **crate no-tmp** (`BlockMountSource::open_from_reader` → `pN/`) | factory nested wire later; LVM/RAID/Btrfs residual |
-| N11 | UDIF DMG from_reader | `koly` + chunk map + inner FAT/ISO offset | **crate no-tmp** (`DmgMountSource::open_from_reader`) | factory nested wire later; HFS+/APFS/encrypted residual |
-| N11 | QCOW2 from_reader | Guest L1/L2 map + block/FAT/EXT4 | **crate no-tmp** (`Qcow2MountSource::open_from_reader`) | factory nested wire later; zstd clusters / HTTP backing residual |
-| N11 | VHD/VHDX from_reader | Footer/BAT guest map + Block/FAT/EXT4 | **crate no-tmp** (`VhdMountSource::open_from_reader`) | factory nested wire later; differencing / VHDX log replay residual |
-| N11 | VMDK KDMV sparse from_reader | Grain map + Block/FAT/EXT4 | **crate no-tmp** (`VmdkMountSource::open_from_reader`) | factory nested wire later; compressed/ESXi/delta residual |
+| N10 | GPT/MBR disk image from_reader | Partition table + FAT/EXT4 offset | **factory no-tmp** (`BlockMountSource::open_from_reader` → `pN/`) | LVM/RAID/Btrfs residual |
+| N11 | UDIF DMG from_reader | `koly` + chunk map + inner FAT/ISO offset | **factory no-tmp** (`DmgMountSource::open_from_reader`) | HFS+/APFS/encrypted residual |
+| N11 | QCOW2 from_reader | Guest L1/L2 map + block/FAT/EXT4 | **factory no-tmp** (`Qcow2MountSource::open_from_reader`) | zstd clusters / HTTP backing residual |
+| N11 | VHD/VHDX from_reader | Footer/BAT guest map + Block/FAT/EXT4 | **factory no-tmp** (`VhdMountSource::open_from_reader`) | differencing / VHDX log replay residual |
+| N11 | VMDK KDMV sparse from_reader | Grain map + Block/FAT/EXT4 | **factory no-tmp** (`VmdkMountSource::open_from_reader`) | compressed/ESXi/delta residual |
 | — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
 | — | 7z BCJ2 / multi-pack multi-GB solid progressive | full-folder residual | partial | deferred (AES+LZMA2 / native BCJ+LZMA2 progressive — [`sevenzip-random-access.md`](sevenzip-random-access.md)) |
 
