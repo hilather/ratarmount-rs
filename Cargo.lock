@@ -3082,6 +3082,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-wim"
+version = "0.1.30"
+dependencies = [
+ "ratarmount-core",
+ "sha1 0.10.7",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-xar"
 version = "0.1.30"
 dependencies = [

@@ -1,0 +1,15 @@
+[package]
+name = "ratarmount-formats-wim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Read-only WIM MountSource (uncompressed + XPRESS; first image)"
+readme = "README.md"
+
+[dependencies]
+ratarmount-core.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+sha1 = "0.10"
