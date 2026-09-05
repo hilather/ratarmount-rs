@@ -3182,6 +3182,12 @@ name = "ratarmount-formats-udf"
 version = "0.1.30"
 dependencies = [
  "ratarmount-core",
+name = "ratarmount-formats-vhd"
+ "fatfs",
+ "log",
+ "ratarmount-formats-block",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
  "tempfile",
  "thiserror",
 ]
