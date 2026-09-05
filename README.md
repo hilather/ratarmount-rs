@@ -336,6 +336,7 @@ Recursive mounts (`-r`) open nested members from a **seekable parent stream** wh
 | CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · UDIF DMG (crate; inner FAT/ISO) | **No** |
 | CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · WIM (crate; LZX/LZMS residual) | **No** |
 | CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · QCOW2 (crate) | **No** |
+| CPIO · AR · ISO · WARC · ASAR · XAR · CAB (store/MSZIP) · FAT · GPT/MBR (`pN/`, crate) · VHD/VHDX (crate) | **No** |
 | SquashFS (none/gzip/zstd/lz4/lzo/xz) · EXT4 (pure path) | **No** |
 | Unencrypted SQLAR · plain nested `.gz`/`.zst`/… | **No** |
 | CAB LZX · classic SquashFS LZMA · RAR nested | Often yes (fallback) |

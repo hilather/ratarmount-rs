@@ -150,6 +150,7 @@ These are recognized from the **member byte stream** by `open_nested_reader_fn` 
 | **UDIF DMG** | `koly` trailer @ EOF-512 | `DmgMountSource::open_from_reader` → inner FAT/ISO/exFAT/NTFS/EXT4/GPT-MBR | Shared seek body + last-chunk cache (no full-image copy). **Residual:** HFS+, APFS, encrypted DMG, LZFSE/LZMA. Factory wiring is a later orchestrator PR |
 | **WIM** | `MSWIM\0\0\0` / `.wim` | `WimMountSource::open_from_reader` | Shared seek body (no image spool). First image; uncompressed + XPRESS. **Residual:** LZX/LZMS `open` errors (not raw bytes); WIMBoot/delta/later images; 64 MiB resource cap; factory nested wire later |
 | **QCOW2** | `QFI\xfb` + version 2/3 | `Qcow2MountSource::open_from_reader` → guest map then block/FAT/EXT4 | Shared seek body (no full-image copy). Relative backing needs a real parent path. **Residual:** zstd clusters; HTTP/NBD backing. Factory wiring is a later orchestrator PR |
+| **VHD / VHDX** | `conectix` footer / `vhdxfile` @ 0 | `VhdMountSource::open_from_reader` → Block/FAT/EXT4 | Shared seek body (no full-image copy). Differencing / VHDX log replay residual. Factory nested wire later |
 | **SquashFS** (none/gzip/zstd/lz4/lzo/xz) | `hsqs`/`sqsh` magic (or AppImage scan) / `.squashfs`/`.sqfs`/`.snap` | `SquashFsMountSource::open_from_reader` | **Yes** — in-process backhand; **no** `/tmp` |
 | **SquashFS classic LZMA** | same magic | open_from_reader **errors** | **Temp spool** → path `open` / `unsquashfs` residual |
 | **EXT2/3/4** | superblock `0xEF53` @ 1024+0x38 / `.ext2`/`.ext3`/`.ext4` | `Ext4MountSource::open_from_reader` | **Yes** — pure ext4-view shared stream; pure fail → temp spool + path/`debugfs` |
@@ -176,6 +177,7 @@ Outer archive must expose a **seekable** `open()` for the nested file. Then the 
 | **7z solid other** | same | No disk if open succeeds | Full-folder decompress residual for **BCJ2 / multi-pack / Deflate / BZip2** |
 | **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / WIM (uncompressed·XPRESS crate)** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and WIM crate paths are no-tmp; factory nested wire is later. WIM LZX/LZMS `open` errors |
 | **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / QCOW2** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and QCOW2 crate paths are no-tmp; factory nested wire is later |
+| **CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / SquashFS (non-LZMA) / EXT4 (pure) / GPT·MBR (FAT/EXT4 `pN/`) / VHD·VHDX** | nested in ZIP/TAR/7z | **No** | Stream `open_from_reader` when magic/name matches. GPT/MBR and VHD crate paths are no-tmp; factory nested wire is later |
 | **SQLAR** unencrypted nested | nested | **No** (full image RAM) | deserialize; encrypted still path residual |
 | **CAB LZX / classic SquashFS LZMA / RAR** | nested | **Often yes (tmp)** | LZX → libarchive path; classic LZMA → unsquashfs path |
 
@@ -283,7 +285,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | `.tar.gz` in ZIP/TAR/7z | yes | yes (gzip seek) |
 | `.zip` / `.7z` in ZIP/TAR/7z | yes | yes* |
 | `.tar.zst` / `.tar.bz2` / `.tar.xz` nested | yes (if TAR body) | yes* |
-| Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / GPT·MBR (`pN/`) | yes | yes\* |
+| Nested CPIO / AR / ISO / WARC / ASAR / XAR / CAB store·MSZIP / FAT / GPT·MBR (`pN/`) / VHD·VHDX | yes | yes\* |
 | Nested SquashFS (none/gzip/zstd/lz4/lzo/xz) | yes | yes (backhand) |
 | Nested EXT2/3/4 (pure ext4-view) | yes | yes |
 | Nested unencrypted SQLAR | yes (no `/tmp`) | yes after full DB load in RAM |

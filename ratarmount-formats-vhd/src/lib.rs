@@ -8,10 +8,11 @@
 //!
 //! # Residual
 //!
-//! Differencing (parent) VHD/VHDX and encrypted VHDX are **not** opened.
-//! Dynamic VHDX without a parent is the same BAT path as fixed (holes read as
-//! zeros). Sector-bitmap partial blocks are treated as fully present. This
-//! crate does **not** edit session `factory.rs` / `formats-all`.
+//! Differencing (parent) VHD/VHDX, encrypted VHDX, and a non-zero VHDX
+//! `LogGuid` (journal replay) are **not** opened. Dynamic VHDX without a
+//! parent is the same BAT path as fixed (holes read as zeros). Sector-bitmap
+//! partial blocks are treated as fully present. This crate does **not** edit
+//! session `factory.rs` / `formats-all`.
 //!
 //! [`BlockMountSource::open_from_reader`]: ratarmount_formats_block::BlockMountSource::open_from_reader
 
@@ -64,8 +65,6 @@ pub struct VhdMountSource {
     inner: Box<dyn MountSource>,
     kind: VhdKind,
     virtual_size: u64,
-    #[allow(dead_code)]
-    archive_label: PathBuf,
 }
 
 impl VhdMountSource {
@@ -130,7 +129,6 @@ impl VhdMountSource {
             inner,
             kind,
             virtual_size,
-            archive_label,
         })
     }
 }
@@ -246,6 +244,7 @@ impl MountSource for VhdMountSource {
 mod tests {
     use super::*;
     use std::io::{Cursor, Write};
+    use std::process::Command;
 
     use fatfs::{FileSystem, FsOptions};
 
@@ -496,5 +495,78 @@ mod tests {
             err.to_string().contains("not a VHD/VHDX"),
             "unexpected: {err}"
         );
+    }
+
+    /// Regression: VHDX File Parameters HasParent is residual (not encoder-only).
+    #[test]
+    fn differencing_vhdx_rejected() {
+        let disk = mbr_wrap(&fat_volume("hello.txt", b"x"), 8);
+        let mut img = encode_fixed_vhdx(&disk, 1024 * 1024).expect("encode");
+        // File Parameters flags sit at metadata region (1 MiB) + 64 KiB + 4.
+        let fp_flags = 1024 * 1024 + 64 * 1024 + 4;
+        img[fp_flags..fp_flags + 4].copy_from_slice(&2u32.to_le_bytes());
+        let err = VhdMountSource::open_from_reader(Cursor::new(img), "diff.vhdx")
+            .err()
+            .expect("HasParent must fail");
+        assert!(
+            err.to_string().contains("differencing"),
+            "unexpected: {err}"
+        );
+    }
+
+    fn qemu_img_bin() -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|path| {
+            std::env::split_paths(&path)
+                .map(|d| d.join("qemu-img"))
+                .find(|p| p.is_file())
+        })
+    }
+
+    fn qemu_convert_open(fmt: &str, extra: &[&str], payload: &[u8]) {
+        let Some(qemu) = qemu_img_bin() else {
+            eprintln!("skip: qemu-img not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("disk.img");
+        let out = dir.path().join(format!("disk.{fmt}"));
+        let mut img = mbr_wrap(&fat_volume("hello.txt", payload), 8);
+        img.resize(1024 * 1024, 0);
+        std::fs::write(&raw, &img).unwrap();
+        let status = Command::new(&qemu)
+            .args(["convert", "-f", "raw", "-O", fmt])
+            .args(extra)
+            .arg(&raw)
+            .arg(&out)
+            .status()
+            .expect("spawn qemu-img");
+        if !status.success() {
+            eprintln!("skip: qemu-img convert -O {fmt} failed ({status})");
+            return;
+        }
+        let m = match VhdMountSource::open(&out) {
+            Ok(m) => m,
+            Err(e) if e.to_string().contains("log replay") => {
+                eprintln!("skip: qemu-img {fmt} LogGuid is non-zero ({e})");
+                return;
+            }
+            Err(e) => panic!("qemu-img {fmt} must open with spec-layout parser: {e}"),
+        };
+        let fi = m.lookup("/p1/hello.txt", 0).expect("p1/hello.txt");
+        let mut got = Vec::new();
+        m.open(&fi, 0).unwrap().read_to_end(&mut got).unwrap();
+        assert_eq!(got, payload);
+    }
+
+    /// Optional: real Connectix VHD from qemu-img (skip if missing). Always-on
+    /// spec-offset unit test is `parse_footer_spec_offsets_not_encoder_relative`.
+    #[test]
+    fn qemu_img_fixed_vhd_skip_if_missing() {
+        qemu_convert_open("vpc", &["-o", "subformat=fixed"], b"qemu-fixed-vhd");
+    }
+
+    #[test]
+    fn qemu_img_fixed_vhdx_skip_if_missing() {
+        qemu_convert_open("vhdx", &["-o", "subformat=fixed"], b"qemu-fixed-vhdx");
     }
 }

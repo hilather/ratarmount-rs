@@ -89,6 +89,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Fixed VHD fixture lists `p1/` (MBR+FAT, always-on; F-8 crate) | `cargo test -p ratarmount-formats-vhd --lib fixed_vhd` |
 | Dynamic VHD BAT maps virtual offsets (unallocated = zeros) | `cargo test -p ratarmount-formats-vhd --lib dynamic_vhd` |
 | VHDX fixed payload maps through BAT / nested no-tmp | `cargo test -p ratarmount-formats-vhd --lib vhdx` · `cargo test -p ratarmount-formats-vhd --lib open_from_reader` |
+| Connectix VHD footer current_size/disk_type +4 vs qemu-img | `cargo test -p ratarmount-formats-vhd --lib parse_footer_spec_offsets` |
+| VHDX non-zero LogGuid mounted without replay | `cargo test -p ratarmount-formats-vhd --lib log_guid` |
 | Warm index tarstats (most formats) | `cargo test -p ratarmount-formats-{ar,cpio,iso9660,sevenzip,warc,cab,xar,asar,libarchive,ogg} --lib warm_index` (run crates separately) · also tar/zip |
 | Nested tar.zst/bz2/xz no-tmp opener | `cargo test -p ratarmount-session --lib nested_tar_` |
 | HTTP Cookie auth (FR-2) | `cargo test -p ratarmount-remote --lib http_cookie` · `cargo test -p ratarmount-remote --lib http_basic_and_cookie` |

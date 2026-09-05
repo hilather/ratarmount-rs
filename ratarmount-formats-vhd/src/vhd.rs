@@ -87,21 +87,34 @@ where
     }
 }
 
+/// Connectix/MS VHD footer (big-endian). Offsets match qemu-img / VirtualBox
+/// (`CurrentSize` @ 48, `DiskType` @ 60, checksum @ 64) — not a +4 shift.
+const FOOTER_DATA_OFFSET: usize = 16;
+#[cfg(test)]
+const FOOTER_ORIGINAL_SIZE: usize = 40;
+const FOOTER_CURRENT_SIZE: usize = 48;
+#[cfg(test)]
+const FOOTER_GEOMETRY: usize = 56;
+const FOOTER_DISK_TYPE: usize = 60;
+const FOOTER_CHECKSUM: usize = 64;
+#[cfg(test)]
+const FOOTER_UNIQUE_ID: usize = 68;
+
 fn parse_footer(raw: &[u8; 512]) -> Result<VhdFooter> {
     if raw[0..8] != *VHD_COOKIE {
         return Err(VhdError::Msg("VHD footer cookie is not 'conectix'".into()));
     }
-    let stored = be_u32(raw, 68);
-    let calc = vhd_checksum(raw, 68);
+    let stored = be_u32(raw, FOOTER_CHECKSUM);
+    let calc = vhd_checksum(raw, FOOTER_CHECKSUM);
     if stored != calc {
         log::warn!(
             "VHD footer checksum mismatch (stored {stored:#08x}, calc {calc:#08x}); parsing anyway"
         );
     }
     Ok(VhdFooter {
-        data_offset: be_u64(raw, 16),
-        current_size: be_u64(raw, 52),
-        disk_type: be_u32(raw, 64),
+        data_offset: be_u64(raw, FOOTER_DATA_OFFSET),
+        current_size: be_u64(raw, FOOTER_CURRENT_SIZE),
+        disk_type: be_u32(raw, FOOTER_DISK_TYPE),
     })
 }
 
@@ -254,19 +267,21 @@ pub(crate) fn encode_footer(current_size: u64, disk_type: u32, data_offset: u64)
     raw[0..8].copy_from_slice(VHD_COOKIE);
     raw[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes()); // reserved feature bit
     raw[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
-    raw[16..24].copy_from_slice(&data_offset.to_be_bytes());
-    raw[32..36].copy_from_slice(b"rtr ");
-    raw[40..44].copy_from_slice(b"Wi2k");
-    raw[44..52].copy_from_slice(&current_size.to_be_bytes());
-    raw[52..60].copy_from_slice(&current_size.to_be_bytes());
+    raw[FOOTER_DATA_OFFSET..FOOTER_DATA_OFFSET + 8].copy_from_slice(&data_offset.to_be_bytes());
+    raw[28..32].copy_from_slice(b"rtr ");
+    raw[32..36].copy_from_slice(&0x0001_0000u32.to_be_bytes()); // creator version
+    raw[36..40].copy_from_slice(b"Wi2k");
+    raw[FOOTER_ORIGINAL_SIZE..FOOTER_ORIGINAL_SIZE + 8]
+        .copy_from_slice(&current_size.to_be_bytes());
+    raw[FOOTER_CURRENT_SIZE..FOOTER_CURRENT_SIZE + 8].copy_from_slice(&current_size.to_be_bytes());
     let (cyl, heads, spt) = vhd_geometry(current_size);
-    raw[60..62].copy_from_slice(&cyl.to_be_bytes());
-    raw[62] = heads;
-    raw[63] = spt;
-    raw[64..68].copy_from_slice(&disk_type.to_be_bytes());
-    raw[72..88].fill(0x11);
-    let sum = vhd_checksum(&raw, 68);
-    raw[68..72].copy_from_slice(&sum.to_be_bytes());
+    raw[FOOTER_GEOMETRY..FOOTER_GEOMETRY + 2].copy_from_slice(&cyl.to_be_bytes());
+    raw[FOOTER_GEOMETRY + 2] = heads;
+    raw[FOOTER_GEOMETRY + 3] = spt;
+    raw[FOOTER_DISK_TYPE..FOOTER_DISK_TYPE + 4].copy_from_slice(&disk_type.to_be_bytes());
+    raw[FOOTER_UNIQUE_ID..FOOTER_UNIQUE_ID + 16].fill(0x11);
+    let sum = vhd_checksum(&raw, FOOTER_CHECKSUM);
+    raw[FOOTER_CHECKSUM..FOOTER_CHECKSUM + 4].copy_from_slice(&sum.to_be_bytes());
     raw
 }
 
@@ -306,7 +321,34 @@ mod tests {
         let f = parse_footer(&raw).unwrap();
         assert_eq!(f.current_size, 1024 * 1024);
         assert_eq!(f.disk_type, VHD_TYPE_FIXED);
-        assert_eq!(vhd_checksum(&raw, 68), be_u32(&raw, 68));
+        assert_eq!(
+            vhd_checksum(&raw, FOOTER_CHECKSUM),
+            be_u32(&raw, FOOTER_CHECKSUM)
+        );
+    }
+
+    /// Regression: Connectix layout is Current Size @ 48, Disk Type @ 60
+    /// (not the +4 shift that only round-trips `encode_footer`).
+    #[test]
+    fn parse_footer_spec_offsets_not_encoder_relative() {
+        let mut raw = [0u8; 512];
+        raw[0..8].copy_from_slice(VHD_COOKIE);
+        raw[8..12].copy_from_slice(&0x0000_0002u32.to_be_bytes());
+        raw[12..16].copy_from_slice(&0x0001_0000u32.to_be_bytes());
+        raw[16..24].copy_from_slice(&u64::MAX.to_be_bytes());
+        let current = 2u64 * 1024 * 1024;
+        raw[40..48].copy_from_slice(&current.to_be_bytes());
+        raw[48..56].copy_from_slice(&current.to_be_bytes());
+        raw[56..58].copy_from_slice(&1u16.to_be_bytes());
+        raw[58] = 16;
+        raw[59] = 63;
+        raw[60..64].copy_from_slice(&2u32.to_be_bytes());
+        let sum = vhd_checksum(&raw, 64);
+        raw[64..68].copy_from_slice(&sum.to_be_bytes());
+        let f = parse_footer(&raw).expect("spec-layout footer");
+        assert_eq!(f.current_size, current);
+        assert_eq!(f.disk_type, VHD_TYPE_FIXED);
+        assert_eq!(f.data_offset, u64::MAX);
     }
 
     #[test]
