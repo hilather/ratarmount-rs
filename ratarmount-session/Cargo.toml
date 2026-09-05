@@ -17,36 +17,54 @@ formats = ["formats-all"]
 formats-all = [
   "ar",
   "asar",
+  "block",
   "cab",
   "cpio",
+  "dmg",
+  "exfat",
   "ext4",
   "fat",
   "git",
   "html",
   "iso9660",
   "libarchive",
+  "ntfs",
   "ogg",
   "pdf",
+  "qcow2",
   "sqlar",
   "squashfs",
+  "udf",
+  "vhd",
+  "vmdk",
   "warc",
+  "wim",
   "xar",
 ]
 ar = ["dep:ratarmount-formats-ar"]
 asar = ["dep:ratarmount-formats-asar"]
+block = ["dep:ratarmount-formats-block"]
 cab = ["dep:ratarmount-formats-cab"]
 cpio = ["dep:ratarmount-formats-cpio"]
+dmg = ["dep:ratarmount-formats-dmg"]
+exfat = ["dep:ratarmount-formats-exfat"]
 ext4 = ["dep:ratarmount-formats-ext4"]
 fat = ["dep:ratarmount-formats-fat"]
 git = ["dep:ratarmount-formats-git"]
 html = ["dep:ratarmount-formats-html"]
 iso9660 = ["dep:ratarmount-formats-iso9660"]
 libarchive = ["dep:ratarmount-formats-libarchive"]
+ntfs = ["dep:ratarmount-formats-ntfs"]
 ogg = ["dep:ratarmount-formats-ogg"]
 pdf = ["dep:ratarmount-formats-pdf"]
+qcow2 = ["dep:ratarmount-formats-qcow2"]
 sqlar = ["dep:ratarmount-formats-sqlar"]
 squashfs = ["dep:ratarmount-formats-squashfs"]
+udf = ["dep:ratarmount-formats-udf"]
+vhd = ["dep:ratarmount-formats-vhd"]
+vmdk = ["dep:ratarmount-formats-vmdk"]
 warc = ["dep:ratarmount-formats-warc"]
+wim = ["dep:ratarmount-formats-wim"]
 xar = ["dep:ratarmount-formats-xar"]
 gzip-rapidgzip = ["ratarmount-compress/gzip-rapidgzip"]
 gzip-rapidgzip-isal = ["gzip-rapidgzip", "ratarmount-compress/gzip-rapidgzip-isal"]
@@ -72,19 +90,28 @@ ratarmount-formats-restic.workspace = true
 ratarmount-http = { workspace = true, optional = true }
 ratarmount-formats-ar = { workspace = true, optional = true }
 ratarmount-formats-asar = { workspace = true, optional = true }
+ratarmount-formats-block = { workspace = true, optional = true }
 ratarmount-formats-cab = { workspace = true, optional = true }
 ratarmount-formats-cpio = { workspace = true, optional = true }
+ratarmount-formats-dmg = { workspace = true, optional = true }
+ratarmount-formats-exfat = { workspace = true, optional = true }
 ratarmount-formats-ext4 = { workspace = true, optional = true }
 ratarmount-formats-fat = { workspace = true, optional = true }
 ratarmount-formats-git = { workspace = true, optional = true }
 ratarmount-formats-html = { workspace = true, optional = true }
 ratarmount-formats-iso9660 = { workspace = true, optional = true }
 ratarmount-formats-libarchive = { workspace = true, optional = true }
+ratarmount-formats-ntfs = { workspace = true, optional = true }
 ratarmount-formats-ogg = { workspace = true, optional = true }
 ratarmount-formats-pdf = { workspace = true, optional = true }
+ratarmount-formats-qcow2 = { workspace = true, optional = true }
 ratarmount-formats-sqlar = { workspace = true, optional = true }
 ratarmount-formats-squashfs = { workspace = true, optional = true }
+ratarmount-formats-udf = { workspace = true, optional = true }
+ratarmount-formats-vhd = { workspace = true, optional = true }
+ratarmount-formats-vmdk = { workspace = true, optional = true }
 ratarmount-formats-warc = { workspace = true, optional = true }
+ratarmount-formats-wim = { workspace = true, optional = true }
 ratarmount-formats-xar = { workspace = true, optional = true }
 
 [dev-dependencies]

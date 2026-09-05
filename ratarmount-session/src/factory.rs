@@ -30,10 +30,16 @@ use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_ar::{looks_like_ar, ArMountSource};
 #[cfg(feature = "asar")]
 use ratarmount_formats_asar::{looks_like_asar, AsarMountSource};
+#[cfg(feature = "block")]
+use ratarmount_formats_block::{looks_like_block, looks_like_block_reader, BlockMountSource};
 #[cfg(feature = "cab")]
 use ratarmount_formats_cab::{looks_like_cab, CabError, CabMountSource};
 #[cfg(feature = "cpio")]
 use ratarmount_formats_cpio::{looks_like_cpio, CpioMountSource};
+#[cfg(feature = "dmg")]
+use ratarmount_formats_dmg::{looks_like_dmg, looks_like_dmg_reader, DmgMountSource};
+#[cfg(feature = "exfat")]
+use ratarmount_formats_exfat::{looks_like_exfat, looks_like_exfat_reader, ExfatMountSource};
 #[cfg(feature = "ext4")]
 use ratarmount_formats_ext4::{looks_like_ext4, looks_like_ext4_reader, Ext4MountSource};
 #[cfg(feature = "fat")]
@@ -48,10 +54,14 @@ use ratarmount_formats_iso9660::{looks_like_iso, Iso9660MountSource};
 use ratarmount_formats_libarchive::{
     looks_like_libarchive, try_open_lrzip_via_libarchive, LibarchiveMountSource,
 };
+#[cfg(feature = "ntfs")]
+use ratarmount_formats_ntfs::{looks_like_ntfs, looks_like_ntfs_reader, NtfsMountSource};
 #[cfg(feature = "ogg")]
 use ratarmount_formats_ogg::{looks_like_ogg, OggMountSource};
 #[cfg(feature = "pdf")]
 use ratarmount_formats_pdf::{looks_like_pdf, PdfMountSource};
+#[cfg(feature = "qcow2")]
+use ratarmount_formats_qcow2::{looks_like_qcow2, looks_like_qcow2_reader, Qcow2MountSource};
 use ratarmount_formats_sevenzip::{looks_like_7z, SevenZipMountSource};
 #[cfg(feature = "sqlar")]
 use ratarmount_formats_sqlar::{looks_like_sqlar, SqlarMountSource};
@@ -60,8 +70,18 @@ use ratarmount_formats_squashfs::{
     looks_like_squashfs, looks_like_squashfs_reader, SquashFsMountSource,
 };
 use ratarmount_formats_tar::{SingleFileMountSource, SqliteIndexedTar};
+#[cfg(feature = "udf")]
+use ratarmount_formats_udf::{looks_like_udf, looks_like_udf_reader, UdfMountSource};
+#[cfg(feature = "vhd")]
+use ratarmount_formats_vhd::{
+    looks_like_vhd, looks_like_vhd_or_vhdx_reader, looks_like_vhdx, VhdMountSource,
+};
+#[cfg(feature = "vmdk")]
+use ratarmount_formats_vmdk::{looks_like_vmdk, looks_like_vmdk_reader, VmdkMountSource};
 #[cfg(feature = "warc")]
 use ratarmount_formats_warc::{looks_like_warc, WarcMountSource};
+#[cfg(feature = "wim")]
+use ratarmount_formats_wim::{looks_like_wim, looks_like_wim_reader, WimMountSource};
 #[cfg(feature = "xar")]
 use ratarmount_formats_xar::{looks_like_xar, XarMountSource};
 use ratarmount_formats_zip::{looks_like_zip, ZipMountSource};
@@ -94,6 +114,9 @@ enum FormatBackend {
     Ar,
     #[cfg(feature = "cpio")]
     Cpio,
+    // UDF-primary mixed discs: NSR02/NSR03 must win over ISO CD001.
+    #[cfg(feature = "udf")]
+    Udf,
     #[cfg(feature = "iso9660")]
     Iso,
     #[cfg(feature = "warc")]
@@ -110,6 +133,23 @@ enum FormatBackend {
     Ext4,
     #[cfg(feature = "fat")]
     Fat,
+    #[cfg(feature = "exfat")]
+    Exfat,
+    #[cfg(feature = "ntfs")]
+    Ntfs,
+    #[cfg(feature = "dmg")]
+    Dmg,
+    #[cfg(feature = "wim")]
+    Wim,
+    // After superfloppy FS magics so FAT/exFAT/NTFS at offset 0 still win.
+    #[cfg(feature = "block")]
+    Block,
+    #[cfg(feature = "qcow2")]
+    Qcow2,
+    #[cfg(feature = "vhd")]
+    Vhd,
+    #[cfg(feature = "vmdk")]
+    Vmdk,
     #[cfg(feature = "ogg")]
     Ogg,
     #[cfg(feature = "pdf")]
@@ -134,6 +174,8 @@ const DEFAULT_FORMAT_PROBE_ORDER: &[FormatBackend] = &[
     FormatBackend::Ar,
     #[cfg(feature = "cpio")]
     FormatBackend::Cpio,
+    #[cfg(feature = "udf")]
+    FormatBackend::Udf,
     #[cfg(feature = "iso9660")]
     FormatBackend::Iso,
     #[cfg(feature = "warc")]
@@ -150,6 +192,22 @@ const DEFAULT_FORMAT_PROBE_ORDER: &[FormatBackend] = &[
     FormatBackend::Ext4,
     #[cfg(feature = "fat")]
     FormatBackend::Fat,
+    #[cfg(feature = "exfat")]
+    FormatBackend::Exfat,
+    #[cfg(feature = "ntfs")]
+    FormatBackend::Ntfs,
+    #[cfg(feature = "dmg")]
+    FormatBackend::Dmg,
+    #[cfg(feature = "wim")]
+    FormatBackend::Wim,
+    #[cfg(feature = "block")]
+    FormatBackend::Block,
+    #[cfg(feature = "qcow2")]
+    FormatBackend::Qcow2,
+    #[cfg(feature = "vhd")]
+    FormatBackend::Vhd,
+    #[cfg(feature = "vmdk")]
+    FormatBackend::Vmdk,
     #[cfg(feature = "ogg")]
     FormatBackend::Ogg,
     #[cfg(feature = "pdf")]
@@ -187,10 +245,28 @@ fn parse_format_backend(name: &str) -> Option<FormatBackend> {
         "ext4" | "ext" => FormatBackend::Ext4,
         #[cfg(feature = "fat")]
         "fat" | "fatfs" | "vfat" => FormatBackend::Fat,
+        #[cfg(feature = "exfat")]
+        "exfat" => FormatBackend::Exfat,
+        #[cfg(feature = "ntfs")]
+        "ntfs" => FormatBackend::Ntfs,
+        #[cfg(feature = "dmg")]
+        "dmg" => FormatBackend::Dmg,
+        #[cfg(feature = "wim")]
+        "wim" => FormatBackend::Wim,
+        #[cfg(feature = "block")]
+        "block" | "gpt" | "mbr" => FormatBackend::Block,
+        #[cfg(feature = "qcow2")]
+        "qcow2" => FormatBackend::Qcow2,
+        #[cfg(feature = "vhd")]
+        "vhd" | "vhdx" => FormatBackend::Vhd,
+        #[cfg(feature = "vmdk")]
+        "vmdk" => FormatBackend::Vmdk,
         #[cfg(feature = "ar")]
         "ar" => FormatBackend::Ar,
         #[cfg(feature = "cpio")]
         "cpio" => FormatBackend::Cpio,
+        #[cfg(feature = "udf")]
+        "udf" => FormatBackend::Udf,
         #[cfg(feature = "iso9660")]
         "iso" | "iso9660" => FormatBackend::Iso,
         #[cfg(feature = "warc")]
@@ -304,6 +380,15 @@ fn try_open_format_backend(
                     .map_err(|e| e.to_string())?,
             )))
         }
+        #[cfg(feature = "udf")]
+        FormatBackend::Udf => {
+            if !looks_like_udf(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                UdfMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
         #[cfg(feature = "iso9660")]
         FormatBackend::Iso => {
             if !looks_like_iso(path) {
@@ -383,6 +468,78 @@ fn try_open_format_backend(
             }
             Ok(Some(Arc::new(
                 FatMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "exfat")]
+        FormatBackend::Exfat => {
+            if !looks_like_exfat(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                ExfatMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "ntfs")]
+        FormatBackend::Ntfs => {
+            if !looks_like_ntfs(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                NtfsMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "dmg")]
+        FormatBackend::Dmg => {
+            if !looks_like_dmg(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                DmgMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "wim")]
+        FormatBackend::Wim => {
+            if !looks_like_wim(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                WimMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "block")]
+        FormatBackend::Block => {
+            if !looks_like_block(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                BlockMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "qcow2")]
+        FormatBackend::Qcow2 => {
+            if !looks_like_qcow2(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                Qcow2MountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "vhd")]
+        FormatBackend::Vhd => {
+            if !looks_like_vhd(path) && !looks_like_vhdx(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                VhdMountSource::open(path).map_err(|e| e.to_string())?,
+            )))
+        }
+        #[cfg(feature = "vmdk")]
+        FormatBackend::Vmdk => {
+            if !looks_like_vmdk(path) {
+                return Ok(None);
+            }
+            Ok(Some(Arc::new(
+                VmdkMountSource::open(path).map_err(|e| e.to_string())?,
             )))
         }
         #[cfg(feature = "ogg")]
@@ -546,6 +703,133 @@ mod split_open_tests {
         );
     }
 
+    /// K7b: Udf immediately before Iso; Block after Fat/Exfat/Ntfs and before
+    /// Qcow2; existing names unmoved (Ogg, Pdf, Html, Libarchive, Tar last).
+    #[test]
+    fn probe_order_f8() {
+        let order = DEFAULT_FORMAT_PROBE_ORDER;
+        let names: Vec<String> = order.iter().map(|b| format!("{b:?}")).collect();
+
+        #[cfg(all(
+            feature = "asar",
+            feature = "ar",
+            feature = "cpio",
+            feature = "iso9660",
+            feature = "warc",
+            feature = "xar",
+            feature = "cab",
+            feature = "sqlar",
+            feature = "squashfs",
+            feature = "ext4",
+            feature = "fat",
+            feature = "ogg",
+            feature = "pdf",
+            feature = "html",
+            feature = "libarchive"
+        ))]
+        {
+            let f8 = [
+                "Udf", "Exfat", "Ntfs", "Dmg", "Wim", "Block", "Qcow2", "Vhd", "Vmdk",
+            ];
+            let pre_f8: Vec<&str> = names
+                .iter()
+                .map(String::as_str)
+                .filter(|n| !f8.contains(n))
+                .collect();
+            assert_eq!(
+                pre_f8,
+                vec![
+                    "SevenZip",
+                    "Zip",
+                    "Asar",
+                    "Ar",
+                    "Cpio",
+                    "Iso",
+                    "Warc",
+                    "Xar",
+                    "Cab",
+                    "Sqlar",
+                    "SquashFs",
+                    "Ext4",
+                    "Fat",
+                    "Ogg",
+                    "Pdf",
+                    "Html",
+                    "Libarchive",
+                    "Tar",
+                ],
+                "existing DEFAULT_FORMAT_PROBE_ORDER names must stay unmoved"
+            );
+            assert_eq!(
+                &names[names.len() - 5..],
+                ["Ogg", "Pdf", "Html", "Libarchive", "Tar"]
+            );
+        }
+
+        #[cfg(all(feature = "udf", feature = "iso9660"))]
+        {
+            let udf = pos(order, FormatBackend::Udf);
+            let iso = pos(order, FormatBackend::Iso);
+            assert_eq!(
+                udf + 1,
+                iso,
+                "Udf must be immediately before Iso; got {names:?}"
+            );
+        }
+
+        #[cfg(all(
+            feature = "fat",
+            feature = "exfat",
+            feature = "ntfs",
+            feature = "block",
+            feature = "qcow2"
+        ))]
+        {
+            let fat = pos(order, FormatBackend::Fat);
+            let exfat = pos(order, FormatBackend::Exfat);
+            let ntfs = pos(order, FormatBackend::Ntfs);
+            let block = pos(order, FormatBackend::Block);
+            let qcow2 = pos(order, FormatBackend::Qcow2);
+            assert!(
+                fat < exfat && exfat < ntfs && ntfs < block && block < qcow2,
+                "Block after Fat/Exfat/Ntfs and before Qcow2; got {names:?}"
+            );
+        }
+
+        #[cfg(feature = "udf")]
+        assert_eq!(parse_format_backend("udf"), Some(FormatBackend::Udf));
+        #[cfg(feature = "exfat")]
+        assert_eq!(parse_format_backend("exfat"), Some(FormatBackend::Exfat));
+        #[cfg(feature = "ntfs")]
+        assert_eq!(parse_format_backend("ntfs"), Some(FormatBackend::Ntfs));
+        #[cfg(feature = "dmg")]
+        assert_eq!(parse_format_backend("dmg"), Some(FormatBackend::Dmg));
+        #[cfg(feature = "wim")]
+        assert_eq!(parse_format_backend("wim"), Some(FormatBackend::Wim));
+        #[cfg(feature = "block")]
+        {
+            assert_eq!(parse_format_backend("block"), Some(FormatBackend::Block));
+            assert_eq!(parse_format_backend("gpt"), Some(FormatBackend::Block));
+            assert_eq!(parse_format_backend("mbr"), Some(FormatBackend::Block));
+        }
+        #[cfg(feature = "qcow2")]
+        assert_eq!(parse_format_backend("qcow2"), Some(FormatBackend::Qcow2));
+        #[cfg(feature = "vhd")]
+        {
+            assert_eq!(parse_format_backend("vhd"), Some(FormatBackend::Vhd));
+            assert_eq!(parse_format_backend("vhdx"), Some(FormatBackend::Vhd));
+        }
+        #[cfg(feature = "vmdk")]
+        assert_eq!(parse_format_backend("vmdk"), Some(FormatBackend::Vmdk));
+    }
+
+    fn pos(order: &[FormatBackend], backend: FormatBackend) -> usize {
+        order
+            .iter()
+            .position(|&b| b == backend)
+            .unwrap_or_else(|| panic!("{backend:?} missing from DEFAULT_FORMAT_PROBE_ORDER"))
+    }
+
     #[test]
     fn open_joined_plain_file() {
         let dir = tempfile::tempdir().unwrap();
@@ -617,8 +901,11 @@ pub fn open_nested_fn(options: OpenOptions) -> OpenNestedFn {
 /// - **7z**, **ZIP**, uncompressed **TAR**
 /// - **gzip / zstd / bzip2 / xz** when the body is a compressed TAR (e.g. `.tar.gz`
 ///   embedded in a store 7z) — seekable decompress + in-memory TAR index
-/// - **CPIO**, **AR**, **ISO 9660**, **WARC**, **ASAR**, **XAR**, **CAB** (store/MSZIP),
-///   **SQLAR** (unencrypted, full image in RAM), **FAT** images
+/// - **CPIO**, **AR**, **UDF** (before ISO on mixed NSR02/NSR03 discs), **ISO 9660**,
+///   **WARC**, **ASAR**, **XAR**, **CAB** (store/MSZIP), **SQLAR** (unencrypted, full
+///   image in RAM), **FAT** / **exFAT** / **NTFS** images
+/// - **UDIF DMG**, **WIM** (uncompressed/XPRESS), **GPT/MBR**, **QCOW2**, **VHD/VHDX**,
+///   **VMDK** (KDMV sparse)
 /// - **SquashFS** (none/gzip/zstd/lz4/lzo/xz via in-process backhand); classic **LZMA**
 ///   images fail here so AutoMount can temp-spool + path/`unsquashfs`
 /// - **EXT2/3/4** via pure ext4-view on a shared stream; pure fail → temp spool + path open
@@ -764,6 +1051,19 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             return open_nested_tar_with_durable(reader, label, &opts, &ctx);
         }
 
+        // UDF VRS (NSR02/NSR03) before ISO CD001 so mixed discs stay UDF-primary.
+        #[cfg(feature = "udf")]
+        {
+            let looks_udf =
+                name_suggests_ext(label, &["udf"]) || looks_like_udf_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_udf {
+                return map_nested_open("UDF", label, || {
+                    UdfMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+
         // ISO 9660: PVD at sector 16 (beyond first 512 bytes) — probe stream or name
         #[cfg(feature = "iso9660")]
         {
@@ -858,6 +1158,96 @@ pub fn open_nested_reader_fn(options: OpenOptions) -> OpenNestedReaderFn {
             if looks_ext4 {
                 return map_nested_open("EXT4", label, || {
                     Ext4MountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+
+        // Superfloppy FS magics at offset 0 before GPT/MBR Block.
+        #[cfg(feature = "exfat")]
+        {
+            let looks_exfat =
+                name_suggests_ext(label, &["exfat"]) || looks_like_exfat_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_exfat {
+                return map_nested_open("exFAT", label, || {
+                    ExfatMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "ntfs")]
+        {
+            let looks_ntfs =
+                name_suggests_ext(label, &["ntfs"]) || looks_like_ntfs_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_ntfs {
+                return map_nested_open("NTFS", label, || {
+                    NtfsMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "dmg")]
+        {
+            let looks_dmg =
+                name_suggests_ext(label, &["dmg"]) || looks_like_dmg_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_dmg {
+                return map_nested_open("DMG", label, || {
+                    DmgMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "wim")]
+        {
+            let looks_wim =
+                name_suggests_ext(label, &["wim"]) || looks_like_wim_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_wim {
+                return map_nested_open("WIM", label, || {
+                    WimMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "block")]
+        {
+            let looks_block =
+                name_suggests_ext(label, &["gpt"]) || looks_like_block_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_block {
+                return map_nested_open("GPT/MBR", label, || {
+                    BlockMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "qcow2")]
+        {
+            let looks_qcow2 = name_suggests_ext(label, &["qcow2", "qcow"])
+                || looks_like_qcow2_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_qcow2 {
+                return map_nested_open("QCOW2", label, || {
+                    Qcow2MountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "vhd")]
+        {
+            let looks_vhd = name_suggests_ext(label, &["vhd", "vhdx"])
+                || looks_like_vhd_or_vhdx_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_vhd {
+                return map_nested_open("VHD", label, || {
+                    VhdMountSource::open_from_reader(reader, label)
+                });
+            }
+        }
+        #[cfg(feature = "vmdk")]
+        {
+            let looks_vmdk =
+                name_suggests_ext(label, &["vmdk"]) || looks_like_vmdk_reader(&mut reader);
+            let _ = reader.seek(SeekFrom::Start(0));
+            if looks_vmdk {
+                return map_nested_open("VMDK", label, || {
+                    VmdkMountSource::open_from_reader(reader, label)
                 });
             }
         }
@@ -3037,9 +3427,18 @@ fn try_open_formats_from_seekable_body(
     use std::io::Read;
     #[cfg(any(
         feature = "iso9660",
+        feature = "udf",
         feature = "fat",
+        feature = "exfat",
+        feature = "ntfs",
         feature = "squashfs",
-        feature = "ext4"
+        feature = "ext4",
+        feature = "dmg",
+        feature = "wim",
+        feature = "block",
+        feature = "qcow2",
+        feature = "vhd",
+        feature = "vmdk"
     ))]
     use std::io::{Seek, SeekFrom};
 
@@ -3137,6 +3536,18 @@ fn try_open_formats_from_seekable_body(
                 .map_err(|e| e.to_string())?,
         )));
     }
+    // UDF VRS (NSR02/NSR03) before ISO CD001 so mixed discs stay UDF-primary.
+    #[cfg(feature = "udf")]
+    {
+        let mut r = open_reader()?;
+        let looks_udf = name_suggests_ext(label, &["udf"]) || looks_like_udf_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_udf {
+            return Ok(Some(Arc::new(
+                UdfMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
     // ISO 9660: PVD at sector 16 or name
     #[cfg(feature = "iso9660")]
     {
@@ -3226,6 +3637,29 @@ fn try_open_formats_from_seekable_body(
             )));
         }
     }
+    // Superfloppy exFAT / NTFS at offset 0 before Block.
+    #[cfg(feature = "exfat")]
+    {
+        let mut r = open_reader()?;
+        let looks_exfat = name_suggests_ext(label, &["exfat"]) || looks_like_exfat_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_exfat {
+            return Ok(Some(Arc::new(
+                ExfatMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "ntfs")]
+    {
+        let mut r = open_reader()?;
+        let looks_ntfs = name_suggests_ext(label, &["ntfs"]) || looks_like_ntfs_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_ntfs {
+            return Ok(Some(Arc::new(
+                NtfsMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
     // SquashFS (in-process backhand; classic LZMA → Ok(None) → path materialize residual)
     #[cfg(feature = "squashfs")]
     {
@@ -3264,6 +3698,74 @@ fn try_open_formats_from_seekable_body(
                     return Ok(None);
                 }
             }
+        }
+    }
+    #[cfg(feature = "dmg")]
+    {
+        let mut r = open_reader()?;
+        let looks_dmg = name_suggests_ext(label, &["dmg"]) || looks_like_dmg_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_dmg {
+            return Ok(Some(Arc::new(
+                DmgMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "wim")]
+    {
+        let mut r = open_reader()?;
+        let looks_wim = name_suggests_ext(label, &["wim"]) || looks_like_wim_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_wim {
+            return Ok(Some(Arc::new(
+                WimMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "block")]
+    {
+        let mut r = open_reader()?;
+        let looks_block = name_suggests_ext(label, &["gpt"]) || looks_like_block_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_block {
+            return Ok(Some(Arc::new(
+                BlockMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "qcow2")]
+    {
+        let mut r = open_reader()?;
+        let looks_qcow2 =
+            name_suggests_ext(label, &["qcow2", "qcow"]) || looks_like_qcow2_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_qcow2 {
+            return Ok(Some(Arc::new(
+                Qcow2MountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "vhd")]
+    {
+        let mut r = open_reader()?;
+        let looks_vhd =
+            name_suggests_ext(label, &["vhd", "vhdx"]) || looks_like_vhd_or_vhdx_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_vhd {
+            return Ok(Some(Arc::new(
+                VhdMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
+        }
+    }
+    #[cfg(feature = "vmdk")]
+    {
+        let mut r = open_reader()?;
+        let looks_vmdk = name_suggests_ext(label, &["vmdk"]) || looks_like_vmdk_reader(&mut r);
+        let _ = r.seek(SeekFrom::Start(0));
+        if looks_vmdk {
+            return Ok(Some(Arc::new(
+                VmdkMountSource::open_from_reader(r, label).map_err(|e| e.to_string())?,
+            )));
         }
     }
 
@@ -6439,6 +6941,316 @@ mod tests {
         assert_eq!(read_all(inner.as_ref(), "/foo/fighter/ufo"), b"iriya\n");
         let mid = read_seek_mid(inner.as_ref(), "/foo/fighter/ufo", 2);
         assert_eq!(mid.as_slice(), b"iya\n");
+    }
+
+    #[cfg(any(feature = "ntfs", feature = "udf"))]
+    fn which_cmd(name: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|p| {
+            std::env::split_paths(&p)
+                .map(|d| d.join(name))
+                .find(|p| p.is_file())
+        })
+    }
+
+    /// Always-on synthetic superfloppy exFAT (OEM `"EXFAT   "` + hello.txt).
+    #[cfg(feature = "exfat")]
+    fn synthetic_exfat_image() -> Vec<u8> {
+        const BPS: u32 = 512;
+        const FAT_OFFSET: u32 = 24;
+        const FAT_LENGTH: u32 = 16;
+        const HEAP_OFFSET: u32 = 40;
+        const CLUSTER_COUNT: u32 = 2008;
+        const ROOT: u32 = 4;
+        const EOC: u32 = 0xFFFF_FFFF;
+        let volume_sectors = 2048u32;
+        let mut img = vec![0u8; (volume_sectors * BPS) as usize];
+        let mut boot = [0u8; 512];
+        boot[0] = 0xEB;
+        boot[1] = 0x76;
+        boot[2] = 0x90;
+        boot[3..11].copy_from_slice(b"EXFAT   ");
+        boot[0x48..0x50].copy_from_slice(&u64::from(volume_sectors).to_le_bytes());
+        boot[0x50..0x54].copy_from_slice(&FAT_OFFSET.to_le_bytes());
+        boot[0x54..0x58].copy_from_slice(&FAT_LENGTH.to_le_bytes());
+        boot[0x58..0x5C].copy_from_slice(&HEAP_OFFSET.to_le_bytes());
+        boot[0x5C..0x60].copy_from_slice(&CLUSTER_COUNT.to_le_bytes());
+        boot[0x60..0x64].copy_from_slice(&ROOT.to_le_bytes());
+        boot[0x64..0x68].copy_from_slice(&0x1234_5678u32.to_le_bytes());
+        boot[0x6C] = 9;
+        boot[0x6D] = 0;
+        boot[0x6E] = 1;
+        boot[0x6F] = 0x80;
+        boot[510] = 0x55;
+        boot[511] = 0xAA;
+        img[..512].copy_from_slice(&boot);
+        img[12 * 512..13 * 512].copy_from_slice(&boot);
+
+        let fat_off = (FAT_OFFSET * BPS) as usize;
+        let put_fat = |img: &mut [u8], cluster: u32, val: u32| {
+            let o = fat_off + cluster as usize * 4;
+            img[o..o + 4].copy_from_slice(&val.to_le_bytes());
+        };
+        put_fat(&mut img, 0, 0xFFFF_FFF8);
+        put_fat(&mut img, 1, EOC);
+        for c in 2..=7u32 {
+            put_fat(&mut img, c, EOC);
+        }
+
+        let cluster_off = |c: u32| (HEAP_OFFSET * BPS) as usize + (c as usize - 2) * BPS as usize;
+        img[cluster_off(2)] = 0xFF;
+        let hello = b"hello-exfat\n";
+        let ufo = b"iriya\n";
+
+        let file_set = |name: &str, is_dir: bool, first: u32, data_len: u64| -> Vec<[u8; 32]> {
+            let utf16: Vec<u16> = name.encode_utf16().collect();
+            let mut name_ents = Vec::new();
+            for chunk in utf16.chunks(15) {
+                let mut e = [0u8; 32];
+                e[0] = 0xC1;
+                for (i, &cu) in chunk.iter().enumerate() {
+                    e[2 + i * 2..4 + i * 2].copy_from_slice(&cu.to_le_bytes());
+                }
+                name_ents.push(e);
+            }
+            let mut file = [0u8; 32];
+            file[0] = 0x85;
+            file[1] = (1 + name_ents.len()) as u8;
+            let attr: u16 = if is_dir { 0x10 } else { 0x20 };
+            file[4..6].copy_from_slice(&attr.to_le_bytes());
+            let mut stream = [0u8; 32];
+            stream[0] = 0xC0;
+            stream[1] = 0x01 | 0x02; // in-use + NoFatChain
+            stream[3] = utf16.len() as u8;
+            stream[8..16].copy_from_slice(&data_len.to_le_bytes());
+            stream[20..24].copy_from_slice(&first.to_le_bytes());
+            stream[24..32].copy_from_slice(&data_len.to_le_bytes());
+            let mut out = vec![file, stream];
+            out.extend(name_ents);
+            out
+        };
+
+        let mut root = Vec::new();
+        root.extend(file_set("hello.txt", false, 6, hello.len() as u64));
+        root.extend(file_set("foo", true, 5, u64::from(BPS)));
+        let mut off = cluster_off(4);
+        for e in &root {
+            img[off..off + 32].copy_from_slice(e);
+            off += 32;
+        }
+        let foo = file_set("ufo", false, 7, ufo.len() as u64);
+        off = cluster_off(5);
+        for e in &foo {
+            img[off..off + 32].copy_from_slice(e);
+            off += 32;
+        }
+        img[cluster_off(6)..cluster_off(6) + hello.len()].copy_from_slice(hello);
+        img[cluster_off(7)..cluster_off(7) + ufo.len()].copy_from_slice(ufo);
+        img
+    }
+
+    /// Factory nested exFAT — no-tmp open_from_reader wiring (always-on synthetic).
+    #[cfg(feature = "exfat")]
+    #[test]
+    fn nested_exfat_from_cursor_via_opener() {
+        let bytes = synthetic_exfat_image();
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.exfat"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested exFAT open without temp spool");
+        assert_eq!(read_all(inner.as_ref(), "/hello.txt"), b"hello-exfat\n");
+        assert_eq!(read_all(inner.as_ref(), "/foo/ufo"), b"iriya\n");
+        let mid = read_seek_mid(inner.as_ref(), "/foo/ufo", 2);
+        assert_eq!(mid.as_slice(), b"iya\n");
+    }
+
+    /// Factory nested NTFS — skip when mkfs.ntfs is missing (no tiny always-on volume).
+    #[cfg(feature = "ntfs")]
+    #[test]
+    fn nested_ntfs_from_cursor_via_opener() {
+        let mkfs = which_cmd("mkfs.ntfs").or_else(|| which_cmd("mkntfs"));
+        let Some(mkfs) = mkfs else {
+            eprintln!("skip: mkfs.ntfs not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("inner.ntfs");
+        {
+            let f = std::fs::File::create(&img).expect("create ntfs image");
+            f.set_len(2 * 1024 * 1024).expect("truncate ntfs image");
+        }
+        let status = std::process::Command::new(&mkfs)
+            .args(["-F", "-Q", "-L", "Ratar", "-s", "512"])
+            .arg(&img)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        let Ok(status) = status else {
+            eprintln!("skip: mkfs.ntfs spawn failed");
+            return;
+        };
+        if !status.success() {
+            eprintln!("skip: mkfs.ntfs failed ({})", mkfs.display());
+            return;
+        }
+        let bytes = std::fs::read(&img).expect("read ntfs image");
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.ntfs"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested NTFS open without temp spool");
+        assert!(
+            inner.lookup("/", 0).is_some(),
+            "NTFS nested mount must list root"
+        );
+    }
+
+    /// Mixed ISO+UDF VRS: NSR02 present → factory probe selects Udf before Iso.
+    #[cfg(all(feature = "udf", feature = "iso9660"))]
+    #[test]
+    fn nested_udf_before_iso_mixed_disc() {
+        let mut img = vec![0u8; 22 * 2048];
+        let pvd = 16 * 2048;
+        img[pvd] = 1;
+        img[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        img[pvd + 6] = 1;
+        let iso_td = 17 * 2048;
+        img[iso_td] = 255;
+        img[iso_td + 1..iso_td + 6].copy_from_slice(b"CD001");
+        let put_vsd = |img: &mut [u8], sector: u32, ident: &[u8; 5]| {
+            let off = sector as usize * 2048;
+            img[off] = 0;
+            img[off + 1..off + 6].copy_from_slice(ident);
+            img[off + 6] = 1;
+        };
+        put_vsd(&mut img, 18, b"BEA01");
+        put_vsd(&mut img, 19, b"NSR02");
+        put_vsd(&mut img, 20, b"TEA01");
+
+        let dir = tempfile::tempdir().unwrap();
+        let mixed = dir.path().join("mixed.iso");
+        std::fs::write(&mixed, &img).expect("write mixed disc");
+
+        assert!(looks_like_udf(&mixed), "NSR02 must match UDF on mixed VRS");
+        assert!(
+            looks_like_iso(&mixed),
+            "CD001 at sector 16 must match ISO on mixed VRS"
+        );
+
+        let mut first = None;
+        for &b in DEFAULT_FORMAT_PROBE_ORDER {
+            match b {
+                FormatBackend::Udf if looks_like_udf(&mixed) => {
+                    first = Some(FormatBackend::Udf);
+                    break;
+                }
+                FormatBackend::Iso if looks_like_iso(&mixed) => {
+                    first = Some(FormatBackend::Iso);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            first,
+            Some(FormatBackend::Udf),
+            "factory probe must select Udf before Iso when NSR02/NSR03 is present"
+        );
+
+        let iso_only = dir.path().join("cd001-only.iso");
+        let mut only = vec![0u8; 18 * 2048];
+        only[pvd] = 1;
+        only[pvd + 1..pvd + 6].copy_from_slice(b"CD001");
+        only[pvd + 6] = 1;
+        std::fs::write(&iso_only, &only).expect("write iso-only");
+        assert!(!looks_like_udf(&iso_only));
+        assert!(looks_like_iso(&iso_only));
+    }
+
+    /// Factory nested UDF — skip when mkudffs/mkisofs/xorriso is missing.
+    #[cfg(feature = "udf")]
+    #[test]
+    fn nested_udf_from_cursor_via_opener() {
+        let bytes = (|| -> Option<Vec<u8>> {
+            let dir = tempfile::tempdir().ok()?;
+            let src = dir.path().join("src");
+            std::fs::create_dir_all(&src).ok()?;
+            std::fs::write(src.join("hello.txt"), b"hello-udf\n").ok()?;
+            let img = dir.path().join("inner.udf");
+            if let Some(mk) = which_cmd("mkudffs") {
+                {
+                    let f = std::fs::File::create(&img).ok()?;
+                    f.set_len(4 * 1024 * 1024).ok()?;
+                }
+                let status = std::process::Command::new(&mk)
+                    .args(["--utf8", "--label=Ratar"])
+                    .arg(&img)
+                    .status()
+                    .ok()?;
+                if status.success() {
+                    return std::fs::read(&img).ok();
+                }
+                eprintln!("skip: mkudffs failed ({})", mk.display());
+            }
+            for bin in ["mkisofs", "genisoimage"] {
+                if let Some(cmd) = which_cmd(bin) {
+                    let status = std::process::Command::new(&cmd)
+                        .args(["-udf", "-o"])
+                        .arg(&img)
+                        .arg(&src)
+                        .status()
+                        .ok()?;
+                    if status.success() {
+                        return std::fs::read(&img).ok();
+                    }
+                    eprintln!("skip: {bin} failed ({})", cmd.display());
+                }
+            }
+            if let Some(xorriso) = which_cmd("xorriso") {
+                let status = std::process::Command::new(&xorriso)
+                    .args(["-as", "mkisofs", "-udf", "-o"])
+                    .arg(&img)
+                    .arg(&src)
+                    .status()
+                    .ok()?;
+                if status.success() {
+                    return std::fs::read(&img).ok();
+                }
+                eprintln!("skip: xorriso failed ({})", xorriso.display());
+            }
+            None
+        })();
+        let Some(bytes) = bytes else {
+            eprintln!("skip: mkudffs/mkisofs/xorriso not available");
+            return;
+        };
+        let opts = OpenOptions {
+            index_in_memory: true,
+            ..Default::default()
+        };
+        let opener = open_nested_reader_fn(opts);
+        let inner = opener(
+            Box::new(std::io::Cursor::new(bytes)),
+            Path::new("inner.udf"),
+            NestedOpenContext::default(),
+        )
+        .expect("nested UDF open without temp spool");
+        assert!(
+            inner.lookup("/", 0).is_some(),
+            "UDF nested mount must list root"
+        );
     }
 
     /// Factory nested SquashFS (hsqs magic) — no-tmp open_from_reader wiring (gzip image).

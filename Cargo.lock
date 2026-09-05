@@ -3225,10 +3225,29 @@ name = "ratarmount-formats-udf"
 version = "0.1.30"
 dependencies = [
  "ratarmount-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-vhd"
+version = "0.1.30"
+dependencies = [
  "fatfs",
  "log",
+ "ratarmount-core",
+ "ratarmount-formats-block",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-vmdk"
+version = "0.1.30"
+dependencies = [
+ "fatfs",
  "ratarmount-core",
  "ratarmount-formats-block",
  "ratarmount-formats-ext4",
@@ -3391,22 +3410,31 @@ dependencies = [
  "ratarmount-core",
  "ratarmount-formats-ar",
  "ratarmount-formats-asar",
+ "ratarmount-formats-block",
  "ratarmount-formats-cab",
  "ratarmount-formats-cpio",
+ "ratarmount-formats-dmg",
+ "ratarmount-formats-exfat",
  "ratarmount-formats-ext4",
  "ratarmount-formats-fat",
  "ratarmount-formats-git",
  "ratarmount-formats-html",
  "ratarmount-formats-iso9660",
  "ratarmount-formats-libarchive",
+ "ratarmount-formats-ntfs",
  "ratarmount-formats-ogg",
  "ratarmount-formats-pdf",
  "ratarmount-formats-restic",
+ "ratarmount-formats-qcow2",
  "ratarmount-formats-sevenzip",
  "ratarmount-formats-sqlar",
  "ratarmount-formats-squashfs",
  "ratarmount-formats-tar",
+ "ratarmount-formats-udf",
+ "ratarmount-formats-vhd",
+ "ratarmount-formats-vmdk",
  "ratarmount-formats-warc",
+ "ratarmount-formats-wim",
  "ratarmount-formats-xar",
  "ratarmount-formats-zip",
  "ratarmount-http",
