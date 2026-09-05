@@ -69,8 +69,8 @@ pub fn decompress(compressed: &[u8], uncompressed_size: usize) -> Result<Vec<u8>
 
 /// Huffman-encode `data` with a flat 9-bit alphabet (test / fixture helper).
 ///
-/// Greedy LZ77: match length 3..=17 (no extra length bytes) so the bitstream
-/// stays in the 16-bit coding units without interleaved raw bytes.
+/// Match length is capped at 17 so the length nibble stays below 0xF (no extra
+/// length bytes). Extra-length coverage is the hand-packed tests below.
 #[cfg(test)]
 pub fn compress(data: &[u8]) -> Vec<u8> {
     let mut lens_bytes = vec![0u8; NUM_SYMBOLS / 2];
@@ -80,12 +80,38 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
     let mut nbits: u32 = 0;
     let mut i = 0usize;
     while i < data.len() {
-        let (sym, consumed, extra_bits, extra_n) = match_or_literal(data, i);
-        emit_bits(&mut bitbuf, &mut nbits, &mut out, u32::from(sym), 9);
-        if extra_n > 0 {
-            emit_bits(&mut bitbuf, &mut nbits, &mut out, extra_bits, extra_n);
+        let tok = match_or_literal(data, i, 17);
+        emit_bits(&mut bitbuf, &mut nbits, &mut out, u32::from(tok.sym), 9);
+        if tok.offset_extra_n > 0 {
+            emit_bits(
+                &mut bitbuf,
+                &mut nbits,
+                &mut out,
+                tok.offset_extra,
+                tok.offset_extra_n,
+            );
         }
-        i += consumed;
+        i += tok.consumed;
+    }
+    if nbits > 0 {
+        let word = (bitbuf >> 16) as u16;
+        out.extend_from_slice(&word.to_le_bytes());
+    }
+    out
+}
+
+/// Literals-only stream with a sparse table (match symbols unused / length 0).
+#[cfg(test)]
+pub fn compress_literals_len8(data: &[u8]) -> Vec<u8> {
+    let mut table = vec![0u8; NUM_SYMBOLS / 2];
+    for b in table.iter_mut().take(NUM_CHARS / 2) {
+        *b = 0x88; // symbols 0..=255 length 8
+    }
+    let mut out = table;
+    let mut bitbuf: u32 = 0;
+    let mut nbits: u32 = 0;
+    for &b in data {
+        emit_bits(&mut bitbuf, &mut nbits, &mut out, u32::from(b), 8);
     }
     if nbits > 0 {
         let word = (bitbuf >> 16) as u16;
@@ -95,12 +121,24 @@ pub fn compress(data: &[u8]) -> Vec<u8> {
 }
 
 #[cfg(test)]
-fn match_or_literal(data: &[u8], i: usize) -> (u16, usize, u32, u32) {
+struct Token {
+    sym: u16,
+    consumed: usize,
+    offset_extra: u32,
+    offset_extra_n: u32,
+}
+
+#[cfg(test)]
+fn match_or_literal(data: &[u8], i: usize, max_match: usize) -> Token {
     if i == 0 || data.len() - i < 3 {
-        return (u16::from(data[i]), 1, 0, 0);
+        return Token {
+            sym: u16::from(data[i]),
+            consumed: 1,
+            offset_extra: 0,
+            offset_extra_n: 0,
+        };
     }
-    // Match length 3..=17 so the length nibble stays < 0xF (no extra bytes).
-    let max_len = (data.len() - i).min(17);
+    let max_len = (data.len() - i).min(max_match);
     let window = i.min(65535);
     let mut best_len = 0usize;
     let mut best_off = 0usize;
@@ -121,14 +159,22 @@ fn match_or_literal(data: &[u8], i: usize) -> (u16, usize, u32, u32) {
         }
     }
     if best_len < 3 {
-        return (u16::from(data[i]), 1, 0, 0);
+        return Token {
+            sym: u16::from(data[i]),
+            consumed: 1,
+            offset_extra: 0,
+            offset_extra_n: 0,
+        };
     }
     let log2 = 31 - (best_off as u32).leading_zeros();
-    // offset = (1 << log2) | extra, extra has `log2` bits.
     let extra = (best_off as u32) ^ (1u32 << log2);
     let nibble = (best_len as u32 - MIN_MATCH_LEN) as u16;
-    let sym = 256 + ((log2 as u16) << 4) + nibble;
-    (sym, best_len, extra, log2)
+    Token {
+        sym: 256 + ((log2 as u16) << 4) + nibble,
+        consumed: best_len,
+        offset_extra: extra,
+        offset_extra_n: log2,
+    }
 }
 
 #[cfg(test)]
@@ -311,5 +357,76 @@ mod tests {
         let c = compress(&src);
         let d = decompress(&c, src.len()).expect("decompress");
         assert_eq!(d, src);
+    }
+
+    fn flat9_table() -> Vec<u8> {
+        vec![0x99; NUM_SYMBOLS / 2]
+    }
+
+    fn push_bits(bits: &mut Vec<bool>, val: u32, n: u32) {
+        for i in (0..n).rev() {
+            bits.push((val >> i) & 1 != 0);
+        }
+    }
+
+    /// Pack Huffman bits the way [`BitReader`] loads 16-bit LE coding units.
+    fn pack_huff_bits(bits: &[bool]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bits.len() {
+            let mut w = 0u16;
+            for b in 0..16 {
+                if i < bits.len() && bits[i] {
+                    w |= 1 << (15 - b);
+                }
+                i += 1;
+            }
+            out.extend_from_slice(&w.to_le_bytes());
+        }
+        out
+    }
+
+    /// Literal + offset-1 match with nibble 0xF and one extra length byte.
+    #[test]
+    fn xpress_extra_length_match_round_trip() {
+        let src = vec![b'Z'; 21];
+        let mut bits = Vec::new();
+        push_bits(&mut bits, u32::from(b'Z'), 9);
+        // symbol 256 + (log2=0 << 4) + 0xF = 271, offset extra bits = 0
+        push_bits(&mut bits, 271, 9);
+        let mut c = flat9_table();
+        c.extend(pack_huff_bits(&bits));
+        c.push(2); // stored len 17 = 0xF + 2 → match 20
+        let d = decompress(&c, src.len()).expect("decompress extra-length");
+        assert_eq!(d, src);
+    }
+
+    /// Literal + offset-1 match using the u16 extra-length replacement.
+    #[test]
+    fn xpress_extra_length_u16_match_round_trip() {
+        let src = vec![b'Q'; 281];
+        let mut bits = Vec::new();
+        push_bits(&mut bits, u32::from(b'Q'), 9);
+        push_bits(&mut bits, 271, 9);
+        let mut c = flat9_table();
+        c.extend(pack_huff_bits(&bits));
+        c.push(0xff);
+        let stored = 277u16; // match 280 - 3
+        c.extend_from_slice(&stored.to_le_bytes());
+        let d = decompress(&c, src.len()).expect("decompress u16 extra-length");
+        assert_eq!(d, src);
+    }
+
+    /// Unused match symbols have length 0 (not a flat 9-bit alphabet).
+    #[test]
+    fn xpress_sparse_huffman_literals() {
+        let src = b"sparse table literals only";
+        let c = compress_literals_len8(src);
+        assert!(
+            c[128..256].iter().all(|&b| b == 0),
+            "match-symbol lengths must be unused"
+        );
+        let d = decompress(&c, src.len()).expect("decompress sparse");
+        assert_eq!(&d, src);
     }
 }

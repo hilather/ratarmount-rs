@@ -320,8 +320,9 @@ mod tests {
     use crate::parse::ResHdr;
     use crate::parse::{
         filetime_to_unix, sha1_bytes, write_reshdr, ATTR_FLAG_ARCHIVE, ATTR_FLAG_DIRECTORY,
-        FILETIME_UNIX_DELTA, HDR_COMPRESSION, HDR_COMPRESS_LZX, HDR_COMPRESS_XPRESS,
-        HEADER_DISK_SIZE, MAGIC, RES_FLAG_COMPRESSED, RES_FLAG_METADATA, WIM_VERSION_DEFAULT,
+        FILETIME_UNIX_DELTA, HDR_COMPRESSION, HDR_COMPRESS_LZMS, HDR_COMPRESS_LZX,
+        HDR_COMPRESS_XPRESS, HEADER_DISK_SIZE, MAGIC, RES_FLAG_COMPRESSED, RES_FLAG_METADATA,
+        WIM_VERSION_DEFAULT,
     };
     use std::io::Write;
     use std::process::Command;
@@ -588,18 +589,26 @@ mod tests {
         out
     }
 
-    fn synthetic_lzx_header() -> Vec<u8> {
+    fn synthetic_compress_header(codec_flag: u32) -> Vec<u8> {
         let mut h = vec![0u8; HEADER_DISK_SIZE];
         h[0..8].copy_from_slice(MAGIC);
         h[8..12].copy_from_slice(&(HEADER_DISK_SIZE as u32).to_le_bytes());
         h[12..16].copy_from_slice(&WIM_VERSION_DEFAULT.to_le_bytes());
-        let flags = HDR_COMPRESSION | HDR_COMPRESS_LZX;
+        let flags = HDR_COMPRESSION | codec_flag;
         h[16..20].copy_from_slice(&flags.to_le_bytes());
         h[20..24].copy_from_slice(&32768u32.to_le_bytes());
         h[40..42].copy_from_slice(&1u16.to_le_bytes());
         h[42..44].copy_from_slice(&1u16.to_le_bytes());
         h[44..48].copy_from_slice(&1u32.to_le_bytes());
         h
+    }
+
+    fn synthetic_lzx_header() -> Vec<u8> {
+        synthetic_compress_header(HDR_COMPRESS_LZX)
+    }
+
+    fn synthetic_lzms_header() -> Vec<u8> {
+        synthetic_compress_header(HDR_COMPRESS_LZMS)
     }
 
     fn which_wimlib_imagex() -> Option<PathBuf> {
@@ -770,6 +779,34 @@ mod tests {
         );
     }
 
+    /// LZMS is residual: same fail-closed path as LZX (`0x0008_0000`).
+    #[test]
+    fn open_from_reader_lzms_is_residual() {
+        let bytes = synthetic_lzms_header();
+        assert!(looks_like_wim_reader(&mut Cursor::new(&bytes)));
+        let err = WimMountSource::open_from_reader(Cursor::new(bytes), "lzms.wim")
+            .err()
+            .expect("LZMS must not open");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("LZMS") && msg.contains("residual"),
+            "unexpected error: {msg}"
+        );
+        assert!(!msg.contains("LZX"), "must name LZMS not LZX: {msg}");
+    }
+
+    /// Regression: blob-table SHA-1 is integrity, not just a lookup key.
+    #[test]
+    fn open_from_reader_sha1_mismatch_on_corrupt_payload() {
+        let mut bytes = synthetic_uncompressed_wim();
+        bytes[HEADER_DISK_SIZE] ^= 0x01;
+        let m = WimMountSource::open_from_reader(Cursor::new(bytes), "corrupt.wim")
+            .expect("catalog still opens");
+        let fi = m.lookup("/hello.txt", 0).expect("hello listed");
+        let err = m.open(&fi, 0).err().expect("corrupt payload must fail");
+        assert!(err.to_string().contains("SHA-1"), "unexpected error: {err}");
+    }
+
     /// Regression: FILETIME 1601→1970 delta must be 100ns ticks.
     #[test]
     fn filetime_unix_epoch_is_zero() {
@@ -795,40 +832,68 @@ mod tests {
         assert!(!looks_like_wim_reader(&mut File::open(&p).unwrap()));
     }
 
-    #[test]
-    fn wimlib_imagex_uncompressed_round_trip() {
-        let Some(bin) = which_wimlib_imagex() else {
-            eprintln!("skip: wimlib-imagex not available");
-            return;
-        };
-        let dir = tempfile::tempdir().unwrap();
+    fn wimlib_imagex_capture(compress: &str) -> Option<(tempfile::TempDir, PathBuf)> {
+        let bin = which_wimlib_imagex()?;
+        let dir = tempfile::tempdir().ok()?;
         let src = dir.path().join("src");
-        std::fs::create_dir(&src).unwrap();
-        std::fs::write(src.join("hello.txt"), b"hello-wim\n").unwrap();
-        std::fs::create_dir(src.join("foo")).unwrap();
-        std::fs::write(src.join("foo").join("ufo"), b"iriya\n").unwrap();
+        std::fs::create_dir(&src).ok()?;
+        std::fs::write(src.join("hello.txt"), b"hello-wim\n").ok()?;
+        std::fs::create_dir(src.join("foo")).ok()?;
+        std::fs::write(src.join("foo").join("ufo"), b"iriya\n").ok()?;
         let wim = dir.path().join("out.wim");
-        let status = Command::new(&bin)
-            .args(["capture", "--compress=none"])
+        let flag = format!("--compress={compress}");
+        let status = match Command::new(&bin)
+            .args(["capture", &flag])
             .arg(&src)
             .arg(&wim)
             .arg("image")
-            .status();
-        let status = match status {
+            .status()
+        {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("skip: wimlib-imagex failed to spawn ({e})");
-                return;
+                return None;
             }
         };
         if !status.success() {
-            eprintln!("skip: wimlib-imagex capture failed ({})", bin.display());
-            return;
+            eprintln!(
+                "skip: wimlib-imagex capture --compress={compress} failed ({})",
+                bin.display()
+            );
+            return None;
         }
+        Some((dir, wim))
+    }
+
+    #[test]
+    fn wimlib_imagex_uncompressed_round_trip() {
+        let Some((_dir, wim)) = wimlib_imagex_capture("none") else {
+            eprintln!("skip: wimlib-imagex not available");
+            return;
+        };
         let m = WimMountSource::open(&wim).expect("open wimlib-imagex capture");
         let fi = m.lookup("/hello.txt", 0).expect("hello.txt from imagex");
         let mut s = String::new();
         m.open(&fi, 0).unwrap().read_to_string(&mut s).unwrap();
         assert_eq!(s, "hello-wim\n");
+    }
+
+    #[test]
+    fn wimlib_imagex_xpress_round_trip() {
+        let Some((_dir, wim)) = wimlib_imagex_capture("xpress") else {
+            eprintln!("skip: wimlib-imagex not available");
+            return;
+        };
+        let m = WimMountSource::open(&wim).expect("open wimlib-imagex xpress capture");
+        let fi = m
+            .lookup("/hello.txt", 0)
+            .expect("hello.txt from imagex xpress");
+        let mut s = String::new();
+        m.open(&fi, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "hello-wim\n");
+        let ufo = m.lookup("/foo/ufo", 0).expect("ufo from imagex xpress");
+        let mut s = String::new();
+        m.open(&ufo, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "iriya\n");
     }
 }

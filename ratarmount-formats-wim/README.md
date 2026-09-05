@@ -12,7 +12,7 @@ This crate is **not** wired into the session factory yet. Probe order / `formats
 |---------|---------|---------|
 | *(none)* | yes | RO first-image list / lookup / open; path and stream opens |
 
-In-process resource reads (no `wimlib`, no DISM). Uncompressed resources and **XPRESS** (LZ77+Huffman, [MS-XCA](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/)) compressed chunks are decoded. File payloads are hashed with SHA-1 in the blob table (same as the on-disk WIM lookup table).
+In-process resource reads (no `wimlib`, no DISM). Uncompressed resources and **XPRESS** (LZ77+Huffman, [MS-XCA](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/)) compressed chunks are decoded. Blob-table SHA-1 indexes payloads and is checked after decompress (fail-closed on mismatch).
 
 ## Nested / `open_from_reader` (no host temp)
 
@@ -30,7 +30,8 @@ Nested WIM members open from any `Read + Seek` stream via `WimMountSource::open_
 - WIMBoot, solid resources, delta / split WIMs, pipable `WLPWM`
 - Images after the first; XML image names as a directory prefix
 - Alternate data streams; encrypted (EFS) members list but `open` is `PermissionDenied`
-- Session factory / `formats-all` / nested matrix row (later PR)
+- **64 MiB** per-resource cap (blob table, metadata, and file payload); `open` buffers the whole member (`Cursor<Vec<u8>>`, same as FAT/exFAT)
+- Session factory / `formats-all` (orchestrator PR). Crate `open_from_reader` is no-tmp when a parent already has a seekable body.
 
 ## Build / test
 
