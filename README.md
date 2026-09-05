@@ -383,27 +383,28 @@ CI runs `fmt` → `clippy -D warnings` → `test`, FUSE phase allowlists, cold-i
 
 | Document | Topic |
 |----------|--------|
-| [docs/session-api.md](docs/session-api.md) | In-process Session API for embedders (no FUSE) |
-| [docs/parity-todo.md](docs/parity-todo.md) | Full feature + test parity checklist |
-| [docs/embedded-nested-archives.md](docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
-| [docs/mount-options-parity.md](docs/mount-options-parity.md) | CLI / mount-ability matrix |
+| [docs/session-api.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/session-api.md) | In-process Session API for embedders (no FUSE) |
+| [docs/parity-todo.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) | Full feature + test parity checklist |
+| [docs/embedded-nested-archives.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md) | Nested / no-tmp matrix |
+| [docs/mount-options-parity.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/mount-options-parity.md) | CLI / mount-ability matrix |
 | [docs/zstd-random-access.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) | Zstd seek-table & `--repack-seekable` producer |
-| [docs/gzip-binding-decision.md](docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
-| [docs/fuse-kernel-tuning.md](docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
+| [docs/gzip-binding-decision.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/gzip-binding-decision.md) | Gzip seek path design (G3 default + Tier D residual) |
+| [docs/fuse-kernel-tuning.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/fuse-kernel-tuning.md) | FUSE mount / kernel tuning + fair disk baseline |
 | [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) | NFSv3 default + opt-in NFSv4.1 (`--nfs-vers 4`) |
 | [docs/export.md](docs/export.md) | HTTP / WebDAV / SMB / 9P / SFTP userspace exports |
 | [docs/systemd-mount.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) | fstab / systemd `.mount` / autofs (`Type=fuse.ratarmount`) |
 | [docs/csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md) | Kubernetes CSI spec (no in-tree driver) |
+| [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) | HTTP / WebDAV / SMB / 9P / SFTP userspace exports |
 | [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md) | Packages + cosign verify |
 | [docs/macos.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) | macOS FUSE / FSKit |
-| [docs/phase10-remote.md](docs/phase10-remote.md) | Remote backends |
-| [docs/cold-index-and-sparse.md](docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
-| [benchmarks/python-vs-rust-results.md](benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.27 BIG suite) |
-| [benchmarks/python-vs-rust-results-big.md](benchmarks/python-vs-rust-results-big.md) | Named `BIG=1` output (same snapshot; re-run with `BIG=1`) |
-| [benchmarks/README.md](benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
+| [docs/phase10-remote.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md) | Remote backends |
+| [docs/cold-index-and-sparse.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/cold-index-and-sparse.md) | Index perf + sparse TAR |
+| [benchmarks/python-vs-rust-results.md](https://github.com/hilather/ratarmount-rs/blob/main/benchmarks/python-vs-rust-results.md) | Latest head-to-head numbers (v0.1.27 BIG suite) |
+| [benchmarks/python-vs-rust-results-big.md](https://github.com/hilather/ratarmount-rs/blob/main/benchmarks/python-vs-rust-results-big.md) | Named `BIG=1` output (same snapshot; re-run with `BIG=1`) |
+| [benchmarks/README.md](https://github.com/hilather/ratarmount-rs/blob/main/benchmarks/README.md) | Bench harnesses (Python vs Rust, gzip backends, FUSE tuning) |
 | [docs/phase12-dual-run.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md) | Dual-run (crates.io **not** required) |
 | [docs/crates-io-policy.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) | crates.io policy (L0 dry-run only; no live publish) |
-| [docs/tasks/beyond-parity-roadmap.md](docs/tasks/beyond-parity-roadmap.md) | Beyond-parity protocols, features, product bets |
+| [docs/tasks/beyond-parity-roadmap.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) | Beyond-parity protocols, features, product bets |
 
 ---
 
