@@ -2847,6 +2847,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-dmg"
+version = "0.1.30"
+dependencies = [
+ "bzip2",
+ "fatfs",
+ "flate2",
+ "log",
+ "ratarmount-core",
+ "ratarmount-formats-block",
+ "ratarmount-formats-exfat",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
+ "ratarmount-formats-iso9660",
+ "ratarmount-formats-ntfs",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-exfat"
 version = "0.1.30"
 dependencies = [
