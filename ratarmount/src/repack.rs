@@ -29,7 +29,7 @@ pub fn validate_local_paths(input: &Path, output: &Path) -> Result<(), String> {
     if let Some(parent) = output.parent() {
         if !parent.as_os_str().is_empty() && !parent.is_dir() {
             return Err(format!(
-                "--repack-seekable OUT parent is not a writable directory: {}",
+                "--repack-seekable OUT parent is not a directory: {}",
                 parent.display()
             ));
         }
@@ -263,6 +263,29 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.contains("not a local file"), "{err}");
+    }
+
+    #[test]
+    fn repack_rejects_missing_out_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.tar");
+        std::fs::write(&input, b"x").unwrap();
+        let output = dir.path().join("no-such-dir").join("out.tar.zst");
+        let err = validate_local_paths(&input, &output).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
+        assert!(!err.contains("writable"), "{err}");
+    }
+
+    #[test]
+    fn repack_rejects_out_parent_that_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.tar");
+        std::fs::write(&input, b"x").unwrap();
+        let parent = dir.path().join("not-a-dir");
+        std::fs::write(&parent, b"x").unwrap();
+        let output = parent.join("out.tar.zst");
+        let err = validate_local_paths(&input, &output).unwrap_err();
+        assert!(err.contains("not a directory"), "{err}");
     }
 
     #[test]

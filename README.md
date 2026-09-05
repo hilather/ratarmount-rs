@@ -135,7 +135,8 @@ ratarmount --no-mount -c archive.tar
 
 # Make a single-frame / gzip archive randomly accessible (multi-frame zstd + seek table)
 ratarmount --repack-seekable big.tar.gz big.tar.zst
-# Gzip sidecar instead of transcode: --repack-keep-gzip in.gz out.gz  (writes out.gz.rgzi)
+# Gzip sidecar instead of transcode (helpers before the flag or after IN OUT):
+ratarmount --repack-keep-gzip --repack-seekable in.gz out.gz   # writes out.gz.rgzi
 # Exclusive with --nfs / -w / a FUSE mountpoint. Local files only.
 
 # Locate without FUSE (TSV path, size, mtime). Quote globs. `--fts` / `--offset-order` are find-only.
@@ -196,7 +197,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | File versions | `.versions/` by default (`--no-file-versions`) |
 | Strip / transform / prefix | Path rewriting on mount |
 | Control plane | Unix socket **and** in-FS `/.ratarmount-control/` (read-only `search/<pattern>` glob locate; quote globs). Live `-w` control/socket last-wins overlay creates/COW/tombstones; CLI `find` stays sidecar SQL and rejects `-w`. `ratarmount find '*.fits' ARCHIVE` (no FUSE; `--fts` / `--offset-order` are find-argv only) |
-| Seekable producer | `--repack-seekable IN OUT` writes multi-frame zstd + official seek table (default 8 MiB frames; `num_args = 2`). Already-seekable inputs are copied. `--repack-keep-gzip` writes `OUT.rgzi`; `--repack-gzidx` adds Python GZIDX; `--repack-force` splits oversized frames. Local files only; exclusive with export / `-w` / a FUSE mountpoint. [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) |
+| Seekable producer | `--repack-seekable IN OUT` writes multi-frame zstd + official seek table (default 8 MiB frames; `num_args = 2`; IN OUT must immediately follow the flag). Already-seekable inputs are copied. Helpers (`--repack-keep-gzip` → `OUT.rgzi`; `--repack-gzidx`; `--repack-force`) go **before** `--repack-seekable` or **after** IN OUT. Local files only; exclusive with export / `-w` / a FUSE mountpoint. [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md) |
 | Readahead | `--readahead BYTES` (sequential FUSE window; max 64 MiB; auto **1 MiB** for gzip when flag omitted) |
 | Depth control | `--recursion-depth`, `--no-mount` |
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |

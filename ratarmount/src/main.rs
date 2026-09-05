@@ -46,12 +46,14 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Optional sugar: ratarmount serve --nfs --http ARCHIVE (requires at\n\
                   least one export; incompatible with --no-mount).\n\
                   Locate: ratarmount find '*.fits' ARCHIVE (no FUSE; TSV path/size/mtime).\n\
-                  Producer: ratarmount --repack-seekable IN OUT (framed zstd + seek table).",
+                  Producer: ratarmount --repack-seekable IN OUT (framed zstd + seek table).\n\
+                  Helpers (--repack-force, …) go before --repack-seekable or after IN OUT.",
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
                   Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
-                  Producer: ratarmount --repack-seekable IN OUT (exclusive with export / -w / mountpoint)."
+                  Producer: ratarmount --repack-seekable IN OUT (exclusive with export / -w / mountpoint).\n\
+                  Helpers (--repack-force, --repack-keep-gzip, …) go before --repack-seekable or after IN OUT."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -421,8 +423,16 @@ struct Args {
 
     /// Offline producer: make IN randomly accessible as OUT.
     /// Two paths required (`num_args = 2`) so clap cannot steal a mountpoint.
+    /// IN and OUT must immediately follow this flag (do not put helpers between
+    /// `--repack-seekable` and the paths; helpers go before it or after IN OUT).
     /// Exclusive with export / `-w` / a FUSE mountpoint. Local files only.
-    #[arg(long = "repack-seekable", value_names = ["IN", "OUT"], num_args = 2)]
+    /// `Set` so a second `--repack-seekable` is a clap conflict (not four paths).
+    #[arg(
+        long = "repack-seekable",
+        value_names = ["IN", "OUT"],
+        num_args = 2,
+        action = ArgAction::Set
+    )]
     repack_seekable: Vec<PathBuf>,
 
     /// Uncompressed bytes per output zstd frame (`K`/`M`/`G`). Default 8 MiB.
@@ -660,7 +670,7 @@ fn repack_cli_error(args: &Args) -> Option<&'static str> {
         return None;
     }
     if args.repack_seekable.len() != 2 {
-        return Some("--repack-seekable requires IN and OUT");
+        return Some("--repack-seekable requires IN and OUT (pass the flag once)");
     }
     if any_export(args) {
         return Some(
@@ -823,6 +833,7 @@ fn main() {
         );
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
         eprintln!("       ratarmount --repack-seekable <in> <out>");
+        eprintln!("       ratarmount --repack-force --repack-seekable <in> <out>");
         eprintln!(
             "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
         );
@@ -3255,6 +3266,65 @@ mod repack_cli_tests {
         let msg = err.to_string();
         assert!(
             msg.contains("repack-seekable") || msg.contains("required") || msg.contains("value"),
+            "{msg}"
+        );
+
+        // Helpers before `--repack-seekable` parse; IN OUT still immediately follow the flag.
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-force",
+            "--repack-frame-size",
+            "1M",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("helpers before --repack-seekable");
+        assert!(a.repack_force);
+        assert_eq!(a.repack_frame_size, "1M");
+        assert_eq!(
+            a.repack_seekable,
+            vec![PathBuf::from("in.tar"), PathBuf::from("out.tar.zst")]
+        );
+        assert!(a.paths.is_empty());
+        assert!(repack_cli_error(&a).is_none());
+
+        // A helper *between* `--repack-seekable` and IN OUT fails: clap treats
+        // `--repack-force` as a flag, so `--repack-seekable` never gets its two
+        // values. Do not set `allow_hyphen_values` (that would steal the helper
+        // as IN). Put helpers before `--repack-seekable` or after IN OUT.
+        let err = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--repack-force",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repack-seekable") && (msg.contains("required") || msg.contains("value")),
+            "{msg}"
+        );
+
+        // A second `--repack-seekable` is a clap conflict (`ArgAction::Set`),
+        // not four paths with a misleading "requires IN and OUT" runtime error.
+        let err = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "old.in",
+            "old.out",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repack-seekable")
+                && (msg.contains("cannot be used")
+                    || msg.contains("conflict")
+                    || msg.contains("provided more than once")),
             "{msg}"
         );
     }

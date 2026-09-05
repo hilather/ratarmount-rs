@@ -58,15 +58,20 @@ The **recommended** producer is the CLI (engine:
 
 ```bash
 ratarmount --repack-seekable IN OUT
-ratarmount --repack-seekable --repack-frame-size 8M --repack-level 3 in.tar.gz out.tar.zst
-ratarmount --repack-seekable --repack-keep-gzip in.tar.gz out.tar.gz   # writes OUT + OUT.rgzi
-ratarmount --repack-seekable --repack-gzidx --repack-keep-gzip in.gz out.gz
-ratarmount --repack-seekable --repack-force in.tar.zst out.tar.zst    # split oversized frames
+ratarmount --repack-frame-size 8M --repack-level 3 --repack-seekable in.tar.gz out.tar.zst
+ratarmount --repack-keep-gzip --repack-seekable in.tar.gz out.tar.gz   # writes OUT + OUT.rgzi
+ratarmount --repack-gzidx --repack-keep-gzip --repack-seekable in.gz out.gz
+ratarmount --repack-force --repack-seekable in.tar.zst out.tar.zst    # split oversized frames
+# Helpers may also follow the two paths:
+#   ratarmount --repack-seekable in.tar.zst out.tar.zst --repack-force
 ```
 
 `--repack-seekable` takes **two** paths (`num_args = 2`) so clap cannot steal a
-mountpoint. It is exclusive with `--nfs` / other exports, `-w`, and a FUSE
-mountpoint. **Local files only** (remote PUT is F-7).
+mountpoint. **IN and OUT must immediately follow** `--repack-seekable`; helper
+flags (`--repack-force`, `--repack-keep-gzip`, `--repack-frame-size`, …) go
+**before** that flag or **after** the two paths — not between the flag and IN.
+It is exclusive with `--nfs` / other exports, `-w`, and a FUSE mountpoint.
+**Local files only** (remote PUT is F-7).
 
 Default output is **multi-frame zstd + official seek table** (footer magic
 `0x8F92EAB1`). Uncompressed frame size defaults to **8 MiB**, matching the
@@ -189,7 +194,7 @@ ratarmount big.zst mnt/
 
 If open is slow or RSS jumps on a multi‑GiB `.zst`, the stream is likely a
 **single frame** (full decode). Recompress with
-`ratarmount --repack-seekable IN OUT` (or the `split` recipes below).
+`ratarmount --repack-seekable IN OUT` (or the `split` recipes above).
 
 ---
 
