@@ -1,4 +1,4 @@
-//! Blocking SMB 2.0.2 Direct-TCP client packet codec (F-6 PR 3a).
+//! Blocking SMB 2.0.2 Direct-TCP client packet codec.
 //!
 //! In-tree `TcpStream` dialect: crates.io `smb` 0.11.x declares rust-version
 //! 1.85–1.89 (workspace MSRV is 1.74). Crate-disjoint from `ratarmount-smb`
@@ -33,6 +33,7 @@ pub const DIALECT_202: u16 = 0x0202;
 pub const DIALECT_210: u16 = 0x0210;
 
 pub const NEGOTIATE_SIGNING_ENABLED: u16 = 0x0001;
+pub const NEGOTIATE_SIGNING_REQUIRED: u16 = 0x0002;
 
 pub const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 pub const FILE_OPEN: u32 = 1;
@@ -85,6 +86,8 @@ pub struct Smb2Client<S> {
     tree_id: u32,
     process_id: u32,
     dialect: u16,
+    security_mode: u16,
+    max_read_size: u32,
     /// SessionBaseKey after NTLMv2; `None` for unsigned guest.
     session_key: Option<[u8; 16]>,
 }
@@ -95,6 +98,8 @@ impl<S> std::fmt::Debug for Smb2Client<S> {
             .field("dialect", &self.dialect)
             .field("session_id", &self.session_id)
             .field("tree_id", &self.tree_id)
+            .field("security_mode", &self.security_mode)
+            .field("max_read_size", &self.max_read_size)
             .field("signed", &self.session_key.is_some())
             .finish_non_exhaustive()
     }
@@ -125,6 +130,8 @@ impl<S: Read + Write> Smb2Client<S> {
             tree_id: 0,
             process_id: 0xfeff,
             dialect: 0,
+            security_mode: 0,
+            max_read_size: MAX_READ,
             session_key: None,
         }
     }
@@ -139,6 +146,14 @@ impl<S: Read + Write> Smb2Client<S> {
 
     pub fn tree_id(&self) -> u32 {
         self.tree_id
+    }
+
+    pub fn max_read_size(&self) -> u32 {
+        self.max_read_size
+    }
+
+    pub fn signing_required(&self) -> bool {
+        self.security_mode & NEGOTIATE_SIGNING_REQUIRED != 0
     }
 
     /// NEGOTIATE dialects 2.0.2 and 2.1. Returns the selected dialect.
@@ -157,21 +172,33 @@ impl<S: Read + Write> Smb2Client<S> {
             ));
         }
         check_status(h.status, "NEGOTIATE")?;
-        if body.len() < 6 {
+        if body.len() < 36 {
             return Err(RemoteError::Smb("NEGOTIATE response truncated".into()));
         }
+        let security_mode = u16_at(&body, 2)?;
         let dialect = u16_at(&body, 4)?;
         if dialect != DIALECT_202 && dialect != DIALECT_210 {
             return Err(RemoteError::Smb(format!(
                 "NEGOTIATE: unsupported dialect {dialect:#06x} (need 2.0.2/2.1)"
             )));
         }
+        let max_read_size = u32_at(&body, 32)?;
+        if max_read_size == 0 {
+            return Err(RemoteError::Smb("NEGOTIATE MaxReadSize is 0".into()));
+        }
         self.dialect = dialect;
+        self.security_mode = security_mode;
+        self.max_read_size = max_read_size.min(MAX_READ);
         Ok(dialect)
     }
 
     /// Two-leg SESSION_SETUP with empty user (guest). Unsigned after success.
     pub fn session_setup_guest(&mut self) -> Result<()> {
+        if self.signing_required() {
+            return Err(RemoteError::Smb(
+                "NEGOTIATE SIGNING_REQUIRED; guest session is unsigned — use NTLMv2".into(),
+            ));
+        }
         let t1 = ntlm_type1();
         let (h, _) = self.session_setup_sec(&t1)?;
         if h.status != STATUS_MORE_PROCESSING_REQUIRED {
@@ -205,11 +232,17 @@ impl<S: Read + Write> Smb2Client<S> {
         })?;
         let target_info = ntlm_type2_target_info(&sec).unwrap_or_default();
         let (t3, key) = ntlm_type3_v2(user, domain, password, challenge, &target_info);
-        // Key is known before the Type3 response; the request itself is unsigned.
-        let (h, _) = self.session_setup_sec(&t3)?;
+        // Type3 request is unsigned (session key not installed yet).
+        let (h, _, raw) = self.exchange(SMB2_SESSION_SETUP, &encode_session_setup_body(&t3))?;
         if h.status != STATUS_SUCCESS {
             self.session_key = None;
             return Err(status_err(h.status, "SESSION_SETUP Type3 (NTLMv2)"));
+        }
+        // Verify Type3 SUCCESS against the just-computed SessionBaseKey before install.
+        if !smb2_verify_packet(&raw, &key) {
+            return Err(RemoteError::Smb(
+                "SESSION_SETUP Type3 SUCCESS unsigned or signature mismatch".into(),
+            ));
         }
         self.session_id = h.session_id;
         self.session_key = Some(key);
@@ -262,11 +295,20 @@ impl<S: Read + Write> Smb2Client<S> {
     }
 
     /// SMB2 READ at `offset`. Short SUCCESS is not EOF; [`STATUS_END_OF_FILE`] is.
+    ///
+    /// `Length` is capped to the negotiated `MaxReadSize` (and [`MAX_READ`]).
+    /// SUCCESS with `DataLength == 0` while a positive length was requested is a
+    /// protocol error — only `STATUS_END_OF_FILE` is EOF.
     pub fn read_at(&mut self, file_id: [u8; 16], offset: u64, length: u32) -> Result<Vec<u8>> {
         if length == 0 {
             return Ok(Vec::new());
         }
-        let length = length.min(MAX_READ);
+        let cap = if self.max_read_size == 0 {
+            MAX_READ
+        } else {
+            self.max_read_size.min(MAX_READ)
+        };
+        let length = length.min(cap);
         let mut body = vec![0u8; 48];
         body[0..2].copy_from_slice(&49u16.to_le_bytes());
         body[4..8].copy_from_slice(&length.to_le_bytes());
@@ -283,7 +325,9 @@ impl<S: Read + Write> Smb2Client<S> {
         let data_off = b[2] as usize;
         let data_len = u32_at(&b, 4)? as usize;
         if data_len == 0 {
-            return Ok(Vec::new());
+            return Err(RemoteError::Smb(
+                "READ SUCCESS DataLength 0 is not EOF (need STATUS_END_OF_FILE)".into(),
+            ));
         }
         let start = data_off.saturating_sub(SMB2_HEADER_LEN);
         b.get(start..start + data_len)
@@ -301,17 +345,22 @@ impl<S: Read + Write> Smb2Client<S> {
     }
 
     fn session_setup_sec(&mut self, sec: &[u8]) -> Result<(Smb2Header, Vec<u8>)> {
-        let mut body = vec![0u8; 24];
-        body[0..2].copy_from_slice(&25u16.to_le_bytes());
-        body[3] = NEGOTIATE_SIGNING_ENABLED as u8;
-        let off = (SMB2_HEADER_LEN + 24) as u16;
-        body[12..14].copy_from_slice(&off.to_le_bytes());
-        body[14..16].copy_from_slice(&(sec.len() as u16).to_le_bytes());
-        body.extend_from_slice(sec);
-        self.roundtrip(SMB2_SESSION_SETUP, &body)
+        self.roundtrip(SMB2_SESSION_SETUP, &encode_session_setup_body(sec))
     }
 
     fn roundtrip(&mut self, command: u16, body: &[u8]) -> Result<(Smb2Header, Vec<u8>)> {
+        let (h, body, raw) = self.exchange(command, body)?;
+        if let Some(key) = self.session_key {
+            if !smb2_verify_packet(&raw, &key) {
+                return Err(RemoteError::Smb(
+                    "SMB2 response unsigned or signature mismatch".into(),
+                ));
+            }
+        }
+        Ok((h, body))
+    }
+
+    fn exchange(&mut self, command: u16, body: &[u8]) -> Result<(Smb2Header, Vec<u8>, Vec<u8>)> {
         let h = self.next_header(command);
         let mut pkt = encode_packet(&h, body);
         if let Some(key) = self.session_key {
@@ -330,19 +379,12 @@ impl<S: Read + Write> Smb2Client<S> {
                 "SMB2 response missing SERVER_TO_REDIR flag".into(),
             ));
         }
-        if rh.flags & SMB2_FLAGS_SIGNED != 0 {
-            if let Some(key) = self.session_key {
-                if !smb2_verify_packet(&raw, &key) {
-                    return Err(RemoteError::Smb("SMB2 response signature mismatch".into()));
-                }
-            }
-        }
         let body = if raw.len() > SMB2_HEADER_LEN {
             raw[SMB2_HEADER_LEN..].to_vec()
         } else {
             Vec::new()
         };
-        Ok((rh, body))
+        Ok((rh, body, raw))
     }
 
     fn next_header(&mut self, command: u16) -> Smb2Header {
@@ -361,6 +403,17 @@ impl<S: Read + Write> Smb2Client<S> {
         self.mid += 1;
         h
     }
+}
+
+fn encode_session_setup_body(sec: &[u8]) -> Vec<u8> {
+    let mut body = vec![0u8; 24];
+    body[0..2].copy_from_slice(&25u16.to_le_bytes());
+    body[3] = NEGOTIATE_SIGNING_ENABLED as u8;
+    let off = (SMB2_HEADER_LEN + 24) as u16;
+    body[12..14].copy_from_slice(&off.to_le_bytes());
+    body[14..16].copy_from_slice(&(sec.len() as u16).to_le_bytes());
+    body.extend_from_slice(sec);
+    body
 }
 
 fn session_setup_sec_buf(body: &[u8]) -> Result<Vec<u8>> {
@@ -707,6 +760,13 @@ fn ntlmv2_session_base_key(response_key_nt: &[u8; 16], nt_proof: &[u8]) -> [u8; 
     hmac_md5(response_key_nt, nt_proof)
 }
 
+/// MS-NLMP 2.2.2.7 `NTLMv2_CLIENT_CHALLENGE` header (28 bytes). AvPairs follow.
+/// ClientChallenge is at offset 16; Reserved3 occupies [24..28].
+const NTLMV2_CLIENT_CHALLENGE_HDR: [u8; 28] = [
+    0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00,
+];
+
 fn ntlm_type3_v2(
     user: &str,
     domain: &str,
@@ -715,16 +775,8 @@ fn ntlm_type3_v2(
     target_info: &[u8],
 ) -> (Vec<u8>, [u8; 16]) {
     const FLAGS: u32 = 0x2088_8201;
-    // MS-NLMP NTLMv2_CLIENT_CHALLENGE; AvPairs copied from Type2 when present.
-    let mut temp = vec![
-        0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x11, 0x22, 0x33,
-        0x44, 0x55, 0x66, 0x77, 0x88, 0x00, 0x00, 0x00, 0x00,
-    ];
-    if target_info.is_empty() {
-        temp.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]);
-    } else {
-        temp.extend_from_slice(target_info);
-    }
+    let mut temp = NTLMV2_CLIENT_CHALLENGE_HDR.to_vec();
+    temp.extend_from_slice(target_info);
     let rk = ntlmv2_response_key_nt(password, user, domain);
     let proof = ntlmv2_nt_proof(&rk, challenge, &temp);
     let skey = ntlmv2_session_base_key(&rk, &proof);
@@ -889,6 +941,40 @@ mod tests {
         RejectDialect,
     }
 
+    struct FakeOpts {
+        auth: AuthMode,
+        unsigned_read: bool,
+        read_data_cap: Option<u32>,
+        max_read_size: u32,
+        signing_required: bool,
+    }
+
+    impl FakeOpts {
+        fn guest() -> Self {
+            Self {
+                auth: AuthMode::Guest,
+                unsigned_read: false,
+                read_data_cap: None,
+                max_read_size: MAX_READ,
+                signing_required: false,
+            }
+        }
+
+        fn password(user: &str, domain: &str, password: &str) -> Self {
+            Self {
+                auth: AuthMode::Password {
+                    user: user.into(),
+                    domain: domain.into(),
+                    password: password.into(),
+                },
+                unsigned_read: false,
+                read_data_cap: None,
+                max_read_size: MAX_READ,
+                signing_required: true,
+            }
+        }
+    }
+
     struct FakeSmb {
         addr: SocketAddr,
         stats: Arc<Mutex<FakeStats>>,
@@ -897,13 +983,31 @@ mod tests {
 
     impl FakeSmb {
         fn spawn(mode: AuthMode) -> Self {
+            match mode {
+                AuthMode::Guest => Self::spawn_with(FakeOpts::guest()),
+                AuthMode::Password {
+                    user,
+                    domain,
+                    password,
+                } => Self::spawn_with(FakeOpts::password(&user, &domain, &password)),
+                AuthMode::RejectDialect => Self::spawn_with(FakeOpts {
+                    auth: AuthMode::RejectDialect,
+                    unsigned_read: false,
+                    read_data_cap: None,
+                    max_read_size: MAX_READ,
+                    signing_required: false,
+                }),
+            }
+        }
+
+        fn spawn_with(opts: FakeOpts) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake SMB");
             let addr = listener.local_addr().expect("local addr");
             let stats = Arc::new(Mutex::new(FakeStats::default()));
             let stats2 = Arc::clone(&stats);
             let handle = thread::spawn(move || {
                 if let Ok((stream, _)) = listener.accept() {
-                    let _ = handle_conn(stream, mode, stats2);
+                    let _ = handle_conn(stream, opts, stats2);
                 }
             });
             Self {
@@ -946,24 +1050,31 @@ mod tests {
         session_key: Option<[u8; 16]>,
         files: HashMap<[u8; 16], Vec<u8>>,
         next_fid: u64,
+        unsigned_read: bool,
+        read_data_cap: Option<u32>,
+        max_read_size: u32,
+        signing_required: bool,
     }
 
     fn handle_conn(
         mut stream: TcpStream,
-        mode: AuthMode,
+        opts: FakeOpts,
         stats: Arc<Mutex<FakeStats>>,
     ) -> io::Result<()> {
         stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
         stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-        if matches!(mode, AuthMode::RejectDialect) {
+        if matches!(opts.auth, AuthMode::RejectDialect) {
             if let Ok(raw) = read_smb2_frame(&mut stream) {
                 if let Ok(h) = parse_smb2_header(&raw) {
-                    write_frame(&mut stream, &error_packet(&h, STATUS_NOT_SUPPORTED))?;
+                    write_frame(
+                        &mut stream,
+                        &error_packet_unsigned(&h, STATUS_NOT_SUPPORTED),
+                    )?;
                 }
             }
             return Ok(());
         }
-        let (require_password, user, domain, password) = match mode {
+        let (require_password, user, domain, password) = match opts.auth {
             AuthMode::Guest => (false, String::new(), String::new(), String::new()),
             AuthMode::Password {
                 user,
@@ -984,6 +1095,10 @@ mod tests {
             session_key: None,
             files: HashMap::new(),
             next_fid: 1,
+            unsigned_read: opts.unsigned_read,
+            read_data_cap: opts.read_data_cap,
+            max_read_size: opts.max_read_size,
+            signing_required: opts.signing_required,
         };
         loop {
             let raw = match read_smb2_frame(&mut stream) {
@@ -1001,7 +1116,7 @@ mod tests {
             };
             if let Some(key) = st.session_key {
                 if h.command != SMB2_SESSION_SETUP && !smb2_verify_packet(&raw, &key) {
-                    write_frame(&mut stream, &error_packet(&h, STATUS_ACCESS_DENIED))?;
+                    write_frame(&mut stream, &error_packet(&h, STATUS_ACCESS_DENIED, &st))?;
                     continue;
                 }
             }
@@ -1013,7 +1128,7 @@ mod tests {
                 SMB2_CREATE => cmd_create(&h, &raw, &mut st, &stats),
                 SMB2_READ => cmd_read(&h, &raw, &st, &stats),
                 SMB2_CLOSE => cmd_close(&h, &raw, &mut st),
-                _ => error_packet(&h, STATUS_NOT_SUPPORTED),
+                _ => error_packet(&h, STATUS_NOT_SUPPORTED, &st),
             };
             write_frame(&mut stream, &pkt)?;
         }
@@ -1053,25 +1168,30 @@ mod tests {
         pkt
     }
 
-    fn error_packet(req: &Smb2Header, status: u32) -> Vec<u8> {
+    fn error_packet_unsigned(req: &Smb2Header, status: u32) -> Vec<u8> {
         let h = reply_header(req, status, req.session_id, req.tree_id);
         encode_packet(&h, &error_body())
+    }
+
+    fn error_packet(req: &Smb2Header, status: u32, st: &ConnState) -> Vec<u8> {
+        let h = reply_header(req, status, st.session_id, st.tree_id);
+        maybe_sign(st, encode_packet(&h, &error_body()))
     }
 
     fn cmd_negotiate(req: &Smb2Header, st: &ConnState) -> Vec<u8> {
         let mut b = vec![0u8; 64];
         b[0..2].copy_from_slice(&65u16.to_le_bytes());
-        let mode = if st.require_password {
-            NEGOTIATE_SIGNING_ENABLED | 0x0002
+        let mode = if st.signing_required {
+            NEGOTIATE_SIGNING_ENABLED | NEGOTIATE_SIGNING_REQUIRED
         } else {
             NEGOTIATE_SIGNING_ENABLED
         };
         b[2..4].copy_from_slice(&mode.to_le_bytes());
         b[4..6].copy_from_slice(&DIALECT_202.to_le_bytes());
         b[8..24].copy_from_slice(b"ratarmnt-cli\0\0\0\x02");
-        b[28..32].copy_from_slice(&MAX_READ.to_le_bytes());
-        b[32..36].copy_from_slice(&MAX_READ.to_le_bytes());
-        b[36..40].copy_from_slice(&MAX_READ.to_le_bytes());
+        b[28..32].copy_from_slice(&st.max_read_size.to_le_bytes());
+        b[32..36].copy_from_slice(&st.max_read_size.to_le_bytes());
+        b[36..40].copy_from_slice(&st.max_read_size.to_le_bytes());
         let h = reply_header(req, STATUS_SUCCESS, 0, 0);
         encode_packet(&h, &b)
     }
@@ -1079,7 +1199,7 @@ mod tests {
     fn cmd_session_setup(req: &Smb2Header, raw: &[u8], st: &mut ConnState) -> Vec<u8> {
         let body = &raw[SMB2_HEADER_LEN..];
         if body.len() < 24 {
-            return error_packet(req, STATUS_LOGON_FAILURE);
+            return error_packet(req, STATUS_LOGON_FAILURE, st);
         }
         let off = u16::from_le_bytes(body[12..14].try_into().unwrap()) as usize;
         let len = u16::from_le_bytes(body[14..16].try_into().unwrap()) as usize;
@@ -1099,24 +1219,24 @@ mod tests {
             return encode_packet(&h, &b);
         }
         let Some(t3) = parse_ntlm_type3(sec) else {
-            return error_packet(req, STATUS_LOGON_FAILURE);
+            return error_packet(req, STATUS_LOGON_FAILURE, st);
         };
         if st.require_password {
             match ntlm_verify_type3(&t3, &st.password, Some(&st.user), CHALLENGE) {
                 Ok(key) => {
                     if !t3.domain.eq_ignore_ascii_case(&st.domain) && !st.domain.is_empty() {
-                        return error_packet(req, STATUS_LOGON_FAILURE);
+                        return error_packet(req, STATUS_LOGON_FAILURE, st);
                     }
                     st.session_key = Some(key);
                     st.authed = true;
                 }
-                Err(stt) => return error_packet(req, stt),
+                Err(stt) => return error_packet(req, stt, st),
             }
         } else if t3.nt_response.is_empty() {
             st.authed = true;
             st.session_key = None;
         } else {
-            return error_packet(req, STATUS_LOGON_FAILURE);
+            return error_packet(req, STATUS_LOGON_FAILURE, st);
         }
         let mut b = vec![0u8; 8];
         b[0..2].copy_from_slice(&9u16.to_le_bytes());
@@ -1130,11 +1250,11 @@ mod tests {
 
     fn cmd_tree_connect(req: &Smb2Header, raw: &[u8], st: &mut ConnState) -> Vec<u8> {
         if !st.authed {
-            return error_packet(req, STATUS_ACCESS_DENIED);
+            return error_packet(req, STATUS_ACCESS_DENIED, st);
         }
         let body = &raw[SMB2_HEADER_LEN..];
         if body.len() < 8 {
-            return error_packet(req, STATUS_BAD_NETWORK_NAME);
+            return error_packet(req, STATUS_BAD_NETWORK_NAME, st);
         }
         let off = u16::from_le_bytes(body[4..6].try_into().unwrap()) as usize;
         let len = u16::from_le_bytes(body[6..8].try_into().unwrap()) as usize;
@@ -1148,7 +1268,7 @@ mod tests {
             .unwrap_or("")
             .to_string();
         if !share.eq_ignore_ascii_case(SHARE) {
-            return error_packet(req, STATUS_BAD_NETWORK_NAME);
+            return error_packet(req, STATUS_BAD_NETWORK_NAME, st);
         }
         st.tree_id = 1;
         let mut b = vec![0u8; 16];
@@ -1165,11 +1285,11 @@ mod tests {
         stats: &Arc<Mutex<FakeStats>>,
     ) -> Vec<u8> {
         if !st.authed || st.tree_id == 0 {
-            return error_packet(req, STATUS_ACCESS_DENIED);
+            return error_packet(req, STATUS_ACCESS_DENIED, st);
         }
         let body = &raw[SMB2_HEADER_LEN..];
         if body.len() < 56 {
-            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND);
+            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND, st);
         }
         let name_off = u16::from_le_bytes(body[44..46].try_into().unwrap()) as usize;
         let name_len = u16::from_le_bytes(body[46..48].try_into().unwrap()) as usize;
@@ -1177,7 +1297,7 @@ mod tests {
         stats.lock().expect("stats").creates.push(name.clone());
         let n = name.replace('\\', "/");
         if n != FILE_NAME {
-            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND);
+            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND, st);
         }
         let mut fid = [0u8; 16];
         fid[..8].copy_from_slice(&st.next_fid.to_le_bytes());
@@ -1204,7 +1324,7 @@ mod tests {
     ) -> Vec<u8> {
         let body = &raw[SMB2_HEADER_LEN..];
         if body.len() < 48 {
-            return error_packet(req, STATUS_ACCESS_DENIED);
+            return error_packet(req, STATUS_ACCESS_DENIED, st);
         }
         let length = u32::from_le_bytes(body[4..8].try_into().unwrap());
         let offset = u64::from_le_bytes(body[8..16].try_into().unwrap());
@@ -1212,13 +1332,16 @@ mod tests {
         fid.copy_from_slice(&body[16..32]);
         stats.lock().expect("stats").reads.push((offset, length));
         let Some(data) = st.files.get(&fid) else {
-            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND);
+            return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND, st);
         };
         if offset >= data.len() as u64 {
-            return error_packet(req, STATUS_END_OF_FILE);
+            return error_packet(req, STATUS_END_OF_FILE, st);
         }
         let start = offset as usize;
-        let end = (start + length as usize).min(data.len());
+        let mut end = (start + length as usize).min(data.len());
+        if let Some(cap) = st.read_data_cap {
+            end = start.saturating_add(cap as usize).min(end);
+        }
         let slice = &data[start..end];
         let mut b = vec![0u8; 16];
         b[0..2].copy_from_slice(&17u16.to_le_bytes());
@@ -1226,7 +1349,12 @@ mod tests {
         b[4..8].copy_from_slice(&(slice.len() as u32).to_le_bytes());
         b.extend_from_slice(slice);
         let h = reply_header(req, STATUS_SUCCESS, st.session_id, st.tree_id);
-        maybe_sign(st, encode_packet(&h, &b))
+        let pkt = encode_packet(&h, &b);
+        if st.unsigned_read {
+            pkt
+        } else {
+            maybe_sign(st, pkt)
+        }
     }
 
     fn cmd_close(req: &Smb2Header, raw: &[u8], st: &mut ConnState) -> Vec<u8> {
@@ -1283,17 +1411,52 @@ mod tests {
         );
     }
 
-    /// Regression: NTLMv2 NTProofStr matches HMAC-MD5(ResponseKeyNT, challenge||temp).
+    fn unhex(s: &str) -> Vec<u8> {
+        let hex: String = s.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    /// Regression: NTLMv2_CLIENT_CHALLENGE is 28 bytes (Reserved3) and MS-NLMP 4.2.4 KAT.
     #[test]
-    fn regression_smb2_ntlmv2_proof_roundtrip() {
-        let challenge = CHALLENGE;
-        let (t3_bytes, key) = ntlm_type3_v2("alice", "CORP", "s3cret", challenge, &[]);
+    fn regression_smb2_ntlmv2_client_challenge_28_byte_kat() {
+        // Encoder layout: ClientChallenge at offset 16, Reserved3 at 24.
+        assert_eq!(NTLMV2_CLIENT_CHALLENGE_HDR.len(), 28);
+        assert_eq!(&NTLMV2_CLIENT_CHALLENGE_HDR[0..2], &[0x01, 0x01]);
+        assert_eq!(
+            &NTLMV2_CLIENT_CHALLENGE_HDR[16..24],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        );
+        assert_eq!(&NTLMV2_CLIENT_CHALLENGE_HDR[24..28], &[0, 0, 0, 0]);
+        let (t3_bytes, _) = ntlm_type3_v2("alice", "CORP", "s3cret", CHALLENGE, &[]);
         let t3 = parse_ntlm_type3(&t3_bytes).expect("Type3");
-        assert_eq!(t3.user, "alice");
-        assert_eq!(t3.domain, "CORP");
-        let got = ntlm_verify_type3(&t3, "s3cret", Some("alice"), challenge).expect("verify");
-        assert_eq!(got, key);
-        assert!(ntlm_verify_type3(&t3, "wrong", Some("alice"), challenge).is_err());
+        assert!(t3.nt_response.len() >= 16 + 28);
+        let temp = &t3.nt_response[16..];
+        assert_eq!(&temp[..28], &NTLMV2_CLIENT_CHALLENGE_HDR);
+        assert_eq!(
+            &temp[16..24],
+            &[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]
+        );
+
+        // MS-NLMP 4.2.4 known-answer (not a self-HMAC of our encoder blob).
+        const KAT_PASSWORD: &str = "Password";
+        const KAT_USER: &str = "User";
+        const KAT_DOMAIN: &str = "Domain";
+        const KAT_RESPONSE_KEY_NT: &str = "0c868a403bfd7a93a3001ef22ef02e3f";
+        const KAT_CHALLENGE: [u8; 8] = [0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef];
+        const KAT_TEMP: &str = "01010000000000000000000011223344556677880000000000000000";
+        const KAT_NT_PROOF: &str = "4ee6b0d655f232aca5d7b24da70c136a";
+        const KAT_SESSION_BASE: &str = "e4a9a329aaa4eb0d48818d127f9f77eb";
+        let rk = ntlmv2_response_key_nt(KAT_PASSWORD, KAT_USER, KAT_DOMAIN);
+        assert_eq!(rk.as_slice(), unhex(KAT_RESPONSE_KEY_NT));
+        let kat_temp = unhex(KAT_TEMP);
+        assert_eq!(kat_temp.len(), 28);
+        let proof = ntlmv2_nt_proof(&rk, KAT_CHALLENGE, &kat_temp);
+        assert_eq!(proof.as_slice(), unhex(KAT_NT_PROOF));
+        let skey = ntlmv2_session_base_key(&rk, &proof);
+        assert_eq!(skey.as_slice(), unhex(KAT_SESSION_BASE));
     }
 
     #[test]
@@ -1388,6 +1551,92 @@ mod tests {
         c.close(open.file_id).expect("CLOSE");
         assert_eq!(got, TAIL);
         assert_eq!(srv.stats().reads, vec![(OFFSET_1MIB, TAIL.len() as u32)]);
+    }
+
+    /// Regression: NTLMv2 session rejects an unsigned READ body (fail-closed).
+    #[test]
+    fn regression_smb2_ntlmv2_rejects_unsigned_read() {
+        let mut opts = FakeOpts::password("alice", "CORP", "s3cret");
+        opts.unsigned_read = true;
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = Smb2Client::connect(srv.addr).expect("connect");
+        c.negotiate().expect("NEGOTIATE");
+        c.session_setup_ntlmv2("alice", "CORP", "s3cret")
+            .expect("NTLMv2 SESSION_SETUP");
+        c.tree_connect("127.0.0.1", SHARE).expect("TREE_CONNECT");
+        let open = c.create(FILE_NAME).expect("CREATE");
+        let err = c
+            .read_at(open.file_id, OFFSET_1MIB, TAIL.len() as u32)
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unsigned") || msg.contains("signature"),
+            "{msg}"
+        );
+    }
+
+    /// Regression: SUCCESS with DataLength 16 of a 32-byte request is not EOF.
+    #[test]
+    fn regression_smb2_short_success_read_is_not_eof() {
+        let mut opts = FakeOpts::guest();
+        opts.read_data_cap = Some(16);
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = connect_guest(srv.addr);
+        let open = c.create(FILE_NAME).expect("CREATE");
+        let got = c.read_at(open.file_id, 0, 32).expect("short SUCCESS");
+        c.close(open.file_id).expect("CLOSE");
+        assert_eq!(
+            got.len(),
+            16,
+            "short SUCCESS must return 16 bytes, not empty"
+        );
+        assert_eq!(&got[..HEAD.len()], HEAD);
+        assert_eq!(srv.stats().reads, vec![(0, 32)]);
+    }
+
+    /// Regression: SUCCESS DataLength 0 with requested > 0 is not EOF.
+    #[test]
+    fn regression_smb2_success_zero_data_is_not_eof() {
+        let mut opts = FakeOpts::guest();
+        opts.read_data_cap = Some(0);
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = connect_guest(srv.addr);
+        let open = c.create(FILE_NAME).expect("CREATE");
+        let err = c.read_at(open.file_id, 0, 16).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("DataLength 0") && msg.contains("END_OF_FILE"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn guest_fails_when_signing_required() {
+        let mut opts = FakeOpts::guest();
+        opts.signing_required = true;
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = Smb2Client::connect(srv.addr).expect("connect");
+        c.negotiate().expect("NEGOTIATE");
+        assert!(c.signing_required());
+        let err = c.session_setup_guest().unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("SIGNING_REQUIRED") && msg.contains("guest"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn read_at_caps_to_negotiated_max_read_size() {
+        let mut opts = FakeOpts::guest();
+        opts.max_read_size = 64 * 1024;
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = connect_guest(srv.addr);
+        assert_eq!(c.max_read_size(), 64 * 1024);
+        let open = c.create(FILE_NAME).expect("CREATE");
+        let _ = c.read_at(open.file_id, 0, MAX_READ).expect("capped READ");
+        c.close(open.file_id).expect("CLOSE");
+        assert_eq!(srv.stats().reads, vec![(0, 64 * 1024)]);
     }
 
     #[test]
