@@ -36,7 +36,7 @@ Nested UDF members open from any `Read + Seek` stream via `UdfMountSource::open_
 - VAT (virtual allocation table) packet-written volumes
 - Extended (20-byte) allocation descriptors (`AD_EXT`)
 - Unreadable child ICBs are **skipped** in `list` / `list_dirents` (the directory still lists)
-- Type-3 AD continuations **are** followed (not residual)
+- Type-3 AD continuations **are** followed (not residual); a continuation longer than 64 KiB (`4096` long_ad slots) fails closed
 - Whole-file buffer on `open` (same as FAT/exFAT; `ArchiveRead` is `Send`)
 - Session factory / `formats-all` / nested matrix row (later PR)
 - Mixed-disc **probe order** (UDF before ISO) — orchestrator factory PR
