@@ -141,6 +141,7 @@ pub(crate) fn looks_like_vhdx_reader<R: Read + Seek>(reader: &mut R) -> bool {
 
 struct Header {
     sequence: u64,
+    log_guid: [u8; 16],
 }
 
 fn read_header<R: Read + Seek>(reader: &mut R, off: u64) -> Result<Option<Header>> {
@@ -163,12 +164,15 @@ fn read_header<R: Read + Seek>(reader: &mut R, off: u64) -> Result<Option<Header
     }
     let version = le_u16(&raw, 66);
     if version != 1 {
-        return Err(VhdError::Msg(format!(
-            "VHDX header version {version} is not 1"
-        )));
+        // Skip this copy; the sibling 4 KiB header may still be v1.
+        log::debug!("VHDX header at {off:#x} version {version} is not 1");
+        return Ok(None);
     }
+    let mut log_guid = [0u8; 16];
+    log_guid.copy_from_slice(&raw[48..64]);
     Ok(Some(Header {
         sequence: le_u64(&raw, 8),
+        log_guid,
     }))
 }
 
@@ -358,7 +362,11 @@ where
             ))
         }
     };
-    let _ = header;
+    if header.log_guid.iter().any(|&b| b != 0) {
+        return Err(VhdError::Msg(
+            "VHDX log replay is residual (LogGuid is non-zero)".into(),
+        ));
+    }
 
     let r1 = parse_region_table(&mut reader, REGION1_OFF)?;
     let r2 = parse_region_table(&mut reader, REGION2_OFF)?;
@@ -477,8 +485,8 @@ pub(crate) fn encode_fixed_vhdx(payload: &[u8], virt_size: u64) -> Result<Vec<u8
         img[o..o + 2].copy_from_slice(&c.to_le_bytes());
     }
 
-    write_header(&mut img, HEADER1_OFF as usize, 1);
-    write_header(&mut img, HEADER2_OFF as usize, 1);
+    write_header(&mut img, HEADER1_OFF as usize, 1, [0u8; 16]);
+    write_header(&mut img, HEADER2_OFF as usize, 1, [0u8; 16]);
 
     let mut regions = vec![0u8; REGION_LEN];
     regions[0..4].copy_from_slice(REGION_SIG);
@@ -513,12 +521,12 @@ pub(crate) fn encode_fixed_vhdx(payload: &[u8], virt_size: u64) -> Result<Vec<u8
 }
 
 #[cfg(test)]
-fn write_header(img: &mut [u8], off: usize, seq: u64) {
+fn write_header(img: &mut [u8], off: usize, seq: u64, log_guid: [u8; 16]) {
     let mut h = vec![0u8; HEADER_LEN];
     h[0..4].copy_from_slice(HEADER_SIG);
     h[8..16].copy_from_slice(&seq.to_le_bytes());
+    h[48..64].copy_from_slice(&log_guid);
     h[66..68].copy_from_slice(&1u16.to_le_bytes()); // Version = 1
-                                                    // LogGuid stays zero (log unused).
     let sum = crc32c(&h);
     h[4..8].copy_from_slice(&sum.to_le_bytes());
     img[off..off + HEADER_LEN].copy_from_slice(&h);
@@ -608,5 +616,34 @@ mod tests {
         let mut buf = [0u8; 3];
         disk.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [0x11, 0x22, 0x33]);
+    }
+
+    /// Regression: non-zero LogGuid is fail-closed (replay residual).
+    #[test]
+    fn log_guid_nonzero_is_residual() {
+        let mut img = encode_fixed_vhdx(&[0x11, 0x22, 0x33], 1024 * 1024).unwrap();
+        write_header(&mut img, HEADER1_OFF as usize, 2, [0xAAu8; 16]);
+        write_header(&mut img, HEADER2_OFF as usize, 1, [0u8; 16]);
+        let err = match open_vhdx(Cursor::new(img)) {
+            Err(e) => e,
+            Ok(_) => panic!("active VHDX log must fail closed"),
+        };
+        assert!(err.to_string().contains("log replay"), "unexpected: {err}");
+    }
+
+    /// Regression: CRC-valid version≠1 header is skipped; sibling v1 still opens.
+    #[test]
+    fn header_version_not_1_tries_sibling() {
+        let mut img = encode_fixed_vhdx(&[0x11], 1024 * 1024).unwrap();
+        let mut h = vec![0u8; HEADER_LEN];
+        h[0..4].copy_from_slice(HEADER_SIG);
+        h[8..16].copy_from_slice(&3u64.to_le_bytes());
+        h[66..68].copy_from_slice(&2u16.to_le_bytes());
+        let sum = crc32c(&h);
+        h[4..8].copy_from_slice(&sum.to_le_bytes());
+        img[HEADER1_OFF as usize..HEADER1_OFF as usize + HEADER_LEN].copy_from_slice(&h);
+        let (disk, kind) = open_vhdx(Cursor::new(img)).expect("sibling v1 header");
+        assert_eq!(kind, VhdKind::Vhdx);
+        assert_eq!(disk.virt_size(), 1024 * 1024);
     }
 }

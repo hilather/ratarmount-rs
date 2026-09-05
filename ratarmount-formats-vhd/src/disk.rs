@@ -112,9 +112,16 @@ impl VirtualDisk {
                 if state != VHDX_STATE_FULLY_PRESENT && state != VHDX_STATE_PARTIALLY_PRESENT {
                     return Ok((MapKind::Zero, run));
                 }
-                let file_off = (entry >> VHDX_OFFSET_SHIFT)
-                    .saturating_mul(MIB)
-                    .saturating_add(in_block);
+                let file_off_mb = entry >> VHDX_OFFSET_SHIFT;
+                // MS-VHDX: present states require a non-zero FileOffsetMB
+                // (offset 0 would leak the file identifier / headers).
+                if file_off_mb == 0 {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "VHDX present BAT FileOffsetMB is 0",
+                    ));
+                }
+                let file_off = file_off_mb.saturating_mul(MIB).saturating_add(in_block);
                 Ok((MapKind::File(file_off), run))
             }
         }
@@ -231,5 +238,20 @@ mod tests {
         let mut buf = [0xAAu8; 8];
         d.read_exact(&mut buf).unwrap();
         assert_eq!(buf, [0; 8]);
+    }
+
+    /// Regression: FULLY_PRESENT with FileOffsetMB 0 must not leak header bytes.
+    #[test]
+    fn vhdx_present_zero_offset_fails_closed() {
+        let map = DiskMap::Vhdx {
+            payload_bat: vec![VHDX_STATE_FULLY_PRESENT],
+            block_size: 1024,
+        };
+        let mut d = VirtualDisk::new(Cursor::new(vec![0xFFu8; 64]), map, 1024);
+        let mut buf = [0u8; 8];
+        let err = d
+            .read_exact(&mut buf)
+            .expect_err("offset 0 must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

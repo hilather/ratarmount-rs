@@ -36,6 +36,7 @@
 | N10 | GPT/MBR disk image from_reader | Partition table + FAT/EXT4 offset | **crate no-tmp** (`BlockMountSource::open_from_reader` → `pN/`) | factory nested wire later; LVM/RAID/Btrfs residual |
 | N11 | UDIF DMG from_reader | `koly` + chunk map + inner FAT/ISO offset | **crate no-tmp** (`DmgMountSource::open_from_reader`) | factory nested wire later; HFS+/APFS/encrypted residual |
 | N11 | QCOW2 from_reader | Guest L1/L2 map + block/FAT/EXT4 | **crate no-tmp** (`Qcow2MountSource::open_from_reader`) | factory nested wire later; zstd clusters / HTTP backing residual |
+| N11 | VHD/VHDX from_reader | Footer/BAT guest map + Block/FAT/EXT4 | **crate no-tmp** (`VhdMountSource::open_from_reader`) | factory nested wire later; differencing / VHDX log replay residual |
 | — | Solid RAR / corrupt xz without Index / libarchive-only | sequential | n/a | **out of scope** here |
 | — | 7z BCJ2 / multi-pack multi-GB solid progressive | full-folder residual | partial | deferred (AES+LZMA2 / native BCJ+LZMA2 progressive — [`sevenzip-random-access.md`](sevenzip-random-access.md)) |
 

@@ -30,10 +30,11 @@ In-process (no `qemu-nbd`, no loop mount). Detection is magic only (no `.vhd` ex
 | Topic | Behaviour |
 |-------|-----------|
 | **Differencing** VHD (type 4) / VHDX `HasParent` | `open` fails with a clear error. No parent-chain walk. |
+| **VHDX log** (`LogGuid` ≠ 0) | `open` fails closed. Journal replay is residual. |
 | **Encrypted** VHDX | Unknown required region GUID fails closed. |
 | Dynamic VHD **sector bitmap** | Allocated blocks are read as fully present. |
 | VHDX **partially present** blocks | Treated as fully present (no sector-bitmap apply). |
-| Factory / AutoMount / nested matrix row | Orchestrator factory PR (not this crate). |
+| Factory / AutoMount nested AutoMount | Orchestrator factory PR (not this crate). |
 
 ## Tests
 
@@ -42,4 +43,4 @@ cargo test -p ratarmount-formats-vhd --lib
 cargo clippy -p ratarmount-formats-vhd --all-targets -- -D warnings
 ```
 
-Always-on: synthetic fixed VHD (MBR+FAT `p1/` list/read + `open_from_reader`), dynamic VHD BAT mapping (allocated + hole zeros), fixed VHDX BAT, differencing reject, `list_dirents` sizes, superfloppy FAT at `/`. No `qemu-img` required.
+Always-on: synthetic fixed VHD (MBR+FAT `p1/` list/read + `open_from_reader`), Connectix spec-offset footer (not encoder-relative), dynamic VHD BAT mapping, fixed VHDX BAT, differencing VHD/VHDX reject, VHDX `LogGuid` fail-closed, `list_dirents` sizes, superfloppy FAT at `/`. Optional `qemu-img convert` skip-if-missing.
