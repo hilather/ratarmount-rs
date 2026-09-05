@@ -897,7 +897,12 @@ fn start_password_server(username: Option<&str>, password: &str) -> Serving {
     }
 }
 
-fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password: &str) -> u32 {
+fn session_setup_type3_v2(
+    c: &mut SmbClient,
+    user: &str,
+    domain: &str,
+    password: &str,
+) -> (u32, u16) {
     let t1 = smb2::ntlm_type1();
     let (rh, body) = c.session_setup_sec(&t1);
     assert_eq!(
@@ -913,6 +918,15 @@ fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password:
     let rh = smb2::parse_smb2_header(&buf).expect("type3 hdr");
     if rh.status == smb2::STATUS_SUCCESS {
         c.session_key = Some(key);
+        let flags = if buf.len() >= smb2::SMB2_HEADER_LEN + 4 {
+            u16::from_le_bytes(
+                buf[smb2::SMB2_HEADER_LEN + 2..smb2::SMB2_HEADER_LEN + 4]
+                    .try_into()
+                    .unwrap(),
+            )
+        } else {
+            0
+        };
         if c.dialect == smb2::DIALECT_311 {
             c.signing_key = Some(smb2::smb311_signing_key(&key, &c.preauth));
             c.c2s_key = Some(smb2::smb311_c2s_key(&key, &c.preauth));
@@ -921,7 +935,7 @@ fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password:
                 smb2::smb3_verify_packet(&buf, &c.signing_key.unwrap()),
                 "Type3 SESSION_SETUP response must be AES-CMAC signed"
             );
-            if c.cipher.is_some() {
+            if flags & smb2::SESSION_FLAG_ENCRYPT_DATA != 0 {
                 c.encrypt_data = true;
             }
         } else {
@@ -930,8 +944,10 @@ fn session_setup_type3_v2(c: &mut SmbClient, user: &str, domain: &str, password:
                 "Type3 SESSION_SETUP response must be signed"
             );
         }
+        (rh.status, flags)
+    } else {
+        (rh.status, 0)
     }
-    rh.status
 }
 
 /// Regression: guest Type3 still succeeds without NT proof when password unset
@@ -963,7 +979,7 @@ fn password_session_rejects_unsigned_tree_connect() {
     let srv = start_password_server(None, "Password");
     let mut c = SmbClient::connect_negotiate(srv.addr);
     assert_eq!(
-        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password").0,
         smb2::STATUS_SUCCESS
     );
     let (rh, _) = c.tree_connect_status("ratarmount", false);
@@ -976,7 +992,7 @@ fn signed_tree_connect_accepted() {
     let srv = start_password_server(Some("User"), "Password");
     let mut c = SmbClient::connect_negotiate(srv.addr);
     assert_eq!(
-        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password").0,
         smb2::STATUS_SUCCESS
     );
     let unc = format!(r"\\127.0.0.1\{DEFAULT_SMB_SHARE}");
@@ -1005,7 +1021,7 @@ fn password_username_mismatch_is_logon_failure() {
     let srv = start_password_server(Some("alice"), "Password");
     let mut c = SmbClient::connect_negotiate(srv.addr);
     assert_eq!(
-        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password").0,
         smb2::STATUS_LOGON_FAILURE
     );
 }
@@ -1016,7 +1032,7 @@ fn ntlmv2_type3_matching_password_live_success() {
     let srv = start_password_server(None, "Password");
     let mut c = SmbClient::connect_negotiate(srv.addr);
     assert_eq!(
-        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
+        session_setup_type3_v2(&mut c, "User", "Domain", "Password").0,
         smb2::STATUS_SUCCESS
     );
     let (rh, _) = c.tree_connect_status("ratarmount", true);
@@ -1114,9 +1130,12 @@ fn encrypted_read_aes128_gcm() {
     let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
     c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
     c.negotiate_311(true);
+    let (st, flags) = session_setup_type3_v2(&mut c, "User", "Domain", "Password");
+    assert_eq!(st, smb2::STATUS_SUCCESS);
     assert_eq!(
-        session_setup_type3_v2(&mut c, "User", "Domain", "Password"),
-        smb2::STATUS_SUCCESS
+        flags & smb2::SESSION_FLAG_ENCRYPT_DATA,
+        smb2::SESSION_FLAG_ENCRYPT_DATA,
+        "Type3 SessionFlags must set SESSION_FLAG_ENCRYPT_DATA"
     );
     assert!(c.encrypt_data, "SESSION_FLAG_ENCRYPT_DATA arms transform");
     c.tree_connect("ratarmount");
@@ -1157,4 +1176,68 @@ fn encrypted_read_aes128_gcm() {
     let start = data_off.saturating_sub(smb2::SMB2_HEADER_LEN);
     let got = b.get(start..start + data_len).unwrap_or(&[]).to_vec();
     assert_eq!(got, b"hello smb\n");
+}
+
+/// Regression: LOGOFF keeps Connection.CipherId so re-auth can encrypt
+#[test]
+fn logoff_keeps_cipher_reauth_sets_encrypt_data() {
+    let srv = start_password_server(None, "Password");
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    c.negotiate_311(true);
+    let after_neg = c.preauth;
+    let (st, flags) = session_setup_type3_v2(&mut c, "User", "Domain", "Password");
+    assert_eq!(st, smb2::STATUS_SUCCESS);
+    assert_eq!(
+        flags & smb2::SESSION_FLAG_ENCRYPT_DATA,
+        smb2::SESSION_FLAG_ENCRYPT_DATA
+    );
+    c.tree_connect("ratarmount");
+    let h = c.hdr(smb2::SMB2_LOGOFF);
+    let buf = c.roundtrip_raw(&smb2::encode_packet(&h, &smb2::encode_empty_sized(4, 4)));
+    let rh = smb2::parse_smb2_header(&buf).unwrap();
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS, "LOGOFF {:08x}", rh.status);
+    c.encrypt_data = false;
+    c.session_key = None;
+    c.signing_key = None;
+    c.c2s_key = None;
+    c.s2c_key = None;
+    c.tree_id = 0;
+    c.preauth = after_neg;
+    let (st, flags) = session_setup_type3_v2(&mut c, "User", "Domain", "Password");
+    assert_eq!(st, smb2::STATUS_SUCCESS);
+    assert_eq!(
+        flags & smb2::SESSION_FLAG_ENCRYPT_DATA,
+        smb2::SESSION_FLAG_ENCRYPT_DATA,
+        "LOGOFF must keep Connection.CipherId"
+    );
+}
+
+/// Regression: 3.1.1 NEGOTIATE without SHA-512 is INVALID_PARAMETER
+#[test]
+fn negotiate_311_without_sha512_is_invalid_parameter() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut body = vec![0u8; 36];
+    body[0..2].copy_from_slice(&36u16.to_le_bytes());
+    body[2..4].copy_from_slice(&1u16.to_le_bytes());
+    body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&smb2::DIALECT_311.to_le_bytes());
+    let pad = (8 - (body.len() % 8)) % 8;
+    body.resize(body.len() + pad, 0);
+    let ctx_off = (smb2::SMB2_HEADER_LEN + body.len()) as u32;
+    body[28..32].copy_from_slice(&ctx_off.to_le_bytes());
+    body[32..34].copy_from_slice(&1u16.to_le_bytes());
+    let mut data = Vec::new();
+    data.extend_from_slice(&1u16.to_le_bytes());
+    data.extend_from_slice(&0u16.to_le_bytes());
+    data.extend_from_slice(&0x0002u16.to_le_bytes());
+    body.extend_from_slice(&smb2::encode_negotiate_context(
+        smb2::SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+        &data,
+    ));
+    let h = c.hdr(smb2::SMB2_NEGOTIATE);
+    let (rh, _) = c.roundtrip(&smb2::encode_packet(&h, &body));
+    assert_eq!(rh.status, smb2::STATUS_INVALID_PARAMETER);
 }

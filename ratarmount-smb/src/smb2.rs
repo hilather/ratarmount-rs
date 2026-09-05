@@ -702,7 +702,28 @@ pub fn parse_encryption_ciphers(contexts: &[(u16, Vec<u8>)]) -> Vec<u16> {
 pub fn has_preauth_context(contexts: &[(u16, Vec<u8>)]) -> bool {
     contexts
         .iter()
-        .any(|(ty, data)| *ty == SMB2_PREAUTH_INTEGRITY_CAPABILITIES && data.len() >= 4)
+        .any(|(ty, data)| *ty == SMB2_PREAUTH_INTEGRITY_CAPABILITIES && preauth_offers_sha512(data))
+}
+
+fn preauth_offers_sha512(data: &[u8]) -> bool {
+    if data.len() < 4 {
+        return false;
+    }
+    let n = u16::from_le_bytes(data[0..2].try_into().unwrap_or([0; 2])) as usize;
+    if n == 0 {
+        return false;
+    }
+    for i in 0..n {
+        let o = 4 + i * 2;
+        if o + 2 > data.len() {
+            return false;
+        }
+        let alg = u16::from_le_bytes(data[o..o + 2].try_into().unwrap_or([0; 2]));
+        if alg == HASH_SHA512 {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn pick_cipher(ciphers: &[u16]) -> Option<u16> {
@@ -2182,16 +2203,83 @@ mod tests {
     }
 
     #[test]
-    fn smb3_kdf_signing_and_cipher_keys_differ() {
-        let session = [0x11u8; 16];
-        let pre = [0x22u8; 64];
-        let sign = smb311_signing_key(&session, &pre);
-        let c2s = smb311_c2s_key(&session, &pre);
-        let s2c = smb311_s2c_key(&session, &pre);
-        assert_ne!(sign, c2s);
-        assert_ne!(c2s, s2c);
-        assert_ne!(sign, s2c);
-        assert_ne!(sign, session);
+    fn transform_aes128_ccm_roundtrip() {
+        let key = [0x42u8; 16];
+        let mut nonce = [0u8; 16];
+        nonce[0] = 1;
+        let plain = encode_packet(
+            &Smb2Header {
+                credit_charge: 1,
+                status: 0,
+                command: SMB2_ECHO,
+                credits: 1,
+                flags: SMB2_FLAGS_SERVER_TO_REDIR,
+                next_command: 0,
+                message_id: 1,
+                process_id: 0xfeff,
+                tree_id: 1,
+                session_id: 7,
+            },
+            &encode_empty_sized(4, 4),
+        );
+        let wire = encrypt_transform(&plain, 7, &key, SmbCipher::Aes128Ccm, nonce).unwrap();
+        assert!(is_smb2_transform(&wire));
+        let back = decrypt_transform(&wire, &key, SmbCipher::Aes128Ccm).unwrap();
+        assert_eq!(back, plain);
+    }
+
+    /// Regression: SMB 3.1.1 KDF vectors from MS blog “SMB 3.1.1 Encryption in Windows 10”.
+    #[test]
+    fn smb3_kdf_ms_smb2_311_signing_and_cipher_keys() {
+        let session: [u8; 16] = unhex("419FDDF34C1E001909D362AE7FB6AF79")
+            .try_into()
+            .unwrap();
+        let pre: [u8; 64] = unhex(concat!(
+            "B23F3CBFD69487D9832B79B1594A367CDD950909B774C3A4C412B4FCEA9EDDDB",
+            "A7DB256BA2EA30E977F11F9B113247578E0E915C6D2A513B8F2FCA5707DC8770",
+        ))
+        .try_into()
+        .unwrap();
+        assert_eq!(
+            smb311_signing_key(&session, &pre).as_slice(),
+            unhex("8765949DFEAEE105CE9118B45BE988F0")
+        );
+        // Client EncryptionKey = server C2S (decrypt).
+        assert_eq!(
+            smb311_c2s_key(&session, &pre).as_slice(),
+            unhex("A2F5E80E5D59103034F32E52F698E5EC")
+        );
+        // Client DecryptionKey = server S2C (encrypt).
+        assert_eq!(
+            smb311_s2c_key(&session, &pre).as_slice(),
+            unhex("748C50868C90F302962A5C35F5F9A8BF")
+        );
+    }
+
+    /// Regression: 3.1.1 preauth context without SHA-512 is rejected
+    #[test]
+    fn preauth_context_without_sha512_is_rejected() {
+        let mut sha = Vec::new();
+        sha.extend_from_slice(&1u16.to_le_bytes());
+        sha.extend_from_slice(&32u16.to_le_bytes());
+        sha.extend_from_slice(&HASH_SHA512.to_le_bytes());
+        sha.extend_from_slice(&[0x11u8; 32]);
+        assert!(has_preauth_context(&[(
+            SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+            sha
+        )]));
+        let mut data = Vec::new();
+        data.extend_from_slice(&1u16.to_le_bytes());
+        data.extend_from_slice(&0u16.to_le_bytes());
+        data.extend_from_slice(&0x0002u16.to_le_bytes());
+        assert!(!has_preauth_context(&[(
+            SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+            data
+        )]));
+        assert!(!has_preauth_context(&[(
+            SMB2_PREAUTH_INTEGRITY_CAPABILITIES,
+            vec![0, 0, 0, 0]
+        )]));
     }
 
     #[test]
