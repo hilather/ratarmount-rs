@@ -4,7 +4,7 @@ use secrecy::SecretString;
 use std::path::PathBuf;
 
 /// What to open. Paths are OS paths; URLs use the same schemes as the CLI
-/// (`http(s):`, `s3://`, `gs://`, `oci://`, `docker://`, …).
+/// (`http(s):`, `s3://`, `gs://`, `oci://`, `docker://`, `restic:/abs/path`, …).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SourceSpec {
     Path(PathBuf),

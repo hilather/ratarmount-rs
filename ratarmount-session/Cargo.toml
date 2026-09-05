@@ -67,6 +67,8 @@ ratarmount-formats-sevenzip.workspace = true
 ratarmount-compress.workspace = true
 ratarmount-compositing.workspace = true
 ratarmount-remote.workspace = true
+# Always on: restic is a remote_open scheme, not a FormatBackend / formats-all probe.
+ratarmount-formats-restic.workspace = true
 ratarmount-http = { workspace = true, optional = true }
 ratarmount-formats-ar = { workspace = true, optional = true }
 ratarmount-formats-asar = { workspace = true, optional = true }

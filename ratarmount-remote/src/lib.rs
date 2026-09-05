@@ -427,7 +427,7 @@ pub type Result<T> = std::result::Result<T, RemoteError>;
 /// `docker://ubuntu:24.04` (`invalid port number`).
 const REMOTE_SCHEMES: &[&str] = &[
     "http", "https", "file", "ftp", "ftps", "s3", "gs", "az", "azure", "ssh", "sftp", "scp", "smb",
-    "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone",
+    "webdav", "webdavs", "dropbox", "oci", "docker", "ghcr", "ipfs", "ipns", "rclone", "restic",
 ];
 
 /// ASCII-lowercase scheme before the first `://`, if any.
@@ -437,6 +437,10 @@ const REMOTE_SCHEMES: &[&str] = &[
 pub fn remote_url_scheme(s: &str) -> Option<String> {
     if s.len() >= 7 && s[..7].eq_ignore_ascii_case("rclone+") {
         return Some("rclone".into());
+    }
+    // `restic:/abs/path` has no `://`; still a scheme so it is not a local colon-name.
+    if s.len() >= 7 && s[..7].eq_ignore_ascii_case("restic:") {
+        return Some("restic".into());
     }
     let (scheme, _) = s.split_once("://")?;
     if scheme.is_empty() {
@@ -1350,9 +1354,27 @@ mod tests {
         assert!(is_remote_url("rclone+gdrive://bucket/path"));
         assert!(is_remote_url("RCLONE+gdrive:bucket/path"));
         assert!(is_remote_url("docker://ubuntu:24.04"));
+        assert!(is_remote_url("restic:/var/x"));
+        assert!(is_remote_url("restic:///var/backup/repo"));
+        assert!(is_remote_url("RESTIC:/tmp/repo"));
         assert!(!is_remote_url("/tmp/x"));
         assert!(!is_remote_url("relative/path"));
         assert!(!is_remote_url("C:\\windows\\path"));
+    }
+
+    /// Regression: `restic:/path` is a scheme-prefix URL, not a local colon filename.
+    #[test]
+    fn restic_scheme_prefix_is_remote_url() {
+        assert!(is_remote_url("restic:/var/x"));
+        assert_eq!(
+            remote_url_scheme("restic:/var/x").as_deref(),
+            Some("restic")
+        );
+        assert_eq!(
+            remote_url_scheme("restic:///var/backup").as_deref(),
+            Some("restic")
+        );
+        assert!(!is_remote_url("relative/path"));
     }
 
     /// Regression: docker://ubuntu:24.04 is not a local path.

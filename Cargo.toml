@@ -35,6 +35,7 @@ members = [
     "ratarmount-formats-html",
     "ratarmount-formats-pdf",
     "ratarmount-formats-git",
+    "ratarmount-formats-restic",
     "ratarmount-remote",
     "ratarmount-compositing",
     "ratarmount-nfs",
@@ -87,6 +88,7 @@ ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }
 ratarmount-formats-pdf = { path = "ratarmount-formats-pdf" }
 ratarmount-formats-git = { path = "ratarmount-formats-git" }
+ratarmount-formats-restic = { path = "ratarmount-formats-restic" }
 ratarmount-remote = { path = "ratarmount-remote" }
 ratarmount-compositing = { path = "ratarmount-compositing" }
 ratarmount-nfs = { path = "ratarmount-nfs" }

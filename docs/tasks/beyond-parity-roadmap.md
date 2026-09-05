@@ -245,6 +245,9 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 | G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `done` | L | `--hashes` (partial today) |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
 | G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | packaging; F-1 makes volumes useful |
+| G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `todo` | L | `--hashes` (partial today) |
+| G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `partial` | L | new MountSources |
+| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
 
 ### G-1 — `ratarmount serve` — `done` (booleans)
 
@@ -270,9 +273,13 @@ Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodi
 
 **Residual:** CDC / nydus-like chunking of members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`).
 
-### G-4 — Snapshot browser
+### G-4 — Snapshot browser — `partial` (restic done; borg / kopia / ZFS residual)
 
-restic / borg / kopia / ZFS send already store trees of archives or content-addressed packs. A MountSource that walks a restic pack index or a ZFS snapshot send-stream gives browse-the-backup-without-restore. Adjacent users, same random-access problem. Start with **restic** (documented index JSON) before borg/kopia/ZFS.
+restic / borg / kopia / ZFS send already store trees of archives or content-addressed packs. A MountSource that walks a restic pack index or a ZFS snapshot send-stream gives browse-the-backup-without-restore.
+
+**restic (done):** `restic:/abs/path` (scheme-prefix, not WHATWG) opens `ResticMountSource` via session `open_remote_input` only — not `open_path` / factory FormatBackend. Presentation: `/snapshots/<short-id>/…`, `/latest` symlink, `/ids/<full-id>/`. Password: `RESTIC_PASSWORD` / `RESTIC_PASSWORD_FILE` (never logged). Local `data/` pack `Read+Seek`; restic v1/v2 JSON indexes. Guide: [`docs/restic.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md).
+
+**Residual:** S3 restic repos (`restic://s3://…` errors; use a local cache copy); borg; kopia; ZFS send.
 
 ### G-5 — Kubernetes CSI / systemd / autofs — `partial`
 
