@@ -50,7 +50,7 @@ Factory (PR-12) opens each layer with `open_from_live_range(layer.open_blob(), r
 
 `--nfs` for Windows shops. Finder/Explorer speak SMB; they do not speak our NFSv3 high-port export. Userspace SMB 2.0.2 / 3.1.1 subset (not kernel `ksmbd`). `-w` overlay writes map to SMB create/write/delete like NFS. Default bind `127.0.0.1:20445`, share `ratarmount`. Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar (2.0.2 when offered). When `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 NT proof is verified and signing is required (HMAC-SHA256 on 2.0.2, AES-CMAC on 3.1.1). A 3.1.1-only client gets SHA-512 preauth; AES-128-GCM/CCM encryption is used when that client also offers an encryption context. Guest `-N` is off on a password listener.
 
-**Residual vs v1:** macOS Finder / Windows Explorer (leases, create contexts); guest encryption. Packet tests stand in for preauth+encrypt. Localhost-first like NFS. See [`docs/export.md`](../export.md). P-2 stays `partial` until Finder.
+**Residual vs v1:** macOS Finder / Windows Explorer (leases, create contexts); guest encryption. Packet tests stand in for preauth+encrypt. Localhost-first like NFS. See [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md). P-2 stays `partial` until Finder.
 
 ### P-3 — GCS `gs://` + Azure Blob `az://` — `done`
 

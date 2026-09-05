@@ -372,16 +372,11 @@ impl Session {
     }
 
     fn wrap_reply(&mut self, reply: &[u8]) -> io::Result<Vec<u8>> {
-        if !self.encrypt_data {
+        let Some((cipher, key)) = encrypt_reply_keys(self.encrypt_data, self.cipher, self.enc_key)?
+        else {
             return Ok(reply.to_vec());
-        }
-        let (cipher, key) = match (self.cipher, self.enc_key) {
-            (Some(c), Some(k)) => (c, k),
-            _ => return Ok(reply.to_vec()),
         };
-        self.nonce_ctr = self.nonce_ctr.saturating_add(1);
-        let mut nonce = [0u8; 16];
-        nonce[..8].copy_from_slice(&self.nonce_ctr.to_le_bytes());
+        let nonce = bump_transform_nonce(&mut self.nonce_ctr)?;
         smb2::encrypt_transform(reply, self.session_id, &key, cipher, nonce)
     }
 
@@ -498,6 +493,7 @@ impl Session {
             smb2::SMB2_NEGOTIATE => self.cmd_negotiate(hdr, cmd, &mut rh),
             smb2::SMB2_SESSION_SETUP => self.cmd_session_setup(hdr, cmd, &mut rh),
             smb2::SMB2_LOGOFF => {
+                // Connection.CipherId / dialect stay; only the session is reset.
                 self.authed = false;
                 self.session_key = None;
                 self.signing_key = None;
@@ -505,7 +501,6 @@ impl Session {
                 self.dec_key = None;
                 self.encrypt_data = false;
                 self.arm_encrypt = false;
-                self.cipher = None;
                 self.ntlm_started = false;
                 self.ntlm_challenge = None;
                 self.session_preauth_init = false;
@@ -1166,6 +1161,33 @@ fn attrs_of(m: &FileMeta) -> u32 {
     a
 }
 
+/// `None` = send plaintext. Missing keys while `encrypt_data` is fail-closed.
+fn encrypt_reply_keys(
+    encrypt_data: bool,
+    cipher: Option<smb2::SmbCipher>,
+    enc_key: Option<[u8; 16]>,
+) -> io::Result<Option<(smb2::SmbCipher, [u8; 16])>> {
+    if !encrypt_data {
+        return Ok(None);
+    }
+    match (cipher, enc_key) {
+        (Some(c), Some(k)) => Ok(Some((c, k))),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "encrypt_data without cipher key",
+        )),
+    }
+}
+
+fn bump_transform_nonce(ctr: &mut u64) -> io::Result<[u8; 16]> {
+    *ctr = ctr
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "TRANSFORM nonce wrap"))?;
+    let mut nonce = [0u8; 16];
+    nonce[..8].copy_from_slice(&ctr.to_le_bytes());
+    Ok(nonce)
+}
+
 fn salt32() -> [u8; 32] {
     let mut s = [0u8; 32];
     for chunk in s.chunks_mut(8) {
@@ -1233,5 +1255,29 @@ mod tests {
         assert!(auth_ok(None, "bob"));
         assert!(auth_ok(Some("Alice"), "alice"));
         assert!(!auth_ok(Some("Alice"), "bob"));
+    }
+
+    /// Regression: encrypt_data without cipher key is fail-closed (no plaintext)
+    #[test]
+    fn wrap_reply_fails_closed_without_cipher_key() {
+        let err = encrypt_reply_keys(true, None, None).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert!(encrypt_reply_keys(false, None, None).unwrap().is_none());
+        let key = [1u8; 16];
+        let got = encrypt_reply_keys(true, Some(smb2::SmbCipher::Aes128Gcm), Some(key)).unwrap();
+        assert!(got.is_some());
+    }
+
+    /// Regression: TRANSFORM nonce wrap drops the connection
+    #[test]
+    fn transform_nonce_wrap_drops_connection() {
+        let mut ctr = u64::MAX;
+        let err = bump_transform_nonce(&mut ctr).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        let mut ctr = 0u64;
+        let n = bump_transform_nonce(&mut ctr).unwrap();
+        assert_eq!(ctr, 1);
+        assert_eq!(&n[..8], &1u64.to_le_bytes());
+        assert_eq!(&n[8..], &[0u8; 8]);
     }
 }
