@@ -24,9 +24,11 @@ ratarmount --nfs --nfs-vers 4 -w :temp: archive.tar.gz
 
 # Live commit into an uncompressed TAR or .tar.zst (not :temp:, not .tar.gz/.zip)
 # Prefix-frame delete/replace is rejected on the live tick; use offline --commit-overlay.
+# s3:// TAR/ZST is allowed (write probe + spool + multipart PUT); offline s3:// exits 2.
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar.zst
+ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m s3://bucket/a.tar.zst
 # Missing .tar / .tar.zst + -w creates an empty write-mount base (same as FUSE)
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 2s new.tar.zst
 
@@ -57,10 +59,12 @@ Live overlay commit (uncompressed TAR or `.tar.zst`):
 # Durable overlay required. gzip/bzip2/xz TAR and ZIP are rejected for live commit.
 # Live ticks reject prefix-frame .tar.zst mutate; offline --commit-overlay splices
 # from the affected frame (create-if-missing is uncompressed .tar only).
+# s3:// TAR/ZST is allowed for live interval/on-exit (offline s3:// exits 2).
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m archive.tar
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-on-exit archive.tar.zst
 ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 2s new.tar.zst
+ratarmount --nfs -w /var/lib/ratarmount/ov --commit-overlay-interval 15m s3://bucket/a.tar.zst
 ```
 
 Interval commit is in-process. Each tick persists only overlay files whose host **mtime is at least `DURATION` in the past** (a per-file settle time). A file still being written stays in the overlay (including a FUSE fd still open for write, even if mtime looks idle); delete tombstones are already settled and go out on the same tick. Uncompressed TAR: sibling copy, GNU `tar --delete`/`--append`, atomic replace, reopen, then drop only the settled overlay files so a later tick cannot duplicate them. `.tar.zst`: rewrites only the last zstd frame (does not recompress the prefix). Persist still copies the compressed prefix; the on-disk sidecar is patched so remount does not rescan prefix frames (`:memory:` still full-rebuild). Plan **2× compressed size** disk headroom (sibling tmp + original until replace). Never refuse on size; warn at startup when the last frame is larger than 64 MiB uncompressed. A missing `.tar` / `.tar.zst` with `-w` is created as an empty archive before open (same path as FUSE). On-exit commits **all** remaining overlay files on SIGINT/SIGTERM or when NFS/FUSE returns (no overlay reset). `:temp:` is rejected. See [zstd-random-access.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md).
@@ -105,7 +109,7 @@ Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist
 
 - **Windows** `mount.exe` / `dir`: nfsserve `READDIR` is unimplemented (Linux/macOS use `READDIRPLUS`). Default client port is often 2049, not 20490.
 - Overlay **rename** / **symlink** work with `-w` on NFSv3 and NFSv4.1 (same overlay folder as FUSE). Without `-w` they stay `NFS3ERR_ROFS` / `NFS4ERR_ROFS`.
-- Live `--commit-overlay-on-exit` / `--commit-overlay-interval` apply to **uncompressed TAR** (copy + GNU `tar --delete`/`--append` + replace) and **`.tar.zst`** (last-frame rewrite; does not recompress the prefix; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; 2× compressed disk headroom). Interval ticks commit files that have **not been modified for `DURATION`**, not every overlay file on the clock. Never refuse on size; warn when last-frame uncompressed > 64 MiB. A missing `.tar` / `.tar.zst` with `-w` is created as an empty write-mount base. Gzip stays rejected. Live ticks **reject** prefix-frame `.tar.zst` mutate. Offline `--commit-overlay` **is** the escape hatch for that case (splice from the affected frame through EOF; prefix frames byte-identical). Create-if-missing is uncompressed `.tar` only; gzip/bzip2/xz TAR and ZIP stay the GNU-tar offline path. `:temp:` is rejected. There is no NFS RPC to trigger commit.
+- Live `--commit-overlay-on-exit` / `--commit-overlay-interval` apply to **uncompressed TAR** (copy + GNU `tar --delete`/`--append` + replace) and **`.tar.zst`** (last-frame rewrite; does not recompress the prefix; persist still copies the compressed prefix; on-disk sidecar is patched so remount does not rescan prefix frames; 2× compressed disk headroom), including **`s3://` TAR/ZST** (write probe + persistent spool + multipart PUT + blob/pointer; reopen live Range; anonymous/missing keys exit 2). Interval ticks commit files that have **not been modified for `DURATION`**, not every overlay file on the clock. Never refuse on size; warn when last-frame uncompressed > 64 MiB. A missing `.tar` / `.tar.zst` with `-w` is created as an empty write-mount base (not remote URLs). Gzip stays rejected. Live ticks **reject** prefix-frame `.tar.zst` mutate. Offline `--commit-overlay` **is** the escape hatch for that case (splice from the affected frame through EOF; prefix frames byte-identical) and **refuses `s3://`**. Create-if-missing is uncompressed `.tar` only; gzip/bzip2/xz TAR and ZIP stay the GNU-tar offline path. `:temp:` is rejected. There is no NFS RPC to trigger commit.
 - Linux NFSv4.1 `cp`/`cat` **close** can return `Remote I/O error` after a successful write (bytes still match on `cmp`). The adapter implements embednfs `COMMIT`; this is a residual, not silent data loss.
 - Kerberos / RPCSEC_GSS / ACLs / delegations / NLM. NFSv4.1 is opt-in (`--nfs-vers 4`). Overlay create/write/mkdir/remove/setattr-size/rename/symlink work with `-w`.
 - **LAN share** and **Windows** NFSv4 clients (embednfs is macOS-first over localhost; “does not guarantee correct behavior for non-macOS clients”).

@@ -283,7 +283,8 @@ struct Args {
     publish_index: bool,
 
     /// Copy the on-disk SQLite sidecar to PATH. Required value (`num_args = 1`);
-    /// do not use `num_args = 0..=1` (that steals the archive). No S3 PUT in v1.
+    /// do not use `num_args = 0..=1` (that steals the archive). `s3://` archives
+    /// PUT the blob then `{url}.index.ptr`.
     #[arg(long = "publish-index-to", value_name = "PATH", num_args = 1)]
     publish_index_to: Option<PathBuf>,
 
@@ -803,6 +804,10 @@ fn main() {
             eprintln!("error: currently only modifications to a single archive may be committed");
             std::process::exit(2);
         }
+        if let Err(e) = overlay_commit::refuse_offline_s3_commit(archive) {
+            eprintln!("error: {e}");
+            std::process::exit(2);
+        }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
             overlay_commit::CreateMissingContext::OfflineCommit,
@@ -1155,17 +1160,21 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let live_commit_archive = if args.commit_overlay_on_exit || commit_interval.is_some() {
-        match overlay_commit::validate_live_commit_args(args.write_overlay.as_deref(), &inputs) {
-            Ok(p) => Some(p),
-            Err(e) => {
-                eprintln!("error: {e}");
-                std::process::exit(2);
+    let (live_commit_archive, live_s3_url) =
+        if args.commit_overlay_on_exit || commit_interval.is_some() {
+            match overlay_commit::prepare_live_commit_args(args.write_overlay.as_deref(), &inputs) {
+                Ok(live) => (Some(live.path), live.s3_url),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(2);
+                }
             }
-        }
-    } else {
-        None
-    };
+        } else {
+            (None, None)
+        };
+    if let (Some(ov), Some(url)) = (overlay_arc.as_ref(), live_s3_url.as_ref()) {
+        overlay_commit::attach_f7_after_persist(ov, url.clone(), open_opts.clone());
+    }
     if args.commit_overlay_on_exit || commit_interval.is_some() {
         overlay_commit::install_term_signal_flag();
     }
@@ -1354,6 +1363,7 @@ fn main() {
                     args.commit_overlay_on_exit,
                     commit_interval,
                     open_opts,
+                    live_s3_url,
                 ),
                 Some(mp) => run_fuse_and_nfs(
                     bundle.source,
@@ -1369,6 +1379,7 @@ fn main() {
                     args.commit_overlay_on_exit,
                     commit_interval,
                     open_opts,
+                    live_s3_url,
                 ),
             }
             return;
@@ -1389,6 +1400,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            live_s3_url,
         );
         return;
     }
@@ -1410,6 +1422,7 @@ fn main() {
             args.commit_overlay_on_exit,
             commit_interval,
             open_opts,
+            live_s3_url,
         );
         return;
     }
@@ -1428,6 +1441,7 @@ fn main() {
         args.commit_overlay_on_exit,
         commit_interval,
         open_opts,
+        live_s3_url,
     );
 }
 
@@ -1819,6 +1833,7 @@ fn run_exports(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    live_s3_url: Option<String>,
 ) {
     overlay_commit::install_term_signal_flag();
     let nfs_stop = ratarmount_nfs::NfsStop::new();
@@ -1845,6 +1860,7 @@ fn run_exports(
             dur,
             Some(nfs_stop.clone()),
             open_opts.clone(),
+            live_s3_url.clone(),
         );
     }
 
@@ -2017,6 +2033,7 @@ fn spawn_nfs_for_opts(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_nfs_only(
     source: Arc<dyn MountSource>,
     mut opts: ratarmount_nfs::NfsOptions,
@@ -2025,6 +2042,7 @@ fn run_nfs_only(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    live_s3_url: Option<String>,
 ) {
     let stop = ratarmount_nfs::NfsStop::new();
     opts.stop = Some(stop.clone());
@@ -2032,7 +2050,14 @@ fn run_nfs_only(
     if let (Some(ov), Some(archive), Some(dur)) =
         (overlay.clone(), live_archive.clone(), commit_interval)
     {
-        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop), open_opts.clone());
+        overlay_commit::spawn_interval_commits(
+            ov,
+            archive,
+            dur,
+            Some(stop),
+            open_opts.clone(),
+            live_s3_url,
+        );
     }
     eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
     let serve_err = serve_nfs_blocking(source, opts);
@@ -2063,6 +2088,7 @@ fn run_fuse_and_nfs(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    live_s3_url: Option<String>,
 ) {
     if foreground {
         let stop = ratarmount_nfs::NfsStop::new();
@@ -2080,6 +2106,7 @@ fn run_fuse_and_nfs(
                 dur,
                 Some(stop.clone()),
                 open_opts.clone(),
+                live_s3_url.clone(),
             );
         }
         let ready = nfs_opts.clone();
@@ -2153,6 +2180,7 @@ fn run_fuse_and_nfs(
                     dur,
                     Some(stop.clone()),
                     open_opts.clone(),
+                    live_s3_url.clone(),
                 );
             }
             if let Err(e) = spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
@@ -2208,6 +2236,7 @@ fn run_fuse_only(
     commit_on_exit: bool,
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
+    live_s3_url: Option<String>,
 ) {
     if live_archive.is_some() {
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
@@ -2258,7 +2287,14 @@ fn run_fuse_only(
             if let (Some(ov), Some(archive), Some(dur)) =
                 (overlay_arc.clone(), live_archive.clone(), commit_interval)
             {
-                overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
+                overlay_commit::spawn_interval_commits(
+                    ov,
+                    archive,
+                    dur,
+                    None,
+                    open_opts.clone(),
+                    live_s3_url.clone(),
+                );
             }
             let mount_err = mount_blocking(
                 source,

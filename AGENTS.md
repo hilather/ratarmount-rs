@@ -190,6 +190,14 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | S3 PutObject / multipart abort on error | `cargo test -p ratarmount-remote --lib s3_put` · `cargo test -p ratarmount-remote --lib s3_put_multipart` |
 | S3 V-2 pointer PUT blob-then-pointer / fail-closed leftover blob | `cargo test -p ratarmount-remote --lib s3_publish_index_blob_then_pointer` · `cargo test -p ratarmount-remote --lib s3_publish_index_fail_closed` |
 | S3 CreateMultipartUpload+abort write probe (F-7) | `cargo test -p ratarmount-remote --lib s3_multipart_create_abort_probe` |
+| Offline `--commit-overlay` + `s3://` exits 2 | `cargo test -p ratarmount --bin ratarmount commit_overlay_refuses_s3` |
+| Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` live `s3://` commit exits 2 | `cargo test -p ratarmount --bin ratarmount -- f7_anonymous_exits_2` |
+| Missing AWS keys fail closed for F-7 | `cargo test -p ratarmount --bin ratarmount -- f7_requires_write_creds` |
+| F-7 reopen is live Range, not File of spool | `cargo test -p ratarmount --bin ratarmount -- f7_reopen_ignores_spool_uses_ranges` |
+| F-7 pointer blob is the patched sqlite (appended name) | `cargo test -p ratarmount --bin ratarmount -- f7_pointer_blob_has_new_member` |
+| F-7 PUT failure keeps overlay | `cargo test -p ratarmount --bin ratarmount overlay_commit_put_fail_keeps_overlay` |
+| Gzip `s3://a.tar.gz` live commit still rejected | `cargo test -p ratarmount --bin ratarmount live_commit_rejects_gzip_s3` |
+| After interval, G-2 lists appended member without full rebuild | `cargo test -p ratarmount --bin ratarmount overlay_commit_live_s3_patched_sidecar_no_rebuild` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |

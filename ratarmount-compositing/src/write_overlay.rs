@@ -64,11 +64,13 @@ pub enum OverlayError {
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
 
+type AfterPersistFn = Arc<dyn Fn(&Path) -> Result<()> + Send + Sync>;
+
 /// Live overlay persist job (V-4). Interval and on-exit only.
 ///
 /// CLI [`commit_overlay`] is the prefix-rewrite escape hatch and must **not**
-/// go through this queue. F-7 write-through will reuse the same live queue
-/// later (do not implement F-7 here).
+/// go through this queue. F-7 write-through reuses this live queue
+/// (`set_after_persist` after persist, before reopen/cleanup).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
     /// Interval tick: persist overlay files idle for at least this long.
@@ -141,6 +143,8 @@ pub struct WriteOverlay {
     on_exit_wait_min: Mutex<Duration>,
     /// Test-only: sleep after taking the inflight flag (injected long persist).
     persist_delay: Mutex<Option<Duration>>,
+    /// F-7: after persist+sync_all, before reopen/cleanup. Err skips cleanup.
+    after_persist: Mutex<Option<AfterPersistFn>>,
 }
 
 impl WriteOverlay {
@@ -179,6 +183,7 @@ impl WriteOverlay {
             last_persist_duration: Mutex::new(Duration::ZERO),
             on_exit_wait_min: Mutex::new(ON_EXIT_WAIT_MIN),
             persist_delay: Mutex::new(None),
+            after_persist: Mutex::new(None),
         })
     }
 
@@ -190,6 +195,13 @@ impl WriteOverlay {
     /// Defaults to `"utf-8"` inside [`Self::new`]; fuse/nfs tests need not call this.
     pub fn set_encoding(&mut self, encoding: &str) {
         self.encoding = encoding.to_string();
+    }
+
+    /// Invoked after persist+sync_all, before reopen/cleanup (F-7 PUT).
+    ///
+    /// `Err` skips overlay cleanup (interval_disabled; overlay kept).
+    pub fn set_after_persist(&self, f: impl Fn(&Path) -> Result<()> + Send + Sync + 'static) {
+        *self.after_persist.lock().expect("overlay after_persist") = Some(Arc::new(f));
     }
 
     /// True after persist-ok + reopen-err; further interval ticks must remount.
@@ -869,6 +881,11 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
+        self.sync_archive(archive)?;
+        if let Err(e) = self.invoke_after_persist(archive) {
+            self.interval_disabled.store(true, Ordering::SeqCst);
+            return Err(e);
+        }
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
@@ -929,8 +946,8 @@ impl WriteOverlay {
     ///
     /// Overlay `create`/`write` stay on `commit_gate.read()`. Inflight is a
     /// separate flag — do not hold the writer-visible gate from enqueue until
-    /// unmount. CLI [`commit_overlay`] stays off this path. F-7 will reuse
-    /// this live queue later.
+    /// unmount. CLI [`commit_overlay`] stays off this path. F-7 reuses this
+    /// live queue (`set_after_persist`).
     pub fn enqueue_commit(
         &self,
         archive: &Path,
@@ -1122,6 +1139,13 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
+        self.sync_archive(archive)?;
+        if let Err(e) = self.invoke_after_persist(archive) {
+            self.interval_disabled.store(true, Ordering::SeqCst);
+            return Err(OverlayError::Msg(format!(
+                "persist succeeded; after-persist failed (remount required): {e}"
+            )));
+        }
         match reopen(archive) {
             Ok(src) => {
                 *self.replacement.write().expect("overlay replacement") = Some(src);
@@ -1228,6 +1252,23 @@ impl WriteOverlay {
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
         self.commit_live(archive, reopen)
+    }
+
+    fn sync_archive(&self, archive: &Path) -> Result<()> {
+        File::open(archive)?.sync_all()?;
+        Ok(())
+    }
+
+    fn invoke_after_persist(&self, archive: &Path) -> Result<()> {
+        let hook = self
+            .after_persist
+            .lock()
+            .expect("overlay after_persist")
+            .clone();
+        if let Some(f) = hook {
+            f(archive)?;
+        }
+        Ok(())
     }
 
     fn persist_by_format(
@@ -1551,9 +1592,7 @@ pub fn sidecar_path_for_patch(archive: &Path, opts: &OpenOptions) -> Option<Path
 
 /// Patch `{archive}.index.sqlite` (or `--index-file`) after persist. No-op when missing.
 ///
-/// One `BEGIN IMMEDIATE` around delete + suffix parse + tarstats + `set_zstd_blocks`.
-/// Never [`SqliteIndex::create_writable`]. Parse-time zstd is a fresh frame scan
-/// ([`open_seekable_zstd_with_threads`]), never pre-splice `zstdblocks`.
+/// Resolves the sidecar then [`patch_sidecar_at`] so local live commit stays one path.
 pub fn patch_sidecar_if_present(
     archive: &Path,
     window: &IndexPatchWindow,
@@ -1563,16 +1602,32 @@ pub fn patch_sidecar_if_present(
         log::info!("incremental reindex skipped (no sidecar); rebuilding");
         return Ok(());
     };
-    let idx = SqliteIndex::open_writable(&sidecar).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    patch_sidecar_at(archive, &sidecar, window, opts)
+}
+
+/// Patch `sidecar` from `body` (parse zstd/TAR from `body`; write rows into `sidecar`).
+///
+/// One `BEGIN IMMEDIATE` around delete + suffix parse + tarstats + `set_zstd_blocks`.
+/// Never [`SqliteIndex::create_writable`]. Parse-time zstd is a fresh frame scan
+/// ([`open_seekable_zstd_with_threads`]), never pre-splice `zstdblocks`.
+///
+/// F-7: `body` is the spool, `sidecar` is the G-2 mount index (not `{spool}.index.sqlite`).
+pub fn patch_sidecar_at(
+    body: &Path,
+    sidecar: &Path,
+    window: &IndexPatchWindow,
+    opts: &OpenOptions,
+) -> Result<()> {
+    let idx = SqliteIndex::open_writable(sidecar).map_err(|e| OverlayError::Msg(e.to_string()))?;
     idx.begin_write()
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
-    let format = detect_live_commit_format(archive)?;
+    let format = detect_live_commit_format(body)?;
     let stats = match format {
         CompressionFormat::Zstd => {
             let threads = opts.threads_for("zstd");
-            let body = open_seekable_zstd_with_threads(archive, threads)
+            let zstd_body = open_seekable_zstd_with_threads(body, threads)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
-            let mut reader = body
+            let mut reader = zstd_body
                 .open_reader()
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
             SqliteIndexedTar::patch_index_from(
@@ -1585,7 +1640,7 @@ pub fn patch_sidecar_if_present(
             .map_err(|e| OverlayError::Msg(e.to_string()))?
         }
         _ => {
-            let mut file = File::open(archive)?;
+            let mut file = File::open(body)?;
             SqliteIndexedTar::patch_index_from(
                 &mut file,
                 &idx,
@@ -1596,24 +1651,25 @@ pub fn patch_sidecar_if_present(
             .map_err(|e| OverlayError::Msg(e.to_string()))?
         }
     };
-    idx.store_tarstats_for_path(archive)
+    idx.store_tarstats_for_path(body)
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
     if format == CompressionFormat::Zstd {
-        let blocks = export_zstd_blocks(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+        let blocks = export_zstd_blocks(body).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let i64_blocks: Vec<(i64, i64)> =
             blocks.iter().map(|&(c, d)| (c as i64, d as i64)).collect();
         idx.set_zstd_blocks(&i64_blocks)
             .map_err(|e| OverlayError::Msg(e.to_string()))?;
     }
     if !opts.hashes.is_empty() && format == CompressionFormat::None {
-        fill_content_hashes(&idx, archive, &opts.hashes)
+        fill_content_hashes(&idx, body, &opts.hashes)
             .map_err(|e| OverlayError::Msg(e.to_string()))?;
     }
     idx.commit_write()
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
     log::info!(
-        "incremental reindex {} window_start={} deleted={} inserted={} parse_start={}",
-        archive.display(),
+        "incremental reindex {} sidecar={} window_start={} deleted={} inserted={} parse_start={}",
+        body.display(),
+        sidecar.display(),
         window.window_start,
         stats.rows_deleted,
         stats.rows_inserted,
@@ -5903,6 +5959,38 @@ mod tests {
         );
         assert!(overlay.join("new.txt").exists());
         // Persist did run on the first tick — remount should see the new member.
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    /// Regression: AfterPersist Err skips overlay cleanup (F-7 PUT failure).
+    #[test]
+    fn overlay_commit_after_persist_err_skips_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("ap-seed");
+        let extra = generated_payload("ap-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        ov.set_after_persist(|_| Err(OverlayError::Msg("put failed".into())));
+
+        let err = ov
+            .commit_live(&archive, |_| {
+                panic!("reopen must not run when after_persist fails")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("after-persist") || err.contains("put failed"),
+            "{err}"
+        );
+        assert!(
+            overlay.join("new.txt").exists(),
+            "overlay must be kept after after-persist failure"
+        );
+        assert!(ov.interval_disabled());
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
     }

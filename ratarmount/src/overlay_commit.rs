@@ -12,15 +12,17 @@ use std::time::{Duration, Instant};
 
 use ratarmount_compositing::{
     classify_createable_archive, maybe_create_empty_write_archive, maybe_wrap_payload_cache,
-    patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind,
-    EmptyCreateOutcome, OverlayError, WriteOverlay,
+    patch_sidecar_at, patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome,
+    EmptyArchiveKind, EmptyCreateOutcome, IndexPatchWindow, OverlayError, WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
+use ratarmount_index::{serialize_tarstats, tar_stats_from_path, IndexPointer, SqliteIndex};
 use ratarmount_nfs::NfsStop;
+use ratarmount_session::factory;
 
 /// Warn when the last zstd frame's uncompressed size exceeds this.
 const LIVE_COMMIT_WARN_LAST_FRAME: u64 = 64 * 1024 * 1024;
@@ -122,12 +124,22 @@ pub fn spawn_signal_fuse_unmount(mp: PathBuf) {
         .expect("fuse signal unmount thread");
 }
 
+/// Persist target for live overlay commit (local file or F-7 spool).
+#[derive(Debug, Clone)]
+pub struct LiveCommitArchive {
+    /// Local path passed to `enqueue_commit` / `persist_by_format` (the spool for `s3://`).
+    pub path: PathBuf,
+    /// Original `s3://` URL when this is an F-7 write-through mount.
+    pub s3_url: Option<String>,
+}
+
 pub fn spawn_interval_commits(
     overlay: Arc<WriteOverlay>,
     archive: PathBuf,
     interval: Duration,
     stop: Option<NfsStop>,
     opts: OpenOptions,
+    s3_url: Option<String>,
 ) {
     // Poll at least once a second so a file enters the archive ~`interval`
     // after its last host mtime, not up to 2× interval later. The settle
@@ -147,11 +159,19 @@ pub fn spawn_interval_commits(
                 return;
             }
             let ov = Arc::clone(&overlay);
+            let opts_c = opts.clone();
+            let s3 = s3_url.clone();
             match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
-                if let Some(window) = ov.last_patch_window() {
-                    patch_sidecar_if_present(p, &window, &opts)?;
+                if let Some(url) = s3.as_deref() {
+                    // Patch+PUT already ran in after_persist; p is the spool.
+                    let _ = p;
+                    factory::open_live_remote(url, &opts_c).map_err(OverlayError::Msg)
+                } else {
+                    if let Some(window) = ov.last_patch_window() {
+                        patch_sidecar_if_present(p, &window, &opts_c)?;
+                    }
+                    reopen_live_archive(p, &opts_c).map_err(OverlayError::Msg)
                 }
-                reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
             }) {
                 Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
@@ -372,6 +392,186 @@ pub fn validate_live_commit_args(
     Ok(archive)
 }
 
+/// Offline `--commit-overlay` is not on the V-4 / F-7 executor.
+pub fn refuse_offline_s3_commit(archive: &Path) -> Result<(), String> {
+    let s = archive.to_string_lossy();
+    if s.starts_with("s3://") {
+        return Err(
+            "offline --commit-overlay does not support s3:// (use --commit-overlay-on-exit / --commit-overlay-interval)"
+                .into(),
+        );
+    }
+    Ok(())
+}
+
+/// Startup gate for live commit, including F-7 `s3://` spool + write probe.
+pub fn prepare_live_commit_args(
+    write_overlay: Option<&Path>,
+    inputs: &[PathBuf],
+) -> Result<LiveCommitArchive, String> {
+    let ov = write_overlay.ok_or_else(|| {
+        "--commit-overlay-on-exit / --commit-overlay-interval require --write-overlay <folder>"
+            .to_string()
+    })?;
+    if ov.as_os_str() == ":temp:" {
+        return Err(
+            "--commit-overlay-on-exit / --commit-overlay-interval cannot use --write-overlay :temp:"
+                .into(),
+        );
+    }
+    if inputs.len() != 1 {
+        return Err(
+            "--commit-overlay-on-exit / --commit-overlay-interval require a single uncompressed TAR or .tar.zst"
+                .into(),
+        );
+    }
+    let s = inputs[0].to_string_lossy();
+    if s.starts_with("s3://") {
+        let spool = spool_s3_for_live_commit(s.as_ref())?;
+        let path = validate_live_commit_args(Some(ov), std::slice::from_ref(&spool))?;
+        return Ok(LiveCommitArchive {
+            path,
+            s3_url: Some(s.into_owned()),
+        });
+    }
+    if ratarmount_remote::is_remote_url(s.as_ref()) {
+        return Err(format!(
+            "live overlay commit supports local TAR/ZST or s3:// TAR/ZST only (got {s})"
+        ));
+    }
+    let path = validate_live_commit_args(Some(ov), inputs)?;
+    Ok(LiveCommitArchive { path, s3_url: None })
+}
+
+/// Attach F-7 AfterPersist (patch sidecar + multipart PUT + pointer). Uses `Weak` so
+/// the overlay does not hold a strong cycle.
+pub fn attach_f7_after_persist(overlay: &Arc<WriteOverlay>, s3_url: String, opts: OpenOptions) {
+    let weak = Arc::downgrade(overlay);
+    overlay.set_after_persist(move |spool| {
+        let ov = weak
+            .upgrade()
+            .ok_or_else(|| OverlayError::Msg("overlay dropped during F-7 PUT".into()))?;
+        let window = ov
+            .last_patch_window()
+            .ok_or_else(|| OverlayError::Msg("missing patch window for F-7 PUT".into()))?;
+        f7_patch_put(spool, &s3_url, &window, &opts)
+    });
+}
+
+/// Persist post-step for IntervalIdle and OnExit: patch mount sidecar from spool,
+/// PUT spool to `s3://`, then blob+pointer. Does not forget overlay or reopen.
+pub fn f7_patch_put(
+    spool: &Path,
+    s3_url: &str,
+    window: &IndexPatchWindow,
+    opts: &OpenOptions,
+) -> std::result::Result<(), OverlayError> {
+    if let Some(sidecar) = f7_mount_sidecar(opts) {
+        patch_sidecar_at(spool, &sidecar, window, opts)?;
+        store_content_tarstats(&sidecar, spool)?;
+        put_spool_then_index(spool, s3_url, Some(&sidecar))?;
+    } else {
+        put_spool_then_index(spool, s3_url, None)?;
+    }
+    Ok(())
+}
+
+fn f7_mount_sidecar(opts: &OpenOptions) -> Option<PathBuf> {
+    let p = opts.index_file_path.as_ref()?;
+    if p.is_file() {
+        Some(p.clone())
+    } else {
+        None
+    }
+}
+
+fn store_content_tarstats(sidecar: &Path, body: &Path) -> std::result::Result<(), OverlayError> {
+    let mut stats = tar_stats_from_path(body).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    // Remote remount checks size + edge hashes, not spool mtime.
+    stats.st_mtime = 0;
+    stats.st_mtime_ns = Some(0);
+    let idx = SqliteIndex::open_writable(sidecar).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    idx.store_metadata_key_value("tarstats", &serialize_tarstats(&stats))
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    Ok(())
+}
+
+fn checkpoint_sqlite(path: &Path) -> std::result::Result<(), OverlayError> {
+    // WAL rows must land in the main file before PutObject of the sqlite blob.
+    let conn = rusqlite::Connection::open(path).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    Ok(())
+}
+
+fn put_spool_then_index(
+    spool: &Path,
+    s3_url: &str,
+    sidecar: Option<&Path>,
+) -> std::result::Result<(), OverlayError> {
+    ratarmount_remote::put_s3_file(s3_url, spool, "application/octet-stream")
+        .map_err(|e| OverlayError::Msg(format!("F-7 PUT {s3_url}: {e}")))?;
+    let Some(sidecar) = sidecar else {
+        return Ok(());
+    };
+    checkpoint_sqlite(sidecar)?;
+    let ptr = IndexPointer::for_blob(sidecar, Some(spool))
+        .map_err(|e| OverlayError::Msg(format!("F-7 index pointer: {e}")))?;
+    let json = format!(
+        "{{\n  \"schema\": \"{}\",\n  \"index_id\": \"{}\",\n  \"etag_sha256\": \"{}\",\n  \"generated_at\": \"{}\"\n}}\n",
+        ptr.schema, ptr.index_id, ptr.etag_sha256, ptr.generated_at
+    );
+    ratarmount_remote::publish_index_to_s3(
+        s3_url,
+        sidecar,
+        &ratarmount_remote::S3IndexPointer {
+            index_id: ptr.index_id,
+            json: json.into_bytes(),
+        },
+    )
+    .map_err(|e| OverlayError::Msg(format!("F-7 publish index: {e}")))?;
+    Ok(())
+}
+
+fn spool_s3_for_live_commit(url: &str) -> Result<PathBuf, String> {
+    ratarmount_remote::s3_create_and_abort_multipart_upload(url).map_err(|e| {
+        format!("s3:// live overlay commit write probe failed (need non-anonymous AWS credentials): {e}")
+    })?;
+    let dest = f7_spool_path(url)?;
+    let (tmp, _) = ratarmount_remote::fetch_s3_to_temp(url)
+        .map_err(|e| format!("s3:// live overlay commit GET {url}: {e}"))?;
+    std::fs::copy(tmp.path(), &dest)
+        .map_err(|e| format!("s3:// live overlay commit spool {}: {e}", dest.display()))?;
+    Ok(dest)
+}
+
+fn f7_spool_path(url: &str) -> Result<PathBuf, String> {
+    let root = std::env::var("RATARMOUNT_COMMIT_SPOOL_DIR")
+        .ok()
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(std::env::temp_dir);
+    let dir = root.join(format!("ratarmount-f7-{}", std::process::id()));
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("s3:// live overlay commit spool dir {}: {e}", dir.display()))?;
+    let loc = ratarmount_remote::parse_s3_url(url).map_err(|e| e.to_string())?;
+    let safe: String = loc
+        .key
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | ':' | ' ' => '_',
+            c if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' => c,
+            _ => '_',
+        })
+        .collect();
+    let safe = if safe.is_empty() {
+        "object".into()
+    } else {
+        safe
+    };
+    Ok(dir.join(safe))
+}
+
 /// K4: warn once at startup; never refuse on size.
 fn maybe_warn_large_zstd_last_frame(archive: &Path) -> bool {
     match detect_compression(archive) {
@@ -410,7 +610,10 @@ pub fn maybe_commit_on_exit(
     match apply_live_commit(ov, path, false, opts) {
         Ok(true) => eprintln!("committed write overlay into {}", path.display()),
         Ok(false) => log::debug!("on-exit overlay commit: nothing to do"),
-        Err(e) => eprintln!("error: on-exit overlay commit failed: {e}"),
+        Err(e) => {
+            eprintln!("error: on-exit overlay commit failed: {e}");
+            std::process::exit(1);
+        }
     }
 }
 
@@ -422,6 +625,7 @@ pub(crate) fn set_term_flag_for_test(v: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn parse_interval_off() {
@@ -794,5 +998,605 @@ mod tests {
             .expect("existing zstd");
         assert_eq!(got, EmptyCreateOutcome::Unchanged);
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn commit_overlay_refuses_s3() {
+        let err = refuse_offline_s3_commit(Path::new("s3://bucket/a.tar")).unwrap_err();
+        assert!(err.contains("s3://"), "{err}");
+        assert!(err.contains("offline") || err.contains("on-exit"), "{err}");
+    }
+
+    #[test]
+    fn f7_anonymous_exits_2() {
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("RATARMOUNT_S3_ANONYMOUS", "1");
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let err = prepare_live_commit_args(Some(&ov), &[PathBuf::from("s3://bucket/a.tar.zst")])
+            .unwrap_err();
+        assert!(
+            err.contains("anonymous") || err.contains("GET-only") || err.contains("non-anonymous"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn f7_requires_write_creds() {
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let err = prepare_live_commit_args(Some(&ov), &[PathBuf::from("s3://bucket/a.tar.zst")])
+            .unwrap_err();
+        assert!(
+            err.contains("credentials")
+                || err.contains("AWS_ACCESS_KEY")
+                || err.contains("write probe"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn live_commit_rejects_gzip_s3() {
+        let mock = MockS3Rw::spawn(Vec::new(), false);
+        mock.objects
+            .lock()
+            .unwrap()
+            .insert("a.tar.gz".into(), b"\x1f\x8b\x08\x00gzip-not-tar".to_vec());
+        let dir = tempfile::tempdir().unwrap();
+        let _g = env_signed_s3(&mock.base_url, dir.path());
+        let ov = dir.path().join("ov");
+        std::fs::create_dir_all(&ov).unwrap();
+        let err = prepare_live_commit_args(Some(&ov), &[PathBuf::from("s3://bucket/a.tar.gz")])
+            .unwrap_err();
+        assert!(
+            err.contains("gzip") || err.contains("uncompressed"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn f7_reopen_ignores_spool_uses_ranges() {
+        let extra = b"f7-range-new\n";
+        let h = f7_ready_overlay(extra);
+        assert!(h
+            .ov
+            .commit_live(&h.spool, |_| {
+                factory::open_live_remote(&h.url, &h.opts).map_err(OverlayError::Msg)
+            })
+            .expect("commit"));
+        std::fs::remove_file(&h.spool).expect("delete spool");
+        let fi = h.ov.lookup("/new.bin", 0).expect("new member after reopen");
+        let got =
+            h.ov.read(&fi, extra.len(), 0)
+                .expect("cat after spool delete");
+        assert_eq!(got, extra);
+        assert!(
+            h.mock.range_headers.load(Ordering::SeqCst) >= 1,
+            "reopen must Range-GET, not File::open(spool); log={:?}",
+            h.mock.log.lock().unwrap()
+        );
+    }
+
+    #[test]
+    fn f7_pointer_blob_has_new_member() {
+        let extra = b"f7-blob-member\n";
+        let h = f7_ready_overlay(extra);
+        assert!(h
+            .ov
+            .commit_live(&h.spool, |_| {
+                factory::open_live_remote(&h.url, &h.opts).map_err(OverlayError::Msg)
+            })
+            .expect("commit"));
+        let objects = h.mock.objects.lock().unwrap();
+        let blob_key = objects
+            .keys()
+            .find(|k| k.contains(".index.") && k.ends_with(".sqlite"))
+            .cloned()
+            .expect("blob PUT");
+        let blob = objects.get(&blob_key).cloned().expect("blob body");
+        drop(objects);
+        let blob_path = h.dir.path().join("blob.sqlite");
+        std::fs::write(&blob_path, &blob).unwrap();
+        let idx = SqliteIndex::open_read_only(&blob_path).expect("open blob");
+        let fi = idx
+            .lookup("/new.bin", 0)
+            .expect("lookup")
+            .expect("appended name in patched blob");
+        assert_eq!(fi.size, extra.len() as u64);
+    }
+
+    #[test]
+    fn overlay_commit_put_fail_keeps_overlay() {
+        let extra = b"f7-keep-overlay\n";
+        let mock = MockS3Rw::spawn(Vec::new(), true);
+        let dir = tempfile::tempdir().unwrap();
+        let zst = f7_seed_zst();
+        mock.objects.lock().unwrap().insert("a.tar.zst".into(), zst);
+        let _g = env_signed_s3(&mock.base_url, dir.path());
+        let ov_dir = dir.path().join("ov");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        let live =
+            prepare_live_commit_args(Some(&ov_dir), &[PathBuf::from("s3://bucket/a.tar.zst")])
+                .expect("prepare");
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+            let _ = SqliteIndexedTar::create_index_body(
+                &live.path,
+                body,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                env!("CARGO_PKG_VERSION"),
+            )
+            .unwrap();
+        }
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar),
+            ..OpenOptions::default()
+        };
+        let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+        let base = SqliteIndexedTar::open_with_existing_index_body(
+            &live.path,
+            body,
+            opts.index_file_path.as_ref().unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        let ov =
+            Arc::new(WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).unwrap());
+        std::fs::write(ov_dir.join("new.bin"), extra).unwrap();
+        attach_f7_after_persist(&ov, live.s3_url.clone().unwrap(), opts.clone());
+        let err = ov
+            .commit_live(&live.path, |_| panic!("reopen must not run when PUT fails"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("PUT") || err.contains("after-persist") || err.contains("500"),
+            "{err}"
+        );
+        assert!(
+            ov_dir.join("new.bin").exists(),
+            "PUT failure must keep overlay"
+        );
+        assert!(ov.interval_disabled());
+    }
+
+    #[test]
+    fn overlay_commit_live_s3_patched_sidecar_no_rebuild() {
+        let extra = b"f7-patched-member\n";
+        let h = f7_ready_overlay(extra);
+        assert!(h
+            .ov
+            .commit_live(&h.spool, |_| {
+                factory::open_live_remote(&h.url, &h.opts).map_err(OverlayError::Msg)
+            })
+            .expect("commit"));
+        let sidecar = h.opts.index_file_path.as_ref().unwrap();
+        let idx = SqliteIndex::open_read_only(sidecar).expect("patched sidecar");
+        let fi = idx
+            .lookup("/new.bin", 0)
+            .expect("lookup")
+            .expect("patched sidecar lists appended member without full rebuild");
+        assert_eq!(fi.size, extra.len() as u64);
+        let old = idx
+            .lookup("/old.txt", 0)
+            .expect("lookup old")
+            .expect("prefix member kept without full rebuild");
+        assert_eq!(old.size, 5);
+    }
+
+    fn f7_seed_zst() -> Vec<u8> {
+        let payload = b"seed\n";
+        let member = ratarmount_formats_tar::UstarMember {
+            path: "old.txt",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        ratarmount_compress::encode_zstd_frame(&tar, 3).unwrap()
+    }
+
+    struct F7Harness {
+        mock: MockS3Rw,
+        spool: PathBuf,
+        ov: Arc<WriteOverlay>,
+        opts: OpenOptions,
+        url: String,
+        dir: tempfile::TempDir,
+        _env: EnvGuard,
+    }
+
+    fn f7_ready_overlay(extra: &[u8]) -> F7Harness {
+        let mock = MockS3Rw::spawn(Vec::new(), false);
+        let dir = tempfile::tempdir().unwrap();
+        let zst = f7_seed_zst();
+        mock.objects.lock().unwrap().insert("a.tar.zst".into(), zst);
+        let env = env_signed_s3(&mock.base_url, dir.path());
+        let ov_dir = dir.path().join("ov");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        let live =
+            prepare_live_commit_args(Some(&ov_dir), &[PathBuf::from("s3://bucket/a.tar.zst")])
+                .expect("prepare");
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+            let _ = SqliteIndexedTar::create_index_body(
+                &live.path,
+                body,
+                Some(&sidecar),
+                &OpenOptions::default(),
+                env!("CARGO_PKG_VERSION"),
+            )
+            .unwrap();
+        }
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar),
+            ..OpenOptions::default()
+        };
+        let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+        let base = SqliteIndexedTar::open_with_existing_index_body(
+            &live.path,
+            body,
+            opts.index_file_path.as_ref().unwrap(),
+            opts.clone(),
+        )
+        .unwrap();
+        let ov =
+            Arc::new(WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).unwrap());
+        std::fs::write(ov_dir.join("new.bin"), extra).unwrap();
+        let url = live.s3_url.clone().unwrap();
+        attach_f7_after_persist(&ov, url.clone(), opts.clone());
+        F7Harness {
+            mock,
+            spool: live.path,
+            ov,
+            opts,
+            url,
+            dir,
+            _env: env,
+        }
+    }
+
+    const AWS_ENV_KEYS: &[&str] = &[
+        "AWS_ACCESS_KEY_ID",
+        "AWS_SECRET_ACCESS_KEY",
+        "AWS_SESSION_TOKEN",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "AWS_ENDPOINT_URL",
+        "S3_ENDPOINT_URL",
+        "AWS_ANONYMOUS",
+        "RATARMOUNT_S3_ANONYMOUS",
+        "AWS_CONTAINER_CREDENTIALS_RELATIVE_URI",
+        "AWS_CONTAINER_CREDENTIALS_FULL_URI",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN",
+        "AWS_CONTAINER_AUTHORIZATION_TOKEN_FILE",
+        "RATARMOUNT_IMDS_BASE",
+        "AWS_EC2_METADATA_SERVICE_ENDPOINT",
+        "RATARMOUNT_COMMIT_SPOOL_DIR",
+    ];
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire(keys: &[&str]) -> Self {
+            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, val: &str) {
+            std::env::set_var(key, val);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(&k, val),
+                    None => std::env::remove_var(&k),
+                }
+            }
+        }
+    }
+
+    fn env_signed_s3(endpoint: &str, spool: &Path) -> EnvGuard {
+        let g = EnvGuard::acquire(AWS_ENV_KEYS);
+        g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        g.set("AWS_ENDPOINT_URL", endpoint);
+        g.set("AWS_REGION", "us-east-1");
+        g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        g.set("RATARMOUNT_COMMIT_SPOOL_DIR", &spool.to_string_lossy());
+        g
+    }
+
+    struct MockS3Rw {
+        base_url: String,
+        log: Arc<std::sync::Mutex<Vec<String>>>,
+        objects: Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+        range_headers: Arc<std::sync::atomic::AtomicUsize>,
+        _join: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl MockS3Rw {
+        fn spawn(initial: Vec<u8>, fail_put: bool) -> Self {
+            use std::io::{BufRead, BufReader, Read, Write};
+            use std::net::TcpListener;
+            use std::sync::atomic::AtomicUsize;
+
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let local = listener.local_addr().unwrap();
+            let base_url = format!("http://{local}");
+            let log = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let objects = Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            if !initial.is_empty() {
+                objects.lock().unwrap().insert("a.tar.zst".into(), initial);
+            }
+            let range_headers = Arc::new(AtomicUsize::new(0));
+            let log_c = Arc::clone(&log);
+            let objects_c = Arc::clone(&objects);
+            let range_c = Arc::clone(&range_headers);
+            let next_upload = Arc::new(AtomicUsize::new(1));
+            type PartsMap = std::collections::HashMap<(String, u32), Vec<u8>>;
+            let parts: Arc<std::sync::Mutex<PartsMap>> =
+                Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            let parts_c = Arc::clone(&parts);
+            let join = std::thread::spawn(move || {
+                for stream in listener.incoming().take(256) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut has_auth = false;
+                    let mut range_hdr: Option<String> = None;
+                    let mut content_length = 0usize;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if lower.starts_with("authorization:") {
+                            has_auth = true;
+                        }
+                        if let Some(rest) = lower.strip_prefix("content-length:") {
+                            content_length = rest.trim().parse().unwrap_or(0);
+                        }
+                        if let Some((_, v)) = line.split_once(':') {
+                            if lower.starts_with("range:") {
+                                range_hdr = Some(v.trim().to_string());
+                            }
+                        }
+                    }
+                    let method = request_line.split_whitespace().next().unwrap_or("");
+                    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let (path, query) = match target.split_once('?') {
+                        Some((p, q)) => (p, q),
+                        None => (target, ""),
+                    };
+                    let key = path
+                        .trim_start_matches('/')
+                        .split_once('/')
+                        .map(|(_, k)| k.to_string())
+                        .unwrap_or_default();
+                    {
+                        let mut lg = log_c.lock().unwrap();
+                        lg.push(format!("{method} {key}"));
+                    }
+                    if range_hdr.is_some() {
+                        range_c.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let mut body = vec![0u8; content_length.min(64 * 1024 * 1024)];
+                    if !body.is_empty() && reader.read_exact(&mut body).is_err() {
+                        continue;
+                    }
+                    if !has_auth {
+                        let msg = b"AccessDenied";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 403 Forbidden\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            msg.len()
+                        );
+                        let _ = stream.write_all(msg);
+                        continue;
+                    }
+                    if method == "GET" {
+                        let held = objects_c.lock().unwrap();
+                        let Some(obj) = held.get(&key).cloned() else {
+                            drop(held);
+                            let msg = b"NoSuchKey";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                msg.len()
+                            );
+                            let _ = stream.write_all(msg);
+                            continue;
+                        };
+                        drop(held);
+                        if let Some(ref r) = range_hdr {
+                            if let Some((start, end)) = parse_bytes_range(r, obj.len()) {
+                                let end = end.min(obj.len().saturating_sub(1));
+                                if start <= end && start < obj.len() {
+                                    let slice = &obj[start..=end];
+                                    let cr = format!("bytes {start}-{end}/{}", obj.len());
+                                    let _ = write!(
+                                        stream,
+                                        "HTTP/1.1 206 Partial Content\r\nContent-Range: {cr}\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                                        slice.len()
+                                    );
+                                    let _ = stream.write_all(slice);
+                                    continue;
+                                }
+                            }
+                        }
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nAccept-Ranges: bytes\r\nConnection: close\r\n\r\n",
+                            obj.len()
+                        );
+                        let _ = stream.write_all(&obj);
+                        continue;
+                    }
+                    let params = parse_query(query);
+                    if method == "POST" && params.iter().any(|(k, _)| k == "uploads") {
+                        let n = next_upload.fetch_add(1, Ordering::SeqCst);
+                        let upload_id = format!("mpu-test-{n}");
+                        let xml = format!(
+                            "<InitiateMultipartUploadResult><Bucket>bucket</Bucket>\
+                             <Key>{key}</Key><UploadId>{upload_id}</UploadId></InitiateMultipartUploadResult>"
+                        );
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                            xml.len()
+                        );
+                        continue;
+                    }
+                    if method == "DELETE" && params.iter().any(|(k, _)| k == "uploadId") {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+                    if method == "PUT" {
+                        if fail_put && params.iter().all(|(k, _)| k != "partNumber") {
+                            let msg = b"InternalError";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                msg.len()
+                            );
+                            let _ = stream.write_all(msg);
+                            continue;
+                        }
+                        if let Some(part) = params
+                            .iter()
+                            .find(|(k, _)| k == "partNumber")
+                            .and_then(|(_, v)| v.parse::<u32>().ok())
+                        {
+                            let upload_id = params
+                                .iter()
+                                .find(|(k, _)| k == "uploadId")
+                                .map(|(_, v)| v.as_str())
+                                .unwrap_or("");
+                            parts_c
+                                .lock()
+                                .unwrap()
+                                .insert((upload_id.to_string(), part), body);
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nETag: \"part-{part}\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                            continue;
+                        }
+                        objects_c.lock().unwrap().insert(key, body);
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 200 OK\r\nETag: \"put\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+                    if method == "POST" {
+                        if let Some(upload_id) = params
+                            .iter()
+                            .find(|(k, _)| k == "uploadId")
+                            .map(|(_, v)| v.clone())
+                        {
+                            let mut held = parts_c.lock().unwrap();
+                            let mut nums: Vec<u32> = held
+                                .keys()
+                                .filter(|(id, _)| id == &upload_id)
+                                .map(|(_, n)| *n)
+                                .collect();
+                            nums.sort_unstable();
+                            let mut assembled = Vec::new();
+                            for n in nums {
+                                if let Some(p) = held.remove(&(upload_id.clone(), n)) {
+                                    assembled.extend_from_slice(&p);
+                                }
+                            }
+                            drop(held);
+                            objects_c.lock().unwrap().insert(key, assembled);
+                            let xml = "<CompleteMultipartUploadResult><ETag>\"mpu\"</ETag></CompleteMultipartUploadResult>";
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nETag: \"mpu\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{xml}",
+                                xml.len()
+                            );
+                            continue;
+                        }
+                    }
+                    let msg = b"UnexpectedRequest";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                }
+            });
+            Self {
+                base_url,
+                log,
+                objects,
+                range_headers,
+                _join: Some(join),
+            }
+        }
+    }
+
+    fn parse_bytes_range(header: &str, total: usize) -> Option<(usize, usize)> {
+        let rest = header.trim().strip_prefix("bytes=")?;
+        let (a, b) = rest.split_once('-')?;
+        let start: usize = a.parse().ok()?;
+        if b.is_empty() {
+            if total == 0 {
+                return None;
+            }
+            return Some((start, total - 1));
+        }
+        let end: usize = b.parse().ok()?;
+        Some((start, end))
+    }
+
+    fn parse_query(q: &str) -> Vec<(String, String)> {
+        if q.is_empty() {
+            return Vec::new();
+        }
+        q.split('&')
+            .filter(|p| !p.is_empty())
+            .map(|p| match p.split_once('=') {
+                Some((k, v)) => (k.to_string(), v.to_string()),
+                None => (p.to_string(), String::new()),
+            })
+            .collect()
     }
 }

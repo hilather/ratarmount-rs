@@ -121,6 +121,9 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
+| F-7 | **Write-through / commit-to-remote** | `partial` | L | compositing + CLI live `s3://` TAR/ZST; GCS/Azure PUT residual |
+| F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS crates; remaining image crates + factory |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
 | F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | session landed; L0 dry-run only (Q5=a); PyO3 residual |
 
@@ -173,12 +176,12 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 **Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, CLOSE. Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. `fetch_smb_to_temp` / `smbclient` is still the production fetch path.
 
 **Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
-
 ### F-7 — Write-through / commit-to-remote
+### F-7 — Write-through / commit-to-remote — `partial`
 
-Overlay commit currently mutates a **local** tar/zip. `s3://bucket/a.tar.zst` + `-w` + interval commit should multipart-upload the spliced object (or a sidecar delta). Depends on F-2 unless we accept full-object PUT of the sibling tmp (works, expensive). Reuse the V-4 live commit queue (`enqueue_commit` IntervalIdle/OnExit); do not put offline `commit_overlay()` on that executor.
+`s3://bucket/a.tar.zst` (or uncompressed TAR) + durable `-w` + `--commit-overlay-interval` / `--commit-overlay-on-exit` multipart-uploads the spliced spool and then the patched sqlite blob + `{url}.index.ptr`. Reuses the V-4 live queue (`enqueue_commit` IntervalIdle/OnExit). Offline `--commit-overlay` + `s3://` exits 2 (not on that executor). Anonymous / `RATARMOUNT_S3_ANONYMOUS=1` / missing keys exit 2 before mount. Write probe is `CreateMultipartUpload` + immediate `AbortMultipartUpload`. Reopen is live Range (`open_live_remote`), not `File::open(spool)`. CLI `--publish-index` PUTs blob-then-pointer for `s3://` archives.
 
-S3 **PUT primitive** is in `ratarmount-remote` (`put_s3_file`, multipart abort-on-error, `s3_create_and_abort_multipart_upload` write probe, `publish_index_to_s3` blob-then-pointer). Live overlay spool / `open_live_remote` / CLI `--publish-index` S3 path are still this item.
+**Residual:** GCS `gs://` / Azure `az://` PUT; offline `s3://` commit; create-if-missing on remote URLs (K16 Unchanged).
 
 ### F-8 — Block and disk-image family
 
@@ -248,7 +251,7 @@ Discovery (fail-open): explicit `--index-file` (CLI `--index-id HEX` pre-resolve
 
 Publish: `--publish-index` copies the sidecar next to the archive; `--publish-index-to PATH` is a required value. Both always write `{archive}.index.ptr` (`ratarmount.index.pointer.v1`; `index_id` = sha256 of the blob, 64 hex), including dest==sidecar. Keep-last-K=2 local snapshots (`{archive}.index.{old_id}.sqlite`) when a pointer is written. HTTP export `GET /.ratarmount-control/index.sqlite` is HTTP-only (not a FUSE control file) with that Content-Type. `--http` still serves the **indexed tree**, not host archive bytes. Inbound clients consume `Link` on the archive HEAD, not on `--http` tree export.
 
-**Residual:** SOCI / eStargz / nydus zTOC converter; CLI `--publish-index` / live overlay S3 PUT (F-7; library primitive landed); GCS/Azure PUT; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
+**Residual:** SOCI / eStargz / nydus zTOC converter; GCS/Azure PUT; offline `s3://` `--commit-overlay`; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
 ### G-3 — Content-addressed member cache — `done`
 
@@ -280,7 +283,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. ~~**F-9** `--repack-seekable`~~ — done (engine + CLI; ZIP/7z/bzip2/xz residual).
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
-9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / CLI+live S3 PUT (F-7; `publish_index_to_s3` primitive landed) / GCS/Azure PUT / FUSE blob / Hub referrers.
+9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known; S3 PUT blob-then-pointer + live `s3://` overlay commit). Residual SOCI / GCS/Azure PUT / offline `s3://` commit / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.

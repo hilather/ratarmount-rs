@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ratarmount_compositing::OciImageMountSource;
+use ratarmount_compositing::{maybe_wrap_payload_cache, OciImageMountSource};
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_index::{
     cache_identity, check_tarstats_matches_remote, hash_hex, invalidate_meta_cache_file,
@@ -836,6 +836,36 @@ pub(super) fn materialize_remote_input(
     remotes.push(remote);
     let src = open_path(&path, opts, recreate)?;
     Ok((path, src))
+}
+
+/// Open a remote URL as a `MountSource` without AutoMount / union / overlay.
+///
+/// G-2 sibling GET / tarstats run. F-7 uses this as the WriteOverlay replacement
+/// after PUT so reopen is live Range, not `File::open(spool)`.
+pub fn open_live_remote(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, String> {
+    if !url.starts_with("s3://") {
+        return Err(format!(
+            "open_live_remote supports s3:// TAR/ZST only (got {url})"
+        ));
+    }
+    let range = ratarmount_remote::open_s3_range(url).map_err(|e| e.to_string())?;
+    if !range.uses_ranges() {
+        return Err(format!(
+            "open_live_remote requires live Range for {url} (got a fully buffered body)"
+        ));
+    }
+    let len = range.len();
+    let mut opts = opts.clone();
+    apply_remote_index_discovery(url, &mut opts, false, len, None)?;
+    let url_owned = url.to_string();
+    match open_from_live_range(range, len, url, &opts, false, "S3 Range", move || {
+        ratarmount_remote::open_s3_range(&url_owned).map_err(|e| e.to_string())
+    })? {
+        Some((_, src)) => Ok(maybe_wrap_payload_cache(src, opts.index_in_memory)),
+        None => Err(format!(
+            "open_live_remote: unsupported format for {url} (need uncompressed TAR or .tar.zst)"
+        )),
+    }
 }
 
 /// Open a remote URL: folder probe, live Range, OCI layer union, else materialize.
