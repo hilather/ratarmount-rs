@@ -204,6 +204,14 @@ impl WriteOverlay {
         *self.after_persist.lock().expect("overlay after_persist") = Some(Arc::new(f));
     }
 
+    /// True when [`Self::set_after_persist`] installed a hook (F-7 already patches).
+    pub fn has_after_persist(&self) -> bool {
+        self.after_persist
+            .lock()
+            .expect("overlay after_persist")
+            .is_some()
+    }
+
     /// True after persist-ok + reopen-err; further interval ticks must remount.
     pub fn interval_disabled(&self) -> bool {
         self.interval_disabled.load(Ordering::SeqCst)

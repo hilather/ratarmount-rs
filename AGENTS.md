@@ -196,8 +196,11 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | F-7 reopen is live Range, not File of spool | `cargo test -p ratarmount --bin ratarmount -- f7_reopen_ignores_spool_uses_ranges` |
 | F-7 pointer blob is the patched sqlite (appended name) | `cargo test -p ratarmount --bin ratarmount -- f7_pointer_blob_has_new_member` |
 | F-7 PUT failure keeps overlay | `cargo test -p ratarmount --bin ratarmount overlay_commit_put_fail_keeps_overlay` |
+| F-7 PUT failure restores sidecar (no ghost remount) | `cargo test -p ratarmount --bin ratarmount overlay_commit_put_fail_keeps_overlay` |
 | Gzip `s3://a.tar.gz` live commit still rejected | `cargo test -p ratarmount --bin ratarmount live_commit_rejects_gzip_s3` |
 | After interval, G-2 lists appended member without full rebuild | `cargo test -p ratarmount --bin ratarmount overlay_commit_live_s3_patched_sidecar_no_rebuild` |
+| Default G-2 sidecar (no `--index-file`) still PUTs pointer | `cargo test -p ratarmount --bin ratarmount -- f7_default_g2_sidecar_publishes_pointer` |
+| F-7 on-exit blob hash equals sidecar; tarstats mtime 0 | `cargo test -p ratarmount --bin ratarmount -- f7_on_exit_blob_matches_sidecar_mtime_zero` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |

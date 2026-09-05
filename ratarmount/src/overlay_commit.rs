@@ -218,7 +218,7 @@ pub fn apply_live_commit(
             Ok(_) => false,
             Err(e) => return Err(e.to_string()),
         };
-        if did {
+        if did && !overlay.has_after_persist() {
             if let Some(window) = overlay.last_patch_window() {
                 patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
             }
@@ -445,7 +445,14 @@ pub fn prepare_live_commit_args(
 
 /// Attach F-7 AfterPersist (patch sidecar + multipart PUT + pointer). Uses `Weak` so
 /// the overlay does not hold a strong cycle.
-pub fn attach_f7_after_persist(overlay: &Arc<WriteOverlay>, s3_url: String, opts: OpenOptions) {
+pub fn attach_f7_after_persist(overlay: &Arc<WriteOverlay>, s3_url: String, mut opts: OpenOptions) {
+    // Pin the sidecar the mount actually opened (G-2 user-cache), not only CLI `--index-file`.
+    let need_pin = !matches!(opts.index_file_path.as_ref(), Some(p) if p.is_file());
+    if need_pin {
+        if let Some(p) = sidecar_path_for_patch(Path::new(&s3_url), &opts) {
+            opts.index_file_path = Some(p);
+        }
+    }
     let weak = Arc::downgrade(overlay);
     overlay.set_after_persist(move |spool| {
         let ov = weak
@@ -460,29 +467,54 @@ pub fn attach_f7_after_persist(overlay: &Arc<WriteOverlay>, s3_url: String, opts
 
 /// Persist post-step for IntervalIdle and OnExit: patch mount sidecar from spool,
 /// PUT spool to `s3://`, then blob+pointer. Does not forget overlay or reopen.
+///
+/// K4 order is persist → patch → PUT object → PUT blob+pointer. The sidecar is
+/// copied first; a failed object PUT restores those bytes so remount cannot skip
+/// tarstats with a pre-commit catalog.
 pub fn f7_patch_put(
     spool: &Path,
     s3_url: &str,
     window: &IndexPatchWindow,
     opts: &OpenOptions,
 ) -> std::result::Result<(), OverlayError> {
-    if let Some(sidecar) = f7_mount_sidecar(opts) {
-        patch_sidecar_at(spool, &sidecar, window, opts)?;
-        store_content_tarstats(&sidecar, spool)?;
-        put_spool_then_index(spool, s3_url, Some(&sidecar))?;
-    } else {
-        put_spool_then_index(spool, s3_url, None)?;
+    let sidecar = f7_mount_sidecar(s3_url, opts);
+    let backup = match sidecar.as_ref() {
+        Some(sc) => {
+            checkpoint_sqlite(sc)?;
+            let bytes = std::fs::read(sc).map_err(|e| {
+                OverlayError::Msg(format!("F-7 sidecar backup {}: {e}", sc.display()))
+            })?;
+            Some((sc.clone(), bytes))
+        }
+        None => None,
+    };
+    if let Some(sc) = sidecar.as_ref() {
+        patch_sidecar_at(spool, sc, window, opts)?;
+        store_content_tarstats(sc, spool)?;
     }
-    Ok(())
+    match ratarmount_remote::put_s3_file(s3_url, spool, "application/octet-stream") {
+        Ok(_) => {
+            if let Some(sc) = sidecar.as_ref() {
+                put_index_blob_and_pointer(spool, s3_url, sc)?;
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if let Some((path, bytes)) = backup {
+                restore_sidecar_bytes(&path, &bytes)?;
+            }
+            Err(OverlayError::Msg(format!("F-7 PUT {s3_url}: {e}")))
+        }
+    }
 }
 
-fn f7_mount_sidecar(opts: &OpenOptions) -> Option<PathBuf> {
-    let p = opts.index_file_path.as_ref()?;
-    if p.is_file() {
-        Some(p.clone())
-    } else {
-        None
+fn f7_mount_sidecar(s3_url: &str, opts: &OpenOptions) -> Option<PathBuf> {
+    if let Some(p) = opts.index_file_path.as_ref() {
+        if p.is_file() {
+            return Some(p.clone());
+        }
     }
+    sidecar_path_for_patch(Path::new(s3_url), opts)
 }
 
 fn store_content_tarstats(sidecar: &Path, body: &Path) -> std::result::Result<(), OverlayError> {
@@ -504,16 +536,23 @@ fn checkpoint_sqlite(path: &Path) -> std::result::Result<(), OverlayError> {
     Ok(())
 }
 
-fn put_spool_then_index(
+fn restore_sidecar_bytes(path: &Path, bytes: &[u8]) -> std::result::Result<(), OverlayError> {
+    let _ = checkpoint_sqlite(path);
+    let mut wal = path.as_os_str().to_os_string();
+    wal.push("-wal");
+    let mut shm = path.as_os_str().to_os_string();
+    shm.push("-shm");
+    let _ = std::fs::remove_file(PathBuf::from(wal));
+    let _ = std::fs::remove_file(PathBuf::from(shm));
+    std::fs::write(path, bytes)
+        .map_err(|e| OverlayError::Msg(format!("F-7 restore sidecar {}: {e}", path.display())))
+}
+
+fn put_index_blob_and_pointer(
     spool: &Path,
     s3_url: &str,
-    sidecar: Option<&Path>,
+    sidecar: &Path,
 ) -> std::result::Result<(), OverlayError> {
-    ratarmount_remote::put_s3_file(s3_url, spool, "application/octet-stream")
-        .map_err(|e| OverlayError::Msg(format!("F-7 PUT {s3_url}: {e}")))?;
-    let Some(sidecar) = sidecar else {
-        return Ok(());
-    };
     checkpoint_sqlite(sidecar)?;
     let ptr = IndexPointer::for_blob(sidecar, Some(spool))
         .map_err(|e| OverlayError::Msg(format!("F-7 index pointer: {e}")))?;
@@ -1164,6 +1203,19 @@ mod tests {
             "PUT failure must keep overlay"
         );
         assert!(ov.interval_disabled());
+        let sidecar = opts.index_file_path.as_ref().unwrap();
+        let idx = SqliteIndex::open_read_only(sidecar).expect("restored sidecar");
+        assert!(
+            idx.lookup("/new.bin", 0).expect("lookup").is_none(),
+            "PUT failure must restore pre-commit sidecar (no ghost member)"
+        );
+        let src = factory::open_live_remote(live.s3_url.as_ref().unwrap(), &opts)
+            .expect("reopen after PUT fail");
+        assert!(
+            src.lookup("/new.bin", 0).is_none(),
+            "remount with same --index-file must not skip tarstats into a pre-commit catalog"
+        );
+        assert!(src.lookup("/old.txt", 0).is_some());
     }
 
     #[test]
@@ -1188,6 +1240,134 @@ mod tests {
             .expect("lookup old")
             .expect("prefix member kept without full rebuild");
         assert_eq!(old.size, 5);
+    }
+
+    /// Regression: default G-2 sidecar (no `--index-file`) still PUTs blob+pointer.
+    #[test]
+    fn f7_default_g2_sidecar_publishes_pointer() {
+        let extra = b"f7-g2-default\n";
+        let mock = MockS3Rw::spawn(Vec::new(), false);
+        let dir = tempfile::tempdir().unwrap();
+        mock.objects
+            .lock()
+            .unwrap()
+            .insert("a.tar.zst".into(), f7_seed_zst());
+        let env = env_signed_s3(&mock.base_url, dir.path());
+        let ov_dir = dir.path().join("ov");
+        std::fs::create_dir_all(&ov_dir).unwrap();
+        let cache = dir.path().join("g2-cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let live =
+            prepare_live_commit_args(Some(&ov_dir), &[PathBuf::from("s3://bucket/a.tar.zst")])
+                .expect("prepare");
+        let url = "s3://bucket/a.tar.zst";
+        let opts_g2 = OpenOptions {
+            index_file_path: None,
+            index_folders: vec![cache.clone()],
+            ..OpenOptions::default()
+        };
+        let sidecar = sidecar_path_for_patch(Path::new(url), &opts_g2)
+            .or_else(|| {
+                match ratarmount_index::resolve_index_location(
+                    Path::new(url),
+                    None,
+                    &opts_g2.index_folders,
+                    false,
+                ) {
+                    ratarmount_index::IndexLocation::Path(p) => Some(p),
+                    _ => None,
+                }
+            })
+            .expect("G-2 dest");
+        if let Some(parent) = sidecar.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        {
+            let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+            let _ = SqliteIndexedTar::create_index_body(
+                &live.path,
+                body,
+                Some(&sidecar),
+                &opts_g2,
+                env!("CARGO_PKG_VERSION"),
+            )
+            .unwrap();
+        }
+        assert!(
+            sidecar.is_file(),
+            "G-2 sidecar must exist at {}",
+            sidecar.display()
+        );
+        let body = open_seekable_zstd_with_threads(&live.path, 1).unwrap();
+        let base = SqliteIndexedTar::open_with_existing_index_body(
+            &live.path,
+            body,
+            &sidecar,
+            opts_g2.clone(),
+        )
+        .unwrap();
+        let ov =
+            Arc::new(WriteOverlay::new(Arc::new(base) as Arc<dyn MountSource>, &ov_dir).unwrap());
+        std::fs::write(ov_dir.join("new.bin"), extra).unwrap();
+        attach_f7_after_persist(&ov, url.to_string(), opts_g2);
+        assert!(ov
+            .commit_live(&live.path, |_| {
+                factory::open_live_remote(url, &OpenOptions::default()).map_err(OverlayError::Msg)
+            })
+            .expect("commit"));
+        let objects = mock.objects.lock().unwrap();
+        assert!(
+            objects.keys().any(|k| k.ends_with(".index.ptr")),
+            "default G-2 must PUT pointer; keys={:?}",
+            objects.keys().collect::<Vec<_>>()
+        );
+        let blob_key = objects
+            .keys()
+            .find(|k| k.contains(".index.") && k.ends_with(".sqlite"))
+            .cloned()
+            .expect("blob PUT without --index-file");
+        let blob = objects.get(&blob_key).cloned().unwrap();
+        drop(objects);
+        let blob_path = dir.path().join("g2-blob.sqlite");
+        std::fs::write(&blob_path, blob).unwrap();
+        let idx = SqliteIndex::open_read_only(&blob_path).unwrap();
+        assert!(idx.lookup("/new.bin", 0).unwrap().is_some());
+        let _ = env;
+    }
+
+    /// Regression: on-exit F-7 must not re-patch spool mtime after f7_patch_put.
+    #[test]
+    fn f7_on_exit_blob_matches_sidecar_mtime_zero() {
+        let extra = b"f7-on-exit\n";
+        let h = f7_ready_overlay(extra);
+        assert!(
+            apply_live_commit(&h.ov, &h.spool, false, &h.opts).expect("on-exit"),
+            "expected persist"
+        );
+        let sidecar = h.opts.index_file_path.as_ref().unwrap();
+        let stats = SqliteIndex::open_read_only(sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("tarstats");
+        assert_eq!(stats.st_mtime, 0, "on-exit must keep content tarstats");
+        assert_eq!(stats.st_mtime_ns, Some(0));
+        let objects = h.mock.objects.lock().unwrap();
+        let blob_key = objects
+            .keys()
+            .find(|k| k.contains(".index.") && k.ends_with(".sqlite"))
+            .cloned()
+            .expect("blob PUT");
+        let blob = objects.get(&blob_key).cloned().unwrap();
+        drop(objects);
+        let sidecar_id = IndexPointer::for_blob(sidecar, None).unwrap().index_id;
+        let blob_path = h.dir.path().join("on-exit-blob.sqlite");
+        std::fs::write(&blob_path, &blob).unwrap();
+        let blob_id = IndexPointer::for_blob(&blob_path, None).unwrap().index_id;
+        assert_eq!(
+            sidecar_id, blob_id,
+            "on-exit must not rewrite sidecar after pointer PUT"
+        );
     }
 
     fn f7_seed_zst() -> Vec<u8> {
