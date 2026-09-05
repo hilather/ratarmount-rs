@@ -6,7 +6,7 @@
 
 Parity leftovers stay in [`parity-todo.md`](../parity-todo.md) and [`upstream-feature-requests.md`](upstream-feature-requests.md). This file is **new surface**: more ways in, more ways out, and making the index do more than open a mount.
 
-Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing shipped; encrypt / 3.1.1 / Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets after F-2 / F-3 / G-2: F-5..F-10, G-3..G-5. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
+Protocol inbound/outbound batch (**P-1–P-10**, **F-1**, **F-4**, **G-1** booleans) landed 2026-08-23 (factory/CLI in PR-12; living tables in PR-14). Leftover close-out 2026-08-24: **P-6** / **P-10** `done`; **P-2** stays `partial` (signing + 3.1.1 preauth/optional encrypt shipped; Finder residual); inbound HMAC / FTP LIST / `rclone+` residuals dropped. Remaining first bets after F-2 / F-3 / G-2: F-5..F-10, G-3..G-5. gzip/rapidgzip thruput and Phase 12 announce stay residual / ops — not this table.
 
 ---
 
@@ -17,7 +17,7 @@ Inbound = fetch archives / trees. Outbound = serve the same `MountSource` tree (
 | ID | Work | Dir | Status | Effort | Ownership |
 |----|------|-----|--------|--------|-----------|
 | P-1 | **OCI / registry** (`oci://`, `docker://`, `ghcr://`) | in | `done` | L | remote fetch + factory layer open + compositing overlayfs |
-| P-2 | **SMB/CIFS server** (`--smb`, reverse of the client) | out | `partial` | L | `ratarmount-smb` (encrypt / 3.1.1 / Finder residual) |
+| P-2 | **SMB/CIFS server** (`--smb`, reverse of the client) | out | `partial` | L | `ratarmount-smb` (Finder/leases residual; 3.1.1 preauth + optional encrypt shipped) |
 | P-3 | **GCS `gs://` + Azure Blob `az://`** | in | `done` | M | `ratarmount-remote` (clone S3 Range; GOOG1 HMAC) |
 | P-4 | **FTP / FTPS** | in | `done` | S | `ratarmount-remote` (implicit FTPS :990 residual) |
 | P-5 | **HTTP Range export** (`--http`) | out | `done` | M | `ratarmount-http` GET/HEAD |
@@ -48,9 +48,9 @@ Factory (PR-12) opens each layer with `open_from_live_range(layer.open_blob(), r
 
 ### P-2 — SMB/CIFS server export — `partial`
 
-`--nfs` for Windows shops. Finder/Explorer speak SMB; they do not speak our NFSv3 high-port export. Userspace SMB 2.0.2 subset (not kernel `ksmbd`). `-w` overlay writes map to SMB create/write/delete like NFS. Default bind `127.0.0.1:20445`, share `ratarmount`. Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar. When `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 NT proof is verified and SMB 2.0.2 HMAC-SHA256 signing is required (guest `-N` is off on that listener).
+`--nfs` for Windows shops. Finder/Explorer speak SMB; they do not speak our NFSv3 high-port export. Userspace SMB 2.0.2 / 3.1.1 subset (not kernel `ksmbd`). `-w` overlay writes map to SMB create/write/delete like NFS. Default bind `127.0.0.1:20445`, share `ratarmount`. Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar (2.0.2 when offered). When `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 NT proof is verified and signing is required (HMAC-SHA256 on 2.0.2, AES-CMAC on 3.1.1). A 3.1.1-only client gets SHA-512 preauth; AES-128-GCM/CCM encryption is used when that client also offers an encryption context. Guest `-N` is off on a password listener.
 
-**Residual vs v1:** encryption, SMB 3.1.1 preauth, macOS Finder / Windows Explorer (leases, create contexts). Packet tests stand in for auth+signing. Localhost-first like NFS. See [`docs/export.md`](../export.md).
+**Residual vs v1:** macOS Finder / Windows Explorer (leases, create contexts); guest encryption. Packet tests stand in for preauth+encrypt. Localhost-first like NFS. See [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md). P-2 stays `partial` until Finder.
 
 ### P-3 — GCS `gs://` + Azure Blob `az://` — `done`
 
@@ -209,7 +209,7 @@ Tracked elsewhere; listed so agents do not rediscover them as new work:
 - Kerberos NFS / LAN / Windows NFS READDIR
 - ZIP incremental commit (full rebuild today)
 - 7z solid dict-reset resume
-- SMB encryption / 3.1.1 / Finder (P-2 stays `partial`)
+- SMB Finder/leases (P-2 stays `partial`; 3.1.1 preauth + optional encrypt shipped)
 - WebDAV same-port HTTP mux; Finder/Explorer not in CI (P-6 `done`)
 - implicit FTPS :990 (P-4)
 - rclone RC `--rc-serve` (P-9)
@@ -271,7 +271,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 1. ~~**F-1** remote directory mounts~~ — done (S3/SSH/WebDAV/HTTP + GCS/Azure/rclone/IPFS/FTP folders).
 2. ~~**P-4** FTP~~ — done (file REST + LIST/MLSD folders; implicit :990 residual).
 3. ~~**F-2** incremental reindex~~ — done (sidecar patch; prefix not rescanned; residuals above).
-4. ~~**P-5** HTTP Range export~~ / ~~**P-6** WebDAV~~ — HTTP `done`; WebDAV `done` (mux residual). SMB **P-2** stays `partial` (encrypt / 3.1.1 / Finder).
+4. ~~**P-5** HTTP Range export~~ / ~~**P-6** WebDAV~~ — HTTP `done`; WebDAV `done` (mux residual). SMB **P-2** stays `partial` (Finder; 3.1.1 preauth + optional encrypt shipped).
 5. ~~**P-1 + F-4** OCI~~, ~~**P-3** GCS/Azure~~, ~~**P-9** rclone~~, ~~**P-10** SFTP~~ — done (`sftp-russh` is a feature note).
 6. ~~**F-3** FTS5/locate~~ — done (`ratarmount find`, read-only `search/<pattern>`, socket `search`; FTS5 table only via `ensure_fts5`).
 7. ~~**F-9** `--repack-seekable`~~ — done (engine + CLI; ZIP/7z/bzip2/xz residual).
@@ -281,6 +281,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 live L0/PyO3 (dry-run landed), G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/leases, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---
 
