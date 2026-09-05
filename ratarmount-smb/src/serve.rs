@@ -39,8 +39,9 @@ pub struct SmbOptions {
     pub share_name: String,
     /// Required SESSION_SETUP user (`RATARMOUNT_SMB_USER`). `None` = any user.
     pub username: Option<String>,
-    /// When set (`RATARMOUNT_SMB_PASSWORD`), NTLMv2 proof is required and SMB 2.0.2
-    /// signing is required. When unset, guest (username match only; unsigned OK).
+    /// When set (`RATARMOUNT_SMB_PASSWORD`), NTLMv2 proof is required and signing
+    /// is required (HMAC-SHA256 on 2.0.2, AES-CMAC on 3.1.1). When unset, guest
+    /// (username match only; unsigned OK).
     pub password: Option<String>,
 }
 
@@ -108,7 +109,7 @@ fn warn_non_loopback(addr: SocketAddr, opts: &SmbOptions) {
     if !addr.ip().is_loopback() {
         if password_configured(opts) {
             log::warn!(
-                "SMB bind {addr} is not loopback; SMB encryption / 3.1.1 are residual (localhost is the security boundary)"
+                "SMB bind {addr} is not loopback; SMB 3.1.1 encryption applies only when the client negotiates it (Finder/leases residual)"
             );
         } else {
             log::warn!(
@@ -244,6 +245,20 @@ struct Session {
     ntlm_started: bool,
     ntlm_challenge: Option<[u8; 8]>,
     session_key: Option<[u8; 16]>,
+    signing_key: Option<[u8; 16]>,
+    /// Server encrypt (S2C).
+    enc_key: Option<[u8; 16]>,
+    /// Server decrypt (C2S).
+    dec_key: Option<[u8; 16]>,
+    dialect: u16,
+    preauth: [u8; 64],
+    session_preauth: [u8; 64],
+    session_preauth_init: bool,
+    cipher: Option<smb2::SmbCipher>,
+    encrypt_data: bool,
+    /// Set on SESSION_SETUP success; applied after the signed success is sent.
+    arm_encrypt: bool,
+    nonce_ctr: u64,
     trees: HashMap<u32, Tree>,
     next_tree: u32,
     opens: HashMap<u64, OpenFile>,
@@ -268,6 +283,17 @@ fn handle_conn(
         ntlm_started: false,
         ntlm_challenge: None,
         session_key: None,
+        signing_key: None,
+        enc_key: None,
+        dec_key: None,
+        dialect: 0,
+        preauth: smb2::PREAUTH_ZERO,
+        session_preauth: smb2::PREAUTH_ZERO,
+        session_preauth_init: false,
+        cipher: None,
+        encrypt_data: false,
+        arm_encrypt: false,
+        nonce_ctr: 0,
         trees: HashMap::new(),
         next_tree: 1,
         opens: HashMap::new(),
@@ -285,15 +311,33 @@ fn handle_conn(
             }
             Err(_) => return,
         };
-        let reply = match session.dispatch_frame(&frame) {
+        let inner = match session.unwrap_frame(&frame) {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("SMB transform: {e}");
+                return;
+            }
+        };
+        let reply = match session.dispatch_frame(&inner) {
             Ok(m) => m,
             Err(e) => {
                 log::debug!("SMB frame: {e}");
                 return;
             }
         };
-        if stream.write_all(&smb2::encode_nbss(&reply)).is_err() {
+        let wire = match session.wrap_reply(&reply) {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("SMB encrypt: {e}");
+                return;
+            }
+        };
+        if stream.write_all(&smb2::encode_nbss(&wire)).is_err() {
             return;
+        }
+        if session.arm_encrypt {
+            session.encrypt_data = true;
+            session.arm_encrypt = false;
         }
     }
 }
@@ -308,6 +352,39 @@ fn read_frame(stream: &mut TcpStream) -> io::Result<Vec<u8>> {
 }
 
 impl Session {
+    fn unwrap_frame(&self, frame: &[u8]) -> io::Result<Vec<u8>> {
+        if smb2::is_smb2_transform(frame) {
+            let (cipher, key) = match (self.cipher, self.dec_key) {
+                (Some(c), Some(k)) if self.encrypt_data || self.authed => (c, k),
+                _ => {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidData,
+                        "unexpected TRANSFORM",
+                    ));
+                }
+            };
+            return smb2::decrypt_transform(frame, &key, cipher);
+        }
+        if self.encrypt_data {
+            return Err(io::Error::new(ErrorKind::InvalidData, "expected TRANSFORM"));
+        }
+        Ok(frame.to_vec())
+    }
+
+    fn wrap_reply(&mut self, reply: &[u8]) -> io::Result<Vec<u8>> {
+        if !self.encrypt_data {
+            return Ok(reply.to_vec());
+        }
+        let (cipher, key) = match (self.cipher, self.enc_key) {
+            (Some(c), Some(k)) => (c, k),
+            _ => return Ok(reply.to_vec()),
+        };
+        self.nonce_ctr = self.nonce_ctr.saturating_add(1);
+        let mut nonce = [0u8; 16];
+        nonce[..8].copy_from_slice(&self.nonce_ctr.to_le_bytes());
+        smb2::encrypt_transform(reply, self.session_id, &key, cipher, nonce)
+    }
+
     fn dispatch_frame(&mut self, frame: &[u8]) -> io::Result<Vec<u8>> {
         if smb2::is_smb1(frame) {
             return self.dispatch_smb1(frame);
@@ -315,14 +392,19 @@ impl Session {
         let parts = smb2::split_compound(frame)?;
         self.last_compound_fid = None;
         let mut replies = Vec::with_capacity(parts.len());
-        let mut sign_key = self.session_key;
+        let mut sign_key = self.signing_key.or(self.session_key);
+        let dialect = self.dialect;
         for part in parts {
             let hdr = smb2::parse_smb2_header(part)?;
             let skip_verify = hdr.command == smb2::SMB2_SESSION_SETUP && !self.authed;
-            if self.signing_required() && !skip_verify {
-                let ok = sign_key
-                    .as_ref()
-                    .is_some_and(|k| smb2::smb2_verify_packet(part, k));
+            if self.signing_required() && !skip_verify && !self.encrypt_data {
+                let ok = sign_key.as_ref().is_some_and(|k| {
+                    if dialect == smb2::DIALECT_311 {
+                        smb2::smb3_verify_packet(part, k)
+                    } else {
+                        smb2::smb2_verify_packet(part, k)
+                    }
+                });
                 if !ok {
                     let credits = hdr.credits.clamp(1, 64);
                     let mut rh = smb2::reply_header(&hdr, 0, credits);
@@ -339,14 +421,30 @@ impl Session {
             if rh.session_id == 0 {
                 rh.session_id = self.session_id;
             }
-            replies.push(smb2::encode_packet(&rh, &body));
-            if self.session_key.is_some() {
-                sign_key = self.session_key;
+            let pkt = smb2::encode_packet(&rh, &body);
+            if hdr.command == smb2::SMB2_NEGOTIATE && self.dialect == smb2::DIALECT_311 {
+                self.preauth = smb2::preauth_hash_update(&self.preauth, &pkt);
+            }
+            if hdr.command == smb2::SMB2_SESSION_SETUP
+                && self.dialect == smb2::DIALECT_311
+                && status == smb2::STATUS_MORE_PROCESSING_REQUIRED
+            {
+                self.session_preauth = smb2::preauth_hash_update(&self.session_preauth, &pkt);
+            }
+            replies.push(pkt);
+            if self.signing_key.is_some() || self.session_key.is_some() {
+                sign_key = self.signing_key.or(self.session_key);
             }
         }
         let mut out = smb2::stitch_compound(&replies);
-        if let Some(key) = sign_key {
-            smb2::smb2_sign_compound(&mut out, &key);
+        if !self.encrypt_data {
+            if let Some(key) = sign_key {
+                if self.dialect == smb2::DIALECT_311 {
+                    smb2::smb3_sign_compound(&mut out, &key);
+                } else {
+                    smb2::smb2_sign_compound(&mut out, &key);
+                }
+            }
         }
         Ok(out)
     }
@@ -402,8 +500,15 @@ impl Session {
             smb2::SMB2_LOGOFF => {
                 self.authed = false;
                 self.session_key = None;
+                self.signing_key = None;
+                self.enc_key = None;
+                self.dec_key = None;
+                self.encrypt_data = false;
+                self.arm_encrypt = false;
+                self.cipher = None;
                 self.ntlm_started = false;
                 self.ntlm_challenge = None;
+                self.session_preauth_init = false;
                 self.trees.clear();
                 self.opens.clear();
                 (smb2::STATUS_SUCCESS, rh, smb2::encode_empty_sized(4, 4))
@@ -441,19 +546,52 @@ impl Session {
         cmd: &[u8],
         rh: &mut Smb2Header,
     ) -> (u32, Smb2Header, Vec<u8>) {
-        let dialects = match smb2::parse_negotiate_dialects(cmd) {
+        let parsed = match smb2::parse_negotiate(cmd) {
             Ok(d) => d,
             Err(_) => return err(rh.clone(), smb2::STATUS_INVALID_PARAMETER),
         };
-        let Some(d) = smb2::pick_dialect(&dialects) else {
+        let prefer_311 = password_configured(&self.cfg);
+        let picked = if prefer_311 {
+            smb2::pick_dialect_prefer(&parsed.dialects, true)
+        } else {
+            smb2::pick_dialect(&parsed.dialects)
+        };
+        let Some(d) = picked else {
             return err(rh.clone(), smb2::STATUS_NOT_SUPPORTED);
         };
+        self.dialect = d;
+        let mut contexts = Vec::new();
+        let mut caps = 0u32;
+        self.cipher = None;
+        if d == smb2::DIALECT_311 {
+            if !smb2::has_preauth_context(&parsed.contexts) {
+                return err(rh.clone(), smb2::STATUS_INVALID_PARAMETER);
+            }
+            self.preauth = smb2::preauth_hash_update(&smb2::PREAUTH_ZERO, cmd);
+            contexts.push(smb2::encode_preauth_context(&salt32()));
+            if prefer_311 {
+                let ciphers = smb2::parse_encryption_ciphers(&parsed.contexts);
+                if let Some(id) = smb2::pick_cipher(&ciphers) {
+                    if let Some(c) = smb2::SmbCipher::from_id(id) {
+                        self.cipher = Some(c);
+                        contexts.push(smb2::encode_encryption_context(id));
+                        caps |= smb2::SMB2_GLOBAL_CAP_ENCRYPTION;
+                    }
+                }
+            }
+        }
         let sec = smb2::spnego_neg_token_init();
         rh.credits = 1;
         (
             smb2::STATUS_SUCCESS,
             rh.clone(),
-            smb2::encode_negotiate_response(d, &sec, self.negotiate_security_mode()),
+            smb2::encode_negotiate_response_ex(
+                d,
+                &sec,
+                self.negotiate_security_mode(),
+                caps,
+                &contexts,
+            ),
         )
     }
 
@@ -467,6 +605,13 @@ impl Session {
             self.session_id = 1;
         }
         rh.session_id = self.session_id;
+        if self.dialect == smb2::DIALECT_311 {
+            if !self.session_preauth_init {
+                self.session_preauth = self.preauth;
+                self.session_preauth_init = true;
+            }
+            self.session_preauth = smb2::preauth_hash_update(&self.session_preauth, cmd);
+        }
         let sec = match smb2::parse_session_setup_sec(cmd) {
             Ok(s) => s,
             Err(_) => return err(rh.clone(), smb2::STATUS_INVALID_PARAMETER),
@@ -493,32 +638,47 @@ impl Session {
             let Some(t3) = smb2::parse_ntlm_type3(&sec) else {
                 return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
             };
-            let flags =
-                if let Some(password) = self.cfg.password.as_deref().filter(|s| !s.is_empty()) {
-                    let Some(challenge) = self.ntlm_challenge else {
-                        return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
-                    };
-                    match smb2::ntlm_verify_type3(
-                        &t3,
-                        password,
-                        self.cfg.username.as_deref(),
-                        challenge,
-                    ) {
-                        Ok(key) => self.session_key = Some(key),
-                        Err(st) => return err(rh.clone(), st),
-                    }
-                    0
-                } else {
-                    if !auth_ok(self.cfg.username.as_deref(), &t3.user) {
-                        return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
-                    }
-                    if self.cfg.username.is_none() {
-                        smb2::SESSION_FLAG_IS_GUEST
-                    } else {
-                        0
-                    }
+            let mut flags = if let Some(password) =
+                self.cfg.password.as_deref().filter(|s| !s.is_empty())
+            {
+                let Some(challenge) = self.ntlm_challenge else {
+                    return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
                 };
+                match smb2::ntlm_verify_type3(
+                    &t3,
+                    password,
+                    self.cfg.username.as_deref(),
+                    challenge,
+                ) {
+                    Ok(key) => {
+                        self.session_key = Some(key);
+                        if self.dialect == smb2::DIALECT_311 {
+                            self.signing_key =
+                                Some(smb2::smb311_signing_key(&key, &self.session_preauth));
+                            self.dec_key = Some(smb2::smb311_c2s_key(&key, &self.session_preauth));
+                            self.enc_key = Some(smb2::smb311_s2c_key(&key, &self.session_preauth));
+                        } else {
+                            self.signing_key = Some(key);
+                        }
+                    }
+                    Err(st) => return err(rh.clone(), st),
+                }
+                0
+            } else {
+                if !auth_ok(self.cfg.username.as_deref(), &t3.user) {
+                    return err(rh.clone(), smb2::STATUS_LOGON_FAILURE);
+                }
+                if self.cfg.username.is_none() {
+                    smb2::SESSION_FLAG_IS_GUEST
+                } else {
+                    0
+                }
+            };
             self.authed = true;
+            if self.cipher.is_some() && self.session_key.is_some() {
+                flags |= smb2::SESSION_FLAG_ENCRYPT_DATA;
+                self.arm_encrypt = true;
+            }
             let buf = if wrap {
                 smb2::spnego_accept()
             } else {
@@ -567,10 +727,15 @@ impl Session {
         } else {
             0x0012_0089
         };
+        let share_flags = if self.arm_encrypt || self.encrypt_data {
+            smb2::SMB2_SHAREFLAG_ENCRYPT_DATA
+        } else {
+            0
+        };
         (
             smb2::STATUS_SUCCESS,
             rh.clone(),
-            smb2::encode_tree_connect_response(stype, access),
+            smb2::encode_tree_connect_response_flags(stype, share_flags, access),
         )
     }
 
@@ -999,6 +1164,14 @@ fn attrs_of(m: &FileMeta) -> u32 {
         a |= smb2::FILE_ATTRIBUTE_READONLY;
     }
     a
+}
+
+fn salt32() -> [u8; 32] {
+    let mut s = [0u8; 32];
+    for chunk in s.chunks_mut(8) {
+        chunk.copy_from_slice(&smb2::challenge8());
+    }
+    s
 }
 
 fn path_missing_status(unix: &str) -> u32 {

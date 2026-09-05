@@ -209,6 +209,7 @@ gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · 
 | NFS export | NFSv3 default (`--nfs` / `--nfs-bind`; `-w` overlay writes). NFSv4.1 via `--nfs-vers 4` (Linux/macOS packages compile `nfsv4`; source needs `--features nfsv4` + rustc ≥ 1.88; `-w` overlay create/write; Linux kernel client **verified** on loopback via privileged Docker `test-harness/nfs-docker`; no Kerberos/LAN/Windows/mux) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md) |
 | Other exports | `--http` (`127.0.0.1:20491`, GET/HEAD of the **indexed tree**, not host archive bytes; optional `GET /.ratarmount-control/index.sqlite`) · `--webdav` (`:20492`, class 2 LOCK/COPY/Basic; mux residual) · `--smb` (`:20445`, signing when password; Finder/encrypt residual) · `--ninep` (`:20493`, TCP; not `--9p`) · `--sftp` (`:20222`, `--sftp-subsystem` stdio, `--features sftp-russh`, russh MSRV 1.85). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`; booleans remain the stable interface) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) |
 | HPC / systemd / autofs | RO `Type=fuse.ratarmount` via `/usr/sbin/mount.fuse.ratarmount` (fstab / systemd `.mount` / autofs). Helper argv has **no** secrets (env / `EnvironmentFile=`). CSI is **spec-only** (separate repo; no kube crates). `-w` StorageClass residual — [systemd](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) · [CSI spec](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md) |
+| Other exports | `--http` (`127.0.0.1:20491`, GET/HEAD of the **indexed tree**, not host archive bytes; optional `GET /.ratarmount-control/index.sqlite`) · `--webdav` (`:20492`, class 2 LOCK/COPY/Basic; mux residual) · `--smb` (`:20445`, signing when password; 3.1.1 preauth + optional GCM/CCM encrypt; Finder residual) · `--ninep` (`:20493`, TCP; not `--9p`) · `--sftp` (`:20222`, `--sftp-subsystem` stdio, `--features sftp-russh`, russh MSRV 1.85). Bind flags take a required value (`num_args = 1`). Combine with `--nfs` in one process. `--http --no-mount` exits 2. Optional `ratarmount serve --nfs --http ARCHIVE` sugar (requires ≥1 export; incompatible with `--no-mount`; booleans remain the stable interface) — [guide](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) |
 
 ### Remote backends
 
@@ -270,7 +271,7 @@ flowchart LR
   Composite --> FUSE[fuser low-level FS]
   Composite --> NFS[nfsserve NFSv3 / embednfs NFSv4.1]
   Composite --> HTTP[HTTP GET/HEAD · WebDAV]
-  Composite --> SMB[SMB 2.0.2]
+  Composite --> SMB[SMB 2.0.2 / 3.1.1]
   Composite --> NINE[9P2000.L TCP]
   Composite --> SFTP[SFTP]
   Index --> FUSE
@@ -291,7 +292,7 @@ flowchart LR
 | `ratarmount-nfs` | In-process NFSv3 export (`--nfs`); optional NFSv4.1 (`--nfs-vers 4`, `nfsv4` feature) |
 | `ratarmount-export-core` | Shared export bind / stop / inode / `fill_read` |
 | `ratarmount-http` | HTTP GET/HEAD (`--http`) + WebDAV (`--webdav`) |
-| `ratarmount-smb` | Userspace SMB 2.0.2 (`--smb`) |
+| `ratarmount-smb` | Userspace SMB 2.0.2 / 3.1.1 (`--smb`) |
 | `ratarmount-9p` | 9P2000.L TCP (`--ninep`) |
 | `ratarmount-sftp` | SFTP (`--sftp`, feature `sftp-russh`) |
 | `ratarmount-compress` | Seekable codecs + stencils |
@@ -308,7 +309,7 @@ ratarmount-fuse/            # fuser low-level FS
 ratarmount-nfs/             # NFSv3 userspace export + optional NFSv4.1
 ratarmount-export-core/     # shared export bind / fill_read
 ratarmount-http/            # HTTP GET/HEAD + WebDAV
-ratarmount-smb/             # userspace SMB 2.0.2
+ratarmount-smb/             # userspace SMB 2.0.2 / 3.1.1
 ratarmount-9p/              # 9P2000.L TCP
 ratarmount-sftp/            # SFTP (sftp-russh)
 ratarmount-compress/        # seekable codecs + stencils
@@ -360,6 +361,7 @@ Honest residuals — tracking upstream-inspired work in [`docs/tasks/upstream-fe
 7. **NFS** — v3 default; v4.1 opt-in in Linux/macOS packages. Linux kernel client **verified** on loopback (privileged Docker `./test-harness/nfs-docker/run.sh`; not default CI). No Kerberos, LAN, Windows, or v3/v4 mux. Idle TTL is not CLOSE. [nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md).
 8. **Other exports** — HTTP GET/HEAD `done`; WebDAV class 2 `done` (mux residual; Finder/Explorer not in CI); SMB **encrypt / 3.1.1 / Finder residual** (signing + NTLMv2 when password set); 9P TCP `done` (virtio residual); SFTP `done` (password env + `--sftp-subsystem`; needs `--features sftp-russh` — packages enable it; default CI does not). No `serve` subcommand. [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 9. **HPC / K8s** — systemd `.mount` + autofs + `mount.fuse.ratarmount` shipped (RO). CSI driver is spec-only (separate repo; no kube crates). `-w` overlay StorageClass residual. [systemd-mount.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md) · [csi.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md).
+8. **Other exports** — HTTP GET/HEAD `done`; WebDAV class 2 `done` (mux residual; Finder/Explorer not in CI); SMB **Finder residual** (signing + NTLMv2 when password set; 3.1.1 preauth + optional AES-128-GCM/CCM encrypt); 9P TCP `done` (virtio residual); SFTP `done` (password env + `--sftp-subsystem`; needs `--features sftp-russh` — packages enable it; default CI does not). No `serve` subcommand. [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 ---
 
