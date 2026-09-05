@@ -218,9 +218,10 @@ Prefer distro packages or the **portable-glibc2.31** tarball for production unti
 
 ## crates.io
 
-**Policy:** [`docs/crates-io-policy.md`](crates-io-policy.md).
+**Policy:** [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md). Dual-run still does **not** require a live publish ([`phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md)).
 
 - Primary deliverable is the **CLI binary** (this doc / GitHub Releases / distro packages), not crates.io.
-- Library crates (`ratarmount-core`, `ratarmount-index`, formats, …) may be published later for embedders under workspace lockstep versioning.
+- **Q5=(a) dry-run only.** Maintainer check: [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh) (`cargo publish -p ratarmount-core --dry-run` and index). No live upload.
+- Library crates (`ratarmount-core`, `ratarmount-index`, formats, …) may be published later for embedders under workspace lockstep versioning. L3.5 `ratarmount-session` stays path-depend until a freeze review.
 - Do **not** publish the `ratarmount` binary as a library API surface; `ratarmount-fuse` is the optional FUSE **adapter** library, not the CLI.
 - Dual-run and 1.0-class packaging do **not** require any crates.io publish.

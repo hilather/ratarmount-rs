@@ -168,7 +168,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 | Makefile release/install | `[x]` |
 | Daemonize default | `[x]` |
 | AppImage / distro packages | `~` `packaging/build-appimage.sh` + desktop; needs linuxdeploy host |
-| crates.io library publish policy | `[x]` documented [`docs/crates-io-policy.md`](crates-io-policy.md) (no crates.io publish required for dual-run) |
+| crates.io library publish policy | `[x]` documented [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (Q5=a dry-run only; [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh); no crates.io publish required for dual-run) |
 | Pure FUSE ABI (Annex A) | `[ ]` deferred; fuser stays product path |
 | GitHub CI (fmt/clippy/test) | `[x]` `.github/workflows/ci.yml` |
 | GitHub CI FUSE allowlist suite | `[x]` (fixtures from mxmlnkn/ratarmount) |
@@ -194,7 +194,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 13. ~~**ASAR**~~ — stencil `ASARMountSource`; harness `phase9-asar`.  
 14. ~~**OGG / HTML / PDF / Git / zlib**~~ — OGG demux; HTML data-URLs; PDF attachments; Git via git2; zlib seekable.  
 15. ~~**Mount options CLI parity**~~ — high-impact flags: password-file, recursive-extensions, transform, disable-union, no-recreate-index, gnu-incremental, color, oss-attributions; matrix: [`docs/mount-options-parity.md`](mount-options-parity.md).  
-16. **Phase 12** dual-run announce → Rust primary — **docs ready** (not announced): [`docs/phase12-dual-run.md`](phase12-dual-run.md) runbook + paste-ready notes; maintainer still must tag, publish packages, set deprecation date. crates.io not required: [`docs/crates-io-policy.md`](crates-io-policy.md).
+16. **Phase 12** dual-run announce → Rust primary — **docs ready** (not announced): [`docs/phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md) runbook + paste-ready notes; maintainer still must tag, publish packages, set deprecation date. crates.io not required: [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md).
 
 ---
 
@@ -207,7 +207,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)
 - **Upstream bugs inspected + fixed (2026-07-28):** [`docs/tasks/upstream-bugs-inspection.md`](tasks/upstream-bugs-inspection.md) / [`upstream-bug-fix-batch.md`](tasks/upstream-bug-fix-batch.md) — **B-4** union dir>symlink, **B-8** sparse>8GiB test, **B-10** dumpdir delete MVP, **B-119** index-min-count, **B-2** lazy-recursive docs. Optional residual: multi-archive GNU incremental `.snar` union
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
-- **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
+- **crates.io policy:** [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (F-10 dry-run; dual-run still not blocked)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
 - **Beyond-parity roadmap (2026-08-23, leftover close-out 2026-08-24):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed; **P-6** / **P-10** `done`; **P-2** stays `partial` (encrypt / 3.1.1 / Finder). **F-2** incremental reindex, **F-3** locate, and **G-2** portable index are `done` (HTTP/S3/GCS/Azure sibling GET of pointer then blob then well-known; residual object-store PUT is F-7). Remaining F-5..F-10, G-3..G-4; **G-5** `partial` (systemd/autofs helper; CSI spec-only). Inbound: [`phase10-remote.md`](phase10-remote.md). Outbound: [`export.md`](export.md) + [`nfs-export.md`](nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
 - **Tier D rapidgzip perf residual:** [`docs/tasks/rapidgzip-perf-batch.md`](tasks/rapidgzip-perf-batch.md) (P1–P5 done) · post-batch [`docs/tasks/rapidgzip-residual-batch.md`](tasks/rapidgzip-residual-batch.md) (R1–R5) · decision residual split in [`docs/gzip-binding-decision.md`](gzip-binding-decision.md)

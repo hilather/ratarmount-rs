@@ -122,7 +122,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress engine + CLI; ZIP/7z/bzip2/xz residual |
-| F-10 | **Library / FFI / `ratar://` replacement** | `todo` | L | core + PyO3 cdylib; crates.io policy already exists |
+| F-10 | **Library / FFI / `ratar://` replacement** | `partial` | L | session landed; L0 dry-run only (Q5=a); PyO3 residual |
 
 ### F-1 — Remote directory mounts — `done`
 
@@ -191,9 +191,11 @@ CLI: `ratarmount --repack-seekable IN OUT` (`num_args = 2`; exclusive with expor
 
 **Residual:** ZIP / 7z / bzip2 / xz / lz4 rewrite. Parallel `zstdmt` encode. In-place Windows rename quirks. Remote PUT is F-7.
 
-### F-10 — Library / FFI / `ratar://` replacement
+### F-10 — Library / FFI / `ratar://` replacement — `partial`
 
-Python still wins on fsspec. A `cdylib` + PyO3 `ratarmountcore` that registers `ratar://` lets the ecosystem keep Python and drop the RAM bill. Dual-run docs: [`phase12-dual-run.md`](../phase12-dual-run.md). crates.io is **not** required: [`crates-io-policy.md`](../crates-io-policy.md).
+`ratarmount-session` G0–G7 is the embedder API (no FUSE). crates.io first-publish is **Q5=(a) dry-run only**: [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh) runs `cargo publish -p ratarmount-core --dry-run` (and index). No live upload. L3.5 session stays path-depend until a freeze review. Dual-run does **not** wait: [`phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md). Policy: [`crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md). G7.3 keep-green: `cargo test -p ratarmount-session --lib index_job_sidecar_python_07` · [`test-harness/run-indexjob-python-interop.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/run-indexjob-python-interop.sh).
+
+Python still wins on fsspec. A `cdylib` + PyO3 `ratarmountcore` that registers `ratar://` is **Q2 residual** (must not land in session default features).
 
 ### Close-the-residual (do not let these eat this roadmap)
 
@@ -278,6 +280,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 live L0/PyO3 (dry-run landed), G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---
 
