@@ -12,11 +12,15 @@
 //! require a [`WriteOverlay`] (`-w`); otherwise those ops return
 //! `STATUS_ACCESS_DENIED`.
 //!
-//! **Residual: Finder/Explorer leases.** Guest `smbclient -N` is the unsigned
-//! 2.0.2 bar. When `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 is required and
-//! SMB 2.0.2 HMAC-SHA256 signing applies; a 3.1.1-only client also gets
-//! SHA-512 preauth and optional AES-128-GCM/CCM encryption. Packet tests
-//! stand in for preauth+encrypt; Finder and Explorer are not a CI bar.
+//! Guest `smbclient -N` is the unsigned v1 bar (2.1 when offered so
+//! `CAP_LEASING` is on; 2.0.2-only clients stay 2.0.2 without leases). When
+//! `RATARMOUNT_SMB_PASSWORD` is set, NTLMv2 is required and SMB 2.0.2
+//! HMAC-SHA256 signing applies; a 3.1.1-only client also gets SHA-512 preauth
+//! and optional AES-128-GCM/CCM encryption. CREATE contexts grant R/RH/WH
+//! leases and durable-handle-v1 (`DHnQ` grant / `DHnC` reconnect); conflicting
+//! open/write sends LEASE_BREAK. Packet tests stand in for leases +
+//! preauth+encrypt; Finder and Explorer are not a CI bar. Residual: Kerberos,
+//! guest encrypt, WAN, durable v2.
 
 mod serve;
 mod smb2;

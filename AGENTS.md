@@ -126,6 +126,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | HTTP/WebDAV/SMB/`--ninep`/`--sftp` clap steals archive | `cargo test -p ratarmount --bin ratarmount http_flag` · `cargo test -p ratarmount --bin ratarmount ninep_flag` · `cargo test -p ratarmount --bin ratarmount webdav_flag` · `cargo test -p ratarmount --bin ratarmount smb_flag` · `cargo test -p ratarmount --bin ratarmount sftp_flag` |
 | HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
 | SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
+| SMB CREATE lease grants R/RH | `cargo test -p ratarmount-smb --lib lease` |
+| SMB LEASE_BREAK on conflicting open/write | `cargo test -p ratarmount-smb --lib lease_break` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
 | `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
 | SFTP non-loopback without authorized_keys file | `cargo test -p ratarmount-sftp --lib regression_non_loopback` |

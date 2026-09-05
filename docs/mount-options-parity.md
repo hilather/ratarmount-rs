@@ -43,7 +43,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | `--http-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20491`; required value) | `[x]` |
 | `--webdav` | no | **added** (PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE/COPY with `-w`; LOCK/UNLOCK; PROPPATCH; Basic env) | `[x]` / mux residual |
 | `--webdav-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20492`; required value) | `[x]` |
-| `--smb` | no | **added** (userspace SMB 2.0.2 / 3.1.1; share `--smb-share` default `ratarmount`; NTLMv2 + signing when password set; 3.1.1 preauth + optional GCM/CCM encrypt) | `~` Finder/leases |
+| `--smb` | no | **added** (userspace SMB 2.0.2 / 3.1.1; share `--smb-share` default `ratarmount`; NTLMv2 + signing when password set; 3.1.1 preauth + optional GCM/CCM encrypt; leases + durable-handle-v1) | `[x]` / Finder not CI |
 | `--smb-bind [host:]port` | no | **added** (IPv4 only; default `127.0.0.1:20445`; required value) | `[x]` |
 | `--smb-share NAME` | no | **added** (TREE_CONNECT share; default `ratarmount`) | `[x]` |
 | `--ninep` | no | **added** (9P2000.L TCP; canonical flag, not `--9p`) | `[x]` / virtio residual |
@@ -94,7 +94,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | NFSv4.1 userspace export (`--nfs --nfs-vers 4`) | no | yes (`MountSource` via embednfs; Linux/macOS packages compile `nfsv4`; `-w` overlay create/write/rename/symlink; Linux kernel client **verified** on loopback via privileged Docker; no Kerberos/LAN/Windows/mux) | `~` Rust-only |
 | HTTP GET/HEAD export (`--http`) | no | yes (Range 206; fill-loop; bind `127.0.0.1:20491`) | `[x]` Rust-only |
 | WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1; overlay PUT/DELETE/MKCOL/MOVE/COPY with `-w`; LOCK/UNLOCK; PROPPATCH; Basic env | `[x]` / mux residual |
-| SMB 2.0.2 / 3.1.1 export (`--smb`) | no | userspace subset; guest `smbclient -N` unsigned; password env signs; 3.1.1 preauth + optional encrypt | `~` Finder/leases |
+| SMB 2.0.2 / 3.1.1 export (`--smb`) | no | userspace subset; guest `smbclient -N` unsigned; password env signs; 3.1.1 preauth + optional encrypt; leases + durable-handle-v1 | `[x]` / Finder not CI |
 | 9P2000.L TCP (`--ninep`) | no | `trans=tcp` port 20493; writes need `-w` | `[x]` / virtio residual |
 | SFTP export (`--sftp` / `--sftp-subsystem`) | no | TCP `:20222` + stdio subsystem; password env; `sftp-russh` (packages on; default CI off) | `[x]` / russh feature note |
 | Multi archive/folder union (later wins) | yes | yes | `[x]` |

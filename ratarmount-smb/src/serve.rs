@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -109,7 +109,7 @@ fn warn_non_loopback(addr: SocketAddr, opts: &SmbOptions) {
     if !addr.ip().is_loopback() {
         if password_configured(opts) {
             log::warn!(
-                "SMB bind {addr} is not loopback; SMB 3.1.1 encryption applies only when the client negotiates it (Finder/leases residual)"
+                "SMB bind {addr} is not loopback; SMB 3.1.1 encryption applies only when the client negotiates it (Kerberos / WAN residual)"
             );
         } else {
             log::warn!(
@@ -159,6 +159,22 @@ pub fn serve_blocking(source: Arc<dyn MountSource>, opts: SmbOptions) -> io::Res
     serve_listener(listener, source, opts)
 }
 
+pub(crate) const MAX_DURABLE_OPENS: usize = 128;
+
+struct SharedSmbState {
+    next_fid: AtomicU64,
+    durable: Mutex<HashMap<u64, OpenFile>>,
+}
+
+impl SharedSmbState {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            next_fid: AtomicU64::new(1),
+            durable: Mutex::new(HashMap::new()),
+        })
+    }
+}
+
 fn serve_listener(
     listener: TcpListener,
     source: Arc<dyn MountSource>,
@@ -167,6 +183,7 @@ fn serve_listener(
     let fs = fs_from_opts(source, &opts);
     let stop = opts.stop.clone();
     let cfg = Arc::new(opts);
+    let shared = SharedSmbState::new();
     loop {
         if stop.as_ref().is_some_and(|s| s.is_stopped()) {
             return Ok(());
@@ -176,9 +193,10 @@ fn serve_listener(
                 let fs = Arc::clone(&fs);
                 let stop = stop.clone();
                 let cfg = Arc::clone(&cfg);
+                let shared = Arc::clone(&shared);
                 let _ = thread::Builder::new()
                     .name("ratarmount-smb-conn".into())
-                    .spawn(move || handle_conn(stream, fs, cfg, stop));
+                    .spawn(move || handle_conn(stream, fs, cfg, stop, shared));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock || e.kind() == ErrorKind::Interrupted => {
                 thread::sleep(STOP_POLL_INTERVAL);
@@ -225,12 +243,24 @@ pub fn spawn_smb_thread(
     Ok(ExportServerHandle::from_join(port, join))
 }
 
+#[derive(Clone)]
 struct OpenFile {
     inode: u64,
     delete_on_close: bool,
     is_dir: bool,
     dir_snapshot: Option<Vec<smb2::DirEntry>>,
     dir_pos: usize,
+    lease_key: Option<[u8; 16]>,
+    durable: bool,
+}
+
+#[derive(Clone)]
+struct LeaseEntry {
+    key: [u8; 16],
+    state: u32,
+    inode: u64,
+    epoch: u16,
+    v2: bool,
 }
 
 struct Tree {
@@ -262,8 +292,10 @@ struct Session {
     trees: HashMap<u32, Tree>,
     next_tree: u32,
     opens: HashMap<u64, OpenFile>,
-    next_fid: AtomicU64,
     last_compound_fid: Option<[u8; 16]>,
+    leases: HashMap<[u8; 16], LeaseEntry>,
+    pending_notifies: Vec<Vec<u8>>,
+    shared: Arc<SharedSmbState>,
 }
 
 fn handle_conn(
@@ -271,6 +303,7 @@ fn handle_conn(
     fs: Arc<RatarmountSmb>,
     cfg: Arc<SmbOptions>,
     stop: Option<ExportStop>,
+    shared: Arc<SharedSmbState>,
 ) {
     let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(STOP_POLL_INTERVAL));
@@ -297,8 +330,10 @@ fn handle_conn(
         trees: HashMap::new(),
         next_tree: 1,
         opens: HashMap::new(),
-        next_fid: AtomicU64::new(1),
         last_compound_fid: None,
+        leases: HashMap::new(),
+        pending_notifies: Vec::new(),
+        shared,
     };
     loop {
         if stop.as_ref().is_some_and(|s| s.is_stopped()) {
@@ -325,6 +360,19 @@ fn handle_conn(
                 return;
             }
         };
+        let notifies = std::mem::take(&mut session.pending_notifies);
+        for n in notifies {
+            let wire = match session.wrap_reply(&n) {
+                Ok(m) => m,
+                Err(e) => {
+                    log::debug!("SMB encrypt: {e}");
+                    return;
+                }
+            };
+            if stream.write_all(&smb2::encode_nbss(&wire)).is_err() {
+                return;
+            }
+        }
         let wire = match session.wrap_reply(&reply) {
             Ok(m) => m,
             Err(e) => {
@@ -505,7 +553,8 @@ impl Session {
                 self.ntlm_challenge = None;
                 self.session_preauth_init = false;
                 self.trees.clear();
-                self.opens.clear();
+                self.drop_session_opens();
+                self.leases.clear();
                 (smb2::STATUS_SUCCESS, rh, smb2::encode_empty_sized(4, 4))
             }
             smb2::SMB2_TREE_CONNECT => self.cmd_tree_connect(hdr, cmd, &mut rh),
@@ -531,6 +580,7 @@ impl Session {
             smb2::SMB2_CHANGE_NOTIFY => err(rh, smb2::STATUS_NOT_SUPPORTED),
             smb2::SMB2_QUERY_INFO => self.cmd_query_info(hdr, cmd, rh),
             smb2::SMB2_SET_INFO => self.cmd_set_info(hdr, cmd, rh),
+            smb2::SMB2_OPLOCK_BREAK => self.cmd_lease_break_ack(hdr, cmd, rh),
             _ => err(rh, smb2::STATUS_NOT_IMPLEMENTED),
         }
     }
@@ -557,6 +607,9 @@ impl Session {
         self.dialect = d;
         let mut contexts = Vec::new();
         let mut caps = 0u32;
+        if d >= smb2::DIALECT_210 {
+            caps |= smb2::SMB2_GLOBAL_CAP_LEASING;
+        }
         self.cipher = None;
         if d == smb2::DIALECT_311 {
             if !smb2::has_preauth_context(&parsed.contexts) {
@@ -757,7 +810,10 @@ impl Session {
                 self.last_compound_fid = Some(file_id);
                 let times = smb2::unix_float_to_filetime(meta.mtime);
                 let attrs = attrs_of(&meta);
-                let body = smb2::encode_create_response(action, times, meta.size, attrs, file_id);
+                let (oplock, contexts) = self.create_response_contexts(&req, fid, meta.inode);
+                let body = smb2::encode_create_response_ex(
+                    action, times, meta.size, attrs, file_id, oplock, &contexts,
+                );
                 (smb2::STATUS_SUCCESS, rh, body)
             }
             Err(s) => err(rh, s),
@@ -765,6 +821,9 @@ impl Session {
     }
 
     fn do_create(&mut self, req: &CreateReq) -> Result<(u64, u32, FileMeta), u32> {
+        if let Some(fid_raw) = req.durable_reconnect {
+            return self.durable_reconnect(fid_raw);
+        }
         let unix = smb2::smb_path_to_unix(&req.name);
         let dir_opt = req.create_options & smb2::FILE_DIRECTORY_FILE != 0;
         let file_opt = req.create_options & smb2::FILE_NON_DIRECTORY_FILE != 0;
@@ -778,6 +837,8 @@ impl Session {
                 | smb2::FILE_SUPERSEDE
         );
         let existing = self.fs.lookup_path(&unix).ok();
+        let except_key = req.lease.as_ref().map(|l| l.key);
+        let new_write = smb2::wants_write(req.desired_access) || write_disp;
 
         if let Some((id, fi)) = existing {
             if dir_opt && !is_dir_mode(fi.mode) {
@@ -792,26 +853,16 @@ impl Session {
                     if smb2::wants_write(req.desired_access) && !self.fs.writable() {
                         return Err(smb2::STATUS_ACCESS_DENIED);
                     }
+                    self.break_leases_for(id, except_key, new_write);
                     let meta = self.fs.meta_for(id)?;
-                    let fid = self.alloc_fid(OpenFile {
-                        inode: id,
-                        delete_on_close: req.create_options & smb2::FILE_DELETE_ON_CLOSE != 0,
-                        is_dir: is_dir_mode(fi.mode),
-                        dir_snapshot: None,
-                        dir_pos: 0,
-                    });
+                    let fid = self.alloc_fid(Self::open_from_req(req, id, is_dir_mode(fi.mode)));
                     return Ok((fid, smb2::FILE_OPENED, meta));
                 }
                 smb2::FILE_OVERWRITE | smb2::FILE_OVERWRITE_IF | smb2::FILE_SUPERSEDE => {
+                    self.break_leases_for(id, except_key, true);
                     self.fs.truncate(id, 0)?;
                     let meta = self.fs.meta_for(id)?;
-                    let fid = self.alloc_fid(OpenFile {
-                        inode: id,
-                        delete_on_close: req.create_options & smb2::FILE_DELETE_ON_CLOSE != 0,
-                        is_dir: false,
-                        dir_snapshot: None,
-                        dir_pos: 0,
-                    });
+                    let fid = self.alloc_fid(Self::open_from_req(req, id, false));
                     return Ok((fid, smb2::FILE_OVERWRITTEN, meta));
                 }
                 _ => return Err(smb2::STATUS_INVALID_PARAMETER),
@@ -842,13 +893,7 @@ impl Session {
             name: unix,
             readonly: false,
         };
-        let fid = self.alloc_fid(OpenFile {
-            inode: id,
-            delete_on_close: req.create_options & smb2::FILE_DELETE_ON_CLOSE != 0,
-            is_dir: meta.is_dir,
-            dir_snapshot: None,
-            dir_pos: 0,
-        });
+        let fid = self.alloc_fid(Self::open_from_req(req, id, meta.is_dir));
         Ok((fid, smb2::FILE_CREATED, meta))
     }
 
@@ -868,7 +913,16 @@ impl Session {
         let key = smb2::file_id_to_u64(&fid_raw);
         match self.opens.remove(&key) {
             Some(open) => {
+                if open.durable {
+                    let mut map = self
+                        .shared
+                        .durable
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    map.remove(&key);
+                }
                 if open.delete_on_close {
+                    self.break_leases_for(open.inode, open.lease_key, true);
                     let _ = self.fs.unlink(open.inode);
                 }
                 (smb2::STATUS_SUCCESS, rh, smb2::encode_close_response())
@@ -921,10 +975,11 @@ impl Session {
             Err(_) => return err(rh, smb2::STATUS_INVALID_PARAMETER),
         };
         let fid = self.resolve_fid(hdr, req.file_id);
-        let inode = match self.opens.get(&smb2::file_id_to_u64(&fid)) {
-            Some(open) => open.inode,
+        let (inode, lease_key) = match self.opens.get(&smb2::file_id_to_u64(&fid)) {
+            Some(open) => (open.inode, open.lease_key),
             None => return err(rh, smb2::STATUS_FILE_CLOSED),
         };
+        self.break_leases_for(inode, lease_key, true);
         match self.fs.write(inode, req.offset, &req.data) {
             Ok(n) => (smb2::STATUS_SUCCESS, rh, smb2::encode_write_response(n)),
             Err(s) => err(rh, s),
@@ -1062,8 +1117,8 @@ impl Session {
         };
         let fid = self.resolve_fid(hdr, req.file_id);
         let key = smb2::file_id_to_u64(&fid);
-        let inode = match self.opens.get(&key) {
-            Some(open) => open.inode,
+        let (inode, lease_key) = match self.opens.get(&key) {
+            Some(open) => (open.inode, open.lease_key),
             None => return err(rh, smb2::STATUS_FILE_CLOSED),
         };
         if req.info_type != smb2::SMB2_0_INFO_FILE {
@@ -1075,12 +1130,16 @@ impl Session {
                     return err(rh, smb2::STATUS_INFO_LENGTH_MISMATCH);
                 }
                 let size = u64::from_le_bytes(req.buffer[..8].try_into().unwrap_or([0; 8]));
+                self.break_leases_for(inode, lease_key, true);
                 if let Err(s) = self.fs.truncate(inode, size) {
                     return err(rh, s);
                 }
             }
             smb2::FILE_DISPOSITION_INFORMATION => {
                 let del = req.buffer.first().copied().unwrap_or(0) != 0;
+                if del {
+                    self.break_leases_for(inode, lease_key, true);
+                }
                 if let Some(open) = self.opens.get_mut(&key) {
                     open.delete_on_close = del;
                 }
@@ -1096,6 +1155,7 @@ impl Session {
                 }
                 let new_name = smb2::decode_utf16le(&req.buffer[20..20 + name_len]);
                 let unix = smb2::smb_path_to_unix(&new_name);
+                self.break_leases_for(inode, lease_key, true);
                 if let Err(s) = self.fs.rename(inode, &unix) {
                     return err(rh, s);
                 }
@@ -1128,10 +1188,218 @@ impl Session {
         }
     }
 
-    fn alloc_fid(&mut self, open: OpenFile) -> u64 {
-        let id = self.next_fid.fetch_add(1, Ordering::Relaxed);
+    fn alloc_fid(&mut self, mut open: OpenFile) -> u64 {
+        let id = self.shared.next_fid.fetch_add(1, Ordering::Relaxed);
+        if open.durable {
+            let mut map = self
+                .shared
+                .durable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if map.len() < MAX_DURABLE_OPENS {
+                map.insert(id, open.clone());
+            } else {
+                open.durable = false;
+            }
+        }
         self.opens.insert(id, open);
         id
+    }
+
+    fn sync_durable_open(&mut self, fid: u64) {
+        let Some(open) = self.opens.get(&fid) else {
+            return;
+        };
+        if !open.durable {
+            return;
+        }
+        let mut map = self
+            .shared
+            .durable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(&fid) {
+            map.insert(fid, open.clone());
+        }
+    }
+
+    fn open_from_req(req: &CreateReq, inode: u64, is_dir: bool) -> OpenFile {
+        OpenFile {
+            inode,
+            delete_on_close: req.create_options & smb2::FILE_DELETE_ON_CLOSE != 0,
+            is_dir,
+            dir_snapshot: None,
+            dir_pos: 0,
+            lease_key: None,
+            durable: req.durable_request,
+        }
+    }
+
+    fn drop_session_opens(&mut self) {
+        let durable_ids: Vec<u64> = self
+            .opens
+            .iter()
+            .filter(|(_, o)| o.durable)
+            .map(|(id, _)| *id)
+            .collect();
+        if !durable_ids.is_empty() {
+            let mut map = self
+                .shared
+                .durable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for id in durable_ids {
+                map.remove(&id);
+            }
+        }
+        self.opens.clear();
+    }
+
+    fn durable_reconnect(&mut self, fid_raw: [u8; 16]) -> Result<(u64, u32, FileMeta), u32> {
+        let key = smb2::file_id_to_u64(&fid_raw);
+        let open = {
+            let map = self
+                .shared
+                .durable
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            map.get(&key).cloned()
+        };
+        let Some(open) = open else {
+            return Err(smb2::STATUS_OBJECT_NAME_NOT_FOUND);
+        };
+        let meta = self.fs.meta_for(open.inode)?;
+        self.opens.insert(key, open);
+        Ok((key, smb2::FILE_OPENED, meta))
+    }
+
+    fn create_response_contexts(
+        &mut self,
+        req: &CreateReq,
+        fid: u64,
+        inode: u64,
+    ) -> (u8, Vec<Vec<u8>>) {
+        let mut ctxs = Vec::new();
+        let mut oplock = smb2::SMB2_OPLOCK_LEVEL_NONE;
+        if req.requested_oplock == smb2::SMB2_OPLOCK_LEVEL_LEASE {
+            if let Some(lease_req) = req.lease.as_ref() {
+                let writable = self.fs.writable() && smb2::wants_write(req.desired_access);
+                let granted = smb2::grant_lease_state(lease_req.state, writable);
+                if granted != 0 {
+                    oplock = smb2::SMB2_OPLOCK_LEVEL_LEASE;
+                    let epoch = lease_req.epoch.max(1);
+                    self.leases.insert(
+                        lease_req.key,
+                        LeaseEntry {
+                            key: lease_req.key,
+                            state: granted,
+                            inode,
+                            epoch,
+                            v2: lease_req.v2,
+                        },
+                    );
+                    if let Some(open) = self.opens.get_mut(&fid) {
+                        open.lease_key = Some(lease_req.key);
+                    }
+                    ctxs.push(smb2::encode_lease_context(lease_req, granted));
+                }
+            }
+        }
+        self.sync_durable_open(fid);
+        if req.durable_request {
+            if let Some(open) = self.opens.get(&fid) {
+                if open.durable {
+                    ctxs.push(smb2::encode_durable_response());
+                }
+            }
+        }
+        if req.maximal_access {
+            let access = if self.fs.writable() {
+                0x001F_01FF
+            } else {
+                0x0012_0089
+            };
+            ctxs.push(smb2::encode_maximal_access_response(access));
+        }
+        (oplock, ctxs)
+    }
+
+    fn break_leases_for(&mut self, inode: u64, except_key: Option<[u8; 16]>, new_write: bool) {
+        let targets: Vec<LeaseEntry> = self
+            .leases
+            .values()
+            .filter(|e| e.inode == inode && e.state != smb2::SMB2_LEASE_NONE)
+            .cloned()
+            .collect();
+        for e in targets {
+            if !new_write && except_key == Some(e.key) {
+                continue;
+            }
+            let new_state = if new_write {
+                smb2::SMB2_LEASE_NONE
+            } else if e.state == smb2::SMB2_LEASE_RH || e.state == smb2::SMB2_LEASE_RWH {
+                smb2::SMB2_LEASE_R
+            } else if e.state == smb2::SMB2_LEASE_WH {
+                smb2::SMB2_LEASE_NONE
+            } else {
+                e.state & !smb2::SMB2_LEASE_HANDLE_CACHING
+            };
+            if new_state == e.state {
+                continue;
+            }
+            self.push_lease_break(&e, new_state);
+            if let Some(entry) = self.leases.get_mut(&e.key) {
+                entry.state = new_state;
+                entry.epoch = entry.epoch.saturating_add(1);
+            }
+        }
+    }
+
+    fn push_lease_break(&mut self, entry: &LeaseEntry, new_state: u32) {
+        let ack = (entry.state & !new_state)
+            & (smb2::SMB2_LEASE_HANDLE_CACHING | smb2::SMB2_LEASE_WRITE_CACHING)
+            != 0;
+        let epoch = if entry.v2 {
+            entry.epoch.saturating_add(1)
+        } else {
+            0
+        };
+        let hdr = smb2::lease_break_header(self.session_id);
+        let body = smb2::encode_lease_break(entry.key, entry.state, new_state, ack, epoch);
+        let mut pkt = smb2::encode_packet(&hdr, &body);
+        if !self.encrypt_data {
+            if let Some(key) = self.signing_key.or(self.session_key) {
+                if self.dialect == smb2::DIALECT_311 {
+                    smb2::smb3_sign_packet(&mut pkt, &key);
+                } else {
+                    smb2::smb2_sign_packet(&mut pkt, &key);
+                }
+            }
+        }
+        self.pending_notifies.push(pkt);
+    }
+
+    fn cmd_lease_break_ack(
+        &mut self,
+        _hdr: &Smb2Header,
+        cmd: &[u8],
+        rh: Smb2Header,
+    ) -> (u32, Smb2Header, Vec<u8>) {
+        let ack = match smb2::parse_lease_break_ack(cmd) {
+            Ok(a) => a,
+            Err(_) => return err(rh, smb2::STATUS_INVALID_PARAMETER),
+        };
+        match self.leases.get_mut(&ack.lease_key) {
+            Some(entry) => {
+                entry.state &= ack.lease_state;
+                (
+                    smb2::STATUS_SUCCESS,
+                    rh,
+                    smb2::encode_lease_break_ack_response(ack.lease_key, entry.state),
+                )
+            }
+            None => err(rh, smb2::STATUS_INVALID_PARAMETER),
+        }
     }
 }
 
