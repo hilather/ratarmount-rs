@@ -13,7 +13,7 @@ use ratarmount_compositing::{
     commit_overlay, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
     WriteOverlay,
 };
-use ratarmount_compress::strip_compression_suffix;
+use ratarmount_compress::{strip_compression_suffix, RepackOptions};
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
     clamp_readahead, mount_blocking, parse_byte_size, unmount, RECOMMENDED_READAHEAD_BYTES,
@@ -30,6 +30,7 @@ use ratarmount_session::factory;
 mod find;
 mod overlay_commit;
 mod publish_index;
+mod repack;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -44,11 +45,15 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   (--nfs, --http, --webdav, --smb, --ninep, --sftp, --sftp-subsystem).\n\
                   Optional sugar: ratarmount serve --nfs --http ARCHIVE (requires at\n\
                   least one export; incompatible with --no-mount).\n\
-                  Locate: ratarmount find '*.fits' ARCHIVE (no FUSE; TSV path/size/mtime).",
+                  Locate: ratarmount find '*.fits' ARCHIVE (no FUSE; TSV path/size/mtime).\n\
+                  Producer: ratarmount --repack-seekable IN OUT (framed zstd + seek table).\n\
+                  Helpers (--repack-force, …) go before --repack-seekable or after IN OUT.",
     after_help = "Export sugar: ratarmount serve --nfs --http ARCHIVE\n\
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
-                  Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE)."
+                  Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
+                  Producer: ratarmount --repack-seekable IN OUT (exclusive with export / -w / mountpoint).\n\
+                  Helpers (--repack-force, --repack-keep-gzip, …) go before --repack-seekable or after IN OUT."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -416,6 +421,42 @@ struct Args {
     )]
     commit_overlay_interval: String,
 
+    /// Offline producer: make IN randomly accessible as OUT.
+    /// Two paths required (`num_args = 2`) so clap cannot steal a mountpoint.
+    /// IN and OUT must immediately follow this flag (do not put helpers between
+    /// `--repack-seekable` and the paths; helpers go before it or after IN OUT).
+    /// Exclusive with export / `-w` / a FUSE mountpoint. Local files only.
+    /// `Set` so a second `--repack-seekable` is a clap conflict (not four paths).
+    #[arg(
+        long = "repack-seekable",
+        value_names = ["IN", "OUT"],
+        num_args = 2,
+        action = ArgAction::Set
+    )]
+    repack_seekable: Vec<PathBuf>,
+
+    /// Uncompressed bytes per output zstd frame (`K`/`M`/`G`). Default 8 MiB.
+    #[arg(long = "repack-frame-size", default_value = "8M", value_name = "BYTES")]
+    repack_frame_size: String,
+
+    /// zstd compression level for `--repack-seekable` (default 3).
+    #[arg(long = "repack-level", default_value_t = 3)]
+    repack_level: i32,
+
+    /// Keep gzip bytes and write a sibling `OUT.rgzi` (do not transcode to zstd).
+    #[arg(long = "repack-keep-gzip", action = ArgAction::SetTrue)]
+    repack_keep_gzip: bool,
+
+    /// Also write `OUT.gzidx` (Python `indexed_gzip`) via `export_indexed_gzip_blob`.
+    /// Implies `--repack-keep-gzip`.
+    #[arg(long = "repack-gzidx", action = ArgAction::SetTrue)]
+    repack_gzidx: bool,
+
+    /// Recompress into `--repack-frame-size` windows even when input is already
+    /// multi-frame (including u32 overflow). Default is copy + omit table.
+    #[arg(long = "repack-force", action = ArgAction::SetTrue)]
+    repack_force: bool,
+
     /// Password for encrypted archives (repeatable)
     #[arg(long = "password", action = ArgAction::Append)]
     passwords: Vec<String>,
@@ -617,6 +658,46 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+/// `--repack-seekable` is an offline producer (no mount). Exit 2 with export/`-w`/mountpoint.
+fn repack_cli_error(args: &Args) -> Option<&'static str> {
+    let has = !args.repack_seekable.is_empty();
+    if !has {
+        if args.repack_keep_gzip || args.repack_gzidx || args.repack_force {
+            return Some(
+                "--repack-keep-gzip / --repack-gzidx / --repack-force require --repack-seekable",
+            );
+        }
+        return None;
+    }
+    if args.repack_seekable.len() != 2 {
+        return Some("--repack-seekable requires IN and OUT (pass the flag once)");
+    }
+    if any_export(args) {
+        return Some(
+            "--repack-seekable cannot be combined with --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem",
+        );
+    }
+    if args.write_overlay.is_some() {
+        return Some("--repack-seekable cannot be combined with -w / --write-overlay");
+    }
+    if args.commit_overlay {
+        return Some("--repack-seekable cannot be combined with --commit-overlay");
+    }
+    if !args.paths.is_empty() {
+        return Some("--repack-seekable cannot be combined with a FUSE mountpoint");
+    }
+    if args.unmount {
+        return Some("--repack-seekable cannot be combined with -u / --unmount");
+    }
+    if args.serve {
+        return Some("--repack-seekable cannot be combined with serve");
+    }
+    if args.find {
+        return Some("--repack-seekable cannot be combined with find");
+    }
+    None
+}
+
 fn main() {
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
@@ -646,9 +727,48 @@ fn main() {
         eprintln!("error: {msg}");
         std::process::exit(2);
     }
+    if let Some(msg) = repack_cli_error(&args) {
+        eprintln!("error: {msg}");
+        std::process::exit(2);
+    }
 
     let write_style = resolve_color_style(args.color, args.no_color);
     init_logger(args.debug, args.log_file.as_deref(), write_style);
+
+    if !args.repack_seekable.is_empty() {
+        let frame_size = match parse_byte_size(&args.repack_frame_size) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("error: invalid --repack-frame-size: {e}");
+                std::process::exit(2);
+            }
+        };
+        if frame_size == 0 || frame_size > u64::from(u32::MAX) {
+            eprintln!("error: --repack-frame-size must be between 1 and 4GiB-1");
+            std::process::exit(2);
+        }
+        let opts = RepackOptions {
+            frame_size,
+            level: args.repack_level,
+            keep_gzip: args.repack_keep_gzip || args.repack_gzidx,
+            write_gzidx: args.repack_gzidx,
+            force: args.repack_force,
+        };
+        match crate::repack::run(&args.repack_seekable[0], &args.repack_seekable[1], &opts) {
+            Ok(outcome) => {
+                eprintln!("{}", crate::repack::describe_outcome(&outcome));
+                return;
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                // Missing IN / remote URL / missing OUT parent are CLI validation.
+                let cli = e.contains("local file")
+                    || e.contains("not a local file")
+                    || e.contains("OUT parent");
+                std::process::exit(if cli { 2 } else { 1 });
+            }
+        }
+    }
 
     if args.unmount {
         if args.paths.is_empty() {
@@ -712,6 +832,8 @@ fn main() {
             "       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.tar.zst|archive.zip>"
         );
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
+        eprintln!("       ratarmount --repack-seekable <in> <out>");
+        eprintln!("       ratarmount --repack-force --repack-seekable <in> <out>");
         eprintln!(
             "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
         );
@@ -3085,6 +3207,191 @@ mod nfs_cli_tests {
         assert!(line.contains("vers=4.1,tcp,port=20490,sec=sys"), "{line}");
         assert!(!line.contains("mountport="), "{line}");
         assert!(!line.contains("nolock"), "{line}");
+    }
+}
+
+#[cfg(test)]
+mod repack_cli_tests {
+    use super::{repack_cli_error, Args};
+    use clap::Parser;
+    use std::path::PathBuf;
+
+    /// Regression: `--repack-seekable IN OUT` is `num_args = 2` and must not
+    /// steal OUT as a FUSE mountpoint (the `--nfs` archive-steal class).
+    #[test]
+    fn repack_seekable_flag() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar.gz",
+            "out.tar.zst",
+        ])
+        .expect("parse");
+        assert_eq!(
+            a.repack_seekable,
+            vec![PathBuf::from("in.tar.gz"), PathBuf::from("out.tar.zst")]
+        );
+        assert!(a.paths.is_empty(), "OUT must not land in positional paths");
+        assert!(!a.repack_force);
+        assert!(!a.repack_gzidx);
+        assert!(!a.repack_keep_gzip);
+        assert_eq!(a.repack_frame_size, "8M");
+        assert_eq!(a.repack_level, 3);
+        assert!(repack_cli_error(&a).is_none());
+
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar.gz",
+            "out.tar.zst",
+            "--repack-force",
+            "--repack-gzidx",
+            "--repack-frame-size",
+            "1M",
+            "--repack-level",
+            "1",
+        ])
+        .expect("helpers after IN OUT");
+        assert!(a.repack_force);
+        assert!(a.repack_gzidx);
+        assert_eq!(a.repack_frame_size, "1M");
+        assert_eq!(a.repack_level, 1);
+        assert_eq!(
+            a.repack_seekable,
+            vec![PathBuf::from("in.tar.gz"), PathBuf::from("out.tar.zst")]
+        );
+        assert!(a.paths.is_empty());
+
+        let err = Args::try_parse_from(["ratarmount", "--repack-seekable", "in.tar"]).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repack-seekable") || msg.contains("required") || msg.contains("value"),
+            "{msg}"
+        );
+
+        // Helpers before `--repack-seekable` parse; IN OUT still immediately follow the flag.
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-force",
+            "--repack-frame-size",
+            "1M",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("helpers before --repack-seekable");
+        assert!(a.repack_force);
+        assert_eq!(a.repack_frame_size, "1M");
+        assert_eq!(
+            a.repack_seekable,
+            vec![PathBuf::from("in.tar"), PathBuf::from("out.tar.zst")]
+        );
+        assert!(a.paths.is_empty());
+        assert!(repack_cli_error(&a).is_none());
+
+        // A helper *between* `--repack-seekable` and IN OUT fails: clap treats
+        // `--repack-force` as a flag, so `--repack-seekable` never gets its two
+        // values. Do not set `allow_hyphen_values` (that would steal the helper
+        // as IN). Put helpers before `--repack-seekable` or after IN OUT.
+        let err = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--repack-force",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repack-seekable") && (msg.contains("required") || msg.contains("value")),
+            "{msg}"
+        );
+
+        // A second `--repack-seekable` is a clap conflict (`ArgAction::Set`),
+        // not four paths with a misleading "requires IN and OUT" runtime error.
+        let err = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "old.in",
+            "old.out",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("repack-seekable")
+                && (msg.contains("cannot be used")
+                    || msg.contains("conflict")
+                    || msg.contains("provided more than once")),
+            "{msg}"
+        );
+    }
+
+    /// Regression: `--repack-seekable` + `--nfs` (or `-w` / a mountpoint) exits 2.
+    #[test]
+    fn repack_incompatible_with_export() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+            "--nfs",
+        ])
+        .expect("parse");
+        assert!(a.nfs);
+        assert_eq!(
+            repack_cli_error(&a),
+            Some(
+                "--repack-seekable cannot be combined with --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem"
+            )
+        );
+
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--http",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("parse");
+        assert!(a.http);
+        assert!(repack_cli_error(&a).is_some());
+
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+            "-w",
+            "/tmp/ov",
+        ])
+        .expect("parse");
+        assert_eq!(
+            repack_cli_error(&a),
+            Some("--repack-seekable cannot be combined with -w / --write-overlay")
+        );
+
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar",
+            "out.tar.zst",
+            "mnt",
+        ])
+        .expect("parse");
+        assert_eq!(a.paths, vec![PathBuf::from("mnt")]);
+        assert_eq!(
+            repack_cli_error(&a),
+            Some("--repack-seekable cannot be combined with a FUSE mountpoint")
+        );
+
+        let a = Args::try_parse_from(["ratarmount", "--repack-force", "a.tar"]).expect("parse");
+        assert_eq!(
+            repack_cli_error(&a),
+            Some("--repack-keep-gzip / --repack-gzidx / --repack-force require --repack-seekable")
+        );
     }
 }
 

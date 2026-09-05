@@ -51,31 +51,46 @@ frame; the full-decode path is simple and fast enough.
 
 ---
 
-## Producer: `repack_seekable` (engine)
+## Producer: `--repack-seekable`
 
-The **recommended** producer is [`ratarmount_compress::repack_seekable`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/repack.rs)
-in `ratarmount-compress` (CLI `--repack-seekable` is **not** wired yet).
+The **recommended** producer is the CLI (engine:
+[`ratarmount_compress::repack_seekable`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/repack.rs)):
+
+```bash
+ratarmount --repack-seekable IN OUT
+ratarmount --repack-frame-size 8M --repack-level 3 --repack-seekable in.tar.gz out.tar.zst
+ratarmount --repack-keep-gzip --repack-seekable in.tar.gz out.tar.gz   # writes OUT + OUT.rgzi
+ratarmount --repack-gzidx --repack-keep-gzip --repack-seekable in.gz out.gz
+ratarmount --repack-force --repack-seekable in.tar.zst out.tar.zst    # split oversized frames
+# Helpers may also follow the two paths:
+#   ratarmount --repack-seekable in.tar.zst out.tar.zst --repack-force
+```
+
+`--repack-seekable` takes **two** paths (`num_args = 2`) so clap cannot steal a
+mountpoint. **IN and OUT must immediately follow** `--repack-seekable`; helper
+flags (`--repack-force`, `--repack-keep-gzip`, `--repack-frame-size`, …) go
+**before** that flag or **after** the two paths — not between the flag and IN.
+It is exclusive with `--nfs` / other exports, `-w`, and a FUSE mountpoint.
+**Local files only** (remote PUT is F-7).
 
 Default output is **multi-frame zstd + official seek table** (footer magic
 `0x8F92EAB1`). Uncompressed frame size defaults to **8 MiB**, matching the
-`split -b 8M` recipes below.
+`split -b 8M` recipes below. TAR member **offset order is preserved** (the
+uncompressed byte stream is copied in order; V-5).
 
 | Input | Default behavior |
 |-------|------------------|
 | Already has a seek table | Byte-copy (`CopiedExistingSeekable`). If `IN == OUT`, skip tmp+rename (`DidNothing`). |
 | Multi-frame zstd, no table, every frame `cSize`/`dSize` fits `u32` | Copy frames, **append** a skippable seek table. |
-| Multi-frame zstd, a frame **exceeds `u32`** | Copy frames, **omit** the table (`CopiedWithoutSeekTable`, `warn!`). Same as live-commit dropping a footer rather than emitting a lying table. |
+| Multi-frame zstd, a frame **exceeds `u32`** | Copy frames, **omit** the table (`CopiedWithoutSeekTable`, `warn!`). Same as live-commit dropping a footer rather than emitting a lying table. `--repack-force` is the only recompress-into-smaller-frames path. |
 | Single-frame zstd / uncompressed | Recompress into 8 MiB windows + seek table. |
-| Gzip | Stream-decode and re-encode as framed zstd. `keep_gzip` instead copies the gzip bytes and writes a sibling `*.rgzi` via [`SeekableGzip::export_seek_index_blob`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/gzip_seek.rs); optional GZIDX via `export_indexed_gzip_blob`. |
+| Gzip | Stream-decode and re-encode as framed zstd. `--repack-keep-gzip` instead copies the gzip bytes and writes a sibling `*.rgzi` via [`SeekableGzip::export_seek_index_blob`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/gzip_seek.rs); `--repack-gzidx` also writes Python `indexed_gzip` GZIDX via `export_indexed_gzip_blob`. |
 
-`RepackOptions::force` is the **only** switch that recompresses already
-multi-frame input into smaller windows (including the `u32`-overflow case).
-
-**Residual (this engine slice):** CLI flags; ZIP / 7z / bzip2 / xz / lz4 rewrite;
-parallel `zstdmt` encode; in-place Windows rename quirks.
+**Residual:** ZIP / 7z / bzip2 / xz / lz4 rewrite; parallel `zstdmt` encode;
+in-place Windows rename quirks.
 
 The `split \| zstd >>` recipes below remain valid **prior art** when you are
-not calling the engine.
+not calling `--repack-seekable`.
 
 ---
 
@@ -178,8 +193,8 @@ ratarmount big.zst mnt/
 ```
 
 If open is slow or RSS jumps on a multi‑GiB `.zst`, the stream is likely a
-**single frame** (full decode). Recompress with multi-frame chunks or a seek
-table using the recipes above.
+**single frame** (full decode). Recompress with
+`ratarmount --repack-seekable IN OUT` (or the `split` recipes above).
 
 ---
 

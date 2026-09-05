@@ -41,7 +41,7 @@ On HDD and on remote Range GET (V-3), a name-order restore of a TAR whose member
 4. Two index helpers, both **v1** (V-5 “optional list_dirents / extract helper” means opt-in, not skip):
    - Per-directory `list_dirents_ordered(..., OffsetHeader)` = sort of today’s newest-wins `list_dirents` set.
    - Flatten `list_visible_files_by_offset` for sequential open of the **mounted** tree (newest-wins, dumpdir-aware). The seek-count regression uses this helper.
-5. Document that F-9 `--repack-seekable` (still `todo`) must keep members in existing archive order. This plan PR already points F-9 here; the implementation PR only flips V-5 boxes.
+5. Document that F-9 `--repack-seekable` must keep members in existing archive order (CLI + engine landed; offset-order regression is `repack_preserves_tar_offset_order`).
 6. Keep `regression_null_offsetheader` green; foreign indexes with NULL `offsetheader` must still cheap-readdir and warm-seal.
 
 `find --offset-order` and `list_visible_files_by_offset` are **different sets**. A unique-name fixture makes them agree; GNU incremental / multi-version archives do not (find emits every catalog version; flatten emits the mount-visible winner only).
