@@ -159,7 +159,7 @@ pub fn serve_blocking(source: Arc<dyn MountSource>, opts: SmbOptions) -> io::Res
     serve_listener(listener, source, opts)
 }
 
-const MAX_DURABLE_OPENS: usize = 128;
+pub(crate) const MAX_DURABLE_OPENS: usize = 128;
 
 struct SharedSmbState {
     next_fid: AtomicU64,
@@ -1188,7 +1188,7 @@ impl Session {
         }
     }
 
-    fn alloc_fid(&mut self, open: OpenFile) -> u64 {
+    fn alloc_fid(&mut self, mut open: OpenFile) -> u64 {
         let id = self.shared.next_fid.fetch_add(1, Ordering::Relaxed);
         if open.durable {
             let mut map = self
@@ -1198,10 +1198,29 @@ impl Session {
                 .unwrap_or_else(|e| e.into_inner());
             if map.len() < MAX_DURABLE_OPENS {
                 map.insert(id, open.clone());
+            } else {
+                open.durable = false;
             }
         }
         self.opens.insert(id, open);
         id
+    }
+
+    fn sync_durable_open(&mut self, fid: u64) {
+        let Some(open) = self.opens.get(&fid) else {
+            return;
+        };
+        if !open.durable {
+            return;
+        }
+        let mut map = self
+            .shared
+            .durable
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if map.contains_key(&fid) {
+            map.insert(fid, open.clone());
+        }
     }
 
     fn open_from_req(req: &CreateReq, inode: u64, is_dir: bool) -> OpenFile {
@@ -1286,6 +1305,7 @@ impl Session {
                 }
             }
         }
+        self.sync_durable_open(fid);
         if req.durable_request {
             if let Some(open) = self.opens.get(&fid) {
                 if open.durable {

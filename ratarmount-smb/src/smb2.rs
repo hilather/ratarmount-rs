@@ -639,15 +639,14 @@ pub fn pick_dialect(dialects: &[u16]) -> Option<u16> {
     pick_dialect_prefer(dialects, false)
 }
 
-/// Guest keeps 2.0.2 when offered (unsigned v1 bar). Password sessions prefer 3.1.1
+/// Guest prefers 2.1+ so `CAP_LEASING` is advertised; 2.0.2 remains if that is
+/// all the client offers (unsigned v1 bar). Password sessions prefer 3.1.1
 /// so preauth + encryption can be negotiated.
 pub fn pick_dialect_prefer(dialects: &[u16], prefer_311: bool) -> Option<u16> {
     if prefer_311 && dialects.contains(&DIALECT_311) {
         return Some(DIALECT_311);
     }
-    if dialects.contains(&DIALECT_202) {
-        Some(DIALECT_202)
-    } else if dialects.contains(&DIALECT_210) {
+    if dialects.contains(&DIALECT_210) {
         Some(DIALECT_210)
     } else if dialects.contains(&DIALECT_300) {
         Some(DIALECT_300)
@@ -655,6 +654,8 @@ pub fn pick_dialect_prefer(dialects: &[u16], prefer_311: bool) -> Option<u16> {
         Some(DIALECT_302)
     } else if dialects.contains(&DIALECT_311) {
         Some(DIALECT_311)
+    } else if dialects.contains(&DIALECT_202) {
+        Some(DIALECT_202)
     } else {
         None
     }
@@ -1316,7 +1317,8 @@ pub fn encode_lease_context(req: &LeaseReq, granted: u32) -> Vec<u8> {
 }
 
 pub fn encode_durable_response() -> Vec<u8> {
-    encode_create_context(CREATE_CTX_DURABLE_RECONNECT, &[0u8; 8])
+    // MS-SMB2 2.2.14.2.5: grant uses DHnQ (same name as the request). DHnC is reconnect-only.
+    encode_create_context(CREATE_CTX_DURABLE_REQUEST, &[0u8; 8])
 }
 
 pub fn encode_maximal_access_response(access: u32) -> Vec<u8> {
@@ -2444,11 +2446,12 @@ mod tests {
     }
 
     #[test]
-    fn pick_dialect_prefers_202() {
+    fn pick_dialect_prefers_210_for_leasing() {
         assert_eq!(
             pick_dialect(&[0x0311, DIALECT_202, DIALECT_210]),
-            Some(DIALECT_202)
+            Some(DIALECT_210)
         );
+        assert_eq!(pick_dialect(&[DIALECT_202]), Some(DIALECT_202));
         assert_eq!(pick_dialect(&[DIALECT_311]), Some(DIALECT_311));
         assert_eq!(pick_dialect(&[DIALECT_210]), Some(DIALECT_210));
         assert_eq!(
@@ -2897,6 +2900,21 @@ mod tests {
         assert_eq!(grant_lease_state(SMB2_LEASE_RWH, false), SMB2_LEASE_RH);
         assert_eq!(grant_lease_state(SMB2_LEASE_WH, true), SMB2_LEASE_WH);
         assert_eq!(grant_lease_state(SMB2_LEASE_R, false), SMB2_LEASE_R);
+    }
+
+    #[test]
+    fn durable_response_tag_is_dhnq() {
+        let ctx = encode_durable_response();
+        let name_off = u16::from_le_bytes(ctx[4..6].try_into().unwrap()) as usize;
+        let name_len = u16::from_le_bytes(ctx[6..8].try_into().unwrap()) as usize;
+        assert_eq!(
+            &ctx[name_off..name_off + name_len],
+            CREATE_CTX_DURABLE_REQUEST
+        );
+        assert_ne!(
+            &ctx[name_off..name_off + name_len],
+            CREATE_CTX_DURABLE_RECONNECT
+        );
     }
 
     #[test]
