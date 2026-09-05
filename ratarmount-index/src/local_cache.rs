@@ -372,9 +372,7 @@ fn find_existing_extra_dir_index(archive: &Path, extra_dirs: &[PathBuf]) -> Opti
 /// macOS: `~/Library/Caches/ratarmount/` unless XDG is set.
 /// Windows: `%LOCALAPPDATA%\ratarmount\`.
 ///
-/// WHY: joining `payload-v1` onto `local-index-v1/` mixed G-3 into the 2 GiB
-/// index LRU. `meta-v3` stays on `xdg_cache_home()` (`$HOME/.cache` on macOS)
-/// so existing remote remounts do not miss.
+/// Sibling of `local-index-v1/`; `meta-v3` stays on `xdg_cache_home()`.
 pub fn platform_cache_root() -> PathBuf {
     platform_cache_root_from(
         env_path("XDG_CACHE_HOME").as_deref(),

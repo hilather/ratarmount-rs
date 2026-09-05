@@ -238,7 +238,6 @@ impl Session {
             comp,
         )
         .map_err(|e| map_factory_error(e, had_passwords, &archive_path))?;
-        // G-3: wrap after the mount source exists (not factory.rs / apply_compositing).
         bundle.source =
             ratarmount_compositing::maybe_wrap_payload_cache(bundle.source, index_in_memory);
         let source = OpenedSource::Bundle(bundle);

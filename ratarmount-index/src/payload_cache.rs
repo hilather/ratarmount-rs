@@ -97,23 +97,21 @@ impl PayloadCache {
     }
 
     /// Existing `{hh}/{sha256}` whose header length matches the blob.
+    ///
+    /// A missing header or blob is a miss, not corruption: install writes the
+    /// header then renames the tmp, so a concurrent lookup must not unlink a
+    /// just-published (or about-to-be-renamed) file.
     pub fn lookup(&self, sha256: &str) -> Option<PathBuf> {
         self.budget?;
         let key = normalize_sha256(sha256)?;
         let blob = self.blob_path(&key);
         let hdr = match self.read_header(&key) {
             Ok(h) if h.schema == PAYLOAD_SCHEMA => h,
-            _ => {
-                self.invalidate_key(&key);
-                return None;
-            }
+            _ => return None,
         };
         let meta = match fs::metadata(&blob) {
             Ok(m) if m.is_file() => m,
-            _ => {
-                self.invalidate_key(&key);
-                return None;
-            }
+            _ => return None,
         };
         if meta.len() != hdr.len || hdr.len == 0 {
             debug!("payload-v1 corrupt {key} (len mismatch or empty)");
@@ -177,17 +175,20 @@ impl PayloadCache {
         if let Ok(f) = File::open(&tmp) {
             let _ = f.sync_all();
         }
-        if let Err(e) = fs::rename(&tmp, &dest) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
         let now = unix_now();
         let hdr = PayloadHeader {
             schema: PAYLOAD_SCHEMA.to_string(),
             len: expected_len,
             last_hit: now,
         };
+        // Header before rename so a concurrent lookup never sees a blob without
+        // metadata; missing blob is a miss (not an unlink).
         if let Err(e) = self.write_header(&key, &hdr) {
+            let _ = fs::remove_file(&tmp);
+            return Err(e);
+        }
+        if let Err(e) = fs::rename(&tmp, &dest) {
+            let _ = fs::remove_file(&tmp);
             self.invalidate_key(&key);
             return Err(e);
         }
@@ -591,10 +592,11 @@ mod tests {
     }
 
     /// Regression: LRU cap deletes oldest `last_hit` sha256 blobs.
+    /// Driven through `install_from_reader` with a small budget (not only `evict_until`).
     #[test]
     fn payload_cache_lru_evicts() {
         let dir = tempfile::tempdir().unwrap();
-        let cache = cache_in(dir.path(), PAYLOAD_CACHE_BYTES_DEFAULT);
+        let cache = cache_in(dir.path(), 8);
         let a = b"aaaa";
         let b = b"bbbb";
         let c = b"cccc";
@@ -607,23 +609,97 @@ mod tests {
         let pb = cache
             .install_from_reader(&sb, b.len() as u64, &mut Cursor::new(b.as_slice()))
             .unwrap();
+        set_last_hit(&cache, &sa, 1);
+        set_last_hit(&cache, &sb, 200);
         let pc = cache
             .install_from_reader(&sc, c.len() as u64, &mut Cursor::new(c.as_slice()))
             .unwrap();
-        set_last_hit(&cache, &sa, 100);
-        set_last_hit(&cache, &sb, 1);
-        set_last_hit(&cache, &sc, 200);
-        cache.evict_until(8, None).unwrap();
-        assert!(pa.is_file(), "newer a must survive");
         assert!(
-            !pb.is_file(),
-            "oldest last_hit (b) must be evicted under an 8-byte cap"
+            !pa.is_file(),
+            "oldest last_hit (a) must be evicted when installing c under an 8-byte cap"
         );
+        assert!(pb.is_file(), "newer b must survive");
         assert!(pc.is_file(), "newest c must survive");
         assert!(
-            !cache.hdr_path(&sb).exists(),
+            !cache.hdr_path(&sa).exists(),
             "eviction must drop the hdr pair"
         );
+    }
+
+    /// Regression: overlapping lookup must not drop a blob that has no `.hdr` yet.
+    #[test]
+    fn payload_cache_lookup_missing_hdr_does_not_drop_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), PAYLOAD_CACHE_BYTES_DEFAULT);
+        let body = b"just-renamed-blob";
+        let sha = sha256_hex(body);
+        cache.ensure_fanout(&sha).unwrap();
+        let dest = cache.blob_path(&sha);
+        fs::write(&dest, body).unwrap();
+        assert!(cache.lookup(&sha).is_none(), "no hdr is a miss");
+        assert!(
+            dest.is_file(),
+            "lookup must not unlink a blob waiting for hdr"
+        );
+        let cache2 = cache.clone();
+        let sha2 = sha.clone();
+        let dest2 = dest.clone();
+        let lookups = std::thread::spawn(move || {
+            for _ in 0..200 {
+                let _ = cache2.lookup(&sha2);
+                assert!(
+                    dest2.is_file(),
+                    "concurrent lookup must not drop the just-renamed blob"
+                );
+            }
+        });
+        let p = cache
+            .install_from_reader(&sha, body.len() as u64, &mut Cursor::new(body.as_slice()))
+            .unwrap();
+        lookups.join().expect("lookup thread");
+        assert_eq!(fs::read(&p).unwrap(), body);
+        assert!(cache.lookup(&sha).is_some());
+    }
+
+    /// Regression: members larger than the v1 cap are not stored.
+    #[test]
+    fn payload_cache_skips_over_member_max() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = PayloadCache::with_dir(
+            dir.path().join(PAYLOAD_V1_DIRNAME),
+            Some(PAYLOAD_CACHE_BYTES_DEFAULT),
+            8,
+        );
+        let body = b"0123456789";
+        let sha = sha256_hex(body);
+        let err = cache
+            .install_from_reader(&sha, body.len() as u64, &mut Cursor::new(body.as_slice()))
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("member max") || msg.contains("skip"), "{msg}");
+        assert!(cache.lookup(&sha).is_none());
+        assert!(
+            !cache.blob_path(&sha).exists(),
+            "over-max member must not leave a dest blob"
+        );
+    }
+
+    /// Regression: digest ≠ key is fail-closed (no dest blob).
+    #[test]
+    fn payload_cache_fail_closed_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = cache_in(dir.path(), PAYLOAD_CACHE_BYTES_DEFAULT);
+        let body = b"aaaa";
+        let sha = sha256_hex(b"bbbb");
+        let err = cache
+            .install_from_reader(&sha, body.len() as u64, &mut Cursor::new(body.as_slice()))
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            cache.lookup(&sha).is_none(),
+            "hash mismatch must not publish"
+        );
+        assert!(!cache.blob_path(&sha).exists());
     }
 
     /// Regression: truncated tmp is not published (fail-closed).
