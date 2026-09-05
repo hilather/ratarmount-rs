@@ -24,8 +24,13 @@ pub const CHUNK_LZMA: u32 = 0x8000_0008;
 pub const CHUNK_COMMENT: u32 = 0x7FFF_FFFE;
 pub const CHUNK_TERM: u32 = 0xFFFF_FFFF;
 
-const ENCRDSA: &[u8; 7] = b"encrdsa";
-const CDSAENCR: &[u8; 8] = b"cdsaencr";
+/// v2 encrypted header at offset 0 (not the 7-byte typo `encrdsa`).
+const ENCRC_DSA: &[u8; 8] = b"encrcdsa";
+/// v1 encrypted trailer magic (`cdsaencr`).
+const CDSA_ENCR: &[u8; 8] = b"cdsaencr";
+
+/// Cap one compressed or uncompressed mish run (allocation / zip-bomb).
+pub(crate) const MAX_CHUNK_BYTES: u64 = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChunkKind {
@@ -109,15 +114,27 @@ pub fn looks_like_udif_reader<R: Read + Seek>(reader: &mut R) -> bool {
     parse_koly(&buf).is_ok()
 }
 
+/// v2 `encrcdsa` at offset 0, or v1 `cdsaencr` trailer (last 8 bytes or last 512).
 pub fn looks_like_encrypted_reader<R: Read + Seek>(reader: &mut R) -> bool {
-    if reader.seek(SeekFrom::Start(0)).is_err() {
-        return false;
+    if reader.seek(SeekFrom::Start(0)).is_ok() {
+        let mut mag = [0u8; 8];
+        if reader.read_exact(&mut mag).is_ok() && mag == *ENCRC_DSA {
+            return true;
+        }
     }
-    let mut mag = [0u8; 8];
-    if reader.read_exact(&mut mag).is_err() {
-        return false;
+    if reader.seek(SeekFrom::End(-8)).is_ok() {
+        let mut mag = [0u8; 8];
+        if reader.read_exact(&mut mag).is_ok() && mag == *CDSA_ENCR {
+            return true;
+        }
     }
-    mag.starts_with(ENCRDSA) || mag == *CDSAENCR
+    if reader.seek(SeekFrom::End(-(KOLY_SIZE as i64))).is_ok() {
+        let mut mag = [0u8; 8];
+        if reader.read_exact(&mut mag).is_ok() && mag == *CDSA_ENCR {
+            return true;
+        }
+    }
+    false
 }
 
 pub fn load_chunks<R: Read + Seek>(reader: &mut R, koly: &KolyTrailer) -> Result<Vec<Chunk>> {
@@ -266,8 +283,11 @@ fn parse_mish(blob: &[u8], data_fork_offset: u64, out: &mut Vec<Chunk>) -> Resul
             CHUNK_ADC => ChunkKind::Adc,
             CHUNK_ZLIB => ChunkKind::Zlib,
             CHUNK_BZIP2 => ChunkKind::Bzip2,
-            CHUNK_LZFSE => ChunkKind::Lzfse,
-            CHUNK_LZMA => ChunkKind::Lzma,
+            CHUNK_LZFSE | CHUNK_LZMA => {
+                return Err(DmgError::Msg(
+                    "UDIF LZFSE/LZMA chunks are residual (fail closed at open)".into(),
+                ));
+            }
             other => {
                 return Err(DmgError::Msg(format!(
                     "unsupported UDIF chunk type 0x{other:08x} (LZFSE/LZMA residual)"
@@ -278,6 +298,14 @@ fn parse_mish(blob: &[u8], data_fork_offset: u64, out: &mut Vec<Chunk>) -> Resul
             .saturating_add(sector)
             .saturating_mul(SECTOR_SIZE);
         let length = sector_count.saturating_mul(SECTOR_SIZE);
+        if matches!(kind, ChunkKind::Adc | ChunkKind::Zlib | ChunkKind::Bzip2)
+            && (length > MAX_CHUNK_BYTES || comp_len > MAX_CHUNK_BYTES)
+        {
+            return Err(DmgError::Msg(format!(
+                "UDIF compressed run exceeds {MAX_CHUNK_BYTES} byte cap \
+                 (uncompressed {length}, compressed {comp_len})"
+            )));
+        }
         let file_offset = data_fork_offset
             .saturating_add(mish_data_offset)
             .saturating_add(comp_off);

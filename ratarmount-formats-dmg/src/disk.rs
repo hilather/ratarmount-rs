@@ -8,17 +8,15 @@ use flate2::read::ZlibDecoder;
 
 use crate::adc::adc_decompress;
 use crate::udif::{
-    load_chunks, looks_like_udif_reader, read_koly, Chunk, ChunkKind, KolyTrailer, SECTOR_SIZE,
+    load_chunks, looks_like_encrypted_reader, looks_like_udif_reader, read_koly, Chunk, ChunkKind,
+    KolyTrailer, MAX_CHUNK_BYTES, SECTOR_SIZE,
 };
 use crate::{DmgError, Result, SeekRead};
-
-/// Cap a single decompressed run so a crafted mish cannot allocate a whole disk.
-const MAX_UNCOMPRESSED_CHUNK: u64 = 32 * 1024 * 1024;
 
 struct Inner {
     file: Box<dyn SeekRead>,
     /// Last decompressed chunk (`index` into `chunks`).
-    cache: Option<(usize, Vec<u8>)>,
+    cache: Option<(usize, Arc<Vec<u8>>)>,
 }
 
 /// Cloneable `Read + Seek` of the virtual disk reconstructed from UDIF runs.
@@ -45,6 +43,12 @@ impl DmgDisk {
     where
         R: Read + Seek + Send + 'static,
     {
+        reader.seek(SeekFrom::Start(0))?;
+        if looks_like_encrypted_reader(&mut reader) {
+            return Err(DmgError::Msg(
+                "encrypted UDIF is residual (no AES passphrase path in this crate)".into(),
+            ));
+        }
         reader.seek(SeekFrom::Start(0))?;
         if !looks_like_udif_reader(&mut reader) {
             return Err(DmgError::Msg("not a UDIF image (no koly trailer)".into()));
@@ -160,20 +164,20 @@ impl DmgDisk {
         }
     }
 
-    fn decoded_chunk(&self, idx: usize) -> io::Result<Vec<u8>> {
+    fn decoded_chunk(&self, idx: usize) -> io::Result<Arc<Vec<u8>>> {
         {
             let guard = self.lock()?;
             if let Some((cidx, bytes)) = &guard.cache {
                 if *cidx == idx {
-                    return Ok(bytes.clone());
+                    return Ok(Arc::clone(bytes));
                 }
             }
         }
         let chunk = &self.chunks[idx];
-        if chunk.length > MAX_UNCOMPRESSED_CHUNK {
+        if chunk.length > MAX_CHUNK_BYTES || chunk.compressed_length > MAX_CHUNK_BYTES {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "UDIF uncompressed chunk exceeds 32 MiB cap",
+                "UDIF compressed run exceeds 32 MiB cap",
             ));
         }
         let mut packed = vec![0u8; chunk.compressed_length as usize];
@@ -182,15 +186,20 @@ impl DmgDisk {
             guard.file.seek(SeekFrom::Start(chunk.file_offset))?;
             guard.file.read_exact(&mut packed)?;
         }
+        let limit = chunk.length;
         let mut decoded = match chunk.kind {
             ChunkKind::Zlib => {
                 let mut out = Vec::new();
-                ZlibDecoder::new(packed.as_slice()).read_to_end(&mut out)?;
+                ZlibDecoder::new(packed.as_slice())
+                    .take(limit)
+                    .read_to_end(&mut out)?;
                 out
             }
             ChunkKind::Bzip2 => {
                 let mut out = Vec::new();
-                BzDecoder::new(packed.as_slice()).read_to_end(&mut out)?;
+                BzDecoder::new(packed.as_slice())
+                    .take(limit)
+                    .read_to_end(&mut out)?;
                 out
             }
             ChunkKind::Adc => {
@@ -207,8 +216,9 @@ impl DmgDisk {
         } else {
             decoded.truncate(chunk.length as usize);
         }
+        let decoded = Arc::new(decoded);
         let mut guard = self.lock()?;
-        guard.cache = Some((idx, decoded.clone()));
+        guard.cache = Some((idx, Arc::clone(&decoded)));
         Ok(decoded)
     }
 }
