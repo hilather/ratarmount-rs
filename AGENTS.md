@@ -206,6 +206,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Temp index unlinked on Drop and failed open | `cargo test -p ratarmount-session --lib index_policy_temp` |
 | Sibling unwritable parent → SiblingNotWritable (no `:memory:`) | `cargo test -p ratarmount-index --lib sibling_not_writable` · `cargo test -p ratarmount-session --lib resolve_sibling` |
 | local-index-v1 LRU / UserCache writes meta-v3 | `cargo test -p ratarmount-index --lib local_index` · `cargo test -p ratarmount-session --lib resolve_user_cache` |
+| payload-v1 member cache (sha256; skip :memory:/overlay; not under local-index-v1) | `cargo test -p ratarmount-index --lib payload_cache` · `cargo test -p ratarmount-compositing --lib payload` |
 | CliCompat still `:memory:` last resort | `cargo test -p ratarmount-index --lib resolve_index_location_unwritable` · `cargo test -p ratarmount-session --lib resolve_clicompat` |
 | IndexJob progress < 4 events / 1k TAR as sole proof | `cargo test -p ratarmount-session --lib index_job_progress_events` · `cargo test -p ratarmount-index --lib regression_index_build_hooks_progress_ticks` |
 | IndexJob cancel at ~50% leaves dest sidecar valid; tmp gone | `cargo test -p ratarmount-session --lib index_job_cancel` · `cargo test -p ratarmount-index --lib regression_cancel_does_not_publish_tmp` |

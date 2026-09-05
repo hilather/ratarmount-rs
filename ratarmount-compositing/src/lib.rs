@@ -1,5 +1,6 @@
 //! Compositing layers: folder bind, union, recursive auto-mount, write overlay,
-//! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs.
+//! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs,
+//! G-3 payload cache.
 
 mod automount;
 mod control;
@@ -7,6 +8,7 @@ mod empty_archive;
 mod folder;
 mod oci_whiteout;
 mod path_intern;
+mod payload;
 mod prefix;
 mod transform;
 mod union;
@@ -31,6 +33,7 @@ pub use empty_archive::{
 };
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
+pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
 pub use prefix::PrefixMountSource;
 pub use transform::TransformMountSource;
 pub use union::{UnionMountOptions, UnionMountSource};

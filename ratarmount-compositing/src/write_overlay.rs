@@ -1879,6 +1879,28 @@ impl MountSource for WriteOverlay {
         }
         self.current_base().member_seek_is_cheap(file_info)
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        if file_info
+            .userdata
+            .iter()
+            .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:")))
+        {
+            return Vec::new();
+        }
+        self.current_base().list_xattr(file_info)
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        if file_info
+            .userdata
+            .iter()
+            .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:")))
+        {
+            return None;
+        }
+        self.current_base().get_xattr(file_info, key)
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {
