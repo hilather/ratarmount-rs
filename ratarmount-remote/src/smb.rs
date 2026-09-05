@@ -605,7 +605,7 @@ impl RemoteListing for SmbListing {
         let mut client = connect_smb_tree(&self.loc).map_err(map_smb_listing_err)?;
         match client.create_dir(&smb_create_name(remote_path)) {
             Ok(open) => {
-                let _ = client.close(open.file_id);
+                client.close_and_shutdown(open.file_id);
                 Ok(true)
             }
             Err(e) if is_not_a_directory(&e) || is_missing_name(&e) => Ok(false),
@@ -626,14 +626,20 @@ fn smb_url_looks_like_folder(url_str: &str, loc: &SmbLocation) -> bool {
 
 /// Open `smb://host/share/` or `smb://host/share/dir/` as a folder.
 ///
-/// `Ok(None)` if the path is a file (factory should fall through to [`open_smb_range`]).
-/// Dialect / QUERY_DIRECTORY failure is `Err` (not an empty listing).
+/// `Ok(None)` if the path is a file (factory should fall through to [`open_smb_range`]),
+/// including when the dialect is unsupported so smbclient Range fallback can run.
+/// Folder URLs still `Err` on dialect / QUERY_DIRECTORY failure (not an empty listing).
 pub fn open_smb_folder(url_str: &str) -> Result<Option<Arc<dyn MountSource>>> {
     let loc = parse_smb_url(url_str)?;
     let looks_like_folder = smb_url_looks_like_folder(url_str, &loc);
     match list_smb_path(&loc, loc.path.trim_end_matches('/')) {
         Ok(_) => {}
-        Err(e) if !looks_like_folder && (is_not_a_directory(&e) || is_missing_name(&e)) => {
+        Err(e)
+            if !looks_like_folder
+                && (is_not_a_directory(&e)
+                    || is_missing_name(&e)
+                    || is_smb_dialect_unsupported(&e)) =>
+        {
             return Ok(None);
         }
         Err(e) => return Err(e),
@@ -1253,6 +1259,23 @@ mod tests {
         assert!(
             open_smb_folder(&url).unwrap().is_none(),
             "file URL must return Ok(None) so Range can take over"
+        );
+    }
+
+    /// File URL + unsupported dialect is Ok(None) so PR 4 can reach smbclient Range.
+    #[test]
+    fn smb_folder_file_url_dialect_unsupported_is_none() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, FILE_NAME, SHARE};
+        let srv = FakeSmb::spawn(AuthMode::RejectDialect);
+        let url = format!(
+            "smb://127.0.0.1:{}/{}/{}",
+            srv.addr.port(),
+            SHARE,
+            FILE_NAME
+        );
+        assert!(
+            open_smb_folder(&url).unwrap().is_none(),
+            "file URL dialect miss must be Ok(None), not Err that skips Range fallback"
         );
     }
 

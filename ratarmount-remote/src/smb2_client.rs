@@ -166,6 +166,14 @@ impl Smb2Client<TcpStream> {
         let _ = self.close(file_id);
         let _ = self.stream.shutdown(std::net::Shutdown::Both);
     }
+
+    /// CREATE directory + QUERY_DIRECTORY pages + short CLOSE/shutdown (not the 30s TCP timeout).
+    pub fn list_directory(&mut self, name: &str) -> Result<Vec<Smb2Dirent>> {
+        let open = self.create_dir(name)?;
+        let listed = self.query_directory_all(open.file_id);
+        self.close_and_shutdown(open.file_id);
+        listed
+    }
 }
 
 impl<S: Read + Write> Smb2Client<S> {
@@ -357,8 +365,16 @@ impl<S: Read + Write> Smb2Client<S> {
         })
     }
 
-    /// One QUERY_DIRECTORY page. Empty Vec is end-of-listing, not a dialect miss.
-    pub fn query_directory(&mut self, file_id: [u8; 16], restart: bool) -> Result<Vec<Smb2Dirent>> {
+    /// One QUERY_DIRECTORY page.
+    ///
+    /// `Ok(None)` is protocol EOF (`NO_MORE_FILES` / `NO_SUCH_FILE`). `Ok(Some)`
+    /// is SUCCESS, including a page whose rows were all `.` / `..` / empty
+    /// (not EOF — more pages may follow).
+    pub fn query_directory(
+        &mut self,
+        file_id: [u8; 16],
+        restart: bool,
+    ) -> Result<Option<Vec<Smb2Dirent>>> {
         let pattern = encode_utf16le("*");
         let mut body = vec![0u8; 32];
         body[0..2].copy_from_slice(&33u16.to_le_bytes());
@@ -372,10 +388,10 @@ impl<S: Read + Write> Smb2Client<S> {
         body.extend_from_slice(&pattern);
         let (h, b) = self.roundtrip(SMB2_QUERY_DIRECTORY, &body)?;
         if h.status == STATUS_NO_MORE_FILES || h.status == STATUS_NO_SUCH_FILE {
-            return Ok(Vec::new());
+            return Ok(None);
         }
         check_status(h.status, "QUERY_DIRECTORY")?;
-        parse_query_directory_output(&b)
+        Ok(Some(parse_query_directory_output(&b)?))
     }
 
     /// Loop QUERY_DIRECTORY until NO_MORE_FILES. Caps entries/pages; never silent-truncate.
@@ -383,30 +399,23 @@ impl<S: Read + Write> Smb2Client<S> {
         let mut out = Vec::new();
         let mut restart = true;
         for _ in 0..QUERY_DIR_PAGE_CAP {
-            let page = self.query_directory(file_id, restart)?;
-            restart = false;
-            if page.is_empty() {
-                return Ok(out);
+            match self.query_directory(file_id, restart)? {
+                None => return Ok(out),
+                Some(page) => {
+                    restart = false;
+                    if out.len().saturating_add(page.len()) > QUERY_DIR_ENTRY_CAP {
+                        return Err(RemoteError::Smb(format!(
+                            "QUERY_DIRECTORY too large (>{QUERY_DIR_ENTRY_CAP} entries); \
+                             listing is not silently truncated"
+                        )));
+                    }
+                    out.extend(page);
+                }
             }
-            if out.len().saturating_add(page.len()) > QUERY_DIR_ENTRY_CAP {
-                return Err(RemoteError::Smb(format!(
-                    "QUERY_DIRECTORY too large (>{QUERY_DIR_ENTRY_CAP} entries); \
-                     listing is not silently truncated"
-                )));
-            }
-            out.extend(page);
         }
         Err(RemoteError::Smb(format!(
             "QUERY_DIRECTORY exceeded {QUERY_DIR_PAGE_CAP} pages; listing is not silently truncated"
         )))
-    }
-
-    /// CREATE directory + QUERY_DIRECTORY pages + CLOSE.
-    pub fn list_directory(&mut self, name: &str) -> Result<Vec<Smb2Dirent>> {
-        let open = self.create_dir(name)?;
-        let listed = self.query_directory_all(open.file_id);
-        let _ = self.close(open.file_id);
-        listed
     }
 
     /// QUERY_INFO FileBasicInformation (attributes).
@@ -1202,6 +1211,10 @@ pub(crate) mod tests {
         max_read_size: u32,
         signing_required: bool,
         pub(crate) reject_query_directory: bool,
+        /// Cap dirents per QUERY_DIRECTORY SUCCESS (forces extra round-trips).
+        pub(crate) query_dir_max_entries: Option<usize>,
+        /// Prepend `.` / `..` so the first page can filter to empty.
+        pub(crate) query_dir_include_dots: bool,
     }
 
     impl FakeOpts {
@@ -1213,6 +1226,8 @@ pub(crate) mod tests {
                 max_read_size: MAX_READ,
                 signing_required: false,
                 reject_query_directory: false,
+                query_dir_max_entries: None,
+                query_dir_include_dots: false,
             }
         }
 
@@ -1228,6 +1243,8 @@ pub(crate) mod tests {
                 max_read_size: MAX_READ,
                 signing_required: true,
                 reject_query_directory: false,
+                query_dir_max_entries: None,
+                query_dir_include_dots: false,
             }
         }
     }
@@ -1255,6 +1272,8 @@ pub(crate) mod tests {
                     max_read_size: MAX_READ,
                     signing_required: false,
                     reject_query_directory: false,
+                    query_dir_max_entries: None,
+                    query_dir_include_dots: false,
                 }),
             }
         }
@@ -1336,6 +1355,8 @@ pub(crate) mod tests {
         max_read_size: u32,
         signing_required: bool,
         reject_query_directory: bool,
+        query_dir_max_entries: Option<usize>,
+        query_dir_include_dots: bool,
     }
 
     fn normalize_name(name: &str) -> String {
@@ -1355,8 +1376,8 @@ pub(crate) mod tests {
         }
     }
 
-    fn dir_children(path: &str) -> Vec<(String, bool, u64)> {
-        match path {
+    fn dir_children(path: &str, include_dots: bool) -> Vec<(String, bool, u64)> {
+        let mut kids = match path {
             "" => vec![
                 (FILE_NAME.into(), false, OFFSET_1MIB + TAIL.len() as u64),
                 (DIR_FILE_A.into(), false, DIR_FILE_A_BODY.len() as u64),
@@ -1364,6 +1385,13 @@ pub(crate) mod tests {
             ],
             DIR_SUB => vec![("nested.bin".into(), false, 4)],
             _ => Vec::new(),
+        };
+        if include_dots {
+            let mut with_dots = vec![(".".into(), true, 0), ("..".into(), true, 0)];
+            with_dots.append(&mut kids);
+            with_dots
+        } else {
+            kids
         }
     }
 
@@ -1457,6 +1485,8 @@ pub(crate) mod tests {
             max_read_size: opts.max_read_size,
             signing_required: opts.signing_required,
             reject_query_directory: opts.reject_query_directory,
+            query_dir_max_entries: opts.query_dir_max_entries,
+            query_dir_include_dots: opts.query_dir_include_dots,
         };
         loop {
             let raw = match read_smb2_frame(&mut stream) {
@@ -1775,12 +1805,16 @@ pub(crate) mod tests {
             Some(OpenObj::File(_)) => return error_packet(req, STATUS_NOT_A_DIRECTORY, st),
             None => return error_packet(req, STATUS_OBJECT_NAME_NOT_FOUND, st),
         };
-        let kids = dir_children(&path);
+        let kids = dir_children(&path, st.query_dir_include_dots);
         if pos >= kids.len() {
             return error_packet(req, STATUS_NO_MORE_FILES, st);
         }
         let remaining = &kids[pos..];
-        let (buf, n) = encode_file_directory_information(remaining, output_len.max(64));
+        let take = st
+            .query_dir_max_entries
+            .unwrap_or(remaining.len())
+            .min(remaining.len());
+        let (buf, n) = encode_file_directory_information(&remaining[..take], output_len.max(64));
         if n == 0 {
             return error_packet(req, STATUS_NO_MORE_FILES, st);
         }
@@ -2170,12 +2204,54 @@ pub(crate) mod tests {
             "Depth-1 must not include nested children: {ents:?}"
         );
         assert!(srv.stats().query_dirs >= 1, "expected QUERY_DIRECTORY");
+        // list_directory shuts down the TCP session (250ms CLOSE).
+        let mut c = connect_guest(srv.addr);
         let nested = c.list_directory(DIR_SUB).expect("subdir");
         assert!(
             nested
                 .iter()
                 .any(|e| e.name == "nested.bin" && e.size == 4 && !e.is_dir),
             "{nested:?}"
+        );
+    }
+
+    /// One dirent per QUERY_DIRECTORY SUCCESS still yields the full Depth-1 set.
+    #[test]
+    fn smb_listing_query_directory_pages_across_round_trips() {
+        let mut opts = FakeOpts::guest();
+        opts.query_dir_max_entries = Some(1);
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = connect_guest(srv.addr);
+        let ents = c.list_directory("").expect("paged QUERY_DIRECTORY");
+        assert!(ents.iter().any(|e| e.name == DIR_FILE_A), "{ents:?}");
+        assert!(ents.iter().any(|e| e.name == FILE_NAME), "{ents:?}");
+        assert!(ents.iter().any(|e| e.name == DIR_SUB), "{ents:?}");
+        assert_eq!(ents.len(), 3, "{ents:?}");
+        assert!(
+            srv.stats().query_dirs >= 4,
+            "one-entry pages need extra QUERY_DIRECTORY round-trips: {}",
+            srv.stats().query_dirs
+        );
+    }
+
+    /// A first SUCCESS page of only `.` / `..` is not EOF; later files are kept.
+    #[test]
+    fn smb_listing_query_directory_dot_page_is_not_eof() {
+        let mut opts = FakeOpts::guest();
+        opts.query_dir_max_entries = Some(1);
+        opts.query_dir_include_dots = true;
+        let srv = FakeSmb::spawn_with(opts);
+        let mut c = connect_guest(srv.addr);
+        let ents = c.list_directory("").expect("dots then files");
+        assert!(!ents.iter().any(|e| e.name == "." || e.name == ".."));
+        assert!(ents.iter().any(|e| e.name == DIR_FILE_A), "{ents:?}");
+        assert!(ents.iter().any(|e| e.name == FILE_NAME), "{ents:?}");
+        assert!(ents.iter().any(|e| e.name == DIR_SUB), "{ents:?}");
+        assert_eq!(ents.len(), 3, "{ents:?}");
+        assert!(
+            srv.stats().query_dirs >= 6,
+            "`.` / `..` pages plus three children plus NO_MORE_FILES: {}",
+            srv.stats().query_dirs
         );
     }
 
