@@ -2806,6 +2806,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-block"
+version = "0.1.30"
+dependencies = [
+ "crc32fast",
+ "fatfs",
+ "log",
+ "ratarmount-core",
+ "ratarmount-formats-ext4",
+ "ratarmount-formats-fat",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-cab"
 version = "0.1.30"
 dependencies = [

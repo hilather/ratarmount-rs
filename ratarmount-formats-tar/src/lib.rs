@@ -1174,7 +1174,7 @@ fn base64_std_decode(input: &[u8]) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
-    #[allow(clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
     for chunk in filtered.chunks_exact(4) {
         let (a, b, c, d) = (
             dec(chunk[0])?,

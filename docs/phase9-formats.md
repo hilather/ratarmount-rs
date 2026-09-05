@@ -25,6 +25,7 @@
 | SquashFS | `ratarmount-formats-squashfs` | In-process via `backhand` (gzip/zstd/lz4/lzo/xz via workspace `xz2`/none); classic LZMA → `unsquashfs` (backhand `xz`/`liblzma` left off to avoid linking conflict) |
 | EXT2/3/4 | `ratarmount-formats-ext4` | Superblock magic `0xEF53`; `debugfs rdump` → FolderMountSource |
 | FAT12/16/32 | `ratarmount-formats-fat` | Pure Rust via `fatfs` crate (in-process cluster reads) |
+| GPT/MBR disk images | `ratarmount-formats-block` | Parse GPT + MBR; union of `p1/`… via FAT/EXT4 `open_*_with_offset`. Superfloppy offset 0 stays FAT/EXT4. **Residual:** LVM, RAID, Btrfs; factory probe is a later orchestrator PR |
 
 ## Delivered (system libarchive FFI)
 
