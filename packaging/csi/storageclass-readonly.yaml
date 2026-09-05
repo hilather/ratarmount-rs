@@ -1,0 +1,24 @@
+# Spec-only example. No in-tree kube crate; a separate CSI repo execs the
+# packaged ratarmount binary. Do not put AWS/RESTIC passwords in parameters.
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: ratarmount-ro
+provisioner: ratarmount.csi.example
+reclaimPolicy: Retain
+volumeBindingMode: Immediate
+allowVolumeExpansion: false
+parameters:
+  archive: s3://bucket/dataset.tar.zst
+  readOnly: "true"
+---
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: ratarmount.csi.example
+spec:
+  attachRequired: false
+  podInfoOnMount: false
+  fsGroupPolicy: File
+  volumeLifecycleModes:
+    - Persistent
