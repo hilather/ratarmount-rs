@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use flate2::{Decompress, FlushDecompress, Status};
+use ratarmount_core::read_exact_or_short;
 use thiserror::Error;
 
 /// Object-safe `Read + Seek + Send` for the shared image / backing file.
@@ -284,9 +285,13 @@ impl Qcow2Inner {
             let desc = entry & !QCOW_OFLAG_COPIED & !QCOW_OFLAG_COMPRESSED;
             let host_offset = desc & ((1u64 << x) - 1);
             let additional = desc >> x;
+            // QEMU: data runs from host_offset to the end of the last occupied
+            // 512-byte sector — not a full (additional+1) sectors from offset 0
+            // of that first sector (unaligned qcow2_alloc_bytes).
             let packed_size = additional
                 .saturating_add(1)
                 .saturating_mul(512)
+                .saturating_sub(host_offset & 511)
                 .min(self.header.cluster_size().saturating_mul(2));
             return Ok(Cluster::Compressed {
                 host_offset,
@@ -478,6 +483,12 @@ fn validate_open(header: &Qcow2Header, label: &Path) -> Result<()> {
             header.crypt_method
         )));
     }
+    if header.compression == Qcow2Compression::Zstd {
+        return Err(Qcow2Error::Msg(format!(
+            "{} uses zstd cluster compression (residual; v1 is zlib/deflate only)",
+            label.display()
+        )));
+    }
     let incompat = header.incompatible_features;
     if incompat & !INCOMPAT_KNOWN != 0 {
         return Err(Qcow2Error::Msg(format!(
@@ -562,17 +573,24 @@ fn open_backing(name: &str, backing_dir: Option<&Path>, depth: u32) -> Result<Ba
         )));
     }
     let mut file = File::open(&path)?;
-    if looks_like_qcow2_reader(&mut file) {
-        file.seek(SeekFrom::Start(0))?;
-        let inner = Qcow2Inner::from_reader(file, &path, path.parent(), depth + 1)?;
-        Ok(Backing::Qcow2(inner))
-    } else {
-        let size = file.seek(SeekFrom::End(0))?;
-        file.seek(SeekFrom::Start(0))?;
-        Ok(Backing::Raw {
-            file: Arc::new(Mutex::new(Box::new(file) as Box<dyn SeekRead>)),
-            size,
-        })
+    match qcow_magic_version(&mut file) {
+        Some(2 | 3) => {
+            file.seek(SeekFrom::Start(0))?;
+            let inner = Qcow2Inner::from_reader(file, &path, path.parent(), depth + 1)?;
+            Ok(Backing::Qcow2(inner))
+        }
+        Some(version) => Err(Qcow2Error::Msg(format!(
+            "qcow2 backing {} is qcow version {version} (v1 residual; need v2/v3)",
+            path.display()
+        ))),
+        None => {
+            let size = file.seek(SeekFrom::End(0))?;
+            file.seek(SeekFrom::Start(0))?;
+            Ok(Backing::Raw {
+                file: Arc::new(Mutex::new(Box::new(file) as Box<dyn SeekRead>)),
+                size,
+            })
+        }
     }
 }
 
@@ -596,15 +614,34 @@ fn u64_be(buf: &[u8], off: usize) -> Result<u64> {
     Ok(u64::from_be_bytes(b))
 }
 
+fn fill_header_prefix<R: Read>(reader: &mut R, buf: &mut Vec<u8>, want: usize) -> Result<()> {
+    if buf.len() >= want {
+        return Ok(());
+    }
+    let start = buf.len();
+    buf.resize(want, 0);
+    let n = read_exact_or_short(reader, &mut buf[start..])?;
+    if start + n < want {
+        return Err(Qcow2Error::Msg("truncated qcow2 header".into()));
+    }
+    Ok(())
+}
+
 /// Parse a QCOW2 v2/v3 header. Leaves the reader at an unspecified position.
+///
+/// Short `Read::read` is not EOF: the prefix is assembled with a fill-loop
+/// (nested stencil / HTTP / one-byte readers).
 pub fn parse_qcow2_header<R: Read + Seek>(reader: &mut R) -> Result<Qcow2Header> {
     reader.seek(SeekFrom::Start(0))?;
-    let mut buf = [0u8; 112];
-    let n = reader.read(&mut buf)?;
-    if n < MIN_HEADER || buf[0..4] != MAGIC[..] {
+    let mut buf = vec![0u8; MIN_HEADER];
+    let n = read_exact_or_short(reader, &mut buf)?;
+    if n < 4 || buf[0..4] != MAGIC[..] {
         return Err(Qcow2Error::Msg(
             "not a QCOW2 image (missing QFI\\xfb)".into(),
         ));
+    }
+    if n < MIN_HEADER {
+        return Err(Qcow2Error::Msg("truncated qcow2 header".into()));
     }
     let version = u32_be(&buf, 4)?;
     if version != 2 && version != 3 {
@@ -633,9 +670,7 @@ pub fn parse_qcow2_header<R: Read + Seek>(reader: &mut R) -> Result<Qcow2Header>
     let mut incompatible_features = 0u64;
     let mut compression = Qcow2Compression::Zlib;
     if version >= 3 {
-        if n < V3_HEADER_MIN {
-            return Err(Qcow2Error::Msg("truncated qcow2 v3 header".into()));
-        }
+        fill_header_prefix(reader, &mut buf, V3_HEADER_MIN)?;
         incompatible_features = u64_be(&buf, 72)?;
         let header_length = u32_be(&buf, 100)?;
         if header_length < V3_HEADER_MIN as u32 {
@@ -644,11 +679,12 @@ pub fn parse_qcow2_header<R: Read + Seek>(reader: &mut R) -> Result<Qcow2Header>
             )));
         }
         if incompatible_features & INCOMPAT_COMPRESSION_TYPE != 0 {
-            if n < 108 && header_length < 108 {
+            if header_length < 108 {
                 return Err(Qcow2Error::Msg(
                     "qcow2 compression_type field missing".into(),
                 ));
             }
+            fill_header_prefix(reader, &mut buf, 108)?;
             let ct = u32_be(&buf, 104)?;
             compression = match ct {
                 0 => Qcow2Compression::Zlib,
@@ -701,20 +737,24 @@ pub fn looks_like_qcow2(path: &Path) -> bool {
     looks_like_qcow2_reader(&mut f)
 }
 
-/// Stream probe (does not use filename). Leaves the reader at an unspecified position.
-pub fn looks_like_qcow2_reader<R: Read + Seek>(reader: &mut R) -> bool {
+/// `Some(version)` when the first 8 bytes are `QFI\xfb` + a version word.
+fn qcow_magic_version<R: Read + Seek>(reader: &mut R) -> Option<u32> {
     if reader.seek(SeekFrom::Start(0)).is_err() {
-        return false;
+        return None;
     }
     let mut buf = [0u8; 8];
     if reader.read_exact(&mut buf).is_err() {
-        return false;
+        return None;
     }
     if buf[0..4] != MAGIC[..] {
-        return false;
+        return None;
     }
-    let version = u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]);
-    version == 2 || version == 3
+    Some(u32::from_be_bytes([buf[4], buf[5], buf[6], buf[7]]))
+}
+
+/// Stream probe (does not use filename). Leaves the reader at an unspecified position.
+pub fn looks_like_qcow2_reader<R: Read + Seek>(reader: &mut R) -> bool {
+    matches!(qcow_magic_version(reader), Some(2 | 3))
 }
 
 #[cfg(test)]
