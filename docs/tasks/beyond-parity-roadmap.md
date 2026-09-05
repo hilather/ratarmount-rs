@@ -117,7 +117,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | `ratarmount-remote` codec + Range + `SmbListing`; factory residual |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | `ratarmount-remote` codec + Range + `SmbListing`; session `remote_open` wired |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
@@ -134,9 +134,9 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 
 Today HTTP/S3/WebDAV/SSH mostly fetched **one archive**. Python fsspec mounts whole trees. Shipped: S3 `ListObjectsV2` prefixes (continuation loop, 100k cap), HTTP nginx/apache autoindex, WebDAV Depth-1 `PROPFIND`, SSH `readdir` as `RemoteFolderMountSource`s that AutoMount nested archives. Cheap `list_dirents` carry real sizes. Listing TTL 30s (`RATARMOUNT_REMOTE_LIST_TTL_SECS`).
 
-`try_open_remote_folder` is those four backends only. GCS/Azure/rclone/IPFS/FTP folders export `open_*_folder` from their modules (wired in factory PR-12 / CLI folder arm). Dropbox stays on its own type.
+`try_open_remote_folder` is those four backends only. GCS/Azure/rclone/IPFS/FTP/SMB folders export `open_*_folder` from their modules (wired in session `remote_open`; factory PR-12 / CLI folder arm for the earlier schemes). Dropbox stays on its own type.
 
-WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.md`](../phase10-remote.md) for Depth-1 collections.
+WebDAV recursive directory mount is no longer out of scope in [`phase10-remote.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md) for Depth-1 collections.
 
 **Residual:** SPA HTML indexes; WebDAV Depth-infinity listing; user-facing S3 pagination UI; forcing Dropbox onto the trait.
 
@@ -176,10 +176,11 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 `smbclient` CLI is a packaging and Windows-host tax. A Range reader plus directory list makes SMB first-class like S3, not a temp-file download. Recursive share listings are F-1 on this backend.
 
-**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
+**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Session `open_remote_input` wires `smb://` through `open_s3_like` (Range) and `try_open_remote_folder_url` (folders). Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
 
 **Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
 **Residual:** factory `smb://` live Range + folder probe (PR 4). `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
+**Residual:** `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.
 
 ### F-7 — Write-through / commit-to-remote
 ### F-7 — Write-through / commit-to-remote — `partial`

@@ -1,6 +1,6 @@
 # Phase 10 — remote inputs
 
-Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](export.md). Status vs Python: [`parity-todo.md`](parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md).
+Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md). Status vs Python: [`parity-todo.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md).
 
 `is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`.
 
@@ -16,7 +16,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
-| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`. Codec + live Range reader (`open_smb_range` / `SmbRangeFile` via in-tree SMB 2.0.2 `Smb2Client`) exist; share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 → F-1 `RemoteFolderMountSource`) exists; session factory wire is later. Dialect `STATUS_NOT_SUPPORTED` / non-2.x (including a non-SMB2 banner) falls back to Samba `smbclient` for **files** when on `PATH`. Folder URLs: QUERY_DIRECTORY unsupported is a clear error (not an empty list; `smbclient` listing is residual). File URLs: dialect miss is `Ok(None)` so Range/smbclient can take over. Missing both names install **or** the dialect residual. Auth and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30) |
+| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`. Session `open_remote_input` live Range (`open_smb_range` / `SmbRangeFile` via in-tree SMB 2.0.2 `Smb2Client`) + share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 → F-1 `RemoteFolderMountSource`). Dialect `STATUS_NOT_SUPPORTED` / non-2.x (including a non-SMB2 banner) falls back to Samba `smbclient` for **files** when on `PATH`. Folder URLs: QUERY_DIRECTORY unsupported is a clear error (not an empty list; `smbclient` listing is residual). File URLs: dialect miss is `Ok(None)` so Range/smbclient can take over. Missing both names install **or** the dialect residual. Auth and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30) |
 | `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`). Index: local `oci:{digest}` cache first, then OCI 1.1 referrers (`artifactType=application/vnd.ratarmount.index.v1+sqlite`) on miss; fail-open if Referrers API is missing (not SOCI; no tag-convention fallback) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
@@ -25,7 +25,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
-Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
+Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder` / `open_smb_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
 
 ### Portable index discovery (G-2)
 
@@ -148,7 +148,7 @@ Path rules (fsspec-like):
 
 ### SMB inbound
 
-In-tree SMB 2.0.2 Direct-TCP codec (`Smb2Client`: NEGOTIATE / SESSION_SETUP guest+NTLMv2 / TREE_CONNECT / CREATE / READ-at-offset / QUERY_DIRECTORY / QUERY_INFO / CLOSE) plus live Range reader (`open_smb_range` / `SmbRangeFile`) and share listing (`open_smb_folder` / `SmbListing` → F-1 `RemoteFolderMountSource`). Auth: URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest. Session factory does not yet open this Range or folder path (`resolve_to_local` still materializes). Dialect `STATUS_NOT_SUPPORTED` / non-2.x (SMB1 or non-SMB2 banner) falls back to Samba `smbclient` on `PATH` for **files** (`apt install smbclient` / `dnf install samba-client`). Folder URLs: QUERY_DIRECTORY unsupported fails with an install/dialect message (not a silent empty list; `smbclient` listing is residual). File URLs: dialect miss returns `Ok(None)` so [`open_smb_range`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/smb.rs) / smbclient can take over. Missing both names the install hint **or** the dialect residual. Logon failure and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30). Outbound `--smb` is [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
+In-tree SMB 2.0.2 Direct-TCP codec (`Smb2Client`: NEGOTIATE / SESSION_SETUP guest+NTLMv2 / TREE_CONNECT / CREATE / READ-at-offset / QUERY_DIRECTORY / QUERY_INFO / CLOSE) plus live Range reader (`open_smb_range` / `SmbRangeFile`) and share listing (`open_smb_folder` / `SmbListing` → F-1 `RemoteFolderMountSource`). Auth: URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest. Session `open_remote_input` opens live Range (`open_s3_like` / `open_smb_range`) and F-1 folders (`open_smb_folder`); dialect residual still materializes via `resolve_to_local` / `smbclient`. Dialect `STATUS_NOT_SUPPORTED` / non-2.x (SMB1 or non-SMB2 banner) falls back to Samba `smbclient` on `PATH` for **files** (`apt install smbclient` / `dnf install samba-client`). Folder URLs: QUERY_DIRECTORY unsupported fails with an install/dialect message (not a silent empty list; `smbclient` listing is residual). File URLs: dialect miss returns `Ok(None)` so [`open_smb_range`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/smb.rs) / smbclient can take over. Missing both names the install hint **or** the dialect residual. Logon failure and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30). Outbound `--smb` is [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 | Env | Purpose |
 |-----|---------|
@@ -201,7 +201,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 
 ## Not yet
 
-- Pure-Rust SMB session factory wire (Range reader + `SmbListing` folders landed; `smbclient` still the file fallback / listing residual) — F-6
+- SMB 3.x encryption, Kerberos, DFS, SMB1; `smbclient` directory listing (file dialect residual still falls back to `smbclient`) — F-6
 - SPA HTML indexes; WebDAV Depth-infinity listing
 - Implicit FTPS (port 990)
 - GCS GOOG4-HMAC-SHA256 (only if live keys reject GOOG1 / V2)
@@ -228,6 +228,7 @@ ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
 ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
+ratarmount -f 'smb://user:pass@fileserver/share/' mnt/   # F-1 QUERY_DIRECTORY folder
 ratarmount -f 'rclone://gdrive:bucket/path.tar' mnt/
 ratarmount -f 'rclone+gdrive:bucket/path.tar' mnt/
 ratarmount -f docker://ubuntu:24.04 mnt/
@@ -241,6 +242,8 @@ ratarmount -f ipfs://bafyhash/path.tar mnt/
 ./test-harness/run-phase10-remote.sh
 # Crate / factory (WHATWG-invalid URLs, folders, Range mocks):
 #   cargo test -p ratarmount-remote --lib
+#   cargo test -p ratarmount-session --lib remote_smb
+#   cargo test -p ratarmount-session --lib try_open_remote_folder_url
 #   cargo test -p ratarmount --bin ratarmount docker_ubuntu
 # Optional live:
 # RATARMOUNT_TEST_S3_URL=s3://bucket/key.tar AWS_… ./test-harness/run-phase10-remote.sh
