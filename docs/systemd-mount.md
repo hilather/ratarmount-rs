@@ -11,10 +11,10 @@ Roadmap: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmou
 `mount(8)` looks up `mount.fuse.TYPE` when the filesystem type is `fuse.ratarmount`:
 
 ```text
-mount.fuse.ratarmount WHAT WHERE [-o OPTIONS]
+mount.fuse.ratarmount WHAT WHERE [-sfnv] [-N ns] [-t type] [-o OPTIONS]
 ```
 
-Defaults: `allow_other,ro`. fstab-only tokens (`_netdev`, `noauto`, `x-systemd.*`, …) are stripped before they reach libfuse. The helper **daemonizes** via the normal `ratarmount` parent/child path (no `-f`).
+Defaults: `allow_other,ro`. fstab-only tokens (`_netdev`, `noauto`, `x-systemd.*`, …) are stripped before they reach libfuse. `-t` / `-N` are ignored (type is already in the helper name). `-f` is mount(8) **fake/dry-run** (no exec), not ratarmount `--foreground`. The helper **daemonizes** via the normal `ratarmount` parent/child path.
 
 **Credentials stay in the environment.** Never put `AWS_*`, `RESTIC_*`, or passwords on `What=`, `Options=`, or the autofs map line. Use `EnvironmentFile=` (mode `0600`) or the process environment.
 
@@ -34,10 +34,10 @@ sudo install -m 755 packaging/mount.fuse.ratarmount /usr/sbin/mount.fuse.ratarmo
 ## fstab
 
 ```fstab
-s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev  0  0
+s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev,x-systemd.mount-timeout=infinity  0  0
 ```
 
-`_netdev` tells systemd to wait for the network. Local archives can omit it.
+`_netdev` tells systemd to wait for the network. Local archives can omit it. **`x-systemd.mount-timeout=infinity` is required on fstab** (generated units use `DefaultTimeoutStartSec`, typically 90s). Indexing runs in the ratarmount **parent** before fork; a 90s kill mid-index of a large remote archive is a failed mount. The helper strips `x-*` so libfuse never sees the token. Hand-written `.mount` units set `TimeoutSec=0` for the same reason.
 
 HPC home-quota: sidecar downloads still use `$XDG_CACHE_HOME/ratarmount/meta-v3/` — point `XDG_CACHE_HOME` at scratch if `$HOME` is small ([`phase10-remote.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md)).
 
@@ -55,15 +55,15 @@ Wants=network-online.target
 What=s3://bucket/dataset.tar.zst
 Where=/mnt/archives/dataset
 Type=fuse.ratarmount
-Options=ro,allow_other,_netdev
+Options=ro,allow_other,_netdev,x-systemd.mount-timeout=infinity
 TimeoutSec=0
 # EnvironmentFile=-/etc/ratarmount/s3.env
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=remote-fs.target
 ```
 
-`TimeoutSec=0` disables the mount timeout so a cold index of a large archive is not killed. `EnvironmentFile=-/etc/ratarmount/s3.env` (create with mode `0600`) is the supported way to pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_ENDPOINT_URL`.
+`TimeoutSec=0` (and fstab `x-systemd.mount-timeout=infinity`) disables the mount timeout so a cold index of a large archive is not killed. `WantedBy=remote-fs.target` matches fstab `_netdev` mounts. `EnvironmentFile=-/etc/ratarmount/s3.env` (create with mode `0600`) is the supported way to pass `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` / `AWS_ENDPOINT_URL`.
 
 ```bash
 sudo install -m 644 packaging/systemd/mnt-archives-dataset.mount \

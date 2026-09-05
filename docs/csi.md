@@ -18,6 +18,7 @@ FUSE needs a mountpoint on the **node**. `--no-mount` is export-only and cannot 
 | Unpublish | `ratarmount -u TARGET` / `fusermount3 -u` |
 | Controller | Optional. Static PV is enough for v1. Dynamic provisioning residual |
 | Attach | `attachRequired: false` (no block attach) |
+| fsGroup | `CSIDriver.spec.fsGroupPolicy: None`. v1 is ReadOnlyMany FUSE (`allow_other`); `File` would recursive-chown a RO mount and fail NodePublish. Kubernetes default `ReadWriteOnceWithFSType` would skip ROM anyway — `None` is explicit |
 | Privileges | Node plugin needs `/dev/fuse` and typically `SYS_ADMIN` (or a fuse device plugin). Not a default unprivileged pod |
 | Credentials | Kubernetes **Secret** → env of the node plugin (`nodePublishSecretRef`). **Never** StorageClass `parameters` or PV `volumeAttributes` |
 

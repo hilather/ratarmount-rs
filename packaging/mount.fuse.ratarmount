@@ -1,7 +1,8 @@
 #!/bin/sh
 # mount(8) helper for Type=fuse.ratarmount (fstab / systemd .mount / autofs).
-# Convention: mount.fuse.TYPE WHAT WHERE [-o OPTIONS]
-# util-linux may also pass [-o OPTIONS] WHAT WHERE and -n/-f/-s/-v.
+# Convention: mount.fuse.TYPE WHAT WHERE [-sfnv] [-N ns] [-t type] [-o OPTIONS]
+# util-linux may also pass flags before WHAT WHERE. -f is mount(8) fake/dry-run
+# (do not exec). -t/-N are documented EXTERNAL HELPERS flags; ignore them.
 #
 # Never put AWS_* / RESTIC_* / passwords on argv — inherit the environment
 # (EnvironmentFile=, autofs env, the process environment). v1 is read-only.
@@ -9,13 +10,14 @@
 set -e
 
 usage() {
-    echo "usage: mount.fuse.ratarmount WHAT WHERE [-o OPTIONS]" >&2
+    echo "usage: mount.fuse.ratarmount WHAT WHERE [-sfnv] [-N ns] [-t type] [-o OPTIONS]" >&2
     exit 2
 }
 
 what=""
 where=""
 opts=""
+fake=0
 
 while [ "$#" -gt 0 ]; do
     case "$1" in
@@ -38,8 +40,35 @@ while [ "$#" -gt 0 ]; do
             fi
             shift
             ;;
-        -n | -f | -s | -v | -h | --help)
-            # mount(8) flags; ratarmount daemonizes on its own.
+        -t)
+            # mount(8) EXTERNAL HELPERS; type is already in the helper name.
+            shift
+            [ "$#" -ge 1 ] || usage
+            shift
+            ;;
+        -t*)
+            shift
+            ;;
+        -N)
+            shift
+            [ "$#" -ge 1 ] || usage
+            shift
+            ;;
+        -N*)
+            shift
+            ;;
+        -h | --help)
+            usage
+            ;;
+        -[sfnv]*)
+            rest=${1#-}
+            case "$rest" in
+                *[!sfnv]*)
+                    echo "mount.fuse.ratarmount: unknown option: $1" >&2
+                    exit 2
+                    ;;
+                *f*) fake=1 ;;
+            esac
             shift
             ;;
         --)
@@ -89,6 +118,9 @@ while [ -n "$raw" ]; do
     else
         raw=${raw#*,}
     fi
+    # fstab may write "ro, allow_other, _netdev"; trim or _netdev is not stripped.
+    tok=${tok#"${tok%%[![:space:]]*}"}
+    tok=${tok%"${tok##*[![:space:]]}"}
     case "$tok" in
         "" | _netdev | auto | noauto | user | nouser | users | owner | group | nofail | defaults)
             continue
@@ -116,4 +148,7 @@ fi
 
 # Default RO + allow_other for fstab; caller FUSE options appended.
 # Secrets stay in the environment — do not interpolate them here.
+if [ "$fake" -eq 1 ]; then
+    exit 0
+fi
 exec "$bin" -o "allow_other,ro${filtered:+,$filtered}" -- "$what" "$where"

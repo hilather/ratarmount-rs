@@ -168,7 +168,7 @@ ratarmount --nfs archive.tar.gz
 # offline --commit-overlay splices .tar.zst from the affected frame.
 
 # HPC / systemd / autofs (RO). Helper argv has no secrets — inherit AWS_* / RESTIC_*.
-# s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev  0  0
+# s3://bucket/dataset.tar.zst  /mnt/archives/dataset  fuse.ratarmount  ro,allow_other,_netdev,x-systemd.mount-timeout=infinity  0  0
 # Type=fuse.ratarmount → /usr/sbin/mount.fuse.ratarmount
 # CSI is spec-only (separate repo). See docs/systemd-mount.md · docs/csi.md
 

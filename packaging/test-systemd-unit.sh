@@ -97,6 +97,44 @@ check_argv_no_secrets "$TMP/argv2" "-o WHAT WHERE"
 tr '\0' '\n' <"$TMP/argv2" | grep -qx 's3://bucket/dataset.tar.zst' \
     || fail_msg "option-first form lost WHAT"
 
+run_helper "$TMP/argv_t" 's3://b/a.tar' /mnt/x -o ro -t fuse.ratarmount
+check_argv_no_secrets "$TMP/argv_t" "-t TYPE"
+argv_t=$(tr '\0' '\n' <"$TMP/argv_t")
+printf '%s\n' "$argv_t" | grep -qx 's3://b/a.tar' || fail_msg "-t form lost WHAT"
+if printf '%s\n' "$argv_t" | grep -qx -- '-t'; then
+    fail_msg "helper passed -t through to ratarmount"
+else
+    pass "helper ignores -t TYPE"
+fi
+if printf '%s\n' "$argv_t" | grep -qx 'fuse.ratarmount'; then
+    fail_msg "-t type leaked into ratarmount argv"
+fi
+
+run_helper "$TMP/argv_n" 's3://b/a.tar' /mnt/x -o ro -N /proc/self/ns/mnt
+check_argv_no_secrets "$TMP/argv_n" "-N NS"
+argv_n=$(tr '\0' '\n' <"$TMP/argv_n")
+printf '%s\n' "$argv_n" | grep -qx '/mnt/x' || fail_msg "-N form lost WHERE"
+if printf '%s\n' "$argv_n" | grep -F '/proc/self/ns/mnt' >/dev/null; then
+    fail_msg "helper passed -N namespace through to ratarmount"
+else
+    pass "helper ignores -N NS"
+fi
+
+run_helper "$TMP/argv_ws" 's3://b/a.tar' /mnt/x -o 'ro, allow_other, _netdev'
+if tr '\0' '\n' <"$TMP/argv_ws" | grep -F '_netdev' >/dev/null; then
+    fail_msg "helper did not trim/strip spaced _netdev: $(tr '\0' ' ' <"$TMP/argv_ws")"
+else
+    pass "helper trims whitespace before stripping fstab tokens"
+fi
+
+rm -f "$TMP/argv_fake"
+run_helper "$TMP/argv_fake" 's3://b/a.tar' /mnt/x -o ro -f
+if [[ -e "$TMP/argv_fake" ]]; then
+    fail_msg "mount(8) -f dry-run still exec'd ratarmount: $(tr '\0' ' ' <"$TMP/argv_fake")"
+else
+    pass "helper -f is mount(8) fake (no exec)"
+fi
+
 # --- unit file ---
 grep -qx 'Type=fuse.ratarmount' "$UNIT" && pass "unit Type=fuse.ratarmount" \
     || fail_msg "unit Type= must be fuse.ratarmount"
@@ -112,6 +150,24 @@ else
 fi
 grep -E '^TimeoutSec=0$' "$UNIT" >/dev/null && pass "unit TimeoutSec=0" \
     || fail_msg "unit should set TimeoutSec=0 (cold index can be long)"
+if grep -F 'x-systemd.mount-timeout=infinity' "$UNIT" >/dev/null; then
+    pass "unit Options includes x-systemd.mount-timeout=infinity"
+else
+    fail_msg "unit Options= should include x-systemd.mount-timeout=infinity (fstab copy-paste)"
+fi
+if grep -E '^WantedBy=remote-fs.target$' "$UNIT" >/dev/null; then
+    pass "unit WantedBy=remote-fs.target"
+else
+    fail_msg "unit WantedBy= should be remote-fs.target (fstab _netdev)"
+fi
+# fstab examples must carry the timeout: generated units use DefaultTimeoutStartSec (~90s).
+for fstab_doc in "$ROOT/docs/systemd-mount.md" "$ROOT/README.md"; do
+    if grep -F 'x-systemd.mount-timeout=infinity' "$fstab_doc" >/dev/null; then
+        pass "fstab timeout in $(basename "$fstab_doc")"
+    else
+        fail_msg "$(basename "$fstab_doc") fstab example missing x-systemd.mount-timeout=infinity"
+    fi
+done
 grep -E '^Where=/mnt/archives/dataset$' "$UNIT" >/dev/null \
     || fail_msg "example Where= must be /mnt/archives/dataset"
 base=$(basename "$UNIT")
@@ -167,6 +223,21 @@ if grep -ERi 'AKIA[0-9A-Z]{16}|BEGIN RSA PRIVATE KEY' "$CSI_DIR" >/dev/null 2>&1
     fail_msg "CSI YAML looks like it contains real credentials"
 else
     pass "CSI YAML has no real-looking credentials"
+fi
+if grep -E '^[[:space:]]*fsGroupPolicy:[[:space:]]*None[[:space:]]*$' "$CSI_DIR"/*.yaml >/dev/null; then
+    pass "CSIDriver fsGroupPolicy: None (RO FUSE)"
+else
+    fail_msg "CSI YAML must set fsGroupPolicy: None (File chowns a RO mount)"
+fi
+if grep -F 'fsGroupPolicy: File' "$CSI_DIR"/*.yaml >/dev/null; then
+    fail_msg "CSI YAML must not use fsGroupPolicy: File"
+fi
+
+WF="$ROOT/.github/workflows/ci.yml"
+if [[ -f "$WF" ]] && grep -F './packaging/test-systemd-unit.sh' "$WF" >/dev/null; then
+    pass "ci.yml runs packaging/test-systemd-unit.sh"
+else
+    fail_msg "ci.yml must invoke ./packaging/test-systemd-unit.sh"
 fi
 
 [[ "$fail" -eq 0 ]] || exit 1

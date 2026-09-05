@@ -39,6 +39,11 @@ jobs:
       - name: cargo test
         run: cargo test --workspace
 
+      - name: packaging systemd/autofs helper
+        run: |
+          chmod +x packaging/test-systemd-unit.sh
+          ./packaging/test-systemd-unit.sh
+
   # Optional feature: NFSv4.1 (embednfs, rustc ≥ 1.88). Default check job
   # stays on workspace MSRV 1.74 and does not compile embednfs. After the
   # RO adapter landed, this job is required so packaging --features nfsv4
