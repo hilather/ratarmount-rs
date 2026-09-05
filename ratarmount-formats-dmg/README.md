@@ -22,11 +22,12 @@ Nested UDIF members open from any `Read + Seek` stream:
 
 | Topic | Behaviour |
 |-------|-----------|
-| **HFS+** | Inner volume is not mounted. Open fails with a residual message. No `apple-hfs` / existing-path claim. |
-| **APFS** | Same residual. |
-| **Encrypted DMG** (`encrdsa` / non-plist XML) | Open fails closed. No passphrase path. |
-| **LZFSE / LZMA** chunk types | Read of those runs fails (`Unsupported`). |
+| **HFS+** | Detected (`H+`/`HX`/`BD` at partition+1024). Open fails; a GPT with only an EFI FAT (`p1/`) does **not** count as success. No `apple-hfs` / existing-path claim. |
+| **APFS** | Detected (`NXSB` at partition+32). Same fail-closed residual. |
+| **Encrypted DMG** (`encrcdsa` header / `cdsaencr` trailer / non-plist XML) | Open fails closed. No passphrase path. |
+| **LZFSE / LZMA** chunk types | Open fails closed (not deferred to first `read`). |
 | **Resource-fork-only** (no XML plist) | Residual. Modern `hdiutil` XML is required. |
+| **Partitioned exFAT/NTFS** | Probed at GPT/MBR data-partition offsets (mounted at `/` when they are the data FS). Block `pN/` is FAT/EXT4 only. |
 | **UDF** inner volumes | Wait on `ratarmount-formats-udf`. |
 | Factory / AutoMount | Orchestrator must call `open_from_reader` (not this crate). |
 
@@ -37,4 +38,4 @@ cargo test -p ratarmount-formats-dmg --lib
 cargo clippy -p ratarmount-formats-dmg --all-targets -- -D warnings
 ```
 
-Always-on tests use a synthetic `koly` trailer (parse + raw/ADC/zlib/bzip2 chunks + inner FAT). If `hdiutil` is on `PATH`, an extra convert test may run; otherwise that test prints `skip: hdiutil not available` and returns.
+Always-on tests use a synthetic `koly` trailer (parse + raw/ADC/zlib/bzip2 chunks + inner FAT/ISO). `hdiutil_convert_fat_udzo` runs `hdiutil convert -format UDZO` when `hdiutil` is on `PATH`; otherwise it prints `skip: hdiutil not available` and returns.
