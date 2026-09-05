@@ -3300,6 +3300,8 @@ dependencies = [
  "hmac 0.12.1",
  "jsonwebtoken",
  "log",
+ "md-5",
+ "md4",
  "ratarmount-core",
  "serde_json",
  "sha1 0.10.7",

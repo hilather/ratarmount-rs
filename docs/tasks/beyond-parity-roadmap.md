@@ -117,7 +117,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `partial` | L | fuse + packaging |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
+| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `partial` | M | `ratarmount-remote` `smb2_client.rs` codec; Range + listing residual |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR + FAT offset + exFAT/NTFS + UDIF DMG crates; remaining image crates + factory |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `partial` | L | GPT/MBR crate + FAT offset + exFAT/NTFS + WIM crates; remaining image crates + factory |
@@ -166,9 +166,13 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 **Residual:** WinFsp product FUSE; Intel tarball (no GHA Intel runner — do not re-add `macos-13`); Homebrew-core merge. `done` only if WinFsp + Intel also ship.
 
-### F-6 — Pure-Rust SMB client
+### F-6 — Pure-Rust SMB client — `partial`
 
 `smbclient` CLI is a packaging and Windows-host tax. A Range reader plus directory list makes SMB first-class like S3, not a temp-file download. Recursive share listings are F-1 on this backend.
+
+**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, CLOSE. Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. `fetch_smb_to_temp` / `smbclient` is still the production fetch path.
+
+**Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
 
 ### F-7 — Write-through / commit-to-remote
 

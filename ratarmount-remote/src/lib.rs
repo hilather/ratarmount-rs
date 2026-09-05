@@ -30,6 +30,7 @@ mod dropbox;
 mod index_sibling;
 mod s3;
 mod smb;
+mod smb2_client;
 mod ssh;
 mod webdav;
 
@@ -106,6 +107,7 @@ pub use s3::{
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
 };
+pub use smb2_client::{Smb2Client, Smb2Open};
 pub use ssh::{
     expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
     parse_proxy_jump_list, parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url,
