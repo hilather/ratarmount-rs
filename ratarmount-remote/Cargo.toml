@@ -16,6 +16,10 @@ ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
+# NTLMv2 (MD4 / HMAC-MD5) for the in-tree SMB 2.0.2 client. crates.io `smb`
+# 0.11.x is rust-version 1.85–1.89; workspace MSRV is 1.74 so F-6 stays in-tree.
+md-5 = "0.10"
+md4 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Dropbox list_folder / metadata JSON (also used by other crates in the workspace).
