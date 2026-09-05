@@ -2,7 +2,7 @@
 
 Status: **boolean flags shipped** (`--http` / `--webdav` / `--smb` / `--ninep` / `--sftp` / `--sftp-subsystem`) on the same `MountSource` tree as FUSE and NFS. Bind default **127.0.0.1** + unprivileged high ports. Auth is localhost unless an env password/user is set (same boundary as NFS AUTH_SYS-not-verified when unset). Overlay writes need `-w` where the protocol includes them; **HTTP GET/HEAD is read-only**.
 
-NFS stays in [`nfs-export.md`](nfs-export.md). This page is the sibling adapters (`ratarmount-http`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`) plus shared bind/stop helpers in `ratarmount-export-core`. Roadmap: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) P-5 / P-6 / P-2 / P-7 / P-10 / G-1.
+NFS stays in [`nfs-export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md). This page is the sibling adapters (`ratarmount-http`, `ratarmount-smb`, `ratarmount-9p`, `ratarmount-sftp`) plus shared bind/stop helpers in `ratarmount-export-core`. Roadmap: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) P-5 / P-6 / P-2 / P-7 / P-10 / G-1.
 
 There is **no** `ratarmount serve` subcommand. Combine flags on the existing CLI:
 
@@ -70,9 +70,9 @@ curl -X PROPFIND -H 'Depth: 1' http://127.0.0.1:20492/
 | Basic | `RATARMOUNT_WEBDAV_USER` / `RATARMOUNT_WEBDAV_PASSWORD` when user is set; else none (localhost). Missing/wrong → 401 |
 | Residual | Same-port HTTP+WebDAV mux; Finder/Explorer not in CI |
 
-## SMB 2.0.2 / 3.1.1 (`--smb`) — P-2 `partial`
+## SMB 2.0.2 / 3.1.1 (`--smb`) — P-2 `done`
 
-Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar (2.0.2 when the client offers it). Password env requires signing; a 3.1.1-only client also negotiates preauth and optional encryption.
+Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar (2.0.2 when the client offers it). Password env requires signing; a 3.1.1-only client also negotiates preauth and optional encryption. CREATE contexts grant R / RH / WH leases and durable-handle-v1; a conflicting open or write sends `LEASE_BREAK` (ACK path included).
 
 ```bash
 ratarmount --smb archive.tar.gz
@@ -82,12 +82,13 @@ smbclient //127.0.0.1/ratarmount -p 20445 -N -c 'get member -'
 
 | Item | Behavior |
 |------|----------|
-| Ops | NEGOTIATE, SESSION_SETUP (guest or `RATARMOUNT_SMB_USER`/`RATARMOUNT_SMB_PASSWORD`), TREE_CONNECT, CREATE, READ, QUERY_DIRECTORY, CLOSE, QUERY_INFO |
+| Ops | NEGOTIATE, SESSION_SETUP (guest or `RATARMOUNT_SMB_USER`/`RATARMOUNT_SMB_PASSWORD`), TREE_CONNECT, CREATE (lease + durable-handle-v1 contexts), READ, WRITE, QUERY_DIRECTORY, CLOSE, QUERY_INFO, LEASE_BREAK / ACK |
 | Writes | CREATE-mkdir / WRITE / SET_INFO / DELETE only with `-w` |
 | Guest | Password unset: unsigned; `smbclient -N` is the bar. Username match only if `RATARMOUNT_SMB_USER` is set. Guest keeps 2.0.2 when offered; 3.1.1-only still unsigned (no encryption) |
 | Password / signing | `RATARMOUNT_SMB_PASSWORD` set: NTLMv2 NT proof required; `SIGNING_REQUIRED`; HMAC-SHA256 (2.0.2) or AES-CMAC (3.1.1) after SESSION_SETUP. Guest `-N` is off |
 | Encryption / SMB 3.1.1 | 3.1.1 preauth SHA-512 when that dialect is selected. AES-128-GCM (prefer) / CCM transform when the client offers an encryption context **and** a password is set. Guest encryption is residual |
-| Finder / Explorer | **Residual** (leases, create contexts; not a CI bar). P-2 stays `partial` until Finder |
+| Leases / create contexts | `SMB2_CREATE_REQUEST_LEASE` (v1 + v2 if parsed) grants R / RH / WH; `LEASE_BREAK` / `LEASE_BREAK_ACK` on conflicting open or write. Durable-handle-v1 (`DHnQ` / reconnect `DHnC`) keeps a fid across a brief TCP drop. Packet tests; Finder/Explorer are not a CI bar |
+| Residual | Kerberos; guest encryption; WAN; durable v2 / persistent handles. Localhost-first like NFS. See [beyond-parity-roadmap.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) |
 
 ## 9P2000.L TCP (`--ninep`) — P-7 `done`
 

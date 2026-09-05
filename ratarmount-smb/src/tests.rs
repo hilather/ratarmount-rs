@@ -473,9 +473,29 @@ impl SmbClient {
         disp: u32,
         options: u32,
     ) -> Result<[u8; 16], u32> {
+        let (rh, b) = self.create_resp(name, access, disp, options, 0, &[]);
+        if rh.status != smb2::STATUS_SUCCESS {
+            return Err(rh.status);
+        }
+        let mut fid = [0u8; 16];
+        fid.copy_from_slice(&b[64..80]);
+        Ok(fid)
+    }
+
+    #[allow(clippy::unused_self)]
+    fn create_body(
+        &self,
+        name: &str,
+        access: u32,
+        disp: u32,
+        options: u32,
+        oplock: u8,
+        contexts: &[Vec<u8>],
+    ) -> Vec<u8> {
         let raw = smb2::encode_utf16le(name);
         let mut body = vec![0u8; 56];
         body[0..2].copy_from_slice(&57u16.to_le_bytes());
+        body[3] = oplock;
         body[4..8].copy_from_slice(&2u32.to_le_bytes()); // impersonation
         body[24..28].copy_from_slice(&access.to_le_bytes());
         body[28..32].copy_from_slice(&smb2::FILE_ATTRIBUTE_NORMAL.to_le_bytes());
@@ -486,14 +506,54 @@ impl SmbClient {
         body[44..46].copy_from_slice(&off.to_le_bytes());
         body[46..48].copy_from_slice(&(raw.len() as u16).to_le_bytes());
         body.extend_from_slice(&raw);
-        let h = self.hdr(smb2::SMB2_CREATE);
-        let (rh, b) = self.roundtrip(&smb2::encode_packet(&h, &body));
-        if rh.status != smb2::STATUS_SUCCESS {
-            return Err(rh.status);
+        if !contexts.is_empty() {
+            let pad = (8 - (body.len() % 8)) % 8;
+            body.resize(body.len() + pad, 0);
+            let blob = smb2::stitch_create_contexts(contexts);
+            let ctx_off = (smb2::SMB2_HEADER_LEN + body.len()) as u32;
+            body[48..52].copy_from_slice(&ctx_off.to_le_bytes());
+            body[52..56].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+            body.extend_from_slice(&blob);
         }
-        let mut fid = [0u8; 16];
-        fid.copy_from_slice(&b[64..80]);
-        Ok(fid)
+        body
+    }
+
+    fn create_resp(
+        &mut self,
+        name: &str,
+        access: u32,
+        disp: u32,
+        options: u32,
+        oplock: u8,
+        contexts: &[Vec<u8>],
+    ) -> (Smb2Header, Vec<u8>) {
+        let body = self.create_body(name, access, disp, options, oplock, contexts);
+        let h = self.hdr(smb2::SMB2_CREATE);
+        self.roundtrip(&smb2::encode_packet(&h, &body))
+    }
+
+    fn recv_raw(&mut self) -> Vec<u8> {
+        let mut nb = [0u8; 4];
+        self.stream.read_exact(&mut nb).expect("nbss hdr");
+        let n = smb2::decode_nbss_len(nb).expect("nbss len");
+        let mut buf = vec![0u8; n];
+        self.stream.read_exact(&mut buf).expect("smb body");
+        if smb2::is_smb2_transform(&buf) {
+            self.decrypt_in(&buf)
+        } else {
+            buf
+        }
+    }
+
+    fn send_raw(&mut self, pkt: &[u8]) {
+        let wire = if self.encrypt_data {
+            self.encrypt_out(pkt)
+        } else {
+            pkt.to_vec()
+        };
+        self.stream
+            .write_all(&smb2::encode_nbss(&wire))
+            .expect("smb write");
     }
 
     fn close(&mut self, fid: [u8; 16]) {
@@ -624,6 +684,28 @@ fn parse_smb_bind_empty_is_20445() {
 }
 
 #[test]
+fn negotiate_210_advertises_leasing() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::from_stream(SmbClient::connect_stream(srv.addr));
+    c.stream.set_read_timeout(Some(Duration::from_secs(5))).ok();
+    let mut body = vec![0u8; 36];
+    body[0..2].copy_from_slice(&36u16.to_le_bytes());
+    body[2..4].copy_from_slice(&1u16.to_le_bytes());
+    body[4..6].copy_from_slice(&1u16.to_le_bytes());
+    body.extend_from_slice(&smb2::DIALECT_210.to_le_bytes());
+    let h = c.hdr(smb2::SMB2_NEGOTIATE);
+    let (rh, nbody) = c.roundtrip(&smb2::encode_packet(&h, &body));
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+    let dialect = u16::from_le_bytes(nbody[4..6].try_into().unwrap());
+    assert_eq!(dialect, smb2::DIALECT_210);
+    let caps = u32::from_le_bytes(nbody[24..28].try_into().unwrap());
+    assert_eq!(
+        caps & smb2::SMB2_GLOBAL_CAP_LEASING,
+        smb2::SMB2_GLOBAL_CAP_LEASING
+    );
+}
+
+#[test]
 fn negotiate_session_tree_ls_get() {
     let srv = Serving::start_fixture();
     let mut c = SmbClient::connect(srv.addr);
@@ -740,6 +822,250 @@ fn overlay_create_write_read() {
     let names = c.query_dir_names(root).expect("ls overlay");
     c.close(root);
     assert!(names.iter().any(|n| n == "new.txt"), "{names:?}");
+}
+
+fn lease_request_ctx(key: [u8; 16], state: u32) -> Vec<u8> {
+    let mut data = vec![0u8; 32];
+    data[..16].copy_from_slice(&key);
+    data[16..20].copy_from_slice(&state.to_le_bytes());
+    smb2::encode_create_context(smb2::CREATE_CTX_LEASE, &data)
+}
+
+fn create_packet_granted_lease(pkt: &[u8]) -> (u8, [u8; 16], Option<u32>) {
+    let body = &pkt[smb2::SMB2_HEADER_LEN..];
+    let oplock = body[2];
+    let mut fid = [0u8; 16];
+    fid.copy_from_slice(&body[64..80]);
+    let ctx_off = u32::from_le_bytes(body[80..84].try_into().unwrap()) as usize;
+    let ctx_len = u32::from_le_bytes(body[84..88].try_into().unwrap()) as usize;
+    let mut granted = None;
+    if ctx_len > 0 {
+        let ctxs = smb2::parse_create_contexts(pkt, ctx_off, ctx_len).expect("contexts");
+        for (name, data) in ctxs {
+            if name == smb2::CREATE_CTX_LEASE && data.len() >= 20 {
+                granted = Some(u32::from_le_bytes(data[16..20].try_into().unwrap()));
+            }
+        }
+    }
+    (oplock, fid, granted)
+}
+
+/// Packet test: CREATE with REQUEST_LEASE grants R or RH on a read-mostly export.
+#[test]
+fn create_with_lease_context_grants_r_or_rh() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::connect(srv.addr);
+    let key = [0x11u8; 16];
+    let ctx = lease_request_ctx(key, smb2::SMB2_LEASE_RWH);
+    let body = c.create_body(
+        "hello.txt",
+        0x0012_0089,
+        smb2::FILE_OPEN,
+        smb2::FILE_NON_DIRECTORY_FILE,
+        smb2::SMB2_OPLOCK_LEVEL_LEASE,
+        &[ctx],
+    );
+    let h = c.hdr(smb2::SMB2_CREATE);
+    let pkt = smb2::encode_packet(&h, &body);
+    let resp = c.roundtrip_raw(&pkt);
+    let rh = smb2::parse_smb2_header(&resp).unwrap();
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS, "CREATE {:08x}", rh.status);
+    let (oplock, _fid, granted) = create_packet_granted_lease(&resp);
+    assert_eq!(oplock, smb2::SMB2_OPLOCK_LEVEL_LEASE);
+    let g = granted.expect("RESPONSE_LEASE");
+    assert!(
+        g == smb2::SMB2_LEASE_R || g == smb2::SMB2_LEASE_RH,
+        "granted {g:#x} must be R or RH on a read-mostly export"
+    );
+    assert_eq!(g & smb2::SMB2_LEASE_WRITE_CACHING, 0);
+}
+
+/// Packet test: a second open of the same file sends LEASE_BREAK (handle caching).
+#[test]
+fn conflicting_open_sends_lease_break() {
+    let srv = Serving::start_fixture();
+    let mut c = SmbClient::connect(srv.addr);
+    let key_a = [0xAAu8; 16];
+    let ctx_a = lease_request_ctx(key_a, smb2::SMB2_LEASE_RH);
+    let (rh, b) = c.create_resp(
+        "hello.txt",
+        0x0012_0089,
+        smb2::FILE_OPEN,
+        smb2::FILE_NON_DIRECTORY_FILE,
+        smb2::SMB2_OPLOCK_LEVEL_LEASE,
+        &[ctx_a],
+    );
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+    let (oplock, _fid, granted) = create_packet_granted_lease(&smb2::encode_packet(&rh, &b));
+    assert_eq!(oplock, smb2::SMB2_OPLOCK_LEVEL_LEASE);
+    assert_eq!(granted, Some(smb2::SMB2_LEASE_RH));
+
+    let key_b = [0xBBu8; 16];
+    let ctx_b = lease_request_ctx(key_b, smb2::SMB2_LEASE_RH);
+    let body = c.create_body(
+        "hello.txt",
+        0x0012_0089,
+        smb2::FILE_OPEN,
+        smb2::FILE_NON_DIRECTORY_FILE,
+        smb2::SMB2_OPLOCK_LEVEL_LEASE,
+        &[ctx_b],
+    );
+    let h = c.hdr(smb2::SMB2_CREATE);
+    c.send_raw(&smb2::encode_packet(&h, &body));
+    let first = c.recv_raw();
+    let bh = smb2::parse_smb2_header(&first).unwrap();
+    assert_eq!(
+        bh.command,
+        smb2::SMB2_OPLOCK_BREAK,
+        "conflicting open must send LEASE_BREAK first, got cmd {:#x} status {:08x}",
+        bh.command,
+        bh.status
+    );
+    assert_eq!(bh.message_id, smb2::LEASE_BREAK_MESSAGE_ID);
+    let br = &first[smb2::SMB2_HEADER_LEN..];
+    assert_eq!(u16::from_le_bytes(br[0..2].try_into().unwrap()), 44);
+    assert_eq!(&br[8..24], &key_a);
+    let current = u32::from_le_bytes(br[24..28].try_into().unwrap());
+    let new_state = u32::from_le_bytes(br[28..32].try_into().unwrap());
+    assert_eq!(current, smb2::SMB2_LEASE_RH);
+    assert_eq!(new_state, smb2::SMB2_LEASE_R);
+    let flags = u32::from_le_bytes(br[4..8].try_into().unwrap());
+    assert_eq!(flags, smb2::SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED);
+
+    let second = c.recv_raw();
+    let ch = smb2::parse_smb2_header(&second).unwrap();
+    assert_eq!(ch.command, smb2::SMB2_CREATE);
+    assert_eq!(ch.status, smb2::STATUS_SUCCESS);
+
+    let mut ack = vec![0u8; 36];
+    ack[0..2].copy_from_slice(&36u16.to_le_bytes());
+    ack[8..24].copy_from_slice(&key_a);
+    ack[24..28].copy_from_slice(&new_state.to_le_bytes());
+    let ah = c.hdr(smb2::SMB2_OPLOCK_BREAK);
+    let (arh, _) = c.roundtrip(&smb2::encode_packet(&ah, &ack));
+    assert_eq!(arh.status, smb2::STATUS_SUCCESS, "LEASE_BREAK_ACK");
+}
+
+/// Overlay WRITE of a leased file sends LEASE_BREAK (R/W invalidation).
+#[test]
+fn overlay_write_sends_lease_break() {
+    let td = tempfile::tempdir().unwrap();
+    let ov = Arc::new(
+        WriteOverlay::new(Arc::new(MemFs::empty()) as Arc<dyn MountSource>, td.path())
+            .expect("overlay"),
+    );
+    let src: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
+    let srv = Serving::start(src, Some(Arc::clone(&ov)));
+    let mut c = SmbClient::connect(srv.addr);
+    let fid = c
+        .create(
+            "new.txt",
+            0x0012_01BF,
+            smb2::FILE_CREATE,
+            smb2::FILE_NON_DIRECTORY_FILE,
+        )
+        .expect("create");
+    c.close(fid);
+
+    let key = [0xCCu8; 16];
+    let ctx = lease_request_ctx(key, smb2::SMB2_LEASE_RH);
+    let (rh, b) = c.create_resp(
+        "new.txt",
+        0x0012_0089,
+        smb2::FILE_OPEN,
+        smb2::FILE_NON_DIRECTORY_FILE,
+        smb2::SMB2_OPLOCK_LEVEL_LEASE,
+        &[ctx],
+    );
+    assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+    let mut fid = [0u8; 16];
+    fid.copy_from_slice(&b[64..80]);
+
+    let mut wbody = vec![0u8; 48];
+    wbody[0..2].copy_from_slice(&49u16.to_le_bytes());
+    let off = (smb2::SMB2_HEADER_LEN + 48) as u16;
+    wbody[2..4].copy_from_slice(&off.to_le_bytes());
+    wbody[4..8].copy_from_slice(&5u32.to_le_bytes());
+    wbody[16..32].copy_from_slice(&fid);
+    wbody.extend_from_slice(b"hello");
+    let h = c.hdr(smb2::SMB2_WRITE);
+    c.send_raw(&smb2::encode_packet(&h, &wbody));
+    let first = c.recv_raw();
+    let bh = smb2::parse_smb2_header(&first).unwrap();
+    assert_eq!(
+        bh.command,
+        smb2::SMB2_OPLOCK_BREAK,
+        "WRITE must send LEASE_BREAK, got cmd {:#x}",
+        bh.command
+    );
+    let br = &first[smb2::SMB2_HEADER_LEN..];
+    assert_eq!(&br[8..24], &key);
+    let new_state = u32::from_le_bytes(br[28..32].try_into().unwrap());
+    assert_eq!(new_state, smb2::SMB2_LEASE_NONE);
+    let second = c.recv_raw();
+    let wh = smb2::parse_smb2_header(&second).unwrap();
+    assert_eq!(wh.command, smb2::SMB2_WRITE);
+    assert_eq!(wh.status, smb2::STATUS_SUCCESS);
+}
+
+/// Durable-handle-v1: CREATE DHnQ then TCP drop; reconnect DHnC still READs.
+#[test]
+fn durable_reconnect_after_tcp_drop() {
+    let srv = Serving::start_fixture();
+    let key_fid;
+    {
+        let mut c = SmbClient::connect(srv.addr);
+        let ctx = smb2::encode_create_context(smb2::CREATE_CTX_DURABLE_REQUEST, &[0u8; 16]);
+        let (rh, b) = c.create_resp(
+            "hello.txt",
+            0x0012_0089,
+            smb2::FILE_OPEN,
+            smb2::FILE_NON_DIRECTORY_FILE,
+            0,
+            &[ctx],
+        );
+        assert_eq!(rh.status, smb2::STATUS_SUCCESS);
+        let mut fid = [0u8; 16];
+        fid.copy_from_slice(&b[64..80]);
+        let ctx_off = u32::from_le_bytes(b[80..84].try_into().unwrap()) as usize;
+        let ctx_len = u32::from_le_bytes(b[84..88].try_into().unwrap()) as usize;
+        let mut pkt = vec![0u8; smb2::SMB2_HEADER_LEN];
+        pkt.extend_from_slice(&b);
+        let ctxs = smb2::parse_create_contexts(&pkt, ctx_off, ctx_len).unwrap();
+        assert!(
+            ctxs.iter()
+                .any(|(n, _)| n == smb2::CREATE_CTX_DURABLE_RECONNECT),
+            "CREATE must return durable handle response"
+        );
+        key_fid = fid;
+        // Drop TCP without CLOSE so the durable fid stays in the shared table.
+    }
+    let mut c = SmbClient::connect(srv.addr);
+    let ctx = smb2::encode_create_context(smb2::CREATE_CTX_DURABLE_RECONNECT, &key_fid);
+    let mut last = None;
+    let fid = (0..20).find_map(|_| {
+        let (rh, b) = c.create_resp(
+            "",
+            0x0012_0089,
+            smb2::FILE_OPEN,
+            smb2::FILE_NON_DIRECTORY_FILE,
+            0,
+            std::slice::from_ref(&ctx),
+        );
+        if rh.status == smb2::STATUS_SUCCESS {
+            let mut fid = [0u8; 16];
+            fid.copy_from_slice(&b[64..80]);
+            Some(fid)
+        } else {
+            last = Some(rh.status);
+            std::thread::sleep(Duration::from_millis(25));
+            None
+        }
+    });
+    let fid = fid.unwrap_or_else(|| panic!("durable reconnect {:08x?}", last));
+    assert_eq!(fid, key_fid);
+    let body = c.read(fid, 0, 64).expect("read after durable reconnect");
+    assert_eq!(body, b"hello smb\n");
 }
 
 #[test]

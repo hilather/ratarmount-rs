@@ -31,6 +31,8 @@ pub const SMB2_QUERY_DIRECTORY: u16 = 0x000E;
 pub const SMB2_CHANGE_NOTIFY: u16 = 0x000F;
 pub const SMB2_QUERY_INFO: u16 = 0x0010;
 pub const SMB2_SET_INFO: u16 = 0x0011;
+/// LEASE_BREAK notification and LEASE_BREAK_ACK (same command).
+pub const SMB2_OPLOCK_BREAK: u16 = 0x0012;
 
 pub const SMB2_HEADER_LEN: usize = 64;
 pub const SMB2_FLAGS_SERVER_TO_REDIR: u32 = 0x0000_0001;
@@ -50,7 +52,34 @@ pub const SESSION_FLAG_IS_GUEST: u16 = 0x0001;
 /// SMB 3.x: subsequent messages are SMB2 TRANSFORM_HEADER (encryption).
 pub const SESSION_FLAG_ENCRYPT_DATA: u16 = 0x0004;
 
+pub const SMB2_GLOBAL_CAP_LEASING: u32 = 0x0000_0002;
 pub const SMB2_GLOBAL_CAP_ENCRYPTION: u32 = 0x0000_0040;
+
+pub const SMB2_OPLOCK_LEVEL_NONE: u8 = 0x00;
+pub const SMB2_OPLOCK_LEVEL_LEASE: u8 = 0xFF;
+
+pub const SMB2_LEASE_NONE: u32 = 0x00;
+pub const SMB2_LEASE_READ_CACHING: u32 = 0x01;
+pub const SMB2_LEASE_HANDLE_CACHING: u32 = 0x02;
+pub const SMB2_LEASE_WRITE_CACHING: u32 = 0x04;
+pub const SMB2_LEASE_R: u32 = SMB2_LEASE_READ_CACHING;
+pub const SMB2_LEASE_RH: u32 = SMB2_LEASE_READ_CACHING | SMB2_LEASE_HANDLE_CACHING;
+pub const SMB2_LEASE_WH: u32 = SMB2_LEASE_WRITE_CACHING | SMB2_LEASE_HANDLE_CACHING;
+pub const SMB2_LEASE_RWH: u32 =
+    SMB2_LEASE_READ_CACHING | SMB2_LEASE_HANDLE_CACHING | SMB2_LEASE_WRITE_CACHING;
+
+pub const SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED: u32 = 0x01;
+pub const LEASE_BREAK_MESSAGE_ID: u64 = u64::MAX;
+
+pub const CREATE_CTX_LEASE: &[u8] = b"RqLs";
+pub const CREATE_CTX_DURABLE_REQUEST: &[u8] = b"DHnQ";
+pub const CREATE_CTX_DURABLE_RECONNECT: &[u8] = b"DHnC";
+pub const CREATE_CTX_MAXIMAL_ACCESS: &[u8] = b"MxAc";
+
+const MAX_CREATE_CONTEXTS: usize = 8;
+const MAX_CONTEXT_NAME: usize = 16;
+const MAX_CONTEXT_DATA: usize = 256;
+const MAX_CREATE_CONTEXTS_LEN: usize = 4096;
 pub const SMB2_PREAUTH_INTEGRITY_CAPABILITIES: u16 = 0x0001;
 pub const SMB2_ENCRYPTION_CAPABILITIES: u16 = 0x0002;
 pub const HASH_SHA512: u16 = 0x0001;
@@ -1078,11 +1107,25 @@ pub fn encode_tree_connect_response_flags(
 // --- create ---
 
 #[derive(Clone, Debug)]
+pub struct LeaseReq {
+    pub key: [u8; 16],
+    pub state: u32,
+    pub v2: bool,
+    pub epoch: u16,
+    pub parent: [u8; 16],
+}
+
+#[derive(Clone, Debug)]
 pub struct CreateReq {
     pub desired_access: u32,
     pub create_disposition: u32,
     pub create_options: u32,
     pub name: String,
+    pub requested_oplock: u8,
+    pub lease: Option<LeaseReq>,
+    pub durable_request: bool,
+    pub durable_reconnect: Option<[u8; 16]>,
+    pub maximal_access: bool,
 }
 
 pub fn parse_create(cmd: &[u8]) -> io::Result<CreateReq> {
@@ -1092,6 +1135,7 @@ pub fn parse_create(cmd: &[u8]) -> io::Result<CreateReq> {
     if body.len() < 56 {
         return Err(io::Error::new(ErrorKind::UnexpectedEof, "CREATE body"));
     }
+    let requested_oplock = body[3];
     let desired_access = u32_at(body, 24)?;
     let create_disposition = u32_at(body, 36)?;
     let create_options = u32_at(body, 40)?;
@@ -1102,24 +1146,197 @@ pub fn parse_create(cmd: &[u8]) -> io::Result<CreateReq> {
     } else {
         decode_utf16le(slice_from_cmd(cmd, name_off, name_len)?)
     };
+    let ctx_off = u32_at(body, 48)? as usize;
+    let ctx_len = u32_at(body, 52)? as usize;
+    let contexts = parse_create_contexts(cmd, ctx_off, ctx_len)?;
+    let mut lease = None;
+    let mut durable_request = false;
+    let mut durable_reconnect = None;
+    let mut maximal_access = false;
+    for (name_b, data) in contexts {
+        if name_b == CREATE_CTX_LEASE {
+            lease = Some(parse_lease_req(&data)?);
+        } else if name_b == CREATE_CTX_DURABLE_REQUEST {
+            durable_request = true;
+        } else if name_b == CREATE_CTX_DURABLE_RECONNECT {
+            if data.len() < 16 {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidData,
+                    "durable reconnect FileId",
+                ));
+            }
+            let mut fid = [0u8; 16];
+            fid.copy_from_slice(&data[..16]);
+            durable_reconnect = Some(fid);
+        } else if name_b == CREATE_CTX_MAXIMAL_ACCESS {
+            maximal_access = true;
+        }
+    }
     Ok(CreateReq {
         desired_access,
         create_disposition,
         create_options,
         name,
+        requested_oplock,
+        lease,
+        durable_request,
+        durable_reconnect,
+        maximal_access,
     })
 }
 
-pub fn encode_create_response(
+pub fn parse_create_contexts(
+    cmd: &[u8],
+    off: usize,
+    len: usize,
+) -> io::Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    if len == 0 || off == 0 {
+        return Ok(Vec::new());
+    }
+    if len > MAX_CREATE_CONTEXTS_LEN || off.saturating_add(len) > cmd.len() {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "CREATE contexts length",
+        ));
+    }
+    let end = off + len;
+    let mut cur = off;
+    let mut out = Vec::new();
+    for _ in 0..MAX_CREATE_CONTEXTS {
+        if cur + 16 > end {
+            break;
+        }
+        let next = u32_at(cmd, cur)? as usize;
+        let name_off = u16_at(cmd, cur + 4)? as usize;
+        let name_len = u16_at(cmd, cur + 6)? as usize;
+        let data_off = u16_at(cmd, cur + 10)? as usize;
+        let data_len = u32_at(cmd, cur + 12)? as usize;
+        if name_len > MAX_CONTEXT_NAME || data_len > MAX_CONTEXT_DATA {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "CREATE context field",
+            ));
+        }
+        let name = slice_from_cmd(cmd, cur.saturating_add(name_off), name_len)?.to_vec();
+        let data = slice_from_cmd(cmd, cur.saturating_add(data_off), data_len)?.to_vec();
+        out.push((name, data));
+        if next == 0 {
+            break;
+        }
+        if next < 16 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "CREATE context Next",
+            ));
+        }
+        cur = cur.saturating_add(next);
+        if cur >= end {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+fn parse_lease_req(data: &[u8]) -> io::Result<LeaseReq> {
+    if data.len() < 32 {
+        return Err(io::Error::new(ErrorKind::UnexpectedEof, "REQUEST_LEASE"));
+    }
+    let mut key = [0u8; 16];
+    key.copy_from_slice(&data[..16]);
+    let state = u32_at(data, 16)?;
+    let v2 = data.len() >= 52;
+    let (epoch, parent) = if v2 {
+        let mut parent = [0u8; 16];
+        parent.copy_from_slice(&data[32..48]);
+        (u16_at(data, 48)?, parent)
+    } else {
+        (0, [0u8; 16])
+    };
+    Ok(LeaseReq {
+        key,
+        state,
+        v2,
+        epoch,
+        parent,
+    })
+}
+
+/// Read-mostly grant: R/RH always; W/WH only when the open is writable.
+pub fn grant_lease_state(requested: u32, writable: bool) -> u32 {
+    let mut g = requested & SMB2_LEASE_RWH;
+    if !writable {
+        g &= !SMB2_LEASE_WRITE_CACHING;
+    }
+    g
+}
+
+pub fn encode_create_context(name: &[u8], data: &[u8]) -> Vec<u8> {
+    let name_off = 16u16;
+    let data_unaligned = 16usize.saturating_add(name.len());
+    let data_off = ((data_unaligned + 7) & !7) as u16;
+    let mut b = vec![0u8; data_off as usize];
+    b[4..6].copy_from_slice(&name_off.to_le_bytes());
+    b[6..8].copy_from_slice(&(name.len() as u16).to_le_bytes());
+    b[10..12].copy_from_slice(&data_off.to_le_bytes());
+    b[12..16].copy_from_slice(&(data.len() as u32).to_le_bytes());
+    b[16..16 + name.len()].copy_from_slice(name);
+    b.extend_from_slice(data);
+    let pad = (8 - (b.len() % 8)) % 8;
+    b.resize(b.len() + pad, 0);
+    b
+}
+
+pub fn stitch_create_contexts(ctxs: &[Vec<u8>]) -> Vec<u8> {
+    if ctxs.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for (i, c) in ctxs.iter().enumerate() {
+        let mut chunk = c.clone();
+        let last = i + 1 == ctxs.len();
+        if !last {
+            let next = chunk.len() as u32;
+            chunk[0..4].copy_from_slice(&next.to_le_bytes());
+        }
+        out.extend_from_slice(&chunk);
+    }
+    out
+}
+
+pub fn encode_lease_context(req: &LeaseReq, granted: u32) -> Vec<u8> {
+    let mut data = vec![0u8; if req.v2 { 52 } else { 32 }];
+    data[..16].copy_from_slice(&req.key);
+    data[16..20].copy_from_slice(&granted.to_le_bytes());
+    if req.v2 {
+        data[32..48].copy_from_slice(&req.parent);
+        let epoch = req.epoch.max(1);
+        data[48..50].copy_from_slice(&epoch.to_le_bytes());
+    }
+    encode_create_context(CREATE_CTX_LEASE, &data)
+}
+
+pub fn encode_durable_response() -> Vec<u8> {
+    encode_create_context(CREATE_CTX_DURABLE_RECONNECT, &[0u8; 8])
+}
+
+pub fn encode_maximal_access_response(access: u32) -> Vec<u8> {
+    let mut data = vec![0u8; 8];
+    data[4..8].copy_from_slice(&access.to_le_bytes());
+    encode_create_context(CREATE_CTX_MAXIMAL_ACCESS, &data)
+}
+
+pub fn encode_create_response_ex(
     action: u32,
     times: u64,
     size: u64,
     attrs: u32,
     file_id: [u8; 16],
+    oplock: u8,
+    contexts: &[Vec<u8>],
 ) -> Vec<u8> {
     let mut b = vec![0u8; 88];
     b[0..2].copy_from_slice(&89u16.to_le_bytes());
-    b[2] = 0; // oplock none
+    b[2] = oplock;
     b[4..8].copy_from_slice(&action.to_le_bytes());
     for off in [8usize, 16, 24, 32] {
         b[off..off + 8].copy_from_slice(&times.to_le_bytes());
@@ -1128,7 +1345,90 @@ pub fn encode_create_response(
     b[48..56].copy_from_slice(&size.to_le_bytes());
     b[56..60].copy_from_slice(&attrs.to_le_bytes());
     b[64..80].copy_from_slice(&file_id);
+    if !contexts.is_empty() {
+        let blob = stitch_create_contexts(contexts);
+        let ctx_off = (SMB2_HEADER_LEN + 88) as u32;
+        b[80..84].copy_from_slice(&ctx_off.to_le_bytes());
+        b[84..88].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+        b.extend_from_slice(&blob);
+    }
     b
+}
+
+#[derive(Clone, Debug)]
+pub struct LeaseBreakAck {
+    pub lease_key: [u8; 16],
+    pub lease_state: u32,
+}
+
+pub fn parse_lease_break_ack(cmd: &[u8]) -> io::Result<LeaseBreakAck> {
+    let body = cmd
+        .get(SMB2_HEADER_LEN..)
+        .ok_or_else(|| io::Error::new(ErrorKind::UnexpectedEof, "LEASE_BREAK_ACK"))?;
+    if body.len() < 36 {
+        return Err(io::Error::new(
+            ErrorKind::UnexpectedEof,
+            "LEASE_BREAK_ACK body",
+        ));
+    }
+    let size = u16_at(body, 0)?;
+    if size != 36 {
+        return Err(io::Error::new(
+            ErrorKind::InvalidData,
+            "LEASE_BREAK_ACK StructureSize",
+        ));
+    }
+    let mut lease_key = [0u8; 16];
+    lease_key.copy_from_slice(&body[8..24]);
+    Ok(LeaseBreakAck {
+        lease_key,
+        lease_state: u32_at(body, 24)?,
+    })
+}
+
+pub fn encode_lease_break(
+    lease_key: [u8; 16],
+    current: u32,
+    new: u32,
+    ack_required: bool,
+    epoch: u16,
+) -> Vec<u8> {
+    let mut b = vec![0u8; 44];
+    b[0..2].copy_from_slice(&44u16.to_le_bytes());
+    b[2..4].copy_from_slice(&epoch.to_le_bytes());
+    let flags = if ack_required {
+        SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED
+    } else {
+        0
+    };
+    b[4..8].copy_from_slice(&flags.to_le_bytes());
+    b[8..24].copy_from_slice(&lease_key);
+    b[24..28].copy_from_slice(&current.to_le_bytes());
+    b[28..32].copy_from_slice(&new.to_le_bytes());
+    b
+}
+
+pub fn encode_lease_break_ack_response(lease_key: [u8; 16], state: u32) -> Vec<u8> {
+    let mut b = vec![0u8; 36];
+    b[0..2].copy_from_slice(&36u16.to_le_bytes());
+    b[8..24].copy_from_slice(&lease_key);
+    b[24..28].copy_from_slice(&state.to_le_bytes());
+    b
+}
+
+pub fn lease_break_header(session_id: u64) -> Smb2Header {
+    Smb2Header {
+        credit_charge: 0,
+        status: 0,
+        command: SMB2_OPLOCK_BREAK,
+        credits: 0,
+        flags: SMB2_FLAGS_SERVER_TO_REDIR,
+        next_command: 0,
+        message_id: LEASE_BREAK_MESSAGE_ID,
+        process_id: 0,
+        tree_id: 0,
+        session_id,
+    }
 }
 
 pub const FILE_OPENED: u32 = 1;
@@ -2505,5 +2805,113 @@ mod tests {
         buf.extend_from_slice(&dialect);
         assert!(is_smb1(&buf));
         assert!(smb1_has_smb2_dialect(&buf));
+    }
+
+    fn fake_create_cmd(name: &str, contexts: &[Vec<u8>]) -> Vec<u8> {
+        let raw = encode_utf16le(name);
+        let mut body = vec![0u8; 56];
+        body[0..2].copy_from_slice(&57u16.to_le_bytes());
+        body[3] = SMB2_OPLOCK_LEVEL_LEASE;
+        body[4..8].copy_from_slice(&2u32.to_le_bytes());
+        body[24..28].copy_from_slice(&0x0012_0089u32.to_le_bytes());
+        body[36..40].copy_from_slice(&FILE_OPEN.to_le_bytes());
+        body[40..44].copy_from_slice(&FILE_NON_DIRECTORY_FILE.to_le_bytes());
+        let name_off = (SMB2_HEADER_LEN + 56) as u16;
+        body[44..46].copy_from_slice(&name_off.to_le_bytes());
+        body[46..48].copy_from_slice(&(raw.len() as u16).to_le_bytes());
+        body.extend_from_slice(&raw);
+        if !contexts.is_empty() {
+            let pad = (8 - (body.len() % 8)) % 8;
+            body.resize(body.len() + pad, 0);
+            let blob = stitch_create_contexts(contexts);
+            let ctx_off = (SMB2_HEADER_LEN + body.len()) as u32;
+            body[48..52].copy_from_slice(&ctx_off.to_le_bytes());
+            body[52..56].copy_from_slice(&(blob.len() as u32).to_le_bytes());
+            body.extend_from_slice(&blob);
+        }
+        let h = Smb2Header {
+            credit_charge: 1,
+            status: 0,
+            command: SMB2_CREATE,
+            credits: 1,
+            flags: 0,
+            next_command: 0,
+            message_id: 1,
+            process_id: 0xfeff,
+            tree_id: 1,
+            session_id: 1,
+        };
+        encode_packet(&h, &body)
+    }
+
+    #[test]
+    fn parse_create_lease_context_v1_and_v2() {
+        let key = [0x11u8; 16];
+        let mut data = vec![0u8; 32];
+        data[..16].copy_from_slice(&key);
+        data[16..20].copy_from_slice(&SMB2_LEASE_RWH.to_le_bytes());
+        let cmd = fake_create_cmd(
+            "hello.txt",
+            &[encode_create_context(CREATE_CTX_LEASE, &data)],
+        );
+        let req = parse_create(&cmd).unwrap();
+        let lease = req.lease.expect("lease");
+        assert_eq!(lease.key, key);
+        assert_eq!(lease.state, SMB2_LEASE_RWH);
+        assert!(!lease.v2);
+
+        let mut data2 = vec![0u8; 52];
+        data2[..16].copy_from_slice(&key);
+        data2[16..20].copy_from_slice(&SMB2_LEASE_RH.to_le_bytes());
+        data2[48..50].copy_from_slice(&3u16.to_le_bytes());
+        let cmd = fake_create_cmd(
+            "hello.txt",
+            &[encode_create_context(CREATE_CTX_LEASE, &data2)],
+        );
+        let lease = parse_create(&cmd).unwrap().lease.unwrap();
+        assert!(lease.v2);
+        assert_eq!(lease.epoch, 3);
+        assert_eq!(lease.state, SMB2_LEASE_RH);
+    }
+
+    #[test]
+    fn create_context_rejects_oversize_data() {
+        let big = vec![0u8; MAX_CONTEXT_DATA + 1];
+        let cmd = fake_create_cmd("x", &[encode_create_context(CREATE_CTX_LEASE, &big)]);
+        assert!(parse_create(&cmd).is_err());
+        assert!(parse_create_contexts(&[0u8; 8], 1, MAX_CREATE_CONTEXTS_LEN + 1).is_err());
+    }
+
+    #[test]
+    fn lease_break_packet_is_44_bytes() {
+        let body = encode_lease_break([9u8; 16], SMB2_LEASE_RH, SMB2_LEASE_R, true, 1);
+        assert_eq!(body.len(), 44);
+        assert_eq!(u16::from_le_bytes(body[0..2].try_into().unwrap()), 44);
+        assert_eq!(
+            u32::from_le_bytes(body[4..8].try_into().unwrap()),
+            SMB2_NOTIFY_BREAK_LEASE_FLAG_ACK_REQUIRED
+        );
+        let hdr = lease_break_header(7);
+        assert_eq!(hdr.command, SMB2_OPLOCK_BREAK);
+        assert_eq!(hdr.message_id, LEASE_BREAK_MESSAGE_ID);
+        assert_eq!(grant_lease_state(SMB2_LEASE_RWH, false), SMB2_LEASE_RH);
+        assert_eq!(grant_lease_state(SMB2_LEASE_WH, true), SMB2_LEASE_WH);
+        assert_eq!(grant_lease_state(SMB2_LEASE_R, false), SMB2_LEASE_R);
+    }
+
+    #[test]
+    fn parse_durable_reconnect_and_maximal_access() {
+        let fid = [0xABu8; 16];
+        let cmd = fake_create_cmd(
+            "",
+            &[
+                encode_create_context(CREATE_CTX_DURABLE_RECONNECT, &fid),
+                encode_create_context(CREATE_CTX_MAXIMAL_ACCESS, &[0u8; 8]),
+            ],
+        );
+        let req = parse_create(&cmd).unwrap();
+        assert_eq!(req.durable_reconnect, Some(fid));
+        assert!(req.maximal_access);
+        assert!(!req.durable_request);
     }
 }
