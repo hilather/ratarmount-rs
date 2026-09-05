@@ -1,16 +1,38 @@
-//! GET-only sibling index objects for S3/GCS/Azure (V-2c).
+//! Sibling index objects for S3/GCS/Azure (V-2c GET + S3 PUT primitive).
 //!
 //! Pointer `{url}.index.ptr` and immutable `{url}.index.{id}.sqlite` are extra
-//! candidates. Object-store PUT is F-7.
+//! GET candidates. S3 PUT of blob-then-pointer is [`publish_index_to_s3`]
+//! (F-7 primitive; live overlay commit and CLI `--publish-index` wiring are later).
+//! GCS/Azure PUT is residual.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::{
     fetch_azure_bytes_capped, fetch_azure_to_temp, fetch_gcs_bytes_capped, fetch_gcs_to_temp,
     fetch_s3_bytes_capped, fetch_s3_to_temp, remote_url_scheme, RemoteError, Result,
 };
+
+/// G-2 pointer schema (`ratarmount.index.pointer.v1`). Not SOCI; not `INDEX_VERSION`.
+pub const INDEX_POINTER_SCHEMA: &str = "ratarmount.index.pointer.v1";
+
+/// SQLite blob media type for `{url}.index.{id}.sqlite` PUT.
+pub const INDEX_MEDIA_TYPE: &str = "application/vnd.ratarmount.index.v1+sqlite";
+
+/// V-2 pointer payload for S3 PUT (schema [`INDEX_POINTER_SCHEMA`]).
+///
+/// Callers typically serialize `ratarmount_index::IndexPointer` into [`Self::json`].
+#[derive(Debug, Clone)]
+pub struct S3IndexPointer {
+    /// 64 lowercase hex SHA-256 of the SQLite blob (`index_id`).
+    pub index_id: String,
+    /// Pretty-printed pointer JSON (already validated by [`publish_index_to_s3`]).
+    pub json: Vec<u8>,
+}
 
 /// True for `s3://` / `gs://` / `az://` / `azure://` archive URLs.
 pub fn is_object_store_archive_url(url: &str) -> bool {
@@ -67,11 +89,119 @@ fn keep_tempfile(tmp: NamedTempFile) -> Result<PathBuf> {
         .map_err(|e| RemoteError::Io(e.error))
 }
 
+fn parse_index_id(s: &str) -> Result<String> {
+    let t = s.trim().to_ascii_lowercase();
+    if t.len() != 64 || !t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(RemoteError::S3(format!(
+            "index_id must be 64 lowercase hex sha256(blob), not {s:?}"
+        )));
+    }
+    Ok(t)
+}
+
+fn validate_s3_index_pointer(pointer: &S3IndexPointer) -> Result<String> {
+    let id = parse_index_id(&pointer.index_id)?;
+    let v: serde_json::Value = serde_json::from_slice(&pointer.json)
+        .map_err(|e| RemoteError::S3(format!("index pointer JSON: {e}")))?;
+    let schema = v.get("schema").and_then(|x| x.as_str()).unwrap_or("");
+    if schema != INDEX_POINTER_SCHEMA {
+        return Err(RemoteError::S3(format!(
+            "index pointer schema {schema:?} (expected {INDEX_POINTER_SCHEMA})"
+        )));
+    }
+    let json_id = v.get("index_id").and_then(|x| x.as_str()).unwrap_or("");
+    let json_id = parse_index_id(json_id)?;
+    if json_id != id {
+        return Err(RemoteError::S3(
+            "index pointer JSON index_id must equal pointer.index_id".into(),
+        ));
+    }
+    let etag = v.get("etag_sha256").and_then(|x| x.as_str()).unwrap_or("");
+    let etag = parse_index_id(etag)?;
+    if etag != id {
+        return Err(RemoteError::S3(
+            "index pointer etag_sha256 must equal index_id".into(),
+        ));
+    }
+    let generated_at = v.get("generated_at").and_then(|x| x.as_str()).unwrap_or("");
+    if generated_at.is_empty() {
+        return Err(RemoteError::S3(
+            "index pointer generated_at is required".into(),
+        ));
+    }
+    Ok(id)
+}
+
+fn sha256_file_hex(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn leftover_blob_err(blob_url: &str, e: impl std::fmt::Display) -> RemoteError {
+    RemoteError::S3(format!(
+        "pointer PUT failed after blob PUT of {blob_url} (leftover blob not deleted): {e}"
+    ))
+}
+
+/// PUT the immutable sqlite blob, then `{url}.index.ptr`. Never pointer-first.
+///
+/// If the pointer PUT fails after a successful blob PUT, returns `Err` and does
+/// **not** claim success. The leftover `{url}.index.{id}.sqlite` is not deleted
+/// (documented in the error). Overlay / CLI `--publish-index` wiring is F-7 PR 7.
+pub fn publish_index_to_s3(
+    archive_url: &str,
+    sqlite_path: &Path,
+    pointer: &S3IndexPointer,
+) -> Result<()> {
+    let archive = archive_url.trim();
+    if !archive.starts_with("s3://") {
+        return Err(RemoteError::S3(
+            "publish_index_to_s3 is S3-only in v1 (GCS/Azure PUT residual)".into(),
+        ));
+    }
+    let id = validate_s3_index_pointer(pointer)?;
+    if !sqlite_path.is_file() {
+        return Err(RemoteError::S3(format!(
+            "publish_index_to_s3: {} is not a file",
+            sqlite_path.display()
+        )));
+    }
+    let digest = sha256_file_hex(sqlite_path)?;
+    if digest != id {
+        return Err(RemoteError::S3(format!(
+            "publish_index_to_s3: sqlite sha256 {digest} != index_id {id}"
+        )));
+    }
+    let blob_url = format!("{archive}.index.{id}.sqlite");
+    let ptr_url = format!("{archive}.index.ptr");
+    crate::s3::put_s3_file(&blob_url, sqlite_path, INDEX_MEDIA_TYPE)?;
+    let mut tmp = NamedTempFile::new().map_err(|e| leftover_blob_err(&blob_url, e))?;
+    tmp.write_all(&pointer.json)
+        .map_err(|e| leftover_blob_err(&blob_url, e))?;
+    if !pointer.json.ends_with(b"\n") {
+        tmp.write_all(b"\n")
+            .map_err(|e| leftover_blob_err(&blob_url, e))?;
+    }
+    tmp.flush().map_err(|e| leftover_blob_err(&blob_url, e))?;
+    crate::s3::put_s3_file(&ptr_url, tmp.path(), "application/json")
+        .map_err(|e| leftover_blob_err(&blob_url, e))?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
-    use std::io::{BufRead, BufReader, Write as IoWrite};
+    use std::io::{BufRead, BufReader, Read, Write as IoWrite};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex as StdMutex};
     use std::thread;
@@ -306,5 +436,241 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
+    }
+
+    /// Path-style PUT mock. `fail_ptr` returns HTTP 500 on `{key}.index.ptr`.
+    struct MockS3Put {
+        base_url: String,
+        puts: Arc<StdMutex<Vec<String>>>,
+        objects: Arc<StdMutex<HashMap<String, Vec<u8>>>>,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockS3Put {
+        fn spawn(fail_ptr: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base_url = format!("http://{}", listener.local_addr().unwrap());
+            let puts = Arc::new(StdMutex::new(Vec::new()));
+            let objects = Arc::new(StdMutex::new(HashMap::new()));
+            let puts_c = Arc::clone(&puts);
+            let objects_c = Arc::clone(&objects);
+            let join = thread::spawn(move || {
+                for stream in listener.incoming().take(32) {
+                    let Ok(mut stream) = stream else { continue };
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        continue;
+                    }
+                    let mut content_length: u64 = 0;
+                    loop {
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_err() {
+                            break;
+                        }
+                        if line == "\r\n" || line == "\n" || line.is_empty() {
+                            break;
+                        }
+                        let lower = line.to_ascii_lowercase();
+                        if let Some(rest) = lower.strip_prefix("content-length:") {
+                            content_length = rest.trim().parse().unwrap_or(0);
+                        }
+                    }
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("");
+                    let path = path.split('?').next().unwrap_or(path);
+                    let key = path
+                        .trim_start_matches('/')
+                        .split_once('/')
+                        .map(|(_, k)| percent_decode(k))
+                        .unwrap_or_default();
+                    let mut body = vec![0u8; content_length.min(8 * 1024 * 1024) as usize];
+                    if !body.is_empty() {
+                        let _ = reader.read_exact(&mut body);
+                    }
+                    if !request_line.starts_with("PUT ") {
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                        );
+                        continue;
+                    }
+                    {
+                        puts_c.lock().unwrap().push(key.clone());
+                    }
+                    if fail_ptr && key.ends_with(".index.ptr") {
+                        let msg = b"InternalError";
+                        let _ = write!(
+                            stream,
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            msg.len()
+                        );
+                        let _ = stream.write_all(msg);
+                        continue;
+                    }
+                    objects_c.lock().unwrap().insert(key, body);
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 200 OK\r\nETag: \"ok\"\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    );
+                }
+            });
+            Self {
+                base_url,
+                puts,
+                objects,
+                _join: Some(join),
+            }
+        }
+    }
+
+    fn sha256_hex_bytes(b: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(b))
+    }
+
+    fn pointer_json(id: &str) -> Vec<u8> {
+        format!(
+            r#"{{"schema":"{INDEX_POINTER_SCHEMA}","index_id":"{id}","etag_sha256":"{id}","generated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .into_bytes()
+    }
+
+    fn env_signed_s3(endpoint: &str) -> EnvGuard {
+        let g = EnvGuard::acquire(AWS_ENV_KEYS);
+        g.set("AWS_ACCESS_KEY_ID", "AKIAEXAMPLE");
+        g.set("AWS_SECRET_ACCESS_KEY", "secretsecretsecretsecretsecr");
+        g.set("AWS_ENDPOINT_URL", endpoint);
+        g.set("AWS_REGION", "us-east-1");
+        g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        g
+    }
+
+    /// Regression: pointer flips only after blob PUT 200 (blob then pointer).
+    #[test]
+    fn s3_publish_index_blob_then_pointer() {
+        let mock = MockS3Put::spawn(false);
+        let _g = env_signed_s3(&mock.base_url);
+        let blob = b"SQLite format 3\0index-blob";
+        let id = sha256_hex_bytes(blob);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let pointer = S3IndexPointer {
+            index_id: id.clone(),
+            json: pointer_json(&id),
+        };
+        publish_index_to_s3("s3://bucket/data/a.tar", tmp.path(), &pointer).unwrap();
+        let puts = mock.puts.lock().unwrap().clone();
+        let blob_key = format!("data/a.tar.index.{id}.sqlite");
+        assert_eq!(
+            puts,
+            vec![blob_key.clone(), "data/a.tar.index.ptr".to_string()],
+            "blob must PUT before pointer; puts={puts:?}"
+        );
+        let objects = mock.objects.lock().unwrap();
+        assert_eq!(
+            objects.get(&blob_key).map(|v| v.as_slice()),
+            Some(&blob[..])
+        );
+        assert!(
+            objects.get("data/a.tar.index.ptr").is_some_and(|v| v
+                .windows(INDEX_POINTER_SCHEMA.len())
+                .any(|w| w == INDEX_POINTER_SCHEMA.as_bytes())),
+            "pointer JSON missing schema"
+        );
+    }
+
+    /// Regression: blob PUT 200 + pointer PUT 500 does not claim success (leftover blob).
+    #[test]
+    fn s3_publish_index_fail_closed() {
+        let mock = MockS3Put::spawn(true);
+        let _g = env_signed_s3(&mock.base_url);
+        let blob = b"SQLite format 3\0fail-closed";
+        let id = sha256_hex_bytes(blob);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let pointer = S3IndexPointer {
+            index_id: id.clone(),
+            json: pointer_json(&id),
+        };
+        let err = publish_index_to_s3("s3://bucket/data/a.tar", tmp.path(), &pointer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("leftover blob") && err.contains(".index.") && err.contains(".sqlite"),
+            "got: {err}"
+        );
+        let puts = mock.puts.lock().unwrap().clone();
+        let blob_key = format!("data/a.tar.index.{id}.sqlite");
+        assert_eq!(puts.first().map(String::as_str), Some(blob_key.as_str()));
+        assert!(
+            puts.iter().any(|k| k.ends_with(".index.ptr")),
+            "pointer PUT must still be attempted; puts={puts:?}"
+        );
+        let objects = mock.objects.lock().unwrap();
+        assert!(
+            objects.contains_key(&blob_key),
+            "blob must remain after pointer failure"
+        );
+        assert!(
+            !objects.contains_key("data/a.tar.index.ptr"),
+            "pointer must not be stored on 500"
+        );
+    }
+
+    #[test]
+    fn leftover_blob_err_names_url() {
+        let err = leftover_blob_err("s3://b/a.tar.index.aa.sqlite", "disk full").to_string();
+        assert!(
+            err.contains("leftover blob not deleted")
+                && err.contains("s3://b/a.tar.index.aa.sqlite")
+                && err.contains("disk full"),
+            "got: {err}"
+        );
+    }
+
+    /// Regression: pointer JSON that GET `parse_index_pointer_json` would reject.
+    #[test]
+    fn s3_publish_index_rejects_etag_mismatch() {
+        let blob = b"SQLite format 3\0etag";
+        let id = sha256_hex_bytes(blob);
+        let other = "b".repeat(64);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let json = format!(
+            r#"{{"schema":"{INDEX_POINTER_SCHEMA}","index_id":"{id}","etag_sha256":"{other}","generated_at":"2026-01-01T00:00:00Z"}}"#
+        )
+        .into_bytes();
+        let err = publish_index_to_s3(
+            "s3://bucket/data/a.tar",
+            tmp.path(),
+            &S3IndexPointer { index_id: id, json },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("etag_sha256"), "got: {err}");
+    }
+
+    /// Regression: blob URL index_id must be sha256 of the sqlite bytes.
+    #[test]
+    fn s3_publish_index_rejects_blob_hash_mismatch() {
+        let blob = b"SQLite format 3\0hash-mismatch";
+        let wrong = "a".repeat(64);
+        let mut tmp = NamedTempFile::new().unwrap();
+        tmp.write_all(blob).unwrap();
+        tmp.flush().unwrap();
+        let pointer = S3IndexPointer {
+            index_id: wrong.clone(),
+            json: pointer_json(&wrong),
+        };
+        let err = publish_index_to_s3("s3://bucket/data/a.tar", tmp.path(), &pointer)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("sha256") && err.contains("index_id"),
+            "got: {err}"
+        );
     }
 }

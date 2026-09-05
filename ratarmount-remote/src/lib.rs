@@ -12,7 +12,9 @@
 //!   Both may be sent together on HEAD, GET, and Range requests. Not a browser cookie
 //!   jar (no `Set-Cookie` persistence / per-domain store).
 //! - `s3://bucket/key` → GetObject to temp with prefer-range for large objects
-//!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`]
+//!   (env keys → ECS/IMDS role → optional anonymous); live Range via [`open_s3_range`] / [`S3RangeFile`];
+//!   PutObject / multipart via [`put_s3_file`] (abort on error; anonymous is GET-only);
+//!   V-2 pointer PUT via [`publish_index_to_s3`] (blob then pointer, fail-closed)
 //! - `ssh://` / `sftp://` / `scp://` → SFTP download to temp (OpenSSH config subset:
 //!   `HostName`/`User`/`Port`/`IdentityFile`/`IdentitiesOnly`/`ProxyJump`/`Include`;
 //!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
@@ -90,13 +92,16 @@ pub use dropbox::{
 pub(crate) use gcs::fetch_gcs_bytes_capped;
 pub use index_sibling::{
     fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
+    publish_index_to_s3, S3IndexPointer, INDEX_MEDIA_TYPE, INDEX_POINTER_SCHEMA,
 };
 pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
     fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, parse_s3_url_allow_prefix,
-    S3Location, S3RangeFile, DEFAULT_S3_RANGE_THRESHOLD,
+    put_s3_file, put_s3_location, s3_abort_multipart_upload, s3_create_and_abort_multipart_upload,
+    s3_create_multipart_upload, S3Location, S3PutObject, S3PutResult, S3RangeFile,
+    DEFAULT_S3_RANGE_THRESHOLD, S3_PUT_PART_SIZE, S3_PUT_PART_THRESHOLD,
 };
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,

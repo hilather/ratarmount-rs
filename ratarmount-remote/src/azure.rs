@@ -217,7 +217,8 @@ fn base64_decode(s: &str) -> Result<Vec<u8>> {
         return Err(azure_err("AZURE_STORAGE_KEY is not valid base64"));
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);
-    #[allow(clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
+    // Keep: this crate's clippy -D warnings is red without unknown_lints (lint name dropped).
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
     for chunk in bytes.chunks_exact(4) {
         let a = val(chunk[0]).ok_or_else(|| azure_err("AZURE_STORAGE_KEY is not valid base64"))?;
         let b = val(chunk[1]).ok_or_else(|| azure_err("AZURE_STORAGE_KEY is not valid base64"))?;

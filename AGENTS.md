@@ -162,6 +162,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Remote sidecar XDG LRU remount 0 GET (no `.ptr`) | `cargo test -p ratarmount-index --lib meta_cache` · `cargo test -p ratarmount-index --lib remount_well_known` · `cargo test -p ratarmount-session --lib apply_remote_index` |
 | Local cached sidecar reused after remote archive replace (URL-label tarstats no-op) | `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_rejects` · `cargo test -p ratarmount-session --lib cached_remote_index_is_stale` · `cargo test -p ratarmount-session --lib hash_http_range_window` · `cargo test -p ratarmount-session --lib apply_remote_index_read_only_stale` · `cargo test -p ratarmount-session --lib apply_remote_index_local_copy_keeps_match` |
 | Remote `{url}.index.ptr` then `{url}.index.{id}.sqlite` GET (HTTP/S3; 404/tarstats continue) | `cargo test -p ratarmount-session --lib apply_remote_index` · `cargo test -p ratarmount-remote --lib fetch_s3_pointer` · `cargo test -p ratarmount-index --lib sibling_index_pointer` |
+| S3 PutObject / multipart abort on error | `cargo test -p ratarmount-remote --lib s3_put` · `cargo test -p ratarmount-remote --lib s3_put_multipart` |
+| S3 V-2 pointer PUT blob-then-pointer / fail-closed leftover blob | `cargo test -p ratarmount-remote --lib s3_publish_index_blob_then_pointer` · `cargo test -p ratarmount-remote --lib s3_publish_index_fail_closed` |
+| S3 CreateMultipartUpload+abort write probe (F-7) | `cargo test -p ratarmount-remote --lib s3_multipart_create_abort_probe` |
 | Outbound GET index.sqlite Content-Type | `cargo test -p ratarmount-http --lib index_content_type` |
 | Local `oci:{digest}` cache skips referrer | `cargo test -p ratarmount-remote --lib oci_referrer_not_fetched_on_cache_hit` |
 | OCI referrer GET on miss | `cargo test -p ratarmount-remote --lib oci_referrer` |
