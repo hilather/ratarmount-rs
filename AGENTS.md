@@ -172,6 +172,9 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | SMB live Range at 1 MiB (fill-loop, not full GET) | `cargo test -p ratarmount-remote --lib smb_range` |
 | SMB dialect STATUS_NOT_SUPPORTED + no smbclient | `cargo test -p ratarmount-remote --lib smb_fallback_clear_error` |
 | SMB dialect residual + smbclient stub is tempfile (`uses_ranges` false) | `cargo test -p ratarmount-remote --lib smb_range_fallback_temp` |
+| SMB QUERY_DIRECTORY Depth-1 names + sizes | `cargo test -p ratarmount-remote --lib smb_listing_query_directory` |
+| SMB share listing RemoteFolderMountSource | `cargo test -p ratarmount-remote --lib smb_folder_mountsource` |
+| SMB file URL dialect miss is Ok(None) (Range/smbclient takeover) | `cargo test -p ratarmount-remote --lib smb_folder_file_url_dialect` |
 | WebDAV LOCK 423 / COPY / Basic | `cargo test -p ratarmount-http --lib lock` · `cargo test -p ratarmount-http --lib copy` · `cargo test -p ratarmount-http --lib basic` |
 | SFTP password policy / non-loopback | `cargo test -p ratarmount-sftp --lib password` · `cargo test -p ratarmount-sftp --features sftp-russh --lib password` |
 | GCS GOOG1 HMAC | `cargo test -p ratarmount-remote --lib goog1` · `cargo test -p ratarmount-remote --lib hmac` |

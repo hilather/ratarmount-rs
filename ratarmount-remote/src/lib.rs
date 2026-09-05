@@ -21,7 +21,9 @@
 //!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → live Range via [`open_smb_range`] / [`SmbRangeFile`] (SMB 2.0.2 codec);
-//!   dialect residual falls back to Samba `smbclient` CLI when present (session factory wire later)
+//!   share listing via [`open_smb_folder`] / [`SmbListing`] (QUERY_DIRECTORY);
+//!   dialect residual falls back to Samba `smbclient` CLI for files when present
+//!   (session factory wire later; `smbclient` listing is residual)
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
@@ -106,10 +108,10 @@ pub use s3::{
     DEFAULT_S3_RANGE_THRESHOLD, S3_PUT_PART_SIZE, S3_PUT_PART_THRESHOLD,
 };
 pub use smb::{
-    fetch_smb_to_temp, find_smbclient, open_smb_range, parse_smb_url, smbclient_download_args,
-    SmbLocation, SmbRangeFile,
+    fetch_smb_to_temp, find_smbclient, open_smb_folder, open_smb_range, parse_smb_url,
+    smbclient_download_args, SmbListing, SmbLocation, SmbRangeFile,
 };
-pub use smb2_client::{Smb2Client, Smb2Open};
+pub use smb2_client::{Smb2Client, Smb2Dirent, Smb2Open};
 pub use ssh::{
     expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
     parse_proxy_jump_list, parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url,

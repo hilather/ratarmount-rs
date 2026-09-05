@@ -4,17 +4,27 @@
 //! Dialect `STATUS_NOT_SUPPORTED` / non-2.x falls back to Samba `smbclient`
 //! download-to-temp when that binary is on `PATH`. Missing both yields
 //! `smb_fallback_clear_error` (install hint or dialect residual).
+//!
+//! Share / directory URLs (`smb://host/share/` or `smb://host/share/dir/`)
+//! list via QUERY_DIRECTORY ([`open_smb_folder`] / [`SmbListing`]). Dialect
+//! failure is a clear error, not an empty listing. `smbclient` listing is residual.
 
 use std::io::{self, Read, Seek, SeekFrom};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 
 use log::debug;
+use ratarmount_core::{ArchiveRead, MountSource};
 use tempfile::NamedTempFile;
 use url::Url;
 
-use crate::smb2_client::{Smb2Client, STATUS_NOT_SUPPORTED};
+use crate::folder::{RemoteDirent, RemoteFolderMountSource, RemoteListing};
+use crate::smb2_client::{
+    Smb2Client, QUERY_DIR_ENTRY_CAP, STATUS_NOT_A_DIRECTORY, STATUS_NOT_SUPPORTED,
+    STATUS_OBJECT_NAME_NOT_FOUND,
+};
 use crate::{RemoteError, Result};
 
 const SMB_USER_ENV: &str = "RATARMOUNT_SMB_USER";
@@ -476,7 +486,7 @@ pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
     SmbRangeFile::open(url_str)
 }
 
-fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
+fn connect_smb_tree(loc: &SmbLocation) -> Result<Smb2Client<TcpStream>> {
     let addr = resolve_smb_addr(&loc.host, loc.port)?;
     let mut client = Smb2Client::connect(addr)?;
     client.negotiate()?;
@@ -487,7 +497,16 @@ fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
         None => client.session_setup_guest()?,
     }
     client.tree_connect(&loc.host, &loc.share)?;
-    let name = loc.path.replace('/', "\\");
+    Ok(client)
+}
+
+fn smb_create_name(path: &str) -> String {
+    path.replace('/', "\\").trim_matches('\\').to_string()
+}
+
+fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
+    let mut client = connect_smb_tree(loc)?;
+    let name = smb_create_name(&loc.path);
     let open = client.create(&name)?;
     Ok(SmbRangeFile {
         loc: loc.clone(),
@@ -498,6 +517,138 @@ fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
             file_id: open.file_id,
         },
     })
+}
+
+/// Error when QUERY_DIRECTORY is unavailable. `smbclient` listing is residual.
+fn smb_listing_clear_error(cause: &RemoteError) -> RemoteError {
+    RemoteError::Smb(format!(
+        "{cause}; QUERY_DIRECTORY requires SMB 2.0.2/2.1 (smbclient directory listing is residual). \
+         install Samba client tools (e.g. `apt install smbclient` / `dnf install samba-client`) \
+         or use an SMB 2.0.2/2.1 share"
+    ))
+}
+
+fn map_smb_listing_err(err: RemoteError) -> RemoteError {
+    if is_smb_dialect_unsupported(&err) {
+        smb_listing_clear_error(&err)
+    } else {
+        err
+    }
+}
+
+fn is_not_a_directory(err: &RemoteError) -> bool {
+    let RemoteError::Smb(msg) = err else {
+        return false;
+    };
+    msg.contains(&format!("{STATUS_NOT_A_DIRECTORY:#010x}"))
+        || msg.to_ascii_lowercase().contains("not_a_directory")
+}
+
+fn is_missing_name(err: &RemoteError) -> bool {
+    let RemoteError::Smb(msg) = err else {
+        return false;
+    };
+    msg.contains(&format!("{STATUS_OBJECT_NAME_NOT_FOUND:#010x}"))
+}
+
+fn join_smb_child(parent: &str, name: &str) -> String {
+    let parent = parent.trim_matches('/').trim_matches('\\');
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn list_smb_path(loc: &SmbLocation, remote_path: &str) -> Result<Vec<RemoteDirent>> {
+    let mut client = connect_smb_tree(loc).map_err(map_smb_listing_err)?;
+    let name = smb_create_name(remote_path);
+    let ents = client.list_directory(&name).map_err(map_smb_listing_err)?;
+    if ents.len() > QUERY_DIR_ENTRY_CAP {
+        return Err(RemoteError::Smb(format!(
+            "QUERY_DIRECTORY too large (>{QUERY_DIR_ENTRY_CAP} entries) for {remote_path}; \
+             listing is not silently truncated"
+        )));
+    }
+    Ok(ents
+        .into_iter()
+        .map(|e| RemoteDirent {
+            remote_path: join_smb_child(remote_path, &e.name),
+            name: e.name,
+            is_dir: e.is_dir,
+            size: e.size,
+            mtime: e.mtime,
+        })
+        .collect())
+}
+
+/// Prefix listing backend for [`RemoteFolderMountSource`].
+pub struct SmbListing {
+    loc: SmbLocation,
+}
+
+impl SmbListing {
+    pub fn new(loc: SmbLocation) -> Self {
+        Self { loc }
+    }
+}
+
+impl RemoteListing for SmbListing {
+    fn list(&self, remote_path: &str) -> Result<Vec<RemoteDirent>> {
+        list_smb_path(&self.loc, remote_path)
+    }
+
+    fn is_dir(&self, remote_path: &str) -> Result<bool> {
+        if remote_path.is_empty() || remote_path.ends_with('/') || remote_path.ends_with('\\') {
+            return Ok(true);
+        }
+        let mut client = connect_smb_tree(&self.loc).map_err(map_smb_listing_err)?;
+        match client.create_dir(&smb_create_name(remote_path)) {
+            Ok(open) => {
+                client.close_and_shutdown(open.file_id);
+                Ok(true)
+            }
+            Err(e) if is_not_a_directory(&e) || is_missing_name(&e) => Ok(false),
+            Err(e) => Err(map_smb_listing_err(e)),
+        }
+    }
+
+    fn open_range(&self, remote_path: &str, _size: u64) -> Result<Box<dyn ArchiveRead>> {
+        let mut loc = self.loc.clone();
+        loc.path = remote_path.trim_matches('/').replace('\\', "/");
+        Ok(Box::new(SmbRangeFile::open_location(&loc)?))
+    }
+}
+
+fn smb_url_looks_like_folder(url_str: &str, loc: &SmbLocation) -> bool {
+    loc.path.is_empty() || loc.path.ends_with('/') || url_str.trim_end().ends_with('/')
+}
+
+/// Open `smb://host/share/` or `smb://host/share/dir/` as a folder.
+///
+/// `Ok(None)` if the path is a file (factory should fall through to [`open_smb_range`]),
+/// including when the dialect is unsupported so smbclient Range fallback can run.
+/// Folder URLs still `Err` on dialect / QUERY_DIRECTORY failure (not an empty listing).
+pub fn open_smb_folder(url_str: &str) -> Result<Option<Arc<dyn MountSource>>> {
+    let loc = parse_smb_url(url_str)?;
+    let looks_like_folder = smb_url_looks_like_folder(url_str, &loc);
+    match list_smb_path(&loc, loc.path.trim_end_matches('/')) {
+        Ok(_) => {}
+        Err(e)
+            if !looks_like_folder
+                && (is_not_a_directory(&e)
+                    || is_missing_name(&e)
+                    || is_smb_dialect_unsupported(&e)) =>
+        {
+            return Ok(None);
+        }
+        Err(e) => return Err(e),
+    }
+    let root = loc.path.trim_end_matches('/').to_string();
+    Ok(Some(Arc::new(RemoteFolderMountSource::new(
+        root,
+        SmbListing::new(loc),
+    ))))
 }
 
 fn open_smb_fallback_temp<F>(loc: &SmbLocation, runner: F) -> Result<SmbRangeFile>
@@ -1032,6 +1183,149 @@ mod tests {
         assert!(
             msg.to_ascii_lowercase().contains("connect"),
             "unexpected: {msg}"
+        );
+    }
+
+    fn fake_smb_share_url(port: u16) -> String {
+        format!(
+            "smb://127.0.0.1:{port}/{}/",
+            crate::smb2_client::tests::SHARE
+        )
+    }
+
+    /// RemoteFolderMountSource list_dirents carries Depth-1 names + sizes.
+    #[test]
+    fn smb_folder_mountsource_list_dirents() {
+        use crate::smb2_client::tests::{
+            AuthMode, FakeSmb, DIR_FILE_A, DIR_FILE_A_BODY, DIR_SUB, FILE_NAME, OFFSET_1MIB, TAIL,
+        };
+        let srv = FakeSmb::spawn(AuthMode::Guest);
+        let url = fake_smb_share_url(srv.addr.port());
+        let ms = open_smb_folder(&url)
+            .expect("open folder")
+            .expect("share URL should mount as folder");
+        let dents = ms.list_dirents("/").expect("dirents");
+        assert!(
+            dents
+                .iter()
+                .any(|d| d.name == DIR_FILE_A && d.size == DIR_FILE_A_BODY.len() as u64),
+            "{dents:?}"
+        );
+        assert!(
+            dents
+                .iter()
+                .any(|d| d.name == FILE_NAME && d.size == OFFSET_1MIB + TAIL.len() as u64),
+            "{dents:?}"
+        );
+        assert!(dents.iter().any(|d| d.name == DIR_SUB), "{dents:?}");
+        assert!(!dents.iter().any(|d| d.name == "." || d.name == ".."));
+        assert!(
+            !dents.iter().any(|d| d.name == "nested.bin"),
+            "Depth-1 must not leak nested names: {dents:?}"
+        );
+        let sub = ms.list_dirents("/sub").expect("subdir dirents");
+        assert!(
+            sub.iter().any(|d| d.name == "nested.bin" && d.size == 4),
+            "{sub:?}"
+        );
+    }
+
+    #[test]
+    fn smb_folder_mountsource_open_range_child() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, DIR_FILE_A, DIR_FILE_A_BODY};
+        let srv = FakeSmb::spawn(AuthMode::Guest);
+        let url = fake_smb_share_url(srv.addr.port());
+        let ms = open_smb_folder(&url).unwrap().expect("folder");
+        let fi = ms
+            .lookup(&format!("/{DIR_FILE_A}"), 0)
+            .expect("lookup a.tar");
+        assert_eq!(fi.size, DIR_FILE_A_BODY.len() as u64);
+        let mut r = ms.open(&fi, 0).expect("open child Range");
+        let mut buf = Vec::new();
+        r.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, DIR_FILE_A_BODY);
+    }
+
+    #[test]
+    fn smb_folder_file_url_is_none() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, FILE_NAME, SHARE};
+        let srv = FakeSmb::spawn(AuthMode::Guest);
+        let url = format!(
+            "smb://127.0.0.1:{}/{}/{}",
+            srv.addr.port(),
+            SHARE,
+            FILE_NAME
+        );
+        assert!(
+            open_smb_folder(&url).unwrap().is_none(),
+            "file URL must return Ok(None) so Range can take over"
+        );
+    }
+
+    /// File URL + unsupported dialect is Ok(None) so PR 4 can reach smbclient Range.
+    #[test]
+    fn smb_folder_file_url_dialect_unsupported_is_none() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, FILE_NAME, SHARE};
+        let srv = FakeSmb::spawn(AuthMode::RejectDialect);
+        let url = format!(
+            "smb://127.0.0.1:{}/{}/{}",
+            srv.addr.port(),
+            SHARE,
+            FILE_NAME
+        );
+        assert!(
+            open_smb_folder(&url).unwrap().is_none(),
+            "file URL dialect miss must be Ok(None), not Err that skips Range fallback"
+        );
+    }
+
+    #[test]
+    fn smb_folder_dialect_unsupported_is_clear_error() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb};
+        let srv = FakeSmb::spawn(AuthMode::RejectDialect);
+        let url = fake_smb_share_url(srv.addr.port());
+        let err = match open_smb_folder(&url) {
+            Err(e) => e,
+            Ok(_) => panic!("dialect residual must be Err, not Ok(None) or a folder"),
+        };
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("smbclient") && lower.contains("install"),
+            "{msg}"
+        );
+        assert!(
+            lower.contains("dialect")
+                || lower.contains("not_supported")
+                || lower.contains("2.0.2")
+                || lower.contains("query_directory"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn smb_folder_query_directory_unsupported_is_not_empty_list() {
+        use crate::smb2_client::tests::{FakeOpts, FakeSmb};
+        let mut opts = FakeOpts::guest();
+        opts.reject_query_directory = true;
+        let srv = FakeSmb::spawn_with(opts);
+        let url = fake_smb_share_url(srv.addr.port());
+        let err = match open_smb_folder(&url) {
+            Err(e) => e,
+            Ok(_) => panic!("QUERY_DIRECTORY unsupported must be Err, not an empty folder"),
+        };
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("not_supported")
+                || lower.contains("query_directory")
+                || lower.contains("dialect")
+                || msg.contains(&format!("{STATUS_NOT_SUPPORTED:#010x}")),
+            "{msg}"
+        );
+        assert!(
+            lower.contains("residual") || lower.contains("smbclient") || lower.contains("install"),
+            "must name install/dialect residual, not return empty: {msg}"
         );
     }
 }
