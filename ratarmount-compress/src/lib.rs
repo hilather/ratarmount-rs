@@ -5,7 +5,8 @@
 //!   ([`gzip_rapidgzip`]): path + nested `from_reader` + GZIDX import/export;
 //!   opt-in with `RATARMOUNT_GZIP_BACKEND=rapidgzip`.
 //! * **zstd** — multi-frame seek map + seekable-format seek table + Python
-//!   `zstdblocks` offset-map import/export; single-frame full decode.
+//!   `zstdblocks` offset-map import/export; single-frame full decode;
+//!   [`repack_seekable`] producer (framed zstd + official seek table).
 //! * **lz4** — frame block index (independent blocks; dependent → frame decode);
 //!   `open_seekable_lz4_with_threads` for `-P` (parallel independent-block size discovery).
 //! * **lzip** — multimember walk via trailer `member_size`;
@@ -35,6 +36,7 @@ mod lz4_seek;
 mod lzip_seek;
 mod lzma_seek;
 mod lzo_seek;
+mod repack;
 mod seekable_body;
 mod split;
 mod xz_seek;
@@ -86,6 +88,7 @@ pub use lzma_seek::{open_seekable_lzma, open_seekable_lzma_with_threads};
 pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo};
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
+pub use repack::{repack_seekable, RepackOptions, RepackOutcome, DEFAULT_REPACK_FRAME_SIZE};
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };
@@ -100,7 +103,7 @@ pub use zstd_seek::{
     open_seekable_zstd_from_reader, open_seekable_zstd_with_threads,
     open_seekable_zstd_with_threads_from_reader, open_seekable_zstd_with_zstd_blocks,
     open_seekable_zstd_with_zstd_blocks_from_reader, scan_zstd_frames, scan_zstd_frames_path,
-    SeekableZstd, ZstdFrameInfo, ZstdFrameMap,
+    SeekableZstd, ZstdFrameInfo, ZstdFrameMap, SEEKABLE_MAGIC,
 };
 pub use zstd_splice::{splice_zstd_last_frames, splice_zstd_last_frames_replace, SpliceStats};
 

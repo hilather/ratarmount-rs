@@ -51,6 +51,34 @@ frame; the full-decode path is simple and fast enough.
 
 ---
 
+## Producer: `repack_seekable` (engine)
+
+The **recommended** producer is [`ratarmount_compress::repack_seekable`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/repack.rs)
+in `ratarmount-compress` (CLI `--repack-seekable` is **not** wired yet).
+
+Default output is **multi-frame zstd + official seek table** (footer magic
+`0x8F92EAB1`). Uncompressed frame size defaults to **8 MiB**, matching the
+`split -b 8M` recipes below.
+
+| Input | Default behavior |
+|-------|------------------|
+| Already has a seek table | Byte-copy (`CopiedExistingSeekable`). If `IN == OUT`, skip tmp+rename (`DidNothing`). |
+| Multi-frame zstd, no table, every frame `cSize`/`dSize` fits `u32` | Copy frames, **append** a skippable seek table. |
+| Multi-frame zstd, a frame **exceeds `u32`** | Copy frames, **omit** the table (`CopiedWithoutSeekTable`, `warn!`). Same as live-commit dropping a footer rather than emitting a lying table. |
+| Single-frame zstd / uncompressed | Recompress into 8 MiB windows + seek table. |
+| Gzip | Stream-decode and re-encode as framed zstd. `keep_gzip` instead copies the gzip bytes and writes a sibling `*.rgzi` via [`SeekableGzip::export_seek_index_blob`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-compress/src/gzip_seek.rs); optional GZIDX via `export_indexed_gzip_blob`. |
+
+`RepackOptions::force` is the **only** switch that recompresses already
+multi-frame input into smaller windows (including the `u32`-overflow case).
+
+**Residual (this engine slice):** CLI flags; ZIP / 7z / bzip2 / xz / lz4 rewrite;
+parallel `zstdmt` encode; in-place Windows rename quirks.
+
+The `split \| zstd >>` recipes below remain valid **prior art** when you are
+not calling the engine.
+
+---
+
 ## How to produce multi-frame zstd
 
 Both patterns create **concatenated independent frames**. Standard `zstd` is
