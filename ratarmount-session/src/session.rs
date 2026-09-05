@@ -231,13 +231,15 @@ impl Session {
             disable_union_mount: false,
             ..CompositingOptions::default()
         };
-        let bundle = factory::build_mount_source_ex(
+        let mut bundle = factory::build_mount_source_ex(
             std::slice::from_ref(&archive_path),
             &options,
             recreate_flag,
             comp,
         )
         .map_err(|e| map_factory_error(e, had_passwords, &archive_path))?;
+        bundle.source =
+            ratarmount_compositing::maybe_wrap_payload_cache(bundle.source, index_in_memory);
         let source = OpenedSource::Bundle(bundle);
         if let Some(p) = loc.path() {
             // WHY: allocate evicts before the sqlite body exists; trim after publish.

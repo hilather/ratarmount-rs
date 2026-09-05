@@ -1266,6 +1266,36 @@ impl MountSource for AutoMountLayer {
         }
         self.root.member_seek_is_cheap(file_info)
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        if let Some(key) = Self::automount_key(file_info) {
+            if key == "/" {
+                return self.root.list_xattr(file_info);
+            }
+            let Ok(mounted) = self.mounted.lock() else {
+                return Vec::new();
+            };
+            if let Some(m) = mounted.get(key) {
+                return m.source.list_xattr(file_info);
+            }
+            return Vec::new();
+        }
+        self.root.list_xattr(file_info)
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        if let Some(am_key) = Self::automount_key(file_info) {
+            if am_key == "/" {
+                return self.root.get_xattr(file_info, key);
+            }
+            let mounted = self.mounted.lock().ok()?;
+            if let Some(m) = mounted.get(am_key) {
+                return m.source.get_xattr(file_info, key);
+            }
+            return None;
+        }
+        self.root.get_xattr(file_info, key)
+    }
 }
 
 fn join(parent: &str, name: &str) -> String {

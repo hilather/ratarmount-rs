@@ -229,6 +229,32 @@ impl MountSource for FileVersionLayer {
     fn statfs(&self) -> ratarmount_core::StatFs {
         self.inner.statfs()
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        let mut fi = file_info.clone();
+        if let Some(UserData::Other(s)) = fi.userdata.last() {
+            if s == TAG_FOLDER {
+                return Vec::new();
+            }
+            if s == TAG_FILE {
+                fi.userdata.pop();
+            }
+        }
+        self.inner.list_xattr(&fi)
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        let mut fi = file_info.clone();
+        if let Some(UserData::Other(s)) = fi.userdata.last() {
+            if s == TAG_FOLDER {
+                return None;
+            }
+            if s == TAG_FILE {
+                fi.userdata.pop();
+            }
+        }
+        self.inner.get_xattr(&fi, key)
+    }
 }
 
 #[cfg(test)]

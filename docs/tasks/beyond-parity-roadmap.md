@@ -224,7 +224,7 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 |----|------|--------|--------|---------|
 | G-1 | **`ratarmount serve`** — one binary, several exports on the same tree | `done` | L | P-2 / P-5 / P-6 (NFS already); **booleans**, no `serve` subcommand |
 | G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `done` | M | index; pairs with P-1 |
-| G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `todo` | L | `--hashes` (partial today) |
+| G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `done` | L | `--hashes` (partial today) |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
 | G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
 
@@ -244,11 +244,13 @@ Publish: `--publish-index` copies the sidecar next to the archive; `--publish-in
 
 **Residual:** SOCI / eStargz / nydus zTOC converter; CLI `--publish-index` / live overlay S3 PUT (F-7; library primitive landed); GCS/Azure PUT; FUSE/NFS exposure of the SQLite blob; Docker Hub Referrers matrix; tag-convention fallback.
 
-### G-3 — Content-addressed member cache
+### G-3 — Content-addressed member cache — `done`
 
-Hash members (`--hashes` exists for TAR/ZIP/7z). Cache decompressed chunks by hash across mounts. Nested Debian sources, OCI layers, and unioned backup tars share gzip/zstd windows. This is nydus chunk-dedup without a new format. Cache dir: XDG cache, size cap, skip on `:memory:` indexes.
+Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodies** by sha256 across mounts (`payload-v1/{hh}/{sha256}`). Nested Debian sources, OCI layers, and unioned backup tars share identical members. Default-on when `user.hash.sha256` exists; do not hash on cold `open`. Skip `:memory:` indexes, overlay writes, members > 64 MiB (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`), and `RATARMOUNT_PAYLOAD_CACHE_BYTES=0`. LRU cap default 4 GiB.
 
-Distinct from V-3 (`$XDG_CACHE_HOME/ratarmount/meta-v3/`), which caches whole **sidecar downloads** (SQLite blobs ≤ 64 MiB), not member payloads.
+`payload-v1/` is a **sibling** of `local-index-v1/` under [`platform_cache_root()`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-index/src/local_cache.rs) (macOS `~/Library/Caches/ratarmount/`, Linux XDG, Windows `%LOCALAPPDATA%\ratarmount\`). Distinct from V-3 (`$XDG_CACHE_HOME/ratarmount/meta-v3/`), which caches whole **sidecar downloads** (SQLite blobs ≤ 64 MiB) and is **not** migrated to Library/Caches.
+
+**Residual:** CDC / nydus-like chunking of members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`).
 
 ### G-4 — Snapshot browser
 
@@ -273,7 +275,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 7. ~~**F-9** `--repack-seekable`~~ — done (engine + CLI; ZIP/7z/bzip2/xz residual).
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / CLI+live S3 PUT (F-7; `publish_index_to_s3` primitive landed) / GCS/Azure PUT / FUSE blob / Hub referrers.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---
 

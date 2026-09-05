@@ -10,8 +10,8 @@ use std::time::{Duration, Instant};
 use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
-    commit_overlay, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
-    WriteOverlay,
+    commit_overlay, maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource,
+    ControlFolderOptions, WriteOverlay,
 };
 use ratarmount_compress::{strip_compression_suffix, RepackOptions};
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
@@ -1119,6 +1119,9 @@ fn main() {
 
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
+
+    // Under WriteOverlay so overlay files never hit payload-v1.
+    bundle.source = maybe_wrap_payload_cache(bundle.source, open_opts.index_in_memory);
 
     if let Some(w) = &args.write_overlay {
         let overlay_path = if w.as_os_str() == ":temp:" {

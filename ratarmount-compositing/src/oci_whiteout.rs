@@ -297,6 +297,24 @@ impl MountSource for OciImageMountSource {
     fn is_immutable(&self) -> bool {
         self.layers.iter().all(|l| l.is_immutable())
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        if let Some(li) = self.layer_from_info(file_info) {
+            if let Some(src) = self.layers.get(li) {
+                return src.list_xattr(&Self::strip_tag(file_info));
+            }
+        }
+        Vec::new()
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        if let Some(li) = self.layer_from_info(file_info) {
+            if let Some(src) = self.layers.get(li) {
+                return src.get_xattr(&Self::strip_tag(file_info), key);
+            }
+        }
+        None
+    }
 }
 
 enum Walk {
@@ -412,6 +430,7 @@ fn join(parent: &str, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeMap;
     use std::io::{Cursor, Read};
     use std::sync::Arc;
 
@@ -557,5 +576,90 @@ mod tests {
         assert!(img.lookup("/", 0).is_some());
         assert!(img.list("/").is_none());
         assert!(img.list_dirents("/").is_none());
+    }
+
+    struct HashXattrLayer {
+        name: String,
+        sha: Vec<u8>,
+    }
+
+    impl MountSource for HashXattrLayer {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                let mut map = BTreeMap::new();
+                map.insert(
+                    self.name.clone(),
+                    FileInfo {
+                        size: 1,
+                        mtime: 0.0,
+                        mode: ratarmount_core::S_IFREG | 0o644,
+                        linkname: String::new(),
+                        uid: 0,
+                        gid: 0,
+                        userdata: vec![],
+                    },
+                );
+                Some(ListResult::Infos(map))
+            } else {
+                None
+            }
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(create_root_file_info());
+            }
+            if path == format!("/{}", self.name) {
+                Some(FileInfo {
+                    size: 1,
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFREG | 0o644,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                })
+            } else {
+                None
+            }
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(Cursor::new(b"x".to_vec())))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+        fn list_xattr(&self, _: &FileInfo) -> Vec<String> {
+            vec!["user.hash.sha256".into()]
+        }
+        fn get_xattr(&self, _: &FileInfo, key: &str) -> Option<Vec<u8>> {
+            if key == "user.hash.sha256" {
+                Some(self.sha.clone())
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Regression: tagged OCI layer FileInfo still returns `user.hash.sha256`.
+    #[test]
+    fn oci_forwards_hash_xattr_on_tagged_layer() {
+        let sha = b"deadbeef".to_vec();
+        let img = OciImageMountSource::new(vec![Arc::new(HashXattrLayer {
+            name: "a.txt".into(),
+            sha: sha.clone(),
+        }) as Arc<dyn MountSource>]);
+        let fi = img.lookup("/a.txt", 0).expect("layer file");
+        assert!(
+            fi.userdata
+                .iter()
+                .any(|u| matches!(u, UserData::Other(s) if s.starts_with("oci:"))),
+            "expected oci: tag, got {:?}",
+            fi.userdata
+        );
+        assert_eq!(
+            img.get_xattr(&fi, "user.hash.sha256").as_deref(),
+            Some(sha.as_slice())
+        );
+        assert_eq!(img.list_xattr(&fi), vec!["user.hash.sha256".to_string()]);
     }
 }
