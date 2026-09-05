@@ -22,7 +22,8 @@
 //! This crate does not edit session `factory.rs` or `formats-all`. Mixed
 //! ISO+UDF discs match UDF magic here; **UDF-primary probe order** (Udf
 //! immediately before Iso) is factory-PR behavior. UDF 2.50 metadata
-//! partitions are residual.
+//! partitions and extended (20-byte) allocation descriptors are residual.
+//! Type-3 AD continuations are followed.
 
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -43,6 +44,7 @@ const TAG_LEN: usize = 16;
 const MAX_SLURP: u64 = 256 * 1024 * 1024;
 const MAX_DIR: u64 = 16 * 1024 * 1024;
 const MAX_INDIRECT: u32 = 8;
+const MAX_AD_HOPS: u32 = 128;
 
 const TAG_AVDP: u16 = 2;
 const TAG_PD: u16 = 5;
@@ -250,7 +252,13 @@ impl UdfMountSource {
             return Err(UdfError::Msg("not a directory".into()));
         }
         let bytes = self.read_entry_bytes(fe, MAX_DIR)?;
-        parse_directory(&bytes)
+        // In-ICB directories are a packed FID stream (no per-block padding).
+        let block_size = if fe.ad_type == AD_IN_ICB {
+            bytes.len().max(1)
+        } else {
+            self.geo.block_size.max(1) as usize
+        };
+        parse_directory(&bytes, block_size)
     }
 
     fn resolve(&self, path: &str) -> Result<Resolved> {
@@ -300,8 +308,11 @@ impl UdfMountSource {
         let ents = self.list_entries(&fe).ok()?;
         let mut map = BTreeMap::new();
         for e in ents {
+            let child_fe = match self.load_icb(e.icb) {
+                Ok(fe) => fe,
+                Err(_) => continue,
+            };
             let child = child_path(path, &e.name);
-            let child_fe = self.load_icb(e.icb).ok()?;
             map.insert(
                 e.name.clone(),
                 entry_to_file_info(&child, child_fe.is_dir, child_fe.size, child_fe.mtime),
@@ -319,7 +330,10 @@ impl UdfMountSource {
         let ents = self.list_entries(&fe).ok()?;
         let mut out = Vec::with_capacity(ents.len());
         for e in ents {
-            let child_fe = self.load_icb(e.icb).ok()?;
+            let child_fe = match self.load_icb(e.icb) {
+                Ok(fe) => fe,
+                Err(_) => continue,
+            };
             let (mode, size) = entry_mode_size(child_fe.is_dir, child_fe.size);
             out.push(CheapDirent {
                 name: e.name,
@@ -883,7 +897,7 @@ fn load_icb_with(
                 let next = parse_long_ad(&buf[36..52])?;
                 loc = next.lba;
             }
-            TAG_FE | TAG_EFE => return parse_file_entry(&buf, tag.ident),
+            TAG_FE | TAG_EFE => return parse_file_entry(&buf, tag.ident, &mut read_part),
             other => {
                 return Err(UdfError::Msg(format!(
                     "unexpected UDF ICB tag {other} at LBA {loc}"
@@ -894,7 +908,11 @@ fn load_icb_with(
     Err(UdfError::Msg("UDF ICB indirection too deep".into()))
 }
 
-fn parse_file_entry(buf: &[u8], ident: u16) -> Result<FileEntry> {
+fn parse_file_entry(
+    buf: &[u8],
+    ident: u16,
+    read_part: &mut impl FnMut(u32) -> Result<Vec<u8>>,
+) -> Result<FileEntry> {
     let (info_off, ea_off, ad_off) = if ident == TAG_EFE {
         (56, 208, 212)
     } else {
@@ -938,7 +956,7 @@ fn parse_file_entry(buf: &[u8], ident: u16) -> Result<FileEntry> {
             "UDF extended allocation descriptors residual".into(),
         ));
     }
-    let extents = parse_alloc_descs(&buf[start..start + l_ad], ad_type)?;
+    let extents = collect_alloc_descs(&buf[start..start + l_ad], ad_type, read_part)?;
     Ok(FileEntry {
         is_dir,
         size,
@@ -949,7 +967,10 @@ fn parse_file_entry(buf: &[u8], ident: u16) -> Result<FileEntry> {
     })
 }
 
-fn parse_alloc_descs(bytes: &[u8], ad_type: u16) -> Result<Vec<Extent>> {
+/// Type-3 continuation: partition LBA and byte length of the next AD list.
+type AdContinuation = (u32, u32);
+
+fn parse_alloc_descs(bytes: &[u8], ad_type: u16) -> Result<(Vec<Extent>, Option<AdContinuation>)> {
     let step = match ad_type {
         AD_SHORT => 8,
         AD_LONG => 16,
@@ -966,10 +987,10 @@ fn parse_alloc_descs(bytes: &[u8], ad_type: u16) -> Result<Vec<Extent>> {
         if len == 0 && ty == 0 {
             break;
         }
-        if ty == 3 {
-            break;
-        }
         let lba = read_u32(bytes, off + 4);
+        if ty == 3 {
+            return Ok((extents, Some((lba, len))));
+        }
         extents.push(Extent {
             lba,
             length: len,
@@ -980,7 +1001,58 @@ fn parse_alloc_descs(bytes: &[u8], ad_type: u16) -> Result<Vec<Extent>> {
             return Err(UdfError::Msg("too many UDF extents".into()));
         }
     }
-    Ok(extents)
+    Ok((extents, None))
+}
+
+fn read_ad_bytes(
+    read_part: &mut impl FnMut(u32) -> Result<Vec<u8>>,
+    start_lba: u32,
+    len: u32,
+) -> Result<Vec<u8>> {
+    if len == 0 {
+        return Ok(Vec::new());
+    }
+    let mut out = Vec::new();
+    let mut got = 0u32;
+    let mut lba = start_lba;
+    while got < len {
+        let block = read_part(lba)?;
+        if block.is_empty() {
+            return Err(UdfError::Msg("empty UDF AD continuation block".into()));
+        }
+        let take = ((len - got) as usize).min(block.len());
+        out.extend_from_slice(&block[..take]);
+        got += take as u32;
+        lba = lba
+            .checked_add(1)
+            .ok_or_else(|| UdfError::Msg("UDF AD continuation LBA overflow".into()))?;
+    }
+    Ok(out)
+}
+
+fn collect_alloc_descs(
+    initial: &[u8],
+    ad_type: u16,
+    read_part: &mut impl FnMut(u32) -> Result<Vec<u8>>,
+) -> Result<Vec<Extent>> {
+    let mut extents = Vec::new();
+    let mut cur = initial.to_vec();
+    for _ in 0..MAX_AD_HOPS {
+        let (more, cont) = parse_alloc_descs(&cur, ad_type)?;
+        extents.extend(more);
+        if extents.len() > 4096 {
+            return Err(UdfError::Msg("too many UDF extents".into()));
+        }
+        match cont {
+            None => return Ok(extents),
+            Some((lba, len)) => {
+                cur = read_ad_bytes(read_part, lba, len)?;
+            }
+        }
+    }
+    Err(UdfError::Msg(
+        "UDF allocation descriptor continuation too deep".into(),
+    ))
 }
 
 fn decode_cs0(bytes: &[u8]) -> String {
@@ -992,7 +1064,7 @@ fn decode_cs0(bytes: &[u8]) -> String {
         16 => {
             let mut rest = &bytes[1..];
             if rest.len() % 2 == 1 {
-                rest = &rest[1..];
+                rest = &rest[..rest.len() - 1];
             }
             let units: Vec<u16> = rest
                 .chunks_exact(2)
@@ -1005,24 +1077,36 @@ fn decode_cs0(bytes: &[u8]) -> String {
     }
 }
 
-fn parse_directory(bytes: &[u8]) -> Result<Vec<Dirent>> {
+fn parse_directory(bytes: &[u8], block_size: usize) -> Result<Vec<Dirent>> {
+    let block_size = block_size.max(1);
     let mut out = Vec::new();
     let mut off = 0usize;
     while off + 38 <= bytes.len() {
-        if bytes[off..].iter().all(|&b| b == 0) {
+        let block_end = ((off / block_size) + 1)
+            .saturating_mul(block_size)
+            .min(bytes.len());
+        if off >= block_end {
             break;
+        }
+        if bytes[off..block_end].iter().all(|&b| b == 0) {
+            off = block_end;
+            continue;
         }
         let tag = match parse_tag(&bytes[off..]) {
             Ok(t) if t.ident == TAG_FID => t,
-            _ => break,
+            _ => {
+                off = block_end;
+                continue;
+            }
         };
         let _ = tag;
         let l_fi = bytes[off + 19] as usize;
         let l_iu = read_u16(bytes, off + 36) as usize;
         let mut total = 38 + l_iu + l_fi;
         total = (total + 3) & !3;
-        if off + total > bytes.len() {
-            break;
+        if off + total > block_end {
+            off = block_end;
+            continue;
         }
         let ch = bytes[off + 18];
         if ch & FID_DELETED == 0 && ch & FID_PARENT == 0 && l_fi > 0 {
@@ -1041,6 +1125,20 @@ fn parse_directory(bytes: &[u8]) -> Result<Vec<Dirent>> {
     Ok(out)
 }
 
+fn udf_timezone_minutes(type_and_tz: u16) -> i32 {
+    let tz = type_and_tz & 0x0FFF;
+    if tz == 0x800 {
+        0
+    } else {
+        let n = i32::from(tz);
+        if n & 0x800 != 0 {
+            n | !0x0FFF
+        } else {
+            n
+        }
+    }
+}
+
 fn udf_timestamp_to_unix(buf: &[u8]) -> f64 {
     if buf.len() < 12 {
         return 0.0;
@@ -1055,7 +1153,8 @@ fn udf_timestamp_to_unix(buf: &[u8]) -> f64 {
     if year < 1970 || !(1..=12).contains(&month) || day == 0 {
         return 0.0;
     }
-    civil_to_unix(year, month, day, hour, min, sec, centi)
+    let offset_min = udf_timezone_minutes(read_u16(buf, 0));
+    civil_to_unix(year, month, day, hour, min, sec, centi) - f64::from(offset_min) * 60.0
 }
 
 fn civil_to_unix(year: i32, month: u8, day: u8, hour: u8, min: u8, sec: u8, centi: u8) -> f64 {
@@ -1152,6 +1251,35 @@ mod tests {
         buf
     }
 
+    fn encode_fid_cs2(
+        name: &str,
+        icb_lba: u32,
+        part: u16,
+        tag_loc: u32,
+        block_size: u32,
+        trailing_pad: bool,
+    ) -> Vec<u8> {
+        let mut ident = vec![16u8];
+        for u in name.encode_utf16() {
+            ident.extend_from_slice(&u.to_be_bytes());
+        }
+        if trailing_pad {
+            ident.push(0);
+        }
+        let l_fi = ident.len();
+        let mut total = 38 + l_fi;
+        total = (total + 3) & !3;
+        let mut buf = vec![0u8; total];
+        write_u16(&mut buf, 16, 1);
+        buf[19] = l_fi as u8;
+        write_u32(&mut buf, 20, block_size);
+        write_u32(&mut buf, 24, icb_lba);
+        write_u16(&mut buf, 28, part);
+        buf[38..38 + ident.len()].copy_from_slice(&ident);
+        finish_tag(&mut buf, TAG_FID, tag_loc);
+        buf
+    }
+
     fn encode_fe_in_icb(
         is_dir: bool,
         data: &[u8],
@@ -1181,23 +1309,47 @@ mod tests {
         parent_lba: u32,
         block_size: usize,
     ) -> Vec<u8> {
+        encode_fe_short_ads(
+            false,
+            size,
+            &[(size as u32, 0, data_lba)],
+            tag_loc,
+            parent_lba,
+            block_size,
+        )
+    }
+
+    fn encode_fe_short_ads(
+        is_dir: bool,
+        info_len: u64,
+        ads: &[(u32, u8, u32)],
+        tag_loc: u32,
+        parent_lba: u32,
+        block_size: usize,
+    ) -> Vec<u8> {
         let mut buf = vec![0u8; block_size];
         write_u16(&mut buf, 20, 4);
         write_u16(&mut buf, 24, 1);
-        buf[27] = 5;
+        buf[27] = if is_dir { FILE_TYPE_DIR } else { 5 };
         write_u32(&mut buf, 28, parent_lba);
         write_u16(&mut buf, 34, AD_SHORT);
         write_u32(&mut buf, 44, 0x7FFF);
         write_u16(&mut buf, 48, 1);
-        write_u64(&mut buf, 56, size);
-        write_u32(&mut buf, 172, 8);
-        write_u32(&mut buf, 176, size as u32);
-        write_u32(&mut buf, 180, data_lba);
+        write_u64(&mut buf, 56, info_len);
+        let l_ad = ads.len() * 8;
+        write_u32(&mut buf, 172, l_ad as u32);
+        for (i, &(len, ty, lba)) in ads.iter().enumerate() {
+            let raw = (len & 0x3FFF_FFFF) | (u32::from(ty) << 30);
+            let off = 176 + i * 8;
+            write_u32(&mut buf, off, raw);
+            write_u32(&mut buf, off + 4, lba);
+        }
         finish_tag(&mut buf, TAG_FE, tag_loc);
         buf
     }
 
-    /// Minimal UDF 2.01 volume: hello.txt, foo/ufo, short_ad big.bin.
+    /// Minimal UDF 2.01 volume: hello.txt, foo/ufo, short_ad big.bin,
+    /// two-block `wide/` directory, CS2 names, type-3 AD continuation.
     fn synthetic_udf_image() -> Vec<u8> {
         const BS: usize = 2048;
         const BS_U: u32 = 2048;
@@ -1258,22 +1410,48 @@ mod tests {
         let hello = b"hello-udf\n";
         let ufo = b"iriya\n";
         let big: Vec<u8> = (0..3000).map(|i| (i % 256) as u8).collect();
+        let first = b"first-block\n";
+        let second = b"second-block\n";
+        let cs2 = b"cs2-utf16\n";
+        let pad = b"pad-cs2\n";
+        let cont = b"type3-continued\n";
 
         let hello_fe = encode_fe_in_icb(false, hello, 2, 1, BS);
         let ufo_fe = encode_fe_in_icb(false, ufo, 4, 3, BS);
         // Data at LBA 5..6; File Entry at LBA 7 so the payload cannot clobber the FE.
         let big_fe = encode_fe_short_ad(big.len() as u64, 5, 7, 1, BS);
+        let first_fe = encode_fe_in_icb(false, first, 10, 12, BS);
+        let second_fe = encode_fe_in_icb(false, second, 11, 12, BS);
+        let wide_fe = encode_fe_short_ads(true, (2 * BS) as u64, &[(2 * BS_U, 0, 8)], 12, 1, BS);
+        let cs2_fe = encode_fe_in_icb(false, cs2, 13, 1, BS);
+        let pad_fe = encode_fe_in_icb(false, pad, 14, 1, BS);
+        let cont_fe = encode_fe_short_ads(false, cont.len() as u64, &[(8, 3, 15)], 17, 1, BS);
 
         let mut foo_dir = Vec::new();
         foo_dir.extend(encode_fid("", 1, 0, true, true, 3, BS_U));
         foo_dir.extend(encode_fid("ufo", 4, 0, false, false, 3, BS_U));
         let foo_fe = encode_fe_in_icb(true, &foo_dir, 3, 1, BS);
 
+        let mut wide0 = vec![0u8; BS];
+        let parent = encode_fid("", 1, 0, true, true, 8, BS_U);
+        let first_fid = encode_fid("first.txt", 10, 0, false, false, 8, BS_U);
+        wide0[..parent.len()].copy_from_slice(&parent);
+        wide0[parent.len()..parent.len() + first_fid.len()].copy_from_slice(&first_fid);
+        let mut wide1 = vec![0u8; BS];
+        let second_fid = encode_fid("second.txt", 11, 0, false, false, 9, BS_U);
+        wide1[..second_fid.len()].copy_from_slice(&second_fid);
+
         let mut root_dir = Vec::new();
         root_dir.extend(encode_fid("", 1, 0, true, true, 1, BS_U));
         root_dir.extend(encode_fid("hello.txt", 2, 0, false, false, 1, BS_U));
         root_dir.extend(encode_fid("foo", 3, 0, true, false, 1, BS_U));
         root_dir.extend(encode_fid("big.bin", 7, 0, false, false, 1, BS_U));
+        root_dir.extend(encode_fid("wide", 12, 0, true, false, 1, BS_U));
+        root_dir.extend(encode_fid_cs2("cs2.txt", 13, 0, 1, BS_U, false));
+        root_dir.extend(encode_fid_cs2("P", 14, 0, 1, BS_U, true));
+        root_dir.extend(encode_fid("cont.bin", 17, 0, false, false, 1, BS_U));
+        // Unreadable child: ICB at empty LBA 99. list/list_dirents must skip it.
+        root_dir.extend(encode_fid("bad", 99, 0, false, false, 1, BS_U));
         let root_fe = encode_fe_in_icb(true, &root_dir, 1, 1, BS);
 
         put_block(&mut img, 1, &root_fe);
@@ -1284,6 +1462,19 @@ mod tests {
         put_block(&mut img, 5, &big[..BS]);
         let data_off = (64 + 5) as usize * BS + BS;
         img[data_off..data_off + (big.len() - BS)].copy_from_slice(&big[BS..]);
+        put_block(&mut img, 8, &wide0);
+        put_block(&mut img, 9, &wide1);
+        put_block(&mut img, 10, &first_fe);
+        put_block(&mut img, 11, &second_fe);
+        put_block(&mut img, 12, &wide_fe);
+        put_block(&mut img, 13, &cs2_fe);
+        put_block(&mut img, 14, &pad_fe);
+        let mut ad_cont = [0u8; 8];
+        write_u32(&mut ad_cont, 0, cont.len() as u32);
+        write_u32(&mut ad_cont, 4, 16);
+        put_block(&mut img, 15, &ad_cont);
+        put_block(&mut img, 16, cont);
+        put_block(&mut img, 17, &cont_fe);
 
         let mut avdp = vec![0u8; 512];
         write_u32(&mut avdp, 16, 16 * BS_U);
@@ -1349,7 +1540,13 @@ mod tests {
         None
     }
 
-    fn mkudffs_or_mkisofs_image() -> Option<(tempfile::TempDir, PathBuf)> {
+    struct ToolImage {
+        _dir: tempfile::TempDir,
+        path: PathBuf,
+        has_hello: bool,
+    }
+
+    fn mkudffs_or_mkisofs_image() -> Option<ToolImage> {
         let dir = tempfile::tempdir().ok()?;
         if let Some(mkudffs) = which_cmd("mkudffs") {
             let img = dir.path().join("vol.udf");
@@ -1365,7 +1562,11 @@ mod tests {
                 .status()
                 .ok()?;
             if status.success() {
-                return Some((dir, img));
+                return Some(ToolImage {
+                    _dir: dir,
+                    path: img,
+                    has_hello: false,
+                });
             }
             eprintln!("skip: mkudffs failed ({})", mkudffs.display());
         }
@@ -1389,7 +1590,11 @@ mod tests {
                 .status()
                 .ok()?;
             if status.success() {
-                return Some((dir, img));
+                return Some(ToolImage {
+                    _dir: dir,
+                    path: img,
+                    has_hello: true,
+                });
             }
             eprintln!("skip: {bin} failed ({})", cmd.display());
         }
@@ -1403,7 +1608,11 @@ mod tests {
                 .status()
                 .ok()?;
             if status.success() {
-                return Some((dir, img));
+                return Some(ToolImage {
+                    _dir: dir,
+                    path: img,
+                    has_hello: true,
+                });
             }
             eprintln!("skip: xorriso failed ({})", xorriso.display());
         }
@@ -1636,24 +1845,121 @@ mod tests {
         );
     }
 
+    /// Always-on: CS0 compression 16 pad is the last byte, not the first unit.
+    #[test]
+    fn decode_cs0_utf16_trims_trailing_pad() {
+        // Odd rest after compression ID: trailing pad. First unit is 'A' (U+0041).
+        assert_eq!(decode_cs0(&[16, 0x00, 0x41, 0x00]), "A");
+        // Even rest, no pad: "cs2".
+        assert_eq!(decode_cs0(&[16, 0x00, b'c', 0x00, b's', 0x00, b'2']), "cs2");
+    }
+
+    /// Regression: 12-bit timezone offset is minutes from UTC (0x800 = unspecified).
+    #[test]
+    fn udf_timestamp_applies_timezone_offset() {
+        let mut ts = [0u8; 12];
+        write_u16(&mut ts, 0, 60);
+        write_u16(&mut ts, 2, 2020);
+        ts[4] = 1;
+        ts[5] = 15;
+        ts[6] = 12;
+        let with_tz = udf_timestamp_to_unix(&ts);
+        write_u16(&mut ts, 0, 0x0800);
+        ts[6] = 11;
+        let unspecified_utc = udf_timestamp_to_unix(&ts);
+        assert_eq!(with_tz, unspecified_utc);
+        write_u16(&mut ts, 0, 0x0800);
+        ts[6] = 12;
+        let unspecified_noon = udf_timestamp_to_unix(&ts);
+        assert_eq!(unspecified_noon, with_tz + 3600.0);
+    }
+
+    /// Regression: directory FIDs after block-0 zero padding must still be listed.
+    #[test]
+    fn list_dirents_reads_second_directory_block() {
+        let bytes = synthetic_udf_image();
+        let m = UdfMountSource::open_from_reader(Cursor::new(bytes), "wide.udf")
+            .expect("open_from_reader");
+        let dents = m.list_dirents("/wide").expect("wide dirents");
+        assert!(
+            dents.iter().any(|e| e.name == "first.txt"),
+            "first-block FID missing: {dents:?}"
+        );
+        let second = dents
+            .iter()
+            .find(|e| e.name == "second.txt")
+            .expect("second-block FID dropped");
+        let fi = m.lookup("/wide/second.txt", 0).expect("lookup second.txt");
+        assert_eq!(second.size, fi.size);
+        let mut s = String::new();
+        m.open(&fi, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "second-block\n");
+    }
+
+    #[test]
+    fn open_from_reader_cs2_names_and_type3_continuation() {
+        let bytes = synthetic_udf_image();
+        let m = UdfMountSource::open_from_reader(Cursor::new(bytes), "cs2.udf")
+            .expect("open_from_reader");
+
+        let cs2 = m.lookup("/cs2.txt", 0).expect("cs2.txt UTF-16 name");
+        let mut s = String::new();
+        m.open(&cs2, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "cs2-utf16\n");
+
+        let pad = m.lookup("/P", 0).expect("padded UTF-16 name P");
+        let mut s = String::new();
+        m.open(&pad, 0).unwrap().read_to_string(&mut s).unwrap();
+        assert_eq!(s, "pad-cs2\n");
+
+        let cont = m.lookup("/cont.bin", 0).expect("cont.bin");
+        let mut data = Vec::new();
+        m.open(&cont, 0).unwrap().read_to_end(&mut data).unwrap();
+        assert_eq!(data, b"type3-continued\n");
+    }
+
+    /// Regression: one bad child ICB must not turn list() into None.
+    #[test]
+    fn list_skips_unreadable_child_icb() {
+        let bytes = synthetic_udf_image();
+        let m = UdfMountSource::open_from_reader(Cursor::new(bytes), "skip-bad.udf")
+            .expect("open_from_reader");
+        match m.list("/").expect("list / with bad child") {
+            ListResult::Infos(map) => {
+                assert!(map.contains_key("hello.txt"));
+                assert!(!map.contains_key("bad"));
+            }
+            other => panic!("expected infos, got {other:?}"),
+        }
+        let dents = m.list_dirents("/").expect("dirents with bad child");
+        assert!(dents.iter().any(|e| e.name == "hello.txt"));
+        assert!(dents.iter().all(|e| e.name != "bad"));
+    }
+
     #[test]
     fn mkudffs_or_mkisofs_open_and_list_root() {
-        let Some((_dir, img)) = mkudffs_or_mkisofs_image() else {
+        let Some(img) = mkudffs_or_mkisofs_image() else {
             eprintln!("skip: mkudffs/mkisofs not available");
             return;
         };
         assert!(
-            looks_like_udf(&img),
+            looks_like_udf(&img.path),
             "tool-built image should have NSR02/NSR03"
         );
-        let m = match UdfMountSource::open(&img) {
-            Ok(m) => m,
-            Err(e) => {
-                eprintln!("skip: tool image did not parse ({e})");
-                return;
-            }
-        };
+        let m = UdfMountSource::open(&img.path).expect("open tool-built UDF image");
         let _root = m.list("/").expect("list root of mkudffs/mkisofs image");
         assert!(m.lookup("/", 0).is_some());
+        if img.has_hello {
+            let fi = m
+                .lookup("/hello.txt", 0)
+                .or_else(|| m.lookup("/HELLO.TXT", 0))
+                .expect("hello.txt from mkisofs src tree");
+            let mut body = Vec::new();
+            m.open(&fi, 0).unwrap().read_to_end(&mut body).unwrap();
+            assert!(
+                body == b"hello-udf\n" || body.starts_with(b"hello"),
+                "unexpected hello.txt bytes: {body:?}"
+            );
+        }
     }
 }

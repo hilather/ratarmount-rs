@@ -34,6 +34,9 @@ Nested UDF members open from any `Read + Seek` stream via `UdfMountSource::open_
 
 - UDF 2.50 / 2.60 **metadata partition** (type-2 `*UDF Metadata Partition` maps): listed as residual; v1 needs a type-1 partition map
 - VAT (virtual allocation table) packet-written volumes
+- Extended (20-byte) allocation descriptors (`AD_EXT`)
+- Unreadable child ICBs are **skipped** in `list` / `list_dirents` (the directory still lists)
+- Type-3 AD continuations **are** followed (not residual)
 - Whole-file buffer on `open` (same as FAT/exFAT; `ArchiveRead` is `Send`)
 - Session factory / `formats-all` / nested matrix row (later PR)
 - Mixed-disc **probe order** (UDF before ISO) — orchestrator factory PR
