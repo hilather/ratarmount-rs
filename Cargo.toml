@@ -25,6 +25,7 @@ members = [
     "ratarmount-formats-ntfs",
     "ratarmount-formats-udf",
     "ratarmount-formats-block",
+    "ratarmount-formats-dmg",
     "ratarmount-formats-asar",
     "ratarmount-formats-ogg",
     "ratarmount-formats-html",
@@ -72,6 +73,7 @@ ratarmount-formats-exfat = { path = "ratarmount-formats-exfat" }
 ratarmount-formats-ntfs = { path = "ratarmount-formats-ntfs" }
 ratarmount-formats-udf = { path = "ratarmount-formats-udf" }
 ratarmount-formats-block = { path = "ratarmount-formats-block" }
+ratarmount-formats-dmg = { path = "ratarmount-formats-dmg" }
 ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
 ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }

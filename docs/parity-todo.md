@@ -25,6 +25,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SquashFS | yes | yes (backhand in-process; xz via xz2; unsquashfs for classic lzma) | `[x]` / `~` classic lzma fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
 | GPT/MBR partitioned disks | guestfish | crate `ratarmount-formats-block`: `/p1/`… via FAT/EXT4 offset; LVM residual; factory later | `~` crate only |
+| Apple UDIF `.dmg` | no | crate `ratarmount-formats-dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual**; factory later | `~` crate only |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG, CMYK, Indexed, ICCBased); OGG; HTML | `[x]` / `~` Separation/Lab residual |
