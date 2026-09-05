@@ -1,0 +1,20 @@
+[package]
+name = "ratarmount-formats-qcow2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "QCOW2 virtual-disk mount source (guest clusters then GPT/MBR + FAT/EXT4)"
+readme = "README.md"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-formats-block.workspace = true
+ratarmount-formats-fat.workspace = true
+ratarmount-formats-ext4.workspace = true
+thiserror.workspace = true
+log.workspace = true
+flate2 = "1"
+
+[dev-dependencies]
+tempfile.workspace = true
+fatfs = "0.3"
