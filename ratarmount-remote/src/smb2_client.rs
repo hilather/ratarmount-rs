@@ -5,7 +5,7 @@
 //! (server) — helpers are duplicated on purpose.
 //!
 //! Commands: NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE,
-//! READ at offset, CLOSE. Range file + listing land in later PRs.
+//! READ at offset, CLOSE. Live Range is [`crate::SmbRangeFile`]; listing is later.
 
 use std::io::{self, ErrorKind, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -787,7 +787,7 @@ fn ntlm_type3_v2(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::io::ErrorKind;
@@ -796,11 +796,11 @@ mod tests {
     use std::thread::{self, JoinHandle};
     use std::time::Duration;
 
-    pub const OFFSET_1MIB: u64 = 1024 * 1024;
-    const TAIL: &[u8] = b"smb2-range-tail!";
-    const HEAD: &[u8] = b"smb2head";
-    const FILE_NAME: &str = "payload.bin";
-    const SHARE: &str = "data";
+    pub(crate) const OFFSET_1MIB: u64 = 1024 * 1024;
+    pub(crate) const TAIL: &[u8] = b"smb2-range-tail!";
+    pub(crate) const HEAD: &[u8] = b"smb2head";
+    pub(crate) const FILE_NAME: &str = "payload.bin";
+    pub(crate) const SHARE: &str = "data";
     const CHALLENGE: [u8; 8] = [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88];
     const NTLMSSP_NEGOTIATE_KEY_EXCH: u32 = 0x4000_0000;
 
@@ -926,12 +926,12 @@ mod tests {
     }
 
     #[derive(Clone, Debug, Default)]
-    struct FakeStats {
-        reads: Vec<(u64, u32)>,
+    pub(crate) struct FakeStats {
+        pub(crate) reads: Vec<(u64, u32)>,
         creates: Vec<String>,
     }
 
-    enum AuthMode {
+    pub(crate) enum AuthMode {
         Guest,
         Password {
             user: String,
@@ -941,16 +941,16 @@ mod tests {
         RejectDialect,
     }
 
-    struct FakeOpts {
-        auth: AuthMode,
+    pub(crate) struct FakeOpts {
+        pub(crate) auth: AuthMode,
         unsigned_read: bool,
-        read_data_cap: Option<u32>,
+        pub(crate) read_data_cap: Option<u32>,
         max_read_size: u32,
         signing_required: bool,
     }
 
     impl FakeOpts {
-        fn guest() -> Self {
+        pub(crate) fn guest() -> Self {
             Self {
                 auth: AuthMode::Guest,
                 unsigned_read: false,
@@ -975,14 +975,14 @@ mod tests {
         }
     }
 
-    struct FakeSmb {
-        addr: SocketAddr,
+    pub(crate) struct FakeSmb {
+        pub(crate) addr: SocketAddr,
         stats: Arc<Mutex<FakeStats>>,
         handle: Option<JoinHandle<()>>,
     }
 
     impl FakeSmb {
-        fn spawn(mode: AuthMode) -> Self {
+        pub(crate) fn spawn(mode: AuthMode) -> Self {
             match mode {
                 AuthMode::Guest => Self::spawn_with(FakeOpts::guest()),
                 AuthMode::Password {
@@ -1000,7 +1000,7 @@ mod tests {
             }
         }
 
-        fn spawn_with(opts: FakeOpts) -> Self {
+        pub(crate) fn spawn_with(opts: FakeOpts) -> Self {
             let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind fake SMB");
             let addr = listener.local_addr().expect("local addr");
             let stats = Arc::new(Mutex::new(FakeStats::default()));
@@ -1017,7 +1017,7 @@ mod tests {
             }
         }
 
-        fn stats(&self) -> FakeStats {
+        pub(crate) fn stats(&self) -> FakeStats {
             self.stats.lock().expect("stats").clone()
         }
     }

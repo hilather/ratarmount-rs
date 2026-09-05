@@ -16,7 +16,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
-| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH`. In-tree SMB 2.0.2 packet codec (`Smb2Client`) is tested; live Range / folders are F-6 residual |
+| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`. Codec + live Range reader (`open_smb_range` / `SmbRangeFile` via in-tree SMB 2.0.2 `Smb2Client`) exist; session factory wire is later. Dialect `STATUS_NOT_SUPPORTED` / non-2.x falls back to Samba `smbclient` when on `PATH`. Missing both names install **or** the dialect residual. Share listing is F-6 residual |
 | `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`). Index: local `oci:{digest}` cache first, then OCI 1.1 referrers (`artifactType=application/vnd.ratarmount.index.v1+sqlite`) on miss; fail-open if Referrers API is missing (not SOCI; no tag-convention fallback) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
@@ -146,9 +146,9 @@ Path rules (fsspec-like):
 - `ssh://host//abs/path` → absolute `/abs/path`
 - `ssh://host//path/dir/` → SFTP `readdir` folder when `stat` says directory
 
-### SMB (`smbclient`) inbound
+### SMB inbound
 
-Requires the Samba client binary on `PATH` (`apt install smbclient` / `dnf install samba-client`). Without it, `resolve_to_local` returns a clear install hint. An in-tree SMB 2.0.2 Direct-TCP codec (`Smb2Client`: NEGOTIATE / SESSION_SETUP guest+NTLMv2 / TREE_CONNECT / CREATE / READ-at-offset / CLOSE) is in `ratarmount-remote`; live Range + share listing still F-6. Outbound `--smb` is [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
+In-tree SMB 2.0.2 Direct-TCP codec (`Smb2Client`: NEGOTIATE / SESSION_SETUP guest+NTLMv2 / TREE_CONNECT / CREATE / READ-at-offset / CLOSE) plus live Range reader (`open_smb_range` / `SmbRangeFile`). Auth: URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest. Session factory does not yet open this Range path (`resolve_to_local` still materializes). Dialect `STATUS_NOT_SUPPORTED` / non-2.x falls back to Samba `smbclient` on `PATH` (`apt install smbclient` / `dnf install samba-client`). Missing both names the install hint **or** the dialect residual. Share listing is still F-6. Outbound `--smb` is [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 | Env | Purpose |
 |-----|---------|

@@ -1,10 +1,12 @@
-//! SMB/CIFS download-to-temp for `smb://` URLs.
+//! SMB/CIFS access for `smb://` URLs.
 //!
-//! Pure-Rust SMB stacks are heavy (async runtimes, large dependency trees). This
-//! module provides robust URL parsing and downloads via the Samba `smbclient`
-//! CLI when available. Without `smbclient` on `PATH`, callers get a clear
-//! install hint.
+//! Live Range I/O uses the in-tree SMB 2.0.2 codec ([`crate::Smb2Client`]).
+//! Dialect `STATUS_NOT_SUPPORTED` / non-2.x falls back to Samba `smbclient`
+//! download-to-temp when that binary is on `PATH`. Missing both yields
+//! `smb_fallback_clear_error` (install hint or dialect residual).
 
+use std::io::{self, Read, Seek, SeekFrom};
+use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
@@ -12,7 +14,11 @@ use log::debug;
 use tempfile::NamedTempFile;
 use url::Url;
 
+use crate::smb2_client::{Smb2Client, STATUS_NOT_SUPPORTED};
 use crate::{RemoteError, Result};
+
+const SMB_USER_ENV: &str = "RATARMOUNT_SMB_USER";
+const SMB_PASSWORD_ENV: &str = "RATARMOUNT_SMB_PASSWORD";
 
 /// Parsed SMB location (`smb://[user[:pass]@]host[:port]/share/path`).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -156,8 +162,8 @@ pub fn smbclient_download_args(loc: &SmbLocation, dest: &Path) -> Vec<String> {
         };
         args.push("-U".into());
         args.push(cred);
-    } else if let Ok(pw) = std::env::var("RATARMOUNT_SMB_PASSWORD") {
-        let user = std::env::var("RATARMOUNT_SMB_USER")
+    } else if let Ok(pw) = std::env::var(SMB_PASSWORD_ENV) {
+        let user = std::env::var(SMB_USER_ENV)
             .or_else(|_| std::env::var("USER"))
             .unwrap_or_else(|_| "guest".into());
         args.push("-U".into());
@@ -308,6 +314,254 @@ pub fn run_smbclient_get(loc: &SmbLocation, dest: &Path) -> Result<u64> {
         }
     }
     Ok(meta.len())
+}
+
+/// Error when the in-tree SMB 2.x client cannot speak the server dialect
+/// and `smbclient` is not on `PATH`. Names the install hint **or** the dialect residual.
+pub(crate) fn smb_fallback_clear_error(cause: &RemoteError) -> RemoteError {
+    RemoteError::Smb(format!(
+        "{cause}; install Samba client tools (e.g. `apt install smbclient` / \
+         `dnf install samba-client`) to fetch smb:// URLs, or use an SMB 2.0.2/2.1 share"
+    ))
+}
+
+fn is_smb_dialect_unsupported(err: &RemoteError) -> bool {
+    match err {
+        RemoteError::Smb(msg) => {
+            let lower = msg.to_ascii_lowercase();
+            lower.contains("not_supported")
+                || lower.contains("dialect")
+                || msg.contains(&format!("{STATUS_NOT_SUPPORTED:#010x}"))
+        }
+        _ => false,
+    }
+}
+
+/// URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest.
+fn smb_credentials(loc: &SmbLocation) -> Option<(String, String, String)> {
+    if let Some(user) = loc.user.as_deref() {
+        let password = loc
+            .password
+            .clone()
+            .or_else(|| std::env::var(SMB_PASSWORD_ENV).ok())
+            .unwrap_or_default();
+        let domain = loc.domain.clone().unwrap_or_default();
+        return Some((user.to_string(), domain, password));
+    }
+    let password = std::env::var(SMB_PASSWORD_ENV).ok()?;
+    let user = std::env::var(SMB_USER_ENV)
+        .or_else(|_| std::env::var("USER"))
+        .unwrap_or_else(|_| "guest".into());
+    let domain = loc.domain.clone().unwrap_or_default();
+    Some((user, domain, password))
+}
+
+fn resolve_smb_addr(host: &str, port: u16) -> Result<std::net::SocketAddr> {
+    (host, port)
+        .to_socket_addrs()
+        .map_err(|e| RemoteError::Smb(format!("SMB resolve {host}:{port} failed: {e}")))?
+        .next()
+        .ok_or_else(|| RemoteError::Smb(format!("SMB resolve {host}:{port}: no addresses")))
+}
+
+fn require_smb_file_path(loc: &SmbLocation) -> Result<()> {
+    if loc.path.is_empty() {
+        Err(RemoteError::Smb(
+            "smb URL must include a file path under the share (smb://host/share/path/to/file)"
+                .into(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+enum SmbRangeInner {
+    Live {
+        client: Smb2Client<TcpStream>,
+        file_id: [u8; 16],
+    },
+    Temp(NamedTempFile),
+}
+
+/// Seekable SMB reader using live SMB2 READ-at-offset when the dialect is 2.0.2/2.1.
+///
+/// Falls back to a tempfile from [`fetch_smb_to_temp`] when the server rejects the
+/// in-tree dialect and `smbclient` is on `PATH`.
+pub struct SmbRangeFile {
+    loc: SmbLocation,
+    size: u64,
+    pos: u64,
+    inner: SmbRangeInner,
+}
+
+impl std::fmt::Debug for SmbRangeFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SmbRangeFile")
+            .field("host", &self.loc.host)
+            .field("share", &self.loc.share)
+            .field("path", &self.loc.path)
+            .field("size", &self.size)
+            .field("pos", &self.pos)
+            .field("uses_ranges", &self.uses_ranges())
+            .finish()
+    }
+}
+
+impl SmbRangeFile {
+    /// Open `smb://…`, using live SMB2 READ when the dialect is supported.
+    pub fn open(url_str: &str) -> Result<Self> {
+        let loc = parse_smb_url(url_str)?;
+        Self::open_location(&loc)
+    }
+
+    /// Open a parsed location (see [`SmbRangeFile::open`]).
+    pub fn open_location(loc: &SmbLocation) -> Result<Self> {
+        Self::open_location_with(loc, find_smbclient)
+    }
+
+    fn open_location_with(
+        loc: &SmbLocation,
+        find_cli: impl Fn() -> Option<PathBuf>,
+    ) -> Result<Self> {
+        require_smb_file_path(loc)?;
+        match open_smb_live(loc) {
+            Ok(f) => Ok(f),
+            Err(e) if is_smb_dialect_unsupported(&e) => {
+                if find_cli().is_some() {
+                    debug!("SMB dialect unsupported ({e}); falling back to smbclient");
+                    open_smb_fallback_temp(loc)
+                } else {
+                    Err(smb_fallback_clear_error(&e))
+                }
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn location(&self) -> &SmbLocation {
+        &self.loc
+    }
+
+    pub fn len(&self) -> u64 {
+        self.size
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.size == 0
+    }
+
+    /// True when reads issue live SMB2 READ (not a tempfile from `smbclient`).
+    pub fn uses_ranges(&self) -> bool {
+        matches!(self.inner, SmbRangeInner::Live { .. })
+    }
+}
+
+/// Open a seekable SMB reader using live Range READs when the dialect allows it.
+///
+/// Equivalent to [`SmbRangeFile::open`].
+pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
+    SmbRangeFile::open(url_str)
+}
+
+fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
+    let addr = resolve_smb_addr(&loc.host, loc.port)?;
+    let mut client = Smb2Client::connect(addr)?;
+    client.negotiate()?;
+    match smb_credentials(loc) {
+        Some((user, domain, password)) => {
+            client.session_setup_ntlmv2(&user, &domain, &password)?;
+        }
+        None => client.session_setup_guest()?,
+    }
+    client.tree_connect(&loc.host, &loc.share)?;
+    let name = loc.path.replace('/', "\\");
+    let open = client.create(&name)?;
+    Ok(SmbRangeFile {
+        loc: loc.clone(),
+        size: open.end_of_file,
+        pos: 0,
+        inner: SmbRangeInner::Live {
+            client,
+            file_id: open.file_id,
+        },
+    })
+}
+
+fn open_smb_fallback_temp(loc: &SmbLocation) -> Result<SmbRangeFile> {
+    let (mut tmp, size) = fetch_smb_location_to_temp(loc)?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok(SmbRangeFile {
+        loc: loc.clone(),
+        size,
+        pos: 0,
+        inner: SmbRangeInner::Temp(tmp),
+    })
+}
+
+impl Read for SmbRangeFile {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if self.pos >= self.size || buf.is_empty() {
+            return Ok(0);
+        }
+        match &mut self.inner {
+            SmbRangeInner::Temp(tmp) => {
+                tmp.as_file_mut().seek(SeekFrom::Start(self.pos))?;
+                let n = tmp.as_file_mut().read(buf)?;
+                self.pos += n as u64;
+                Ok(n)
+            }
+            SmbRangeInner::Live { client, file_id } => {
+                let file_id = *file_id;
+                let cap = client.max_read_size().max(1);
+                let want = ((self.size - self.pos) as usize).min(buf.len());
+                let mut filled = 0;
+                while filled < want {
+                    let remaining = want - filled;
+                    let length = remaining.min(cap as usize) as u32;
+                    let chunk = client
+                        .read_at(file_id, self.pos, length)
+                        .map_err(|e| io::Error::other(e.to_string()))?;
+                    if chunk.is_empty() {
+                        break;
+                    }
+                    let n = chunk.len().min(remaining);
+                    buf[filled..filled + n].copy_from_slice(&chunk[..n]);
+                    filled += n;
+                    self.pos += n as u64;
+                    if self.pos >= self.size {
+                        break;
+                    }
+                }
+                Ok(filled)
+            }
+        }
+    }
+}
+
+impl Seek for SmbRangeFile {
+    fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+        let new = match pos {
+            SeekFrom::Start(o) => o as i64,
+            SeekFrom::End(o) => self.size as i64 + o,
+            SeekFrom::Current(o) => self.pos as i64 + o,
+        };
+        if new < 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "seek before start",
+            ));
+        }
+        self.pos = new as u64;
+        Ok(self.pos)
+    }
+}
+
+impl Drop for SmbRangeFile {
+    fn drop(&mut self) {
+        if let SmbRangeInner::Live { client, file_id } = &mut self.inner {
+            let _ = client.close(*file_id);
+        }
+    }
 }
 
 /// Redact `user%password` after `-U` for logs.
@@ -491,5 +745,143 @@ mod tests {
             msg.contains("smbclient") && (msg.contains("install") || msg.contains("not found")),
             "unexpected message: {msg}"
         );
+    }
+
+    fn fake_smb_url(port: u16) -> String {
+        format!(
+            "smb://127.0.0.1:{port}/{}/{}",
+            crate::smb2_client::tests::SHARE,
+            crate::smb2_client::tests::FILE_NAME
+        )
+    }
+
+    fn open_smb_range_without_smbclient(url: &str) -> Result<SmbRangeFile> {
+        let loc = parse_smb_url(url)?;
+        SmbRangeFile::open_location_with(&loc, || None)
+    }
+
+    fn assert_send<T: Send>() {}
+
+    #[test]
+    fn smb_range_file_is_send() {
+        assert_send::<SmbRangeFile>();
+    }
+
+    /// Regression: READ at offset 1 MiB issues SMB2 READ(s) at that offset, not a from-0 GET.
+    #[test]
+    fn smb_range_read_at_one_mib_issues_read_at_offset() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, OFFSET_1MIB, TAIL};
+        let srv = FakeSmb::spawn(AuthMode::Guest);
+        let url = fake_smb_url(srv.addr.port());
+        let mut f = open_smb_range(&url).expect("open live SMB range");
+        assert!(
+            f.uses_ranges(),
+            "expected live SMB2 READ, not smbclient temp"
+        );
+        assert_eq!(f.len(), OFFSET_1MIB + TAIL.len() as u64);
+        f.seek(SeekFrom::Start(OFFSET_1MIB)).unwrap();
+        let mut buf = vec![0u8; TAIL.len()];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, TAIL);
+        let stats = srv.stats();
+        assert!(
+            !stats.reads.is_empty(),
+            "live Range must issue at least one READ"
+        );
+        assert!(
+            stats.reads.iter().all(|(off, _)| *off >= OFFSET_1MIB),
+            "READs must start at 1 MiB, not a prefix GET: {:?}",
+            stats.reads
+        );
+        assert_eq!(stats.reads[0], (OFFSET_1MIB, TAIL.len() as u32));
+    }
+
+    /// Regression: short SUCCESS (request 32, reply 16) then remaining bytes is not EOF.
+    #[test]
+    fn smb_range_short_success_fill_loop_is_not_eof() {
+        use crate::smb2_client::tests::{FakeOpts, FakeSmb, HEAD};
+        let mut opts = FakeOpts::guest();
+        opts.read_data_cap = Some(16);
+        let srv = FakeSmb::spawn_with(opts);
+        let url = fake_smb_url(srv.addr.port());
+        let mut f = open_smb_range(&url).expect("open live SMB range");
+        let mut buf = [0u8; 32];
+        let n = f.read(&mut buf).expect("fill-loop read");
+        assert_eq!(n, 32, "short SUCCESS must continue until 32 bytes, not EOF");
+        assert_eq!(&buf[..HEAD.len()], HEAD);
+        let stats = srv.stats();
+        assert!(
+            stats.reads.len() >= 2,
+            "fill-loop must issue a second READ after short SUCCESS: {:?}",
+            stats.reads
+        );
+        assert_eq!(stats.reads[0], (0, 32));
+        assert_eq!(stats.reads[1].0, 16);
+    }
+
+    #[test]
+    fn smb_range_ntlmv2_read_at_one_mib() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb, FILE_NAME, OFFSET_1MIB, SHARE, TAIL};
+        let srv = FakeSmb::spawn(AuthMode::Password {
+            user: "alice".into(),
+            domain: "CORP".into(),
+            password: "s3cret".into(),
+        });
+        let url = format!(
+            "smb://CORP;alice:s3cret@127.0.0.1:{}/{}/{}",
+            srv.addr.port(),
+            SHARE,
+            FILE_NAME
+        );
+        let mut f = open_smb_range(&url).expect("NTLMv2 live range");
+        assert!(f.uses_ranges());
+        f.seek(SeekFrom::Start(OFFSET_1MIB)).unwrap();
+        let mut buf = vec![0u8; TAIL.len()];
+        f.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, TAIL);
+        assert_eq!(srv.stats().reads[0].0, OFFSET_1MIB);
+    }
+
+    #[test]
+    fn smb_fallback_clear_error_message_names_install_or_dialect() {
+        let cause = RemoteError::Smb(format!(
+            "NEGOTIATE NTSTATUS {STATUS_NOT_SUPPORTED:#010x} (NOT_SUPPORTED)"
+        ));
+        let err = smb_fallback_clear_error(&cause);
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("smbclient") && lower.contains("install"),
+            "{msg}"
+        );
+        assert!(
+            lower.contains("dialect") || lower.contains("not_supported") || lower.contains("2.0.2"),
+            "{msg}"
+        );
+    }
+
+    /// Dialect STATUS_NOT_SUPPORTED + no smbclient → clear error (install or dialect).
+    #[test]
+    fn smb_fallback_clear_error_without_smbclient() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb};
+        let srv = FakeSmb::spawn(AuthMode::RejectDialect);
+        let url = fake_smb_url(srv.addr.port());
+        let err = open_smb_range_without_smbclient(&url).unwrap_err();
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("smbclient") && lower.contains("install"),
+            "{msg}"
+        );
+        assert!(
+            lower.contains("dialect") || lower.contains("not_supported") || lower.contains("2.0.2"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn smb_range_rejects_empty_file_path() {
+        let err = open_smb_range("smb://host/shareonly").unwrap_err();
+        assert!(err.to_string().contains("file path") || err.to_string().contains("smb"));
     }
 }
