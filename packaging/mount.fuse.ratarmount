@@ -1,0 +1,154 @@
+#!/bin/sh
+# mount(8) helper for Type=fuse.ratarmount (fstab / systemd .mount / autofs).
+# Convention: mount.fuse.TYPE WHAT WHERE [-sfnv] [-N ns] [-t type] [-o OPTIONS]
+# util-linux may also pass flags before WHAT WHERE. -f is mount(8) fake/dry-run
+# (do not exec). -t/-N are documented EXTERNAL HELPERS flags; ignore them.
+#
+# Never put AWS_* / RESTIC_* / passwords on argv — inherit the environment
+# (EnvironmentFile=, autofs env, the process environment). v1 is read-only.
+
+set -e
+
+usage() {
+    echo "usage: mount.fuse.ratarmount WHAT WHERE [-sfnv] [-N ns] [-t type] [-o OPTIONS]" >&2
+    exit 2
+}
+
+what=""
+where=""
+opts=""
+fake=0
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        -o)
+            shift
+            [ "$#" -ge 1 ] || usage
+            if [ -n "$opts" ]; then
+                opts="$opts,$1"
+            else
+                opts=$1
+            fi
+            shift
+            ;;
+        -o*)
+            extra=${1#-o}
+            if [ -n "$opts" ]; then
+                opts="$opts,$extra"
+            else
+                opts=$extra
+            fi
+            shift
+            ;;
+        -t)
+            # mount(8) EXTERNAL HELPERS; type is already in the helper name.
+            shift
+            [ "$#" -ge 1 ] || usage
+            shift
+            ;;
+        -t*)
+            shift
+            ;;
+        -N)
+            shift
+            [ "$#" -ge 1 ] || usage
+            shift
+            ;;
+        -N*)
+            shift
+            ;;
+        -h | --help)
+            usage
+            ;;
+        -[sfnv]*)
+            rest=${1#-}
+            case "$rest" in
+                *[!sfnv]*)
+                    echo "mount.fuse.ratarmount: unknown option: $1" >&2
+                    exit 2
+                    ;;
+                *f*) fake=1 ;;
+            esac
+            shift
+            ;;
+        --)
+            shift
+            break
+            ;;
+        -*)
+            echo "mount.fuse.ratarmount: unknown option: $1" >&2
+            exit 2
+            ;;
+        *)
+            if [ -z "$what" ]; then
+                what=$1
+            elif [ -z "$where" ]; then
+                where=$1
+            else
+                echo "mount.fuse.ratarmount: unexpected argument: $1" >&2
+                exit 2
+            fi
+            shift
+            ;;
+    esac
+done
+
+while [ "$#" -gt 0 ]; do
+    if [ -z "$what" ]; then
+        what=$1
+    elif [ -z "$where" ]; then
+        where=$1
+    else
+        echo "mount.fuse.ratarmount: unexpected argument: $1" >&2
+        exit 2
+    fi
+    shift
+done
+
+[ -n "$what" ] && [ -n "$where" ] || usage
+
+# Drop fstab/systemd tokens that are not FUSE options (libfuse would see them
+# as CUSTOM and may reject the mount).
+filtered=""
+raw=$opts
+while [ -n "$raw" ]; do
+    tok=${raw%%,*}
+    if [ "$tok" = "$raw" ]; then
+        raw=""
+    else
+        raw=${raw#*,}
+    fi
+    # fstab may write "ro, allow_other, _netdev"; trim or _netdev is not stripped.
+    tok=${tok#"${tok%%[![:space:]]*}"}
+    tok=${tok%"${tok##*[![:space:]]}"}
+    case "$tok" in
+        "" | _netdev | auto | noauto | user | nouser | users | owner | group | nofail | defaults)
+            continue
+            ;;
+        comment=* | x-*)
+            continue
+            ;;
+    esac
+    if [ -n "$filtered" ]; then
+        filtered="$filtered,$tok"
+    else
+        filtered=$tok
+    fi
+done
+
+bin=$(command -v ratarmount 2>/dev/null || true)
+if [ -z "$bin" ]; then
+    if [ -x /usr/bin/ratarmount ]; then
+        bin=/usr/bin/ratarmount
+    else
+        echo "mount.fuse.ratarmount: ratarmount not found on PATH" >&2
+        exit 127
+    fi
+fi
+
+# Default RO + allow_other for fstab; caller FUSE options appended.
+# Secrets stay in the environment — do not interpolate them here.
+if [ "$fake" -eq 1 ]; then
+    exit 0
+fi
+exec "$bin" -o "allow_other,ro${filtered:+,$filtered}" -- "$what" "$where"

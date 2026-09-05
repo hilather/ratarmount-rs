@@ -226,7 +226,7 @@ Larger than a protocol or a feature; still concrete enough to implement. Items 6
 | G-2 | **Index as a portable artifact** (sidecar + OCI referrer / HTTP `Link:`) | `done` | M | index; pairs with P-1 |
 | G-3 | **Content-addressed member cache** (hash to decompressed chunk) | `done` | L | `--hashes` (partial today) |
 | G-4 | **Snapshot browser:** restic / borg / kopia / ZFS send | `todo` | L | new MountSources |
-| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `todo` | L | packaging; F-1 makes volumes useful |
+| G-5 | **Kubernetes CSI + systemd `.mount` + autofs** | `partial` | L | packaging; F-1 makes volumes useful |
 
 ### G-1 — `ratarmount serve` — `done` (booleans)
 
@@ -256,9 +256,9 @@ Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodi
 
 restic / borg / kopia / ZFS send already store trees of archives or content-addressed packs. A MountSource that walks a restic pack index or a ZFS snapshot send-stream gives browse-the-backup-without-restore. Adjacent users, same random-access problem. Start with **restic** (documented index JSON) before borg/kopia/ZFS.
 
-### G-5 — Kubernetes CSI / systemd / autofs
+### G-5 — Kubernetes CSI / systemd / autofs — `partial`
 
-`ratarmount-csi` presents `s3://bucket/dataset.tar.zst` as ReadOnlyMany. systemd `What=s3://...` + autofs for `/mnt/archives/...`. HPC already uses Python ratarmount this way; a static binary + CSI is how this gets into clusters. RO-only v1; `-w` overlay is a later StorageClass.
+v1 shipped: `packaging/mount.fuse.ratarmount` (`Type=fuse.ratarmount`, installed as `/usr/sbin/mount.fuse.ratarmount` in `.deb`/`.rpm`), example systemd `.mount` + autofs map, operator docs ([`systemd-mount.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/systemd-mount.md)). Helper argv has **no** secrets (env / `EnvironmentFile=` only). CSI is **spec-only** ([`csi.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/csi.md)); the driver is a **separate repo** that execs the packaged binary — **no kube crate** in this workspace. Residual: CSI node plugin implementation, `-w` overlay StorageClass (needs F-7), SELinux / AppArmor, Windows CSI.
 
 ---
 
@@ -276,6 +276,8 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / CLI+live S3 PUT (F-7; `publish_index_to_s3` primitive landed) / GCS/Azure PUT / FUSE blob / Hub referrers.
 10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, ~~G-3 cache~~, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
+10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI driver (systemd/autofs helper shipped); P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---
 

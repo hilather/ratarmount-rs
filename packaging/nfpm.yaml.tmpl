@@ -17,8 +17,20 @@ contents:
     dst: /usr/bin/ratarmount
     file_info:
       mode: 0755
+  - src: packaging/mount.fuse.ratarmount
+    dst: /usr/sbin/mount.fuse.ratarmount
+    file_info:
+      mode: 0755
   - src: packaging/ratarmount.desktop
     dst: /usr/share/applications/ratarmount.desktop
+    file_info:
+      mode: 0644
+  - src: packaging/systemd/mnt-archives-dataset.mount
+    dst: /usr/share/doc/ratarmount/examples/mnt-archives-dataset.mount
+    file_info:
+      mode: 0644
+  - src: packaging/autofs/auto.ratarmount
+    dst: /usr/share/doc/ratarmount/examples/auto.ratarmount
     file_info:
       mode: 0644
 depends:
