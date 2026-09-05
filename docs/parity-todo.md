@@ -28,6 +28,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | Apple UDIF `.dmg` | no | crate `ratarmount-formats-dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual**; factory later | `~` crate only |
 | QCOW2 | guestfish / qemu-nbd | crate `ratarmount-formats-qcow2`: v2/v3 zlib + local backing then block `pN/`; zstd/HTTP residual; factory later | `~` crate only |
 | VHD / VHDX | guestfish | crate `ratarmount-formats-vhd`: fixed+dynamic VHD, VHDX fixed; wraps block `pN/`; differencing residual; factory later | `~` crate only |
+| VMDK | guestfish | crate `ratarmount-formats-vmdk`: KDMV sparse → Block/FAT/EXT4; compressed/ESXi residual; factory later | `~` crate only |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG, CMYK, Indexed, ICCBased); OGG; HTML | `[x]` / `~` Separation/Lab residual |

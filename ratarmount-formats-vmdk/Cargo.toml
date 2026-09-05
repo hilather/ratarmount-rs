@@ -1,0 +1,18 @@
+[package]
+name = "ratarmount-formats-vmdk"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VMDK virtual-disk mount source (KDMV sparse extents wrapping GPT/MBR)"
+readme = "README.md"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-formats-block.workspace = true
+ratarmount-formats-fat.workspace = true
+ratarmount-formats-ext4.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+fatfs = "0.3"
