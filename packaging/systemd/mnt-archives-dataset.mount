@@ -17,9 +17,9 @@ Wants=network-online.target
 What=s3://bucket/dataset.tar.zst
 Where=/mnt/archives/dataset
 Type=fuse.ratarmount
-Options=ro,allow_other,_netdev
+Options=ro,allow_other,_netdev,x-systemd.mount-timeout=infinity
 TimeoutSec=0
 # EnvironmentFile=-/etc/ratarmount/s3.env
 
 [Install]
-WantedBy=multi-user.target
+WantedBy=remote-fs.target

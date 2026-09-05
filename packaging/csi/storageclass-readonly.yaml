@@ -19,6 +19,9 @@ metadata:
 spec:
   attachRequired: false
   podInfoOnMount: false
-  fsGroupPolicy: File
+  # None: v1 is ReadOnlyMany FUSE (allow_other). File would recursive-chown
+  # a RO mount and fail NodePublish. ReadWriteOnceWithFSType would skip ROM
+  # anyway; None is explicit.
+  fsGroupPolicy: None
   volumeLifecycleModes:
     - Persistent
