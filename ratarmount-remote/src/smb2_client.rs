@@ -119,6 +119,15 @@ impl Smb2Client<TcpStream> {
         stream.set_write_timeout(Some(Duration::from_secs(30))).ok();
         Ok(Self::new(stream))
     }
+
+    /// Best-effort CLOSE then TCP shutdown. Short I/O timeout so Drop cannot stall 30s.
+    pub fn close_and_shutdown(&mut self, file_id: [u8; 16]) {
+        const DROP_IO: Duration = Duration::from_millis(250);
+        let _ = self.stream.set_read_timeout(Some(DROP_IO));
+        let _ = self.stream.set_write_timeout(Some(DROP_IO));
+        let _ = self.close(file_id);
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
 }
 
 impl<S: Read + Write> Smb2Client<S> {

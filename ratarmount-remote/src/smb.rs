@@ -326,15 +326,26 @@ pub(crate) fn smb_fallback_clear_error(cause: &RemoteError) -> RemoteError {
 }
 
 fn is_smb_dialect_unsupported(err: &RemoteError) -> bool {
-    match err {
-        RemoteError::Smb(msg) => {
-            let lower = msg.to_ascii_lowercase();
-            lower.contains("not_supported")
-                || lower.contains("dialect")
-                || msg.contains(&format!("{STATUS_NOT_SUPPORTED:#010x}"))
-        }
-        _ => false,
+    let RemoteError::Smb(msg) = err else {
+        return false;
+    };
+    let lower = msg.to_ascii_lowercase();
+    // Auth / transport must not silently materialize via smbclient.
+    if lower.contains("connect ")
+        || lower.contains("resolve ")
+        || lower.contains("logon_failure")
+        || lower.contains("access_denied")
+        || lower.contains("signing_required")
+    {
+        return false;
     }
+    lower.contains("not_supported")
+        || lower.contains("dialect")
+        || lower.contains("not smb2")
+        || lower.contains("smb2 header truncated")
+        || lower.contains("direct tcp type")
+        || lower.contains("smb frame length")
+        || msg.contains(&format!("{STATUS_NOT_SUPPORTED:#010x}"))
 }
 
 /// URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest.
@@ -416,24 +427,26 @@ impl SmbRangeFile {
 
     /// Open a parsed location (see [`SmbRangeFile::open`]).
     pub fn open_location(loc: &SmbLocation) -> Result<Self> {
-        Self::open_location_with(loc, find_smbclient)
+        Self::open_location_with(
+            loc,
+            find_smbclient().map(|_| run_smbclient_get as fn(&SmbLocation, &Path) -> Result<u64>),
+        )
     }
 
-    fn open_location_with(
-        loc: &SmbLocation,
-        find_cli: impl Fn() -> Option<PathBuf>,
-    ) -> Result<Self> {
+    fn open_location_with<F>(loc: &SmbLocation, fallback: Option<F>) -> Result<Self>
+    where
+        F: FnOnce(&SmbLocation, &Path) -> Result<u64>,
+    {
         require_smb_file_path(loc)?;
         match open_smb_live(loc) {
             Ok(f) => Ok(f),
-            Err(e) if is_smb_dialect_unsupported(&e) => {
-                if find_cli().is_some() {
+            Err(e) if is_smb_dialect_unsupported(&e) => match fallback {
+                Some(runner) => {
                     debug!("SMB dialect unsupported ({e}); falling back to smbclient");
-                    open_smb_fallback_temp(loc)
-                } else {
-                    Err(smb_fallback_clear_error(&e))
+                    open_smb_fallback_temp(loc, runner)
                 }
-            }
+                None => Err(smb_fallback_clear_error(&e)),
+            },
             Err(e) => Err(e),
         }
     }
@@ -487,8 +500,11 @@ fn open_smb_live(loc: &SmbLocation) -> Result<SmbRangeFile> {
     })
 }
 
-fn open_smb_fallback_temp(loc: &SmbLocation) -> Result<SmbRangeFile> {
-    let (mut tmp, size) = fetch_smb_location_to_temp(loc)?;
+fn open_smb_fallback_temp<F>(loc: &SmbLocation, runner: F) -> Result<SmbRangeFile>
+where
+    F: FnOnce(&SmbLocation, &Path) -> Result<u64>,
+{
+    let (mut tmp, size) = fetch_smb_location_to_temp_with(loc, runner)?;
     tmp.as_file_mut().seek(SeekFrom::Start(0))?;
     Ok(SmbRangeFile {
         loc: loc.clone(),
@@ -559,7 +575,7 @@ impl Seek for SmbRangeFile {
 impl Drop for SmbRangeFile {
     fn drop(&mut self) {
         if let SmbRangeInner::Live { client, file_id } = &mut self.inner {
-            let _ = client.close(*file_id);
+            client.close_and_shutdown(*file_id);
         }
     }
 }
@@ -587,8 +603,11 @@ fn redact_smbclient_args(args: &[String]) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::io::Write;
+    use std::net::{Ipv4Addr, TcpListener};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::thread;
 
     #[test]
     fn parse_basic() {
@@ -755,9 +774,35 @@ mod tests {
         )
     }
 
+    fn no_smbclient_runner() -> Option<fn(&SmbLocation, &Path) -> Result<u64>> {
+        None
+    }
+
     fn open_smb_range_without_smbclient(url: &str) -> Result<SmbRangeFile> {
         let loc = parse_smb_url(url)?;
-        SmbRangeFile::open_location_with(&loc, || None)
+        SmbRangeFile::open_location_with(&loc, no_smbclient_runner())
+    }
+
+    /// Direct-TCP NBSS frame whose payload is SMB1 magic (`0xffSMB`), not SMB2.
+    fn spawn_smb1_banner() -> (u16, thread::JoinHandle<()>) {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).expect("bind smb1 banner");
+        let port = listener.local_addr().expect("addr").port();
+        let handle = thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut payload = vec![0xff, b'S', b'M', b'B'];
+                payload.resize(64, 0);
+                let n = payload.len();
+                let mut framed = vec![
+                    0,
+                    ((n >> 16) & 0xff) as u8,
+                    ((n >> 8) & 0xff) as u8,
+                    (n & 0xff) as u8,
+                ];
+                framed.extend_from_slice(&payload);
+                let _ = stream.write_all(&framed);
+            }
+        });
+        (port, handle)
     }
 
     fn assert_send<T: Send>() {}
@@ -883,5 +928,110 @@ mod tests {
     fn smb_range_rejects_empty_file_path() {
         let err = open_smb_range("smb://host/shareonly").unwrap_err();
         assert!(err.to_string().contains("file path") || err.to_string().contains("smb"));
+    }
+
+    #[test]
+    fn smb_range_dialect_matcher_keeps_auth_and_connect_out() {
+        assert!(is_smb_dialect_unsupported(&RemoteError::Smb(
+            "not SMB2".into()
+        )));
+        assert!(is_smb_dialect_unsupported(&RemoteError::Smb(
+            "SMB2 header truncated".into()
+        )));
+        assert!(is_smb_dialect_unsupported(&RemoteError::Smb(
+            "SMB Direct TCP type must be 0".into()
+        )));
+        assert!(is_smb_dialect_unsupported(&RemoteError::Smb(
+            "NEGOTIATE: unsupported dialect 0x0300 (need 2.0.2/2.1)".into()
+        )));
+        assert!(is_smb_dialect_unsupported(&RemoteError::Smb(format!(
+            "NEGOTIATE NTSTATUS {STATUS_NOT_SUPPORTED:#010x} (NOT_SUPPORTED)"
+        ))));
+        assert!(!is_smb_dialect_unsupported(&RemoteError::Smb(
+            "SMB connect 127.0.0.1:445 failed: Connection refused".into()
+        )));
+        assert!(!is_smb_dialect_unsupported(&RemoteError::Smb(
+            "SESSION_SETUP Type3 (NTLMv2) NTSTATUS 0xc000006d (LOGON_FAILURE)".into()
+        )));
+        assert!(!is_smb_dialect_unsupported(&RemoteError::Smb(
+            "NEGOTIATE SIGNING_REQUIRED; guest session is unsigned — use NTLMv2".into()
+        )));
+    }
+
+    /// Regression: non-SMB2 banner is dialect residual (falls back / clear error), not a hard fail.
+    #[test]
+    fn smb_fallback_clear_error_non_smb2_banner() {
+        let (port, handle) = spawn_smb1_banner();
+        let url = format!("smb://127.0.0.1:{port}/data/payload.bin");
+        let err = open_smb_range_without_smbclient(&url).unwrap_err();
+        let _ = handle.join();
+        let msg = err.to_string();
+        let lower = msg.to_ascii_lowercase();
+        assert!(
+            lower.contains("smbclient") && lower.contains("install"),
+            "{msg}"
+        );
+        assert!(
+            lower.contains("not smb2") || lower.contains("dialect") || lower.contains("2.0.2"),
+            "{msg}"
+        );
+    }
+
+    /// Dialect STATUS_NOT_SUPPORTED with a stub smbclient runner materializes tempfile Range.
+    #[test]
+    fn smb_range_fallback_temp_when_dialect_unsupported() {
+        use crate::smb2_client::tests::{AuthMode, FakeSmb};
+        let srv = FakeSmb::spawn(AuthMode::RejectDialect);
+        let url = fake_smb_url(srv.addr.port());
+        let loc = parse_smb_url(&url).unwrap();
+        let body = b"smbclient-fallback-body";
+        let mut f = SmbRangeFile::open_location_with(
+            &loc,
+            Some(|_l: &SmbLocation, dest: &Path| {
+                std::fs::write(dest, body).map_err(RemoteError::Io)?;
+                Ok(body.len() as u64)
+            }),
+        )
+        .expect("dialect residual should use stub smbclient");
+        assert!(
+            !f.uses_ranges(),
+            "fallback must be tempfile mode, not live READ"
+        );
+        let mut buf = Vec::new();
+        f.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, body);
+        assert!(
+            srv.stats().reads.is_empty(),
+            "live READ must not run after dialect reject: {:?}",
+            srv.stats().reads
+        );
+    }
+
+    #[test]
+    fn smb_range_connect_refused_does_not_fallback() {
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener);
+        let url = format!("smb://127.0.0.1:{port}/data/payload.bin");
+        let loc = parse_smb_url(&url).unwrap();
+        let called = AtomicBool::new(false);
+        let err = SmbRangeFile::open_location_with(
+            &loc,
+            Some(|_l: &SmbLocation, dest: &Path| {
+                called.store(true, Ordering::SeqCst);
+                std::fs::write(dest, b"should-not-run").map_err(RemoteError::Io)?;
+                Ok(0)
+            }),
+        )
+        .unwrap_err();
+        assert!(
+            !called.load(Ordering::SeqCst),
+            "connect refused must not invoke smbclient fallback"
+        );
+        let msg = err.to_string();
+        assert!(
+            msg.to_ascii_lowercase().contains("connect"),
+            "unexpected: {msg}"
+        );
     }
 }
