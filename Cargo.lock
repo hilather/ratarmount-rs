@@ -3040,6 +3040,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ratarmount-formats-udf"
+version = "0.1.30"
+dependencies = [
+ "ratarmount-core",
+ "tempfile",
+ "thiserror",
+]
+
+[[package]]
 name = "ratarmount-formats-warc"
 version = "0.1.30"
 dependencies = [
