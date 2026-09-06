@@ -33,6 +33,9 @@ jobs:
       - name: cargo fmt
         run: cargo fmt --all -- --check
 
+      - name: windows-lib workflow + stable Windows API guard
+        run: ./packaging/test-windows-lib-ci.sh
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -364,14 +367,13 @@ jobs:
           chmod +x test-harness/run-macos-smoke.sh
           ./test-harness/run-macos-smoke.sh
 
-  # G6.1: Windows library compile without FUSE / WinFsp. Not a merge gate.
-  # Must not be `needs:` of `check` or `fuse-harness` (those stay Linux-only).
-  # Default session still links libarchive until G5.3 — skip that step when
-  # pkg-config `archive` is missing.
+  # G6.1: Windows library compile without FUSE / WinFsp.
+  # core+index is a merge gate (stable rustc; no nightly windows_by_handle).
+  # Session still skips when pkg-config `archive` is missing. Must not be
+  # `needs:` of `check` or `fuse-harness` (those stay Linux-only).
   windows-lib:
-    name: windows-lib (session check, best-effort)
+    name: windows-lib (core+index gate; session skippable)
     runs-on: windows-2022
-    continue-on-error: true
     timeout-minutes: 45
     env:
       RUSTFLAGS: "-Dwarnings"
@@ -394,7 +396,7 @@ jobs:
           set -euo pipefail
           if ! command -v pkg-config >/dev/null 2>&1 \
             || { ! pkg-config --exists libarchive && ! pkg-config --exists archive; }; then
-            echo "::notice::skip: pkg-config archive missing (G6.1 best-effort until G5.3)"
+            echo "::notice::skip: pkg-config archive missing (G6.1 until default session drops libarchive)"
             exit 0
           fi
           cargo check -p ratarmount-session --all-targets

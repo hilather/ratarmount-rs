@@ -1027,9 +1027,9 @@ G6 crate-by-crate (compile unless noted):
 8. **Split `find.rs` before moving locate** (G3.3 / G6.2): Unix `silence_stdout` stays in the binary; session `locate.rs` has no `std::os::unix`.
 9. File locking (G6.3): SQLite `locking_mode=EXCLUSIVE` on the tmp file. NTFS supports SQLite’s lock. Do **not** add `fs2` unless we observe two `publish_tmp` races corrupting dest.
 10. `pid_is_alive` already fail-closed `true` on non-Linux.
-11. **Until G5.3**, default session still links libarchive/git (same as the binary). Windows `cargo check` of default features **needs** `libarchive` (and may fail without it). G6.1 stays **best-effort**; document skip when pkg-config `archive` is missing. After G5.3, Windows can use a TAR/ZIP/7z default without FFI.
+11. **Until G5.3**, default session still links libarchive/git (same as the binary). Windows `cargo check` of default features **needs** `libarchive` (and may fail without it). G6.1 **core+index is a merge gate**; session still **skips** when pkg-config `archive` is missing. After G5.3, Windows can use a TAR/ZIP/7z default without FFI.
 
-CI (G6.1): best-effort `windows-lib` on `windows-2022`: `cargo check -p ratarmount-session --all-targets` (default = all L2 until G5.3). Not a merge gate in the first slice. Do not let this job skip Linux `fmt + clippy + test`.
+CI (G6.1): `windows-lib` on `windows-2022` merge-gates `cargo check -p ratarmount-core -p ratarmount-index --all-targets`. Session check skips without libarchive. Linux `check` runs `./packaging/test-windows-lib-ci.sh` (forbids nightly `windows_by_handle` APIs). Do not let this job skip Linux `fmt + clippy + test`.
 
 ---
 
@@ -1282,7 +1282,7 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 
 | ID | Task | Effort | Status |
 |---|---|---|---|
-| **G6.1** | CI `cargo check -p ratarmount-session` for Windows (best-effort) | M | **landed (PR11)** — `windows-lib` on `windows-2022`, `continue-on-error`; skip session check if pkg-config `archive` missing. Core+index check always runs. No WinFsp. |
+| **G6.1** | CI `cargo check -p ratarmount-session` for Windows (best-effort) | M | **landed (PR11)** — `windows-lib` on `windows-2022`. **core+index is a merge gate** (stable rustc; no `windows_by_handle`). Session check still **skips** if pkg-config `archive` missing. Linux `check` runs `./packaging/test-windows-lib-ci.sh`. No WinFsp. |
 | **G6.2** | Cfg audit: core uid/gid, compositing `empty_archive`, tar `O_NOFOLLOW`, `MetadataExt`; UDS stays CLI; split `find.rs` first | M | **landed (PR11)** — portable `effective_uid`/`metadata_*`; tar `SingleFileMountSource` + html/ogg/pdf/libarchive `store_stats` use helpers; `find.rs` Unix silence stays in the binary. Overlay raw fds Unix-only. Default session Windows `cargo check` still needs libarchive until G5.3. |
 | **G6.3** | NTFS: rely on SQLite exclusive/tmp+rename; document | M | **landed (PR11)** — `locking_mode=EXCLUSIVE` comment; no `fs2`. `meta-v3` still `xdg_cache_home()`. |
 
@@ -1320,7 +1320,7 @@ Status remains **proposed** until the matching PR merges, except **G0.2 is decid
 | `docs/crates-io-policy.md` | L3.5 |
 | `docs/tasks/gui-embedder-support.md` | this file |
 | `README.md` | index discovery + library embedder (when G4 env vars / session exist) |
-| `.github/workflows/ci.yml` | optional `windows-lib` job (G6.1) |
+| `.github/workflows/ci.yml` | `windows-lib` job (G6.1; core+index merge gate) |
 | `Cargo.toml` workspace members | add `ratarmount-session` |
 | `AGENTS.md` | catalog rows; **PR2** rewrite factory test filters to `-p ratarmount-session --lib` |
 

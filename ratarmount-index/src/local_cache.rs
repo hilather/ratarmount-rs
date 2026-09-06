@@ -463,10 +463,15 @@ fn file_id(meta: &fs::Metadata) -> String {
     }
     #[cfg(windows)]
     {
+        // Stable MetadataExt: creation_time (FILETIME). rust-lang/rust#63010
+        // windows_by_handle methods are nightly-only and fail `cargo check`
+        // on windows-2022 (E0658). Identity already includes path+size+mtime.
         use std::os::windows::fs::MetadataExt;
-        match (meta.volume_serial_number(), meta.file_index()) {
-            (Some(vol), Some(idx)) => format!("{vol:08x}:{idx:016x}"),
-            _ => "0".into(),
+        let created = meta.creation_time();
+        if created == 0 {
+            "0".into()
+        } else {
+            format!("{created:016x}")
         }
     }
     #[cfg(not(any(unix, windows)))]
@@ -822,6 +827,58 @@ mod tests {
         let pa = cache.allocate(&a).unwrap();
         let pb = cache.allocate(&b).unwrap();
         assert_ne!(pa, pb, "path is part of the identity key");
+    }
+
+    /// Regression: Windows `cargo check` E0658 `windows_by_handle` (CI windows-lib).
+    #[test]
+    fn regression_windows_file_id_avoids_unstable_by_handle_methods() {
+        let src = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/local_cache.rs"));
+        // concat! so this test source does not itself match the needles.
+        assert!(
+            !src.contains(concat!("volume_serial", "_number(")),
+            "Regression: Windows cargo check E0658 windows_by_handle (volume serial number)"
+        );
+        assert!(
+            !src.contains(concat!("file_index", "(")),
+            "Regression: Windows cargo check E0658 windows_by_handle (file index)"
+        );
+        assert!(
+            !src.contains(concat!("number_of_links", "(")),
+            "Regression: Windows cargo check E0658 windows_by_handle (number of links)"
+        );
+        assert!(
+            !src.contains(concat!("change_time", "(")),
+            "Regression: Windows cargo check E0658 windows_by_handle (change time)"
+        );
+        assert!(
+            !src.contains(concat!("feature(windows_by", "_handle)")),
+            "Regression: do not enable nightly windows_by_handle on stable CI"
+        );
+    }
+
+    /// Regression: `file_id` stays non-empty and uses inode on Unix / birth FILETIME on Windows.
+    #[test]
+    fn regression_file_id_unix_inode_or_windows_creation_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let p = write_archive(dir.path(), "id.tar", b"x");
+        let meta = fs::metadata(&p).unwrap();
+        let id = file_id(&meta);
+        assert!(!id.is_empty(), "identity file_id must not be empty");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(id, meta.ino().to_string());
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            let created = meta.creation_time();
+            if created == 0 {
+                assert_eq!(id, "0");
+            } else {
+                assert_eq!(id, format!("{created:016x}"));
+            }
+        }
     }
 
     #[test]
