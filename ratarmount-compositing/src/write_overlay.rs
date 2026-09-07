@@ -1569,7 +1569,15 @@ pub fn patch_sidecar_if_present(
     let format = detect_live_commit_format(archive)?;
     let stats = match format {
         CompressionFormat::Zstd => {
-            let threads = opts.threads_for("zstd");
+            // Live persist can rewrite a window that still contains an interior
+            // TAR EOF (one zstd frame holding concatenated complete TARs).
+            // `parse_tar_from` with the mount's `ignore_zeros: false` stops
+            // there and drops later members — including newly appended overlay
+            // files. Offline splice already forces `ignore_zeros: true`; live
+            // must match.
+            let mut patch_opts = opts.clone();
+            patch_opts.ignore_zeros = true;
+            let threads = patch_opts.threads_for("zstd");
             let body = open_seekable_zstd_with_threads(archive, threads)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
             let mut reader = body
@@ -1578,7 +1586,7 @@ pub fn patch_sidecar_if_present(
             SqliteIndexedTar::patch_index_from(
                 &mut reader,
                 &idx,
-                opts,
+                &patch_opts,
                 window.window_start,
                 env!("CARGO_PKG_VERSION"),
             )
@@ -4183,6 +4191,89 @@ mod tests {
             "later-frame name must be gone when classified with ignore_zeros"
         );
         assert_eq!(read_member(src.as_ref(), "/prefix.txt"), prefix);
+    }
+
+    /// Regression: live persist of a single-frame concatenated `.tar.zst`
+    /// must reinsert members after the first interior TAR EOF when patching
+    /// the sibling sidecar. `window_start` is 0 for a one-frame archive, so
+    /// `ignore_zeros: false` (default live CLI opts) used to wipe the suffix
+    /// and stop at the first EOF — the appended overlay file vanished on
+    /// warm remount.
+    #[test]
+    fn live_commit_tar_zst_single_frame_concatenated_patches_sidecar_after_interior_eof() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("live-1f-first");
+        let second = generated_payload("live-1f-second");
+        let extra = generated_payload("live-1f-new");
+        let archive = dir.path().join("a.tar.zst");
+        let mut combined = pack_tar(&[ustar_file("first.txt", &first)]);
+        combined.extend(pack_tar(&[ustar_file("second.txt", &second)]));
+        fs::write(&archive, concat_zstd_frames(&[&combined], false)).unwrap();
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert_eq!(map.frames.len(), 1, "fixture must be one zstd frame");
+
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd(&archive).expect("open zstd");
+            let opts = OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            };
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &opts,
+                "test",
+            )
+            .expect("create sidecar");
+        }
+        assert!(sidecar.is_file(), "pre-existing sidecar");
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, true), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, true))
+            .expect("live commit append"));
+        let window = ov.last_patch_window().expect("stashed window");
+        assert_eq!(
+            window.window_start, 0,
+            "single-frame persist rewrites from uncompressed offset 0"
+        );
+
+        // Live CLI passes the mount OpenOptions (ignore_zeros: false).
+        let mount_opts = OpenOptions {
+            ignore_zeros: false,
+            gnu_incremental: Some(false),
+            ..OpenOptions::default()
+        };
+        patch_sidecar_if_present(&archive, &window, &mount_opts).expect("patch sidecar");
+
+        let body = open_seekable_zstd(&archive).expect("fresh zstd");
+        let src = ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index_body(
+            &archive,
+            body,
+            &sidecar,
+            OpenOptions {
+                ignore_zeros: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("warm-open patched sidecar");
+        assert_eq!(read_member(&src, "/first.txt"), first);
+        assert_eq!(
+            read_member(&src, "/second.txt"),
+            second,
+            "second complete TAR after the interior EOF must stay in the sidecar"
+        );
+        assert_eq!(
+            read_member(&src, "/new.txt"),
+            extra,
+            "appended overlay file after the interior EOF must be reinserted \
+             (ignore_zeros: false on the patch would stop after first.txt)"
+        );
     }
 
     /// Regression: offline later-frame delete must reinsert later complete-TAR
