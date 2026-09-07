@@ -120,7 +120,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `todo` | L | new `formats-*` crates |
-| F-9 | **Producer: `--repack-seekable`** | `todo` | M | compress + formats-tar + CLI |
+| F-9 | **Producer: `--repack-seekable`** | `partial` | M | compress engine landed; CLI not wired |
 | F-10 | **Library / FFI / `ratar://` replacement** | `todo` | L | core + PyO3 cdylib; crates.io policy already exists |
 
 ### F-1 — Remote directory mounts — `done`
@@ -179,11 +179,11 @@ We already do EXT4 + FAT + ISO + SquashFS. Next users: mount this VM disk / Wind
 
 Suggested order inside the family: exFAT, then NTFS (read-only), then UDF, then DMG, then WIM, then QCOW2/VHD/VMDK (block layer then partition + existing FAT/EXT4).
 
-### F-9 — Producer: make archives seekable
+### F-9 — Producer: make archives seekable — `partial`
 
-`ratarmount --repack-seekable in.tar.gz out.tar.zst` (zstd seek table and/or gzip index sidecar). Random access is only as good as the producer. [`zstd-random-access.md`](../zstd-random-access.md) recipes help; a one-shot rewriter makes every subsequent mount instant.
+Engine: `ratarmount_compress::repack_seekable` writes multi-frame zstd + official seek table (magic `0x8F92EAB1`, default 8 MiB frames). Already-seekable inputs are copied (`DidNothing` in-place). Multi-frame without a table gets a footer appended when every frame fits `u32`; overflow copies frames and omits the table (`CopiedWithoutSeekTable`). Gzip sidecar is `*.rgzi` via `SeekableGzip::export_seek_index_blob` (optional GZIDX). `--repack-force` (engine `RepackOptions::force`) is the only recompress-into-smaller-frames path. Guide: [`zstd-random-access.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/zstd-random-access.md).
 
-Do not recompress if the input is already multi-frame + seek-table; just copy + emit index.
+**Not in this slice:** CLI `--repack-seekable` / `--repack-force` (binary crate). ZIP / 7z / bzip2 / xz / lz4 rewrite. TAR offset-order regression lives in the binary crate (this crate has no TAR parser).
 
 ### F-10 — Library / FFI / `ratar://` replacement
 

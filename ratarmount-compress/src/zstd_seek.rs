@@ -422,8 +422,8 @@ const SKIPPABLE_MAGIC_MIN: u32 = 0x184D2A50;
 const SKIPPABLE_MAGIC_MAX: u32 = 0x184D2A5F;
 /// Seekable-format skippable frame subtype (`ZSTD_MAGIC_SKIPPABLE_START | 0xE`).
 const SEEK_TABLE_SKIPPABLE_MAGIC: u32 = 0x184D2A5E;
-/// Footer magic for the zstd seekable format seek table.
-const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
+/// Footer magic for the zstd seekable format seek table (`0x8F92EAB1`).
+pub const SEEKABLE_MAGIC: u32 = 0x8F92_EAB1;
 const SEEK_TABLE_FOOTER_SIZE: u64 = 9;
 const SKIPPABLE_HEADER_SIZE: u64 = 8;
 
