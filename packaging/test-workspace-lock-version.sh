@@ -138,7 +138,6 @@ cargo_path = root / "Cargo.toml"
 lock_path = root / "Cargo.lock"
 cargo_bytes = cargo_path.read_bytes()
 assert_trailing_newline(cargo_path, cargo_bytes, "repo Cargo.toml trailing newline")
-# tomllib needs a trailing newline; we already required one.
 assert_lock_matches(
     cargo_bytes.decode(),
     lock_path.read_text(),
