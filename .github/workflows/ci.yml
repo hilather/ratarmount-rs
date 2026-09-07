@@ -36,6 +36,9 @@ jobs:
       - name: windows-lib workflow + stable Windows API guard
         run: ./packaging/test-windows-lib-ci.sh
 
+      - name: workspace lock version matches Cargo.toml
+        run: bash packaging/test-workspace-lock-version.sh
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
 
