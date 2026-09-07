@@ -95,6 +95,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | PAX `size=` member (≥ 8 GiB / zeroed ustar field) indexes as size 0 | `cargo test -p ratarmount-formats-tar --lib pax_size_keyword` |
 | Overlay rename loses symlinks / destination on COW failure; rmdir non-empty | `cargo test -p ratarmount-compositing --lib rename_base_symlink` · `cargo test -p ratarmount-compositing --lib rename_keeps_destination` · `cargo test -p ratarmount-compositing --lib rmdir_refuses` |
 | GitHub Release dies on 0-byte assets | `./packaging/test-release-asset-filter.sh` |
+| Workspace lock versions stale after version bump (#66) | `./packaging/test-workspace-lock-version.sh` |
 | Packages portable apt CDN reset (missing glibc2.31 amd64) | `./packaging/test-packages-apt-retries.sh` |
 | CI apt CDN hang cancels cold-index / FUSE allowlists | `./packaging/test-ci-apt-retries.sh` |
 | Windows session/index compile without FUSE (G6, no WinFsp); `windows_by_handle` E0658 on stable | `./packaging/test-windows-lib-ci.sh` · `cargo test -p ratarmount-index --lib regression_windows_file_id` · `cargo test -p ratarmount-index --lib regression_file_id` · `cargo test -p ratarmount-core --lib effective_ids` · `cargo test -p ratarmount-core --lib metadata_helpers` · `cargo test -p ratarmount-index --lib tar_stats_from_metadata_uses_len` · `cargo test -p ratarmount-index --lib home_dir_prefers` |
@@ -246,6 +247,8 @@ Linux/macOS package scripts compile **`--features nfsv4,sftp-russh`** (`packagin
 
 1. Bump **workspace** `version` in root [`Cargo.toml`](Cargo.toml) (Packages resolve
    version from the tag + Cargo.toml — do **not** hardcode per-job `VERSION` envs).
+   Run `cargo check` and **commit the `Cargo.lock` rewrite** so workspace crate
+   versions match. Keep a trailing newline on `Cargo.toml`.
 2. Update README / docs version strings that mention the release tag (if any).
 3. `cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings`
 4. `cargo test --workspace` (or full relevant crates when the release is large).
