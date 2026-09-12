@@ -627,11 +627,15 @@ impl WriteOverlay {
             self.ensure_modifiable(path)?;
             let real = self.realpath(path);
             self.ensure_under_root(&real)?;
-            // If still missing and write flags, create empty
+            // If still missing and write flags, create empty. `create_file_inner`
+            // returns an owned raw fd (`into_raw_fd`); discarding it leaked one
+            // descriptor per call. Interval persist wipes the overlay host file,
+            // so the next FUSE/NFS/9P/SMB/SFTP rewrite hits this every time.
             if fs::symlink_metadata(&real).is_err()
                 && (flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT)) != 0
             {
-                self.create_file_inner(path, 0o644)?;
+                let leftover = self.create_file_inner(path, 0o644)?;
+                self.close_overlay_fd(leftover);
             }
             if fs::symlink_metadata(&real).is_err() {
                 return Err(OverlayError::Io(io::Error::new(
@@ -6062,6 +6066,49 @@ mod tests {
             read_member(&ov as &dyn MountSource, "/hot.txt"),
             hot,
             "mount view still serves the overlay copy"
+        );
+    }
+
+    #[cfg(unix)]
+    fn count_open_fds() -> Option<usize> {
+        let rd = std::fs::read_dir("/proc/self/fd").ok()?;
+        Some(rd.count())
+    }
+
+    /// Regression: `open_overlay_fd` materialized a missing host file via
+    /// `create_file_inner` and discarded the raw fd (`into_raw_fd` is not
+    /// Drop-closed). Interval persist wipes the overlay copy, so the next
+    /// FUSE/NFS/9P rewrite leaked one descriptor each time — long-lived
+    /// `--commit-overlay-interval` mounts hit EMFILE.
+    #[cfg(unix)]
+    #[test]
+    fn open_overlay_fd_create_does_not_leak_materialize_fd() {
+        let Some(before) = count_open_fds() else {
+            eprintln!("skip: /proc/self/fd not available");
+            return;
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
+        const N: usize = 32;
+        for i in 0..N {
+            let path = format!("/rewrite-{i}.txt");
+            let fd = ov
+                .open_overlay_fd(&path, libc::O_RDWR | libc::O_CREAT)
+                .expect("first O_CREAT open");
+            ov.close_overlay_fd(fd);
+            // Same as interval `forget_committed_overlay`: host file is gone.
+            fs::remove_file(overlay.join(format!("rewrite-{i}.txt"))).expect("wipe overlay host");
+            let fd = ov
+                .open_overlay_fd(&path, libc::O_RDWR | libc::O_CREAT)
+                .expect("post-wipe O_CREAT open");
+            ov.close_overlay_fd(fd);
+        }
+        let after = count_open_fds().expect("/proc/self/fd after loop");
+        assert!(
+            after <= before + 4,
+            "Regression: discarded create_file_inner fd leaked on missing-file \
+             O_CREAT (before={before} after={after}; 32×2 opens would leak 64)"
         );
     }
 
