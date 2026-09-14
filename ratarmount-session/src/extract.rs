@@ -140,6 +140,17 @@ impl Session {
             emit(progress, state, Some(member.to_string()));
             return Ok(());
         }
+        // TAR typeflag '1' is S_IFREG + linkname + size 0. open() returns an
+        // empty Cursor, so copy_member would persist a 0-byte dest (and
+        // Replace would clobber a pre-existing file) while the payload lives
+        // at linkname. Follow the target member instead.
+        let fi = resolve_hardlink_file_info(self, fi)?;
+        if is_lnk_mode(fi.mode) {
+            extract_symlink(&dest, &fi.linkname, req.overwrite)?;
+            state.files_done += 1;
+            emit(progress, state, Some(member.to_string()));
+            return Ok(());
+        }
         copy_member(self, &fi, &dest, progress, cancel, state, member)
     }
 }
@@ -383,17 +394,66 @@ fn symlink_action(unix: bool, dest_exists: bool, overwrite: Overwrite) -> Symlin
     SymlinkAction::Write
 }
 
+/// TAR hardlink (typeflag `'1'`): regular mode, size 0, linkname is the target.
+fn is_hardlink_member(fi: &FileInfo) -> bool {
+    !is_dir_mode(fi.mode) && !is_lnk_mode(fi.mode) && fi.size == 0 && !fi.linkname.is_empty()
+}
+
+fn resolve_hardlink_file_info(session: &Session, fi: FileInfo) -> Result<FileInfo, Error> {
+    if !is_hardlink_member(&fi) {
+        return Ok(fi);
+    }
+    let mut current = fi;
+    for _ in 0..32 {
+        if current.linkname.is_empty() || current.linkname.contains('\0') {
+            return Err(Error::NotFound);
+        }
+        let path = query_normpath(&current.linkname);
+        let next = session
+            .mount_source()
+            .lookup(&path, 0)
+            .ok_or(Error::NotFound)?;
+        if is_dir_mode(next.mode) {
+            return Err(Error::Internal(format!(
+                "hardlink target {path} is a directory"
+            )));
+        }
+        if is_lnk_mode(next.mode) || !is_hardlink_member(&next) {
+            return Ok(next);
+        }
+        current = next;
+    }
+    Err(Error::Internal(
+        "hardlink hop limit exceeded (cycle or chain too long)".into(),
+    ))
+}
+
 fn extract_symlink(dest: &Path, target: &str, overwrite: Overwrite) -> Result<(), Error> {
-    if symlink_action(cfg!(unix), dest.exists(), overwrite) == SymlinkAction::SkipUnchanged {
+    // Path::exists follows. A dangling dest symlink must count as present for
+    // Skip, matching dest_exists_nofollow on regular files.
+    if symlink_action(cfg!(unix), dest_exists_nofollow(dest)?, overwrite)
+        == SymlinkAction::SkipUnchanged
+    {
         return Ok(());
     }
     #[cfg(unix)]
     {
-        if dest.exists() {
-            std::fs::remove_file(dest).map_err(|e| map_dest_io(e, dest))?;
+        // Sibling tmp + rename. remove_file(dest) then symlink() was the
+        // symlink analogue of File::create: a failed symlink() (empty target,
+        // ENAMETOOLONG PAX linkpath, FS without symlink support) left dest gone.
+        let tmp = {
+            let (f, path) = create_extract_tmp(dest)?;
+            drop(f);
+            let _ = std::fs::remove_file(&path);
+            path
+        };
+        match std::os::unix::fs::symlink(target, &tmp) {
+            Ok(()) => persist_extract_tmp(&tmp, dest),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                Err(map_dest_io(e, dest))
+            }
         }
-        std::os::unix::fs::symlink(target, dest).map_err(|e| map_dest_io(e, dest))?;
-        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -1282,6 +1342,187 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "cancel must unlink the extract tmp, leftover {leftovers:?}"
+        );
+    }
+
+    fn ustar_header(name: &str, size: u64, typeflag: u8, linkname: &str) -> [u8; 512] {
+        let mut h = [0u8; 512];
+        let nb = name.as_bytes();
+        h[..nb.len()].copy_from_slice(nb);
+        let oct = |v: u64, width: usize| {
+            let digits = width - 1;
+            let s = format!("{v:0digits$o}");
+            let mut v = s.into_bytes();
+            v.push(0);
+            v.resize(width, 0);
+            v
+        };
+        h[100..108].copy_from_slice(&oct(0o644, 8));
+        h[108..116].copy_from_slice(&oct(0, 8));
+        h[116..124].copy_from_slice(&oct(0, 8));
+        h[124..136].copy_from_slice(&oct(size, 12));
+        h[136..148].copy_from_slice(&oct(0, 12));
+        h[156] = typeflag;
+        let lb = linkname.as_bytes();
+        h[157..157 + lb.len()].copy_from_slice(lb);
+        h[257..263].copy_from_slice(b"ustar\0");
+        h[263..265].copy_from_slice(b"00");
+        h[148..156].copy_from_slice(b"        ");
+        let csum: u32 = h.iter().map(|&b| u32::from(b)).sum();
+        let cs = format!("{csum:06o}\0 ");
+        h[148..156].copy_from_slice(cs.as_bytes());
+        h
+    }
+
+    fn open_raw_tar(dir: &Path, name: &str, bytes: &[u8]) -> Session {
+        let tar = dir.join(name);
+        std::fs::write(&tar, bytes).unwrap();
+        let idx = dir.join(format!("{name}.index.sqlite"));
+        Session::open(OpenRequest {
+            source: SourceSpec::Path(tar),
+            index: IndexPolicy::Explicit,
+            explicit_index: Some(idx),
+            extra_dirs: Vec::new(),
+            password: None,
+            recursive: false,
+            recursion_depth: None,
+            recreate: Recreate::IfInvalid,
+        })
+        .expect("Session::open of raw tar")
+    }
+
+    /// Regression: Replace of a symlink member must not unlink dest before
+    /// `symlink()` succeeds. A PAX `linkpath` longer than Linux `SYMLINK_MAX`
+    /// makes `symlink()` fail with ENAMETOOLONG.
+    #[cfg(unix)]
+    #[test]
+    fn extract_to_replace_failed_symlink_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_target = "x".repeat(5000);
+        let session = open_tar(
+            dir.path(),
+            "long-link.tar",
+            &[member_symlink("broken_link", &long_target)],
+        );
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("broken_link");
+        let original = b"keep-me-symlink-replace";
+        std::fs::write(&out_file, original).unwrap();
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/broken_link".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::Internal(_) | Error::NotWritable(_)),
+            "expected failed symlink create, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&out_file).unwrap(),
+            original,
+            "failed symlink Replace must leave the pre-existing dest intact"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&dest)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name())
+            .filter(|n| {
+                n.to_string_lossy().contains(".extract-") && n.to_string_lossy().ends_with(".tmp")
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "failed symlink must unlink tmp, leftover {leftovers:?}"
+        );
+    }
+
+    /// Regression: TAR typeflag `'1'` hardlink extract must copy the target
+    /// member, not persist a 0-byte dest (`open()` empty Cursor + size 0).
+    #[test]
+    fn extract_to_hardlink_copies_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"hardlink-payload\n";
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&ustar_header("foo.txt", payload.len() as u64, b'0', ""));
+        tar.extend_from_slice(payload);
+        tar.extend(std::iter::repeat_n(
+            0u8,
+            (512 - (payload.len() % 512)) % 512,
+        ));
+        tar.extend_from_slice(&ustar_header("bar.txt", 0, b'1', "foo.txt"));
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+        let session = open_raw_tar(dir.path(), "hardlink.tar", &tar);
+        let ent = session
+            .lookup("/bar.txt")
+            .expect("lookup")
+            .expect("bar.txt present");
+        assert_eq!(ent.size, 0, "hardlink index size is 0 (typeflag 1)");
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("bar.txt");
+        let original = b"keep-me-not-empty";
+        std::fs::write(&out_file, original).unwrap();
+        session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/bar.txt".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .expect("extract hardlink");
+        assert_eq!(
+            std::fs::read(&out_file).unwrap(),
+            payload,
+            "hardlink extract must follow the target member, not persist empty"
+        );
+    }
+
+    /// Regression: dangling hardlink (missing target) must not persist a
+    /// 0-byte dest over a pre-existing file.
+    #[test]
+    fn extract_to_hardlink_missing_target_preserves_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tar = Vec::new();
+        tar.extend_from_slice(&ustar_header("orphan.txt", 0, b'1', "missing.txt"));
+        tar.extend(std::iter::repeat_n(0u8, 1024));
+        let session = open_raw_tar(dir.path(), "orphan-hl.tar", &tar);
+        let dest = dir.path().join("out");
+        std::fs::create_dir_all(&dest).unwrap();
+        let out_file = dest.join("orphan.txt");
+        let original = b"keep-me-dangling-hardlink";
+        std::fs::write(&out_file, original).unwrap();
+        let err = session
+            .extract_to(
+                ExtractRequest {
+                    members: vec!["/orphan.txt".into()],
+                    dest_dir: dest.clone(),
+                    overwrite: Overwrite::Replace,
+                    allow_unsafe_paths: false,
+                },
+                None,
+                None,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound),
+            "expected NotFound for dangling hardlink, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(&out_file).unwrap(),
+            original,
+            "dangling hardlink must not persist an empty dest over existing bytes"
         );
     }
 
