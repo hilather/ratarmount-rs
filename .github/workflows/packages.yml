@@ -242,16 +242,50 @@ jobs:
       - name: Bootstrap
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get -o Acquire::Retries=5 update
-          apt-get -o Acquire::Retries=5 install -y ca-certificates curl git
+          # debian-security CDN can 404 packages listed in a just-fetched index
+          # (mirror skew). Acquire::Retries alone retries the same URL; refresh
+          # indexes between install attempts.
+          apt_get_install() {
+            local attempt=1 max=5
+            while true; do
+              apt-get -o Acquire::Retries=5 update
+              if apt-get -o Acquire::Retries=5 install -y "$@"; then
+                return 0
+              fi
+              if (( attempt >= max )); then
+                echo "apt-get install failed after ${max} attempts" >&2
+                return 1
+              fi
+              echo "apt-get install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
+              sleep $(( attempt * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          apt_get_install ca-certificates curl git
 
       - uses: actions/checkout@v4
 
       - name: Install build deps
         run: |
           export DEBIAN_FRONTEND=noninteractive
-          apt-get -o Acquire::Retries=5 update
-          apt-get -o Acquire::Retries=5 install -y \
+          # Same debian-security CDN 404 / mirror-skew issue as Bootstrap.
+          apt_get_install() {
+            local attempt=1 max=5
+            while true; do
+              apt-get -o Acquire::Retries=5 update
+              if apt-get -o Acquire::Retries=5 install -y "$@"; then
+                return 0
+              fi
+              if (( attempt >= max )); then
+                echo "apt-get install failed after ${max} attempts" >&2
+                return 1
+              fi
+              echo "apt-get install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
+              sleep $(( attempt * 3 ))
+              attempt=$(( attempt + 1 ))
+            done
+          }
+          apt_get_install \
             build-essential pkg-config curl ca-certificates git \
             libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 
