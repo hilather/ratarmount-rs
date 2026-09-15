@@ -1341,6 +1341,7 @@ impl WriteOverlay {
             let output = tar_env_command()
                 .args([
                     "--delete",
+                    "--ignore-zeros",
                     "--null",
                     &format!("--files-from={}", deletion_list.display()),
                     "--file",
@@ -1370,7 +1371,7 @@ impl WriteOverlay {
         }
         if !plan.appends_nul.is_empty() {
             let status = tar_env_command()
-                .args(["--append", "-C"])
+                .args(["--append", "--ignore-zeros", "-C"])
                 .arg(&self.root)
                 .args([
                     "--null",
@@ -1567,16 +1568,16 @@ pub fn patch_sidecar_if_present(
     idx.begin_write()
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
     let format = detect_live_commit_format(archive)?;
+    // Live persist can rewrite a window that still contains an interior TAR
+    // EOF (concatenated complete TARs, or one zstd frame holding them).
+    // `parse_tar_from` with the mount's `ignore_zeros: false` stops there and
+    // drops later members — including newly appended overlay files. Offline
+    // splice already forces `ignore_zeros: true`; live must match for every
+    // format that patches a sidecar (zstd and uncompressed TAR).
+    let mut patch_opts = opts.clone();
+    patch_opts.ignore_zeros = true;
     let stats = match format {
         CompressionFormat::Zstd => {
-            // Live persist can rewrite a window that still contains an interior
-            // TAR EOF (one zstd frame holding concatenated complete TARs).
-            // `parse_tar_from` with the mount's `ignore_zeros: false` stops
-            // there and drops later members — including newly appended overlay
-            // files. Offline splice already forces `ignore_zeros: true`; live
-            // must match.
-            let mut patch_opts = opts.clone();
-            patch_opts.ignore_zeros = true;
             let threads = patch_opts.threads_for("zstd");
             let body = open_seekable_zstd_with_threads(archive, threads)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
@@ -1597,7 +1598,7 @@ pub fn patch_sidecar_if_present(
             SqliteIndexedTar::patch_index_from(
                 &mut file,
                 &idx,
-                opts,
+                &patch_opts,
                 window.window_start,
                 env!("CARGO_PKG_VERSION"),
             )
@@ -2107,10 +2108,10 @@ pub struct CommitOverlayOptions {
     pub debug: u8,
     /// TAR member-name encoding (`-e` / `--encoding`). Default `"utf-8"`.
     pub encoding: String,
-    /// Concatenated TAR (`-i` / `--ignore-zeros`) for GNU-tar / mount reopen.
-    /// Offline and live `.tar.zst` delete classification (and offline sidecar
-    /// patch) always walk past per-frame TAR EOF so later-frame deletes apply
-    /// even when this is false.
+    /// Concatenated TAR (`-i` / `--ignore-zeros`) for mount reopen.
+    /// Offline/live GNU tar `--delete`/`--append`, `.tar.zst` delete
+    /// classification, and sidecar patch always walk past per-frame TAR EOF
+    /// so later concatenated members survive even when this is false.
     pub ignore_zeros: bool,
 }
 
@@ -2698,7 +2699,7 @@ fn commit_overlay_tar(
         }
         if !plan.deletions_nul.is_empty() {
             println!(
-                "    tar --delete --null --files-from='{}' --file '{}' 2>&1 |",
+                "    tar --delete --ignore-zeros --null --files-from='{}' --file '{}' 2>&1 |",
                 deletion_list.display(),
                 work_tar.display()
             );
@@ -2706,7 +2707,7 @@ fn commit_overlay_tar(
         }
         if !plan.appends_nul.is_empty() {
             println!(
-                "    tar --append -C '{}' --null --files-from='{}' --file '{}'",
+                "    tar --append --ignore-zeros -C '{}' --null --files-from='{}' --file '{}'",
                 write_overlay.display(),
                 append_list.display(),
                 work_tar.display()
@@ -2733,6 +2734,7 @@ fn commit_overlay_tar(
         let output = tar_env_command()
             .args([
                 "--delete",
+                "--ignore-zeros",
                 "--null",
                 &format!("--files-from={}", deletion_list.display()),
                 "--file",
@@ -2763,7 +2765,7 @@ fn commit_overlay_tar(
 
     if !plan.appends_nul.is_empty() {
         let status = tar_env_command()
-            .args(["--append", "-C"])
+            .args(["--append", "--ignore-zeros", "-C"])
             .arg(write_overlay)
             .args([
                 "--null",
@@ -4276,6 +4278,76 @@ mod tests {
         );
     }
 
+    /// Regression: uncompressed concatenated TAR sidecar patch from
+    /// `window_start` 0 (unclassified delete / first-frame rewrite) must
+    /// reinsert members after the interior TAR EOF. Mount CLI opts default
+    /// to `ignore_zeros: false` and used to wipe the suffix.
+    #[test]
+    fn patch_sidecar_uncompressed_concatenated_keeps_later_members() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("patch-tar-first");
+        let second = generated_payload("patch-tar-second");
+        let archive = dir.path().join("a.tar");
+        let mut combined = pack_tar(&[ustar_file("first.txt", &first)]);
+        combined.extend(pack_tar(&[ustar_file("second.txt", &second)]));
+        fs::write(&archive, &combined).unwrap();
+
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let opts = OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            };
+            let mut materialised = None;
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                &archive,
+                &archive,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut materialised,
+            )
+            .expect("create sidecar");
+        }
+        assert!(sidecar.is_file(), "pre-existing sidecar");
+
+        let mount_opts = OpenOptions {
+            ignore_zeros: false,
+            gnu_incremental: Some(false),
+            ..OpenOptions::default()
+        };
+        patch_sidecar_if_present(
+            &archive,
+            &IndexPatchWindow {
+                window_start: 0,
+                from_frame: None,
+                offsets_shifted: true,
+            },
+            &mount_opts,
+        )
+        .expect("patch sidecar");
+
+        let mut materialised = None;
+        let src = ratarmount_formats_tar::SqliteIndexedTar::open_with_existing_index(
+            &archive,
+            &archive,
+            &sidecar,
+            OpenOptions {
+                ignore_zeros: true,
+                ..OpenOptions::default()
+            },
+            &mut materialised,
+        )
+        .expect("warm-open patched sidecar");
+        assert_eq!(read_member(&src, "/first.txt"), first);
+        assert_eq!(
+            read_member(&src, "/second.txt"),
+            second,
+            "second complete TAR after the interior EOF must stay in the sidecar"
+        );
+    }
+
     /// Regression: offline later-frame delete must reinsert later complete-TAR
     /// frames when patching a sibling sidecar (not stop at the first TAR EOF).
     #[test]
@@ -5322,6 +5394,121 @@ mod tests {
         assert_eq!(new_count2, 1, "second tick must not duplicate: {text2}");
     }
 
+    /// Regression: GNU tar `--delete` without `--ignore-zeros` stops at the
+    /// first TAR EOF and rewrites only the first complete archive, destroying
+    /// later concatenated members (symptom: `second.txt` gone after deleting
+    /// `first.txt` from `cat a.tar b.tar`).
+    #[test]
+    fn live_commit_uncompressed_tar_concatenated_delete_keeps_later_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("live-tar-first");
+        let second = generated_payload("live-tar-second");
+        let archive = dir.path().join("a.tar");
+        let mut combined = pack_tar(&[ustar_file("first.txt", &first)]);
+        combined.extend(pack_tar(&[ustar_file("second.txt", &second)]));
+        fs::write(&archive, &combined).unwrap();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&archive, true), &overlay);
+        ov.unlink("/first.txt")
+            .expect("unlink first complete-TAR member");
+        match ov.commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, true))) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("live commit concatenated delete: {other:?}"),
+        }
+
+        let src = open_uncompressed_tar_base(&archive, true);
+        assert!(
+            src.lookup("/first.txt", 0).is_none(),
+            "deleted first-frame name must be gone"
+        );
+        assert_eq!(
+            read_member(src.as_ref(), "/second.txt"),
+            second,
+            "later complete TAR must survive GNU tar --delete"
+        );
+    }
+
+    /// Regression: offline `--commit-overlay` used the same GNU tar `--delete`
+    /// without `--ignore-zeros`, so a first-frame delete dropped later
+    /// concatenated archives (and later-frame deletes were "Not found").
+    #[test]
+    fn commit_overlay_uncompressed_tar_concatenated_delete_keeps_later_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("off-tar-first");
+        let second = generated_payload("off-tar-second");
+        let archive = dir.path().join("a.tar");
+        let mut combined = pack_tar(&[ustar_file("first.txt", &first)]);
+        combined.extend(pack_tar(&[ustar_file("second.txt", &second)]));
+        fs::write(&archive, &combined).unwrap();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&archive, true), &overlay);
+        ov.unlink("/first.txt")
+            .expect("unlink first complete-TAR member");
+        drop(ov);
+
+        match commit_overlay(&overlay, &archive, &yes_commit_opts()) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("offline concatenated delete: {other:?}"),
+        }
+
+        let src = open_uncompressed_tar_base(&archive, true);
+        assert!(
+            src.lookup("/first.txt", 0).is_none(),
+            "deleted first-frame name must be gone"
+        );
+        assert_eq!(
+            read_member(src.as_ref(), "/second.txt"),
+            second,
+            "later complete TAR must survive offline GNU tar --delete"
+        );
+    }
+
+    /// Regression: later-frame delete on a concatenated uncompressed TAR must
+    /// apply (GNU tar without `--ignore-zeros` reported "Not found in archive",
+    /// which persist filtered as success, and the member stayed on disk).
+    #[test]
+    fn commit_overlay_uncompressed_tar_concatenated_later_frame_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("off-tar-later-first");
+        let second = generated_payload("off-tar-later-second");
+        let archive = dir.path().join("a.tar");
+        let mut combined = pack_tar(&[ustar_file("first.txt", &first)]);
+        combined.extend(pack_tar(&[ustar_file("second.txt", &second)]));
+        fs::write(&archive, &combined).unwrap();
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&archive, true), &overlay);
+        ov.unlink("/second.txt")
+            .expect("unlink later complete-TAR member");
+        drop(ov);
+
+        match commit_overlay(&overlay, &archive, &yes_commit_opts()) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("offline later-frame delete: {other:?}"),
+        }
+
+        let src = open_uncompressed_tar_base(&archive, true);
+        assert!(
+            src.lookup("/second.txt", 0).is_none(),
+            "later-frame name must be gone after offline commit"
+        );
+        assert_eq!(read_member(src.as_ref(), "/first.txt"), first);
+    }
+
     /// Base that lists `gone.txt` but strips TAR userdata (AutoMount nested
     /// archive, foreign sidecar, or any wrapper that hides `offsetheader`).
     struct NoTarOffsetheaderBase;
@@ -5642,6 +5829,26 @@ mod tests {
 
     fn open_tar_zst_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
         reopen_tar_zst(path, ignore_zeros).expect("index tar.zst")
+    }
+
+    fn open_uncompressed_tar_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ignore_zeros,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        let mut materialised = None;
+        Arc::new(
+            ratarmount_formats_tar::SqliteIndexedTar::create_index(
+                path,
+                path,
+                None,
+                &opts,
+                "test",
+                &mut materialised,
+            )
+            .expect("index uncompressed tar"),
+        )
     }
 
     fn read_member(src: &dyn MountSource, path: &str) -> Vec<u8> {
