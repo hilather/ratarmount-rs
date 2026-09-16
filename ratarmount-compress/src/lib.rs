@@ -109,7 +109,7 @@ use std::io::{self, copy, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use bzip2::read::BzDecoder;
+use bzip2::read::MultiBzDecoder;
 use flate2::read::MultiGzDecoder;
 use log::debug;
 use tempfile::NamedTempFile;
@@ -287,16 +287,25 @@ pub fn materialize_gzip(path: &Path) -> Result<(NamedTempFile, u64)> {
 }
 
 /// Decompress bzip2 into a persistent temp file.
+///
+/// Uses `MultiBzDecoder` so concatenated streams (`cat a.bz2 b.bz2`) are
+/// fully decoded. A single-stream decoder stops at the first `STREAM_END`,
+/// which made `--commit-overlay` rewrite only the first TAR and drop later
+/// members.
 pub fn materialize_bzip2(path: &Path) -> Result<(NamedTempFile, u64)> {
     let input = File::open(path)?;
-    let decoder = BzDecoder::new(BufReader::new(input));
+    let decoder = MultiBzDecoder::new(BufReader::new(input));
     materialize_from_reader(decoder, "bzip2", path)
 }
 
 /// Decompress xz into a persistent temp file.
+///
+/// Uses `XzDecoder::new_multi_decoder` so concatenated streams
+/// (`cat a.xz b.xz`) are fully decoded. `XzDecoder::new` stops after the
+/// first stream footer, which made `--commit-overlay` drop later TAR members.
 pub fn materialize_xz(path: &Path) -> Result<(NamedTempFile, u64)> {
     let input = File::open(path)?;
-    let decoder = XzDecoder::new(BufReader::new(input));
+    let decoder = XzDecoder::new_multi_decoder(BufReader::new(input));
     materialize_from_reader(decoder, "xz", path)
 }
 
@@ -711,7 +720,7 @@ pub fn path_buf(tmp: &NamedTempFile) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Write};
 
     #[test]
     fn stencil_concat() {
@@ -833,6 +842,52 @@ mod tests {
             return;
         }
         assert_simple_body(&path, CompressionFormat::Lrzip);
+    }
+
+    fn bz2_compress(plain: &[u8]) -> Vec<u8> {
+        let mut enc = bzip2::write::BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn xz_compress(plain: &[u8]) -> Vec<u8> {
+        let mut enc = xz2::write::XzEncoder::new(Vec::new(), 0);
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap()
+    }
+
+    /// Regression: `BzDecoder` stops at the first stream; overlay commit then
+    /// recompressed only that prefix (later concatenated TAR members gone).
+    #[test]
+    fn materialize_bzip2_concatenated_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.bz2");
+        let mut concat = bz2_compress(b"first-stream");
+        concat.extend(bz2_compress(b"+second-stream"));
+        std::fs::write(&path, concat).unwrap();
+        let (tmp, size) = materialize_bzip2(&path).unwrap();
+        assert_eq!(size, 26);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"first-stream+second-stream"
+        );
+    }
+
+    /// Regression: `XzDecoder::new` stops at the first stream footer; overlay
+    /// commit then recompressed only that prefix (later TAR members gone).
+    #[test]
+    fn materialize_xz_concatenated_streams() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("c.xz");
+        let mut concat = xz_compress(b"first-stream");
+        concat.extend(xz_compress(b"+second-stream"));
+        std::fs::write(&path, concat).unwrap();
+        let (tmp, size) = materialize_xz(&path).unwrap();
+        assert_eq!(size, 26);
+        assert_eq!(
+            std::fs::read(tmp.path()).unwrap(),
+            b"first-stream+second-stream"
+        );
     }
 
     #[test]

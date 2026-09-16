@@ -3515,6 +3515,7 @@ fn walkdir_files_and_empty_dirs(root: &Path) -> Result<Vec<WalkEntry>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratarmount_compress::{open_seekable_bzip2, open_seekable_xz};
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
@@ -5513,6 +5514,90 @@ mod tests {
         assert_eq!(read_member(src.as_ref(), "/first.txt"), first);
     }
 
+    /// Regression: `BzDecoder` (not multi) dropped later bzip2 streams
+    /// during `--commit-overlay` materialize. Symptom: `second.txt` gone
+    /// after deleting `first.txt` from `cat a.tar.bz2 b.tar.bz2`.
+    #[test]
+    fn commit_overlay_tar_bz2_concatenated_delete_keeps_later_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("off-bz2-del-first");
+        let second = generated_payload("off-bz2-del-second");
+        let archive = dir.path().join("a.tar.bz2");
+        write_concatenated_tar_bz2(
+            &archive,
+            &[ustar_file("first.txt", &first)],
+            &[ustar_file("second.txt", &second)],
+        );
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_bz2_base(&archive, true), &overlay);
+        ov.unlink("/first.txt")
+            .expect("unlink first complete-TAR member");
+        drop(ov);
+
+        match commit_overlay(&overlay, &archive, &yes_commit_opts()) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("offline concatenated tar.bz2 delete: {other:?}"),
+        }
+
+        let src = open_tar_bz2_base(&archive, true);
+        assert!(
+            src.lookup("/first.txt", 0).is_none(),
+            "deleted first-stream name must be gone"
+        );
+        assert_eq!(
+            read_member(src.as_ref(), "/second.txt"),
+            second,
+            "later bzip2 stream must survive offline GNU tar --delete"
+        );
+    }
+
+    /// Regression: `XzDecoder::new` (not multi) dropped later xz streams
+    /// during `--commit-overlay` materialize. Symptom: `second.txt` gone
+    /// after deleting `first.txt` from `cat a.tar.xz b.tar.xz`.
+    #[test]
+    fn commit_overlay_tar_xz_concatenated_delete_keeps_later_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = generated_payload("off-xz-del-first");
+        let second = generated_payload("off-xz-del-second");
+        let archive = dir.path().join("a.tar.xz");
+        write_concatenated_tar_xz(
+            &archive,
+            &[ustar_file("first.txt", &first)],
+            &[ustar_file("second.txt", &second)],
+        );
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_xz_base(&archive, true), &overlay);
+        ov.unlink("/first.txt")
+            .expect("unlink first complete-TAR member");
+        drop(ov);
+
+        match commit_overlay(&overlay, &archive, &yes_commit_opts()) {
+            Ok(true) => {}
+            Err(e) if e.to_string().contains("GNU tar") => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("offline concatenated tar.xz delete: {other:?}"),
+        }
+
+        let src = open_tar_xz_base(&archive, true);
+        assert!(
+            src.lookup("/first.txt", 0).is_none(),
+            "deleted first-stream name must be gone"
+        );
+        assert_eq!(
+            read_member(src.as_ref(), "/second.txt"),
+            second,
+            "later xz stream must survive offline GNU tar --delete"
+        );
+    }
+
     /// Base that lists `gone.txt` but strips TAR userdata (AutoMount nested
     /// archive, foreign sidecar, or any wrapper that hides `offsetheader`).
     struct NoTarOffsetheaderBase;
@@ -5833,6 +5918,64 @@ mod tests {
 
     fn open_tar_zst_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
         reopen_tar_zst(path, ignore_zeros).expect("index tar.zst")
+    }
+
+    fn bz2_compress(plain: &[u8]) -> Vec<u8> {
+        let mut enc = BzEncoder::new(Vec::new(), bzip2::Compression::fast());
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn xz_compress(plain: &[u8]) -> Vec<u8> {
+        let mut enc = XzEncoder::new(Vec::new(), 0);
+        enc.write_all(plain).unwrap();
+        enc.finish().unwrap()
+    }
+
+    fn write_concatenated_tar_bz2(
+        path: &Path,
+        first: &[UstarMember<'_>],
+        second: &[UstarMember<'_>],
+    ) {
+        let mut out = bz2_compress(&pack_tar(first));
+        out.extend(bz2_compress(&pack_tar(second)));
+        fs::write(path, out).unwrap();
+    }
+
+    fn write_concatenated_tar_xz(
+        path: &Path,
+        first: &[UstarMember<'_>],
+        second: &[UstarMember<'_>],
+    ) {
+        let mut out = xz_compress(&pack_tar(first));
+        out.extend(xz_compress(&pack_tar(second)));
+        fs::write(path, out).unwrap();
+    }
+
+    fn open_compressed_tar_base(
+        path: &Path,
+        body: Arc<dyn ratarmount_compress::SeekableBody>,
+        ignore_zeros: bool,
+        label: &str,
+    ) -> Arc<dyn MountSource> {
+        let opts = ratarmount_core::OpenOptions {
+            index_in_memory: true,
+            ignore_zeros,
+            ..ratarmount_core::OpenOptions::default()
+        };
+        ratarmount_formats_tar::SqliteIndexedTar::create_index_body(path, body, None, &opts, "test")
+            .map(|t| Arc::new(t) as Arc<dyn MountSource>)
+            .unwrap_or_else(|e| panic!("index {label}: {e}"))
+    }
+
+    fn open_tar_bz2_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
+        let body = open_seekable_bzip2(path).expect("open seekable bzip2");
+        open_compressed_tar_base(path, body, ignore_zeros, "tar.bz2")
+    }
+
+    fn open_tar_xz_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
+        let body = open_seekable_xz(path).expect("open seekable xz");
+        open_compressed_tar_base(path, body, ignore_zeros, "tar.xz")
     }
 
     fn open_uncompressed_tar_base(path: &Path, ignore_zeros: bool) -> Arc<dyn MountSource> {
