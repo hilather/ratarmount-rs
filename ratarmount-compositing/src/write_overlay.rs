@@ -3467,7 +3467,6 @@ fn tar_env_command() -> Command {
     cmd
 }
 
-
 /// Map unfiltered GNU tar `--delete` stderr lines into the overlay error.
 ///
 /// Includes the stderr text so callers/tests can detect known broken builds
@@ -3964,7 +3963,6 @@ mod tests {
             || s.contains("lseek")
             || s.contains("Value too large for defined data type")
     }
-
 
     fn sibling_index_sqlite_paths(dir: &Path) -> Vec<PathBuf> {
         let mut out: Vec<PathBuf> = fs::read_dir(dir)
