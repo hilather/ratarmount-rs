@@ -51,6 +51,42 @@ frame; the full-decode path is simple and fast enough.
 
 ---
 
+## One-shot producer
+
+`ratarmount --repack-seekable INPUT OUTPUT` rewrites a file and exits. It does
+not mount and is not combined with `--commit-overlay` (or a non-zero
+`--commit-overlay-interval` / `--commit-overlay-on-exit`). `--yes` overwrites.
+`--repack-frame-size BYTES` defaults to 8 MiB when omitted (`1M` = 1 048 576)
+and only affects a recompress.
+
+```bash
+ratarmount --repack-seekable in.tar.gz out.tar.zst
+```
+
+| Output suffix | Product |
+|---------------|---------|
+| `.zst`, `.tzst`, `.zstd`, `.tar.zst`, `.tar.zstd` | Multi-frame zstd plus a seek-table footer |
+| `.gz`, `.tgz`, `.gzip`, `.tar.gz` | Byte copy of a gzip input, plus `{output}.rgzi` (or `--repack-gzip-index gzidx` / `both`) |
+| anything else | Error, exit 2 |
+
+Zstd destination — copy versus recompress:
+
+| Input | Action |
+|-------|--------|
+| At least two frames and a seek-table footer | **Copy**. Output bytes match the input. |
+| At least two frames, no footer, packed from offset 0 with no gaps, every size fits `u32` | **Append** a seek-table footer. Prefix frames stay byte-identical. |
+| At least two frames, no footer, and a size does not fit `u32` **or** a skippable frame sits before or between data frames | **Copy**. No footer. A footer would hide the gap: the loader places frame *i* at the sum of compressed sizes from 0. |
+| Single zstd frame, with or without a one-row seek table | **Recompress** into `frame_size` chunks, then one footer. |
+| gzip or uncompressed bytes | **Recompress** the same way. |
+| bzip2, xz, lz4, 7z, zip | Error. v1 reads gzip, zstd, or uncompressed bytes. |
+
+Gzip output is copy-only: a second deflate does not create seek points, so the
+index is the sidecar. A non-gzip input named `.gz` is an error. The default
+sidecar is `.rgzi` only. TAR member order stays input byte order; names are
+not sorted.
+
+---
+
 ## How to produce multi-frame zstd
 
 Both patterns create **concatenated independent frames**. Standard `zstd` is

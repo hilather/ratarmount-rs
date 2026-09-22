@@ -169,6 +169,8 @@ TAR (ustar / PAX / GNU + sparse) · ZIP (store / deflate, password, multi-part) 
 
 gzip · bzip2 · xz · zstd (multi-frame + seek-table) · lz4 · lzip · lzo · compress (`.Z`) · lzma · zlib
 
+`ratarmount --repack-seekable in.tar.gz out.tar.zst` writes seekable zstd without mounting (copy, append a footer, or recompress — [guide](docs/zstd-random-access.md)).
+
 ### Compositing & UX
 
 | Capability | Notes |

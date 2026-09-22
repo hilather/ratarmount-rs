@@ -2,9 +2,10 @@
 //!
 //! Zstd output is multi-frame zstd plus an official seek-table footer
 //! ([`build_seek_table_skippable`], descriptor byte 0, no per-frame checksum).
-//! Gzip output is a byte copy of a gzip input plus an `.rgzi` sidecar beside
-//! the output. The body and the sidecar are renamed into place only after both
-//! temps are durable, so a failed index leaves the previous files alone. TAR
+//! Gzip output is a byte copy of a gzip input plus a sidecar beside the
+//! output. The default sidecar is `.rgzi` only; `.gzidx` and both are opt-in.
+//! The body and every sidecar are renamed into place only after the temps are
+//! durable, so a failed index leaves the previous files alone. TAR
 //! member names are never parsed and never sorted: uncompressed bytes stay in
 //! input order, so a two-member TAR stays in offset order.
 //!
@@ -48,6 +49,17 @@ pub const DEFAULT_REPACK_FRAME_SIZE: u64 = 8 * 1024 * 1024;
 /// Default zstd level for a recompress.
 pub const DEFAULT_REPACK_ZSTD_LEVEL: i32 = 3;
 
+/// Gzip index written beside a gzip output. Default is [`GzipSidecar::Rgzi`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GzipSidecar {
+    /// `{output}.rgzi`.
+    Rgzi,
+    /// `{output}.gzidx` (32 KiB windows; opt-in).
+    Gzidx,
+    /// Both `.rgzi` and `.gzidx`.
+    Both,
+}
+
 /// Options for [`repack_seekable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepackOptions {
@@ -56,7 +68,9 @@ pub struct RepackOptions {
     pub frame_size: u64,
     /// Zstd compression level for a recompress.
     pub zstd_level: i32,
-    /// Replace an existing output file or `.rgzi`. Never follows a final symlink.
+    /// Sidecar for a gzip destination. Ignored for zstd output.
+    pub gzip_sidecar: GzipSidecar,
+    /// Replace an existing output file or selected sidecar. Never follows a final symlink.
     pub overwrite: bool,
 }
 
@@ -65,6 +79,7 @@ impl Default for RepackOptions {
         Self {
             frame_size: DEFAULT_REPACK_FRAME_SIZE,
             zstd_level: DEFAULT_REPACK_ZSTD_LEVEL,
+            gzip_sidecar: GzipSidecar::Rgzi,
             overwrite: false,
         }
     }
@@ -84,10 +99,10 @@ pub enum RepackAction {
     CopiedWithoutFooter,
     /// Single zstd frame, or gzip/plain input written as zstd, chunked at `frame_size`.
     Recompressed { frames: u32 },
-    /// Gzip input copied to a gzip destination; an `.rgzi` sidecar was written beside `output`.
+    /// Gzip input copied to a gzip destination; the selected sidecar(s) were written.
     ///
     /// Plain (or any non-gzip) input to a `.gz` destination is an error, not this variant.
-    CopiedWithGzipIndex,
+    CopiedWithGzipIndex { format: GzipSidecar },
 }
 
 /// Lengths after a successful [`repack_seekable`].
@@ -111,20 +126,23 @@ pub fn repack_seekable(input: &Path, output: &Path, opts: &RepackOptions) -> Res
     refuse_same_path(input, output)?;
     let dest = output_family(output)?;
     let kind = classify_input(input)?;
-    let sidecar = match dest {
-        Dest::Gzip => Some(sidecar_path(output, "rgzi")),
-        Dest::Zstd => None,
+    let sidecars: Vec<PathBuf> = match dest {
+        Dest::Gzip => gzip_sidecar_exts(opts.gzip_sidecar)
+            .iter()
+            .map(|ext| sidecar_path(output, ext))
+            .collect(),
+        Dest::Zstd => Vec::new(),
     };
-    if let Some(sidecar) = &sidecar {
+    for sidecar in &sidecars {
         refuse_same_path(input, sidecar)?;
     }
     ensure_destination(output, opts.overwrite)?;
-    if let Some(sidecar) = &sidecar {
+    for sidecar in &sidecars {
         ensure_destination(sidecar, opts.overwrite)?;
     }
     match dest {
         Dest::Zstd => repack_zstd_dest(input, output, opts, kind),
-        Dest::Gzip => repack_gzip_dest(input, output, kind),
+        Dest::Gzip => repack_gzip_dest(input, output, opts, kind),
     }
 }
 
@@ -317,6 +335,14 @@ fn parent_dir(path: &Path) -> &Path {
     }
 }
 
+fn gzip_sidecar_exts(kind: GzipSidecar) -> &'static [&'static str] {
+    match kind {
+        GzipSidecar::Rgzi => &["rgzi"],
+        GzipSidecar::Gzidx => &["gzidx"],
+        GzipSidecar::Both => &["rgzi", "gzidx"],
+    }
+}
+
 fn sidecar_path(output: &Path, ext: &str) -> PathBuf {
     let mut name = output.file_name().unwrap_or_default().to_os_string();
     name.push(".");
@@ -394,16 +420,20 @@ fn repack_zstd_dest(
     recompress_to_output(input, output, opts, kind, input_len)
 }
 
-fn repack_gzip_dest(input: &Path, output: &Path, kind: InputKind) -> Result<RepackReport> {
+fn repack_gzip_dest(
+    input: &Path,
+    output: &Path,
+    opts: &RepackOptions,
+    kind: InputKind,
+) -> Result<RepackReport> {
     if kind != InputKind::Gzip {
         return Err(v1_gzip_out_err());
     }
     let input_len = fs::metadata(input)?.len();
     let parent = parent_dir(output);
-    let sidecar = sidecar_path(output, "rgzi");
 
-    // Both temps are durable before either final name is replaced. An index
-    // error drops the temps and leaves the previous archive and `.rgzi`.
+    // Temps are durable before any final name is replaced. An index error
+    // drops the temps and leaves the previous archive and sidecars.
     let mut body = NamedTempFile::new_in(parent)?;
     copy_path(input, body.as_file_mut())?;
     body.as_file_mut().flush()?;
@@ -411,18 +441,24 @@ fn repack_gzip_dest(input: &Path, output: &Path, kind: InputKind) -> Result<Repa
 
     let indexed = SeekableGzip::open(body.path(), DEFAULT_GZIP_SEEK_SPACING)?;
     let uncompressed_len = indexed.uncompressed_size();
-    let blob = indexed.export_seek_index_blob();
+    let blobs = gzip_index_blobs(&indexed, opts.gzip_sidecar);
     drop(indexed);
 
-    let mut side = NamedTempFile::new_in(parent)?;
-    side.write_all(&blob)?;
-    side.as_file_mut().flush()?;
-    side.as_file().sync_all()?;
+    let mut sides = Vec::with_capacity(blobs.len());
+    for (ext, blob) in gzip_sidecar_exts(opts.gzip_sidecar).iter().zip(blobs) {
+        let mut side = NamedTempFile::new_in(parent)?;
+        side.write_all(&blob)?;
+        side.as_file_mut().flush()?;
+        side.as_file().sync_all()?;
+        sides.push((side, sidecar_path(output, ext)));
+    }
 
     let output_len = body.as_file().metadata()?.len();
-    publish_pair(body, output, side, &sidecar)?;
+    publish_with_sidecars(body, output, sides)?;
     Ok(report(
-        RepackAction::CopiedWithGzipIndex,
+        RepackAction::CopiedWithGzipIndex {
+            format: opts.gzip_sidecar,
+        },
         input_len,
         output_len,
         uncompressed_len,
@@ -430,14 +466,23 @@ fn repack_gzip_dest(input: &Path, output: &Path, kind: InputKind) -> Result<Repa
     ))
 }
 
-/// Rename `body` onto `output` and `side` onto `sidecar`.
-///
-/// If either rename fails, put the previous files back.
-fn publish_pair(
+fn gzip_index_blobs(indexed: &SeekableGzip, kind: GzipSidecar) -> Vec<Vec<u8>> {
+    match kind {
+        GzipSidecar::Rgzi => vec![indexed.export_seek_index_blob()],
+        GzipSidecar::Gzidx => vec![indexed.export_indexed_gzip_blob()],
+        GzipSidecar::Both => vec![
+            indexed.export_seek_index_blob(),
+            indexed.export_indexed_gzip_blob(),
+        ],
+    }
+}
+
+/// Rename `body` onto `output`, then each sidecar. If a later rename fails,
+/// put the previous files back so a gzip file is not left without its index.
+fn publish_with_sidecars(
     body: NamedTempFile,
     output: &Path,
-    side: NamedTempFile,
-    sidecar: &Path,
+    sides: Vec<(NamedTempFile, PathBuf)>,
 ) -> Result<()> {
     let output_bak = move_aside(output)?;
     if let Err(e) = persist_replacing(body, output) {
@@ -446,34 +491,49 @@ fn publish_pair(
         }
         return Err(e);
     }
-    let sidecar_bak = match move_aside(sidecar) {
-        Ok(bak) => bak,
-        Err(e) => {
-            let _ = fs::remove_file(output);
-            if let Some(bak) = output_bak.as_deref() {
-                restore_backup(output, bak);
+
+    let mut done: Vec<(PathBuf, Option<PathBuf>)> = Vec::with_capacity(sides.len());
+    for (side, sidecar) in sides {
+        let sidecar_bak = match move_aside(&sidecar) {
+            Ok(bak) => bak,
+            Err(e) => {
+                undo_publish(output, &output_bak, &done);
+                return Err(e);
             }
+        };
+        if let Err(e) = persist_replacing(side, &sidecar) {
+            let _ = fs::remove_file(&sidecar);
+            if let Some(bak) = sidecar_bak.as_deref() {
+                restore_backup(&sidecar, bak);
+            }
+            undo_publish(output, &output_bak, &done);
             return Err(e);
         }
-    };
-    if let Err(e) = persist_replacing(side, sidecar) {
-        let _ = fs::remove_file(output);
-        let _ = fs::remove_file(sidecar);
-        if let Some(bak) = output_bak.as_deref() {
-            restore_backup(output, bak);
-        }
-        if let Some(bak) = sidecar_bak.as_deref() {
-            restore_backup(sidecar, bak);
-        }
-        return Err(e);
+        done.push((sidecar, sidecar_bak));
     }
+
     if let Some(bak) = output_bak {
         let _ = fs::remove_file(bak);
     }
-    if let Some(bak) = sidecar_bak {
-        let _ = fs::remove_file(bak);
+    for (_, bak) in done {
+        if let Some(bak) = bak {
+            let _ = fs::remove_file(bak);
+        }
     }
     Ok(())
+}
+
+fn undo_publish(output: &Path, output_bak: &Option<PathBuf>, done: &[(PathBuf, Option<PathBuf>)]) {
+    let _ = fs::remove_file(output);
+    if let Some(bak) = output_bak {
+        restore_backup(output, bak);
+    }
+    for (path, bak) in done.iter().rev() {
+        let _ = fs::remove_file(path);
+        if let Some(bak) = bak {
+            restore_backup(path, bak);
+        }
+    }
 }
 
 fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
@@ -669,6 +729,7 @@ fn report(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::gzip_seek::GzipSeekBlobFormat;
     use crate::zstd_seek::{
         build_seek_table_skippable, encode_zstd_frame, scan_zstd_frames, ZstdFrameInfo,
         ZstdFrameMap,
@@ -955,13 +1016,67 @@ mod tests {
         let gz = gzip_bytes(raw);
         fs::write(&input, &gz).unwrap();
         let report = repack_seekable(&input, &output, &RepackOptions::default()).unwrap();
-        assert_eq!(report.action, RepackAction::CopiedWithGzipIndex);
+        assert_eq!(
+            report.action,
+            RepackAction::CopiedWithGzipIndex {
+                format: GzipSidecar::Rgzi,
+            }
+        );
         assert_eq!(fs::read(&output).unwrap(), gz);
         assert_eq!(report.uncompressed_len, raw.len() as u64);
         let rgzi = dir.path().join("out.gz.rgzi");
         let parsed = try_import_gzip_seek_blob(&fs::read(&rgzi).unwrap()).unwrap();
         assert_eq!(parsed.uncompressed_size, raw.len() as u64);
         assert!(!dir.path().join("out.gz.gzidx").exists());
+    }
+
+    #[test]
+    fn repack_gzip_copy_writes_gzidx_and_both() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        let raw = b"hello gzip sidecars";
+        let gz = gzip_bytes(raw);
+        fs::write(&input, &gz).unwrap();
+
+        let gzidx_out = dir.path().join("only.gz");
+        let gzidx_opts = RepackOptions {
+            gzip_sidecar: GzipSidecar::Gzidx,
+            ..RepackOptions::default()
+        };
+        let report = repack_seekable(&input, &gzidx_out, &gzidx_opts).unwrap();
+        assert_eq!(
+            report.action,
+            RepackAction::CopiedWithGzipIndex {
+                format: GzipSidecar::Gzidx,
+            }
+        );
+        assert_eq!(fs::read(&gzidx_out).unwrap(), gz);
+        assert!(!dir.path().join("only.gz.rgzi").exists());
+        let gzidx = fs::read(dir.path().join("only.gz.gzidx")).unwrap();
+        let parsed = try_import_gzip_seek_blob(&gzidx).unwrap();
+        assert_eq!(parsed.format, GzipSeekBlobFormat::IndexedGzip);
+        assert_eq!(parsed.uncompressed_size, raw.len() as u64);
+
+        let both_out = dir.path().join("both.gz");
+        let both_opts = RepackOptions {
+            gzip_sidecar: GzipSidecar::Both,
+            ..RepackOptions::default()
+        };
+        let report = repack_seekable(&input, &both_out, &both_opts).unwrap();
+        assert_eq!(
+            report.action,
+            RepackAction::CopiedWithGzipIndex {
+                format: GzipSidecar::Both,
+            }
+        );
+        assert_eq!(fs::read(&both_out).unwrap(), gz);
+        let rgzi =
+            try_import_gzip_seek_blob(&fs::read(dir.path().join("both.gz.rgzi")).unwrap()).unwrap();
+        assert_eq!(rgzi.format, GzipSeekBlobFormat::Rgzi);
+        let both_gzidx =
+            try_import_gzip_seek_blob(&fs::read(dir.path().join("both.gz.gzidx")).unwrap())
+                .unwrap();
+        assert_eq!(both_gzidx.format, GzipSeekBlobFormat::IndexedGzip);
     }
 
     #[test]
