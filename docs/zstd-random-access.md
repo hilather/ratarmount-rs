@@ -84,7 +84,9 @@ Gzip output is copy-only: a second deflate does not create seek points, so the
 index is the sidecar. A non-gzip input named `.gz` is an error. The default
 sidecar is `.rgzi` only. `--yes` removes the sidecar that was not selected
 after a successful publish (a previous `.rgzi` does not survive `gzidx`, and
-the reverse); a failed publish leaves the previous archive and both sidecars.
+the reverse), unless that sidecar is the input: the command then refuses
+before publish and does not unlink it. A failed publish leaves the previous
+archive and both sidecars.
 TAR member order stays input byte order; names are not sorted.
 
 ---

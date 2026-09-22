@@ -121,12 +121,19 @@ pub struct RepackReport {
 
 /// Rewrite `input` into a seekable `output`.
 ///
-/// Refuses `input == output` after canonicalizing. Refuses an existing output
-/// or sidecar unless [`RepackOptions::overwrite`]. Does not follow a final
-/// symlink at `output`.
+/// Refuses `input == output` after canonicalizing, and refuses when `input` is
+/// the gzip sidecar that overwrite would delete (`.rgzi` for gzidx, `.gzidx`
+/// for rgzi). Refuses an existing output or selected sidecar unless
+/// [`RepackOptions::overwrite`]. Does not follow a final symlink at `output`.
 pub fn repack_seekable(input: &Path, output: &Path, opts: &RepackOptions) -> Result<RepackReport> {
     refuse_same_path(input, output)?;
     let dest = output_family(output)?;
+    // Before any temp copy or publish. Do not unlink this path: it is the source.
+    if let Dest::Gzip = dest {
+        if let Some(ext) = unselected_gzip_sidecar_ext(opts.gzip_sidecar) {
+            refuse_same_path(input, &sidecar_path(output, ext))?;
+        }
+    }
     let kind = classify_input(input)?;
     let sidecars: Vec<PathBuf> = match dest {
         Dest::Gzip => gzip_sidecar_exts(opts.gzip_sidecar)
@@ -474,11 +481,17 @@ fn repack_gzip_dest(
 }
 
 /// `.rgzi` when the selection is gzidx, `.gzidx` when it is rgzi. `Both` keeps both.
+fn unselected_gzip_sidecar_ext(kind: GzipSidecar) -> Option<&'static str> {
+    match kind {
+        GzipSidecar::Rgzi => Some("gzidx"),
+        GzipSidecar::Gzidx => Some("rgzi"),
+        GzipSidecar::Both => None,
+    }
+}
+
 fn remove_unselected_gzip_sidecar(output: &Path, kind: GzipSidecar) -> Result<()> {
-    let ext = match kind {
-        GzipSidecar::Rgzi => "gzidx",
-        GzipSidecar::Gzidx => "rgzi",
-        GzipSidecar::Both => return Ok(()),
+    let Some(ext) = unselected_gzip_sidecar_ext(kind) else {
+        return Ok(());
     };
     match fs::remove_file(sidecar_path(output, ext)) {
         Ok(()) => Ok(()),
@@ -1149,6 +1162,28 @@ mod tests {
         assert_eq!(fs::read(&fail_out).unwrap(), b"old-archive");
         assert_eq!(fs::read(&fail_rgzi).unwrap(), b"old-rgzi");
         assert_eq!(fs::read(&fail_gzidx).unwrap(), b"old-gzidx");
+    }
+
+    /// Regression: `--repack-gzip-index gzidx` must not delete an input named
+    /// `{output}.rgzi`. The call fails before publish and the source stays.
+    #[test]
+    fn repack_refuses_gzidx_input_that_is_unselected_rgzi() {
+        let dir = tempfile::tempdir().unwrap();
+        let output = dir.path().join("out.gz");
+        let input = dir.path().join("out.gz.rgzi");
+        let source = gzip_bytes(b"source-is-the-rgzi");
+        fs::write(&input, &source).unwrap();
+        fs::write(&output, b"old-archive").unwrap();
+        let opts = RepackOptions {
+            gzip_sidecar: GzipSidecar::Gzidx,
+            overwrite: true,
+            ..RepackOptions::default()
+        };
+        let err = repack_seekable(&input, &output, &opts).unwrap_err();
+        assert!(err.to_string().contains("itself"), "{err}");
+        assert_eq!(fs::read(&input).unwrap(), source);
+        assert_eq!(fs::read(&output).unwrap(), b"old-archive");
+        assert!(!dir.path().join("out.gz.gzidx").exists());
     }
 
     #[test]
