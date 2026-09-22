@@ -117,7 +117,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 | F-3 | **SQLite FTS5 / locate** over the index | `done` | M | index + CLI + control plane |
 | F-4 | **OCI image mount** (layer union; product on P-1) | `done` | L | compositing `OciImageMountSource` + remote fetch + factory |
 | F-5 | **Windows (WinFsp) + Homebrew + macOS Intel** | `todo` | L | fuse + packaging |
-| F-6 | **Pure-Rust SMB client** + recursive SMB/WebDAV folders | `todo` | M | `ratarmount-remote` smb.rs |
+| F-6 | **Pure-Rust SMB client** (SMB 2.0.2 read/list; `smbclient` hatch) | `done` | M | `ratarmount-remote` smb_client.rs + session dispatch |
 | F-7 | **Write-through / commit-to-remote** | `todo` | L | compositing + remote S3/HTTP |
 | F-8 | **Block/disk images:** QCOW2, VMDK, VHD/X, DMG, WIM, exFAT, NTFS, UDF | `todo` | L | new `formats-*` crates |
 | F-9 | **Producer: `--repack-seekable`** | `done` | M | compress + CLI |
@@ -165,9 +165,9 @@ One static binary is the Rust story. Without WinFsp/WinGet, NFS-on-Windows resid
 
 Split if needed: Homebrew formula first (S), WinFsp (L), Intel tarball when a runner exists.
 
-### F-6 — Pure-Rust SMB client
+### F-6 — Pure-Rust SMB client — `done`
 
-`smbclient` CLI is a packaging and Windows-host tax. A Range reader plus directory list makes SMB first-class like S3, not a temp-file download. Recursive share listings are F-1 on this backend.
+`smb://` file URLs open through `SmbRangeFile` (SMB 2.0.2, read-only, dialect `0x0202`). A share or directory URL is `try_open_smb_folder` (one directory; AutoMount is the recursion). `smbclient` runs only when `RATARMOUNT_SMB_USE_SMBCLIENT=1`. Client env is `RATARMOUNT_SMB_CLIENT_*`, never `RATARMOUNT_SMB_PASSWORD`. The **server** line stays P-2 `partial` (encrypt / 3.1.1 / Finder). No WRITE and no SMB 3.1.1 on the client. WebDAV Depth-infinity stays the F-1 residual.
 
 ### F-7 — Write-through / commit-to-remote
 
@@ -265,7 +265,7 @@ Protocol batch is in. Parallel-safe splits use the ownership column. Orchestrato
 7. ~~**F-9** `--repack-seekable`~~ — done (copy or append a footer when frames are packed; no footer across a skippable gap; recompress a single frame).
 8. ~~**G-1** booleans~~ — done (`--http --nfs ARCHIVE`; no `serve` subcommand).
 9. ~~**G-2** portable index~~ — done (`Link` / sibling / OCI referrer on miss; `--publish-index` + `{archive}.index.ptr` / `--index-id`; HTTP + S3/GCS/Azure sibling GET of pointer then blob then well-known). Residual SOCI / object-store PUT (F-7) / FUSE blob / Hub referrers.
-10. Everything else as capacity allows: F-5 packaging, F-6 SMB client, F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
+10. Everything else as capacity allows: F-5 packaging, ~~F-6 SMB client~~ (done; P-2 server stays `partial`), F-8 images, F-10 FFI, G-3 cache, G-4 snapshots, G-5 CSI; P-2 Finder/encrypt, HTTP+WebDAV mux, implicit FTPS :990, rclone RC, eStargz, virtio.
 
 ---
 

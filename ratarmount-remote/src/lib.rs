@@ -20,9 +20,10 @@
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
 //! - `smb://` → [`open_smb_range`] / [`SmbRangeFile`] reads one file (SMB 2.0.2).
 //!   [`try_open_smb_folder`] lists one share directory and opens children through
-//!   [`SmbRangeFile`]. The default `smb://` resolver is still `smbclient`
-//!   ([`fetch_smb_to_temp`]) until dispatch lands. Inbound credentials are
-//!   `RATARMOUNT_SMB_CLIENT_*`, never the export server's `RATARMOUNT_SMB_PASSWORD`.
+//!   [`SmbRangeFile`]. Session dispatch uses that client unless
+//!   `RATARMOUNT_SMB_USE_SMBCLIENT=1`, which keeps [`fetch_smb_to_temp`].
+//!   Inbound credentials are `RATARMOUNT_SMB_CLIENT_*`, never the export
+//!   server's `RATARMOUNT_SMB_PASSWORD`.
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.

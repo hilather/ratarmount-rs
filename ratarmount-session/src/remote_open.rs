@@ -914,6 +914,34 @@ pub(super) fn open_remote_input(
             || open_ipfs(input),
         );
     }
+    // smb:// is not open_s3_like: that helper materializes on Err and when
+    // uses_ranges() is false (resolve_to_local → fetch_smb_to_temp). The only
+    // smbclient path is RATARMOUNT_SMB_USE_SMBCLIENT=1. Client env is
+    // RATARMOUNT_SMB_CLIENT_*; this arm does not read RATARMOUNT_SMB_PASSWORD.
+    if input.starts_with("smb://") {
+        if std::env::var("RATARMOUNT_SMB_USE_SMBCLIENT")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return materialize_remote_input(input, opts, recreate, remotes);
+        }
+        if let Some(ms) =
+            ratarmount_remote::try_open_smb_folder(input).map_err(|e| e.to_string())?
+        {
+            return Ok((PathBuf::from(input), ms));
+        }
+        let range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
+        if !range.uses_ranges() {
+            return Err(format!("SMB Range unavailable for {input}"));
+        }
+        let len = range.len();
+        return open_from_live_range(range, len, input, opts, recreate, "SMB Range", || {
+            ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())
+        })?
+        .ok_or_else(|| format!("SMB Range format unsupported for {input}"));
+    }
+
     if input.starts_with("rclone://") {
         match open_rclone(input) {
             Ok(handle) => {
@@ -1046,6 +1074,7 @@ impl_live_range!(ratarmount_remote::GcsRangeFile);
 impl_live_range!(ratarmount_remote::AzureRangeFile);
 impl_live_range!(ratarmount_remote::FtpRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
+impl_live_range!(ratarmount_remote::SmbRangeFile);
 
 fn is_oci_scheme(input: &str) -> bool {
     matches!(
@@ -1182,6 +1211,275 @@ mod tests {
                 "{input} must not be probed as a remote folder"
             );
         }
+    }
+
+    const SMB_EXPORT_PW: &str = "EXPORT_SERVER_PW_7f3c9a";
+    const SMB_EXPORT_USER: &str = "EXPORT_SERVER_USER_7f3c9a";
+
+    struct SmbEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SmbEnv {
+        fn acquire(keys: &[&'static str]) -> Self {
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = keys
+                .iter()
+                .map(|&k| (k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for &k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+            debug_assert!(self.saved.iter().any(|(k, _)| *k == key));
+            std::env::set_var(key, val);
+        }
+    }
+
+    impl Drop for SmbEnv {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn smb_open_opts() -> OpenOptions {
+        OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn shell_single(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    /// Fake `smbclient` that appends one argv line and exits 1. That line count
+    /// is the `fetch_smb_to_temp` counter (the hatch is the only caller).
+    fn install_fake_smbclient(dir: &Path, log: &Path) -> std::ffi::OsString {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n",
+            shell_single(&log.display().to_string())
+        );
+        let bin = dir.join("smbclient");
+        fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+        fs::write(log, b"").unwrap();
+        let mut path = dir.as_os_str().to_os_string();
+        path.push(":");
+        if let Some(old) = std::env::var_os("PATH") {
+            path.push(old);
+        }
+        path
+    }
+
+    fn argv_lines(log: &Path) -> Vec<String> {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Dialect other than 0x0202 so the client fails in NEGOTIATE.
+    fn spawn_smb_bad_dialect() -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            let mut nb = [0u8; 4];
+            if stream.read_exact(&mut nb).is_err() {
+                return;
+            }
+            let n = ((nb[1] as usize) << 16) | ((nb[2] as usize) << 8) | (nb[3] as usize);
+            let mut req = vec![0u8; n];
+            if stream.read_exact(&mut req).is_err() {
+                return;
+            }
+            let mut pkt = vec![0u8; 128];
+            pkt[0] = 0xfe;
+            pkt[1..4].copy_from_slice(b"SMB");
+            pkt[4..6].copy_from_slice(&64u16.to_le_bytes());
+            pkt[14..16].copy_from_slice(&1u16.to_le_bytes());
+            pkt[16..20].copy_from_slice(&1u32.to_le_bytes());
+            if req.len() >= 32 {
+                pkt[24..32].copy_from_slice(&req[24..32]);
+            }
+            pkt[64..66].copy_from_slice(&65u16.to_le_bytes());
+            pkt[68..70].copy_from_slice(&0x0311u16.to_le_bytes());
+            let len = pkt.len();
+            let mut out = [0u8; 4];
+            out[1] = ((len >> 16) & 0xff) as u8;
+            out[2] = ((len >> 8) & 0xff) as u8;
+            out[3] = (len & 0xff) as u8;
+            let _ = stream.write_all(&out);
+            let _ = stream.write_all(&pkt);
+        });
+        addr
+    }
+
+    /// File URL does not call `fetch_smb_to_temp`. A share or directory URL is a
+    /// folder mount source, not a tempfile.
+    ///
+    /// Regression: negotiate failure with `RATARMOUNT_SMB_PASSWORD` set and the
+    /// hatch unset does not spawn `smbclient`.
+    #[test]
+    fn smb_range_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let path = install_fake_smbclient(dir.path(), &log);
+        let env = SmbEnv::acquire(&[
+            "PATH",
+            "RATARMOUNT_SMB_USE_SMBCLIENT",
+            "RATARMOUNT_SMB_PASSWORD",
+            "RATARMOUNT_SMB_USER",
+            "RATARMOUNT_SMB_CLIENT_USER",
+            "RATARMOUNT_SMB_CLIENT_PASSWORD",
+            "RATARMOUNT_SMB_CLIENT_DOMAIN",
+        ]);
+        env.set("PATH", &path);
+        env.set("RATARMOUNT_SMB_PASSWORD", SMB_EXPORT_PW);
+        env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
+
+        let opts = smb_open_opts();
+        for folder in [
+            "smb://fileserver/backups",
+            "smb://fileserver/backups/archives/",
+        ] {
+            let mut remotes = Vec::new();
+            let (opened, src) = open_remote_input(folder, &opts, false, &mut remotes)
+                .unwrap_or_else(|e| panic!("{folder} folder open: {e}"));
+            assert!(
+                remotes.is_empty(),
+                "{folder} must not materialize a tempfile"
+            );
+            assert_eq!(opened, PathBuf::from(folder));
+            assert!(
+                !opened.exists(),
+                "{folder} path must stay the URL, not a temp file"
+            );
+            let root = src.lookup("/", 0).expect("folder root");
+            assert_eq!(
+                root.mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFDIR,
+                "{folder} must be a directory mount source"
+            );
+        }
+        assert!(
+            argv_lines(&log).is_empty(),
+            "folder open spawned smbclient: {:?}",
+            argv_lines(&log)
+        );
+
+        let addr = spawn_smb_bad_dialect();
+        let file_url = format!("smb://127.0.0.1:{}/share/archive.tar", addr.port());
+        let mut remotes = Vec::new();
+        let err = match open_remote_input(&file_url, &opts, false, &mut remotes) {
+            Err(e) => e,
+            Ok(_) => panic!("negotiate failure should not open {file_url}"),
+        };
+        assert!(remotes.is_empty(), "file URL materialized: {remotes:?}");
+        assert!(
+            err.contains("SMB 2.0.2 only"),
+            "expected negotiate failure, got {err}"
+        );
+        assert!(
+            !err.contains("smbclient"),
+            "negotiate failure must not mention smbclient: {err}"
+        );
+        assert!(
+            !err.contains(SMB_EXPORT_PW),
+            "export password leaked into the error: {err}"
+        );
+        let calls = argv_lines(&log);
+        assert!(
+            calls.is_empty(),
+            "fetch_smb_to_temp counter {}: negotiate failure spawned smbclient: {calls:?}",
+            calls.len()
+        );
+    }
+
+    /// Hatch set: materialize runs. Argv still does not contain the export password.
+    #[test]
+    fn smb_use_smbclient_env_still_materializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let path = install_fake_smbclient(dir.path(), &log);
+        let env = SmbEnv::acquire(&[
+            "PATH",
+            "RATARMOUNT_SMB_USE_SMBCLIENT",
+            "RATARMOUNT_SMB_PASSWORD",
+            "RATARMOUNT_SMB_USER",
+            "RATARMOUNT_SMB_CLIENT_USER",
+            "RATARMOUNT_SMB_CLIENT_PASSWORD",
+            "RATARMOUNT_SMB_CLIENT_DOMAIN",
+        ]);
+        env.set("PATH", &path);
+        env.set("RATARMOUNT_SMB_USE_SMBCLIENT", "1");
+        env.set("RATARMOUNT_SMB_PASSWORD", SMB_EXPORT_PW);
+        env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
+
+        let url = "smb://127.0.0.1/share/archive.tar";
+        let mut remotes = Vec::new();
+        let err = match open_remote_input(url, &smb_open_opts(), false, &mut remotes) {
+            Err(e) => e,
+            Ok(_) => panic!("fake smbclient should not open {url}"),
+        };
+        assert!(
+            err.contains("smbclient"),
+            "hatch must materialize via smbclient, got {err}"
+        );
+        assert!(
+            remotes.is_empty(),
+            "failed materialize must not keep a remote"
+        );
+        let calls = argv_lines(&log);
+        assert_eq!(
+            calls.len(),
+            1,
+            "fetch_smb_to_temp counter: expected one smbclient spawn, got {calls:?}"
+        );
+        let argv = &calls[0];
+        assert!(
+            !argv.contains(SMB_EXPORT_PW),
+            "export password leaked into smbclient argv: {argv}"
+        );
+        assert!(
+            !argv.contains(SMB_EXPORT_USER),
+            "export user leaked into smbclient argv: {argv}"
+        );
+        assert!(
+            argv.contains("-N"),
+            "guest hatch should pass -N, not the server password: {argv}"
+        );
+        assert!(
+            !argv.contains("-U"),
+            "export env must not become -U: {argv}"
+        );
     }
 
     /// Regression: `ftp://` / `ftps://` directory URLs dispatch to `open_ftp_folder`

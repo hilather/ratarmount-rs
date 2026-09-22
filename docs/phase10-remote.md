@@ -16,7 +16,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
-| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`; download via Samba `smbclient` CLI when on `PATH` |
+| `smb://` | SMB 2.0.2 read/list (`SmbRangeFile` / one-share folder). `smbclient` temp file only if `RATARMOUNT_SMB_USE_SMBCLIENT=1` |
 | `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`). Index: local `oci:{digest}` cache first, then OCI 1.1 referrers (`artifactType=application/vnd.ratarmount.index.v1+sqlite`) on miss; fail-open if Referrers API is missing (not SOCI; no tag-convention fallback) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
@@ -25,7 +25,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
-Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
+Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder`, then live Range, then materialize. `smb://` is its own arm (not `open_s3_like`): `try_open_smb_folder` or `open_smb_range`, and it does not materialize unless `RATARMOUNT_SMB_USE_SMBCLIENT=1`. OCI is a layer-union mount, not a single-file download.
 
 ### Portable index discovery (G-2)
 
@@ -132,20 +132,32 @@ Path rules (fsspec-like):
 - `ssh://host//abs/path` → absolute `/abs/path`
 - `ssh://host//path/dir/` → SFTP `readdir` folder when `stat` says directory
 
-### SMB (`smbclient`) inbound
+### SMB (SMB 2.0.2) inbound
 
-Requires the Samba client binary on `PATH` (`apt install smbclient` / `dnf install samba-client`). Without it, `resolve_to_local` returns a clear install hint. Pure-Rust SMB **client** is F-6 (out of this batch). Outbound `--smb` is [`export.md`](export.md).
+File URLs are a live Range reader (dialect **0x0202** only). A share root (`smb://host/share`), a trailing slash, or QUERY_INFO that says directory is an F-1 folder (`try_open_smb_folder` / `RemoteFolderMountSource`). `smbclient` downloads to a temp file only when `RATARMOUNT_SMB_USE_SMBCLIENT=1`. With that hatch unset, a failed open returns the error and does not spawn `smbclient` or call `fetch_smb_to_temp`. Outbound `--smb` is [`export.md`](export.md).
+
+Short non-zero `STATUS_SUCCESS` READ replies are not EOF. The fill stops when the caller buffer is full, `offset` is at least the QUERY_INFO size, status is `STATUS_END_OF_FILE` (`0xC0000011`), or status is `STATUS_SUCCESS` and `DataLength == 0`. `0x80000002` (`STATUS_DATATYPE_MISALIGNMENT`) is an error, not EOF. Chunk size is the server `MaxReadSize`, capped at 1 MiB.
+
+Directory list is `QUERY_DIRECTORY` / `FileIdBothDirectoryInformation`, pattern `*`, ended on `STATUS_NO_MORE_FILES` (`0x80000006`). An empty directory is `STATUS_NO_SUCH_FILE`. Caps are 100_000 entries and 10_000 pages; hitting a cap is an error, not a silent truncate. Listing TTL is `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30). No WRITE, SET_INFO, or DELETE. Encryption and any dialect other than `0x0202` fail closed.
+
+`RATARMOUNT_SMB_PASSWORD` and `RATARMOUNT_SMB_USER` are **export-only** (the `--smb` server). The inbound client does not read them. URL userinfo wins over the client env.
 
 | Env | Purpose |
 |-----|---------|
-| `RATARMOUNT_SMB_PASSWORD` | Password when URL has no userinfo (pairs with `RATARMOUNT_SMB_USER` or `$USER`) |
-| `RATARMOUNT_SMB_USER` | Username when using `RATARMOUNT_SMB_PASSWORD` |
+| `RATARMOUNT_SMB_CLIENT_USER` | Username when the URL has no user |
+| `RATARMOUNT_SMB_CLIENT_PASSWORD` | NTLMv2 password |
+| `RATARMOUNT_SMB_CLIENT_DOMAIN` | Domain when the URL has none |
+| `RATARMOUNT_SMB_USE_SMBCLIENT` | Set to `1` to force the `smbclient` temp-file hatch |
 
-URL path: first segment is the **share**, remainder is the file path inside the share. Domain may appear as `DOMAIN;user` or `DOMAIN%5Cuser` in userinfo.
+No URL user and no client password is a guest session (still two SESSION_SETUP legs). If the server requires signing and no client password is set, the open fails. It does not retry unsigned and it does not fall back to `RATARMOUNT_SMB_PASSWORD`.
 
 ```bash
 ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
+ratarmount -f 'smb://fileserver/backups/' mnt/
+RATARMOUNT_SMB_USE_SMBCLIENT=1 ratarmount -f 'smb://fileserver/share/a.tar' mnt/
 ```
+
+URL path: first segment is the **share**, remainder is the path inside the share. Domain may appear as `DOMAIN;user` or `DOMAIN%5Cuser` in userinfo. `smb://host` with no share is a parse error. The hatch still needs `smbclient` on `PATH` (`apt install smbclient` / `dnf install samba-client`).
 
 ### OCI / Docker / GHCR
 
@@ -187,7 +199,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 
 ## Not yet
 
-- Pure-Rust SMB client (no `smbclient` dependency) — F-6
+- SMB 3.1.1 / encryption on the inbound client (v1 is dialect `0x0202` only; no WRITE). `smbclient` remains the `RATARMOUNT_SMB_USE_SMBCLIENT=1` hatch
 - SPA HTML indexes; WebDAV Depth-infinity listing
 - Implicit FTPS (port 990)
 - GCS GOOG4-HMAC-SHA256 (only if live keys reject GOOG1 / V2)

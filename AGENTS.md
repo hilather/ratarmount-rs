@@ -107,7 +107,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | NFS clap steals archive / concurrent readers | `cargo test -p ratarmount --bin ratarmount nfs_flag` · `cargo test -p ratarmount-nfs --lib concurrent_readers` |
 | HTTP/WebDAV/SMB/`--ninep`/`--sftp` clap steals archive | `cargo test -p ratarmount --bin ratarmount http_flag` · `cargo test -p ratarmount --bin ratarmount ninep_flag` · `cargo test -p ratarmount --bin ratarmount webdav_flag` · `cargo test -p ratarmount --bin ratarmount smb_flag` · `cargo test -p ratarmount --bin ratarmount sftp_flag` |
 | `--repack-frame-size 1M` steals the next positional (`archive.tar`) | `cargo test -p ratarmount --bin ratarmount repack_seekable` |
-| Inbound SMB client must not send the export password (`RATARMOUNT_SMB_PASSWORD` / `RATARMOUNT_SMB_USER`); `smbclient_download_args` uses `RATARMOUNT_SMB_CLIENT_*` | `cargo test -p ratarmount-remote --lib smb_guest` · `cargo test -p ratarmount-remote --lib smbclient_ignores` |
+| Inbound SMB client must not send the export password (`RATARMOUNT_SMB_PASSWORD` / `RATARMOUNT_SMB_USER`); `smbclient_download_args` uses `RATARMOUNT_SMB_CLIENT_*` | `cargo test -p ratarmount-remote --lib smb_guest` · `cargo test -p ratarmount-remote --lib smbclient_ignores` · `cargo test -p ratarmount-session --lib smb_range_dispatch` |
 | HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
 | SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
