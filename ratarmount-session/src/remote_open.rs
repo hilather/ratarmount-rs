@@ -1395,13 +1395,13 @@ mod tests {
         env.set("RATARMOUNT_SMB_PASSWORD", SMB_EXPORT_PW);
         env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
 
-        let opts = smb_open_opts();
+        let mut opts = smb_open_opts();
         for folder in [
             "smb://fileserver/backups",
             "smb://fileserver/backups/archives/",
         ] {
             let mut remotes = Vec::new();
-            let (opened, src) = open_remote_input(folder, &opts, false, &mut remotes)
+            let (opened, src) = open_remote_input(folder, &mut opts, false, &mut remotes)
                 .unwrap_or_else(|e| panic!("{folder} folder open: {e}"));
             assert!(
                 remotes.is_empty(),
@@ -1429,7 +1429,7 @@ mod tests {
             let addr = spawn_smb_bad_dialect();
             let file_url = format!("{scheme}://127.0.0.1:{}/share/archive.tar", addr.port());
             let mut remotes = Vec::new();
-            let err = match open_remote_input(&file_url, &opts, false, &mut remotes) {
+            let err = match open_remote_input(&file_url, &mut opts, false, &mut remotes) {
                 Err(e) => e,
                 Ok(_) => panic!("negotiate failure should not open {file_url}"),
             };
@@ -1506,8 +1506,9 @@ mod tests {
         env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
 
         let url = "smb://127.0.0.1/share/archive.tar";
+        let mut opts = smb_open_opts();
         let mut remotes = Vec::new();
-        let err = match open_remote_input(url, &smb_open_opts(), false, &mut remotes) {
+        let err = match open_remote_input(url, &mut opts, false, &mut remotes) {
             Err(e) => e,
             Ok(_) => panic!("fake smbclient should not open {url}"),
         };
