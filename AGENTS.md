@@ -144,6 +144,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Incremental `files` ≠ full `create_index_body` | `cargo test -p ratarmount-formats-tar --lib regression_incremental_equals_full_index` |
 | On-exit persist leaves stale sidecar (remount full-parses) | `cargo test -p ratarmount --test commit_overlay_live on_exit_remount` · `cargo test -p ratarmount --bin ratarmount -- live_commit_on_exit_remount` |
 | Live uncompressed TAR sidecar patch from EOF after unclassified delete (ghost member) | `cargo test -p ratarmount-compositing --lib regression_unclassified_delete` |
+| S3 PUT lands then client times out; next tick must not splice again. Remote on-exit must not `wait_inflight_cleared(None)`. Sidecar stamp/pointer only after the file table matches the uploaded spool. | `cargo test -p ratarmount-compositing --lib remote_publish_timeout_after_landed_put` · `cargo test -p ratarmount-compositing --lib remote_on_exit_bounds_wait` · `cargo test -p ratarmount --bin ratarmount -- publish_refuses_stamp` · `cargo test -p ratarmount --test commit_overlay_live etag_mismatch_landed_put` |
 | Interval reopen | `cargo test -p ratarmount --test commit_overlay_live` · `cargo test -p ratarmount --bin ratarmount -- live_commit` |
 | Pre-splice `zstdblocks` used for suffix parse | `cargo test -p ratarmount-formats-tar --lib regression_incremental_zstdblocks_fresh` |
 | GNU `--append` from `pre_size` misses members | `cargo test -p ratarmount-formats-tar --lib regression_incremental_append_eof` |

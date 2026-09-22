@@ -1219,6 +1219,34 @@ impl SqliteIndex {
         })
     }
 
+    /// Merge the WAL into the main database and truncate the `-wal` file.
+    ///
+    /// Callers that hash or upload the sqlite file must do this and then drop
+    /// the writer. A busy result is an error: the main file would still be the
+    /// pre-patch snapshot.
+    pub fn wal_checkpoint_truncate(&self) -> Result<()> {
+        if self.read_only || self.compact_only {
+            return Ok(());
+        }
+        for attempt in 0..40 {
+            let busy = self.with_conn(|conn| {
+                Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })?;
+            if busy == 0 {
+                return Ok(());
+            }
+            if attempt + 1 == 40 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Err(IndexError::Invalid(
+            "wal_checkpoint(TRUNCATE) busy; sidecar not fully in the main file".into(),
+        ))
+    }
+
     /// Commit the current write transaction.
     pub fn commit_write(&self) -> Result<()> {
         if self.read_only {

@@ -1087,6 +1087,13 @@ struct S3Live {
 }
 
 fn spawn_s3_live(objects: std::collections::HashMap<String, Vec<u8>>) -> S3Live {
+    spawn_s3_live_ex(objects, false)
+}
+
+fn spawn_s3_live_ex(
+    objects: std::collections::HashMap<String, Vec<u8>>,
+    fail_first_archive_put: bool,
+) -> S3Live {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
@@ -1099,6 +1106,7 @@ fn spawn_s3_live(objects: std::collections::HashMap<String, Vec<u8>>) -> S3Live 
     let hits_t = std::sync::Arc::clone(&hits);
     let objs_t = std::sync::Arc::clone(&objs);
     thread::spawn(move || {
+        let failed_archive_put = std::sync::atomic::AtomicBool::new(false);
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
             let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
@@ -1238,6 +1246,20 @@ fn spawn_s3_live(objects: std::collections::HashMap<String, Vec<u8>>) -> S3Live 
                 let n = hits_t.lock().unwrap().len();
                 let new_etag = format!("\"put-{n}\"");
                 etags.lock().unwrap().insert(key.clone(), new_etag.clone());
+                let fail_landed = fail_first_archive_put
+                    && !key.contains(".index")
+                    && !failed_archive_put.swap(true, std::sync::atomic::Ordering::SeqCst);
+                if fail_landed {
+                    let msg = b"body mentions HTTP 412";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    hits_t.lock().unwrap().push(S3Hit { method, key, body });
+                    continue;
+                }
                 let _ = write!(
                     stream,
                     "HTTP/1.1 200 OK\r\nETag: {new_etag}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
@@ -1442,6 +1464,14 @@ fn s3_interval_uploads_once() {
         "blob PUT must equal the meta-v3 sidecar under {}",
         meta.display()
     );
+    let blob_sqlite = dir.path().join("uploaded.sqlite");
+    fs::write(&blob_sqlite, &puts[1].2).unwrap();
+    let uploaded_idx = ratarmount_index::SqliteIndex::open_read_only(&blob_sqlite)
+        .expect("uploaded sidecar opens");
+    assert!(
+        uploaded_idx.version_count("/tick.bin").unwrap() >= 1,
+        "uploaded sqlite must list the overlay member"
+    );
     let archive_put_at = hits
         .iter()
         .position(|h| h.0 == "PUT" && h.1 == key)
@@ -1463,6 +1493,168 @@ fn s3_interval_uploads_once() {
             .unwrap_or_default()
             .contains(secret),
         "log must not contain the AWS secret"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}
+
+fn ustar_name_count(tar: &[u8], name: &str) -> usize {
+    let want = name.as_bytes();
+    tar.chunks(512)
+        .filter(|block| {
+            if block.len() < 512 || block.get(257..262) != Some(b"ustar") {
+                return false;
+            }
+            let raw = &block[..100];
+            let end = raw.iter().position(|&b| b == 0).unwrap_or(100);
+            &raw[..end] == want
+        })
+        .count()
+}
+
+/// Regression: the first archive PUT is stored, then the client sees HTTP 500
+/// whose body mentions HTTP 412. The next tick must not splice that object again.
+#[test]
+fn etag_mismatch_landed_put_keeps_one_member() {
+    let dir = tempfile::tempdir().unwrap();
+    let member = ratarmount_formats_tar::UstarMember {
+        path: "seed.txt",
+        payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    let mut plain = Vec::new();
+    ratarmount_formats_tar::write_ustar_members(&mut plain, &[member]).unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+    let zst_bytes = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+    let zst = dir.path().join("a.tar.zst");
+    fs::write(&zst, &zst_bytes).unwrap();
+    let idx = dir.path().join("a.tar.zst.index.sqlite");
+    let body = ratarmount_compress::open_seekable_zstd(&zst).unwrap();
+    let opts = ratarmount_core::OpenOptions {
+        write_index: true,
+        index_minimum_file_count: 0,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        &zst,
+        body,
+        Some(&idx),
+        &opts,
+        "test",
+    )
+    .expect("sidecar");
+    let index_bytes = fs::read(&idx).unwrap();
+    let pointer = ratarmount_index::IndexPointer::for_blob(&idx, Some(&zst)).unwrap();
+    let pointer_bytes = ratarmount_index::index_pointer_to_json(&pointer)
+        .unwrap()
+        .into_bytes();
+    let id = pointer.index_id.clone();
+    let key = "data/a.tar.zst";
+    let mut objects = std::collections::HashMap::new();
+    objects.insert(key.into(), zst_bytes);
+    objects.insert(format!("{key}.index.ptr"), pointer_bytes);
+    objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
+    let s3 = spawn_s3_live_ex(objects, true);
+    let cache = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let secret = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
+    let payload = format!("etag-landed-{}\n", std::process::id());
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args(["--commit-overlay-interval", "1s"])
+        .arg("s3://bkt/data/a.tar.zst")
+        .env("AWS_ACCESS_KEY_ID", "AKIAIOSFODNN7EXAMPLE")
+        .env("AWS_SECRET_ACCESS_KEY", secret)
+        .env("AWS_REGION", "us-east-1")
+        .env("AWS_DEFAULT_REGION", "us-east-1")
+        .env("AWS_ENDPOINT_URL", format!("http://{}", s3.addr))
+        .env("XDG_CACHE_HOME", cache.path())
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_ANONYMOUS")
+        .env_remove("RATARMOUNT_S3_ANONYMOUS")
+        .env("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1")
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(15)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("tick.bin"), payload.as_bytes()).unwrap();
+    let archive_puts = || {
+        s3.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.method == "PUT" && h.key == key)
+            .count()
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(12) && archive_puts() == 0 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        archive_puts() >= 1,
+        "no archive PUT: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(15) && ov.join("tick.bin").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ov.join("tick.bin").exists(),
+        "overlay file should be forgotten after the landed object is accepted: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert_eq!(
+        archive_puts(),
+        1,
+        "landed PUT must not be uploaded again: {:?}",
+        s3.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| format!("{} {}", h.method, h.key))
+            .collect::<Vec<_>>()
+    );
+    let stored = s3.objects.lock().unwrap().get(key).cloned().unwrap();
+    let uploaded = dir.path().join("uploaded.tar.zst");
+    let plain_out = dir.path().join("uploaded.tar");
+    fs::write(&uploaded, &stored).unwrap();
+    decode_tar_zst_to_tar(&uploaded, &plain_out);
+    let plain_bytes = fs::read(&plain_out).unwrap();
+    assert_eq!(
+        ustar_name_count(&plain_bytes, "tick.bin"),
+        1,
+        "one copy of the member"
+    );
+    assert_eq!(ustar_name_count(&plain_bytes, "seed.txt"), 1);
+    assert!(
+        plain_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_bytes()),
+        "member bytes must be the overlay payload"
+    );
+    let hits = s3.hits.lock().unwrap();
+    assert!(
+        hits.iter()
+            .any(|h| h.method == "PUT" && h.key == format!("{key}.index.ptr")),
+        "success path still publishes the pointer"
     );
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(child.id() as i32),

@@ -2232,6 +2232,13 @@ fn run_fuse_only(
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
     }
     if foreground {
+        // NFS and the forked daemon child already spawn this. `-f` must too,
+        // or `--commit-overlay-interval` waits until process exit.
+        if let (Some(ov), Some(archive), Some(dur)) =
+            (overlay_arc.clone(), live_archive.clone(), commit_interval)
+        {
+            overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
+        }
         let mount_err = mount_blocking(
             source,
             &mp,

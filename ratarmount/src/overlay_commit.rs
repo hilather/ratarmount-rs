@@ -21,7 +21,7 @@ use ratarmount_compress::{
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
-use ratarmount_index::{index_pointer_to_json, IndexPointer, META_SIDECAR_WHOLE_MAX};
+use ratarmount_index::{index_pointer_to_json, IndexPointer, SqliteIndex, META_SIDECAR_WHOLE_MAX};
 use ratarmount_nfs::NfsStop;
 
 /// Warn when the last zstd frame's uncompressed size exceeds this.
@@ -425,20 +425,62 @@ pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &Ope
 
 const S3_PUT_SINGLE_MAX: u64 = 8 * 1024 * 1024;
 
+/// `ensure_s3_write_ok` formats `{op} HTTP 412 precondition failed: {body}`.
+/// The first ` HTTP ` status is the code. A 500 body that mentions 412 stays retryable.
+fn is_s3_http_412(msg: &str) -> bool {
+    match msg.find(" HTTP ") {
+        Some(i) => msg[i + " HTTP ".len()..].starts_with("412"),
+        None => false,
+    }
+}
+
 fn map_s3_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
     let msg = err.to_string();
-    if msg.contains("412") {
+    if is_s3_http_412(&msg) {
         RemotePublishError::EtagMismatch(msg)
     } else {
         RemotePublishError::Retryable(msg)
     }
 }
 
+const SIDECAR_NOT_REBUILT: &str =
+    "sidecar file table was not rebuilt from the uploaded spool; leaving the previous pointer";
+
+/// Partial windows keep file-table rows from the mount. Those rows describe the
+/// uploaded spool only when tarstats still match the pre-splice bytes, or when
+/// `window_start == 0` rebuilds every row from the spool.
+fn sidecar_file_table_rebuilt_for_upload(
+    sidecar: &Path,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    if req.window.window_start == 0 {
+        return Ok(());
+    }
+    let idx = SqliteIndex::open_read_only(sidecar)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let Some(stats) = idx
+        .tarstats()
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
+    else {
+        return Ok(());
+    };
+    let size_ok = stats.st_size == req.presplice_len;
+    let hash_ok = match stats.full_sha256.as_deref() {
+        Some(stored) => stored.eq_ignore_ascii_case(req.presplice_sha256.trim()),
+        None => true,
+    };
+    if size_ok && hash_ok {
+        Ok(())
+    } else {
+        Err(RemotePublishError::Retryable(SIDECAR_NOT_REBUILT.into()))
+    }
+}
+
 /// Object PUT, then patch the meta-v3 sidecar, then blob, then pointer.
 ///
-/// A failure of the object PUT is returned. Index failures after a successful
-/// object replace are warnings: the object already stands, and a retry must
-/// not splice the uploaded bytes again.
+/// A failure of the object PUT is returned. A sidecar whose file table was not
+/// rebuilt from this spool is also returned: tarstats are not stamped and the
+/// previous pointer stays. A retry must not splice bytes that already match.
 fn publish_s3(
     url: &str,
     opts: &OpenOptions,
@@ -446,52 +488,60 @@ fn publish_s3(
 ) -> std::result::Result<(), RemotePublishError> {
     let loc = ratarmount_remote::parse_s3_url(url)
         .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
-    let len = std::fs::metadata(&req.staged)
-        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
-        .len();
-    let etag = req.etag_at_download.as_deref();
-    log::info!(
-        "s3 live commit uploading {len} bytes prefix={} etag={}",
-        req.prefix_compressed_bytes,
-        etag.unwrap_or("-")
-    );
-    let put = if len <= S3_PUT_SINGLE_MAX {
-        let body =
-            std::fs::read(&req.staged).map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
-        ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
+    if req.skip_object_put {
+        log::info!(
+            "s3 live commit object already matches the spliced spool; not uploading it again"
+        );
     } else {
-        let copy = if req.prefix_compressed_bytes == 0 {
-            None
+        let len = std::fs::metadata(&req.staged)
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
+            .len();
+        let etag = req.etag_at_download.as_deref();
+        log::info!(
+            "s3 live commit uploading {len} bytes prefix={} etag={}",
+            req.prefix_compressed_bytes,
+            etag.unwrap_or("-")
+        );
+        let put = if len <= S3_PUT_SINGLE_MAX {
+            let body = std::fs::read(&req.staged)
+                .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+            ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
         } else {
-            Some(req.prefix_compressed_bytes)
+            let copy = if req.prefix_compressed_bytes == 0 {
+                None
+            } else {
+                Some(req.prefix_compressed_bytes)
+            };
+            ratarmount_remote::put_s3_multipart(
+                &loc,
+                &req.staged,
+                copy,
+                etag,
+                Some("application/octet-stream"),
+            )
         };
-        ratarmount_remote::put_s3_multipart(
-            &loc,
-            &req.staged,
-            copy,
-            etag,
-            Some("application/octet-stream"),
-        )
-    };
-    if let Err(e) = put {
-        return Err(map_s3_put(e));
+        if let Err(e) = put {
+            return Err(map_s3_put(e));
+        }
     }
-    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
-        log::warn!("incremental reindex skipped ({e})");
-        return Ok(());
-    }
-    let Some(sidecar) = opts.index_file_path.as_ref().filter(|p| p.is_file()) else {
+    let Some(sidecar) = sidecar_path_for_patch(Path::new(url), opts) else {
         log::info!("incremental reindex skipped (no sidecar); rebuilding");
         return Ok(());
     };
-    let blob_len = std::fs::metadata(sidecar).map(|m| m.len()).unwrap_or(0);
+    sidecar_file_table_rebuilt_for_upload(&sidecar, req)?;
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        return Err(RemotePublishError::Retryable(format!(
+            "incremental reindex failed after object replace: {e}"
+        )));
+    }
+    let blob_len = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
     if blob_len > META_SIDECAR_WHOLE_MAX {
         log::warn!(
             "skipping s3 index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
         );
         return Ok(());
     }
-    let pointer = match IndexPointer::for_blob(sidecar, Some(&req.staged)) {
+    let pointer = match IndexPointer::for_blob(&sidecar, Some(&req.staged)) {
         Ok(p) => p,
         Err(e) => {
             log::warn!("index pointer skipped ({e})");
@@ -509,7 +559,7 @@ fn publish_s3(
         &loc,
         &pointer.index_id,
         json.as_bytes(),
-        sidecar,
+        &sidecar,
     ) {
         Ok(ratarmount_remote::S3IndexSiblingPut::Uploaded) => {}
         Ok(ratarmount_remote::S3IndexSiblingPut::Skipped { blob_len, limit }) => {
@@ -980,5 +1030,208 @@ mod tests {
             .expect("existing zstd");
         assert_eq!(got, EmptyCreateOutcome::Unchanged);
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    fn sha256_file(path: &std::path::Path) -> String {
+        let mut f = std::fs::File::open(path).unwrap();
+        ratarmount_index::sha256_hex_stream(&mut f).unwrap()
+    }
+
+    fn publish_req(
+        staged: &std::path::Path,
+        window_start: u64,
+        from_frame: Option<usize>,
+    ) -> RemotePublishRequest {
+        RemotePublishRequest {
+            staged: staged.to_path_buf(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: Some("\"reget\"".into()),
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start,
+                from_frame,
+                offsets_shifted: window_start > 0,
+            },
+            skip_object_put: true,
+            presplice_len: std::fs::metadata(staged).unwrap().len(),
+            presplice_sha256: sha256_file(staged),
+        }
+    }
+
+    fn assert_publish_leaves_previous_pointer(
+        sidecar: &std::path::Path,
+        mount_len: u64,
+        req: &RemotePublishRequest,
+    ) {
+        let before = SqliteIndex::open_read_only(sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("mount tarstats");
+        assert_eq!(before.st_size, mount_len);
+        assert!(before.full_sha256.is_some());
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.to_path_buf()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, req).unwrap_err();
+        match err {
+            RemotePublishError::Retryable(ref msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            RemotePublishError::EtagMismatch(msg) => {
+                panic!("re-GET mismatch must not be an ETag failure: {msg}")
+            }
+        }
+        let after = SqliteIndex::open_read_only(sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("tarstats after refused publish");
+        assert_eq!(
+            after.st_size, before.st_size,
+            "tarstats must not be stamped"
+        );
+        assert_eq!(after.full_sha256, before.full_sha256);
+        assert_ne!(
+            after.full_sha256.as_deref().map(|s| s.to_ascii_lowercase()),
+            Some(req.presplice_sha256.to_ascii_lowercase()),
+            "stamp would record the re-GET, not the mounted generation"
+        );
+    }
+
+    /// Regression: uncompressed delete window is the mount's offset, not the re-GET.
+    #[test]
+    fn publish_refuses_stamp_when_reget_differs_uncompressed_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mount.tar");
+        let keep = b"keep-mount\n";
+        let dropped = b"drop-mount\n";
+        let members = [
+            ratarmount_formats_tar::UstarMember {
+                path: "keep.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: keep },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+            ratarmount_formats_tar::UstarMember {
+                path: "drop.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: dropped },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        ];
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        std::fs::write(&mount, &tar).unwrap();
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let mut mat = None;
+            let _idx = SqliteIndexedTar::create_index(
+                &mount,
+                &mount,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut mat,
+            )
+            .expect("index mount tar");
+        }
+        let spool = dir.path().join("reget.tar");
+        let other = b"different-reget-bytes-not-the-mount\n";
+        let spool_members = [
+            ratarmount_formats_tar::UstarMember {
+                path: "keep.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+            ratarmount_formats_tar::UstarMember {
+                path: "drop.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        ];
+        let mut spool_tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut spool_tar, &spool_members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut spool_tar).unwrap();
+        std::fs::write(&spool, &spool_tar).unwrap();
+        let window_start = 512 + (keep.len() as u64).div_ceil(512) * 512;
+        assert!(window_start > 0);
+        let req = publish_req(&spool, window_start, None);
+        assert_publish_leaves_previous_pointer(
+            &sidecar,
+            std::fs::metadata(&mount).unwrap().len(),
+            &req,
+        );
+    }
+
+    /// Regression: .tar.zst prefix splice keeps rows before window_start from the mount.
+    #[test]
+    fn publish_refuses_stamp_when_reget_differs_tar_zst_splice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mount.tar.zst");
+        write_split_tar_zst(&mount, b"prefix-mount\n", b"last-mount\n");
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let body = open_seekable_zstd_with_threads(&mount, 1).expect("open zstd");
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let _idx =
+                SqliteIndexedTar::create_index_body(&mount, body, Some(&sidecar), &opts, "test")
+                    .expect("index mount tar.zst");
+        }
+        let map = scan_zstd_frames_path(&mount).unwrap();
+        assert!(
+            map.frames.len() >= 2,
+            "prefix-preserving splice needs two frames"
+        );
+        let window_start = map.frames[1].uncompressed_offset;
+        assert!(window_start > 0);
+        let spool = dir.path().join("reget.tar.zst");
+        write_split_tar_zst(
+            &spool,
+            b"prefix-reget-differs-from-mount\n",
+            b"last-reget-differs\n",
+        );
+        let req = publish_req(&spool, window_start, Some(1));
+        assert_publish_leaves_previous_pointer(
+            &sidecar,
+            std::fs::metadata(&mount).unwrap().len(),
+            &req,
+        );
+    }
+
+    #[test]
+    fn map_s3_put_matches_http_412_status_prefix_only() {
+        let mismatch = map_s3_put(ratarmount_remote::RemoteError::S3(
+            "PutObject HTTP 412 precondition failed: lost update".into(),
+        ));
+        assert!(
+            matches!(mismatch, RemotePublishError::EtagMismatch(_)),
+            "{mismatch}"
+        );
+        let retry = map_s3_put(ratarmount_remote::RemoteError::S3(
+            "PutObject HTTP 500: body mentions HTTP 412".into(),
+        ));
+        assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
     }
 }

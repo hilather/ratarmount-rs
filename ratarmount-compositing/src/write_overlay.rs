@@ -134,6 +134,9 @@ struct SpoolSpliced {
     prefix_compressed_bytes: u64,
     etag_at_download: Option<String>,
     committed: OverlayCommitPlan,
+    /// Length and SHA-256 of the spool **before** `persist_by_format`.
+    presplice_len: u64,
+    presplice_sha256: String,
 }
 
 enum SpoolState {
@@ -167,6 +170,11 @@ pub struct RemotePublishRequest {
     pub prefix_compressed_bytes: u64,
     pub etag_at_download: Option<String>,
     pub window: IndexPatchWindow,
+    /// The object already matches this spool. Do not PUT it again.
+    pub skip_object_put: bool,
+    /// SHA-256 and length of the downloaded object before splice.
+    pub presplice_len: u64,
+    pub presplice_sha256: String,
 }
 
 /// Publish failed before a successful object replace.
@@ -250,6 +258,9 @@ pub struct WriteOverlay {
     spool: Mutex<Option<SpoolHold>>,
     /// Times [`Self::persist_by_format`] ran (tests assert a `Spliced` retry skips it).
     persist_count: AtomicU64,
+    /// Set for the duration of remote on-exit so the interval thread cannot start
+    /// another PUT while on-exit is waiting.
+    interval_suppressed: AtomicBool,
 }
 
 impl WriteOverlay {
@@ -292,6 +303,7 @@ impl WriteOverlay {
             remote: Mutex::new(None),
             spool: Mutex::new(None),
             persist_count: AtomicU64::new(0),
+            interval_suppressed: AtomicBool::new(false),
         })
     }
 
@@ -1130,10 +1142,18 @@ impl WriteOverlay {
         if self.interval_disabled() {
             return Ok(CommitOutcome::Disabled);
         }
+        if self.interval_suppressed.load(Ordering::SeqCst) {
+            log::debug!("interval overlay commit skipped (on-exit in progress)");
+            return Ok(CommitOutcome::Nothing);
+        }
         let Some(_guard) = InFlightGuard::try_begin(self) else {
             log::debug!("interval overlay commit coalesced (persist already in flight)");
             return Ok(CommitOutcome::Coalesced);
         };
+        if self.interval_suppressed.load(Ordering::SeqCst) {
+            log::debug!("interval overlay commit skipped (on-exit in progress)");
+            return Ok(CommitOutcome::Nothing);
+        }
         self.apply_test_persist_delay();
         let start = Instant::now();
         let result = if self.remote_enabled() {
@@ -1157,6 +1177,11 @@ impl WriteOverlay {
         if self.interval_disabled() {
             return Err(interval_disabled_err());
         }
+        let remote = self.remote_enabled();
+        if remote {
+            // The interval thread must not start another PUT during this wait.
+            self.interval_suppressed.store(true, Ordering::SeqCst);
+        }
         let timeout = self.on_exit_wait_timeout();
         if !self.wait_inflight_cleared(Some(timeout)) {
             if let Some(extra) = self.remote_on_exit_extra() {
@@ -1169,9 +1194,7 @@ impl WriteOverlay {
                         "remote on-exit still in flight after object-store timeout; \
                          not splicing"
                     );
-                    return Err(OverlayError::Msg(
-                        "remote on-exit timed out waiting for in-flight persist".into(),
-                    ));
+                    return Err(remote_on_exit_timeout_err());
                 }
             } else {
                 log::error!(
@@ -1187,11 +1210,39 @@ impl WriteOverlay {
         // Own inflight before `commit_atomic`. `commit_gate` serializes splice
         // I/O but on-exit persist does not forget overlay files; overlapping
         // interval would append the same names again.
-        let _guard = loop {
-            if let Some(g) = InFlightGuard::try_begin(self) {
-                break g;
+        let _guard = if remote {
+            let extra = self
+                .remote_on_exit_extra()
+                .unwrap_or(REMOTE_ON_EXIT_EXTRA_DEFAULT);
+            match InFlightGuard::try_begin(self) {
+                Some(g) => g,
+                None => {
+                    if !self.wait_inflight_cleared(Some(extra)) {
+                        log::error!(
+                            "remote on-exit still in flight after object-store timeout; \
+                             not splicing"
+                        );
+                        return Err(remote_on_exit_timeout_err());
+                    }
+                    match InFlightGuard::try_begin(self) {
+                        Some(g) => g,
+                        None => {
+                            log::error!(
+                                "remote on-exit could not start after the bounded wait; \
+                                 not splicing"
+                            );
+                            return Err(remote_on_exit_timeout_err());
+                        }
+                    }
+                }
             }
-            self.wait_inflight_cleared(None);
+        } else {
+            loop {
+                if let Some(g) = InFlightGuard::try_begin(self) {
+                    break g;
+                }
+                self.wait_inflight_cleared(None);
+            }
         };
         match self.commit_atomic(archive) {
             Ok(true) => Ok(CommitOutcome::DidWork),
@@ -1379,7 +1430,12 @@ impl WriteOverlay {
         Ok(())
     }
 
-    fn mark_spool_spliced(&self, plan: &OverlayCommitPlan) {
+    fn mark_spool_spliced(
+        &self,
+        plan: &OverlayCommitPlan,
+        presplice_len: u64,
+        presplice_sha256: String,
+    ) {
         let prefix = self
             .last_publish_plan()
             .map(|p| p.prefix_compressed_bytes)
@@ -1396,6 +1452,8 @@ impl WriteOverlay {
             prefix_compressed_bytes: prefix,
             etag_at_download: etag,
             committed: plan.clone(),
+            presplice_len,
+            presplice_sha256,
         });
     }
 
@@ -1417,6 +1475,9 @@ impl WriteOverlay {
             prefix_compressed_bytes: s.prefix_compressed_bytes,
             etag_at_download: s.etag_at_download.clone(),
             window,
+            skip_object_put: false,
+            presplice_len: s.presplice_len,
+            presplice_sha256: s.presplice_sha256.clone(),
         })
     }
 
@@ -1445,7 +1506,28 @@ impl WriteOverlay {
             );
             return Ok(Some(self.spliced_publish_request()?));
         }
-        if !(same && self.spool_path_and_downloaded_etag().is_some()) {
+        if self.spool_is_spliced() {
+            // ETag moved after a spliced PUT. The body may already be this spool
+            // (client timed out after the server stored it) or a concurrent writer.
+            let spool_path = self
+                .spool_path_and_downloaded_etag()
+                .map(|(p, _, _)| p)
+                .ok_or_else(|| OverlayError::Msg("s3 spliced spool missing".into()))?;
+            let dl = self.remote_download()?;
+            let already = files_same_len_and_hash(dl.file.path(), &spool_path)?;
+            if already {
+                log::info!(
+                    "remote object already matches the spliced spool; skipping persist and object PUT"
+                );
+                drop(dl);
+                let mut req = self.spliced_publish_request()?;
+                req.skip_object_put = true;
+                return Ok(Some(req));
+            }
+            log::info!("remote object changed under a spliced spool; splicing onto the new bytes");
+            self.drop_spool();
+            self.accept_download(dl, head.etag.clone())?;
+        } else if !(same && self.spool_path_and_downloaded_etag().is_some()) {
             self.drop_spool();
             let dl = self.remote_download()?;
             self.accept_download(dl, head.etag.clone())?;
@@ -1486,10 +1568,14 @@ impl WriteOverlay {
         if format != CompressionFormat::Zstd {
             ensure_gnu_tar()?;
         }
+        // Snapshot the downloaded object before splice. Publish compares this
+        // to the sidecar so a partial window is not stamped onto a different re-GET.
+        let presplice_len = fs::metadata(&spool_path)?.len();
+        let presplice_sha256 = file_sha256(&spool_path)?;
         // `earlier_frame_err` returns here. State stays `Downloaded`. No PUT.
         let window = self.persist_by_format(&spool_path, format, &plan)?;
         self.stash_patch_window(window);
-        self.mark_spool_spliced(&plan);
+        self.mark_spool_spliced(&plan, presplice_len, presplice_sha256);
         Ok(Some(self.spliced_publish_request()?))
     }
 
@@ -2120,6 +2206,11 @@ pub fn patch_sidecar_if_present(
     }
     idx.commit_write()
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    // The mount holds a read-only connection. Checkpoint until the main file
+    // has the patched rows, then drop the writer before the caller hashes it.
+    idx.wal_checkpoint_truncate()
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    drop(idx);
     log::info!(
         "incremental reindex {} window_start={} deleted={} inserted={} parse_start={}",
         archive.display(),
@@ -3577,6 +3668,26 @@ const ON_EXIT_WAIT_MIN: Duration = Duration::from_secs(60);
 
 /// v1 still downloads the whole object. Warn above this; do not refuse.
 const REMOTE_SPOOL_WARN_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn remote_on_exit_timeout_err() -> OverlayError {
+    OverlayError::Msg("remote on-exit timed out waiting for in-flight persist".into())
+}
+
+const REMOTE_ON_EXIT_EXTRA_DEFAULT: Duration = Duration::from_secs(120);
+
+fn file_sha256(path: &Path) -> Result<String> {
+    let mut f = File::open(path)?;
+    ratarmount_index::sha256_hex_stream(&mut f).map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+fn files_same_len_and_hash(a: &Path, b: &Path) -> Result<bool> {
+    let la = fs::metadata(a)?.len();
+    let lb = fs::metadata(b)?.len();
+    if la != lb {
+        return Ok(false);
+    }
+    Ok(file_sha256(a)? == file_sha256(b)?)
+}
 
 fn set_spool_mode_0600(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -8606,6 +8717,270 @@ mod tests {
         let second = paths.lock().expect("paths")[1].clone();
         assert_ne!(first, second, "must not resplice the old spool");
         assert!(!overlay.join("new.txt").exists());
+    }
+
+    fn spool_from_bytes(bytes: &[u8]) -> RemoteDownload {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new()
+            .prefix(".ratarmount-spool-")
+            .tempfile()
+            .unwrap();
+        file.write_all(bytes).unwrap();
+        file.flush().unwrap();
+        RemoteDownload {
+            file,
+            len: bytes.len() as u64,
+        }
+    }
+
+    fn count_member(bytes: &[u8], dir: &Path, name: &str) -> u32 {
+        let stored = dir.join(format!(
+            "stored-{}.tar.zst",
+            name.trim_start_matches('/').replace('/', "_")
+        ));
+        fs::write(&stored, bytes).unwrap();
+        open_tar_zst_base(&stored, false).versions(name)
+    }
+
+    /// Regression: a PUT that lands and then times out must not splice again.
+    #[test]
+    fn remote_publish_timeout_after_landed_put_keeps_one_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("land-seed");
+        let extra = generated_payload("land-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let remote = Arc::new(Mutex::new((
+            "\"e1\"".to_string(),
+            fs::read(&archive).unwrap(),
+        )));
+        let remote_h = Arc::clone(&remote);
+        let remote_dl = Arc::clone(&remote);
+        let remote_pub = Arc::clone(&remote);
+        let puts = Arc::new(AtomicU64::new(0));
+        let puts_p = Arc::clone(&puts);
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                let g = remote_h.lock().expect("remote");
+                Ok(RemoteObjectHead {
+                    etag: Some(g.0.clone()),
+                    len: g.1.len() as u64,
+                })
+            }),
+            Box::new(move || {
+                let bytes = remote_dl.lock().expect("remote").1.clone();
+                Ok(spool_from_bytes(&bytes))
+            }),
+            Box::new(move |req| {
+                let n = puts_p.fetch_add(1, Ordering::SeqCst);
+                if !req.skip_object_put {
+                    let bytes = fs::read(&req.staged).expect("staged");
+                    let mut g = remote_pub.lock().expect("remote");
+                    g.1 = bytes;
+                    g.0 = format!("\"put-{n}\"");
+                }
+                if n == 0 {
+                    Err(RemotePublishError::Retryable(
+                        "timeout after the body was stored".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }),
+            Duration::from_millis(200),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("timeout must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timeout"), "{err}");
+        assert_eq!(ov.persist_count_for_test(), 1);
+        assert!(!ov.interval_disabled());
+        assert_eq!(ov.commit_generation(), 0);
+        assert!(overlay.join("new.txt").is_file());
+
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("byte-match retry"),
+            CommitOutcome::DidWork
+        );
+        assert_eq!(
+            ov.persist_count_for_test(),
+            1,
+            "object that already contains the splice must not be persisted again"
+        );
+        assert!(
+            !overlay.join("new.txt").exists(),
+            "success path forgets only the stashed plan"
+        );
+        assert_eq!(ov.commit_generation(), 1);
+        assert!(!ov.interval_disabled());
+        let stored = remote.lock().expect("remote").1.clone();
+        assert_eq!(
+            count_member(&stored, dir.path(), "/new.txt"),
+            1,
+            "one copy of the member"
+        );
+        assert_eq!(count_member(&stored, dir.path(), "/seed.txt"), 1);
+    }
+
+    /// A moved ETag whose bytes differ is a concurrent writer: splice onto that object once.
+    #[test]
+    fn remote_publish_concurrent_object_is_spliced_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("conc-seed");
+        let other_seed = generated_payload("conc-other");
+        let extra = generated_payload("conc-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let other = dir.path().join("other.tar.zst");
+        write_single_frame_tar_zst(&other, &[ustar_file("other.txt", &other_seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let remote = Arc::new(Mutex::new((
+            "\"e1\"".to_string(),
+            fs::read(&archive).unwrap(),
+        )));
+        let remote_h = Arc::clone(&remote);
+        let remote_dl = Arc::clone(&remote);
+        let remote_pub = Arc::clone(&remote);
+        let puts = Arc::new(AtomicU64::new(0));
+        let puts_p = Arc::clone(&puts);
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                let g = remote_h.lock().expect("remote");
+                Ok(RemoteObjectHead {
+                    etag: Some(g.0.clone()),
+                    len: g.1.len() as u64,
+                })
+            }),
+            Box::new(move || {
+                let bytes = remote_dl.lock().expect("remote").1.clone();
+                Ok(spool_from_bytes(&bytes))
+            }),
+            Box::new(move |req| {
+                let n = puts_p.fetch_add(1, Ordering::SeqCst);
+                if !req.skip_object_put {
+                    let bytes = fs::read(&req.staged).expect("staged");
+                    let mut g = remote_pub.lock().expect("remote");
+                    g.1 = bytes;
+                    g.0 = format!("\"put-{n}\"");
+                }
+                if n == 0 {
+                    Err(RemotePublishError::Retryable(
+                        "timeout after the body was stored".into(),
+                    ))
+                } else {
+                    Ok(())
+                }
+            }),
+            Duration::from_millis(200),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("timeout must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timeout"), "{err}");
+        {
+            let mut g = remote.lock().expect("remote");
+            g.0 = "\"concurrent\"".into();
+            g.1 = fs::read(&other).unwrap();
+        }
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("splice onto concurrent object"),
+            CommitOutcome::DidWork
+        );
+        assert_eq!(ov.persist_count_for_test(), 2);
+        let stored = remote.lock().expect("remote").1.clone();
+        assert_eq!(count_member(&stored, dir.path(), "/new.txt"), 1);
+        assert_eq!(count_member(&stored, dir.path(), "/other.txt"), 1);
+        assert_eq!(count_member(&stored, dir.path(), "/seed.txt"), 0);
+    }
+
+    /// Regression: remote on-exit must not wait forever for a new interval PUT.
+    #[test]
+    fn remote_on_exit_bounds_wait_without_disabling() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("exit-seed");
+        let extra = generated_payload("exit-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(overlay_with_base(
+            open_tar_zst_base(&archive, false),
+            &overlay,
+        ));
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let puts = Arc::new(AtomicU64::new(0));
+        let puts_p = Arc::clone(&puts);
+        let archive_dl = archive.clone();
+        ov.set_persist_delay_for_test(Duration::from_secs(5));
+        ov.set_on_exit_wait_min_for_test(Duration::from_millis(50));
+        ov.install_remote_live_commit(
+            Box::new(|| {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"e\"".into()),
+                    len: 1,
+                })
+            }),
+            Box::new(move || Ok(fresh_spool(&archive_dl))),
+            Box::new(move |_| {
+                puts_p.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            Duration::from_millis(200),
+        );
+        let ov_i = Arc::clone(&ov);
+        let archive_i = archive.clone();
+        let worker = std::thread::spawn(move || {
+            ov_i.enqueue_commit(&archive_i, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+        });
+        let started = Instant::now();
+        while !ov.persist_inflight_for_test() && started.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ov.persist_inflight_for_test(),
+            "interval thread did not take the inflight flag"
+        );
+        let t0 = Instant::now();
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::OnExit, |_| unreachable!())
+            .unwrap_err();
+        let elapsed = t0.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "remote on-exit waited {elapsed:?}"
+        );
+        assert!(
+            err.to_string().contains("timed out"),
+            "expected timeout, got {err}"
+        );
+        assert!(!ov.interval_disabled());
+        assert_eq!(ov.persist_count_for_test(), 0, "timeout must not splice");
+        assert_eq!(ov.commit_generation(), 0);
+        assert_eq!(
+            puts.load(Ordering::SeqCst),
+            0,
+            "interval must not start a PUT during the on-exit wait"
+        );
+        assert!(overlay.join("new.txt").is_file());
+        let _ = worker.join().expect("interval thread");
     }
 
     fn overlay_entry_names(dir: &Path) -> Vec<String> {
