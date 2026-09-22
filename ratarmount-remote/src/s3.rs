@@ -3,7 +3,9 @@
 //! # Upload
 //!
 //! [`put_s3_object`] sends at most 8 MiB. Larger staged files use
-//! [`put_s3_multipart`] (8 MiB upload parts). A copied prefix of at least 5 MiB
+//! [`put_s3_multipart`] (8 MiB upload parts). Optional `content-type` is a
+//! signed header (PutObject, or CreateMultipartUpload for the object type).
+//! A copied prefix of at least 5 MiB
 //! is split into inclusive `UploadPartCopy` ranges of at most 5 GiB. A shorter
 //! prefix is folded into the first `UploadPart`. A zero prefix uploads every
 //! byte. Multipart canonical queries are the sorted query string (not empty).
@@ -70,7 +72,7 @@ use crate::{
 pub const DEFAULT_S3_RANGE_THRESHOLD: u64 = 1024 * 1024;
 
 /// PutObject ceiling and `UploadPart` size (8 MiB). Above 10_000 parts is an error.
-const S3_PUT_PART_BYTES: u64 = 8 * 1024 * 1024;
+pub(crate) const S3_PUT_PART_BYTES: u64 = 8 * 1024 * 1024;
 /// S3 rejects a non-last part below this (5 MiB).
 const S3_COPY_PART_MIN: u64 = 5 * 1024 * 1024;
 /// S3 maximum for one `UploadPartCopy` (5 GiB).
@@ -984,8 +986,11 @@ fn read_file_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn create_multipart(ctx: &S3CallCtx) -> Result<String> {
-    let resp = ctx.execute("POST", &[("uploads", "")], b"", &[], &[], None)?;
+fn create_multipart(ctx: &S3CallCtx, content_type: Option<&str>) -> Result<String> {
+    let extra: Vec<(&str, &str)> = content_type
+        .map(|ct| vec![("content-type", ct)])
+        .unwrap_or_default();
+    let resp = ctx.execute("POST", &[("uploads", "")], b"", &extra, &[], None)?;
     ensure_s3_write_ok("CreateMultipartUpload", &resp)?;
     let id = xml_tag_text(&resp.body, "uploadid")
         .filter(|s| !s.is_empty())
@@ -1144,9 +1149,15 @@ fn upload_all_parts(
 
 /// PutObject for a body of at most 8 MiB.
 ///
-/// `if_match`, when set, is sent as `If-Match` (the ETag from download).
+/// `if_match`, when set, is sent as `If-Match` (unsigned; the ETag from download).
+/// `content_type`, when set, is a signed `content-type` header.
 /// Anonymous credentials are an error. The payload hash is SHA-256 of `body`.
-pub fn put_s3_object(loc: &S3Location, body: &[u8], if_match: Option<&str>) -> Result<()> {
+pub fn put_s3_object(
+    loc: &S3Location,
+    body: &[u8],
+    if_match: Option<&str>,
+    content_type: Option<&str>,
+) -> Result<()> {
     require_signing_creds()?;
     let ctx = prepare_s3_write(loc);
     if body.len() as u64 > S3_PUT_PART_BYTES {
@@ -1155,10 +1166,13 @@ pub fn put_s3_object(loc: &S3Location, body: &[u8], if_match: Option<&str>) -> R
             body.len()
         )));
     }
-    let resp = match if_match {
-        Some(etag) => ctx.execute("PUT", &[], body, &[], &[("If-Match", etag)], None)?,
-        None => ctx.execute("PUT", &[], body, &[], &[], None)?,
-    };
+    let extra: Vec<(&str, &str)> = content_type
+        .map(|ct| vec![("content-type", ct)])
+        .unwrap_or_default();
+    let unsigned: Vec<(&str, &str)> = if_match
+        .map(|etag| vec![("If-Match", etag)])
+        .unwrap_or_default();
+    let resp = ctx.execute("PUT", &[], body, &extra, &unsigned, None)?;
     ensure_s3_write_ok("PutObject", &resp)
 }
 
@@ -1171,6 +1185,8 @@ pub fn put_s3_object(loc: &S3Location, body: &[u8], if_match: Option<&str>) -> R
 /// (`bytes={start}-{end}`). A copy tail under 5 MiB that is not the last part
 /// is uploaded with the following bytes. `if_match` is
 /// `x-amz-copy-source-if-match` on each copy and `If-Match` on complete.
+/// `content_type`, when set, is a signed `content-type` header on
+/// CreateMultipartUpload (the object's media type).
 /// Credentials are resolved on every request. Any error after create aborts,
 /// including HTTP 200 whose body is an `<Error>`. A 412 does not complete.
 /// More than 10_000 parts is an error.
@@ -1179,6 +1195,7 @@ pub fn put_s3_multipart(
     staged: &Path,
     copy_prefix: Option<u64>,
     if_match: Option<&str>,
+    content_type: Option<&str>,
 ) -> Result<()> {
     require_signing_creds()?;
     let ctx = prepare_s3_write(loc);
@@ -1187,7 +1204,7 @@ pub fn put_s3_multipart(
     let len = file.metadata()?.len();
     let prefix = copy_prefix.unwrap_or(0);
     let plan = plan_multipart(len, prefix)?;
-    let upload_id = create_multipart(&ctx)?;
+    let upload_id = create_multipart(&ctx, content_type)?;
     match upload_all_parts(&ctx, loc, &mut file, if_match, &upload_id, &plan) {
         Ok(()) => Ok(()),
         Err(e) => match abort_multipart(&ctx, &upload_id) {
@@ -3192,6 +3209,8 @@ mod tests {
     enum MockWriteMode {
         Ok,
         Copy412,
+        /// First PUT returns 500 (index blob PutObject).
+        FirstPut500,
         /// Second PUT returns 500 after part 1 was accepted.
         SecondPut500,
         /// Complete returns HTTP 200 with an `<Error>` body.
@@ -3207,6 +3226,14 @@ mod tests {
         put_n: u32,
     ) -> MockReply {
         let has = |name: &str| headers.iter().any(|(k, _)| k == name);
+        if method == "PUT" && mode == MockWriteMode::FirstPut500 && put_n == 1 {
+            return MockReply {
+                status: 500,
+                reason: "Server Error",
+                headers: Vec::new(),
+                body: b"blob failed".to_vec(),
+            };
+        }
         if method == "PUT" && mode == MockWriteMode::SecondPut500 && put_n == 2 {
             return MockReply {
                 status: 500,
@@ -3440,7 +3467,7 @@ mod tests {
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
         let body = b"put-body-not-empty";
         let log_from = captured_logs().len();
-        put_s3_object(&loc, body, Some("\"src-etag\"")).unwrap();
+        put_s3_object(&loc, body, Some("\"src-etag\""), None).unwrap();
         let logs = captured_logs();
         let logs = &logs[log_from.min(logs.len())..];
         let reqs = s3.requests();
@@ -3473,7 +3500,7 @@ mod tests {
         staged.write_all(body).unwrap();
         staged.flush().unwrap();
         let log_from = captured_logs().len();
-        put_s3_multipart(&loc, staged.path(), Some(0), Some("\"src-etag\"")).unwrap();
+        put_s3_multipart(&loc, staged.path(), Some(0), Some("\"src-etag\""), None).unwrap();
         let logs = captured_logs();
         let logs = &logs[log_from.min(logs.len())..];
         let reqs = s3.requests();
@@ -3541,7 +3568,7 @@ mod tests {
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
         let etag = "\"src-etag\"";
         let log_from = captured_logs().len();
-        put_s3_multipart(&loc, staged.path(), Some(prefix), Some(etag)).unwrap();
+        put_s3_multipart(&loc, staged.path(), Some(prefix), Some(etag), None).unwrap();
         let logs = captured_logs();
         let logs = &logs[log_from.min(logs.len())..];
         let reqs = s3.requests();
@@ -3608,9 +3635,15 @@ mod tests {
         let staged = write_prefix_file(prefix, b"SUFFIX!!");
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
         let log_from = captured_logs().len();
-        let err = put_s3_multipart(&loc, staged.path(), Some(prefix), Some("\"src-etag\""))
-            .unwrap_err()
-            .to_string();
+        let err = put_s3_multipart(
+            &loc,
+            staged.path(),
+            Some(prefix),
+            Some("\"src-etag\""),
+            None,
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("412"), "{err}");
         let reqs = s3.requests();
         let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
@@ -3660,11 +3693,11 @@ mod tests {
         _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
         let log_from = captured_logs().len();
-        let err = put_s3_object(&loc, b"nope", Some("\"etag\""))
+        let err = put_s3_object(&loc, b"nope", Some("\"etag\""), None)
             .unwrap_err()
             .to_string();
         assert!(err.contains("anonymous"), "{err}");
-        let err = put_s3_multipart(&loc, Path::new("/no/such/staged-object"), None, None)
+        let err = put_s3_multipart(&loc, Path::new("/no/such/staged-object"), None, None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3690,7 +3723,7 @@ mod tests {
         let suffix = vec![0xCDu8; 8 * mib];
         let staged = write_prefix_file(prefix, &suffix);
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
-        put_s3_multipart(&loc, staged.path(), Some(prefix), None).unwrap();
+        put_s3_multipart(&loc, staged.path(), Some(prefix), None, None).unwrap();
         let reqs = s3.requests();
         let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
         assert_eq!(puts.len(), 2, "{}", summarize_reqs(&reqs));
@@ -3760,6 +3793,7 @@ mod tests {
             staged.path(),
             Some(S3_COPY_PART_MIN),
             Some("\"src-etag\""),
+            None,
         )
         .unwrap_err()
         .to_string();
@@ -3809,7 +3843,7 @@ mod tests {
         staged.write_all(b"one-part").unwrap();
         staged.flush().unwrap();
         let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
-        let err = put_s3_multipart(&loc, staged.path(), Some(0), None)
+        let err = put_s3_multipart(&loc, staged.path(), Some(0), None, None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -3824,5 +3858,187 @@ mod tests {
             "error body must abort: {}",
             summarize_reqs(&reqs)
         );
+    }
+
+    fn assert_signed_content_type(req: &CapturedS3Req, content_type: &str) {
+        assert_eq!(req.header("content-type"), content_type);
+        let signed = req
+            .header("authorization")
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .unwrap_or("");
+        assert!(
+            signed.split(';').any(|name| name == "content-type"),
+            "SignedHeaders={signed} missing content-type on {} {}",
+            req.method,
+            req.target
+        );
+        assert_sigv4_covers(req);
+    }
+
+    fn index_id_hex() -> String {
+        "ab".repeat(32)
+    }
+
+    fn write_index_blob(bytes: &[u8]) -> NamedTempFile {
+        let mut staged = NamedTempFile::new().unwrap();
+        staged.write_all(bytes).unwrap();
+        staged.flush().unwrap();
+        staged
+    }
+
+    /// Two PUTs, blob first. The pointer's `index_id` is in the blob key
+    /// (`{key}.index.{id}.sqlite`). The pointer object is `{key}.index.ptr`.
+    #[test]
+    fn put_s3_index_siblings_puts_blob_then_pointer() {
+        install_capture_log();
+        let s3 = MockS3Write::spawn("uid-idx", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let id = index_id_hex();
+        let blob_bytes = b"SQLite format 3\0blob";
+        let pointer = format!(r#"{{"index_id":"{id}"}}"#);
+        let staged = write_index_blob(blob_bytes);
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        let log_from = captured_logs().len();
+        let got =
+            crate::put_s3_index_siblings(&loc, &id, pointer.as_bytes(), staged.path()).unwrap();
+        assert_eq!(got, crate::S3IndexSiblingPut::Uploaded);
+        let reqs = s3.requests();
+        let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(puts.len(), 2, "{}", summarize_reqs(&reqs));
+        assert_eq!(reqs.len(), 2, "small blob is PutObject, not multipart");
+        let blob_key = format!("/mybucket/dir/a.tar.index.{id}.sqlite");
+        let pointer_key = "/mybucket/dir/a.tar.index.ptr";
+        let well_known = "/mybucket/dir/a.tar.index.sqlite";
+        assert_eq!(puts[0].path_only(), blob_key);
+        assert!(
+            puts[0].path_only().contains(&id),
+            "pointer index_id must be in the blob key"
+        );
+        assert_eq!(puts[0].body, blob_bytes);
+        assert_signed_content_type(puts[0], crate::OCI_INDEX_ARTIFACT_TYPE);
+        assert_eq!(puts[1].path_only(), pointer_key);
+        assert_eq!(puts[1].body, pointer.as_bytes());
+        assert_signed_content_type(puts[1], "application/json");
+        assert!(
+            reqs.iter().all(|r| r.path_only() != well_known),
+            "well-known key must not be written: {}",
+            summarize_reqs(&reqs)
+        );
+        let logs = captured_logs();
+        assert_logs_omit_secret(&logs[log_from.min(logs.len())..]);
+    }
+
+    #[test]
+    fn put_s3_index_siblings_blob_500_does_not_put_pointer() {
+        let s3 = MockS3Write::spawn("uid-idx-500", MockWriteMode::FirstPut500);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let id = index_id_hex();
+        let pointer = b"{\"index_id\":\"should-not-upload\"}";
+        let staged = write_index_blob(b"SQLite format 3\0blob");
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        let err = crate::put_s3_index_siblings(&loc, &id, pointer, staged.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("500"), "{err}");
+        let reqs = s3.requests();
+        assert_eq!(reqs.len(), 1, "{}", summarize_reqs(&reqs));
+        assert_eq!(reqs[0].method, "PUT");
+        assert!(reqs[0].path_only().contains(&id), "{}", reqs[0].path_only());
+        assert!(
+            reqs.iter().all(|r| r.body != pointer),
+            "pointer body must not be written when the blob PUT returns 500"
+        );
+        assert!(
+            reqs.iter().all(|r| !r.path_only().ends_with(".index.ptr")),
+            "pointer key must not be written: {}",
+            summarize_reqs(&reqs)
+        );
+    }
+
+    #[test]
+    fn put_s3_index_siblings_oversize_skips_with_zero_puts() {
+        let s3 = MockS3Write::spawn("uid-idx-big", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let id = index_id_hex();
+        let staged = NamedTempFile::new().unwrap();
+        let len = ratarmount_core::META_SIDECAR_WHOLE_MAX + 1;
+        staged.as_file().set_len(len).unwrap();
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        let got = crate::put_s3_index_siblings(&loc, &id, b"{}", staged.path()).unwrap();
+        assert_eq!(
+            got,
+            crate::S3IndexSiblingPut::Skipped {
+                blob_len: len,
+                limit: ratarmount_core::META_SIDECAR_WHOLE_MAX,
+            }
+        );
+        assert!(
+            s3.requests().is_empty(),
+            "oversize blob must not PUT: {}",
+            summarize_reqs(&s3.requests())
+        );
+    }
+
+    #[test]
+    fn put_s3_index_siblings_anonymous_errors_before_write() {
+        let s3 = MockS3Write::spawn("uid-idx-anon", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        _g.set("AWS_ANONYMOUS", "1");
+        _g.set("AWS_ENDPOINT_URL", &s3.base_url);
+        _g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
+        let staged = write_index_blob(b"blob");
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        let err = crate::put_s3_index_siblings(&loc, &index_id_hex(), b"{}", staged.path())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("anonymous"), "{err}");
+        assert!(
+            s3.requests().is_empty(),
+            "anonymous index PUT must not hit the network"
+        );
+    }
+
+    /// A blob above the 8 MiB PutObject ceiling and at or below the sidecar cap
+    /// still uploads, with content-type signed on CreateMultipartUpload.
+    #[test]
+    fn put_s3_index_siblings_multipart_blob_then_pointer() {
+        let s3 = MockS3Write::spawn("uid-idx-mp", MockWriteMode::Ok);
+        let _g = EnvGuard::acquire(AWS_ENV_KEYS);
+        aws_signing_env(&_g, &s3.base_url);
+        let id = index_id_hex();
+        let staged = NamedTempFile::new().unwrap();
+        staged.as_file().set_len(S3_PUT_PART_BYTES + 1).unwrap();
+        let pointer = format!(r#"{{"index_id":"{id}"}}"#);
+        let loc = parse_s3_url("s3://mybucket/dir/a.tar").unwrap();
+        crate::put_s3_index_siblings(&loc, &id, pointer.as_bytes(), staged.path()).unwrap();
+        let reqs = s3.requests();
+        let create = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.query() == "uploads=")
+            .unwrap_or_else(|| panic!("missing create: {}", summarize_reqs(&reqs)));
+        assert_signed_content_type(create, crate::OCI_INDEX_ARTIFACT_TYPE);
+        assert!(create.path_only().contains(&id));
+        let last = reqs.last().unwrap();
+        assert_eq!(last.method, "PUT");
+        assert_eq!(last.path_only(), "/mybucket/dir/a.tar.index.ptr");
+        assert_eq!(last.body, pointer.as_bytes());
+        assert_signed_content_type(last, "application/json");
+        assert!(reqs.iter().any(|r| {
+            r.method == "PUT" && r.path_only().contains(&format!(".index.{id}.sqlite"))
+        }));
+        assert!(reqs
+            .iter()
+            .all(|r| r.path_only() != "/mybucket/dir/a.tar.index.sqlite"));
+        let pointer_at = reqs
+            .iter()
+            .position(|r| r.path_only().ends_with(".index.ptr"))
+            .unwrap();
+        assert_eq!(pointer_at, reqs.len() - 1);
+        assert!(pointer_at > 0);
     }
 }

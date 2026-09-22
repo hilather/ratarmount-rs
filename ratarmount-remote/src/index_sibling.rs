@@ -1,16 +1,151 @@
-//! GET-only sibling index objects for S3/GCS/Azure (V-2c).
+//! Sibling index objects for S3/GCS/Azure (V-2c).
 //!
 //! Pointer `{url}.index.ptr` and immutable `{url}.index.{id}.sqlite` are extra
-//! candidates. Object-store PUT is F-7.
+//! candidates. GET is `fetch_*`; PUT is [`put_s3_index_siblings`].
+//! GCS and Azure stay GET-only. The well-known `{url}.index.sqlite` key is not written.
 
-use std::path::PathBuf;
+use std::fs::File;
+use std::io::Read;
+use std::path::{Path, PathBuf};
 
+use log::warn;
+use ratarmount_core::META_SIDECAR_WHOLE_MAX;
 use tempfile::NamedTempFile;
 
+use crate::s3::{put_s3_multipart, put_s3_object, S3_PUT_PART_BYTES};
 use crate::{
     fetch_azure_bytes_capped, fetch_azure_to_temp, fetch_gcs_bytes_capped, fetch_gcs_to_temp,
-    fetch_s3_bytes_capped, fetch_s3_to_temp, remote_url_scheme, RemoteError, Result,
+    fetch_s3_bytes_capped, fetch_s3_to_temp, remote_url_scheme, RemoteError, Result, S3Location,
+    OCI_INDEX_ARTIFACT_TYPE,
 };
+
+/// Signed `Content-Type` for `{key}.index.ptr`.
+const INDEX_POINTER_CONTENT_TYPE: &str = "application/json";
+
+/// Outcome of [`put_s3_index_siblings`]. Oversize is not an error: the archive
+/// object may already have been replaced, and a blob meta-v3 will refuse is not uploaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum S3IndexSiblingPut {
+    /// `{key}.index.{id}.sqlite` then `{key}.index.ptr` were written.
+    Uploaded,
+    /// `blob_len` is above [`META_SIDECAR_WHOLE_MAX`]. No request was sent.
+    Skipped { blob_len: u64, limit: u64 },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BlobPutKind {
+    Skip,
+    Single,
+    Multipart,
+}
+
+/// `>` the shared cap skips. Equal to the cap still uploads (multipart above 8 MiB).
+fn blob_put_kind(len: u64) -> BlobPutKind {
+    if len > META_SIDECAR_WHOLE_MAX {
+        BlobPutKind::Skip
+    } else if len > S3_PUT_PART_BYTES {
+        BlobPutKind::Multipart
+    } else {
+        BlobPutKind::Single
+    }
+}
+
+/// Same 64-hex rule as `ratarmount_index::parse_index_id` (no index dependency).
+fn canonical_index_id(index_id: &str) -> Result<String> {
+    let t = index_id.trim().to_ascii_lowercase();
+    if t.len() != 64 || !t.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(RemoteError::S3(format!(
+            "index_id must be 64 lowercase hex, not {index_id:?}"
+        )));
+    }
+    Ok(t)
+}
+
+fn index_sibling_object_keys(archive_key: &str, index_id: &str) -> (String, String) {
+    (
+        format!("{archive_key}.index.{index_id}.sqlite"),
+        format!("{archive_key}.index.ptr"),
+    )
+}
+
+fn read_exact_file(path: &Path, len: u64) -> Result<Vec<u8>> {
+    let n = usize::try_from(len)
+        .map_err(|_| RemoteError::S3(format!("index blob length {len} does not fit usize")))?;
+    let mut file = File::open(path)?;
+    let mut buf = vec![0u8; n];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+/// PUT `{key}.index.{id}.sqlite`, then `{key}.index.ptr`.
+///
+/// The caller passes `(index_id, pointer_bytes, blob_path)` after
+/// `IndexPointer::for_blob`. This function only orders the PUTs. Content-Type
+/// is signed: [`OCI_INDEX_ARTIFACT_TYPE`] on the blob and `application/json`
+/// on the pointer. A blob longer than [`META_SIDECAR_WHOLE_MAX`] returns
+/// [`S3IndexSiblingPut::Skipped`] and does not PUT. The well-known
+/// `{key}.index.sqlite` key is not written. A failed blob PUT does not write
+/// the pointer. Anonymous credentials error before any request.
+pub fn put_s3_index_siblings(
+    archive: &S3Location,
+    index_id: &str,
+    pointer_bytes: &[u8],
+    blob_path: &Path,
+) -> Result<S3IndexSiblingPut> {
+    let index_id = canonical_index_id(index_id)?;
+    let meta = std::fs::metadata(blob_path)?;
+    if !meta.is_file() {
+        return Err(RemoteError::S3(format!(
+            "index blob {} is not a file",
+            blob_path.display()
+        )));
+    }
+    let len = meta.len();
+    if matches!(blob_put_kind(len), BlobPutKind::Skip) {
+        warn!(
+            "skipping s3 index sibling PUT for s3://{}/{}: blob is {len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})",
+            archive.bucket, archive.key
+        );
+        return Ok(S3IndexSiblingPut::Skipped {
+            blob_len: len,
+            limit: META_SIDECAR_WHOLE_MAX,
+        });
+    }
+    if pointer_bytes.len() as u64 > S3_PUT_PART_BYTES {
+        return Err(RemoteError::S3(format!(
+            "index pointer is {} bytes; max PutObject is {S3_PUT_PART_BYTES}",
+            pointer_bytes.len()
+        )));
+    }
+    let (blob_key, ptr_key) = index_sibling_object_keys(&archive.key, &index_id);
+    let blob_loc = S3Location {
+        bucket: archive.bucket.clone(),
+        key: blob_key,
+    };
+    let ptr_loc = S3Location {
+        bucket: archive.bucket.clone(),
+        key: ptr_key,
+    };
+    if blob_put_kind(len) == BlobPutKind::Single {
+        let body = read_exact_file(blob_path, len)?;
+        put_s3_object(&blob_loc, &body, None, Some(OCI_INDEX_ARTIFACT_TYPE))?;
+    } else {
+        put_s3_multipart(
+            &blob_loc,
+            blob_path,
+            None,
+            None,
+            Some(OCI_INDEX_ARTIFACT_TYPE),
+        )?;
+    }
+    put_s3_object(
+        &ptr_loc,
+        pointer_bytes,
+        None,
+        Some(INDEX_POINTER_CONTENT_TYPE),
+    )?;
+    Ok(S3IndexSiblingPut::Uploaded)
+}
 
 /// True for `s3://` / `gs://` / `az://` / `azure://` archive URLs.
 pub fn is_object_store_archive_url(url: &str) -> bool {
@@ -21,7 +156,9 @@ pub fn is_object_store_archive_url(url: &str) -> bool {
         || s.starts_with("azure://")
 }
 
-/// Download a sibling index object to a kept tempfile. GET only — no PUT.
+/// Download a sibling index object to a kept tempfile.
+///
+/// GET is `fetch_*`; PUT is [`put_s3_index_siblings`].
 pub fn fetch_index_sibling_to_temp(url: &str) -> Result<PathBuf> {
     let (tmp, _) = fetch_object_store_to_temp(url)?;
     keep_tempfile(tmp)
@@ -219,6 +356,50 @@ mod tests {
             i += 1;
         }
         String::from_utf8_lossy(&out).into_owned()
+    }
+
+    #[test]
+    fn put_s3_index_siblings_cap_is_meta_sidecar_whole_max() {
+        assert_eq!(META_SIDECAR_WHOLE_MAX, 64 * 1024 * 1024);
+        assert_eq!(blob_put_kind(0), BlobPutKind::Single);
+        assert_eq!(blob_put_kind(S3_PUT_PART_BYTES), BlobPutKind::Single);
+        assert_eq!(blob_put_kind(S3_PUT_PART_BYTES + 1), BlobPutKind::Multipart);
+        assert_eq!(
+            blob_put_kind(META_SIDECAR_WHOLE_MAX),
+            BlobPutKind::Multipart
+        );
+        assert_eq!(blob_put_kind(META_SIDECAR_WHOLE_MAX + 1), BlobPutKind::Skip);
+    }
+
+    #[test]
+    fn put_s3_index_siblings_index_id_is_lowercase_hex() {
+        assert_eq!(canonical_index_id(&"A".repeat(64)).unwrap(), "a".repeat(64));
+        assert!(canonical_index_id("not-hex").is_err());
+        assert!(canonical_index_id(&"a".repeat(63)).is_err());
+        assert!(canonical_index_id("../").is_err());
+    }
+
+    #[test]
+    fn put_s3_index_sibling_keys_put_index_id_on_blob_not_well_known() {
+        let id = "ab".repeat(32);
+        let (blob, ptr) = index_sibling_object_keys("dir/a.tar", &id);
+        assert_eq!(blob, format!("dir/a.tar.index.{id}.sqlite"));
+        assert!(blob.contains(&id));
+        assert_eq!(ptr, "dir/a.tar.index.ptr");
+        assert_ne!(blob, "dir/a.tar.index.sqlite");
+        assert_ne!(ptr, "dir/a.tar.index.sqlite");
+    }
+
+    #[test]
+    fn put_s3_index_siblings_rejects_bad_index_id_before_put() {
+        let loc = S3Location {
+            bucket: "b".into(),
+            key: "a.tar".into(),
+        };
+        let err = put_s3_index_siblings(&loc, "not-hex", b"{}", Path::new("missing-blob"))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("index_id"), "{err}");
     }
 
     #[test]

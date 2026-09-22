@@ -90,6 +90,7 @@ pub use dropbox::{
 pub(crate) use gcs::fetch_gcs_bytes_capped;
 pub use index_sibling::{
     fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
+    put_s3_index_siblings, S3IndexSiblingPut,
 };
 pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{
