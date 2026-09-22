@@ -446,9 +446,17 @@ fn map_s3_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
 const SIDECAR_NOT_REBUILT: &str =
     "sidecar file table was not rebuilt from the uploaded spool; leaving the previous pointer";
 
+fn tarstats_hex_eq(stored: Option<&str>, got: &str) -> bool {
+    match stored.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(want) => !got.trim().is_empty() && want.eq_ignore_ascii_case(got.trim()),
+        None => false,
+    }
+}
+
 /// Partial windows keep file-table rows from the mount. Those rows describe the
-/// uploaded spool only when tarstats still match the pre-splice bytes, or when
-/// `window_start == 0` rebuilds every row from the spool.
+/// pre-splice spool only when size, prefix, and suffix match, and the full hash
+/// matches when the sidecar stored one. `window_start == 0` rebuilds every row.
+/// Missing tarstats is a refusal.
 fn sidecar_file_table_rebuilt_for_upload(
     sidecar: &Path,
     req: &RemotePublishRequest,
@@ -462,25 +470,33 @@ fn sidecar_file_table_rebuilt_for_upload(
         .tarstats()
         .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
     else {
-        return Ok(());
+        return Err(RemotePublishError::Retryable(SIDECAR_NOT_REBUILT.into()));
     };
-    let size_ok = stats.st_size == req.presplice_len;
-    let hash_ok = match stats.full_sha256.as_deref() {
-        Some(stored) => stored.eq_ignore_ascii_case(req.presplice_sha256.trim()),
+    let full_ok = match stats.full_sha256.as_deref() {
+        Some(stored) => tarstats_hex_eq(Some(stored), &req.presplice_sha256),
         None => true,
     };
-    if size_ok && hash_ok {
+    if stats.st_size == req.presplice_len
+        && tarstats_hex_eq(
+            stats.prefix512_sha256.as_deref(),
+            &req.presplice_prefix512_sha256,
+        )
+        && tarstats_hex_eq(
+            stats.suffix512_sha256.as_deref(),
+            &req.presplice_suffix512_sha256,
+        )
+        && full_ok
+    {
         Ok(())
     } else {
         Err(RemotePublishError::Retryable(SIDECAR_NOT_REBUILT.into()))
     }
 }
 
-/// Object PUT, then patch the meta-v3 sidecar, then blob, then pointer.
-///
-/// A failure of the object PUT is returned. A sidecar whose file table was not
-/// rebuilt from this spool is also returned: tarstats are not stamped and the
-/// previous pointer stays. A retry must not splice bytes that already match.
+/// The file-table check runs before the object PUT. A refusal leaves the
+/// previous pointer unstamped. When the object already contains the splice,
+/// the error is [`RemotePublishError::PointerRefused`] so the caller forgets
+/// the stashed plan and a remount does not append those members again.
 fn publish_s3(
     url: &str,
     opts: &OpenOptions,
@@ -488,6 +504,17 @@ fn publish_s3(
 ) -> std::result::Result<(), RemotePublishError> {
     let loc = ratarmount_remote::parse_s3_url(url)
         .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let sidecar = sidecar_path_for_patch(Path::new(url), opts);
+    if let Some(ref path) = sidecar {
+        if let Err(e) = sidecar_file_table_rebuilt_for_upload(path, req) {
+            let msg = e.to_string();
+            return Err(if req.skip_object_put {
+                RemotePublishError::PointerRefused(msg)
+            } else {
+                RemotePublishError::Retryable(msg)
+            });
+        }
+    }
     if req.skip_object_put {
         log::info!(
             "s3 live commit object already matches the spliced spool; not uploading it again"
@@ -524,13 +551,12 @@ fn publish_s3(
             return Err(map_s3_put(e));
         }
     }
-    let Some(sidecar) = sidecar_path_for_patch(Path::new(url), opts) else {
+    let Some(sidecar) = sidecar else {
         log::info!("incremental reindex skipped (no sidecar); rebuilding");
         return Ok(());
     };
-    sidecar_file_table_rebuilt_for_upload(&sidecar, req)?;
     if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
-        return Err(RemotePublishError::Retryable(format!(
+        return Err(RemotePublishError::PointerRefused(format!(
             "incremental reindex failed after object replace: {e}"
         )));
     }
@@ -1042,6 +1068,7 @@ mod tests {
         window_start: u64,
         from_frame: Option<usize>,
     ) -> RemotePublishRequest {
+        let (prefix, suffix) = ratarmount_index::archive_edge_hashes(staged).unwrap();
         RemotePublishRequest {
             staged: staged.to_path_buf(),
             prefix_compressed_bytes: 0,
@@ -1054,6 +1081,8 @@ mod tests {
             skip_object_put: true,
             presplice_len: std::fs::metadata(staged).unwrap().len(),
             presplice_sha256: sha256_file(staged),
+            presplice_prefix512_sha256: prefix,
+            presplice_suffix512_sha256: suffix,
         }
     }
 
@@ -1076,7 +1105,8 @@ mod tests {
         };
         let err = publish_s3("s3://bkt/data/a.tar", &opts, req).unwrap_err();
         match err {
-            RemotePublishError::Retryable(ref msg) => {
+            RemotePublishError::Retryable(ref msg)
+            | RemotePublishError::PointerRefused(ref msg) => {
                 assert!(msg.contains("leaving the previous pointer"), "{msg}");
             }
             RemotePublishError::EtagMismatch(msg) => {
@@ -1218,6 +1248,131 @@ mod tests {
             std::fs::metadata(&mount).unwrap().len(),
             &req,
         );
+    }
+
+    fn ustar_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+        let member = ratarmount_formats_tar::UstarMember {
+            path: name,
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        tar
+    }
+
+    /// Regression: same-size re-GET above the full-hash cap, prefix differs.
+    /// The pointer is not PUT and tarstats are not stamped.
+    #[test]
+    fn publish_refuses_same_size_reget_over_full_hash_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload_len = ratarmount_index::TARSTATS_FULL_HASH_MAX as usize;
+        let payload = vec![b'A'; payload_len];
+        let mount_bytes = ustar_archive("aaaa.txt", &payload);
+        let mut reget_payload = payload.clone();
+        reget_payload[..512].fill(b'B');
+        let reget_bytes = ustar_archive("bbbb.txt", &reget_payload);
+        assert_eq!(mount_bytes.len(), reget_bytes.len());
+        assert!(mount_bytes.len() as u64 > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+        assert_ne!(&mount_bytes[..512], &reget_bytes[..512]);
+        let mount = dir.path().join("mount.tar");
+        let spool = dir.path().join("reget.tar");
+        std::fs::write(&mount, &mount_bytes).unwrap();
+        std::fs::write(&spool, &reget_bytes).unwrap();
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let mut mat = None;
+            let _idx = SqliteIndexedTar::create_index(
+                &mount,
+                &mount,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut mat,
+            )
+            .expect("index large tar");
+        }
+        let before = SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("edge tarstats");
+        assert!(before.st_size > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+        assert!(before.full_sha256.is_none(), "above the full-hash cap");
+        assert!(before.prefix512_sha256.is_some());
+        assert!(before.suffix512_sha256.is_some());
+        let mut req = publish_req(&spool, 512, None);
+        req.skip_object_put = false;
+        assert_ne!(
+            before
+                .prefix512_sha256
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase()),
+            Some(req.presplice_prefix512_sha256.to_ascii_lowercase())
+        );
+        let before_bytes = std::fs::read(&sidecar).unwrap();
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, &req).unwrap_err();
+        match err {
+            RemotePublishError::Retryable(msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            other => panic!("check runs before the object PUT: {other}"),
+        }
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            before_bytes,
+            "tarstats must not be stamped and the pointer sqlite is unchanged"
+        );
+    }
+
+    /// Regression: a partial window with no tarstats row is a refusal.
+    #[test]
+    fn publish_refuses_partial_window_when_tarstats_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("bare.index.sqlite");
+        {
+            let mut idx = SqliteIndex::create_writable(Some(&sidecar)).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        assert!(SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .is_none());
+        let spool = dir.path().join("reget.tar");
+        std::fs::write(&spool, ustar_archive("keep.txt", b"reget-bytes\n")).unwrap();
+        let req = publish_req(&spool, 512, None);
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, &req).unwrap_err();
+        match err {
+            RemotePublishError::PointerRefused(msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            other => panic!("missing tarstats must refuse the pointer: {other}"),
+        }
+        assert!(SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .is_none());
     }
 
     #[test]

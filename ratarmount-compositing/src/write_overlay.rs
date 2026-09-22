@@ -134,9 +134,11 @@ struct SpoolSpliced {
     prefix_compressed_bytes: u64,
     etag_at_download: Option<String>,
     committed: OverlayCommitPlan,
-    /// Length and SHA-256 of the spool **before** `persist_by_format`.
+    /// Length, full SHA-256, and edge hashes of the spool **before** `persist_by_format`.
     presplice_len: u64,
     presplice_sha256: String,
+    presplice_prefix512_sha256: String,
+    presplice_suffix512_sha256: String,
 }
 
 enum SpoolState {
@@ -172,24 +174,31 @@ pub struct RemotePublishRequest {
     pub window: IndexPatchWindow,
     /// The object already matches this spool. Do not PUT it again.
     pub skip_object_put: bool,
-    /// SHA-256 and length of the downloaded object before splice.
+    /// SHA-256, edge hashes, and length of the downloaded object before splice.
     pub presplice_len: u64,
     pub presplice_sha256: String,
+    pub presplice_prefix512_sha256: String,
+    pub presplice_suffix512_sha256: String,
 }
 
-/// Publish failed before a successful object replace.
+/// Publish failed before a successful object replace, or the object already
+/// stands and the pointer must not be published.
 #[derive(Debug)]
 pub enum RemotePublishError {
     /// HTTP 412. Drop `Spliced`; the next tick downloads again.
     EtagMismatch(String),
-    /// 500 / timeout. Keep `Spliced` and retry the PUT only.
+    /// 500 / timeout, or the file table does not describe this spool and the
+    /// object was not replaced. Keep `Spliced` and retry the PUT only.
     Retryable(String),
+    /// The object already contains the splice. Do not PUT a pointer. The caller
+    /// forgets only the stashed plan so a remount does not append it again.
+    PointerRefused(String),
 }
 
 impl std::fmt::Display for RemotePublishError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::EtagMismatch(m) | Self::Retryable(m) => f.write_str(m),
+            Self::EtagMismatch(m) | Self::Retryable(m) | Self::PointerRefused(m) => f.write_str(m),
         }
     }
 }
@@ -1430,12 +1439,7 @@ impl WriteOverlay {
         Ok(())
     }
 
-    fn mark_spool_spliced(
-        &self,
-        plan: &OverlayCommitPlan,
-        presplice_len: u64,
-        presplice_sha256: String,
-    ) {
+    fn mark_spool_spliced(&self, plan: &OverlayCommitPlan, fp: PrespliceFingerprint) {
         let prefix = self
             .last_publish_plan()
             .map(|p| p.prefix_compressed_bytes)
@@ -1452,8 +1456,10 @@ impl WriteOverlay {
             prefix_compressed_bytes: prefix,
             etag_at_download: etag,
             committed: plan.clone(),
-            presplice_len,
-            presplice_sha256,
+            presplice_len: fp.len,
+            presplice_sha256: fp.sha256,
+            presplice_prefix512_sha256: fp.prefix512_sha256,
+            presplice_suffix512_sha256: fp.suffix512_sha256,
         });
     }
 
@@ -1478,6 +1484,8 @@ impl WriteOverlay {
             skip_object_put: false,
             presplice_len: s.presplice_len,
             presplice_sha256: s.presplice_sha256.clone(),
+            presplice_prefix512_sha256: s.presplice_prefix512_sha256.clone(),
+            presplice_suffix512_sha256: s.presplice_suffix512_sha256.clone(),
         })
     }
 
@@ -1570,12 +1578,11 @@ impl WriteOverlay {
         }
         // Snapshot the downloaded object before splice. Publish compares this
         // to the sidecar so a partial window is not stamped onto a different re-GET.
-        let presplice_len = fs::metadata(&spool_path)?.len();
-        let presplice_sha256 = file_sha256(&spool_path)?;
+        let presplice = presplice_fingerprint(&spool_path)?;
         // `earlier_frame_err` returns here. State stays `Downloaded`. No PUT.
         let window = self.persist_by_format(&spool_path, format, &plan)?;
         self.stash_patch_window(window);
-        self.mark_spool_spliced(&plan, presplice_len, presplice_sha256);
+        self.mark_spool_spliced(&plan, presplice);
         Ok(Some(self.spliced_publish_request()?))
     }
 
@@ -1591,6 +1598,14 @@ impl WriteOverlay {
             }
             Err(RemotePublishError::Retryable(msg)) => {
                 Err(OverlayError::Msg(format!("s3 publish failed: {msg}")))
+            }
+            Err(RemotePublishError::PointerRefused(msg)) => {
+                // The object already contains this splice. Leave the previous
+                // pointer. The Ok arm forgets only the stashed plan.
+                log::warn!(
+                    "s3 pointer refused after the object already contained the splice: {msg}"
+                );
+                Ok(())
             }
         }
     }
@@ -3678,6 +3693,25 @@ const REMOTE_ON_EXIT_EXTRA_DEFAULT: Duration = Duration::from_secs(120);
 fn file_sha256(path: &Path) -> Result<String> {
     let mut f = File::open(path)?;
     ratarmount_index::sha256_hex_stream(&mut f).map_err(|e| OverlayError::Msg(e.to_string()))
+}
+
+/// Bytes of the downloaded object before `persist_by_format`.
+struct PrespliceFingerprint {
+    len: u64,
+    sha256: String,
+    prefix512_sha256: String,
+    suffix512_sha256: String,
+}
+
+fn presplice_fingerprint(path: &Path) -> Result<PrespliceFingerprint> {
+    let (prefix512_sha256, suffix512_sha256) = ratarmount_index::archive_edge_hashes(path)
+        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+    Ok(PrespliceFingerprint {
+        len: fs::metadata(path)?.len(),
+        sha256: file_sha256(path)?,
+        prefix512_sha256,
+        suffix512_sha256,
+    })
 }
 
 fn files_same_len_and_hash(a: &Path, b: &Path) -> Result<bool> {
@@ -8908,6 +8942,109 @@ mod tests {
         assert_eq!(count_member(&stored, dir.path(), "/new.txt"), 1);
         assert_eq!(count_member(&stored, dir.path(), "/other.txt"), 1);
         assert_eq!(count_member(&stored, dir.path(), "/seed.txt"), 0);
+    }
+
+    /// Regression: a refused partial window forgets the overlay once the object
+    /// body already matches the spool, so a remount does not append again.
+    #[test]
+    fn publish_refuses_partial_window_forgets_matching_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("pref-keep");
+        let last = generated_payload("last-keep");
+        let extra = generated_payload("partial-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("old.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let remote = Arc::new(Mutex::new((
+            "\"e1\"".to_string(),
+            fs::read(&archive).unwrap(),
+        )));
+        let remote_h = Arc::clone(&remote);
+        let remote_dl = Arc::clone(&remote);
+        let remote_pub = Arc::clone(&remote);
+        let puts = Arc::new(AtomicU64::new(0));
+        let puts_p = Arc::clone(&puts);
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                let g = remote_h.lock().expect("remote");
+                Ok(RemoteObjectHead {
+                    etag: Some(g.0.clone()),
+                    len: g.1.len() as u64,
+                })
+            }),
+            Box::new(move || {
+                let bytes = remote_dl.lock().expect("remote").1.clone();
+                Ok(spool_from_bytes(&bytes))
+            }),
+            Box::new(move |req| {
+                let n = puts_p.fetch_add(1, Ordering::SeqCst);
+                if !req.skip_object_put {
+                    let bytes = fs::read(&req.staged).expect("staged");
+                    let mut g = remote_pub.lock().expect("remote");
+                    g.1 = bytes;
+                    g.0 = format!("\"put-{n}\"");
+                }
+                if n == 0 {
+                    return Err(RemotePublishError::Retryable(
+                        "timeout after the body was stored".into(),
+                    ));
+                }
+                assert!(
+                    req.skip_object_put,
+                    "second publish must see the object that already matches the spool"
+                );
+                assert!(
+                    req.window.window_start > 0,
+                    "last-frame splice must keep a partial window"
+                );
+                Err(RemotePublishError::PointerRefused(
+                    "sidecar file table was not rebuilt from the uploaded spool; leaving the previous pointer"
+                        .into(),
+                ))
+            }),
+            Duration::from_millis(200),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("timeout must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("timeout"), "{err}");
+        assert!(overlay.join("new.txt").is_file());
+        assert_eq!(ov.persist_count_for_test(), 1);
+
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("pointer refusal forgets the stashed plan"),
+            CommitOutcome::DidWork
+        );
+        assert!(
+            !overlay.join("new.txt").exists(),
+            "refused partial window must not leave the overlay file in place"
+        );
+        assert_eq!(ov.persist_count_for_test(), 1);
+        assert!(!ov.interval_disabled());
+        let stored = remote.lock().expect("remote").1.clone();
+        assert_eq!(count_member(&stored, dir.path(), "/new.txt"), 1);
+        assert_eq!(count_member(&stored, dir.path(), "/old.txt"), 1);
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("empty overlay must not publish")
+            })
+            .expect("nothing left to splice"),
+            CommitOutcome::Nothing
+        );
+        assert_eq!(ov.persist_count_for_test(), 1);
     }
 
     /// Regression: remote on-exit must not wait forever for a new interval PUT.
