@@ -1,11 +1,11 @@
-//! Synchronous SMB 2.0.2 client (`Read` + `Seek` of one file).
+//! Synchronous SMB 2.0.2 client: one-file `Read` + `Seek`, and one directory
+//! listing per share prefix.
 //!
 //! Direct TCP to `host:port` (default 445). Dialect offered is only `0x0202`.
 //! Session setup is two legs: NTLM Type1, then Type3 (guest or NTLMv2). No
-//! WRITE and no QUERY_DIRECTORY. Credentials are URL userinfo, else
-//! [`crate::SMB_CLIENT_USER_ENV`] / [`crate::SMB_CLIENT_PASSWORD_ENV`] /
-//! [`crate::SMB_CLIENT_DOMAIN_ENV`]. This module does not read
-//! `RATARMOUNT_SMB_PASSWORD` or `RATARMOUNT_SMB_USER`.
+//! WRITE. Credentials are URL userinfo, else [`crate::SMB_CLIENT_USER_ENV`] /
+//! [`crate::SMB_CLIENT_PASSWORD_ENV`] / [`crate::SMB_CLIENT_DOMAIN_ENV`]. This
+//! module does not read `RATARMOUNT_SMB_PASSWORD` or `RATARMOUNT_SMB_USER`.
 //!
 //! A short non-zero READ (`STATUS_SUCCESS` with `DataLength` < requested) is
 //! not EOF. The fill loop stops when the caller's buffer is full, `offset >=
@@ -13,12 +13,26 @@
 //! `STATUS_SUCCESS` with `DataLength == 0`. `0x80000002`
 //! (`STATUS_DATATYPE_MISALIGNMENT`) is a hard error, not EOF.
 //!
+//! [`try_open_smb_folder`] lists with `QUERY_DIRECTORY`
+//! (`FileIdBothDirectoryInformation`, pattern `*`) on the session that opened
+//! the directory. The scan ends on `STATUS_NO_MORE_FILES` (`0x80000006`).
+//! `STATUS_NO_SUCH_FILE` (`0xC000000F`) on the first reply is an empty
+//! directory. Rows are MS-FSCC `FILE_ID_BOTH_DIR_INFORMATION` (`EndOfFile` at
+//! byte 40, `FileName` at byte 104). [`SMB_LIST_ENTRY_CAP`] and
+//! [`SMB_LIST_PAGE_CAP`] are errors, not a silent truncate. Child files open
+//! as a new [`SmbRangeFile`] (one TCP session each; no WRITE). Listings go
+//! through [`RemoteFolderMountSource`], whose TTL
+//! ([`crate::folder::DEFAULT_REMOTE_LIST_TTL_SECS`], env
+//! `RATARMOUNT_REMOTE_LIST_TTL_SECS`) suppresses a second `QUERY_DIRECTORY`.
+//! Signed sessions verify every response HMAC, including `QUERY_DIRECTORY`.
+//!
 //! Packet layouts and NTLMv2 / HMAC-SHA256 signing follow `ratarmount-smb`'s
 //! SMB 2.0.2 codec. Those helpers are `pub(crate)` there; this crate must not
 //! depend on the server crate, so the pieces used here are copied.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use hmac::{Hmac, Mac};
@@ -26,8 +40,10 @@ use log::{debug, info};
 use md4::Digest;
 use md4::Md4;
 use md5::Md5;
+use ratarmount_core::{ArchiveRead, MountSource};
 use sha2::Sha256;
 
+use crate::folder::{RemoteDirent, RemoteFolderMountSource, RemoteListing};
 use crate::smb::{
     env_nonempty, parse_smb_url, SmbLocation, SMB_CLIENT_DOMAIN_ENV, SMB_CLIENT_PASSWORD_ENV,
     SMB_CLIENT_USER_ENV,
@@ -40,6 +56,7 @@ const SMB2_TREE_CONNECT: u16 = 0x0003;
 const SMB2_CREATE: u16 = 0x0005;
 const SMB2_CLOSE: u16 = 0x0006;
 const SMB2_READ: u16 = 0x0008;
+const SMB2_QUERY_DIRECTORY: u16 = 0x000E;
 const SMB2_QUERY_INFO: u16 = 0x0010;
 
 const SMB2_HEADER_LEN: usize = 64;
@@ -55,11 +72,34 @@ const STATUS_MORE_PROCESSING_REQUIRED: u32 = 0xC000_0016;
 const STATUS_END_OF_FILE: u32 = 0xC000_0011;
 /// Not EOF. Samba and Windows use [`STATUS_END_OF_FILE`] at end of file.
 const STATUS_DATATYPE_MISALIGNMENT: u32 = 0x8000_0002;
+/// `QUERY_DIRECTORY` finished. Not a hard error.
+const STATUS_NO_MORE_FILES: u32 = 0x8000_0006;
+/// First `QUERY_DIRECTORY` reply when the directory has no entries.
+const STATUS_NO_SUCH_FILE: u32 = 0xC000_000F;
+const STATUS_OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
+const STATUS_OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
 
 const MAX_FRAME: usize = 8 * 1024 * 1024;
 const MAX_READ_CAP: u32 = 1024 * 1024;
 /// Read-only desired access (no bits from the server crate's write mask).
 const FILE_READ_ACCESS: u32 = 0x0012_0089;
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
+/// MS-FSCC `FileIdBothDirectoryInformation`.
+const FILE_ID_BOTH_DIRECTORY_INFORMATION: u8 = 37;
+const SMB2_RESTART_SCANS: u8 = 0x01;
+/// One `QUERY_DIRECTORY` output buffer. Large enough for many id-both rows.
+const QUERY_DIRECTORY_OUTPUT: u32 = 65_536;
+
+/// Hard cap on `QUERY_DIRECTORY` rows for one directory (not a silent truncate).
+///
+/// The row past this cap — the 100_001st — is an error. `.` and `..` are not
+/// counted and are not returned. [`SMB_LIST_PAGE_CAP`] bounds replies so a
+/// share cannot loop the process.
+pub const SMB_LIST_ENTRY_CAP: usize = 100_000;
+/// Hard cap on `QUERY_DIRECTORY` replies for one listing (not a silent truncate).
+pub const SMB_LIST_PAGE_CAP: usize = 10_000;
 const TYPE3_FLAGS: u32 = 0x2088_8201;
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
@@ -233,8 +273,91 @@ pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
                 .into(),
         ));
     }
-    let creds = client_creds(&loc);
-    let mut conn = SmbConn::connect(&loc)?;
+    open_smb_location(&loc)
+}
+
+fn open_smb_location(loc: &SmbLocation) -> Result<SmbRangeFile> {
+    let mut conn = open_session(loc)?;
+    let file_id = conn.create(&loc.path)?;
+    let info = conn.query_standard(file_id)?;
+    debug!(
+        "SMB 2.0.2 open //{}/{} {} ({} bytes, ranges)",
+        loc.host, loc.share, loc.path, info.size
+    );
+    Ok(SmbRangeFile {
+        conn,
+        file_id,
+        size: info.size,
+        pos: 0,
+        sized: true,
+    })
+}
+
+/// Open `smb://host/share[/path]` as a folder.
+///
+/// `Ok(None)` when QUERY_INFO says the path is a file. Share root and a
+/// trailing slash are directories without that probe. The mount lists through
+/// [`RemoteFolderMountSource`] (no WRITE). Child [`RemoteListing::open_range`]
+/// returns [`SmbRangeFile`].
+pub fn try_open_smb_folder(url_str: &str) -> Result<Option<Arc<dyn MountSource>>> {
+    let loc = parse_smb_url(url_str)?;
+    let explicit_dir = loc.path.is_empty() || loc.path.ends_with('/');
+    if !explicit_dir && !smb_path_is_dir(&loc)? {
+        return Ok(None);
+    }
+    let root = normalize_rel(&loc.path);
+    let mut loc = loc;
+    loc.path = root.clone();
+    Ok(Some(Arc::new(RemoteFolderMountSource::new(
+        root,
+        SmbListing { loc },
+    ))))
+}
+
+struct SmbListing {
+    loc: SmbLocation,
+}
+
+impl RemoteListing for SmbListing {
+    fn list(&self, remote_path: &str) -> Result<Vec<RemoteDirent>> {
+        let mut loc = self.loc.clone();
+        loc.path = normalize_rel(remote_path);
+        list_smb_children(&loc, SMB_LIST_ENTRY_CAP)
+    }
+
+    fn is_dir(&self, remote_path: &str) -> Result<bool> {
+        let mut loc = self.loc.clone();
+        loc.path = normalize_rel(remote_path);
+        smb_path_is_dir(&loc)
+    }
+
+    fn open_range(&self, remote_path: &str, _size: u64) -> Result<Box<dyn ArchiveRead>> {
+        let mut loc = self.loc.clone();
+        loc.path = normalize_rel(remote_path);
+        if loc.path.is_empty() {
+            return Err(RemoteError::Smb(
+                "SMB open_range requires a file path under the share".into(),
+            ));
+        }
+        Ok(Box::new(open_smb_location(&loc)?))
+    }
+}
+
+struct StandardInfo {
+    size: u64,
+    is_dir: bool,
+}
+
+struct SmbDirRow {
+    name: String,
+    is_dir: bool,
+    size: u64,
+    mtime: f64,
+}
+
+fn open_session(loc: &SmbLocation) -> Result<SmbConn> {
+    let creds = client_creds(loc);
+    let mut conn = SmbConn::connect(loc)?;
     conn.negotiate()?;
     if conn.signing_required && creds.password.is_none() {
         // A named user with no password is still unsigned, but it is not guest.
@@ -250,20 +373,83 @@ pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
         ));
     }
     conn.session_setup(&creds)?;
-    conn.tree_connect(&loc)?;
-    let file_id = conn.create(&loc.path)?;
-    let size = conn.query_standard_size(file_id)?;
+    conn.tree_connect(loc)?;
+    Ok(conn)
+}
+
+fn smb_path_is_dir(loc: &SmbLocation) -> Result<bool> {
+    if loc.path.is_empty() || loc.path.ends_with('/') {
+        return Ok(true);
+    }
+    let mut conn = open_session(loc)?;
+    let fid = match conn.create_with(&loc.path, 0) {
+        Ok(fid) => fid,
+        Err(e) if smb_status_is_missing(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    let info = conn.query_standard(fid)?;
+    conn.close_file(fid);
+    Ok(info.is_dir)
+}
+
+fn smb_status_is_missing(err: &RemoteError) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains(&format!("{STATUS_NO_SUCH_FILE:#010x}"))
+        || msg.contains(&format!("{STATUS_OBJECT_NAME_NOT_FOUND:#010x}"))
+        || msg.contains(&format!("{STATUS_OBJECT_PATH_NOT_FOUND:#010x}"))
+}
+
+/// List immediate children. `cap` is [`SMB_LIST_ENTRY_CAP`] in production.
+/// The entry past `cap` is an error; this does not return a shorter `Ok`.
+fn list_smb_children(loc: &SmbLocation, cap: usize) -> Result<Vec<RemoteDirent>> {
+    let dir = normalize_rel(&loc.path);
+    let mut conn = open_session(loc)?;
+    let fid = conn.create_with(&dir, FILE_DIRECTORY_FILE)?;
+    let rows = conn.query_directory_capped(fid, cap, loc);
+    conn.close_file(fid);
+    let rows = rows?;
     debug!(
-        "SMB 2.0.2 open //{}/{} {} ({} bytes, ranges)",
-        loc.host, loc.share, loc.path, size
+        "SMB 2.0.2 list //{}/{} {} ({} entries)",
+        loc.host,
+        loc.share,
+        dir,
+        rows.len()
     );
-    Ok(SmbRangeFile {
-        conn,
-        file_id,
-        size,
-        pos: 0,
-        sized: true,
-    })
+    let parent = dir.as_str();
+    Ok(rows
+        .into_iter()
+        .map(|row| RemoteDirent {
+            remote_path: child_remote(parent, &row.name),
+            name: row.name,
+            is_dir: row.is_dir,
+            size: row.size,
+            mtime: row.mtime,
+        })
+        .collect())
+}
+
+fn normalize_rel(path: &str) -> String {
+    path.trim_matches('/').to_string()
+}
+
+fn child_remote(parent: &str, name: &str) -> String {
+    if parent.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent}/{name}")
+    }
+}
+
+fn list_too_large(loc: &SmbLocation, detail: &str) -> RemoteError {
+    let path = if loc.path.is_empty() {
+        String::new()
+    } else {
+        format!("/{}", loc.path)
+    };
+    RemoteError::Smb(format!(
+        "SMB directory listing {detail} for //{}/{}{path}; listing is not silently truncated",
+        loc.host, loc.share
+    ))
 }
 
 fn client_creds(loc: &SmbLocation) -> ClientCreds {
@@ -440,6 +626,10 @@ impl SmbConn {
     }
 
     fn create(&mut self, path: &str) -> Result<[u8; 16]> {
+        self.create_with(path, FILE_NON_DIRECTORY_FILE)
+    }
+
+    fn create_with(&mut self, path: &str, create_options: u32) -> Result<[u8; 16]> {
         let name = encode_utf16le(&path.replace('/', "\\"));
         let mut body = vec![0u8; 56];
         body[0..2].copy_from_slice(&57u16.to_le_bytes());
@@ -448,7 +638,7 @@ impl SmbConn {
         body[28..32].copy_from_slice(&0x80u32.to_le_bytes());
         body[32..36].copy_from_slice(&0x7u32.to_le_bytes());
         body[36..40].copy_from_slice(&1u32.to_le_bytes());
-        body[40..44].copy_from_slice(&0x40u32.to_le_bytes());
+        body[40..44].copy_from_slice(&create_options.to_le_bytes());
         let off = (SMB2_HEADER_LEN + 56) as u16;
         body[44..46].copy_from_slice(&off.to_le_bytes());
         body[46..48].copy_from_slice(&(name.len() as u16).to_le_bytes());
@@ -461,7 +651,7 @@ impl SmbConn {
         copy_at(&resp, SMB2_HEADER_LEN + 64)
     }
 
-    fn query_standard_size(&mut self, fid: [u8; 16]) -> Result<u64> {
+    fn query_standard(&mut self, fid: [u8; 16]) -> Result<StandardInfo> {
         let mut body = vec![0u8; 40];
         body[0..2].copy_from_slice(&41u16.to_le_bytes());
         body[2] = 1;
@@ -481,7 +671,88 @@ impl SmbConn {
         }
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&info[8..16]);
-        Ok(u64::from_le_bytes(raw))
+        let is_dir = info.get(21).copied().unwrap_or(0) != 0;
+        Ok(StandardInfo {
+            size: u64::from_le_bytes(raw),
+            is_dir,
+        })
+    }
+
+    /// `FileIdBothDirectoryInformation` until `STATUS_NO_MORE_FILES`.
+    ///
+    /// `STATUS_NO_SUCH_FILE` with no rows yet is an empty directory. `cap` is
+    /// the production [`SMB_LIST_ENTRY_CAP`] unless a test injects a smaller one.
+    fn query_directory_capped(
+        &mut self,
+        fid: [u8; 16],
+        cap: usize,
+        loc: &SmbLocation,
+    ) -> Result<Vec<SmbDirRow>> {
+        let page_cap = cap.saturating_add(1).min(SMB_LIST_PAGE_CAP);
+        let mut out = Vec::new();
+        let mut kept = 0usize;
+        let mut pages = 0usize;
+        let mut restart = true;
+        loop {
+            pages = pages.saturating_add(1);
+            if pages > page_cap {
+                return Err(list_too_large(
+                    loc,
+                    &format!(
+                        "too many QUERY_DIRECTORY replies (>{page_cap} pages, >{cap} entries)"
+                    ),
+                ));
+            }
+            let (status, buf) = self.query_directory_page(fid, restart)?;
+            restart = false;
+            if status == STATUS_NO_MORE_FILES {
+                return Ok(out);
+            }
+            if status == STATUS_NO_SUCH_FILE && out.is_empty() && kept == 0 {
+                return Ok(out);
+            }
+            if status != STATUS_SUCCESS {
+                return Err(RemoteError::Smb(format!(
+                    "SMB QUERY_DIRECTORY status {status:#010x}"
+                )));
+            }
+            let rows = parse_file_id_both(&buf)?;
+            if rows.is_empty() {
+                return Err(RemoteError::Smb(
+                    "empty SMB QUERY_DIRECTORY page; listing is not complete".into(),
+                ));
+            }
+            for row in rows {
+                if row.name.is_empty() || row.name == "." || row.name == ".." {
+                    continue;
+                }
+                if kept >= cap {
+                    return Err(list_too_large(loc, &format!("too large (>{cap} entries)")));
+                }
+                kept = kept.saturating_add(1);
+                out.push(row);
+            }
+        }
+    }
+
+    fn query_directory_page(&mut self, fid: [u8; 16], restart: bool) -> Result<(u32, Vec<u8>)> {
+        let pat = encode_utf16le("*");
+        let mut body = vec![0u8; 32];
+        body[0..2].copy_from_slice(&33u16.to_le_bytes());
+        body[2] = FILE_ID_BOTH_DIRECTORY_INFORMATION;
+        body[3] = if restart { SMB2_RESTART_SCANS } else { 0 };
+        body[8..24].copy_from_slice(&fid);
+        let off = (SMB2_HEADER_LEN + 32) as u16;
+        body[24..26].copy_from_slice(&off.to_le_bytes());
+        body[26..28].copy_from_slice(&(pat.len() as u16).to_le_bytes());
+        body[28..32].copy_from_slice(&QUERY_DIRECTORY_OUTPUT.to_le_bytes());
+        body.extend_from_slice(&pat);
+        let resp = self.transact(SMB2_QUERY_DIRECTORY, &body)?;
+        let st = header_status(&resp)?;
+        if st != STATUS_SUCCESS {
+            return Ok((st, Vec::new()));
+        }
+        Ok((st, query_output(&resp)?.to_vec()))
     }
 
     fn read_file(&mut self, fid: [u8; 16], offset: u64, length: u32) -> Result<(u32, Vec<u8>)> {
@@ -818,6 +1089,89 @@ fn encode_utf16le(s: &str) -> Vec<u8> {
     s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
 }
 
+fn decode_utf16le(raw: &[u8]) -> String {
+    let mut units = Vec::with_capacity(raw.len() / 2);
+    let mut i = 0;
+    while i + 1 < raw.len() {
+        units.push(u16::from_le_bytes([raw[i], raw[i + 1]]));
+        i += 2;
+    }
+    String::from_utf16_lossy(&units)
+}
+
+fn filetime_to_unix(ft: u64) -> f64 {
+    if ft <= FILETIME_UNIX_EPOCH {
+        return 0.0;
+    }
+    let ticks = ft - FILETIME_UNIX_EPOCH;
+    (ticks / 10_000_000) as f64 + ((ticks % 10_000_000) as f64) / 10_000_000.0
+}
+
+/// MS-FSCC 2.4.17 `FILE_ID_BOTH_DIR_INFORMATION`.
+/// `EndOfFile` is at offset 40 and `FileName` at offset 104. Not the in-tree
+/// server encoder, which swaps allocation size and end-of-file.
+fn parse_file_id_both(buf: &[u8]) -> Result<Vec<SmbDirRow>> {
+    if buf.is_empty() {
+        return Ok(Vec::new());
+    }
+    if buf.len() < 104 {
+        return Err(RemoteError::Smb(
+            "SMB QUERY_DIRECTORY entry truncated".into(),
+        ));
+    }
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    let mut guard = 0usize;
+    while off + 104 <= buf.len() {
+        guard = guard.saturating_add(1);
+        if guard > SMB_LIST_ENTRY_CAP.saturating_add(8) {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_DIRECTORY entry chain did not end".into(),
+            ));
+        }
+        let next = u32_at(buf, off)? as usize;
+        let mtime_ft = u64_at(buf, off + 24)?;
+        let size = u64_at(buf, off + 40)?;
+        let attrs = u32_at(buf, off + 56)?;
+        let name_len = u32_at(buf, off + 60)? as usize;
+        let name_at = off + 104;
+        let name_end = name_at.saturating_add(name_len);
+        if name_len > buf.len() || name_end > buf.len() {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_DIRECTORY name truncated".into(),
+            ));
+        }
+        let name = decode_utf16le(&buf[name_at..name_end]);
+        let name = name.trim_end_matches('\0').to_string();
+        out.push(SmbDirRow {
+            name,
+            is_dir: attrs & FILE_ATTRIBUTE_DIRECTORY != 0,
+            size,
+            mtime: filetime_to_unix(mtime_ft),
+        });
+        if next == 0 {
+            break;
+        }
+        if next < 104 {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_DIRECTORY NextEntryOffset is too small".into(),
+            ));
+        }
+        let Some(new_off) = off.checked_add(next) else {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_DIRECTORY NextEntryOffset overflow".into(),
+            ));
+        };
+        if new_off <= off || new_off > buf.len() {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_DIRECTORY NextEntryOffset is out of range".into(),
+            ));
+        }
+        off = new_off;
+    }
+    Ok(out)
+}
+
 fn extract_ntlm(buf: &[u8]) -> Option<&[u8]> {
     buf.windows(8)
         .position(|w| w == b"NTLMSSP\0")
@@ -1026,6 +1380,15 @@ mod tests {
         ClearSignature,
     }
 
+    #[derive(Clone)]
+    struct TestEnt {
+        name: String,
+        is_dir: bool,
+        size: u64,
+        mtime: f64,
+    }
+
+    #[derive(Clone)]
     struct Script {
         dialect: u16,
         security_mode: u16,
@@ -1042,6 +1405,15 @@ mod tests {
         challenge: [u8; 8],
         max_reads: u32,
         read_tamper: ReadTamper,
+        /// `QUERY_DIRECTORY` children. Empty means the first reply is `STATUS_NO_SUCH_FILE`.
+        entries: Vec<TestEnt>,
+        /// Paths whose QUERY_INFO Directory bit is set (forward slashes).
+        dir_paths: Vec<String>,
+        /// Full share-relative path → file bytes for READ.
+        files: Vec<(String, Vec<u8>)>,
+        /// Max children per QUERY_DIRECTORY success. `usize::MAX` packs one page.
+        dir_page: usize,
+        query_tamper: ReadTamper,
     }
 
     fn script_file(file: &[u8]) -> Script {
@@ -1061,6 +1433,11 @@ mod tests {
             challenge: CHALLENGE,
             max_reads: 128,
             read_tamper: ReadTamper::None,
+            entries: Vec::new(),
+            dir_paths: Vec::new(),
+            files: Vec::new(),
+            dir_page: usize::MAX,
+            query_tamper: ReadTamper::None,
         }
     }
 
@@ -1083,6 +1460,9 @@ mod tests {
         saw_type1: bool,
         file_id: [u8; 16],
         reads: u32,
+        opened_dir: bool,
+        opened_name: String,
+        dir_pos: usize,
     }
 
     impl Server {
@@ -1096,6 +1476,9 @@ mod tests {
                 saw_type1: false,
                 file_id: [0x11; 16],
                 reads: 0,
+                opened_dir: false,
+                opened_name: String::new(),
+                dir_pos: 0,
             }
         }
 
@@ -1154,19 +1537,10 @@ mod tests {
                 smb2_sign_packet(&mut pkt, &key);
             }
             if hdr.command == SMB2_READ {
-                match self.script.read_tamper {
-                    ReadTamper::FlipPayload => {
-                        if pkt.len() > 80 {
-                            pkt[80] ^= 0xff;
-                        }
-                    }
-                    ReadTamper::ClearSignature => {
-                        if pkt.len() >= SMB2_HEADER_LEN {
-                            pkt[48..64].fill(0);
-                        }
-                    }
-                    ReadTamper::None => {}
-                }
+                apply_tamper(&mut pkt, self.script.read_tamper);
+            }
+            if hdr.command == SMB2_QUERY_DIRECTORY {
+                apply_tamper(&mut pkt, self.script.query_tamper);
             }
             pkt
         }
@@ -1194,19 +1568,85 @@ mod tests {
                     self.tree_id = 7;
                     Ok((STATUS_SUCCESS, encode_tree_connect_response()))
                 }
-                SMB2_CREATE => Ok((
-                    STATUS_SUCCESS,
-                    encode_create_response(self.file_id, self.script.size_claim),
-                )),
-                SMB2_QUERY_INFO => Ok((
-                    STATUS_SUCCESS,
-                    encode_query_info_response(&file_standard(self.script.size_claim)),
-                )),
+                SMB2_CREATE => {
+                    let name = create_name(pkt);
+                    let options = create_options_of(pkt);
+                    let is_dir = options & FILE_DIRECTORY_FILE != 0
+                        || self.script.dir_paths.iter().any(|p| p == &name);
+                    self.opened_dir = is_dir;
+                    self.opened_name = name;
+                    self.dir_pos = 0;
+                    Ok((
+                        STATUS_SUCCESS,
+                        encode_create_response(self.file_id, self.opened_size()),
+                    ))
+                }
+                SMB2_QUERY_INFO => {
+                    let mut info = file_standard(self.opened_size());
+                    if self.opened_dir && info.len() > 21 {
+                        info[21] = 1;
+                    }
+                    Ok((STATUS_SUCCESS, encode_query_info_response(&info)))
+                }
+                SMB2_QUERY_DIRECTORY => self.dispatch_query_dir(pkt),
                 SMB2_READ => self.dispatch_read(pkt),
                 SMB2_CLOSE => Ok((STATUS_SUCCESS, encode_close_response())),
-                0x0009 | 0x000E => Ok((ACCESS_DENIED, error_body())),
+                0x0009 => Ok((ACCESS_DENIED, error_body())),
                 _ => Ok((0xC000_0002, error_body())),
             }
+        }
+
+        fn opened_size(&self) -> u64 {
+            if self.opened_dir {
+                return 0;
+            }
+            if let Some((_, bytes)) = self
+                .script
+                .files
+                .iter()
+                .find(|(path, _)| path == &self.opened_name)
+            {
+                return bytes.len() as u64;
+            }
+            self.script.size_claim
+        }
+
+        fn dispatch_query_dir(&mut self, pkt: &[u8]) -> std::result::Result<(u32, Vec<u8>), ()> {
+            if !self.opened_dir {
+                return Ok((ACCESS_DENIED, error_body()));
+            }
+            if self.dir_pos >= self.script.entries.len() {
+                let st = if self.dir_pos == 0 {
+                    STATUS_NO_SUCH_FILE
+                } else {
+                    STATUS_NO_MORE_FILES
+                };
+                return Ok((st, error_body()));
+            }
+            let output_len = query_output_len(pkt).unwrap_or(65_536) as usize;
+            let page = self.script.dir_page.max(1);
+            let mut chosen: Vec<TestEnt> = Vec::new();
+            let mut used = 0usize;
+            while self.dir_pos + chosen.len() < self.script.entries.len() && chosen.len() < page {
+                let ent = &self.script.entries[self.dir_pos + chosen.len()];
+                let row_len = id_both_record_len(&ent.name);
+                if !chosen.is_empty() && used + row_len > output_len {
+                    break;
+                }
+                if chosen.is_empty() && output_len > 0 && row_len > output_len {
+                    return Ok((STATUS_NO_MORE_FILES, error_body()));
+                }
+                used += row_len;
+                chosen.push(ent.clone());
+            }
+            if chosen.is_empty() {
+                return Ok((STATUS_NO_MORE_FILES, error_body()));
+            }
+            self.dir_pos += chosen.len();
+            Ok((
+                STATUS_SUCCESS,
+                encode_query_info_response(&encode_id_both_entries(&chosen)),
+            ))
         }
 
         fn dispatch_session(&mut self, pkt: &[u8]) -> std::result::Result<(u32, Vec<u8>), ()> {
@@ -1268,15 +1708,16 @@ mod tests {
             let mut raw = [0u8; 8];
             raw.copy_from_slice(&body[8..16]);
             let offset = u64::from_le_bytes(raw);
-            if offset >= self.script.stop_after {
+            let (file, stop_after) = self.read_target();
+            if offset >= stop_after {
                 return Ok(self.eof_reply());
             }
             let start = offset as usize;
-            let room = (self.script.stop_after as usize).saturating_sub(start);
+            let room = (stop_after as usize).saturating_sub(start);
             let n = self.script.chunk.min(length).min(room);
-            let end = start.saturating_add(n).min(self.script.file.len());
-            let data = if start < self.script.file.len() && end > start {
-                self.script.file[start..end].to_vec()
+            let end = start.saturating_add(n).min(file.len());
+            let data = if start < file.len() && end > start {
+                file[start..end].to_vec()
             } else {
                 Vec::new()
             };
@@ -1292,16 +1733,51 @@ mod tests {
                 EofStyle::EmptySuccess => (STATUS_SUCCESS, encode_read_response(&[])),
             }
         }
+
+        fn read_target(&self) -> (Vec<u8>, u64) {
+            if !self.opened_dir {
+                if let Some((_, bytes)) = self
+                    .script
+                    .files
+                    .iter()
+                    .find(|(path, _)| path == &self.opened_name)
+                {
+                    let n = bytes.len() as u64;
+                    return (bytes.clone(), n);
+                }
+            }
+            (self.script.file.clone(), self.script.stop_after)
+        }
+    }
+
+    fn apply_tamper(pkt: &mut [u8], tamper: ReadTamper) {
+        match tamper {
+            ReadTamper::FlipPayload => {
+                if pkt.len() > 80 {
+                    pkt[80] ^= 0xff;
+                }
+            }
+            ReadTamper::ClearSignature => {
+                if pkt.len() >= SMB2_HEADER_LEN {
+                    pkt[48..64].fill(0);
+                }
+            }
+            ReadTamper::None => {}
+        }
     }
 
     struct Running {
         addr: std::net::SocketAddr,
         seen: Arc<Mutex<Vec<Seen>>>,
         join: Option<thread::JoinHandle<()>>,
+        stop: Option<Arc<std::sync::atomic::AtomicBool>>,
     }
 
     impl Drop for Running {
         fn drop(&mut self) {
+            if let Some(stop) = &self.stop {
+                stop.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if let Some(j) = self.join.take() {
                 let _ = j.join();
             }
@@ -1318,6 +1794,64 @@ mod tests {
             addr,
             seen,
             join: Some(join),
+            stop: None,
+        }
+    }
+
+    /// Accept more than one session so a cached second list is observable.
+    fn serve_many(script: Script) -> Running {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+        let addr = listener.local_addr().expect("addr");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let seen2 = Arc::clone(&seen);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let join = thread::spawn(move || serve_many_loop(listener, script, seen2, stop2));
+        Running {
+            addr,
+            seen,
+            join: Some(join),
+            stop: Some(stop),
+        }
+    }
+
+    fn serve_many_loop(
+        listener: TcpListener,
+        script: Script,
+        seen: Arc<Mutex<Vec<Seen>>>,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) {
+        let _ = listener.set_nonblocking(true);
+        while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
+                    let _ = stream.set_nodelay(true);
+                    let mut srv = Server::new(script.clone());
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::SeqCst) {
+                            return;
+                        }
+                        let frame = match read_frame(&mut stream) {
+                            Ok(f) => f,
+                            Err(_) => break,
+                        };
+                        let reply = match srv.handle(&frame, &seen) {
+                            Ok(p) => p,
+                            Err(_) => break,
+                        };
+                        if write_frame(&mut stream, &reply).is_err() {
+                            break;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return,
+            }
         }
     }
 
@@ -1582,6 +2116,139 @@ mod tests {
         format!("smb://127.0.0.1:{}/share/dir/file.bin", running.addr.port())
     }
 
+    fn create_name(pkt: &[u8]) -> String {
+        let Some(body) = pkt.get(SMB2_HEADER_LEN..) else {
+            return String::new();
+        };
+        if body.len() < 48 {
+            return String::new();
+        }
+        let off = u16::from_le_bytes([body[44], body[45]]) as usize;
+        let len = u16::from_le_bytes([body[46], body[47]]) as usize;
+        if len == 0 || off.saturating_add(len) > pkt.len() {
+            return String::new();
+        }
+        decode_utf16le(&pkt[off..off + len]).replace('\\', "/")
+    }
+
+    fn create_options_of(pkt: &[u8]) -> u32 {
+        let Some(body) = pkt.get(SMB2_HEADER_LEN..) else {
+            return 0;
+        };
+        if body.len() < 44 {
+            return 0;
+        }
+        u32::from_le_bytes([body[40], body[41], body[42], body[43]])
+    }
+
+    fn query_output_len(pkt: &[u8]) -> Option<u32> {
+        let body = pkt.get(SMB2_HEADER_LEN..)?;
+        if body.len() < 32 {
+            return None;
+        }
+        Some(u32::from_le_bytes([body[28], body[29], body[30], body[31]]))
+    }
+
+    fn query_class_and_pattern(pkt: &[u8]) -> Option<(u8, String)> {
+        let body = pkt.get(SMB2_HEADER_LEN..)?;
+        if body.len() < 32 {
+            return None;
+        }
+        let class = body[2];
+        let off = u16::from_le_bytes([body[24], body[25]]) as usize;
+        let len = u16::from_le_bytes([body[26], body[27]]) as usize;
+        if len == 0 || off.saturating_add(len) > pkt.len() {
+            return None;
+        }
+        Some((class, decode_utf16le(&pkt[off..off + len])))
+    }
+
+    fn id_both_record_len(name: &str) -> usize {
+        let raw = 104 + name.encode_utf16().count() * 2;
+        raw + (8 - (raw % 8)) % 8
+    }
+
+    fn unix_to_filetime(t: f64) -> u64 {
+        if !t.is_finite() || t <= 0.0 {
+            return 0;
+        }
+        let sec = t.trunc() as u64;
+        let frac = ((t - sec as f64) * 10_000_000.0).round() as u64;
+        FILETIME_UNIX_EPOCH
+            .saturating_add(sec.saturating_mul(10_000_000))
+            .saturating_add(frac.min(9_999_999))
+    }
+
+    fn encode_one_id_both(ent: &TestEnt) -> Vec<u8> {
+        let name = encode_utf16le(&ent.name);
+        let mut b = vec![0u8; 104 + name.len()];
+        let ft = unix_to_filetime(ent.mtime);
+        for off in [8usize, 16, 24, 32] {
+            b[off..off + 8].copy_from_slice(&ft.to_le_bytes());
+        }
+        b[40..48].copy_from_slice(&ent.size.to_le_bytes());
+        let alloc = if ent.size == 0 {
+            0
+        } else {
+            ent.size.saturating_add(4095) & !4095
+        };
+        b[48..56].copy_from_slice(&alloc.to_le_bytes());
+        let attrs: u32 = if ent.is_dir {
+            FILE_ATTRIBUTE_DIRECTORY
+        } else {
+            0x20
+        };
+        b[56..60].copy_from_slice(&attrs.to_le_bytes());
+        b[60..64].copy_from_slice(&(name.len() as u32).to_le_bytes());
+        b[104..104 + name.len()].copy_from_slice(&name);
+        let pad = (8 - (b.len() % 8)) % 8;
+        b.resize(b.len() + pad, 0);
+        b
+    }
+
+    fn encode_id_both_entries(entries: &[TestEnt]) -> Vec<u8> {
+        let mut rows: Vec<Vec<u8>> = entries.iter().map(encode_one_id_both).collect();
+        let tail = rows.len().saturating_sub(1);
+        for row in rows.iter_mut().take(tail) {
+            let n = row.len() as u32;
+            row[0..4].copy_from_slice(&n.to_le_bytes());
+        }
+        rows.into_iter().flatten().collect()
+    }
+
+    fn sample_dir_script() -> Script {
+        let mut script = script_file(b"");
+        script.dir_paths = vec!["dir".into(), "dir/subdir".into()];
+        script.entries = vec![
+            TestEnt {
+                name: ".".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0.0,
+            },
+            TestEnt {
+                name: "..".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 0.0,
+            },
+            TestEnt {
+                name: "notes.txt".into(),
+                is_dir: false,
+                size: 11,
+                mtime: 1_700_000_000.0,
+            },
+            TestEnt {
+                name: "subdir".into(),
+                is_dir: true,
+                size: 0,
+                mtime: 1_600_000_000.5,
+            },
+        ];
+        script.files = vec![("dir/notes.txt".into(), b"hello notes!".to_vec())];
+        script
+    }
+
     fn bytes_contain(hay: &[u8], needle: &str) -> bool {
         let ascii = needle.as_bytes();
         if hay.windows(ascii.len()).any(|w| w == ascii) {
@@ -1643,6 +2310,7 @@ mod tests {
     /// Regression: 1 byte per READ, then `0xC0000011`; `read_exact` matches.
     #[test]
     fn smb_read_fills_short_data_length() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let data = b"short-read-payload!";
         let mut script = script_file(data);
         script.chunk = 1;
@@ -1670,6 +2338,7 @@ mod tests {
     /// In-tree server EOF: `STATUS_SUCCESS` and `DataLength == 0` while offset < size.
     #[test]
     fn smb_read_fills_empty_status_success() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let data = b"abcdefghijklmnop";
         let mut script = script_file(data);
         script.chunk = 1;
@@ -1695,6 +2364,7 @@ mod tests {
     /// `0x80000002` is `STATUS_DATATYPE_MISALIGNMENT`, not an EOF status.
     #[test]
     fn smb_read_fills_misalignment_is_not_eof() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let mut script = script_file(b"0123456789");
         script.hard_status = Some(STATUS_DATATYPE_MISALIGNMENT);
         script.size_claim = 10;
@@ -1708,6 +2378,7 @@ mod tests {
 
     #[test]
     fn smb_two_leg_session_setup() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let running = serve(script_file(b"two-leg"));
         let f = open_smb_range(&url_for(&running)).expect("open");
         drop(f);
@@ -1736,6 +2407,7 @@ mod tests {
 
     #[test]
     fn smb_negotiate_rejects_dialect_other_than_202() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let mut script = script_file(b"dialect");
         script.dialect = 0x0210;
         let running = serve(script);
@@ -1964,6 +2636,7 @@ mod tests {
 
     #[test]
     fn smb_client_does_not_encode_write() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let running = serve(script_file(b"abc"));
         let mut f = open_smb_range(&url_for(&running)).expect("open");
         let mut buf = [0u8; 3];
@@ -2002,5 +2675,231 @@ mod tests {
         assert_eq!(create.desired_access & WRITE_MASK, 0);
         assert_ne!(create.desired_access, 0);
         assert!(seen.iter().any(|s| s.command == SMB2_READ));
+    }
+
+    #[test]
+    fn smb_query_directory_maps_file_and_dir() {
+        use ratarmount_core::is_dir_mode;
+
+        let _env = EnvGuard::acquire(ENV_KEYS);
+        let running = serve_many(sample_dir_script());
+        let url = format!("smb://127.0.0.1:{}/share/dir", running.addr.port());
+        let ms = try_open_smb_folder(&url)
+            .expect("folder open")
+            .expect("QUERY_INFO directory bit selects the folder");
+        let ents = ms.list_dirents("/").expect("list");
+        assert!(
+            ents.iter().all(|e| e.name != "." && e.name != ".."),
+            "dot entries are not children: {ents:?}"
+        );
+        assert_eq!(ents.len(), 2, "{ents:?}");
+        let file = ents.iter().find(|e| e.name == "notes.txt").expect("file");
+        assert!(!is_dir_mode(file.mode));
+        assert_eq!(file.size, 11);
+        let dir = ents.iter().find(|e| e.name == "subdir").expect("dir");
+        assert!(is_dir_mode(dir.mode));
+        assert_eq!(dir.size, 0);
+        let fi = ms.lookup("/notes.txt", 0).expect("file lookup");
+        assert!((fi.mtime - 1_700_000_000.0).abs() < 1e-6, "{}", fi.mtime);
+        let di = ms.lookup("/subdir", 0).expect("dir lookup");
+        assert!(is_dir_mode(di.mode));
+        assert!((di.mtime - 1_600_000_000.5).abs() < 1e-6, "{}", di.mtime);
+        drop(ms);
+        let seen = snapshot(&running);
+        assert!(seen.iter().all(|s| s.command != 0x0009), "no WRITE");
+        let queries: Vec<_> = seen
+            .iter()
+            .filter(|s| s.command == SMB2_QUERY_DIRECTORY)
+            .collect();
+        assert!(
+            queries.len() >= 2,
+            "listing must keep querying until STATUS_NO_MORE_FILES ({})",
+            queries.len()
+        );
+        assert_eq!(
+            queries.last().expect("query").response_status,
+            STATUS_NO_MORE_FILES
+        );
+        let (class, pat) = query_class_and_pattern(&queries[0].raw).expect("pattern");
+        assert_eq!(class, FILE_ID_BOTH_DIRECTORY_INFORMATION);
+        assert_eq!(pat, "*");
+        assert_eq!(
+            queries[0].raw[SMB2_HEADER_LEN + 3] & SMB2_RESTART_SCANS,
+            SMB2_RESTART_SCANS
+        );
+        assert!(seen.iter().any(|s| {
+            s.command == SMB2_CREATE && create_options_of(&s.raw) & FILE_DIRECTORY_FILE != 0
+        }));
+
+        let mut empty = script_file(b"");
+        empty.dir_paths = vec!["dir".into()];
+        let running = serve_many(empty);
+        let url = format!("smb://127.0.0.1:{}/share/dir", running.addr.port());
+        let ms = try_open_smb_folder(&url)
+            .unwrap()
+            .expect("empty directory is still a folder");
+        let ents = ms
+            .list_dirents("/")
+            .expect("STATUS_NO_SUCH_FILE on the first reply is an empty directory");
+        assert!(ents.is_empty());
+        let seen = snapshot(&running);
+        assert!(seen.iter().any(|s| {
+            s.command == SMB2_QUERY_DIRECTORY && s.response_status == STATUS_NO_SUCH_FILE
+        }));
+    }
+
+    #[test]
+    fn smb_list_cap_is_not_silent_truncate() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
+        assert_eq!(SMB_LIST_ENTRY_CAP, 100_000);
+        assert_eq!(SMB_LIST_PAGE_CAP, 10_000);
+        let mut script = script_file(b"");
+        script.dir_paths = vec!["dir".into()];
+        script.dir_page = 1;
+        script.entries = (0..3)
+            .map(|i| TestEnt {
+                name: format!("f{i}.txt"),
+                is_dir: false,
+                size: 1,
+                mtime: 10.0,
+            })
+            .collect();
+        let running = serve_many(script);
+        let loc = parse_smb_url(&format!(
+            "smb://127.0.0.1:{}/share/dir",
+            running.addr.port()
+        ))
+        .unwrap();
+        let err = list_smb_children(&loc, 2).unwrap_err().to_string();
+        assert!(
+            err.contains("not silently truncated"),
+            "the entry past the cap must error, not return a shorter list: {err}"
+        );
+        let got = list_smb_children(&loc, 3).expect("exactly cap entries is a full listing");
+        assert_eq!(got.len(), 3, "cap must not drop the last in-range entry");
+        assert!(got.iter().any(|e| e.name == "f2.txt"));
+    }
+
+    #[test]
+    fn smb_folder_open_range_reads_child() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
+        let running = serve_many(sample_dir_script());
+        let port = running.addr.port();
+        let file_url = format!("smb://127.0.0.1:{port}/share/dir/notes.txt");
+        assert!(
+            try_open_smb_folder(&file_url).unwrap().is_none(),
+            "a file URL stays a range file, not a folder"
+        );
+        let url = format!("smb://127.0.0.1:{port}/share/dir/");
+        let ms = try_open_smb_folder(&url)
+            .unwrap()
+            .expect("trailing slash is a folder");
+        let fi = ms.lookup("/notes.txt", 0).expect("child");
+        assert_eq!(fi.size, 11);
+        let mut reader = ms.open(&fi, 0).expect("open_range");
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf).unwrap();
+        assert_eq!(buf, b"hello notes!");
+        drop(reader);
+        drop(ms);
+        let seen = snapshot(&running);
+        assert!(seen.iter().any(|s| s.command == SMB2_READ));
+        assert!(seen.iter().all(|s| s.command != 0x0009), "no WRITE");
+    }
+
+    #[test]
+    fn smb_list_within_ttl_sends_one_query() {
+        let _env = EnvGuard::acquire(&[
+            crate::folder::REMOTE_LIST_TTL_ENV,
+            "RATARMOUNT_SMB_PASSWORD",
+            "RATARMOUNT_SMB_USER",
+            SMB_CLIENT_PASSWORD_ENV,
+            SMB_CLIENT_USER_ENV,
+            SMB_CLIENT_DOMAIN_ENV,
+        ]);
+        let running = serve_many(sample_dir_script());
+        let url = format!("smb://127.0.0.1:{}/share/dir/", running.addr.port());
+        let ms = try_open_smb_folder(&url).unwrap().expect("folder");
+        let first = ms.list_dirents("/").expect("first list");
+        assert!(!first.is_empty());
+        let seen = snapshot(&running);
+        let q1 = seen
+            .iter()
+            .filter(|s| s.command == SMB2_QUERY_DIRECTORY)
+            .count();
+        let n1 = seen.iter().filter(|s| s.command == SMB2_NEGOTIATE).count();
+        let second = ms.list_dirents("/").expect("cached list");
+        let key = |e: &ratarmount_core::CheapDirent| (e.name.clone(), e.mode, e.size);
+        assert_eq!(
+            first.iter().map(key).collect::<Vec<_>>(),
+            second.iter().map(key).collect::<Vec<_>>()
+        );
+        let seen = snapshot(&running);
+        let q2 = seen
+            .iter()
+            .filter(|s| s.command == SMB2_QUERY_DIRECTORY)
+            .count();
+        let n2 = seen.iter().filter(|s| s.command == SMB2_NEGOTIATE).count();
+        assert!(q1 >= 1, "the first list must QUERY_DIRECTORY");
+        assert_eq!(q1, q2, "listing TTL must not send a second QUERY_DIRECTORY");
+        assert_eq!(n1, n2, "listing TTL must not open a second session");
+    }
+
+    #[test]
+    fn smb_query_directory_verifies_response_hmac() {
+        let env = EnvGuard::acquire(ENV_KEYS);
+        env.set(SMB_CLIENT_USER_ENV, "alice");
+        env.set(SMB_CLIENT_PASSWORD_ENV, "client-pw");
+        env.set(SMB_CLIENT_DOMAIN_ENV, "CORP");
+        let mut script = sample_dir_script();
+        script.password = Some("client-pw".into());
+        let running = serve_many(script);
+        let url = format!("smb://127.0.0.1:{}/share/dir/", running.addr.port());
+        let ms = try_open_smb_folder(&url).unwrap().expect("folder");
+        let ents = ms.list_dirents("/").expect("signed QUERY_DIRECTORY");
+        assert!(ents.iter().any(|e| e.name == "notes.txt"));
+        drop(ms);
+        let seen = snapshot(&running);
+        let setups: Vec<_> = seen
+            .iter()
+            .filter(|s| s.command == SMB2_SESSION_SETUP)
+            .collect();
+        let t3 = parse_type3(&setups[1].sec).expect("type3");
+        let rk = ntlmv2_response_key_nt("client-pw", &t3.user, &t3.domain);
+        let proof = ntlmv2_nt_proof(&rk, CHALLENGE, &t3.nt_response[16..]);
+        let key = ntlmv2_session_base_key(&rk, &proof);
+        let queries: Vec<_> = seen
+            .iter()
+            .filter(|s| s.command == SMB2_QUERY_DIRECTORY)
+            .collect();
+        assert!(queries.len() >= 2);
+        assert!(queries
+            .iter()
+            .any(|q| q.response_status == STATUS_NO_MORE_FILES));
+        for q in &queries {
+            assert!(
+                sig_ok(&q.raw, &Some(key)),
+                "QUERY_DIRECTORY request signature was not HMAC-SHA256"
+            );
+        }
+
+        for tamper in [ReadTamper::FlipPayload, ReadTamper::ClearSignature] {
+            let mut script = sample_dir_script();
+            script.password = Some("client-pw".into());
+            script.query_tamper = tamper;
+            let running = serve_many(script);
+            let loc = parse_smb_url(&format!(
+                "smb://127.0.0.1:{}/share/dir",
+                running.addr.port()
+            ))
+            .unwrap();
+            let err = list_smb_children(&loc, SMB_LIST_ENTRY_CAP)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("signature"),
+                "tampered QUERY_DIRECTORY ({tamper:?}) must fail HMAC check: {err}"
+            );
+        }
     }
 }

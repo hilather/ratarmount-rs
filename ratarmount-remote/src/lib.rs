@@ -18,10 +18,11 @@
 //!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
 //!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
-//! - `smb://` → [`open_smb_range`] / [`SmbRangeFile`] is the SMB 2.0.2 range API.
-//!   The default `smb://` resolver is still `smbclient` ([`fetch_smb_to_temp`]) until
-//!   dispatch lands. Inbound credentials are `RATARMOUNT_SMB_CLIENT_*`, never the
-//!   export server's `RATARMOUNT_SMB_PASSWORD`.
+//! - `smb://` → [`open_smb_range`] / [`SmbRangeFile`] reads one file (SMB 2.0.2).
+//!   [`try_open_smb_folder`] lists one share directory and opens children through
+//!   [`SmbRangeFile`]. The default `smb://` resolver is still `smbclient`
+//!   ([`fetch_smb_to_temp`]) until dispatch lands. Inbound credentials are
+//!   `RATARMOUNT_SMB_CLIENT_*`, never the export server's `RATARMOUNT_SMB_PASSWORD`.
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
@@ -110,7 +111,7 @@ pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
     SMB_CLIENT_DOMAIN_ENV, SMB_CLIENT_PASSWORD_ENV, SMB_CLIENT_USER_ENV,
 };
-pub use smb_client::{open_smb_range, SmbRangeFile};
+pub use smb_client::{open_smb_range, try_open_smb_folder, SmbRangeFile};
 pub use ssh::{
     expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
     parse_proxy_jump_list, parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url,
