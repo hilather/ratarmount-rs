@@ -29,10 +29,11 @@ use ratarmount_formats_tar::{
     SqliteIndexedTar, UstarMember, UstarPayload,
 };
 use ratarmount_index::{
-    fill_content_hashes, locate_pattern_matches, resolve_index_location,
-    store_index_pointer_atomic, IndexLocation, IndexPointer, SqliteIndex, DEFAULT_SEARCH_LIMIT,
-    MEMORY_INDEX,
+    fill_content_hashes, locate_pattern_matches, resolve_index_location, IndexLocation,
+    SqliteIndex, DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
 };
+#[cfg(test)]
+use ratarmount_index::{index_pointer_to_json, IndexPointer};
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
 use xz2::write::XzEncoder;
@@ -42,8 +43,6 @@ use zip::{CompressionMethod, ZipArchive, ZipWriter};
 pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
 
 /// Overlay-relative names with this prefix are not commit members.
-/// The real F-7 spool is a temp file outside the overlay; this skip is
-/// defense in depth for a name someone plants in the folder.
 const SPOOL_NAME_PREFIX: &str = ".ratarmount-spool-";
 
 const SCHEMA: &str = r#"
@@ -74,8 +73,8 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// Live overlay persist job (V-4). Interval and on-exit only.
 ///
 /// CLI [`commit_overlay`] is the prefix-rewrite escape hatch and must **not**
-/// go through this queue. The F-7 publish callback is still `None` for local
-/// files: persist renames the spliced temp onto the archive and does not upload.
+/// go through this queue. F-7 write-through will reuse the same live queue
+/// later (do not implement F-7 here).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
     /// Interval tick: persist overlay files idle for at least this long.
@@ -111,29 +110,23 @@ pub struct IndexPatchWindow {
     pub offsets_shifted: bool,
 }
 
-/// Prefix cut from the splice that just ran. Not uploaded.
+/// Prefix cut from the splice that just ran.
 ///
 /// `prefix_compressed_bytes` is [`SpliceStats::prefix_compressed_bytes`]
-/// (pre-splice `frames[from_idx].compressed_offset`). Uncompressed TAR stores
-/// `0` (a later upload would send every byte). Not a rescan of the spliced
-/// file and not the offline debug print.
+/// (pre-splice `frames[from_idx].compressed_offset`). Uncompressed TAR stores `0`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LivePublishPlan {
-    pub prefix_compressed_bytes: u64,
+struct LivePublishPlan {
+    prefix_compressed_bytes: u64,
 }
 
-/// Pointer JSON from [`IndexPointer::for_blob`] after the caller patched.
-///
-/// No socket. Hashing the sidecar before that patch publishes the pre-commit id.
+/// Pointer JSON from [`IndexPointer::for_blob`] after the sidecar is patched.
+#[cfg(test)]
 #[derive(Clone, Debug)]
-pub struct IndexPointerPlan {
-    pub pointer: IndexPointer,
-    /// Pretty JSON plus trailing newline (`store_index_pointer_atomic` bytes).
-    pub json: String,
+struct IndexPointerPlan {
+    pointer: IndexPointer,
+    /// Pretty JSON plus a trailing newline.
+    json: String,
 }
-
-/// F-7 upload hook. `None` keeps rename-only local persist.
-type LivePublishCallback = Arc<dyn Fn(&LivePublishPlan, &Path) -> Result<()> + Send + Sync>;
 
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
@@ -174,8 +167,6 @@ pub struct WriteOverlay {
     persist_delay: Mutex<Option<Duration>>,
     /// Prefix from the splice that just ran (`0` for uncompressed TAR).
     last_publish_plan: Mutex<Option<LivePublishPlan>>,
-    /// Still `None` for local files (rename, no upload).
-    publish_callback: Mutex<Option<LivePublishCallback>>,
 }
 
 impl WriteOverlay {
@@ -215,7 +206,6 @@ impl WriteOverlay {
             on_exit_wait_min: Mutex::new(ON_EXIT_WAIT_MIN),
             persist_delay: Mutex::new(None),
             last_publish_plan: Mutex::new(None),
-            publish_callback: Mutex::new(None),
         })
     }
 
@@ -247,39 +237,13 @@ impl WriteOverlay {
     }
 
     /// Prefix recorded by the last successful live persist.
-    pub fn last_publish_plan(&self) -> Option<LivePublishPlan> {
+    #[cfg(test)]
+    fn last_publish_plan(&self) -> Option<LivePublishPlan> {
         *self.last_publish_plan.lock().expect("overlay publish plan")
     }
 
     fn stash_publish_plan(&self, plan: LivePublishPlan) {
         *self.last_publish_plan.lock().expect("overlay publish plan") = Some(plan);
-    }
-
-    /// Install an F-7 upload hook. Local mounts leave this unset: persist still
-    /// renames the spliced temp onto `archive` and does not upload.
-    pub fn set_publish_callback<F>(&self, callback: F)
-    where
-        F: Fn(&LivePublishPlan, &Path) -> Result<()> + Send + Sync + 'static,
-    {
-        *self
-            .publish_callback
-            .lock()
-            .expect("overlay publish callback") = Some(Arc::new(callback));
-    }
-
-    fn invoke_publish_callback(&self, archive: &Path) -> Result<()> {
-        let cb = self
-            .publish_callback
-            .lock()
-            .expect("overlay publish callback")
-            .clone();
-        let Some(cb) = cb else {
-            return Ok(());
-        };
-        let plan = self
-            .last_publish_plan()
-            .ok_or_else(|| OverlayError::Msg("live publish plan missing after persist".into()))?;
-        cb(&plan, archive)
     }
 
     fn current_base(&self) -> Arc<dyn MountSource> {
@@ -946,8 +910,6 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
-        // Callback is `None` for local files: the splice already renamed.
-        self.invoke_publish_callback(archive)?;
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
@@ -1008,8 +970,8 @@ impl WriteOverlay {
     ///
     /// Overlay `create`/`write` stay on `commit_gate.read()`. Inflight is a
     /// separate flag — do not hold the writer-visible gate from enqueue until
-    /// unmount. CLI [`commit_overlay`] stays off this path. The publish
-    /// callback is still `None` for local files.
+    /// unmount. CLI [`commit_overlay`] stays off this path. F-7 will reuse
+    /// this live queue later.
     pub fn enqueue_commit(
         &self,
         archive: &Path,
@@ -1201,8 +1163,6 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
-        // Before reopen. `None` does not upload; the splice already renamed.
-        self.invoke_publish_callback(archive)?;
         match reopen(archive) {
             Ok(src) => {
                 *self.replacement.write().expect("overlay replacement") = Some(src);
@@ -1322,7 +1282,7 @@ impl WriteOverlay {
                 let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
                 (window, stats.prefix_compressed_bytes)
             }
-            // Uncompressed TAR has no SpliceStats. 0 means upload every byte.
+            // Uncompressed TAR stores 0.
             _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
         };
         self.stash_publish_plan(LivePublishPlan {
@@ -1731,19 +1691,16 @@ pub fn patch_sidecar_if_present(
 
 /// Pointer JSON for a sidecar the caller has already patched.
 ///
-/// Uses [`IndexPointer::for_blob`] only. Does not patch, open a socket, or
-/// write `{archive}.index.ptr`. Call after [`patch_sidecar_if_present`]: the
-/// id is SHA-256 of the sidecar bytes, so an unpatched file is a different id.
-pub fn index_pointer_plan_after_patch(
+/// Uses [`IndexPointer::for_blob`]. Call after [`patch_sidecar_if_present`]:
+/// the id is SHA-256 of the sidecar bytes, so an unpatched file is a different id.
+#[cfg(test)]
+fn index_pointer_plan_after_patch(
     sidecar: &Path,
     archive: Option<&Path>,
 ) -> Result<IndexPointerPlan> {
     let pointer =
         IndexPointer::for_blob(sidecar, archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
-    let dir = tempfile::tempdir()?;
-    let path = dir.path().join("index.ptr");
-    store_index_pointer_atomic(&path, &pointer).map_err(|e| OverlayError::Msg(e.to_string()))?;
-    let json = fs::read_to_string(&path)?;
+    let json = index_pointer_to_json(&pointer).map_err(|e| OverlayError::Msg(e.to_string()))?;
     Ok(IndexPointerPlan { pointer, json })
 }
 
@@ -2378,8 +2335,7 @@ fn collect_overlay_commit_plan_from_conn(
         if rel.is_empty() {
             continue;
         }
-        // Planted `.ratarmount-spool-*` is not an append member. The real
-        // spool is not created in this directory.
+        // Planted `.ratarmount-spool-*` is not an append member.
         if rel.starts_with(SPOOL_NAME_PREFIX) {
             continue;
         }
@@ -7756,7 +7712,6 @@ mod tests {
         let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
         assert!(ov.last_publish_plan().is_none());
         fs::write(overlay.join("new.txt"), &extra).unwrap();
-        // Publish callback stays None: splice still renames onto the archive.
         assert!(ov
             .commit_live(&archive, |p| reopen_tar_zst(p, false))
             .expect("commit"));
@@ -7781,7 +7736,7 @@ mod tests {
         );
     }
 
-    /// Regression: uncompressed TAR publish plan stores prefix 0 (upload every byte).
+    /// Regression: uncompressed TAR publish plan stores prefix 0.
     #[test]
     fn uncompressed_tar_publish_plan_has_zero_prefix() {
         let dir = tempfile::tempdir().unwrap();
