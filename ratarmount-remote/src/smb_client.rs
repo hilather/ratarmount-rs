@@ -666,15 +666,18 @@ impl SmbConn {
             )));
         }
         let info = query_output(&resp)?;
-        if info.len() < 16 {
-            return Err(RemoteError::Smb("SMB QUERY_INFO short file size".into()));
+        // MS-FSCC FILE_STANDARD_INFORMATION is 24 bytes. A shorter buffer
+        // omits Directory (byte 21) or Reserved; do not treat that as a file.
+        if info.len() < 24 {
+            return Err(RemoteError::Smb(
+                "SMB QUERY_INFO FileStandardInformation is shorter than 24 bytes".into(),
+            ));
         }
         let mut raw = [0u8; 8];
         raw.copy_from_slice(&info[8..16]);
-        let is_dir = info.get(21).copied().unwrap_or(0) != 0;
         Ok(StandardInfo {
             size: u64::from_le_bytes(raw),
-            is_dir,
+            is_dir: info[21] != 0,
         })
     }
 
@@ -1152,9 +1155,13 @@ fn parse_file_id_both(buf: &[u8]) -> Result<Vec<SmbDirRow>> {
         if next == 0 {
             break;
         }
-        if next < 104 {
+        // The offset must pass this record's fixed header and FileName, and
+        // land on another fixed header. A value inside the name, or a tail
+        // shorter than 104 bytes, would drop the rest of the buffer.
+        let name_end_rel = 104usize.saturating_add(name_len);
+        if next < name_end_rel {
             return Err(RemoteError::Smb(
-                "SMB QUERY_DIRECTORY NextEntryOffset is too small".into(),
+                "SMB QUERY_DIRECTORY NextEntryOffset does not cover the file name".into(),
             ));
         }
         let Some(new_off) = off.checked_add(next) else {
@@ -1162,9 +1169,9 @@ fn parse_file_id_both(buf: &[u8]) -> Result<Vec<SmbDirRow>> {
                 "SMB QUERY_DIRECTORY NextEntryOffset overflow".into(),
             ));
         };
-        if new_off <= off || new_off > buf.len() {
+        if new_off <= off || new_off.saturating_add(104) > buf.len() {
             return Err(RemoteError::Smb(
-                "SMB QUERY_DIRECTORY NextEntryOffset is out of range".into(),
+                "SMB QUERY_DIRECTORY NextEntryOffset does not cover the next fixed header".into(),
             ));
         }
         off = new_off;
@@ -1414,6 +1421,19 @@ mod tests {
         /// Max children per QUERY_DIRECTORY success. `usize::MAX` packs one page.
         dir_page: usize,
         query_tamper: ReadTamper,
+        /// Replace the first record's NextEntryOffset. `None` leaves the chain.
+        dir_next_override: Option<DirNextOverride>,
+        /// Truncate FileStandardInformation to this many bytes. `None` is 24.
+        standard_info_len: Option<usize>,
+    }
+
+    /// Fault injected into one `QUERY_DIRECTORY` chain.
+    #[derive(Clone, Copy)]
+    enum DirNextOverride {
+        /// 106: two bytes into `FileName` (past the 104-byte header).
+        InsideName,
+        /// Just after `FileName`, so the next fixed header does not fit.
+        ShortTail,
     }
 
     fn script_file(file: &[u8]) -> Script {
@@ -1438,6 +1458,8 @@ mod tests {
             files: Vec::new(),
             dir_page: usize::MAX,
             query_tamper: ReadTamper::None,
+            dir_next_override: None,
+            standard_info_len: None,
         }
     }
 
@@ -1586,6 +1608,9 @@ mod tests {
                     if self.opened_dir && info.len() > 21 {
                         info[21] = 1;
                     }
+                    if let Some(n) = self.script.standard_info_len {
+                        info.truncate(n);
+                    }
                     Ok((STATUS_SUCCESS, encode_query_info_response(&info)))
                 }
                 SMB2_QUERY_DIRECTORY => self.dispatch_query_dir(pkt),
@@ -1643,10 +1668,9 @@ mod tests {
                 return Ok((STATUS_NO_MORE_FILES, error_body()));
             }
             self.dir_pos += chosen.len();
-            Ok((
-                STATUS_SUCCESS,
-                encode_query_info_response(&encode_id_both_entries(&chosen)),
-            ))
+            let mut raw = encode_id_both_entries(&chosen);
+            apply_dir_next_override(&mut raw, self.script.dir_next_override);
+            Ok((STATUS_SUCCESS, encode_query_info_response(&raw)))
         }
 
         fn dispatch_session(&mut self, pkt: &[u8]) -> std::result::Result<(u32, Vec<u8>), ()> {
@@ -2214,6 +2238,23 @@ mod tests {
             row[0..4].copy_from_slice(&n.to_le_bytes());
         }
         rows.into_iter().flatten().collect()
+    }
+
+    /// Rewrite the first record's NextEntryOffset. `InsideName` is 106, which
+    /// is past the 104-byte header and inside a name longer than one UTF-16 unit.
+    fn apply_dir_next_override(buf: &mut [u8], fault: Option<DirNextOverride>) {
+        let Some(fault) = fault else {
+            return;
+        };
+        if buf.len() < 64 {
+            return;
+        }
+        let name_len = u32::from_le_bytes(buf[60..64].try_into().unwrap_or([0; 4])) as usize;
+        let next: u32 = match fault {
+            DirNextOverride::InsideName => 106,
+            DirNextOverride::ShortTail => (104 + name_len) as u32,
+        };
+        buf[0..4].copy_from_slice(&next.to_le_bytes());
     }
 
     fn sample_dir_script() -> Script {
@@ -2900,6 +2941,86 @@ mod tests {
                 err.contains("signature"),
                 "tampered QUERY_DIRECTORY ({tamper:?}) must fail HMAC check: {err}"
             );
+        }
+    }
+
+    /// Regression: NextEntryOffset inside FileName must not skip the rest of the page.
+    #[test]
+    fn smb_query_directory_next_inside_name_is_error() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
+        let mut script = script_file(b"");
+        script.entries = vec![
+            TestEnt {
+                name: "notes.txt".into(),
+                is_dir: false,
+                size: 4,
+                mtime: 1.0,
+            },
+            TestEnt {
+                name: "later.txt".into(),
+                is_dir: false,
+                size: 2,
+                mtime: 1.0,
+            },
+        ];
+        script.dir_next_override = Some(DirNextOverride::InsideName);
+        let running = serve(script);
+        let loc = parse_smb_url(&format!(
+            "smb://127.0.0.1:{}/share/dir",
+            running.addr.port()
+        ))
+        .unwrap();
+        let err = list_smb_children(&loc, SMB_LIST_ENTRY_CAP)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("NextEntryOffset") && err.contains("file name"),
+            "offset inside the name must fail the listing, not return a prefix: {err}"
+        );
+
+        let mut script = script_file(b"");
+        script.entries = vec![TestEnt {
+            name: "notes.txt".into(),
+            is_dir: false,
+            size: 4,
+            mtime: 1.0,
+        }];
+        script.dir_next_override = Some(DirNextOverride::ShortTail);
+        let running = serve(script);
+        let loc = parse_smb_url(&format!(
+            "smb://127.0.0.1:{}/share/dir",
+            running.addr.port()
+        ))
+        .unwrap();
+        let err = list_smb_children(&loc, SMB_LIST_ENTRY_CAP)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("next fixed header"),
+            "offset that misses the next header must fail the listing: {err}"
+        );
+    }
+
+    /// Regression: FileStandardInformation shorter than 24 bytes is not a file.
+    #[test]
+    fn smb_short_file_standard_info_is_not_a_file() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
+        let mut script = script_file(b"abcd");
+        // 22 bytes includes Directory (offset 21) but not the 24-byte struct.
+        // The old path read that as a non-directory and returned Ok(None).
+        script.standard_info_len = Some(22);
+        let running = serve(script);
+        let url = format!("smb://127.0.0.1:{}/share/dir/file.bin", running.addr.port());
+        match try_open_smb_folder(&url) {
+            Ok(None) => panic!("short FileStandardInformation was treated as a file"),
+            Ok(Some(_)) => panic!("short FileStandardInformation opened as a folder"),
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("24") && msg.contains("FileStandardInformation"),
+                    "{msg}"
+                );
+            }
         }
     }
 }
