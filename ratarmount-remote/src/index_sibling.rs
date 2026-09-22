@@ -1,8 +1,9 @@
 //! Sibling index objects for S3/GCS/Azure (V-2c).
 //!
 //! Pointer `{url}.index.ptr` and immutable `{url}.index.{id}.sqlite` are extra
-//! candidates. GET is `fetch_*`; PUT is [`put_s3_index_siblings`].
-//! GCS and Azure stay GET-only. The well-known `{url}.index.sqlite` key is not written.
+//! candidates. GET is `fetch_*`; S3 PUT is [`put_s3_index_siblings`].
+//! GCS live commit PUTs through `put_gcs_object` (one object, caller-ordered).
+//! Azure stays GET-only. The well-known `{url}.index.sqlite` key is not written.
 
 use std::fs::File;
 use std::io::Read;

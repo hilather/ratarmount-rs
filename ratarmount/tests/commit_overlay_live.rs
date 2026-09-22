@@ -1501,6 +1501,223 @@ fn s3_interval_uploads_once() {
     let _ = child.wait();
 }
 
+/// The in-test listener (not a private `gcs.rs` mock) sees archive, blob, then
+/// pointer PUTs. Auth is `GOOGLE_HMAC_*` plus `RATARMOUNT_GCS_ENDPOINT`, not AWS.
+#[test]
+fn gs_interval_uploads_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let member = ratarmount_formats_tar::UstarMember {
+        path: "seed.txt",
+        payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    let mut plain = Vec::new();
+    ratarmount_formats_tar::write_ustar_members(&mut plain, &[member]).unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+    let zst_bytes = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+    let zst = dir.path().join("a.tar.zst");
+    fs::write(&zst, &zst_bytes).unwrap();
+    let idx = dir.path().join("a.tar.zst.index.sqlite");
+    let body = ratarmount_compress::open_seekable_zstd(&zst).unwrap();
+    let opts = ratarmount_core::OpenOptions {
+        write_index: true,
+        index_minimum_file_count: 0,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        &zst,
+        body,
+        Some(&idx),
+        &opts,
+        "test",
+    )
+    .expect("sidecar");
+    let index_bytes = fs::read(&idx).unwrap();
+    let pointer = ratarmount_index::IndexPointer::for_blob(&idx, Some(&zst)).unwrap();
+    let pointer_bytes = ratarmount_index::index_pointer_to_json(&pointer)
+        .unwrap()
+        .into_bytes();
+    let id = pointer.index_id.clone();
+    let key = "data/a.tar.zst";
+    let mut objects = std::collections::HashMap::new();
+    objects.insert(key.into(), zst_bytes);
+    objects.insert(format!("{key}.index.ptr"), pointer_bytes);
+    objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
+    let gcs = spawn_s3_live(objects);
+    let cache = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let secret = "gcs-fixture-secret-DO-NOT-LOG";
+    let payload = format!("gs-interval-{}\n", std::process::id());
+    let mut child = Command::new(bin())
+        .args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args(["--commit-overlay-interval", "1s"])
+        .arg("gs://bkt/data/a.tar.zst")
+        .env("GOOGLE_HMAC_KEY", "GOOG1ACCESS")
+        .env("GOOGLE_HMAC_SECRET", secret)
+        .env("RATARMOUNT_GCS_ENDPOINT", format!("http://{}", gcs.addr))
+        .env("RATARMOUNT_GCS_IMDS_BASE", "http://127.0.0.1:1")
+        .env("XDG_CACHE_HOME", cache.path())
+        .env_remove("CLOUDSDK_AUTH_ACCESS_TOKEN")
+        .env_remove("GOOGLE_OAUTH_ACCESS_TOKEN")
+        .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
+        .env_remove("RATARMOUNT_GCS_ANONYMOUS")
+        .env_remove("CLOUDSDK_ANONYMOUS")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_ENDPOINT_URL")
+        .env_remove("S3_ENDPOINT_URL")
+        .env_remove("AWS_ANONYMOUS")
+        .env_remove("RATARMOUNT_S3_ANONYMOUS")
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(15)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(secret),
+        "mount log must not contain the GCS HMAC secret"
+    );
+    fs::write(ov.join("tick.bin"), payload.as_bytes()).unwrap();
+    let archive_puts = || {
+        gcs.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.method == "PUT" && h.key == key)
+            .count()
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(12) && archive_puts() == 0 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        archive_puts() >= 1,
+        "no archive PUT: {:?} log={}",
+        gcs.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| format!("{} {}", h.method, h.key))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(8) && ov.join("tick.bin").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ov.join("tick.bin").exists(),
+        "overlay file should be forgotten after upload: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let hits: Vec<(String, String, Vec<u8>)> = gcs
+        .hits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|h| (h.method.clone(), h.key.clone(), h.body.clone()))
+        .collect();
+    let puts: Vec<&(String, String, Vec<u8>)> = hits.iter().filter(|h| h.0 == "PUT").collect();
+    let put_keys: Vec<&String> = puts.iter().map(|h| &h.1).collect();
+    assert!(
+        puts.len() >= 3,
+        "expected archive, blob, pointer PUTs, got {put_keys:?}"
+    );
+    assert_eq!(puts[0].1, key, "archive PUT first: {put_keys:?}");
+    assert!(
+        puts[1].1.starts_with(&format!("{key}.index.")) && puts[1].1.ends_with(".sqlite"),
+        "blob PUT second: {}",
+        puts[1].1
+    );
+    assert!(
+        puts[1].1 != format!("{key}.index.sqlite"),
+        "blob key must include the index id"
+    );
+    assert_eq!(puts[2].1, format!("{key}.index.ptr"), "pointer PUT third");
+    assert!(
+        puts.iter().all(|h| h.1 != format!("{key}.index.sqlite")),
+        "well-known key must not be written"
+    );
+    let archive_body = &puts[0].2;
+    assert_eq!(
+        gcs.objects.lock().unwrap().get(key).map(Vec::as_slice),
+        Some(archive_body.as_slice()),
+        "stored object bytes must match the uploaded spool"
+    );
+    let uploaded = dir.path().join("uploaded.tar.zst");
+    let plain_out = dir.path().join("uploaded.tar");
+    fs::write(&uploaded, archive_body).unwrap();
+    decode_tar_zst_to_tar(&uploaded, &plain_out);
+    let plain_bytes = fs::read(&plain_out).unwrap();
+    assert!(
+        plain_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_bytes()),
+        "uploaded spool must contain the overlay file"
+    );
+    let meta = cache.path().join("ratarmount").join("meta-v3");
+    let mut matched = false;
+    if meta.is_dir() {
+        for ent in fs::read_dir(&meta).unwrap().flatten() {
+            if ent.file_name().to_string_lossy().ends_with(".hdr") {
+                continue;
+            }
+            if fs::read(ent.path()).ok().as_deref() == Some(puts[1].2.as_slice()) {
+                matched = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        matched,
+        "blob PUT must equal the meta-v3 sidecar under {}",
+        meta.display()
+    );
+    let archive_put_at = hits
+        .iter()
+        .position(|h| h.0 == "PUT" && h.1 == key)
+        .unwrap();
+    assert!(
+        hits.iter()
+            .skip(archive_put_at + 1)
+            .any(|h| h.0 == "GET" && h.1 == key),
+        "reopen must read the listener, not the spool path"
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        archive_puts(),
+        1,
+        "second tick must not PUT the archive again"
+    );
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(secret),
+        "log must not contain the GCS HMAC secret"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}
+
 fn ustar_name_count(tar: &[u8], name: &str) -> usize {
     let want = name.as_bytes();
     tar.chunks(512)

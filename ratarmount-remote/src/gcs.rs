@@ -1,4 +1,5 @@
-//! GCS `gs://bucket/object` Range GET (XML path-style) and prefix listing.
+//! GCS `gs://bucket/object` Range GET (XML path-style), prefix listing, and
+//! a single live-commit PUT (GOOG1 or bearer; no multipart).
 //!
 //! # File wire
 //!
@@ -37,6 +38,7 @@ use std::time::Duration;
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{encode, Algorithm, EncodingKey, Header};
 use log::debug;
+use md5::{Digest, Md5};
 use ratarmount_core::{ArchiveRead, MountSource};
 use sha1::Sha1;
 use tempfile::NamedTempFile;
@@ -503,8 +505,27 @@ fn resolve_auth() -> Result<ResolvedAuth> {
 }
 
 /// GOOG1 string-to-sign (AWS V2). Range is not included (unsigned on the wire).
+///
+/// Content-MD5 and Content-Type are hard-coded empty. GET and HEAD stay on
+/// this helper. A PUT that sets those headers must use [`goog1_put_string_to_sign`].
 fn goog1_string_to_sign(verb: &str, date: &str, resource: &str) -> String {
     format!("{verb}\n\n\n{date}\n{resource}")
+}
+
+/// GOOG1 PUT string-to-sign. Field order is verb, Content-MD5, Content-Type,
+/// Date, resource. Do not call [`goog1_string_to_sign`] for a body PUT.
+fn goog1_put_string_to_sign(
+    verb: &str,
+    content_md5: &str,
+    content_type: &str,
+    date: &str,
+    resource: &str,
+) -> String {
+    format!("{verb}\n{content_md5}\n{content_type}\n{date}\n{resource}")
+}
+
+fn content_md5_b64(body: &[u8]) -> String {
+    base64_encode(&Md5::digest(body))
 }
 
 fn goog1_canonical_resource_object(bucket: &str, object: &str) -> String {
@@ -650,9 +671,141 @@ fn gcs_get_object(
         req = req.set("Range", r);
     }
     let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
         .call()
         .map_err(|e| gcs_err(format!("GetObject gs://{}/{}: {e}", loc.bucket, loc.object)))?;
     Ok((auth.source, resp))
+}
+
+/// HEAD metadata for a live-commit tick. Missing keys are an error (do not create).
+///
+/// The verb is `HEAD` on the empty-MD5 helper. Anonymous GET stays allowed.
+#[derive(Clone, Debug)]
+pub struct GcsHead {
+    pub etag: Option<String>,
+    pub len: u64,
+}
+
+/// `HEAD` the object. ETag is the raw header value (quotes included).
+pub fn head_gcs_object(url_str: &str) -> Result<GcsHead> {
+    let loc = parse_gcs_url(url_str)?;
+    let auth = resolve_auth()?;
+    let url = gcs_xml_object_url(&loc);
+    debug!("gcs HEAD {url} (auth={:?})", auth.source);
+    let resource = goog1_canonical_resource_object(&loc.bucket, &loc.object);
+    let date = rfc1123_gmt(chrono::Utc::now());
+    let req = apply_gcs_auth(ureq::head(&url), &auth, "HEAD", &resource, &date)?;
+    let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(status, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                gcs_status_error(auth.source, status, &loc, &body)
+            }
+            other => gcs_err(format!("HEAD gs://{}/{}: {other}", loc.bucket, loc.object)),
+        })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(gcs_status_error(auth.source, status, &loc, &body));
+    }
+    let etag = resp.header("etag").map(str::to_string);
+    let len = resp
+        .header("Content-Length")
+        .or_else(|| resp.header("content-length"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            gcs_err(format!(
+                "HEAD gs://{}/{} missing Content-Length",
+                loc.bucket, loc.object
+            ))
+        })?;
+    Ok(GcsHead { etag, len })
+}
+
+fn apply_gcs_put_auth(
+    mut req: ureq::Request,
+    auth: &ResolvedAuth,
+    content_md5: &str,
+    content_type: &str,
+    resource: &str,
+    date: &str,
+) -> Result<ureq::Request> {
+    req = req
+        .set("User-Agent", USER_AGENT)
+        .set("Content-MD5", content_md5)
+        .set("Content-Type", content_type);
+    if auth.source == CredSource::Hmac {
+        let keys = auth
+            .hmac
+            .as_ref()
+            .ok_or_else(|| gcs_err("HMAC auth missing keys"))?;
+        // Bearer tokens do not reach this signer.
+        let sts = goog1_put_string_to_sign("PUT", content_md5, content_type, date, resource);
+        let hdr = goog1_authorization(&keys.access_id, &keys.secret, &sts)?;
+        req = req.set("Date", date).set("Authorization", &hdr);
+        return Ok(req);
+    }
+    if let Some(tok) = &auth.bearer {
+        req = req.set("Authorization", &format!("Bearer {tok}"));
+    }
+    Ok(req)
+}
+
+/// One PutObject. No multipart and no resumable session.
+///
+/// `content_type` is the GOOG1 field and the `Content-Type` header.
+/// `Content-MD5` is the base64 MD5 of `body` (not hex). Anonymous credentials
+/// error before any request. Bearer auth sends `Authorization: Bearer` and
+/// does not use the GOOG1 signer. The HMAC secret is not logged.
+pub fn put_gcs_object(loc: &GcsLocation, body: &[u8], content_type: &str) -> Result<()> {
+    let auth = resolve_auth()?;
+    if auth.source == CredSource::Anonymous || (auth.hmac.is_none() && auth.bearer.is_none()) {
+        return Err(gcs_auth_err(
+            "anonymous credentials cannot PUT gs:// objects",
+        ));
+    }
+    let md5 = content_md5_b64(body);
+    let date = rfc1123_gmt(chrono::Utc::now());
+    let resource = goog1_canonical_resource_object(&loc.bucket, &loc.object);
+    let url = gcs_xml_object_url(loc);
+    debug!(
+        "gcs PUT {url} (auth={:?}, bytes={}, content-type={content_type})",
+        auth.source,
+        body.len()
+    );
+    let req = apply_gcs_put_auth(ureq::put(&url), &auth, &md5, content_type, &resource, &date)?;
+    let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
+        .send_bytes(body)
+        .map_err(|e| match e {
+            ureq::Error::Status(status, resp) => {
+                let text = resp.into_string().unwrap_or_default();
+                let msg = format!(
+                    "PutObject HTTP {status} for gs://{}/{}: {text}",
+                    loc.bucket, loc.object
+                );
+                if status == 401 || status == 403 {
+                    gcs_auth_err(msg)
+                } else {
+                    gcs_err(msg)
+                }
+            }
+            other => gcs_err(format!(
+                "PutObject gs://{}/{}: {other}",
+                loc.bucket, loc.object
+            )),
+        })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let text = resp.into_string().unwrap_or_default();
+        return Err(gcs_err(format!(
+            "PutObject HTTP {status} for gs://{}/{}: {text}",
+            loc.bucket, loc.object
+        )));
+    }
+    Ok(())
 }
 
 enum GcsProbe {
@@ -739,6 +892,16 @@ pub fn fetch_gcs_to_temp(url_str: &str) -> Result<(NamedTempFile, u64)> {
     fetch_gcs_location_to_temp(&loc)
 }
 
+fn gcs_spool_file() -> Result<NamedTempFile> {
+    let tmp = NamedTempFile::new()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(tmp)
+}
+
 fn fetch_gcs_location_to_temp(loc: &GcsLocation) -> Result<(NamedTempFile, u64)> {
     let (source, resp) = gcs_get_object(loc, None)?;
     let status = resp.status();
@@ -747,11 +910,121 @@ fn fetch_gcs_location_to_temp(loc: &GcsLocation) -> Result<(NamedTempFile, u64)>
         return Err(gcs_status_error(source, status, loc, &body));
     }
     let mut reader = resp.into_reader();
-    let mut tmp = NamedTempFile::new()?;
+    let mut tmp = gcs_spool_file()?;
     let n = io::copy(&mut reader, &mut tmp)?;
     tmp.flush()?;
     tmp.as_file_mut().seek(SeekFrom::Start(0))?;
     Ok((tmp, n))
+}
+
+fn gcs_bytes_to_tempfile(bytes: &[u8]) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = gcs_spool_file()?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok((tmp, bytes.len() as u64))
+}
+
+/// Sequential Range materialization into a mode `0o600` tempfile.
+fn fetch_gcs_via_ranges(loc: &GcsLocation, size: u64) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = gcs_spool_file()?;
+    if size == 0 {
+        tmp.flush()?;
+        return Ok((tmp, 0));
+    }
+    let mut written = 0u64;
+    for (start, end) in crate::range_chunk_windows(size, crate::HTTP_RANGE_CHUNK) {
+        let range = format!("bytes={start}-{end}");
+        let (source, resp) = gcs_get_object(loc, Some((start, end)))?;
+        let status = resp.status();
+        if status == 206 {
+            let expected = end - start + 1;
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            if n != expected {
+                return Err(gcs_err(format!(
+                    "range {range} for gs://{}/{} returned {n} bytes, expected {expected}",
+                    loc.bucket, loc.object
+                )));
+            }
+            written += n;
+        } else if status == 200 && start == 0 {
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            tmp.flush()?;
+            tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+            debug!(
+                "gcs download gs://{}/{} -> {n} bytes (full body; Range ignored)",
+                loc.bucket, loc.object
+            );
+            return Ok((tmp, n));
+        } else {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(gcs_status_error(source, status, loc, &body));
+        }
+    }
+    if written != size {
+        return Err(gcs_err(format!(
+            "range download size mismatch for gs://{}/{}: wrote {written}, expected {size}",
+            loc.bucket, loc.object
+        )));
+    }
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    debug!(
+        "gcs range download gs://{}/{} -> {written} bytes",
+        loc.bucket, loc.object
+    );
+    Ok((tmp, written))
+}
+
+/// Download a GCS object, preferring sequential HTTP Range chunks when feasible.
+///
+/// Same threshold and fallback as S3: above [`DEFAULT_GCS_RANGE_THRESHOLD`]
+/// uses Range; a failed Range or a small object falls back to one full GET.
+/// The tempfile is mode `0o600` in the system temp dir (not the overlay).
+/// `fetch_gcs_to_temp` stays the single full GET and is not this path.
+pub fn fetch_gcs_location_to_temp_prefer_range(
+    loc: &GcsLocation,
+    known_size: Option<u64>,
+) -> Result<(NamedTempFile, u64)> {
+    let size_for_range = match known_size {
+        Some(n) if n > DEFAULT_GCS_RANGE_THRESHOLD => Some(n),
+        Some(_) => None,
+        None => match probe_gcs_object(loc) {
+            Ok(GcsProbe::RangesOk(n)) if n > DEFAULT_GCS_RANGE_THRESHOLD => Some(n),
+            Ok(GcsProbe::RangesOk(_)) => None,
+            Ok(GcsProbe::FullBody(bytes)) => {
+                return gcs_bytes_to_tempfile(&bytes);
+            }
+            Ok(GcsProbe::Unusable) => None,
+            Err(e) => {
+                debug!(
+                    "gcs range probe failed for gs://{}/{}: {e}; full download",
+                    loc.bucket, loc.object
+                );
+                None
+            }
+        },
+    };
+    if let Some(size) = size_for_range {
+        debug!(
+            "gcs prefer-range: gs://{}/{} ({size} bytes) in {}-byte chunks",
+            loc.bucket,
+            loc.object,
+            crate::HTTP_RANGE_CHUNK
+        );
+        match fetch_gcs_via_ranges(loc, size) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                debug!(
+                    "gcs range download failed for gs://{}/{}: {e}; falling back to full GET",
+                    loc.bucket, loc.object
+                );
+            }
+        }
+    }
+    fetch_gcs_location_to_temp(loc)
 }
 
 /// Inclusive byte range GET (`start..=end_inclusive`). Expects HTTP 206.
@@ -1445,6 +1718,7 @@ mod tests {
         auth_headers: Arc<AtomicUsize>,
         range_headers: Arc<AtomicUsize>,
         list_gets: Arc<AtomicUsize>,
+        requests: Arc<AtomicUsize>,
         _join: Option<thread::JoinHandle<()>>,
     }
 
@@ -1470,6 +1744,8 @@ mod tests {
             file_body: Vec<u8>,
         },
         NotFound,
+        /// Records every method, including PUT, and returns 200 with an empty body.
+        AcceptPut,
     }
 
     impl MockGcs {
@@ -1482,12 +1758,14 @@ mod tests {
             let auth_headers = Arc::new(AtomicUsize::new(0));
             let range_headers = Arc::new(AtomicUsize::new(0));
             let list_gets = Arc::new(AtomicUsize::new(0));
+            let requests = Arc::new(AtomicUsize::new(0));
             let log_c = Arc::clone(&log);
             let gets_c = Arc::clone(&gets);
             let posts_c = Arc::clone(&posts);
             let auth_c = Arc::clone(&auth_headers);
             let range_c = Arc::clone(&range_headers);
             let list_c = Arc::clone(&list_gets);
+            let requests_c = Arc::clone(&requests);
             let join = thread::spawn(move || {
                 for stream in listener.incoming().take(64) {
                     let Ok(mut stream) = stream else { continue };
@@ -1501,6 +1779,10 @@ mod tests {
                     let mut range_hdr: Option<String> = None;
                     let mut meta_flavor: Option<String> = None;
                     let mut content_len: usize = 0;
+                    let mut content_md5: Option<String> = None;
+                    let mut content_type: Option<String> = None;
+                    let mut date_hdr: Option<String> = None;
+                    requests_c.fetch_add(1, Ordering::SeqCst);
                     loop {
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_err() {
@@ -1530,6 +1812,21 @@ mod tests {
                         if let Some(rest) = lower.strip_prefix("content-length:") {
                             content_len = rest.trim().parse().unwrap_or(0);
                         }
+                        if lower.starts_with("content-md5:") {
+                            if let Some((_, v)) = line.split_once(':') {
+                                content_md5 = Some(v.trim().to_string());
+                            }
+                        }
+                        if lower.starts_with("content-type:") {
+                            if let Some((_, v)) = line.split_once(':') {
+                                content_type = Some(v.trim().to_string());
+                            }
+                        }
+                        if lower.starts_with("date:") {
+                            if let Some((_, v)) = line.split_once(':') {
+                                date_hdr = Some(v.trim().to_string());
+                            }
+                        }
                     }
                     if content_len > 0 {
                         let mut dump = vec![0u8; content_len];
@@ -1548,6 +1845,15 @@ mod tests {
                         }
                         if let Some(ref r) = range_hdr {
                             lg.push(format!("Range: {r}"));
+                        }
+                        if let Some(ref v) = content_md5 {
+                            lg.push(format!("Content-MD5: {v}"));
+                        }
+                        if let Some(ref v) = content_type {
+                            lg.push(format!("Content-Type: {v}"));
+                        }
+                        if let Some(ref v) = date_hdr {
+                            lg.push(format!("Date: {v}"));
                         }
                     }
                     if has_auth {
@@ -1768,6 +2074,12 @@ mod tests {
                             );
                             let _ = stream.write_all(msg);
                         }
+                        MockMode::AcceptPut => {
+                            let _ = write!(
+                                stream,
+                                "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            );
+                        }
                     }
                 }
             });
@@ -1779,6 +2091,7 @@ mod tests {
                 auth_headers,
                 range_headers,
                 list_gets,
+                requests,
                 _join: Some(join),
             }
         }
@@ -2252,6 +2565,154 @@ c8kyOVCJusup7SdkiG+QF64=
         assert_eq!(
             auth.hmac.as_ref().map(|h| h.access_id.as_str()),
             Some("GOOG1ACCESS")
+        );
+    }
+
+    fn log_field(log: &[String], prefix: &str) -> String {
+        log.iter()
+            .find_map(|l| l.strip_prefix(prefix).map(|s| s.trim().to_string()))
+            .unwrap_or_else(|| panic!("missing {prefix} in {log:?}"))
+    }
+
+    /// Known fixture: MD5 is field 2, content-type is field 3.
+    /// GET stays on the empty-MD5 helper.
+    #[test]
+    fn goog1_put_string_to_sign_puts_md5_and_content_type_in_fields() {
+        let md5 = "XUFAKrxLKna5cZ2REBfFkg==";
+        let content_type = "application/octet-stream";
+        let resource = "/bkt/obj.bin";
+        let sts = goog1_put_string_to_sign("PUT", md5, content_type, GOOG1_DATE, resource);
+        assert_eq!(
+            sts,
+            "PUT\nXUFAKrxLKna5cZ2REBfFkg==\napplication/octet-stream\nMon, 24 Aug 2026 12:00:00 GMT\n/bkt/obj.bin"
+        );
+        let fields: Vec<&str> = sts.split('\n').collect();
+        assert_eq!(fields.len(), 5, "{sts}");
+        assert_eq!(fields[1], md5, "field 2 is Content-MD5");
+        assert_eq!(fields[2], content_type, "field 3 is Content-Type");
+        let get_sts = goog1_string_to_sign("GET", GOOG1_DATE, resource);
+        assert_eq!(
+            get_sts,
+            "GET\n\n\nMon, 24 Aug 2026 12:00:00 GMT\n/bkt/obj.bin"
+        );
+        assert_ne!(
+            sts,
+            goog1_string_to_sign("PUT", GOOG1_DATE, resource),
+            "PUT must not use the empty-MD5 helper"
+        );
+    }
+
+    /// The mock records PUT. The fixture secret is not in the log, and the
+    /// Authorization value matches the PUT string-to-sign rather than the GET helper.
+    #[test]
+    fn gcs_put_records_put_and_not_the_secret() {
+        let secret = "supersecret";
+        let mock = MockGcs::spawn(MockMode::AcceptPut);
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", secret);
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        put_gcs_object(&loc, b"hello", "application/octet-stream").unwrap();
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("PUT ")),
+            "mock must record PUT, log={log:?}"
+        );
+        assert!(
+            log.iter().all(|l| !l.contains(secret)),
+            "fixture secret leaked: {log:?}"
+        );
+        let md5 = log_field(&log, "Content-MD5:");
+        let content_type = log_field(&log, "Content-Type:");
+        let date = log_field(&log, "Date:");
+        let auth = log_field(&log, "Authorization-Value:");
+        assert_eq!(md5, "XUFAKrxLKna5cZ2REBfFkg==");
+        assert_eq!(content_type, "application/octet-stream");
+        let resource = "/bkt/obj.bin";
+        let put_sts = goog1_put_string_to_sign("PUT", &md5, &content_type, &date, resource);
+        let expect = goog1_authorization("GOOG1ACCESS", secret, &put_sts).unwrap();
+        assert_eq!(auth, expect, "PUT signer mismatch, sts={put_sts:?}");
+        let get_form = goog1_string_to_sign("PUT", &date, resource);
+        let not_get = goog1_authorization("GOOG1ACCESS", secret, &get_form).unwrap();
+        assert_ne!(
+            auth, not_get,
+            "PUT must not be signed with the empty-MD5 helper"
+        );
+    }
+
+    #[test]
+    fn gcs_bearer_put_sends_content_md5_not_hmac() {
+        let mock = MockGcs::spawn(MockMode::AcceptPut);
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("CLOUDSDK_AUTH_ACCESS_TOKEN", "ya29.bearer-put");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        put_gcs_object(&loc, b"hello", "application/json").unwrap();
+        let log = mock.log.lock().unwrap();
+        assert!(log.iter().any(|l| l.starts_with("PUT ")), "{log:?}");
+        let auth = log_field(&log, "Authorization-Value:");
+        assert_eq!(auth, "Bearer ya29.bearer-put");
+        assert!(!auth.starts_with("GOOG1"), "{auth}");
+        assert_eq!(log_field(&log, "Content-MD5:"), "XUFAKrxLKna5cZ2REBfFkg==");
+        assert_eq!(log_field(&log, "Content-Type:"), "application/json");
+        assert!(
+            !log.iter().any(|l| l.starts_with("Date:")),
+            "bearer PUT must not send the GOOG1 Date field, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn gcs_anonymous_put_errors_before_request() {
+        let mock = MockGcs::spawn(MockMode::AcceptPut);
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("RATARMOUNT_GCS_ANONYMOUS", "1");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        let err = put_gcs_object(&loc, b"hello", "application/octet-stream")
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("anonymous"), "{err}");
+        assert_eq!(
+            mock.requests.load(Ordering::SeqCst),
+            0,
+            "anonymous PUT must not send a request"
+        );
+    }
+
+    #[test]
+    fn gcs_prefer_range_spool_is_0600_and_uses_chunks() {
+        let extra = DEFAULT_GCS_RANGE_THRESHOLD as usize + 16;
+        let body: Vec<u8> = (0u8..=255).cycle().take(extra).collect();
+        let mock = MockGcs::spawn(MockMode::Object {
+            body: body.clone(),
+            require_auth: false,
+            honor_range: true,
+        });
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("RATARMOUNT_GCS_ANONYMOUS", "1");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_gcs_url("gs://bkt/big.bin").unwrap();
+        let (mut tmp, size) = fetch_gcs_location_to_temp_prefer_range(&loc, None).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "spool mode {mode:o}");
+        }
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("Range: bytes=0-") && l != "Range: bytes=0-0"),
+            "expected a content range after the probe, log={log:?}"
         );
     }
 }

@@ -1184,9 +1184,7 @@ fn main() {
         overlay_commit::install_term_signal_flag();
     }
     if let (Some(ov), Some(archive)) = (overlay_arc.as_ref(), live_commit_archive.as_ref()) {
-        if archive.to_string_lossy().starts_with("s3://") {
-            overlay_commit::install_s3_live_commit(ov, archive, &open_opts);
-        }
+        overlay_commit::install_object_store_live_commit(ov, archive, &open_opts);
     }
 
     if args.no_mount {

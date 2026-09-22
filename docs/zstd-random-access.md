@@ -201,7 +201,7 @@ table using the recipes above.
 host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 (or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
 `.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
-no seek table) when `-w` is set. One existing `s3://` `.tar` or `.tar.zst`
+no seek table) when `-w` is set. One existing `s3://` or `gs://` `.tar` or `.tar.zst`
 uses the same live queue: the object is spooled outside the overlay, spliced,
 and uploaded (object, then index blob, then pointer). Live ticks still
 **reject** prefix-frame mutate (append-only + last-window, no upload).

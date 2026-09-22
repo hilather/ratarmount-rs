@@ -11,7 +11,7 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 | `file://` | Map to local path |
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite`, then `Link: rel="describedby"` on archive HEAD, then well-known `{url}.index.sqlite` (+ `.gz`/`.zst`/`.xz`/`.bz2`). Pointer/blob/tarstats failure continues |
 | `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. Live commit PUTs the archive object, then the pointer blob, then `{url}.index.ptr`. Well-known `{url}.index.sqlite` stays GET-only |
-| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Same sibling pointer/blob/well-known GET as S3 |
+| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Sibling pointer/blob/well-known GET as S3. Live commit: one PUT of the archive (GOOG1 or bearer; no multipart), then `{url}.index.{id}.sqlite`, then `{url}.index.ptr`. Well-known stays GET-only. Anonymous PUT is an error |
 | `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://`. Same sibling pointer/blob/well-known GET as S3 |
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
@@ -29,7 +29,7 @@ Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_g
 
 ### Portable index discovery (G-2)
 
-Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 live commit **PUT**s the archive object, then the pointer blob, then `{url}.index.ptr` (well-known stays GET-only). GCS/Azure PUT is still F-7. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
+Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 and GCS live commit **PUT** the archive object, then the pointer blob, then `{url}.index.ptr` (well-known stays GET-only; GCS is a single PUT). Azure PUT is still F-7. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
 
 Whole sidecar GETs ≤ 64 MiB are stored in `$XDG_CACHE_HOME/ratarmount/meta-v3/` (V-3; cap `RATARMOUNT_META_CACHE_BYTES`, default 256 MiB, `=0` disables). Lookup is URL-first so a remount without `.ptr` still hits. Not archive `HttpRangeFile` paging and not G-3 member bodies. `file://` / `:memory:` / a nonempty local folder candidate skip the download. HPC home-quota: set `XDG_CACHE_HOME` to scratch.
 
@@ -87,8 +87,10 @@ XML file GET; JSON list API (Bearer/ADC/IMDS). HMAC GOOG1 uses XML ListBucket (q
 | `GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET` | GOOG1 HMAC (both non-empty; selected **before** the ADC/IMDS token cache) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s) |
 | GCE/GKE IMDS | `Metadata-Flavor: Google` (override `RATARMOUNT_GCS_IMDS_BASE` for tests) |
-| `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET |
+| `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET (PUT is an error before any request) |
 | `RATARMOUNT_GCS_ENDPOINT` | XML/JSON API base override |
+
+Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one existing `gs://` `.tar` or `.tar.zst` spools with ranged GET when the object is large, splices locally, then sends one PUT. GOOG1 signs verb, Content-MD5, Content-Type, Date, and resource. Bearer sends `Authorization: Bearer` plus Content-MD5 and does not use that signer. Content-Type is `application/octet-stream` for the archive, `application/vnd.ratarmount.index.v1+sqlite` for the blob, and `application/json` for the pointer. No multipart and no well-known key. Offline `--commit-overlay` does not upload.
 
 ### Azure Blob (`az://` / `azure://`)
 
@@ -208,7 +210,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
 - rclone RC `--rc-serve` HTTP GET (`rclone+remote:path` **is** shipped)
 - OCI eStargz / SOCI / nydus / config JSON
-- S3 write-through landed; GCS/Azure follow
+- S3 and GCS write-through landed; Azure follows
 
 ## Usage
 
