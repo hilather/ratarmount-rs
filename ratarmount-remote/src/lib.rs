@@ -96,7 +96,8 @@ pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
     fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, parse_s3_url_allow_prefix,
-    S3Location, S3RangeFile, DEFAULT_S3_RANGE_THRESHOLD,
+    put_s3_multipart, put_s3_object, S3Location, S3RangeFile, DEFAULT_S3_RANGE_THRESHOLD,
+    OBJECT_STORE_IO_TIMEOUT,
 };
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,

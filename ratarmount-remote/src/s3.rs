@@ -1,4 +1,14 @@
-//! S3 GetObject for `s3://bucket/key` (AWS SigV4 + ureq).
+//! S3 GetObject / PutObject for `s3://bucket/key` (AWS SigV4 + ureq).
+//!
+//! # Upload
+//!
+//! [`put_s3_object`] sends at most 8 MiB. Larger staged files use
+//! [`put_s3_multipart`] (8 MiB parts). A copied prefix of at least 5 MiB is
+//! `UploadPartCopy` of `bytes=0-{prefix-1}`; a zero prefix uploads every byte.
+//! Multipart canonical queries are the sorted query string (not empty). The
+//! payload hash is SHA-256 of the bytes sent on that request, never
+//! `UNSIGNED-PAYLOAD`. Empty bodies (create, copy, abort) hash `b""`.
+//! Anonymous credentials are rejected. Writes use [`OBJECT_STORE_IO_TIMEOUT`].
 //!
 //! # Download paths
 //!
@@ -38,9 +48,43 @@
 //! | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
 //! | `RATARMOUNT_IMDS_BASE` / `AWS_EC2_METADATA_SERVICE_ENDPOINT` | Override IMDS base (tests) |
 
+use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
+
+/// Per-thread stand-in for AWS env vars. Parallel `s3_*` tests in other modules
+/// also mutate `AWS_ENDPOINT_URL`; a process-global env would cross wires.
+#[cfg(test)]
+struct TestS3Override {
+    access_key: String,
+    secret_key: String,
+    region: String,
+    endpoint: String,
+    anonymous: bool,
+}
+
+#[cfg(test)]
+thread_local! {
+    // `const { RefCell::new(None) }` needs Rust 1.79; MSRV is 1.74.
+    #[allow(clippy::missing_const_for_thread_local)]
+    static TEST_S3_OVERRIDE: std::cell::RefCell<Option<TestS3Override>> =
+        std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+fn test_s3_override() -> Option<TestS3Override> {
+    TEST_S3_OVERRIDE.with(|slot| {
+        slot.borrow().as_ref().map(|over| TestS3Override {
+            access_key: over.access_key.clone(),
+            secret_key: over.secret_key.clone(),
+            region: over.region.clone(),
+            endpoint: over.endpoint.clone(),
+            anonymous: over.anonymous,
+        })
+    })
+}
 
 use hmac::{Hmac, Mac};
 use log::debug;
@@ -55,6 +99,16 @@ use crate::{
 
 /// Objects larger than this prefer chunked Range downloads (1 MiB).
 pub const DEFAULT_S3_RANGE_THRESHOLD: u64 = 1024 * 1024;
+
+/// PutObject ceiling and multipart part size (8 MiB). Above 10_000 parts is an error.
+const S3_PUT_PART_BYTES: u64 = 8 * 1024 * 1024;
+/// S3 rejects `UploadPartCopy` below this except as the last part (5 MiB).
+const S3_COPY_PART_MIN: u64 = 5 * 1024 * 1024;
+const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
+
+/// Socket budget for object-store GET chunks and PUT / multipart calls.
+/// IMDS and ECS credential fetches stay on their own 2s timeout.
+pub const OBJECT_STORE_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -127,12 +181,22 @@ struct ResolvedAuth {
 static ROLE_CREDS_CACHE: Mutex<Option<(CredSource, AwsCreds)>> = Mutex::new(None);
 
 fn region() -> String {
+    #[cfg(test)]
+    if let Some(over) = test_s3_override() {
+        return over.region;
+    }
     std::env::var("AWS_REGION")
         .or_else(|_| std::env::var("AWS_DEFAULT_REGION"))
         .unwrap_or_else(|_| "us-east-1".into())
 }
 
 fn custom_endpoint() -> Option<String> {
+    #[cfg(test)]
+    if let Some(over) = test_s3_override() {
+        if !over.endpoint.is_empty() {
+            return Some(over.endpoint);
+        }
+    }
     std::env::var("AWS_ENDPOINT_URL")
         .or_else(|_| std::env::var("S3_ENDPOINT_URL"))
         .ok()
@@ -411,6 +475,24 @@ fn fetch_imds_credentials() -> Result<AwsCreds> {
 
 /// Resolve auth for a GetObject: env → container/IMDS (cached) → anonymous → error.
 fn resolve_auth() -> Result<ResolvedAuth> {
+    #[cfg(test)]
+    if let Some(over) = test_s3_override() {
+        if over.anonymous {
+            return Ok(ResolvedAuth {
+                source: CredSource::Anonymous,
+                creds: None,
+            });
+        }
+        return Ok(ResolvedAuth {
+            source: CredSource::Env,
+            creds: Some(AwsCreds {
+                access_key: over.access_key,
+                secret_key: over.secret_key,
+                session_token: None,
+                expiration: None,
+            }),
+        });
+    }
     // 1. Explicit env keys
     if let Some(creds) = load_env_credentials()? {
         return Ok(ResolvedAuth {
@@ -662,6 +744,476 @@ fn s3_status_error(source: CredSource, status: u16, loc: &S3Location, body: &str
         "{kind} HTTP {status} for s3://{}/{}: {body}",
         loc.bucket, loc.key
     ))
+}
+
+struct S3CallCtx {
+    source: CredSource,
+    creds: AwsCreds,
+    region: String,
+    host: String,
+    uri_path: String,
+    https: bool,
+}
+
+struct S3HttpResult {
+    status: u16,
+    body: String,
+    etag: Option<String>,
+}
+
+struct MultipartPlan {
+    /// Part 1 is `UploadPartCopy` of `[0, prefix)`.
+    copy_prefix: bool,
+    /// Part 1 is a normal `UploadPart` of a prefix below [`S3_COPY_PART_MIN`].
+    upload_prefix: bool,
+    /// First byte of the trailing `UploadPart`s.
+    data_from: u64,
+    /// One empty `UploadPart` (S3 rejects a complete with zero parts).
+    empty_object: bool,
+    len: u64,
+    prefix: u64,
+}
+
+/// Anonymous GET stays allowed. Writes need a signing key.
+fn prepare_s3_write(loc: &S3Location) -> Result<S3CallCtx> {
+    let auth = resolve_auth()?;
+    let Some(creds) = auth.creds else {
+        return Err(RemoteError::S3(
+            "anonymous credentials cannot PutObject or upload multipart; public buckets stay GET-only"
+                .into(),
+        ));
+    };
+    let region = region();
+    let (host, uri_path, https) = s3_request_target(loc, &region);
+    Ok(S3CallCtx {
+        source: auth.source,
+        creds,
+        region,
+        host,
+        uri_path,
+        https,
+    })
+}
+
+fn s3_http_url(https: bool, host: &str, path: &str, query: &str) -> String {
+    let scheme = if https { "https" } else { "http" };
+    if query.is_empty() {
+        format!("{scheme}://{host}{path}")
+    } else {
+        format!("{scheme}://{host}{path}?{query}")
+    }
+}
+
+/// `/{bucket}/{key}` with the same per-segment encoding as [`s3_request_target`].
+fn copy_source_header(loc: &S3Location) -> String {
+    let key = loc
+        .key
+        .split('/')
+        .map(urlencoding_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{}/{}", urlencoding_encode(&loc.bucket), key)
+}
+
+impl S3CallCtx {
+    /// SigV4 for one write. Payload hash is SHA-256 of `body` (empty when the
+    /// request has no bytes). `query` is the canonical string, not a blank line.
+    fn sign(
+        &self,
+        verb: &str,
+        query: &str,
+        body: &[u8],
+        extra_signed: &[(&str, &str)],
+    ) -> (String, String, String) {
+        let now = chrono::Utc::now();
+        let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+        let date_stamp = now.format("%Y%m%d").to_string();
+        let payload_hash = sha256_hex(body);
+        let mut headers_to_sign: Vec<(&str, String)> = vec![
+            ("host", self.host.clone()),
+            ("x-amz-content-sha256", payload_hash.clone()),
+            ("x-amz-date", amz_date.clone()),
+        ];
+        if let Some(token) = &self.creds.session_token {
+            headers_to_sign.push(("x-amz-security-token", token.clone()));
+        }
+        for (name, value) in extra_signed {
+            debug_assert!(
+                !name.bytes().any(|b| b.is_ascii_uppercase()),
+                "signed header {name} must be lowercase"
+            );
+            headers_to_sign.push((*name, (*value).to_string()));
+        }
+        headers_to_sign.sort_by(|a, b| a.0.cmp(b.0));
+        let signed_headers = headers_to_sign
+            .iter()
+            .map(|(k, _)| *k)
+            .collect::<Vec<_>>()
+            .join(";");
+        let canonical_headers = headers_to_sign
+            .iter()
+            .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+            .collect::<String>();
+        let canonical_request = format!(
+            "{verb}\n{}\n{query}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            self.uri_path
+        );
+        let credential_scope = format!("{date_stamp}/{}/s3/aws4_request", self.region);
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+            sha256_hex(canonical_request.as_bytes())
+        );
+        let signature = hex::encode(hmac_sha256(
+            &signing_key(&self.creds.secret_key, &date_stamp, &self.region, "s3"),
+            string_to_sign.as_bytes(),
+        ));
+        let authorization = format!(
+            "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+            self.creds.access_key
+        );
+        (authorization, payload_hash, amz_date)
+    }
+
+    /// `extra_signed` names are lowercase and are part of the canonical request.
+    /// `unsigned` is sent but not signed (`If-Match` on PutObject and Complete).
+    fn execute(
+        &self,
+        verb: &str,
+        query_params: &[(&str, &str)],
+        body: &[u8],
+        extra_signed: &[(&str, &str)],
+        unsigned: &[(&str, &str)],
+        upload_id: Option<&str>,
+    ) -> Result<S3HttpResult> {
+        let query = s3_canonical_query(query_params);
+        // Upload id and canonical query only. Never the secret, session token, or Authorization.
+        debug!(
+            "s3 {verb} {} query={query} upload_id={} (auth={:?})",
+            self.uri_path,
+            upload_id.unwrap_or("-"),
+            self.source
+        );
+        let (authorization, payload_hash, amz_date) = self.sign(verb, &query, body, extra_signed);
+        let url = s3_http_url(self.https, &self.host, &self.uri_path, &query);
+        let mut req = ureq::request(verb, &url)
+            .set("User-Agent", USER_AGENT)
+            .set("Authorization", &authorization)
+            .set("x-amz-content-sha256", &payload_hash)
+            .set("x-amz-date", &amz_date);
+        if let Some(token) = &self.creds.session_token {
+            req = req.set("x-amz-security-token", token);
+        }
+        for (name, value) in extra_signed {
+            req = req.set(name, value);
+        }
+        for (name, value) in unsigned {
+            req = req.set(name, value);
+        }
+        let resp = match req.timeout(OBJECT_STORE_IO_TIMEOUT).send_bytes(body) {
+            Ok(resp) => resp,
+            Err(ureq::Error::Status(_, resp)) => resp,
+            Err(e) => {
+                return Err(RemoteError::S3(format!(
+                    "{verb} {} query={query}: {e}",
+                    self.uri_path
+                )));
+            }
+        };
+        let status = resp.status();
+        let etag = resp.header("etag").map(str::to_string);
+        let resp_body = resp.into_string().unwrap_or_default();
+        Ok(S3HttpResult {
+            status,
+            body: resp_body,
+            etag,
+        })
+    }
+}
+
+fn ensure_s3_write_ok(op: &str, resp: &S3HttpResult) -> Result<()> {
+    if resp.status == 412 {
+        return Err(RemoteError::S3(format!(
+            "{op} HTTP 412 precondition failed: {}",
+            resp.body
+        )));
+    }
+    if !(200..300).contains(&resp.status) {
+        return Err(RemoteError::S3(format!(
+            "{op} HTTP {}: {}",
+            resp.status, resp.body
+        )));
+    }
+    Ok(())
+}
+
+fn require_etag(op: &str, resp: &S3HttpResult) -> Result<String> {
+    ensure_s3_write_ok(op, resp)?;
+    if let Some(etag) = resp.etag.as_deref().filter(|s| !s.is_empty()) {
+        return Ok(etag.to_string());
+    }
+    xml_tag_text(&resp.body, "etag")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| RemoteError::S3(format!("{op} response missing ETag")))
+}
+
+fn xml_text(s: &str) -> String {
+    // Quotes stay literal so `<ETag>"abc"</ETag>` matches S3's ETag text.
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn complete_multipart_xml(parts: &[(u32, String)]) -> String {
+    let mut xml = String::from("<CompleteMultipartUpload>");
+    for (number, etag) in parts {
+        xml.push_str("<Part><PartNumber>");
+        xml.push_str(&number.to_string());
+        xml.push_str("</PartNumber><ETag>");
+        xml.push_str(&xml_text(etag));
+        xml.push_str("</ETag></Part>");
+    }
+    xml.push_str("</CompleteMultipartUpload>");
+    xml
+}
+
+fn plan_multipart(len: u64, prefix: u64) -> Result<MultipartPlan> {
+    if prefix > len {
+        return Err(RemoteError::S3(format!(
+            "copy_prefix {prefix} exceeds staged object length {len}"
+        )));
+    }
+    let copy_prefix = prefix >= S3_COPY_PART_MIN;
+    let upload_prefix = prefix > 0 && !copy_prefix;
+    let data_from = if prefix > 0 { prefix } else { 0 };
+    let data_len = len - data_from;
+    let data_parts = if data_len == 0 {
+        0
+    } else {
+        data_len.div_ceil(S3_PUT_PART_BYTES)
+    };
+    let prefix_parts = u64::from(prefix > 0);
+    let empty_object = len == 0;
+    let total = if empty_object {
+        1
+    } else {
+        prefix_parts + data_parts
+    };
+    if total > S3_MULTIPART_MAX_PARTS {
+        return Err(RemoteError::S3(format!(
+            "multipart upload needs {total} parts (limit {S3_MULTIPART_MAX_PARTS}); not widening the 8 MiB part size"
+        )));
+    }
+    Ok(MultipartPlan {
+        copy_prefix,
+        upload_prefix,
+        data_from,
+        empty_object,
+        len,
+        prefix,
+    })
+}
+
+fn read_file_at(file: &mut File, offset: u64, len: usize) -> Result<Vec<u8>> {
+    file.seek(SeekFrom::Start(offset))?;
+    let mut buf = vec![0u8; len];
+    file.read_exact(&mut buf)?;
+    Ok(buf)
+}
+
+fn create_multipart(ctx: &S3CallCtx) -> Result<String> {
+    let resp = ctx.execute("POST", &[("uploads", "")], b"", &[], &[], None)?;
+    ensure_s3_write_ok("CreateMultipartUpload", &resp)?;
+    let id = xml_tag_text(&resp.body, "uploadid")
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            RemoteError::S3(format!(
+                "CreateMultipartUpload response missing UploadId: {}",
+                resp.body
+            ))
+        })?;
+    debug!(
+        "s3 CreateMultipartUpload upload_id={id} (auth={:?})",
+        ctx.source
+    );
+    Ok(id)
+}
+
+fn abort_multipart(ctx: &S3CallCtx, upload_id: &str) -> Result<()> {
+    let resp = ctx.execute(
+        "DELETE",
+        &[("uploadId", upload_id)],
+        b"",
+        &[],
+        &[],
+        Some(upload_id),
+    )?;
+    ensure_s3_write_ok("AbortMultipartUpload", &resp)
+}
+
+fn upload_part(ctx: &S3CallCtx, part_number: u32, upload_id: &str, body: &[u8]) -> Result<String> {
+    let pn = part_number.to_string();
+    let resp = ctx.execute(
+        "PUT",
+        &[("partNumber", pn.as_str()), ("uploadId", upload_id)],
+        body,
+        &[],
+        &[],
+        Some(upload_id),
+    )?;
+    require_etag("UploadPart", &resp)
+}
+
+fn upload_part_copy(
+    ctx: &S3CallCtx,
+    loc: &S3Location,
+    part_number: u32,
+    prefix: u64,
+    if_match: Option<&str>,
+    upload_id: &str,
+) -> Result<String> {
+    let pn = part_number.to_string();
+    // Inclusive end: the half-open span `[0, prefix)` is `bytes=0-{prefix-1}`.
+    let range = format!("bytes=0-{}", prefix - 1);
+    let source = copy_source_header(loc);
+    let mut extra = vec![
+        ("x-amz-copy-source", source.as_str()),
+        ("x-amz-copy-source-range", range.as_str()),
+    ];
+    if let Some(etag) = if_match {
+        extra.push(("x-amz-copy-source-if-match", etag));
+    }
+    let resp = ctx.execute(
+        "PUT",
+        &[("partNumber", pn.as_str()), ("uploadId", upload_id)],
+        b"",
+        &extra,
+        &[],
+        Some(upload_id),
+    )?;
+    require_etag("UploadPartCopy", &resp)
+}
+
+fn complete_multipart(
+    ctx: &S3CallCtx,
+    upload_id: &str,
+    if_match: Option<&str>,
+    parts: &[(u32, String)],
+) -> Result<()> {
+    let xml = complete_multipart_xml(parts);
+    let resp = match if_match {
+        Some(etag) => ctx.execute(
+            "POST",
+            &[("uploadId", upload_id)],
+            xml.as_bytes(),
+            &[],
+            &[("If-Match", etag)],
+            Some(upload_id),
+        )?,
+        None => ctx.execute(
+            "POST",
+            &[("uploadId", upload_id)],
+            xml.as_bytes(),
+            &[],
+            &[],
+            Some(upload_id),
+        )?,
+    };
+    ensure_s3_write_ok("CompleteMultipartUpload", &resp)
+}
+
+fn upload_all_parts(
+    ctx: &S3CallCtx,
+    loc: &S3Location,
+    file: &mut File,
+    if_match: Option<&str>,
+    upload_id: &str,
+    plan: &MultipartPlan,
+) -> Result<()> {
+    let mut part_number: u32 = 1;
+    let mut parts: Vec<(u32, String)> = Vec::new();
+    if plan.copy_prefix {
+        let etag = upload_part_copy(ctx, loc, part_number, plan.prefix, if_match, upload_id)?;
+        parts.push((part_number, etag));
+        part_number += 1;
+    } else if plan.upload_prefix {
+        let n = usize::try_from(plan.prefix).map_err(|_| {
+            RemoteError::S3(format!(
+                "copy prefix {} does not fit in memory",
+                plan.prefix
+            ))
+        })?;
+        let buf = read_file_at(file, 0, n)?;
+        let etag = upload_part(ctx, part_number, upload_id, &buf)?;
+        parts.push((part_number, etag));
+        part_number += 1;
+    }
+    if plan.empty_object {
+        let etag = upload_part(ctx, part_number, upload_id, b"")?;
+        parts.push((part_number, etag));
+    } else {
+        let mut offset = plan.data_from;
+        while offset < plan.len {
+            let n64 = (plan.len - offset).min(S3_PUT_PART_BYTES);
+            let n = usize::try_from(n64)
+                .map_err(|_| RemoteError::S3(format!("part length {n64} does not fit usize")))?;
+            let buf = read_file_at(file, offset, n)?;
+            let etag = upload_part(ctx, part_number, upload_id, &buf)?;
+            parts.push((part_number, etag));
+            part_number += 1;
+            offset += n64;
+        }
+    }
+    complete_multipart(ctx, upload_id, if_match, &parts)
+}
+
+/// PutObject for a body of at most 8 MiB.
+///
+/// `if_match`, when set, is sent as `If-Match` (the ETag from download).
+/// Anonymous credentials are an error. The payload hash is SHA-256 of `body`.
+pub fn put_s3_object(loc: &S3Location, body: &[u8], if_match: Option<&str>) -> Result<()> {
+    let ctx = prepare_s3_write(loc)?;
+    if body.len() as u64 > S3_PUT_PART_BYTES {
+        return Err(RemoteError::S3(format!(
+            "PutObject body is {} bytes; max is {S3_PUT_PART_BYTES} (use multipart)",
+            body.len()
+        )));
+    }
+    let resp = match if_match {
+        Some(etag) => ctx.execute("PUT", &[], body, &[], &[("If-Match", etag)], None)?,
+        None => ctx.execute("PUT", &[], body, &[], &[], None)?,
+    };
+    ensure_s3_write_ok("PutObject", &resp)
+}
+
+/// Multipart upload of a staged file (8 MiB parts).
+///
+/// `copy_prefix` of `None` or `Some(0)` uploads every byte. `Some(n)` with
+/// `n >= 5 MiB` copies `bytes=0-{n-1}` as part 1 and uploads the rest.
+/// A smaller non-zero prefix is a normal `UploadPart` of those bytes (a copy
+/// part below 5 MiB would be rejected). `if_match` is
+/// `x-amz-copy-source-if-match` on the copy and `If-Match` on complete.
+/// Any error after create aborts. A 412 does not call complete.
+/// More than 10_000 parts is an error; the part size stays 8 MiB.
+pub fn put_s3_multipart(
+    loc: &S3Location,
+    staged: &Path,
+    copy_prefix: Option<u64>,
+    if_match: Option<&str>,
+) -> Result<()> {
+    let ctx = prepare_s3_write(loc)?;
+    let mut file = File::open(staged)
+        .map_err(|e| RemoteError::S3(format!("staged file {}: {e}", staged.display())))?;
+    let len = file.metadata()?.len();
+    let prefix = copy_prefix.unwrap_or(0);
+    let plan = plan_multipart(len, prefix)?;
+    let upload_id = create_multipart(&ctx)?;
+    match upload_all_parts(&ctx, loc, &mut file, if_match, &upload_id, &plan) {
+        Ok(()) => Ok(()),
+        Err(e) => match abort_multipart(&ctx, &upload_id) {
+            Ok(()) => Err(e),
+            Err(abort_err) => Err(RemoteError::S3(format!("{e}; abort failed: {abort_err}"))),
+        },
+    }
 }
 
 /// Download `s3://bucket/key` to a tempfile.
@@ -1502,6 +2054,11 @@ pub fn list_s3_prefix_capped(loc: &S3Location, cap: usize) -> Result<Vec<S3ListE
     Ok(out)
 }
 
+/// One lock for every test that mutates `AWS_*` / IMDS env. `folder` and
+/// `index_sibling` tests take this too; separate mutexes raced under `s3_`.
+#[cfg(test)]
+pub(crate) static S3_AWS_ENV_LOCK: Mutex<()> = Mutex::new(());
+
 /// Directory probe: empty key, trailing `/`, or children exist without an exact object.
 ///
 /// ListBucket failures on a non-prefix key (no trailing `/`) are `Ok(false)` so
@@ -1546,8 +2103,6 @@ mod tests {
     use std::thread;
 
     /// Serialize tests that mutate process environment / credential cache.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -1555,7 +2110,9 @@ mod tests {
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = super::S3_AWS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             clear_role_creds_cache();
             let mut saved = Vec::new();
             for &k in keys {
@@ -2503,5 +3060,629 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("invalid range"), "got: {err}");
+    }
+
+    const FIXTURE_SECRET: &str = "fixture-secret-do-not-log";
+
+    struct CaptureLog;
+
+    static CAPTURED_LOGS: StdMutex<Vec<String>> = StdMutex::new(Vec::new());
+
+    impl log::Log for CaptureLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Debug
+                && metadata.target().starts_with("ratarmount_remote")
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            if let Ok(mut lines) = CAPTURED_LOGS.lock() {
+                lines.push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_capture_log() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let _ = log::set_logger(&CaptureLog);
+        });
+        log::set_max_level(log::LevelFilter::Debug);
+    }
+
+    fn captured_logs() -> Vec<String> {
+        CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    fn assert_logs_omit_secret(lines: &[String]) {
+        let redacted: Vec<String> = lines
+            .iter()
+            .map(|l| l.replace(FIXTURE_SECRET, "[secret]"))
+            .collect();
+        assert!(
+            lines.iter().all(|l| !l.contains(FIXTURE_SECRET)),
+            "debug log contains the fixture secret: {redacted:?}"
+        );
+        assert!(
+            lines.iter().all(|l| !l.contains("AWS4-HMAC-SHA256")),
+            "debug log contains an Authorization value: {redacted:?}"
+        );
+    }
+
+    struct OverrideGuard;
+
+    impl OverrideGuard {
+        fn signed(endpoint: &str) -> Self {
+            TEST_S3_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = Some(TestS3Override {
+                    access_key: "AKIA_FIXTURE_KEY".into(),
+                    secret_key: FIXTURE_SECRET.into(),
+                    region: "us-east-1".into(),
+                    endpoint: endpoint.to_string(),
+                    anonymous: false,
+                });
+            });
+            Self
+        }
+
+        fn anonymous(endpoint: &str) -> Self {
+            TEST_S3_OVERRIDE.with(|slot| {
+                *slot.borrow_mut() = Some(TestS3Override {
+                    access_key: String::new(),
+                    secret_key: FIXTURE_SECRET.into(),
+                    region: "us-east-1".into(),
+                    endpoint: endpoint.to_string(),
+                    anonymous: true,
+                });
+            });
+            Self
+        }
+    }
+
+    impl Drop for OverrideGuard {
+        fn drop(&mut self) {
+            TEST_S3_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
+        }
+    }
+
+    #[derive(Clone)]
+    struct CapturedS3Req {
+        method: String,
+        target: String,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    impl CapturedS3Req {
+        fn header(&self, name: &str) -> &str {
+            self.headers
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, v)| v.as_str())
+                .unwrap_or("")
+        }
+
+        fn query(&self) -> &str {
+            self.target.split_once('?').map(|(_, q)| q).unwrap_or("")
+        }
+
+        fn path_only(&self) -> &str {
+            self.target
+                .split_once('?')
+                .map(|(p, _)| p)
+                .unwrap_or(self.target.as_str())
+        }
+    }
+
+    fn summarize_reqs(reqs: &[CapturedS3Req]) -> String {
+        reqs.iter()
+            .map(|r| format!("{} {} body={}", r.method, r.target, r.body.len()))
+            .collect::<Vec<_>>()
+            .join("; ")
+    }
+
+    struct MockReply {
+        status: u16,
+        reason: &'static str,
+        headers: Vec<(String, String)>,
+        body: Vec<u8>,
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Option<CapturedS3Req> {
+        let mut reader = BufReader::new(stream.try_clone().ok()?);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).ok()?;
+        if request_line.is_empty() {
+            return None;
+        }
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or("").to_string();
+        let target = parts.next().unwrap_or("/").to_string();
+        let mut headers = Vec::new();
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).is_err() {
+                break;
+            }
+            if line == "\r\n" || line == "\n" || line.is_empty() {
+                break;
+            }
+            if let Some((k, v)) = line.split_once(':') {
+                headers.push((k.trim().to_ascii_lowercase(), v.trim().to_string()));
+            }
+        }
+        let n = headers
+            .iter()
+            .find(|(k, _)| k == "content-length")
+            .and_then(|(_, v)| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        let mut body = vec![0u8; n];
+        if n > 0 {
+            reader.read_exact(&mut body).ok()?;
+        }
+        Some(CapturedS3Req {
+            method,
+            target,
+            headers,
+            body,
+        })
+    }
+
+    fn mock_s3_write_reply(
+        method: &str,
+        target: &str,
+        headers: &[(String, String)],
+        upload_id: &str,
+        copy_412: bool,
+    ) -> MockReply {
+        let has = |name: &str| headers.iter().any(|(k, _)| k == name);
+        if method == "POST" && target.contains("uploads=") {
+            let body = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\
+                 <InitiateMultipartUploadResult><UploadId>{upload_id}</UploadId>\
+                 </InitiateMultipartUploadResult>"
+            );
+            return MockReply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("Content-Type".into(), "application/xml".into())],
+                body: body.into_bytes(),
+            };
+        }
+        if method == "DELETE" {
+            return MockReply {
+                status: 204,
+                reason: "No Content",
+                headers: Vec::new(),
+                body: Vec::new(),
+            };
+        }
+        if method == "PUT" && has("x-amz-copy-source") {
+            if copy_412 {
+                return MockReply {
+                    status: 412,
+                    reason: "Precondition Failed",
+                    headers: Vec::new(),
+                    body: b"PreconditionFailed".to_vec(),
+                };
+            }
+            return MockReply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("ETag".into(), "\"etag-copy\"".into())],
+                body: b"<CopyPartResult><ETag>\"etag-copy\"</ETag></CopyPartResult>".to_vec(),
+            };
+        }
+        if method == "PUT" {
+            return MockReply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("ETag".into(), "\"etag-part\"".into())],
+                body: Vec::new(),
+            };
+        }
+        if method == "POST" {
+            return MockReply {
+                status: 200,
+                reason: "OK",
+                headers: vec![("Content-Type".into(), "application/xml".into())],
+                body: b"<CompleteMultipartUploadResult></CompleteMultipartUploadResult>".to_vec(),
+            };
+        }
+        MockReply {
+            status: 405,
+            reason: "Method Not Allowed",
+            headers: Vec::new(),
+            body: b"method".to_vec(),
+        }
+    }
+
+    fn write_http(stream: &mut std::net::TcpStream, reply: &MockReply) {
+        let _ = write!(stream, "HTTP/1.1 {} {}\r\n", reply.status, reply.reason);
+        for (k, v) in &reply.headers {
+            let _ = write!(stream, "{k}: {v}\r\n");
+        }
+        let _ = write!(
+            stream,
+            "Content-Length: {}\r\nConnection: close\r\n\r\n",
+            reply.body.len()
+        );
+        let _ = stream.write_all(&reply.body);
+    }
+
+    struct MockS3Write {
+        base_url: String,
+        reqs: Arc<StdMutex<Vec<CapturedS3Req>>>,
+        _join: Option<thread::JoinHandle<()>>,
+    }
+
+    impl MockS3Write {
+        fn spawn(upload_id: &str, copy_412: bool) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let local = listener.local_addr().unwrap();
+            let base_url = format!("http://{local}");
+            let reqs = Arc::new(StdMutex::new(Vec::new()));
+            let reqs_c = Arc::clone(&reqs);
+            let upload_id_owned = upload_id.to_string();
+            let join = thread::spawn(move || {
+                for stream in listener.incoming().take(32) {
+                    let Ok(mut stream) = stream else { continue };
+                    let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+                    let Some(req) = read_http_request(&mut stream) else {
+                        continue;
+                    };
+                    let reply = mock_s3_write_reply(
+                        &req.method,
+                        &req.target,
+                        &req.headers,
+                        &upload_id_owned,
+                        copy_412,
+                    );
+                    reqs_c.lock().unwrap().push(req);
+                    write_http(&mut stream, &reply);
+                }
+            });
+            Self {
+                base_url,
+                reqs,
+                _join: Some(join),
+            }
+        }
+
+        fn requests(&self) -> Vec<CapturedS3Req> {
+            self.reqs.lock().unwrap().clone()
+        }
+    }
+
+    /// Recompute SigV4 from the bytes and query on the wire.
+    /// A signer that hashed `b""` or signed an empty query will not match.
+    fn assert_sigv4_covers(req: &CapturedS3Req) {
+        let auth = req.header("authorization");
+        assert!(
+            auth.starts_with("AWS4-HMAC-SHA256 "),
+            "missing sigv4 authorization on {} {}",
+            req.method,
+            req.target
+        );
+        let signed_headers = auth
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .unwrap_or("")
+            .trim();
+        let signature = auth
+            .split("Signature=")
+            .nth(1)
+            .unwrap_or("")
+            .trim()
+            .to_string();
+        let payload_hash = req.header("x-amz-content-sha256");
+        assert_eq!(
+            payload_hash,
+            sha256_hex(&req.body),
+            "payload hash must be SHA-256 of the bytes sent"
+        );
+        assert_ne!(payload_hash, "UNSIGNED-PAYLOAD");
+        let amz_date = req.header("x-amz-date");
+        assert_eq!(amz_date.len(), 16, "x-amz-date={amz_date}");
+        let date_stamp = &amz_date[..8];
+        let mut canonical_headers = String::new();
+        for name in signed_headers.split(';') {
+            assert!(!name.is_empty(), "empty signed header in {signed_headers}");
+            let value = req.header(name).trim();
+            assert!(
+                !value.is_empty(),
+                "signed header {name} missing on {} {}",
+                req.method,
+                req.target
+            );
+            canonical_headers.push_str(&format!("{name}:{value}\n"));
+        }
+        let canonical = format!(
+            "{}\n{}\n{}\n{canonical_headers}\n{signed_headers}\n{payload_hash}",
+            req.method,
+            req.path_only(),
+            req.query()
+        );
+        let scope = format!("{date_stamp}/us-east-1/s3/aws4_request");
+        let string_to_sign = format!(
+            "AWS4-HMAC-SHA256\n{amz_date}\n{scope}\n{}",
+            sha256_hex(canonical.as_bytes())
+        );
+        let expect = hex::encode(hmac_sha256(
+            &signing_key(FIXTURE_SECRET, date_stamp, "us-east-1", "s3"),
+            string_to_sign.as_bytes(),
+        ));
+        assert_eq!(
+            signature,
+            expect,
+            "signature does not cover canonical query {:?} for {} {}\n{canonical}",
+            req.query(),
+            req.method,
+            req.target
+        );
+    }
+
+    fn write_prefix_file(prefix: u64, suffix: &[u8]) -> NamedTempFile {
+        let mut staged = NamedTempFile::new().unwrap();
+        let chunk = vec![0xABu8; 64 * 1024];
+        let mut left = prefix;
+        while left > 0 {
+            let n = (left as usize).min(chunk.len());
+            staged.write_all(&chunk[..n]).unwrap();
+            left -= n as u64;
+        }
+        staged.write_all(suffix).unwrap();
+        staged.flush().unwrap();
+        staged
+    }
+
+    #[test]
+    fn s3_put_signs_body_hash_not_empty_payload() {
+        install_capture_log();
+        let s3 = MockS3Write::spawn("uid-put", false);
+        let _over = OverrideGuard::signed(&s3.base_url);
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let body = b"put-body-not-empty";
+        let log_from = captured_logs().len();
+        put_s3_object(&loc, body, Some("\"src-etag\"")).unwrap();
+        let logs = captured_logs();
+        let logs = &logs[log_from.min(logs.len())..];
+        let reqs = s3.requests();
+        assert_eq!(reqs.len(), 1, "{}", summarize_reqs(&reqs));
+        let req = &reqs[0];
+        assert_eq!(req.method, "PUT");
+        assert_eq!(req.query(), "", "PutObject signs an empty canonical query");
+        assert_eq!(req.body, body);
+        assert_ne!(req.header("x-amz-content-sha256"), sha256_hex(b""));
+        assert_eq!(req.header("if-match"), "\"src-etag\"");
+        assert_sigv4_covers(req);
+        assert!(
+            logs.iter()
+                .any(|l| l.contains("s3 PUT") && l.contains("query= upload_id=-")),
+            "expected the empty canonical query in the debug log"
+        );
+        assert_logs_omit_secret(logs);
+    }
+
+    #[test]
+    fn s3_multipart_signs_partnumber_and_uploadid() {
+        install_capture_log();
+        let upload_id = "uid-mp-1";
+        let s3 = MockS3Write::spawn(upload_id, false);
+        let _over = OverrideGuard::signed(&s3.base_url);
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let mut staged = NamedTempFile::new().unwrap();
+        let body = b"multipart-body-not-empty";
+        staged.write_all(body).unwrap();
+        staged.flush().unwrap();
+        let log_from = captured_logs().len();
+        put_s3_multipart(&loc, staged.path(), Some(0), Some("\"src-etag\"")).unwrap();
+        let logs = captured_logs();
+        let logs = &logs[log_from.min(logs.len())..];
+        let reqs = s3.requests();
+
+        let create_q = s3_canonical_query(&[("uploads", "")]);
+        assert_eq!(create_q, "uploads=");
+        let create = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.query() == create_q)
+            .unwrap_or_else(|| panic!("missing CreateMultipartUpload: {}", summarize_reqs(&reqs)));
+        assert!(create.body.is_empty());
+        assert_sigv4_covers(create);
+
+        let part_q = s3_canonical_query(&[("partNumber", "1"), ("uploadId", upload_id)]);
+        assert_eq!(part_q, format!("partNumber=1&uploadId={upload_id}"));
+        let part = reqs
+            .iter()
+            .find(|r| r.method == "PUT" && r.query() == part_q)
+            .unwrap_or_else(|| panic!("missing UploadPart: {}", summarize_reqs(&reqs)));
+        assert_eq!(part.body, body);
+        assert_ne!(part.header("x-amz-content-sha256"), sha256_hex(b""));
+        assert!(
+            part.header("x-amz-copy-source").is_empty(),
+            "prefix 0 must not UploadPartCopy"
+        );
+        assert_sigv4_covers(part);
+
+        let complete_q = s3_canonical_query(&[("uploadId", upload_id)]);
+        assert!(!complete_q.contains("partNumber"));
+        let complete = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.query() == complete_q)
+            .unwrap_or_else(|| {
+                panic!("missing CompleteMultipartUpload: {}", summarize_reqs(&reqs))
+            });
+        let complete_xml = String::from_utf8(complete.body.clone()).unwrap();
+        assert!(
+            complete_xml.contains("\"etag-part\""),
+            "complete body lost the part etag: {complete_xml}"
+        );
+        assert_eq!(complete.header("if-match"), "\"src-etag\"");
+        assert_sigv4_covers(complete);
+
+        assert!(
+            logs.iter().any(|l| l.contains(&format!("query={part_q}"))),
+            "log must include the signed part query, not only the verb"
+        );
+        assert!(logs.iter().any(|l| l.contains("query=uploads=")));
+        assert!(logs
+            .iter()
+            .any(|l| { l.contains("s3 POST") && l.contains(&format!("query={complete_q}")) }));
+        assert_logs_omit_secret(logs);
+    }
+
+    #[test]
+    fn s3_upload_part_copy_range_is_inclusive_and_if_match() {
+        install_capture_log();
+        let upload_id = "uid-copy-1";
+        let s3 = MockS3Write::spawn(upload_id, false);
+        let _over = OverrideGuard::signed(&s3.base_url);
+        let prefix = S3_COPY_PART_MIN;
+        let suffix = b"SUFFIX!!";
+        let staged = write_prefix_file(prefix, suffix);
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let etag = "\"src-etag\"";
+        let log_from = captured_logs().len();
+        put_s3_multipart(&loc, staged.path(), Some(prefix), Some(etag)).unwrap();
+        let logs = captured_logs();
+        let logs = &logs[log_from.min(logs.len())..];
+        let reqs = s3.requests();
+
+        let copy_q = s3_canonical_query(&[("partNumber", "1"), ("uploadId", upload_id)]);
+        let copy = reqs
+            .iter()
+            .find(|r| r.method == "PUT" && r.query() == copy_q)
+            .unwrap_or_else(|| panic!("missing UploadPartCopy: {}", summarize_reqs(&reqs)));
+        let range = format!("bytes=0-{}", prefix - 1);
+        assert_eq!(copy.header("x-amz-copy-source-range"), range);
+        assert_ne!(
+            copy.header("x-amz-copy-source-range"),
+            format!("bytes=0-{prefix}"),
+            "copy range end is inclusive, not the prefix length"
+        );
+        assert_eq!(copy.header("x-amz-copy-source-if-match"), etag);
+        assert_eq!(copy.header("x-amz-copy-source"), "/mybucket/dir/obj.bin");
+        assert!(copy.body.is_empty(), "UploadPartCopy sends no body");
+        assert_sigv4_covers(copy);
+        let signed = copy
+            .header("authorization")
+            .split("SignedHeaders=")
+            .nth(1)
+            .and_then(|s| s.split(',').next())
+            .unwrap_or("");
+        for name in [
+            "x-amz-copy-source",
+            "x-amz-copy-source-if-match",
+            "x-amz-copy-source-range",
+        ] {
+            assert!(
+                signed.split(';').any(|h| h == name),
+                "SignedHeaders={signed} missing {name}"
+            );
+        }
+
+        let part2_q = s3_canonical_query(&[("partNumber", "2"), ("uploadId", upload_id)]);
+        let part2 = reqs
+            .iter()
+            .find(|r| r.method == "PUT" && r.query() == part2_q)
+            .unwrap_or_else(|| panic!("missing suffix UploadPart: {}", summarize_reqs(&reqs)));
+        assert_eq!(part2.body, suffix);
+        assert_sigv4_covers(part2);
+
+        let complete_q = s3_canonical_query(&[("uploadId", upload_id)]);
+        let complete = reqs
+            .iter()
+            .find(|r| r.method == "POST" && r.query() == complete_q)
+            .unwrap_or_else(|| panic!("missing complete: {}", summarize_reqs(&reqs)));
+        assert_eq!(complete.header("if-match"), etag);
+        assert_sigv4_covers(complete);
+        assert_logs_omit_secret(logs);
+    }
+
+    #[test]
+    fn s3_copy_412_does_not_complete() {
+        install_capture_log();
+        let upload_id = "uid-copy-412";
+        let s3 = MockS3Write::spawn(upload_id, true);
+        let _over = OverrideGuard::signed(&s3.base_url);
+        let prefix = S3_COPY_PART_MIN;
+        let staged = write_prefix_file(prefix, b"SUFFIX!!");
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let log_from = captured_logs().len();
+        let err = put_s3_multipart(&loc, staged.path(), Some(prefix), Some("\"src-etag\""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("412"), "{err}");
+        let reqs = s3.requests();
+        let puts: Vec<_> = reqs.iter().filter(|r| r.method == "PUT").collect();
+        assert_eq!(puts.len(), 1, "{}", summarize_reqs(&reqs));
+        let range = format!("bytes=0-{}", prefix - 1);
+        assert_eq!(puts[0].header("x-amz-copy-source-range"), range);
+        assert_eq!(puts[0].header("x-amz-copy-source-if-match"), "\"src-etag\"");
+        assert_eq!(
+            puts[0].query(),
+            s3_canonical_query(&[("partNumber", "1"), ("uploadId", upload_id)])
+        );
+        assert_sigv4_covers(puts[0]);
+        assert!(
+            !reqs.iter().any(|r| {
+                r.method == "POST" && r.query().split('&').any(|p| p.starts_with("uploadId="))
+            }),
+            "412 must not CompleteMultipartUpload: {}",
+            summarize_reqs(&reqs)
+        );
+        let abort_q = s3_canonical_query(&[("uploadId", upload_id)]);
+        let abort = reqs
+            .iter()
+            .find(|r| r.method == "DELETE" && r.query() == abort_q)
+            .unwrap_or_else(|| panic!("missing abort: {}", summarize_reqs(&reqs)));
+        assert_sigv4_covers(abort);
+        let logs = captured_logs();
+        let logs = &logs[log_from.min(logs.len())..];
+        assert!(logs
+            .iter()
+            .any(|l| l.contains(&format!("query={}", puts[0].query()))));
+        assert!(
+            !logs.iter().any(|l| {
+                l.contains("s3 POST") && l.contains(&format!("query=uploadId={upload_id}"))
+            }),
+            "log must not record CompleteMultipartUpload for {upload_id}"
+        );
+        assert_logs_omit_secret(logs);
+    }
+
+    #[test]
+    fn s3_anonymous_put_errors() {
+        install_capture_log();
+        let s3 = MockS3Write::spawn("uid-anon", false);
+        let _over = OverrideGuard::anonymous(&s3.base_url);
+        let loc = parse_s3_url("s3://mybucket/dir/obj.bin").unwrap();
+        let log_from = captured_logs().len();
+        let err = put_s3_object(&loc, b"nope", Some("\"etag\""))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("anonymous"), "{err}");
+        let err = put_s3_multipart(&loc, Path::new("/no/such/staged-object"), None, None)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("anonymous"),
+            "auth must fail before opening the staged file: {err}"
+        );
+        assert!(
+            s3.requests().is_empty(),
+            "anonymous PUT must not hit the network"
+        );
+        let logs = captured_logs();
+        assert_logs_omit_secret(&logs[log_from.min(logs.len())..]);
     }
 }
