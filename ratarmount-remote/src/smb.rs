@@ -149,7 +149,7 @@ pub const SMB_CLIENT_PASSWORD_ENV: &str = "RATARMOUNT_SMB_CLIENT_PASSWORD";
 /// Inbound SMB domain. Not read from the export server's environment.
 pub const SMB_CLIENT_DOMAIN_ENV: &str = "RATARMOUNT_SMB_CLIENT_DOMAIN";
 
-fn env_nonempty(key: &str) -> Option<String> {
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
     std::env::var(key)
         .ok()
         .map(|s| s.trim().to_string())

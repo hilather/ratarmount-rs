@@ -29,7 +29,8 @@ use md5::Md5;
 use sha2::Sha256;
 
 use crate::smb::{
-    parse_smb_url, SmbLocation, SMB_CLIENT_DOMAIN_ENV, SMB_CLIENT_PASSWORD_ENV, SMB_CLIENT_USER_ENV,
+    env_nonempty, parse_smb_url, SmbLocation, SMB_CLIENT_DOMAIN_ENV, SMB_CLIENT_PASSWORD_ENV,
+    SMB_CLIENT_USER_ENV,
 };
 use crate::{RemoteError, Result};
 
@@ -62,6 +63,8 @@ const FILE_READ_ACCESS: u32 = 0x0012_0089;
 const TYPE3_FLAGS: u32 = 0x2088_8201;
 const FILETIME_UNIX_EPOCH: u64 = 116_444_736_000_000_000;
 const IO_TIMEOUT: Duration = Duration::from_secs(15);
+/// Drop must not wait out [`IO_TIMEOUT`] when the server is already dead.
+const CLOSE_TIMEOUT: Duration = Duration::from_millis(200);
 
 type HmacSha256 = Hmac<Sha256>;
 type HmacMd5 = Hmac<Md5>;
@@ -234,9 +237,16 @@ pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
     let mut conn = SmbConn::connect(&loc)?;
     conn.negotiate()?;
     if conn.signing_required && creds.password.is_none() {
-        info!("SMB signing required and client is guest");
+        // A named user with no password is still unsigned, but it is not guest.
+        if creds.user.is_empty() {
+            info!("SMB signing required and client is guest");
+            return Err(RemoteError::Smb(
+                "SMB server requires signing; guest sessions are unsigned".into(),
+            ));
+        }
+        info!("SMB signing required and no client password is set");
         return Err(RemoteError::Smb(
-            "SMB server requires signing; guest sessions are unsigned".into(),
+            "SMB server requires signing and no client password is set".into(),
         ));
     }
     conn.session_setup(&creds)?;
@@ -257,29 +267,30 @@ pub fn open_smb_range(url_str: &str) -> Result<SmbRangeFile> {
 }
 
 fn client_creds(loc: &SmbLocation) -> ClientCreds {
-    if loc.user.is_some() || loc.password.is_some() || loc.domain.is_some() {
-        return ClientCreds {
-            user: loc.user.clone().unwrap_or_default(),
-            password: nonempty_opt(loc.password.clone()),
-            domain: loc.domain.clone().unwrap_or_default(),
+    let (mut user, password, domain) =
+        if loc.user.is_some() || loc.password.is_some() || loc.domain.is_some() {
+            (
+                loc.user.clone().unwrap_or_default(),
+                loc.password.clone().filter(|s| !s.is_empty()),
+                loc.domain.clone().unwrap_or_default(),
+            )
+        } else {
+            (
+                env_nonempty(SMB_CLIENT_USER_ENV).unwrap_or_default(),
+                env_nonempty(SMB_CLIENT_PASSWORD_ENV),
+                env_nonempty(SMB_CLIENT_DOMAIN_ENV).unwrap_or_default(),
+            )
         };
+    // Password with no username is the same `guest` smbclient puts in `-U`.
+    // A URL user, when present, is already in `user` and wins.
+    if password.is_some() && user.is_empty() {
+        user = "guest".to_string();
     }
     ClientCreds {
-        user: env_nonempty(SMB_CLIENT_USER_ENV).unwrap_or_default(),
-        password: env_nonempty(SMB_CLIENT_PASSWORD_ENV),
-        domain: env_nonempty(SMB_CLIENT_DOMAIN_ENV).unwrap_or_default(),
+        user,
+        password,
+        domain,
     }
-}
-
-fn nonempty_opt(v: Option<String>) -> Option<String> {
-    v.filter(|s| !s.is_empty())
-}
-
-fn env_nonempty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 fn read_stop(status: u32, data_len: usize) -> Result<ReadStop> {
@@ -392,6 +403,11 @@ impl SmbConn {
         let (challenge, av) = ntlm_type2_parts(sec)?;
         let password = creds.password.as_deref().unwrap_or("");
         let (t3, key) = ntlm_type3_v2(&creds.user, &creds.domain, password, challenge, &av);
+        // The Type3 request stays unsigned. The key is known now, so the
+        // Type3 response and everything after it must be signed.
+        if creds.password.is_some() || self.signing_required {
+            self.session_key = Some(key);
+        }
         let resp2 = self.transact(SMB2_SESSION_SETUP, &session_setup_body(&t3))?;
         let st2 = header_status(&resp2)?;
         if st2 != STATUS_SUCCESS {
@@ -399,12 +415,7 @@ impl SmbConn {
                 "SMB SESSION_SETUP Type3 status {st2:#010x}"
             )));
         }
-        // Sign after the second SESSION_SETUP when a password is set, or when
-        // the server requires signing (guest + required already failed).
-        if creds.password.is_some() || self.signing_required {
-            self.session_key = Some(key);
-            self.sign = true;
-        }
+        self.sign = self.session_key.is_some();
         Ok(())
     }
 
@@ -492,6 +503,9 @@ impl SmbConn {
             return;
         }
         self.closed = true;
+        // READ keeps [`IO_TIMEOUT`]. CLOSE is best-effort and must not stall Drop.
+        let _ = self.stream.set_read_timeout(Some(CLOSE_TIMEOUT));
+        let _ = self.stream.set_write_timeout(Some(CLOSE_TIMEOUT));
         let mut body = vec![0u8; 24];
         body[0..2].copy_from_slice(&24u16.to_le_bytes());
         body[8..24].copy_from_slice(&fid);
@@ -499,6 +513,7 @@ impl SmbConn {
     }
 
     fn transact(&mut self, command: u16, body: &[u8]) -> Result<Vec<u8>> {
+        let message_id = self.message_id;
         let hdr = Smb2Header {
             credit_charge: 1,
             status: 0,
@@ -506,7 +521,7 @@ impl SmbConn {
             credits: 1,
             flags: 0,
             next_command: 0,
-            message_id: self.message_id,
+            message_id,
             process_id: 0xfeff,
             tree_id: self.tree_id,
             session_id: self.session_id,
@@ -522,6 +537,16 @@ impl SmbConn {
         write_frame(&mut self.stream, &pkt)?;
         let resp = read_frame(&mut self.stream)?;
         let rh = parse_smb2_header(&resp)?;
+        if let Some(key) = self.session_key {
+            if !smb2_verify_packet(&resp, &key) {
+                return Err(RemoteError::Smb("SMB response signature mismatch".into()));
+            }
+        }
+        if rh.command != command || rh.message_id != message_id {
+            return Err(RemoteError::Smb(
+                "SMB response command or message id does not match the request".into(),
+            ));
+        }
         if command == SMB2_SESSION_SETUP && rh.session_id != 0 {
             self.session_id = rh.session_id;
         }
@@ -686,6 +711,39 @@ fn smb2_sign_packet(msg: &mut [u8], session_key: &[u8; 16]) {
     mac.update(msg);
     let sig = mac.finalize().into_bytes();
     msg[48..64].copy_from_slice(&sig[..16]);
+}
+
+/// HMAC-SHA256 over the packet with signature bytes 48..64 forced to zero.
+fn smb2_verify_packet(msg: &[u8], session_key: &[u8; 16]) -> bool {
+    if msg.len() < SMB2_HEADER_LEN {
+        return false;
+    }
+    let Ok(flags) = u32_at(msg, 16) else {
+        return false;
+    };
+    if flags & SMB2_FLAGS_SIGNED == 0 {
+        return false;
+    }
+    let got = &msg[48..64];
+    let mut mac = HmacSha256::new_from_slice(session_key).expect("HMAC-SHA256 key");
+    mac.update(&msg[..48]);
+    mac.update(&[0u8; 16]);
+    if msg.len() > SMB2_HEADER_LEN {
+        mac.update(&msg[SMB2_HEADER_LEN..]);
+    }
+    let computed = mac.finalize().into_bytes();
+    ct_eq(&computed[..16], got)
+}
+
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut d = 0u8;
+    for (x, y) in a.iter().zip(b.iter()) {
+        d |= x ^ y;
+    }
+    d == 0
 }
 
 fn write_frame(stream: &mut TcpStream, payload: &[u8]) -> Result<()> {
@@ -954,6 +1012,13 @@ mod tests {
         EmptySuccess,
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum ReadTamper {
+        None,
+        FlipPayload,
+        ClearSignature,
+    }
+
     struct Script {
         dialect: u16,
         security_mode: u16,
@@ -969,6 +1034,7 @@ mod tests {
         password: Option<String>,
         challenge: [u8; 8],
         max_reads: u32,
+        read_tamper: ReadTamper,
     }
 
     fn script_file(file: &[u8]) -> Script {
@@ -987,6 +1053,7 @@ mod tests {
             password: None,
             challenge: CHALLENGE,
             max_reads: 128,
+            read_tamper: ReadTamper::None,
         }
     }
 
@@ -1075,7 +1142,26 @@ mod tests {
             }
             meta.response_status = status;
             seen.lock().unwrap_or_else(|e| e.into_inner()).push(meta);
-            encode_packet(&rh, &body)
+            let mut pkt = encode_packet(&rh, &body);
+            if let Some(key) = self.session_key {
+                smb2_sign_packet(&mut pkt, &key);
+            }
+            if hdr.command == SMB2_READ {
+                match self.script.read_tamper {
+                    ReadTamper::FlipPayload => {
+                        if pkt.len() > 80 {
+                            pkt[80] ^= 0xff;
+                        }
+                    }
+                    ReadTamper::ClearSignature => {
+                        if pkt.len() >= SMB2_HEADER_LEN {
+                            pkt[48..64].fill(0);
+                        }
+                    }
+                    ReadTamper::None => {}
+                }
+            }
+            pkt
         }
 
         fn dispatch(
@@ -1708,10 +1794,12 @@ mod tests {
         let unit_key = [7u8; 16];
         smb2_sign_packet(&mut garbage, &unit_key);
         assert!(
-            sig_ok(&garbage, &Some(unit_key)),
+            smb2_verify_packet(&garbage, &unit_key),
             "signature must be HMAC-SHA256 over the packet with bytes 48..64 zeroed"
         );
         assert_ne!(&garbage[48..64], &[0x5a; 16]);
+        garbage[70] ^= 0xff;
+        assert!(!smb2_verify_packet(&garbage, &unit_key));
 
         let env = EnvGuard::acquire(ENV_KEYS);
         env.set(SMB_CLIENT_USER_ENV, "alice");
@@ -1772,6 +1860,82 @@ mod tests {
             ACCESS_DENIED,
             "unsigned READ must fail"
         );
+
+        // A flipped READ payload or a cleared signature must fail read_at.
+        for tamper in [ReadTamper::FlipPayload, ReadTamper::ClearSignature] {
+            let mut script = script_file(b"signed-payload");
+            script.password = Some("client-pw".into());
+            script.challenge = CHALLENGE;
+            script.read_tamper = tamper;
+            let running = serve(script);
+            let mut f = open_smb_range(&url_for(&running)).expect("open before tampered read");
+            let mut buf = vec![0u8; b"signed-payload".len()];
+            let err = f.read_at(0, &mut buf).expect_err("tampered READ");
+            assert!(
+                err.to_string().contains("signature"),
+                "tamper {tamper:?}: {err}"
+            );
+            assert!(
+                buf.iter().all(|b| *b == 0),
+                "read_at returned tampered bytes ({tamper:?}): {buf:?}"
+            );
+        }
+    }
+
+    /// Regression: a client password with no username is NTLMv2 user `guest`.
+    #[test]
+    fn smb_guest_password_without_username() {
+        let pw = "only-client-pw";
+        let env = EnvGuard::acquire(ENV_KEYS);
+        env.set(SMB_CLIENT_PASSWORD_ENV, pw);
+        env.set("RATARMOUNT_SMB_PASSWORD", EXPORT_PW);
+        env.set("RATARMOUNT_SMB_USER", EXPORT_USER);
+        let loc = crate::SmbLocation {
+            host: "h".into(),
+            port: 445,
+            share: "pub".into(),
+            path: "a.tar".into(),
+            user: None,
+            password: None,
+            domain: None,
+        };
+        let args = crate::smbclient_download_args(&loc, std::path::Path::new("/tmp/x"));
+        let joined = args.join("\n");
+        assert!(
+            args.contains(&format!("guest%{pw}")),
+            "smbclient argv: {args:?}"
+        );
+        assert!(!joined.contains(EXPORT_PW), "{args:?}");
+        assert!(!joined.contains(EXPORT_USER), "{args:?}");
+        let url_user = crate::SmbLocation {
+            user: Some("alice".into()),
+            password: Some(pw.into()),
+            ..loc
+        };
+        let args = crate::smbclient_download_args(&url_user, std::path::Path::new("/tmp/x"));
+        assert!(args.contains(&format!("alice%{pw}")), "{args:?}");
+        assert!(
+            !args.iter().any(|a| a.starts_with("guest%")),
+            "URL user must win: {args:?}"
+        );
+
+        let mut script = script_file(b"guest-user");
+        script.password = Some(pw.into());
+        let running = serve(script);
+        let f = open_smb_range(&url_for(&running)).expect("guest-named password open");
+        drop(f);
+        let seen = snapshot(&running);
+        assert!(seen.iter().all(|s| !bytes_contain(&s.raw, EXPORT_PW)));
+        assert!(seen.iter().all(|s| !bytes_contain(&s.raw, EXPORT_USER)));
+        let setups: Vec<_> = seen
+            .iter()
+            .filter(|s| s.command == SMB2_SESSION_SETUP)
+            .collect();
+        let t3 = parse_type3(&setups[1].sec).expect("type3");
+        assert_eq!(t3.user, "guest");
+        let rk = ntlmv2_response_key_nt(pw, "guest", &t3.domain);
+        let proof = ntlmv2_nt_proof(&rk, CHALLENGE, &t3.nt_response[16..]);
+        assert_eq!(&t3.nt_response[..16], &proof[..]);
     }
 
     #[test]

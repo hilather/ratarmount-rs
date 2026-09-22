@@ -18,9 +18,10 @@
 //!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
 //!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
-//! - `smb://` → sync SMB 2.0.2 range reads ([`open_smb_range`] / [`SmbRangeFile`]).
-//!   `smbclient` remains a download helper. Inbound credentials are
-//!   `RATARMOUNT_SMB_CLIENT_*`, never the export server's `RATARMOUNT_SMB_PASSWORD`.
+//! - `smb://` → [`open_smb_range`] / [`SmbRangeFile`] is the SMB 2.0.2 range API.
+//!   The default `smb://` resolver is still `smbclient` ([`fetch_smb_to_temp`]) until
+//!   dispatch lands. Inbound credentials are `RATARMOUNT_SMB_CLIENT_*`, never the
+//!   export server's `RATARMOUNT_SMB_PASSWORD`.
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
