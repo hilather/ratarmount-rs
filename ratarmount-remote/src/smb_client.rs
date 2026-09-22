@@ -403,8 +403,9 @@ impl SmbConn {
         let (challenge, av) = ntlm_type2_parts(sec)?;
         let password = creds.password.as_deref().unwrap_or("");
         let (t3, key) = ntlm_type3_v2(&creds.user, &creds.domain, password, challenge, &av);
-        // The Type3 request stays unsigned. The key is known now, so the
-        // Type3 response and everything after it must be signed.
+        // The Type3 request stays unsigned. The key is known so a signed
+        // Type3 response can be checked. An unsigned failure (wrong password)
+        // is returned as its NT status; STATUS_SUCCESS still requires a signature.
         if creds.password.is_some() || self.signing_required {
             self.session_key = Some(key);
         }
@@ -538,7 +539,13 @@ impl SmbConn {
         let resp = read_frame(&mut self.stream)?;
         let rh = parse_smb2_header(&resp)?;
         if let Some(key) = self.session_key {
-            if !smb2_verify_packet(&resp, &key) {
+            // SESSION_SETUP may be unsigned when the server rejects the logon
+            // before it has a key. STATUS_SUCCESS and every later command still
+            // require a valid HMAC. A set FLAGS_SIGNED is always verified.
+            let signed = rh.flags & SMB2_FLAGS_SIGNED != 0;
+            let allow_unsigned =
+                command == SMB2_SESSION_SETUP && !signed && rh.status != STATUS_SUCCESS;
+            if !allow_unsigned && !smb2_verify_packet(&resp, &key) {
                 return Err(RemoteError::Smb("SMB response signature mismatch".into()));
             }
         }
@@ -1880,6 +1887,23 @@ mod tests {
                 "read_at returned tampered bytes ({tamper:?}): {buf:?}"
             );
         }
+    }
+
+    /// Regression: wrong password, unsigned Type3 failure is `0xC000006D`, not a signature error.
+    #[test]
+    fn smb_ntlmv2_unsigned_logon_failure_is_nt_status() {
+        let env = EnvGuard::acquire(ENV_KEYS);
+        env.set(SMB_CLIENT_USER_ENV, "alice");
+        env.set(SMB_CLIENT_PASSWORD_ENV, "client-pw");
+        env.set(SMB_CLIENT_DOMAIN_ENV, "CORP");
+        let mut script = script_file(b"nope");
+        script.password = Some("server-does-not-match".into());
+        script.challenge = CHALLENGE;
+        let running = serve(script);
+        let err = open_smb_range(&url_for(&running)).expect_err("wrong password");
+        let msg = err.to_string();
+        assert!(msg.to_ascii_lowercase().contains("c000006d"), "{msg}");
+        assert!(!msg.to_ascii_lowercase().contains("signature"), "{msg}");
     }
 
     /// Regression: a client password with no username is NTLMv2 user `guest`.
