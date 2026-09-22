@@ -817,6 +817,10 @@ fn main() {
             eprintln!("error: currently only modifications to a single archive may be committed");
             std::process::exit(2);
         }
+        if let Some(msg) = overlay_commit::offline_remote_commit_error(archive) {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
+        }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
             overlay_commit::CreateMissingContext::OfflineCommit,
@@ -928,7 +932,7 @@ fn main() {
         Some(false)
     };
 
-    let open_opts = OpenOptions {
+    let mut open_opts = OpenOptions {
         recursive: args.recursive,
         ignore_zeros: args.ignore_zeros,
         gnu_incremental,
@@ -997,7 +1001,7 @@ fn main() {
 
     let mut bundle = match factory::build_mount_source_ex(
         &inputs,
-        &open_opts,
+        &mut open_opts,
         args.recreate_index && !args.no_recreate_index,
         factory::CompositingOptions {
             recursive: args.recursive || args.recursion_depth != 0,
@@ -1178,6 +1182,11 @@ fn main() {
     };
     if args.commit_overlay_on_exit || commit_interval.is_some() {
         overlay_commit::install_term_signal_flag();
+    }
+    if let (Some(ov), Some(archive)) = (overlay_arc.as_ref(), live_commit_archive.as_ref()) {
+        if archive.to_string_lossy().starts_with("s3://") {
+            overlay_commit::install_s3_live_commit(ov, archive, &open_opts);
+        }
     }
 
     if args.no_mount {
@@ -3931,6 +3940,39 @@ mod create_missing_cli_tests {
         fs::write(path, bytes).unwrap();
     }
 
+    #[test]
+    fn s3_commit_offline_rejected() {
+        let msg = crate::overlay_commit::offline_remote_commit_error(std::path::Path::new(
+            "s3://bucket/a.tar",
+        ))
+        .expect("s3 offline commit is rejected");
+        assert!(msg.contains("does not upload"), "{msg}");
+        assert!(
+            crate::overlay_commit::offline_remote_commit_error(std::path::Path::new("a.tar"))
+                .is_none()
+        );
+        if skip_no_bin() {
+            eprintln!("skip: ratarmount binary not next to the test exe");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        fs::create_dir_all(&ov).unwrap();
+        let out = run_cli(
+            &[
+                "--commit-overlay",
+                "-w",
+                ov.to_str().unwrap(),
+                "s3://bucket/a.tar",
+            ],
+            dir.path(),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains("does not upload"), "{err}");
+        assert!(!err.to_ascii_lowercase().contains("aws_secret"), "{err}");
+    }
+
     /// Regression: missing archive.tar is not found without -w
     #[test]
     fn create_missing_without_w_does_not_create() {
@@ -3938,7 +3980,7 @@ mod create_missing_cli_tests {
         let archive = dir.path().join("archive.tar");
         let err = match factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         ) {
@@ -4065,7 +4107,7 @@ mod create_missing_cli_tests {
         assert_eq!(fs::read(&gz).unwrap(), before_gz);
         factory::build_mount_source_ex(
             std::slice::from_ref(&gz),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )
@@ -4105,7 +4147,7 @@ mod create_missing_cli_tests {
         );
         let err = match factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         ) {
@@ -4216,7 +4258,7 @@ mod create_missing_cli_tests {
         assert!(bytes.iter().all(|&b| b == 0));
         factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )
@@ -4369,7 +4411,7 @@ mod create_missing_cli_tests {
         );
         factory::build_mount_source_ex(
             std::slice::from_ref(&dest),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )

@@ -116,18 +116,18 @@ fn apply_remote_index_discovery(
     }
 
     if ratarmount_remote::is_object_store_archive_url(input) {
-        if try_object_store_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
+        // No explicit `--index-file`: keep the meta-v3 blob as `index_file_path`
+        // so interval commit patches that file. An explicit path still wins.
+        let object_dest = if opts.index_file_path.is_some() {
+            cache_dest.as_deref()
+        } else {
+            None
+        };
+        if try_object_store_pointer_then_blob(opts, input, archive_size, object_dest) {
             return Ok(());
         }
         for cand in object_store_sibling_index_candidates(input) {
-            if try_fetch_object_store_index(
-                opts,
-                &cand,
-                archive_size,
-                input,
-                cache_dest.as_deref(),
-                None,
-            ) {
+            if try_fetch_object_store_index(opts, &cand, archive_size, input, object_dest, None) {
                 return Ok(());
             }
             log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
@@ -568,38 +568,50 @@ fn try_fetch_object_store_index(
     cache_dest: Option<&Path>,
     expected_id: Option<&str>,
 ) -> bool {
-    match ratarmount_remote::fetch_index_sibling_to_temp(index_url) {
-        Ok(path) => {
-            let path = match materialize_fetched_index(path) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
-                    return false;
-                }
-            };
-            if let Some(id) = expected_id {
-                if !blob_matches_index_id(&path, id) {
-                    log::warn!("index blob sha256 != pointer {id}; continue discovery");
-                    let _ = std::fs::remove_file(&path);
-                    return false;
-                }
-            }
-            let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
-            try_install_remote_index(
-                opts,
-                path,
-                archive_size,
-                prefix.as_deref(),
-                suffix.as_deref(),
-                full.as_deref(),
-                cache_dest,
-            )
-        }
+    let cache = MetaCache::from_env();
+    let identity = cache_identity("object-store", index_url);
+    let fetched = match cache.get_or_fetch_path(&identity, None, || {
+        ratarmount_remote::fetch_index_sibling_to_temp(index_url)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }) {
+        Ok(p) => p,
         Err(e) => {
             log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
-            false
+            return false;
+        }
+    };
+    let path = match materialize_fetched_index(fetched.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
+            invalidate_meta_cache_identity("object-store", index_url);
+            return false;
+        }
+    };
+    if let Some(id) = expected_id {
+        if !blob_matches_index_id(&path, id) {
+            log::warn!("index blob sha256 != pointer {id}; continue discovery");
+            invalidate_meta_cache_identity("object-store", index_url);
+            if !is_meta_cache_path(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+            return false;
         }
     }
+    let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
+    let ok = try_install_remote_index(
+        opts,
+        path,
+        archive_size,
+        prefix.as_deref(),
+        suffix.as_deref(),
+        full.as_deref(),
+        cache_dest,
+    );
+    if !ok {
+        invalidate_meta_cache_identity("object-store", index_url);
+    }
+    ok
 }
 
 fn try_install_remote_index(
@@ -853,7 +865,7 @@ pub(super) fn materialize_remote_input(
 /// Open a remote URL: folder probe, live Range, OCI layer union, else materialize.
 pub(super) fn open_remote_input(
     input: &str,
-    opts: &OpenOptions,
+    opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
@@ -997,24 +1009,22 @@ pub(super) fn open_remote_input(
     match access {
         RemoteAccess::Http(RemoteHttp::Range(range)) => {
             let len = range.len();
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             let input_owned = input.to_string();
-            match open_from_live_range(range, len, input, &opts, recreate, "HTTP Range", || {
+            match open_from_live_range(range, len, input, opts, recreate, "HTTP Range", || {
                 // Buffered fallback is still Read+Seek-usable for rebuild.
                 ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
-                None => materialize_remote_input(input, &opts, recreate, remotes),
+                None => materialize_remote_input(input, opts, recreate, remotes),
             }
         }
         RemoteAccess::Http(RemoteHttp::Materialized(remote)) => {
             let path = remote.path().to_path_buf();
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             remotes.push(remote);
-            let src = open_path(&path, &opts, recreate)?;
+            let src = open_path(&path, opts, recreate)?;
             Ok((path, src))
         }
         RemoteAccess::Path(remote) => {
@@ -1029,7 +1039,7 @@ pub(super) fn open_remote_input(
 /// Shared Range-or-materialize path for S3-shaped readers (`uses_ranges` + `len`).
 fn open_s3_like<R, Reopen>(
     input: &str,
-    opts: &OpenOptions,
+    opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     transport: &str,
@@ -1044,15 +1054,14 @@ where
         Ok(range) if range.live_ranges() => {
             let len = range.body_len();
             eprintln!("{transport}: {input} ({len} bytes, live Range)");
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
-            match open_from_live_range(range, len, input, &opts, recreate, transport, || {
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
+            match open_from_live_range(range, len, input, opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
                 None => {
                     eprintln!("info: {transport} format unsupported for {input}; materializing");
-                    materialize_remote_input(input, &opts, recreate, remotes)
+                    materialize_remote_input(input, opts, recreate, remotes)
                 }
             }
         }
@@ -1061,10 +1070,9 @@ where
             eprintln!(
                 "info: {transport} unavailable for {input} (full body buffered); materializing"
             );
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             drop(range);
-            materialize_remote_input(input, &opts, recreate, remotes)
+            materialize_remote_input(input, opts, recreate, remotes)
         }
         Err(e) => {
             eprintln!("info: {transport} open failed for {input}: {e}; materializing");
@@ -2300,6 +2308,66 @@ mod tests {
             !logged.iter().any(|k| k == "data/a.tar.index.sqlite"),
             "S3 well-known GET must be skipped; gets={logged:?}"
         );
+    }
+
+    /// CLI `index_file_path` starts unset; discovery must land on the caller's opts.
+    #[test]
+    fn discovered_index_lands_on_caller_opts() {
+        with_isolated_xdg(|| {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("a.tar");
+            let member = ratarmount_formats_tar::UstarMember {
+                path: "hello.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            };
+            let mut archive_bytes = Vec::new();
+            ratarmount_formats_tar::write_ustar_members(&mut archive_bytes, &[member]).unwrap();
+            ratarmount_formats_tar::write_tar_eof(&mut archive_bytes).unwrap();
+            fs::write(&archive, &archive_bytes).unwrap();
+            let index_bytes = make_sidecar_for(&archive);
+            let id = ratarmount_index::sha256_hex(&index_bytes);
+            let ptr = pointer_json_for_blob(&index_bytes);
+            let folders = empty_index_folders(dir.path());
+
+            let mut objects = std::collections::HashMap::new();
+            objects.insert("data/a.tar".into(), archive_bytes);
+            objects.insert("data/a.tar.index.ptr".into(), ptr);
+            objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes);
+            let s3 = spawn_s3_index(objects, true);
+            let _g = bind_anon_s3(&format!("http://{}", s3.addr));
+
+            let url = PathBuf::from("s3://bucket/data/a.tar");
+            let mut opts = OpenOptions {
+                index_file_path: None,
+                index_folders: folders,
+                write_index: false,
+                ..OpenOptions::default()
+            };
+            assert!(
+                opts.index_file_path.is_none(),
+                "CLI index_file_path starts unset"
+            );
+            let _bundle = super::super::build_mount_source_ex(
+                std::slice::from_ref(&url),
+                &mut opts,
+                false,
+                super::super::CompositingOptions::default(),
+            )
+            .unwrap_or_else(|e| panic!("open s3 tar: {e}"));
+            let got = opts
+                .index_file_path
+                .expect("discovered meta-v3 path must be copied onto the caller");
+            assert!(
+                ratarmount_index::is_meta_cache_path(&got),
+                "expected meta-v3, got {}",
+                got.display()
+            );
+            assert!(got.is_file(), "{}", got.display());
+        });
     }
 
     /// Regression: S3 pointer 404 still installs well-known `{url}.index.sqlite`.

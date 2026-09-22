@@ -201,8 +201,11 @@ table using the recipes above.
 host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 (or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
 `.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
-no seek table) when `-w` is set. Live ticks still **reject** prefix-frame
-mutate (append-only + last-window). Offline `--commit-overlay` **is** the
+no seek table) when `-w` is set. One existing `s3://` `.tar` or `.tar.zst`
+uses the same live queue: the object is spooled outside the overlay, spliced,
+and uploaded (object, then index blob, then pointer). Live ticks still
+**reject** prefix-frame mutate (append-only + last-window, no upload).
+Offline `--commit-overlay` **is** the
 escape hatch for earlier-frame delete/replace: splice from the affected frame
 through EOF (prefix frames byte-identical). Classification of that splice
 always walks past per-frame TAR EOF (the `xargs tar -c | zstd >>` shape),

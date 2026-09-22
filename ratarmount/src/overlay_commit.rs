@@ -13,13 +13,15 @@ use std::time::{Duration, Instant};
 use ratarmount_compositing::{
     classify_createable_archive, maybe_create_empty_write_archive, patch_sidecar_if_present,
     sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind, EmptyCreateOutcome,
-    OverlayError, WriteOverlay,
+    OverlayError, RemoteDownload, RemoteObjectHead, RemotePublishError, RemotePublishRequest,
+    WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
+use ratarmount_index::{index_pointer_to_json, IndexPointer, META_SIDECAR_WHOLE_MAX};
 use ratarmount_nfs::NfsStop;
 
 /// Warn when the last zstd frame's uncompressed size exceeds this.
@@ -133,6 +135,8 @@ pub fn spawn_interval_commits(
     // after its last host mtime, not up to 2× interval later. The settle
     // threshold is still `interval` (only idle files are persisted).
     let poll = Duration::from_secs(1).min(interval);
+    let remote_s3 = archive.to_string_lossy().starts_with("s3://");
+    let remote_url = archive.to_string_lossy().into_owned();
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
         .spawn(move || loop {
@@ -148,10 +152,15 @@ pub fn spawn_interval_commits(
             }
             let ov = Arc::clone(&overlay);
             match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
-                if let Some(window) = ov.last_patch_window() {
-                    patch_sidecar_if_present(p, &window, &opts)?;
+                if remote_s3 {
+                    // Reopen is `open_s3_range` of the URL only. Patch ran inside publish.
+                    reopen_s3_mount(&remote_url, &opts)
+                } else {
+                    if let Some(window) = ov.last_patch_window() {
+                        patch_sidecar_if_present(p, &window, &opts)?;
+                    }
+                    reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
                 }
-                reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
             }) {
                 Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
@@ -198,7 +207,7 @@ pub fn apply_live_commit(
             Ok(_) => false,
             Err(e) => return Err(e.to_string()),
         };
-        if did {
+        if did && !archive.to_string_lossy().starts_with("s3://") {
             if let Some(window) = overlay.last_patch_window() {
                 patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
             }
@@ -345,6 +354,17 @@ pub fn validate_live_commit_args(
         );
     }
     let archive = inputs[0].clone();
+    let shown = archive.to_string_lossy();
+    if shown.starts_with("s3://") {
+        if !s3_live_commit_name(&shown) {
+            return Err(format!(
+                "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
+                archive.display()
+            ));
+        }
+        // Do not create the key and do not stat it as a local file.
+        return Ok(archive);
+    }
     if !archive.is_file() {
         return Err(format!(
             "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
@@ -354,6 +374,188 @@ pub fn validate_live_commit_args(
     ratarmount_compositing::live_commit_is_supported(&archive).map_err(|e| e.to_string())?;
     maybe_warn_large_zstd_last_frame(&archive);
     Ok(archive)
+}
+
+/// Offline `--commit-overlay` on an object-store URL. Not a live-queue job.
+pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
+    let s = archive.to_string_lossy();
+    if ratarmount_remote::is_object_store_archive_url(&s) {
+        Some(
+            "offline --commit-overlay does not upload; use --commit-overlay-on-exit or --commit-overlay-interval",
+        )
+    } else {
+        None
+    }
+}
+
+fn s3_live_commit_name(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.ends_with(".tar")
+        || lower.ends_with(".tar.zst")
+        || lower.ends_with(".tzst")
+        || lower.ends_with(".tar.zstd")
+}
+
+/// Wire one `s3://` archive into the live queue. `-w` is not decided here.
+pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &OpenOptions) {
+    let url_head = archive.to_string_lossy().into_owned();
+    let url_dl = url_head.clone();
+    let url_pub = url_head.clone();
+    let opts_pub = opts.clone();
+    overlay.install_remote_live_commit(
+        Box::new(move || {
+            let head = ratarmount_remote::head_s3_object(&url_head)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            Ok(RemoteObjectHead {
+                etag: head.etag,
+                len: head.len,
+            })
+        }),
+        Box::new(move || {
+            let loc = ratarmount_remote::parse_s3_url(&url_dl)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            let (file, len) = ratarmount_remote::fetch_s3_location_to_temp_prefer_range(&loc, None)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            Ok(RemoteDownload { file, len })
+        }),
+        Box::new(move |req| publish_s3(&url_pub, &opts_pub, req)),
+        ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
+    );
+}
+
+const S3_PUT_SINGLE_MAX: u64 = 8 * 1024 * 1024;
+
+fn map_s3_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
+    let msg = err.to_string();
+    if msg.contains("412") {
+        RemotePublishError::EtagMismatch(msg)
+    } else {
+        RemotePublishError::Retryable(msg)
+    }
+}
+
+/// Object PUT, then patch the meta-v3 sidecar, then blob, then pointer.
+///
+/// A failure of the object PUT is returned. Index failures after a successful
+/// object replace are warnings: the object already stands, and a retry must
+/// not splice the uploaded bytes again.
+fn publish_s3(
+    url: &str,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    let loc = ratarmount_remote::parse_s3_url(url)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let len = std::fs::metadata(&req.staged)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
+        .len();
+    let etag = req.etag_at_download.as_deref();
+    log::info!(
+        "s3 live commit uploading {len} bytes prefix={} etag={}",
+        req.prefix_compressed_bytes,
+        etag.unwrap_or("-")
+    );
+    let put = if len <= S3_PUT_SINGLE_MAX {
+        let body =
+            std::fs::read(&req.staged).map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+        ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
+    } else {
+        let copy = if req.prefix_compressed_bytes == 0 {
+            None
+        } else {
+            Some(req.prefix_compressed_bytes)
+        };
+        ratarmount_remote::put_s3_multipart(
+            &loc,
+            &req.staged,
+            copy,
+            etag,
+            Some("application/octet-stream"),
+        )
+    };
+    if let Err(e) = put {
+        return Err(map_s3_put(e));
+    }
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        log::warn!("incremental reindex skipped ({e})");
+        return Ok(());
+    }
+    let Some(sidecar) = opts.index_file_path.as_ref().filter(|p| p.is_file()) else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    let blob_len = std::fs::metadata(sidecar).map(|m| m.len()).unwrap_or(0);
+    if blob_len > META_SIDECAR_WHOLE_MAX {
+        log::warn!(
+            "skipping s3 index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
+        );
+        return Ok(());
+    }
+    let pointer = match IndexPointer::for_blob(sidecar, Some(&req.staged)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let json = match index_pointer_to_json(&pointer) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    match ratarmount_remote::put_s3_index_siblings(
+        &loc,
+        &pointer.index_id,
+        json.as_bytes(),
+        sidecar,
+    ) {
+        Ok(ratarmount_remote::S3IndexSiblingPut::Uploaded) => {}
+        Ok(ratarmount_remote::S3IndexSiblingPut::Skipped { blob_len, limit }) => {
+            log::warn!("skipping s3 index sibling PUT for {url}: blob {blob_len} above {limit}");
+        }
+        Err(e) => {
+            log::warn!(
+                "s3 index pointer PUT failed after object replace for s3://{}/{}: {e}",
+                loc.bucket,
+                loc.key
+            );
+        }
+    }
+    Ok(())
+}
+
+fn url_is_tar_zst(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.ends_with(".tar.zst") || lower.ends_with(".tzst") || lower.ends_with(".tar.zstd")
+}
+
+/// Reopen via [`ratarmount_remote::open_s3_range`] only. The spool path is not a mount.
+fn reopen_s3_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = ratarmount_remote::open_s3_range(url)
+        .map_err(|e| OverlayError::Msg(format!("reopen s3: {e}")))?;
+    let label = PathBuf::from(url);
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    if url_is_tar_zst(url) {
+        let threads = o.threads_for("zstd");
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range, threads, &label,
+        )
+        .map_err(|e| OverlayError::Msg(format!("reopen s3 zstd: {e}")))?;
+        let tar =
+            SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen s3 tar.zst: {e}")))?;
+        Ok(Arc::new(tar))
+    } else {
+        let tar =
+            SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen s3 tar: {e}")))?;
+        Ok(Arc::new(tar))
+    }
 }
 
 /// K4: warn once at startup; never refuse on size.

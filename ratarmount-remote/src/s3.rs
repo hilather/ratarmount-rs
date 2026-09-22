@@ -80,7 +80,7 @@ const S3_COPY_PART_MAX: u64 = 5 * 1024 * 1024 * 1024;
 const S3_MULTIPART_MAX_PARTS: u64 = 10_000;
 
 /// Socket budget for PUT / multipart calls. IMDS and ECS stay on their 2s timeout.
-const OBJECT_STORE_IO_TIMEOUT: Duration = Duration::from_secs(120);
+pub const OBJECT_STORE_IO_TIMEOUT: Duration = Duration::from_secs(120);
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -606,7 +606,7 @@ fn s3_get_object(
             if let Some(ref r) = range_value {
                 req = req.set("Range", r);
             }
-            req.call().map_err(|e| {
+            req.timeout(OBJECT_STORE_IO_TIMEOUT).call().map_err(|e| {
                 RemoteError::S3(format!(
                     "anonymous GetObject s3://{}/{}: {e}",
                     loc.bucket, loc.key
@@ -669,13 +669,127 @@ fn s3_get_object(
             if let Some(token) = &creds.session_token {
                 req = req.set("x-amz-security-token", token);
             }
-            req.call().map_err(|e| {
+            req.timeout(OBJECT_STORE_IO_TIMEOUT).call().map_err(|e| {
                 RemoteError::S3(format!("GetObject s3://{}/{}: {e}", loc.bucket, loc.key))
             })?
         }
     };
 
     Ok((auth.source, resp))
+}
+
+/// HEAD metadata for a live-commit tick. Missing keys are an error (do not create).
+#[derive(Clone, Debug)]
+pub struct S3Head {
+    pub etag: Option<String>,
+    pub len: u64,
+}
+
+/// `HEAD` the object. ETag is the raw header value (quotes included). Anonymous
+/// GET stays allowed; this uses the same credential chain and does not log secrets.
+pub fn head_s3_object(url_str: &str) -> Result<S3Head> {
+    let loc = parse_s3_url(url_str)?;
+    let auth = resolve_auth()?;
+    let region = region();
+    let (host, uri_path, use_https) = s3_request_target(&loc, &region);
+    let url = if use_https {
+        format!("https://{host}{uri_path}")
+    } else {
+        format!("http://{host}{uri_path}")
+    };
+    debug!("s3 HEAD {url} (auth={:?})", auth.source);
+    let resp = match &auth.creds {
+        None => ureq::head(&url)
+            .set("User-Agent", USER_AGENT)
+            .timeout(OBJECT_STORE_IO_TIMEOUT)
+            .call()
+            .map_err(|e| match e {
+                ureq::Error::Status(status, resp) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    s3_status_error(auth.source, status, &loc, &body)
+                }
+                other => RemoteError::S3(format!(
+                    "anonymous HEAD s3://{}/{}: {other}",
+                    loc.bucket, loc.key
+                )),
+            })?,
+        Some(creds) => {
+            let now = chrono::Utc::now();
+            let amz_date = now.format("%Y%m%dT%H%M%SZ").to_string();
+            let date_stamp = now.format("%Y%m%d").to_string();
+            let payload_hash = sha256_hex(b"");
+            let mut headers_to_sign: Vec<(&str, String)> = vec![
+                ("host", host.clone()),
+                ("x-amz-content-sha256", payload_hash.clone()),
+                ("x-amz-date", amz_date.clone()),
+            ];
+            if let Some(token) = &creds.session_token {
+                headers_to_sign.push(("x-amz-security-token", token.clone()));
+            }
+            headers_to_sign.sort_by(|a, b| a.0.cmp(b.0));
+            let signed_headers = headers_to_sign
+                .iter()
+                .map(|(k, _)| *k)
+                .collect::<Vec<_>>()
+                .join(";");
+            let canonical_headers = headers_to_sign
+                .iter()
+                .map(|(k, v)| format!("{k}:{}\n", v.trim()))
+                .collect::<String>();
+            let canonical_request = format!(
+                "HEAD\n{uri_path}\n\n{canonical_headers}\n{signed_headers}\n{payload_hash}"
+            );
+            let credential_scope = format!("{date_stamp}/{region}/s3/aws4_request");
+            let string_to_sign = format!(
+                "AWS4-HMAC-SHA256\n{amz_date}\n{credential_scope}\n{}",
+                sha256_hex(canonical_request.as_bytes())
+            );
+            let signature = hex::encode(hmac_sha256(
+                &signing_key(&creds.secret_key, &date_stamp, &region, "s3"),
+                string_to_sign.as_bytes(),
+            ));
+            let authorization = format!(
+                "AWS4-HMAC-SHA256 Credential={}/{credential_scope}, SignedHeaders={signed_headers}, Signature={signature}",
+                creds.access_key
+            );
+            let mut req = ureq::head(&url)
+                .set("User-Agent", USER_AGENT)
+                .set("Authorization", &authorization)
+                .set("x-amz-content-sha256", &payload_hash)
+                .set("x-amz-date", &amz_date)
+                .timeout(OBJECT_STORE_IO_TIMEOUT);
+            if let Some(token) = &creds.session_token {
+                req = req.set("x-amz-security-token", token);
+            }
+            req.call().map_err(|e| match e {
+                ureq::Error::Status(status, resp) => {
+                    let body = resp.into_string().unwrap_or_default();
+                    RemoteError::S3(format!(
+                        "HEAD HTTP {status} for s3://{}/{}: {body}",
+                        loc.bucket, loc.key
+                    ))
+                }
+                other => RemoteError::S3(format!("HEAD s3://{}/{}: {other}", loc.bucket, loc.key)),
+            })?
+        }
+    };
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(s3_status_error(auth.source, status, &loc, &body));
+    }
+    let etag = resp.header("etag").map(str::to_string);
+    let len = resp
+        .header("Content-Length")
+        .or_else(|| resp.header("content-length"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            RemoteError::S3(format!(
+                "HEAD s3://{}/{} missing Content-Length",
+                loc.bucket, loc.key
+            ))
+        })?;
+    Ok(S3Head { etag, len })
 }
 
 fn s3_status_error(source: CredSource, status: u16, loc: &S3Location, body: &str) -> RemoteError {

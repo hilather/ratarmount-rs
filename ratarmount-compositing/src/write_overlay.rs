@@ -6,7 +6,7 @@ use std::fs::{self, File, OpenOptions as FsOpenOptions};
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -73,8 +73,10 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// Live overlay persist job (V-4). Interval and on-exit only.
 ///
 /// CLI [`commit_overlay`] is the prefix-rewrite escape hatch and must **not**
-/// go through this queue. F-7 write-through will reuse the same live queue
-/// later (do not implement F-7 here).
+/// go through this queue. F-7 S3 write-through reuses this queue via
+/// [`WriteOverlay::install_remote_live_commit`]. `None` (no install) keeps
+/// local rename-only persist. Direct [`WriteOverlay::commit_live`] is not the
+/// remote path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
     /// Interval tick: persist overlay files idle for at least this long.
@@ -117,6 +119,81 @@ pub struct IndexPatchWindow {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct LivePublishPlan {
     prefix_compressed_bytes: u64,
+}
+
+/// Bytes match the remote object at this ETag. Safe to splice once.
+#[derive(Clone, Debug)]
+struct SpoolDownloaded {
+    etag: Option<String>,
+    len: u64,
+}
+
+/// `persist_by_format` already replaced this file. Do not splice it again.
+#[derive(Clone, Debug)]
+struct SpoolSpliced {
+    prefix_compressed_bytes: u64,
+    etag_at_download: Option<String>,
+    committed: OverlayCommitPlan,
+}
+
+enum SpoolState {
+    Downloaded(SpoolDownloaded),
+    Spliced(SpoolSpliced),
+}
+
+struct SpoolHold {
+    file: tempfile::NamedTempFile,
+    state: SpoolState,
+}
+
+/// HEAD of the remote object before a live tick decides to splice or retry PUT.
+#[derive(Clone, Debug)]
+pub struct RemoteObjectHead {
+    pub etag: Option<String>,
+    pub len: u64,
+}
+
+/// Prefer-range download. The file must live outside the overlay directory.
+pub struct RemoteDownload {
+    pub file: tempfile::NamedTempFile,
+    pub len: u64,
+}
+
+/// Arguments for one publish attempt (object PUT, then index). Owned so the
+/// hook can run without borrowing the spool lock.
+#[derive(Clone, Debug)]
+pub struct RemotePublishRequest {
+    pub staged: PathBuf,
+    pub prefix_compressed_bytes: u64,
+    pub etag_at_download: Option<String>,
+    pub window: IndexPatchWindow,
+}
+
+/// Publish failed before a successful object replace.
+#[derive(Debug)]
+pub enum RemotePublishError {
+    /// HTTP 412. Drop `Spliced`; the next tick downloads again.
+    EtagMismatch(String),
+    /// 500 / timeout. Keep `Spliced` and retry the PUT only.
+    Retryable(String),
+}
+
+impl std::fmt::Display for RemotePublishError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EtagMismatch(m) | Self::Retryable(m) => f.write_str(m),
+        }
+    }
+}
+
+type RemotePublishHook =
+    Box<dyn FnMut(&RemotePublishRequest) -> std::result::Result<(), RemotePublishError> + Send>;
+
+struct RemoteLive {
+    head: Box<dyn FnMut() -> Result<RemoteObjectHead> + Send>,
+    download: Box<dyn FnMut() -> Result<RemoteDownload> + Send>,
+    publish: RemotePublishHook,
+    on_exit_extra_wait: Duration,
 }
 
 /// Pointer JSON from [`IndexPointer::for_blob`] after the sidecar is patched.
@@ -167,6 +244,12 @@ pub struct WriteOverlay {
     persist_delay: Mutex<Option<Duration>>,
     /// Prefix from the splice that just ran (`0` for uncompressed TAR).
     last_publish_plan: Mutex<Option<LivePublishPlan>>,
+    /// F-7 live queue. `None` keeps local rename and the unbounded on-exit wait.
+    remote: Mutex<Option<RemoteLive>>,
+    /// Downloaded or spliced spool. Not in the overlay directory.
+    spool: Mutex<Option<SpoolHold>>,
+    /// Times [`Self::persist_by_format`] ran (tests assert a `Spliced` retry skips it).
+    persist_count: AtomicU64,
 }
 
 impl WriteOverlay {
@@ -206,7 +289,53 @@ impl WriteOverlay {
             on_exit_wait_min: Mutex::new(ON_EXIT_WAIT_MIN),
             persist_delay: Mutex::new(None),
             last_publish_plan: Mutex::new(None),
+            remote: Mutex::new(None),
+            spool: Mutex::new(None),
+            persist_count: AtomicU64::new(0),
         })
+    }
+
+    /// Install the F-7 publish hook. Local commits leave this unset.
+    ///
+    /// `on_exit_extra_wait` bounds the remote on-exit wait after the 2× floor
+    /// (object-store I/O timeout, 120s). Direct [`Self::commit_live`] does not
+    /// call the hook.
+    pub fn install_remote_live_commit(
+        &self,
+        head: Box<dyn FnMut() -> Result<RemoteObjectHead> + Send>,
+        download: Box<dyn FnMut() -> Result<RemoteDownload> + Send>,
+        publish: RemotePublishHook,
+        on_exit_extra_wait: Duration,
+    ) {
+        *self.remote.lock().expect("overlay remote") = Some(RemoteLive {
+            head,
+            download,
+            publish,
+            on_exit_extra_wait,
+        });
+    }
+
+    fn remote_enabled(&self) -> bool {
+        self.remote.lock().expect("overlay remote").is_some()
+    }
+
+    fn remote_on_exit_extra(&self) -> Option<Duration> {
+        self.remote
+            .lock()
+            .expect("overlay remote")
+            .as_ref()
+            .map(|r| r.on_exit_extra_wait)
+    }
+
+    /// Successful live commits (not counting a base source's own generation).
+    pub fn commit_generation(&self) -> u64 {
+        self.commit_generation.load(Ordering::SeqCst)
+    }
+
+    /// How many times [`Self::persist_by_format`] has run.
+    #[doc(hidden)]
+    pub fn persist_count_for_test(&self) -> u64 {
+        self.persist_count.load(Ordering::SeqCst)
     }
 
     pub fn root(&self) -> &Path {
@@ -237,7 +366,6 @@ impl WriteOverlay {
     }
 
     /// Prefix recorded by the last successful live persist.
-    #[cfg(test)]
     fn last_publish_plan(&self) -> Option<LivePublishPlan> {
         *self.last_publish_plan.lock().expect("overlay publish plan")
     }
@@ -892,6 +1020,9 @@ impl WriteOverlay {
 
     /// Persist only (on-exit). No reopen/reset.
     pub fn commit_atomic(&self, archive: &Path) -> Result<bool> {
+        if self.remote_enabled() {
+            return self.commit_atomic_remote();
+        }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
         if format != CompressionFormat::Zstd {
@@ -1005,7 +1136,12 @@ impl WriteOverlay {
         };
         self.apply_test_persist_delay();
         let start = Instant::now();
-        let result = self.commit_live_idle(archive, idle_for, reopen);
+        let result = if self.remote_enabled() {
+            // Remote mounts enter here. Direct `commit_live` does not.
+            self.commit_remote_interval(idle_for, reopen)
+        } else {
+            self.commit_live_idle(archive, idle_for, reopen)
+        };
         match result {
             Ok(true) => {
                 // Empty/error ticks must not shrink the on-exit wait (2× last splice).
@@ -1023,11 +1159,27 @@ impl WriteOverlay {
         }
         let timeout = self.on_exit_wait_timeout();
         if !self.wait_inflight_cleared(Some(timeout)) {
-            log::error!(
-                "on-exit overlay commit timed out waiting for in-flight persist; \
-                 waiting for it to finish before final flush"
-            );
-            self.wait_inflight_cleared(None);
+            if let Some(extra) = self.remote_on_exit_extra() {
+                log::error!(
+                    "on-exit overlay commit timed out waiting for in-flight persist; \
+                     waiting at most {extra:?} more (object-store I/O timeout)"
+                );
+                if !self.wait_inflight_cleared(Some(extra)) {
+                    log::error!(
+                        "remote on-exit still in flight after object-store timeout; \
+                         not splicing"
+                    );
+                    return Err(OverlayError::Msg(
+                        "remote on-exit timed out waiting for in-flight persist".into(),
+                    ));
+                }
+            } else {
+                log::error!(
+                    "on-exit overlay commit timed out waiting for in-flight persist; \
+                     waiting for it to finish before final flush"
+                );
+                self.wait_inflight_cleared(None);
+            }
         }
         if self.interval_disabled() {
             return Err(interval_disabled_err());
@@ -1124,6 +1276,295 @@ impl WriteOverlay {
     #[doc(hidden)]
     pub fn persist_inflight_for_test(&self) -> bool {
         self.commit_inflight.load(Ordering::SeqCst)
+    }
+
+    fn with_remote_mut<T>(&self, f: impl FnOnce(&mut RemoteLive) -> T) -> Result<T> {
+        let mut guard = self.remote.lock().expect("overlay remote");
+        let hooks = guard
+            .as_mut()
+            .ok_or_else(|| OverlayError::Msg("remote live commit is not installed".into()))?;
+        Ok(f(hooks))
+    }
+
+    fn remote_head(&self) -> Result<RemoteObjectHead> {
+        self.with_remote_mut(|h| (h.head)())?
+    }
+
+    fn remote_download(&self) -> Result<RemoteDownload> {
+        self.with_remote_mut(|h| (h.download)())?
+    }
+
+    fn remote_publish(
+        &self,
+        req: &RemotePublishRequest,
+    ) -> std::result::Result<(), RemotePublishError> {
+        match self.with_remote_mut(|h| (h.publish)(req)) {
+            Ok(inner) => inner,
+            Err(e) => Err(RemotePublishError::Retryable(e.to_string())),
+        }
+    }
+
+    fn drop_spool(&self) {
+        *self.spool.lock().expect("overlay spool") = None;
+    }
+
+    fn spool_path_and_downloaded_etag(&self) -> Option<(PathBuf, Option<String>, bool)> {
+        let guard = self.spool.lock().expect("overlay spool");
+        let hold = guard.as_ref()?;
+        let path = hold.file.path().to_path_buf();
+        let (etag, spliced) = match &hold.state {
+            SpoolState::Downloaded(d) => (d.etag.clone(), false),
+            SpoolState::Spliced(s) => (s.etag_at_download.clone(), true),
+        };
+        Some((path, etag, spliced))
+    }
+
+    /// `true` when HEAD's ETag is the one stored for this spool.
+    fn spool_etag_matches(&self, head_etag: Option<&str>) -> bool {
+        let guard = self.spool.lock().expect("overlay spool");
+        let Some(hold) = guard.as_ref() else {
+            return false;
+        };
+        let stored = match &hold.state {
+            SpoolState::Downloaded(d) => d.etag.as_deref(),
+            SpoolState::Spliced(s) => s.etag_at_download.as_deref(),
+        };
+        match (stored, head_etag) {
+            (Some(a), Some(b)) => a == b,
+            (None, None) => true,
+            _ => false,
+        }
+    }
+
+    fn spool_is_spliced(&self) -> bool {
+        let guard = self.spool.lock().expect("overlay spool");
+        matches!(
+            guard.as_ref().map(|h| &h.state),
+            Some(SpoolState::Spliced(_))
+        )
+    }
+
+    fn accept_download(&self, dl: RemoteDownload, etag: Option<String>) -> Result<PathBuf> {
+        self.ensure_spool_outside_overlay(dl.file.path())?;
+        set_spool_mode_0600(dl.file.path())?;
+        if dl.len > REMOTE_SPOOL_WARN_BYTES {
+            log::warn!(
+                "remote live commit downloaded {len} bytes; v1 still splices a local spool",
+                len = dl.len
+            );
+        }
+        log::info!(
+            "remote spool downloaded {len} bytes (etag {etag})",
+            len = dl.len,
+            etag = etag.as_deref().unwrap_or("-")
+        );
+        let path = dl.file.path().to_path_buf();
+        *self.spool.lock().expect("overlay spool") = Some(SpoolHold {
+            file: dl.file,
+            state: SpoolState::Downloaded(SpoolDownloaded { etag, len: dl.len }),
+        });
+        Ok(path)
+    }
+
+    fn ensure_spool_outside_overlay(&self, path: &Path) -> Result<()> {
+        let parent = path.parent().unwrap_or(path);
+        let parent_canon = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        if parent_canon.starts_with(&self.root) || path.starts_with(&self.root) {
+            return Err(OverlayError::Msg(
+                "s3 spool must not be created inside the overlay directory".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn mark_spool_spliced(&self, plan: &OverlayCommitPlan) {
+        let prefix = self
+            .last_publish_plan()
+            .map(|p| p.prefix_compressed_bytes)
+            .unwrap_or(0);
+        let mut guard = self.spool.lock().expect("overlay spool");
+        let Some(hold) = guard.as_mut() else {
+            return;
+        };
+        let etag = match &hold.state {
+            SpoolState::Downloaded(d) => d.etag.clone(),
+            SpoolState::Spliced(s) => s.etag_at_download.clone(),
+        };
+        hold.state = SpoolState::Spliced(SpoolSpliced {
+            prefix_compressed_bytes: prefix,
+            etag_at_download: etag,
+            committed: plan.clone(),
+        });
+    }
+
+    fn spliced_publish_request(&self) -> Result<RemotePublishRequest> {
+        let guard = self.spool.lock().expect("overlay spool");
+        let hold = guard
+            .as_ref()
+            .ok_or_else(|| OverlayError::Msg("s3 publish requested without a spool".into()))?;
+        let SpoolState::Spliced(s) = &hold.state else {
+            return Err(OverlayError::Msg(
+                "s3 publish requested before splice".into(),
+            ));
+        };
+        let window = self.last_patch_window().ok_or_else(|| {
+            OverlayError::Msg("s3 publish missing the splice patch window".into())
+        })?;
+        Ok(RemotePublishRequest {
+            staged: hold.file.path().to_path_buf(),
+            prefix_compressed_bytes: s.prefix_compressed_bytes,
+            etag_at_download: s.etag_at_download.clone(),
+            window,
+        })
+    }
+
+    fn take_stashed_plan(&self) -> Result<OverlayCommitPlan> {
+        let guard = self.spool.lock().expect("overlay spool");
+        match guard.as_ref().map(|h| &h.state) {
+            Some(SpoolState::Spliced(s)) => Ok(s.committed.clone()),
+            _ => Err(OverlayError::Msg(
+                "s3 commit has no stashed overlay plan".into(),
+            )),
+        }
+    }
+
+    /// Download or keep the spool, splice at most once, leave state `Spliced`
+    /// when there is something to upload. `Ok(None)` is an empty plan.
+    fn prepare_remote_spool(
+        &self,
+        idle_for: Option<Duration>,
+    ) -> Result<Option<RemotePublishRequest>> {
+        let head = self.remote_head()?;
+        let same = self.spool_etag_matches(head.etag.as_deref());
+        if self.spool_is_spliced() && same {
+            log::info!(
+                "remote spool still spliced at etag {}; retrying PUT without persist",
+                head.etag.as_deref().unwrap_or("-")
+            );
+            return Ok(Some(self.spliced_publish_request()?));
+        }
+        if !(same && self.spool_path_and_downloaded_etag().is_some()) {
+            self.drop_spool();
+            let dl = self.remote_download()?;
+            self.accept_download(dl, head.etag.clone())?;
+        }
+        let spool_len = {
+            let guard = self.spool.lock().expect("overlay spool");
+            match guard.as_ref().map(|h| &h.state) {
+                Some(SpoolState::Downloaded(d)) => d.len,
+                _ => 0,
+            }
+        };
+        log::debug!("remote spool ready ({spool_len} bytes) before splice");
+        let cutoff = idle_for.map(|d| {
+            SystemTime::now()
+                .checked_sub(d)
+                .unwrap_or(SystemTime::UNIX_EPOCH)
+        });
+        let busy = if cutoff.is_some() {
+            match self.write_open_inodes() {
+                Some(b) => b,
+                None => return Ok(None),
+            }
+        } else {
+            HashSet::new()
+        };
+        let plan = {
+            let db = self.db.lock().expect("overlay db");
+            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff, &busy)?
+        };
+        if plan.is_empty() {
+            return Ok(None);
+        }
+        let spool_path = self
+            .spool_path_and_downloaded_etag()
+            .map(|(p, _, _)| p)
+            .ok_or_else(|| OverlayError::Msg("s3 spool missing after download".into()))?;
+        let format = detect_live_commit_format(&spool_path)?;
+        if format != CompressionFormat::Zstd {
+            ensure_gnu_tar()?;
+        }
+        // `earlier_frame_err` returns here. State stays `Downloaded`. No PUT.
+        let window = self.persist_by_format(&spool_path, format, &plan)?;
+        self.stash_patch_window(window);
+        self.mark_spool_spliced(&plan);
+        Ok(Some(self.spliced_publish_request()?))
+    }
+
+    fn publish_prepared(&self, req: &RemotePublishRequest) -> Result<()> {
+        match self.remote_publish(req) {
+            Ok(()) => Ok(()),
+            Err(RemotePublishError::EtagMismatch(msg)) => {
+                // Do not resplice the old spool. The next tick downloads.
+                self.drop_spool();
+                Err(OverlayError::Msg(format!(
+                    "s3 publish precondition failed: {msg}"
+                )))
+            }
+            Err(RemotePublishError::Retryable(msg)) => {
+                Err(OverlayError::Msg(format!("s3 publish failed: {msg}")))
+            }
+        }
+    }
+
+    fn commit_remote_interval(
+        &self,
+        idle_for: Duration,
+        reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
+    ) -> Result<bool> {
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
+        let Some(req) = self.prepare_remote_spool(Some(idle_for))? else {
+            return Ok(false);
+        };
+        // Publish is a separate `?` before reopen. A 500 must not disable.
+        self.publish_prepared(&req)?;
+        let staged = req.staged.clone();
+        match reopen(&staged) {
+            Ok(src) => {
+                *self.replacement.write().expect("overlay replacement") = Some(src);
+                let plan = self.take_stashed_plan()?;
+                // Bump only in this arm, then forget only the stashed plan.
+                self.commit_generation.fetch_add(1, Ordering::SeqCst);
+                if let Err(e) = self.forget_committed_overlay(&plan) {
+                    self.interval_disabled.store(true, Ordering::SeqCst);
+                    return Err(OverlayError::Msg(format!(
+                        "persist succeeded; overlay cleanup failed (remount required): {e}"
+                    )));
+                }
+                self.drop_spool();
+                Ok(true)
+            }
+            Err(e) => {
+                // Object replace already happened. Do not bump or forget.
+                self.interval_disabled.store(true, Ordering::SeqCst);
+                Err(OverlayError::Msg(format!(
+                    "persist succeeded; reopen failed (remount required): {e}"
+                )))
+            }
+        }
+    }
+
+    fn commit_atomic_remote(&self) -> Result<bool> {
+        let _gate = self.commit_gate.write().expect("overlay commit gate");
+        if self.interval_disabled() {
+            return Err(interval_disabled_err());
+        }
+        let Some(req) = self.prepare_remote_spool(None)? else {
+            return Ok(false);
+        };
+        // No reopen. Bump only after the object PUT succeeds. A failure leaves
+        // the counter unchanged and does not set `interval_disabled`.
+        self.publish_prepared(&req)?;
+        let plan = self.take_stashed_plan()?;
+        self.commit_generation.fetch_add(1, Ordering::SeqCst);
+        self.forget_committed_overlay(&plan)?;
+        self.drop_spool();
+        Ok(true)
     }
 
     fn commit_live_inner(
@@ -1277,6 +1718,7 @@ impl WriteOverlay {
         format: CompressionFormat,
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
+        self.persist_count.fetch_add(1, Ordering::SeqCst);
         let (window, prefix) = match format {
             CompressionFormat::Zstd => {
                 let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
@@ -2249,6 +2691,7 @@ pub fn commit_overlay(
 }
 
 /// Overlay changes collected for commit (paths relative to archive root, `/`-separated).
+#[derive(Clone, Debug)]
 struct OverlayCommitPlan {
     /// Null-terminated path variants for GNU tar `--files-from`.
     deletions_nul: Vec<u8>,
@@ -3131,6 +3574,22 @@ fn interval_disabled_err() -> OverlayError {
 
 /// On-exit wait: 2× last persist duration, at least 60s (fail-closed flush, not skip).
 const ON_EXIT_WAIT_MIN: Duration = Duration::from_secs(60);
+
+/// v1 still downloads the whole object. Warn above this; do not refuse.
+const REMOTE_SPOOL_WARN_BYTES: u64 = 1024 * 1024 * 1024;
+
+fn set_spool_mode_0600(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+    Ok(())
+}
 
 /// Sets `commit_inflight` for the lifetime of a live persist; clears + notifies on drop.
 struct InFlightGuard<'a> {
@@ -7902,6 +8361,251 @@ mod tests {
         );
         let src = open_tar_zst_base(&archive, false);
         assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    fn fresh_spool(src: &Path) -> RemoteDownload {
+        use std::io::Write;
+        let mut file = tempfile::Builder::new()
+            .prefix(".ratarmount-spool-")
+            .tempfile()
+            .unwrap();
+        std::io::copy(&mut fs::File::open(src).unwrap(), &mut file).unwrap();
+        file.flush().unwrap();
+        let len = file.as_file().metadata().unwrap().len();
+        RemoteDownload { file, len }
+    }
+
+    /// Local `commit_live` does not call the publish hook, even if one is installed.
+    #[test]
+    fn remote_publish_not_called_for_local() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("loc-seed");
+        let extra = generated_payload("loc-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_p = Arc::clone(&calls);
+        let archive_dl = archive.clone();
+        ov.install_remote_live_commit(
+            Box::new(|| {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"e\"".into()),
+                    len: 1,
+                })
+            }),
+            Box::new(move || Ok(fresh_spool(&archive_dl))),
+            Box::new(move |_| {
+                calls_p.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            Duration::from_secs(120),
+        );
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("local commit"));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "direct commit_live must not publish"
+        );
+    }
+
+    /// Regression: prefix-frame delete does not call the publish callback.
+    #[test]
+    fn earlier_frame_skips_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("efp-prefix");
+        let last = generated_payload("efp-last");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("old.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let before = fs::read(&archive).unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        ov.unlink("/old.txt").expect("unlink prefix member");
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls_p = Arc::clone(&calls);
+        let archive_dl = archive.clone();
+        let len = before.len() as u64;
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"ef\"".into()),
+                    len,
+                })
+            }),
+            Box::new(move || Ok(fresh_spool(&archive_dl))),
+            Box::new(move |_| {
+                calls_p.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            }),
+            Duration::from_secs(120),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("publish/reopen must not run on earlier-frame error")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("append-only"), "{err}");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "prefix-frame delete must not PUT"
+        );
+        assert!(!ov.interval_disabled());
+        assert_eq!(ov.commit_generation(), 0);
+        assert_eq!(fs::read(&archive).unwrap(), before);
+        assert_eq!(ov.persist_count_for_test(), 1, "splice was attempted once");
+    }
+
+    /// Regression: retry forgets only overlay bytes that were uploaded.
+    #[test]
+    fn publish_500_does_not_disable_interval() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("p500-seed");
+        let extra = generated_payload("p500-new");
+        let during = generated_payload("p500-during");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let len = fs::metadata(&archive).unwrap().len();
+        let fail_once = Arc::new(AtomicU64::new(1));
+        let fail_pub = Arc::clone(&fail_once);
+        let archive_dl = archive.clone();
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"e1\"".into()),
+                    len,
+                })
+            }),
+            Box::new(move || Ok(fresh_spool(&archive_dl))),
+            Box::new(move |_| {
+                if fail_pub.swap(0, Ordering::SeqCst) == 1 {
+                    Err(RemotePublishError::Retryable("HTTP 500".into()))
+                } else {
+                    Ok(())
+                }
+            }),
+            Duration::from_secs(120),
+        );
+        let gen = ov.commit_generation();
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("500 must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("500"), "{err}");
+        assert!(!ov.interval_disabled());
+        assert_eq!(ov.commit_generation(), gen);
+        assert!(
+            overlay.join("new.txt").is_file(),
+            "original overlay file stays"
+        );
+        assert_eq!(ov.persist_count_for_test(), 1);
+
+        fs::write(overlay.join("during.txt"), &during).unwrap();
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("retry"),
+            CommitOutcome::DidWork
+        );
+        assert_eq!(
+            ov.persist_count_for_test(),
+            1,
+            "Spliced retry with a matching ETag must not persist again"
+        );
+        assert!(
+            !overlay.join("new.txt").exists(),
+            "stashed plan file is gone"
+        );
+        assert!(
+            overlay.join("during.txt").is_file(),
+            "file created during the failed PUT stays"
+        );
+        assert_eq!(ov.commit_generation(), gen + 1);
+        assert!(!ov.interval_disabled());
+    }
+
+    /// 412 drops `Spliced` and the next tick downloads instead of resplicing.
+    #[test]
+    fn etag_mismatch_regets_instead_of_resplicing() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("etag-seed");
+        let extra = generated_payload("etag-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let len = fs::metadata(&archive).unwrap().len();
+        let downloads = Arc::new(AtomicU64::new(0));
+        let downloads_d = Arc::clone(&downloads);
+        let archive_dl = archive.clone();
+        let fail_once = Arc::new(AtomicU64::new(1));
+        let fail_pub = Arc::clone(&fail_once);
+        let paths = Arc::new(std::sync::Mutex::new(Vec::<PathBuf>::new()));
+        let paths_p = Arc::clone(&paths);
+        ov.install_remote_live_commit(
+            Box::new(move || {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"e1\"".into()),
+                    len,
+                })
+            }),
+            Box::new(move || {
+                downloads_d.fetch_add(1, Ordering::SeqCst);
+                Ok(fresh_spool(&archive_dl))
+            }),
+            Box::new(move |req| {
+                paths_p.lock().expect("paths").push(req.staged.clone());
+                if fail_pub.swap(0, Ordering::SeqCst) == 1 {
+                    Err(RemotePublishError::EtagMismatch("HTTP 412".into()))
+                } else {
+                    Ok(())
+                }
+            }),
+            Duration::from_secs(120),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("412 must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("412"), "{err}");
+        assert_eq!(downloads.load(Ordering::SeqCst), 1);
+        assert_eq!(ov.persist_count_for_test(), 1);
+        assert_eq!(ov.commit_generation(), 0);
+        assert!(overlay.join("new.txt").is_file());
+        let first = paths.lock().expect("paths")[0].clone();
+        assert!(!first.exists(), "412 must drop the spliced spool");
+
+        assert_eq!(
+            ov.enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |p| {
+                reopen_tar_zst(p, false)
+            })
+            .expect("redownload tick"),
+            CommitOutcome::DidWork
+        );
+        assert_eq!(downloads.load(Ordering::SeqCst), 2, "next tick downloads");
+        assert_eq!(ov.persist_count_for_test(), 2);
+        let second = paths.lock().expect("paths")[1].clone();
+        assert_ne!(first, second, "must not resplice the old spool");
+        assert!(!overlay.join("new.txt").exists());
     }
 
     fn overlay_entry_names(dir: &Path) -> Vec<String> {
