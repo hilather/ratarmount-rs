@@ -1722,6 +1722,569 @@ fn gs_interval_uploads_once() {
     let _ = child.wait();
 }
 
+struct AzHit {
+    method: String,
+    key: String,
+    query: String,
+    body: Vec<u8>,
+}
+
+struct AzLive {
+    addr: std::net::SocketAddr,
+    hits: std::sync::Arc<std::sync::Mutex<Vec<AzHit>>>,
+    objects: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, Vec<u8>>>>,
+}
+
+/// In-test HTTP listener for `az://`. Not the private mock inside `azure.rs`.
+/// Put Block does not replace the blob. `fail_block_list` answers Put Block List
+/// with HTTP 500 and leaves the committed bytes alone.
+fn spawn_azure_live(
+    objects: std::collections::HashMap<String, Vec<u8>>,
+    fail_block_list: bool,
+) -> AzLive {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let hits = std::sync::Arc::new(std::sync::Mutex::new(Vec::<AzHit>::new()));
+    let objs = std::sync::Arc::new(std::sync::Mutex::new(objects));
+    let etags = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+        String,
+        String,
+    >::new()));
+    let hits_t = std::sync::Arc::clone(&hits);
+    let objs_t = std::sync::Arc::clone(&objs);
+    thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut request_line = String::new();
+            if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                continue;
+            }
+            let mut parts = request_line.split_whitespace();
+            let method = parts.next().unwrap_or("").to_string();
+            let target = parts.next().unwrap_or("/").to_string();
+            let mut content_length = 0usize;
+            let mut range_hdr: Option<String> = None;
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).is_err() {
+                    break;
+                }
+                if line == "\r\n" || line == "\n" || line.is_empty() {
+                    break;
+                }
+                let lower = line.to_ascii_lowercase();
+                if let Some(v) = lower.strip_prefix("content-length:") {
+                    content_length = v.trim().parse().unwrap_or(0);
+                } else if let Some(v) = lower.strip_prefix("range:") {
+                    range_hdr = Some(v.trim().to_string());
+                }
+            }
+            let mut body = vec![0u8; content_length];
+            if content_length > 0 && reader.read_exact(&mut body).is_err() {
+                continue;
+            }
+            let (path, query) = target.split_once('?').unwrap_or((&target, ""));
+            let key = path
+                .trim_start_matches('/')
+                .split_once('/')
+                .map(|(_, k)| k.to_string())
+                .unwrap_or_default();
+            let query = query.to_string();
+            if method == "HEAD" || method == "GET" {
+                let guard = objs_t.lock().unwrap();
+                if let Some(obj) = guard.get(&key) {
+                    let etag = etags
+                        .lock()
+                        .unwrap()
+                        .get(&key)
+                        .cloned()
+                        .unwrap_or_else(|| "\"v1\"".into());
+                    let mut start = 0usize;
+                    let mut end = obj.len().saturating_sub(1);
+                    let mut partial = false;
+                    if let Some(r) = range_hdr.as_deref().and_then(|r| r.strip_prefix("bytes=")) {
+                        let bits: Vec<&str> = r.splitn(2, '-').collect();
+                        if bits.len() == 2 && !bits[0].is_empty() {
+                            start = bits[0].parse().unwrap_or(0);
+                            if !bits[1].is_empty() {
+                                end = bits[1].parse().unwrap_or(end);
+                            }
+                            if start < obj.len() && start <= end {
+                                end = end.min(obj.len() - 1);
+                                partial = true;
+                            }
+                        }
+                    }
+                    let resp_body = if method == "HEAD" {
+                        Vec::new()
+                    } else if partial {
+                        obj[start..=end].to_vec()
+                    } else {
+                        obj.clone()
+                    };
+                    let status = if partial && method == "GET" { 206 } else { 200 };
+                    let reason = if status == 206 {
+                        "Partial Content"
+                    } else {
+                        "OK"
+                    };
+                    let len_hdr = if method == "HEAD" {
+                        obj.len()
+                    } else {
+                        resp_body.len()
+                    };
+                    let mut extra = format!("ETag: {etag}\r\nAccept-Ranges: bytes\r\n");
+                    if partial {
+                        extra.push_str(&format!(
+                            "Content-Range: bytes {start}-{end}/{}\r\n",
+                            obj.len()
+                        ));
+                    }
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 {status} {reason}\r\n{extra}Content-Length: {len_hdr}\r\nConnection: close\r\n\r\n"
+                    );
+                    if method != "HEAD" {
+                        let _ = stream.write_all(&resp_body);
+                    }
+                    hits_t.lock().unwrap().push(AzHit {
+                        method,
+                        key,
+                        query,
+                        body: Vec::new(),
+                    });
+                    continue;
+                }
+                drop(guard);
+                let msg = b"BlobNotFound";
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    msg.len()
+                );
+                let _ = stream.write_all(msg);
+                hits_t.lock().unwrap().push(AzHit {
+                    method,
+                    key,
+                    query,
+                    body: Vec::new(),
+                });
+            } else if method == "PUT" {
+                let comp_block = query.contains("comp=block") && !query.contains("comp=blocklist");
+                let comp_list = query.contains("comp=blocklist");
+                if comp_list && fail_block_list {
+                    let msg = b"block list failed";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    hits_t.lock().unwrap().push(AzHit {
+                        method,
+                        key,
+                        query,
+                        body: Vec::new(),
+                    });
+                    continue;
+                }
+                if !comp_block && !comp_list {
+                    objs_t.lock().unwrap().insert(key.clone(), body.clone());
+                    let n = hits_t.lock().unwrap().len();
+                    etags
+                        .lock()
+                        .unwrap()
+                        .insert(key.clone(), format!("\"put-{n}\""));
+                }
+                let stored = if body.len() > 2 * 1024 * 1024 {
+                    Vec::new()
+                } else {
+                    body
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+                hits_t.lock().unwrap().push(AzHit {
+                    method,
+                    key,
+                    query,
+                    body: stored,
+                });
+            } else {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 405 Method Not Allowed\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        }
+    });
+    AzLive {
+        addr,
+        hits,
+        objects: objs,
+    }
+}
+
+fn az_env(cmd: &mut Command, addr: std::net::SocketAddr, secret_b64: &str, cache: &Path) {
+    cmd.env("AZURE_STORAGE_ACCOUNT", "acct")
+        .env("AZURE_STORAGE_KEY", secret_b64)
+        .env("AZURE_STORAGE_ENDPOINT", format!("http://{addr}"))
+        .env("RATARMOUNT_AZURE_IMDS_BASE", "http://127.0.0.1:1")
+        .env("XDG_CACHE_HOME", cache)
+        .env_remove("AZURE_STORAGE_SAS_TOKEN")
+        .env_remove("RATARMOUNT_AZURE_ANONYMOUS")
+        .env_remove("AWS_ACCESS_KEY_ID")
+        .env_remove("AWS_SECRET_ACCESS_KEY")
+        .env_remove("AWS_SESSION_TOKEN")
+        .env_remove("AWS_ENDPOINT_URL")
+        .env_remove("GOOGLE_HMAC_KEY")
+        .env_remove("GOOGLE_HMAC_SECRET")
+        .env_remove("RATARMOUNT_GCS_ENDPOINT");
+}
+
+/// The in-test listener (not a private `azure.rs` mock) sees archive, blob, then
+/// pointer PUTs. The `az://` arm calls `publish_azure`.
+#[test]
+fn az_interval_uploads_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let member = ratarmount_formats_tar::UstarMember {
+        path: "seed.txt",
+        payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    let mut plain = Vec::new();
+    ratarmount_formats_tar::write_ustar_members(&mut plain, &[member]).unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+    let zst_bytes = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+    let zst = dir.path().join("a.tar.zst");
+    fs::write(&zst, &zst_bytes).unwrap();
+    let idx = dir.path().join("a.tar.zst.index.sqlite");
+    let body = ratarmount_compress::open_seekable_zstd(&zst).unwrap();
+    let opts = ratarmount_core::OpenOptions {
+        write_index: true,
+        index_minimum_file_count: 0,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        &zst,
+        body,
+        Some(&idx),
+        &opts,
+        "test",
+    )
+    .expect("sidecar");
+    let index_bytes = fs::read(&idx).unwrap();
+    let pointer = ratarmount_index::IndexPointer::for_blob(&idx, Some(&zst)).unwrap();
+    let pointer_bytes = ratarmount_index::index_pointer_to_json(&pointer)
+        .unwrap()
+        .into_bytes();
+    let id = pointer.index_id.clone();
+    let key = "data/a.tar.zst";
+    let mut objects = std::collections::HashMap::new();
+    objects.insert(key.into(), zst_bytes);
+    objects.insert(format!("{key}.index.ptr"), pointer_bytes);
+    objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
+    let az = spawn_azure_live(objects, false);
+    let cache = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let secret = "YXp1cmUtc2VjcmV0LWtleS1ET05PVExPRw==";
+    let payload = format!("az-interval-{}\n", std::process::id());
+    let mut cmd = Command::new(bin());
+    cmd.args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args(["--commit-overlay-interval", "1s"])
+        .arg("az://bkt/data/a.tar.zst");
+    az_env(&mut cmd, az.addr, secret, cache.path());
+    let mut child = cmd
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(20)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(secret),
+        "mount log must not contain the SharedKey secret"
+    );
+    fs::write(ov.join("tick.bin"), payload.as_bytes()).unwrap();
+    let archive_puts = || {
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.method == "PUT" && h.key == key && h.query.is_empty())
+            .count()
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) && archive_puts() == 0 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        archive_puts() >= 1,
+        "no archive PUT: {:?} log={}",
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| format!("{} {} {}", h.method, h.key, h.query))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(15) && ov.join("tick.bin").exists() {
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        !ov.join("tick.bin").exists(),
+        "overlay file should be forgotten after upload: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    let hits: Vec<(String, String, String, Vec<u8>)> = az
+        .hits
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|h| {
+            (
+                h.method.clone(),
+                h.key.clone(),
+                h.query.clone(),
+                h.body.clone(),
+            )
+        })
+        .collect();
+    let puts: Vec<&(String, String, String, Vec<u8>)> = hits
+        .iter()
+        .filter(|h| h.0 == "PUT" && h.2.is_empty())
+        .collect();
+    let put_keys: Vec<&String> = puts.iter().map(|h| &h.1).collect();
+    assert!(
+        puts.len() >= 3,
+        "expected archive, blob, pointer PUTs, got {put_keys:?}"
+    );
+    assert_eq!(puts[0].1, key, "archive PUT first: {put_keys:?}");
+    assert!(
+        puts[1].1.starts_with(&format!("{key}.index.")) && puts[1].1.ends_with(".sqlite"),
+        "blob PUT second: {}",
+        puts[1].1
+    );
+    assert!(
+        puts[1].1 != format!("{key}.index.sqlite"),
+        "blob key must include the index id"
+    );
+    assert_eq!(puts[2].1, format!("{key}.index.ptr"), "pointer PUT third");
+    assert!(
+        puts.iter().all(|h| h.1 != format!("{key}.index.sqlite")),
+        "well-known key must not be written"
+    );
+    let archive_body = &puts[0].3;
+    assert_eq!(
+        az.objects.lock().unwrap().get(key).map(Vec::as_slice),
+        Some(archive_body.as_slice()),
+        "stored object bytes must match the uploaded spool"
+    );
+    let uploaded = dir.path().join("uploaded.tar.zst");
+    let plain_out = dir.path().join("uploaded.tar");
+    fs::write(&uploaded, archive_body).unwrap();
+    decode_tar_zst_to_tar(&uploaded, &plain_out);
+    let plain_bytes = fs::read(&plain_out).unwrap();
+    assert!(
+        plain_bytes
+            .windows(payload.len())
+            .any(|w| w == payload.as_bytes()),
+        "uploaded spool must contain the overlay file"
+    );
+    assert!(
+        plain_bytes.windows(5).any(|w| w == b"seed\n"),
+        "uploaded spool must keep the seed member"
+    );
+    let archive_put_at = hits
+        .iter()
+        .position(|h| h.0 == "PUT" && h.1 == key && h.2.is_empty())
+        .unwrap();
+    assert!(
+        hits.iter()
+            .skip(archive_put_at + 1)
+            .any(|h| h.0 == "GET" && h.1 == key),
+        "reopen must read the listener, not the spool path"
+    );
+    thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        archive_puts(),
+        1,
+        "second tick must not PUT the archive again"
+    );
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(secret),
+        "log must not contain the SharedKey secret"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}
+
+/// Regression: a failed Put Block List leaves the overlay file in place.
+#[test]
+fn az_block_list_failure_keeps_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut payload = vec![0u8; 8 * 1024 * 1024 + 64 * 1024];
+    let mut state = 0xA5A5_1234u32;
+    for b in &mut payload {
+        state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+        *b = (state >> 24) as u8;
+    }
+    let member = ratarmount_formats_tar::UstarMember {
+        path: "seed.bin",
+        payload: ratarmount_formats_tar::UstarPayload::File { bytes: &payload },
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    let mut plain = Vec::new();
+    ratarmount_formats_tar::write_ustar_members(&mut plain, &[member]).unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+    let zst_bytes = ratarmount_compress::encode_zstd_frame(&plain, 1).unwrap();
+    assert!(
+        zst_bytes.len() > 8 * 1024 * 1024,
+        "compressed fixture must exceed the single Put Blob limit, got {}",
+        zst_bytes.len()
+    );
+    let zst = dir.path().join("a.tar.zst");
+    fs::write(&zst, &zst_bytes).unwrap();
+    let idx = dir.path().join("a.tar.zst.index.sqlite");
+    let body = ratarmount_compress::open_seekable_zstd(&zst).unwrap();
+    let opts = ratarmount_core::OpenOptions {
+        write_index: true,
+        index_minimum_file_count: 0,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        &zst,
+        body,
+        Some(&idx),
+        &opts,
+        "test",
+    )
+    .expect("sidecar");
+    let index_bytes = fs::read(&idx).unwrap();
+    let pointer = ratarmount_index::IndexPointer::for_blob(&idx, Some(&zst)).unwrap();
+    let pointer_bytes = ratarmount_index::index_pointer_to_json(&pointer)
+        .unwrap()
+        .into_bytes();
+    let id = pointer.index_id.clone();
+    let key = "data/a.tar.zst";
+    let original = zst_bytes.clone();
+    let mut objects = std::collections::HashMap::new();
+    objects.insert(key.into(), zst_bytes);
+    objects.insert(format!("{key}.index.ptr"), pointer_bytes);
+    objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
+    let az = spawn_azure_live(objects, true);
+    let cache = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let secret = "YXp1cmUtc2VjcmV0LWtleS1ET05PVExPRw==";
+    let mut cmd = Command::new(bin());
+    cmd.args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args(["--commit-overlay-interval", "1s"])
+        .arg("az://bkt/data/a.tar.zst");
+    az_env(&mut cmd, az.addr, secret, cache.path());
+    let mut child = cmd
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(30)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("tick.bin"), b"keep-me\n").unwrap();
+    let block_lists = || {
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.method == "PUT" && h.query.contains("comp=blocklist"))
+            .count()
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(90) && block_lists() == 0 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        block_lists() >= 1,
+        "no block list PUT: {:?} log={}",
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| format!("{} {} {}", h.method, h.key, h.query))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(
+        ov.join("tick.bin").exists(),
+        "failed block list must not forget the overlay: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        ov.join("tick.bin").exists(),
+        "retry after a failed block list must not forget the overlay"
+    );
+    assert_eq!(
+        az.objects.lock().unwrap().get(key).map(Vec::as_slice),
+        Some(original.as_slice()),
+        "failed block list must not replace the blob"
+    );
+    assert!(
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|h| { h.key != format!("{key}.index.sqlite") || h.method != "PUT" }),
+        "well-known key must not be written"
+    );
+    assert!(
+        !fs::read_to_string(&log)
+            .unwrap_or_default()
+            .contains(secret),
+        "log must not contain the SharedKey secret"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}
+
 fn ustar_name_count(tar: &[u8], name: &str) -> usize {
     let want = name.as_bytes();
     tar.chunks(512)

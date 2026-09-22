@@ -156,6 +156,7 @@ pub fn spawn_interval_commits(
                     // Reopen is the URL only. Patch ran inside publish.
                     LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
                     LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
+                    LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
                     LiveRemote::Local => {
                         if let Some(window) = ov.last_patch_window() {
                             patch_sidecar_if_present(p, &window, &opts)?;
@@ -357,7 +358,10 @@ pub fn validate_live_commit_args(
     }
     let archive = inputs[0].clone();
     let shown = archive.to_string_lossy();
-    if matches!(live_remote_kind(&shown), LiveRemote::S3 | LiveRemote::Gcs) {
+    if matches!(
+        live_remote_kind(&shown),
+        LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
+    ) {
         if !live_commit_archive_name(&shown) {
             return Err(format!(
                 "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
@@ -395,6 +399,7 @@ enum LiveRemote {
     Local,
     S3,
     Gcs,
+    Azure,
 }
 
 fn live_remote_kind(url: &str) -> LiveRemote {
@@ -402,13 +407,15 @@ fn live_remote_kind(url: &str) -> LiveRemote {
         LiveRemote::S3
     } else if url.starts_with("gs://") {
         LiveRemote::Gcs
+    } else if url.starts_with("az://") || url.starts_with("azure://") {
+        LiveRemote::Azure
     } else {
         LiveRemote::Local
     }
 }
 
 fn remote_publish_patches_sidecar(kind: LiveRemote) -> bool {
-    matches!(kind, LiveRemote::S3 | LiveRemote::Gcs)
+    matches!(kind, LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure)
 }
 
 fn live_commit_archive_name(url: &str) -> bool {
@@ -449,7 +456,8 @@ pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &Ope
 }
 
 /// Wire one object-store archive into the live queue. Local paths are unchanged.
-/// The `gs://` arm calls [`publish_gcs`]. `-w` is not decided here.
+/// The `gs://` arm calls [`publish_gcs`]. The `az://` arm calls [`publish_azure`].
+/// `-w` is not decided here.
 pub fn install_object_store_live_commit(
     overlay: &WriteOverlay,
     archive: &Path,
@@ -484,6 +492,34 @@ pub fn install_object_store_live_commit(
                     Ok(RemoteDownload { file, len })
                 }),
                 Box::new(move |req| publish_gcs(&url_pub, &opts_pub, req)),
+                ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
+            );
+        }
+        LiveRemote::Azure => {
+            let url_head = url.clone();
+            let url_dl = url.clone();
+            let url_pub = url;
+            let url_label = url_pub.clone();
+            let opts_pub = opts.clone();
+            overlay.install_remote_live_commit_for(
+                &url_label,
+                Box::new(move || {
+                    let head = ratarmount_remote::head_azure_object(&url_head)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteObjectHead {
+                        etag: head.etag,
+                        len: head.len,
+                    })
+                }),
+                Box::new(move || {
+                    let loc = ratarmount_remote::parse_azure_url(&url_dl)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    let (file, len) =
+                        ratarmount_remote::fetch_azure_location_to_temp_prefer_range(&loc, None)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteDownload { file, len })
+                }),
+                Box::new(move |req| publish_azure(&url_pub, &opts_pub, req)),
                 ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
             );
         }
@@ -813,6 +849,153 @@ fn publish_gcs(
     Ok(())
 }
 
+fn map_azure_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
+    let msg = err.to_string();
+    if is_s3_http_412(&msg) {
+        RemotePublishError::EtagMismatch(msg)
+    } else {
+        RemotePublishError::Retryable(msg)
+    }
+}
+
+fn azure_index_locations(
+    archive: &ratarmount_remote::AzureLocation,
+    index_id: &str,
+) -> std::result::Result<
+    (
+        ratarmount_remote::AzureLocation,
+        ratarmount_remote::AzureLocation,
+    ),
+    String,
+> {
+    let id = index_id.trim().to_ascii_lowercase();
+    if id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "index_id must be 64 lowercase hex, not {index_id:?}"
+        ));
+    }
+    let container = archive.container.clone();
+    Ok((
+        ratarmount_remote::AzureLocation {
+            container: container.clone(),
+            blob: format!("{}.index.{id}.sqlite", archive.blob),
+        },
+        ratarmount_remote::AzureLocation {
+            container,
+            blob: format!("{}.index.ptr", archive.blob),
+        },
+    ))
+}
+
+/// Same order as [`publish_gcs`]: file-table check, object upload, patch,
+/// `for_blob`, blob PUT, pointer PUT. No well-known key. A failed block list
+/// is retryable: the caller does not forget the overlay and does not bump
+/// `commit_generation`, so the next attempt reuses the same block ids.
+fn publish_azure(
+    url: &str,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    let loc = ratarmount_remote::parse_azure_url(url)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let sidecar = sidecar_path_for_patch(Path::new(url), opts);
+    if let Some(ref path) = sidecar {
+        if let Err(e) = sidecar_file_table_rebuilt_for_upload(path, req) {
+            let msg = e.to_string();
+            return Err(if req.skip_object_put {
+                RemotePublishError::PointerRefused(msg)
+            } else {
+                RemotePublishError::Retryable(msg)
+            });
+        }
+    }
+    if req.skip_object_put {
+        log::info!(
+            "azure live commit object already matches the spliced spool; not uploading it again"
+        );
+    } else {
+        let len = std::fs::metadata(&req.staged)
+            .map(|m| m.len())
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+        log::info!(
+            "azure live commit uploading {len} bytes prefix={} generation={}",
+            req.prefix_compressed_bytes,
+            req.commit_generation
+        );
+        if let Err(e) = ratarmount_remote::put_azure_blocks(
+            &loc,
+            &req.staged,
+            "application/octet-stream",
+            req.commit_generation,
+        ) {
+            return Err(map_azure_put(e));
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        return Err(RemotePublishError::PointerRefused(format!(
+            "incremental reindex failed after object replace: {e}"
+        )));
+    }
+    let blob_len = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
+    if blob_len > META_SIDECAR_WHOLE_MAX {
+        log::warn!(
+            "skipping azure index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
+        );
+        return Ok(());
+    }
+    let pointer = match IndexPointer::for_blob(&sidecar, Some(&req.staged)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let json = match index_pointer_to_json(&pointer) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let (blob_loc, ptr_loc) = match azure_index_locations(&loc, &pointer.index_id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    if let Err(e) = ratarmount_remote::put_azure_blocks(
+        &blob_loc,
+        &sidecar,
+        ratarmount_remote::OCI_INDEX_ARTIFACT_TYPE,
+        req.commit_generation,
+    ) {
+        log::warn!(
+            "azure index blob PUT failed after object replace for az://{}/{}: {e}",
+            loc.container,
+            loc.blob
+        );
+        return Ok(());
+    }
+    if let Err(e) = ratarmount_remote::put_azure_bytes(
+        &ptr_loc,
+        json.as_bytes(),
+        "application/json",
+        req.commit_generation,
+    ) {
+        log::warn!(
+            "azure index pointer PUT failed after object replace for az://{}/{}: {e}",
+            loc.container,
+            loc.blob
+        );
+    }
+    Ok(())
+}
+
 fn url_is_tar_zst(url: &str) -> bool {
     let lower = url.to_ascii_lowercase();
     lower.ends_with(".tar.zst") || lower.ends_with(".tzst") || lower.ends_with(".tar.zstd")
@@ -868,6 +1051,33 @@ fn reopen_gcs_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource
         let tar =
             SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
                 .map_err(|e| OverlayError::Msg(format!("reopen gcs tar: {e}")))?;
+        Ok(Arc::new(tar))
+    }
+}
+
+/// Reopen via [`ratarmount_remote::open_azure_range`] only. The spool path is not a mount.
+fn reopen_azure_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = ratarmount_remote::open_azure_range(url)
+        .map_err(|e| OverlayError::Msg(format!("reopen azure: {e}")))?;
+    let label = PathBuf::from(url);
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    if url_is_tar_zst(url) {
+        let threads = o.threads_for("zstd");
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range, threads, &label,
+        )
+        .map_err(|e| OverlayError::Msg(format!("reopen azure zstd: {e}")))?;
+        let tar =
+            SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen azure tar.zst: {e}")))?;
+        Ok(Arc::new(tar))
+    } else {
+        let tar =
+            SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen azure tar: {e}")))?;
         Ok(Arc::new(tar))
     }
 }
@@ -1321,6 +1531,7 @@ mod tests {
             presplice_sha256: sha256_file(staged),
             presplice_prefix512_sha256: prefix,
             presplice_suffix512_sha256: suffix,
+            commit_generation: 0,
         }
     }
 

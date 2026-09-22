@@ -179,6 +179,10 @@ pub struct RemotePublishRequest {
     pub presplice_sha256: String,
     pub presplice_prefix512_sha256: String,
     pub presplice_suffix512_sha256: String,
+    /// `commit_generation` sampled before this attempt's success bump.
+    /// Azure block ids use it. A failed attempt does not bump, so a retry
+    /// reuses the same ids.
+    pub commit_generation: u64,
 }
 
 /// Publish failed before a successful object replace, or the object already
@@ -1516,6 +1520,7 @@ impl WriteOverlay {
             presplice_sha256: s.presplice_sha256.clone(),
             presplice_prefix512_sha256: s.presplice_prefix512_sha256.clone(),
             presplice_suffix512_sha256: s.presplice_suffix512_sha256.clone(),
+            commit_generation: self.commit_generation(),
         })
     }
 

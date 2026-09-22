@@ -56,8 +56,9 @@ pub use gcs::{
 };
 mod azure;
 pub use azure::{
-    fetch_azure_range_bytes, fetch_azure_to_temp, open_azure_folder, open_azure_range,
-    parse_azure_url, AzureListing, AzureLocation, AzureRangeFile,
+    fetch_azure_location_to_temp_prefer_range, fetch_azure_range_bytes, fetch_azure_to_temp,
+    head_azure_object, open_azure_folder, open_azure_range, parse_azure_url, put_azure_blocks,
+    put_azure_bytes, AzureHead, AzureListing, AzureLocation, AzureRangeFile,
 };
 mod rclone;
 pub use rclone::{
