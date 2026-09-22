@@ -82,8 +82,10 @@ Zstd destination — copy versus recompress:
 
 Gzip output is copy-only: a second deflate does not create seek points, so the
 index is the sidecar. A non-gzip input named `.gz` is an error. The default
-sidecar is `.rgzi` only. TAR member order stays input byte order; names are
-not sorted.
+sidecar is `.rgzi` only. `--yes` removes the sidecar that was not selected
+after a successful publish (a previous `.rgzi` does not survive `gzidx`, and
+the reverse); a failed publish leaves the previous archive and both sidecars.
+TAR member order stays input byte order; names are not sorted.
 
 ---
 

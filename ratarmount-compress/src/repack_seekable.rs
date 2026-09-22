@@ -70,7 +70,9 @@ pub struct RepackOptions {
     pub zstd_level: i32,
     /// Sidecar for a gzip destination. Ignored for zstd output.
     pub gzip_sidecar: GzipSidecar,
-    /// Replace an existing output file or selected sidecar. Never follows a final symlink.
+    /// Replace an existing output file or selected sidecar. A successful gzip
+    /// overwrite also removes the sidecar that was not selected. Never follows
+    /// a final symlink.
     pub overwrite: bool,
 }
 
@@ -455,6 +457,11 @@ fn repack_gzip_dest(
 
     let output_len = body.as_file().metadata()?.len();
     publish_with_sidecars(body, output, sides)?;
+    if opts.overwrite {
+        // After the new body is in place. A failed publish restores the
+        // previous archive and must leave this sibling alone.
+        remove_unselected_gzip_sidecar(output, opts.gzip_sidecar)?;
+    }
     Ok(report(
         RepackAction::CopiedWithGzipIndex {
             format: opts.gzip_sidecar,
@@ -464,6 +471,20 @@ fn repack_gzip_dest(
         uncompressed_len,
         0,
     ))
+}
+
+/// `.rgzi` when the selection is gzidx, `.gzidx` when it is rgzi. `Both` keeps both.
+fn remove_unselected_gzip_sidecar(output: &Path, kind: GzipSidecar) -> Result<()> {
+    let ext = match kind {
+        GzipSidecar::Rgzi => "gzidx",
+        GzipSidecar::Gzidx => "rgzi",
+        GzipSidecar::Both => return Ok(()),
+    };
+    match fs::remove_file(sidecar_path(output, ext)) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e.into()),
+    }
 }
 
 fn gzip_index_blobs(indexed: &SeekableGzip, kind: GzipSidecar) -> Vec<Vec<u8>> {
@@ -1077,6 +1098,57 @@ mod tests {
             try_import_gzip_seek_blob(&fs::read(dir.path().join("both.gz.gzidx")).unwrap())
                 .unwrap();
         assert_eq!(both_gzidx.format, GzipSeekBlobFormat::IndexedGzip);
+    }
+
+    /// Overwrite with gzidx drops a stale `.rgzi`. The new `.gzidx` is the index
+    /// of the new body. A failed publish leaves the previous archive and both sidecars.
+    #[test]
+    fn repack_gzip_overwrite_gzidx_drops_stale_rgzi() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        let output = dir.path().join("out.gz");
+        let rgzi = dir.path().join("out.gz.rgzi");
+        let gzidx = dir.path().join("out.gz.gzidx");
+        let new_raw = b"new-gzip-body";
+        let new_gz = gzip_bytes(new_raw);
+        fs::write(&input, &new_gz).unwrap();
+        fs::write(&output, gzip_bytes(b"old-gzip-body")).unwrap();
+        fs::write(&rgzi, b"old-rgzi").unwrap();
+        fs::write(&gzidx, b"old-gzidx").unwrap();
+
+        let opts = RepackOptions {
+            gzip_sidecar: GzipSidecar::Gzidx,
+            overwrite: true,
+            ..RepackOptions::default()
+        };
+        let report = repack_seekable(&input, &output, &opts).unwrap();
+        assert_eq!(
+            report.action,
+            RepackAction::CopiedWithGzipIndex {
+                format: GzipSidecar::Gzidx,
+            }
+        );
+        assert_eq!(fs::read(&output).unwrap(), new_gz);
+        assert!(!rgzi.exists(), "stale .rgzi must not describe the new gzip");
+        let indexed = SeekableGzip::open(&output, DEFAULT_GZIP_SEEK_SPACING).unwrap();
+        assert_eq!(indexed.uncompressed_size(), new_raw.len() as u64);
+        assert_eq!(
+            fs::read(&gzidx).unwrap(),
+            indexed.export_indexed_gzip_blob()
+        );
+
+        let fail_in = dir.path().join("bad.gz");
+        let fail_out = dir.path().join("fail.gz");
+        let fail_rgzi = dir.path().join("fail.gz.rgzi");
+        let fail_gzidx = dir.path().join("fail.gz.gzidx");
+        fs::write(&fail_in, b"\x1f\x8b").unwrap();
+        fs::write(&fail_out, b"old-archive").unwrap();
+        fs::write(&fail_rgzi, b"old-rgzi").unwrap();
+        fs::write(&fail_gzidx, b"old-gzidx").unwrap();
+        assert!(repack_seekable(&fail_in, &fail_out, &opts).is_err());
+        assert_eq!(fs::read(&fail_out).unwrap(), b"old-archive");
+        assert_eq!(fs::read(&fail_rgzi).unwrap(), b"old-rgzi");
+        assert_eq!(fs::read(&fail_gzidx).unwrap(), b"old-gzidx");
     }
 
     #[test]
