@@ -16,6 +16,9 @@ ssh2 = { version = "0.9", features = ["vendored-openssl"] }
 hmac = "0.12"
 sha1 = "0.10"
 sha2 = "0.10"
+# NTLMv2 (MD4) and HMAC-MD5. Same crates as ratarmount-smb; no feature gate.
+md4 = "0.10"
+md-5 = "0.10"
 hex = "0.4"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 # Dropbox list_folder / metadata JSON (also used by other crates in the workspace).
