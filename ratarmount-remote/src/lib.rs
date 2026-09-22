@@ -51,8 +51,8 @@ pub use ftp::{
 mod gcs;
 pub use gcs::{
     fetch_gcs_location_to_temp_prefer_range, fetch_gcs_range_bytes, fetch_gcs_to_temp,
-    head_gcs_object, open_gcs_folder, open_gcs_range, parse_gcs_url, put_gcs_object, GcsHead,
-    GcsListing, GcsLocation, GcsRangeFile,
+    head_gcs_object, open_gcs_folder, open_gcs_range, parse_gcs_url, put_gcs_file, put_gcs_object,
+    GcsHead, GcsListing, GcsLocation, GcsRangeFile,
 };
 mod azure;
 pub use azure::{

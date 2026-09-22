@@ -211,6 +211,8 @@ struct RemoteLive {
     download: Box<dyn FnMut() -> Result<RemoteDownload> + Send>,
     publish: RemotePublishHook,
     on_exit_extra_wait: Duration,
+    /// `s3://…` or `gs://…`. Failure text uses the scheme, not a hard-coded `s3`.
+    archive_url: String,
 }
 
 /// Pointer JSON from [`IndexPointer::for_blob`] after the sidecar is patched.
@@ -328,12 +330,39 @@ impl WriteOverlay {
         publish: RemotePublishHook,
         on_exit_extra_wait: Duration,
     ) {
+        self.install_remote_live_commit_for("s3://", head, download, publish, on_exit_extra_wait);
+    }
+
+    /// Same as [`Self::install_remote_live_commit`], with the archive URL used
+    /// in publish errors (`gs publish failed`, not `s3 publish failed`).
+    pub fn install_remote_live_commit_for(
+        &self,
+        archive_url: &str,
+        head: Box<dyn FnMut() -> Result<RemoteObjectHead> + Send>,
+        download: Box<dyn FnMut() -> Result<RemoteDownload> + Send>,
+        publish: RemotePublishHook,
+        on_exit_extra_wait: Duration,
+    ) {
         *self.remote.lock().expect("overlay remote") = Some(RemoteLive {
             head,
             download,
             publish,
             on_exit_extra_wait,
+            archive_url: archive_url.to_string(),
         });
+    }
+
+    fn remote_scheme_label(&self) -> String {
+        let guard = self.remote.lock().expect("overlay remote");
+        let url = guard
+            .as_ref()
+            .map(|r| r.archive_url.as_str())
+            .unwrap_or("s3://");
+        url.split("://")
+            .next()
+            .filter(|s| !s.is_empty() && !s.contains('/'))
+            .unwrap_or("s3")
+            .to_string()
     }
 
     fn remote_enabled(&self) -> bool {
@@ -1464,17 +1493,18 @@ impl WriteOverlay {
     }
 
     fn spliced_publish_request(&self) -> Result<RemotePublishRequest> {
+        let scheme = self.remote_scheme_label();
         let guard = self.spool.lock().expect("overlay spool");
-        let hold = guard
-            .as_ref()
-            .ok_or_else(|| OverlayError::Msg("s3 publish requested without a spool".into()))?;
+        let hold = guard.as_ref().ok_or_else(|| {
+            OverlayError::Msg(format!("{scheme} publish requested without a spool"))
+        })?;
         let SpoolState::Spliced(s) = &hold.state else {
-            return Err(OverlayError::Msg(
-                "s3 publish requested before splice".into(),
-            ));
+            return Err(OverlayError::Msg(format!(
+                "{scheme} publish requested before splice"
+            )));
         };
         let window = self.last_patch_window().ok_or_else(|| {
-            OverlayError::Msg("s3 publish missing the splice patch window".into())
+            OverlayError::Msg(format!("{scheme} publish missing the splice patch window"))
         })?;
         Ok(RemotePublishRequest {
             staged: hold.file.path().to_path_buf(),
@@ -1587,23 +1617,24 @@ impl WriteOverlay {
     }
 
     fn publish_prepared(&self, req: &RemotePublishRequest) -> Result<()> {
+        let scheme = self.remote_scheme_label();
         match self.remote_publish(req) {
             Ok(()) => Ok(()),
             Err(RemotePublishError::EtagMismatch(msg)) => {
                 // Do not resplice the old spool. The next tick downloads.
                 self.drop_spool();
                 Err(OverlayError::Msg(format!(
-                    "s3 publish precondition failed: {msg}"
+                    "{scheme} publish precondition failed: {msg}"
                 )))
             }
             Err(RemotePublishError::Retryable(msg)) => {
-                Err(OverlayError::Msg(format!("s3 publish failed: {msg}")))
+                Err(OverlayError::Msg(format!("{scheme} publish failed: {msg}")))
             }
             Err(RemotePublishError::PointerRefused(msg)) => {
                 // The object already contains this splice. Leave the previous
                 // pointer. The Ok arm forgets only the stashed plan.
                 log::warn!(
-                    "s3 pointer refused after the object already contained the splice: {msg}"
+                    "{scheme} pointer refused after the object already contained the splice: {msg}"
                 );
                 Ok(())
             }
@@ -8683,6 +8714,45 @@ mod tests {
         );
         assert_eq!(ov.commit_generation(), gen + 1);
         assert!(!ov.interval_disabled());
+    }
+
+    /// Regression: a GCS publish failure is not logged as an S3 publish.
+    #[test]
+    fn gs_publish_failure_is_not_labeled_s3() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("gs-fail-seed");
+        let extra = generated_payload("gs-fail-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        let len = fs::metadata(&archive).unwrap().len();
+        let archive_dl = archive.clone();
+        ov.install_remote_live_commit_for(
+            "gs://bkt/data/a.tar.zst",
+            Box::new(move || {
+                Ok(RemoteObjectHead {
+                    etag: Some("\"e1\"".into()),
+                    len,
+                })
+            }),
+            Box::new(move || Ok(fresh_spool(&archive_dl))),
+            Box::new(|_| Err(RemotePublishError::Retryable("HTTP 500".into()))),
+            Duration::from_secs(120),
+        );
+        let err = ov
+            .enqueue_commit(&archive, CommitKind::IntervalIdle(Duration::ZERO), |_| {
+                panic!("500 must not reopen")
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.starts_with("gs publish failed:"),
+            "GCS failure must name gs, not s3: {err}"
+        );
+        assert!(!err.contains("s3 publish"), "{err}");
+        assert!(overlay.join("new.txt").is_file(), "overlay file stays");
     }
 
     /// 412 drops `Spliced` and the next tick downloads instead of resplicing.

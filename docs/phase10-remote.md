@@ -85,12 +85,12 @@ XML file GET; JSON list API (Bearer/ADC/IMDS). HMAC GOOG1 uses XML ListBucket (q
 |-----|---------|
 | `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` | Bearer (tried first) |
 | `GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET` | GOOG1 HMAC (both non-empty; selected **before** the ADC/IMDS token cache) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s) |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s). GET scope is `devstorage.read_only`. PUT mints `devstorage.read_write` and does not reuse the read token |
 | GCE/GKE IMDS | `Metadata-Flavor: Google` (override `RATARMOUNT_GCS_IMDS_BASE` for tests) |
 | `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET (PUT is an error before any request) |
 | `RATARMOUNT_GCS_ENDPOINT` | XML/JSON API base override |
 
-Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one existing `gs://` `.tar` or `.tar.zst` spools with ranged GET when the object is large, splices locally, then sends one PUT. GOOG1 signs verb, Content-MD5, Content-Type, Date, and resource. Bearer sends `Authorization: Bearer` plus Content-MD5 and does not use that signer. Content-Type is `application/octet-stream` for the archive, `application/vnd.ratarmount.index.v1+sqlite` for the blob, and `application/json` for the pointer. No multipart and no well-known key. Offline `--commit-overlay` does not upload.
+Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one existing `gs://` `.tar` or `.tar.zst` spools with ranged GET when the object is large, splices locally, then streams one PUT (`Content-Length` set; the spool is not buffered twice). GOOG1 signs verb, Content-MD5, Content-Type, Date, and resource. Bearer sends `Authorization: Bearer` plus Content-MD5 and does not use that signer. Content-Type is `application/octet-stream` for the archive, `application/vnd.ratarmount.index.v1+sqlite` for the blob, and `application/json` for the pointer. No multipart and no well-known key. Offline `--commit-overlay` does not upload.
 
 ### Azure Blob (`az://` / `azure://`)
 

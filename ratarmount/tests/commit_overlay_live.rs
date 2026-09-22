@@ -1671,6 +1671,10 @@ fn gs_interval_uploads_once() {
             .any(|w| w == payload.as_bytes()),
         "uploaded spool must contain the overlay file"
     );
+    assert!(
+        plain_bytes.windows(5).any(|w| w == b"seed\n"),
+        "uploaded spool must keep the seed member"
+    );
     let meta = cache.path().join("ratarmount").join("meta-v3");
     let mut matched = false;
     if meta.is_dir() {

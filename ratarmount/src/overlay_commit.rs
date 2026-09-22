@@ -424,8 +424,10 @@ pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &Ope
     let url_head = archive.to_string_lossy().into_owned();
     let url_dl = url_head.clone();
     let url_pub = url_head.clone();
+    let url_label = url_pub.clone();
     let opts_pub = opts.clone();
-    overlay.install_remote_live_commit(
+    overlay.install_remote_live_commit_for(
+        &url_label,
         Box::new(move || {
             let head = ratarmount_remote::head_s3_object(&url_head)
                 .map_err(|e| OverlayError::Msg(e.to_string()))?;
@@ -461,8 +463,10 @@ pub fn install_object_store_live_commit(
             let url_head = url.clone();
             let url_dl = url.clone();
             let url_pub = url;
+            let url_label = url_pub.clone();
             let opts_pub = opts.clone();
-            overlay.install_remote_live_commit(
+            overlay.install_remote_live_commit_for(
+                &url_label,
                 Box::new(move || {
                     let head = ratarmount_remote::head_gcs_object(&url_head)
                         .map_err(|e| OverlayError::Msg(e.to_string()))?;
@@ -729,14 +733,16 @@ fn publish_gcs(
             "gcs live commit object already matches the spliced spool; not uploading it again"
         );
     } else {
-        let body =
-            std::fs::read(&req.staged).map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+        let len = std::fs::metadata(&req.staged)
+            .map(|m| m.len())
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
         log::info!(
-            "gcs live commit uploading {} bytes prefix={}",
-            body.len(),
+            "gcs live commit uploading {len} bytes prefix={}",
             req.prefix_compressed_bytes
         );
-        if let Err(e) = ratarmount_remote::put_gcs_object(&loc, &body, "application/octet-stream") {
+        if let Err(e) =
+            ratarmount_remote::put_gcs_file(&loc, &req.staged, "application/octet-stream")
+        {
             return Err(map_gcs_put(e));
         }
     }

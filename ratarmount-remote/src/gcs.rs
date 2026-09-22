@@ -64,7 +64,10 @@ pub const GCS_ENDPOINT_ENV: &str = "RATARMOUNT_GCS_ENDPOINT";
 
 const DEFAULT_GCS_HOST: &str = "storage.googleapis.com";
 const DEFAULT_IMDS_BASE: &str = "http://169.254.169.254";
+/// GET, HEAD, and list. Do not use this token for PUT.
 const GCS_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_only";
+/// Service-account PUT only. Never stored in the read-mount cache.
+const GCS_WRITE_SCOPE: &str = "https://www.googleapis.com/auth/devstorage.read_write";
 const DEFAULT_TOKEN_URI: &str = "https://oauth2.googleapis.com/token";
 const CREDS_EXPIRY_SKEW: Duration = Duration::from_secs(120);
 const IMDS_TIMEOUT: Duration = Duration::from_secs(2);
@@ -249,15 +252,29 @@ fn redact_secret(s: &str) -> &'static str {
 struct CachedToken {
     access_token: String,
     expiration: chrono::DateTime<chrono::Utc>,
+    /// OAuth scope this token was minted with. Read and write do not share a slot.
+    scope: String,
 }
 
-static TOKEN_CACHE: Mutex<Option<(CredSource, CachedToken)>> = Mutex::new(None);
+struct TokenCache {
+    read: Option<(CredSource, CachedToken)>,
+    write: Option<(CredSource, CachedToken)>,
+}
+
+static TOKEN_CACHE: Mutex<TokenCache> = Mutex::new(TokenCache {
+    read: None,
+    write: None,
+});
+
+fn cache_lock() -> std::sync::MutexGuard<'static, TokenCache> {
+    TOKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 #[cfg(test)]
 fn clear_token_cache() {
-    if let Ok(mut guard) = TOKEN_CACHE.lock() {
-        *guard = None;
-    }
+    let mut guard = cache_lock();
+    guard.read = None;
+    guard.write = None;
 }
 
 fn token_still_valid(tok: &CachedToken) -> bool {
@@ -265,17 +282,31 @@ fn token_still_valid(tok: &CachedToken) -> bool {
     chrono::Utc::now() + skew < tok.expiration
 }
 
+/// Read-mount cache only. A `devstorage.read_write` token is not returned.
 fn take_cached_token() -> Option<(CredSource, String)> {
-    let guard = TOKEN_CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    let guard = cache_lock();
     guard
+        .read
         .as_ref()
-        .filter(|(_, t)| token_still_valid(t))
+        .filter(|(_, t)| t.scope == GCS_SCOPE && token_still_valid(t))
+        .map(|(src, t)| (*src, t.access_token.clone()))
+}
+
+fn take_write_cached_token() -> Option<(CredSource, String)> {
+    let guard = cache_lock();
+    guard
+        .write
+        .as_ref()
+        .filter(|(_, t)| t.scope == GCS_WRITE_SCOPE && token_still_valid(t))
         .map(|(src, t)| (*src, t.access_token.clone()))
 }
 
 fn store_cached_token(source: CredSource, token: CachedToken) {
-    if let Ok(mut guard) = TOKEN_CACHE.lock() {
-        *guard = Some((source, token));
+    let mut guard = cache_lock();
+    if token.scope == GCS_WRITE_SCOPE {
+        guard.write = Some((source, token));
+    } else {
+        guard.read = Some((source, token));
     }
 }
 
@@ -296,7 +327,7 @@ impl std::fmt::Debug for ResolvedAuth {
     }
 }
 
-fn parse_oauth_token_json(body: &str) -> Result<CachedToken> {
+fn parse_oauth_token_json(body: &str, scope: &str) -> Result<CachedToken> {
     let v: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| gcs_err(format!("failed to parse OAuth token JSON: {e}")))?;
     let access_token = v
@@ -316,6 +347,7 @@ fn parse_oauth_token_json(body: &str) -> Result<CachedToken> {
     Ok(CachedToken {
         access_token,
         expiration,
+        scope: scope.to_string(),
     })
 }
 
@@ -325,10 +357,19 @@ fn load_env_access_token() -> Option<String> {
 }
 
 fn fetch_imds_token() -> Result<CachedToken> {
-    let url = format!(
+    // No `scopes` query: the read mount keeps the metadata server's default token.
+    fetch_imds_token_scoped(None)
+}
+
+fn fetch_imds_token_scoped(scope: Option<&str>) -> Result<CachedToken> {
+    let mut url = format!(
         "{}/computeMetadata/v1/instance/service-accounts/default/token",
         imds_base()
     );
+    if let Some(scope) = scope {
+        url.push_str("?scopes=");
+        url.push_str(&urlencoding_encode(scope));
+    }
     debug!("gcs: fetching IMDS token");
     let resp = ureq::get(&url)
         .set("User-Agent", USER_AGENT)
@@ -341,10 +382,10 @@ fn fetch_imds_token() -> Result<CachedToken> {
     if !(200..300).contains(&status) {
         return Err(gcs_err(format!("IMDS GET {url}: status {status}: {body}")));
     }
-    parse_oauth_token_json(&body)
+    parse_oauth_token_json(&body, scope.unwrap_or(GCS_SCOPE))
 }
 
-fn exchange_jwt_for_token(sa: &serde_json::Value) -> Result<CachedToken> {
+fn exchange_jwt_for_token(sa: &serde_json::Value, scope: &str) -> Result<CachedToken> {
     let client_email = sa
         .get("client_email")
         .and_then(|x| x.as_str())
@@ -364,7 +405,7 @@ fn exchange_jwt_for_token(sa: &serde_json::Value) -> Result<CachedToken> {
     let now = chrono::Utc::now().timestamp();
     let claims = serde_json::json!({
         "iss": client_email,
-        "scope": GCS_SCOPE,
+        "scope": scope,
         "aud": token_uri,
         "iat": now,
         "exp": now + 3600,
@@ -394,17 +435,21 @@ fn exchange_jwt_for_token(sa: &serde_json::Value) -> Result<CachedToken> {
             "ADC token POST {token_uri}: status {status}"
         )));
     }
-    parse_oauth_token_json(&text)
+    parse_oauth_token_json(&text, scope)
 }
 
 fn fetch_adc_token() -> Result<CachedToken> {
+    fetch_adc_token_with_scope(GCS_SCOPE)
+}
+
+fn fetch_adc_token_with_scope(scope: &str) -> Result<CachedToken> {
     let path = non_empty_env("GOOGLE_APPLICATION_CREDENTIALS")
         .ok_or_else(|| gcs_err("GOOGLE_APPLICATION_CREDENTIALS unset"))?;
     let text = std::fs::read_to_string(&path)
         .map_err(|e| gcs_err(format!("reading ADC file {path}: {e}")))?;
     let sa: serde_json::Value = serde_json::from_str(&text)
         .map_err(|e| gcs_err(format!("parsing ADC JSON {path}: {e}")))?;
-    exchange_jwt_for_token(&sa)
+    exchange_jwt_for_token(&sa, scope)
 }
 
 fn load_hmac_keys() -> Option<HmacKeys> {
@@ -504,6 +549,86 @@ fn resolve_auth() -> Result<ResolvedAuth> {
     Err(gcs_err(msg))
 }
 
+/// Credentials for one PUT. Env bearer and GOOG1 HMAC are used as-is.
+/// A service account mints [`GCS_WRITE_SCOPE`] and does not reuse a cached
+/// `devstorage.read_only` token. Anonymous is an error.
+fn resolve_put_auth() -> Result<ResolvedAuth> {
+    if let Some(tok) = load_env_access_token() {
+        return Ok(ResolvedAuth {
+            source: CredSource::EnvToken,
+            bearer: Some(tok),
+            hmac: None,
+        });
+    }
+    if let Some(keys) = load_hmac_keys() {
+        debug!("gcs: using HMAC GOOG1 for PUT");
+        return Ok(ResolvedAuth {
+            source: CredSource::Hmac,
+            bearer: None,
+            hmac: Some(keys),
+        });
+    }
+    if let Some((source, tok)) = take_write_cached_token() {
+        debug!("gcs: using cached write-scoped {source:?} token");
+        return Ok(ResolvedAuth {
+            source,
+            bearer: Some(tok),
+            hmac: None,
+        });
+    }
+
+    if non_empty_env("GOOGLE_APPLICATION_CREDENTIALS").is_some() {
+        match fetch_adc_token_with_scope(GCS_WRITE_SCOPE) {
+            Ok(tok) => {
+                let bearer = tok.access_token.clone();
+                store_cached_token(CredSource::Adc, tok);
+                return Ok(ResolvedAuth {
+                    source: CredSource::Adc,
+                    bearer: Some(bearer),
+                    hmac: None,
+                });
+            }
+            Err(e) => {
+                debug!("gcs: ADC write-scope exchange failed: {e}");
+            }
+        }
+    }
+
+    match fetch_imds_token_scoped(Some(GCS_WRITE_SCOPE)) {
+        Ok(tok) => {
+            let bearer = tok.access_token.clone();
+            store_cached_token(CredSource::Imds, tok);
+            return Ok(ResolvedAuth {
+                source: CredSource::Imds,
+                bearer: Some(bearer),
+                hmac: None,
+            });
+        }
+        Err(e) => {
+            debug!("gcs: IMDS write-scope token failed: {e}");
+        }
+    }
+
+    if anonymous_enabled() {
+        return Err(gcs_auth_err(
+            "anonymous credentials cannot PUT gs:// objects",
+        ));
+    }
+    Err(gcs_err(
+        "no GCS credentials found for gs:// PUT; set GOOGLE_HMAC_KEY + GOOGLE_HMAC_SECRET, \
+         a bearer token, or GOOGLE_APPLICATION_CREDENTIALS with devstorage.read_write",
+    ))
+}
+
+fn reject_anonymous_put(auth: &ResolvedAuth) -> Result<()> {
+    if auth.source == CredSource::Anonymous || (auth.hmac.is_none() && auth.bearer.is_none()) {
+        return Err(gcs_auth_err(
+            "anonymous credentials cannot PUT gs:// objects",
+        ));
+    }
+    Ok(())
+}
+
 /// GOOG1 string-to-sign (AWS V2). Range is not included (unsigned on the wire).
 ///
 /// Content-MD5 and Content-Type are hard-coded empty. GET and HEAD stay on
@@ -526,6 +651,24 @@ fn goog1_put_string_to_sign(
 
 fn content_md5_b64(body: &[u8]) -> String {
     base64_encode(&Md5::digest(body))
+}
+
+/// Stream MD5 of a staged file. Does not keep the bytes.
+fn content_md5_path(path: &std::path::Path) -> Result<(String, u64)> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| gcs_err(format!("reading {} for Content-MD5: {e}", path.display())))?;
+    let mut hasher = Md5::new();
+    let mut buf = [0u8; 64 * 1024];
+    let mut len = 0u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((base64_encode(hasher.finalize().as_slice()), len))
 }
 
 fn goog1_canonical_resource_object(bucket: &str, object: &str) -> String {
@@ -753,50 +896,7 @@ fn apply_gcs_put_auth(
     Ok(req)
 }
 
-/// One PutObject. No multipart and no resumable session.
-///
-/// `content_type` is the GOOG1 field and the `Content-Type` header.
-/// `Content-MD5` is the base64 MD5 of `body` (not hex). Anonymous credentials
-/// error before any request. Bearer auth sends `Authorization: Bearer` and
-/// does not use the GOOG1 signer. The HMAC secret is not logged.
-pub fn put_gcs_object(loc: &GcsLocation, body: &[u8], content_type: &str) -> Result<()> {
-    let auth = resolve_auth()?;
-    if auth.source == CredSource::Anonymous || (auth.hmac.is_none() && auth.bearer.is_none()) {
-        return Err(gcs_auth_err(
-            "anonymous credentials cannot PUT gs:// objects",
-        ));
-    }
-    let md5 = content_md5_b64(body);
-    let date = rfc1123_gmt(chrono::Utc::now());
-    let resource = goog1_canonical_resource_object(&loc.bucket, &loc.object);
-    let url = gcs_xml_object_url(loc);
-    debug!(
-        "gcs PUT {url} (auth={:?}, bytes={}, content-type={content_type})",
-        auth.source,
-        body.len()
-    );
-    let req = apply_gcs_put_auth(ureq::put(&url), &auth, &md5, content_type, &resource, &date)?;
-    let resp = req
-        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
-        .send_bytes(body)
-        .map_err(|e| match e {
-            ureq::Error::Status(status, resp) => {
-                let text = resp.into_string().unwrap_or_default();
-                let msg = format!(
-                    "PutObject HTTP {status} for gs://{}/{}: {text}",
-                    loc.bucket, loc.object
-                );
-                if status == 401 || status == 403 {
-                    gcs_auth_err(msg)
-                } else {
-                    gcs_err(msg)
-                }
-            }
-            other => gcs_err(format!(
-                "PutObject gs://{}/{}: {other}",
-                loc.bucket, loc.object
-            )),
-        })?;
+fn finish_gcs_put(loc: &GcsLocation, resp: ureq::Response) -> Result<()> {
     let status = resp.status();
     if !(200..300).contains(&status) {
         let text = resp.into_string().unwrap_or_default();
@@ -806,6 +906,83 @@ pub fn put_gcs_object(loc: &GcsLocation, body: &[u8], content_type: &str) -> Res
         )));
     }
     Ok(())
+}
+
+fn map_gcs_put_send(loc: &GcsLocation, err: ureq::Error) -> RemoteError {
+    match err {
+        ureq::Error::Status(status, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let msg = format!(
+                "PutObject HTTP {status} for gs://{}/{}: {text}",
+                loc.bucket, loc.object
+            );
+            if status == 401 || status == 403 {
+                gcs_auth_err(msg)
+            } else {
+                gcs_err(msg)
+            }
+        }
+        other => gcs_err(format!(
+            "PutObject gs://{}/{}: {other}",
+            loc.bucket, loc.object
+        )),
+    }
+}
+
+fn send_gcs_put(
+    loc: &GcsLocation,
+    auth: &ResolvedAuth,
+    md5: &str,
+    content_type: &str,
+    content_length: u64,
+    body: impl Read,
+) -> Result<()> {
+    let date = rfc1123_gmt(chrono::Utc::now());
+    let resource = goog1_canonical_resource_object(&loc.bucket, &loc.object);
+    let url = gcs_xml_object_url(loc);
+    debug!(
+        "gcs PUT {url} (auth={:?}, bytes={content_length}, content-type={content_type})",
+        auth.source
+    );
+    let req = apply_gcs_put_auth(ureq::put(&url), auth, md5, content_type, &resource, &date)?
+        .set("Content-Length", &content_length.to_string());
+    let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
+        .send(body)
+        .map_err(|e| map_gcs_put_send(loc, e))?;
+    finish_gcs_put(loc, resp)
+}
+
+/// One PutObject of an in-memory body. No multipart and no resumable session.
+///
+/// `content_type` is the GOOG1 field and the `Content-Type` header.
+/// `Content-MD5` is the base64 MD5 of `body` (not hex). Anonymous credentials
+/// error before any request. Bearer auth sends `Authorization: Bearer` and
+/// does not use the GOOG1 signer. The HMAC secret is not logged.
+/// Archive spools use [`put_gcs_file`] so the bytes are not held twice.
+pub fn put_gcs_object(loc: &GcsLocation, body: &[u8], content_type: &str) -> Result<()> {
+    let auth = resolve_put_auth()?;
+    reject_anonymous_put(&auth)?;
+    let md5 = content_md5_b64(body);
+    send_gcs_put(
+        loc,
+        &auth,
+        &md5,
+        content_type,
+        body.len() as u64,
+        std::io::Cursor::new(body),
+    )
+}
+
+/// One PutObject of a staged file. MD5 is hashed from disk, then the file is
+/// streamed with `Content-Length` set to that byte count. No second full copy.
+pub fn put_gcs_file(loc: &GcsLocation, path: &std::path::Path, content_type: &str) -> Result<()> {
+    let auth = resolve_put_auth()?;
+    reject_anonymous_put(&auth)?;
+    let (md5, len) = content_md5_path(path)?;
+    let file = std::fs::File::open(path)
+        .map_err(|e| gcs_err(format!("opening {} for PUT: {e}", path.display())))?;
+    send_gcs_put(loc, &auth, &md5, content_type, len, file)
 }
 
 enum GcsProbe {
@@ -1719,6 +1896,7 @@ mod tests {
         range_headers: Arc<AtomicUsize>,
         list_gets: Arc<AtomicUsize>,
         requests: Arc<AtomicUsize>,
+        bodies: Arc<StdMutex<Vec<Vec<u8>>>>,
         _join: Option<thread::JoinHandle<()>>,
     }
 
@@ -1759,6 +1937,7 @@ mod tests {
             let range_headers = Arc::new(AtomicUsize::new(0));
             let list_gets = Arc::new(AtomicUsize::new(0));
             let requests = Arc::new(AtomicUsize::new(0));
+            let bodies = Arc::new(StdMutex::new(Vec::new()));
             let log_c = Arc::clone(&log);
             let gets_c = Arc::clone(&gets);
             let posts_c = Arc::clone(&posts);
@@ -1766,6 +1945,7 @@ mod tests {
             let range_c = Arc::clone(&range_headers);
             let list_c = Arc::clone(&list_gets);
             let requests_c = Arc::clone(&requests);
+            let bodies_c = Arc::clone(&bodies);
             let join = thread::spawn(move || {
                 for stream in listener.incoming().take(64) {
                     let Ok(mut stream) = stream else { continue };
@@ -1782,6 +1962,7 @@ mod tests {
                     let mut content_md5: Option<String> = None;
                     let mut content_type: Option<String> = None;
                     let mut date_hdr: Option<String> = None;
+                    let mut saw_length = false;
                     requests_c.fetch_add(1, Ordering::SeqCst);
                     loop {
                         let mut line = String::new();
@@ -1811,6 +1992,7 @@ mod tests {
                         }
                         if let Some(rest) = lower.strip_prefix("content-length:") {
                             content_len = rest.trim().parse().unwrap_or(0);
+                            saw_length = true;
                         }
                         if lower.starts_with("content-md5:") {
                             if let Some((_, v)) = line.split_once(':') {
@@ -1828,9 +2010,11 @@ mod tests {
                             }
                         }
                     }
+                    let mut dump = Vec::new();
                     if content_len > 0 {
-                        let mut dump = vec![0u8; content_len];
+                        dump.resize(content_len, 0);
                         let _ = reader.read_exact(&mut dump);
+                        bodies_c.lock().unwrap().push(dump.clone());
                     }
                     {
                         let mut lg = log_c.lock().unwrap();
@@ -1854,6 +2038,9 @@ mod tests {
                         }
                         if let Some(ref v) = date_hdr {
                             lg.push(format!("Date: {v}"));
+                        }
+                        if saw_length {
+                            lg.push(format!("Content-Length: {content_len}"));
                         }
                     }
                     if has_auth {
@@ -2092,6 +2279,7 @@ mod tests {
                 range_headers,
                 list_gets,
                 requests,
+                bodies,
                 _join: Some(join),
             }
         }
@@ -2557,6 +2745,7 @@ c8kyOVCJusup7SdkiG+QF64=
             CachedToken {
                 access_token: "ya29.cached-should-not-win".into(),
                 expiration: chrono::Utc::now() + chrono::Duration::hours(1),
+                scope: GCS_SCOPE.to_string(),
             },
         );
         let auth = resolve_auth().unwrap();
@@ -2714,5 +2903,151 @@ c8kyOVCJusup7SdkiG+QF64=
                 .any(|l| l.starts_with("Range: bytes=0-") && l != "Range: bytes=0-0"),
             "expected a content range after the probe, log={log:?}"
         );
+    }
+
+    fn b64url_decode(input: &str) -> Vec<u8> {
+        fn val(c: u8) -> u8 {
+            match c {
+                b'A'..=b'Z' => c - b'A',
+                b'a'..=b'z' => c - b'a' + 26,
+                b'0'..=b'9' => c - b'0' + 52,
+                b'+' | b'-' => 62,
+                b'/' | b'_' => 63,
+                _ => 0,
+            }
+        }
+        let bytes: Vec<u8> = input.bytes().filter(|b| *b != b'=').collect();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i + 4 <= bytes.len() {
+            let n = ((val(bytes[i]) as u32) << 18)
+                | ((val(bytes[i + 1]) as u32) << 12)
+                | ((val(bytes[i + 2]) as u32) << 6)
+                | (val(bytes[i + 3]) as u32);
+            out.push((n >> 16) as u8);
+            out.push((n >> 8) as u8);
+            out.push(n as u8);
+            i += 4;
+        }
+        match bytes.len() - i {
+            2 => {
+                let n = ((val(bytes[i]) as u32) << 18) | ((val(bytes[i + 1]) as u32) << 12);
+                out.push((n >> 16) as u8);
+            }
+            3 => {
+                let n = ((val(bytes[i]) as u32) << 18)
+                    | ((val(bytes[i + 1]) as u32) << 12)
+                    | ((val(bytes[i + 2]) as u32) << 6);
+                out.push((n >> 16) as u8);
+                out.push((n >> 8) as u8);
+            }
+            _ => {}
+        }
+        out
+    }
+
+    fn jwt_scope_from_form(form: &[u8]) -> String {
+        let form = std::str::from_utf8(form).expect("jwt form");
+        let assertion = form
+            .split('&')
+            .find_map(|p| p.strip_prefix("assertion="))
+            .expect("assertion");
+        let payload = assertion.split('.').nth(1).expect("jwt payload");
+        let json: serde_json::Value =
+            serde_json::from_slice(&b64url_decode(payload)).expect("jwt json");
+        json["scope"].as_str().expect("scope").to_string()
+    }
+
+    /// Regression: a service-account PUT mints devstorage.read_write and does
+    /// not reuse the read_only token from GET.
+    #[test]
+    fn gcs_put_jwt_scope_is_read_write_and_get_stays_read_only() {
+        let oauth = MockGcs::spawn(MockMode::Oauth {
+            body: r#"{"access_token":"ya29.adc-scope","expires_in":3600}"#.into(),
+        });
+        let storage = MockGcs::spawn(MockMode::AcceptPut);
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let sa = serde_json::json!({
+            "type": "service_account",
+            "client_email": "test@proj.iam.gserviceaccount.com",
+            "private_key": TEST_RSA_PEM,
+            "token_uri": format!("{}/token", oauth.base_url),
+        });
+        std::fs::write(tmp.path(), sa.to_string()).unwrap();
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set(
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            tmp.path().to_str().unwrap(),
+        );
+        _g.set(GCS_ENDPOINT_ENV, &storage.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+
+        fetch_gcs_to_temp("gs://bkt/obj.bin").unwrap();
+        let forms = oauth.bodies.lock().unwrap();
+        assert_eq!(forms.len(), 1, "GET must exchange one JWT");
+        assert_eq!(
+            jwt_scope_from_form(&forms[0]),
+            "https://www.googleapis.com/auth/devstorage.read_only"
+        );
+        drop(forms);
+
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        put_gcs_object(&loc, b"hello", "application/octet-stream").unwrap();
+        let forms = oauth.bodies.lock().unwrap();
+        assert_eq!(
+            forms.len(),
+            2,
+            "PUT must not reuse the read_only cached token"
+        );
+        assert_eq!(
+            jwt_scope_from_form(&forms[1]),
+            "https://www.googleapis.com/auth/devstorage.read_write"
+        );
+        drop(forms);
+        let log = storage.log.lock().unwrap();
+        assert!(
+            log.iter().any(|l| l.starts_with("GET ")),
+            "GET still ran, log={log:?}"
+        );
+        assert!(
+            log.iter().any(|l| l.starts_with("PUT ")),
+            "PUT ran, log={log:?}"
+        );
+        assert!(
+            log.iter()
+                .any(|l| l == "Authorization-Value: Bearer ya29.adc-scope"),
+            "bearer on the wire, log={log:?}"
+        );
+    }
+
+    #[test]
+    fn gcs_put_file_streams_with_content_length() {
+        let payload: Vec<u8> = (0u8..=255).cycle().take(200_000).collect();
+        let mock = MockGcs::spawn(MockMode::AcceptPut);
+        let _g = EnvGuard::acquire(GCS_ENV_KEYS);
+        _g.set("GOOGLE_HMAC_KEY", "GOOG1ACCESS");
+        _g.set("GOOGLE_HMAC_SECRET", "supersecret");
+        _g.set(GCS_ENDPOINT_ENV, &mock.base_url);
+        _g.set(GCS_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let mut staged = tempfile::NamedTempFile::new().unwrap();
+        std::io::Write::write_all(&mut staged, &payload).unwrap();
+        std::io::Write::flush(&mut staged).unwrap();
+        let loc = parse_gcs_url("gs://bkt/obj.bin").unwrap();
+        put_gcs_file(&loc, staged.path(), "application/octet-stream").unwrap();
+        let log = mock.log.lock().unwrap();
+        assert!(log.iter().any(|l| l.starts_with("PUT ")), "{log:?}");
+        assert_eq!(
+            log_field(&log, "Content-Length:"),
+            payload.len().to_string()
+        );
+        assert_eq!(log_field(&log, "Content-MD5:"), content_md5_b64(&payload));
+        assert!(
+            log.iter().all(|l| !l.contains("supersecret")),
+            "secret leaked: {log:?}"
+        );
+        drop(log);
+        let bodies = mock.bodies.lock().unwrap();
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(bodies[0], payload);
     }
 }

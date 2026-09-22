@@ -109,6 +109,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | `--repack-frame-size 1M` steals the next positional (`archive.tar`) | `cargo test -p ratarmount --bin ratarmount repack_seekable` |
 | Inbound SMB client must not send the export password (`RATARMOUNT_SMB_PASSWORD` / `RATARMOUNT_SMB_USER`); `smbclient_download_args` uses `RATARMOUNT_SMB_CLIENT_*` | `cargo test -p ratarmount-remote --lib smb_guest` · `cargo test -p ratarmount-remote --lib smbclient_ignores` · `cargo test -p ratarmount-session --lib smb_range_dispatch` |
 | HTTP GET of gzip member truncated (short `Read::read` = EOF) | `cargo test -p ratarmount-http --lib regression_http_get_gzip` |
+| GCS service-account PUT reuses read_only ADC token (403) | `cargo test -p ratarmount-remote --lib gcs_put_jwt_scope` · `cargo test -p ratarmount-remote --lib gcs_put_file_streams` · `cargo test -p ratarmount-compositing --lib gs_publish_failure_is_not_labeled_s3` · `cargo test -p ratarmount --test commit_overlay_live gs_interval` |
 | SMB READ fill-loop truncated | `cargo test -p ratarmount-smb --lib regression_smb_read_fill` |
 | 9P Tread fill-loop truncated | `cargo test -p ratarmount-9p --lib fill_read_ninep` |
 | `docker://ubuntu:24.04` treated as a local path | `cargo test -p ratarmount-session --lib docker_ubuntu` · `cargo test -p ratarmount-remote --lib docker_ubuntu` |
