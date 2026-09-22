@@ -16,7 +16,8 @@ use flate2::Compression as GzCompression;
 use ratarmount_compress::{
     body_looks_like_tar, decode_zstd_frames_to, detect_compression, export_zstd_blocks,
     materialize, open_seekable_zstd, open_seekable_zstd_with_threads, scan_zstd_frames_path,
-    splice_zstd_last_frames_replace, CompressionFormat, ZstdFrameMap, DEFAULT_MEMORY_CAP,
+    splice_zstd_last_frames_replace, CompressionFormat, SpliceStats, ZstdFrameMap,
+    DEFAULT_MEMORY_CAP,
 };
 use ratarmount_core::{
     create_root_file_info, metadata_gid, metadata_mode, metadata_mtime_secs, metadata_uid,
@@ -28,8 +29,9 @@ use ratarmount_formats_tar::{
     SqliteIndexedTar, UstarMember, UstarPayload,
 };
 use ratarmount_index::{
-    fill_content_hashes, locate_pattern_matches, resolve_index_location, IndexLocation,
-    SqliteIndex, DEFAULT_SEARCH_LIMIT, MEMORY_INDEX,
+    fill_content_hashes, locate_pattern_matches, resolve_index_location,
+    store_index_pointer_atomic, IndexLocation, IndexPointer, SqliteIndex, DEFAULT_SEARCH_LIMIT,
+    MEMORY_INDEX,
 };
 use rusqlite::{params, Connection, OpenFlags};
 use thiserror::Error;
@@ -38,6 +40,11 @@ use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipArchive, ZipWriter};
 
 pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
+
+/// Overlay-relative names with this prefix are not commit members.
+/// The real F-7 spool is a temp file outside the overlay; this skip is
+/// defense in depth for a name someone plants in the folder.
+const SPOOL_NAME_PREFIX: &str = ".ratarmount-spool-";
 
 const SCHEMA: &str = r#"
 CREATE TABLE IF NOT EXISTS "files" (
@@ -67,8 +74,8 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// Live overlay persist job (V-4). Interval and on-exit only.
 ///
 /// CLI [`commit_overlay`] is the prefix-rewrite escape hatch and must **not**
-/// go through this queue. F-7 write-through will reuse the same live queue
-/// later (do not implement F-7 here).
+/// go through this queue. The F-7 publish callback is still `None` for local
+/// files: persist renames the spliced temp onto the archive and does not upload.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommitKind {
     /// Interval tick: persist overlay files idle for at least this long.
@@ -103,6 +110,30 @@ pub struct IndexPatchWindow {
     /// `true` when GNU tar `--delete` may have shifted later members.
     pub offsets_shifted: bool,
 }
+
+/// Prefix cut from the splice that just ran. Not uploaded.
+///
+/// `prefix_compressed_bytes` is [`SpliceStats::prefix_compressed_bytes`]
+/// (pre-splice `frames[from_idx].compressed_offset`). Uncompressed TAR stores
+/// `0` (a later upload would send every byte). Not a rescan of the spliced
+/// file and not the offline debug print.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LivePublishPlan {
+    pub prefix_compressed_bytes: u64,
+}
+
+/// Pointer JSON from [`IndexPointer::for_blob`] after the caller patched.
+///
+/// No socket. Hashing the sidecar before that patch publishes the pre-commit id.
+#[derive(Clone, Debug)]
+pub struct IndexPointerPlan {
+    pub pointer: IndexPointer,
+    /// Pretty JSON plus trailing newline (`store_index_pointer_atomic` bytes).
+    pub json: String,
+}
+
+/// F-7 upload hook. `None` keeps rename-only local persist.
+type LivePublishCallback = Arc<dyn Fn(&LivePublishPlan, &Path) -> Result<()> + Send + Sync>;
 
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
@@ -141,6 +172,10 @@ pub struct WriteOverlay {
     on_exit_wait_min: Mutex<Duration>,
     /// Test-only: sleep after taking the inflight flag (injected long persist).
     persist_delay: Mutex<Option<Duration>>,
+    /// Prefix from the splice that just ran (`0` for uncompressed TAR).
+    last_publish_plan: Mutex<Option<LivePublishPlan>>,
+    /// Still `None` for local files (rename, no upload).
+    publish_callback: Mutex<Option<LivePublishCallback>>,
 }
 
 impl WriteOverlay {
@@ -179,6 +214,8 @@ impl WriteOverlay {
             last_persist_duration: Mutex::new(Duration::ZERO),
             on_exit_wait_min: Mutex::new(ON_EXIT_WAIT_MIN),
             persist_delay: Mutex::new(None),
+            last_publish_plan: Mutex::new(None),
+            publish_callback: Mutex::new(None),
         })
     }
 
@@ -207,6 +244,42 @@ impl WriteOverlay {
 
     fn stash_patch_window(&self, window: IndexPatchWindow) {
         *self.last_patch_window.lock().expect("overlay patch window") = Some(window);
+    }
+
+    /// Prefix recorded by the last successful live persist.
+    pub fn last_publish_plan(&self) -> Option<LivePublishPlan> {
+        *self.last_publish_plan.lock().expect("overlay publish plan")
+    }
+
+    fn stash_publish_plan(&self, plan: LivePublishPlan) {
+        *self.last_publish_plan.lock().expect("overlay publish plan") = Some(plan);
+    }
+
+    /// Install an F-7 upload hook. Local mounts leave this unset: persist still
+    /// renames the spliced temp onto `archive` and does not upload.
+    pub fn set_publish_callback<F>(&self, callback: F)
+    where
+        F: Fn(&LivePublishPlan, &Path) -> Result<()> + Send + Sync + 'static,
+    {
+        *self
+            .publish_callback
+            .lock()
+            .expect("overlay publish callback") = Some(Arc::new(callback));
+    }
+
+    fn invoke_publish_callback(&self, archive: &Path) -> Result<()> {
+        let cb = self
+            .publish_callback
+            .lock()
+            .expect("overlay publish callback")
+            .clone();
+        let Some(cb) = cb else {
+            return Ok(());
+        };
+        let plan = self
+            .last_publish_plan()
+            .ok_or_else(|| OverlayError::Msg("live publish plan missing after persist".into()))?;
+        cb(&plan, archive)
     }
 
     fn current_base(&self) -> Arc<dyn MountSource> {
@@ -873,6 +946,8 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
+        // Callback is `None` for local files: the splice already renamed.
+        self.invoke_publish_callback(archive)?;
         self.commit_generation.fetch_add(1, Ordering::SeqCst);
         Ok(true)
     }
@@ -933,8 +1008,8 @@ impl WriteOverlay {
     ///
     /// Overlay `create`/`write` stay on `commit_gate.read()`. Inflight is a
     /// separate flag — do not hold the writer-visible gate from enqueue until
-    /// unmount. CLI [`commit_overlay`] stays off this path. F-7 will reuse
-    /// this live queue later.
+    /// unmount. CLI [`commit_overlay`] stays off this path. The publish
+    /// callback is still `None` for local files.
     pub fn enqueue_commit(
         &self,
         archive: &Path,
@@ -1126,6 +1201,8 @@ impl WriteOverlay {
         }
         let window = self.persist_by_format(archive, format, &plan)?;
         self.stash_patch_window(window);
+        // Before reopen. `None` does not upload; the splice already renamed.
+        self.invoke_publish_callback(archive)?;
         match reopen(archive) {
             Ok(src) => {
                 *self.replacement.write().expect("overlay replacement") = Some(src);
@@ -1240,18 +1317,29 @@ impl WriteOverlay {
         format: CompressionFormat,
         plan: &OverlayCommitPlan,
     ) -> Result<IndexPatchWindow> {
-        match format {
-            CompressionFormat::Zstd => self.persist_tar_zst_plan(archive, plan),
-            _ => self.persist_uncompressed_tar_plan(archive, plan),
-        }
+        let (window, prefix) = match format {
+            CompressionFormat::Zstd => {
+                let (window, stats) = self.persist_tar_zst_plan(archive, plan)?;
+                (window, stats.prefix_compressed_bytes)
+            }
+            // Uncompressed TAR has no SpliceStats. 0 means upload every byte.
+            _ => (self.persist_uncompressed_tar_plan(archive, plan)?, 0),
+        };
+        self.stash_publish_plan(LivePublishPlan {
+            prefix_compressed_bytes: prefix,
+        });
+        Ok(window)
     }
 
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
+    ///
+    /// Returns [`SpliceStats`] from this splice. `prefix_compressed_bytes` is
+    /// the pre-splice `frames[from_idx].compressed_offset`, not a rescan.
     fn persist_tar_zst_plan(
         &self,
         archive: &Path,
         plan: &OverlayCommitPlan,
-    ) -> Result<IndexPatchWindow> {
+    ) -> Result<(IndexPatchWindow, SpliceStats)> {
         let map = scan_zstd_frames_path(archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
         let (from_idx, rewrite_window_start_uncomp) =
             find_last_n_tar_window(archive, &map, "live")?;
@@ -1272,23 +1360,31 @@ impl WriteOverlay {
             }
         }
         let pending = self.collect_ustar_pending(&plan.append_entries)?;
-        splice_zstd_last_frames_replace(archive, from_idx, |mut suffix, stream_offset, mut out| {
-            let members: Vec<UstarMember<'_>> =
-                pending.iter().map(PendingUstar::as_member).collect();
-            let opts = RewriteTarSuffix {
-                deleted_paths: &last_window_deletes,
-                append: &members,
-                encoding: self.encoding.as_str(),
-            };
-            // Extra refs so R/W are `&mut dyn …` (Sized); the hook itself is unsized.
-            rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
-        })
+        // Captured during the splice (pre-write map). Do not rescan `archive`.
+        let stats = splice_zstd_last_frames_replace(
+            archive,
+            from_idx,
+            |mut suffix, stream_offset, mut out| {
+                let members: Vec<UstarMember<'_>> =
+                    pending.iter().map(PendingUstar::as_member).collect();
+                let opts = RewriteTarSuffix {
+                    deleted_paths: &last_window_deletes,
+                    append: &members,
+                    encoding: self.encoding.as_str(),
+                };
+                // Extra refs so R/W are `&mut dyn …` (Sized); the hook itself is unsized.
+                rewrite_tar_suffix(&mut suffix, stream_offset, &opts, &mut out).map(|_| ())
+            },
+        )
         .map_err(|e| OverlayError::Msg(e.to_string()))?;
-        Ok(IndexPatchWindow {
-            window_start: rewrite_window_start_uncomp,
-            from_frame: Some(from_idx),
-            offsets_shifted: false,
-        })
+        Ok((
+            IndexPatchWindow {
+                window_start: rewrite_window_start_uncomp,
+                from_frame: Some(from_idx),
+                offsets_shifted: false,
+            },
+            stats,
+        ))
     }
 
     fn collect_ustar_pending(
@@ -1631,6 +1727,24 @@ pub fn patch_sidecar_if_present(
         stats.parse_start
     );
     Ok(())
+}
+
+/// Pointer JSON for a sidecar the caller has already patched.
+///
+/// Uses [`IndexPointer::for_blob`] only. Does not patch, open a socket, or
+/// write `{archive}.index.ptr`. Call after [`patch_sidecar_if_present`]: the
+/// id is SHA-256 of the sidecar bytes, so an unpatched file is a different id.
+pub fn index_pointer_plan_after_patch(
+    sidecar: &Path,
+    archive: Option<&Path>,
+) -> Result<IndexPointerPlan> {
+    let pointer =
+        IndexPointer::for_blob(sidecar, archive).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("index.ptr");
+    store_index_pointer_atomic(&path, &pointer).map_err(|e| OverlayError::Msg(e.to_string()))?;
+    let json = fs::read_to_string(&path)?;
+    Ok(IndexPointerPlan { pointer, json })
 }
 
 fn uncompressed_patch_window(
@@ -2227,6 +2341,9 @@ fn collect_overlay_commit_plan_from_conn(
             let (path, name) = row?;
             let rel = join_rel(&path, &name);
             let norm = normalize_archive_rel_path(&rel);
+            if norm.starts_with(SPOOL_NAME_PREFIX) {
+                continue;
+            }
             if !norm.is_empty() {
                 deleted_paths.insert(norm);
             }
@@ -2259,6 +2376,11 @@ fn collect_overlay_commit_plan_from_conn(
         };
         let rel = rel.trim_start_matches('/').to_string();
         if rel.is_empty() {
+            continue;
+        }
+        // Planted `.ratarmount-spool-*` is not an append member. The real
+        // spool is not created in this directory.
+        if rel.starts_with(SPOOL_NAME_PREFIX) {
             continue;
         }
         if ignored.iter().any(|i| rel == *i || rel.ends_with(i)) {
@@ -7608,5 +7730,232 @@ mod tests {
         assert!(last_tar.lookup("/prefix.txt", 0).is_none());
         assert_eq!(read_member(&last_tar, "/last.txt"), last);
         assert_eq!(read_member(&last_tar, "/new.txt"), extra);
+    }
+
+    /// Multi-frame live splice records the pre-splice cut, not the new length.
+    #[test]
+    fn prefix_compressed_bytes_matches_splice_stats() {
+        let dir = tempfile::tempdir().unwrap();
+        let prefix = generated_payload("plan-prefix");
+        let last = generated_payload("plan-last");
+        let extra = generated_payload("plan-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_split_tar_zst(
+            &archive,
+            &[ustar_file("prefix.txt", &prefix)],
+            &[ustar_file("last.txt", &last)],
+            false,
+        );
+        let map = scan_zstd_frames_path(&archive).unwrap();
+        assert!(map.frames.len() >= 2, "fixture must be multi-frame");
+        let (from_idx, _) = find_last_n_tar_window(&archive, &map, "test").unwrap();
+        let pre_cut = map.frames[from_idx].compressed_offset;
+        assert!(pre_cut > 0, "prefix frames must occupy compressed bytes");
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        assert!(ov.last_publish_plan().is_none());
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        // Publish callback stays None: splice still renames onto the archive.
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+        let plan = ov.last_publish_plan().expect("publish plan");
+        assert_eq!(
+            plan.prefix_compressed_bytes, pre_cut,
+            "prefix must equal SpliceStats.prefix_compressed_bytes / pre-splice frames[from_idx].compressed_offset"
+        );
+        let post_len = fs::metadata(&archive).unwrap().len();
+        assert_ne!(
+            plan.prefix_compressed_bytes, post_len,
+            "prefix cut is not the post-splice file length"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+        assert!(
+            !fs::read_dir(&overlay).unwrap().flatten().any(|e| e
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".ratarmount-spool-")),
+            "real spool must not be created inside the overlay"
+        );
+    }
+
+    /// Regression: uncompressed TAR publish plan stores prefix 0 (upload every byte).
+    #[test]
+    fn uncompressed_tar_publish_plan_has_zero_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = make_tiny_tar(dir.path(), &[("old.txt", b"keep\n")]);
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        let ov = WriteOverlay::new(open_uncompressed_tar_base(&tar, false), &overlay).unwrap();
+        fs::write(overlay.join("new.txt"), b"appended\n").unwrap();
+        match ov.commit_atomic(&tar) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("commit_atomic: {other:?}"),
+        }
+        let plan = ov.last_publish_plan().expect("publish plan");
+        assert_eq!(plan.prefix_compressed_bytes, 0);
+    }
+
+    /// Schema and 64-hex id match `IndexPointer::for_blob` only after the patch.
+    #[test]
+    fn pointer_plan_matches_index_pointer_for_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("ptr-seed");
+        let extra = generated_payload("ptr-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let sidecar = ratarmount_index::default_index_path(&archive);
+        {
+            let body = open_seekable_zstd(&archive).expect("open zstd");
+            let opts = OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            };
+            let _ = ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+                &archive,
+                body,
+                Some(&sidecar),
+                &opts,
+                "test",
+            )
+            .expect("create sidecar");
+        }
+
+        let unpatched =
+            index_pointer_plan_after_patch(&sidecar, Some(&archive)).expect("unpatched plan");
+        assert_eq!(
+            unpatched.pointer.schema,
+            ratarmount_index::INDEX_POINTER_SCHEMA
+        );
+        assert_eq!(
+            unpatched.pointer.index_id.len(),
+            ratarmount_index::INDEX_ID_HEX_LEN
+        );
+        assert!(unpatched
+            .pointer
+            .index_id
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')));
+        assert_eq!(unpatched.pointer.etag_sha256, unpatched.pointer.index_id);
+        let parsed = ratarmount_index::parse_index_pointer_json(&unpatched.json).expect("json");
+        assert_eq!(parsed.index_id, unpatched.pointer.index_id);
+        assert_eq!(parsed.schema, unpatched.pointer.schema);
+
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| reopen_tar_zst(p, false))
+            .expect("commit"));
+        let window = ov.last_patch_window().expect("window");
+        // Helper does not patch. Hashing here would still be the pre-commit id.
+        let still_unpatched =
+            index_pointer_plan_after_patch(&sidecar, Some(&archive)).expect("pre-patch plan");
+        assert_eq!(still_unpatched.pointer.index_id, unpatched.pointer.index_id);
+
+        patch_sidecar_if_present(
+            &archive,
+            &window,
+            &OpenOptions {
+                ignore_zeros: true,
+                gnu_incremental: Some(false),
+                ..OpenOptions::default()
+            },
+        )
+        .expect("patch sidecar");
+
+        let patched = index_pointer_plan_after_patch(&sidecar, Some(&archive)).expect("patched");
+        let direct = IndexPointer::for_blob(&sidecar, Some(&archive)).expect("for_blob");
+        assert_eq!(patched.pointer.schema, direct.schema);
+        assert_eq!(patched.pointer.index_id, direct.index_id);
+        assert_eq!(patched.pointer.etag_sha256, direct.etag_sha256);
+        assert_eq!(
+            patched.pointer.index_id.len(),
+            ratarmount_index::INDEX_ID_HEX_LEN
+        );
+        assert_ne!(
+            patched.pointer.index_id, unpatched.pointer.index_id,
+            "hash changes if the helper runs on the unpatched sidecar"
+        );
+        let parsed = ratarmount_index::parse_index_pointer_json(&patched.json).expect("json");
+        assert_eq!(parsed.index_id, direct.index_id);
+        assert_eq!(parsed.schema, ratarmount_index::INDEX_POINTER_SCHEMA);
+        assert!(!ratarmount_index::index_pointer_path(&archive).exists());
+    }
+
+    #[test]
+    fn collect_overlay_commit_plan_from_conn_skips_planted_spool_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir_all(&overlay).unwrap();
+        fs::write(overlay.join(".ratarmount-spool-x"), b"planted").unwrap();
+        fs::write(overlay.join("real.txt"), b"keep").unwrap();
+        let names_before = overlay_entry_names(&overlay);
+        let plan =
+            collect_overlay_commit_plan_from_conn(&overlay, None, None, &HashSet::new()).unwrap();
+        assert!(
+            plan.append_entries
+                .iter()
+                .all(|(p, _)| !p.starts_with(".ratarmount-spool-")),
+            "planted spool name must not be an append entry: {:?}",
+            plan.append_entries
+        );
+        assert!(plan
+            .append_entries
+            .iter()
+            .any(|(p, is_dir)| p == "real.txt" && !*is_dir));
+        assert!(!plan
+            .deleted_paths
+            .iter()
+            .any(|p| p.starts_with(".ratarmount-spool-")));
+        assert_eq!(
+            overlay_entry_names(&overlay),
+            names_before,
+            "real spool must not be created in the overlay"
+        );
+        assert!(overlay.join(".ratarmount-spool-x").is_file());
+    }
+
+    /// Offline `commit_overlay` must not take the live inflight flag.
+    #[test]
+    fn commit_overlay_is_not_enqueued() {
+        let dir = tempfile::tempdir().unwrap();
+        let seed = generated_payload("off-q-seed");
+        let extra = generated_payload("off-q-new");
+        let archive = dir.path().join("a.tar.zst");
+        write_single_frame_tar_zst(&archive, &[ustar_file("seed.txt", &seed)]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_tar_zst_base(&archive, false), &overlay);
+        fs::write(overlay.join("new.txt"), &extra).unwrap();
+        // The live connection holds LOCKING_MODE=EXCLUSIVE. Drop that file
+        // handle so offline commit can open the sqlite, without dropping `ov`.
+        {
+            let mut db = ov.db.lock().expect("overlay db");
+            *db = Connection::open_in_memory().expect("release overlay db");
+        }
+        assert!(commit_overlay(&overlay, &archive, &yes_commit_opts()).expect("commit"));
+        assert!(
+            !ov.persist_inflight_for_test(),
+            "offline commit_overlay must not enqueue"
+        );
+        let src = open_tar_zst_base(&archive, false);
+        assert_eq!(read_member(src.as_ref(), "/new.txt"), extra);
+    }
+
+    fn overlay_entry_names(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
     }
 }
