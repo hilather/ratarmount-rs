@@ -1737,10 +1737,13 @@ struct AzLive {
 
 /// In-test HTTP listener for `az://`. Not the private mock inside `azure.rs`.
 /// Put Block does not replace the blob. `fail_block_list` answers Put Block List
-/// with HTTP 500 and leaves the committed bytes alone.
+/// with HTTP 500 and leaves the committed bytes alone. Put Blob without
+/// `x-ms-blob-type: BlockBlob` is HTTP 400. `fail_pointer` answers the
+/// `.index.ptr` Put Blob with HTTP 500.
 fn spawn_azure_live(
     objects: std::collections::HashMap<String, Vec<u8>>,
     fail_block_list: bool,
+    fail_pointer: bool,
 ) -> AzLive {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1767,6 +1770,7 @@ fn spawn_azure_live(
             let target = parts.next().unwrap_or("/").to_string();
             let mut content_length = 0usize;
             let mut range_hdr: Option<String> = None;
+            let mut blob_type = String::new();
             loop {
                 let mut line = String::new();
                 if reader.read_line(&mut line).is_err() {
@@ -1780,6 +1784,10 @@ fn spawn_azure_live(
                     content_length = v.trim().parse().unwrap_or(0);
                 } else if let Some(v) = lower.strip_prefix("range:") {
                     range_hdr = Some(v.trim().to_string());
+                } else if lower.starts_with("x-ms-blob-type:") {
+                    if let Some((_, v)) = line.split_once(':') {
+                        blob_type = v.trim().to_string();
+                    }
                 }
             }
             let mut body = vec![0u8; content_length];
@@ -1875,6 +1883,39 @@ fn spawn_azure_live(
             } else if method == "PUT" {
                 let comp_block = query.contains("comp=block") && !query.contains("comp=blocklist");
                 let comp_list = query.contains("comp=blocklist");
+                let put_blob = !comp_block && !comp_list;
+                if put_blob && blob_type != "BlockBlob" {
+                    let msg = b"MissingRequiredHeader";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    hits_t.lock().unwrap().push(AzHit {
+                        method,
+                        key,
+                        query,
+                        body: Vec::new(),
+                    });
+                    continue;
+                }
+                if put_blob && fail_pointer && key.ends_with(".index.ptr") {
+                    let msg = b"pointer failed";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    hits_t.lock().unwrap().push(AzHit {
+                        method,
+                        key,
+                        query,
+                        body,
+                    });
+                    continue;
+                }
                 if comp_list && fail_block_list {
                     let msg = b"block list failed";
                     let _ = write!(
@@ -1991,7 +2032,7 @@ fn az_interval_uploads_once() {
     objects.insert(key.into(), zst_bytes);
     objects.insert(format!("{key}.index.ptr"), pointer_bytes);
     objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
-    let az = spawn_azure_live(objects, false);
+    let az = spawn_azure_live(objects, false, false);
     let cache = tempfile::tempdir().unwrap();
     let ov = dir.path().join("ov");
     fs::create_dir_all(&ov).unwrap();
@@ -2144,6 +2185,116 @@ fn az_interval_uploads_once() {
     let _ = child.wait();
 }
 
+/// Regression: a pointer PUT failure must not forget the overlay.
+#[test]
+fn az_pointer_put_failure_keeps_overlay() {
+    let dir = tempfile::tempdir().unwrap();
+    let member = ratarmount_formats_tar::UstarMember {
+        path: "seed.txt",
+        payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"seed\n" },
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+        mtime: 0,
+    };
+    let mut plain = Vec::new();
+    ratarmount_formats_tar::write_ustar_members(&mut plain, &[member]).unwrap();
+    ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+    let zst_bytes = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+    let zst = dir.path().join("a.tar.zst");
+    fs::write(&zst, &zst_bytes).unwrap();
+    let idx = dir.path().join("a.tar.zst.index.sqlite");
+    let body = ratarmount_compress::open_seekable_zstd(&zst).unwrap();
+    let opts = ratarmount_core::OpenOptions {
+        write_index: true,
+        index_minimum_file_count: 0,
+        ..ratarmount_core::OpenOptions::default()
+    };
+    ratarmount_formats_tar::SqliteIndexedTar::create_index_body(
+        &zst,
+        body,
+        Some(&idx),
+        &opts,
+        "test",
+    )
+    .expect("sidecar");
+    let index_bytes = fs::read(&idx).unwrap();
+    let pointer = ratarmount_index::IndexPointer::for_blob(&idx, Some(&zst)).unwrap();
+    let pointer_bytes = ratarmount_index::index_pointer_to_json(&pointer)
+        .unwrap()
+        .into_bytes();
+    let id = pointer.index_id.clone();
+    let key = "data/a.tar.zst";
+    let mut objects = std::collections::HashMap::new();
+    objects.insert(key.into(), zst_bytes);
+    objects.insert(format!("{key}.index.ptr"), pointer_bytes);
+    objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
+    let az = spawn_azure_live(objects, false, true);
+    let cache = tempfile::tempdir().unwrap();
+    let ov = dir.path().join("ov");
+    fs::create_dir_all(&ov).unwrap();
+    let log = dir.path().join("server.log");
+    let logf = fs::File::create(&log).unwrap();
+    let secret = "YXp1cmUtc2VjcmV0LWtleS1ET05PVExPRw==";
+    let mut cmd = Command::new(bin());
+    cmd.args(["--nfs", "--nfs-bind", "127.0.0.1:0", "-w"])
+        .arg(&ov)
+        .args(["--commit-overlay-interval", "1s"])
+        .arg("az://bkt/data/a.tar.zst");
+    az_env(&mut cmd, az.addr, secret, cache.path());
+    let mut child = cmd
+        .stdout(Stdio::from(logf.try_clone().unwrap()))
+        .stderr(Stdio::from(logf))
+        .spawn()
+        .expect("spawn");
+    if !wait_ready(&log, "NFSv3", Duration::from_secs(20)) {
+        let _ = child.kill();
+        panic!(
+            "server not ready: {}",
+            fs::read_to_string(&log).unwrap_or_default()
+        );
+    }
+    fs::write(ov.join("tick.bin"), b"keep-pointer\n").unwrap();
+    let pointer_puts = || {
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|h| h.method == "PUT" && h.key.ends_with(".index.ptr"))
+            .count()
+    };
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(20) && pointer_puts() == 0 {
+        thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        pointer_puts() >= 1,
+        "no pointer PUT: {:?} log={}",
+        az.hits
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|h| format!("{} {}", h.method, h.key))
+            .collect::<Vec<_>>(),
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    assert!(
+        ov.join("tick.bin").exists(),
+        "pointer failure must not forget the overlay: log={}",
+        fs::read_to_string(&log).unwrap_or_default()
+    );
+    thread::sleep(Duration::from_secs(3));
+    assert!(
+        ov.join("tick.bin").exists(),
+        "retry after a pointer failure must not forget the overlay"
+    );
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(child.id() as i32),
+        nix::sys::signal::Signal::SIGTERM,
+    );
+    let _ = child.wait();
+}
+
 /// Regression: a failed Put Block List leaves the overlay file in place.
 #[test]
 fn az_block_list_failure_keeps_overlay() {
@@ -2200,7 +2351,7 @@ fn az_block_list_failure_keeps_overlay() {
     objects.insert(key.into(), zst_bytes);
     objects.insert(format!("{key}.index.ptr"), pointer_bytes);
     objects.insert(format!("{key}.index.{id}.sqlite"), index_bytes);
-    let az = spawn_azure_live(objects, true);
+    let az = spawn_azure_live(objects, true, false);
     let cache = tempfile::tempdir().unwrap();
     let ov = dir.path().join("ov");
     fs::create_dir_all(&ov).unwrap();

@@ -922,11 +922,13 @@ fn publish_azure(
             req.prefix_compressed_bytes,
             req.commit_generation
         );
+        let if_match = req.etag_at_download.as_deref().filter(|s| !s.is_empty());
         if let Err(e) = ratarmount_remote::put_azure_blocks(
             &loc,
             &req.staged,
             "application/octet-stream",
             req.commit_generation,
+            if_match,
         ) {
             return Err(map_azure_put(e));
         }
@@ -973,25 +975,20 @@ fn publish_azure(
         &sidecar,
         ratarmount_remote::OCI_INDEX_ARTIFACT_TYPE,
         req.commit_generation,
+        None,
     ) {
-        log::warn!(
-            "azure index blob PUT failed after object replace for az://{}/{}: {e}",
-            loc.container,
-            loc.blob
-        );
-        return Ok(());
+        return Err(map_azure_put(e));
     }
     if let Err(e) = ratarmount_remote::put_azure_bytes(
         &ptr_loc,
         json.as_bytes(),
         "application/json",
         req.commit_generation,
+        None,
     ) {
-        log::warn!(
-            "azure index pointer PUT failed after object replace for az://{}/{}: {e}",
-            loc.container,
-            loc.blob
-        );
+        // Not Ok: a 400 here used to bump commit_generation and forget the overlay
+        // while the pointer stayed stale.
+        return Err(map_azure_put(e));
     }
     Ok(())
 }
