@@ -824,6 +824,18 @@ fn oci_fingerprint(
     (prefix, suffix, full)
 }
 
+/// Formats `open_from_live_range` actually opens. Anything else (7z, ISO,
+/// SquashFS, pre-ustar tar) is an error on the native SMB path, not a download.
+fn smb_live_range_kind(kind: &str) -> bool {
+    matches!(kind, "tar" | "zip" | "gzip" | "bzip2" | "xz" | "zstd")
+}
+
+fn smb_unsupported_range_error(input: &str) -> String {
+    format!(
+        "SMB Range format unsupported for {input}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)"
+    )
+}
+
 /// Materialize a remote URL to a local path and open it.
 pub(super) fn materialize_remote_input(
     input: &str,
@@ -914,11 +926,12 @@ pub(super) fn open_remote_input(
             || open_ipfs(input),
         );
     }
-    // smb:// is not open_s3_like: that helper materializes on Err and when
-    // uses_ranges() is false (resolve_to_local → fetch_smb_to_temp). The only
-    // smbclient path is RATARMOUNT_SMB_USE_SMBCLIENT=1. Client env is
-    // RATARMOUNT_SMB_CLIENT_*; this arm does not read RATARMOUNT_SMB_PASSWORD.
-    if input.starts_with("smb://") {
+    // Scheme match is ASCII-case-insensitive (`SMB://` / `Smb://`). Not
+    // open_s3_like: that helper materializes on Err and when uses_ranges() is
+    // false (resolve_to_local → fetch_smb_to_temp). The only smbclient path is
+    // RATARMOUNT_SMB_USE_SMBCLIENT=1. Client env is RATARMOUNT_SMB_CLIENT_*;
+    // this arm does not read RATARMOUNT_SMB_PASSWORD.
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("smb") {
         if std::env::var("RATARMOUNT_SMB_USE_SMBCLIENT")
             .ok()
             .as_deref()
@@ -931,15 +944,24 @@ pub(super) fn open_remote_input(
         {
             return Ok((PathBuf::from(input), ms));
         }
-        let range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
+        let mut range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
         if !range.uses_ranges() {
             return Err(format!("SMB Range unavailable for {input}"));
         }
         let len = range.len();
+        // Peek before open_from_live_range. Its unsupported arm logs
+        // "materializing" for every remote; this caller returns an error
+        // instead, so that shared line must not run.
+        let mut magic = [0u8; 512];
+        let n = range.read(&mut magic).map_err(|e| e.to_string())?;
+        range.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        if !smb_live_range_kind(super::probe_archive_magic(&magic[..n])) {
+            return Err(smb_unsupported_range_error(input));
+        }
         return open_from_live_range(range, len, input, opts, recreate, "SMB Range", || {
             ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())
         })?
-        .ok_or_else(|| format!("SMB Range format unsupported for {input}"));
+        .ok_or_else(|| smb_unsupported_range_error(input));
     }
 
     if input.starts_with("rclone://") {
@@ -1395,32 +1417,64 @@ mod tests {
             argv_lines(&log)
         );
 
-        let addr = spawn_smb_bad_dialect();
-        let file_url = format!("smb://127.0.0.1:{}/share/archive.tar", addr.port());
-        let mut remotes = Vec::new();
-        let err = match open_remote_input(&file_url, &opts, false, &mut remotes) {
-            Err(e) => e,
-            Ok(_) => panic!("negotiate failure should not open {file_url}"),
-        };
-        assert!(remotes.is_empty(), "file URL materialized: {remotes:?}");
-        assert!(
-            err.contains("SMB 2.0.2 only"),
-            "expected negotiate failure, got {err}"
-        );
-        assert!(
-            !err.contains("smbclient"),
-            "negotiate failure must not mention smbclient: {err}"
-        );
-        assert!(
-            !err.contains(SMB_EXPORT_PW),
-            "export password leaked into the error: {err}"
-        );
-        let calls = argv_lines(&log);
-        assert!(
-            calls.is_empty(),
-            "fetch_smb_to_temp counter {}: negotiate failure spawned smbclient: {calls:?}",
-            calls.len()
-        );
+        for scheme in ["smb", "SMB", "Smb"] {
+            let addr = spawn_smb_bad_dialect();
+            let file_url = format!("{scheme}://127.0.0.1:{}/share/archive.tar", addr.port());
+            let mut remotes = Vec::new();
+            let err = match open_remote_input(&file_url, &opts, false, &mut remotes) {
+                Err(e) => e,
+                Ok(_) => panic!("negotiate failure should not open {file_url}"),
+            };
+            assert!(remotes.is_empty(), "{file_url} materialized: {remotes:?}");
+            assert!(
+                err.contains("SMB 2.0.2 only"),
+                "expected negotiate failure for {file_url}, got {err}"
+            );
+            assert!(
+                !err.contains("smbclient"),
+                "negotiate failure must not mention smbclient: {err}"
+            );
+            assert!(
+                !err.contains(SMB_EXPORT_PW),
+                "export password leaked into the error: {err}"
+            );
+            let calls = argv_lines(&log);
+            assert!(
+                calls.is_empty(),
+                "fetch_smb_to_temp counter {}: {scheme}:// negotiate failure spawned smbclient: {calls:?}",
+                calls.len()
+            );
+        }
+    }
+
+    /// 7z / ISO / SquashFS / pre-ustar are not live-range formats. The error
+    /// names the smbclient hatch; the shared "materializing" log is not this path.
+    #[test]
+    fn smb_range_dispatch_unsupported_names_hatch() {
+        let seven = b"7z\xbc\xaf'\x1c";
+        assert!(!smb_live_range_kind(super::super::probe_archive_magic(
+            seven
+        )));
+        assert!(!smb_live_range_kind(super::super::probe_archive_magic(
+            b"hsqs"
+        )));
+        let mut pre_ustar = vec![0u8; 512];
+        pre_ustar[..4].copy_from_slice(b"file");
+        pre_ustar[100..108].copy_from_slice(b"0000644\0");
+        assert_eq!(super::super::probe_archive_magic(&pre_ustar), "other");
+        assert!(!smb_live_range_kind("other"));
+        let err = smb_unsupported_range_error("smb://host/share/disk.iso");
+        assert!(err.contains("RATARMOUNT_SMB_USE_SMBCLIENT=1"), "{err}");
+        assert!(err.contains("7z"), "{err}");
+        assert!(err.contains("ISO"), "{err}");
+        assert!(err.contains("SquashFS"), "{err}");
+        assert!(err.contains("pre-ustar"), "{err}");
+        assert!(smb_live_range_kind("tar"));
+        assert!(smb_live_range_kind("zip"));
+        assert!(smb_live_range_kind("gzip"));
+        assert!(smb_live_range_kind("bzip2"));
+        assert!(smb_live_range_kind("xz"));
+        assert!(smb_live_range_kind("zstd"));
     }
 
     /// Hatch set: materialize runs. Argv still does not contain the export password.

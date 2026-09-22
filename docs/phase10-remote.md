@@ -134,7 +134,7 @@ Path rules (fsspec-like):
 
 ### SMB (SMB 2.0.2) inbound
 
-File URLs are a live Range reader (dialect **0x0202** only). A share root (`smb://host/share`), a trailing slash, or QUERY_INFO that says directory is an F-1 folder (`try_open_smb_folder` / `RemoteFolderMountSource`). `smbclient` downloads to a temp file only when `RATARMOUNT_SMB_USE_SMBCLIENT=1`. With that hatch unset, a failed open returns the error and does not spawn `smbclient` or call `fetch_smb_to_temp`. Outbound `--smb` is [`export.md`](export.md).
+File URLs are a live Range reader (dialect **0x0202** only). The scheme match is ASCII-case-insensitive (`SMB://` / `Smb://` use the same arm). A share root (`smb://host/share`), a trailing slash, or QUERY_INFO that says directory is an F-1 folder (`try_open_smb_folder` / `RemoteFolderMountSource`). `smbclient` downloads to a temp file only when `RATARMOUNT_SMB_USE_SMBCLIENT=1`. With that hatch unset, a failed open returns the error and does not spawn `smbclient` or call `fetch_smb_to_temp`. The live reader opens ustar TAR, ZIP, gzip, bzip2, xz, and zstd only. 7z, ISO, SquashFS, and pre-ustar tar are not read on this path; set `RATARMOUNT_SMB_USE_SMBCLIENT=1` to fetch those with `smbclient`. Outbound `--smb` is [`export.md`](export.md).
 
 Short non-zero `STATUS_SUCCESS` READ replies are not EOF. The fill stops when the caller buffer is full, `offset` is at least the QUERY_INFO size, status is `STATUS_END_OF_FILE` (`0xC0000011`), or status is `STATUS_SUCCESS` and `DataLength == 0`. `0x80000002` (`STATUS_DATATYPE_MISALIGNMENT`) is an error, not EOF. Chunk size is the server `MaxReadSize`, capped at 1 MiB.
 
