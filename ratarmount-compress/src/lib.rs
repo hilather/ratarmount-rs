@@ -88,8 +88,8 @@ pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_thre
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
 pub use repack_seekable::{
-    repack_seekable, should_invent_seek_table, GzipSidecar, RepackAction, RepackOptions,
-    RepackReport, DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL,
+    repack_seekable, RepackAction, RepackOptions, RepackReport, DEFAULT_REPACK_FRAME_SIZE,
+    DEFAULT_REPACK_ZSTD_LEVEL,
 };
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,

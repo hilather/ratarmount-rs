@@ -2,18 +2,21 @@
 //!
 //! Zstd output is multi-frame zstd plus an official seek-table footer
 //! ([`build_seek_table_skippable`], descriptor byte 0, no per-frame checksum).
-//! Gzip output is a byte copy of a gzip input plus a sidecar next to the
-//! output path (`.rgzi` by default). TAR member names are never parsed and
-//! never sorted: uncompressed bytes stay in input order, so a two-member TAR
-//! stays in offset order.
+//! Gzip output is a byte copy of a gzip input plus an `.rgzi` sidecar beside
+//! the output. The body and the sidecar are renamed into place only after both
+//! temps are durable, so a failed index leaves the previous files alone. TAR
+//! member names are never parsed and never sorted: uncompressed bytes stay in
+//! input order, so a two-member TAR stays in offset order.
 //!
-//! A footer is invented only by [`should_invent_seek_table`]. Copy when the
-//! input is already multi-frame with a seek table. If any walked frame does
-//! not fit `u32`, copy and do not invent a footer. A single zstd frame, or
-//! gzip/plain bytes aimed at a zstd destination, is recompressed by
-//! `zstd::stream::read::Decoder` (or a gzip/plain reader) into
-//! [`encode_zstd_frame_to`] of a `frame_size` [`std::io::Read::take`].
-//! `frame_size == 0` or `frame_size > u32::MAX` is an error on that path.
+//! A footer is invented only when frames are packed from offset 0 with no gaps
+//! and every size fits `u32`. Copy when the input is already multi-frame with
+//! a seek table. Otherwise copy and do not invent a footer (a size above
+//! `u32`, a leading skippable frame, or a skippable frame between data
+//! frames). A single zstd frame, or gzip/plain bytes aimed at a zstd
+//! destination, is recompressed by `zstd::stream::read::Decoder` (or a
+//! gzip/plain reader) into [`encode_zstd_frame_to`] of a `frame_size`
+//! [`std::io::Read::take`]. `frame_size == 0` or `frame_size > u32::MAX` is
+//! an error on that path.
 //!
 //! The destination suffix picks the family: `.zst` / `.tzst` / `.zstd` /
 //! `.tar.zst` / `.tar.zstd`, or `.gz` / `.tgz` / `.gzip` / `.tar.gz`.
@@ -45,17 +48,6 @@ pub const DEFAULT_REPACK_FRAME_SIZE: u64 = 8 * 1024 * 1024;
 /// Default zstd level for a recompress.
 pub const DEFAULT_REPACK_ZSTD_LEVEL: i32 = 3;
 
-/// Sidecar written beside a gzip destination.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum GzipSidecar {
-    /// `{output}.rgzi` via [`crate::encode_gzip_seek_index_blob`]. Default.
-    Rgzi,
-    /// `{output}.gzidx` via [`crate::encode_indexed_gzip_index_blob`] (32 KiB windows).
-    Gzidx,
-    /// Both sidecars.
-    Both,
-}
-
 /// Options for [`repack_seekable`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RepackOptions {
@@ -64,11 +56,7 @@ pub struct RepackOptions {
     pub frame_size: u64,
     /// Zstd compression level for a recompress.
     pub zstd_level: i32,
-    /// Uncompressed spacing passed to the gzip seek indexer.
-    pub gzip_spacing: u64,
-    /// Which sidecar to write for a gzip destination.
-    pub gzip_sidecar: GzipSidecar,
-    /// Replace an existing output file or sidecar. Never follows a final symlink.
+    /// Replace an existing output file or `.rgzi`. Never follows a final symlink.
     pub overwrite: bool,
 }
 
@@ -77,8 +65,6 @@ impl Default for RepackOptions {
         Self {
             frame_size: DEFAULT_REPACK_FRAME_SIZE,
             zstd_level: DEFAULT_REPACK_ZSTD_LEVEL,
-            gzip_spacing: DEFAULT_GZIP_SEEK_SPACING,
-            gzip_sidecar: GzipSidecar::Rgzi,
             overwrite: false,
         }
     }
@@ -91,14 +77,17 @@ pub enum RepackAction {
     Copied,
     /// At least two frames, no footer, every size fits `u32`. Prefix bytes unchanged.
     SeekTableAppended,
-    /// At least two frames, no footer, some size does not fit `u32`. Bytes copied.
+    /// At least two frames and no footer, but a footer must not be invented.
+    ///
+    /// A size does not fit `u32`, or the frames are not packed from offset 0
+    /// (a skippable frame before or between data frames). Bytes are copied.
     CopiedWithoutFooter,
     /// Single zstd frame, or gzip/plain input written as zstd, chunked at `frame_size`.
     Recompressed { frames: u32 },
-    /// Gzip input copied to a gzip destination; a sidecar was written beside `output`.
+    /// Gzip input copied to a gzip destination; an `.rgzi` sidecar was written beside `output`.
     ///
     /// Plain (or any non-gzip) input to a `.gz` destination is an error, not this variant.
-    CopiedWithGzipIndex { format: GzipSidecar },
+    CopiedWithGzipIndex,
 }
 
 /// Lengths after a successful [`repack_seekable`].
@@ -122,35 +111,45 @@ pub fn repack_seekable(input: &Path, output: &Path, opts: &RepackOptions) -> Res
     refuse_same_path(input, output)?;
     let dest = output_family(output)?;
     let kind = classify_input(input)?;
-    let sidecars = match dest {
-        Dest::Zstd => Vec::new(),
-        Dest::Gzip => planned_sidecars(output, opts.gzip_sidecar),
+    let sidecar = match dest {
+        Dest::Gzip => Some(sidecar_path(output, "rgzi")),
+        Dest::Zstd => None,
     };
-    for sidecar in &sidecars {
+    if let Some(sidecar) = &sidecar {
         refuse_same_path(input, sidecar)?;
     }
     ensure_destination(output, opts.overwrite)?;
-    for sidecar in &sidecars {
+    if let Some(sidecar) = &sidecar {
         ensure_destination(sidecar, opts.overwrite)?;
     }
     match dest {
         Dest::Zstd => repack_zstd_dest(input, output, opts, kind),
-        Dest::Gzip => repack_gzip_dest(input, output, opts, kind),
+        Dest::Gzip => repack_gzip_dest(input, output, kind),
     }
 }
 
-/// Invent a footer iff there are at least two frames, the map has no footer span,
-/// and every compressed and uncompressed size fits in `u32`.
+/// Invent a footer iff there are at least two frames, no footer span, every
+/// size fits in `u32`, and the frames are packed from offset 0 with no gaps.
 ///
+/// A skippable frame before or between data frames makes `compressed_offset`
+/// diverge from the sum of `compressed_size`. The seek-table loader places
+/// frame *i* at that sum, so inventing a footer would hide a correct scan.
 /// `maybe_rebuild_seek_table` never invents; this function is the only inventor.
-pub fn should_invent_seek_table(map: &ZstdFrameMap) -> bool {
+fn should_invent_seek_table(map: &ZstdFrameMap) -> bool {
     if map.frames.len() < 2 || map.seek_table.is_some() {
         return false;
     }
-    map.frames.iter().all(|frame| {
-        u32::try_from(frame.compressed_size).is_ok()
-            && u32::try_from(frame.uncompressed_size).is_ok()
-    })
+    if map.frames[0].compressed_offset != 0 {
+        return false;
+    }
+    let packed = map.frames.windows(2).all(|pair| {
+        pair[1].compressed_offset == pair[0].compressed_offset + pair[0].compressed_size
+    });
+    packed
+        && map.frames.iter().all(|frame| {
+            u32::try_from(frame.compressed_size).is_ok()
+                && u32::try_from(frame.uncompressed_size).is_ok()
+        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -217,8 +216,6 @@ fn classify_input(path: &Path) -> Result<InputKind> {
         CompressionFormat::Zstd => Ok(InputKind::Zstd),
         CompressionFormat::Gzip => Ok(InputKind::Gzip),
         CompressionFormat::None => match detect_compression_extension(path) {
-            Some(CompressionFormat::Zstd) => Ok(InputKind::Zstd),
-            Some(CompressionFormat::Gzip) => Ok(InputKind::Gzip),
             Some(_) => Err(v1_reads_err()),
             None if rejected_extension(path) => Err(v1_reads_err()),
             None => Ok(InputKind::Plain),
@@ -245,11 +242,9 @@ fn rejected_extension(path: &Path) -> bool {
         return false;
     };
     let name = name.to_ascii_lowercase();
-    [
-        ".7z", ".zip", ".bz2", ".bzip2", ".xz", ".lz4", ".txz", ".tbz2",
-    ]
-    .iter()
-    .any(|ext| name.ends_with(ext))
+    [".7z", ".zip", ".bz2", ".bzip2", ".xz", ".txz", ".tbz2"]
+        .iter()
+        .any(|ext| name.ends_with(ext))
 }
 
 fn refuse_same_path(input: &Path, output: &Path) -> Result<()> {
@@ -332,14 +327,6 @@ fn sidecar_path(output: &Path, ext: &str) -> PathBuf {
     }
 }
 
-fn planned_sidecars(output: &Path, kind: GzipSidecar) -> Vec<PathBuf> {
-    match kind {
-        GzipSidecar::Rgzi => vec![sidecar_path(output, "rgzi")],
-        GzipSidecar::Gzidx => vec![sidecar_path(output, "gzidx")],
-        GzipSidecar::Both => vec![sidecar_path(output, "rgzi"), sidecar_path(output, "gzidx")],
-    }
-}
-
 fn repack_zstd_dest(
     input: &Path,
     output: &Path,
@@ -368,7 +355,17 @@ fn repack_zstd_dest(
         }
         if should_invent_seek_table(&map) {
             let uncompressed_len = sum_uncompressed(&map)?;
-            let entries = frame_entries_u32(&map)?;
+            // Sizes fit `u32`: `should_invent_seek_table` just returned true.
+            let entries: Vec<(u32, u32)> = map
+                .frames
+                .iter()
+                .map(|frame| {
+                    (
+                        u32::try_from(frame.compressed_size).expect("compressed size fits u32"),
+                        u32::try_from(frame.uncompressed_size).expect("uncompressed size fits u32"),
+                    )
+                })
+                .collect();
             let output_len = write_atomic(output, |out| {
                 copy_path(input, out)?;
                 out.write_all(&build_seek_table_skippable(&entries))?;
@@ -397,60 +394,125 @@ fn repack_zstd_dest(
     recompress_to_output(input, output, opts, kind, input_len)
 }
 
-fn repack_gzip_dest(
-    input: &Path,
-    output: &Path,
-    opts: &RepackOptions,
-    kind: InputKind,
-) -> Result<RepackReport> {
+fn repack_gzip_dest(input: &Path, output: &Path, kind: InputKind) -> Result<RepackReport> {
     if kind != InputKind::Gzip {
         return Err(v1_gzip_out_err());
     }
     let input_len = fs::metadata(input)?.len();
-    let output_len = write_atomic(output, |out| copy_path(input, out))?;
-    match write_gzip_sidecars(output, opts) {
-        Ok(uncompressed_len) => Ok(report(
-            RepackAction::CopiedWithGzipIndex {
-                format: opts.gzip_sidecar,
-            },
-            input_len,
-            output_len,
-            uncompressed_len,
-            0,
-        )),
-        Err(e) => {
-            let _ = fs::remove_file(output);
-            Err(e)
-        }
-    }
+    let parent = parent_dir(output);
+    let sidecar = sidecar_path(output, "rgzi");
+
+    // Both temps are durable before either final name is replaced. An index
+    // error drops the temps and leaves the previous archive and `.rgzi`.
+    let mut body = NamedTempFile::new_in(parent)?;
+    copy_path(input, body.as_file_mut())?;
+    body.as_file_mut().flush()?;
+    body.as_file().sync_all()?;
+
+    let indexed = SeekableGzip::open(body.path(), DEFAULT_GZIP_SEEK_SPACING)?;
+    let uncompressed_len = indexed.uncompressed_size();
+    let blob = indexed.export_seek_index_blob();
+    drop(indexed);
+
+    let mut side = NamedTempFile::new_in(parent)?;
+    side.write_all(&blob)?;
+    side.as_file_mut().flush()?;
+    side.as_file().sync_all()?;
+
+    let output_len = body.as_file().metadata()?.len();
+    publish_pair(body, output, side, &sidecar)?;
+    Ok(report(
+        RepackAction::CopiedWithGzipIndex,
+        input_len,
+        output_len,
+        uncompressed_len,
+        0,
+    ))
 }
 
-fn write_gzip_sidecars(output: &Path, opts: &RepackOptions) -> Result<u64> {
-    let gzip = SeekableGzip::open(output, opts.gzip_spacing)?;
-    let uncompressed = gzip.uncompressed_size();
-    let blobs: Vec<(&str, Vec<u8>)> = match opts.gzip_sidecar {
-        GzipSidecar::Rgzi => vec![("rgzi", gzip.export_seek_index_blob())],
-        GzipSidecar::Gzidx => vec![("gzidx", gzip.export_indexed_gzip_blob())],
-        GzipSidecar::Both => vec![
-            ("rgzi", gzip.export_seek_index_blob()),
-            ("gzidx", gzip.export_indexed_gzip_blob()),
-        ],
-    };
-    let mut published = Vec::with_capacity(blobs.len());
-    for (ext, bytes) in blobs {
-        let path = sidecar_path(output, ext);
-        if let Err(e) = write_atomic(&path, |out| {
-            out.write_all(&bytes)?;
-            Ok(())
-        }) {
-            for published_path in published {
-                let _ = fs::remove_file(published_path);
+/// Rename `body` onto `output` and `side` onto `sidecar`.
+///
+/// If either rename fails, put the previous files back.
+fn publish_pair(
+    body: NamedTempFile,
+    output: &Path,
+    side: NamedTempFile,
+    sidecar: &Path,
+) -> Result<()> {
+    let output_bak = move_aside(output)?;
+    if let Err(e) = persist_replacing(body, output) {
+        if let Some(bak) = output_bak.as_deref() {
+            restore_backup(output, bak);
+        }
+        return Err(e);
+    }
+    let sidecar_bak = match move_aside(sidecar) {
+        Ok(bak) => bak,
+        Err(e) => {
+            let _ = fs::remove_file(output);
+            if let Some(bak) = output_bak.as_deref() {
+                restore_backup(output, bak);
             }
             return Err(e);
         }
-        published.push(path);
+    };
+    if let Err(e) = persist_replacing(side, sidecar) {
+        let _ = fs::remove_file(output);
+        let _ = fs::remove_file(sidecar);
+        if let Some(bak) = output_bak.as_deref() {
+            restore_backup(output, bak);
+        }
+        if let Some(bak) = sidecar_bak.as_deref() {
+            restore_backup(sidecar, bak);
+        }
+        return Err(e);
     }
-    Ok(uncompressed)
+    if let Some(bak) = output_bak {
+        let _ = fs::remove_file(bak);
+    }
+    if let Some(bak) = sidecar_bak {
+        let _ = fs::remove_file(bak);
+    }
+    Ok(())
+}
+
+fn move_aside(path: &Path) -> Result<Option<PathBuf>> {
+    match fs::symlink_metadata(path) {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+        Ok(_) => {}
+    }
+    let (file, bak) = NamedTempFile::new_in(parent_dir(path))?
+        .keep()
+        .map_err(|e| {
+            CompressError::Msg(format!(
+                "repack-seekable failed to stage a backup of '{}': {}",
+                path.display(),
+                e.error
+            ))
+        })?;
+    drop(file);
+    if let Err(e) = fs::rename(path, &bak) {
+        let _ = fs::remove_file(&bak);
+        return Err(e.into());
+    }
+    Ok(Some(bak))
+}
+
+fn restore_backup(dest: &Path, backup: &Path) {
+    let _ = fs::remove_file(dest);
+    let _ = fs::rename(backup, dest);
+}
+
+fn persist_replacing(tmp: NamedTempFile, dest: &Path) -> Result<()> {
+    tmp.persist(dest).map_err(|e| {
+        CompressError::Msg(format!(
+            "repack-seekable failed to publish '{}': {}",
+            dest.display(),
+            e.error
+        ))
+    })?;
+    Ok(())
 }
 
 fn recompress_to_output(
@@ -569,26 +631,6 @@ fn sum_uncompressed(map: &ZstdFrameMap) -> Result<u64> {
     Ok(n)
 }
 
-fn frame_entries_u32(map: &ZstdFrameMap) -> Result<Vec<(u32, u32)>> {
-    let mut entries = Vec::with_capacity(map.frames.len());
-    for frame in &map.frames {
-        let compressed = u32::try_from(frame.compressed_size).map_err(|_| {
-            CompressError::Msg(format!(
-                "repack-seekable frame compressed size {} exceeds u32::MAX",
-                frame.compressed_size
-            ))
-        })?;
-        let plain = u32::try_from(frame.uncompressed_size).map_err(|_| {
-            CompressError::Msg(format!(
-                "repack-seekable frame uncompressed size {} exceeds u32::MAX",
-                frame.uncompressed_size
-            ))
-        })?;
-        entries.push((compressed, plain));
-    }
-    Ok(entries)
-}
-
 fn copy_path(input: &Path, out: &mut File) -> Result<()> {
     let mut src = File::open(input)?;
     io::copy(&mut src, out)?;
@@ -601,13 +643,7 @@ fn write_atomic(output: &Path, write_body: impl FnOnce(&mut File) -> Result<()>)
     tmp.as_file_mut().flush()?;
     tmp.as_file().sync_all()?;
     let len = tmp.as_file().metadata()?.len();
-    tmp.persist(output).map_err(|e| {
-        CompressError::Msg(format!(
-            "repack-seekable failed to publish '{}': {}",
-            output.display(),
-            e.error
-        ))
-    })?;
+    persist_replacing(tmp, output)?;
     Ok(len)
 }
 
@@ -755,10 +791,47 @@ mod tests {
         // `open_seekable_zstd` returns `Arc<dyn SeekableBody>`, so
         // `SeekableZstd::used_seek_table` is not callable. `kind` is that flag.
         assert_eq!(body.kind(), "zstd-seek-table");
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(b"alpha".len() as u64)).unwrap();
+        let mut byte = [0u8; 1];
+        reader.read_exact(&mut byte).unwrap();
+        assert_eq!(byte, [b'b']);
         let mut src = File::open(&output).unwrap();
         let map = scan_zstd_frames(&mut src).unwrap();
         assert!(map.seek_table.is_some());
         assert!(map.frames.len() >= 2);
+    }
+
+    /// Regression: a skippable frame between data frames must not gain a seek-table
+    /// footer. The loader would place frame 2 at the sum of `cSize` from 0 and
+    /// skip the gap.
+    #[test]
+    fn repack_skippable_gap_copies_without_footer() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.zst");
+        let output = dir.path().join("out.zst");
+        let first = encode_zstd_frame(b"AAAA", 3).unwrap();
+        let second = encode_zstd_frame(b"BBBB-second", 3).unwrap();
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&first);
+        let gap = b"gap!";
+        bytes.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        bytes.extend_from_slice(&(gap.len() as u32).to_le_bytes());
+        bytes.extend_from_slice(gap);
+        bytes.extend_from_slice(&second);
+        fs::write(&input, &bytes).unwrap();
+
+        let report = repack_seekable(&input, &output, &RepackOptions::default()).unwrap();
+        assert_eq!(report.action, RepackAction::CopiedWithoutFooter);
+        assert_eq!(fs::read(&output).unwrap(), bytes);
+
+        let body = open_seekable_zstd(&output).unwrap();
+        assert_ne!(body.kind(), "zstd-seek-table");
+        let mut reader = body.open_reader().unwrap();
+        reader.seek(SeekFrom::Start(4)).unwrap();
+        let mut buf = vec![0u8; b"BBBB-second".len()];
+        reader.read_exact(&mut buf).unwrap();
+        assert_eq!(buf, b"BBBB-second");
     }
 
     /// Regression: single-frame zstd recompress round-trips; a random read matches
@@ -866,6 +939,9 @@ mod tests {
         fits.frames[0].uncompressed_size = 10;
         fits.frames[1].uncompressed_offset = 10;
         assert!(should_invent_seek_table(&fits));
+        let mut gapped = fits.clone();
+        gapped.frames[1].compressed_offset += 1;
+        assert!(!should_invent_seek_table(&gapped));
         fits.seek_table = Some(0..1);
         assert!(!should_invent_seek_table(&fits));
     }
@@ -879,12 +955,7 @@ mod tests {
         let gz = gzip_bytes(raw);
         fs::write(&input, &gz).unwrap();
         let report = repack_seekable(&input, &output, &RepackOptions::default()).unwrap();
-        assert_eq!(
-            report.action,
-            RepackAction::CopiedWithGzipIndex {
-                format: GzipSidecar::Rgzi
-            }
-        );
+        assert_eq!(report.action, RepackAction::CopiedWithGzipIndex);
         assert_eq!(fs::read(&output).unwrap(), gz);
         assert_eq!(report.uncompressed_len, raw.len() as u64);
         let rgzi = dir.path().join("out.gz.rgzi");
@@ -990,5 +1061,41 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("u32"), "{msg}");
         assert!(!output.exists());
+    }
+
+    #[test]
+    fn repack_rejects_frame_size_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("plain.txt");
+        let output = dir.path().join("out.zst");
+        let original = b"hello";
+        fs::write(&input, original).unwrap();
+        let opts = RepackOptions {
+            frame_size: 0,
+            ..RepackOptions::default()
+        };
+        let err = repack_seekable(&input, &output, &opts).unwrap_err();
+        assert!(err.to_string().contains("frame_size"), "{err}");
+        assert_eq!(fs::read(&input).unwrap(), original);
+        assert!(!output.exists());
+    }
+
+    /// Regression: a failed gzip index must not replace an existing archive or `.rgzi`.
+    #[test]
+    fn repack_gzip_index_failure_keeps_existing_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        fs::write(&input, b"\x1f\x8b").unwrap();
+        let output = dir.path().join("out.gz");
+        let sidecar = dir.path().join("out.gz.rgzi");
+        fs::write(&output, b"old-archive").unwrap();
+        fs::write(&sidecar, b"old-index").unwrap();
+        let opts = RepackOptions {
+            overwrite: true,
+            ..RepackOptions::default()
+        };
+        assert!(repack_seekable(&input, &output, &opts).is_err());
+        assert_eq!(fs::read(&output).unwrap(), b"old-archive");
+        assert_eq!(fs::read(&sidecar).unwrap(), b"old-index");
     }
 }
