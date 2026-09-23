@@ -19,7 +19,10 @@ use serde::{Deserialize, Serialize};
 use crate::sha256_hex;
 
 /// Whole-sidecar blob cap (bytes). Larger downloads stay tempfiles.
-pub const META_SIDECAR_WHOLE_MAX: u64 = 64 * 1024 * 1024;
+///
+/// Defined once as [`ratarmount_core::META_SIDECAR_WHOLE_MAX`] so S3 index PUT
+/// can share it without depending on this crate.
+pub use ratarmount_core::META_SIDECAR_WHOLE_MAX;
 
 /// Env cap for the LRU directory. `0` disables. Default [`META_CACHE_BYTES_DEFAULT`].
 pub const META_CACHE_BYTES_ENV: &str = "RATARMOUNT_META_CACHE_BYTES";

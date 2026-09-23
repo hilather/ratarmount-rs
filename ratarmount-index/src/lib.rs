@@ -34,7 +34,7 @@ pub use local_cache::{
 pub use location::{
     archive_base_from_index_path, bind_local_index_id, default_index_folders, default_index_path,
     expand_user, find_existing_sibling_index, index_id_path, index_pointer_path,
-    index_pointer_path_for_index_file, is_index_url, load_index_pointer,
+    index_pointer_path_for_index_file, index_pointer_to_json, is_index_url, load_index_pointer,
     local_sibling_index_candidates, looks_like_url_archive, materialize_index_file,
     maybe_fetch_index_url, object_store_sibling_index_candidates, parse_index_folders,
     parse_index_id, parse_index_pointer_json, parse_link_describedby, path_can_create_index,
@@ -1217,6 +1217,34 @@ impl SqliteIndex {
             conn.execute_batch("BEGIN IMMEDIATE")?;
             Ok(())
         })
+    }
+
+    /// Merge the WAL into the main database and truncate the `-wal` file.
+    ///
+    /// Callers that hash or upload the sqlite file must do this and then drop
+    /// the writer. A busy result is an error: the main file would still be the
+    /// pre-patch snapshot.
+    pub fn wal_checkpoint_truncate(&self) -> Result<()> {
+        if self.read_only || self.compact_only {
+            return Ok(());
+        }
+        for attempt in 0..40 {
+            let busy = self.with_conn(|conn| {
+                Ok(conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |r| {
+                    r.get::<_, i64>(0)
+                })?)
+            })?;
+            if busy == 0 {
+                return Ok(());
+            }
+            if attempt + 1 == 40 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        Err(IndexError::Invalid(
+            "wal_checkpoint(TRUNCATE) busy; sidecar not fully in the main file".into(),
+        ))
     }
 
     /// Commit the current write transaction.

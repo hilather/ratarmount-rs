@@ -18,16 +18,25 @@
 //!   URL fields override destination User/Port; path via `RATARMOUNT_SSH_CONFIG` or
 //!   `~/.ssh/config`. Residual: ProxyCommand, Match, live hop handshake without sshd)
 //! - `webdav://` / `webdavs://` → WebDAV GET to temp (optional PROPFIND, Basic auth)
-//! - `smb://` → download via Samba `smbclient` CLI when present
+//! - `smb://` → [`open_smb_range`] / [`SmbRangeFile`] reads one file (SMB 2.0.2).
+//!   [`try_open_smb_folder`] lists one share directory and opens children through
+//!   [`SmbRangeFile`]. Session dispatch uses that client unless
+//!   `RATARMOUNT_SMB_USE_SMBCLIENT=1`, which keeps [`fetch_smb_to_temp`].
+//!   Inbound credentials are `RATARMOUNT_SMB_CLIENT_*`, never the export
+//!   server's `RATARMOUNT_SMB_PASSWORD`.
 //! - `dropbox://` → Dropbox content API download to temp (`DROPBOX_TOKEN`); folder browse via
 //!   [`DropboxMountSource`] (`files/list_folder` + download on open). Listings use a TTL cache
 //!   (`RATARMOUNT_DROPBOX_LIST_TTL_SECS`, default 30s); large opens prefer chunked HTTP Range.
 //! - other schemes → clear "not yet" errors
 
+#[cfg(test)]
+pub(crate) static SMB_CLIENT_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 mod dropbox;
 mod index_sibling;
 mod s3;
 mod smb;
+mod smb_client;
 mod ssh;
 mod webdav;
 
@@ -41,13 +50,15 @@ pub use ftp::{
 };
 mod gcs;
 pub use gcs::{
-    fetch_gcs_range_bytes, fetch_gcs_to_temp, open_gcs_folder, open_gcs_range, parse_gcs_url,
-    GcsListing, GcsLocation, GcsRangeFile,
+    fetch_gcs_location_to_temp_prefer_range, fetch_gcs_range_bytes, fetch_gcs_to_temp,
+    head_gcs_object, open_gcs_folder, open_gcs_range, parse_gcs_url, put_gcs_file, put_gcs_object,
+    GcsHead, GcsListing, GcsLocation, GcsRangeFile,
 };
 mod azure;
 pub use azure::{
-    fetch_azure_range_bytes, fetch_azure_to_temp, open_azure_folder, open_azure_range,
-    parse_azure_url, AzureListing, AzureLocation, AzureRangeFile,
+    fetch_azure_location_to_temp_prefer_range, fetch_azure_range_bytes, fetch_azure_to_temp,
+    head_azure_object, open_azure_folder, open_azure_range, parse_azure_url, put_azure_blocks,
+    put_azure_bytes, AzureHead, AzureListing, AzureLocation, AzureRangeFile,
 };
 mod rclone;
 pub use rclone::{
@@ -90,17 +101,21 @@ pub use dropbox::{
 pub(crate) use gcs::fetch_gcs_bytes_capped;
 pub use index_sibling::{
     fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
+    put_s3_index_siblings, S3IndexSiblingPut,
 };
 pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{
     fetch_s3_location_range_bytes, fetch_s3_location_to_temp,
     fetch_s3_location_to_temp_prefer_range, fetch_s3_range_bytes, fetch_s3_to_temp,
-    fetch_s3_to_temp_prefer_range, open_s3_range, parse_s3_url, parse_s3_url_allow_prefix,
-    S3Location, S3RangeFile, DEFAULT_S3_RANGE_THRESHOLD,
+    fetch_s3_to_temp_prefer_range, head_s3_object, open_s3_range, parse_s3_url,
+    parse_s3_url_allow_prefix, put_s3_multipart, put_s3_object, S3Head, S3Location, S3RangeFile,
+    DEFAULT_S3_RANGE_THRESHOLD, OBJECT_STORE_IO_TIMEOUT,
 };
 pub use smb::{
     fetch_smb_to_temp, find_smbclient, parse_smb_url, smbclient_download_args, SmbLocation,
+    SMB_CLIENT_DOMAIN_ENV, SMB_CLIENT_PASSWORD_ENV, SMB_CLIENT_USER_ENV,
 };
+pub use smb_client::{open_smb_range, try_open_smb_folder, SmbRangeFile};
 pub use ssh::{
     expand_tilde, fetch_ssh_to_temp, host_line_matches, host_pattern_matches, load_ssh_config,
     parse_proxy_jump_list, parse_ssh_config_file, parse_ssh_config_reader, parse_ssh_url,

@@ -213,16 +213,24 @@ pub fn load_index_pointer(path: &Path) -> Result<Option<IndexPointer>> {
         .map_err(|e| IndexError::Invalid(format!("index pointer {}: {e}", path.display())))
 }
 
+/// Pretty-printed pointer JSON plus a trailing newline.
+pub fn index_pointer_to_json(ptr: &IndexPointer) -> Result<String> {
+    ptr.validate()?;
+    let mut json = serde_json::to_vec_pretty(ptr)
+        .map_err(|e| IndexError::Invalid(format!("serialize index pointer: {e}")))?;
+    json.push(b'\n');
+    String::from_utf8(json)
+        .map_err(|e| IndexError::Invalid(format!("serialize index pointer: {e}")))
+}
+
 /// Atomically replace `path` with pretty-printed pointer JSON (tmp + rename).
 pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()> {
-    ptr.validate()?;
+    let json = index_pointer_to_json(ptr)?;
     if let Some(parent) = path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    let json = serde_json::to_vec_pretty(ptr)
-        .map_err(|e| IndexError::Invalid(format!("serialize index pointer: {e}")))?;
     let mut builder = tempfile::Builder::new();
     builder.prefix(".ratarmount-index-ptr-").suffix(".tmp");
     let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
@@ -230,8 +238,7 @@ pub fn store_index_pointer_atomic(path: &Path, ptr: &IndexPointer) -> Result<()>
         Some(p) => builder.tempfile_in(p)?,
         None => builder.tempfile_in(".")?,
     };
-    tmp.write_all(&json)?;
-    tmp.write_all(b"\n")?;
+    tmp.write_all(json.as_bytes())?;
     tmp.flush()?;
     tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| IndexError::Io(e.error))?;

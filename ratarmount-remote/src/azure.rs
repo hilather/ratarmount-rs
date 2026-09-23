@@ -25,6 +25,13 @@
 //!
 //! `AZURE_STORAGE_ACCOUNT` is required for non-anonymous (and to form the host
 //! unless [`AZURE_ENDPOINT_ENV`] is set). R2/MinIO remain S3.
+//!
+//! # Write
+//!
+//! Live commit PUTs with `shared_key_put_string_to_sign`. Do not sign a body
+//! with `shared_key_string_to_sign` (that helper hard-codes GET). At most
+//! 8 MiB is one Put Blob. Larger bodies are 8 MiB Put Block calls plus one
+//! Put Block List. Anonymous or a missing key errors before any request.
 
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex};
@@ -57,6 +64,8 @@ pub const AZURE_IMDS_BASE_ENV: &str = "RATARMOUNT_AZURE_IMDS_BASE";
 
 const DEFAULT_IMDS_BASE: &str = "http://169.254.169.254";
 const X_MS_VERSION: &str = "2020-10-02";
+/// One Put Blob at or below this size. Larger files are Put Block + Put Block List.
+const AZURE_PUT_BLOB_MAX: u64 = 8 * 1024 * 1024;
 const IMDS_TIMEOUT: Duration = Duration::from_secs(2);
 const CREDS_EXPIRY_SKEW: Duration = Duration::from_secs(120);
 const IMDS_RESOURCE: &str = "https://storage.azure.com/";
@@ -568,6 +577,80 @@ fn shared_key_string_to_sign(
     s
 }
 
+/// SharedKey string-to-sign for one PUT body.
+///
+/// Twelve standard fields, then canonical `x-ms-*` headers, then
+/// `canonical_resource`. A positive Content-Length is decimal. A zero-length
+/// body signs that field empty (`x-ms-version` 2020-10-02). Content-MD5 is
+/// empty when the header is absent. Date is empty because `x-ms-date` is set.
+/// If-Match is empty unless this request sends it. `extra_x_ms` is name/value
+/// pairs other than `x-ms-date` and `x-ms-version` (Put Blob sends
+/// `x-ms-blob-type`; Put Block List sends `x-ms-blob-content-type`). They are
+/// merged in lexicographic order. Do not call `shared_key_string_to_sign`.
+fn shared_key_put_string_to_sign(
+    content_length: u64,
+    content_md5: &str,
+    content_type: &str,
+    if_match: &str,
+    x_ms_date: &str,
+    extra_x_ms: &[(&str, &str)],
+    canonical_resource: &str,
+) -> String {
+    let mut s = String::from("PUT\n");
+    s.push('\n'); // Content-Encoding
+    s.push('\n'); // Content-Language
+    if content_length == 0 {
+        s.push('\n');
+    } else {
+        s.push_str(&content_length.to_string());
+        s.push('\n');
+    }
+    s.push_str(content_md5);
+    s.push('\n');
+    s.push_str(content_type);
+    s.push('\n');
+    s.push('\n'); // Date (x-ms-date is set)
+    s.push('\n'); // If-Modified-Since
+    s.push_str(if_match);
+    s.push('\n');
+    s.push('\n'); // If-None-Match
+    s.push('\n'); // If-Unmodified-Since
+    s.push('\n'); // Range
+    let mut headers: Vec<(&str, &str)> =
+        vec![("x-ms-date", x_ms_date), ("x-ms-version", X_MS_VERSION)];
+    for (name, value) in extra_x_ms {
+        if !value.is_empty() {
+            headers.push((name, value));
+        }
+    }
+    headers.sort_by(|a, b| a.0.cmp(b.0));
+    for (name, value) in headers {
+        s.push_str(name);
+        s.push(':');
+        s.push_str(value);
+        s.push('\n');
+    }
+    s.push_str(canonical_resource);
+    s
+}
+
+/// HEAD is not a body PUT. Same empty standard headers as GET, verb `HEAD`.
+fn shared_key_head_string_to_sign(x_ms_date: &str, canonical_resource: &str) -> String {
+    let mut s = String::from("HEAD\n");
+    for _ in 0..10 {
+        s.push('\n');
+    }
+    s.push('\n');
+    s.push_str("x-ms-date:");
+    s.push_str(x_ms_date);
+    s.push('\n');
+    s.push_str("x-ms-version:");
+    s.push_str(X_MS_VERSION);
+    s.push('\n');
+    s.push_str(canonical_resource);
+    s
+}
+
 fn shared_key_authorization(account: &str, key: &[u8], string_to_sign: &str) -> String {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key");
     mac.update(string_to_sign.as_bytes());
@@ -680,9 +763,29 @@ fn azure_get_blob(
         &x_ms_date,
     );
     let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
         .call()
-        .map_err(|e| azure_err(format!("GetBlob az://{}/{}: {e}", loc.container, loc.blob)))?;
+        .map_err(|e| azure_ureq_err("GetBlob", &loc.container, &loc.blob, e))?;
     Ok((auth.source(), resp))
+}
+
+/// Transport failures name the container and blob only. `ureq`'s `Display`
+/// includes the request URL, and a SAS `sig` must not be copied into the error.
+fn azure_ureq_err(op: &str, container: &str, name: &str, err: ureq::Error) -> RemoteError {
+    match err {
+        ureq::Error::Status(status, resp) => {
+            let text = resp.into_string().unwrap_or_default();
+            let msg = format!("{op} HTTP {status} for az://{container}/{name}: {text}");
+            if status == 401 || status == 403 {
+                azure_auth_err(msg)
+            } else {
+                azure_err(msg)
+            }
+        }
+        ureq::Error::Transport(t) => {
+            azure_err(format!("{op} az://{container}/{name}: {}", t.kind()))
+        }
+    }
 }
 
 enum AzureProbe {
@@ -782,6 +885,467 @@ fn fetch_azure_location_to_temp(loc: &AzureLocation) -> Result<(NamedTempFile, u
     tmp.flush()?;
     tmp.as_file_mut().seek(SeekFrom::Start(0))?;
     Ok((tmp, n))
+}
+
+/// Credentials for one PUT. SAS or SharedKey only.
+///
+/// Anonymous and a missing key error here, before any blob or IMDS request.
+fn resolve_put_auth() -> Result<AzureAuth> {
+    if let Some(token) = non_empty_env(AZURE_SAS_ENV) {
+        let account = require_account("SAS")?;
+        return Ok(AzureAuth::Sas { token, account });
+    }
+    if let Some(key_b64) = non_empty_env(AZURE_KEY_ENV) {
+        let account = require_account("SharedKey")?;
+        let key = base64_decode(&key_b64)?;
+        return Ok(AzureAuth::SharedKey { account, key });
+    }
+    if anonymous_enabled() {
+        return Err(azure_auth_err(
+            "anonymous credentials cannot PUT az:// objects",
+        ));
+    }
+    Err(azure_auth_err(
+        "AZURE_STORAGE_KEY is required to PUT az:// objects",
+    ))
+}
+
+fn azure_block_id(generation: u64, part: u32) -> String {
+    let raw = format!("{generation:016x}{part:08x}");
+    base64_encode(raw.as_bytes())
+}
+
+fn block_list_xml(ids: &[String]) -> String {
+    let mut xml = String::from("<?xml version=\"1.0\" encoding=\"utf-8\"?><BlockList>");
+    for id in ids {
+        xml.push_str("<Uncommitted>");
+        xml.push_str(id);
+        xml.push_str("</Uncommitted>");
+    }
+    xml.push_str("</BlockList>");
+    xml
+}
+
+fn canonical_resource_put_block(account: &str, loc: &AzureLocation, block_id: &str) -> String {
+    format!(
+        "{}\nblockid:{block_id}\ncomp:block",
+        canonical_resource_blob(account, loc)
+    )
+}
+
+fn canonical_resource_block_list(account: &str, loc: &AzureLocation) -> String {
+    format!("{}\ncomp:blocklist", canonical_resource_blob(account, loc))
+}
+
+fn azure_put_url(auth: &AzureAuth, loc: &AzureLocation, query: &str) -> String {
+    let base = blob_url(auth, loc);
+    if query.is_empty() {
+        return base;
+    }
+    if base.contains('?') {
+        format!("{base}&{query}")
+    } else {
+        format!("{base}?{query}")
+    }
+}
+
+enum AzurePutKind {
+    Blob,
+    Block { id: String },
+    BlockList,
+}
+
+struct AzurePutSign<'a> {
+    content_type: &'a str,
+    content_length: u64,
+    if_match: &'a str,
+    x_ms_date: &'a str,
+    extra_x_ms: &'a [(&'a str, &'a str)],
+    canonical_resource: &'a str,
+}
+
+fn apply_azure_put_headers(
+    mut req: ureq::Request,
+    auth: &AzureAuth,
+    sign: &AzurePutSign<'_>,
+) -> ureq::Request {
+    req = req
+        .set("User-Agent", USER_AGENT)
+        .set("x-ms-version", X_MS_VERSION)
+        .set("x-ms-date", sign.x_ms_date)
+        .set("Content-Type", sign.content_type)
+        .set("Content-Length", &sign.content_length.to_string());
+    for (name, value) in sign.extra_x_ms {
+        if !value.is_empty() {
+            req = req.set(name, value);
+        }
+    }
+    if !sign.if_match.is_empty() {
+        req = req.set("If-Match", sign.if_match);
+    }
+    match auth {
+        AzureAuth::SharedKey { account, key } => {
+            let sts = shared_key_put_string_to_sign(
+                sign.content_length,
+                "",
+                sign.content_type,
+                sign.if_match,
+                sign.x_ms_date,
+                sign.extra_x_ms,
+                sign.canonical_resource,
+            );
+            let hdr = shared_key_authorization(account, key, &sts);
+            req.set("Authorization", &hdr)
+        }
+        AzureAuth::Bearer { token, .. } => req.set("Authorization", &format!("Bearer {token}")),
+        AzureAuth::Sas { .. } | AzureAuth::Anonymous { .. } => req,
+    }
+}
+
+fn send_azure_put(
+    loc: &AzureLocation,
+    kind: AzurePutKind,
+    blob_content_type: &str,
+    content_length: u64,
+    if_match: Option<&str>,
+    body: impl Read,
+) -> Result<()> {
+    let auth = resolve_put_auth()?;
+    // If-Match is the download ETag on archive Put Blob and Put Block List only.
+    let if_match = match &kind {
+        AzurePutKind::Block { .. } => "",
+        AzurePutKind::Blob | AzurePutKind::BlockList => if_match.unwrap_or(""),
+    };
+    let (url, resource, op, content_type, extra_x_ms): (
+        String,
+        String,
+        &str,
+        &str,
+        Vec<(&str, &str)>,
+    ) = match &kind {
+        AzurePutKind::Blob => (
+            azure_put_url(&auth, loc, ""),
+            canonical_resource_blob(auth.account(), loc),
+            "PutBlob",
+            blob_content_type,
+            vec![("x-ms-blob-type", "BlockBlob")],
+        ),
+        AzurePutKind::Block { id } => (
+            azure_put_url(
+                &auth,
+                loc,
+                &format!("comp=block&blockid={}", urlencoding_encode(id)),
+            ),
+            canonical_resource_put_block(auth.account(), loc, id),
+            "PutBlock",
+            blob_content_type,
+            Vec::new(),
+        ),
+        AzurePutKind::BlockList => (
+            azure_put_url(&auth, loc, "comp=blocklist"),
+            canonical_resource_block_list(auth.account(), loc),
+            "PutBlockList",
+            "application/xml",
+            vec![("x-ms-blob-content-type", blob_content_type)],
+        ),
+    };
+    let x_ms_date = rfc1123_now();
+    debug!(
+        "azure {op} {} (auth={:?}, bytes={content_length})",
+        redact_url_sas(&url, auth.sas()),
+        auth.source()
+    );
+    let req = apply_azure_put_headers(
+        ureq::put(&url),
+        &auth,
+        &AzurePutSign {
+            content_type,
+            content_length,
+            if_match,
+            x_ms_date: &x_ms_date,
+            extra_x_ms: &extra_x_ms,
+            canonical_resource: &resource,
+        },
+    );
+    let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
+        .send(body)
+        .map_err(|e| azure_ureq_err(op, &loc.container, &loc.blob, e))?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let text = resp.into_string().unwrap_or_default();
+        return Err(azure_err(format!(
+            "{op} HTTP {status} for az://{}/{}: {text}",
+            loc.container, loc.blob
+        )));
+    }
+    Ok(())
+}
+
+/// HEAD metadata for a live-commit tick. A missing blob is an error (do not create).
+#[derive(Clone, Debug)]
+pub struct AzureHead {
+    pub etag: Option<String>,
+    pub len: u64,
+}
+
+/// `HEAD` the blob. ETag is the raw header value.
+pub fn head_azure_object(url_str: &str) -> Result<AzureHead> {
+    let loc = parse_azure_url(url_str)?;
+    let auth = resolve_auth()?;
+    let url = blob_url(&auth, &loc);
+    let x_ms_date = rfc1123_now();
+    let resource = canonical_resource_blob(auth.account(), &loc);
+    let sts = match &auth {
+        AzureAuth::SharedKey { .. } => Some(shared_key_head_string_to_sign(&x_ms_date, &resource)),
+        _ => None,
+    };
+    debug!(
+        "azure HEAD {} (auth={:?})",
+        redact_url_sas(&url, auth.sas()),
+        auth.source()
+    );
+    let req = apply_azure_headers(ureq::head(&url), &auth, None, sts.as_deref(), &x_ms_date);
+    let resp = req
+        .timeout(crate::OBJECT_STORE_IO_TIMEOUT)
+        .call()
+        .map_err(|e| match e {
+            ureq::Error::Status(status, resp) => {
+                let body = resp.into_string().unwrap_or_default();
+                azure_err(format!(
+                    "HEAD HTTP {status} for az://{}/{}: {body}",
+                    loc.container, loc.blob
+                ))
+            }
+            other => azure_ureq_err("HEAD", &loc.container, &loc.blob, other),
+        })?;
+    let status = resp.status();
+    if !(200..300).contains(&status) {
+        let body = resp.into_string().unwrap_or_default();
+        return Err(azure_err(format!(
+            "HEAD HTTP {status} for az://{}/{}: {body}",
+            loc.container, loc.blob
+        )));
+    }
+    let etag = resp.header("etag").map(str::to_string);
+    let len = resp
+        .header("Content-Length")
+        .or_else(|| resp.header("content-length"))
+        .and_then(|s| s.parse::<u64>().ok())
+        .ok_or_else(|| {
+            azure_err(format!(
+                "HEAD az://{}/{} missing Content-Length",
+                loc.container, loc.blob
+            ))
+        })?;
+    Ok(AzureHead { etag, len })
+}
+
+/// One Put Blob, or 8 MiB Put Block calls plus Put Block List when `body` is larger.
+///
+/// The pointer JSON is already in memory. A large slice is spilled to a tempfile
+/// and streamed; it is not the archive spool.
+pub fn put_azure_bytes(
+    loc: &AzureLocation,
+    body: &[u8],
+    content_type: &str,
+    generation: u64,
+    if_match: Option<&str>,
+) -> Result<()> {
+    if body.len() as u64 > AZURE_PUT_BLOB_MAX {
+        let mut tmp = NamedTempFile::new()?;
+        tmp.write_all(body)?;
+        tmp.flush()?;
+        return put_azure_blocks(loc, tmp.path(), content_type, generation, if_match);
+    }
+    let _ = resolve_put_auth()?;
+    send_azure_put(
+        loc,
+        AzurePutKind::Blob,
+        content_type,
+        body.len() as u64,
+        if_match,
+        std::io::Cursor::new(body),
+    )
+}
+
+/// Stream `path` to the blob. At most 8 MiB is one Put Blob
+/// (path-only resource, Content-Length of the whole body). Larger files use
+/// 8 MiB Put Block plus Put Block List. Block ids are
+/// `{generation:016x}{part:08x}` base64. The query `blockid` is percent-encoded;
+/// the string-to-sign uses the decoded id. The body is not loaded into a `Vec`.
+/// Anonymous or a missing key errors before a request. The SharedKey secret is
+/// not logged.
+pub fn put_azure_blocks(
+    loc: &AzureLocation,
+    path: &std::path::Path,
+    content_type: &str,
+    generation: u64,
+    if_match: Option<&str>,
+) -> Result<()> {
+    let _ = resolve_put_auth()?;
+    let len = std::fs::metadata(path)
+        .map_err(|e| azure_err(format!("reading {} for PUT: {e}", path.display())))?
+        .len();
+    if len <= AZURE_PUT_BLOB_MAX {
+        let file = std::fs::File::open(path)
+            .map_err(|e| azure_err(format!("opening {} for PUT: {e}", path.display())))?;
+        return send_azure_put(loc, AzurePutKind::Blob, content_type, len, if_match, file);
+    }
+    let mut ids = Vec::new();
+    let mut offset = 0u64;
+    let mut part: u32 = 0;
+    while offset < len {
+        let n = (len - offset).min(AZURE_PUT_BLOB_MAX);
+        let id = azure_block_id(generation, part);
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| azure_err(format!("opening {} for Put Block: {e}", path.display())))?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|e| azure_err(format!("seeking {} for Put Block: {e}", path.display())))?;
+        send_azure_put(
+            loc,
+            AzurePutKind::Block { id: id.clone() },
+            content_type,
+            n,
+            None,
+            file.take(n),
+        )?;
+        ids.push(id);
+        offset += n;
+        part = part
+            .checked_add(1)
+            .ok_or_else(|| azure_err("too many azure blocks"))?;
+    }
+    let xml = block_list_xml(&ids);
+    let xml_len = xml.len() as u64;
+    send_azure_put(
+        loc,
+        AzurePutKind::BlockList,
+        content_type,
+        xml_len,
+        if_match,
+        std::io::Cursor::new(xml.into_bytes()),
+    )
+}
+
+fn azure_spool_file() -> Result<NamedTempFile> {
+    let tmp = NamedTempFile::new()?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(tmp)
+}
+
+fn azure_bytes_to_tempfile(bytes: &[u8]) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = azure_spool_file()?;
+    tmp.write_all(bytes)?;
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    Ok((tmp, bytes.len() as u64))
+}
+
+/// Sequential Range materialization into a mode `0o600` tempfile.
+fn fetch_azure_via_ranges(loc: &AzureLocation, size: u64) -> Result<(NamedTempFile, u64)> {
+    let mut tmp = azure_spool_file()?;
+    if size == 0 {
+        tmp.flush()?;
+        return Ok((tmp, 0));
+    }
+    let mut written = 0u64;
+    for (start, end) in crate::range_chunk_windows(size, crate::HTTP_RANGE_CHUNK) {
+        let range = format!("bytes={start}-{end}");
+        let (source, resp) = azure_get_blob(loc, Some((start, end)))?;
+        let status = resp.status();
+        if status == 206 {
+            let expected = end - start + 1;
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            if n != expected {
+                return Err(azure_err(format!(
+                    "range {range} for az://{}/{} returned {n} bytes, expected {expected}",
+                    loc.container, loc.blob
+                )));
+            }
+            written += n;
+        } else if status == 200 && start == 0 {
+            let mut reader = resp.into_reader();
+            let n = io::copy(&mut reader, &mut tmp)?;
+            tmp.flush()?;
+            tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+            debug!(
+                "azure download az://{}/{} -> {n} bytes (full body; Range ignored)",
+                loc.container, loc.blob
+            );
+            return Ok((tmp, n));
+        } else {
+            let body = resp.into_string().unwrap_or_default();
+            return Err(azure_status_error(source, status, loc, &body));
+        }
+    }
+    if written != size {
+        return Err(azure_err(format!(
+            "range download size mismatch for az://{}/{}: wrote {written}, expected {size}",
+            loc.container, loc.blob
+        )));
+    }
+    tmp.flush()?;
+    tmp.as_file_mut().seek(SeekFrom::Start(0))?;
+    debug!(
+        "azure range download az://{}/{} -> {written} bytes",
+        loc.container, loc.blob
+    );
+    Ok((tmp, written))
+}
+
+/// Download an Azure blob, preferring sequential HTTP Range chunks when feasible.
+///
+/// Same threshold and fallback as S3: above [`DEFAULT_AZURE_RANGE_THRESHOLD`]
+/// uses Range; a failed Range or a small object falls back to one full GET.
+/// The tempfile is mode `0o600` in the system temp dir (not the overlay).
+/// [`fetch_azure_to_temp`] stays the single full GET and is not this path.
+pub fn fetch_azure_location_to_temp_prefer_range(
+    loc: &AzureLocation,
+    known_size: Option<u64>,
+) -> Result<(NamedTempFile, u64)> {
+    let size_for_range = match known_size {
+        Some(n) if n > DEFAULT_AZURE_RANGE_THRESHOLD => Some(n),
+        Some(_) => None,
+        None => match probe_azure_blob(loc) {
+            Ok(AzureProbe::RangesOk(n)) if n > DEFAULT_AZURE_RANGE_THRESHOLD => Some(n),
+            Ok(AzureProbe::RangesOk(_)) => None,
+            Ok(AzureProbe::FullBody(bytes)) => {
+                return azure_bytes_to_tempfile(&bytes);
+            }
+            Ok(AzureProbe::Unusable) => None,
+            Err(e) => {
+                debug!(
+                    "azure range probe failed for az://{}/{}: {e}; full download",
+                    loc.container, loc.blob
+                );
+                None
+            }
+        },
+    };
+    if let Some(size) = size_for_range {
+        debug!(
+            "azure prefer-range: az://{}/{} ({size} bytes) in {}-byte chunks",
+            loc.container,
+            loc.blob,
+            crate::HTTP_RANGE_CHUNK
+        );
+        match fetch_azure_via_ranges(loc, size) {
+            Ok(v) => return Ok(v),
+            Err(e) => {
+                debug!(
+                    "azure range download failed for az://{}/{}: {e}; falling back to full GET",
+                    loc.container, loc.blob
+                );
+            }
+        }
+    }
+    fetch_azure_location_to_temp(loc)
 }
 
 /// Inclusive byte range GET (`start..=end_inclusive`). Expects HTTP 206.
@@ -1125,7 +1689,7 @@ fn azure_list_page(container: &str, prefix: &str, marker: Option<&str>) -> Resul
     let req = apply_azure_headers(ureq::get(&url), &auth, None, sts.as_deref(), &x_ms_date);
     let resp = req
         .call()
-        .map_err(|e| azure_err(format!("List Blobs az://{container}/{prefix}: {e}")))?;
+        .map_err(|e| azure_ureq_err("List Blobs", container, prefix, e))?;
     let status = resp.status();
     let body = resp.into_string().unwrap_or_default();
     if !(200..300).contains(&status) {
@@ -1319,6 +1883,7 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex as StdMutex;
     use std::thread;
+    use std::time::Duration;
 
     static ENV_LOCK: StdMutex<()> = StdMutex::new(());
 
@@ -1918,5 +2483,540 @@ mod tests {
         let raw = b"azure-account-key-material!!";
         let enc = base64_encode(raw);
         assert_eq!(base64_decode(&enc).unwrap(), raw);
+    }
+
+    /// Known fixture: PUT, Content-Length, `comp:block`, and the decoded block id.
+    /// GET stays on the old helper and still starts with GET.
+    #[test]
+    fn shared_key_put_string_includes_length_and_decoded_block_id() {
+        let decoded = "aa+/=";
+        let date = "Fri, 26 Jun 2015 23:39:38 GMT";
+        let resource = format!("/acct/ctr/data/a.tar\nblockid:{decoded}\ncomp:block");
+        let sts = shared_key_put_string_to_sign(
+            8_388_608,
+            "",
+            "application/octet-stream",
+            "",
+            date,
+            &[],
+            &resource,
+        );
+        let lines: Vec<&str> = sts.split('\n').collect();
+        assert_eq!(lines[0], "PUT", "{sts}");
+        assert_eq!(lines[3], "8388608", "Content-Length field, sts={sts}");
+        assert_eq!(lines[5], "application/octet-stream", "{sts}");
+        assert_eq!(lines[8], "", "If-Match stays empty, sts={sts}");
+        assert!(
+            sts.contains("comp:block\n") || sts.ends_with("comp:block"),
+            "{sts}"
+        );
+        assert!(
+            sts.contains("blockid:aa+/="),
+            "string-to-sign must use the decoded id, sts={sts}"
+        );
+        assert!(
+            !sts.contains("%2B") && !sts.contains("%2F") && !sts.contains("%3D"),
+            "{sts}"
+        );
+        assert!(
+            sts.contains("x-ms-date:Fri, 26 Jun 2015 23:39:38 GMT"),
+            "{sts}"
+        );
+        assert!(sts.contains("x-ms-version:2020-10-02"), "{sts}");
+        let get_sts = shared_key_string_to_sign(None, date, "/acct/ctr/data/a.tar");
+        assert!(get_sts.starts_with("GET\n"), "{get_sts}");
+        assert!(!get_sts.contains("8388608"), "{get_sts}");
+        assert!(!get_sts.contains("comp:block"), "{get_sts}");
+    }
+
+    /// Regression: x-ms-version 2020-10-02 signs a zero-length PUT with an empty
+    /// Content-Length field. A positive length stays decimal.
+    #[test]
+    fn shared_key_put_zero_length_signs_empty_content_length() {
+        let date = "Fri, 26 Jun 2015 23:39:38 GMT";
+        let sts = shared_key_put_string_to_sign(
+            0,
+            "",
+            "application/octet-stream",
+            "",
+            date,
+            &[("x-ms-blob-type", "BlockBlob")],
+            "/acct/ctr/empty.bin",
+        );
+        let lines: Vec<&str> = sts.split('\n').collect();
+        assert_eq!(lines[0], "PUT", "{sts}");
+        assert_eq!(lines[3], "", "zero Content-Length must be empty: {sts}");
+        assert!(
+            sts.contains("x-ms-blob-type:BlockBlob\nx-ms-date:"),
+            "blob type sorts before x-ms-date: {sts}"
+        );
+        let one = shared_key_put_string_to_sign(
+            1,
+            "",
+            "application/octet-stream",
+            "\"e\"",
+            date,
+            &[("x-ms-blob-type", "BlockBlob")],
+            "/acct/ctr/empty.bin",
+        );
+        let one_lines: Vec<&str> = one.split('\n').collect();
+        assert_eq!(one_lines[3], "1", "{one}");
+        assert_eq!(one_lines[8], "\"e\"", "{one}");
+    }
+
+    #[derive(Clone, Debug)]
+    struct PutHit {
+        target: String,
+        content_length: String,
+        content_type: String,
+        authorization: String,
+        x_ms_date: String,
+        blob_type: String,
+        blob_content_type: String,
+        if_match: String,
+    }
+
+    fn percent_decode_query(s: &str) -> String {
+        let bytes = s.as_bytes();
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'%' && i + 2 < bytes.len() {
+                if let Ok(b) =
+                    u8::from_str_radix(std::str::from_utf8(&bytes[i + 1..i + 3]).unwrap_or(""), 16)
+                {
+                    out.push(b);
+                    i += 3;
+                    continue;
+                }
+            }
+            out.push(bytes[i]);
+            i += 1;
+        }
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    fn query_value(target: &str, name: &str) -> Option<String> {
+        let q = target.split_once('?')?.1;
+        for pair in q.split('&') {
+            if let Some((k, v)) = pair.split_once('=') {
+                if k == name {
+                    return Some(percent_decode_query(v));
+                }
+            }
+        }
+        None
+    }
+
+    /// In-test listener. Reads the body so a large Put Block cannot deadlock.
+    /// `fail_block_list` answers `comp=blocklist` with HTTP 500.
+    fn spawn_put_listener(
+        fail_block_list: bool,
+    ) -> (String, Arc<StdMutex<Vec<PutHit>>>, Arc<AtomicUsize>) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(StdMutex::new(Vec::new()));
+        let accepts = Arc::new(AtomicUsize::new(0));
+        let hits_t = Arc::clone(&hits);
+        let accepts_t = Arc::clone(&accepts);
+        thread::spawn(move || {
+            for stream in listener.incoming().take(16) {
+                let Ok(mut stream) = stream else { continue };
+                accepts_t.fetch_add(1, Ordering::SeqCst);
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut request_line = String::new();
+                if reader.read_line(&mut request_line).is_err() || request_line.is_empty() {
+                    continue;
+                }
+                let target = request_line
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or("/")
+                    .to_string();
+                let mut content_length = 0usize;
+                let mut content_length_s = String::new();
+                let mut content_type = String::new();
+                let mut authorization = String::new();
+                let mut x_ms_date = String::new();
+                let mut blob_type = String::new();
+                let mut blob_content_type = String::new();
+                let mut if_match = String::new();
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).is_err() {
+                        break;
+                    }
+                    if line == "\r\n" || line == "\n" || line.is_empty() {
+                        break;
+                    }
+                    let lower = line.to_ascii_lowercase();
+                    if let Some(v) = lower.strip_prefix("content-length:") {
+                        content_length_s = v.trim().to_string();
+                        content_length = content_length_s.parse().unwrap_or(0);
+                    } else if let Some((_, v)) = line.split_once(':') {
+                        let name = line.split_once(':').map(|(n, _)| n).unwrap_or("");
+                        if name.eq_ignore_ascii_case("content-type") {
+                            content_type = v.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("authorization") {
+                            authorization = v.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("x-ms-date") {
+                            x_ms_date = v.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("x-ms-blob-type") {
+                            blob_type = v.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("x-ms-blob-content-type") {
+                            blob_content_type = v.trim().to_string();
+                        } else if name.eq_ignore_ascii_case("if-match") {
+                            if_match = v.trim().to_string();
+                        }
+                    }
+                }
+                let mut left = content_length;
+                let mut buf = [0u8; 64 * 1024];
+                while left > 0 {
+                    let want = left.min(buf.len());
+                    let n = reader.read(&mut buf[..want]).unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    left -= n;
+                }
+                hits_t.lock().unwrap().push(PutHit {
+                    target: target.clone(),
+                    content_length: content_length_s,
+                    content_type,
+                    authorization,
+                    x_ms_date,
+                    blob_type: blob_type.clone(),
+                    blob_content_type,
+                    if_match,
+                });
+                let put_blob = !target.contains("comp=");
+                if put_blob && blob_type != "BlockBlob" {
+                    let msg = b"MissingRequiredHeader";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 400 Bad Request\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    continue;
+                }
+                if fail_block_list && target.contains("comp=blocklist") {
+                    let msg = b"block list failed";
+                    let _ = write!(
+                        stream,
+                        "HTTP/1.1 500 Internal Server Error\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        msg.len()
+                    );
+                    let _ = stream.write_all(msg);
+                    continue;
+                }
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 201 Created\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                );
+            }
+        });
+        (base, hits, accepts)
+    }
+
+    #[test]
+    fn azure_put_anonymous_errors_before_request() {
+        let (base, _hits, accepts) = spawn_put_listener(false);
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ANON_ENV, "1");
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_ENDPOINT_ENV, &base);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_azure_url("az://ctr/obj.bin").unwrap();
+        let err = put_azure_blocks(
+            &loc,
+            std::path::Path::new("/no/such"),
+            "application/octet-stream",
+            0,
+            None,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("anonymous"), "{err}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "anonymous PUT must not connect"
+        );
+    }
+
+    #[test]
+    fn azure_put_missing_key_errors_before_request() {
+        let (base, _hits, accepts) = spawn_put_listener(false);
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_ENDPOINT_ENV, &base);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_azure_url("az://ctr/obj.bin").unwrap();
+        let err = put_azure_bytes(&loc, b"hello", "application/octet-stream", 0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("AZURE_STORAGE_KEY"), "{err}");
+        assert_eq!(
+            accepts.load(Ordering::SeqCst),
+            0,
+            "missing key must not connect"
+        );
+    }
+
+    #[test]
+    fn azure_put_small_is_single_put_blob() {
+        let secret = b"azure-shared-key-secret!!";
+        let (base, hits, _accepts) = spawn_put_listener(false);
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_KEY_ENV, &base64_encode(secret));
+        _g.set(AZURE_ENDPOINT_ENV, &base);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
+        std::fs::write(&path, b"hello").unwrap();
+        let loc = parse_azure_url("az://ctr/obj.bin").unwrap();
+        put_azure_blocks(&loc, &path, "application/octet-stream", 3, Some("\"v9\"")).unwrap();
+        let got = hits.lock().unwrap();
+        assert_eq!(got.len(), 1, "one Put Blob, hits={}", got.len());
+        assert!(
+            !got[0].target.contains("comp="),
+            "single put is path-only: {}",
+            got[0].target
+        );
+        assert_eq!(got[0].content_length, "5");
+        assert_eq!(got[0].blob_type, "BlockBlob");
+        assert_eq!(got[0].if_match, "\"v9\"");
+        assert!(
+            !got[0].authorization.contains("azure-shared-key-secret"),
+            "{got:?}"
+        );
+        let sts = shared_key_put_string_to_sign(
+            5,
+            "",
+            "application/octet-stream",
+            "\"v9\"",
+            &got[0].x_ms_date,
+            &[("x-ms-blob-type", "BlockBlob")],
+            "/acct/ctr/obj.bin",
+        );
+        assert!(
+            sts.find("x-ms-blob-type:BlockBlob") < sts.find("x-ms-date:"),
+            "{sts}"
+        );
+        let expect = shared_key_authorization("acct", secret, &sts);
+        assert_eq!(got[0].authorization, expect, "sts={sts}");
+        assert!(sts.starts_with("PUT\n"), "{sts}");
+    }
+
+    /// Regression: a failed Put Block List returns an error. The string-to-sign
+    /// uses the decoded block id. The query is percent-encoded (`+`, `/`, `=`).
+    /// Hex block ids have none of those characters; the encoder is still applied.
+    #[test]
+    fn azure_put_block_list_failure_signs_decoded_id() {
+        let secret = b"azure-shared-key-secret!!";
+        assert_eq!(urlencoding_encode("+/="), "%2B%2F%3D");
+        let generation = 0u64;
+        let id = azure_block_id(generation, 0);
+        let (base, hits, _accepts) = spawn_put_listener(true);
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_KEY_ENV, &base64_encode(secret));
+        _g.set(AZURE_ENDPOINT_ENV, &base);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.bin");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(AZURE_PUT_BLOB_MAX + 1).unwrap();
+        let loc = parse_azure_url("az://ctr/path/blob.bin").unwrap();
+        let err = put_azure_blocks(
+            &loc,
+            &path,
+            "application/octet-stream",
+            generation,
+            Some("\"etag-dl\""),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("PutBlockList") && err.contains("HTTP 500"),
+            "{err}"
+        );
+        let got = hits.lock().unwrap();
+        assert!(
+            got.len() >= 3,
+            "two blocks and a block list, hits={}",
+            got.len()
+        );
+        let block = got
+            .iter()
+            .find(|h| {
+                h.target.contains("comp=block&")
+                    || h.target.contains("comp=block&blockid=")
+                    || (h.target.contains("comp=block") && !h.target.contains("blocklist"))
+            })
+            .expect("Put Block");
+        assert_eq!(block.content_length, AZURE_PUT_BLOB_MAX.to_string());
+        let decoded = query_value(&block.target, "blockid").expect("blockid");
+        assert_eq!(decoded, id, "query decodes to the block id");
+        let encoded = urlencoding_encode(&id);
+        assert!(
+            block.target.contains(&encoded),
+            "query must percent-encode the id, target={} encoded={encoded}",
+            block.target
+        );
+        assert!(
+            !block.target.contains(&format!("blockid={id}")) || encoded == id,
+            "raw id must not be the query value when it needs encoding"
+        );
+        let resource = canonical_resource_put_block("acct", &loc, &decoded);
+        assert!(
+            resource.contains(&format!("blockid:{decoded}")),
+            "{resource}"
+        );
+        assert!(resource.contains("comp:block"), "{resource}");
+        assert!(
+            block.blob_type.is_empty(),
+            "Put Block must not send x-ms-blob-type"
+        );
+        assert!(
+            block.if_match.is_empty(),
+            "Put Block must not send If-Match"
+        );
+        let sts = shared_key_put_string_to_sign(
+            AZURE_PUT_BLOB_MAX,
+            "",
+            "application/octet-stream",
+            "",
+            &block.x_ms_date,
+            &[],
+            &resource,
+        );
+        assert!(sts.starts_with("PUT\n"), "{sts}");
+        assert!(sts.contains(&format!("\n{AZURE_PUT_BLOB_MAX}\n")), "{sts}");
+        assert!(sts.contains(&format!("blockid:{decoded}")), "{sts}");
+        assert!(sts.contains("comp:block"), "{sts}");
+        assert!(!sts.contains("%2B") && !sts.contains("%2F"), "{sts}");
+        let expect = shared_key_authorization("acct", secret, &sts);
+        assert_eq!(block.authorization, expect, "signed with the decoded id");
+        let list = got
+            .iter()
+            .find(|h| h.target.contains("comp=blocklist"))
+            .expect("block list was attempted");
+        assert_eq!(list.content_type, "application/xml");
+        assert_eq!(list.blob_content_type, "application/octet-stream");
+        assert!(
+            list.blob_type.is_empty(),
+            "block list must not send x-ms-blob-type"
+        );
+        assert_eq!(list.if_match, "\"etag-dl\"");
+        let list_len: u64 = list.content_length.parse().unwrap();
+        let list_resource = canonical_resource_block_list("acct", &loc);
+        let list_sts = shared_key_put_string_to_sign(
+            list_len,
+            "",
+            "application/xml",
+            "\"etag-dl\"",
+            &list.x_ms_date,
+            &[("x-ms-blob-content-type", "application/octet-stream")],
+            &list_resource,
+        );
+        assert!(
+            list_sts.contains("x-ms-blob-content-type:application/octet-stream"),
+            "{list_sts}"
+        );
+        assert!(
+            list_sts.find("x-ms-blob-content-type:") < list_sts.find("x-ms-date:"),
+            "{list_sts}"
+        );
+        let list_expect = shared_key_authorization("acct", secret, &list_sts);
+        assert_eq!(
+            list.authorization, list_expect,
+            "block list signer, sts={list_sts}"
+        );
+        assert!(
+            got.iter()
+                .all(|h| !h.authorization.contains("azure-shared-key-secret")),
+            "secret leaked"
+        );
+        assert_eq!(block.content_type, "application/octet-stream");
+    }
+
+    /// Regression: a transport failure must not include the SAS `sig`.
+    #[test]
+    fn azure_transport_error_omits_sas_sig() {
+        let sig = "FIXTURE_SAS_SIG_DO_NOT_LEAK";
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_SAS_ENV, &format!("sv=2020-10-02&sig={sig}"));
+        _g.set(AZURE_ENDPOINT_ENV, "http://127.0.0.1:1");
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let head = head_azure_object("az://ctr/obj.bin")
+            .unwrap_err()
+            .to_string();
+        assert!(!head.contains(sig), "{head}");
+        assert!(!head.contains("sig="), "{head}");
+        assert!(head.contains("az://ctr/obj.bin"), "{head}");
+        let loc = parse_azure_url("az://ctr/obj.bin").unwrap();
+        let put = put_azure_bytes(&loc, b"x", "application/octet-stream", 0, None)
+            .unwrap_err()
+            .to_string();
+        assert!(!put.contains(sig), "{put}");
+        assert!(!put.contains("sig="), "{put}");
+        assert!(put.contains("az://ctr/obj.bin"), "{put}");
+    }
+
+    /// The in-test listener rejects Put Blob that omits x-ms-blob-type: BlockBlob.
+    #[test]
+    fn azure_listener_rejects_put_blob_without_blob_type() {
+        let (base, _hits, _accepts) = spawn_put_listener(false);
+        let addr = base.trim_start_matches("http://");
+        let mut stream = std::net::TcpStream::connect(addr).unwrap();
+        write!(
+            stream,
+            "PUT /ctr/obj.bin HTTP/1.1\r\nHost: localhost\r\nContent-Length: 2\r\nContent-Type: application/octet-stream\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        stream.write_all(b"hi").unwrap();
+        let mut resp = String::new();
+        stream.read_to_string(&mut resp).unwrap();
+        assert!(resp.contains("400"), "{resp}");
+        assert!(resp.contains("MissingRequiredHeader"), "{resp}");
+    }
+
+    #[test]
+    fn azure_prefer_range_spool_is_0600_and_uses_chunks() {
+        let extra = DEFAULT_AZURE_RANGE_THRESHOLD as usize + 16;
+        let body: Vec<u8> = (0u8..=255).cycle().take(extra).collect();
+        let mock = MockAzure::spawn(MockMode::Object {
+            body: body.clone(),
+            require_auth: false,
+        });
+        let _g = EnvGuard::acquire(AZ_ENV_KEYS);
+        _g.set(AZURE_ANON_ENV, "1");
+        _g.set(AZURE_ACCOUNT_ENV, "acct");
+        _g.set(AZURE_ENDPOINT_ENV, &mock.base_url);
+        _g.set(AZURE_IMDS_BASE_ENV, "http://127.0.0.1:1");
+        let loc = parse_azure_url("az://ctr/big.bin").unwrap();
+        let (mut tmp, size) = fetch_azure_location_to_temp_prefer_range(&loc, None).unwrap();
+        assert_eq!(size, body.len() as u64);
+        let mut got = Vec::new();
+        tmp.read_to_end(&mut got).unwrap();
+        assert_eq!(got, body);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(tmp.path()).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600, "spool mode {mode:o}");
+        }
+        let log = mock.log.lock().unwrap();
+        assert!(
+            log.iter()
+                .any(|l| l.starts_with("Range: bytes=0-") && l != "Range: bytes=0-0"),
+            "expected a content range after the probe, log={log:?}"
+        );
     }
 }

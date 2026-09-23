@@ -7,6 +7,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
+/// Whole-sidecar blob cap (bytes).
+///
+/// Meta-v3 stores a sidecar only at or below this size. Object-store index
+/// publish uses the same cap and does not PUT a larger blob. Not a second limit.
+pub const META_SIDECAR_WHOLE_MAX: u64 = 64 * 1024 * 1024;
+
 /// Per-backend decompression thread matrix (Python `-P` / `--parallelization`).
 ///
 /// Accepts the same string forms as Python `parse_parallelization`:

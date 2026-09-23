@@ -35,6 +35,7 @@ mod lz4_seek;
 mod lzip_seek;
 mod lzma_seek;
 mod lzo_seek;
+mod repack_seekable;
 mod seekable_body;
 mod split;
 mod xz_seek;
@@ -86,6 +87,10 @@ pub use lzma_seek::{open_seekable_lzma, open_seekable_lzma_with_threads};
 pub use lzo_seek::{lzo_available, open_seekable_lzo, open_seekable_lzo_with_threads, SeekableLzo};
 /// Re-export for `-P` / backend matrix parsing at the compress boundary.
 pub use ratarmount_core::ParallelizationSpec;
+pub use repack_seekable::{
+    repack_seekable, GzipSidecar, RepackAction, RepackOptions, RepackReport,
+    DEFAULT_REPACK_FRAME_SIZE, DEFAULT_REPACK_ZSTD_LEVEL,
+};
 pub use seekable_body::{
     body_looks_like_tar, DecodedBody, SeekRead, SeekableBody, DEFAULT_MEMORY_CAP,
 };

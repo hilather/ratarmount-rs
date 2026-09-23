@@ -51,6 +51,46 @@ frame; the full-decode path is simple and fast enough.
 
 ---
 
+## One-shot producer
+
+`ratarmount --repack-seekable INPUT OUTPUT` rewrites a file and exits. It does
+not mount and is not combined with `--commit-overlay` (or a non-zero
+`--commit-overlay-interval` / `--commit-overlay-on-exit`). `--yes` overwrites.
+`--repack-frame-size BYTES` defaults to 8 MiB when omitted (`1M` = 1 048 576)
+and only affects a recompress.
+
+```bash
+ratarmount --repack-seekable in.tar.gz out.tar.zst
+```
+
+| Output suffix | Product |
+|---------------|---------|
+| `.zst`, `.tzst`, `.zstd`, `.tar.zst`, `.tar.zstd` | Multi-frame zstd plus a seek-table footer |
+| `.gz`, `.tgz`, `.gzip`, `.tar.gz` | Byte copy of a gzip input, plus `{output}.rgzi` (or `--repack-gzip-index gzidx` / `both`) |
+| anything else | Error, exit 2 |
+
+Zstd destination — copy versus recompress:
+
+| Input | Action |
+|-------|--------|
+| At least two frames and a seek-table footer | **Copy**. Output bytes match the input. |
+| At least two frames, no footer, packed from offset 0 with no gaps, every size fits `u32` | **Append** a seek-table footer. Prefix frames stay byte-identical. |
+| At least two frames, no footer, and a size does not fit `u32` **or** a skippable frame sits before or between data frames | **Copy**. No footer. A footer would hide the gap: the loader places frame *i* at the sum of compressed sizes from 0. |
+| Single zstd frame, with or without a one-row seek table | **Recompress** into `frame_size` chunks, then one footer. |
+| gzip or uncompressed bytes | **Recompress** the same way. |
+| bzip2, xz, lz4, 7z, zip | Error. v1 reads gzip, zstd, or uncompressed bytes. |
+
+Gzip output is copy-only: a second deflate does not create seek points, so the
+index is the sidecar. A non-gzip input named `.gz` is an error. The default
+sidecar is `.rgzi` only. `--yes` removes the sidecar that was not selected
+after a successful publish (a previous `.rgzi` does not survive `gzidx`, and
+the reverse), unless that sidecar is the input: the command then refuses
+before publish and does not unlink it. A failed publish leaves the previous
+archive and both sidecars.
+TAR member order stays input byte order; names are not sorted.
+
+---
+
 ## How to produce multi-frame zstd
 
 Both patterns create **concatenated independent frames**. Standard `zstd` is
@@ -161,8 +201,11 @@ table using the recipes above.
 host file that is an uncompressed TAR or `.tar.zst` / `.tzst` / `.tar.zstd`
 (or zstd magic + TAR body), with durable `-w` (not `:temp:`). A missing
 `.tar.zst` is created as **one empty zstd frame** (1024-byte POSIX TAR EOF,
-no seek table) when `-w` is set. Live ticks still **reject** prefix-frame
-mutate (append-only + last-window). Offline `--commit-overlay` **is** the
+no seek table) when `-w` is set. One existing `s3://`, `gs://`, or `az://` `.tar` or `.tar.zst`
+uses the same live queue: the object is spooled outside the overlay, spliced,
+and uploaded (object, then index blob, then pointer). Live ticks still
+**reject** prefix-frame mutate (append-only + last-window, no upload).
+Offline `--commit-overlay` **is** the
 escape hatch for earlier-frame delete/replace: splice from the affected frame
 through EOF (prefix frames byte-identical). Classification of that splice
 always walks past per-frame TAR EOF (the `xargs tar -c | zstd >>` shape),

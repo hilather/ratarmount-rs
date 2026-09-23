@@ -1,9 +1,10 @@
-//! SMB/CIFS download-to-temp for `smb://` URLs.
+//! SMB URL parsing and the Samba `smbclient` download fallback.
 //!
-//! Pure-Rust SMB stacks are heavy (async runtimes, large dependency trees). This
-//! module provides robust URL parsing and downloads via the Samba `smbclient`
-//! CLI when available. Without `smbclient` on `PATH`, callers get a clear
-//! install hint.
+//! Range reads are [`crate::open_smb_range`]. This module never reads
+//! `RATARMOUNT_SMB_PASSWORD` or `RATARMOUNT_SMB_USER` (those configure the
+//! export server). Inbound auth is URL userinfo, else [`SMB_CLIENT_USER_ENV`] /
+//! [`SMB_CLIENT_PASSWORD_ENV`] / [`SMB_CLIENT_DOMAIN_ENV`]. Without `smbclient`
+//! on `PATH`, the fallback returns an install hint.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -141,14 +142,35 @@ fn split_user_domain(username: Option<String>) -> (Option<String>, Option<String
     (Some(raw), None)
 }
 
+/// Inbound SMB username. Not the export server's `RATARMOUNT_SMB_USER`.
+pub const SMB_CLIENT_USER_ENV: &str = "RATARMOUNT_SMB_CLIENT_USER";
+/// Inbound SMB password. Not the export server's `RATARMOUNT_SMB_PASSWORD`.
+pub const SMB_CLIENT_PASSWORD_ENV: &str = "RATARMOUNT_SMB_CLIENT_PASSWORD";
+/// Inbound SMB domain. Not read from the export server's environment.
+pub const SMB_CLIENT_DOMAIN_ENV: &str = "RATARMOUNT_SMB_CLIENT_DOMAIN";
+
+pub(crate) fn env_nonempty(key: &str) -> Option<String> {
+    std::env::var(key)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Build argv for `smbclient //host/share … -c 'get remote local'`.
 ///
 /// Exposed for unit tests (mock runners compare against this shape).
+///
+/// URL userinfo wins. Otherwise [`SMB_CLIENT_USER_ENV`] /
+/// [`SMB_CLIENT_PASSWORD_ENV`] / [`SMB_CLIENT_DOMAIN_ENV`]. This function does
+/// not read `RATARMOUNT_SMB_PASSWORD` or `RATARMOUNT_SMB_USER`.
 pub fn smbclient_download_args(loc: &SmbLocation, dest: &Path) -> Vec<String> {
     let mut args = vec![loc.unc_share(), "-p".into(), loc.port.to_string()];
 
-    // Auth: URL credentials, then env password, else guest (`-N`, no prompt).
-    if let Some(user) = loc.user.as_deref() {
+    // URL userinfo wins over the client env. Never the export-server password:
+    // a later dispatch revert must not be able to put that read back.
+    let url_auth = loc.user.is_some() || loc.password.is_some();
+    if url_auth {
+        let user = loc.user.clone().unwrap_or_else(|| "guest".into());
         // `user%` / `user%pass` avoids interactive password prompts.
         let cred = match loc.password.as_deref() {
             Some(pw) => format!("{user}%{pw}"),
@@ -156,10 +178,8 @@ pub fn smbclient_download_args(loc: &SmbLocation, dest: &Path) -> Vec<String> {
         };
         args.push("-U".into());
         args.push(cred);
-    } else if let Ok(pw) = std::env::var("RATARMOUNT_SMB_PASSWORD") {
-        let user = std::env::var("RATARMOUNT_SMB_USER")
-            .or_else(|_| std::env::var("USER"))
-            .unwrap_or_else(|_| "guest".into());
+    } else if let Some(pw) = env_nonempty(SMB_CLIENT_PASSWORD_ENV) {
+        let user = env_nonempty(SMB_CLIENT_USER_ENV).unwrap_or_else(|| "guest".into());
         args.push("-U".into());
         args.push(format!("{user}%{pw}"));
     } else {
@@ -169,6 +189,11 @@ pub fn smbclient_download_args(loc: &SmbLocation, dest: &Path) -> Vec<String> {
     if let Some(domain) = loc.domain.as_deref() {
         args.push("-W".into());
         args.push(domain.to_string());
+    } else if !url_auth {
+        if let Some(domain) = env_nonempty(SMB_CLIENT_DOMAIN_ENV) {
+            args.push("-W".into());
+            args.push(domain);
+        }
     }
 
     // smbclient accepts forward slashes for the remote path.
@@ -336,6 +361,47 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
+    struct EnvGuard {
+        saved: Vec<(&'static str, Option<String>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl EnvGuard {
+        fn acquire(keys: &[&'static str]) -> Self {
+            let lock = crate::SMB_CLIENT_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k, std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            Self { saved, _lock: lock }
+        }
+        fn set(&self, key: &str, val: &str) {
+            std::env::set_var(key, val);
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    const ENV_KEYS: &[&str] = &[
+        "RATARMOUNT_SMB_PASSWORD",
+        "RATARMOUNT_SMB_USER",
+        SMB_CLIENT_PASSWORD_ENV,
+        SMB_CLIENT_USER_ENV,
+        SMB_CLIENT_DOMAIN_ENV,
+    ];
+
     #[test]
     fn parse_basic() {
         let loc = parse_smb_url("smb://fileserver/backups/archives/a.tar").unwrap();
@@ -422,6 +488,7 @@ mod tests {
 
     #[test]
     fn smbclient_args_guest() {
+        let _env = EnvGuard::acquire(ENV_KEYS);
         let loc = SmbLocation {
             host: "h".into(),
             port: 445,
@@ -434,6 +501,57 @@ mod tests {
         let args = smbclient_download_args(&loc, Path::new("/tmp/x"));
         assert!(args.contains(&"-N".into()));
         assert!(!args.contains(&"-U".into()));
+    }
+
+    /// Regression: export-server env must not become `smbclient -U` credentials.
+    #[test]
+    fn smbclient_ignores_server_password() {
+        let env = EnvGuard::acquire(ENV_KEYS);
+        env.set("RATARMOUNT_SMB_PASSWORD", "EXPORT_SERVER_PW_7f3c9a");
+        env.set("RATARMOUNT_SMB_USER", "EXPORT_SERVER_USER_7f3c9a");
+        let loc = SmbLocation {
+            host: "h".into(),
+            port: 445,
+            share: "pub".into(),
+            path: "a.tar".into(),
+            user: None,
+            password: None,
+            domain: None,
+        };
+        let args = smbclient_download_args(&loc, Path::new("/tmp/x"));
+        let joined = args.join("\n");
+        assert!(
+            args.iter().any(|a| a == "-N"),
+            "guest argv should stay -N: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "-U"));
+        assert!(
+            !joined.contains("EXPORT_SERVER_PW_7f3c9a"),
+            "server password leaked into argv: {args:?}"
+        );
+        assert!(
+            !joined.contains("EXPORT_SERVER_USER_7f3c9a"),
+            "server user leaked into argv: {args:?}"
+        );
+
+        env.set(SMB_CLIENT_USER_ENV, "alice");
+        env.set(SMB_CLIENT_PASSWORD_ENV, "client-secret");
+        let args = smbclient_download_args(&loc, Path::new("/tmp/x"));
+        let joined = args.join("\n");
+        assert!(args.contains(&"alice%client-secret".into()));
+        assert!(!joined.contains("EXPORT_SERVER_PW_7f3c9a"));
+        assert!(!joined.contains("EXPORT_SERVER_USER_7f3c9a"));
+
+        let url_loc = SmbLocation {
+            user: Some("urluser".into()),
+            password: Some("urlpass".into()),
+            ..loc
+        };
+        let args = smbclient_download_args(&url_loc, Path::new("/tmp/x"));
+        let joined = args.join("\n");
+        assert!(args.contains(&"urluser%urlpass".into()));
+        assert!(!joined.contains("client-secret"));
+        assert!(!joined.contains("EXPORT_SERVER_PW_7f3c9a"));
     }
 
     #[test]

@@ -13,7 +13,10 @@ use ratarmount_compositing::{
     commit_overlay, CommitOverlayOptions, ControlFolderMountSource, ControlFolderOptions,
     WriteOverlay,
 };
-use ratarmount_compress::strip_compression_suffix;
+use ratarmount_compress::{
+    repack_seekable, strip_compression_suffix, GzipSidecar, RepackAction, RepackOptions,
+    RepackReport, DEFAULT_REPACK_FRAME_SIZE,
+};
 use ratarmount_core::{MountSource, OpenOptions, ParallelizationSpec};
 use ratarmount_fuse::{
     clamp_readahead, mount_blocking, parse_byte_size, unmount, RECOMMENDED_READAHEAD_BYTES,
@@ -416,6 +419,29 @@ struct Args {
     )]
     commit_overlay_interval: String,
 
+    /// Producer: rewrite INPUT into a seekable OUTPUT and exit. Does not mount.
+    /// Boolean (`SetTrue`). INPUT and OUTPUT are the two positionals.
+    /// Do not use `num_args = 0..=1` — that steals the archive path.
+    #[arg(long = "repack-seekable", action = ArgAction::SetTrue)]
+    repack_seekable: bool,
+
+    /// Uncompressed frame size for a zstd recompress. `num_args = 1` so the next
+    /// positional is not stolen. No `default_value`: absence means 8 MiB.
+    /// `Option<String>` because clap will not parse `1M` into `u64`.
+    /// `1M` = `1024 * 1024`, same as `--readahead`. Only affects recompress.
+    #[arg(long = "repack-frame-size", value_name = "BYTES", num_args = 1)]
+    repack_frame_size: Option<String>,
+
+    /// Gzip sidecar when OUTPUT is gzip: `rgzi` (default), `gzidx`, or `both`.
+    /// `num_args = 1` so the next positional is not stolen.
+    #[arg(
+        long = "repack-gzip-index",
+        value_name = "KIND",
+        num_args = 1,
+        default_value = "rgzi"
+    )]
+    repack_gzip_index: String,
+
     /// Password for encrypted archives (repeatable)
     #[arg(long = "password", action = ArgAction::Append)]
     passwords: Vec<String>,
@@ -606,6 +632,104 @@ fn find_cli_error(args: &Args) -> Option<&'static str> {
     None
 }
 
+/// Exit 2 before mount. Interval exclusion uses [`overlay_commit::parse_interval`],
+/// not the raw presence of the flag (`"0"` is off).
+fn repack_seekable_cli_error(args: &Args) -> Option<String> {
+    if !args.repack_seekable {
+        return None;
+    }
+    if args.serve {
+        return Some("--repack-seekable cannot be combined with serve".into());
+    }
+    if args.find {
+        return Some("--repack-seekable cannot be combined with find".into());
+    }
+    if args.commit_overlay {
+        return Some("--repack-seekable cannot be combined with --commit-overlay".into());
+    }
+    if args.commit_overlay_on_exit {
+        return Some("--repack-seekable cannot be combined with --commit-overlay-on-exit".into());
+    }
+    match overlay_commit::parse_interval(&args.commit_overlay_interval) {
+        Ok(Some(_)) => {
+            return Some(
+                "--repack-seekable cannot be combined with --commit-overlay-interval".into(),
+            );
+        }
+        Ok(None) => {}
+        Err(e) => return Some(e),
+    }
+    match args.paths.len() {
+        2 => None,
+        n if n > 2 => Some("--repack-seekable does not mount".into()),
+        _ => Some("--repack-seekable requires INPUT OUTPUT".into()),
+    }
+}
+
+fn parse_repack_gzip_index(s: &str) -> Result<GzipSidecar, String> {
+    match s.trim().to_ascii_lowercase().as_str() {
+        "rgzi" => Ok(GzipSidecar::Rgzi),
+        "gzidx" => Ok(GzipSidecar::Gzidx),
+        "both" => Ok(GzipSidecar::Both),
+        _ => Err(format!(
+            "--repack-gzip-index must be rgzi, gzidx, or both (got {s:?})"
+        )),
+    }
+}
+
+fn repack_stdout_line(output: &Path, report: &RepackReport) -> String {
+    let detail = match report.action {
+        RepackAction::Copied => "copied".to_string(),
+        RepackAction::SeekTableAppended => "seek table appended".to_string(),
+        RepackAction::CopiedWithoutFooter => "copied without footer".to_string(),
+        RepackAction::Recompressed { frames } => format!("recompressed, {frames} frames"),
+        RepackAction::CopiedWithGzipIndex { format } => {
+            let kind = match format {
+                GzipSidecar::Rgzi => "rgzi",
+                GzipSidecar::Gzidx => "gzidx",
+                GzipSidecar::Both => "rgzi+gzidx",
+            };
+            format!("copied with {kind}")
+        }
+    };
+    format!(
+        "Repacked {} ({detail}, {} bytes).",
+        output.display(),
+        report.output_len
+    )
+}
+
+fn run_repack_seekable_cli(args: &Args) -> Result<(), (i32, String)> {
+    if let Some(msg) = repack_seekable_cli_error(args) {
+        return Err((2, msg));
+    }
+    let frame_size = match args.repack_frame_size.as_deref() {
+        Some(s) => {
+            parse_byte_size(s).map_err(|e| (2, format!("invalid --repack-frame-size: {e}")))?
+        }
+        None => DEFAULT_REPACK_FRAME_SIZE,
+    };
+    let gzip_sidecar = parse_repack_gzip_index(&args.repack_gzip_index).map_err(|e| (2, e))?;
+    let output = &args.paths[1];
+    let opts = RepackOptions {
+        frame_size,
+        gzip_sidecar,
+        overwrite: args.yes,
+        ..RepackOptions::default()
+    };
+    match repack_seekable(&args.paths[0], output, &opts) {
+        Ok(report) => {
+            println!("{}", repack_stdout_line(output, &report));
+            Ok(())
+        }
+        Err(e) => {
+            let msg = e.to_string();
+            let code = if msg.contains("v1 writes") { 2 } else { 1 };
+            Err((code, msg))
+        }
+    }
+}
+
 fn index_id_cli_error(args: &Args) -> Option<&'static str> {
     args.index_id.as_ref()?;
     if args.recreate_index {
@@ -650,6 +774,16 @@ fn main() {
     let write_style = resolve_color_style(args.color, args.no_color);
     init_logger(args.debug, args.log_file.as_deref(), write_style);
 
+    if args.repack_seekable {
+        match run_repack_seekable_cli(&args) {
+            Ok(()) => return,
+            Err((code, msg)) => {
+                eprintln!("error: {msg}");
+                std::process::exit(code);
+            }
+        }
+    }
+
     if args.unmount {
         if args.paths.is_empty() {
             eprintln!("error: -u requires a mountpoint");
@@ -683,6 +817,10 @@ fn main() {
             eprintln!("error: currently only modifications to a single archive may be committed");
             std::process::exit(2);
         }
+        if let Some(msg) = overlay_commit::offline_remote_commit_error(archive) {
+            eprintln!("error: {msg}");
+            std::process::exit(2);
+        }
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             archive,
             overlay_commit::CreateMissingContext::OfflineCommit,
@@ -711,6 +849,7 @@ fn main() {
         eprintln!(
             "       ratarmount --commit-overlay -w <overlay> <archive.tar|archive.tar.zst|archive.zip>"
         );
+        eprintln!("       ratarmount --repack-seekable <INPUT> <OUTPUT>");
         eprintln!("       ratarmount -w ov --commit-overlay-interval 2s new.tar.zst mnt");
         eprintln!(
             "       ratarmount serve --nfs|--http|--webdav|--smb|--ninep|--sftp|--sftp-subsystem <archive>..."
@@ -793,7 +932,7 @@ fn main() {
         Some(false)
     };
 
-    let open_opts = OpenOptions {
+    let mut open_opts = OpenOptions {
         recursive: args.recursive,
         ignore_zeros: args.ignore_zeros,
         gnu_incremental,
@@ -862,7 +1001,7 @@ fn main() {
 
     let mut bundle = match factory::build_mount_source_ex(
         &inputs,
-        &open_opts,
+        &mut open_opts,
         args.recreate_index && !args.no_recreate_index,
         factory::CompositingOptions {
             recursive: args.recursive || args.recursion_depth != 0,
@@ -1043,6 +1182,9 @@ fn main() {
     };
     if args.commit_overlay_on_exit || commit_interval.is_some() {
         overlay_commit::install_term_signal_flag();
+    }
+    if let (Some(ov), Some(archive)) = (overlay_arc.as_ref(), live_commit_archive.as_ref()) {
+        overlay_commit::install_object_store_live_commit(ov, archive, &open_opts);
     }
 
     if args.no_mount {
@@ -2088,6 +2230,13 @@ fn run_fuse_only(
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
     }
     if foreground {
+        // NFS and the forked daemon child already spawn this. `-f` must too,
+        // or `--commit-overlay-interval` waits until process exit.
+        if let (Some(ov), Some(archive), Some(dur)) =
+            (overlay_arc.clone(), live_archive.clone(), commit_interval)
+        {
+            overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
+        }
         let mount_err = mount_blocking(
             source,
             &mp,
@@ -3796,6 +3945,39 @@ mod create_missing_cli_tests {
         fs::write(path, bytes).unwrap();
     }
 
+    #[test]
+    fn s3_commit_offline_rejected() {
+        let msg = crate::overlay_commit::offline_remote_commit_error(std::path::Path::new(
+            "s3://bucket/a.tar",
+        ))
+        .expect("s3 offline commit is rejected");
+        assert!(msg.contains("does not upload"), "{msg}");
+        assert!(
+            crate::overlay_commit::offline_remote_commit_error(std::path::Path::new("a.tar"))
+                .is_none()
+        );
+        if skip_no_bin() {
+            eprintln!("skip: ratarmount binary not next to the test exe");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ov = dir.path().join("ov");
+        fs::create_dir_all(&ov).unwrap();
+        let out = run_cli(
+            &[
+                "--commit-overlay",
+                "-w",
+                ov.to_str().unwrap(),
+                "s3://bucket/a.tar",
+            ],
+            dir.path(),
+        );
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{err}");
+        assert!(err.contains("does not upload"), "{err}");
+        assert!(!err.to_ascii_lowercase().contains("aws_secret"), "{err}");
+    }
+
     /// Regression: missing archive.tar is not found without -w
     #[test]
     fn create_missing_without_w_does_not_create() {
@@ -3803,7 +3985,7 @@ mod create_missing_cli_tests {
         let archive = dir.path().join("archive.tar");
         let err = match factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         ) {
@@ -3930,7 +4112,7 @@ mod create_missing_cli_tests {
         assert_eq!(fs::read(&gz).unwrap(), before_gz);
         factory::build_mount_source_ex(
             std::slice::from_ref(&gz),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )
@@ -3970,7 +4152,7 @@ mod create_missing_cli_tests {
         );
         let err = match factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         ) {
@@ -4081,7 +4263,7 @@ mod create_missing_cli_tests {
         assert!(bytes.iter().all(|&b| b == 0));
         factory::build_mount_source_ex(
             std::slice::from_ref(&archive),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )
@@ -4234,7 +4416,7 @@ mod create_missing_cli_tests {
         );
         factory::build_mount_source_ex(
             std::slice::from_ref(&dest),
-            &open_opts(),
+            &mut open_opts(),
             false,
             factory::CompositingOptions::default(),
         )
@@ -4308,5 +4490,255 @@ mod create_missing_cli_tests {
                 || help.contains("remains unsupported offline"),
             "{help}"
         );
+    }
+}
+
+#[cfg(test)]
+mod repack_seekable_cli_tests {
+    use super::{
+        parse_byte_size, parse_repack_gzip_index, repack_seekable_cli_error,
+        run_repack_seekable_cli, Args,
+    };
+    use clap::Parser;
+    use std::fs;
+    use std::io::Read;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::time::Duration;
+
+    /// Regression: `--repack-seekable` is boolean and must not swallow OUTPUT.
+    /// A bare flag is not a path named `--repack-seekable`.
+    #[test]
+    fn repack_seekable_does_not_steal_output_path() {
+        let a = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar.gz",
+            "out.tar.zst",
+        ])
+        .expect("parse");
+        assert!(a.repack_seekable);
+        assert_eq!(
+            a.paths,
+            vec![PathBuf::from("in.tar.gz"), PathBuf::from("out.tar.zst")]
+        );
+        assert_eq!(a.repack_gzip_index, "rgzi");
+        assert!(a.repack_frame_size.is_none());
+        assert!(repack_seekable_cli_error(&a).is_none());
+
+        let indexed = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--repack-gzip-index",
+            "both",
+            "in.gz",
+            "out.gz",
+        ])
+        .expect("gzip index does not steal");
+        assert_eq!(indexed.repack_gzip_index, "both");
+        assert_eq!(
+            indexed.paths,
+            vec![PathBuf::from("in.gz"), PathBuf::from("out.gz")]
+        );
+        assert_eq!(
+            parse_repack_gzip_index("both").unwrap(),
+            ratarmount_compress::GzipSidecar::Both
+        );
+
+        let bare = Args::try_parse_from(["ratarmount", "--repack-seekable"]).expect("bare flag");
+        assert!(bare.repack_seekable);
+        assert!(
+            bare.paths.is_empty(),
+            "bare flag must not become a path: {:?}",
+            bare.paths
+        );
+        let err = repack_seekable_cli_error(&bare).expect("exit 2 before mount");
+        assert!(err.contains("INPUT OUTPUT"), "{err}");
+
+        let third = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar.gz",
+            "out.tar.zst",
+            "mnt",
+        ])
+        .expect("three paths still parse");
+        assert_eq!(
+            repack_seekable_cli_error(&third).as_deref(),
+            Some("--repack-seekable does not mount")
+        );
+    }
+
+    /// Regression: `--repack-frame-size 1M` must not steal `archive.tar`.
+    #[test]
+    fn repack_seekable_frame_size_1m_does_not_steal_archive() {
+        let a = Args::try_parse_from(["ratarmount", "--repack-frame-size", "1M", "archive.tar"])
+            .expect("parse");
+        assert_eq!(a.paths, vec![PathBuf::from("archive.tar")]);
+        assert_eq!(a.repack_frame_size.as_deref(), Some("1M"));
+        assert_eq!(parse_byte_size("1M").unwrap(), 1024 * 1024);
+        assert_eq!(
+            parse_byte_size(a.repack_frame_size.as_deref().unwrap()).unwrap(),
+            1024 * 1024
+        );
+
+        let both = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--repack-frame-size",
+            "1M",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("frame size does not steal OUTPUT");
+        assert_eq!(
+            both.paths,
+            vec![PathBuf::from("in.tar"), PathBuf::from("out.tar.zst")]
+        );
+        assert_eq!(
+            parse_byte_size(both.repack_frame_size.as_deref().unwrap()).unwrap(),
+            1024 * 1024
+        );
+    }
+
+    /// Mutual exclusion uses the parsed interval: default `"0"` is off.
+    #[test]
+    fn repack_seekable_mutual_exclusion_uses_parsed_interval() {
+        let off =
+            Args::try_parse_from(["ratarmount", "--repack-seekable", "in.tar", "out.tar.zst"])
+                .expect("default interval");
+        assert_eq!(off.commit_overlay_interval, "0");
+        assert_eq!(
+            crate::overlay_commit::parse_interval(&off.commit_overlay_interval).unwrap(),
+            None
+        );
+        assert!(repack_seekable_cli_error(&off).is_none());
+
+        let explicit_zero = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--commit-overlay-interval",
+            "0",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("interval 0");
+        assert_eq!(
+            crate::overlay_commit::parse_interval(&explicit_zero.commit_overlay_interval).unwrap(),
+            None
+        );
+        assert!(repack_seekable_cli_error(&explicit_zero).is_none());
+
+        let interval = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--commit-overlay-interval",
+            "2s",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("interval 2s");
+        assert_eq!(
+            crate::overlay_commit::parse_interval(&interval.commit_overlay_interval).unwrap(),
+            Some(Duration::from_secs(2))
+        );
+        let err = repack_seekable_cli_error(&interval).expect("nonzero interval excluded");
+        assert!(err.contains("--commit-overlay-interval"), "{err}");
+
+        let commit = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--commit-overlay",
+            "-w",
+            "/tmp/ov",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("commit-overlay parses");
+        let err = repack_seekable_cli_error(&commit).expect("commit excluded");
+        assert!(err.contains("--commit-overlay"), "{err}");
+        assert!(!err.contains("interval"), "{err}");
+
+        let on_exit = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "--commit-overlay-on-exit",
+            "in.tar",
+            "out.tar.zst",
+        ])
+        .expect("on-exit parses");
+        let err = repack_seekable_cli_error(&on_exit).expect("on-exit excluded");
+        assert!(err.contains("--commit-overlay-on-exit"), "{err}");
+    }
+
+    /// Temp-dir gzip → `.tar.zst` using the in-tree decoder, not an external `zstd`.
+    #[test]
+    fn repack_seekable_gzip_round_trip_without_external_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        let output = dir.path().join("out.tar.zst");
+        // gzip of `hi\n`, mtime 0. Produced without the `zstd` or `gzip` CLIs.
+        let gz: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0xc8, 0xe4, 0x02,
+            0x00, 0x7a, 0x7a, 0x6f, 0xed, 0x03, 0x00, 0x00, 0x00,
+        ];
+        fs::write(&input, gz).unwrap();
+
+        // Frame size 1 forces a recompress into multiple frames. A one-frame
+        // file under the memory cap is full-decoded (`kind` = "zstd") even
+        // when a footer is present.
+        let args = [
+            "--repack-seekable",
+            "--repack-frame-size",
+            "1",
+            input.to_str().unwrap(),
+            output.to_str().unwrap(),
+        ];
+        if let Some(bin) = ratarmount_bin() {
+            let out = Command::new(bin)
+                .args(args)
+                .current_dir(dir.path())
+                .output()
+                .expect("spawn ratarmount");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "stdout={stdout} stderr={stderr}");
+            assert!(stdout.contains("Repacked"), "{stdout}");
+            assert!(stdout.contains("recompressed"), "{stdout}");
+        } else {
+            let parsed =
+                Args::try_parse_from(std::iter::once("ratarmount").chain(args)).expect("parse");
+            run_repack_seekable_cli(&parsed).expect("in-process repack");
+        }
+
+        let map = ratarmount_compress::scan_zstd_frames_path(&output).expect("scan footer");
+        assert!(
+            map.seek_table.is_some(),
+            "recompress writes a seek-table footer"
+        );
+        assert!(map.frames.len() > 1, "frame size 1 splits hi\\n");
+        let body = ratarmount_compress::open_seekable_zstd(&output).expect("open zst");
+        assert_eq!(body.kind(), "zstd-seek-table");
+        let mut reader = body.open_reader().unwrap();
+        let mut got = Vec::new();
+        reader.read_to_end(&mut got).unwrap();
+        assert_eq!(got, b"hi\n");
+        assert_eq!(fs::read(&input).unwrap(), gz);
+    }
+
+    fn ratarmount_bin() -> Option<PathBuf> {
+        if let Some(p) = option_env!("CARGO_BIN_EXE_ratarmount") {
+            let path = PathBuf::from(p);
+            if path.is_file() {
+                return Some(path);
+            }
+        }
+        let mut exe = std::env::current_exe().ok()?;
+        exe.pop();
+        if exe.file_name().and_then(|s| s.to_str()) == Some("deps") {
+            exe.pop();
+        }
+        exe.push(format!("ratarmount{}", std::env::consts::EXE_SUFFIX));
+        exe.is_file().then_some(exe)
     }
 }

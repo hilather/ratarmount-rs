@@ -116,18 +116,18 @@ fn apply_remote_index_discovery(
     }
 
     if ratarmount_remote::is_object_store_archive_url(input) {
-        if try_object_store_pointer_then_blob(opts, input, archive_size, cache_dest.as_deref()) {
+        // No explicit `--index-file`: keep the meta-v3 blob as `index_file_path`
+        // so interval commit patches that file. An explicit path still wins.
+        let object_dest = if opts.index_file_path.is_some() {
+            cache_dest.as_deref()
+        } else {
+            None
+        };
+        if try_object_store_pointer_then_blob(opts, input, archive_size, object_dest) {
             return Ok(());
         }
         for cand in object_store_sibling_index_candidates(input) {
-            if try_fetch_object_store_index(
-                opts,
-                &cand,
-                archive_size,
-                input,
-                cache_dest.as_deref(),
-                None,
-            ) {
+            if try_fetch_object_store_index(opts, &cand, archive_size, input, object_dest, None) {
                 return Ok(());
             }
             log::debug!("index sibling unusable: {}", redact_remote_url(&cand));
@@ -568,38 +568,50 @@ fn try_fetch_object_store_index(
     cache_dest: Option<&Path>,
     expected_id: Option<&str>,
 ) -> bool {
-    match ratarmount_remote::fetch_index_sibling_to_temp(index_url) {
-        Ok(path) => {
-            let path = match materialize_fetched_index(path) {
-                Ok(p) => p,
-                Err(e) => {
-                    log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
-                    return false;
-                }
-            };
-            if let Some(id) = expected_id {
-                if !blob_matches_index_id(&path, id) {
-                    log::warn!("index blob sha256 != pointer {id}; continue discovery");
-                    let _ = std::fs::remove_file(&path);
-                    return false;
-                }
-            }
-            let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
-            try_install_remote_index(
-                opts,
-                path,
-                archive_size,
-                prefix.as_deref(),
-                suffix.as_deref(),
-                full.as_deref(),
-                cache_dest,
-            )
-        }
+    let cache = MetaCache::from_env();
+    let identity = cache_identity("object-store", index_url);
+    let fetched = match cache.get_or_fetch_path(&identity, None, || {
+        ratarmount_remote::fetch_index_sibling_to_temp(index_url)
+            .map_err(|e| std::io::Error::other(e.to_string()))
+    }) {
+        Ok(p) => p,
         Err(e) => {
             log::debug!("index fetch {}: {e}", redact_remote_url(index_url));
-            false
+            return false;
+        }
+    };
+    let path = match materialize_fetched_index(fetched.clone()) {
+        Ok(p) => p,
+        Err(e) => {
+            log::debug!("index materialize {}: {e}", redact_remote_url(index_url));
+            invalidate_meta_cache_identity("object-store", index_url);
+            return false;
+        }
+    };
+    if let Some(id) = expected_id {
+        if !blob_matches_index_id(&path, id) {
+            log::warn!("index blob sha256 != pointer {id}; continue discovery");
+            invalidate_meta_cache_identity("object-store", index_url);
+            if !is_meta_cache_path(&path) {
+                let _ = std::fs::remove_file(&path);
+            }
+            return false;
         }
     }
+    let (prefix, suffix, full) = object_store_fingerprint(archive_url, archive_size);
+    let ok = try_install_remote_index(
+        opts,
+        path,
+        archive_size,
+        prefix.as_deref(),
+        suffix.as_deref(),
+        full.as_deref(),
+        cache_dest,
+    );
+    if !ok {
+        invalidate_meta_cache_identity("object-store", index_url);
+    }
+    ok
 }
 
 fn try_install_remote_index(
@@ -824,6 +836,18 @@ fn oci_fingerprint(
     (prefix, suffix, full)
 }
 
+/// Formats `open_from_live_range` actually opens. Anything else (7z, ISO,
+/// SquashFS, pre-ustar tar) is an error on the native SMB path, not a download.
+fn smb_live_range_kind(kind: &str) -> bool {
+    matches!(kind, "tar" | "zip" | "gzip" | "bzip2" | "xz" | "zstd")
+}
+
+fn smb_unsupported_range_error(input: &str) -> String {
+    format!(
+        "SMB Range format unsupported for {input}; 7z, ISO, SquashFS, and pre-ustar tar are not read here (set RATARMOUNT_SMB_USE_SMBCLIENT=1)"
+    )
+}
+
 /// Materialize a remote URL to a local path and open it.
 pub(super) fn materialize_remote_input(
     input: &str,
@@ -841,7 +865,7 @@ pub(super) fn materialize_remote_input(
 /// Open a remote URL: folder probe, live Range, OCI layer union, else materialize.
 pub(super) fn open_remote_input(
     input: &str,
-    opts: &OpenOptions,
+    opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
 ) -> Result<(PathBuf, Arc<dyn MountSource>), String> {
@@ -914,6 +938,44 @@ pub(super) fn open_remote_input(
             || open_ipfs(input),
         );
     }
+    // Scheme match is ASCII-case-insensitive (`SMB://` / `Smb://`). Not
+    // open_s3_like: that helper materializes on Err and when uses_ranges() is
+    // false (resolve_to_local → fetch_smb_to_temp). The only smbclient path is
+    // RATARMOUNT_SMB_USE_SMBCLIENT=1. Client env is RATARMOUNT_SMB_CLIENT_*;
+    // this arm does not read RATARMOUNT_SMB_PASSWORD.
+    if ratarmount_remote::remote_url_scheme(input).as_deref() == Some("smb") {
+        if std::env::var("RATARMOUNT_SMB_USE_SMBCLIENT")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
+            return materialize_remote_input(input, opts, recreate, remotes);
+        }
+        if let Some(ms) =
+            ratarmount_remote::try_open_smb_folder(input).map_err(|e| e.to_string())?
+        {
+            return Ok((PathBuf::from(input), ms));
+        }
+        let mut range = ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())?;
+        if !range.uses_ranges() {
+            return Err(format!("SMB Range unavailable for {input}"));
+        }
+        let len = range.len();
+        // Peek before open_from_live_range. Its unsupported arm logs
+        // "materializing" for every remote; this caller returns an error
+        // instead, so that shared line must not run.
+        let mut magic = [0u8; 512];
+        let n = range.read(&mut magic).map_err(|e| e.to_string())?;
+        range.seek(SeekFrom::Start(0)).map_err(|e| e.to_string())?;
+        if !smb_live_range_kind(super::probe_archive_magic(&magic[..n])) {
+            return Err(smb_unsupported_range_error(input));
+        }
+        return open_from_live_range(range, len, input, opts, recreate, "SMB Range", || {
+            ratarmount_remote::open_smb_range(input).map_err(|e| e.to_string())
+        })?
+        .ok_or_else(|| smb_unsupported_range_error(input));
+    }
+
     if input.starts_with("rclone://") {
         match open_rclone(input) {
             Ok(handle) => {
@@ -947,24 +1009,22 @@ pub(super) fn open_remote_input(
     match access {
         RemoteAccess::Http(RemoteHttp::Range(range)) => {
             let len = range.len();
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             let input_owned = input.to_string();
-            match open_from_live_range(range, len, input, &opts, recreate, "HTTP Range", || {
+            match open_from_live_range(range, len, input, opts, recreate, "HTTP Range", || {
                 // Buffered fallback is still Read+Seek-usable for rebuild.
                 ratarmount_remote::open_http_range(&input_owned).map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
-                None => materialize_remote_input(input, &opts, recreate, remotes),
+                None => materialize_remote_input(input, opts, recreate, remotes),
             }
         }
         RemoteAccess::Http(RemoteHttp::Materialized(remote)) => {
             let path = remote.path().to_path_buf();
             let len = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             remotes.push(remote);
-            let src = open_path(&path, &opts, recreate)?;
+            let src = open_path(&path, opts, recreate)?;
             Ok((path, src))
         }
         RemoteAccess::Path(remote) => {
@@ -979,7 +1039,7 @@ pub(super) fn open_remote_input(
 /// Shared Range-or-materialize path for S3-shaped readers (`uses_ranges` + `len`).
 fn open_s3_like<R, Reopen>(
     input: &str,
-    opts: &OpenOptions,
+    opts: &mut OpenOptions,
     recreate: bool,
     remotes: &mut Vec<ratarmount_remote::RemoteLocal>,
     transport: &str,
@@ -994,15 +1054,14 @@ where
         Ok(range) if range.live_ranges() => {
             let len = range.body_len();
             eprintln!("{transport}: {input} ({len} bytes, live Range)");
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
-            match open_from_live_range(range, len, input, &opts, recreate, transport, || {
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
+            match open_from_live_range(range, len, input, opts, recreate, transport, || {
                 reopen().map_err(|e| e.to_string())
             })? {
                 Some(opened) => Ok(opened),
                 None => {
                     eprintln!("info: {transport} format unsupported for {input}; materializing");
-                    materialize_remote_input(input, &opts, recreate, remotes)
+                    materialize_remote_input(input, opts, recreate, remotes)
                 }
             }
         }
@@ -1011,10 +1070,9 @@ where
             eprintln!(
                 "info: {transport} unavailable for {input} (full body buffered); materializing"
             );
-            let mut opts = opts.clone();
-            apply_remote_index_discovery(input, &mut opts, recreate, len, None)?;
+            apply_remote_index_discovery(input, opts, recreate, len, None)?;
             drop(range);
-            materialize_remote_input(input, &opts, recreate, remotes)
+            materialize_remote_input(input, opts, recreate, remotes)
         }
         Err(e) => {
             eprintln!("info: {transport} open failed for {input}: {e}; materializing");
@@ -1046,6 +1104,7 @@ impl_live_range!(ratarmount_remote::GcsRangeFile);
 impl_live_range!(ratarmount_remote::AzureRangeFile);
 impl_live_range!(ratarmount_remote::FtpRangeFile);
 impl_live_range!(ratarmount_remote::IpfsHandle);
+impl_live_range!(ratarmount_remote::SmbRangeFile);
 
 fn is_oci_scheme(input: &str) -> bool {
     matches!(
@@ -1182,6 +1241,308 @@ mod tests {
                 "{input} must not be probed as a remote folder"
             );
         }
+    }
+
+    const SMB_EXPORT_PW: &str = "EXPORT_SERVER_PW_7f3c9a";
+    const SMB_EXPORT_USER: &str = "EXPORT_SERVER_USER_7f3c9a";
+
+    struct SmbEnv {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl SmbEnv {
+        fn acquire(keys: &[&'static str]) -> Self {
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let saved = keys
+                .iter()
+                .map(|&k| (k, std::env::var_os(k)))
+                .collect::<Vec<_>>();
+            for &k in keys {
+                std::env::remove_var(k);
+            }
+            Self { saved, _lock: lock }
+        }
+
+        fn set(&self, key: &str, val: impl AsRef<std::ffi::OsStr>) {
+            debug_assert!(self.saved.iter().any(|(k, _)| *k == key));
+            std::env::set_var(key, val);
+        }
+    }
+
+    impl Drop for SmbEnv {
+        fn drop(&mut self) {
+            for (k, v) in self.saved.drain(..) {
+                match v {
+                    Some(val) => std::env::set_var(k, val),
+                    None => std::env::remove_var(k),
+                }
+            }
+        }
+    }
+
+    fn smb_open_opts() -> OpenOptions {
+        OpenOptions {
+            index_in_memory: true,
+            write_index: false,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn shell_single(s: &str) -> String {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
+
+    /// Fake `smbclient` that appends one argv line and exits 1. That line count
+    /// is the `fetch_smb_to_temp` counter (the hatch is the only caller).
+    fn install_fake_smbclient(dir: &Path, log: &Path) -> std::ffi::OsString {
+        let script = format!(
+            "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {}\nexit 1\n",
+            shell_single(&log.display().to_string())
+        );
+        let bin = dir.join("smbclient");
+        fs::write(&bin, script).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = fs::metadata(&bin).unwrap().permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&bin, perms).unwrap();
+        }
+        fs::write(log, b"").unwrap();
+        let mut path = dir.as_os_str().to_os_string();
+        path.push(":");
+        if let Some(old) = std::env::var_os("PATH") {
+            path.push(old);
+        }
+        path
+    }
+
+    fn argv_lines(log: &Path) -> Vec<String> {
+        let text = fs::read_to_string(log).unwrap_or_default();
+        text.lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Dialect other than 0x0202 so the client fails in NEGOTIATE.
+    fn spawn_smb_bad_dialect() -> std::net::SocketAddr {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::thread;
+        use std::time::Duration;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(5)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            let mut nb = [0u8; 4];
+            if stream.read_exact(&mut nb).is_err() {
+                return;
+            }
+            let n = ((nb[1] as usize) << 16) | ((nb[2] as usize) << 8) | (nb[3] as usize);
+            let mut req = vec![0u8; n];
+            if stream.read_exact(&mut req).is_err() {
+                return;
+            }
+            let mut pkt = vec![0u8; 128];
+            pkt[0] = 0xfe;
+            pkt[1..4].copy_from_slice(b"SMB");
+            pkt[4..6].copy_from_slice(&64u16.to_le_bytes());
+            pkt[14..16].copy_from_slice(&1u16.to_le_bytes());
+            pkt[16..20].copy_from_slice(&1u32.to_le_bytes());
+            if req.len() >= 32 {
+                pkt[24..32].copy_from_slice(&req[24..32]);
+            }
+            pkt[64..66].copy_from_slice(&65u16.to_le_bytes());
+            pkt[68..70].copy_from_slice(&0x0311u16.to_le_bytes());
+            let len = pkt.len();
+            let mut out = [0u8; 4];
+            out[1] = ((len >> 16) & 0xff) as u8;
+            out[2] = ((len >> 8) & 0xff) as u8;
+            out[3] = (len & 0xff) as u8;
+            let _ = stream.write_all(&out);
+            let _ = stream.write_all(&pkt);
+        });
+        addr
+    }
+
+    /// File URL does not call `fetch_smb_to_temp`. A share or directory URL is a
+    /// folder mount source, not a tempfile.
+    ///
+    /// Regression: negotiate failure with `RATARMOUNT_SMB_PASSWORD` set and the
+    /// hatch unset does not spawn `smbclient`.
+    #[test]
+    fn smb_range_dispatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let path = install_fake_smbclient(dir.path(), &log);
+        let env = SmbEnv::acquire(&[
+            "PATH",
+            "RATARMOUNT_SMB_USE_SMBCLIENT",
+            "RATARMOUNT_SMB_PASSWORD",
+            "RATARMOUNT_SMB_USER",
+            "RATARMOUNT_SMB_CLIENT_USER",
+            "RATARMOUNT_SMB_CLIENT_PASSWORD",
+            "RATARMOUNT_SMB_CLIENT_DOMAIN",
+        ]);
+        env.set("PATH", &path);
+        env.set("RATARMOUNT_SMB_PASSWORD", SMB_EXPORT_PW);
+        env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
+
+        let mut opts = smb_open_opts();
+        for folder in [
+            "smb://fileserver/backups",
+            "smb://fileserver/backups/archives/",
+        ] {
+            let mut remotes = Vec::new();
+            let (opened, src) = open_remote_input(folder, &mut opts, false, &mut remotes)
+                .unwrap_or_else(|e| panic!("{folder} folder open: {e}"));
+            assert!(
+                remotes.is_empty(),
+                "{folder} must not materialize a tempfile"
+            );
+            assert_eq!(opened, PathBuf::from(folder));
+            assert!(
+                !opened.exists(),
+                "{folder} path must stay the URL, not a temp file"
+            );
+            let root = src.lookup("/", 0).expect("folder root");
+            assert_eq!(
+                root.mode & ratarmount_core::S_IFMT,
+                ratarmount_core::S_IFDIR,
+                "{folder} must be a directory mount source"
+            );
+        }
+        assert!(
+            argv_lines(&log).is_empty(),
+            "folder open spawned smbclient: {:?}",
+            argv_lines(&log)
+        );
+
+        for scheme in ["smb", "SMB", "Smb"] {
+            let addr = spawn_smb_bad_dialect();
+            let file_url = format!("{scheme}://127.0.0.1:{}/share/archive.tar", addr.port());
+            let mut remotes = Vec::new();
+            let err = match open_remote_input(&file_url, &mut opts, false, &mut remotes) {
+                Err(e) => e,
+                Ok(_) => panic!("negotiate failure should not open {file_url}"),
+            };
+            assert!(remotes.is_empty(), "{file_url} materialized: {remotes:?}");
+            assert!(
+                err.contains("SMB 2.0.2 only"),
+                "expected negotiate failure for {file_url}, got {err}"
+            );
+            assert!(
+                !err.contains("smbclient"),
+                "negotiate failure must not mention smbclient: {err}"
+            );
+            assert!(
+                !err.contains(SMB_EXPORT_PW),
+                "export password leaked into the error: {err}"
+            );
+            let calls = argv_lines(&log);
+            assert!(
+                calls.is_empty(),
+                "fetch_smb_to_temp counter {}: {scheme}:// negotiate failure spawned smbclient: {calls:?}",
+                calls.len()
+            );
+        }
+    }
+
+    /// 7z / ISO / SquashFS / pre-ustar are not live-range formats. The error
+    /// names the smbclient hatch; the shared "materializing" log is not this path.
+    #[test]
+    fn smb_range_dispatch_unsupported_names_hatch() {
+        let seven = b"7z\xbc\xaf'\x1c";
+        assert!(!smb_live_range_kind(super::super::probe_archive_magic(
+            seven
+        )));
+        assert!(!smb_live_range_kind(super::super::probe_archive_magic(
+            b"hsqs"
+        )));
+        let mut pre_ustar = vec![0u8; 512];
+        pre_ustar[..4].copy_from_slice(b"file");
+        pre_ustar[100..108].copy_from_slice(b"0000644\0");
+        assert_eq!(super::super::probe_archive_magic(&pre_ustar), "other");
+        assert!(!smb_live_range_kind("other"));
+        let err = smb_unsupported_range_error("smb://host/share/disk.iso");
+        assert!(err.contains("RATARMOUNT_SMB_USE_SMBCLIENT=1"), "{err}");
+        assert!(err.contains("7z"), "{err}");
+        assert!(err.contains("ISO"), "{err}");
+        assert!(err.contains("SquashFS"), "{err}");
+        assert!(err.contains("pre-ustar"), "{err}");
+        assert!(smb_live_range_kind("tar"));
+        assert!(smb_live_range_kind("zip"));
+        assert!(smb_live_range_kind("gzip"));
+        assert!(smb_live_range_kind("bzip2"));
+        assert!(smb_live_range_kind("xz"));
+        assert!(smb_live_range_kind("zstd"));
+    }
+
+    /// Hatch set: materialize runs. Argv still does not contain the export password.
+    #[test]
+    fn smb_use_smbclient_env_still_materializes() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("argv.log");
+        let path = install_fake_smbclient(dir.path(), &log);
+        let env = SmbEnv::acquire(&[
+            "PATH",
+            "RATARMOUNT_SMB_USE_SMBCLIENT",
+            "RATARMOUNT_SMB_PASSWORD",
+            "RATARMOUNT_SMB_USER",
+            "RATARMOUNT_SMB_CLIENT_USER",
+            "RATARMOUNT_SMB_CLIENT_PASSWORD",
+            "RATARMOUNT_SMB_CLIENT_DOMAIN",
+        ]);
+        env.set("PATH", &path);
+        env.set("RATARMOUNT_SMB_USE_SMBCLIENT", "1");
+        env.set("RATARMOUNT_SMB_PASSWORD", SMB_EXPORT_PW);
+        env.set("RATARMOUNT_SMB_USER", SMB_EXPORT_USER);
+
+        let url = "smb://127.0.0.1/share/archive.tar";
+        let mut opts = smb_open_opts();
+        let mut remotes = Vec::new();
+        let err = match open_remote_input(url, &mut opts, false, &mut remotes) {
+            Err(e) => e,
+            Ok(_) => panic!("fake smbclient should not open {url}"),
+        };
+        assert!(
+            err.contains("smbclient"),
+            "hatch must materialize via smbclient, got {err}"
+        );
+        assert!(
+            remotes.is_empty(),
+            "failed materialize must not keep a remote"
+        );
+        let calls = argv_lines(&log);
+        assert_eq!(
+            calls.len(),
+            1,
+            "fetch_smb_to_temp counter: expected one smbclient spawn, got {calls:?}"
+        );
+        let argv = &calls[0];
+        assert!(
+            !argv.contains(SMB_EXPORT_PW),
+            "export password leaked into smbclient argv: {argv}"
+        );
+        assert!(
+            !argv.contains(SMB_EXPORT_USER),
+            "export user leaked into smbclient argv: {argv}"
+        );
+        assert!(
+            argv.contains("-N"),
+            "guest hatch should pass -N, not the server password: {argv}"
+        );
+        assert!(
+            !argv.contains("-U"),
+            "export env must not become -U: {argv}"
+        );
     }
 
     /// Regression: `ftp://` / `ftps://` directory URLs dispatch to `open_ftp_folder`
@@ -1899,7 +2260,9 @@ mod tests {
     ];
 
     fn bind_anon_s3(endpoint: &str) -> EnvGuard {
-        let g = EnvGuard::acquire(AWS_TEST_ENV);
+        // Isolate XDG under REMOTE_ENV_LOCK so MetaCache::from_env cannot race
+        // parallel with_isolated_xdg tests (CI flake: pointer blob install None).
+        let g = EnvGuard::acquire_with_isolated_xdg(AWS_TEST_ENV);
         g.set("AWS_ANONYMOUS", "1");
         g.set("AWS_ENDPOINT_URL", endpoint);
         g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
@@ -1948,6 +2311,65 @@ mod tests {
             !logged.iter().any(|k| k == "data/a.tar.index.sqlite"),
             "S3 well-known GET must be skipped; gets={logged:?}"
         );
+    }
+
+    /// CLI `index_file_path` starts unset; discovery must land on the caller's opts.
+    #[test]
+    fn discovered_index_lands_on_caller_opts() {
+        // bind_anon_s3 isolates XDG under REMOTE_ENV_LOCK (do not nest with_isolated_xdg).
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let member = ratarmount_formats_tar::UstarMember {
+            path: "hello.txt",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut archive_bytes = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut archive_bytes, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut archive_bytes).unwrap();
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
+
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes);
+        objects.insert("data/a.tar.index.ptr".into(), ptr);
+        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes);
+        let s3 = spawn_s3_index(objects, true);
+        let _g = bind_anon_s3(&format!("http://{}", s3.addr));
+
+        let url = PathBuf::from("s3://bucket/data/a.tar");
+        let mut opts = OpenOptions {
+            index_file_path: None,
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        assert!(
+            opts.index_file_path.is_none(),
+            "CLI index_file_path starts unset"
+        );
+        let _bundle = super::super::build_mount_source_ex(
+            std::slice::from_ref(&url),
+            &mut opts,
+            false,
+            super::super::CompositingOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("open s3 tar: {e}"));
+        let got = opts
+            .index_file_path
+            .expect("discovered meta-v3 path must be copied onto the caller");
+        assert!(
+            ratarmount_index::is_meta_cache_path(&got),
+            "expected meta-v3, got {}",
+            got.display()
+        );
+        assert!(got.is_file(), "{}", got.display());
     }
 
     /// Regression: S3 pointer 404 still installs well-known `{url}.index.sqlite`.
@@ -2021,22 +2443,53 @@ mod tests {
         );
     }
 
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Shared with [`with_isolated_xdg`]: AWS + cookie + XDG env must not
+    /// interleave under parallel `cargo test` or MetaCache paths flip mid-GET.
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
+        /// Keeps isolated XDG alive for [`Self::acquire_with_isolated_xdg`].
+        _xdg_tmpdir: Option<tempfile::TempDir>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
-            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let mut saved = Vec::new();
             for &k in keys {
                 saved.push((k.to_string(), std::env::var(k).ok()));
                 std::env::remove_var(k);
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _xdg_tmpdir: None,
+                _lock: lock,
+            }
+        }
+
+        /// Like [`Self::acquire`], plus a private `XDG_CACHE_HOME` so S3 discovery
+        /// MetaCache cannot race parallel `with_isolated_xdg` tests.
+        fn acquire_with_isolated_xdg(keys: &[&str]) -> Self {
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            for k in ["XDG_CACHE_HOME", ratarmount_index::META_CACHE_BYTES_ENV] {
+                if saved.iter().any(|(name, _)| name == k) {
+                    continue;
+                }
+                saved.push((k.to_string(), std::env::var(k).ok()));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("XDG_CACHE_HOME", dir.path());
+            std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV);
+            Self {
+                saved,
+                _xdg_tmpdir: Some(dir),
+                _lock: lock,
+            }
         }
 
         fn set(&self, key: &str, val: &str) {
@@ -2052,6 +2505,8 @@ mod tests {
                     None => std::env::remove_var(&k),
                 }
             }
+            // Drop isolated XDG after restoring the previous env.
+            self._xdg_tmpdir.take();
         }
     }
     fn well_known_sqlite_gets(gets: &[String], archive_path: &str) -> usize {

@@ -190,7 +190,7 @@ impl Session {
             }
         };
 
-        let options = OpenOptions {
+        let mut options = OpenOptions {
             recursive: req.recursive,
             recursion_depth: req.recursion_depth,
             passwords,
@@ -233,7 +233,7 @@ impl Session {
         };
         let bundle = factory::build_mount_source_ex(
             std::slice::from_ref(&archive_path),
-            &options,
+            &mut options,
             recreate_flag,
             comp,
         )

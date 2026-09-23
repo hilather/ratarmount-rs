@@ -3901,7 +3901,7 @@ fn body_looks_like_tar_gzip(gzip: &SharedSeekableGzip) -> Result<bool, String> {
 #[allow(dead_code)]
 pub fn build_mount_source(
     paths: &[PathBuf],
-    options: &OpenOptions,
+    options: &mut OpenOptions,
     recreate: bool,
     recursive: bool,
 ) -> Result<MountBundle, String> {
@@ -3928,7 +3928,7 @@ pub fn build_mount_source(
 /// Build with full compositing knobs (versions, prefix, lazy).
 pub fn build_mount_source_ex(
     paths: &[PathBuf],
-    options: &OpenOptions,
+    options: &mut OpenOptions,
     recreate: bool,
     comp: CompositingOptions,
 ) -> Result<MountBundle, String> {
@@ -3942,11 +3942,16 @@ pub fn build_mount_source_ex(
         .unwrap_or_default();
     let mut sources = Vec::new();
     let mut remotes = Vec::new();
+    // Per-input clone of the CLI options. `read_only_index` may clear write
+    // flags on that clone only. A discovered `index_file_path` is copied back
+    // onto `options` (the value `spawn_interval_commits` clones). Do not inject
+    // one input's sidecar into the next input's clone.
+    let cli_opts = options.clone();
     for p in paths {
         let input = p.to_string_lossy();
 
         // Do not force a default index path here — `open_path` resolves via folders / :memory:.
-        let mut opts = options.clone();
+        let mut opts = cli_opts.clone();
         if opts.read_only_index {
             opts.write_index = false;
             opts.clear_index_cache = false;
@@ -3968,13 +3973,19 @@ pub fn build_mount_source_ex(
             continue;
         }
 
-        let (local_path, mut src) = if ratarmount_remote::is_remote_url(&input) {
-            remote_open::open_remote_input(input.as_ref(), &opts, recreate_src, &mut remotes)?
+        let remote = ratarmount_remote::is_remote_url(&input);
+        let (local_path, mut src) = if remote {
+            remote_open::open_remote_input(input.as_ref(), &mut opts, recreate_src, &mut remotes)?
         } else {
             let local_path = p.clone();
             let src = open_path(&local_path, &opts, recreate_src)?;
             (local_path, src)
         };
+        if remote && options.index_file_path.is_none() {
+            if let Some(path) = opts.index_file_path.clone() {
+                options.index_file_path = Some(path);
+            }
+        }
 
         let folder_hint = local_path
             .file_name()
@@ -6945,7 +6956,7 @@ mod tests {
             .success());
         let index_path = dir.path().join("outer.tar.index.sqlite");
 
-        let opts = OpenOptions {
+        let mut opts = OpenOptions {
             index_file_path: Some(index_path.clone()),
             write_index: true,
             recursion_depth: Some(2),
@@ -6964,9 +6975,13 @@ mod tests {
             union_cache: Default::default(),
             parallel_nested_threads: 1,
         };
-        let bundle =
-            build_mount_source_ex(std::slice::from_ref(&outer_tar), &opts, true, comp.clone())
-                .expect("first mount with recursive nested");
+        let bundle = build_mount_source_ex(
+            std::slice::from_ref(&outer_tar),
+            &mut opts,
+            true,
+            comp.clone(),
+        )
+        .expect("first mount with recursive nested");
         // Touch nested content (eager scan should have opened inner.zip).
         let fi = bundle
             .source
@@ -7023,7 +7038,7 @@ mod tests {
 
         // Second mount: warm nested load; still serves content.
         let bundle2 =
-            build_mount_source_ex(&[outer_tar], &opts, false, comp).expect("second warm mount");
+            build_mount_source_ex(&[outer_tar], &mut opts, false, comp).expect("second warm mount");
         let fi2 = bundle2
             .source
             .lookup("/inner-durable.zip/hello.txt", 0)

@@ -72,7 +72,7 @@ curl -X PROPFIND -H 'Depth: 1' http://127.0.0.1:20492/
 
 ## SMB 2.0.2 (`--smb`) — P-2 `partial`
 
-Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar. Password env requires signing.
+Userspace dialect subset. Share name `--smb-share` (default `ratarmount`). Guest `smbclient -N` `ls`/`get` on localhost is the **unsigned** v1 bar. Password env requires signing. The inbound `smb://` client does not read `RATARMOUNT_SMB_PASSWORD`; that variable is export-only (`RATARMOUNT_SMB_CLIENT_*` is the client env).
 
 ```bash
 ratarmount --smb archive.tar.gz

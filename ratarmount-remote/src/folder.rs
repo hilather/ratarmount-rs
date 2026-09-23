@@ -817,7 +817,6 @@ mod tests {
     use std::io::{BufRead, BufReader, Write as IoWrite};
     use std::net::TcpListener;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Mutex as StdMutex;
     use std::thread;
 
     struct FakeListing {
@@ -954,9 +953,7 @@ mod tests {
         );
     }
 
-    /// Serialize tests that mutate process AWS env.
-    static ENV_LOCK: StdMutex<()> = StdMutex::new(());
-
+    /// Same lock as `s3` tests: both mutate `AWS_*` on the process.
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
@@ -964,7 +961,9 @@ mod tests {
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
-            let lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::s3::S3_AWS_ENV_LOCK
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut saved = Vec::new();
             for &k in keys {
                 saved.push((k.to_string(), std::env::var(k).ok()));
