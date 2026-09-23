@@ -2260,7 +2260,9 @@ mod tests {
     ];
 
     fn bind_anon_s3(endpoint: &str) -> EnvGuard {
-        let g = EnvGuard::acquire(AWS_TEST_ENV);
+        // Isolate XDG under REMOTE_ENV_LOCK so MetaCache::from_env cannot race
+        // parallel with_isolated_xdg tests (CI flake: pointer blob install None).
+        let g = EnvGuard::acquire_with_isolated_xdg(AWS_TEST_ENV);
         g.set("AWS_ANONYMOUS", "1");
         g.set("AWS_ENDPOINT_URL", endpoint);
         g.set("RATARMOUNT_IMDS_BASE", "http://127.0.0.1:1");
@@ -2314,61 +2316,60 @@ mod tests {
     /// CLI `index_file_path` starts unset; discovery must land on the caller's opts.
     #[test]
     fn discovered_index_lands_on_caller_opts() {
-        with_isolated_xdg(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let archive = dir.path().join("a.tar");
-            let member = ratarmount_formats_tar::UstarMember {
-                path: "hello.txt",
-                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
-                mode: 0o644,
-                uid: 0,
-                gid: 0,
-                mtime: 0,
-            };
-            let mut archive_bytes = Vec::new();
-            ratarmount_formats_tar::write_ustar_members(&mut archive_bytes, &[member]).unwrap();
-            ratarmount_formats_tar::write_tar_eof(&mut archive_bytes).unwrap();
-            fs::write(&archive, &archive_bytes).unwrap();
-            let index_bytes = make_sidecar_for(&archive);
-            let id = ratarmount_index::sha256_hex(&index_bytes);
-            let ptr = pointer_json_for_blob(&index_bytes);
-            let folders = empty_index_folders(dir.path());
+        // bind_anon_s3 isolates XDG under REMOTE_ENV_LOCK (do not nest with_isolated_xdg).
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let member = ratarmount_formats_tar::UstarMember {
+            path: "hello.txt",
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut archive_bytes = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut archive_bytes, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut archive_bytes).unwrap();
+        fs::write(&archive, &archive_bytes).unwrap();
+        let index_bytes = make_sidecar_for(&archive);
+        let id = ratarmount_index::sha256_hex(&index_bytes);
+        let ptr = pointer_json_for_blob(&index_bytes);
+        let folders = empty_index_folders(dir.path());
 
-            let mut objects = std::collections::HashMap::new();
-            objects.insert("data/a.tar".into(), archive_bytes);
-            objects.insert("data/a.tar.index.ptr".into(), ptr);
-            objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes);
-            let s3 = spawn_s3_index(objects, true);
-            let _g = bind_anon_s3(&format!("http://{}", s3.addr));
+        let mut objects = std::collections::HashMap::new();
+        objects.insert("data/a.tar".into(), archive_bytes);
+        objects.insert("data/a.tar.index.ptr".into(), ptr);
+        objects.insert(format!("data/a.tar.index.{id}.sqlite"), index_bytes);
+        let s3 = spawn_s3_index(objects, true);
+        let _g = bind_anon_s3(&format!("http://{}", s3.addr));
 
-            let url = PathBuf::from("s3://bucket/data/a.tar");
-            let mut opts = OpenOptions {
-                index_file_path: None,
-                index_folders: folders,
-                write_index: false,
-                ..OpenOptions::default()
-            };
-            assert!(
-                opts.index_file_path.is_none(),
-                "CLI index_file_path starts unset"
-            );
-            let _bundle = super::super::build_mount_source_ex(
-                std::slice::from_ref(&url),
-                &mut opts,
-                false,
-                super::super::CompositingOptions::default(),
-            )
-            .unwrap_or_else(|e| panic!("open s3 tar: {e}"));
-            let got = opts
-                .index_file_path
-                .expect("discovered meta-v3 path must be copied onto the caller");
-            assert!(
-                ratarmount_index::is_meta_cache_path(&got),
-                "expected meta-v3, got {}",
-                got.display()
-            );
-            assert!(got.is_file(), "{}", got.display());
-        });
+        let url = PathBuf::from("s3://bucket/data/a.tar");
+        let mut opts = OpenOptions {
+            index_file_path: None,
+            index_folders: folders,
+            write_index: false,
+            ..OpenOptions::default()
+        };
+        assert!(
+            opts.index_file_path.is_none(),
+            "CLI index_file_path starts unset"
+        );
+        let _bundle = super::super::build_mount_source_ex(
+            std::slice::from_ref(&url),
+            &mut opts,
+            false,
+            super::super::CompositingOptions::default(),
+        )
+        .unwrap_or_else(|e| panic!("open s3 tar: {e}"));
+        let got = opts
+            .index_file_path
+            .expect("discovered meta-v3 path must be copied onto the caller");
+        assert!(
+            ratarmount_index::is_meta_cache_path(&got),
+            "expected meta-v3, got {}",
+            got.display()
+        );
+        assert!(got.is_file(), "{}", got.display());
     }
 
     /// Regression: S3 pointer 404 still installs well-known `{url}.index.sqlite`.
@@ -2442,22 +2443,53 @@ mod tests {
         );
     }
 
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+    /// Shared with [`with_isolated_xdg`]: AWS + cookie + XDG env must not
+    /// interleave under parallel `cargo test` or MetaCache paths flip mid-GET.
     struct EnvGuard {
         saved: Vec<(String, Option<String>)>,
+        /// Keeps isolated XDG alive for [`Self::acquire_with_isolated_xdg`].
+        _xdg_tmpdir: Option<tempfile::TempDir>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
 
     impl EnvGuard {
         fn acquire(keys: &[&str]) -> Self {
-            let lock = TEST_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
             let mut saved = Vec::new();
             for &k in keys {
                 saved.push((k.to_string(), std::env::var(k).ok()));
                 std::env::remove_var(k);
             }
-            Self { saved, _lock: lock }
+            Self {
+                saved,
+                _xdg_tmpdir: None,
+                _lock: lock,
+            }
+        }
+
+        /// Like [`Self::acquire`], plus a private `XDG_CACHE_HOME` so S3 discovery
+        /// MetaCache cannot race parallel `with_isolated_xdg` tests.
+        fn acquire_with_isolated_xdg(keys: &[&str]) -> Self {
+            let lock = REMOTE_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let mut saved = Vec::new();
+            for &k in keys {
+                saved.push((k.to_string(), std::env::var(k).ok()));
+                std::env::remove_var(k);
+            }
+            for k in ["XDG_CACHE_HOME", ratarmount_index::META_CACHE_BYTES_ENV] {
+                if saved.iter().any(|(name, _)| name == k) {
+                    continue;
+                }
+                saved.push((k.to_string(), std::env::var(k).ok()));
+            }
+            let dir = tempfile::tempdir().unwrap();
+            std::env::set_var("XDG_CACHE_HOME", dir.path());
+            std::env::remove_var(ratarmount_index::META_CACHE_BYTES_ENV);
+            Self {
+                saved,
+                _xdg_tmpdir: Some(dir),
+                _lock: lock,
+            }
         }
 
         fn set(&self, key: &str, val: &str) {
@@ -2473,6 +2505,8 @@ mod tests {
                     None => std::env::remove_var(&k),
                 }
             }
+            // Drop isolated XDG after restoring the previous env.
+            self._xdg_tmpdir.take();
         }
     }
     fn well_known_sqlite_gets(gets: &[String], archive_path: &str) -> usize {
