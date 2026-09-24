@@ -1315,6 +1315,17 @@ mod tests {
         );
     }
 
+    /// Soft-skip GNU tar commit tests when the host tar is missing/wrong, or when
+    /// `--delete` hits the known Debian 1.35 lseek EOVERFLOW bug (`Err` carries
+    /// `lseek` / `Value too large for defined data type`). Mirrors
+    /// `soft_skip_gnu_tar_commit` in `ratarmount-compositing` write_overlay tests.
+    fn soft_skip_gnu_tar_commit(err: &impl std::fmt::Display) -> bool {
+        let s = err.to_string();
+        s.contains("GNU tar")
+            || s.contains("lseek")
+            || s.contains("Value too large for defined data type")
+    }
+
     /// Regression: live commit after an overlay DELETE shifts base member
     /// offsets; a cached reader slot / FileInfo for an untouched base file
     /// must be invalidated by the commit generation sweep, or the next NFS
@@ -1387,15 +1398,21 @@ mod tests {
         // Delete a.txt in the overlay and commit: b.txt shifts 1024 bytes
         // down (one 512 header + one 512 data block) in the new archive.
         nfs.remove_sync(1, &name("a.txt")).expect("delete a.txt");
-        ov.commit_live_uncompressed_tar(&tar, |p| {
+        match ov.commit_live_uncompressed_tar(&tar, |p| {
             let mut mat = None;
             ratarmount_formats_tar::SqliteIndexedTar::create_index(
                 p, p, None, &opts, "test", &mut mat,
             )
             .map(|t| Arc::new(t) as Arc<dyn MountSource>)
             .map_err(|e| ratarmount_compositing::OverlayError::Msg(e.to_string()))
-        })
-        .expect("commit_live");
+        }) {
+            Ok(_) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            Err(e) => panic!("commit_live: {e}"),
+        }
 
         let (after, _) = nfs
             .read_sync(b_id, 0, 128)
