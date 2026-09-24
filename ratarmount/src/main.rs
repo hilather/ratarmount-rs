@@ -659,6 +659,15 @@ fn repack_seekable_cli_error(args: &Args) -> Option<String> {
         Ok(None) => {}
         Err(e) => return Some(e),
     }
+    if any_export(args) {
+        return Some(
+            "--repack-seekable cannot be combined with --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem"
+                .into(),
+        );
+    }
+    if args.write_overlay.is_some() {
+        return Some("--repack-seekable cannot be combined with -w / --write-overlay".into());
+    }
     match args.paths.len() {
         2 => None,
         n if n > 2 => Some("--repack-seekable does not mount".into()),
@@ -4672,6 +4681,87 @@ mod repack_seekable_cli_tests {
         .expect("on-exit parses");
         let err = repack_seekable_cli_error(&on_exit).expect("on-exit excluded");
         assert!(err.contains("--commit-overlay-on-exit"), "{err}");
+    }
+
+    /// Regression (#80): `--repack-seekable` is exclusive with every export flag,
+    /// `-w` / `--write-overlay`, and a FUSE mountpoint (exit 2, OUTPUT untouched).
+    #[test]
+    fn repack_incompatible_with_export() {
+        for flag in [
+            "--nfs",
+            "--http",
+            "--webdav",
+            "--smb",
+            "--ninep",
+            "--sftp",
+            "--sftp-subsystem",
+        ] {
+            let a = Args::try_parse_from([
+                "ratarmount",
+                flag,
+                "--repack-seekable",
+                "in.tar.gz",
+                "out.tar.zst",
+            ])
+            .expect("export flag parses");
+            let err = repack_seekable_cli_error(&a).expect("export excluded");
+            assert!(err.contains("cannot be combined"), "{flag}: {err}");
+            assert!(err.contains(flag), "{flag}: {err}");
+        }
+        for overlay in [["-w", "/tmp/ov"], ["--write-overlay", "/tmp/ov"]] {
+            let a = Args::try_parse_from([
+                "ratarmount",
+                "--repack-seekable",
+                overlay[0],
+                overlay[1],
+                "in.tar.gz",
+                "out.tar.zst",
+            ])
+            .expect("write overlay parses");
+            let err = repack_seekable_cli_error(&a).expect("write overlay excluded");
+            assert!(err.contains("--write-overlay"), "{}: {err}", overlay[0]);
+        }
+        let mountpoint = Args::try_parse_from([
+            "ratarmount",
+            "--repack-seekable",
+            "in.tar.gz",
+            "out.tar.zst",
+            "mnt",
+        ])
+        .expect("mountpoint parses");
+        assert_eq!(
+            repack_seekable_cli_error(&mountpoint).as_deref(),
+            Some("--repack-seekable does not mount")
+        );
+
+        // Exit code 2 before any output is written, with a real gzip input.
+        let dir = tempfile::tempdir().unwrap();
+        let input = dir.path().join("in.gz");
+        // gzip of `hi\n`, mtime 0.
+        let gz: &[u8] = &[
+            0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x02, 0xff, 0xcb, 0xc8, 0xe4, 0x02,
+            0x00, 0x7a, 0x7a, 0x6f, 0xed, 0x03, 0x00, 0x00, 0x00,
+        ];
+        fs::write(&input, gz).unwrap();
+        let overlay = dir.path().join("ov");
+        let output = dir.path().join("out.tar.zst");
+        for extra in [
+            vec!["--nfs".to_string()],
+            vec!["-w".to_string(), overlay.to_str().unwrap().to_string()],
+        ] {
+            let argv = std::iter::once("ratarmount".to_string())
+                .chain(extra.iter().cloned())
+                .chain([
+                    "--repack-seekable".to_string(),
+                    input.to_str().unwrap().to_string(),
+                    output.to_str().unwrap().to_string(),
+                ]);
+            let parsed = Args::try_parse_from(argv).expect("parse");
+            let (code, msg) = run_repack_seekable_cli(&parsed).expect_err("exclusive");
+            assert_eq!(code, 2, "{extra:?}: {msg}");
+            assert!(msg.contains("cannot be combined"), "{extra:?}: {msg}");
+            assert!(!output.exists(), "{extra:?}: OUTPUT must not be written");
+        }
     }
 
     /// Temp-dir gzip → `.tar.zst` using the in-tree decoder, not an external `zstd`.
