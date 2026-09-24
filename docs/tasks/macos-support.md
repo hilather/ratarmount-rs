@@ -1,8 +1,8 @@
 # macOS support — evaluation & task list
 
-**Status:** **First-class on Apple Silicon** — Phase A–D in tree; GHA `macos-14` job exists (`ci.yml` `macos:`); v0.1.24 GitHub Release ships signed `ratarmount-0.1.24-macos-arm64.tar.gz`. Intel tarball **deferred** (no GHA `macos-13` capacity). Homebrew formula is **E1** (later).  
+**Status:** **First-class on Apple Silicon** — Phase A–D in tree; GHA `macos-14` job exists (`ci.yml` `macos:`); GitHub Release ships signed `ratarmount-*-macos-arm64.tar.gz`. Homebrew **E1 tap cask** shipped (`packaging/homebrew/Casks/ratarmount.rb`). Intel tarball **deferred** (no GHA `macos-13` capacity). Homebrew-core / WinFsp residual.  
 **Target:** keep Apple Silicon tarballs on release tags; do not re-add Intel until runners exist.  
-**Related:** [`docs/macos.md`](../macos.md) (FUSE install + Tahoe); `docs/packaging.md`; `.github/workflows/{ci,packages}.yml`.
+**Related:** [`docs/macos.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/macos.md) (FUSE install + Tahoe); [`docs/packaging.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md); `.github/workflows/{ci,packages}.yml`.
 
 ---
 
@@ -19,10 +19,10 @@
 | **libc mode bits** | `S_IFDIR` etc. for FUSE attrs | OK on Darwin |
 | **libarchive** | `pkg-config` in `build.rs` | Need Homebrew `libarchive` (+ `pkg-config`) |
 | **EXT4 / SquashFS MVP** | Shell out to `debugfs` / `unsquashfs` | Tools often missing on Mac; keep soft-skip (already skip-if-absent) |
-| **Packaging** | deb / rpm / portable-glibc tarball + **macOS arm64** tarball on tags | Intel tarball deferred; Homebrew E1 later |
+| **Packaging** | deb / rpm / portable-glibc tarball + **macOS arm64** tarball on tags; Homebrew tap **cask** | Intel tarball deferred; Homebrew-core out of v1 |
 | **CI** | Linux `check` + **`macos-14` job** (`ci.yml` `macos:`) | Intel `macos-13` deferred |
 
-**Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. Unmount, mount-ready, packaging/CI, and harness `ratar_unmount` **shipped**. Remaining product leftovers: user must install macFUSE or FUSE-T; Intel tarball and Homebrew (E1) later.
+**Good news:** Most of the workspace is already *Unix*-shaped, not *Linux*-shaped. Unmount, mount-ready, packaging/CI, harness `ratar_unmount`, and the Homebrew tap **cask** **shipped**. Remaining product leftovers: user must install macFUSE or FUSE-T; Intel tarball and Homebrew-core later.
 
 **Hard CI constraint:** GitHub-hosted macOS runners **cannot load macFUSE kexts**. Practical approach:
 
@@ -50,7 +50,7 @@ Document both in README; link against whichever `pkg-config fuse` (or fuse3) pro
   - `ratarmount-<ver>-macos-x86_64.tar.gz` (Intel) — **deferred** (no GHA Intel runner)
 - **Do not** ship a fat universal binary in v1 unless linking both arches is painless.
 - Dynamic link against system/Homebrew **libfuse** + **libarchive** (document `brew install libarchive macfuse` / `fuse-t`).
-- Optional later: Homebrew formula (E1), `.pkg` installer.
+- Homebrew tap **cask** (E1, shipped): unpacks the signed `macos-arm64` GitHub Release tarball. Not a source formula. Install from a clone: `brew tap-new hilather/ratarmount`, `mkdir -p "$(brew --repo hilather/ratarmount)/Casks"`, copy `packaging/homebrew/Casks/ratarmount.rb` into that dir, then `brew install --cask hilather/ratarmount/ratarmount` (or `./packaging/homebrew/install.sh`). Homebrew-core / `.pkg` installer later.
 
 ### Out of scope for first macOS milestone
 
@@ -245,7 +245,7 @@ Either:
 
 ### 5.4 Docs
 
-- README: Platforms → Linux + macOS **arm64** first-class; install via tarball + brew deps. Intel deferred; Homebrew later.  
+- README: Platforms → Linux + macOS **arm64** first-class; install via tarball or Homebrew tap cask. Intel deferred; Homebrew-core later.  
 - `docs/packaging.md`: macOS matrix is **macos-14 arm64 only**.  
 - Short `docs/macos.md`: enable kext (macFUSE), FUSE-T alternative, `PKG_CONFIG_PATH`, known limits (EXT4/SquashFS helpers).
 
@@ -298,7 +298,7 @@ Use as implementation order. Effort: **S** &lt; 0.5d, **M** 0.5–2d, **L** mult
 
 | ID | Task | Effort | Notes |
 |----|------|--------|-------|
-| **E1** | Homebrew formula (tap or core) | L | `[ ]` After tarball stable — **not** this train |
+| **E1** | Homebrew tap **cask** (prebuilt `macos-arm64` tarball; not a source formula) | S | **done** (tap-ready cask; Homebrew-core out of v1) |
 | **E2** | Universal binary (lipo) or only arm64 if Intel share is low | M | Optional |
 | **E3** | Finder `volname` / icon / xattr quirks | M | UX |
 | **E4** | Pure SquashFS/EXT4 (drop external tools) | L | Independent of Mac |
@@ -316,7 +316,7 @@ Smallest path to “Mac binary on release + CI build/test”:
 4. **B3 + C2** — smoke script + optional job.  
 5. **D1 + D2 + D3 + D4** — release tarball arm64 on tags.
 
-Defer intel matrix, Homebrew formula, and required FUSE smoke until arm64 is solid.
+Defer intel matrix, Homebrew-core, and required FUSE smoke until arm64 is solid. Homebrew tap cask (E1) is shipped.
 
 ---
 
@@ -340,7 +340,8 @@ Defer intel matrix, Homebrew formula, and required FUSE smoke until arm64 is sol
 - [x] Documented install: brew deps + extract binary + mount sample archive (`docs/macos.md`)  
 - [x] `ratarmount -u` uses Darwin unmount path (`umount` / `diskutil`)  
 - [x] Smoke script: mount tar.gz, read file, unmount (`test-harness/run-macos-smoke.sh`; verified on Linux; Mac CI best-effort)  
-- [x] README platforms line: macOS **first-class on Apple Silicon** (not beta)
+- [x] README platforms line: macOS **first-class on Apple Silicon** (not beta)  
+- [x] Homebrew tap **cask** unpacks signed `macos-arm64` GitHub Release tarball (`packaging/homebrew/Casks/ratarmount.rb`; `./packaging/test-homebrew-cask.sh`)
 
 ---
 
@@ -357,7 +358,10 @@ Defer intel matrix, Homebrew formula, and required FUSE smoke until arm64 is sol
 | `.github/workflows/packages.yml` | macos matrix + release needs |
 | `packaging/build-macos-tarball.sh` | **new** |
 | `docs/macos.md`, `docs/packaging.md`, `README.md` | docs |
+| `packaging/homebrew/Casks/ratarmount.rb` | **E1** tap-ready cask (prebuilt tarball) |
+| `packaging/homebrew/install.sh` | `brew tap-new` + copy (packaging/homebrew is not a git repo) |
+| `packaging/test-homebrew-cask.sh` | static cask checks + `brew audit --cask` via tap-new |
 
 ---
 
-*Generated from codebase audit (fuse unmount, daemonize, libarchive build.rs, CI/packages, harness fusermount3). Phase A–D shipped; Intel tarball and Homebrew (E1) remain later.*
+*Generated from codebase audit (fuse unmount, daemonize, libarchive build.rs, CI/packages, harness fusermount3). Phase A–D + E1 tap cask shipped; Intel tarball and Homebrew-core remain later.*

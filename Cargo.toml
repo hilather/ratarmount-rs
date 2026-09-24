@@ -21,11 +21,21 @@ members = [
     "ratarmount-formats-squashfs",
     "ratarmount-formats-ext4",
     "ratarmount-formats-fat",
+    "ratarmount-formats-exfat",
+    "ratarmount-formats-ntfs",
+    "ratarmount-formats-udf",
+    "ratarmount-formats-block",
+    "ratarmount-formats-dmg",
+    "ratarmount-formats-wim",
+    "ratarmount-formats-qcow2",
+    "ratarmount-formats-vhd",
+    "ratarmount-formats-vmdk",
     "ratarmount-formats-asar",
     "ratarmount-formats-ogg",
     "ratarmount-formats-html",
     "ratarmount-formats-pdf",
     "ratarmount-formats-git",
+    "ratarmount-formats-restic",
     "ratarmount-remote",
     "ratarmount-compositing",
     "ratarmount-nfs",
@@ -41,7 +51,7 @@ default-members = ["ratarmount"]
 version = "0.1.33"
 edition = "2021"
 license = "MIT"
-repository = "https://github.com/mxmlnkn/ratarmount-rs"
+repository = "https://github.com/hilather/ratarmount-rs"
 rust-version = "1.74"
 
 [workspace.dependencies]
@@ -64,11 +74,21 @@ ratarmount-formats-sqlar = { path = "ratarmount-formats-sqlar" }
 ratarmount-formats-squashfs = { path = "ratarmount-formats-squashfs" }
 ratarmount-formats-ext4 = { path = "ratarmount-formats-ext4" }
 ratarmount-formats-fat = { path = "ratarmount-formats-fat" }
+ratarmount-formats-exfat = { path = "ratarmount-formats-exfat" }
+ratarmount-formats-ntfs = { path = "ratarmount-formats-ntfs" }
+ratarmount-formats-udf = { path = "ratarmount-formats-udf" }
+ratarmount-formats-block = { path = "ratarmount-formats-block" }
+ratarmount-formats-dmg = { path = "ratarmount-formats-dmg" }
+ratarmount-formats-wim = { path = "ratarmount-formats-wim" }
+ratarmount-formats-qcow2 = { path = "ratarmount-formats-qcow2" }
+ratarmount-formats-vhd = { path = "ratarmount-formats-vhd" }
+ratarmount-formats-vmdk = { path = "ratarmount-formats-vmdk" }
 ratarmount-formats-asar = { path = "ratarmount-formats-asar" }
 ratarmount-formats-ogg = { path = "ratarmount-formats-ogg" }
 ratarmount-formats-html = { path = "ratarmount-formats-html" }
 ratarmount-formats-pdf = { path = "ratarmount-formats-pdf" }
 ratarmount-formats-git = { path = "ratarmount-formats-git" }
+ratarmount-formats-restic = { path = "ratarmount-formats-restic" }
 ratarmount-remote = { path = "ratarmount-remote" }
 ratarmount-compositing = { path = "ratarmount-compositing" }
 ratarmount-nfs = { path = "ratarmount-nfs" }

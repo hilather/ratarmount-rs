@@ -1,0 +1,24 @@
+[package]
+name = "ratarmount-formats-dmg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "UDIF DMG block reader (inner FAT/ISO/exFAT/NTFS; HFS+/APFS residual)"
+readme = "README.md"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-formats-fat.workspace = true
+ratarmount-formats-ext4.workspace = true
+ratarmount-formats-exfat.workspace = true
+ratarmount-formats-ntfs.workspace = true
+ratarmount-formats-iso9660.workspace = true
+ratarmount-formats-block.workspace = true
+thiserror.workspace = true
+log.workspace = true
+flate2 = "1"
+bzip2 = { version = "0.5", features = ["static"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+fatfs = "0.3"

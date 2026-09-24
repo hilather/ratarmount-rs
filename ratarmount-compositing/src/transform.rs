@@ -319,6 +319,14 @@ impl MountSource for TransformMountSource {
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         self.inner.member_seek_is_cheap(file_info)
     }
+
+    fn list_xattr(&self, file_info: &FileInfo) -> Vec<String> {
+        self.inner.list_xattr(file_info)
+    }
+
+    fn get_xattr(&self, file_info: &FileInfo, key: &str) -> Option<Vec<u8>> {
+        self.inner.get_xattr(file_info, key)
+    }
 }
 
 fn internal_parent(path: &str) -> String {

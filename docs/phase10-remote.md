@@ -1,8 +1,8 @@
 # Phase 10 — remote inputs
 
-Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](export.md). Status vs Python: [`parity-todo.md`](parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md).
+Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md). Status vs Python: [`parity-todo.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) · beyond-parity IDs: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md).
 
-`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`.
+`is_remote_url` is a **scheme-prefix** check (not `url::Url` first). Forms that fail WHATWG parse still mount: `rclone://gdrive:bucket/path`, `rclone+gdrive:bucket/path`, `docker://ubuntu:24.04`. `restic:/abs/path` has no `://` and is still remote (not a local colon filename).
 
 ## Supported
 
@@ -10,26 +10,27 @@ Inbound URL schemes. Outbound servers (`--http` / `--smb` / …) are [`export.md
 |--------|----------|
 | `file://` | Map to local path |
 | `http://` / `https://` | Probe for `Accept-Ranges: bytes` + size; sequential Range GETs (4 MiB chunks) when supported, else full GET → temp file; **HTTP Basic** + **Cookie** auth on HEAD/GET/Range. Trailing `/` or HTML autoindex → **folder** (nginx/apache `<a href>`). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite`, then `Link: rel="describedby"` on archive HEAD, then well-known `{url}.index.sqlite` (+ `.gz`/`.zst`/`.xz`/`.bz2`). Pointer/blob/tarstats failure continues |
-| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. Live commit PUTs the archive object, then the pointer blob, then `{url}.index.ptr`. Well-known `{url}.index.sqlite` stays GET-only |
-| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Sibling pointer/blob/well-known GET as S3. Live commit: one PUT of the archive (GOOG1 or bearer; no multipart), then `{url}.index.{id}.sqlite`, then `{url}.index.ptr`. Well-known stays GET-only. Anonymous PUT is an error |
-| `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://`. Sibling pointer/blob/well-known GET as S3. Live commit: SharedKey Put Blob at or below 8 MiB, else 8 MiB Put Block + Put Block List, then `{url}.index.{id}.sqlite`, then `{url}.index.ptr`. Well-known stays GET-only. Anonymous PUT is an error |
+| `s3://bucket/key` | Live Range (`open_s3_range` / `S3RangeFile`) when the object supports it; else GetObject → temp. SigV4 env + IMDS/ECS + anonymous. Empty key / trailing `/` / list children → **prefix folder** (`ListObjectsV2`, continuation loop, 100k cap). Index discovery: GET `{url}.index.ptr` then `{url}.index.{id}.sqlite` then well-known `{url}.index.sqlite`. **PUT** (`put_s3_file` / multipart, abort on error; `publish_index_to_s3` blob-then-pointer). Anonymous is GET-only. Live overlay commit (`-w` + `--commit-overlay-interval` / `--on-exit`) for TAR/ZST: write probe, persistent spool, multipart PUT, then blob+pointer; reopen is live Range. Offline `--commit-overlay` + `s3://` exits 2 |
+| `gs://bucket/object` | XML path-style Range GET (`storage.googleapis.com/{bucket}/{object}`). Prefix folder via JSON list + `pageToken` (HMAC GOOG1 lists via XML). R2/MinIO stay `s3://` + `AWS_ENDPOINT_URL`. Same sibling pointer/blob/well-known GET as S3 |
+| `az://container/blob` | Azure Blob Range (`azure://` alias). Prefix folder via List Blobs + `NextMarker`. Account from env, not URL host. Not `wasb://`. Same sibling pointer/blob/well-known GET as S3 |
 | `ftp://` / `ftps://` | REST/SIZE Range or full RETR. `ftps://` = explicit AUTH TLS (`suppaftp` rustls). Trailing `/` or CWD-success → **folder** (MLSD preferred, Unix LIST fallback). Implicit FTPS :990 residual |
 | `ssh://` / `sftp://` / `scp://` | SFTP download → temp (`ssh_config` HostName/User/Port/IdentityFile/IdentitiesOnly/ProxyJump/Include). Directory URL → SFTP `readdir` folder |
 | `webdav://` / `webdavs://` | Map to `http`/`https`; Depth-0 PROPFIND for size; GET → temp (Basic from URL userinfo). Collection → Depth-1 **folder** |
-| `smb://` | SMB 2.0.2 read/list (`SmbRangeFile` / one-share folder). `smbclient` temp file only if `RATARMOUNT_SMB_USE_SMBCLIENT=1` |
+| `smb://` | Parse `smb://[domain;]user[:pass]@host[:port]/share/path`. Session `open_remote_input` live Range (`open_smb_range` / `SmbRangeFile` via in-tree SMB 2.0.2 `Smb2Client`) + share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 → F-1 `RemoteFolderMountSource`). Dialect `STATUS_NOT_SUPPORTED` / non-2.x (including a non-SMB2 banner) falls back to Samba `smbclient` for **files** when on `PATH`. Folder URLs: QUERY_DIRECTORY unsupported is a clear error (not an empty list; `smbclient` listing is residual). File URLs: dialect miss is `Ok(None)` so Range/smbclient can take over. Missing both names install **or** the dialect residual. Auth and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30) |
 | `dropbox://` | Dropbox content API (`DROPBOX_TOKEN`); folder browse via `DropboxMountSource` (list TTL 30s); large opens prefer chunked HTTP Range |
 | `oci://` / `docker://` / `ghcr://` | Registry manifest + Bearer blob Range + overlayfs layer union (`OciImageMountSource`). Custom parser (WHATWG-invalid `docker://ubuntu:24.04`). Index: local `oci:{digest}` cache first, then OCI 1.1 referrers (`artifactType=application/vnd.ratarmount.index.v1+sqlite`) on miss; fail-open if Referrers API is missing (not SOCI; no tag-convention fallback) |
 | `ipfs://` / `ipns://` | Gateway Range GET (`IPFS_GATEWAY`, default `http://127.0.0.1:8080`). UnixFS dirs via `IPFS_API` `/api/v0/ls`. No embedded node |
 | `rclone://remote:path` | argv `rclone cat --offset --count` + `lsjson` (one process per open). Slash alias `rclone://remote/path`. Plus-form `rclone+remote:path` / `rclone+remote://path` (no `://` required). Config stays in rclone |
+| `restic:/abs/path` | Local restic snapshot browser (`ResticMountSource`). Scheme-prefix (not WHATWG): `restic:/var/repo`, extra-slash `restic:///var/repo`. Relative `restic:path` errors. `restic://s3://bucket/repo` / `restic:s3://…` error (`S3 restic repos residual; use a local cache copy`). Password `RESTIC_PASSWORD` / `RESTIC_PASSWORD_FILE` (never logged). Session `open_remote_input` only — not `open_path`. Layout `/snapshots/<id>/`, `/latest`, `/ids/<full-id>/`. Guide: [restic.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/restic.md). borg/kopia residual |
 | bare local paths | Unchanged |
 
 `resolve_to_local` / `fetch_http_to_temp_prefer_range` prefer Range materialization (Python fsspec-style) and fall back to a full GET when the server does not support ranges. `HttpRangeFile` provides a seekable Range reader for the same probe; without ranges it buffers a full download.
 
-Factory `open_remote_input` probes F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder`, then live Range, then materialize. `smb://` is its own arm (not `open_s3_like`): `try_open_smb_folder` or `open_smb_range`, and it does not materialize unless `RATARMOUNT_SMB_USE_SMBCLIENT=1`. OCI is a layer-union mount, not a single-file download.
+Factory `open_remote_input` probes `restic:` first (local snapshot browser), then F-1 folders (s3/ssh/webdav/http) then `open_gcs_folder` / `open_azure_folder` / `open_rclone_folder` / `open_ipfs_folder` / `open_ftp_folder` / `open_smb_folder`, then live Range, then materialize. OCI is a layer-union mount, not a single-file download.
 
 ### Portable index discovery (G-2)
 
-Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3, GCS, and Azure live commit **PUT** the archive object, then the pointer blob, then `{url}.index.ptr` (well-known stays GET-only; GCS is a single PUT; Azure uses Put Block above 8 MiB). Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
+Order: explicit `--index-file` (including `--index-id HEX` already resolved to that path) → local folder candidates (`resolve_index_location`, including `oci:{digest}` cache) → GET `{url}.index.ptr` then immutable `{url}.index.{id}.sqlite` → HTTP `Link: rel="describedby"` on HEAD of the **archive** URL → http(s) well-known `{url}.index.sqlite` (+ compressed suffixes) → S3/GCS/Azure well-known sibling GET → OCI 1.1 referrer **on local miss**. Fail-open. Pointer/blob/tarstats failure **continues** the chain (pointer is an additional candidate, not terminal). Remote sidecar is checked with `check_tarstats_matches_remote` (size + edge hashes); mismatch → warn + cold index. Media type `application/vnd.ratarmount.index.v1+sqlite` is the blob family; `INDEX_VERSION` `0.7.0` is the `files` schema — not SOCI. Publish with `--publish-index` / `--publish-index-to PATH` (local copy + `{archive}.index.ptr` JSON pointer, schema `ratarmount.index.pointer.v1`, `index_id` = sha256 of the blob). Object-store **GET** of pointer/blob/well-known is supported. S3 **PUT** of the immutable blob then the pointer is [`publish_index_to_s3`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/index_sibling.rs) (never pointer-first; pointer PUT failure after blob PUT does not claim success — leftover blob is not deleted). CLI `--publish-index` PUTs that blob-then-pointer for `s3://` archives. GCS/Azure PUT is residual. Local `--index-id HEX` remounts `{archive}.index.{id}.sqlite` (keep-last-K=2 when a pointer is written).
 
 Whole sidecar GETs ≤ 64 MiB are stored in `$XDG_CACHE_HOME/ratarmount/meta-v3/` (V-3; cap `RATARMOUNT_META_CACHE_BYTES`, default 256 MiB, `=0` disables). Lookup is URL-first so a remount without `.ptr` still hits. Not archive `HttpRangeFile` paging and not G-3 member bodies. `file://` / `:memory:` / a nonempty local folder candidate skip the download. HPC home-quota: set `XDG_CACHE_HOME` to scratch.
 
@@ -70,12 +71,26 @@ RATARMOUNT_HTTP_COOKIE='session=abc; token=xyz' \
 
 | Env | Purpose |
 |-----|---------|
-| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Required |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Required for PUT / live overlay commit (anonymous is GET-only) |
 | `AWS_SESSION_TOKEN` | Optional STS |
 | `AWS_REGION` / `AWS_DEFAULT_REGION` | Default `us-east-1` |
 | `AWS_ENDPOINT_URL` / `S3_ENDPOINT_URL` | MinIO / LocalStack (path-style) |
+| `RATARMOUNT_S3_ANONYMOUS` / `AWS_ANONYMOUS` | Unsigned GET; live overlay commit exits 2 |
+| `RATARMOUNT_COMMIT_SPOOL_DIR` | Persistent F-7 live-commit mirror (default `$TMPDIR`) |
 
 `s3://bucket/prefix/` (trailing slash **or** no object at key + ListObjectsV2 children) mounts as a directory. `list_dirents` returns common prefixes as dirs and objects as files with sizes. Opening a `.tar` child uses `S3RangeFile` (no full-bucket download). Continuation tokens loop until empty; more than 100 000 keys is an error (not a silent truncate). Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30).
+
+### S3 PUT (F-7 primitive)
+
+Live overlay `s3://… -w --commit-overlay-interval` / `--commit-overlay-on-exit` (uncompressed TAR or `.tar.zst`) GETs a persistent spool under `$RATARMOUNT_COMMIT_SPOOL_DIR` or `$TMPDIR/ratarmount-f7-{pid}/`, splices locally, multipart-PUTs the spool, then PUTs the patched sqlite blob and `{url}.index.ptr`. Startup write probe is `CreateMultipartUpload` + `AbortMultipartUpload` (fail-closed on 403/404; no leftover object). `RATARMOUNT_S3_ANONYMOUS=1` / missing keys exit 2. Reopen is live Range (`open_live_remote`). Offline `--commit-overlay` + `s3://` exits 2. CLI `--publish-index` PUTs blob-then-pointer for `s3://`.
+
+| API | Behavior |
+|-----|----------|
+| `put_s3_file` | Single **PutObject** if size ≤ 8 MiB; else multipart (`CreateMultipartUpload` → 8 MiB `UploadPart` → `CompleteMultipartUpload`). Body is a file path (never a `Vec` of the archive). **Abort** the MPU on any error. |
+| `s3_create_and_abort_multipart_upload` | F-7 startup write probe: Create + immediate Abort. Fail-closed on 403/404. Does not leave a `.ratarmount-write-probe` object. |
+| `publish_index_to_s3` | PUT `{url}.index.{id}.sqlite` **then** `{url}.index.ptr` (schema `ratarmount.index.pointer.v1`). Pointer PUT failure after blob PUT returns `Err` and names the leftover blob. |
+
+PUT requires non-anonymous AWS credentials (`AWS_ACCESS_KEY_ID` / IMDS/ECS). `AWS_ANONYMOUS=1` / `RATARMOUNT_S3_ANONYMOUS=1` is GET-only. Residual: GCS `gs://` / Azure `az://` PUT.
 
 ### GCS (`gs://`)
 
@@ -85,12 +100,10 @@ XML file GET; JSON list API (Bearer/ADC/IMDS). HMAC GOOG1 uses XML ListBucket (q
 |-----|---------|
 | `CLOUDSDK_AUTH_ACCESS_TOKEN` / `GOOGLE_OAUTH_ACCESS_TOKEN` | Bearer (tried first) |
 | `GOOGLE_HMAC_KEY` / `GOOGLE_HMAC_SECRET` | GOOG1 HMAC (both non-empty; selected **before** the ADC/IMDS token cache) |
-| `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s). GET scope is `devstorage.read_only`. PUT mints `devstorage.read_write` and does not reuse the read token |
+| `GOOGLE_APPLICATION_CREDENTIALS` | Service-account JSON (RS256 JWT → oauth2; cached until expiry−120s) |
 | GCE/GKE IMDS | `Metadata-Flavor: Google` (override `RATARMOUNT_GCS_IMDS_BASE` for tests) |
-| `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET (PUT is an error before any request) |
+| `RATARMOUNT_GCS_ANONYMOUS` / `CLOUDSDK_ANONYMOUS` | Anonymous GET |
 | `RATARMOUNT_GCS_ENDPOINT` | XML/JSON API base override |
-
-Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one existing `gs://` `.tar` or `.tar.zst` spools with ranged GET when the object is large, splices locally, then streams one PUT (`Content-Length` set; the spool is not buffered twice). GOOG1 signs verb, Content-MD5, Content-Type, Date, and resource. Bearer sends `Authorization: Bearer` plus Content-MD5 and does not use that signer. Content-Type is `application/octet-stream` for the archive, `application/vnd.ratarmount.index.v1+sqlite` for the blob, and `application/json` for the pointer. No multipart and no well-known key. Offline `--commit-overlay` does not upload.
 
 ### Azure Blob (`az://` / `azure://`)
 
@@ -102,8 +115,6 @@ Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one ex
 | IMDS MSI | `Metadata: true`, resource `https://storage.azure.com/` (`RATARMOUNT_AZURE_IMDS_BASE` for tests) |
 | `RATARMOUNT_AZURE_ANONYMOUS` | Anonymous |
 | `AZURE_STORAGE_ENDPOINT` | Azurite / private endpoint |
-
-Live commit (`--commit-overlay-interval` / `--commit-overlay-on-exit`) on one existing `az://` `.tar` or `.tar.zst` spools with ranged GET when the object is large, splices locally, then uploads. SharedKey signs the 12 standard fields (PUT and Content-Length; a zero-length body signs that field empty), then lexicographic `x-ms-*` headers, then the resource. Put Blob sends `x-ms-blob-type: BlockBlob`. Put Block List keeps `Content-Type: application/xml` and sets `x-ms-blob-content-type` to the blob type. Archive Put Blob and Put Block List send `If-Match` of the download ETag when HEAD had one. A body of at most 8 MiB is one Put Blob. Larger bodies are 8 MiB Put Block calls plus Put Block List. Block ids are `{generation:016x}{part:08x}` base64, sampled from `commit_generation` before the success bump. The query `blockid` is percent-encoded; the string-to-sign uses the decoded id. Content-Type is `application/octet-stream` for the archive, `application/vnd.ratarmount.index.v1+sqlite` for the blob, and `application/json` for the pointer. No well-known key. Anonymous or a missing key errors before a request. A failed block list or pointer PUT leaves the overlay in place and does not bump the commit generation. Offline `--commit-overlay` does not upload.
 
 ### FTP / FTPS
 
@@ -136,32 +147,20 @@ Path rules (fsspec-like):
 - `ssh://host//abs/path` → absolute `/abs/path`
 - `ssh://host//path/dir/` → SFTP `readdir` folder when `stat` says directory
 
-### SMB (SMB 2.0.2) inbound
+### SMB inbound
 
-File URLs are a live Range reader (dialect **0x0202** only). The scheme match is ASCII-case-insensitive (`SMB://` / `Smb://` use the same arm). A share root (`smb://host/share`), a trailing slash, or QUERY_INFO that says directory is an F-1 folder (`try_open_smb_folder` / `RemoteFolderMountSource`). `smbclient` downloads to a temp file only when `RATARMOUNT_SMB_USE_SMBCLIENT=1`. With that hatch unset, a failed open returns the error and does not spawn `smbclient` or call `fetch_smb_to_temp`. The live reader opens ustar TAR, ZIP, gzip, bzip2, xz, and zstd only. 7z, ISO, SquashFS, and pre-ustar tar are not read on this path; set `RATARMOUNT_SMB_USE_SMBCLIENT=1` to fetch those with `smbclient`. Outbound `--smb` is [`export.md`](export.md).
-
-Short non-zero `STATUS_SUCCESS` READ replies are not EOF. The fill stops when the caller buffer is full, `offset` is at least the QUERY_INFO size, status is `STATUS_END_OF_FILE` (`0xC0000011`), or status is `STATUS_SUCCESS` and `DataLength == 0`. `0x80000002` (`STATUS_DATATYPE_MISALIGNMENT`) is an error, not EOF. Chunk size is the server `MaxReadSize`, capped at 1 MiB.
-
-Directory list is `QUERY_DIRECTORY` / `FileIdBothDirectoryInformation`, pattern `*`, ended on `STATUS_NO_MORE_FILES` (`0x80000006`). An empty directory is `STATUS_NO_SUCH_FILE`. Caps are 100_000 entries and 10_000 pages; hitting a cap is an error, not a silent truncate. Listing TTL is `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30). No WRITE, SET_INFO, or DELETE. Encryption and any dialect other than `0x0202` fail closed.
-
-`RATARMOUNT_SMB_PASSWORD` and `RATARMOUNT_SMB_USER` are **export-only** (the `--smb` server). The inbound client does not read them. URL userinfo wins over the client env.
+In-tree SMB 2.0.2 Direct-TCP codec (`Smb2Client`: NEGOTIATE / SESSION_SETUP guest+NTLMv2 / TREE_CONNECT / CREATE / READ-at-offset / QUERY_DIRECTORY / QUERY_INFO / CLOSE) plus live Range reader (`open_smb_range` / `SmbRangeFile`) and share listing (`open_smb_folder` / `SmbListing` → F-1 `RemoteFolderMountSource`). Auth: URL userinfo, then `RATARMOUNT_SMB_USER` / `RATARMOUNT_SMB_PASSWORD`, else guest. Session `open_remote_input` opens live Range (`open_s3_like` / `open_smb_range`) and F-1 folders (`open_smb_folder`); dialect residual still materializes via `resolve_to_local` / `smbclient`. Dialect `STATUS_NOT_SUPPORTED` / non-2.x (SMB1 or non-SMB2 banner) falls back to Samba `smbclient` on `PATH` for **files** (`apt install smbclient` / `dnf install samba-client`). Folder URLs: QUERY_DIRECTORY unsupported fails with an install/dialect message (not a silent empty list; `smbclient` listing is residual). File URLs: dialect miss returns `Ok(None)` so [`open_smb_range`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-remote/src/smb.rs) / smbclient can take over. Missing both names the install hint **or** the dialect residual. Logon failure and connect-refused do not fall back. Listing TTL: `RATARMOUNT_REMOTE_LIST_TTL_SECS` (default 30). Outbound `--smb` is [export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 | Env | Purpose |
 |-----|---------|
-| `RATARMOUNT_SMB_CLIENT_USER` | Username when the URL has no user |
-| `RATARMOUNT_SMB_CLIENT_PASSWORD` | NTLMv2 password |
-| `RATARMOUNT_SMB_CLIENT_DOMAIN` | Domain when the URL has none |
-| `RATARMOUNT_SMB_USE_SMBCLIENT` | Set to `1` to force the `smbclient` temp-file hatch |
+| `RATARMOUNT_SMB_PASSWORD` | Password when URL has no userinfo (pairs with `RATARMOUNT_SMB_USER` or `$USER`) |
+| `RATARMOUNT_SMB_USER` | Username when using `RATARMOUNT_SMB_PASSWORD` |
 
-No URL user and no client password is a guest session (still two SESSION_SETUP legs). If the server requires signing and no client password is set, the open fails. It does not retry unsigned and it does not fall back to `RATARMOUNT_SMB_PASSWORD`.
+URL path: first segment is the **share**, remainder is the file path inside the share. Domain may appear as `DOMAIN;user` or `DOMAIN%5Cuser` in userinfo.
 
 ```bash
 ratarmount -f 'smb://user:pass@fileserver/backups/archives/a.tar' mnt/
-ratarmount -f 'smb://fileserver/backups/' mnt/
-RATARMOUNT_SMB_USE_SMBCLIENT=1 ratarmount -f 'smb://fileserver/share/a.tar' mnt/
 ```
-
-URL path: first segment is the **share**, remainder is the path inside the share. Domain may appear as `DOMAIN;user` or `DOMAIN%5Cuser` in userinfo. `smb://host` with no share is a parse error. The hatch still needs `smbclient` on `PATH` (`apt install smbclient` / `dnf install samba-client`).
 
 ### OCI / Docker / GHCR
 
@@ -203,7 +202,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 
 ## Not yet
 
-- SMB 3.1.1 / encryption on the inbound client (v1 is dialect `0x0202` only; no WRITE). `smbclient` remains the `RATARMOUNT_SMB_USE_SMBCLIENT=1` hatch
+- SMB 3.x encryption, Kerberos, DFS, SMB1; `smbclient` directory listing (file dialect residual still falls back to `smbclient`) — F-6
 - SPA HTML indexes; WebDAV Depth-infinity listing
 - Implicit FTPS (port 990)
 - GCS GOOG4-HMAC-SHA256 (only if live keys reject GOOG1 / V2)
@@ -212,7 +211,7 @@ Primary URL **`rclone://remote:path`** (colon after remote name). Alias **`rclon
 - S3 credential **refresh after open** (anonymous + IMDS/ECS snapshot at open **are** shipped; live Range is the default path, not GetObject→temp)
 - rclone RC `--rc-serve` HTTP GET (`rclone+remote:path` **is** shipped)
 - OCI eStargz / SOCI / nydus / config JSON
-- S3, GCS, and Azure live write-through landed. Residuals: no offline upload, no ZIP or gzip commit, no well-known PUT, no create-missing, prefix-frame `.tar.zst` mutate still fail-closed
+- GCS/Azure PUT; offline `--commit-overlay` + `s3://`; create-if-missing on remote URLs (F-7 live `s3://` TAR/ZST interval/on-exit **is** shipped)
 
 ## Usage
 
@@ -230,6 +229,7 @@ ratarmount -f 'ssh://user@host//home/user/archive.tar' mnt/
 ratarmount -f 'webdav://user:pass@dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'webdavs://dav.example.com/archives/a.tar' mnt/
 ratarmount -f 'smb://user:pass@fileserver/share/path/archive.tar' mnt/
+ratarmount -f 'smb://user:pass@fileserver/share/' mnt/   # F-1 QUERY_DIRECTORY folder
 ratarmount -f 'rclone://gdrive:bucket/path.tar' mnt/
 ratarmount -f 'rclone+gdrive:bucket/path.tar' mnt/
 ratarmount -f docker://ubuntu:24.04 mnt/
@@ -243,7 +243,12 @@ ratarmount -f ipfs://bafyhash/path.tar mnt/
 ./test-harness/run-phase10-remote.sh
 # Crate / factory (WHATWG-invalid URLs, folders, Range mocks):
 #   cargo test -p ratarmount-remote --lib
+#   cargo test -p ratarmount-session --lib remote_smb
+#   cargo test -p ratarmount-session --lib try_open_remote_folder_url
 #   cargo test -p ratarmount --bin ratarmount docker_ubuntu
+#   cargo test -p ratarmount-formats-restic --lib
+#   cargo test -p ratarmount-remote --lib restic
+#   cargo test -p ratarmount-session --lib restic
 # Optional live:
 # RATARMOUNT_TEST_S3_URL=s3://bucket/key.tar AWS_… ./test-harness/run-phase10-remote.sh
 # RATARMOUNT_TEST_SSH_URL=ssh://user@host//path/a.tar ./test-harness/run-phase10-remote.sh

@@ -1,10 +1,13 @@
-//! Local-archive index cache (`local-index-v1/`), distinct from V-3 `meta-v3/`.
+//! Local-archive index cache (`local-index-v1/`), distinct from V-3 `meta-v3/`
+//! and G-3 `payload-v1/`.
 //!
 //! User-cache policy (`IndexPolicy::UserCache`) stores 0.7.x sidecars as
 //! `{sha256}.sqlite` plus a JSON header. Remote sidecar **downloads** stay in
 //! `meta-v3/` (`MetaCache`); mixing the two would evict the wrong class of blobs.
+//! Decompressed member bodies live in sibling `payload-v1/` (never a child of
+//! this directory).
 //!
-//! Layout: `<root>/ratarmount/local-index-v1/{hex}.sqlite` + `{hex}.json`.
+//! Layout: [`platform_cache_root()`]`/local-index-v1/{hex}.sqlite` + `{hex}.json`.
 //! Root is platform-specific (macOS `Library/Caches` unless XDG override);
 //! `meta-v3` keeps `xdg_cache_home()` and is not migrated.
 
@@ -363,37 +366,42 @@ fn find_existing_extra_dir_index(archive: &Path, extra_dirs: &[PathBuf]) -> Opti
         .find(|p| path_is_usable_existing_index(p))
 }
 
-/// Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/ratarmount/local-index-v1/`.
-/// macOS: `~/Library/Caches/ratarmount/local-index-v1/` unless XDG is set.
-/// Windows: `%LOCALAPPDATA%\ratarmount\local-index-v1\`.
+/// Parent of `local-index-v1/` and `payload-v1/` (and not `meta-v3/`).
 ///
-/// WHY: `meta-v3` stays on `xdg_cache_home()` (`$HOME/.cache` on macOS) so
-/// existing remote remounts do not miss after this helper lands.
-fn platform_local_index_root(
+/// Linux: `${XDG_CACHE_HOME:-$HOME/.cache}/ratarmount/`.
+/// macOS: `~/Library/Caches/ratarmount/` unless XDG is set.
+/// Windows: `%LOCALAPPDATA%\ratarmount\`.
+///
+/// Sibling of `local-index-v1/`; `meta-v3` stays on `xdg_cache_home()`.
+pub fn platform_cache_root() -> PathBuf {
+    platform_cache_root_from(
+        env_path("XDG_CACHE_HOME").as_deref(),
+        env_path("HOME").as_deref(),
+        env_path("LOCALAPPDATA").as_deref(),
+    )
+}
+
+pub(crate) fn platform_cache_root_from(
     xdg_cache_home: Option<&Path>,
     home: Option<&Path>,
     local_appdata: Option<&Path>,
 ) -> PathBuf {
     if let Some(xdg) = xdg_cache_home {
         if !xdg.as_os_str().is_empty() {
-            return xdg.join("ratarmount").join(LOCAL_INDEX_V1_DIRNAME);
+            return xdg.join("ratarmount");
         }
     }
     #[cfg(target_os = "macos")]
     {
         if let Some(home) = home {
-            return home
-                .join("Library")
-                .join("Caches")
-                .join("ratarmount")
-                .join(LOCAL_INDEX_V1_DIRNAME);
+            return home.join("Library").join("Caches").join("ratarmount");
         }
     }
     #[cfg(windows)]
     {
         if let Some(app) = local_appdata {
             if !app.as_os_str().is_empty() {
-                return app.join("ratarmount").join(LOCAL_INDEX_V1_DIRNAME);
+                return app.join("ratarmount");
             }
         }
     }
@@ -401,7 +409,14 @@ fn platform_local_index_root(
     home.map(|h| h.join(".cache"))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("ratarmount")
-        .join(LOCAL_INDEX_V1_DIRNAME)
+}
+
+fn platform_local_index_root(
+    xdg_cache_home: Option<&Path>,
+    home: Option<&Path>,
+    local_appdata: Option<&Path>,
+) -> PathBuf {
+    platform_cache_root_from(xdg_cache_home, home, local_appdata).join(LOCAL_INDEX_V1_DIRNAME)
 }
 
 fn archive_identity(archive: &Path) -> ArchiveIdentity {

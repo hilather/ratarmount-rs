@@ -19,6 +19,7 @@ mod mem;
 mod meta_cache;
 mod nested;
 mod patch;
+mod payload_cache;
 mod search;
 
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
@@ -28,7 +29,7 @@ pub use hashing::{
 };
 pub use local_cache::{
     enforce_local_index_budget_if_path, find_existing_user_cache_index, is_local_index_cache_path,
-    local_index_v1_dir, resolve_user_cache_index_location, LocalIndexCache,
+    local_index_v1_dir, platform_cache_root, resolve_user_cache_index_location, LocalIndexCache,
     LOCAL_INDEX_CACHE_BYTES_DEFAULT, LOCAL_INDEX_CACHE_BYTES_ENV, LOCAL_INDEX_DIR_ENV,
 };
 pub use location::{
@@ -49,6 +50,11 @@ pub use location::{
 pub use meta_cache::{
     cache_identity, invalidate_meta_cache_file, invalidate_meta_cache_identity, is_meta_cache_path,
     MetaCache, META_CACHE_BYTES_DEFAULT, META_CACHE_BYTES_ENV, META_SIDECAR_WHOLE_MAX,
+};
+pub use payload_cache::{
+    is_payload_cache_path, payload_v1_dir, PayloadCache, PAYLOAD_CACHE_BYTES_DEFAULT,
+    PAYLOAD_CACHE_BYTES_ENV, PAYLOAD_CACHE_DIR_ENV, PAYLOAD_CACHE_MEMBER_MAX_DEFAULT,
+    PAYLOAD_CACHE_MEMBER_MAX_ENV,
 };
 pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 

@@ -24,6 +24,12 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | SevenZip BCJ2 + stream pack/AES + meta-only encrypt | yes | yes | `[x]` |
 | SquashFS | yes | yes (backhand in-process; xz via xz2; unsquashfs for classic lzma) | `[x]` / `~` classic lzma fallback |
 | EXT4 / FAT images | yes | EXT4 pure (`ext4-view`) + debugfs fallback; FAT pure | `[x]` EXT4 pure path |
+| GPT/MBR partitioned disks | guestfish | factory `Block` after FAT/exFAT/NTFS; `/p1/`… via FAT/EXT4 offset; LVM residual | `[x]` / `~` LVM/RAID/Btrfs |
+| Apple UDIF `.dmg` | no | factory `Dmg`: `koly` + inner FAT/ISO/exFAT/NTFS; **HFS+/APFS/encrypted residual** | `[x]` / `~` HFS+/APFS |
+| QCOW2 | guestfish / qemu-nbd | factory `Qcow2`: v2/v3 zlib + local backing then block `pN/`; zstd/HTTP residual | `[x]` / `~` zstd/HTTP |
+| VHD / VHDX | guestfish | factory `Vhd`: fixed+dynamic VHD, VHDX fixed; wraps block `pN/`; differencing residual | `[x]` / `~` differencing |
+| VMDK | guestfish | factory `Vmdk`: KDMV sparse → Block/FAT/EXT4; compressed/ESXi residual | `[x]` / `~` compressed/ESXi |
+| exFAT / NTFS / UDF | guestfish | factory `Exfat`/`Ntfs`/`Udf` (Udf immediately before Iso); NTFS LZNT1/EFS residual | `[x]` / `~` LZNT1/EFS, UDF metadata partition |
 | SQLAR | yes | unencrypted + encrypt detect; sqlcipher feature optional | `~` feature-gated decrypt |
 | ASAR | yes | yes (stencil) | `[x]` |
 | PDF / OGG / HTML | yes | PDF attachments + XObject images (JPEG/JP2/Flate PNG, CMYK, Indexed, ICCBased); OGG; HTML | `[x]` / `~` Separation/Lab residual |
@@ -49,7 +55,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 |------------|--------|------|--------|
 | Folder bind mount | yes | yes | `[x]` |
 | Union of multiple sources | yes | yes + folder cache (depth/entries/timeout) | `[x]` |
-| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/SquashFS(non-LZMA)/EXT4(pure) + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
+| AutoMount recursive (`-r`) | yes | nested no-tmp for TAR/ZIP/7z/`.tar.gz`/CPIO/AR/ISO/UDF/WARC/ASAR/XAR/CAB·MSZIP/SQLAR/FAT/exFAT/NTFS/SquashFS(non-LZMA)/EXT4(pure)/GPT·MBR/DMG/WIM/QCOW2/VHD/VMDK + TAR flatten; eager same-dir parallel nested opens (FR-6 / #80, `--parallel-nested`); default recursive includes `.sqfs`/`.snap`; see [`embedded-nested-archives.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/embedded-nested-archives.md) | `[x]` / `~` CAB LZX, classic SquashFS LZMA, pure-fail EXT4, RAR nested still spool |
 | Write overlay (`-w` / `:temp:`) | yes | yes (missing uncompressed `.tar` / `.tar.zst` created as an empty archive) | `~` |
 | `--commit-overlay` into archive | yes | yes (uncompressed + gzip/bzip2/xz TAR via GNU tar; `.tar.zst` splice including earlier-frame delete; ZIP full rebuild). Create-if-missing for uncompressed `.tar` only. Live interval still rejects prefix-frame mutate. | `[x]` TAR compressions + ZIP MVP / residual live earlier-frame |
 | Live `--commit-overlay-on-exit` / `--interval` | no | uncompressed TAR + `.tar.zst` last-frame rewrite (does not recompress the prefix; persist still copies the compressed prefix; on-disk sidecar patched so remount does not rescan prefix frames; `:memory:` still full-rebuild; 2× compressed disk headroom; never refuse on size; warn when last-frame uncompressed > 64 MiB). Same create-if-missing as `-w`. Interval is a per-file settle time (idle host mtime ≥ `DURATION` and no open write fd), not a dump of every overlay file. Gzip stays rejected. | `[x]` Rust-only / residual earlier-frame delete |
@@ -68,7 +74,7 @@ Check items off as they land; keep allowlists and `README` status table in sync.
 | NFSv4.1 userspace export | no | yes (`embednfs` 0.4.1, `--nfs --nfs-vers 4`; Linux/macOS packages compile `nfsv4`; source `--features nfsv4`, rustc ≥ 1.88; lookup/read/readdir + `-w` overlay writes including rename/symlink) | `~` / Linux kernel client **verified** (privileged Docker loopback `test-harness/nfs-docker`, 2026-08-15; not default CI); no Kerberos/LAN/Windows; no v3/v4 mux; idle-TTL-not-CLOSE; embednfs macOS-first |
 | HTTP GET/HEAD export (`--http`) | no | yes (`127.0.0.1:20491`; Range 206; fill-loop) | `[x]` Rust-only |
 | WebDAV export (`--webdav`) | no | PROPFIND Depth 0/1 + GET; PUT/DELETE/MKCOL/MOVE/COPY with `-w`; LOCK/UNLOCK; PROPPATCH; Basic env | `[x]` / mux residual |
-| SMB 2.0.2 export (`--smb`) | no | userspace 2.0.2 subset; guest `smbclient -N` unsigned; NTLMv2 + signing when password set | `~` encrypt / 3.1.1 / Finder residual |
+| SMB 2.0.2 / 3.1.1 export (`--smb`) | no | userspace subset; guest `smbclient -N` unsigned; NTLMv2 + signing when password set; 3.1.1 preauth + optional GCM/CCM encrypt; leases + durable-handle-v1 | `[x]` / Finder not CI; Kerberos/guest encrypt/WAN residual |
 | 9P2000.L TCP (`--ninep`) | no | TCP `trans=tcp` port 20493; writes need `-w` | `[x]` / virtio residual |
 | SFTP export (`--sftp`) | no | TCP `:20222` + `--sftp-subsystem` stdio; password env; `--features sftp-russh` (packages on; default CI off; russh MSRV 1.85) | `[x]` / russh feature note |
 | Daemonize / foreground | yes | yes | `[x]` |
@@ -166,7 +172,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 | Makefile release/install | `[x]` |
 | Daemonize default | `[x]` |
 | AppImage / distro packages | `~` `packaging/build-appimage.sh` + desktop; needs linuxdeploy host |
-| crates.io library publish policy | `[x]` documented [`docs/crates-io-policy.md`](crates-io-policy.md) (no crates.io publish required for dual-run) |
+| crates.io library publish policy | `[x]` documented [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (Q5=a dry-run only; [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh); no crates.io publish required for dual-run) |
 | Pure FUSE ABI (Annex A) | `[ ]` deferred; fuser stays product path |
 | GitHub CI (fmt/clippy/test) | `[x]` `.github/workflows/ci.yml` |
 | GitHub CI FUSE allowlist suite | `[x]` (fixtures from mxmlnkn/ratarmount) |
@@ -192,7 +198,7 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 13. ~~**ASAR**~~ — stencil `ASARMountSource`; harness `phase9-asar`.  
 14. ~~**OGG / HTML / PDF / Git / zlib**~~ — OGG demux; HTML data-URLs; PDF attachments; Git via git2; zlib seekable.  
 15. ~~**Mount options CLI parity**~~ — high-impact flags: password-file, recursive-extensions, transform, disable-union, no-recreate-index, gnu-incremental, color, oss-attributions; matrix: [`docs/mount-options-parity.md`](mount-options-parity.md).  
-16. **Phase 12** dual-run announce → Rust primary — **docs ready** (not announced): [`docs/phase12-dual-run.md`](phase12-dual-run.md) runbook + paste-ready notes; maintainer still must tag, publish packages, set deprecation date. crates.io not required: [`docs/crates-io-policy.md`](crates-io-policy.md).
+16. **Phase 12** dual-run announce → Rust primary — **docs ready** (not announced): [`docs/phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md) runbook + paste-ready notes; maintainer still must tag, publish packages, set deprecation date. crates.io not required: [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md).
 
 ---
 
@@ -205,7 +211,8 @@ Wrappers: `run-fixed-archive-subset.sh` (`RUN=1`), `run-index-interop.sh` (Py↔
 - **Upstream feature requests:** [`docs/tasks/upstream-feature-requests.md`](tasks/upstream-feature-requests.md) (mxmlnkn/ratarmount issues → implementable FR list)
 - **Upstream bugs inspected + fixed (2026-07-28):** [`docs/tasks/upstream-bugs-inspection.md`](tasks/upstream-bugs-inspection.md) / [`upstream-bug-fix-batch.md`](tasks/upstream-bug-fix-batch.md) — **B-4** union dir>symlink, **B-8** sparse>8GiB test, **B-10** dumpdir delete MVP, **B-119** index-min-count, **B-2** lazy-recursive docs. Optional residual: multi-archive GNU incremental `.snar` union
 - **Phase 12 dual-run:** [`docs/phase12-dual-run.md`](phase12-dual-run.md)
-- **crates.io policy:** [`docs/crates-io-policy.md`](crates-io-policy.md)
+- **crates.io policy:** [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (F-10 dry-run; dual-run still not blocked)
 - **Gap batches:** [`docs/tasks/gap-implementation-batch.md`](tasks/gap-implementation-batch.md)
-- **Beyond-parity roadmap (2026-08-23, leftover close-out 2026-08-24):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed; **P-6** / **P-10** `done`; **P-2** stays `partial` (encrypt / 3.1.1 / Finder). **F-2** incremental reindex, **F-3** locate, and **G-2** portable index are `done` (HTTP/S3/GCS/Azure sibling GET of pointer then blob then well-known; residual object-store PUT is F-7). Remaining F-5..F-10, G-3..G-5. Inbound: [`phase10-remote.md`](phase10-remote.md). Outbound: [`export.md`](export.md) + [`nfs-export.md`](nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
+- **Beyond-parity roadmap (2026-08-23, leftover close-out 2026-08-24):** [`docs/tasks/beyond-parity-roadmap.md`](tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed; **P-6** / **P-10** `done`; **P-2** stays `partial` (encrypt / 3.1.1 / Finder). **F-2** incremental reindex, **F-3** locate, and **G-2** portable index are `done` (HTTP/S3/GCS/Azure sibling GET of pointer then blob then well-known; residual object-store PUT is F-7). Remaining F-5..F-10, G-3..G-4; **G-5** `partial` (systemd/autofs helper; CSI spec-only). Inbound: [`phase10-remote.md`](phase10-remote.md). Outbound: [`export.md`](export.md) + [`nfs-export.md`](nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
+- **Beyond-parity roadmap (2026-08-23, leftover close-out 2026-08-24):** [`docs/tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) — P-1–P-10 / F-1 / F-4 / G-1 booleans landed; **P-6** / **P-10** / **P-2** `done` (SMB leases + 3.1.1 preauth/encrypt; Finder not CI). **F-2** incremental reindex, **F-3** locate, and **G-2** portable index are `done` (HTTP/S3/GCS/Azure sibling GET of pointer then blob then well-known; residual object-store PUT is F-7). Remaining F-5..F-10, G-3..G-5. Inbound: [`phase10-remote.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase10-remote.md). Outbound: [`export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md) + [`nfs-export.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md). gzip/rapidgzip thruput and Phase 12 announce stay residual / ops.
 - **Tier D rapidgzip perf residual:** [`docs/tasks/rapidgzip-perf-batch.md`](tasks/rapidgzip-perf-batch.md) (P1–P5 done) · post-batch [`docs/tasks/rapidgzip-residual-batch.md`](tasks/rapidgzip-residual-batch.md) (R1–R5) · decision residual split in [`docs/gzip-binding-decision.md`](gzip-binding-decision.md)

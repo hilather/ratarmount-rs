@@ -2,9 +2,20 @@
 
 In-process embedder contract for [ratarmount-rs](https://github.com/hilather/ratarmount-rs). Desktop GUIs and other hosts browse, search, preview, and extract archives **without FUSE** and **without importing the `ratarmount` binary crate**.
 
-This crate is the **supported embedder surface**. Path-depend it (`ratarmount-session = { path = "…" }`). It is **not** published on crates.io in this slice. Never treat the `ratarmount` binary crate as a library.
+This crate is the **supported embedder surface**. Path-depend it (`ratarmount-session = { path = "…" }`). It is **not** published on crates.io until a freeze review (Q5=a dry-run only). Never treat the `ratarmount` binary crate as a library.
 
-Related: [`docs/tasks/gui-embedder-support.md`](tasks/gui-embedder-support.md), [`docs/crates-io-policy.md`](crates-io-policy.md) (L3.5).
+Related: [`docs/tasks/gui-embedder-support.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/gui-embedder-support.md), [`docs/crates-io-policy.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/crates-io-policy.md) (L3.5).
+
+## crates.io status
+
+| Item | Status |
+|------|--------|
+| Path-depend | **required** for embedders (`ratarmount-session = { path = "…" }`) |
+| crates.io | **not published**. L3.5 first publish waits on a freeze review. Dual-run does **not** wait ([`phase12-dual-run.md`](https://github.com/hilather/ratarmount-rs/blob/main/docs/phase12-dual-run.md)). |
+| L0 dry-run | [`packaging/test-crates-io-dry-run.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/test-crates-io-dry-run.sh) — `cargo publish -p ratarmount-core --dry-run` and index. **No live publish** (Q5=a). |
+| Binary crate | **never** the embedder library |
+| PyO3 `ratar://` | Open Question (Q2); not in session default features |
+| G7.3 keep-green | `cargo test -p ratarmount-session --lib index_job_sidecar_python_07` · [`test-harness/run-indexjob-python-interop.sh`](https://github.com/hilather/ratarmount-rs/blob/main/test-harness/run-indexjob-python-interop.sh) |
 
 ## Status (this slice)
 

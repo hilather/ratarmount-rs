@@ -1,0 +1,19 @@
+[package]
+name = "ratarmount-formats-vhd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "VHD/VHDX virtual-disk mount source (wraps GPT/MBR BlockMountSource)"
+readme = "README.md"
+
+[dependencies]
+ratarmount-core.workspace = true
+ratarmount-formats-block.workspace = true
+ratarmount-formats-ext4.workspace = true
+ratarmount-formats-fat.workspace = true
+thiserror.workspace = true
+log.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+fatfs = "0.3"

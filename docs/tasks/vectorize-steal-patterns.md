@@ -113,14 +113,14 @@ Suggested order: **V-1** (finish cheap find) → **V-2** (snapshot index; unbloc
 - Range readers: HTTP, S3, GCS, Azure, SSH, OCI blob, IPFS gateway.
 - Remote folder listing TTL (`RATARMOUNT_REMOTE_LIST_TTL_SECS`, 30s).
 - Local sibling index discovery; OCI `{digest}` cache then referrer (G-2).
-- G-3 **content-addressed member cache** is `todo` (decompressed chunks by hash). Different layer — payload, not metadata I/O.
+- G-3 **content-addressed member cache** is `done` (`payload-v1/` sibling of `local-index-v1/` under `platform_cache_root()`; CDC residual). Different layer — payload, not metadata I/O. See [beyond-parity-roadmap.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/tasks/beyond-parity-roadmap.md) **G-3**.
 
 **Still open / landed:**
 
 - [x] Process-local LRU (`$XDG_CACHE_HOME/ratarmount/meta-v3/`, `RATARMOUNT_META_CACHE_BYTES` default 256 MiB, `=0` disables) keyed by canonical **backend+url** (etag is a header, **not** the lookup key) for whole SQLite sidecar downloads ≤ 64 MiB (`fetch_index_http`). A remount without `.ptr` still hits.
 - [ ] SQLite page / Range pager over index URLs; standalone RGZI/GZIDX **files** next to the archive (sidecar-internal `zstdblocks` / `bzip2blocks` / `nestedindexes` come along with the blob)
 - [x] Skip on `file://` and `:memory:` indexes (and local `path_is_nonempty_file`).
-- [x] Do **not** cache uncompressed member bodies here (that is G-3, still `todo`).
+- [x] Do **not** cache uncompressed member bodies here (that is G-3, `payload-v1/`).
 - [x] Regression: second fake-HTTP remount of a well-known sidecar does not GET again; corrupting the cached blob fails closed to refetch; pointer etag mismatch GETs once.
 - [x] Bench: `VECTOR_REMOTE=1 ./benchmarks/compare-vector-wave.sh` local HTTP fixture (sidecar GET count).
 
