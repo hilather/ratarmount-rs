@@ -13,13 +13,15 @@ use std::time::{Duration, Instant};
 use ratarmount_compositing::{
     classify_createable_archive, maybe_create_empty_write_archive, maybe_wrap_payload_cache,
     patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome, EmptyArchiveKind,
-    EmptyCreateOutcome, OverlayError, WriteOverlay,
+    EmptyCreateOutcome, OverlayError, RemoteDownload, RemoteObjectHead, RemotePublishError,
+    RemotePublishRequest, WriteOverlay,
 };
 use ratarmount_compress::{
     detect_compression, open_seekable_zstd_with_threads, scan_zstd_frames_path, CompressionFormat,
 };
 use ratarmount_core::{MountSource, OpenOptions};
 use ratarmount_formats_tar::SqliteIndexedTar;
+use ratarmount_index::{index_pointer_to_json, IndexPointer, SqliteIndex, META_SIDECAR_WHOLE_MAX};
 use ratarmount_nfs::NfsStop;
 
 /// Warn when the last zstd frame's uncompressed size exceeds this.
@@ -133,6 +135,8 @@ pub fn spawn_interval_commits(
     // after its last host mtime, not up to 2× interval later. The settle
     // threshold is still `interval` (only idle files are persisted).
     let poll = Duration::from_secs(1).min(interval);
+    let remote_kind = live_remote_kind(&archive.to_string_lossy());
+    let remote_url = archive.to_string_lossy().into_owned();
     thread::Builder::new()
         .name("ratarmount-overlay-commit".into())
         .spawn(move || loop {
@@ -148,10 +152,18 @@ pub fn spawn_interval_commits(
             }
             let ov = Arc::clone(&overlay);
             match overlay.enqueue_commit(&archive, CommitKind::IntervalIdle(interval), |p| {
-                if let Some(window) = ov.last_patch_window() {
-                    patch_sidecar_if_present(p, &window, &opts)?;
+                match remote_kind {
+                    // Reopen is the URL only. Patch ran inside publish.
+                    LiveRemote::S3 => reopen_s3_mount(&remote_url, &opts),
+                    LiveRemote::Gcs => reopen_gcs_mount(&remote_url, &opts),
+                    LiveRemote::Azure => reopen_azure_mount(&remote_url, &opts),
+                    LiveRemote::Local => {
+                        if let Some(window) = ov.last_patch_window() {
+                            patch_sidecar_if_present(p, &window, &opts)?;
+                        }
+                        reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
+                    }
                 }
-                reopen_live_archive(p, &opts).map_err(OverlayError::Msg)
             }) {
                 Ok(CommitOutcome::DidWork) => log::info!(
                     "interval overlay commit wrote idle files into {}",
@@ -198,7 +210,7 @@ pub fn apply_live_commit(
             Ok(_) => false,
             Err(e) => return Err(e.to_string()),
         };
-        if did {
+        if did && !remote_publish_patches_sidecar(live_remote_kind(&archive.to_string_lossy())) {
             if let Some(window) = overlay.last_patch_window() {
                 patch_sidecar_if_present(archive, &window, opts).map_err(|e| e.to_string())?;
             }
@@ -361,6 +373,20 @@ pub fn validate_live_commit_args(
         );
     }
     let archive = inputs[0].clone();
+    let shown = archive.to_string_lossy();
+    if matches!(
+        live_remote_kind(&shown),
+        LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure
+    ) {
+        if !live_commit_archive_name(&shown) {
+            return Err(format!(
+                "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
+                archive.display()
+            ));
+        }
+        // Do not create the key and do not stat it as a local file.
+        return Ok(archive);
+    }
     if !archive.is_file() {
         return Err(format!(
             "live overlay commit requires an uncompressed TAR or .tar.zst file (got {})",
@@ -370,6 +396,703 @@ pub fn validate_live_commit_args(
     ratarmount_compositing::live_commit_is_supported(&archive).map_err(|e| e.to_string())?;
     maybe_warn_large_zstd_last_frame(&archive);
     Ok(archive)
+}
+
+/// Offline `--commit-overlay` on an object-store URL. Not a live-queue job.
+pub fn offline_remote_commit_error(archive: &Path) -> Option<&'static str> {
+    let s = archive.to_string_lossy();
+    if ratarmount_remote::is_object_store_archive_url(&s) {
+        Some(
+            "offline --commit-overlay does not upload; use --commit-overlay-on-exit or --commit-overlay-interval",
+        )
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum LiveRemote {
+    Local,
+    S3,
+    Gcs,
+    Azure,
+}
+
+fn live_remote_kind(url: &str) -> LiveRemote {
+    if url.starts_with("s3://") {
+        LiveRemote::S3
+    } else if url.starts_with("gs://") {
+        LiveRemote::Gcs
+    } else if url.starts_with("az://") || url.starts_with("azure://") {
+        LiveRemote::Azure
+    } else {
+        LiveRemote::Local
+    }
+}
+
+fn remote_publish_patches_sidecar(kind: LiveRemote) -> bool {
+    matches!(kind, LiveRemote::S3 | LiveRemote::Gcs | LiveRemote::Azure)
+}
+
+fn live_commit_archive_name(url: &str) -> bool {
+    let lower = url.trim().to_ascii_lowercase();
+    lower.ends_with(".tar")
+        || lower.ends_with(".tar.zst")
+        || lower.ends_with(".tzst")
+        || lower.ends_with(".tar.zstd")
+}
+
+/// Wire one `s3://` archive into the live queue. `-w` is not decided here.
+pub fn install_s3_live_commit(overlay: &WriteOverlay, archive: &Path, opts: &OpenOptions) {
+    let url_head = archive.to_string_lossy().into_owned();
+    let url_dl = url_head.clone();
+    let url_pub = url_head.clone();
+    let url_label = url_pub.clone();
+    let opts_pub = opts.clone();
+    overlay.install_remote_live_commit_for(
+        &url_label,
+        Box::new(move || {
+            let head = ratarmount_remote::head_s3_object(&url_head)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            Ok(RemoteObjectHead {
+                etag: head.etag,
+                len: head.len,
+            })
+        }),
+        Box::new(move || {
+            let loc = ratarmount_remote::parse_s3_url(&url_dl)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            let (file, len) = ratarmount_remote::fetch_s3_location_to_temp_prefer_range(&loc, None)
+                .map_err(|e| OverlayError::Msg(e.to_string()))?;
+            Ok(RemoteDownload { file, len })
+        }),
+        Box::new(move |req| publish_s3(&url_pub, &opts_pub, req)),
+        ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
+    );
+}
+
+/// Wire one object-store archive into the live queue. Local paths are unchanged.
+/// The `gs://` arm calls [`publish_gcs`]. The `az://` arm calls [`publish_azure`].
+/// `-w` is not decided here.
+pub fn install_object_store_live_commit(
+    overlay: &WriteOverlay,
+    archive: &Path,
+    opts: &OpenOptions,
+) {
+    let url = archive.to_string_lossy().into_owned();
+    match live_remote_kind(&url) {
+        LiveRemote::Local => {}
+        LiveRemote::S3 => install_s3_live_commit(overlay, archive, opts),
+        LiveRemote::Gcs => {
+            let url_head = url.clone();
+            let url_dl = url.clone();
+            let url_pub = url;
+            let url_label = url_pub.clone();
+            let opts_pub = opts.clone();
+            overlay.install_remote_live_commit_for(
+                &url_label,
+                Box::new(move || {
+                    let head = ratarmount_remote::head_gcs_object(&url_head)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteObjectHead {
+                        etag: head.etag,
+                        len: head.len,
+                    })
+                }),
+                Box::new(move || {
+                    let loc = ratarmount_remote::parse_gcs_url(&url_dl)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    let (file, len) =
+                        ratarmount_remote::fetch_gcs_location_to_temp_prefer_range(&loc, None)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteDownload { file, len })
+                }),
+                Box::new(move |req| publish_gcs(&url_pub, &opts_pub, req)),
+                ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
+            );
+        }
+        LiveRemote::Azure => {
+            let url_head = url.clone();
+            let url_dl = url.clone();
+            let url_pub = url;
+            let url_label = url_pub.clone();
+            let opts_pub = opts.clone();
+            overlay.install_remote_live_commit_for(
+                &url_label,
+                Box::new(move || {
+                    let head = ratarmount_remote::head_azure_object(&url_head)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteObjectHead {
+                        etag: head.etag,
+                        len: head.len,
+                    })
+                }),
+                Box::new(move || {
+                    let loc = ratarmount_remote::parse_azure_url(&url_dl)
+                        .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    let (file, len) =
+                        ratarmount_remote::fetch_azure_location_to_temp_prefer_range(&loc, None)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?;
+                    Ok(RemoteDownload { file, len })
+                }),
+                Box::new(move |req| publish_azure(&url_pub, &opts_pub, req)),
+                ratarmount_remote::OBJECT_STORE_IO_TIMEOUT,
+            );
+        }
+    }
+}
+
+const S3_PUT_SINGLE_MAX: u64 = 8 * 1024 * 1024;
+
+/// `ensure_s3_write_ok` formats `{op} HTTP 412 precondition failed: {body}`.
+/// The first ` HTTP ` status is the code. A 500 body that mentions 412 stays retryable.
+fn is_s3_http_412(msg: &str) -> bool {
+    match msg.find(" HTTP ") {
+        Some(i) => msg[i + " HTTP ".len()..].starts_with("412"),
+        None => false,
+    }
+}
+
+fn map_s3_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
+    let msg = err.to_string();
+    if is_s3_http_412(&msg) {
+        RemotePublishError::EtagMismatch(msg)
+    } else {
+        RemotePublishError::Retryable(msg)
+    }
+}
+
+const SIDECAR_NOT_REBUILT: &str =
+    "sidecar file table was not rebuilt from the uploaded spool; leaving the previous pointer";
+
+fn tarstats_hex_eq(stored: Option<&str>, got: &str) -> bool {
+    match stored.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(want) => !got.trim().is_empty() && want.eq_ignore_ascii_case(got.trim()),
+        None => false,
+    }
+}
+
+/// Partial windows keep file-table rows from the mount. Those rows describe the
+/// pre-splice spool only when size, prefix, and suffix match, and the full hash
+/// matches when the sidecar stored one. `window_start == 0` rebuilds every row.
+/// Missing tarstats is a refusal.
+fn sidecar_file_table_rebuilt_for_upload(
+    sidecar: &Path,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    if req.window.window_start == 0 {
+        return Ok(());
+    }
+    let idx = SqliteIndex::open_read_only(sidecar)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let Some(stats) = idx
+        .tarstats()
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
+    else {
+        return Err(RemotePublishError::Retryable(SIDECAR_NOT_REBUILT.into()));
+    };
+    let full_ok = match stats.full_sha256.as_deref() {
+        Some(stored) => tarstats_hex_eq(Some(stored), &req.presplice_sha256),
+        None => true,
+    };
+    if stats.st_size == req.presplice_len
+        && tarstats_hex_eq(
+            stats.prefix512_sha256.as_deref(),
+            &req.presplice_prefix512_sha256,
+        )
+        && tarstats_hex_eq(
+            stats.suffix512_sha256.as_deref(),
+            &req.presplice_suffix512_sha256,
+        )
+        && full_ok
+    {
+        Ok(())
+    } else {
+        Err(RemotePublishError::Retryable(SIDECAR_NOT_REBUILT.into()))
+    }
+}
+
+/// The file-table check runs before the object PUT. A refusal leaves the
+/// previous pointer unstamped. When the object already contains the splice,
+/// the error is [`RemotePublishError::PointerRefused`] so the caller forgets
+/// the stashed plan and a remount does not append those members again.
+fn publish_s3(
+    url: &str,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    let loc = ratarmount_remote::parse_s3_url(url)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let sidecar = sidecar_path_for_patch(Path::new(url), opts);
+    if let Some(ref path) = sidecar {
+        if let Err(e) = sidecar_file_table_rebuilt_for_upload(path, req) {
+            let msg = e.to_string();
+            return Err(if req.skip_object_put {
+                RemotePublishError::PointerRefused(msg)
+            } else {
+                RemotePublishError::Retryable(msg)
+            });
+        }
+    }
+    if req.skip_object_put {
+        log::info!(
+            "s3 live commit object already matches the spliced spool; not uploading it again"
+        );
+    } else {
+        let len = std::fs::metadata(&req.staged)
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?
+            .len();
+        let etag = req.etag_at_download.as_deref();
+        log::info!(
+            "s3 live commit uploading {len} bytes prefix={} etag={}",
+            req.prefix_compressed_bytes,
+            etag.unwrap_or("-")
+        );
+        let put = if len <= S3_PUT_SINGLE_MAX {
+            let body = std::fs::read(&req.staged)
+                .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+            ratarmount_remote::put_s3_object(&loc, &body, etag, Some("application/octet-stream"))
+        } else {
+            let copy = if req.prefix_compressed_bytes == 0 {
+                None
+            } else {
+                Some(req.prefix_compressed_bytes)
+            };
+            ratarmount_remote::put_s3_multipart(
+                &loc,
+                &req.staged,
+                copy,
+                etag,
+                Some("application/octet-stream"),
+            )
+        };
+        if let Err(e) = put {
+            return Err(map_s3_put(e));
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        return Err(RemotePublishError::PointerRefused(format!(
+            "incremental reindex failed after object replace: {e}"
+        )));
+    }
+    let blob_len = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
+    if blob_len > META_SIDECAR_WHOLE_MAX {
+        log::warn!(
+            "skipping s3 index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
+        );
+        return Ok(());
+    }
+    let pointer = match IndexPointer::for_blob(&sidecar, Some(&req.staged)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let json = match index_pointer_to_json(&pointer) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    match ratarmount_remote::put_s3_index_siblings(
+        &loc,
+        &pointer.index_id,
+        json.as_bytes(),
+        &sidecar,
+    ) {
+        Ok(ratarmount_remote::S3IndexSiblingPut::Uploaded) => {}
+        Ok(ratarmount_remote::S3IndexSiblingPut::Skipped { blob_len, limit }) => {
+            log::warn!("skipping s3 index sibling PUT for {url}: blob {blob_len} above {limit}");
+        }
+        Err(e) => {
+            log::warn!(
+                "s3 index pointer PUT failed after object replace for s3://{}/{}: {e}",
+                loc.bucket,
+                loc.key
+            );
+        }
+    }
+    Ok(())
+}
+
+fn map_gcs_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
+    let msg = err.to_string();
+    if is_s3_http_412(&msg) {
+        RemotePublishError::EtagMismatch(msg)
+    } else {
+        RemotePublishError::Retryable(msg)
+    }
+}
+
+fn gcs_index_locations(
+    archive: &ratarmount_remote::GcsLocation,
+    index_id: &str,
+) -> std::result::Result<
+    (
+        ratarmount_remote::GcsLocation,
+        ratarmount_remote::GcsLocation,
+    ),
+    String,
+> {
+    let id = index_id.trim().to_ascii_lowercase();
+    if id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "index_id must be 64 lowercase hex, not {index_id:?}"
+        ));
+    }
+    let bucket = archive.bucket.clone();
+    Ok((
+        ratarmount_remote::GcsLocation {
+            bucket: bucket.clone(),
+            object: format!("{}.index.{id}.sqlite", archive.object),
+        },
+        ratarmount_remote::GcsLocation {
+            bucket,
+            object: format!("{}.index.ptr", archive.object),
+        },
+    ))
+}
+
+/// Same order as [`publish_s3`]: file-table check, object PUT, patch, `for_blob`,
+/// blob PUT, pointer PUT. One PUT, no multipart, no well-known key. A failed
+/// object PUT is retryable and does not disable the interval.
+fn publish_gcs(
+    url: &str,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    let loc = ratarmount_remote::parse_gcs_url(url)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let sidecar = sidecar_path_for_patch(Path::new(url), opts);
+    if let Some(ref path) = sidecar {
+        if let Err(e) = sidecar_file_table_rebuilt_for_upload(path, req) {
+            let msg = e.to_string();
+            return Err(if req.skip_object_put {
+                RemotePublishError::PointerRefused(msg)
+            } else {
+                RemotePublishError::Retryable(msg)
+            });
+        }
+    }
+    if req.skip_object_put {
+        log::info!(
+            "gcs live commit object already matches the spliced spool; not uploading it again"
+        );
+    } else {
+        let len = std::fs::metadata(&req.staged)
+            .map(|m| m.len())
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+        log::info!(
+            "gcs live commit uploading {len} bytes prefix={}",
+            req.prefix_compressed_bytes
+        );
+        if let Err(e) =
+            ratarmount_remote::put_gcs_file(&loc, &req.staged, "application/octet-stream")
+        {
+            return Err(map_gcs_put(e));
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        return Err(RemotePublishError::PointerRefused(format!(
+            "incremental reindex failed after object replace: {e}"
+        )));
+    }
+    let blob_len = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
+    if blob_len > META_SIDECAR_WHOLE_MAX {
+        log::warn!(
+            "skipping gcs index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
+        );
+        return Ok(());
+    }
+    let pointer = match IndexPointer::for_blob(&sidecar, Some(&req.staged)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let json = match index_pointer_to_json(&pointer) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let (blob_loc, ptr_loc) = match gcs_index_locations(&loc, &pointer.index_id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let blob = match std::fs::read(&sidecar) {
+        Ok(b) => b,
+        Err(e) => {
+            log::warn!("gcs index blob read failed after object replace: {e}");
+            return Ok(());
+        }
+    };
+    if let Err(e) = ratarmount_remote::put_gcs_object(
+        &blob_loc,
+        &blob,
+        ratarmount_remote::OCI_INDEX_ARTIFACT_TYPE,
+    ) {
+        log::warn!(
+            "gcs index blob PUT failed after object replace for gs://{}/{}: {e}",
+            loc.bucket,
+            loc.object
+        );
+        return Ok(());
+    }
+    if let Err(e) = ratarmount_remote::put_gcs_object(&ptr_loc, json.as_bytes(), "application/json")
+    {
+        log::warn!(
+            "gcs index pointer PUT failed after object replace for gs://{}/{}: {e}",
+            loc.bucket,
+            loc.object
+        );
+    }
+    Ok(())
+}
+
+fn map_azure_put(err: ratarmount_remote::RemoteError) -> RemotePublishError {
+    let msg = err.to_string();
+    if is_s3_http_412(&msg) {
+        RemotePublishError::EtagMismatch(msg)
+    } else {
+        RemotePublishError::Retryable(msg)
+    }
+}
+
+fn azure_index_locations(
+    archive: &ratarmount_remote::AzureLocation,
+    index_id: &str,
+) -> std::result::Result<
+    (
+        ratarmount_remote::AzureLocation,
+        ratarmount_remote::AzureLocation,
+    ),
+    String,
+> {
+    let id = index_id.trim().to_ascii_lowercase();
+    if id.len() != 64 || !id.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err(format!(
+            "index_id must be 64 lowercase hex, not {index_id:?}"
+        ));
+    }
+    let container = archive.container.clone();
+    Ok((
+        ratarmount_remote::AzureLocation {
+            container: container.clone(),
+            blob: format!("{}.index.{id}.sqlite", archive.blob),
+        },
+        ratarmount_remote::AzureLocation {
+            container,
+            blob: format!("{}.index.ptr", archive.blob),
+        },
+    ))
+}
+
+/// Same order as [`publish_gcs`]: file-table check, object upload, patch,
+/// `for_blob`, blob PUT, pointer PUT. No well-known key. A failed block list
+/// is retryable: the caller does not forget the overlay and does not bump
+/// `commit_generation`, so the next attempt reuses the same block ids.
+fn publish_azure(
+    url: &str,
+    opts: &OpenOptions,
+    req: &RemotePublishRequest,
+) -> std::result::Result<(), RemotePublishError> {
+    let loc = ratarmount_remote::parse_azure_url(url)
+        .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+    let sidecar = sidecar_path_for_patch(Path::new(url), opts);
+    if let Some(ref path) = sidecar {
+        if let Err(e) = sidecar_file_table_rebuilt_for_upload(path, req) {
+            let msg = e.to_string();
+            return Err(if req.skip_object_put {
+                RemotePublishError::PointerRefused(msg)
+            } else {
+                RemotePublishError::Retryable(msg)
+            });
+        }
+    }
+    if req.skip_object_put {
+        log::info!(
+            "azure live commit object already matches the spliced spool; not uploading it again"
+        );
+    } else {
+        let len = std::fs::metadata(&req.staged)
+            .map(|m| m.len())
+            .map_err(|e| RemotePublishError::Retryable(e.to_string()))?;
+        log::info!(
+            "azure live commit uploading {len} bytes prefix={} generation={}",
+            req.prefix_compressed_bytes,
+            req.commit_generation
+        );
+        let if_match = req.etag_at_download.as_deref().filter(|s| !s.is_empty());
+        if let Err(e) = ratarmount_remote::put_azure_blocks(
+            &loc,
+            &req.staged,
+            "application/octet-stream",
+            req.commit_generation,
+            if_match,
+        ) {
+            return Err(map_azure_put(e));
+        }
+    }
+    let Some(sidecar) = sidecar else {
+        log::info!("incremental reindex skipped (no sidecar); rebuilding");
+        return Ok(());
+    };
+    if let Err(e) = patch_sidecar_if_present(&req.staged, &req.window, opts) {
+        return Err(RemotePublishError::PointerRefused(format!(
+            "incremental reindex failed after object replace: {e}"
+        )));
+    }
+    let blob_len = std::fs::metadata(&sidecar).map(|m| m.len()).unwrap_or(0);
+    if blob_len > META_SIDECAR_WHOLE_MAX {
+        log::warn!(
+            "skipping azure index pointer PUT for {url}: sidecar is {blob_len} bytes, above META_SIDECAR_WHOLE_MAX ({META_SIDECAR_WHOLE_MAX})"
+        );
+        return Ok(());
+    }
+    let pointer = match IndexPointer::for_blob(&sidecar, Some(&req.staged)) {
+        Ok(p) => p,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let json = match index_pointer_to_json(&pointer) {
+        Ok(j) => j,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    let (blob_loc, ptr_loc) = match azure_index_locations(&loc, &pointer.index_id) {
+        Ok(v) => v,
+        Err(e) => {
+            log::warn!("index pointer skipped ({e})");
+            return Ok(());
+        }
+    };
+    if let Err(e) = ratarmount_remote::put_azure_blocks(
+        &blob_loc,
+        &sidecar,
+        ratarmount_remote::OCI_INDEX_ARTIFACT_TYPE,
+        req.commit_generation,
+        None,
+    ) {
+        return Err(map_azure_put(e));
+    }
+    if let Err(e) = ratarmount_remote::put_azure_bytes(
+        &ptr_loc,
+        json.as_bytes(),
+        "application/json",
+        req.commit_generation,
+        None,
+    ) {
+        // Not Ok: a 400 here used to bump commit_generation and forget the overlay
+        // while the pointer stayed stale.
+        return Err(map_azure_put(e));
+    }
+    Ok(())
+}
+
+fn url_is_tar_zst(url: &str) -> bool {
+    let lower = url.to_ascii_lowercase();
+    lower.ends_with(".tar.zst") || lower.ends_with(".tzst") || lower.ends_with(".tar.zstd")
+}
+
+/// Reopen via [`ratarmount_remote::open_s3_range`] only. The spool path is not a mount.
+fn reopen_s3_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = ratarmount_remote::open_s3_range(url)
+        .map_err(|e| OverlayError::Msg(format!("reopen s3: {e}")))?;
+    let label = PathBuf::from(url);
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    if url_is_tar_zst(url) {
+        let threads = o.threads_for("zstd");
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range, threads, &label,
+        )
+        .map_err(|e| OverlayError::Msg(format!("reopen s3 zstd: {e}")))?;
+        let tar =
+            SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen s3 tar.zst: {e}")))?;
+        Ok(Arc::new(tar))
+    } else {
+        let tar =
+            SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen s3 tar: {e}")))?;
+        Ok(Arc::new(tar))
+    }
+}
+
+/// Reopen via [`ratarmount_remote::open_gcs_range`] only. The spool path is not a mount.
+fn reopen_gcs_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = ratarmount_remote::open_gcs_range(url)
+        .map_err(|e| OverlayError::Msg(format!("reopen gcs: {e}")))?;
+    let label = PathBuf::from(url);
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    if url_is_tar_zst(url) {
+        let threads = o.threads_for("zstd");
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range, threads, &label,
+        )
+        .map_err(|e| OverlayError::Msg(format!("reopen gcs zstd: {e}")))?;
+        let tar =
+            SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen gcs tar.zst: {e}")))?;
+        Ok(Arc::new(tar))
+    } else {
+        let tar =
+            SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen gcs tar: {e}")))?;
+        Ok(Arc::new(tar))
+    }
+}
+
+/// Reopen via [`ratarmount_remote::open_azure_range`] only. The spool path is not a mount.
+fn reopen_azure_mount(url: &str, opts: &OpenOptions) -> Result<Arc<dyn MountSource>, OverlayError> {
+    let range = ratarmount_remote::open_azure_range(url)
+        .map_err(|e| OverlayError::Msg(format!("reopen azure: {e}")))?;
+    let label = PathBuf::from(url);
+    let mut o = opts.clone();
+    o.index_in_memory = true;
+    o.index_file_path = None;
+    o.write_index = false;
+    if url_is_tar_zst(url) {
+        let threads = o.threads_for("zstd");
+        let body = ratarmount_compress::open_seekable_zstd_with_threads_from_reader(
+            range, threads, &label,
+        )
+        .map_err(|e| OverlayError::Msg(format!("reopen azure zstd: {e}")))?;
+        let tar =
+            SqliteIndexedTar::create_index_body(&label, body, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen azure tar.zst: {e}")))?;
+        Ok(Arc::new(tar))
+    } else {
+        let tar =
+            SqliteIndexedTar::open_from_reader(range, &label, None, &o, env!("CARGO_PKG_VERSION"))
+                .map_err(|e| OverlayError::Msg(format!("reopen azure tar: {e}")))?;
+        Ok(Arc::new(tar))
+    }
 }
 
 /// K4: warn once at startup; never refuse on size.
@@ -794,5 +1517,338 @@ mod tests {
             .expect("existing zstd");
         assert_eq!(got, EmptyCreateOutcome::Unchanged);
         assert_eq!(std::fs::read(&path).unwrap(), b"keep");
+    }
+
+    fn sha256_file(path: &std::path::Path) -> String {
+        let mut f = std::fs::File::open(path).unwrap();
+        ratarmount_index::sha256_hex_stream(&mut f).unwrap()
+    }
+
+    fn publish_req(
+        staged: &std::path::Path,
+        window_start: u64,
+        from_frame: Option<usize>,
+    ) -> RemotePublishRequest {
+        let (prefix, suffix) = ratarmount_index::archive_edge_hashes(staged).unwrap();
+        RemotePublishRequest {
+            staged: staged.to_path_buf(),
+            prefix_compressed_bytes: 0,
+            etag_at_download: Some("\"reget\"".into()),
+            window: ratarmount_compositing::IndexPatchWindow {
+                window_start,
+                from_frame,
+                offsets_shifted: window_start > 0,
+            },
+            skip_object_put: true,
+            presplice_len: std::fs::metadata(staged).unwrap().len(),
+            presplice_sha256: sha256_file(staged),
+            presplice_prefix512_sha256: prefix,
+            presplice_suffix512_sha256: suffix,
+            commit_generation: 0,
+        }
+    }
+
+    fn assert_publish_leaves_previous_pointer(
+        sidecar: &std::path::Path,
+        mount_len: u64,
+        req: &RemotePublishRequest,
+    ) {
+        let before = SqliteIndex::open_read_only(sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("mount tarstats");
+        assert_eq!(before.st_size, mount_len);
+        assert!(before.full_sha256.is_some());
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.to_path_buf()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, req).unwrap_err();
+        match err {
+            RemotePublishError::Retryable(ref msg)
+            | RemotePublishError::PointerRefused(ref msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            RemotePublishError::EtagMismatch(msg) => {
+                panic!("re-GET mismatch must not be an ETag failure: {msg}")
+            }
+        }
+        let after = SqliteIndex::open_read_only(sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("tarstats after refused publish");
+        assert_eq!(
+            after.st_size, before.st_size,
+            "tarstats must not be stamped"
+        );
+        assert_eq!(after.full_sha256, before.full_sha256);
+        assert_ne!(
+            after.full_sha256.as_deref().map(|s| s.to_ascii_lowercase()),
+            Some(req.presplice_sha256.to_ascii_lowercase()),
+            "stamp would record the re-GET, not the mounted generation"
+        );
+    }
+
+    /// Regression: uncompressed delete window is the mount's offset, not the re-GET.
+    #[test]
+    fn publish_refuses_stamp_when_reget_differs_uncompressed_delete() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mount.tar");
+        let keep = b"keep-mount\n";
+        let dropped = b"drop-mount\n";
+        let members = [
+            ratarmount_formats_tar::UstarMember {
+                path: "keep.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: keep },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+            ratarmount_formats_tar::UstarMember {
+                path: "drop.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: dropped },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        ];
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        std::fs::write(&mount, &tar).unwrap();
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let mut mat = None;
+            let _idx = SqliteIndexedTar::create_index(
+                &mount,
+                &mount,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut mat,
+            )
+            .expect("index mount tar");
+        }
+        let spool = dir.path().join("reget.tar");
+        let other = b"different-reget-bytes-not-the-mount\n";
+        let spool_members = [
+            ratarmount_formats_tar::UstarMember {
+                path: "keep.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+            ratarmount_formats_tar::UstarMember {
+                path: "drop.txt",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: other },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            },
+        ];
+        let mut spool_tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut spool_tar, &spool_members).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut spool_tar).unwrap();
+        std::fs::write(&spool, &spool_tar).unwrap();
+        let window_start = 512 + (keep.len() as u64).div_ceil(512) * 512;
+        assert!(window_start > 0);
+        let req = publish_req(&spool, window_start, None);
+        assert_publish_leaves_previous_pointer(
+            &sidecar,
+            std::fs::metadata(&mount).unwrap().len(),
+            &req,
+        );
+    }
+
+    /// Regression: .tar.zst prefix splice keeps rows before window_start from the mount.
+    #[test]
+    fn publish_refuses_stamp_when_reget_differs_tar_zst_splice() {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mount.tar.zst");
+        write_split_tar_zst(&mount, b"prefix-mount\n", b"last-mount\n");
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let body = open_seekable_zstd_with_threads(&mount, 1).expect("open zstd");
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let _idx =
+                SqliteIndexedTar::create_index_body(&mount, body, Some(&sidecar), &opts, "test")
+                    .expect("index mount tar.zst");
+        }
+        let map = scan_zstd_frames_path(&mount).unwrap();
+        assert!(
+            map.frames.len() >= 2,
+            "prefix-preserving splice needs two frames"
+        );
+        let window_start = map.frames[1].uncompressed_offset;
+        assert!(window_start > 0);
+        let spool = dir.path().join("reget.tar.zst");
+        write_split_tar_zst(
+            &spool,
+            b"prefix-reget-differs-from-mount\n",
+            b"last-reget-differs\n",
+        );
+        let req = publish_req(&spool, window_start, Some(1));
+        assert_publish_leaves_previous_pointer(
+            &sidecar,
+            std::fs::metadata(&mount).unwrap().len(),
+            &req,
+        );
+    }
+
+    fn ustar_archive(name: &str, payload: &[u8]) -> Vec<u8> {
+        let member = ratarmount_formats_tar::UstarMember {
+            path: name,
+            payload: ratarmount_formats_tar::UstarPayload::File { bytes: payload },
+            mode: 0o644,
+            uid: 0,
+            gid: 0,
+            mtime: 0,
+        };
+        let mut tar = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(&mut tar, &[member]).unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut tar).unwrap();
+        tar
+    }
+
+    /// Regression: same-size re-GET above the full-hash cap, prefix differs.
+    /// The pointer is not PUT and tarstats are not stamped.
+    #[test]
+    fn publish_refuses_same_size_reget_over_full_hash_cap() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload_len = ratarmount_index::TARSTATS_FULL_HASH_MAX as usize;
+        let payload = vec![b'A'; payload_len];
+        let mount_bytes = ustar_archive("aaaa.txt", &payload);
+        let mut reget_payload = payload.clone();
+        reget_payload[..512].fill(b'B');
+        let reget_bytes = ustar_archive("bbbb.txt", &reget_payload);
+        assert_eq!(mount_bytes.len(), reget_bytes.len());
+        assert!(mount_bytes.len() as u64 > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+        assert_ne!(&mount_bytes[..512], &reget_bytes[..512]);
+        let mount = dir.path().join("mount.tar");
+        let spool = dir.path().join("reget.tar");
+        std::fs::write(&mount, &mount_bytes).unwrap();
+        std::fs::write(&spool, &reget_bytes).unwrap();
+        let sidecar = dir.path().join("mount.index.sqlite");
+        {
+            let opts = OpenOptions {
+                write_index: true,
+                index_minimum_file_count: 0,
+                ..OpenOptions::default()
+            };
+            let mut mat = None;
+            let _idx = SqliteIndexedTar::create_index(
+                &mount,
+                &mount,
+                Some(&sidecar),
+                &opts,
+                "test",
+                &mut mat,
+            )
+            .expect("index large tar");
+        }
+        let before = SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .expect("edge tarstats");
+        assert!(before.st_size > ratarmount_index::TARSTATS_FULL_HASH_MAX);
+        assert!(before.full_sha256.is_none(), "above the full-hash cap");
+        assert!(before.prefix512_sha256.is_some());
+        assert!(before.suffix512_sha256.is_some());
+        let mut req = publish_req(&spool, 512, None);
+        req.skip_object_put = false;
+        assert_ne!(
+            before
+                .prefix512_sha256
+                .as_deref()
+                .map(|s| s.to_ascii_lowercase()),
+            Some(req.presplice_prefix512_sha256.to_ascii_lowercase())
+        );
+        let before_bytes = std::fs::read(&sidecar).unwrap();
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, &req).unwrap_err();
+        match err {
+            RemotePublishError::Retryable(msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            other => panic!("check runs before the object PUT: {other}"),
+        }
+        assert_eq!(
+            std::fs::read(&sidecar).unwrap(),
+            before_bytes,
+            "tarstats must not be stamped and the pointer sqlite is unchanged"
+        );
+    }
+
+    /// Regression: a partial window with no tarstats row is a refusal.
+    #[test]
+    fn publish_refuses_partial_window_when_tarstats_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("bare.index.sqlite");
+        {
+            let mut idx = SqliteIndex::create_writable(Some(&sidecar)).unwrap();
+            idx.publish_tmp().unwrap();
+        }
+        assert!(SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .is_none());
+        let spool = dir.path().join("reget.tar");
+        std::fs::write(&spool, ustar_archive("keep.txt", b"reget-bytes\n")).unwrap();
+        let req = publish_req(&spool, 512, None);
+        let opts = OpenOptions {
+            index_file_path: Some(sidecar.clone()),
+            index_in_memory: false,
+            ..OpenOptions::default()
+        };
+        let err = publish_s3("s3://bkt/data/a.tar", &opts, &req).unwrap_err();
+        match err {
+            RemotePublishError::PointerRefused(msg) => {
+                assert!(msg.contains("leaving the previous pointer"), "{msg}");
+            }
+            other => panic!("missing tarstats must refuse the pointer: {other}"),
+        }
+        assert!(SqliteIndex::open_read_only(&sidecar)
+            .unwrap()
+            .tarstats()
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn map_s3_put_matches_http_412_status_prefix_only() {
+        let mismatch = map_s3_put(ratarmount_remote::RemoteError::S3(
+            "PutObject HTTP 412 precondition failed: lost update".into(),
+        ));
+        assert!(
+            matches!(mismatch, RemotePublishError::EtagMismatch(_)),
+            "{mismatch}"
+        );
+        let retry = map_s3_put(ratarmount_remote::RemoteError::S3(
+            "PutObject HTTP 500: body mentions HTTP 412".into(),
+        ));
+        assert!(matches!(retry, RemotePublishError::Retryable(_)), "{retry}");
     }
 }
