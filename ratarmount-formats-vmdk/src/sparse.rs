@@ -378,12 +378,10 @@ pub fn load_grain_directory(
         guard.read_exact(&mut buf)?;
     }
     Ok(buf
-        .chunks_exact(4)
-        .map(|c| {
-            let mut b = [0u8; 4];
-            b.copy_from_slice(c);
-            u32::from_le_bytes(b)
-        })
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| u32::from_le_bytes(*c))
         .collect())
 }
 

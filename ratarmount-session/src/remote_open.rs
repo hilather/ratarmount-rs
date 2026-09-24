@@ -1595,7 +1595,7 @@ mod tests {
     /// Regression: S3 restic URLs are rejected (not silently accepted).
     #[test]
     fn restic_s3_residual_open_remote_input() {
-        let opts = OpenOptions {
+        let mut opts = OpenOptions {
             index_in_memory: true,
             write_index: false,
             ..OpenOptions::default()
@@ -1606,7 +1606,7 @@ mod tests {
             "restic:s3://bucket/repo",
             "restic:relative/path",
         ] {
-            let err = match open_remote_input(input, &opts, false, &mut remotes) {
+            let err = match open_remote_input(input, &mut opts, false, &mut remotes) {
                 Err(e) => e,
                 Ok(_) => panic!("{input} must not open"),
             };
@@ -1633,13 +1633,13 @@ mod tests {
         let old_file = std::env::var_os("RESTIC_PASSWORD_FILE");
         std::env::set_var("RESTIC_PASSWORD", "session-restic-pw");
         std::env::remove_var("RESTIC_PASSWORD_FILE");
-        let opts = OpenOptions {
+        let mut opts = OpenOptions {
             index_in_memory: true,
             write_index: false,
             ..OpenOptions::default()
         };
         let mut remotes = Vec::new();
-        let result = open_remote_input(&url, &opts, false, &mut remotes);
+        let result = open_remote_input(&url, &mut opts, false, &mut remotes);
         match old_pw {
             Some(v) => std::env::set_var("RESTIC_PASSWORD", v),
             None => std::env::remove_var("RESTIC_PASSWORD"),

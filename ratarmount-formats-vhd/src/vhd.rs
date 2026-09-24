@@ -1,6 +1,6 @@
 //! Connectix VHD footer + dynamic BAT (big-endian). Differencing is residual.
 
-use std::io::{self, Read, Seek, SeekFrom};
+use std::io::{Read, Seek, SeekFrom};
 
 use crate::disk::{vhd_bitmap_size, DiskMap, VirtualDisk};
 use crate::{Result, VhdError, VhdKind};
@@ -180,10 +180,8 @@ where
     reader.seek(SeekFrom::Start(table_offset))?;
     reader.read_exact(&mut raw)?;
     let mut bat = Vec::with_capacity(max_entries as usize);
-    for chunk in raw.chunks_exact(4) {
-        bat.push(u32::from_be_bytes(chunk.try_into().map_err(|_| {
-            io::Error::new(io::ErrorKind::InvalidData, "BAT entry")
-        })?));
+    for chunk in raw.as_chunks::<4>().0 {
+        bat.push(u32::from_be_bytes(*chunk));
     }
     let bitmap_size = vhd_bitmap_size(block_size);
     Ok(VirtualDisk::new(

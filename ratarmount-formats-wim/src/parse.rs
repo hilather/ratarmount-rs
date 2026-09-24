@@ -458,8 +458,10 @@ fn read_dentry(meta: &[u8], offset: u64) -> Result<(Option<DiskDentry>, u64)> {
             return Err(WimError::Msg("WIM dentry name truncated".into()));
         }
         let units: Vec<u16> = d[p..p + name_nbytes]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|c| u16::from_le_bytes(*c))
             .collect();
         p += name_nbytes + 2;
         String::from_utf16(&units).unwrap_or_else(|_| String::from('\u{FFFD}'))

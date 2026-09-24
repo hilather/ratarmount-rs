@@ -194,8 +194,10 @@ impl Qcow2Inner {
             reader.read_exact(&mut l1_bytes)?;
         }
         let l1 = l1_bytes
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().expect("chunks_exact 8")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c))
             .collect();
 
         let backing = match header.backing_file.as_deref() {
@@ -244,8 +246,10 @@ impl Qcow2Inner {
         let mut buf = vec![0u8; cs];
         self.read_exact_at(l2_offset, &mut buf)?;
         let entries = buf
-            .chunks_exact(8)
-            .map(|c| u64::from_be_bytes(c.try_into().expect("chunks_exact 8")))
+            .as_chunks::<8>()
+            .0
+            .iter()
+            .map(|c| u64::from_be_bytes(*c))
             .collect();
         cache.offset = Some(l2_offset);
         cache.entries = entries;

@@ -339,7 +339,7 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
         return Err(DmgError::Msg("invalid base64 length in UDIF plist".into()));
     }
     let mut out = Vec::with_capacity(filtered.len() / 4 * 3);
-    for chunk in filtered.chunks_exact(4) {
+    for chunk in filtered.as_chunks::<4>().0 {
         let a = b64_val(chunk[0])?;
         let b = b64_val(chunk[1])?;
         let (c, pad_c) = if chunk[2] == b'=' {
