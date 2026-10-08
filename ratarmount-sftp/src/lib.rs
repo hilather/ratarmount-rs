@@ -4,12 +4,12 @@
 //! CLI `--sftp` / `--sftp-bind` are wired in the binary (PR-12), not this crate.
 //! Stdio SFTP v3 is [`serve_stdio`] (OpenSSH `Subsystem sftp`; no SSH-2).
 //!
-//! **MSRV:** current `russh` 0.62+ declares `rust-version = "1.85"` (edition
-//! 2024). Workspace MSRV is **1.74**, so the SSH-2 daemon and stdio handler are
-//! optional feature `sftp-russh` (same pattern as `nfsv4`). Default `cargo test`
-//! does **not** compile russh. `--sftp` / [`serve_stdio`] should exit 2 with
-//! [`SFTP_RUSSH_HINT`] unless the feature is on. Linux/macOS packages enable
-//! the feature. SSH-2 is **not** implemented in this crate.
+//! **Feature:** current `russh` 0.62+ declares `rust-version = "1.85"` (edition
+//! 2024). The SSH-2 daemon and stdio handler are optional feature `sftp-russh`
+//! because default builds and CI do not compile russh (same pattern as `nfsv4`).
+//! Default `cargo test` does **not** compile russh. `--sftp` / [`serve_stdio`]
+//! should exit 2 with [`SFTP_RUSSH_HINT`] unless the feature is on. Linux/macOS
+//! packages enable the feature. SSH-2 is **not** implemented in this crate.
 //!
 //! Auth (TCP russh): `RATARMOUNT_SFTP_AUTHORIZED_KEYS` (default
 //! `~/.ssh/authorized_keys` **only on loopback**) and/or

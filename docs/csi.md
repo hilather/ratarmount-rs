@@ -6,7 +6,7 @@ Roadmap: [`tasks/beyond-parity-roadmap.md`](https://github.com/hilather/ratarmou
 
 ## Why not an in-tree crate
 
-FUSE needs a mountpoint on the **node**. `--no-mount` is export-only and cannot implement `NodePublishVolume`. Pulling `k8s-openapi` / controller-runtime into this workspace would threaten MSRV 1.74 and default CI. Exec of the already-packaged binary keeps CSI out of `cargo test --workspace`.
+FUSE needs a mountpoint on the **node**. `--no-mount` is export-only and cannot implement `NodePublishVolume`. Pulling `k8s-openapi` / controller-runtime into this workspace would add those crates to default CI. Exec of the already-packaged binary keeps CSI out of `cargo test --workspace`.
 
 ## v1 bar (RO)
 

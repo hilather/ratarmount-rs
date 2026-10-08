@@ -7,8 +7,9 @@ description = "SFTP export of a ratarmount MountSource"
 
 [features]
 default = []
-# russh 0.62+ declares rust-version 1.85 (edition 2024). Workspace MSRV is 1.74,
-# so the SSH daemon is optional — same pattern as ratarmount-nfs `nfsv4`.
+# russh 0.62+ declares rust-version 1.85 (edition 2024). The SSH daemon is
+# optional because default builds and CI do not compile russh — same pattern
+# as ratarmount-nfs `nfsv4`.
 sftp-russh = ["dep:russh", "dep:russh-sftp", "dep:tokio", "dep:rand"]
 
 [dependencies]

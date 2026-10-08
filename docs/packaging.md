@@ -91,9 +91,9 @@ Uses [nfpm](https://nfpm.goreleaser.com/) for `.deb`/`.rpm` (auto-downloaded if 
 |--------|----------------------------------------|
 | [`packaging/build-native-packages.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-native-packages.sh) (deb / rpm / portable) | `--features nfsv4,sftp-russh` |
 | [`packaging/build-appimage.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-appimage.sh) | `--features nfsv4,sftp-russh` |
-| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh` (rustup **stable**, rustc ≥ 1.88 assumed) |
+| [`packaging/build-macos-tarball.sh`](https://github.com/hilather/ratarmount-rs/blob/main/packaging/build-macos-tarball.sh) | `--features nfsv4,sftp-russh` (rustup **stable**; workspace MSRV 1.90) |
 
-Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Without `--features sftp-russh`, `--sftp` exits 2 (`rebuild with --features sftp-russh`; russh MSRV 1.85 > workspace 1.74). Default `cargo test --workspace` compiles neither embednfs nor russh. Current package jobs install rustup **stable**, so 1.88+ is expected. If a Rocky/portable/macOS builder is ever pinned below 1.88, keep `nfsv4` off in that script and update this table.
+Source builds without `--features nfsv4` leave `--nfs --nfs-vers 4` as exit 2 (`rebuild with --features nfsv4 (rustc >= 1.88)`). Without `--features sftp-russh`, `--sftp` exits 2 (`rebuild with --features sftp-russh`). Default `cargo test --workspace` compiles neither embednfs nor russh (opt-in features, not compiled by default CI). Current package jobs install rustup **stable**.
 
 `--print-features` on a packaged binary prints `nfsv4: compiled` and `sftp-russh: compiled`. `--oss-attributions` lists **embednfs** (MIT) and russh when compiled.
 

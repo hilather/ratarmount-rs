@@ -333,7 +333,7 @@ fn decode_base64(s: &str) -> Result<Vec<u8>> {
     if filtered.is_empty() {
         return Ok(Vec::new());
     }
-    // `% 4` not `is_multiple_of` — that method is rustc 1.87+ (MSRV 1.74).
+    // `% 4` not `is_multiple_of` — that method is rustc 1.87+ (written for the former 1.74 MSRV).
     #[allow(clippy::manual_is_multiple_of)]
     if filtered.len() % 4 != 0 {
         return Err(DmgError::Msg("invalid base64 length in UDIF plist".into()));

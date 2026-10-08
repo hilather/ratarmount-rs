@@ -49,7 +49,7 @@ Stable-ish building blocks for embedders. Publish only after docs + semver story
 | **L2 — formats** | `ratarmount-formats-*` (tar, zip, ar, cpio, sevenzip, …) | Per-format MountSource backends |
 | **L3 — I/O & compose** | `ratarmount-remote`, `ratarmount-compositing` | URL backends; union/automount/overlay |
 | **L3.5 — embedder session** | `ratarmount-session` | Supported in-process **Session** API (no FUSE). First-class embedder of L0–L3; L4 export is opt-in on the binary only. GUI/embedders **path-depend**. **Not published** on crates.io until a freeze review (Q5=a dry-run only). Slim graph: `--no-default-features` (TAR/ZIP/7z). Full factory matrix: `formats-all`. |
-| **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) + optional NFSv4.1 (`embednfs` 0.4.1, feature `nfsv4`, rustc ≥ 1.88) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. Linux/macOS packages compile `nfsv4`; default crates stay MSRV 1.74. |
+| **L4 — export adapters** | `ratarmount-fuse`, `ratarmount-nfs` | FUSE (`fuser`) and in-process NFSv3 (`nfsserve`) + optional NFSv4.1 (`embednfs` 0.4.1, feature `nfsv4`, rustc ≥ 1.88) bridges — *not* the CLI binary. Path deps only; **do not publish** until embedders need the same export surface. Linux/macOS packages compile `nfsv4`; default CI does not compile embednfs (opt-in). Workspace MSRV is 1.90. |
 
 ### System / FFI caveats
 

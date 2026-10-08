@@ -125,7 +125,7 @@ pub(crate) fn basic_authorized(
     ct_eq(&decoded, expected.as_bytes())
 }
 
-#[allow(clippy::manual_is_multiple_of)] // MSRV 1.74: `is_multiple_of` is newer
+#[allow(clippy::manual_is_multiple_of)] // written for the former 1.74 MSRV: `is_multiple_of` is newer
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
     fn val(c: u8) -> Option<u8> {
         match c {

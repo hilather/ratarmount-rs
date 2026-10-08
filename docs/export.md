@@ -101,7 +101,7 @@ Writes (`Tlcreate` / `Twrite` / `Tmkdir` / `Tunlinkat` / `Trenameat` / `Tsymlink
 
 ## SFTP (`--sftp`) — P-10 `done`
 
-TCP listener `--sftp` / `--sftp-bind` (port 22 is `--sftp-bind 22`). Stdio OpenSSH `Subsystem sftp`: `--sftp-subsystem` (SFTP v3; no SSH-2). Needs **`--features sftp-russh`** (russh MSRV 1.85 > workspace 1.74 — **feature note**, not a protocol leftover). Linux/macOS packages enable it. Source builds without the feature: `--sftp` / `--sftp-subsystem` **exit 2** with a rebuild hint. Default CI does not compile russh.
+TCP listener `--sftp` / `--sftp-bind` (port 22 is `--sftp-bind 22`). Stdio OpenSSH `Subsystem sftp`: `--sftp-subsystem` (SFTP v3; no SSH-2). Needs **`--features sftp-russh`** (opt-in; default CI does not compile russh — **feature note**, not a protocol leftover). Linux/macOS packages enable it. Source builds without the feature: `--sftp` / `--sftp-subsystem` **exit 2** with a rebuild hint. Default CI does not compile russh.
 
 ```bash
 # Packaged binary (sftp-russh compiled):
@@ -130,7 +130,7 @@ sftp -P 20222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null 127.0.
 
 ## Packaging
 
-HTTP / WebDAV / SMB / 9P are always-on (MSRV 1.74). SFTP is **`sftp-russh`** on the same cargo line as `nfsv4`:
+HTTP / WebDAV / SMB / 9P are always-on. SFTP is **`sftp-russh`** on the same cargo line as `nfsv4`:
 
 ```text
 cargo build --release -p ratarmount --features nfsv4,sftp-russh

@@ -1,4 +1,4 @@
-//! Compact 9P2000.L wire codec (no `rs9p`; keeps MSRV 1.74 and skips a lockfile bump).
+//! Compact 9P2000.L wire codec (no `rs9p`; written for the former 1.74 MSRV and skips a lockfile bump).
 
 use std::io::{self, Read, Write};
 

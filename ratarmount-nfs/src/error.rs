@@ -14,7 +14,7 @@ pub fn io_to_nfsstat3(err: &std::io::Error) -> nfsstat3 {
         ErrorKind::AlreadyExists => nfsstat3::NFS3ERR_EXIST,
         ErrorKind::InvalidInput => nfsstat3::NFS3ERR_INVAL,
         ErrorKind::Unsupported => nfsstat3::NFS3ERR_NOTSUPP,
-        // `ErrorKind::NotADirectory` is Rust 1.83+; MSRV is 1.74. VFS-layer
+        // `ErrorKind::NotADirectory` is Rust 1.83+; written for the former 1.74 MSRV. VFS-layer
         // `readdir` on a file returns `NFS3ERR_NOTDIR` without going through
         // `io::Error`.
         _ => nfsstat3::NFS3ERR_IO,

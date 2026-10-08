@@ -12,7 +12,7 @@ use std::cell::Cell;
 
 #[cfg(test)]
 thread_local! {
-    // Inline `const { Cell::new(0) }` needs Rust 1.79+; workspace MSRV is 1.74.
+    // Inline `const { Cell::new(0) }` needs Rust 1.79+; written for the former 1.74 MSRV.
     #[allow(clippy::missing_const_for_thread_local)]
     static TO_FILE_INFO_COUNT: Cell<u64> = Cell::new(0);
 }
