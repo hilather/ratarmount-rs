@@ -18,10 +18,11 @@ use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
 
-/// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
+/// Kernel attribute/entry cache TTL for immutable attrs (read-only mounts and
+/// archive members that the write overlay has not shadowed).
 const TTL: Duration = Duration::from_secs(60);
-/// With a write overlay, sizes change after create/write — do not let the kernel
-/// cache attrs for long (or getattr would keep serving create-time size 0).
+/// Overlay-backed files and create placeholders change size after write.
+/// A non-zero kernel TTL would keep serving create-time size 0.
 const OVERLAY_ATTR_TTL: Duration = Duration::from_secs(0);
 const BLKSIZE: u32 = 256 * 1024;
 const DIR_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -304,14 +305,20 @@ enum OpenBackend {
 
 struct InodeEntry {
     path: String,
-    /// Fat FileInfo cache. Immutable mounts only (and overlay root).
-    /// Overlay child inodes store [`InodeAttrCookie`] instead.
+    /// Fat FileInfo cache. Immutable mounts, the root, and archive members
+    /// the write overlay has not shadowed. Overlay-backed children store
+    /// [`InodeAttrCookie`] instead and re-lookup.
     file_info: Option<FileInfo>,
-    /// Compact getattr scalars on overlay child inodes. Not served as
+    /// Compact getattr scalars on overlay-backed child inodes. Not served as
     /// getattr/open truth — those paths re-lookup. Cleared by the generation
     /// sweep. Never `Some` together with `file_info` on a child overlay inode.
     #[allow(dead_code)] // density store; production must not reconstruct FileInfo
     cookie: Option<InodeAttrCookie>,
+}
+
+enum KernelInval {
+    Inode(u64),
+    Entry { parent: u64, name: String },
 }
 
 struct DirCacheEntry {
@@ -336,6 +343,13 @@ pub struct RatarmountFs {
     /// and dirents are then stale — same contract as NFS
     /// `ReaderLru::sweep_if_generation_advanced`.
     source_generation: AtomicU64,
+    /// Filled from `Session::notifier` before the FUSE loop so a shadowed
+    /// archive member can drop a 60s kernel attr/entry cache. `None` in unit
+    /// tests and until mount.
+    kernel_notify: Arc<Mutex<Option<fuser::Notifier>>>,
+    /// Invalidations queued by a request handler and sent after the reply,
+    /// so the notification write does not run before the kernel has the reply.
+    pending_inval: Mutex<Vec<KernelInval>>,
 }
 
 impl RatarmountFs {
@@ -375,6 +389,8 @@ impl RatarmountFs {
             next_fh: AtomicU64::new(1),
             dir_cache: Mutex::new(HashMap::new()),
             source_generation: AtomicU64::new(0),
+            kernel_notify: Arc::new(Mutex::new(None)),
+            pending_inval: Mutex::new(Vec::new()),
         }
     }
 
@@ -408,21 +424,22 @@ impl RatarmountFs {
         ino
     }
 
-    /// Overlay child inodes store a cookie only. Root and immutable mounts keep
-    /// a fat [`FileInfo`].
-    fn overlay_stores_cookie(&self, ino: u64) -> bool {
-        self.overlay.is_some() && ino != FUSE_ROOT_ID
-    }
-
+    /// Overlay-backed children and empty-userdata placeholders store a cookie
+    /// only. Root, immutable mounts, and unshadowed archive members keep a fat
+    /// [`FileInfo`] so repeated stat/open does not re-query the index.
     fn inode_cache_from_fi(
         &self,
         ino: u64,
         fi: Option<FileInfo>,
     ) -> (Option<FileInfo>, Option<InodeAttrCookie>) {
-        if self.overlay_stores_cookie(ino) {
-            (None, fi.as_ref().map(InodeAttrCookie::from_file_info))
-        } else {
-            (fi, None)
+        match fi {
+            Some(fi)
+                if self.overlay.is_some() && ino != FUSE_ROOT_ID && !file_info_attr_stable(&fi) =>
+            {
+                let cookie = InodeAttrCookie::from_file_info(&fi);
+                (None, Some(cookie))
+            }
+            other => (other, None),
         }
     }
 
@@ -533,11 +550,15 @@ impl RatarmountFs {
         }
     }
 
-    /// FileInfo for `open`. Immutable mounts reuse the lookup/getattr cache;
-    /// overlay always re-looks up so create(size 0) → write is visible.
-    /// Overlay lookup miss → `None` (do not serve a cookie / create-time size 0).
+    /// FileInfo for `open`. Immutable mounts and unshadowed archive members
+    /// reuse the lookup/getattr cache. Overlay-backed files re-lookup so
+    /// create(size 0) → write is visible. Overlay lookup miss → `None`
+    /// (do not serve a cookie / create-time size 0).
     fn file_info_for_open(&self, ino: u64, path: &str) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
+        if let Some(fi) = self.cached_stable_fi(ino) {
+            return Some(fi);
+        }
         if self.overlay.is_some() {
             if let Some(fi) = self.source.lookup(path, 0) {
                 self.store_fi(ino, fi.clone());
@@ -702,12 +723,117 @@ impl RatarmountFs {
         self.dir_cache.lock().unwrap().remove(parent);
     }
 
-    /// Kernel attr/entry TTL: zero when a write overlay can change size/names.
-    fn attr_ttl(&self) -> Duration {
-        if self.overlay.is_some() {
+    /// Kernel attr/entry TTL for this `FileInfo`.
+    ///
+    /// Unshadowed archive members use [`TTL`] (same as a read-only mount).
+    /// Overlay-backed files and empty-userdata create placeholders stay at
+    /// [`OVERLAY_ATTR_TTL`] so create(size 0) → write → stat cannot pin size 0.
+    fn attr_ttl_for_fi(&self, fi: &FileInfo) -> Duration {
+        if self.overlay.is_some() && !file_info_attr_stable(fi) {
             OVERLAY_ATTR_TTL
         } else {
             TTL
+        }
+    }
+
+    fn cached_stable_fi(&self, ino: u64) -> Option<FileInfo> {
+        let fi = self.cached_fi(ino)?;
+        if self.overlay.is_none() || file_info_attr_stable(&fi) {
+            Some(fi)
+        } else {
+            None
+        }
+    }
+
+    fn existing_ino(&self, path: &str) -> Option<u64> {
+        self.path_to_ino.lock().unwrap().get(path).copied()
+    }
+
+    /// Lookup used by FUSE `lookup`. A stable cached `FileInfo` skips
+    /// `MountSource::lookup` (overlay SQL, host stat, archive index).
+    fn lookup_file_info(&self, path: &str) -> Option<FileInfo> {
+        self.sweep_if_generation_advanced();
+        if let Some(ino) = self.existing_ino(path) {
+            if let Some(fi) = self.cached_stable_fi(ino) {
+                return Some(fi);
+            }
+        }
+        let fi = self.source.lookup(path, 0)?;
+        self.ino_for_path_with_fi(path, Some(fi.clone()));
+        Some(fi)
+    }
+
+    /// Drop a fat archive-member cache. Returns whether the kernel may still
+    /// be holding a non-zero attr TTL for this inode.
+    fn drop_stable_attr(&self, ino: u64) -> bool {
+        let stable = {
+            let mut inodes = self.inodes.lock().unwrap();
+            let Some(ent) = inodes.get_mut(&ino) else {
+                return false;
+            };
+            let stable = ent.file_info.as_ref().is_some_and(file_info_attr_stable);
+            if stable {
+                ent.file_info = None;
+                ent.cookie = None;
+            }
+            stable
+        };
+        if stable {
+            self.queue_kernel_inode(ino);
+        }
+        stable
+    }
+
+    fn queue_kernel_inode(&self, ino: u64) {
+        if self.kernel_notify.lock().unwrap().is_none() {
+            return;
+        }
+        self.pending_inval
+            .lock()
+            .unwrap()
+            .push(KernelInval::Inode(ino));
+    }
+
+    fn queue_kernel_entry(&self, parent: u64, name: &str) {
+        if self.kernel_notify.lock().unwrap().is_none() {
+            return;
+        }
+        self.pending_inval.lock().unwrap().push(KernelInval::Entry {
+            parent,
+            name: name.to_string(),
+        });
+    }
+
+    /// Send invalidations queued by this request. Call after the FUSE reply.
+    fn flush_kernel_invals(&self) {
+        let notify = self.kernel_notify.lock().unwrap().clone();
+        let batch = std::mem::take(&mut *self.pending_inval.lock().unwrap());
+        let Some(notify) = notify else {
+            return;
+        };
+        for item in batch {
+            match item {
+                KernelInval::Inode(ino) => {
+                    let _ = notify.inval_inode(ino, 0, -1);
+                }
+                KernelInval::Entry { parent, name } => {
+                    let _ = notify.inval_entry(parent, OsStr::new(&name));
+                }
+            }
+        }
+    }
+
+    /// Parent directory attrs and the child name must not keep a 60s cache
+    /// across create/unlink/mkdir/rmdir.
+    fn note_dir_changed(&self, parent: u64, name: &str) {
+        self.drop_stable_attr(parent);
+        self.queue_kernel_entry(parent, name);
+        if let Some(parent_path) = self.path_for_ino(parent) {
+            let child = join_path(&parent_path, name);
+            if let Some(ino) = self.existing_ino(&child) {
+                self.drop_stable_attr(ino);
+                self.queue_kernel_inode(ino);
+            }
         }
     }
 
@@ -740,15 +866,18 @@ impl RatarmountFs {
 
     /// Resolve `FileInfo` for an inode.
     ///
-    /// With a write overlay, always re-lookup so size/mtime after create/write
-    /// match the on-disk overlay file (cookie is not getattr truth).
-    /// Overlay lookup miss → `None` (do not serve a cookie).
+    /// Unshadowed archive members reuse the fat cache. Overlay-backed files
+    /// re-lookup so size/mtime after create/write match the host file (cookie
+    /// is not getattr truth). Overlay lookup miss → `None`.
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
         let path = self.path_for_ino(ino)?;
         if path == "/" {
             let fi = ratarmount_core::create_root_file_info();
             self.store_fi(ino, fi.clone());
+            return Some(fi);
+        }
+        if let Some(fi) = self.cached_stable_fi(ino) {
             return Some(fi);
         }
         if self.overlay.is_some() {
@@ -776,10 +905,16 @@ impl RatarmountFs {
         // Writes always go to the overlay; reads of files that exist in the overlay
         // must also use the overlay FD (not the base archive). Previously RO open
         // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
+        // A stable archive-member cache has already proven this path is not
+        // shadowed, so read-only open skips the overlay host stat.
         if let Some(ov) = &self.overlay {
-            if write || ov.has_file(&path) {
+            let shadowed = write || (self.cached_stable_fi(ino).is_none() && ov.has_file(&path));
+            if shadowed {
                 match ov.open_overlay_fd(&path, flags) {
                     Ok(fd) => {
+                        // COW / create replaces the archive member. Drop the fat
+                        // cache before storing the overlay cookie.
+                        self.drop_stable_attr(ino);
                         if let Some(fi) = self.source.lookup(&path, 0) {
                             self.store_fi(ino, fi);
                         }
@@ -867,6 +1002,18 @@ fn unix_float_to_system_time(t: f64) -> SystemTime {
         .unwrap_or(UNIX_EPOCH + Duration::new(FAR_FUTURE_SECS, 0))
 }
 
+/// Archive member the write overlay has not replaced.
+///
+/// Empty userdata is a create placeholder (size 0) and must not be pinned.
+/// `overlay:` userdata is the host file and changes on write.
+fn file_info_attr_stable(fi: &FileInfo) -> bool {
+    !fi.userdata.is_empty()
+        && !fi
+            .userdata
+            .iter()
+            .any(|u| matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:")))
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -883,22 +1030,24 @@ impl Filesystem for RatarmountFs {
         };
         let name = name.to_string_lossy();
         let path = join_path(&parent_path, &name);
-        let Some(fi) = self.source.lookup(&path, 0) else {
+        let Some(fi) = self.lookup_file_info(&path) else {
             reply.error(ENOENT);
             return;
         };
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
+        let ttl = self.attr_ttl_for_fi(&fi);
+        reply.entry(&ttl, &Self::file_attr(ino, &fi), 0);
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        // Always go through file_info_for_ino: with a write overlay it re-lookups
-        // so create (size 0) → write → stat/ls sees the real size.
+        // Stable archive members return the fat cache. Overlay-backed inodes
+        // re-lookup so create (size 0) → write → stat/ls sees the real size.
         let Some(fi) = self.file_info_for_ino(ino) else {
             reply.error(ENOENT);
             return;
         };
-        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
+        let ttl = self.attr_ttl_for_fi(&fi);
+        reply.attr(&ttl, &Self::file_attr(ino, &fi));
     }
 
     fn readdir(
@@ -1018,7 +1167,10 @@ impl Filesystem for RatarmountFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         match self.open_inode(ino, flags) {
-            Ok((fh, open_flags)) => reply.opened(fh, open_flags),
+            Ok((fh, open_flags)) => {
+                reply.opened(fh, open_flags);
+                self.flush_kernel_invals();
+            }
             Err(e) => {
                 debug!("open error kind={e}");
                 reply.error(e);
@@ -1046,7 +1198,7 @@ impl Filesystem for RatarmountFs {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -1069,7 +1221,11 @@ impl Filesystem for RatarmountFs {
         if n < 0 {
             reply.error(EIO);
         } else {
+            // First write of a previously cached archive member must drop the
+            // 60s kernel attr. Later overlay writes already have TTL 0.
+            self.drop_stable_attr(ino);
             reply.written(n as u32);
+            self.flush_kernel_invals();
         }
     }
 
@@ -1104,6 +1260,9 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
+                // Drop a previously cached archive member before the new
+                // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
+                self.note_dir_changed(parent, &name);
                 let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
                 self.invalidate_dir_cache(&parent_path);
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -1111,7 +1270,9 @@ impl Filesystem for RatarmountFs {
                     .lock()
                     .unwrap()
                     .insert(fh, OpenBackend::OverlayFd(fd));
-                reply.created(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0, fh, 0);
+                let ttl = self.attr_ttl_for_fi(&fi);
+                reply.created(&ttl, &Self::file_attr(ino, &fi), 0, fh, 0);
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("create: {e}");
@@ -1150,9 +1311,12 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
+                self.note_dir_changed(parent, &name);
                 let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
                 self.invalidate_dir_cache(&parent_path);
-                reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
+                let ttl = self.attr_ttl_for_fi(&fi);
+                reply.entry(&ttl, &Self::file_attr(ino, &fi), 0);
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("mkdir: {e}");
@@ -1170,11 +1334,14 @@ impl Filesystem for RatarmountFs {
             reply.error(ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let name = name.to_string_lossy();
+        let path = join_path(&parent_path, &name);
         match ov.unlink(&path) {
             Ok(()) => {
                 self.invalidate_dir_cache(&parent_path);
+                self.note_dir_changed(parent, &name);
                 reply.ok();
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("unlink: {e}");
@@ -1192,11 +1359,14 @@ impl Filesystem for RatarmountFs {
             reply.error(ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let name = name.to_string_lossy();
+        let path = join_path(&parent_path, &name);
         match ov.rmdir(&path) {
             Ok(()) => {
                 self.invalidate_dir_cache(&parent_path);
+                self.note_dir_changed(parent, &name);
                 reply.ok();
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("rmdir: {e}");
@@ -1237,6 +1407,7 @@ impl Filesystem for RatarmountFs {
                 reply.error(EIO);
                 return;
             }
+            self.drop_stable_attr(ino);
         } else if !self.writable() {
             reply.error(ENOSYS);
             return;
@@ -1245,7 +1416,9 @@ impl Filesystem for RatarmountFs {
             .file_info_for_ino(ino)
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
-        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
+        let ttl = self.attr_ttl_for_fi(&fi);
+        reply.attr(&ttl, &Self::file_attr(ino, &fi));
+        self.flush_kernel_invals();
     }
 
     fn release(
@@ -1384,7 +1557,12 @@ pub fn mount_blocking(
     }
     let _ = foreground;
     let fs = RatarmountFs::with_readahead(source, overlay, readahead);
-    fuser::mount2(fs, mountpoint, &options)?;
+    // `mount2` does not hand back `Session::notifier`. Write mounts need it
+    // before `run` so a shadowed archive member can drop a 60s kernel cache.
+    let kernel_notify = Arc::clone(&fs.kernel_notify);
+    let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
+    *kernel_notify.lock().unwrap() = Some(session.notifier());
+    session.run()?;
     Ok(())
 }
 
@@ -1716,9 +1894,9 @@ mod tests {
             "getattr-equivalent attr must reflect post-write size"
         );
         assert_eq!(
-            fs.attr_ttl(),
+            fs.attr_ttl_for_fi(&fi),
             OVERLAY_ATTR_TTL,
-            "writable overlay must not pin long kernel attr TTL"
+            "overlay-backed file must not pin a long kernel attr TTL"
         );
         // After refresh, overlay inode stores a cookie (not a fat FileInfo).
         let cached = fs.cached_cookie(ino).expect("cached cookie after refresh");
@@ -1844,6 +2022,197 @@ mod tests {
             "cookie size must match the lookup FileInfo"
         );
         assert_eq!(fs.cached_cookie(ino).unwrap().size, b"payload".len() as u64);
+    }
+
+    /// Regression: a write mount re-queried the archive index on every stat of
+    /// an unmodified member, because the kernel attr TTL was 0 for the whole
+    /// mount. Unshadowed members keep a fat `FileInfo` and the 60s TTL. A
+    /// write still drops that cache so the next stat sees the overlay size.
+    #[test]
+    fn overlay_archive_member_stat_skips_repeat_lookup() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingTar {
+            lookups: Arc<AtomicU64>,
+            opens: Arc<AtomicU64>,
+        }
+
+        fn tar_file(size: u64, offset: u64) -> FileInfo {
+            FileInfo {
+                size,
+                mtime: 1.0,
+                mode: S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                    offset,
+                    offsetheader: Some(offset),
+                    istar: true,
+                    issparse: false,
+                    isgenerated: false,
+                    recursiondepth: 0,
+                })],
+            }
+        }
+
+        impl MountSource for CountingTar {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path == "/" {
+                    let mut map = BTreeMap::new();
+                    map.insert("a".into(), tar_file(4, 0));
+                    map.insert("b".into(), tar_file(5, 4));
+                    Some(ListResult::Infos(map))
+                } else {
+                    None
+                }
+            }
+
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                match path {
+                    "/" => Some(ratarmount_core::create_root_file_info()),
+                    "/a" => Some(tar_file(4, 0)),
+                    "/b" => Some(tar_file(5, 4)),
+                    _ => None,
+                }
+            }
+
+            fn open(
+                &self,
+                fi: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                let bytes: &[u8] = if fi.size == 4 { b"aaaa" } else { b"bbbbb" };
+                Ok(Box::new(io::Cursor::new(bytes.to_vec())))
+            }
+
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+
+        let lookups = Arc::new(AtomicU64::new(0));
+        let opens = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(CountingTar {
+            lookups: Arc::clone(&lookups),
+            opens: Arc::clone(&opens),
+        }) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+
+        let ino_a = fs.ino_for_path("/a");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "inode alloc does not look up"
+        );
+        let fi = fs.lookup_file_info("/a").expect("first lookup");
+        assert_eq!(fi.size, 4);
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(fs.attr_ttl_for_fi(&fi), TTL);
+        assert!(
+            fs.cached_fi(ino_a).is_some(),
+            "unshadowed member keeps fat FileInfo"
+        );
+        assert!(fs.cached_cookie(ino_a).is_none());
+
+        for _ in 0..32 {
+            let again = fs.file_info_for_ino(ino_a).expect("cached getattr");
+            assert_eq!(again.size, 4);
+            let looked = fs.lookup_file_info("/a").expect("cached lookup");
+            assert_eq!(looked.size, 4);
+        }
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            1,
+            "repeated stat/lookup of an unmodified member must not hit the archive index"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+
+        let ino_b = fs.ino_for_path("/b");
+        assert_eq!(fs.file_info_for_ino(ino_b).expect("sibling").size, 5);
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        for _ in 0..8 {
+            assert_eq!(fs.file_info_for_ino(ino_b).expect("sibling cache").size, 5);
+        }
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        assert_eq!(fs.attr_ttl_for_fi(&fs.cached_fi(ino_b).unwrap()), TTL);
+
+        let (fh, flags) = fs.open_inode(ino_a, libc::O_RDONLY).expect("read open");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            2,
+            "stable read open skips overlay stat"
+        );
+        assert!(!fs.test_fh_is_overlay_fd(fh));
+        assert_eq!(flags, fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(fs.read_handle(fh, 0, 8).expect("read"), b"aaaa");
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+
+        let (wfh, wflags) = fs.open_inode(ino_a, libc::O_WRONLY).expect("write open");
+        assert!(fs.test_fh_is_overlay_fd(wfh));
+        assert_eq!(
+            wflags, 0,
+            "overlay open must not keep the kernel data cache"
+        );
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "copy-on-write looks the member up once"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        assert!(
+            fs.cached_fi(ino_a).is_none(),
+            "write drops the fat archive-member cache"
+        );
+        assert_eq!(fs.cached_cookie(ino_a).expect("overlay cookie").size, 4);
+
+        let fi = fs.file_info_for_ino(ino_a).expect("post-cow getattr");
+        assert_eq!(fi.size, 4);
+        assert_eq!(fs.attr_ttl_for_fi(&fi), OVERLAY_ATTR_TTL);
+        assert!(
+            matches!(fi.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:")),
+            "shadowed member is served from the overlay"
+        );
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "overlay getattr must not call the archive index"
+        );
+
+        ov.truncate("/a", 1).expect("truncate");
+        let fi = fs.file_info_for_ino(ino_a).expect("post-truncate getattr");
+        assert_eq!(
+            fi.size, 1,
+            "stat after truncate must not keep the archive size"
+        );
+        assert_eq!(fs.attr_ttl_for_fi(&fi), OVERLAY_ATTR_TTL);
+        assert!(fs.cached_fi(ino_a).is_none());
+        assert_eq!(fs.cached_cookie(ino_a).expect("refreshed cookie").size, 1);
+        assert_eq!(lookups.load(Ordering::Relaxed), 3);
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            fs.file_info_for_ino(ino_b)
+                .expect("sibling still cached")
+                .size,
+            5
+        );
+        assert!(fs.cached_fi(ino_b).is_some());
+        assert!(fs.cached_cookie(ino_b).is_none());
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "shadowing one member must not invalidate its sibling"
+        );
+        assert_eq!(fs.attr_ttl_for_fi(&fs.cached_fi(ino_b).unwrap()), TTL);
     }
 
     /// Live backing store whose member offsets shift when an earlier member is

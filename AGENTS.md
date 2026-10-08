@@ -52,6 +52,8 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | 7z parse CRC uses crc32fast (IEEE) | `cargo test -p ratarmount-formats-sevenzip --lib crc32` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_wrong_password` · `cargo test -p ratarmount-formats-sevenzip --lib encrypted_store_aes` |
 | Write-overlay create then cat empty (size-0 cache) | `cargo test -p ratarmount-fuse --lib overlay_file_info` |
 | Overlay open after create+write (`has_file` → OverlayFd) | `cargo test -p ratarmount-fuse --lib overlay_open_after_create_write` |
+| Write-mount stat re-queries unmodified archive member | `cargo test -p ratarmount-fuse --lib overlay_archive_member` |
+| Overlay unlink tombstone SQL on every lookup | `cargo test -p ratarmount-compositing --lib tombstone_cache` |
 | NFS overlay create then write then read payload (size-0 cookie) | `cargo test -p ratarmount-nfs --lib overlay_open_after_create_write` · `cargo test -p ratarmount-nfs --features nfsv4 --lib overlay_open_after_create_write` · `cargo test -p ratarmount-nfs --lib get_or_open_overlay_cookie` |
 | NFS overlay empty create then cat "" | `cargo test -p ratarmount-nfs --lib overlay_open_after_create_reads_empty` · `cargo test -p ratarmount-nfs --features nfsv4 --lib overlay_open_after_create_reads_empty` |
 | 9P/SMB/SFTP overlay create then write then read payload (size-0 cookie) | `cargo test -p ratarmount-export-core --lib get_or_open_overlay_cookie` · `cargo test -p ratarmount-9p --lib overlay_open_after_create_write` |

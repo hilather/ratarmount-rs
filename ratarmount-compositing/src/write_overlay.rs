@@ -235,6 +235,11 @@ pub struct WriteOverlay {
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
     root: PathBuf,
     db: Mutex<Connection>,
+    /// Mount paths with `deleted = 1` (for example `/dir/file`).
+    ///
+    /// `is_deleted` checks this set. The `files` table remains the durable
+    /// copy; every insert or clear of a tombstone updates both.
+    tombstones: Mutex<HashSet<String>>,
     /// Writers take a read lock; live commit takes the write lock.
     commit_gate: RwLock<()>,
     /// Set when persist succeeded but reopen failed (K11). Further interval
@@ -297,11 +302,13 @@ impl WriteOverlay {
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
         conn.execute_batch(SCHEMA)?;
+        let tombstones = tombstone_set_from_conn(&conn);
         Ok(Self {
             base,
             replacement: RwLock::new(None),
             root,
             db: Mutex::new(conn),
+            tombstones: Mutex::new(tombstones),
             commit_gate: RwLock::new(()),
             interval_disabled: AtomicBool::new(false),
             commit_generation: std::sync::atomic::AtomicU64::new(0),
@@ -471,31 +478,33 @@ impl WriteOverlay {
     }
 
     pub fn is_deleted(&self, path: &str) -> bool {
-        let (folder, name) = Self::split(path);
-        let db = self.db.lock().expect("overlay db");
-        db.query_row(
-            r#"SELECT COUNT(*) > 0 FROM "files" WHERE path = ?1 AND name = ?2 AND deleted = 1"#,
-            params![folder, name],
-            |r| r.get::<_, i64>(0),
-        )
-        .map(|n| n != 0)
-        .unwrap_or(false)
+        let path = normpath(path);
+        if path == "/" {
+            return false;
+        }
+        self.tombstones
+            .lock()
+            .expect("overlay tombstones")
+            .contains(&path)
     }
 
     pub fn list_deleted(&self, path: &str) -> Vec<String> {
-        let path = normpath(path).trim_end_matches('/').to_string();
-        let db = self.db.lock().expect("overlay db");
-        let mut stmt =
-            match db.prepare(r#"SELECT name FROM "files" WHERE path = ?1 AND deleted = 1"#) {
-                Ok(s) => s,
-                Err(_) => return vec![HIDDEN_DB.to_string()],
-            };
-        let rows = stmt
-            .query_map(params![path], |r| r.get::<_, String>(0))
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok());
-        let mut out: Vec<String> = rows.collect();
+        let path = normpath(path);
+        let folder = path.trim_end_matches('/');
+        let folder = if folder.is_empty() || folder == "/" {
+            ""
+        } else {
+            folder
+        };
+        let mut out = Vec::new();
+        {
+            let set = self.tombstones.lock().expect("overlay tombstones");
+            for full in set.iter() {
+                if tombstone_parent(full) == folder {
+                    out.push(tombstone_name(full).to_string());
+                }
+            }
+        }
         // Hide overlay DB and SQLite sidecars
         for suf in ["", "-journal", "-shm", "-wal"] {
             out.push(format!("{HIDDEN_DB}{suf}"));
@@ -503,34 +512,70 @@ impl WriteOverlay {
         out
     }
 
+    fn tombstone_remember(&self, path: &str) {
+        self.tombstones
+            .lock()
+            .expect("overlay tombstones")
+            .insert(normpath(path));
+    }
+
+    fn tombstone_forget(&self, path: &str) {
+        self.tombstones
+            .lock()
+            .expect("overlay tombstones")
+            .remove(&normpath(path));
+    }
+
+    fn tombstone_forget_many(&self, paths: &[String]) {
+        let mut set = self.tombstones.lock().expect("overlay tombstones");
+        for path in paths {
+            set.remove(&normpath(path));
+        }
+    }
+
+    fn tombstone_clear(&self) {
+        self.tombstones.lock().expect("overlay tombstones").clear();
+    }
+
     fn mark_deleted(&self, path: &str) -> Result<()> {
         let (folder, name) = Self::split(path);
-        let db = self.db.lock().expect("overlay db");
-        if self.current_base().exists(path) {
-            db.execute(
-                r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
-                params![folder, name],
-            )?;
+        let hides_base = self.current_base().exists(path);
+        {
+            let db = self.db.lock().expect("overlay db");
+            if hides_base {
+                db.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
+                    params![folder, name],
+                )?;
+            } else {
+                db.execute(
+                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+                    params![folder, name],
+                )?;
+            }
+        }
+        if hides_base {
+            self.tombstone_remember(path);
         } else {
-            db.execute(
-                r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
-                params![folder, name],
-            )?;
+            self.tombstone_forget(path);
         }
         Ok(())
     }
 
     fn mark_present(&self, path: &str, mode: u32) -> Result<()> {
         let (folder, name) = Self::split(path);
-        let db = self.db.lock().expect("overlay db");
-        db.execute(
-            r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
-            params![folder, name, mode as i64],
-        )?;
-        db.execute(
-            r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-            params![folder, name],
-        )?;
+        {
+            let db = self.db.lock().expect("overlay db");
+            db.execute(
+                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
+                params![folder, name, mode as i64],
+            )?;
+            db.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            )?;
+        }
+        self.tombstone_forget(path);
         Ok(())
     }
 
@@ -633,29 +678,7 @@ impl WriteOverlay {
     }
 
     fn load_tombstone_paths(&self) -> HashSet<String> {
-        let db = self.db.lock().expect("overlay db");
-        let mut stmt = match db.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#) {
-            Ok(s) => s,
-            Err(_) => return HashSet::new(),
-        };
-        let rows = stmt
-            .query_map([], |r| {
-                let folder: String = r.get(0)?;
-                let name: String = r.get(1)?;
-                Ok((folder, name))
-            })
-            .into_iter()
-            .flatten()
-            .filter_map(|r| r.ok());
-        let mut out = HashSet::new();
-        for (folder, name) in rows {
-            if folder.is_empty() || folder == "/" {
-                out.insert(format!("/{name}"));
-            } else {
-                out.insert(format!("{folder}/{name}"));
-            }
-        }
-        out
+        self.tombstones.lock().expect("overlay tombstones").clone()
     }
 
     /// `symlink_metadata` size/mtime on an overlay host path — never [`FileInfo`].
@@ -882,11 +905,14 @@ impl WriteOverlay {
                 self.register_write_fd(fd, path);
             }
             let (folder, name) = Self::split(path);
-            let db = self.db.lock().expect("overlay db");
-            let _ = db.execute(
-                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                params![folder, name],
-            );
+            {
+                let db = self.db.lock().expect("overlay db");
+                let _ = db.execute(
+                    r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                    params![folder, name],
+                );
+            }
+            self.tombstone_forget(path);
             Ok(fd)
         }
     }
@@ -1750,13 +1776,17 @@ impl WriteOverlay {
                 let cleanup = if idle_for.is_some() {
                     self.forget_committed_overlay(&plan)
                 } else {
-                    reset_overlay_dir(&self.root).and_then(|_| {
+                    let wiped = reset_overlay_dir(&self.root).and_then(|_| {
                         self.db
                             .lock()
                             .expect("overlay db")
                             .execute(r#"DELETE FROM "files""#, [])?;
                         Ok(())
-                    })
+                    });
+                    if wiped.is_ok() {
+                        self.tombstone_clear();
+                    }
+                    wiped
                 };
                 if let Err(e) = cleanup {
                     self.interval_disabled.store(true, Ordering::SeqCst);
@@ -1778,60 +1808,67 @@ impl WriteOverlay {
     /// Drop only the overlay files / tombstones that this idle tick persisted.
     /// Unsettled siblings stay so the next tick can pick them up.
     fn forget_committed_overlay(&self, plan: &OverlayCommitPlan) -> Result<()> {
-        let db = self.db.lock().expect("overlay db");
-        let mut dirs: Vec<&str> = Vec::new();
-        for (rel, is_dir) in &plan.append_entries {
-            if *is_dir {
-                dirs.push(rel.as_str());
-                continue;
-            }
-            let host = self.realpath(rel);
-            match fs::remove_file(&host) {
-                Ok(()) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e.into()),
-            }
-            delete_overlay_files_row(&db, rel)?;
-        }
-        dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
-        for rel in dirs {
-            let host = self.realpath(rel);
-            // Not empty: a hot child appeared or was skipped. Leave the dir.
-            match fs::remove_dir(&host) {
-                Ok(()) => {}
-                Err(e)
-                    if e.kind() == io::ErrorKind::NotFound
-                        || e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-                Err(e) => return Err(e.into()),
-            }
-            delete_overlay_files_row(&db, rel)?;
-        }
-        for rel in &plan.deleted_paths {
-            if plan.append_entries.iter().any(|(p, _)| p == rel) {
-                continue;
-            }
-            delete_overlay_files_row(&db, rel)?;
-        }
-        // Drop leftover empty parents so a later tick does not persist them
-        // as extra TAR directory members. Stop at a dir that still has a
-        // hot sibling.
-        let mut parents: Vec<String> = plan
-            .append_entries
-            .iter()
-            .filter_map(|(rel, is_dir)| {
+        let mut dropped_rows = Vec::new();
+        {
+            let db = self.db.lock().expect("overlay db");
+            let mut dirs: Vec<&str> = Vec::new();
+            for (rel, is_dir) in &plan.append_entries {
                 if *is_dir {
-                    None
-                } else {
-                    rel.rsplit_once('/').map(|(p, _)| p.to_string())
+                    dirs.push(rel.as_str());
+                    continue;
                 }
-            })
-            .collect();
-        parents.sort();
-        parents.dedup();
-        parents.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
-        for parent in parents {
-            prune_empty_overlay_ancestors(&self.root, &db, &parent)?;
+                let host = self.realpath(rel);
+                match fs::remove_file(&host) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                    Err(e) => return Err(e.into()),
+                }
+                delete_overlay_files_row(&db, rel)?;
+                dropped_rows.push(rel.clone());
+            }
+            dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+            for rel in dirs {
+                let host = self.realpath(rel);
+                // Not empty: a hot child appeared or was skipped. Leave the dir.
+                match fs::remove_dir(&host) {
+                    Ok(()) => {}
+                    Err(e)
+                        if e.kind() == io::ErrorKind::NotFound
+                            || e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                    Err(e) => return Err(e.into()),
+                }
+                delete_overlay_files_row(&db, rel)?;
+                dropped_rows.push(rel.to_string());
+            }
+            for rel in &plan.deleted_paths {
+                if plan.append_entries.iter().any(|(p, _)| p == rel) {
+                    continue;
+                }
+                delete_overlay_files_row(&db, rel)?;
+                dropped_rows.push(rel.clone());
+            }
+            // Drop leftover empty parents so a later tick does not persist them
+            // as extra TAR directory members. Stop at a dir that still has a
+            // hot sibling.
+            let mut parents: Vec<String> = plan
+                .append_entries
+                .iter()
+                .filter_map(|(rel, is_dir)| {
+                    if *is_dir {
+                        None
+                    } else {
+                        rel.rsplit_once('/').map(|(p, _)| p.to_string())
+                    }
+                })
+                .collect();
+            parents.sort();
+            parents.dedup();
+            parents.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+            for parent in parents {
+                prune_empty_overlay_ancestors(&self.root, &db, &parent, &mut dropped_rows)?;
+            }
         }
+        self.tombstone_forget_many(&dropped_rows);
         Ok(())
     }
 
@@ -2038,8 +2075,11 @@ impl WriteOverlay {
     pub fn reset_overlay_contents(&self) -> Result<()> {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         reset_overlay_dir(&self.root)?;
-        let db = self.db.lock().expect("overlay db");
-        db.execute(r#"DELETE FROM "files""#, [])?;
+        {
+            let db = self.db.lock().expect("overlay db");
+            db.execute(r#"DELETE FROM "files""#, [])?;
+        }
+        self.tombstone_clear();
         Ok(())
     }
 
@@ -3032,6 +3072,47 @@ fn path_is_under_rel(parent: &str, child: &str) -> bool {
     child.starts_with(parent) && child.as_bytes().get(parent.len()) == Some(&b'/')
 }
 
+fn tombstone_key(folder: &str, name: &str) -> String {
+    if folder.is_empty() || folder == "/" {
+        format!("/{name}")
+    } else {
+        format!("{folder}/{name}")
+    }
+}
+
+fn tombstone_parent(full: &str) -> &str {
+    match full.rsplit_once('/') {
+        Some(("", _)) => "",
+        Some((dir, _)) => dir,
+        None => "",
+    }
+}
+
+fn tombstone_name(full: &str) -> &str {
+    full.rsplit_once('/').map(|(_, name)| name).unwrap_or(full)
+}
+
+fn tombstone_set_from_conn(conn: &Connection) -> HashSet<String> {
+    let mut stmt = match conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#) {
+        Ok(stmt) => stmt,
+        Err(_) => return HashSet::new(),
+    };
+    let rows = stmt
+        .query_map([], |row| {
+            let folder: String = row.get(0)?;
+            let name: String = row.get(1)?;
+            Ok((folder, name))
+        })
+        .into_iter()
+        .flatten()
+        .filter_map(|row| row.ok());
+    let mut out = HashSet::new();
+    for (folder, name) in rows {
+        out.insert(tombstone_key(&folder, &name));
+    }
+    out
+}
+
 fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
     let (folder, name) = WriteOverlay::split(rel);
     db.execute(
@@ -3041,7 +3122,12 @@ fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
     Ok(())
 }
 
-fn prune_empty_overlay_ancestors(root: &Path, db: &Connection, start: &str) -> Result<()> {
+fn prune_empty_overlay_ancestors(
+    root: &Path,
+    db: &Connection,
+    start: &str,
+    dropped_rows: &mut Vec<String>,
+) -> Result<()> {
     let mut cur = Some(start.to_string());
     while let Some(rel) = cur {
         if rel.is_empty() || rel == "/" {
@@ -3058,6 +3144,7 @@ fn prune_empty_overlay_ancestors(root: &Path, db: &Connection, start: &str) -> R
         match fs::remove_dir(&host) {
             Ok(()) => {
                 delete_overlay_files_row(db, &rel)?;
+                dropped_rows.push(rel.clone());
                 cur = rel.rsplit_once('/').map(|(p, _)| p.to_string());
             }
             Err(e)
@@ -5426,6 +5513,104 @@ mod tests {
         }
     }
 
+    /// Regression: unlinking an archive member must hide it without a per-lookup
+    /// SQL probe, including after the overlay is reopened from the same folder.
+    #[test]
+    fn tombstone_cache_hides_unlinked_base_across_remount() {
+        struct OneFile;
+        impl MountSource for OneFile {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path == "/" {
+                    let mut map = BTreeMap::new();
+                    map.insert("keep.txt".into(), keep_info());
+                    map.insert("other.txt".into(), other_info());
+                    Some(ListResult::Infos(map))
+                } else {
+                    None
+                }
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                match path {
+                    "/" => Some(create_root_file_info()),
+                    "/keep.txt" => Some(keep_info()),
+                    "/other.txt" => Some(other_info()),
+                    _ => None,
+                }
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Err(io::Error::new(io::ErrorKind::NotFound, "one file"))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        fn keep_info() -> FileInfo {
+            FileInfo {
+                size: 4,
+                mtime: 0.0,
+                mode: ratarmount_core::S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                    offset: 0,
+                    offsetheader: Some(0),
+                    istar: true,
+                    issparse: false,
+                    isgenerated: false,
+                    recursiondepth: 0,
+                })],
+            }
+        }
+        fn other_info() -> FileInfo {
+            let mut fi = keep_info();
+            fi.size = 5;
+            fi
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(OneFile) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        assert!(!ov.is_deleted("/keep.txt"));
+        assert!(ov.lookup("/keep.txt", 0).is_some());
+        for _ in 0..64 {
+            assert!(!ov.is_deleted("/other.txt"));
+        }
+        ov.unlink("/keep.txt").unwrap();
+        assert!(ov.is_deleted("/keep.txt"));
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        assert!(ov.lookup("/other.txt", 0).is_some());
+        assert!(
+            ov.list_deleted("/").iter().any(|name| name == "keep.txt"),
+            "root listing must still hide the tombstone"
+        );
+        drop(ov);
+
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert!(
+            ov.is_deleted("/keep.txt"),
+            "reopen must load tombstones from the overlay database"
+        );
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        assert!(!ov.is_deleted("/other.txt"));
+        let fd = ov.create_file("/keep.txt", 0o644).unwrap();
+        drop(unsafe {
+            use std::os::unix::io::FromRawFd;
+            std::fs::File::from_raw_fd(fd)
+        });
+        assert!(!ov.is_deleted("/keep.txt"));
+        let restored = ov.lookup("/keep.txt", 0).expect("recreated overlay file");
+        assert!(
+            matches!(restored.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:")),
+            "create after unlink must clear the tombstone and serve the overlay file"
+        );
+    }
+
     /// Regression: overlay open/create must not follow host symlinks outside root.
     ///
     /// Symptom: `realpath` is join+normpath only; `libc::open` / `File::create`
@@ -7214,10 +7399,22 @@ mod tests {
         );
     }
 
+    /// Descriptors whose target is under `root`, including unlinked files
+    /// (`readlink` appends ` (deleted)`). Ignores the rest of the process so
+    /// the leak check stays valid when other tests hold fds.
     #[cfg(unix)]
-    fn count_open_fds() -> Option<usize> {
+    fn count_fds_under(root: &Path) -> Option<usize> {
+        let prefix = root.to_string_lossy();
         let rd = std::fs::read_dir("/proc/self/fd").ok()?;
-        Some(rd.count())
+        Some(
+            rd.flatten()
+                .filter(|ent| {
+                    std::fs::read_link(ent.path())
+                        .ok()
+                        .is_some_and(|target| target.to_string_lossy().starts_with(prefix.as_ref()))
+                })
+                .count(),
+        )
     }
 
     /// Regression: `open_overlay_fd` materialized a missing host file via
@@ -7228,13 +7425,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn open_overlay_fd_create_does_not_leak_materialize_fd() {
-        let Some(before) = count_open_fds() else {
-            eprintln!("skip: /proc/self/fd not available");
-            return;
-        };
         let dir = tempfile::tempdir().unwrap();
         let overlay = dir.path().join("ov");
         let ov = overlay_with_base(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay);
+        let Some(before) = count_fds_under(&overlay) else {
+            eprintln!("skip: /proc/self/fd not available");
+            return;
+        };
         const N: usize = 32;
         for i in 0..N {
             let path = format!("/rewrite-{i}.txt");
@@ -7249,11 +7446,11 @@ mod tests {
                 .expect("post-wipe O_CREAT open");
             ov.close_overlay_fd(fd);
         }
-        let after = count_open_fds().expect("/proc/self/fd after loop");
-        assert!(
-            after <= before + 4,
+        let after = count_fds_under(&overlay).expect("/proc/self/fd after loop");
+        assert_eq!(
+            after, before,
             "Regression: discarded create_file_inner fd leaked on missing-file \
-             O_CREAT (before={before} after={after}; 32×2 opens would leak 64)"
+             O_CREAT (overlay fds before={before} after={after}; 32×2 opens would leak 64)"
         );
     }
 
