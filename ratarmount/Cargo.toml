@@ -27,7 +27,7 @@ gzip-rapidgzip-isal = [
 ]
 # NFSv4.1 via embednfs (requires rustc ≥ 1.88 / edition 2024). See docs/nfs-export.md.
 nfsv4 = ["ratarmount-nfs/nfsv4"]
-# SFTP export via russh (requires rustc ≥ 1.85). Default CI stays 1.74.
+# SFTP export via russh (requires rustc ≥ 1.85). Not enabled in default CI.
 sftp-russh = ["ratarmount-sftp/sftp-russh"]
 
 [dependencies]

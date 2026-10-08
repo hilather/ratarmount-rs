@@ -1,6 +1,6 @@
 //! Authorized-keys policy and OpenSSH `authorized_keys` subset parser.
 //!
-//! Always compiled (MSRV 1.74). The russh server loads the same lines.
+//! Always compiled (default builds do not require the russh feature). The russh server loads the same lines.
 
 use std::env;
 use std::fs;
@@ -173,7 +173,7 @@ fn is_key_type(tok: &str) -> bool {
         || tok.starts_with("sk-ecdsa-")
 }
 
-/// Serialize env mutation across tests (MSRV 1.74 `set_var` is safe; 1.87+ is not).
+/// Serialize env mutation across tests (`set_var` is unsafe since 1.87).
 #[cfg(test)]
 pub(crate) struct EnvGuard {
     saved: Vec<(String, Option<String>)>,

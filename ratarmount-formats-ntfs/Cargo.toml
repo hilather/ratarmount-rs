@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "NTFS image mount source (read-only, pure Rust via ntfs)"
-# crates.io `ntfs` 0.4.0 declares rust-version 1.60 (workspace MSRV 1.74).
+# crates.io `ntfs` 0.4.0 declares rust-version 1.60 (pin written for the former 1.74 MSRV).
 # GitHub master has rust-version 1.83 — pin the published 0.4 line, do not
 # take an unpublished git rev that would need an nfsv4-style feature gate.
 
@@ -13,7 +13,7 @@ ratarmount-core.workspace = true
 thiserror.workspace = true
 log.workspace = true
 # Exact pin: crates.io 0.4.0 is rust-version 1.60. GitHub master is still
-# versioned 0.4.0 but rust-version 1.83 — a caret `0.4` would break MSRV 1.74
+# versioned 0.4.0 but rust-version 1.83 — a caret `0.4` would break the former 1.74 MSRV
 # on `cargo update` if a 0.4.1 from that tree is published.
 ntfs = "=0.4.0"
 

@@ -404,7 +404,7 @@ pub(crate) fn http_date_gmt(unix_secs: u64) -> String {
     )
 }
 
-#[allow(clippy::manual_is_multiple_of)] // MSRV 1.74: `is_multiple_of` is newer
+#[allow(clippy::manual_is_multiple_of)] // written for the former 1.74 MSRV: `is_multiple_of` is newer
 fn is_leap(year: u64) -> bool {
     year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }

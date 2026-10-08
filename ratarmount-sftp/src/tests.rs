@@ -158,11 +158,11 @@ fn sftp_batch(
 }
 
 /// OpenSSH `sftp` skip-without. When `sftp-russh` is off this is a documented
-/// skip (default CI stays 1.74). When compiled, requires `sftp` + `ssh-keygen`.
+/// skip (default CI does not compile russh). When compiled, requires `sftp` + `ssh-keygen`.
 #[test]
 fn sftp_client_ls_get_skip_without() {
     if !sftp_russh_compiled() {
-        eprintln!("skip: crate built without sftp-russh (russh MSRV 1.85 > workspace 1.74)");
+        eprintln!("skip: crate built without sftp-russh (not compiled by default CI)");
         return;
     }
     if which("sftp").is_none() {
@@ -216,7 +216,7 @@ fn run_sftp_client_ls_get() {
 #[test]
 fn overlay_write_via_sftp_client_skip_without() {
     if !sftp_russh_compiled() {
-        eprintln!("skip: crate built without sftp-russh (russh MSRV 1.85 > workspace 1.74)");
+        eprintln!("skip: crate built without sftp-russh (not compiled by default CI)");
         return;
     }
     if which("sftp").is_none() {

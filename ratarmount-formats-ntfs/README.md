@@ -2,7 +2,7 @@
 
 Read-only NTFS filesystem image mount source for the Rust ratarmount rewrite (F-8).
 
-Uses Colin Finck’s pure-Rust [`ntfs`](https://crates.io/crates/ntfs) crate (v0.4, MSRV-compatible with workspace 1.74). No loop mount, no `ntfs-3g`, no journal replay.
+Uses Colin Finck’s pure-Rust [`ntfs`](https://crates.io/crates/ntfs) crate (v0.4). No loop mount, no `ntfs-3g`, no journal replay.
 
 This crate is **not** wired into the session factory in this PR. Callers use `looks_like_ntfs` / `NtfsMountSource::open` / `open_from_reader` (and the `*_with_offset` variants for a partition start). Factory probe order is an orchestrator PR.
 

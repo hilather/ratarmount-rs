@@ -94,7 +94,7 @@ One backend unlocks Drive, OneDrive, B2, Swift, HDFS, and the rest of rclone's l
 
 `sshfs` in reverse. `--sftp` / `--sftp-bind` default `127.0.0.1:20222` (well-known port 22 is `--sftp-bind 22`). Overlay writes map to SFTP open/write/close. Auth: `RATARMOUNT_SFTP_AUTHORIZED_KEYS` (default `~/.ssh/authorized_keys` **only on loopback**) and/or `RATARMOUNT_SFTP_USER` / `RATARMOUNT_SFTP_PASSWORD`. Non-loopback needs an explicit keys file **or** password env (else exit 2). Host key: `RATARMOUNT_SFTP_HOST_KEY` or ephemeral ed25519. `--sftp-subsystem` is stdio SFTP v3 (OpenSSH `Subsystem sftp`; no SSH-2).
 
-**Feature gate:** russh MSRV **1.85** > workspace **1.74**, so SSH-2 is optional `sftp-russh` (same pattern as `nfsv4`). Default `cargo test` does **not** compile russh; `--sftp` / `--sftp-subsystem` exit 2 with a rebuild hint. Linux/macOS packages enable the feature. No from-scratch SSH-2. That is a **feature note**, not a protocol leftover.
+**Feature gate:** SSH-2 is optional `sftp-russh` because default CI does not compile russh (same pattern as `nfsv4`). Workspace MSRV is **1.90**. Default `cargo test` does **not** compile russh; `--sftp` / `--sftp-subsystem` exit 2 with a rebuild hint. Linux/macOS packages enable the feature. No from-scratch SSH-2. That is a **feature note**, not a protocol leftover.
 
 ### Not doing (protocols)
 
@@ -177,7 +177,7 @@ Homebrew **tap cask** shipped: unpacks the signed `macos-arm64` GitHub Release t
 
 `smbclient` CLI is a packaging and Windows-host tax. A Range reader plus directory list makes SMB first-class like S3, not a temp-file download. Recursive share listings are F-1 on this backend.
 
-**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Session `open_remote_input` wires `smb://` through `open_s3_like` (Range) and `try_open_remote_folder_url` (folders). Fake-server tests; crates.io `smb` is rust-version 1.85–1.89 so default stays in-tree on MSRV 1.74. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
+**Landed:** in-tree blocking SMB 2.0.2 Direct-TCP packet codec (`ratarmount-remote/src/smb2_client.rs`): NEGOTIATE, SESSION_SETUP (guest + NTLMv2), TREE_CONNECT, CREATE, READ at offset, QUERY_DIRECTORY, QUERY_INFO, CLOSE. Live Range (`open_smb_range` / `SmbRangeFile`). Share listing (`open_smb_folder` / `SmbListing` QUERY_DIRECTORY Depth-1 on F-1 `RemoteFolderMountSource`; listing TTL `RATARMOUNT_REMOTE_LIST_TTL_SECS`). Session `open_remote_input` wires `smb://` through `open_s3_like` (Range) and `try_open_remote_folder_url` (folders). Fake-server tests; default stays on the in-tree codec. Crate-disjoint from `ratarmount-smb`. File dialect residual still falls back to `smbclient` download-to-temp.
 
 **Residual:** `SmbRangeFile` / `open_smb_range` (PR 3b), `SmbListing` folders (PR 3c), factory `smb://` live Range (PR 4). SMB 3.x encryption, Kerberos, DFS, SMB1.
 **Residual:** factory `smb://` live Range + folder probe (PR 4). `smbclient` directory listing. SMB 3.x encryption, Kerberos, DFS, SMB1.

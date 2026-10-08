@@ -117,13 +117,13 @@ Non-loopback bind (`0.0.0.0`, LAN IP) prints a warning. There is no IP allowlist
 
 ## NFSv4.1 (`--nfs --nfs-vers 4`)
 
-Status: **RO + `-w` overlay adapter shipped**. Optional feature `nfsv4` on `ratarmount-nfs` (forwarded from `ratarmount`) compiles [embednfs 0.4.1](https://docs.rs/embednfs/0.4.1/embednfs/) (`rust-version = "1.88"`, edition 2024). Workspace MSRV stays **1.74**; default `cargo test` / CI does **not** compile embednfs (same pattern as `gzip-rapidgzip`). `--nfs` without `--nfs-vers` remains NFSv3.
+Status: **RO + `-w` overlay adapter shipped**. Optional feature `nfsv4` on `ratarmount-nfs` (forwarded from `ratarmount`) compiles [embednfs 0.4.1](https://docs.rs/embednfs/0.4.1/embednfs/) (`rust-version = "1.88"`, edition 2024). Workspace MSRV is **1.90**. Default `cargo test` / CI does **not** compile embednfs (opt-in; not compiled by default CI; same pattern as `gzip-rapidgzip`). `--nfs` without `--nfs-vers` remains NFSv3.
 
 ```bash
 # Release packages (deb/rpm/portable/AppImage/macOS tarball) already compile nfsv4.
 # Source without the feature: `--nfs --nfs-vers 4` exits 2:
 #   rebuild with --features nfsv4 (rustc >= 1.88)
-# Workspace MSRV stays 1.74; default `cargo test` / CI check does not compile embednfs.
+# Workspace MSRV is 1.90; default `cargo test` / CI check does not compile embednfs.
 cargo run --features nfsv4 -- --nfs --nfs-vers 4 archive.tar.gz
 # Accepts `4` or `4.1`. Rejects `4.0` (macOS `vers=4` is NFSv4.0).
 ```
@@ -165,7 +165,7 @@ Status: **PASSED** (2026-08-15, rustc 1.97.1).
 | Unprivileged TCP COMPOUND `EXCHANGE_ID` (program 100003, version 4) | **NFS4_OK** (`v4_exchange_id_smoke`) |
 | Live Linux `mount -t nfs` | **PASSED** (2026-08-15) privileged Docker `./test-harness/nfs-docker/run.sh` — NFSv3 `vers=3,tcp,nolock,port=,mountport=` and NFSv4.1 `vers=4.1,tcp,port=,sec=sys`; `ls`/`cat` matched fixture files. Unprivileged host `mount` still exits 32 (`must be superuser`). |
 
-**Packaging (PR 6):** Linux `packaging/build-native-packages.sh` and `packaging/build-appimage.sh` pass `--features nfsv4,sftp-russh` on the **cargo** line. macOS `packaging/build-macos-tarball.sh` does too (rustup **stable**, rustc ≥ 1.88 assumed). Editing only `.github/workflows/packages.yml` does **not** compile v4. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
+**Packaging (PR 6):** Linux `packaging/build-native-packages.sh` and `packaging/build-appimage.sh` pass `--features nfsv4,sftp-russh` on the **cargo** line. macOS `packaging/build-macos-tarball.sh` does too (rustup **stable**; any builder needs the workspace MSRV 1.90). Editing only `.github/workflows/packages.yml` does **not** compile v4. `--nfs` remains NFSv3 unless `--nfs-vers 4` is passed to a `nfsv4` binary. Overlay writes on v4 require `-w` (same as v3). Idle reader drop is the 90s TTL above, not a real CLOSE.
 
 ### embednfs 0.4.1 API actually used
 
@@ -184,7 +184,7 @@ embednfs non-promises (do not advertise LAN / Windows / Kerberos): “does not g
 
 None for compile / bind / EXCHANGE_ID / Linux loopback kernel mount. Residual: Kerberos / LAN / Windows / no mux; default CI stays unprivileged (no `mount -t nfs` there).
 
-Source builds of `--features nfsv4` need **rustc ≥ 1.88**. rustc &lt; 1.88 cannot compile embednfs; do not vendor an NFS4 codec.
+Source builds need the workspace MSRV (**rustc ≥ 1.90**); embednfs itself declares 1.88. Do not vendor an NFS4 codec.
 
 ## How it differs from FUSE-T / kernel re-export
 
@@ -196,14 +196,14 @@ Userspace only. Deb/rpm/portable tarballs / AppImage do **not** need `nfs-kernel
 
 | Build | `nfsv4` compiled? |
 |-------|-------------------|
-| `cargo test --workspace` / default CI `fmt + clippy + test` | **No** (MSRV 1.74; same pattern as `gzip-rapidgzip` / `sftp-russh`) |
+| `cargo test --workspace` / default CI `fmt + clippy + test` | **No** (opt-in; not compiled by default CI; same pattern as `gzip-rapidgzip` / `sftp-russh`) |
 | CI job `nfsv4 feature tests` (`ci.yml`) | **Yes** (rustup stable) |
 | `packaging/build-native-packages.sh` (deb/rpm/portable) | **Yes** — `cargo build --release -p ratarmount --features nfsv4,sftp-russh` |
 | `packaging/build-appimage.sh` | **Yes** — same cargo line |
-| `packaging/build-macos-tarball.sh` | **Yes** (rustup stable ≥ 1.88 assumed). If a macOS builder is ever pinned below 1.88, drop `nfsv4` and update this table. `sftp-russh` needs rustc ≥ 1.85. |
+| `packaging/build-macos-tarball.sh` | **Yes** (rustup stable; any builder needs the workspace MSRV 1.90). |
 | `cargo build` / `make release` (no features) | `--nfs --nfs-vers 4` → exit 2 |
 
-This is a **stronger** packaging commitment than `gzip-rapidgzip` (still off). Current package jobs install rustup **stable**. If a Rocky/portable builder is ever pinned below rustc 1.88, keep the feature off and document here.
+This is a **stronger** packaging commitment than `gzip-rapidgzip` (still off). Current package jobs install rustup **stable**; any builder needs at least the workspace MSRV (1.90).
 
 `--print-features` prints `nfsv4: compiled` on packaged binaries. `--oss-attributions` lists **embednfs** (MIT) when the feature is compiled.
 
