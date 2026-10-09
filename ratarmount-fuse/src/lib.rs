@@ -1011,11 +1011,12 @@ impl RatarmountFs {
     /// is no kernel attr to drop and `drop_stable_attr` queues nothing. Do not
     /// also call `queue_kernel_inode` for the child.
     ///
-    /// Upstream #86 (rename, not implemented here): resolve both names, then
-    /// before the single `flush_kernel_invals` after the reply, `drop_stable_attr`
-    /// both parents and call this for `(old_parent, old_name)` and
-    /// `(new_parent, new_name)`. One batch then carries both parents' inode
-    /// invalidations and both names through the same notifier.
+    /// Upstream #86 (rename, not implemented here): before updating the path
+    /// map, save both child inodes, then before the single `flush_kernel_invals`
+    /// after the reply, `drop_stable_attr` both parents and call this for
+    /// `(old_parent, old_name)` and `(new_parent, new_name)`. One batch then
+    /// carries every still-stable parent inode and each advertised name
+    /// through the same notifier.
     fn note_entry_changed(&self, parent: u64, name: &str) {
         let key = (parent, name.to_string());
         let advertised = self.entry_advertised.lock().unwrap().remove(&key);
@@ -1752,13 +1753,16 @@ pub fn mount_blocking(
     // kernel cache, and so those writes never run on the request thread.
     //
     // Shutdown, every return path: drop the sender, `session.unmount()`,
-    // join the notifier, then return `res`. `unmount` is libfuse
-    // `fuse_session_unmount` and is valid here because the session channel
-    // stays open until `Session` drops. `run` can return `Ok` on a bad
-    // request while the connection is still up; the notifier's cloned
-    // `/dev/fuse` fd (`Arc<File>` inside `fuser::Notifier`) must not outlive
-    // the mount. With the mount gone, a notify blocked in the kernel returns
-    // `ENODEV` or `ENOENT` and the thread exits.
+    // join the notifier, then return `res`. With libfuse3, `unmount` drops
+    // fuser's `Mount` (`fuse_session_unmount` + `fuse_session_destroy`). The
+    // notifier writes on its own dup of the `/dev/fuse` fd (`Arc<File>` in
+    // `fuser::Notifier`) and shares no lock with libfuse, so this is safe.
+    // `run` can return `Ok` on a bad request while the connection is still
+    // up, hence the explicit unmount. A notify parked on a directory
+    // `i_rwsem` returns once the holder's request is answered; no request
+    // thread remains, so after the workers' replies the write completes,
+    // a later write fails with `ENODEV` (thread exits) and the closed
+    // channel ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
     let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
     let (tx, notifier_thread) = spawn_notifier(session.notifier());

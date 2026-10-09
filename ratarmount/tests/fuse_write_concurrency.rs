@@ -17,7 +17,10 @@ const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const PHASE1_DEADLINE: Duration = Duration::from_secs(20);
 const WAVE_DEADLINE: Duration = Duration::from_secs(30);
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(10);
-const DAEMON_EXIT_DEADLINE: Duration = Duration::from_secs(10);
+/// Daemon exit after `fusermount3 -u`. Usually milliseconds; a loaded host
+/// (shared CI, slow fsync of overlay/index files) has taken ~5-10s on base
+/// acec114 too. Still bounded, so a stuck notifier join fails the test.
+const DAEMON_EXIT_DEADLINE: Duration = Duration::from_secs(30);
 const KILL_REAP: Duration = Duration::from_secs(2);
 const LAZY_UNMOUNT_DEADLINE: Duration = Duration::from_secs(8);
 const DAEMON_KILL_REAP: Duration = Duration::from_secs(5);
@@ -326,8 +329,10 @@ fn fuse_concurrent_writers_same_dir_no_deadlock() {
     }
     guard.assert_workers_ok("wave");
 
-    // Finish in-flight notifier ioctls before umount. Unmounting while
-    // FUSE_NOTIFY_INVAL_* is inside the kernel can stall the daemon join.
+    // Flake hedge only: let the last queued FUSE_NOTIFY_INVAL_* land before
+    // umount. Runs after every worker exited 0, so it cannot turn a deadlock
+    // into a pass; a stuck notifier join still fails the bounded daemon-exit wait.
+    // A slow daemon exit under host load was also seen on base acec114.
     thread::sleep(Duration::from_millis(200));
     if let Err(e) = guard.graceful_unmount() {
         panic!("{e}");
@@ -550,8 +555,9 @@ impl MountGuard {
                 tail(&self.daemon_log)
             )),
             None => Err(format!(
-                "daemon pid {} did not exit within 10s after fusermount3 -u\n{}\n{}",
+                "daemon pid {} did not exit within {:?} after fusermount3 -u\n{}\n{}",
                 self.daemon_pid,
+                DAEMON_EXIT_DEADLINE,
                 proc_snapshot(self.daemon_pid),
                 tail(&self.daemon_log)
             )),
