@@ -27,12 +27,27 @@ const KILL_REAP: Duration = Duration::from_secs(5);
 /// copy-up rename of an archive-only member, and the errno cases.
 #[test]
 fn fuse_rename_write_overlay() {
+    with_mount("rrs86-fuse-rename-", run_cases);
+}
+
+/// Regression (#86 on #84): rename of an archive member the kernel holds with
+/// the 60s entry/attr TTL. Inside that window the old name must be gone, the
+/// new name must show the member's bytes and size, and readdir must agree,
+/// also when renaming over another 60s-cached member.
+#[test]
+fn fuse_rename_stable_archive_member_within_ttl() {
+    with_mount("rrs86-fuse-rename-ttl-", run_ttl_cases);
+}
+
+/// Mount the fixture with `-w`, run `cases` on `<mnt>/d` with a deadline, and
+/// unmount. A stuck case lazy-unmounts and SIGKILLs the daemon.
+fn with_mount(prefix: &str, cases: fn(&Path)) {
     if let Some(msg) = skip_reason() {
         eprintln!("{msg}");
         return;
     }
     let tmp = tempfile::Builder::new()
-        .prefix("rrs86-fuse-rename-")
+        .prefix(prefix)
         .tempdir()
         .expect("tempdir");
     let root = tmp.path();
@@ -51,8 +66,8 @@ fn fuse_rename_write_overlay() {
 
     let d = mnt.join("d");
     let (tx, rx) = mpsc::channel();
-    let cases = thread::spawn(move || {
-        let r = std::panic::catch_unwind(|| run_cases(&d));
+    let worker = thread::spawn(move || {
+        let r = std::panic::catch_unwind(|| cases(&d));
         let _ = tx.send(());
         r
     });
@@ -61,11 +76,11 @@ fn fuse_rename_write_overlay() {
         Err(_) => {
             let pid = guard.daemon_pid;
             guard.force_cleanup();
-            let _ = cases.join();
+            let _ = worker.join();
             panic!("rename cases did not finish in {CASES_DEADLINE:?} (daemon pid {pid})");
         }
     }
-    if let Err(p) = cases.join().expect("cases thread") {
+    if let Err(p) = worker.join().expect("cases thread") {
         // Unmount first (guard drop), then surface the assertion.
         drop(guard);
         std::panic::resume_unwind(p);
@@ -73,6 +88,36 @@ fn fuse_rename_write_overlay() {
     if let Err(e) = guard.graceful_unmount() {
         panic!("{e}");
     }
+}
+
+fn run_ttl_cases(d: &Path) {
+    let start = Instant::now();
+    // Prime the kernel caches: lookup (60s entry + attr TTL) and readdir.
+    for name in ["s1", "s2", "s3"] {
+        let m = fs::metadata(d.join(name)).unwrap_or_else(|e| panic!("stat {name}: {e}"));
+        assert_eq!(m.len(), 13, "{name} archive size");
+    }
+    assert_listing(d, &["s1", "s2", "s3"], &[]);
+
+    // Plain rename of a cached member.
+    rename_ok(d, "s1", "r1");
+    assert_enoent(d, "s1");
+    assert_eq!(read(d, "r1"), "stable-one-1\n");
+    assert_eq!(fs::metadata(d.join("r1")).expect("stat r1").len(), 13);
+    assert_listing(d, &["r1"], &["s1"]);
+
+    // Rename a cached member over another cached member.
+    rename_ok(d, "s3", "s2");
+    assert_enoent(d, "s3");
+    assert_eq!(read(d, "s2"), "stable-three\n");
+    assert_eq!(fs::metadata(d.join("s2")).expect("stat s2").len(), 13);
+    assert_listing(d, &["s2"], &["s3"]);
+
+    assert!(
+        start.elapsed() < Duration::from_secs(50),
+        "checks must run inside the 60s TTL window ({:?})",
+        start.elapsed()
+    );
 }
 
 fn run_cases(d: &Path) {
@@ -248,6 +293,9 @@ fn build_fixture(root: &Path) -> PathBuf {
     fs::write(src.join("a1"), "archive-one\n").expect("a1");
     fs::write(src.join("a2"), "archive-two\n").expect("a2");
     fs::write(src.join("sub").join("f"), "in-sub\n").expect("sub/f");
+    fs::write(src.join("s1"), "stable-one-1\n").expect("s1");
+    fs::write(src.join("s2"), "stable-two-2\n").expect("s2");
+    fs::write(src.join("s3"), "stable-three\n").expect("s3");
     let tar = root.join("a.tar");
     let status = Command::new("tar")
         .args(["-C", root.join("src").to_str().expect("src utf8"), "-cf"])
@@ -340,6 +388,17 @@ impl MountGuard {
             let _ = self.daemon.kill();
         }
         let _ = reap(&mut self.daemon, KILL_REAP);
+        // The kill aborts the FUSE connection; a lazy unmount that failed
+        // while the daemon was alive often succeeds now.
+        if mount_visible(&self.mnt) {
+            let _ = run_fusermount(&["-u", "-z"], &self.mnt, UNMOUNT_DEADLINE);
+        }
+        if mount_visible(&self.mnt) {
+            eprintln!(
+                "warning: {} still mounted after cleanup (fusermount3 failed); unmount it by hand",
+                self.mnt.display()
+            );
+        }
     }
 
     fn graceful_unmount(&mut self) -> Result<(), String> {

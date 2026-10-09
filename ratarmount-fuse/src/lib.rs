@@ -921,7 +921,32 @@ impl RatarmountFs {
                 return Err(EIO);
             }
         }
+        // Kernel cache: queue both names and both parents while `from` still
+        // resolves through path_to_ino (note_entry_changed looks the child up
+        // there; after the rebind the old path no longer resolves). The
+        // handler flushes once, after the reply.
+        let (src_advertised, dest_advertised) = {
+            let adv = self.entry_advertised.lock().unwrap();
+            (
+                adv.contains(&(parent, name.to_string())),
+                adv.contains(&(newparent, newname.to_string())),
+            )
+        };
+        self.note_entry_changed(parent, name);
+        self.note_entry_changed(newparent, newname);
+        self.drop_stable_attr(parent);
+        if newparent != parent {
+            self.drop_stable_attr(newparent);
+        }
         self.rebind_after_rename(&from, &to);
+        // The kernel d_moves the advertised dentry, with its 60s timeout, to
+        // the new name. Drop it there too: the inode is overlay-backed now
+        // (TTL 0), and `entry_advertised` does not track the moved name. A
+        // replaced advertised target already queued this name; the notify
+        // runs after the reply, so it hits the moved dentry either way.
+        if src_advertised && !dest_advertised {
+            self.queue_kernel_entry(newparent, newname);
+        }
         self.invalidate_dir_cache(&parent_path);
         self.invalidate_dir_cache(&newparent_path);
         Ok(())
@@ -1090,12 +1115,11 @@ impl RatarmountFs {
     /// is no kernel attr to drop and `drop_stable_attr` queues nothing. Do not
     /// also call `queue_kernel_inode` for the child.
     ///
-    /// Upstream #86 (rename, not implemented here): before updating the path
-    /// map (this resolves each child through it), call this for
-    /// `(old_parent, old_name)` and `(new_parent, new_name)` and
-    /// `drop_stable_attr` both parents. The single `flush_kernel_invals`
-    /// after the reply then carries each still-stable parent and child inode
-    /// and each advertised name through the same notifier in one batch.
+    /// Rename (#86, [`Self::rename_paths`]) calls this for both names and
+    /// `drop_stable_attr` on both parents before rebinding the path map
+    /// (this resolves each child through it). The single `flush_kernel_invals`
+    /// after the reply carries every still-stable parent and child inode and
+    /// each advertised name through the notifier in one batch.
     fn note_entry_changed(&self, parent: u64, name: &str) {
         let key = (parent, name.to_string());
         let advertised = self.entry_advertised.lock().unwrap().remove(&key);
@@ -1662,7 +1686,12 @@ impl Filesystem for RatarmountFs {
             &newname.to_string_lossy(),
             flags,
         ) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                reply.ok();
+                // Never notify inline: the kernel holds both directories'
+                // i_rwsem across FUSE_RENAME.
+                self.flush_kernel_invals();
+            }
             Err(errno) => reply.error(errno),
         }
     }
@@ -4245,6 +4274,142 @@ mod tests {
             created.is_empty(),
             "create after the pair was consumed sends no Entry: {created:?}"
         );
+        stop_recording(&fs, rec);
+    }
+
+    /// Stable archive members in `/` whose bytes can be read (copy-up on
+    /// rename needs it). `file_info_attr_stable` is true for each.
+    struct ReadableMembers(Vec<(String, FileInfo)>);
+
+    impl MountSource for ReadableMembers {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            let m: BTreeMap<String, FileInfo> = self.0.iter().cloned().collect();
+            Some(ListResult::Infos(m))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            let name = path.strip_prefix('/')?;
+            self.0
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, fi)| fi.clone())
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(vec![b'a'; fi.size as usize])))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    fn readable_members_fs(names: &[&str]) -> (tempfile::TempDir, RatarmountFs) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let members = names
+            .iter()
+            .map(|n| (n.to_string(), stable_tar_fi(4)))
+            .collect();
+        let base = Arc::new(ReadableMembers(members)) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        (dir, fs)
+    }
+
+    /// Regression (#86 on #84): rename of a 60s-advertised archive member must
+    /// queue the old name, the stable child inode and the stable parent before
+    /// the path map is rebound, and send nothing until the post-reply flush.
+    #[test]
+    fn rename_paths_queues_old_name_child_and_parent_before_rebind() {
+        let (_dir, fs) = readable_members_fs(&["m"]);
+        let rec = attach_recording(&fs);
+        let (child, _attr, ttl) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("m"))
+            .expect("lookup m");
+        assert_eq!(ttl, TTL, "stable archive member is advertised for 60s");
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0)
+            .expect("rename archive member");
+        assert_eq!(
+            fs.pending_inval.lock().unwrap().len(),
+            4,
+            "queued, not sent, until the handler flushes after reply.ok()"
+        );
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child),
+                KernelInval::Inode(FUSE_ROOT_ID),
+                // The moved dentry keeps its 60s timeout under the new name.
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "n".into(),
+                },
+            ]
+        );
+        assert!(!fs
+            .entry_advertised
+            .lock()
+            .unwrap()
+            .contains(&(FUSE_ROOT_ID, "m".into())));
+        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/n"));
+        let fi = fs.file_info_for_ino(child).expect("renamed member");
+        assert!(
+            fs.attr_ttl_for_fi(&fi).is_zero(),
+            "copied-up member is overlay-backed: TTL 0 from now on"
+        );
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#86 on #84): rename of one 60s-advertised member over
+    /// another queues both names and both stable children (the replaced one
+    /// before `rebind_after_rename` detaches it) plus the parent.
+    #[test]
+    fn rename_paths_over_advertised_member_queues_both_names_and_children() {
+        let (_dir, fs) = readable_members_fs(&["m", "t"]);
+        let rec = attach_recording(&fs);
+        let (child_m, _, ttl_m) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        let (child_t, _, ttl_t) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("t")).expect("t");
+        assert_eq!((ttl_m, ttl_t), (TTL, TTL));
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "t", 0)
+            .expect("rename over");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child_m),
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "t".into(),
+                },
+                KernelInval::Inode(child_t),
+                KernelInval::Inode(FUSE_ROOT_ID),
+            ]
+        );
+        assert_eq!(fs.path_for_ino(child_m).as_deref(), Some("/t"));
+        assert_ne!(fs.path_for_ino(child_t).as_deref(), Some("/t"));
+        assert!(fs.entry_advertised.lock().unwrap().is_empty());
         stop_recording(&fs, rec);
     }
 
