@@ -12,7 +12,7 @@ use fuser::{
     ReplyDirectoryPlus, ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, ReplyXattr, Request,
     FUSE_ROOT_ID,
 };
-use libc::{EACCES, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
+use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
 use log::debug;
 use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
@@ -36,6 +36,7 @@ fn io_to_errno(err: &std::io::Error) -> i32 {
         ErrorKind::NotFound => ENOENT,
         ErrorKind::PermissionDenied => EACCES,
         ErrorKind::IsADirectory => EISDIR,
+        ErrorKind::AlreadyExists => EEXIST,
         ErrorKind::InvalidInput => EINVAL,
         ErrorKind::Unsupported => ENOSYS,
         _ => EIO,
@@ -702,6 +703,84 @@ impl RatarmountFs {
         self.dir_cache.lock().unwrap().remove(parent);
     }
 
+    /// Overlay rename for `Filesystem::rename` (#86). Returns an errno.
+    ///
+    /// With a negotiated FUSE ABI below 7.23 (fuser 0.15 without `abi-7-23`)
+    /// the kernel only sends plain `FUSE_RENAME` (flags 0) and fails
+    /// `renameat2` flags with EINVAL itself. Any nonzero `flags` that still
+    /// arrives is refused here.
+    fn rename_paths(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+    ) -> Result<(), i32> {
+        let Some(ov) = &self.overlay else {
+            return Err(EROFS);
+        };
+        let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
+        let newparent_path = self.path_for_ino(newparent).ok_or(ENOENT)?;
+        let from = join_path(&parent_path, name);
+        let to = join_path(&newparent_path, newname);
+        if flags != 0 {
+            return Err(EINVAL);
+        }
+        if from == to {
+            return if self.source.lookup(&from, 0).is_some() {
+                Ok(())
+            } else {
+                Err(ENOENT)
+            };
+        }
+        match ov.rename(&from, &to) {
+            Ok(()) => {}
+            Err(ratarmount_compositing::OverlayError::Io(e)) => {
+                debug!("rename {from} -> {to}: {e}");
+                return Err(io_to_errno(&e));
+            }
+            Err(e) => {
+                debug!("rename {from} -> {to}: {e}");
+                return Err(EIO);
+            }
+        }
+        self.rebind_after_rename(&from, &to);
+        self.invalidate_dir_cache(&parent_path);
+        self.invalidate_dir_cache(&newparent_path);
+        Ok(())
+    }
+
+    /// Keep the source inode number across rename; detach a replaced
+    /// destination inode (same as export-core `InodeTable::rebind_path`).
+    /// The kernel may still hold the old destination inode (open fd, no
+    /// FORGET yet); it must not resolve to the file now at `to`.
+    fn rebind_after_rename(&self, from: &str, to: &str) {
+        // Lock order matches ino_for_path_with_fi: path_to_ino, then inodes.
+        let mut p2i = self.path_to_ino.lock().unwrap();
+        let mut inodes = self.inodes.lock().unwrap();
+        let src = p2i.get(from).copied();
+        if let Some(old_dest) = p2i.get(to).copied() {
+            if Some(old_dest) != src {
+                p2i.remove(to);
+                if let Some(ent) = inodes.get_mut(&old_dest) {
+                    ent.path = format!("\0stale-{old_dest}");
+                    ent.file_info = None;
+                    ent.cookie = None;
+                }
+            }
+        }
+        if let Some(src) = src {
+            p2i.remove(from);
+            if let Some(ent) = inodes.get_mut(&src) {
+                ent.path = to.to_string();
+                ent.file_info = None;
+                ent.cookie = None;
+            }
+            p2i.insert(to.to_string(), src);
+        }
+    }
+
     /// Kernel attr/entry TTL: zero when a write overlay can change size/names.
     fn attr_ttl(&self) -> Duration {
         if self.overlay.is_some() {
@@ -1202,6 +1281,28 @@ impl Filesystem for RatarmountFs {
                 debug!("rmdir: {e}");
                 reply.error(EIO);
             }
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        name: &OsStr,
+        newparent: u64,
+        newname: &OsStr,
+        flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        match self.rename_paths(
+            parent,
+            &name.to_string_lossy(),
+            newparent,
+            &newname.to_string_lossy(),
+            flags,
+        ) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -2018,6 +2119,134 @@ mod tests {
         assert_eq!(
             after, b_body,
             "base member read after offset-shifting commit must not be stale"
+        );
+    }
+
+    fn overlay_fs_for_rename() -> (tempfile::TempDir, Arc<WriteOverlay>, RatarmountFs) {
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        (dir, ov, fs)
+    }
+
+    fn overlay_write_new(ov: &WriteOverlay, path: &str, body: &[u8]) {
+        let fd = ov.create_file(path, 0o644).expect("create");
+        // SAFETY: fd was just returned by create_file and is closed once here.
+        let n = unsafe { libc::write(fd, body.as_ptr().cast(), body.len()) };
+        assert_eq!(n, body.len() as isize, "write {path}");
+        unsafe { libc::close(fd) };
+    }
+
+    /// Regression: FUSE rename returned ENOSYS (#86). Overwrite keeps the
+    /// source inode and detaches the replaced destination inode so a kernel
+    /// reference to it cannot resolve to the new file at `to`.
+    #[test]
+    fn rename_paths_rebinds_source_inode_and_detaches_replaced_destination() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/src", b"source-body");
+        overlay_write_new(&ov, "/dst", b"dest");
+        let src_ino = fs.ino_for_path("/src");
+        let dst_ino = fs.ino_for_path("/dst");
+        assert_ne!(src_ino, dst_ino);
+        fs.list_mode_cached("/").expect("prime dir cache");
+
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .expect("rename over existing target");
+
+        assert_eq!(fs.path_for_ino(src_ino).as_deref(), Some("/dst"));
+        assert_eq!(fs.path_to_ino.lock().unwrap().get("/dst"), Some(&src_ino));
+        assert!(!fs.path_to_ino.lock().unwrap().contains_key("/src"));
+        assert_ne!(fs.path_for_ino(dst_ino).as_deref(), Some("/dst"));
+        assert!(
+            fs.file_info_for_ino(dst_ino).is_none(),
+            "replaced destination inode must not resolve to the renamed file"
+        );
+        assert_eq!(
+            fs.file_info_for_ino(src_ino).expect("renamed").size,
+            b"source-body".len() as u64
+        );
+        assert!(ov.lookup("/src", 0).is_none(), "old name gone");
+        let names: Vec<String> = fs
+            .list_mode_cached("/")
+            .expect("list")
+            .into_iter()
+            .map(|(n, ..)| n)
+            .collect();
+        assert!(names.contains(&"dst".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"src".to_string()),
+            "dir cache dropped: {names:?}"
+        );
+
+        // Plain rename to a fresh name, source inode never looked up.
+        overlay_write_new(&ov, "/tmp", b"x");
+        fs.rename_paths(FUSE_ROOT_ID, "tmp", FUSE_ROOT_ID, "final", 0)
+            .expect("plain rename");
+        assert!(ov.lookup("/final", 0).is_some());
+        assert!(ov.lookup("/tmp", 0).is_none());
+    }
+
+    /// Regression (#86): rename errnos. renameat2 flags are refused (EINVAL),
+    /// a directory source gives EISDIR like the other frontends, a missing
+    /// source ENOENT, and a read-only mount EROFS.
+    #[test]
+    fn rename_paths_errnos_flags_dir_missing_readonly() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/a", b"a");
+        overlay_write_new(&ov, "/b", b"b");
+        ov.mkdir("/d", 0o755).expect("mkdir");
+        for flags in [1u32, 2, 4] {
+            assert_eq!(
+                fs.rename_paths(FUSE_ROOT_ID, "a", FUSE_ROOT_ID, "c", flags),
+                Err(EINVAL),
+                "flags {flags}"
+            );
+        }
+        assert!(ov.lookup("/a", 0).is_some(), "refused rename left source");
+        assert!(ov.lookup("/c", 0).is_none());
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "d", FUSE_ROOT_ID, "d2", 0),
+            Err(EISDIR)
+        );
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "nope", FUSE_ROOT_ID, "x", 0),
+            Err(ENOENT)
+        );
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "a", FUSE_ROOT_ID, "d", 0),
+            Err(EEXIST),
+            "file over directory"
+        );
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "a", FUSE_ROOT_ID, "a", 0),
+            Ok(())
+        );
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "nope", FUSE_ROOT_ID, "nope", 0),
+            Err(ENOENT)
+        );
+        assert_eq!(
+            fs.rename_paths(999_999, "a", FUSE_ROOT_ID, "x", 0),
+            Err(ENOENT),
+            "unknown parent inode"
+        );
+
+        let ro = RatarmountFs::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, None);
+        assert_eq!(
+            ro.rename_paths(FUSE_ROOT_ID, "a", FUSE_ROOT_ID, "b", 0),
+            Err(EROFS)
+        );
+    }
+
+    #[test]
+    fn io_to_errno_maps_already_exists_to_eexist() {
+        assert_eq!(
+            io_to_errno(&std::io::Error::new(ErrorKind::AlreadyExists, "x")),
+            EEXIST
         );
     }
 
