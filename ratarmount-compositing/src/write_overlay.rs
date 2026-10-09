@@ -1809,66 +1809,83 @@ impl WriteOverlay {
     /// Unsettled siblings stay so the next tick can pick them up.
     fn forget_committed_overlay(&self, plan: &OverlayCommitPlan) -> Result<()> {
         let mut dropped_rows = Vec::new();
-        {
+        // Rows already deleted are forgotten even when a later remove or prune
+        // returns. The db lock ends with `cleaned`.
+        let cleaned = {
             let db = self.db.lock().expect("overlay db");
-            let mut dirs: Vec<&str> = Vec::new();
-            for (rel, is_dir) in &plan.append_entries {
-                if *is_dir {
-                    dirs.push(rel.as_str());
-                    continue;
-                }
-                let host = self.realpath(rel);
-                match fs::remove_file(&host) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                    Err(e) => return Err(e.into()),
-                }
-                delete_overlay_files_row(&db, rel)?;
-                dropped_rows.push(rel.clone());
-            }
-            dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
-            for rel in dirs {
-                let host = self.realpath(rel);
-                // Not empty: a hot child appeared or was skipped. Leave the dir.
-                match fs::remove_dir(&host) {
-                    Ok(()) => {}
-                    Err(e)
-                        if e.kind() == io::ErrorKind::NotFound
-                            || e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
-                    Err(e) => return Err(e.into()),
-                }
-                delete_overlay_files_row(&db, rel)?;
-                dropped_rows.push(rel.to_string());
-            }
-            for rel in &plan.deleted_paths {
-                if plan.append_entries.iter().any(|(p, _)| p == rel) {
-                    continue;
-                }
-                delete_overlay_files_row(&db, rel)?;
-                dropped_rows.push(rel.clone());
-            }
-            // Drop leftover empty parents so a later tick does not persist them
-            // as extra TAR directory members. Stop at a dir that still has a
-            // hot sibling.
-            let mut parents: Vec<String> = plan
-                .append_entries
-                .iter()
-                .filter_map(|(rel, is_dir)| {
-                    if *is_dir {
-                        None
-                    } else {
-                        rel.rsplit_once('/').map(|(p, _)| p.to_string())
-                    }
-                })
-                .collect();
-            parents.sort();
-            parents.dedup();
-            parents.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
-            for parent in parents {
-                prune_empty_overlay_ancestors(&self.root, &db, &parent, &mut dropped_rows)?;
-            }
-        }
+            self.forget_committed_overlay_rows(&db, plan, &mut dropped_rows)
+        };
         self.tombstone_forget_many(&dropped_rows);
+        cleaned
+    }
+
+    /// Remove committed overlay files and SQL rows.
+    ///
+    /// Returns `Err` from a failed remove or from [`prune_empty_overlay_ancestors`]
+    /// without skipping rows already pushed onto `dropped_rows`. The caller
+    /// forgets those tombstones after dropping the db lock.
+    fn forget_committed_overlay_rows(
+        &self,
+        db: &Connection,
+        plan: &OverlayCommitPlan,
+        dropped_rows: &mut Vec<String>,
+    ) -> Result<()> {
+        let mut dirs: Vec<&str> = Vec::new();
+        for (rel, is_dir) in &plan.append_entries {
+            if *is_dir {
+                dirs.push(rel.as_str());
+                continue;
+            }
+            let host = self.realpath(rel);
+            match fs::remove_file(&host) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e.into()),
+            }
+            delete_overlay_files_row(db, rel)?;
+            dropped_rows.push(rel.clone());
+        }
+        dirs.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+        for rel in dirs {
+            let host = self.realpath(rel);
+            // Not empty: a hot child appeared or was skipped. Leave the dir.
+            match fs::remove_dir(&host) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::NotFound
+                        || e.kind() == io::ErrorKind::DirectoryNotEmpty => {}
+                Err(e) => return Err(e.into()),
+            }
+            delete_overlay_files_row(db, rel)?;
+            dropped_rows.push(rel.to_string());
+        }
+        for rel in &plan.deleted_paths {
+            if plan.append_entries.iter().any(|(p, _)| p == rel) {
+                continue;
+            }
+            delete_overlay_files_row(db, rel)?;
+            dropped_rows.push(rel.clone());
+        }
+        // Drop leftover empty parents so a later tick does not persist them
+        // as extra TAR directory members. Stop at a dir that still has a
+        // hot sibling.
+        let mut parents: Vec<String> = plan
+            .append_entries
+            .iter()
+            .filter_map(|(rel, is_dir)| {
+                if *is_dir {
+                    None
+                } else {
+                    rel.rsplit_once('/').map(|(p, _)| p.to_string())
+                }
+            })
+            .collect();
+        parents.sort();
+        parents.dedup();
+        parents.sort_by_key(|p| std::cmp::Reverse(p.matches('/').count()));
+        for parent in parents {
+            prune_empty_overlay_ancestors(&self.root, db, &parent, dropped_rows)?;
+        }
         Ok(())
     }
 
@@ -5608,6 +5625,98 @@ mod tests {
         assert!(
             matches!(restored.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:")),
             "create after unlink must clear the tombstone and serve the overlay file"
+        );
+    }
+
+    /// Regression: prune EACCES after a committed delete left `is_deleted` true.
+    ///
+    /// Symptom: `forget_committed_overlay` deleted the `gone` row, then
+    /// `prune_empty_overlay_ancestors` returned before `tombstone_forget_many`,
+    /// so the in-memory set still hid `gone`.
+    #[test]
+    fn forget_committed_overlay_forgets_tombstone_when_prune_fails() {
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!("skip: euid 0 ignores mode 0o555");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(NullBase) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+
+        let sub = ov.root.join("sub");
+        fs::create_dir_all(sub.join("nested")).unwrap();
+        fs::write(sub.join("nested").join("f"), b"payload").unwrap();
+        {
+            let db = ov.db.lock().expect("overlay db");
+            db.execute(
+                r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES ('','gone',1)"#,
+                [],
+            )
+            .unwrap();
+        }
+        ov.tombstone_remember("gone");
+        assert!(
+            ov.is_deleted("gone"),
+            "fixture must seed the in-memory tombstone"
+        );
+
+        // `sub` at 0o555 blocks removing `nested`. Restore before TempDir drops.
+        struct RestoreMode {
+            path: PathBuf,
+            mode: u32,
+        }
+        impl Drop for RestoreMode {
+            fn drop(&mut self) {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = fs::set_permissions(&self.path, fs::Permissions::from_mode(self.mode));
+            }
+        }
+        let original_mode = {
+            use std::os::unix::fs::PermissionsExt;
+            fs::metadata(&sub).unwrap().permissions().mode()
+        };
+        let _restore = RestoreMode {
+            path: sub.clone(),
+            mode: original_mode,
+        };
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&sub, fs::Permissions::from_mode(0o555)).unwrap();
+        }
+
+        let plan = OverlayCommitPlan {
+            deletions_nul: Vec::new(),
+            appends_nul: Vec::new(),
+            deleted_paths: ["gone".into()].into_iter().collect(),
+            append_entries: vec![("sub/nested/f".into(), false)],
+        };
+        let err = ov
+            .forget_committed_overlay(&plan)
+            .expect_err("prune remove_dir(sub/nested) must fail");
+        let OverlayError::Io(ioe) = &err else {
+            panic!("expected io::PermissionDenied from prune, got {err}");
+        };
+        assert_eq!(
+            ioe.kind(),
+            io::ErrorKind::PermissionDenied,
+            "expected EACCES from prune, got {err}"
+        );
+        {
+            let db = ov.db.lock().expect("overlay db");
+            let n: i64 = db
+                .query_row(
+                    r#"SELECT COUNT(*) FROM "files" WHERE path = '' AND name = 'gone'"#,
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(n, 0, "gone row must be deleted before prune fails");
+        }
+        assert!(
+            !ov.is_deleted("gone"),
+            "committed tombstone must leave the cache when prune fails"
         );
     }
 
