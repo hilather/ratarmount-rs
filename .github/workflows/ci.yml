@@ -51,7 +51,7 @@ jobs:
           ./packaging/test-systemd-unit.sh
 
   # Optional feature: NFSv4.1 (embednfs, rustc ≥ 1.88). Default check job
-  # stays on workspace MSRV 1.74 and does not compile embednfs. After the
+  # uses stable rustc and does not compile embednfs. After the
   # RO adapter landed, this job is required so packaging --features nfsv4
   # cannot go stale. Soft-skip is not allowed for the unit tests.
   nfsv4:
@@ -408,3 +408,62 @@ jobs:
             exit 0
           fi
           cargo check -p ratarmount-session --all-targets
+
+  # Declared workspace MSRV (Cargo.toml rust-version). Default `check` stays
+  # on stable and does not compile embednfs; this job checks the lockfile on
+  # the declared toolchain.
+  msrv:
+    name: msrv
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: MSRV contract
+        run: ./test-harness/test-msrv-ci.sh
+
+      - name: Install system deps
+        run: |
+          sudo apt-get update -o Acquire::Retries=5
+          sudo apt-get install -y -o Acquire::Retries=5 \
+            libfuse3-dev fuse3 pkg-config libarchive-dev zlib1g-dev
+
+      - name: Install declared MSRV
+        id: msrv
+        run: |
+          set -euo pipefail
+          V=$(sed -n 's/^rust-version = "\([0-9][0-9.]*\)"$/\1/p' Cargo.toml)
+          if [[ -z "${V}" ]]; then
+            echo "::error::Cargo.toml rust-version is empty"
+            exit 1
+          fi
+          if [[ ! "${V}" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Cargo.toml rust-version is not a single X.Y[.Z] (${V})"
+            exit 1
+          fi
+          echo "version=${V}" >> "$GITHUB_OUTPUT"
+          rustup toolchain install "${V}" --profile minimal
+          rustup override set "${V}"
+          got=$(rustc --version)
+          case "${got}" in
+            "rustc ${V}."*|"rustc ${V} "*)
+              echo "msrv rustc: ${got}"
+              ;;
+            *)
+              echo "::error::rustc --version (${got}) does not start with rustc ${V}. or rustc ${V} "
+              exit 1
+              ;;
+          esac
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-${{ steps.msrv.outputs.version }}
+
+      - name: cargo check workspace
+        run: cargo check --workspace --all-targets
+
+      - name: cargo check nfsv4
+        run: cargo check -p ratarmount-nfs --all-targets --features nfsv4
+
+      - name: cargo check ratarmount nfsv4
+        run: cargo check -p ratarmount --all-targets --features nfsv4

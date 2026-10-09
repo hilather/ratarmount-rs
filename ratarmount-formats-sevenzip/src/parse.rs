@@ -348,7 +348,7 @@ impl<'a> Cursor<'a> {
         Ok(result)
     }
 
-    #[allow(clippy::chunks_exact_to_as_chunks)] // MSRV 1.74: `as_chunks` is 1.88+
+    #[allow(clippy::chunks_exact_to_as_chunks)] // written for the former 1.74 MSRV: `as_chunks` is 1.88+
     fn read_utf16z(&mut self) -> Result<String> {
         let mut chars = Vec::new();
         loop {

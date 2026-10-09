@@ -20,8 +20,7 @@ use crate::auth::{
 use crate::vfs::RatarmountSftp;
 
 /// Rebuild hint when the binary was not compiled with russh (PR-12 maps to exit 2).
-pub const SFTP_RUSSH_HINT: &str =
-    "rebuild with --features sftp-russh (russh MSRV 1.85 > workspace 1.74)";
+pub const SFTP_RUSSH_HINT: &str = "rebuild with --features sftp-russh";
 
 /// `127.0.0.1:20222` — empty-string result of [`parse_sftp_bind`].
 pub const DEFAULT_SFTP_BIND: SocketAddr =
@@ -233,6 +232,11 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use ratarmount_core::{create_root_file_info, FileInfo, ListResult};
+
+    #[test]
+    fn sftp_russh_hint_literal() {
+        assert_eq!(SFTP_RUSSH_HINT, "rebuild with --features sftp-russh");
+    }
 
     struct EmptyFs;
     impl MountSource for EmptyFs {

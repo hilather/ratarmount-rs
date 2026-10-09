@@ -1127,7 +1127,7 @@ fn base64_decode(s: &str) -> Option<Vec<u8>> {
         }
     }
     let bytes: Vec<u8> = s.bytes().filter(|b| !b.is_ascii_whitespace()).collect();
-    // `usize::is_multiple_of` is 1.87+; keep `%` for workspace MSRV 1.74.
+    // `usize::is_multiple_of` is 1.87+; keep `%` (written for the former 1.74 MSRV).
     #[allow(clippy::manual_is_multiple_of)]
     if bytes.len() % 4 != 0 {
         return None;

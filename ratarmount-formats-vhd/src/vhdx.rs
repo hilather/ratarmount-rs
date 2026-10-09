@@ -465,7 +465,7 @@ where
 #[cfg(test)]
 pub(crate) fn encode_fixed_vhdx(payload: &[u8], virt_size: u64) -> Result<Vec<u8>> {
     const BLOCK: u64 = MIB;
-    // `% 512` not `is_multiple_of` — that method is rustc 1.87+ (MSRV 1.74).
+    // `% 512` not `is_multiple_of` — that method is rustc 1.87+ (written for the former 1.74 MSRV).
     #[allow(clippy::manual_is_multiple_of)]
     if virt_size == 0 || virt_size % 512 != 0 {
         return Err(VhdError::Msg(

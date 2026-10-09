@@ -25,6 +25,6 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 serde_json = "1"
 # Pre-landed for P-4 FTP (`suppaftp` rustls) and P-3 GCS ADC RS256 JWT.
 # Unused until those inbound PRs `use` them. Do not add `native-tls`.
-# 6.2.1+ rust-version is 1.80.1; pin 6.2.0 for workspace MSRV 1.74.
+# 6.2.1+ rust-version is 1.80.1; pin 6.2.0 written for the former 1.74 MSRV.
 suppaftp = { version = "=6.2.0", default-features = false, features = ["rustls"] }
 jsonwebtoken = "9"

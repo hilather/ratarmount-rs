@@ -1,6 +1,6 @@
 //! SMB 2.0.2 / 3.1.1 packet codec (Direct TCP) plus a tiny NTLMSSP/SPNEGO subset.
 //!
-//! No crates.io SMB server compiled on workspace MSRV 1.74 without raising
+//! No crates.io SMB server compiled on the former 1.74 MSRV without raising
 //! edition/rustc, so this module is the dialect.
 
 use std::io::{self, ErrorKind};
@@ -564,7 +564,7 @@ pub fn encode_utf16le(s: &str) -> Vec<u8> {
 
 pub fn decode_utf16le(bytes: &[u8]) -> String {
     let even = bytes.len() & !1;
-    // `as_chunks` is rustc 1.88+; workspace MSRV is 1.74.
+    // `as_chunks` is rustc 1.88+; written for the former 1.74 MSRV.
     #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     let u: Vec<u16> = bytes[..even]
         .chunks_exact(2)

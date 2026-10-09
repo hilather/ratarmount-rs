@@ -477,7 +477,7 @@ fn parse_gpt<R: Read + Seek>(reader: &mut R, sector_size: u32) -> Result<Vec<Par
     let part_entry_size = le_u32(&hdr, 84);
     // Cap before multiply: a crafted SizeOfPartitionEntry of ~4 GiB × 256 entries
     // would OOM (or panic on 32-bit saturating_mul + slice) the FUSE/NFS process.
-    // `% 128` not `is_multiple_of` — that method is rustc 1.87+ (MSRV 1.74).
+    // `% 128` not `is_multiple_of` — that method is rustc 1.87+ (written for the former 1.74 MSRV).
     #[allow(clippy::manual_is_multiple_of)]
     if !(128..=MAX_GPT_ENTRY_SIZE).contains(&part_entry_size) || part_entry_size % 128 != 0 {
         return Err(BlockError::Msg(format!(

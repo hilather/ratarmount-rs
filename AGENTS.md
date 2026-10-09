@@ -249,6 +249,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Nested flatten/AutoMount cancel publishes over dest | `cargo test -p ratarmount-session --lib index_job_cancel_nested_flatten_keeps_dest` |
 | Session not `Send` / L2 probe order reorder | `cargo test -p ratarmount-session --lib session_send` · `cargo test -p ratarmount-session --lib ordered_format_backends` |
 | Session HTTP Range (`http-export`) | `cargo test -p ratarmount-session --features http-export --lib http::` |
+| Declared MSRV lower than the toolchain the workspace needs (README/Cargo.toml drift) | `./test-harness/test-msrv-ci.sh` · CI job `msrv` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
@@ -296,7 +297,7 @@ assets** (`.deb` / `.rpm` / portable tarballs / cosign bundles). Workflow:
 **After every release tag, watch CI until settled** (fix failures, re-tag if needed).
 Full procedure: skill **`release-tag-ci-watch`** (`.grok/skills/release-tag-ci-watch/SKILL.md`).
 
-Linux/macOS package scripts compile **`--features nfsv4,sftp-russh`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4 or russh. Workspace MSRV stays 1.74; default CI `fmt + clippy + test` compiles neither embednfs nor russh. Privileged kernel-client check (not default CI): `./test-harness/nfs-docker/run.sh`. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md), [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md), and [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
+Linux/macOS package scripts compile **`--features nfsv4,sftp-russh`** (`packaging/build-native-packages.sh`, `build-appimage.sh`, `build-macos-tarball.sh`). Editing only `packages.yml` does **not** compile v4 or russh. Workspace MSRV is 1.90 (CI `msrv` job); default CI `fmt + clippy + test` compiles neither embednfs nor russh. Privileged kernel-client check (not default CI): `./test-harness/nfs-docker/run.sh`. See [docs/packaging.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/packaging.md), [docs/nfs-export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/nfs-export.md), and [docs/export.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/export.md).
 
 ### Version bump checklist
 
