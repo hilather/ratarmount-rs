@@ -54,6 +54,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Overlay open after create+write (`has_file` → OverlayFd) | `cargo test -p ratarmount-fuse --lib overlay_open_after_create_write` |
 | Write-mount stat re-queries unmodified archive member | `cargo test -p ratarmount-fuse --lib overlay_archive_member` |
 | FUSE kernel notify on the request thread deadlocks (parent i_rwsem vs FUSE reply) | `cargo test -p ratarmount-fuse --lib notifier` |
+| Concurrent FUSE writers in one directory deadlock (request-thread notify) | `cargo test -p ratarmount --test fuse_write_concurrency` |
 | Kernel inval_entry only for names advertised with a non-zero entry TTL | `cargo test -p ratarmount-fuse --lib entry_advertised` |
 | Overlay unlink tombstone SQL on every lookup | `cargo test -p ratarmount-compositing --lib tombstone_cache` |
 | Committed tombstone stays cached when overlay prune fails | `cargo test -p ratarmount-compositing --lib forget_committed_overlay_forgets_tombstone_when_prune_fails` |
