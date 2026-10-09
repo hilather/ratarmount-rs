@@ -108,7 +108,7 @@ fn run_cases(d: &Path) {
     assert_rename_errno(d, "nope", "x", libc::ENOENT);
 
     // 6. renameat2 flags. The VFS answers RENAME_NOREPLACE onto an existing
-    // name with EEXIST itself. fuser 0.15 negotiates FUSE minor 8, so for
+    // name with EEXIST itself. The negotiated FUSE ABI is below 7.23, so for
     // anything that reaches the filesystem the kernel refuses flags with
     // EINVAL before the daemon sees them (kernel-observed; the handler's own
     // flag check is covered by the ratarmount-fuse lib unit test).

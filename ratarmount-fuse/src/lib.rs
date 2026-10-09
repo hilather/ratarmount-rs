@@ -705,9 +705,10 @@ impl RatarmountFs {
 
     /// Overlay rename for `Filesystem::rename` (#86). Returns an errno.
     ///
-    /// fuser 0.15 without `abi-7-23` negotiates FUSE minor 8: the kernel only
-    /// sends plain `FUSE_RENAME` (flags 0) and fails `renameat2` flags with
-    /// EINVAL itself. Any nonzero `flags` that still arrives is refused here.
+    /// With a negotiated FUSE ABI below 7.23 (fuser 0.15 without `abi-7-23`)
+    /// the kernel only sends plain `FUSE_RENAME` (flags 0) and fails
+    /// `renameat2` flags with EINVAL itself. Any nonzero `flags` that still
+    /// arrives is refused here.
     fn rename_paths(
         &self,
         parent: u64,
