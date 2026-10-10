@@ -922,8 +922,8 @@ impl RatarmountFs {
             }
         }
         // Kernel cache: queue the old name, both children and both parents
-        // while `from` still resolves through path_to_ino (the children are
-        // looked up there; after the rebind the old path no longer resolves).
+        // before the rebind, while path_to_ino still maps `from` to the
+        // source and `to` to a replaced target (afterwards neither does).
         // The handler flushes once, after the reply.
         //
         // No INVAL_ENTRY for the destination name, cached or not. After the
