@@ -952,6 +952,27 @@ impl RatarmountFs {
         Ok(())
     }
 
+    /// FUSE `rename` body: run [`Self::rename_paths`], hand the result to
+    /// `reply`, then (on success) flush the queued invalidations.
+    fn rename_reply(
+        &self,
+        parent: u64,
+        name: &str,
+        newparent: u64,
+        newname: &str,
+        flags: u32,
+        reply: impl FnOnce(Result<(), i32>),
+    ) {
+        let result = self.rename_paths(parent, name, newparent, newname, flags);
+        let ok = result.is_ok();
+        reply(result);
+        if ok {
+            // Never notify inline: the kernel holds both directories'
+            // i_rwsem across FUSE_RENAME.
+            self.flush_kernel_invals();
+        }
+    }
+
     /// Keep the source inode number across rename; detach a replaced
     /// destination inode (same as export-core `InodeTable::rebind_path`).
     /// The kernel may still hold the old destination inode (open fd, no
@@ -1679,21 +1700,17 @@ impl Filesystem for RatarmountFs {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        match self.rename_paths(
+        self.rename_reply(
             parent,
             &name.to_string_lossy(),
             newparent,
             &newname.to_string_lossy(),
             flags,
-        ) {
-            Ok(()) => {
-                reply.ok();
-                // Never notify inline: the kernel holds both directories'
-                // i_rwsem across FUSE_RENAME.
-                self.flush_kernel_invals();
-            }
-            Err(errno) => reply.error(errno),
-        }
+            |result| match result {
+                Ok(()) => reply.ok(),
+                Err(errno) => reply.error(errno),
+            },
+        );
     }
 
     fn setattr(
@@ -4277,16 +4294,29 @@ mod tests {
         stop_recording(&fs, rec);
     }
 
-    /// Stable archive members in `/` whose bytes can be read (copy-up on
-    /// rename needs it). `file_info_attr_stable` is true for each.
+    /// Stable archive entries keyed by relative path (`m`, `sub`, `sub/x`)
+    /// whose bytes can be read (copy-up on rename needs it).
+    /// `file_info_attr_stable` is true for each.
     struct ReadableMembers(Vec<(String, FileInfo)>);
 
     impl MountSource for ReadableMembers {
         fn list(&self, path: &str) -> Option<ListResult> {
-            if path != "/" {
+            let dir = path.strip_prefix('/')?;
+            if !dir.is_empty()
+                && !self
+                    .lookup(path, 0)
+                    .is_some_and(|fi| fi.mode & S_IFMT == ratarmount_core::S_IFDIR)
+            {
                 return None;
             }
-            let m: BTreeMap<String, FileInfo> = self.0.iter().cloned().collect();
+            let m: BTreeMap<String, FileInfo> = self
+                .0
+                .iter()
+                .filter_map(|(key, fi)| {
+                    let (parent, base) = key.rsplit_once('/').unwrap_or(("", key));
+                    (parent == dir).then(|| (base.to_string(), fi.clone()))
+                })
+                .collect();
             Some(ListResult::Infos(m))
         }
 
@@ -4311,20 +4341,31 @@ mod tests {
     }
 
     fn readable_members_fs(names: &[&str]) -> (tempfile::TempDir, RatarmountFs) {
-        use ratarmount_compositing::WriteOverlay;
-
-        let dir = tempfile::tempdir().unwrap();
         let members = names
             .iter()
             .map(|n| (n.to_string(), stable_tar_fi(4)))
             .collect();
-        let base = Arc::new(ReadableMembers(members)) as Arc<dyn MountSource>;
+        readable_tree_fs(members)
+    }
+
+    fn readable_tree_fs(entries: Vec<(String, FileInfo)>) -> (tempfile::TempDir, RatarmountFs) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(ReadableMembers(entries)) as Arc<dyn MountSource>;
         let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
         let fs = RatarmountFs::new(
             Arc::clone(&ov) as Arc<dyn MountSource>,
             Some(Arc::clone(&ov)),
         );
         (dir, fs)
+    }
+
+    /// Archive directory entry; tar userdata keeps `file_info_attr_stable`.
+    fn stable_tar_dir_fi() -> FileInfo {
+        let mut fi = stable_tar_fi(0);
+        fi.mode = ratarmount_core::S_IFDIR | 0o755;
+        fi
     }
 
     /// Regression (#86 on #84): rename of a 60s-advertised archive member must
@@ -4410,6 +4451,118 @@ mod tests {
         assert_eq!(fs.path_for_ino(child_m).as_deref(), Some("/t"));
         assert_ne!(fs.path_for_ino(child_t).as_deref(), Some("/t"));
         assert!(fs.entry_advertised.lock().unwrap().is_empty());
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#86 on #84): a cross-directory rename must also drop the
+    /// new parent's 60s attr. Every other rename test used one directory, so
+    /// deleting `drop_stable_attr(newparent)` left the suite green.
+    #[test]
+    fn rename_paths_across_dirs_queues_both_parents() {
+        let (_dir, fs) = readable_tree_fs(vec![
+            ("m".into(), stable_tar_fi(4)),
+            ("sub".into(), stable_tar_dir_fi()),
+            ("sub/x".into(), stable_tar_fi(4)),
+        ]);
+        let names = |dir: &str| -> Vec<String> {
+            fs.list_mode_cached(dir)
+                .expect("list")
+                .into_iter()
+                .map(|(n, _, _)| n)
+                .collect()
+        };
+        // Primes the 30s dir cache for /sub; the rename must invalidate it.
+        assert_eq!(names("/sub"), vec!["x".to_string()]);
+        let rec = attach_recording(&fs);
+        let (child, _, ttl_m) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        let (sub, _, ttl_sub) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("sub"))
+            .expect("sub");
+        assert_eq!((ttl_m, ttl_sub), (TTL, TTL));
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", sub, "n", 0)
+            .expect("rename into sub");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child),
+                KernelInval::Inode(FUSE_ROOT_ID),
+                KernelInval::Inode(sub),
+                KernelInval::Entry {
+                    parent: sub,
+                    name: "n".into(),
+                },
+            ]
+        );
+        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/sub/n"));
+        assert_eq!(fs.path_for_ino(sub).as_deref(), Some("/sub"));
+        assert!(fs.source.lookup("/m", 0).is_none());
+        assert!(fs.source.lookup("/sub/n", 0).is_some());
+        let mut sub_names = names("/sub");
+        sub_names.sort();
+        assert_eq!(sub_names, vec!["n".to_string(), "x".to_string()]);
+        assert!(!names("/").contains(&"m".to_string()));
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#86 on #84): the rename handler replies first, then
+    /// flushes. Without the flush the invalidations stayed queued (and went
+    /// out with some later request, or never).
+    #[test]
+    fn rename_reply_flushes_after_reply() {
+        let (_dir, fs) = readable_members_fs(&["m"]);
+        let rec = attach_recording(&fs);
+        let (child, _, ttl) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        assert_eq!(ttl, TTL);
+
+        let mut replied = None;
+        fs.rename_reply(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0, |result| {
+            let queued = fs.pending_inval.lock().unwrap().len();
+            let sent = rec.rx.try_recv();
+            replied = Some((result, queued, sent));
+        });
+        let (result, queued, sent) = replied.expect("reply called");
+        assert_eq!(result, Ok(()));
+        assert_eq!(
+            queued, 4,
+            "invalidations are queued when the reply goes out"
+        );
+        assert_eq!(
+            sent,
+            Err(mpsc::TryRecvError::Empty),
+            "nothing sent before the reply"
+        );
+        assert!(
+            fs.pending_inval.lock().unwrap().is_empty(),
+            "rename_reply must flush after the reply"
+        );
+        assert_eq!(
+            flush_recorded(&fs, &rec.rx),
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child),
+                KernelInval::Inode(FUSE_ROOT_ID),
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "n".into(),
+                },
+            ]
+        );
+
+        let mut missing = None;
+        fs.rename_reply(FUSE_ROOT_ID, "zz", FUSE_ROOT_ID, "y", 0, |result| {
+            missing = Some(result);
+        });
+        assert_eq!(missing, Some(Err(ENOENT)));
+        assert!(fs.pending_inval.lock().unwrap().is_empty());
         stop_recording(&fs, rec);
     }
 
