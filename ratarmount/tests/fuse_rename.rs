@@ -27,7 +27,7 @@ const KILL_REAP: Duration = Duration::from_secs(5);
 /// copy-up rename of an archive-only member, and the errno cases.
 #[test]
 fn fuse_rename_write_overlay() {
-    with_mount("rrs86-fuse-rename-", run_cases);
+    with_mount("rrs86-fuse-rename-", |d, _| run_cases(d));
 }
 
 /// Regression (#86 on #84): rename of an archive member the kernel holds with
@@ -36,12 +36,23 @@ fn fuse_rename_write_overlay() {
 /// also when renaming over another 60s-cached member.
 #[test]
 fn fuse_rename_stable_archive_member_within_ttl() {
-    with_mount("rrs86-fuse-rename-ttl-", run_ttl_cases);
+    with_mount("rrs86-fuse-rename-ttl-", |d, _| run_ttl_cases(d));
 }
 
-/// Mount the fixture with `-w`, run `cases` on `<mnt>/d` with a deadline, and
-/// unmount. A stuck case lazy-unmounts and SIGKILLs the daemon.
-fn with_mount(prefix: &str, cases: fn(&Path)) {
+/// Regression (#84 follow-up): rename of a 60s-cached archive member onto a
+/// name the kernel never looked up. The new name must stay fresh (host
+/// append to the copied-up file is visible at once) without an extra
+/// `inval_entry` on the new name, and an fd held across the rename must not
+/// read as "(deleted)" in /proc (that notify unhashed the moved dentry).
+/// Same for a rename over another 60s-cached member.
+#[test]
+fn fuse_rename_cached_source_to_uncached_name_stays_fresh() {
+    with_mount("rrs84-fuse-rename-moved-", run_moved_name_cases);
+}
+
+/// Mount the fixture with `-w`, run `cases(<mnt>/d, <overlay dir>)` with a
+/// deadline, and unmount. A stuck case lazy-unmounts and SIGKILLs the daemon.
+fn with_mount(prefix: &str, cases: fn(&Path, &Path)) {
     if let Some(msg) = skip_reason() {
         eprintln!("{msg}");
         return;
@@ -65,9 +76,10 @@ fn with_mount(prefix: &str, cases: fn(&Path)) {
     }
 
     let d = mnt.join("d");
+    let ov_dir = ov.clone();
     let (tx, rx) = mpsc::channel();
     let worker = thread::spawn(move || {
-        let r = std::panic::catch_unwind(|| cases(&d));
+        let r = std::panic::catch_unwind(|| cases(&d, &ov_dir));
         let _ = tx.send(());
         r
     });
@@ -112,6 +124,113 @@ fn run_ttl_cases(d: &Path) {
     assert_eq!(read(d, "s2"), "stable-three\n");
     assert_eq!(fs::metadata(d.join("s2")).expect("stat s2").len(), 13);
     assert_listing(d, &["s2"], &["s3"]);
+
+    assert!(
+        start.elapsed() < Duration::from_secs(50),
+        "checks must run inside the 60s TTL window ({:?})",
+        start.elapsed()
+    );
+}
+
+/// Time for the post-reply notifier batch to reach the kernel.
+const NOTIFY_SETTLE: Duration = Duration::from_secs(1);
+
+fn run_moved_name_cases(d: &Path, ov: &Path) {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::unix::io::AsRawFd;
+
+    let start = Instant::now();
+    // Prime: 60s entry + attr TTL for s1, readdir, and an fd held across the
+    // rename. `fresh` is never looked up before the rename.
+    assert_eq!(fs::metadata(d.join("s1")).expect("stat s1").len(), 13);
+    assert_listing(d, &["s1"], &["fresh"]);
+    let mut held = File::open(d.join("s1")).expect("open s1");
+
+    rename_ok(d, "s1", "fresh");
+    thread::sleep(NOTIFY_SETTLE);
+
+    // Freshness oracle, before any read or write through the mount: append
+    // on the host to the copied-up overlay file. A stale 60s attr on the
+    // moved inode would still report 13 bytes.
+    let host = ov.join("d").join("fresh");
+    assert!(host.is_file(), "copy-up file {} missing", host.display());
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&host)
+        .and_then(|mut f| f.write_all(b"host\n"))
+        .expect("host append");
+    assert_eq!(
+        fs::metadata(d.join("fresh")).expect("stat fresh").len(),
+        18,
+        "moved name serves a stale size after a host append"
+    );
+    assert_eq!(read(d, "fresh"), "stable-one-1\nhost\n");
+
+    // Visibility sanity checks (true bytes; not a cache oracle).
+    assert_enoent(d, "s1");
+    assert!(File::open(d.join("s1")).is_err(), "open s1 after rename");
+    assert_listing(d, &["fresh"], &["s1"]);
+    let out = Command::new("stat")
+        .args(["-c", "%s"])
+        .arg(d.join("fresh"))
+        .output()
+        .expect("spawn stat");
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), "18");
+
+    // The held fd still reads, and /proc names the new path, not "(deleted)".
+    let mut body = String::new();
+    held.seek(SeekFrom::Start(0)).expect("seek held");
+    held.read_to_string(&mut body).expect("read held");
+    assert!(body.starts_with("stable-one-1\n"), "held fd read {body:?}");
+    let link = fs::read_link(format!("/proc/self/fd/{}", held.as_raw_fd())).expect("readlink");
+    let link = link.to_string_lossy().into_owned();
+    assert!(
+        link.ends_with("/d/fresh") && !link.contains("(deleted)"),
+        "fd held across the rename reads as {link:?}"
+    );
+    drop(held);
+
+    // Write through the mount, then rename back.
+    fs::OpenOptions::new()
+        .append(true)
+        .open(d.join("fresh"))
+        .and_then(|mut f| f.write_all(b"more\n"))
+        .expect("append through mount");
+    assert_eq!(fs::metadata(d.join("fresh")).expect("stat").len(), 23);
+    assert_eq!(read(d, "fresh"), "stable-one-1\nhost\nmore\n");
+    rename_ok(d, "fresh", "s1");
+    assert_enoent(d, "fresh");
+    assert_eq!(read(d, "s1"), "stable-one-1\nhost\nmore\n");
+    assert_listing(d, &["s1"], &["fresh"]);
+
+    // Rename a cached member over another cached member, with an fd held on
+    // the source. Same oracle: host append to the copy-up, then stat/read.
+    for name in ["s2", "s3"] {
+        assert_eq!(fs::metadata(d.join(name)).expect("stat").len(), 13);
+    }
+    let held = File::open(d.join("s3")).expect("open s3");
+    rename_ok(d, "s3", "s2");
+    thread::sleep(NOTIFY_SETTLE);
+    fs::OpenOptions::new()
+        .append(true)
+        .open(ov.join("d").join("s2"))
+        .and_then(|mut f| f.write_all(b"host\n"))
+        .expect("host append s2");
+    assert_eq!(
+        fs::metadata(d.join("s2")).expect("stat s2").len(),
+        18,
+        "replaced name serves a stale size after a host append"
+    );
+    assert_eq!(read(d, "s2"), "stable-three\nhost\n");
+    assert_enoent(d, "s3");
+    assert_listing(d, &["s2"], &["s3"]);
+    let link = fs::read_link(format!("/proc/self/fd/{}", held.as_raw_fd())).expect("readlink");
+    let link = link.to_string_lossy().into_owned();
+    assert!(
+        link.ends_with("/d/s2") && !link.contains("(deleted)"),
+        "fd held across rename-over reads as {link:?}"
+    );
+    drop(held);
 
     assert!(
         start.elapsed() < Duration::from_secs(50),

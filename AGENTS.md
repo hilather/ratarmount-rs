@@ -255,6 +255,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Session HTTP Range (`http-export`) | `cargo test -p ratarmount-session --features http-export --lib http::` |
 | Declared MSRV lower than the toolchain the workspace needs (README/Cargo.toml drift) | `./test-harness/test-msrv-ci.sh` · CI job `msrv` |
 | FUSE `rename(2)` ENOSYS on `-w` (#86; temp-then-rename writers) | `cargo test -p ratarmount --test fuse_rename` · `cargo test -p ratarmount-fuse --lib rename_paths` · `cargo test -p ratarmount-fuse --lib io_to_errno_maps_already_exists` |
+| FUSE rename of a 60s-cached member (to a new name or over a cached one): held fd read as `(deleted)` in /proc; destination must stay fresh (host append) | `cargo test -p ratarmount --test fuse_rename fuse_rename_cached_source` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

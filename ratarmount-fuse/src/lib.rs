@@ -921,32 +921,32 @@ impl RatarmountFs {
                 return Err(EIO);
             }
         }
-        // Kernel cache: queue both names and both parents while `from` still
-        // resolves through path_to_ino (note_entry_changed looks the child up
-        // there; after the rebind the old path no longer resolves). The
-        // handler flushes once, after the reply.
-        let (src_advertised, dest_advertised) = {
-            let adv = self.entry_advertised.lock().unwrap();
-            (
-                adv.contains(&(parent, name.to_string())),
-                adv.contains(&(newparent, newname.to_string())),
-            )
-        };
+        // Kernel cache: queue the old name, both children and both parents
+        // before the rebind, while path_to_ino still maps `from` to the
+        // source and `to` to a replaced target (afterwards neither does).
+        // The handler flushes once, after the reply.
+        //
+        // No INVAL_ENTRY for the destination name, cached or not. After the
+        // reply the kernel has d_moved the source dentry there (unhashing a
+        // replaced target itself), so an INVAL_ENTRY on that name would only
+        // unhash the moved dentry: a held fd then reads "... (deleted)". The
+        // moved inode is at `to` now with TTL 0 attrs, and `Inode(child)`
+        // from the old name drops its 60s attr; a replaced target's inode is
+        // still dropped below. Later changes to the destination name are
+        // kernel ops on that dentry, which the VFS updates itself.
         self.note_entry_changed(parent, name);
-        self.note_entry_changed(newparent, newname);
+        self.entry_advertised
+            .lock()
+            .unwrap()
+            .remove(&(newparent, newname.to_string()));
+        if let Some(replaced) = self.existing_ino(&to) {
+            self.drop_stable_attr(replaced);
+        }
         self.drop_stable_attr(parent);
         if newparent != parent {
             self.drop_stable_attr(newparent);
         }
         self.rebind_after_rename(&from, &to);
-        // The kernel d_moves the advertised dentry, with its 60s timeout, to
-        // the new name. Drop it there too: the inode is overlay-backed now
-        // (TTL 0), and `entry_advertised` does not track the moved name. A
-        // replaced advertised target already queued this name; the notify
-        // runs after the reply, so it hits the moved dentry either way.
-        if src_advertised && !dest_advertised {
-            self.queue_kernel_entry(newparent, newname);
-        }
         self.invalidate_dir_cache(&parent_path);
         self.invalidate_dir_cache(&newparent_path);
         Ok(())
@@ -1115,11 +1115,11 @@ impl RatarmountFs {
     /// is no kernel attr to drop and `drop_stable_attr` queues nothing. Do not
     /// also call `queue_kernel_inode` for the child.
     ///
-    /// Rename (#86, [`Self::rename_paths`]) calls this for both names and
-    /// `drop_stable_attr` on both parents before rebinding the path map
-    /// (this resolves each child through it). The single `flush_kernel_invals`
-    /// after the reply carries every still-stable parent and child inode and
-    /// each advertised name through the notifier in one batch.
+    /// Rename ([`Self::rename_paths`]) calls this for the old name only; the
+    /// destination name is forgotten without an INVAL_ENTRY (it would unhash
+    /// the dentry the kernel just moved there). Both children and both
+    /// parents are dropped before the path map is rebound; the single
+    /// `flush_kernel_invals` after the reply sends the batch.
     fn note_entry_changed(&self, parent: u64, name: &str) {
         let key = (parent, name.to_string());
         let advertised = self.entry_advertised.lock().unwrap().remove(&key);
@@ -4343,7 +4343,7 @@ mod tests {
             .expect("rename archive member");
         assert_eq!(
             fs.pending_inval.lock().unwrap().len(),
-            4,
+            3,
             "queued, not sent, until the handler flushes after reply.ok()"
         );
         let batch = flush_recorded(&fs, &rec.rx);
@@ -4356,11 +4356,7 @@ mod tests {
                 },
                 KernelInval::Inode(child),
                 KernelInval::Inode(FUSE_ROOT_ID),
-                // The moved dentry keeps its 60s timeout under the new name.
-                KernelInval::Entry {
-                    parent: FUSE_ROOT_ID,
-                    name: "n".into(),
-                },
+                // No Entry for "n": that would unhash the moved dentry.
             ]
         );
         assert!(!fs
@@ -4378,10 +4374,12 @@ mod tests {
     }
 
     /// Regression (#86 on #84): rename of one 60s-advertised member over
-    /// another queues both names and both stable children (the replaced one
-    /// before `rebind_after_rename` detaches it) plus the parent.
+    /// another queues the old name and both stable children (the replaced one
+    /// before `rebind_after_rename` detaches it) plus the parent, and forgets
+    /// the destination name without an INVAL_ENTRY (that unhashed the moved
+    /// dentry, so a held fd read "(deleted)").
     #[test]
-    fn rename_paths_over_advertised_member_queues_both_names_and_children() {
+    fn rename_paths_over_advertised_member_queues_old_name_and_both_children() {
         let (_dir, fs) = readable_members_fs(&["m", "t"]);
         let rec = attach_recording(&fs);
         let (child_m, _, ttl_m) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
@@ -4399,10 +4397,7 @@ mod tests {
                     name: "m".into(),
                 },
                 KernelInval::Inode(child_m),
-                KernelInval::Entry {
-                    parent: FUSE_ROOT_ID,
-                    name: "t".into(),
-                },
+                // No Entry for "t": it would unhash the moved dentry.
                 KernelInval::Inode(child_t),
                 KernelInval::Inode(FUSE_ROOT_ID),
             ]
