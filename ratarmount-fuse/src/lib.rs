@@ -498,6 +498,14 @@ pub struct RatarmountFs {
     /// This models kernel dentry cache, not our inode cache. The generation
     /// sweep must not clear it: the kernel still holds those dentries.
     entry_advertised: Mutex<HashSet<(u64, String)>>,
+    /// Inodes whose attr went to the kernel with a non-zero TTL (write-overlay
+    /// mounts only) since their last `Inode` invalidation.
+    ///
+    /// This models the kernel attr cache, not our inode cache: the generation
+    /// sweep and `rebind_after_rename` clear `InodeEntry::file_info` while the
+    /// kernel may still hold a 60s attr, so [`Self::drop_stable_attr`] decides
+    /// from this set. Never pre-seeded from the inode cache. A leaf lock.
+    attr_advertised: Mutex<HashSet<u64>>,
 }
 
 impl RatarmountFs {
@@ -540,6 +548,7 @@ impl RatarmountFs {
             kernel_notify: Arc::new(KernelNotifyQueue::new()),
             pending_inval: Mutex::new(Vec::new()),
             entry_advertised: Mutex::new(HashSet::new()),
+            attr_advertised: Mutex::new(HashSet::new()),
         }
     }
 
@@ -735,8 +744,9 @@ impl RatarmountFs {
         let gen = self.source.content_generation();
         let prev = self.source_generation.fetch_max(gen, Ordering::SeqCst);
         if prev < gen {
-            // Inode and directory caches are ours. `entry_advertised` tracks
-            // kernel dentries and must survive this sweep.
+            // Inode and directory caches are ours. `entry_advertised` and
+            // `attr_advertised` track kernel dentries and attrs and must
+            // survive this sweep.
             for ent in self.inodes.lock().unwrap().values_mut() {
                 ent.file_info = None;
                 ent.cookie = None;
@@ -956,6 +966,8 @@ impl RatarmountFs {
     /// destination inode (same as export-core `InodeTable::rebind_path`).
     /// The kernel may still hold the old destination inode (open fd, no
     /// FORGET yet); it must not resolve to the file now at `to`.
+    /// Clears only the userspace cache; `attr_advertised` keeps the kernel
+    /// record so a later `drop_stable_attr` still invalidates.
     fn rebind_after_rename(&self, from: &str, to: &str) {
         // Lock order matches ino_for_path_with_fi: path_to_ino, then inodes.
         let mut p2i = self.path_to_ino.lock().unwrap();
@@ -1022,25 +1034,59 @@ impl RatarmountFs {
         Some(fi)
     }
 
-    /// Drop a fat archive-member cache. Returns whether the kernel may still
-    /// be holding a non-zero attr TTL for this inode.
+    /// Drop a fat archive-member cache, and the kernel's attr for `ino` if a
+    /// reply advertised one. Returns whether an `Inode` invalidation was
+    /// queued.
+    ///
+    /// The kernel decision reads `attr_advertised`, not `file_info`: a sweep
+    /// or rebind may have cleared the userspace cache while the kernel still
+    /// holds the 60s attr. Without a notifier (unit tests, before mount) the
+    /// record is kept, since nothing would be sent.
+    ///
+    /// Residual, not handled here: after a live commit a cached attr lasts
+    /// until this drop, a later attr reply, or the 60s TTL, and
+    /// `FOPEN_KEEP_CACHE` pages until an `Inode` invalidation.
     fn drop_stable_attr(&self, ino: u64) -> bool {
-        let stable = {
+        {
             let mut inodes = self.inodes.lock().unwrap();
-            let Some(ent) = inodes.get_mut(&ino) else {
-                return false;
-            };
-            let stable = ent.file_info.as_ref().is_some_and(file_info_attr_stable);
-            if stable {
-                ent.file_info = None;
-                ent.cookie = None;
+            if let Some(ent) = inodes.get_mut(&ino) {
+                if ent.file_info.as_ref().is_some_and(file_info_attr_stable) {
+                    ent.file_info = None;
+                    ent.cookie = None;
+                }
             }
-            stable
-        };
-        if stable {
+        }
+        if !self.kernel_notify.is_active() {
+            return false;
+        }
+        let advertised = self.attr_advertised.lock().unwrap().remove(&ino);
+        if advertised {
             self.queue_kernel_inode(ino);
         }
-        stable
+        advertised
+    }
+
+    /// Record that `ino`'s attr went to the kernel with `ttl`.
+    fn note_attr_advertised(&self, ino: u64, ttl: Duration) {
+        if self.overlay.is_some() && !ttl.is_zero() {
+            self.attr_advertised.lock().unwrap().insert(ino);
+        }
+    }
+
+    /// Attr TTL for a getattr/setattr reply, recorded in `attr_advertised`.
+    fn reply_attr_ttl(&self, ino: u64, fi: &FileInfo) -> Duration {
+        let ttl = self.attr_ttl_for_fi(fi);
+        self.note_attr_advertised(ino, ttl);
+        ttl
+    }
+
+    /// FUSE `getattr` body: TTL and attr to reply, `None` for ENOENT.
+    fn getattr_reply(&self, ino: u64) -> Option<(Duration, FileAttr)> {
+        // Stable archive members return the fat cache. Overlay-backed inodes
+        // re-lookup so create (size 0) → write → stat/ls sees the real size.
+        let fi = self.file_info_for_ino(ino)?;
+        let ttl = self.reply_attr_ttl(ino, &fi);
+        Some((ttl, Self::file_attr(ino, &fi)))
     }
 
     fn queue_kernel(&self, item: KernelInval) {
@@ -1082,8 +1128,10 @@ impl RatarmountFs {
     /// A non-zero TTL inserts `(parent, name)` into `entry_advertised`. A zero
     /// TTL (overlay-backed file, create placeholder) does not: there is no
     /// kernel dentry cache to drop later.
-    fn reply_entry_ttl(&self, parent: u64, name: &str, fi: &FileInfo) -> Duration {
+    fn reply_entry_ttl(&self, parent: u64, name: &str, ino: u64, fi: &FileInfo) -> Duration {
         let ttl = self.attr_ttl_for_fi(fi);
+        // The entry reply carries the child's attr with the same TTL.
+        self.note_attr_advertised(ino, ttl);
         if !ttl.is_zero() {
             self.entry_advertised
                 .lock()
@@ -1101,7 +1149,7 @@ impl RatarmountFs {
         let path = join_path(&parent_path, name.as_ref());
         let fi = self.lookup_file_info(&path)?;
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        let ttl = self.reply_entry_ttl(parent, name.as_ref(), &fi);
+        let ttl = self.reply_entry_ttl(parent, name.as_ref(), ino, &fi);
         Some((ino, Self::file_attr(ino, &fi), ttl))
     }
 
@@ -1111,9 +1159,10 @@ impl RatarmountFs {
     /// When `(parent, name)` is in `entry_advertised`, remove it and queue
     /// `KernelInval::Entry`. `drop_stable_attr` on the child inode, if that
     /// inode exists, is unconditional and outside that branch. It is the only
-    /// child-inode invalidation: a non-stable child was given TTL 0, so there
-    /// is no kernel attr to drop and `drop_stable_attr` queues nothing. Do not
-    /// also call `queue_kernel_inode` for the child.
+    /// child-inode invalidation: it queues `Inode` iff the child is in
+    /// `attr_advertised` (a reply gave it a non-zero attr TTL), including when
+    /// a sweep or rebind already cleared its userspace cache. Do not also call
+    /// `queue_kernel_inode` for the child.
     ///
     /// Rename (#86, [`Self::rename_paths`]) calls this for both names and
     /// `drop_stable_attr` on both parents before rebinding the path map
@@ -1334,14 +1383,10 @@ impl Filesystem for RatarmountFs {
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        // Stable archive members return the fat cache. Overlay-backed inodes
-        // re-lookup so create (size 0) → write → stat/ls sees the real size.
-        let Some(fi) = self.file_info_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let ttl = self.attr_ttl_for_fi(&fi);
-        reply.attr(&ttl, &Self::file_attr(ino, &fi));
+        match self.getattr_reply(ino) {
+            Some((ttl, attr)) => reply.attr(&ttl, &attr),
+            None => reply.error(ENOENT),
+        }
     }
 
     fn readdir(
@@ -1455,6 +1500,12 @@ impl Filesystem for RatarmountFs {
             if reply.add(cino, (i + 1) as i64, name, &entry_ttl, &attr, 0) {
                 break;
             }
+            // Buffered with this TTL for entry and attr (zero with an overlay
+            // today, so nothing is recorded). If it ever becomes non-zero
+            // under an overlay, `(parent, name)` must go into
+            // `entry_advertised` in the same change (see
+            // `readdirplus_entry_ttl`).
+            self.note_attr_advertised(cino, entry_ttl);
         }
         reply.ok();
     }
@@ -1564,7 +1615,7 @@ impl Filesystem for RatarmountFs {
                     .lock()
                     .unwrap()
                     .insert(fh, OpenBackend::OverlayFd(fd));
-                let ttl = self.reply_entry_ttl(parent, &name, &fi);
+                let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
                 reply.created(&ttl, &Self::file_attr(ino, &fi), 0, fh, 0);
                 self.flush_kernel_invals();
             }
@@ -1608,7 +1659,7 @@ impl Filesystem for RatarmountFs {
                 self.note_dir_changed(parent, &name);
                 let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
                 self.invalidate_dir_cache(&parent_path);
-                let ttl = self.reply_entry_ttl(parent, &name, &fi);
+                let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
                 reply.entry(&ttl, &Self::file_attr(ino, &fi), 0);
                 self.flush_kernel_invals();
             }
@@ -1737,7 +1788,7 @@ impl Filesystem for RatarmountFs {
             .file_info_for_ino(ino)
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
-        let ttl = self.attr_ttl_for_fi(&fi);
+        let ttl = self.reply_attr_ttl(ino, &fi);
         reply.attr(&ttl, &Self::file_attr(ino, &fi));
         self.flush_kernel_invals();
     }
@@ -4163,6 +4214,8 @@ mod tests {
             Some(Arc::clone(&ov)),
         );
         let rec = attach_recording(&fs);
+        // The kernel holds root's attr from a getattr reply.
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
 
         assert!(
             file_info_attr_stable(&fs.cached_fi(FUSE_ROOT_ID).expect("root fi")),
@@ -4179,7 +4232,7 @@ mod tests {
         fs.note_dir_changed(FUSE_ROOT_ID, "fresh.txt");
         let _ino = fs.ino_for_path_with_fi("/fresh.txt", Some(fi.clone()));
         fs.invalidate_dir_cache("/");
-        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "fresh.txt", &fi);
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "fresh.txt", _ino, &fi);
         assert!(ttl.is_zero());
         assert!(
             !fs.entry_advertised
@@ -4212,6 +4265,8 @@ mod tests {
             Some(Arc::clone(&ov)),
         );
         let rec = attach_recording(&fs);
+        // The kernel holds root's attr from a getattr reply.
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
 
         assert!(file_info_attr_stable(
             &fs.cached_fi(FUSE_ROOT_ID).expect("root")
@@ -4267,7 +4322,8 @@ mod tests {
         let fi = fs.source.lookup("/m", 0).expect("recreated overlay fi");
         assert!(fs.attr_ttl_for_fi(&fi).is_zero());
         fs.note_dir_changed(FUSE_ROOT_ID, "m");
-        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "m", &fi);
+        let m_ino = fs.ino_for_path_with_fi("/m", Some(fi.clone()));
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "m", m_ino, &fi);
         assert!(ttl.is_zero());
         let created = flush_recorded(&fs, &rec.rx);
         assert!(
@@ -4334,6 +4390,8 @@ mod tests {
     fn rename_paths_queues_old_name_child_and_parent_before_rebind() {
         let (_dir, fs) = readable_members_fs(&["m"]);
         let rec = attach_recording(&fs);
+        // The kernel holds root's attr from a getattr reply.
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
         let (child, _attr, ttl) = fs
             .lookup_entry(FUSE_ROOT_ID, OsStr::new("m"))
             .expect("lookup m");
@@ -4384,6 +4442,8 @@ mod tests {
     fn rename_paths_over_advertised_member_queues_both_names_and_children() {
         let (_dir, fs) = readable_members_fs(&["m", "t"]);
         let rec = attach_recording(&fs);
+        // The kernel holds root's attr from a getattr reply.
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
         let (child_m, _, ttl_m) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
         let (child_t, _, ttl_t) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("t")).expect("t");
         assert_eq!((ttl_m, ttl_t), (TTL, TTL));
@@ -4413,6 +4473,167 @@ mod tests {
         stop_recording(&fs, rec);
     }
 
+    /// `ReadableMembers` whose `content_generation` the test can bump (a live
+    /// commit's generation advance, seen through `WriteOverlay`).
+    struct GenMembers(ReadableMembers, Arc<AtomicU64>);
+
+    impl MountSource for GenMembers {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            self.0.list(path)
+        }
+        fn lookup(&self, path: &str, v: i32) -> Option<FileInfo> {
+            self.0.lookup(path, v)
+        }
+        fn open(&self, fi: &FileInfo, v: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.0.open(fi, v)
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+        fn content_generation(&self) -> u64 {
+            self.1.load(Ordering::SeqCst)
+        }
+    }
+
+    /// Write-overlay fs over `GenMembers`: stable file `m`, stable dir `sub`.
+    fn gen_members_fs() -> (tempfile::TempDir, RatarmountFs, Arc<AtomicU64>) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut sub = stable_tar_fi(0);
+        sub.mode = ratarmount_core::S_IFDIR | 0o755;
+        let gen = Arc::new(AtomicU64::new(0));
+        let base = Arc::new(GenMembers(
+            ReadableMembers(vec![("m".into(), stable_tar_fi(4)), ("sub".into(), sub)]),
+            Arc::clone(&gen),
+        )) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        (dir, fs, gen)
+    }
+
+    /// Bump the source generation and run the sweep a live commit triggers.
+    fn advance_generation(fs: &RatarmountFs, gen: &AtomicU64) {
+        let before = fs.source.content_generation();
+        gen.fetch_add(1, Ordering::SeqCst);
+        assert!(fs.source.content_generation() > before);
+        fs.sweep_if_generation_advanced();
+    }
+
+    /// Regression (#84 follow-up): the generation sweep cleared the stable
+    /// cache, so the first write/truncate of a 60s-advertised member queued no
+    /// `Inode` and the kernel kept the old attr. A later attr reply re-arms.
+    #[test]
+    fn drop_after_generation_sweep_still_invalidates_kernel_attr() {
+        let (_dir, fs, gen) = gen_members_fs();
+        let rec = attach_recording(&fs);
+        let (child, _, ttl) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        assert_eq!(ttl, TTL);
+        assert!(fs.cached_fi(child).is_some());
+        advance_generation(&fs, &gen);
+        assert!(
+            fs.cached_fi(child).is_none(),
+            "sweep cleared the userspace cache"
+        );
+
+        assert!(
+            fs.drop_stable_attr(child),
+            "kernel still holds the 60s attr"
+        );
+        assert_eq!(
+            flush_recorded(&fs, &rec.rx),
+            vec![KernelInval::Inode(child)]
+        );
+        assert!(!fs.drop_stable_attr(child), "consumed: no second Inode");
+        assert!(flush_recorded(&fs, &rec.rx).is_empty());
+
+        let (ttl, _) = fs.getattr_reply(child).expect("getattr m");
+        assert_eq!(ttl, TTL, "re-looked-up archive member is advertised again");
+        assert!(fs.drop_stable_attr(child));
+        assert_eq!(
+            flush_recorded(&fs, &rec.rx),
+            vec![KernelInval::Inode(child)]
+        );
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#84 follow-up): a rename after the sweep queued only the
+    /// old name; the moved inode and the parent kept their 60s attrs.
+    #[test]
+    fn rename_after_generation_sweep_invalidates_child_and_parent() {
+        let (_dir, fs, gen) = gen_members_fs();
+        let rec = attach_recording(&fs);
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
+        let (child, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        advance_generation(&fs, &gen);
+        assert!(fs.cached_fi(child).is_none());
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0)
+            .expect("rename");
+        let batch = flush_recorded(&fs, &rec.rx);
+        for want in [
+            KernelInval::Entry {
+                parent: FUSE_ROOT_ID,
+                name: "m".into(),
+            },
+            KernelInval::Inode(child),
+            KernelInval::Inode(FUSE_ROOT_ID),
+        ] {
+            assert!(batch.contains(&want), "{want:?} missing from {batch:?}");
+        }
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#84 follow-up): a create/unlink in a 60s-advertised
+    /// directory after the sweep left the directory's attr cached.
+    #[test]
+    fn dir_change_after_generation_sweep_invalidates_parent() {
+        let (_dir, fs, gen) = gen_members_fs();
+        let rec = attach_recording(&fs);
+        let (sub, _, ttl) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("sub"))
+            .expect("sub");
+        assert_eq!(ttl, TTL);
+        assert!(fs.cached_fi(sub).is_some(), "stable archive dir is cached");
+        advance_generation(&fs, &gen);
+        assert!(fs.cached_fi(sub).is_none());
+
+        fs.note_dir_changed(sub, "new");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert!(batch.contains(&KernelInval::Inode(sub)), "{batch:?}");
+        stop_recording(&fs, rec);
+    }
+
+    /// TTL-0 replies (overlay-backed) never enter `attr_advertised`, and a
+    /// read-only mount records nothing.
+    #[test]
+    fn attr_advertised_skips_ttl_zero_and_read_only() {
+        let (_dir, fs) = readable_members_fs(&["m"]);
+        let rec = attach_recording(&fs);
+        let (child, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0)
+            .expect("rename");
+        flush_recorded(&fs, &rec.rx);
+        let (ttl, _) = fs.getattr_reply(child).expect("getattr n");
+        assert!(ttl.is_zero(), "copied-up member is overlay-backed");
+        assert!(!fs.attr_advertised.lock().unwrap().contains(&child));
+        assert!(!fs.drop_stable_attr(child));
+        assert!(flush_recorded(&fs, &rec.rx).is_empty());
+        stop_recording(&fs, rec);
+
+        let ro = RatarmountFs::new(
+            Arc::new(ReadableMembers(vec![("m".into(), stable_tar_fi(4))])) as Arc<dyn MountSource>,
+            None,
+        );
+        let (ttl, _) = ro.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
+        assert_eq!(ttl, TTL);
+        ro.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        assert!(ro.attr_advertised.lock().unwrap().is_empty());
+    }
+
     /// Regression: an overlay-backed name (entry TTL 0) was never advertised.
     /// Unlink sends no Entry and no Inode(child).
     #[test]
@@ -4427,6 +4648,8 @@ mod tests {
             Some(Arc::clone(&ov)),
         );
         let rec = attach_recording(&fs);
+        // The kernel holds root's attr from a getattr reply.
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
 
         let fd = ov.create_file("/new.txt", 0o644).expect("create");
         ov.close_overlay_fd(fd);
@@ -4436,7 +4659,7 @@ mod tests {
         fs.note_dir_changed(FUSE_ROOT_ID, "new.txt");
         let child = fs.ino_for_path_with_fi("/new.txt", Some(fi.clone()));
         fs.invalidate_dir_cache("/");
-        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "new.txt", &fi);
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "new.txt", child, &fi);
         assert!(ttl.is_zero());
         assert!(
             fs.cached_fi(child).is_none(),
