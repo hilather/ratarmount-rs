@@ -254,7 +254,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Session not `Send` / L2 probe order reorder | `cargo test -p ratarmount-session --lib session_send` · `cargo test -p ratarmount-session --lib ordered_format_backends` |
 | Session HTTP Range (`http-export`) | `cargo test -p ratarmount-session --features http-export --lib http::` |
 | Declared MSRV lower than the toolchain the workspace needs (README/Cargo.toml drift) | `./test-harness/test-msrv-ci.sh` · CI job `msrv` |
-| FUSE `rename(2)` ENOSYS on `-w` (#86; temp-then-rename writers) | `cargo test -p ratarmount --test fuse_rename` · `cargo test -p ratarmount-fuse --lib rename_paths` · `cargo test -p ratarmount-fuse --lib io_to_errno_maps_already_exists` |
+| FUSE `rename(2)` ENOSYS on `-w` (#86; temp-then-rename writers); rename kernel invalidation (cross-dir new parent, flush after reply) | `cargo test -p ratarmount --test fuse_rename` · `cargo test -p ratarmount-fuse --lib rename_paths` · `cargo test -p ratarmount-fuse --lib rename_reply` · `cargo test -p ratarmount-fuse --lib io_to_errno_maps_already_exists` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
