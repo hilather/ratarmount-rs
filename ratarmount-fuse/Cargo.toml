@@ -8,7 +8,11 @@ description = "FUSE layer for ratarmount-rs (fuser low-level)"
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-compositing.workspace = true
-fuser = "0.15"
+# abi-7-12 negotiates FUSE 7.12 so write mounts can drop a cached
+# archive-member attr with FUSE_NOTIFY_INVAL_{INODE,ENTRY}. Minor 7.8
+# (fuser's default) has no invalidation opcode. 7.12 is the oldest minor
+# that can do this; mkdir/mknod/getattr use that minor's struct sizes.
+fuser = { version = "0.15", features = ["abi-7-12"] }
 libc.workspace = true
 log.workspace = true
 thiserror.workspace = true

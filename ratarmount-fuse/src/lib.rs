@@ -1,10 +1,10 @@
 //! FUSE mount using `fuser` low-level API (read + optional write overlay).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use fuser::{
@@ -18,10 +18,11 @@ use ratarmount_compositing::WriteOverlay;
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
 
-/// Kernel attribute/entry cache TTL. Short values force re-lookup on every find/stat.
+/// Kernel attribute/entry cache TTL for immutable attrs (read-only mounts and
+/// archive members that the write overlay has not shadowed).
 const TTL: Duration = Duration::from_secs(60);
-/// With a write overlay, sizes change after create/write — do not let the kernel
-/// cache attrs for long (or getattr would keep serving create-time size 0).
+/// Overlay-backed files and create placeholders change size after write.
+/// A non-zero kernel TTL would keep serving create-time size 0.
 const OVERLAY_ATTR_TTL: Duration = Duration::from_secs(0);
 const BLKSIZE: u32 = 256 * 1024;
 const DIR_CACHE_TTL: Duration = Duration::from_secs(30);
@@ -305,14 +306,160 @@ enum OpenBackend {
 
 struct InodeEntry {
     path: String,
-    /// Fat FileInfo cache. Immutable mounts only (and overlay root).
-    /// Overlay child inodes store [`InodeAttrCookie`] instead.
+    /// Fat FileInfo cache. Immutable mounts, the root, and archive members
+    /// the write overlay has not shadowed. Overlay-backed children store
+    /// [`InodeAttrCookie`] instead and re-lookup.
     file_info: Option<FileInfo>,
-    /// Compact getattr scalars on overlay child inodes. Not served as
+    /// Compact getattr scalars on overlay-backed child inodes. Not served as
     /// getattr/open truth — those paths re-lookup. Cleared by the generation
     /// sweep. Never `Some` together with `file_info` on a child overlay inode.
     #[allow(dead_code)] // density store; production must not reconstruct FileInfo
     cookie: Option<InodeAttrCookie>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum KernelInval {
+    Inode(u64),
+    Entry { parent: u64, name: String },
+}
+
+/// Sender half of the kernel-notification queue.
+///
+/// The `Session::run` thread only moves a finished batch onto an unbounded
+/// channel. It never writes `FUSE_NOTIFY_*`: the kernel holds the parent
+/// `i_rwsem` across `FUSE_NOTIFY_INVAL_ENTRY`, so a notify from the single
+/// request thread deadlocks against a task blocked in a FUSE reply.
+struct KernelNotifyQueue {
+    tx: Mutex<Option<mpsc::Sender<Vec<KernelInval>>>>,
+}
+
+impl KernelNotifyQueue {
+    fn new() -> Self {
+        Self {
+            tx: Mutex::new(None),
+        }
+    }
+
+    /// `true` once [`spawn_notifier`] has installed a sender.
+    ///
+    /// Unit tests leave this `false`, so they queue nothing.
+    fn is_active(&self) -> bool {
+        self.tx.lock().unwrap().is_some()
+    }
+
+    fn install(&self, tx: mpsc::Sender<Vec<KernelInval>>) {
+        *self.tx.lock().unwrap() = Some(tx);
+    }
+
+    /// Drop the sender. The notifier thread exits once every sender is gone.
+    fn clear(&self) {
+        *self.tx.lock().unwrap() = None;
+    }
+
+    /// `send` never blocks (unbounded channel). Errors mean the notifier has
+    /// already exited; the batch is dropped.
+    fn send_batch(&self, batch: Vec<KernelInval>) {
+        if batch.is_empty() {
+            return;
+        }
+        let tx = self.tx.lock().unwrap().clone();
+        if let Some(tx) = tx {
+            let _ = tx.send(batch);
+        }
+    }
+}
+
+/// Kernel invalidation writes. Implemented for [`fuser::Notifier`] and for
+/// test sinks that record or fail calls without FUSE.
+trait InvalSink: Send + 'static {
+    fn inval_inode(&self, ino: u64) -> std::io::Result<()>;
+    fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()>;
+}
+
+impl InvalSink for fuser::Notifier {
+    fn inval_inode(&self, ino: u64) -> std::io::Result<()> {
+        // Whole inode: offset 0, len -1 (fuser / libfuse convention).
+        fuser::Notifier::inval_inode(self, ino, 0, -1)
+    }
+
+    fn inval_entry(&self, parent: u64, name: &OsStr) -> std::io::Result<()> {
+        fuser::Notifier::inval_entry(self, parent, name)
+    }
+}
+
+enum NotifyStep {
+    Continue,
+    Stop,
+}
+
+fn is_eintr(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::Interrupted || err.raw_os_error() == Some(libc::EINTR)
+}
+
+/// ENOENT: the kernel already dropped the inode or dentry. Normal.
+fn is_absent(err: &std::io::Error) -> bool {
+    err.kind() == ErrorKind::NotFound || err.raw_os_error() == Some(libc::ENOENT)
+}
+
+fn is_connection_gone(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::ENODEV | libc::ENOTCONN | libc::EBADF)
+    )
+}
+
+/// Apply one invalidation. Retries `EINTR`. `Stop` means the connection is
+/// gone and the notifier thread must exit.
+fn dispatch_inval(sink: &impl InvalSink, item: &KernelInval) -> NotifyStep {
+    loop {
+        let result = match item {
+            KernelInval::Inode(ino) => sink.inval_inode(*ino),
+            KernelInval::Entry { parent, name } => sink.inval_entry(*parent, OsStr::new(name)),
+        };
+        match result {
+            Ok(()) => return NotifyStep::Continue,
+            Err(e) if is_eintr(&e) => continue,
+            Err(e) if is_absent(&e) => return NotifyStep::Continue,
+            Err(e) if is_connection_gone(&e) => {
+                debug!("fuse notifier stopping: {e}");
+                return NotifyStep::Stop;
+            }
+            Err(e) => {
+                debug!("fuse kernel notify failed: {e}");
+                return NotifyStep::Continue;
+            }
+        }
+    }
+}
+
+fn notifier_loop(rx: mpsc::Receiver<Vec<KernelInval>>, sink: impl InvalSink) {
+    while let Ok(batch) = rx.recv() {
+        let mut stop = false;
+        for item in &batch {
+            if matches!(dispatch_inval(&sink, item), NotifyStep::Stop) {
+                stop = true;
+                break;
+            }
+        }
+        if stop {
+            // Connection is gone. Drop anything else already queued.
+            while rx.try_recv().is_ok() {}
+            break;
+        }
+    }
+}
+
+/// Spawn the thread that owns `sink`. The returned sender is unbounded.
+/// Dropping every sender ends the thread (`recv` returns disconnect).
+fn spawn_notifier(
+    sink: impl InvalSink,
+) -> (mpsc::Sender<Vec<KernelInval>>, std::thread::JoinHandle<()>) {
+    let (tx, rx) = mpsc::channel();
+    let handle = std::thread::Builder::new()
+        .name("ratarmount-fuse-notify".into())
+        .spawn(move || notifier_loop(rx, sink))
+        .expect("spawn ratarmount-fuse-notify");
+    (tx, handle)
 }
 
 struct DirCacheEntry {
@@ -337,6 +484,20 @@ pub struct RatarmountFs {
     /// and dirents are then stale — same contract as NFS
     /// `ReaderLru::sweep_if_generation_advanced`.
     source_generation: AtomicU64,
+    /// Queue of kernel invalidations. The `Session::run` thread only enqueues;
+    /// `ratarmount-fuse-notify` performs the writes. No sender in unit tests
+    /// and until mount, so those paths queue nothing.
+    kernel_notify: Arc<KernelNotifyQueue>,
+    /// Invalidations queued by a request handler. [`Self::flush_kernel_invals`]
+    /// moves the batch onto `kernel_notify` after the FUSE reply, so a
+    /// notification never precedes its reply. The single consumer keeps
+    /// per-batch order.
+    pending_inval: Mutex<Vec<KernelInval>>,
+    /// `(parent ino, name)` pairs replied with a non-zero entry TTL.
+    ///
+    /// This models kernel dentry cache, not our inode cache. The generation
+    /// sweep must not clear it: the kernel still holds those dentries.
+    entry_advertised: Mutex<HashSet<(u64, String)>>,
 }
 
 impl RatarmountFs {
@@ -376,6 +537,9 @@ impl RatarmountFs {
             next_fh: AtomicU64::new(1),
             dir_cache: Mutex::new(HashMap::new()),
             source_generation: AtomicU64::new(0),
+            kernel_notify: Arc::new(KernelNotifyQueue::new()),
+            pending_inval: Mutex::new(Vec::new()),
+            entry_advertised: Mutex::new(HashSet::new()),
         }
     }
 
@@ -409,21 +573,22 @@ impl RatarmountFs {
         ino
     }
 
-    /// Overlay child inodes store a cookie only. Root and immutable mounts keep
-    /// a fat [`FileInfo`].
-    fn overlay_stores_cookie(&self, ino: u64) -> bool {
-        self.overlay.is_some() && ino != FUSE_ROOT_ID
-    }
-
+    /// Overlay-backed children and empty-userdata placeholders store a cookie
+    /// only. Root, immutable mounts, and unshadowed archive members keep a fat
+    /// [`FileInfo`] so repeated stat/open does not re-query the index.
     fn inode_cache_from_fi(
         &self,
         ino: u64,
         fi: Option<FileInfo>,
     ) -> (Option<FileInfo>, Option<InodeAttrCookie>) {
-        if self.overlay_stores_cookie(ino) {
-            (None, fi.as_ref().map(InodeAttrCookie::from_file_info))
-        } else {
-            (fi, None)
+        match fi {
+            Some(fi)
+                if self.overlay.is_some() && ino != FUSE_ROOT_ID && !file_info_attr_stable(&fi) =>
+            {
+                let cookie = InodeAttrCookie::from_file_info(&fi);
+                (None, Some(cookie))
+            }
+            other => (other, None),
         }
     }
 
@@ -523,6 +688,11 @@ impl RatarmountFs {
     /// placeholder (default `list_dirents` fallback, control `status`,
     /// versions-folder entries): caching size 0 for a file that is not really
     /// empty makes the kernel serve reads at EOF, so those revalidate instead.
+    ///
+    /// With an overlay this returns zero, so readdirplus does not advertise a
+    /// dentry. If it ever returns non-zero while an overlay is mounted, the
+    /// caller must insert `(parent ino, name)` into `entry_advertised` too
+    /// (same contract as [`Self::reply_entry_ttl`]).
     fn readdirplus_entry_ttl(&self, attr: &FileAttr) -> Duration {
         if self.overlay.is_some() {
             return OVERLAY_ATTR_TTL;
@@ -534,11 +704,15 @@ impl RatarmountFs {
         }
     }
 
-    /// FileInfo for `open`. Immutable mounts reuse the lookup/getattr cache;
-    /// overlay always re-looks up so create(size 0) → write is visible.
-    /// Overlay lookup miss → `None` (do not serve a cookie / create-time size 0).
+    /// FileInfo for `open`. Immutable mounts and unshadowed archive members
+    /// reuse the lookup/getattr cache. Overlay-backed files re-lookup so
+    /// create(size 0) → write is visible. Overlay lookup miss → `None`
+    /// (do not serve a cookie / create-time size 0).
     fn file_info_for_open(&self, ino: u64, path: &str) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
+        if let Some(fi) = self.cached_stable_fi(ino) {
+            return Some(fi);
+        }
         if self.overlay.is_some() {
             if let Some(fi) = self.source.lookup(path, 0) {
                 self.store_fi(ino, fi.clone());
@@ -561,6 +735,8 @@ impl RatarmountFs {
         let gen = self.source.content_generation();
         let prev = self.source_generation.fetch_max(gen, Ordering::SeqCst);
         if prev < gen {
+            // Inode and directory caches are ours. `entry_advertised` tracks
+            // kernel dentries and must survive this sweep.
             for ent in self.inodes.lock().unwrap().values_mut() {
                 ent.file_info = None;
                 ent.cookie = None;
@@ -745,7 +921,32 @@ impl RatarmountFs {
                 return Err(EIO);
             }
         }
+        // Kernel cache: queue both names and both parents while `from` still
+        // resolves through path_to_ino (note_entry_changed looks the child up
+        // there; after the rebind the old path no longer resolves). The
+        // handler flushes once, after the reply.
+        let (src_advertised, dest_advertised) = {
+            let adv = self.entry_advertised.lock().unwrap();
+            (
+                adv.contains(&(parent, name.to_string())),
+                adv.contains(&(newparent, newname.to_string())),
+            )
+        };
+        self.note_entry_changed(parent, name);
+        self.note_entry_changed(newparent, newname);
+        self.drop_stable_attr(parent);
+        if newparent != parent {
+            self.drop_stable_attr(newparent);
+        }
         self.rebind_after_rename(&from, &to);
+        // The kernel d_moves the advertised dentry, with its 60s timeout, to
+        // the new name. Drop it there too: the inode is overlay-backed now
+        // (TTL 0), and `entry_advertised` does not track the moved name. A
+        // replaced advertised target already queued this name; the notify
+        // runs after the reply, so it hits the moved dentry either way.
+        if src_advertised && !dest_advertised {
+            self.queue_kernel_entry(newparent, newname);
+        }
         self.invalidate_dir_cache(&parent_path);
         self.invalidate_dir_cache(&newparent_path);
         Ok(())
@@ -781,13 +982,162 @@ impl RatarmountFs {
         }
     }
 
-    /// Kernel attr/entry TTL: zero when a write overlay can change size/names.
-    fn attr_ttl(&self) -> Duration {
-        if self.overlay.is_some() {
+    /// Kernel attr/entry TTL for this `FileInfo`.
+    ///
+    /// Unshadowed archive members use [`TTL`] (same as a read-only mount).
+    /// Overlay-backed files and empty-userdata create placeholders stay at
+    /// [`OVERLAY_ATTR_TTL`] so create(size 0) → write → stat cannot pin size 0.
+    fn attr_ttl_for_fi(&self, fi: &FileInfo) -> Duration {
+        if self.overlay.is_some() && !file_info_attr_stable(fi) {
             OVERLAY_ATTR_TTL
         } else {
             TTL
         }
+    }
+
+    fn cached_stable_fi(&self, ino: u64) -> Option<FileInfo> {
+        let fi = self.cached_fi(ino)?;
+        if self.overlay.is_none() || file_info_attr_stable(&fi) {
+            Some(fi)
+        } else {
+            None
+        }
+    }
+
+    fn existing_ino(&self, path: &str) -> Option<u64> {
+        self.path_to_ino.lock().unwrap().get(path).copied()
+    }
+
+    /// Lookup used by FUSE `lookup`. A stable cached `FileInfo` skips
+    /// `MountSource::lookup` (overlay SQL, host stat, archive index).
+    fn lookup_file_info(&self, path: &str) -> Option<FileInfo> {
+        self.sweep_if_generation_advanced();
+        if let Some(ino) = self.existing_ino(path) {
+            if let Some(fi) = self.cached_stable_fi(ino) {
+                return Some(fi);
+            }
+        }
+        let fi = self.source.lookup(path, 0)?;
+        self.ino_for_path_with_fi(path, Some(fi.clone()));
+        Some(fi)
+    }
+
+    /// Drop a fat archive-member cache. Returns whether the kernel may still
+    /// be holding a non-zero attr TTL for this inode.
+    fn drop_stable_attr(&self, ino: u64) -> bool {
+        let stable = {
+            let mut inodes = self.inodes.lock().unwrap();
+            let Some(ent) = inodes.get_mut(&ino) else {
+                return false;
+            };
+            let stable = ent.file_info.as_ref().is_some_and(file_info_attr_stable);
+            if stable {
+                ent.file_info = None;
+                ent.cookie = None;
+            }
+            stable
+        };
+        if stable {
+            self.queue_kernel_inode(ino);
+        }
+        stable
+    }
+
+    fn queue_kernel(&self, item: KernelInval) {
+        if !self.kernel_notify.is_active() {
+            return;
+        }
+        self.pending_inval.lock().unwrap().push(item);
+    }
+
+    fn queue_kernel_inode(&self, ino: u64) {
+        self.queue_kernel(KernelInval::Inode(ino));
+    }
+
+    fn queue_kernel_entry(&self, parent: u64, name: &str) {
+        self.queue_kernel(KernelInval::Entry {
+            parent,
+            name: name.to_string(),
+        });
+    }
+
+    /// Move invalidations queued by this request onto the notifier thread.
+    /// Call after the FUSE reply. This never calls the kernel.
+    ///
+    /// The notification lands shortly after the reply, not before it returns.
+    /// create/mkdir/setattr replies carry the fresh attr; the kernel updates
+    /// `i_size` on write itself; unlink/rmdir `d_delete` the dentry. The
+    /// notify only drops other cached state (parent directory attrs, a 60s
+    /// attr of a member whose first write or truncate turned it overlay-backed).
+    ///
+    /// `send` errors are ignored: the notifier has already exited.
+    fn flush_kernel_invals(&self) {
+        let batch = std::mem::take(&mut *self.pending_inval.lock().unwrap());
+        self.kernel_notify.send_batch(batch);
+    }
+
+    /// Entry TTL for lookup/create/mkdir, and the record of names the kernel
+    /// may cache.
+    ///
+    /// A non-zero TTL inserts `(parent, name)` into `entry_advertised`. A zero
+    /// TTL (overlay-backed file, create placeholder) does not: there is no
+    /// kernel dentry cache to drop later.
+    fn reply_entry_ttl(&self, parent: u64, name: &str, fi: &FileInfo) -> Duration {
+        let ttl = self.attr_ttl_for_fi(fi);
+        if !ttl.is_zero() {
+            self.entry_advertised
+                .lock()
+                .unwrap()
+                .insert((parent, name.to_string()));
+        }
+        ttl
+    }
+
+    /// FUSE `lookup` body. `None` is ENOENT (no negative dentry). A non-zero
+    /// entry TTL is recorded by [`Self::reply_entry_ttl`].
+    fn lookup_entry(&self, parent: u64, name: &OsStr) -> Option<(u64, FileAttr, Duration)> {
+        let parent_path = self.path_for_ino(parent)?;
+        let name = name.to_string_lossy();
+        let path = join_path(&parent_path, name.as_ref());
+        let fi = self.lookup_file_info(&path)?;
+        let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+        let ttl = self.reply_entry_ttl(parent, name.as_ref(), &fi);
+        Some((ino, Self::file_attr(ino, &fi), ttl))
+    }
+
+    /// Invalidate one directory entry the kernel may have cached, then drop
+    /// the child's stable attr.
+    ///
+    /// When `(parent, name)` is in `entry_advertised`, remove it and queue
+    /// `KernelInval::Entry`. `drop_stable_attr` on the child inode, if that
+    /// inode exists, is unconditional and outside that branch. It is the only
+    /// child-inode invalidation: a non-stable child was given TTL 0, so there
+    /// is no kernel attr to drop and `drop_stable_attr` queues nothing. Do not
+    /// also call `queue_kernel_inode` for the child.
+    ///
+    /// Rename (#86, [`Self::rename_paths`]) calls this for both names and
+    /// `drop_stable_attr` on both parents before rebinding the path map
+    /// (this resolves each child through it). The single `flush_kernel_invals`
+    /// after the reply carries every still-stable parent and child inode and
+    /// each advertised name through the notifier in one batch.
+    fn note_entry_changed(&self, parent: u64, name: &str) {
+        let key = (parent, name.to_string());
+        let advertised = self.entry_advertised.lock().unwrap().remove(&key);
+        if advertised {
+            self.queue_kernel_entry(parent, name);
+        }
+        if let Some(parent_path) = self.path_for_ino(parent) {
+            let child = join_path(&parent_path, name);
+            if let Some(ino) = self.existing_ino(&child) {
+                self.drop_stable_attr(ino);
+            }
+        }
+    }
+
+    /// Parent directory attrs and one child name changed (create/unlink/mkdir/rmdir).
+    fn note_dir_changed(&self, parent: u64, name: &str) {
+        self.drop_stable_attr(parent);
+        self.note_entry_changed(parent, name);
     }
 
     fn file_attr(ino: u64, fi: &FileInfo) -> FileAttr {
@@ -819,15 +1169,18 @@ impl RatarmountFs {
 
     /// Resolve `FileInfo` for an inode.
     ///
-    /// With a write overlay, always re-lookup so size/mtime after create/write
-    /// match the on-disk overlay file (cookie is not getattr truth).
-    /// Overlay lookup miss → `None` (do not serve a cookie).
+    /// Unshadowed archive members reuse the fat cache. Overlay-backed files
+    /// re-lookup so size/mtime after create/write match the host file (cookie
+    /// is not getattr truth). Overlay lookup miss → `None`.
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
         let path = self.path_for_ino(ino)?;
         if path == "/" {
             let fi = ratarmount_core::create_root_file_info();
             self.store_fi(ino, fi.clone());
+            return Some(fi);
+        }
+        if let Some(fi) = self.cached_stable_fi(ino) {
             return Some(fi);
         }
         if self.overlay.is_some() {
@@ -855,10 +1208,16 @@ impl RatarmountFs {
         // Writes always go to the overlay; reads of files that exist in the overlay
         // must also use the overlay FD (not the base archive). Previously RO open
         // used a cached size-0 FileInfo → Empty backend, so write-then-cat returned "".
+        // A stable archive-member cache has already proven this path is not
+        // shadowed, so read-only open skips the overlay host stat.
         if let Some(ov) = &self.overlay {
-            if write || ov.has_file(&path) {
+            let shadowed = write || (self.cached_stable_fi(ino).is_none() && ov.has_file(&path));
+            if shadowed {
                 match ov.open_overlay_fd(&path, flags) {
                     Ok(fd) => {
+                        // COW / create replaces the archive member. Drop the fat
+                        // cache before storing the overlay cookie.
+                        self.drop_stable_attr(ino);
                         if let Some(fi) = self.source.lookup(&path, 0) {
                             self.store_fi(ino, fi);
                         }
@@ -946,6 +1305,18 @@ fn unix_float_to_system_time(t: f64) -> SystemTime {
         .unwrap_or(UNIX_EPOCH + Duration::new(FAR_FUTURE_SECS, 0))
 }
 
+/// Archive member the write overlay has not replaced.
+///
+/// Empty userdata is a create placeholder (size 0) and must not be pinned.
+/// `overlay:` userdata is the host file and changes on write.
+fn file_info_attr_stable(fi: &FileInfo) -> bool {
+    !fi.userdata.is_empty()
+        && !fi
+            .userdata
+            .iter()
+            .any(|u| matches!(u, ratarmount_core::UserData::Other(s) if s.starts_with("overlay:")))
+}
+
 fn join_path(parent: &str, name: &str) -> String {
     if parent == "/" {
         format!("/{name}")
@@ -956,28 +1327,21 @@ fn join_path(parent: &str, name: &str) -> String {
 
 impl Filesystem for RatarmountFs {
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
-        let Some(parent_path) = self.path_for_ino(parent) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, &name);
-        let Some(fi) = self.source.lookup(&path, 0) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-        reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
+        match self.lookup_entry(parent, name) {
+            Some((_, attr, ttl)) => reply.entry(&ttl, &attr, 0),
+            None => reply.error(ENOENT),
+        }
     }
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        // Always go through file_info_for_ino: with a write overlay it re-lookups
-        // so create (size 0) → write → stat/ls sees the real size.
+        // Stable archive members return the fat cache. Overlay-backed inodes
+        // re-lookup so create (size 0) → write → stat/ls sees the real size.
         let Some(fi) = self.file_info_for_ino(ino) else {
             reply.error(ENOENT);
             return;
         };
-        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
+        let ttl = self.attr_ttl_for_fi(&fi);
+        reply.attr(&ttl, &Self::file_attr(ino, &fi));
     }
 
     fn readdir(
@@ -1097,7 +1461,10 @@ impl Filesystem for RatarmountFs {
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
         match self.open_inode(ino, flags) {
-            Ok((fh, open_flags)) => reply.opened(fh, open_flags),
+            Ok((fh, open_flags)) => {
+                reply.opened(fh, open_flags);
+                self.flush_kernel_invals();
+            }
             Err(e) => {
                 debug!("open error kind={e}");
                 reply.error(e);
@@ -1125,7 +1492,7 @@ impl Filesystem for RatarmountFs {
     fn write(
         &mut self,
         _req: &Request<'_>,
-        _ino: u64,
+        ino: u64,
         fh: u64,
         offset: i64,
         data: &[u8],
@@ -1148,7 +1515,11 @@ impl Filesystem for RatarmountFs {
         if n < 0 {
             reply.error(EIO);
         } else {
+            // First write of a previously cached archive member must drop the
+            // 60s kernel attr. Later overlay writes already have TTL 0.
+            self.drop_stable_attr(ino);
             reply.written(n as u32);
+            self.flush_kernel_invals();
         }
     }
 
@@ -1183,6 +1554,9 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
+                // Drop a previously cached archive member before the new
+                // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
+                self.note_dir_changed(parent, &name);
                 let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
                 self.invalidate_dir_cache(&parent_path);
                 let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
@@ -1190,7 +1564,9 @@ impl Filesystem for RatarmountFs {
                     .lock()
                     .unwrap()
                     .insert(fh, OpenBackend::OverlayFd(fd));
-                reply.created(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0, fh, 0);
+                let ttl = self.reply_entry_ttl(parent, &name, &fi);
+                reply.created(&ttl, &Self::file_attr(ino, &fi), 0, fh, 0);
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("create: {e}");
@@ -1229,9 +1605,12 @@ impl Filesystem for RatarmountFs {
                     gid: unsafe { libc::getegid() },
                     userdata: vec![],
                 });
+                self.note_dir_changed(parent, &name);
                 let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
                 self.invalidate_dir_cache(&parent_path);
-                reply.entry(&self.attr_ttl(), &Self::file_attr(ino, &fi), 0);
+                let ttl = self.reply_entry_ttl(parent, &name, &fi);
+                reply.entry(&ttl, &Self::file_attr(ino, &fi), 0);
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("mkdir: {e}");
@@ -1249,11 +1628,14 @@ impl Filesystem for RatarmountFs {
             reply.error(ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let name = name.to_string_lossy();
+        let path = join_path(&parent_path, &name);
         match ov.unlink(&path) {
             Ok(()) => {
                 self.invalidate_dir_cache(&parent_path);
+                self.note_dir_changed(parent, &name);
                 reply.ok();
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("unlink: {e}");
@@ -1271,11 +1653,14 @@ impl Filesystem for RatarmountFs {
             reply.error(ENOENT);
             return;
         };
-        let path = join_path(&parent_path, &name.to_string_lossy());
+        let name = name.to_string_lossy();
+        let path = join_path(&parent_path, &name);
         match ov.rmdir(&path) {
             Ok(()) => {
                 self.invalidate_dir_cache(&parent_path);
+                self.note_dir_changed(parent, &name);
                 reply.ok();
+                self.flush_kernel_invals();
             }
             Err(e) => {
                 debug!("rmdir: {e}");
@@ -1301,7 +1686,12 @@ impl Filesystem for RatarmountFs {
             &newname.to_string_lossy(),
             flags,
         ) {
-            Ok(()) => reply.ok(),
+            Ok(()) => {
+                reply.ok();
+                // Never notify inline: the kernel holds both directories'
+                // i_rwsem across FUSE_RENAME.
+                self.flush_kernel_invals();
+            }
             Err(errno) => reply.error(errno),
         }
     }
@@ -1338,6 +1728,7 @@ impl Filesystem for RatarmountFs {
                 reply.error(EIO);
                 return;
             }
+            self.drop_stable_attr(ino);
         } else if !self.writable() {
             reply.error(ENOSYS);
             return;
@@ -1346,7 +1737,9 @@ impl Filesystem for RatarmountFs {
             .file_info_for_ino(ino)
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
-        reply.attr(&self.attr_ttl(), &Self::file_attr(ino, &fi));
+        let ttl = self.attr_ttl_for_fi(&fi);
+        reply.attr(&ttl, &Self::file_attr(ino, &fi));
+        self.flush_kernel_invals();
     }
 
     fn release(
@@ -1485,8 +1878,30 @@ pub fn mount_blocking(
     }
     let _ = foreground;
     let fs = RatarmountFs::with_readahead(source, overlay, readahead);
-    fuser::mount2(fs, mountpoint, &options)?;
-    Ok(())
+    // `mount2` does not hand back `Session::notifier`. The notifier thread
+    // must exist before `run` so a shadowed archive member can drop a 60s
+    // kernel cache, and so those writes never run on the request thread.
+    //
+    // Shutdown, every return path: drop the sender, `session.unmount()`,
+    // join the notifier, then return `res`. With libfuse3, `unmount` drops
+    // fuser's `Mount` (`fuse_session_unmount` + `fuse_session_destroy`). The
+    // notifier writes on its own dup of the `/dev/fuse` fd (`Arc<File>` in
+    // `fuser::Notifier`) and shares no lock with libfuse, so this is safe.
+    // `run` can return `Ok` on a bad request while the connection is still
+    // up, hence the explicit unmount. A notify parked on a directory
+    // `i_rwsem` returns once the holder drops that lock; the holder was
+    // waiting on a reply the session thread sent before `run` returned.
+    // After unmount a further write fails with `ENODEV` (thread exits), and
+    // the dropped sender ends `recv`.
+    let kernel_notify = Arc::clone(&fs.kernel_notify);
+    let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
+    let (tx, notifier_thread) = spawn_notifier(session.notifier());
+    kernel_notify.install(tx);
+    let res = session.run();
+    kernel_notify.clear();
+    session.unmount();
+    let _ = notifier_thread.join();
+    res
 }
 
 pub fn unmount(mountpoint: impl AsRef<Path>) -> std::io::Result<()> {
@@ -1568,6 +1983,10 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::io::{self, Seek};
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Instant;
 
     /// Minimal MountSource that only serves synthetic xattrs for unit tests.
     struct XattrSource {
@@ -1817,9 +2236,9 @@ mod tests {
             "getattr-equivalent attr must reflect post-write size"
         );
         assert_eq!(
-            fs.attr_ttl(),
+            fs.attr_ttl_for_fi(&fi),
             OVERLAY_ATTR_TTL,
-            "writable overlay must not pin long kernel attr TTL"
+            "overlay-backed file must not pin a long kernel attr TTL"
         );
         // After refresh, overlay inode stores a cookie (not a fat FileInfo).
         let cached = fs.cached_cookie(ino).expect("cached cookie after refresh");
@@ -1945,6 +2364,197 @@ mod tests {
             "cookie size must match the lookup FileInfo"
         );
         assert_eq!(fs.cached_cookie(ino).unwrap().size, b"payload".len() as u64);
+    }
+
+    /// Regression: a write mount re-queried the archive index on every stat of
+    /// an unmodified member, because the kernel attr TTL was 0 for the whole
+    /// mount. Unshadowed members keep a fat `FileInfo` and the 60s TTL. A
+    /// write still drops that cache so the next stat sees the overlay size.
+    #[test]
+    fn overlay_archive_member_stat_skips_repeat_lookup() {
+        use ratarmount_compositing::WriteOverlay;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        struct CountingTar {
+            lookups: Arc<AtomicU64>,
+            opens: Arc<AtomicU64>,
+        }
+
+        fn tar_file(size: u64, offset: u64) -> FileInfo {
+            FileInfo {
+                size,
+                mtime: 1.0,
+                mode: S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                    offset,
+                    offsetheader: Some(offset),
+                    istar: true,
+                    issparse: false,
+                    isgenerated: false,
+                    recursiondepth: 0,
+                })],
+            }
+        }
+
+        impl MountSource for CountingTar {
+            fn list(&self, path: &str) -> Option<ListResult> {
+                if path == "/" {
+                    let mut map = BTreeMap::new();
+                    map.insert("a".into(), tar_file(4, 0));
+                    map.insert("b".into(), tar_file(5, 4));
+                    Some(ListResult::Infos(map))
+                } else {
+                    None
+                }
+            }
+
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                self.lookups.fetch_add(1, Ordering::Relaxed);
+                match path {
+                    "/" => Some(ratarmount_core::create_root_file_info()),
+                    "/a" => Some(tar_file(4, 0)),
+                    "/b" => Some(tar_file(5, 4)),
+                    _ => None,
+                }
+            }
+
+            fn open(
+                &self,
+                fi: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                self.opens.fetch_add(1, Ordering::Relaxed);
+                let bytes: &[u8] = if fi.size == 4 { b"aaaa" } else { b"bbbbb" };
+                Ok(Box::new(io::Cursor::new(bytes.to_vec())))
+            }
+
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+
+        let lookups = Arc::new(AtomicU64::new(0));
+        let opens = Arc::new(AtomicU64::new(0));
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(CountingTar {
+            lookups: Arc::clone(&lookups),
+            opens: Arc::clone(&opens),
+        }) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+
+        let ino_a = fs.ino_for_path("/a");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            0,
+            "inode alloc does not look up"
+        );
+        let fi = fs.lookup_file_info("/a").expect("first lookup");
+        assert_eq!(fi.size, 4);
+        assert_eq!(lookups.load(Ordering::Relaxed), 1);
+        assert_eq!(fs.attr_ttl_for_fi(&fi), TTL);
+        assert!(
+            fs.cached_fi(ino_a).is_some(),
+            "unshadowed member keeps fat FileInfo"
+        );
+        assert!(fs.cached_cookie(ino_a).is_none());
+
+        for _ in 0..32 {
+            let again = fs.file_info_for_ino(ino_a).expect("cached getattr");
+            assert_eq!(again.size, 4);
+            let looked = fs.lookup_file_info("/a").expect("cached lookup");
+            assert_eq!(looked.size, 4);
+        }
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            1,
+            "repeated stat/lookup of an unmodified member must not hit the archive index"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 0);
+
+        let ino_b = fs.ino_for_path("/b");
+        assert_eq!(fs.file_info_for_ino(ino_b).expect("sibling").size, 5);
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        for _ in 0..8 {
+            assert_eq!(fs.file_info_for_ino(ino_b).expect("sibling cache").size, 5);
+        }
+        assert_eq!(lookups.load(Ordering::Relaxed), 2);
+        assert_eq!(fs.attr_ttl_for_fi(&fs.cached_fi(ino_b).unwrap()), TTL);
+
+        let (fh, flags) = fs.open_inode(ino_a, libc::O_RDONLY).expect("read open");
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            2,
+            "stable read open skips overlay stat"
+        );
+        assert!(!fs.test_fh_is_overlay_fd(fh));
+        assert_eq!(flags, fuser::consts::FOPEN_KEEP_CACHE);
+        assert_eq!(fs.read_handle(fh, 0, 8).expect("read"), b"aaaa");
+        assert_eq!(opens.load(Ordering::Relaxed), 1);
+
+        let (wfh, wflags) = fs.open_inode(ino_a, libc::O_WRONLY).expect("write open");
+        assert!(fs.test_fh_is_overlay_fd(wfh));
+        assert_eq!(
+            wflags, 0,
+            "overlay open must not keep the kernel data cache"
+        );
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "copy-on-write looks the member up once"
+        );
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+        assert!(
+            fs.cached_fi(ino_a).is_none(),
+            "write drops the fat archive-member cache"
+        );
+        assert_eq!(fs.cached_cookie(ino_a).expect("overlay cookie").size, 4);
+
+        let fi = fs.file_info_for_ino(ino_a).expect("post-cow getattr");
+        assert_eq!(fi.size, 4);
+        assert_eq!(fs.attr_ttl_for_fi(&fi), OVERLAY_ATTR_TTL);
+        assert!(
+            matches!(fi.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:")),
+            "shadowed member is served from the overlay"
+        );
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "overlay getattr must not call the archive index"
+        );
+
+        ov.truncate("/a", 1).expect("truncate");
+        let fi = fs.file_info_for_ino(ino_a).expect("post-truncate getattr");
+        assert_eq!(
+            fi.size, 1,
+            "stat after truncate must not keep the archive size"
+        );
+        assert_eq!(fs.attr_ttl_for_fi(&fi), OVERLAY_ATTR_TTL);
+        assert!(fs.cached_fi(ino_a).is_none());
+        assert_eq!(fs.cached_cookie(ino_a).expect("refreshed cookie").size, 1);
+        assert_eq!(lookups.load(Ordering::Relaxed), 3);
+        assert_eq!(opens.load(Ordering::Relaxed), 2);
+
+        assert_eq!(
+            fs.file_info_for_ino(ino_b)
+                .expect("sibling still cached")
+                .size,
+            5
+        );
+        assert!(fs.cached_fi(ino_b).is_some());
+        assert!(fs.cached_cookie(ino_b).is_none());
+        assert_eq!(
+            lookups.load(Ordering::Relaxed),
+            3,
+            "shadowing one member must not invalidate its sibling"
+        );
+        assert_eq!(fs.attr_ttl_for_fi(&fs.cached_fi(ino_b).unwrap()), TTL);
     }
 
     /// Live backing store whose member offsets shift when an earlier member is
@@ -3108,6 +3718,794 @@ mod tests {
         assert_eq!(
             clamp_readahead(RECOMMENDED_READAHEAD_BYTES),
             RECOMMENDED_READAHEAD_BYTES
+        );
+    }
+
+    const NOTIFIER_WAIT: Duration = Duration::from_secs(5);
+    /// Not a real inode. Flushed after a batch so the test knows the notifier
+    /// has finished that batch. Every wait is `recv_timeout(NOTIFIER_WAIT)`.
+    const NOTIFIER_SENTINEL_INO: u64 = u64::MAX;
+
+    fn signal_notifier_done(slot: &Mutex<Option<mpsc::Sender<()>>>) {
+        if let Some(tx) = slot.lock().unwrap().take() {
+            let _ = tx.send(());
+        }
+    }
+
+    struct RecordingSink {
+        tx: mpsc::Sender<KernelInval>,
+        done: Mutex<Option<mpsc::Sender<()>>>,
+    }
+
+    impl Drop for RecordingSink {
+        fn drop(&mut self) {
+            signal_notifier_done(&self.done);
+        }
+    }
+
+    impl InvalSink for RecordingSink {
+        fn inval_inode(&self, ino: u64) -> io::Result<()> {
+            let _ = self.tx.send(KernelInval::Inode(ino));
+            Ok(())
+        }
+
+        fn inval_entry(&self, parent: u64, name: &OsStr) -> io::Result<()> {
+            let _ = self.tx.send(KernelInval::Entry {
+                parent,
+                name: name.to_string_lossy().into_owned(),
+            });
+            Ok(())
+        }
+    }
+
+    struct NotifyRec {
+        rx: mpsc::Receiver<KernelInval>,
+        done_rx: mpsc::Receiver<()>,
+        thread: thread::JoinHandle<()>,
+    }
+
+    fn attach_recording(fs: &RatarmountFs) -> NotifyRec {
+        let (item_tx, rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let (tx, thread) = spawn_notifier(RecordingSink {
+            tx: item_tx,
+            done: Mutex::new(Some(done_tx)),
+        });
+        fs.kernel_notify.install(tx);
+        NotifyRec {
+            rx,
+            done_rx,
+            thread,
+        }
+    }
+
+    /// Flush `pending_inval`, then a sentinel inode, and return everything the
+    /// sink delivered before the sentinel.
+    fn flush_recorded(fs: &RatarmountFs, rx: &mpsc::Receiver<KernelInval>) -> Vec<KernelInval> {
+        fs.flush_kernel_invals();
+        fs.queue_kernel_inode(NOTIFIER_SENTINEL_INO);
+        fs.flush_kernel_invals();
+        let deadline = Instant::now() + NOTIFIER_WAIT;
+        let mut out = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            assert!(
+                !left.is_zero(),
+                "timeout waiting for notifier batch; got {out:?}"
+            );
+            match rx.recv_timeout(left) {
+                Ok(KernelInval::Inode(ino)) if ino == NOTIFIER_SENTINEL_INO => return out,
+                Ok(item) => out.push(item),
+                Err(e) => panic!("notifier recv failed ({e}); got {out:?}"),
+            }
+        }
+    }
+
+    fn stop_recording(fs: &RatarmountFs, rec: NotifyRec) {
+        fs.kernel_notify.clear();
+        rec.done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("notifier thread ended");
+        // Detach. `join` has no timeout; the done channel is the bounded wait.
+        drop(rec.thread);
+    }
+
+    fn stable_tar_fi(size: u64) -> FileInfo {
+        FileInfo {
+            size,
+            mtime: 1.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                offset: 0,
+                offsetheader: Some(0),
+                istar: true,
+                issparse: false,
+                isgenerated: false,
+                recursiondepth: 0,
+            })],
+        }
+    }
+
+    /// One stable archive member. `file_info_attr_stable` is true (tar userdata).
+    struct NamedMember {
+        name: String,
+        fi: FileInfo,
+    }
+
+    impl MountSource for NamedMember {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                let mut m = BTreeMap::new();
+                m.insert(self.name.clone(), self.fi.clone());
+                Some(ListResult::Infos(m))
+            } else {
+                None
+            }
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                Some(ratarmount_core::create_root_file_info())
+            } else if path == format!("/{}", self.name) {
+                Some(self.fi.clone())
+            } else {
+                None
+            }
+        }
+
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(ErrorKind::NotFound, "named member"))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    /// Regression: FUSE_NOTIFY_INVAL_ENTRY on the Session::run thread deadlocks
+    /// (kernel holds the parent i_rwsem while a task waits on the FUSE reply).
+    /// The sink runs on `ratarmount-fuse-notify`, and a parked sink must not
+    /// block a second `flush_kernel_invals`.
+    #[test]
+    fn notifier_parked_sink_does_not_block_second_flush() {
+        let (entered_tx, entered_rx) = mpsc::channel::<(thread::ThreadId, String)>();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (seen_tx, seen_rx) = mpsc::channel::<u64>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        // Longer than NOTIFIER_WAIT. A flush that blocks in the sink must still
+        // be parked when the 5s deadline fires; this timeout must not release
+        // it first and let the flush return.
+        let park_for = Duration::from_secs(15);
+
+        struct ParkingSink {
+            entered: Mutex<Option<mpsc::Sender<(thread::ThreadId, String)>>>,
+            release: Mutex<mpsc::Receiver<()>>,
+            seen: mpsc::Sender<u64>,
+            park_for: Duration,
+            done: Mutex<Option<mpsc::Sender<()>>>,
+        }
+
+        impl Drop for ParkingSink {
+            fn drop(&mut self) {
+                signal_notifier_done(&self.done);
+            }
+        }
+
+        impl InvalSink for ParkingSink {
+            fn inval_inode(&self, ino: u64) -> io::Result<()> {
+                if let Some(tx) = self.entered.lock().unwrap().take() {
+                    let name = thread::current().name().unwrap_or("").to_string();
+                    let _ = tx.send((thread::current().id(), name));
+                    let _ = self.release.lock().unwrap().recv_timeout(self.park_for);
+                }
+                let _ = self.seen.send(ino);
+                Ok(())
+            }
+
+            fn inval_entry(&self, _: u64, _: &OsStr) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let fs = Arc::new(RatarmountFs::new(
+            Arc::new(EmptyBase) as Arc<dyn MountSource>,
+            None,
+        ));
+        let (tx, notifier_thread) = spawn_notifier(ParkingSink {
+            entered: Mutex::new(Some(entered_tx)),
+            release: Mutex::new(release_rx),
+            seen: seen_tx,
+            park_for,
+            done: Mutex::new(Some(done_tx)),
+        });
+        fs.kernel_notify.install(tx);
+
+        let (caller_tx, caller_rx) = mpsc::channel();
+        let (first_done_tx, first_done_rx) = mpsc::channel();
+        let fs1 = Arc::clone(&fs);
+        thread::spawn(move || {
+            let _ = caller_tx.send(thread::current().id());
+            fs1.queue_kernel_inode(7);
+            fs1.flush_kernel_invals();
+            let _ = first_done_tx.send(());
+        });
+
+        let (sink_tid, sink_name) = entered_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("sink entered on the notifier thread");
+        let caller_tid = caller_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("flush caller reported its thread id");
+        assert_ne!(
+            sink_tid, caller_tid,
+            "kernel notify must not run on the flush caller"
+        );
+        assert_eq!(sink_name, "ratarmount-fuse-notify");
+        first_done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("first flush returned while the sink is parked");
+
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let fs2 = Arc::clone(&fs);
+        // thread::spawn + recv_timeout, not std::thread::scope: scope joins the
+        // caller even after a timeout panic, so a blocked flush would hang the test.
+        thread::spawn(move || {
+            fs2.queue_kernel_inode(8);
+            fs2.flush_kernel_invals();
+            let _ = second_done_tx.send(());
+        });
+        second_done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("second flush returned within 5s while the notifier sink is still parked");
+        assert!(
+            seen_rx.try_recv().is_err(),
+            "sink must still be parked; no inval delivered yet"
+        );
+
+        release_tx.send(()).expect("unpark");
+        let first = seen_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("first inval after unpark");
+        let second = seen_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("second inval after unpark");
+        assert_eq!(first, 7);
+        assert_eq!(second, 8);
+
+        fs.kernel_notify.clear();
+        done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("dropping the sender ends the notifier thread");
+        drop(notifier_thread);
+    }
+
+    /// Regression: mount shutdown drops the notify sender. The thread must end
+    /// without a sink call. The wait is `recv_timeout`, not `join`.
+    #[test]
+    fn notifier_exits_when_sender_dropped() {
+        let (done_tx, done_rx) = mpsc::channel();
+
+        struct IdleSink {
+            done: Mutex<Option<mpsc::Sender<()>>>,
+        }
+
+        impl Drop for IdleSink {
+            fn drop(&mut self) {
+                signal_notifier_done(&self.done);
+            }
+        }
+
+        impl InvalSink for IdleSink {
+            fn inval_inode(&self, _: u64) -> io::Result<()> {
+                Ok(())
+            }
+
+            fn inval_entry(&self, _: u64, _: &OsStr) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, thread) = spawn_notifier(IdleSink {
+            done: Mutex::new(Some(done_tx)),
+        });
+        drop(tx);
+        done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("dropping the sender ends the notifier thread");
+        drop(thread);
+    }
+
+    /// Regression: ENODEV, ENOTCONN, and EBADF mean the FUSE connection is gone.
+    /// The notifier exits on the first of those, without delivering the rest of
+    /// the batch, while the sender is still alive.
+    #[test]
+    fn notifier_exits_on_enodev() {
+        for code in [libc::ENODEV, libc::ENOTCONN, libc::EBADF] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (done_tx, done_rx) = mpsc::channel();
+
+            struct FatalSink {
+                code: i32,
+                calls: Arc<AtomicUsize>,
+                done: Mutex<Option<mpsc::Sender<()>>>,
+            }
+
+            impl Drop for FatalSink {
+                fn drop(&mut self) {
+                    signal_notifier_done(&self.done);
+                }
+            }
+
+            impl InvalSink for FatalSink {
+                fn inval_inode(&self, _: u64) -> io::Result<()> {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::from_raw_os_error(self.code))
+                }
+
+                fn inval_entry(&self, _: u64, _: &OsStr) -> io::Result<()> {
+                    self.calls.fetch_add(1, Ordering::SeqCst);
+                    Err(io::Error::from_raw_os_error(self.code))
+                }
+            }
+
+            let (tx, thread) = spawn_notifier(FatalSink {
+                code,
+                calls: Arc::clone(&calls),
+                done: Mutex::new(Some(done_tx)),
+            });
+            tx.send(vec![
+                KernelInval::Inode(1),
+                KernelInval::Entry {
+                    parent: 1,
+                    name: "left".into(),
+                },
+            ])
+            .expect("queue batch");
+            done_rx
+                .recv_timeout(NOTIFIER_WAIT)
+                .unwrap_or_else(|_| panic!("errno {code} should end the notifier thread"));
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "errno {code}: stop on the first fatal call and drain the rest"
+            );
+            drop(tx);
+            drop(thread);
+        }
+    }
+
+    /// Regression: the notifier retries EINTR and ignores ENOENT. Neither ends
+    /// the thread; a later invalidation is still delivered.
+    #[test]
+    fn notifier_retries_eintr_and_ignores_not_found() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let script = Arc::new(Mutex::new(vec![libc::EINTR, libc::ENOENT]));
+        let (ok_tx, ok_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+
+        struct ScriptSink {
+            calls: Arc<AtomicUsize>,
+            script: Arc<Mutex<Vec<i32>>>,
+            ok_tx: mpsc::Sender<u64>,
+            done: Mutex<Option<mpsc::Sender<()>>>,
+        }
+
+        impl Drop for ScriptSink {
+            fn drop(&mut self) {
+                signal_notifier_done(&self.done);
+            }
+        }
+
+        impl InvalSink for ScriptSink {
+            fn inval_inode(&self, ino: u64) -> io::Result<()> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                let code = {
+                    let mut script = self.script.lock().unwrap();
+                    if script.is_empty() {
+                        None
+                    } else {
+                        Some(script.remove(0))
+                    }
+                };
+                match code {
+                    Some(code) => Err(io::Error::from_raw_os_error(code)),
+                    None => {
+                        let _ = self.ok_tx.send(ino);
+                        Ok(())
+                    }
+                }
+            }
+
+            fn inval_entry(&self, _: u64, _: &OsStr) -> io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let (tx, thread) = spawn_notifier(ScriptSink {
+            calls: Arc::clone(&calls),
+            script,
+            ok_tx,
+            done: Mutex::new(Some(done_tx)),
+        });
+        tx.send(vec![KernelInval::Inode(1)]).expect("first batch");
+        tx.send(vec![KernelInval::Inode(2)]).expect("second batch");
+        let delivered = ok_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("Ok invalidation after EINTR retry and ENOENT");
+        assert_eq!(delivered, 2);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "EINTR retried, ENOENT ignored, then the next inode"
+        );
+        drop(tx);
+        done_rx
+            .recv_timeout(NOTIFIER_WAIT)
+            .expect("sender drop still ends the thread after a retried notify");
+        drop(thread);
+    }
+
+    /// Regression: create of a never-looked-up name must not send
+    /// FUSE_NOTIFY_INVAL_ENTRY. Root attrs are stable (`create_root_file_info`),
+    /// so the batch is exactly `Inode(root)`.
+    #[test]
+    fn entry_advertised_create_unseen_name_sends_root_inode_not_entry() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let rec = attach_recording(&fs);
+
+        assert!(
+            file_info_attr_stable(&fs.cached_fi(FUSE_ROOT_ID).expect("root fi")),
+            "root FileInfo is stable"
+        );
+        let fd = ov.create_file("/fresh.txt", 0o644).expect("create");
+        ov.close_overlay_fd(fd);
+        let fi = fs.source.lookup("/fresh.txt", 0).expect("overlay fi");
+        assert!(
+            fs.attr_ttl_for_fi(&fi).is_zero(),
+            "new overlay file has entry TTL 0"
+        );
+        // Same order as Filesystem::create: note, assign ino, reply TTL, flush.
+        fs.note_dir_changed(FUSE_ROOT_ID, "fresh.txt");
+        let _ino = fs.ino_for_path_with_fi("/fresh.txt", Some(fi.clone()));
+        fs.invalidate_dir_cache("/");
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "fresh.txt", &fi);
+        assert!(ttl.is_zero());
+        assert!(
+            !fs.entry_advertised
+                .lock()
+                .unwrap()
+                .contains(&(FUSE_ROOT_ID, "fresh.txt".into())),
+            "TTL 0 must not advertise the name"
+        );
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(batch, vec![KernelInval::Inode(FUSE_ROOT_ID)]);
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression: a stable member looked up with a non-zero entry TTL is
+    /// advertised. Unlink then sends exactly one Entry(parent, name), exactly
+    /// one Inode(child), and Inode(parent) because the root is stable. A second
+    /// unlink or create of that name sends no Entry: the pair was consumed.
+    #[test]
+    fn entry_advertised_lookup_inserts_pair_and_unlink_sends_entry() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(NamedMember {
+            name: "m".into(),
+            fi: stable_tar_fi(4),
+        }) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let rec = attach_recording(&fs);
+
+        assert!(file_info_attr_stable(
+            &fs.cached_fi(FUSE_ROOT_ID).expect("root")
+        ));
+        let (child, _attr, ttl) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("m"))
+            .expect("lookup helper used by Filesystem::lookup");
+        assert_eq!(ttl, TTL, "stable archive member is advertised for 60s");
+        assert!(
+            fs.entry_advertised
+                .lock()
+                .unwrap()
+                .contains(&(FUSE_ROOT_ID, "m".into())),
+            "lookup path must insert (parent, name)"
+        );
+        assert!(file_info_attr_stable(
+            &fs.cached_fi(child).expect("stable child")
+        ));
+
+        ov.unlink("/m").expect("unlink");
+        fs.invalidate_dir_cache("/");
+        fs.note_dir_changed(FUSE_ROOT_ID, "m");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Inode(FUSE_ROOT_ID),
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child),
+            ]
+        );
+        assert!(
+            !fs.entry_advertised
+                .lock()
+                .unwrap()
+                .contains(&(FUSE_ROOT_ID, "m".into())),
+            "unlink consumes the advertised pair"
+        );
+
+        ov.unlink("/m").expect("second unlink");
+        fs.note_dir_changed(FUSE_ROOT_ID, "m");
+        let again = flush_recorded(&fs, &rec.rx);
+        assert!(
+            again.is_empty(),
+            "second unlink of a consumed name sends no Entry: {again:?}"
+        );
+
+        let fd = ov.create_file("/m", 0o644).expect("recreate");
+        ov.close_overlay_fd(fd);
+        let fi = fs.source.lookup("/m", 0).expect("recreated overlay fi");
+        assert!(fs.attr_ttl_for_fi(&fi).is_zero());
+        fs.note_dir_changed(FUSE_ROOT_ID, "m");
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "m", &fi);
+        assert!(ttl.is_zero());
+        let created = flush_recorded(&fs, &rec.rx);
+        assert!(
+            created.is_empty(),
+            "create after the pair was consumed sends no Entry: {created:?}"
+        );
+        stop_recording(&fs, rec);
+    }
+
+    /// Stable archive members in `/` whose bytes can be read (copy-up on
+    /// rename needs it). `file_info_attr_stable` is true for each.
+    struct ReadableMembers(Vec<(String, FileInfo)>);
+
+    impl MountSource for ReadableMembers {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            let m: BTreeMap<String, FileInfo> = self.0.iter().cloned().collect();
+            Some(ListResult::Infos(m))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            let name = path.strip_prefix('/')?;
+            self.0
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, fi)| fi.clone())
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(vec![b'a'; fi.size as usize])))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    fn readable_members_fs(names: &[&str]) -> (tempfile::TempDir, RatarmountFs) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let members = names
+            .iter()
+            .map(|n| (n.to_string(), stable_tar_fi(4)))
+            .collect();
+        let base = Arc::new(ReadableMembers(members)) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        (dir, fs)
+    }
+
+    /// Regression (#86 on #84): rename of a 60s-advertised archive member must
+    /// queue the old name, the stable child inode and the stable parent before
+    /// the path map is rebound, and send nothing until the post-reply flush.
+    #[test]
+    fn rename_paths_queues_old_name_child_and_parent_before_rebind() {
+        let (_dir, fs) = readable_members_fs(&["m"]);
+        let rec = attach_recording(&fs);
+        let (child, _attr, ttl) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("m"))
+            .expect("lookup m");
+        assert_eq!(ttl, TTL, "stable archive member is advertised for 60s");
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "n", 0)
+            .expect("rename archive member");
+        assert_eq!(
+            fs.pending_inval.lock().unwrap().len(),
+            4,
+            "queued, not sent, until the handler flushes after reply.ok()"
+        );
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child),
+                KernelInval::Inode(FUSE_ROOT_ID),
+                // The moved dentry keeps its 60s timeout under the new name.
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "n".into(),
+                },
+            ]
+        );
+        assert!(!fs
+            .entry_advertised
+            .lock()
+            .unwrap()
+            .contains(&(FUSE_ROOT_ID, "m".into())));
+        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/n"));
+        let fi = fs.file_info_for_ino(child).expect("renamed member");
+        assert!(
+            fs.attr_ttl_for_fi(&fi).is_zero(),
+            "copied-up member is overlay-backed: TTL 0 from now on"
+        );
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#86 on #84): rename of one 60s-advertised member over
+    /// another queues both names and both stable children (the replaced one
+    /// before `rebind_after_rename` detaches it) plus the parent.
+    #[test]
+    fn rename_paths_over_advertised_member_queues_both_names_and_children() {
+        let (_dir, fs) = readable_members_fs(&["m", "t"]);
+        let rec = attach_recording(&fs);
+        let (child_m, _, ttl_m) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).expect("m");
+        let (child_t, _, ttl_t) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("t")).expect("t");
+        assert_eq!((ttl_m, ttl_t), (TTL, TTL));
+
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "t", 0)
+            .expect("rename over");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            batch,
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child_m),
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "t".into(),
+                },
+                KernelInval::Inode(child_t),
+                KernelInval::Inode(FUSE_ROOT_ID),
+            ]
+        );
+        assert_eq!(fs.path_for_ino(child_m).as_deref(), Some("/t"));
+        assert_ne!(fs.path_for_ino(child_t).as_deref(), Some("/t"));
+        assert!(fs.entry_advertised.lock().unwrap().is_empty());
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression: an overlay-backed name (entry TTL 0) was never advertised.
+    /// Unlink sends no Entry and no Inode(child).
+    #[test]
+    fn entry_advertised_overlay_unlink_sends_no_entry_or_child_inode() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let rec = attach_recording(&fs);
+
+        let fd = ov.create_file("/new.txt", 0o644).expect("create");
+        ov.close_overlay_fd(fd);
+        let fi = fs.source.lookup("/new.txt", 0).expect("overlay fi");
+        assert!(!file_info_attr_stable(&fi));
+        // create() notes the directory before the new inode exists.
+        fs.note_dir_changed(FUSE_ROOT_ID, "new.txt");
+        let child = fs.ino_for_path_with_fi("/new.txt", Some(fi.clone()));
+        fs.invalidate_dir_cache("/");
+        let ttl = fs.reply_entry_ttl(FUSE_ROOT_ID, "new.txt", &fi);
+        assert!(ttl.is_zero());
+        assert!(
+            fs.cached_fi(child).is_none(),
+            "overlay child keeps no fat FileInfo"
+        );
+        assert_ne!(child, FUSE_ROOT_ID);
+        let create_batch = flush_recorded(&fs, &rec.rx);
+        assert_eq!(
+            create_batch,
+            vec![KernelInval::Inode(FUSE_ROOT_ID)],
+            "create of a TTL 0 name invalidates the stable root only"
+        );
+
+        ov.unlink("/new.txt").expect("unlink");
+        fs.invalidate_dir_cache("/");
+        fs.note_dir_changed(FUSE_ROOT_ID, "new.txt");
+        let batch = flush_recorded(&fs, &rec.rx);
+        assert!(
+            batch.iter().all(|item| match item {
+                KernelInval::Entry { .. } => false,
+                KernelInval::Inode(ino) => *ino != child,
+            }),
+            "overlay unlink must not send Entry or Inode(child): {batch:?}"
+        );
+        assert!(
+            batch.is_empty(),
+            "exact unlink batch is empty (parent attr already dropped): {batch:?}"
+        );
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression: with an overlay, readdirplus entry TTL is 0, including for a
+    /// non-zero-size file. It must not insert into `entry_advertised`.
+    #[test]
+    fn entry_advertised_readdirplus_entry_ttl_is_zero_with_overlay() {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(EmptyBase) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+        );
+        let file_attr = RatarmountFs::file_attr(
+            2,
+            &FileInfo {
+                size: 5,
+                mtime: 1.0,
+                mode: S_IFREG | 0o644,
+                linkname: String::new(),
+                uid: 0,
+                gid: 0,
+                userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                    offset: 0,
+                    offsetheader: Some(0),
+                    istar: true,
+                    issparse: false,
+                    isgenerated: false,
+                    recursiondepth: 0,
+                })],
+            },
+        );
+        let dir_attr = RatarmountFs::file_attr(3, &ratarmount_core::create_root_file_info());
+        assert_eq!(fs.readdirplus_entry_ttl(&file_attr), Duration::ZERO);
+        assert_eq!(fs.readdirplus_entry_ttl(&dir_attr), Duration::ZERO);
+        assert!(
+            fs.entry_advertised.lock().unwrap().is_empty(),
+            "readdirplus must not advertise entries while its TTL is zero"
         );
     }
 }
