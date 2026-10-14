@@ -258,6 +258,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FUSE rename of a 60s-cached member (to a new name or over a cached one): held fd read as `(deleted)` in /proc; destination must stay fresh (host append) | `cargo test -p ratarmount --test fuse_rename fuse_rename_cached_source` |
 | Overlay opened with an empty/partial tombstone set on a SQL error (unlinked archive members reappear) | `cargo test -p ratarmount-compositing --lib overlay_open_fails_when` |
 | Startup exits 101 when the launcher's stdout/stderr pipe has no reader (#93; `println!` panics on EPIPE) | `cargo test -p ratarmount --test startup_broken_stdio` |
+| Missing or table-less overlay DB silently recreated on `-w` open (tombstones lost, unlinked members reappear) (#96) | `cargo test -p ratarmount-compositing --lib overlay_open_` · `cargo test -p ratarmount-compositing --lib overlay_marker` · `cargo test -p ratarmount-compositing --lib overlay_commit_plan_refuses` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
