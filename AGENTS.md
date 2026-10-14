@@ -256,6 +256,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Declared MSRV lower than the toolchain the workspace needs (README/Cargo.toml drift) | `./test-harness/test-msrv-ci.sh` · CI job `msrv` |
 | FUSE `rename(2)` ENOSYS on `-w` (#86; temp-then-rename writers) | `cargo test -p ratarmount --test fuse_rename` · `cargo test -p ratarmount-fuse --lib rename_paths` · `cargo test -p ratarmount-fuse --lib io_to_errno_maps_already_exists` |
 | Overlay opened with an empty/partial tombstone set on a SQL error (unlinked archive members reappear) | `cargo test -p ratarmount-compositing --lib overlay_open_fails_when` |
+| Startup exits 101 when the launcher's stdout/stderr pipe has no reader (#93; `println!` panics on EPIPE) | `cargo test -p ratarmount --test startup_broken_stdio` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 

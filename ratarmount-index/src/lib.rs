@@ -659,10 +659,10 @@ impl SqliteIndex {
         }
         if announce {
             // Harness contract: Python prints this when logger level is WARNING+
-            println!(
+            print_status(format_args!(
                 "Successfully loaded offset dictionary from {}",
                 path.display()
-            );
+            ));
         }
         Ok(idx)
     }
@@ -1462,14 +1462,18 @@ impl SqliteIndex {
                 let _ = conn.execute(r#"DELETE FROM "files""#, []);
                 Ok(())
             });
-            println!("Successfully loaded compact offset dictionary (no SQLite files table)");
+            print_status(format_args!(
+                "Successfully loaded compact offset dictionary (no SQLite files table)"
+            ));
         } else if let Some(path) = &self.path {
-            println!(
+            print_status(format_args!(
                 "Successfully loaded offset dictionary from {}",
                 path.display()
-            );
+            ));
         } else {
-            println!("Successfully loaded offset dictionary from :memory:");
+            print_status(format_args!(
+                "Successfully loaded offset dictionary from :memory:"
+            ));
         }
         Ok(self)
     }
@@ -3090,6 +3094,14 @@ pub fn discard_index_file_if_below_minimum(path: impl AsRef<Path>, minimum: u64)
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(true),
         Err(e) => Err(e.into()),
     }
+}
+
+/// Harness status line on stdout (`println!` text). Write errors (EPIPE when
+/// a launcher's pipe has no reader, #93) are ignored instead of panicking.
+/// Not captured by libtest, unlike `println!`.
+fn print_status(args: std::fmt::Arguments<'_>) {
+    use std::io::Write;
+    let _ = writeln!(std::io::stdout().lock(), "{args}");
 }
 
 #[cfg(test)]
