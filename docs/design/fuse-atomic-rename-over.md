@@ -1,6 +1,6 @@
 # Design: atomic rename-over on `-w` mounts (#88)
 
-Status: **architecture LGTM (Keystone, review 5524814067); doc revised per review**.
+Status: **design LGTM (Keystone, review 5525526113, at c8dadb1)**; architecture review 5524814067.
 Docs and a measurement harness only; no product code changes in this PR.
 
 ## Problem
@@ -91,7 +91,9 @@ every run.
 
 1. COW `from` into the overlay (unchanged; a failure leaves `to` untouched).
 2. If `to` is a directory: `AlreadyExists` (unchanged).
-3. **Park hook** (for section 2; FUSE is its only consumer until phase 3):
+3. **Park hook** (for section 2): an explicit opt-in (`rename_parked` /
+   `unlink_parked`, used only by FUSE). Plain `rename` / `unlink`, which the
+   other frontends call, never open the old file:
    if `to_real` exists, open it **before** the host rename, and return that
    handle to the caller with the result. This is the only point where the
    old inode is still reachable by path. On Linux the open is
@@ -240,7 +242,10 @@ until the kernel `FORGET`s it.
   parked fd is closed at zero, and the inode entry is dropped. Unmount closes the rest. (fuser notes FORGET is not
   guaranteed for every inode; unmount covers that.)
 - **Startup fd limit.** At FUSE daemon startup, raise the `RLIMIT_NOFILE`
-  soft limit to the hard limit. Log on failure and continue.
+  soft limit to the hard limit. On macOS the hard limit can be
+  `RLIM_INFINITY`, so cap the raise at the system max
+  (`kern.maxfilesperproc`, and `OPEN_MAX` for `setrlimit`). Log on failure
+  and continue.
 - **No silent fallback.** There is no LRU that closes a parked fd early.
   If parking fails with `EMFILE`/`ENFILE`, the rename or unlink itself
   fails with that errno before the destination is touched (a rename's
