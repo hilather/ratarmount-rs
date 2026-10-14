@@ -934,6 +934,14 @@ impl RatarmountFs {
         // from the old name drops its 60s attr; a replaced target's inode is
         // still dropped below. Later changes to the destination name are
         // kernel ops on that dentry, which the VFS updates itself.
+        //
+        // Residual: the moved dentry keeps the rest of its 60s entry timeout
+        // and neither name stays in `entry_advertised`, so a change made
+        // outside the mount (host delete/replace of the overlay copy) is not
+        // seen under the destination name for up to 60s. A future option is
+        // FUSE_NOTIFY_INVAL_ENTRY with FUSE_EXPIRE_ONLY (ABI 7.38), which
+        // expires the dentry without unhashing it, so held fds keep their
+        // path; fuser 0.15 does not expose it.
         self.note_entry_changed(parent, name);
         self.entry_advertised
             .lock()
