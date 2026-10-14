@@ -88,15 +88,39 @@ fn locked_overlay_db_says_in_use_without_move_aside() {
 
 #[test]
 fn unopenable_overlay_db_suggests_checking_access() {
+    use std::os::unix::fs::PermissionsExt;
     let tmp = tempfile::tempdir().unwrap();
     let src = tmp.path().join("src");
     std::fs::create_dir(&src).unwrap();
     let ov = tmp.path().join("ov");
-    // A directory where the database file should be: SQLITE_CANTOPEN.
-    std::fs::create_dir_all(ov.join(".ratarmount.overlay.sqlite")).unwrap();
+    std::fs::create_dir(&ov).unwrap();
+    // A read-only overlay folder: SQLite cannot create the database
+    // (SQLITE_CANTOPEN).
+    std::fs::set_permissions(&ov, std::fs::Permissions::from_mode(0o555)).unwrap();
+    if std::fs::write(ov.join("probe"), b"").is_ok() {
+        eprintln!("skip: read-only folder is writable (running as root?)");
+        return;
+    }
     let out = run_w(&ov, &src);
+    std::fs::set_permissions(&ov, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(out.status.code(), Some(1));
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("are readable and writable"), "{stderr}");
     assert!(!stderr.contains("move it aside"), "{stderr}");
+}
+
+#[test]
+fn overlay_db_path_that_is_a_directory_is_named() {
+    let tmp = tempfile::tempdir().unwrap();
+    let src = tmp.path().join("src");
+    std::fs::create_dir(&src).unwrap();
+    let ov = tmp.path().join("ov");
+    std::fs::create_dir_all(ov.join(".ratarmount.overlay.sqlite")).unwrap();
+    let out = run_w(&ov, &src);
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("is a directory, not a database file"),
+        "{stderr}"
+    );
 }
