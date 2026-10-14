@@ -1043,9 +1043,14 @@ impl RatarmountFs {
     /// holds the 60s attr. Without a notifier (unit tests, before mount) the
     /// record is kept, since nothing would be sent.
     ///
-    /// Residual, not handled here: after a live commit a cached attr lasts
-    /// until this drop, a later attr reply, or the 60s TTL, and
+    /// Residual, not handled here: after a live commit the generation sweep
+    /// sends nothing to the kernel (lookup/getattr/readdir/read never flush),
+    /// so a member the commit replaced can show stale attrs for up to 60s
+    /// (until this drop, a later attr reply, or the TTL) and stale
     /// `FOPEN_KEEP_CACHE` pages until an `Inode` invalidation.
+    /// `attr_advertised` is also never trimmed on FORGET (inode numbers are
+    /// not reused, and the inode map does not shrink either); trimming it
+    /// would need per-inode lookup counts.
     fn drop_stable_attr(&self, ino: u64) -> bool {
         {
             let mut inodes = self.inodes.lock().unwrap();
