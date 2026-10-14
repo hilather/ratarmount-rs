@@ -2692,13 +2692,27 @@ fn path_is_fuse_superblock(path: &Path) -> bool {
 
 /// Startup message for a failed `WriteOverlay::new`. Every `Sqlite` error there
 /// comes from the overlay database itself (open, exclusive lock, schema,
-/// tombstone load, #89), so name the file and the way out. `<e>` still tells a
-/// lock or permission error apart from corruption.
+/// tombstone load, #89). A busy/locked database belongs to another mount, so
+/// never suggest moving it aside then; access errors point at permissions.
+/// Paths are canonical when the overlay folder exists.
 fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
+    let ov = overlay_path
+        .canonicalize()
+        .unwrap_or_else(|_| overlay_path.to_path_buf());
+    let db = ov.join(HIDDEN_DB);
     match e {
+        e if e.is_locked() => format!(
+            "write overlay {} is in use by another ratarmount process (database is locked); unmount it first",
+            ov.display()
+        ),
+        e if e.is_access_error() => format!(
+            "error opening write overlay database {}: {e}; check that it and {} are readable and writable",
+            db.display(),
+            ov.display()
+        ),
         OverlayError::Sqlite(_) => format!(
             "error opening write overlay database {}: {e}; move it aside to start a fresh overlay, or mount without -w",
-            overlay_path.join(HIDDEN_DB).display()
+            db.display()
         ),
         _ => format!("error creating write overlay: {e}"),
     }
