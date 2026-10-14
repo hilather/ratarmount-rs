@@ -55,8 +55,13 @@ pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
 pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 
 /// Overlay bookkeeping names that never show up as overlay content.
+/// ASCII case is ignored: on a case-insensitive overlay folder (macOS,
+/// Windows shares) `/.RATARMOUNT.OVERLAY.SQLITE` is the real database.
 fn is_overlay_internal_name(name: &str) -> bool {
-    name.starts_with(HIDDEN_DB) || name == OVERLAY_MARKER
+    let n = name.as_bytes();
+    let db = HIDDEN_DB.as_bytes();
+    (n.len() >= db.len() && n[..db.len()].eq_ignore_ascii_case(db))
+        || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
 /// Mount path with any component that is overlay bookkeeping (database, its
@@ -530,7 +535,22 @@ impl WriteOverlay {
         // Once the current marker is in place the legacy one is redundant;
         // removing it keeps a reset to one file (also cleans folders that an
         // earlier build migrated but left both names in).
-        if fs::symlink_metadata(&new_marker_path).is_ok_and(|m| m.file_type().is_file()) {
+        // The folder is fsynced first so a crash cannot leave neither marker;
+        // skipped when there is no legacy marker to remove.
+        let legacy_present = fs::symlink_metadata(root.join(LEGACY_OVERLAY_MARKER)).is_ok();
+        let marker_durable = legacy_present
+            && fs::symlink_metadata(&new_marker_path).is_ok_and(|m| m.file_type().is_file())
+            && match fs::File::open(&root).and_then(|d| d.sync_all()) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!(
+                        "could not sync overlay folder {}; keeping legacy marker: {e}",
+                        root.display()
+                    );
+                    false
+                }
+            };
+        if marker_durable {
             let legacy = root.join(LEGACY_OVERLAY_MARKER);
             if let Err(e) = fs::remove_file(&legacy) {
                 if e.kind() != io::ErrorKind::NotFound {
@@ -4561,13 +4581,8 @@ fn reset_overlay_dir(root: &Path) -> Result<()> {
     for ent in rd.flatten() {
         let name = ent.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == HIDDEN_DB
-            || name_s == format!("{HIDDEN_DB}-journal")
-            || name_s == format!("{HIDDEN_DB}-shm")
-            || name_s == format!("{HIDDEN_DB}-wal")
-            || name_s == OVERLAY_MARKER
-            || name_s == LEGACY_OVERLAY_MARKER
-        {
+        // Same (ASCII case-insensitive) rule the mount uses to hide them.
+        if is_overlay_internal_name(&name_s) {
             continue;
         }
         let p = ent.path();
@@ -6337,6 +6352,38 @@ mod tests {
         assert!(overlay.join(OVERLAY_MARKER).is_file());
         let ov = reopen_keep_overlay(&overlay).unwrap();
         assert!(ov.lookup("/keep.txt", 0).is_none(), "tombstone kept");
+    }
+
+    /// Keystone (#99): on a case-insensitive overlay folder a case variant
+    /// of the database or marker name is the real file, so it is refused and
+    /// hidden like the exact name.
+    #[test]
+    fn overlay_internal_names_ignore_ascii_case() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        let db_len = fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        let denied = |r: Result<()>| match r {
+            Err(OverlayError::Io(e)) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        };
+        for p in [
+            "/.RATARMOUNT.OVERLAY.SQLITE",
+            "/.Ratarmount-Overlay.Used",
+            "/.Ratarmount.Overlay.Sqlite-journal",
+            "/sub/.RATARMOUNT-OVERLAY.USED/foo",
+        ] {
+            assert!(denied(ov.create_file(p, 0o644).map(|_| ())), "create {p}");
+            assert!(denied(ov.unlink(p)), "unlink {p}");
+            assert!(denied(ov.mkdir(p, 0o755)), "mkdir {p}");
+            assert!(denied(ov.truncate(p, 0)), "truncate {p}");
+            assert!(denied(ov.rename("/keep.txt", p)), "rename to {p}");
+            assert!(ov.lookup(p, 0).is_none(), "lookup {p}");
+        }
+        drop(ov);
+        assert_eq!(fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len(), db_len);
+        if cfg!(target_os = "linux") {
+            assert!(!overlay.join(".RATARMOUNT.OVERLAY.SQLITE").exists());
+        }
     }
 
     /// Plan skeptic (round 2): SMB/SFTP pass full paths, so a path *beneath*
