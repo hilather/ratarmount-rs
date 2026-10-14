@@ -27,6 +27,15 @@ const OVERLAY_ATTR_TTL: Duration = Duration::from_secs(0);
 const BLKSIZE: u32 = 256 * 1024;
 const DIR_CACHE_TTL: Duration = Duration::from_secs(30);
 
+/// Errno for a failed overlay operation: an `OverlayError::Io` keeps its kind
+/// (EACCES for a refused bookkeeping name), anything else is EIO.
+fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
+    match err {
+        ratarmount_compositing::OverlayError::Io(e) => io_to_errno(e),
+        _ => EIO,
+    }
+}
+
 /// Map `std::io::Error` to a FUSE/libc errno.
 ///
 /// Password / permission failures must not collapse to generic EIO — that is what
@@ -889,6 +898,104 @@ impl RatarmountFs {
         self.dir_cache.lock().unwrap().remove(parent);
     }
 
+    /// Overlay path for `parent`/`name`, or the errno to reply.
+    fn overlay_child_path(&self, parent: u64, name: &OsStr) -> Result<String, i32> {
+        if self.overlay.is_none() {
+            return Err(EROFS);
+        }
+        let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
+        Ok(join_path(&parent_path, &name.to_string_lossy()))
+    }
+
+    /// Body of `create`, replying-free so it can be unit-tested.
+    fn create_entry(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(Duration, FileAttr, u64), i32> {
+        let path = self.overlay_child_path(parent, name)?;
+        let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
+        let name = name.to_string_lossy();
+        let ov = self.overlay.as_ref().ok_or(EROFS)?;
+        let fd = ov.create_file(&path, mode).map_err(|e| {
+            debug!("create: {e}");
+            overlay_errno(&e)
+        })?;
+        let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: mode | ratarmount_core::S_IFREG,
+            linkname: String::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            userdata: vec![],
+        });
+        // Drop a previously cached archive member before the new
+        // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
+        self.note_dir_changed(parent, &name);
+        let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+        self.invalidate_dir_cache(&parent_path);
+        let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+        self.handles
+            .lock()
+            .unwrap()
+            .insert(fh, OpenBackend::OverlayFd(fd));
+        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        Ok((ttl, Self::file_attr(ino, &fi), fh))
+    }
+
+    /// Body of `mkdir`, replying-free so it can be unit-tested.
+    fn mkdir_entry(
+        &mut self,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+    ) -> Result<(Duration, FileAttr), i32> {
+        let path = self.overlay_child_path(parent, name)?;
+        let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
+        let name = name.to_string_lossy();
+        let ov = self.overlay.as_ref().ok_or(EROFS)?;
+        ov.mkdir(&path, mode).map_err(|e| {
+            debug!("mkdir: {e}");
+            overlay_errno(&e)
+        })?;
+        let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
+            size: 0,
+            mtime: 0.0,
+            mode: mode | ratarmount_core::S_IFDIR,
+            linkname: String::new(),
+            uid: unsafe { libc::geteuid() },
+            gid: unsafe { libc::getegid() },
+            userdata: vec![],
+        });
+        self.note_dir_changed(parent, &name);
+        let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
+        self.invalidate_dir_cache(&parent_path);
+        let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        Ok((ttl, Self::file_attr(ino, &fi)))
+    }
+
+    /// Body of `unlink` / `rmdir`, replying-free so it can be unit-tested.
+    fn remove_entry(&mut self, parent: u64, name: &OsStr, dir: bool) -> Result<(), i32> {
+        let path = self.overlay_child_path(parent, name)?;
+        let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
+        let name = name.to_string_lossy();
+        let ov = self.overlay.as_ref().ok_or(EROFS)?;
+        let r = if dir {
+            ov.rmdir(&path)
+        } else {
+            ov.unlink(&path)
+        };
+        r.map_err(|e| {
+            debug!("{}: {e}", if dir { "rmdir" } else { "unlink" });
+            overlay_errno(&e)
+        })?;
+        self.invalidate_dir_cache(&parent_path);
+        self.note_dir_changed(parent, &name);
+        Ok(())
+    }
+
     /// Overlay rename for `Filesystem::rename` (#86). Returns an errno.
     ///
     /// With a negotiated FUSE ABI below 7.23 (fuser 0.15 without `abi-7-23`)
@@ -1315,7 +1422,7 @@ impl RatarmountFs {
                     Err(e) => {
                         if write {
                             debug!("overlay open: {e}");
-                            return Err(EIO);
+                            return Err(overlay_errno(&e));
                         }
                         // RO open of non-overlay path: fall through to base source.
                         debug!("overlay open (read fallthrough): {e}");
@@ -1618,45 +1725,12 @@ impl Filesystem for RatarmountFs {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let Some(ov) = &self.overlay else {
-            reply.error(EROFS);
-            return;
-        };
-        let Some(parent_path) = self.path_for_ino(parent) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, &name);
-        match ov.create_file(&path, mode) {
-            Ok(fd) => {
-                let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
-                    size: 0,
-                    mtime: 0.0,
-                    mode: mode | ratarmount_core::S_IFREG,
-                    linkname: String::new(),
-                    uid: unsafe { libc::geteuid() },
-                    gid: unsafe { libc::getegid() },
-                    userdata: vec![],
-                });
-                // Drop a previously cached archive member before the new
-                // overlay FileInfo replaces it, or the kernel keeps 60s attrs.
-                self.note_dir_changed(parent, &name);
-                let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-                self.invalidate_dir_cache(&parent_path);
-                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
-                self.handles
-                    .lock()
-                    .unwrap()
-                    .insert(fh, OpenBackend::OverlayFd(fd));
-                let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
-                reply.created(&ttl, &Self::file_attr(ino, &fi), 0, fh, 0);
+        match self.create_entry(parent, name, mode) {
+            Ok((ttl, attr, fh)) => {
+                reply.created(&ttl, &attr, 0, fh, 0);
                 self.flush_kernel_invals();
             }
-            Err(e) => {
-                debug!("create: {e}");
-                reply.error(EIO);
-            }
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1669,88 +1743,32 @@ impl Filesystem for RatarmountFs {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let Some(ov) = &self.overlay else {
-            reply.error(EROFS);
-            return;
-        };
-        let Some(parent_path) = self.path_for_ino(parent) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, &name);
-        match ov.mkdir(&path, mode) {
-            Ok(()) => {
-                let fi = self.source.lookup(&path, 0).unwrap_or_else(|| FileInfo {
-                    size: 0,
-                    mtime: 0.0,
-                    mode: mode | ratarmount_core::S_IFDIR,
-                    linkname: String::new(),
-                    uid: unsafe { libc::geteuid() },
-                    gid: unsafe { libc::getegid() },
-                    userdata: vec![],
-                });
-                self.note_dir_changed(parent, &name);
-                let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
-                self.invalidate_dir_cache(&parent_path);
-                let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
-                reply.entry(&ttl, &Self::file_attr(ino, &fi), 0);
+        match self.mkdir_entry(parent, name, mode) {
+            Ok((ttl, attr)) => {
+                reply.entry(&ttl, &attr, 0);
                 self.flush_kernel_invals();
             }
-            Err(e) => {
-                debug!("mkdir: {e}");
-                reply.error(EIO);
-            }
+            Err(errno) => reply.error(errno),
         }
     }
 
     fn unlink(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(ov) = &self.overlay else {
-            reply.error(EROFS);
-            return;
-        };
-        let Some(parent_path) = self.path_for_ino(parent) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, &name);
-        match ov.unlink(&path) {
+        match self.remove_entry(parent, name, false) {
             Ok(()) => {
-                self.invalidate_dir_cache(&parent_path);
-                self.note_dir_changed(parent, &name);
                 reply.ok();
                 self.flush_kernel_invals();
             }
-            Err(e) => {
-                debug!("unlink: {e}");
-                reply.error(EIO);
-            }
+            Err(errno) => reply.error(errno),
         }
     }
 
     fn rmdir(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(ov) = &self.overlay else {
-            reply.error(EROFS);
-            return;
-        };
-        let Some(parent_path) = self.path_for_ino(parent) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let name = name.to_string_lossy();
-        let path = join_path(&parent_path, &name);
-        match ov.rmdir(&path) {
+        match self.remove_entry(parent, name, true) {
             Ok(()) => {
-                self.invalidate_dir_cache(&parent_path);
-                self.note_dir_changed(parent, &name);
                 reply.ok();
                 self.flush_kernel_invals();
             }
-            Err(e) => {
-                debug!("rmdir: {e}");
-                reply.error(EIO);
-            }
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1806,7 +1824,7 @@ impl Filesystem for RatarmountFs {
             };
             if let Err(e) = ov.truncate(&path, sz) {
                 debug!("truncate: {e}");
-                reply.error(EIO);
+                reply.error(overlay_errno(&e));
                 return;
             }
             self.drop_stable_attr(ino);
@@ -4574,6 +4592,35 @@ mod tests {
         assert_eq!(sub_names, vec!["n".to_string(), "x".to_string()]);
         assert!(!names("/").contains(&"m".to_string()));
         stop_recording(&fs, rec);
+    }
+
+    /// Regression (Robo-Ilya, #97): a create/unlink of the overlay database
+    /// through the mount replied EIO (and create truncated the DB). Now the
+    /// overlay refuses it and the handlers reply EACCES.
+    #[test]
+    fn overlay_internal_name_create_unlink_reply_eacces() {
+        let (dir, mut fs) = readable_members_fs(&["m"]);
+        let ov = fs.overlay.as_ref().expect("write overlay");
+        let db = ov.root().join(ratarmount_compositing::HIDDEN_DB);
+        let len = std::fs::metadata(&db).unwrap().len();
+        let db_name = OsStr::new(ratarmount_compositing::HIDDEN_DB);
+        let marker = OsStr::new(ratarmount_compositing::OVERLAY_MARKER);
+        assert_eq!(
+            fs.create_entry(FUSE_ROOT_ID, db_name, 0o644).err(),
+            Some(EACCES)
+        );
+        assert_eq!(
+            fs.mkdir_entry(FUSE_ROOT_ID, marker, 0o755).err(),
+            Some(EACCES)
+        );
+        assert_eq!(fs.remove_entry(FUSE_ROOT_ID, db_name, false), Err(EACCES));
+        assert_eq!(fs.remove_entry(FUSE_ROOT_ID, marker, false), Err(EACCES));
+        assert_eq!(fs.remove_entry(FUSE_ROOT_ID, marker, true), Err(EACCES));
+        assert_eq!(std::fs::metadata(&db).unwrap().len(), len);
+        assert!(fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new(ratarmount_compositing::HIDDEN_DB))
+            .is_none());
+        drop(dir);
     }
 
     /// Regression (#86 on #84): the rename handler replies first, then

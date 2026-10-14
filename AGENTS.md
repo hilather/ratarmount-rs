@@ -261,6 +261,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | Unopenable overlay database gives a bare SQLite error with no path or recovery hint; a locked one (another mount) must say "in use", never "move it aside" (#89 follow-up) | `cargo test -p ratarmount --test overlay_open_error` |
 | Startup exits 101 when the launcher's stdout/stderr pipe has no reader (#93; `println!` panics on EPIPE) | `cargo test -p ratarmount --test startup_broken_stdio` |
 | Missing or table-less overlay DB silently recreated on `-w` open (tombstones lost, unlinked members reappear) (#96) | `cargo test -p ratarmount-compositing --lib overlay_open_` · `cargo test -p ratarmount-compositing --lib overlay_marker` · `cargo test -p ratarmount-compositing --lib overlay_commit_plan_refuses` |
+| Overlay DB / marker names visible and mutable through the mount (create truncated the DB; FUSE replied EIO); legacy marker left behind (#97 follow-up) | `cargo test -p ratarmount-compositing --lib overlay_internal_names` · `cargo test -p ratarmount-compositing --lib overlay_markers_fail_closed` · `cargo test -p ratarmount-compositing --lib overlay_refusal_lists` · `cargo test -p ratarmount-compositing --lib overlay_commit_refusal` · `cargo test -p ratarmount-fuse --lib overlay_internal_name` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.
 
