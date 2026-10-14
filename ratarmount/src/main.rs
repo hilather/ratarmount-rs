@@ -30,6 +30,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use ratarmount_session::factory;
 
+#[macro_use]
+mod quiet_print;
+
 mod find;
 mod overlay_commit;
 mod publish_index;

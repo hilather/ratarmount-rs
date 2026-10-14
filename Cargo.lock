@@ -3401,6 +3401,7 @@ dependencies = [
  "bzip2",
  "crc32fast",
  "flate2",
+ "libc",
  "log",
  "md-5",
  "ratarmount-core",
