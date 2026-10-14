@@ -751,6 +751,10 @@ fn index_id_cli_error(args: &Args) -> Option<&'static str> {
 }
 
 fn main() {
+    // #93: a desktop launcher can hand us a pipe with no reader as
+    // stdout/stderr. println!/eprintln! panic on EPIPE (exit 101) before the
+    // mount exists, so point dead stdio at /dev/null first.
+    neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
     if args.print_features {
@@ -2715,6 +2719,47 @@ fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
             db.display()
         ),
         _ => format!("error creating write overlay: {e}"),
+    }
+}
+
+/// Point fd 1 and fd 2 at `/dev/null` when they are closed (EBADF) or their
+/// reader is gone (`poll` reports POLLERR/POLLHUP, e.g. a pipe whose read end
+/// was closed). Working terminals, files and pipes are left alone. Never
+/// fails: on any error the fd is left as it was.
+fn neutralize_dead_stdio() {
+    for target in [libc::STDOUT_FILENO, libc::STDERR_FILENO] {
+        let closed = unsafe { libc::fcntl(target, libc::F_GETFD) } == -1
+            && std::io::Error::last_os_error().raw_os_error() == Some(libc::EBADF);
+        let dead = !closed && {
+            let mut pfd = libc::pollfd {
+                fd: target,
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            let n = unsafe { libc::poll(&mut pfd, 1, 0) };
+            n > 0 && pfd.revents & (libc::POLLERR | libc::POLLHUP) != 0
+        };
+        if !(closed || dead) {
+            continue;
+        }
+        let null = unsafe { libc::open(c"/dev/null".as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if null < 0 {
+            continue;
+        }
+        unsafe {
+            if null != target {
+                libc::dup2(null, target);
+            } else {
+                // `open` reused the closed target; drop O_CLOEXEC like dup2 would.
+                libc::fcntl(target, libc::F_SETFD, 0);
+            }
+        }
+        // `open` may have returned the closed target itself; keep that one.
+        if null != libc::STDOUT_FILENO && null != libc::STDERR_FILENO {
+            unsafe {
+                libc::close(null);
+            }
+        }
     }
 }
 
