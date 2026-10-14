@@ -3106,6 +3106,44 @@ fn print_status(args: std::fmt::Arguments<'_>) {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: #93 follow-up, the index harness line must not panic when
+    /// stdout is a pipe with no reader (without the CLI's startup guard).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn print_status_survives_dead_stdout() {
+        use std::os::fd::AsRawFd;
+        const CHILD_ENV: &str = "RATARMOUNT_PRINT_STATUS_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let (r, w) = std::io::pipe().unwrap();
+            drop(r);
+            if unsafe { libc::dup2(w.as_raw_fd(), 1) } != 1 {
+                std::process::exit(3);
+            }
+            drop(w);
+            super::print_status(format_args!("status {}", 1));
+            let idx = super::SqliteIndex::create_writable(None).unwrap();
+            let _ = idx.into_read_only().unwrap();
+            std::process::exit(0);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_ENV, "1")
+            .args([
+                "tests::print_status_survives_dead_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "child stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(String::from_utf8_lossy(&out.stdout).contains("running 1 test"));
+    }
+
     use super::*;
 
     fn py_fixture(rel: &str) -> PathBuf {

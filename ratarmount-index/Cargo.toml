@@ -30,3 +30,4 @@ zstd = "0.13"
 bzip2 = { version = "0.5", features = ["static"] }
 
 [dev-dependencies]
+libc.workspace = true
