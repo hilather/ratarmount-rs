@@ -302,7 +302,7 @@ impl WriteOverlay {
         let conn = Connection::open(&db_path)?;
         conn.execute_batch("PRAGMA LOCKING_MODE = EXCLUSIVE;")?;
         conn.execute_batch(SCHEMA)?;
-        let tombstones = tombstone_set_from_conn(&conn);
+        let tombstones = tombstone_set_from_conn(&conn)?;
         Ok(Self {
             base,
             replacement: RwLock::new(None),
@@ -3109,25 +3109,22 @@ fn tombstone_name(full: &str) -> &str {
     full.rsplit_once('/').map(|(_, name)| name).unwrap_or(full)
 }
 
-fn tombstone_set_from_conn(conn: &Connection) -> HashSet<String> {
-    let mut stmt = match conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#) {
-        Ok(stmt) => stmt,
-        Err(_) => return HashSet::new(),
-    };
-    let rows = stmt
-        .query_map([], |row| {
-            let folder: String = row.get(0)?;
-            let name: String = row.get(1)?;
-            Ok((folder, name))
-        })
-        .into_iter()
-        .flatten()
-        .filter_map(|row| row.ok());
+/// Load every `deleted = 1` row. Any SQL error (prepare, step, or a row that
+/// does not decode) fails the overlay open: an empty or partial set would
+/// make unlinked archive members reappear.
+fn tombstone_set_from_conn(conn: &Connection) -> rusqlite::Result<HashSet<String>> {
+    let mut stmt = conn.prepare(r#"SELECT path, name FROM "files" WHERE deleted = 1"#)?;
+    let rows = stmt.query_map([], |row| {
+        let folder: String = row.get(0)?;
+        let name: String = row.get(1)?;
+        Ok((folder, name))
+    })?;
     let mut out = HashSet::new();
-    for (folder, name) in rows {
+    for row in rows {
+        let (folder, name) = row?;
         out.insert(tombstone_key(&folder, &name));
     }
-    out
+    Ok(out)
 }
 
 fn delete_overlay_files_row(db: &Connection, rel: &str) -> Result<()> {
@@ -5626,6 +5623,122 @@ mod tests {
             matches!(restored.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:")),
             "create after unlink must clear the tombstone and serve the overlay file"
         );
+    }
+
+    /// Archive base with one member, `/keep.txt` (lookup `Some`, so unlink
+    /// writes a `deleted = 1` tombstone row).
+    struct KeepBase;
+    impl MountSource for KeepBase {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path == "/" {
+                let mut map = BTreeMap::new();
+                map.insert("keep.txt".into(), keep_base_info());
+                Some(ListResult::Infos(map))
+            } else {
+                None
+            }
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            match path {
+                "/" => Some(create_root_file_info()),
+                "/keep.txt" => Some(keep_base_info()),
+                _ => None,
+            }
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(io::Error::new(io::ErrorKind::NotFound, "keep base"))
+        }
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+    fn keep_base_info() -> FileInfo {
+        FileInfo {
+            size: 4,
+            mtime: 0.0,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                offset: 0,
+                offsetheader: Some(0),
+                istar: true,
+                issparse: false,
+                isgenerated: false,
+                recursiondepth: 0,
+            })],
+        }
+    }
+
+    /// Overlay folder whose database holds a `/keep.txt` tombstone.
+    fn overlay_with_keep_tombstone() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        ov.unlink("/keep.txt").unwrap();
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        drop(ov);
+        (dir, overlay)
+    }
+
+    fn reopen_keep_overlay(overlay: &Path) -> Result<WriteOverlay> {
+        WriteOverlay::new(Arc::new(KeepBase) as Arc<dyn MountSource>, overlay)
+    }
+
+    /// Regression: a failing tombstone SELECT at open became an empty set, so
+    /// every unlinked archive member reappeared. Opening must fail instead.
+    #[test]
+    fn overlay_open_fails_when_tombstone_query_errors() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        {
+            let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+            conn.execute_batch(r#"ALTER TABLE "files" RENAME COLUMN "deleted" TO "deleted_x";"#)
+                .unwrap();
+        } // EXCLUSIVE locking: drop before reopening.
+        match reopen_keep_overlay(&overlay) {
+            Ok(ov) => panic!(
+                "overlay opened with an unreadable tombstone table; /keep.txt visible: {}",
+                ov.lookup("/keep.txt", 0).is_some()
+            ),
+            Err(e) => assert!(
+                matches!(e, OverlayError::Sqlite(_)) && e.to_string().contains("no such column"),
+                "want the tombstone SELECT error, got {e}"
+            ),
+        }
+    }
+
+    /// Regression: an unreadable tombstone row was dropped by
+    /// `filter_map(ok)`, opening with a partial set (that member reappears).
+    #[test]
+    fn overlay_open_fails_when_a_tombstone_row_is_unreadable() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        {
+            let conn = Connection::open(overlay.join(HIDDEN_DB)).unwrap();
+            conn.execute(
+                r#"INSERT INTO "files" (path, name, deleted) VALUES ('', X'FF', 1)"#,
+                [],
+            )
+            .unwrap();
+            let kind: String = conn
+                .query_row(
+                    r#"SELECT typeof(name) FROM "files" WHERE path = '' AND deleted = 1 AND typeof(name) = 'blob'"#,
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(kind, "blob", "TEXT affinity keeps blobs as blobs");
+        }
+        match reopen_keep_overlay(&overlay) {
+            Ok(_) => panic!("overlay opened with a partial tombstone set"),
+            Err(e) => assert!(
+                matches!(
+                    e,
+                    OverlayError::Sqlite(rusqlite::Error::InvalidColumnType(..))
+                ),
+                "want InvalidColumnType from the tombstone row, got {e}"
+            ),
+        }
     }
 
     /// Regression: prune EACCES after a committed delete left `is_deleted` true.
