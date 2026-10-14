@@ -2,6 +2,8 @@
 //! file versions, path prefix, path transform, in-FS control folder, OCI overlayfs,
 //! G-3 payload cache.
 
+#[macro_use]
+mod quiet_print;
 mod automount;
 mod control;
 mod empty_archive;
