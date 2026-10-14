@@ -258,6 +258,7 @@ Run filters **separately** (`cargo test` does not treat `|` as OR).
 | FUSE `-w`: generation sweep / rename rebind cleared the stable cache, so a later write/truncate/rename/dir change sent no kernel attr invalidation (60s stale attr) | `cargo test -p ratarmount-fuse --lib after_generation_sweep` · `cargo test -p ratarmount-fuse --lib attr_advertised` |
 | FUSE rename of a 60s-cached member (to a new name or over a cached one): held fd read as `(deleted)` in /proc; destination must stay fresh (host append) | `cargo test -p ratarmount --test fuse_rename fuse_rename_cached_source` |
 | Overlay opened with an empty/partial tombstone set on a SQL error (unlinked archive members reappear) | `cargo test -p ratarmount-compositing --lib overlay_open_fails_when` |
+| Unopenable overlay database gives a bare SQLite error with no path or recovery hint; a locked one (another mount) must say "in use", never "move it aside" (#89 follow-up) | `cargo test -p ratarmount --test overlay_open_error` |
 | Startup exits 101 when the launcher's stdout/stderr pipe has no reader (#93; `println!` panics on EPIPE) | `cargo test -p ratarmount --test startup_broken_stdio` |
 
 When you fix a **new** production bug, **add a row** here and ship the test in the same commit.

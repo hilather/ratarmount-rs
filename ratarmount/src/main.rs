@@ -11,7 +11,7 @@ use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
     commit_overlay, maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource,
-    ControlFolderOptions, WriteOverlay,
+    ControlFolderOptions, OverlayError, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_compress::{
     repack_seekable, strip_compression_suffix, GzipSidecar, RepackAction, RepackOptions,
@@ -1172,7 +1172,7 @@ fn main() {
                 overlay_arc = Some(ov);
             }
             Err(e) => {
-                eprintln!("error creating write overlay: {e}");
+                eprintln!("{}", overlay_open_error(&overlay_path, &e));
                 std::process::exit(1);
             }
         }
@@ -2692,6 +2692,34 @@ fn path_is_fuse_superblock(path: &Path) -> bool {
     };
     let r = unsafe { statfs(c.as_ptr(), &mut buf) };
     r == 0 && buf.f_type == FUSE_SUPER_MAGIC
+}
+
+/// Startup message for a failed `WriteOverlay::new`. Every `Sqlite` error there
+/// comes from the overlay database itself (open, exclusive lock, schema,
+/// tombstone load, #89). A busy/locked database belongs to another mount, so
+/// never suggest moving it aside then; access errors point at permissions.
+/// Paths are canonical when the overlay folder exists.
+fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
+    let ov = overlay_path
+        .canonicalize()
+        .unwrap_or_else(|_| overlay_path.to_path_buf());
+    let db = ov.join(HIDDEN_DB);
+    match e {
+        e if e.is_locked() => format!(
+            "write overlay {} is in use by another ratarmount process (database is locked); unmount it first",
+            ov.display()
+        ),
+        e if e.is_access_error() => format!(
+            "error opening write overlay database {}: {e}; check that it and {} are readable and writable",
+            db.display(),
+            ov.display()
+        ),
+        OverlayError::Sqlite(_) => format!(
+            "error opening write overlay database {}: {e}; move it aside to start a fresh overlay, or mount without -w",
+            db.display()
+        ),
+        _ => format!("error creating write overlay: {e}"),
+    }
 }
 
 /// Point fd 1 and fd 2 at `/dev/null` when they are closed (EBADF) or their
