@@ -337,6 +337,36 @@ pub struct WriteOverlay {
     interval_suppressed: AtomicBool,
 }
 
+impl OverlayError {
+    fn sqlite_code(&self) -> Option<rusqlite::ErrorCode> {
+        match self {
+            OverlayError::Sqlite(rusqlite::Error::SqliteFailure(f, _)) => Some(f.code),
+            _ => None,
+        }
+    }
+
+    /// SQLITE_BUSY / SQLITE_LOCKED: another process holds the overlay database.
+    pub fn is_locked(&self) -> bool {
+        matches!(
+            self.sqlite_code(),
+            Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+        )
+    }
+
+    /// SQLITE_READONLY / SQLITE_CANTOPEN / SQLITE_PERM: an access problem,
+    /// not a corrupt database.
+    pub fn is_access_error(&self) -> bool {
+        matches!(
+            self.sqlite_code(),
+            Some(
+                rusqlite::ErrorCode::ReadOnly
+                    | rusqlite::ErrorCode::CannotOpen
+                    | rusqlite::ErrorCode::PermissionDenied
+            )
+        )
+    }
+}
+
 impl WriteOverlay {
     pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
         let root = overlay.as_ref().to_path_buf();
