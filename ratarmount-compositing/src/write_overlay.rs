@@ -55,28 +55,59 @@ pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
 pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
 
 /// Overlay bookkeeping names that never show up as overlay content.
+/// ASCII case is ignored: on a case-insensitive overlay folder (macOS,
+/// Windows shares) `/.RATARMOUNT.OVERLAY.SQLITE` is the real database.
 fn is_overlay_internal_name(name: &str) -> bool {
-    name.starts_with(HIDDEN_DB) || name == OVERLAY_MARKER
+    let n = name.as_bytes();
+    let db = HIDDEN_DB.as_bytes();
+    (n.len() >= db.len() && n[..db.len()].eq_ignore_ascii_case(db))
+        || name.eq_ignore_ascii_case(OVERLAY_MARKER)
 }
 
-/// The existing overlay marker (current name first, then the legacy one).
-/// A marker that is not a regular file (symlink, directory) is an error.
-fn overlay_marker(root: &Path) -> Result<Option<PathBuf>> {
+/// Mount path with any component that is overlay bookkeeping (database, its
+/// SQLite sidecars, either marker name). Hidden and immutable through the
+/// mount at every depth, including anything beneath such a name, so a
+/// full-path frontend (SMB, SFTP) cannot `create_dir_all` one into being.
+fn is_overlay_internal_path(path: &str) -> bool {
+    path.split('/').any(is_overlay_internal_name)
+}
+
+/// Refusal for a mount-side create/delete/rename/write of an internal name.
+fn internal_name_refused(path: &str) -> OverlayError {
+    OverlayError::Io(io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!("{path} is reserved for the write overlay's bookkeeping"),
+    ))
+}
+
+/// Every regular overlay marker present (current name first, then legacy).
+/// A non-regular entry under either marker name fails closed.
+fn overlay_markers(root: &Path) -> Result<Vec<PathBuf>> {
+    let mut found = Vec::new();
+    let mut bad: Option<PathBuf> = None;
     for name in [OVERLAY_MARKER, LEGACY_OVERLAY_MARKER] {
         let p = root.join(name);
         match fs::symlink_metadata(&p) {
-            Ok(m) if m.file_type().is_file() => return Ok(Some(p)),
+            Ok(m) if m.file_type().is_file() => found.push(p),
             Ok(_) => {
-                return Err(OverlayError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!("overlay marker {} is not a regular file", p.display()),
-                )))
+                bad.get_or_insert(p);
             }
             Err(e) if e.kind() == io::ErrorKind::NotFound => {}
             Err(e) => return Err(OverlayError::Io(e)),
         }
     }
-    Ok(None)
+    if let Some(p) = bad {
+        return Err(OverlayError::Io(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!("overlay marker {} is not a regular file", p.display()),
+        )));
+    }
+    Ok(found)
+}
+
+/// The first regular overlay marker (see [`overlay_markers`]).
+fn overlay_marker(root: &Path) -> Result<Option<PathBuf>> {
+    Ok(overlay_markers(root)?.into_iter().next())
 }
 
 /// Reset hint appended to every #96 refusal.
@@ -400,7 +431,12 @@ impl WriteOverlay {
                  Restore the database, or use a new empty folder{}",
                 root.display(),
                 db_path.display(),
-                discard_hint(&[&marker_path])
+                discard_hint(
+                    &overlay_markers(&root)?
+                        .iter()
+                        .map(|p| p.as_path())
+                        .collect::<Vec<_>>()
+                )
             )));
         }
         let conn = Connection::open(&db_path)?;
@@ -420,11 +456,13 @@ impl WriteOverlay {
                 db_path.display(),
                 // Removing only the marker would still leave a non-empty,
                 // table-less database that is refused.
-                discard_hint(&if marker {
-                    vec![marker_path.as_path(), db_path.as_path()]
-                } else {
-                    vec![db_path.as_path()]
-                })
+                discard_hint(
+                    &overlay_markers(&root)?
+                        .iter()
+                        .map(|p| p.as_path())
+                        .chain([db_path.as_path()])
+                        .collect::<Vec<_>>()
+                )
             )));
         }
         // Marker before SCHEMA: a brand-new overlay whose marker cannot be
@@ -494,6 +532,35 @@ impl WriteOverlay {
                 return Err(e);
             }
         };
+        // Once the current marker is in place the legacy one is redundant;
+        // removing it keeps a reset to one file (also cleans folders that an
+        // earlier build migrated but left both names in).
+        // The folder is fsynced first so a crash cannot leave neither marker;
+        // skipped when there is no legacy marker to remove.
+        let legacy_present = fs::symlink_metadata(root.join(LEGACY_OVERLAY_MARKER)).is_ok();
+        let marker_durable = legacy_present
+            && fs::symlink_metadata(&new_marker_path).is_ok_and(|m| m.file_type().is_file())
+            && match fs::File::open(&root).and_then(|d| d.sync_all()) {
+                Ok(()) => true,
+                Err(e) => {
+                    log::warn!(
+                        "could not sync overlay folder {}; keeping legacy marker: {e}",
+                        root.display()
+                    );
+                    false
+                }
+            };
+        if marker_durable {
+            let legacy = root.join(LEGACY_OVERLAY_MARKER);
+            if let Err(e) = fs::remove_file(&legacy) {
+                if e.kind() != io::ErrorKind::NotFound {
+                    log::warn!(
+                        "could not remove legacy overlay marker {}: {e}",
+                        legacy.display()
+                    );
+                }
+            }
+        }
         Ok(Self {
             base,
             replacement: RwLock::new(None),
@@ -786,6 +853,9 @@ impl WriteOverlay {
 
     /// Copy base file into overlay (COW) if not already present.
     pub fn ensure_modifiable(&self, path: &str) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -836,7 +906,7 @@ impl WriteOverlay {
         let tombstones = self.load_tombstone_paths();
         let mut out: Vec<CheapSearchHit> = base
             .into_iter()
-            .filter(|hit| !tombstones.contains(&hit.path))
+            .filter(|hit| !tombstones.contains(&hit.path) && !is_overlay_internal_path(&hit.path))
             .collect();
         if fts {
             let mut seen_path: HashSet<String> = HashSet::new();
@@ -927,6 +997,9 @@ impl WriteOverlay {
 
     /// True when the overlay root has a real file (or symlink) for this path.
     pub fn has_file(&self, path: &str) -> bool {
+        if is_overlay_internal_path(path) {
+            return false;
+        }
         let real = self.realpath(path);
         real.is_file() || real.is_symlink()
     }
@@ -937,6 +1010,9 @@ impl WriteOverlay {
     }
 
     pub fn create_file(&self, path: &str, mode: u32) -> Result<i32> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let fd = self.create_file_inner(path, mode)?;
         self.register_write_fd(fd, path);
@@ -1019,6 +1095,9 @@ impl WriteOverlay {
     }
 
     fn create_file_inner(&self, path: &str, mode: u32) -> Result<i32> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         #[cfg(not(unix))]
         {
             let _ = (self, path, mode);
@@ -1050,6 +1129,9 @@ impl WriteOverlay {
     }
 
     pub fn open_overlay_fd(&self, path: &str, flags: i32) -> Result<i32> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         #[cfg(not(unix))]
         {
             let _ = (self, path, flags);
@@ -1110,6 +1192,9 @@ impl WriteOverlay {
     }
 
     pub fn mkdir(&self, path: &str, mode: u32) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.ensure_parent(path)?;
         let real = self.realpath(path);
@@ -1125,6 +1210,9 @@ impl WriteOverlay {
     }
 
     pub fn unlink(&self, path: &str) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.unlink_inner(path)
     }
@@ -1148,6 +1236,9 @@ impl WriteOverlay {
     }
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -1189,6 +1280,9 @@ impl WriteOverlay {
     }
 
     pub fn truncate(&self, path: &str, size: u64) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         self.ensure_modifiable(path)?;
         let real = self.realpath(path);
@@ -1202,6 +1296,9 @@ impl WriteOverlay {
 
     /// Create a symlink in the overlay folder (`O_NOFOLLOW` / no escape).
     pub fn create_symlink(&self, path: &str, target: &str) -> Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(internal_name_refused(path));
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         if target.is_empty() {
             return Err(OverlayError::Io(io::Error::new(
@@ -1228,6 +1325,11 @@ impl WriteOverlay {
 
     /// Rename within the overlay (COW archive members first).
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        for p in [from, to] {
+            if is_overlay_internal_path(p) {
+                return Err(internal_name_refused(p));
+            }
+        }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
         let from = normpath(from);
         let to = normpath(to);
@@ -2619,6 +2721,9 @@ fn classify_deleted_offsetheaders(
 
 impl MountSource for WriteOverlay {
     fn list(&self, path: &str) -> Option<ListResult> {
+        if is_overlay_internal_path(path) {
+            return None;
+        }
         let path = normpath(path);
         if self.is_deleted(&path) && path != "/" {
             return None;
@@ -2632,14 +2737,14 @@ impl MountSource for WriteOverlay {
             match base_list {
                 ListResult::Infos(m) => {
                     for (k, v) in m {
-                        if !deleted.contains(&k) {
+                        if !deleted.contains(&k) && !is_overlay_internal_name(&k) {
                             map.insert(k, v);
                         }
                     }
                 }
                 ListResult::Names(names) => {
                     for name in names {
-                        if deleted.contains(&name) {
+                        if deleted.contains(&name) || is_overlay_internal_name(&name) {
                             continue;
                         }
                         let full = join(&path, &name);
@@ -2674,6 +2779,9 @@ impl MountSource for WriteOverlay {
     }
 
     fn list_dirents(&self, path: &str) -> Option<Vec<CheapDirent>> {
+        if is_overlay_internal_path(path) {
+            return None;
+        }
         let path = normpath(path);
         if self.is_deleted(&path) && path != "/" {
             return None;
@@ -2683,7 +2791,7 @@ impl MountSource for WriteOverlay {
 
         if let Some(base_dents) = self.current_base().list_dirents(&path) {
             for d in base_dents {
-                if !deleted.contains(&d.name) {
+                if !deleted.contains(&d.name) && !is_overlay_internal_name(&d.name) {
                     by_name.insert(d.name.clone(), d);
                 }
             }
@@ -2718,6 +2826,9 @@ impl MountSource for WriteOverlay {
     }
 
     fn list_mode(&self, path: &str) -> Option<ListModeResult> {
+        if is_overlay_internal_path(path) {
+            return None;
+        }
         let dents = self.list_dirents(path)?;
         Some(ListModeResult::Modes(
             dents.into_iter().map(|d| (d.name, d.mode)).collect(),
@@ -2733,6 +2844,9 @@ impl MountSource for WriteOverlay {
     }
 
     fn lookup(&self, path: &str, file_version: i32) -> Option<FileInfo> {
+        if is_overlay_internal_path(path) {
+            return None;
+        }
         let path = normpath(path);
         if path == "/" {
             return Some(create_root_file_info());
@@ -3148,23 +3262,42 @@ impl OverlayCommitPlan {
 
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
     let db_path = write_overlay.join(HIDDEN_DB);
-    let marker = overlay_marker(write_overlay)?;
+    let markers = overlay_markers(write_overlay)?;
+    let marker = markers.first().cloned();
     let db_regular = match fs::metadata(&db_path) {
-        Ok(m) if m.is_dir() => return Err(db_is_directory_error(&db_path)),
+        Ok(m) if m.is_dir() => {
+            let canon = write_overlay
+                .canonicalize()
+                .unwrap_or_else(|_| write_overlay.to_path_buf());
+            return Err(db_is_directory_error(&canon.join(HIDDEN_DB)));
+        }
         // A 0-byte file in a marked folder is as gone as a missing one.
         Ok(m) => m.is_file() && (marker.is_none() || m.len() > 0),
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(OverlayError::Io(e)),
     };
-    if let (Some(marker), false) = (&marker, db_regular) {
+    if marker.is_some() && !db_regular {
         // #96: committing without the tombstones would write the unlinked
-        // members back into the archive.
+        // members back into the archive. Same wording and canonical paths as
+        // the mount refusal.
+        let canon = write_overlay
+            .canonicalize()
+            .unwrap_or_else(|_| write_overlay.to_path_buf());
+        let canon_markers: Vec<PathBuf> = markers
+            .iter()
+            .map(|m| canon.join(m.file_name().unwrap_or_default()))
+            .collect();
         return Err(OverlayError::Msg(format!(
-            "write overlay {} was used before but its database {} is missing; \
+            "write overlay {} was used before but its database {} is missing or empty; \
              refusing to commit without its deletions{}",
-            write_overlay.display(),
-            db_path.display(),
-            discard_hint(&[marker])
+            canon.display(),
+            canon.join(HIDDEN_DB).display(),
+            discard_hint(
+                &canon_markers
+                    .iter()
+                    .map(|p| p.as_path())
+                    .collect::<Vec<_>>()
+            )
         )));
     }
     let conn = if db_regular {
@@ -3242,7 +3375,7 @@ fn collect_overlay_commit_plan_from_conn(
         if rel.starts_with(SPOOL_NAME_PREFIX) {
             continue;
         }
-        if ignored.iter().any(|i| rel == *i || rel.ends_with(i)) {
+        if ignored.iter().any(|i| rel == *i || rel.ends_with(i)) || is_overlay_internal_path(&rel) {
             continue;
         }
         // Only top-level DB name
@@ -4448,13 +4581,8 @@ fn reset_overlay_dir(root: &Path) -> Result<()> {
     for ent in rd.flatten() {
         let name = ent.file_name();
         let name_s = name.to_string_lossy();
-        if name_s == HIDDEN_DB
-            || name_s == format!("{HIDDEN_DB}-journal")
-            || name_s == format!("{HIDDEN_DB}-shm")
-            || name_s == format!("{HIDDEN_DB}-wal")
-            || name_s == OVERLAY_MARKER
-            || name_s == LEGACY_OVERLAY_MARKER
-        {
+        // Same (ASCII case-insensitive) rule the mount uses to hide them.
+        if is_overlay_internal_name(&name_s) {
             continue;
         }
         let p = ent.path();
@@ -6053,8 +6181,8 @@ mod tests {
         assert!(msg.contains(&hint), "{msg}");
     }
 
-    /// The pre-rename marker name still guards the folder and is migrated to
-    /// the new name, so the old `sqlite*` glob no longer removes the guard.
+    /// The pre-rename marker name still guards the folder; it is migrated to
+    /// the new name and then deleted, so a reset is one file.
     #[test]
     fn overlay_open_accepts_legacy_marker() {
         let (_dir, overlay) = overlay_with_keep_tombstone();
@@ -6070,7 +6198,11 @@ mod tests {
             overlay.join(OVERLAY_MARKER).is_file(),
             "legacy marker is migrated to the new name"
         );
-        // The old glob takes the legacy marker and the DB; the new one stays.
+        assert!(
+            !overlay.join(LEGACY_OVERLAY_MARKER).exists(),
+            "legacy removed"
+        );
+        // The old glob takes the DB; the new marker stays.
         for ent in fs::read_dir(&overlay).unwrap().flatten() {
             if ent.file_name().to_string_lossy().starts_with(HIDDEN_DB) {
                 fs::remove_file(ent.path()).unwrap();
@@ -6078,6 +6210,229 @@ mod tests {
         }
         let msg = msg_of(reopen_keep_overlay(&overlay));
         assert!(msg.contains(OVERLAY_MARKER), "{msg}");
+    }
+
+    /// Regression: folders an earlier build migrated kept both markers, so a
+    /// reset needed two removals. The next open drops the legacy one.
+    #[test]
+    fn overlay_open_removes_legacy_marker_when_both_present() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        fs::write(overlay.join(LEGACY_OVERLAY_MARKER), b"").unwrap();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        assert!(ov.lookup("/keep.txt", 0).is_none(), "tombstone kept");
+        drop(ov);
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        assert!(!overlay.join(LEGACY_OVERLAY_MARKER).exists());
+    }
+
+    /// Every marker present is named in the reset hint (here: legacy could
+    /// not be cleaned because the DB was already gone).
+    #[test]
+    fn overlay_refusal_lists_every_marker() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        fs::write(overlay.join(LEGACY_OVERLAY_MARKER), b"").unwrap();
+        remove_overlay_db(&overlay);
+        let msg = msg_of(reopen_keep_overlay(&overlay));
+        assert!(
+            msg.contains(OVERLAY_MARKER) && msg.contains(LEGACY_OVERLAY_MARKER),
+            "{msg}"
+        );
+        let msg = match collect_overlay_commit_plan(&overlay) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("commit must be refused"),
+        };
+        assert!(
+            msg.contains(OVERLAY_MARKER) && msg.contains(LEGACY_OVERLAY_MARKER),
+            "{msg}"
+        );
+    }
+
+    /// Regression (Keystone, #97): the commit refusal said only "missing" and
+    /// printed the overlay path as given.
+    #[test]
+    fn overlay_commit_refusal_missing_or_empty_canonical() {
+        let (dir, overlay) = overlay_with_keep_tombstone();
+        remove_overlay_db(&overlay);
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&overlay, &link).unwrap();
+        let msg = match collect_overlay_commit_plan(&link) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("commit must be refused"),
+        };
+        let canon = overlay.canonicalize().unwrap();
+        assert!(msg.contains("is missing or empty"), "{msg}");
+        assert!(
+            msg.contains(&canon.join(HIDDEN_DB).display().to_string()),
+            "{msg}"
+        );
+        assert!(!msg.contains(&format!("{}/", link.display())), "{msg}");
+    }
+
+    /// Regression (Robo-Ilya, #97): the database and markers were visible to
+    /// lookup through the mount.
+    #[test]
+    fn overlay_internal_names_hidden_from_lookup() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        for p in [
+            format!("/{HIDDEN_DB}"),
+            format!("/{HIDDEN_DB}-journal"),
+            format!("/{OVERLAY_MARKER}"),
+            format!("/{LEGACY_OVERLAY_MARKER}"),
+            format!("/sub/{OVERLAY_MARKER}"),
+        ] {
+            assert!(ov.lookup(&p, 0).is_none(), "{p}");
+            assert!(!ov.has_file(&p), "{p}");
+        }
+        // A base-archive member with the database name is hidden too.
+        struct DbNamedBase;
+        impl MountSource for DbNamedBase {
+            fn list(&self, _: &str) -> Option<ListResult> {
+                None
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                (path == "/.ratarmount.overlay.sqlite").then(keep_base_info)
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Err(io::Error::from(io::ErrorKind::Unsupported))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let ov2 = WriteOverlay::new(Arc::new(DbNamedBase), dir.path().join("o")).unwrap();
+        // Remove the host DB so only the base member could answer.
+        fs::remove_file(dir.path().join("o").join(HIDDEN_DB)).unwrap();
+        assert!(ov2.lookup("/.ratarmount.overlay.sqlite", 0).is_none());
+    }
+
+    /// Regression (Robo-Ilya, #97): create/delete/rename/truncate of the
+    /// database or a marker through the mount could destroy the tombstones.
+    #[test]
+    fn overlay_internal_names_refuse_mutation() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        let db_len = fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        let denied = |r: Result<()>| match r {
+            Err(OverlayError::Io(e)) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        };
+        for p in [
+            format!("/{HIDDEN_DB}"),
+            format!("/{HIDDEN_DB}-journal"),
+            format!("/{OVERLAY_MARKER}"),
+            format!("/{LEGACY_OVERLAY_MARKER}"),
+            format!("/sub/{OVERLAY_MARKER}"),
+        ] {
+            assert!(denied(ov.create_file(&p, 0o644).map(|_| ())), "create {p}");
+            assert!(
+                denied(ov.open_overlay_fd(&p, libc::O_RDONLY).map(|_| ())),
+                "open {p}"
+            );
+            assert!(
+                denied(ov.open_overlay_fd(&p, libc::O_WRONLY).map(|_| ())),
+                "open w {p}"
+            );
+            assert!(denied(ov.unlink(&p)), "unlink {p}");
+            assert!(denied(ov.mkdir(&p, 0o755)), "mkdir {p}");
+            assert!(denied(ov.rmdir(&p)), "rmdir {p}");
+            assert!(denied(ov.truncate(&p, 0)), "truncate {p}");
+            assert!(denied(ov.create_symlink(&p, "x")), "symlink {p}");
+            assert!(denied(ov.rename(&p, "/x")), "rename from {p}");
+            assert!(denied(ov.rename("/keep.txt", &p)), "rename to {p}");
+            assert!(denied(ov.ensure_modifiable(&p)), "cow {p}");
+        }
+        drop(ov);
+        assert_eq!(fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len(), db_len);
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        assert!(ov.lookup("/keep.txt", 0).is_none(), "tombstone kept");
+    }
+
+    /// Keystone (#99): on a case-insensitive overlay folder a case variant
+    /// of the database or marker name is the real file, so it is refused and
+    /// hidden like the exact name.
+    #[test]
+    fn overlay_internal_names_ignore_ascii_case() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        let db_len = fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        let denied = |r: Result<()>| match r {
+            Err(OverlayError::Io(e)) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        };
+        for p in [
+            "/.RATARMOUNT.OVERLAY.SQLITE",
+            "/.Ratarmount-Overlay.Used",
+            "/.Ratarmount.Overlay.Sqlite-journal",
+            "/sub/.RATARMOUNT-OVERLAY.USED/foo",
+        ] {
+            assert!(denied(ov.create_file(p, 0o644).map(|_| ())), "create {p}");
+            assert!(denied(ov.unlink(p)), "unlink {p}");
+            assert!(denied(ov.mkdir(p, 0o755)), "mkdir {p}");
+            assert!(denied(ov.truncate(p, 0)), "truncate {p}");
+            assert!(denied(ov.rename("/keep.txt", p)), "rename to {p}");
+            assert!(ov.lookup(p, 0).is_none(), "lookup {p}");
+        }
+        drop(ov);
+        assert_eq!(fs::metadata(overlay.join(HIDDEN_DB)).unwrap().len(), db_len);
+        if cfg!(target_os = "linux") {
+            assert!(!overlay.join(".RATARMOUNT.OVERLAY.SQLITE").exists());
+        }
+    }
+
+    /// Plan skeptic (round 2): SMB/SFTP pass full paths, so a path *beneath*
+    /// a bookkeeping name must be refused before `create_dir_all`, hidden from
+    /// lookup/listing, and skipped by the commit walk.
+    #[test]
+    fn overlay_internal_names_refused_beneath_any_component() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        let denied = |r: Result<()>| match r {
+            Err(OverlayError::Io(e)) => e.kind() == io::ErrorKind::PermissionDenied,
+            _ => false,
+        };
+        let p = format!("/sub/{OVERLAY_MARKER}/foo");
+        assert!(denied(ov.create_file(&p, 0o644).map(|_| ())), "create {p}");
+        assert!(denied(ov.mkdir(&p, 0o755)), "mkdir {p}");
+        assert!(denied(ov.rename("/keep.txt", &p)), "rename to {p}");
+        assert!(!overlay.join("sub").join(OVERLAY_MARKER).exists());
+        assert!(ov.lookup(&format!("/{HIDDEN_DB}/."), 0).is_none());
+        // A child planted on the host under that name is invisible and
+        // never appended by commit.
+        fs::create_dir_all(overlay.join("sub").join(OVERLAY_MARKER)).unwrap();
+        fs::write(overlay.join("sub").join(OVERLAY_MARKER).join("foo"), b"x").unwrap();
+        assert!(ov.lookup(&p, 0).is_none());
+        assert!(ov.list(&format!("/sub/{OVERLAY_MARKER}")).is_none());
+        drop(ov);
+        let plan =
+            collect_overlay_commit_plan_from_conn(&overlay, None, None, &HashSet::new()).unwrap();
+        assert!(
+            !plan.append_entries.is_empty()
+                && plan
+                    .append_entries
+                    .iter()
+                    .all(|(e, _)| !e.split('/').any(is_overlay_internal_name)),
+            "{:?}",
+            plan.append_entries
+        );
+    }
+
+    /// Plan skeptic (round 2): a non-regular entry under either marker name
+    /// fails closed even when the other marker is a regular file.
+    #[test]
+    fn overlay_markers_fail_closed_on_non_regular_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(LEGACY_OVERLAY_MARKER), b"").unwrap();
+        fs::create_dir(dir.path().join(OVERLAY_MARKER)).unwrap();
+        let e = overlay_markers(dir.path()).unwrap_err().to_string();
+        assert!(e.contains("not a regular file"), "{e}");
+        assert!(e.contains(OVERLAY_MARKER), "{e}");
     }
 
     /// Regression: a first open that fails after the marker was created
