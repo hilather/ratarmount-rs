@@ -1628,16 +1628,17 @@ impl WriteOverlay {
             .expect("overlay rename hook") = hook;
     }
 
-    /// Run the fault hook without holding its mutex, so the hook may call back
-    /// into lookup / the database. `None` when no hook is installed.
-    /// One-shot: the hook is taken and not restored.
+    /// Take the one-shot fault hook, drop its mutex guard, then call it.
+    /// The hook may call back into lookup or the database.
+    /// `None` when no hook is installed. The hook is not restored.
     #[cfg(test)]
     fn run_rename_before_tx_hook(&self) -> Option<Result<()>> {
-        self.rename_before_tx_hook
+        let hook = self
+            .rename_before_tx_hook
             .lock()
             .expect("overlay rename hook")
-            .take()
-            .map(|mut hook| hook())
+            .take();
+        hook.map(|mut hook| hook())
     }
 
     #[cfg(test)]
@@ -11572,18 +11573,98 @@ mod tests {
     }
 
     /// Regression: non-Linux park opens add O_NONBLOCK so a FIFO cannot block (#88).
+    ///
+    /// `#[cfg]` rather than `cfg!`: macOS libc has no `O_PATH`, so that name
+    /// must not be compiled off Linux.
     #[cfg(unix)]
     #[test]
     fn park_open_flags_set_nonblock_off_linux() {
         let flags = park_open_flags();
         assert_ne!(flags & libc::O_NOFOLLOW, 0);
         assert_ne!(flags & libc::O_CLOEXEC, 0);
-        if cfg!(target_os = "linux") {
-            assert_ne!(flags & libc::O_PATH, 0);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(flags, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC);
             assert_eq!(flags & libc::O_NONBLOCK, 0);
-        } else {
-            assert_ne!(flags & libc::O_NONBLOCK, 0);
         }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                flags,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            );
+        }
+    }
+
+    /// Regression: park-open EACCES is metadata-only (#88).
+    /// `rename_parked` and `unlink_parked` still change the names; `fd` is
+    /// `None` and `last_fi` keeps the pre-change attributes.
+    #[test]
+    fn park_open_eacces_is_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old-dst");
+        put_overlay_bytes(&ov, "/src", b"new-src");
+        let dst_before = ov.lookup("/dst", 0).expect("dst metadata");
+        ov.set_park_open_hook(Some(Box::new(|| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })));
+        let parked = ov
+            .rename_parked("/src", "/dst")
+            .expect("EACCES park open still renames")
+            .expect("destination parked");
+        assert!(parked.fd().is_none(), "metadata-only park");
+        assert_eq!(parked.file_info().size, dst_before.size);
+        assert_eq!(parked.file_info().mode, dst_before.mode);
+        assert_eq!(parked.file_info().linkname, dst_before.linkname);
+        assert_eq!(parked.file_info().size, b"old-dst".len() as u64);
+        drop(parked);
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
+        assert!(!overlay.join("src").exists());
+        assert!(ov.lookup("/src", 0).is_none());
+        assert!(ov.lookup("/dst", 0).is_some());
+        assert_eq!(ov.park_open_count(), 1);
+
+        put_overlay_bytes(&ov, "/victim", b"stay-bytes");
+        let victim_before = ov.lookup("/victim", 0).expect("victim metadata");
+        let parked = ov
+            .unlink_parked("/victim")
+            .expect("EACCES park open still unlinks")
+            .expect("victim parked");
+        assert!(parked.fd().is_none(), "metadata-only park");
+        assert_eq!(parked.file_info().size, victim_before.size);
+        assert_eq!(parked.file_info().mode, victim_before.mode);
+        assert_eq!(parked.file_info().linkname, victim_before.linkname);
+        assert_eq!(parked.file_info().size, b"stay-bytes".len() as u64);
+        drop(parked);
+        assert!(!overlay.join("victim").exists());
+        assert!(ov.lookup("/victim", 0).is_none());
+        assert_eq!(ov.park_open_count(), 2);
+    }
+
+    /// Regression: the before-tx hook runs after its mutex guard is dropped (#88).
+    #[test]
+    fn rename_before_tx_hook_runs_after_mutex_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        put_overlay_bytes(&ov, "/dst", b"old");
+        put_overlay_bytes(&ov, "/src", b"new");
+        let probe = Arc::downgrade(&ov);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            let probe = probe.upgrade().expect("overlay");
+            assert!(
+                probe.rename_before_tx_hook.try_lock().is_ok(),
+                "hook ran while its mutex was still held"
+            );
+            Ok(())
+        })));
+        ov.rename("/src", "/dst").expect("rename");
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new");
+        assert!(!overlay.join("src").exists());
     }
 
     fn overlay_entry_names(dir: &Path) -> Vec<String> {
