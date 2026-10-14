@@ -46,7 +46,55 @@ pub const HIDDEN_DB: &str = ".ratarmount.overlay.sqlite";
 /// A marked folder whose database is missing, or whose database lost its
 /// `files` table, is refused instead of silently recreated (that would drop
 /// every tombstone and unlinked archive members would reappear).
-pub const OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
+///
+/// Not prefixed with [`HIDDEN_DB`], so `rm .ratarmount.overlay.sqlite*` does not
+/// take it along with the database.
+pub const OVERLAY_MARKER: &str = ".ratarmount-overlay.used";
+
+/// Marker name used before the rename; still accepted (never created).
+pub const LEGACY_OVERLAY_MARKER: &str = ".ratarmount.overlay.sqlite.used";
+
+/// Overlay bookkeeping names that never show up as overlay content.
+fn is_overlay_internal_name(name: &str) -> bool {
+    name.starts_with(HIDDEN_DB) || name == OVERLAY_MARKER
+}
+
+/// The existing overlay marker (current name first, then the legacy one).
+/// A marker that is not a regular file (symlink, directory) is an error.
+fn overlay_marker(root: &Path) -> Result<Option<PathBuf>> {
+    for name in [OVERLAY_MARKER, LEGACY_OVERLAY_MARKER] {
+        let p = root.join(name);
+        match fs::symlink_metadata(&p) {
+            Ok(m) if m.file_type().is_file() => return Ok(Some(p)),
+            Ok(_) => {
+                return Err(OverlayError::Io(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    format!("overlay marker {} is not a regular file", p.display()),
+                )))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(OverlayError::Io(e)),
+        }
+    }
+    Ok(None)
+}
+
+/// Reset hint appended to every #96 refusal.
+fn discard_hint(paths: &[&Path]) -> String {
+    let list: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
+    format!(
+        "; or, to discard this overlay's deletions on purpose, remove {}",
+        list.join(" and ")
+    )
+}
+
+/// The database path exists but is a directory (Robo-Ilya, #96 review).
+fn db_is_directory_error(db_path: &Path) -> OverlayError {
+    OverlayError::Msg(format!(
+        "overlay database path {} is a directory, not a database file; move it aside",
+        db_path.display()
+    ))
+}
 
 /// Overlay-relative names with this prefix are not commit members.
 const SPOOL_NAME_PREFIX: &str = ".ratarmount-spool-";
@@ -305,23 +353,12 @@ impl WriteOverlay {
         // Canonical root so confinement checks use a stable absolute prefix.
         let root = root.canonicalize().map_err(OverlayError::Io)?;
         let db_path = root.join(HIDDEN_DB);
-        let marker_path = root.join(OVERLAY_MARKER);
-        let marker = match fs::symlink_metadata(&marker_path) {
-            Ok(m) if m.file_type().is_file() => true,
-            Ok(_) => {
-                return Err(OverlayError::Io(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    format!(
-                        "overlay marker {} is not a regular file",
-                        marker_path.display()
-                    ),
-                )))
-            }
-            Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-            Err(e) => return Err(OverlayError::Io(e)),
-        };
+        let found_marker = overlay_marker(&root)?;
+        let marker = found_marker.is_some();
+        let marker_path = found_marker.unwrap_or_else(|| root.join(OVERLAY_MARKER));
         // Follows a symlinked database exactly like `Connection::open` does.
         let db_len = match fs::metadata(&db_path) {
+            Ok(m) if m.is_dir() => return Err(db_is_directory_error(&db_path)),
             Ok(m) => Some(m.len()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => None,
             Err(e) => return Err(OverlayError::Io(e)),
@@ -330,9 +367,10 @@ impl WriteOverlay {
             return Err(OverlayError::Msg(format!(
                 "write overlay {} was used before but its database {} is missing or empty; \
                  its deletions would be lost (unlinked archive members reappear). \
-                 Restore the database, or use a new empty folder",
+                 Restore the database, or use a new empty folder{}",
                 root.display(),
-                db_path.display()
+                db_path.display(),
+                discard_hint(&[&marker_path])
             )));
         }
         let conn = Connection::open(&db_path)?;
@@ -348,8 +386,15 @@ impl WriteOverlay {
             drop(conn);
             return Err(OverlayError::Msg(format!(
                 "overlay database {} has no files table; its deletions would be lost \
-                 (unlinked archive members reappear). Restore it, or use a new empty folder",
-                db_path.display()
+                 (unlinked archive members reappear). Restore it, or use a new empty folder{}",
+                db_path.display(),
+                // Removing only the marker would still leave a non-empty,
+                // table-less database that is refused.
+                discard_hint(&if marker {
+                    vec![marker_path.as_path(), db_path.as_path()]
+                } else {
+                    vec![db_path.as_path()]
+                })
             )));
         }
         // Marker before SCHEMA: a brand-new overlay whose marker cannot be
@@ -375,7 +420,18 @@ impl WriteOverlay {
                 Some(_) => {}
             }
         };
+        // A legacy-named marker is migrated: `rm .ratarmount.overlay.sqlite*`
+        // deletes the old name together with the database.
+        let new_marker_path = root.join(OVERLAY_MARKER);
         let mut created_marker = false;
+        if marker && marker_path != new_marker_path {
+            if let Err(e) = create_overlay_marker(&new_marker_path) {
+                log::warn!(
+                    "could not create overlay marker {}: {e}",
+                    new_marker_path.display()
+                );
+            }
+        }
         if !marker {
             match create_overlay_marker(&marker_path) {
                 Ok(created) => created_marker = created,
@@ -614,6 +670,7 @@ impl WriteOverlay {
         for suf in ["", "-journal", "-shm", "-wal", ".used"] {
             out.push(format!("{HIDDEN_DB}{suf}"));
         }
+        out.push(OVERLAY_MARKER.to_string());
         out
     }
 
@@ -791,7 +848,7 @@ impl WriteOverlay {
         let real = self.realpath(mount_path);
         self.ensure_under_root(&real).ok()?;
         let name = mount_path.rsplit('/').next().unwrap_or("").to_string();
-        if name.is_empty() || name.starts_with(HIDDEN_DB) {
+        if name.is_empty() || is_overlay_internal_name(&name) {
             return None;
         }
         let meta = fs::symlink_metadata(&real).ok()?;
@@ -2281,7 +2338,7 @@ fn for_each_overlay_host_non_dir(
     };
     for ent in rd.flatten() {
         let name = ent.file_name().to_string_lossy().into_owned();
-        if name.starts_with(HIDDEN_DB) {
+        if is_overlay_internal_name(&name) {
             continue;
         }
         let child_mount = join(mount_dir, &name);
@@ -2569,7 +2626,7 @@ impl MountSource for WriteOverlay {
         if let Ok(rd) = fs::read_dir(&real) {
             for ent in rd.flatten() {
                 let name = ent.file_name().to_string_lossy().into_owned();
-                if name.starts_with(HIDDEN_DB) || deleted.contains(&name) {
+                if is_overlay_internal_name(&name) || deleted.contains(&name) {
                     continue;
                 }
                 let full = join(&path, &name);
@@ -2606,7 +2663,7 @@ impl MountSource for WriteOverlay {
         if let Ok(rd) = fs::read_dir(&real) {
             for ent in rd.flatten() {
                 let name = ent.file_name().to_string_lossy().into_owned();
-                if name.starts_with(HIDDEN_DB) || deleted.contains(&name) {
+                if is_overlay_internal_name(&name) || deleted.contains(&name) {
                     continue;
                 }
                 let full = join(&path, &name);
@@ -3061,24 +3118,23 @@ impl OverlayCommitPlan {
 
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
     let db_path = write_overlay.join(HIDDEN_DB);
-    let marked = match fs::symlink_metadata(write_overlay.join(OVERLAY_MARKER)) {
-        Ok(_) => true,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => false,
-        Err(e) => return Err(OverlayError::Io(e)),
-    };
+    let marker = overlay_marker(write_overlay)?;
     let db_regular = match fs::metadata(&db_path) {
-        Ok(m) => m.is_file(),
+        Ok(m) if m.is_dir() => return Err(db_is_directory_error(&db_path)),
+        // A 0-byte file in a marked folder is as gone as a missing one.
+        Ok(m) => m.is_file() && (marker.is_none() || m.len() > 0),
         Err(e) if e.kind() == io::ErrorKind::NotFound => false,
         Err(e) => return Err(OverlayError::Io(e)),
     };
-    if marked && !db_regular {
+    if let (Some(marker), false) = (&marker, db_regular) {
         // #96: committing without the tombstones would write the unlinked
         // members back into the archive.
         return Err(OverlayError::Msg(format!(
             "write overlay {} was used before but its database {} is missing; \
-             refusing to commit without its deletions",
+             refusing to commit without its deletions{}",
             write_overlay.display(),
-            db_path.display()
+            db_path.display(),
+            discard_hint(&[marker])
         )));
     }
     let conn = if db_regular {
@@ -3111,7 +3167,10 @@ fn collect_overlay_commit_plan_from_conn(
             let (path, name) = row?;
             let rel = join_rel(&path, &name);
             let norm = normalize_archive_rel_path(&rel);
-            if norm.starts_with(SPOOL_NAME_PREFIX) || norm == OVERLAY_MARKER {
+            if norm.starts_with(SPOOL_NAME_PREFIX)
+                || norm == OVERLAY_MARKER
+                || norm == LEGACY_OVERLAY_MARKER
+            {
                 continue;
             }
             if !norm.is_empty() {
@@ -3123,7 +3182,8 @@ fn collect_overlay_commit_plan_from_conn(
 
     // Overlay walk: files to append (and replace = delete + append)
     let suffixes = ["", "-journal", "-shm", "-wal", ".used"];
-    let ignored: Vec<String> = suffixes.iter().map(|s| format!("{HIDDEN_DB}{s}")).collect();
+    let mut ignored: Vec<String> = suffixes.iter().map(|s| format!("{HIDDEN_DB}{s}")).collect();
+    ignored.push(OVERLAY_MARKER.to_string());
 
     let overlay_str = write_overlay.to_string_lossy();
     let overlay_prefix = if overlay_str.ends_with('/') {
@@ -4363,6 +4423,7 @@ fn reset_overlay_dir(root: &Path) -> Result<()> {
             || name_s == format!("{HIDDEN_DB}-shm")
             || name_s == format!("{HIDDEN_DB}-wal")
             || name_s == OVERLAY_MARKER
+            || name_s == LEGACY_OVERLAY_MARKER
         {
             continue;
         }
@@ -5895,6 +5956,8 @@ mod tests {
         let msg = msg_of(reopen_keep_overlay(&overlay));
         assert!(msg.contains("has no files table"), "{msg}");
         assert!(!has_files_table(&db), "refusal must not run SCHEMA");
+        assert!(msg.contains("on purpose, remove"), "{msg}");
+        assert!(msg.contains(" and "), "marker and DB both named: {msg}");
         assert_eq!(msg, msg_of(reopen_keep_overlay(&overlay)));
         // Without the marker (overlay from an older build) a non-empty DB
         // without the table is still refused.
@@ -5930,6 +5993,102 @@ mod tests {
             Ok(_) => panic!("commit plan must be refused"),
         };
         assert!(msg.contains("refusing to commit"), "{msg}");
+        assert!(
+            msg.contains(OVERLAY_MARKER) && msg.contains("on purpose"),
+            "{msg}"
+        );
+    }
+
+    /// Regression: #97 review, the old marker name started with the DB name,
+    /// so `rm ov/.ratarmount.overlay.sqlite*` deleted it too.
+    #[test]
+    fn overlay_open_refuses_after_db_glob_rm() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        for ent in fs::read_dir(&overlay).unwrap().flatten() {
+            if ent.file_name().to_string_lossy().starts_with(HIDDEN_DB) {
+                fs::remove_file(ent.path()).unwrap();
+            }
+        }
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        let msg = msg_of(reopen_keep_overlay(&overlay));
+        assert!(msg.contains("is missing"), "{msg}");
+        let hint = format!(
+            "to discard this overlay's deletions on purpose, remove {}",
+            overlay
+                .canonicalize()
+                .unwrap()
+                .join(OVERLAY_MARKER)
+                .display()
+        );
+        assert!(msg.contains(&hint), "{msg}");
+    }
+
+    /// The pre-rename marker name still guards the folder and is migrated to
+    /// the new name, so the old `sqlite*` glob no longer removes the guard.
+    #[test]
+    fn overlay_open_accepts_legacy_marker() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        fs::rename(
+            overlay.join(OVERLAY_MARKER),
+            overlay.join(LEGACY_OVERLAY_MARKER),
+        )
+        .unwrap();
+        let ov = reopen_keep_overlay(&overlay).unwrap();
+        assert!(ov.lookup("/keep.txt", 0).is_none());
+        drop(ov);
+        assert!(
+            overlay.join(OVERLAY_MARKER).is_file(),
+            "legacy marker is migrated to the new name"
+        );
+        // The old glob takes the legacy marker and the DB; the new one stays.
+        for ent in fs::read_dir(&overlay).unwrap().flatten() {
+            if ent.file_name().to_string_lossy().starts_with(HIDDEN_DB) {
+                fs::remove_file(ent.path()).unwrap();
+            }
+        }
+        let msg = msg_of(reopen_keep_overlay(&overlay));
+        assert!(msg.contains(OVERLAY_MARKER), "{msg}");
+    }
+
+    /// Regression: a first open that fails after the marker was created
+    /// (SCHEMA on a read-only 0-byte database) must not leave the marker.
+    #[test]
+    fn overlay_first_open_failure_removes_marker() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        let db = overlay.join(HIDDEN_DB);
+        fs::write(&db, b"").unwrap();
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o444)).unwrap();
+        if fs::OpenOptions::new().write(true).open(&db).is_ok() {
+            eprintln!("skip: read-only file is writable (running as root?)");
+            return;
+        }
+        let r = reopen_keep_overlay(&overlay);
+        assert!(r.is_err(), "SCHEMA on a read-only DB must fail");
+        assert!(
+            !overlay.join(OVERLAY_MARKER).exists(),
+            "marker must be removed"
+        );
+        fs::set_permissions(&db, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(fs::metadata(&db).unwrap().len(), 0);
+        reopen_keep_overlay(&overlay).expect("folder still opens as new");
+    }
+
+    /// Robo-Ilya: a directory at the database path is named as such.
+    #[test]
+    fn overlay_open_db_path_directory_is_named() {
+        let (_dir, overlay) = overlay_with_keep_tombstone();
+        remove_overlay_db(&overlay);
+        fs::create_dir(overlay.join(HIDDEN_DB)).unwrap();
+        let msg = msg_of(reopen_keep_overlay(&overlay));
+        assert!(msg.contains("is a directory, not a database file"), "{msg}");
+        let msg = match collect_overlay_commit_plan(&overlay) {
+            Err(e) => e.to_string(),
+            Ok(_) => panic!("commit must be refused"),
+        };
+        assert!(msg.contains("is a directory"), "{msg}");
     }
 
     #[test]

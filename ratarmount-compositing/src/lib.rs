@@ -42,5 +42,6 @@ pub use write_overlay::{
     commit_overlay, live_commit_is_supported, name_suggests_tar_zst, overlay_only_names,
     patch_sidecar_if_present, sidecar_path_for_patch, CommitKind, CommitOutcome,
     CommitOverlayOptions, IndexPatchWindow, OverlayError, RemoteDownload, RemoteObjectHead,
-    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, OVERLAY_MARKER,
+    RemotePublishError, RemotePublishRequest, WriteOverlay, HIDDEN_DB, LEGACY_OVERLAY_MARKER,
+    OVERLAY_MARKER,
 };
