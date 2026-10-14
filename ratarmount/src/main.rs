@@ -11,7 +11,7 @@ use clap::{ArgAction, Parser};
 use nix::unistd::{fork, setsid, ForkResult};
 use ratarmount_compositing::{
     commit_overlay, maybe_wrap_payload_cache, CommitOverlayOptions, ControlFolderMountSource,
-    ControlFolderOptions, WriteOverlay,
+    ControlFolderOptions, OverlayError, WriteOverlay, HIDDEN_DB,
 };
 use ratarmount_compress::{
     repack_seekable, strip_compression_suffix, GzipSidecar, RepackAction, RepackOptions,
@@ -1168,7 +1168,7 @@ fn main() {
                 overlay_arc = Some(ov);
             }
             Err(e) => {
-                eprintln!("error creating write overlay: {e}");
+                eprintln!("{}", overlay_open_error(&overlay_path, &e));
                 std::process::exit(1);
             }
         }
@@ -2688,6 +2688,20 @@ fn path_is_fuse_superblock(path: &Path) -> bool {
     };
     let r = unsafe { statfs(c.as_ptr(), &mut buf) };
     r == 0 && buf.f_type == FUSE_SUPER_MAGIC
+}
+
+/// Startup message for a failed `WriteOverlay::new`. Every `Sqlite` error there
+/// comes from the overlay database itself (open, exclusive lock, schema,
+/// tombstone load, #89), so name the file and the way out. `<e>` still tells a
+/// lock or permission error apart from corruption.
+fn overlay_open_error(overlay_path: &Path, e: &OverlayError) -> String {
+    match e {
+        OverlayError::Sqlite(_) => format!(
+            "error opening write overlay database {}: {e}; move it aside to start a fresh overlay, or mount without -w",
+            overlay_path.join(HIDDEN_DB).display()
+        ),
+        _ => format!("error creating write overlay: {e}"),
+    }
 }
 
 fn redirect_stdio_to_null() -> std::io::Result<()> {
