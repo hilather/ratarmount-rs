@@ -7,9 +7,11 @@
 //! text and line ending, and drop write errors. Exit codes are unchanged:
 //! error paths call `std::process::exit` themselves.
 //!
-//! Not covered: library crates (format-crate progress lines, session factory
-//! messages) still use `std` and can panic if the reader goes away after
-//! startup; `neutralize_dead_stdio` covers a reader that is already gone.
+//! `ratarmount-compositing` has its own crate-wide copy (commit plan, confirm
+//! prompt, GNU tar stderr relay and create-if-missing prints). Not covered: the format crates' progress lines
+//! and session factory messages still use `std` and can panic if the reader
+//! goes away after startup; `neutralize_dead_stdio` covers a reader that is
+//! already gone.
 //!
 //! Unlike `std`'s macros these bypass libtest output capture.
 
