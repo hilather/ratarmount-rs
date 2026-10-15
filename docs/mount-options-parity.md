@@ -101,7 +101,7 @@ Legend: `[x]` parity · `~` partial · `[ ]` missing
 | Recursive nested archives | yes | yes | `[x]` |
 | Lazy recursive mount | yes | yes | `[x]` |
 | Configurable recursive extension set | yes | **added** | `[x]` |
-| Write overlay + whiteouts | yes | yes; FUSE `-w`: file rename via the overlay (copy-up, replace). Directory rename returns EISDIR, same as NFS/9P/SFTP/SMB. `renameat2` NOREPLACE/EXCHANGE return EINVAL (FUSE ABI < 7.23); NOREPLACE onto an existing name gets EEXIST from the VFS first | `[x]` |
+| Write overlay + whiteouts | yes | yes; FUSE `-w`: file rename via the overlay (copy-up, replace). Directory rename returns EISDIR, same as NFS/9P/SFTP/SMB. `renameat2` NOREPLACE/EXCHANGE return EINVAL (FUSE ABI < 7.23); NOREPLACE onto an existing name gets EEXIST from the VFS first. On FUSE `-w`, a file that is unlinked or replaced while the kernel still holds it keeps returning its old bytes and attrs (`nlink` 0) until the last reference is dropped. A write handle opened before the rename or unlink keeps writing the orphan (those bytes are discarded at commit). A new write `OPEN` or an fh-less `SETATTR` on that nodeid returns `EACCES`. | `[x]` |
 | Commit overlay into TAR | yes | uncompressed + GNU tar (gzip/bzip2/xz); `.tar.zst` splice (offline earlier-frame delete shipped; live last-window only) | `[x]` / residual live prefix-frame |
 | File versions virtual dirs | yes | yes | `[x]` |
 | Prefix remount | yes | yes | `[x]` |
