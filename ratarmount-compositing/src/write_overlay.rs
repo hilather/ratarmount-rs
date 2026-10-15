@@ -158,8 +158,19 @@ pub type Result<T> = std::result::Result<T, OverlayError>;
 /// `cfg(test)` hook invoked once after `rename(2)` and before the tombstone
 /// transaction. Taken on the first attempt and not restored. `Err` fails that
 /// attempt only; later attempts still run.
+///
+/// Runs while [`WriteOverlay`]'s pending-row queue is held. Must not lock that
+/// queue (lookup and the database are fine).
 #[cfg(test)]
 type RenameBeforeTxHook = Box<dyn FnMut() -> Result<()> + Send>;
+
+/// `cfg(test)` hook invoked once during a pending-row replay, after the batch
+/// is taken and before SQL, while the pending-row queue is held.
+///
+/// Must not lock that queue. `Err` fails that attempt; the batch is restored
+/// in front of anything appended under the same lock.
+#[cfg(test)]
+type ReplayHoldHook = Box<dyn FnMut() -> Result<()> + Send>;
 
 /// `cfg(test)` hook consulted when a parked open is about to run.
 ///
@@ -384,13 +395,55 @@ struct IndexPointerPlan {
 const RENAME_TX_ATTEMPTS: u32 = 3;
 const RENAME_TX_BACKOFF: Duration = Duration::from_millis(5);
 
-/// One rename whose host `rename(2)` finished and whose `files` transaction did not.
-#[derive(Clone, Debug)]
-struct PendingRenameRows {
-    from: String,
-    to: String,
-    mode: u32,
-    hides_from: bool,
+/// One `files` change whose host effect already happened.
+///
+/// Lock order when these rows are applied: `pending_rows`, then `db`, then
+/// `tombstones`. Replay holds `pending_rows` across take, SQL, and restore.
+/// A direct writer holds it across the emptiness check and the SQL write.
+/// Releasing it between take and apply lets a newer writer commit first; the
+/// restored rows then undo that writer and an archive member reappears.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingFilesOp {
+    /// Host rename finished: `to` present, `from` tombstoned iff `hides_from`.
+    Rename {
+        from: String,
+        to: String,
+        mode: u32,
+        hides_from: bool,
+    },
+    /// Host unlink or rmdir finished.
+    Deleted { path: String, hides_base: bool },
+    /// Host create finished (file, directory, or symlink).
+    Present { path: String, mode: u32 },
+    /// Open cleared `deleted` without inserting a row.
+    ClearDeleted { path: String },
+}
+
+impl PendingFilesOp {
+    fn is_rename(&self) -> bool {
+        matches!(self, Self::Rename { .. })
+    }
+}
+
+impl std::fmt::Display for PendingFilesOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rename { from, to, .. } => write!(f, "rename {from} -> {to}"),
+            Self::Deleted { path, .. } => write!(f, "delete {path}"),
+            Self::Present { path, .. } => write!(f, "present {path}"),
+            Self::ClearDeleted { path } => write!(f, "clear tombstone {path}"),
+        }
+    }
+}
+
+/// Put `batch` back in front of `queued`. `batch` is the older snapshot.
+fn restore_pending_front(queued: &mut Vec<PendingFilesOp>, mut batch: Vec<PendingFilesOp>) {
+    if queued.is_empty() {
+        *queued = batch;
+        return;
+    }
+    batch.append(queued);
+    *queued = batch;
 }
 
 /// Union of a read-only base with a writable overlay folder + deletion DB.
@@ -405,11 +458,15 @@ pub struct WriteOverlay {
     /// `is_deleted` checks this set. The `files` table remains the durable
     /// copy; every insert or clear of a tombstone updates both.
     tombstones: Mutex<HashSet<String>>,
-    /// Rename rows saved after `rename(2)` when the tombstone transaction
-    /// still failed after [`RENAME_TX_ATTEMPTS`]. Replayed at the start of the
-    /// next `files` write and before a commit plan is built. Live, interval,
-    /// and on-exit commits refuse while this is non-empty after a replay attempt.
-    pending_rows: Mutex<Vec<PendingRenameRows>>,
+    /// `files` rows saved after the host change when the transaction still
+    /// failed. Replayed at the start of the next `files` write, on drop, and
+    /// before a commit plan is built. Live, interval, and on-exit commits
+    /// refuse while this is non-empty after a replay attempt.
+    ///
+    /// Lock order: this queue, then [`Self::db`], then [`Self::tombstones`].
+    /// Held across take / apply / restore and across a direct write's
+    /// emptiness check. See [`PendingFilesOp`].
+    pending_rows: Mutex<Vec<PendingFilesOp>>,
     /// Writers take a read lock; live commit takes the write lock.
     commit_gate: RwLock<()>,
     /// Set when persist succeeded but reopen failed (K11). Further interval
@@ -461,6 +518,9 @@ pub struct WriteOverlay {
     /// and pending-row replays. `0` means the fault is off.
     #[cfg(test)]
     rename_tx_fail_remaining: AtomicU64,
+    /// Test-only: one-shot hook inside replay, while `pending_rows` is held.
+    #[cfg(test)]
+    replay_hold_hook: Mutex<Option<ReplayHoldHook>>,
     /// Test-only: injected park-open result. Stays installed until replaced.
     /// Plain `rename` / `unlink` never consult it.
     #[cfg(test)]
@@ -705,6 +765,8 @@ impl WriteOverlay {
             #[cfg(test)]
             rename_tx_fail_remaining: AtomicU64::new(0),
             #[cfg(test)]
+            replay_hold_hook: Mutex::new(None),
+            #[cfg(test)]
             park_open_hook: Mutex::new(None),
             #[cfg(test)]
             park_open_count: AtomicU64::new(0),
@@ -921,46 +983,29 @@ impl WriteOverlay {
     }
 
     fn mark_deleted(&self, path: &str) -> Result<()> {
-        self.replay_pending_rows()?;
-        let (folder, name) = Self::split(path);
         let hides_base = self.current_base().exists(path);
-        {
-            let db = self.db.lock().expect("overlay db");
-            if hides_base {
-                db.execute(
-                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
-                    params![folder, name],
-                )?;
-            } else {
-                db.execute(
-                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
-                    params![folder, name],
-                )?;
-            }
-        }
+        let path = normpath(path);
+        // The host entry is already gone. Queue instead of returning an error
+        // when older rows are still unsaved or this write fails.
+        self.persist_files_op(PendingFilesOp::Deleted {
+            path: path.clone(),
+            hides_base,
+        })?;
         if hides_base {
-            self.tombstone_remember(path);
+            self.tombstone_remember(&path);
         } else {
-            self.tombstone_forget(path);
+            self.tombstone_forget(&path);
         }
         Ok(())
     }
 
     fn mark_present(&self, path: &str, mode: u32) -> Result<()> {
-        self.replay_pending_rows()?;
-        let (folder, name) = Self::split(path);
-        {
-            let db = self.db.lock().expect("overlay db");
-            db.execute(
-                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
-                params![folder, name, mode as i64],
-            )?;
-            db.execute(
-                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                params![folder, name],
-            )?;
-        }
-        self.tombstone_forget(path);
+        let path = normpath(path);
+        self.persist_files_op(PendingFilesOp::Present {
+            path: path.clone(),
+            mode,
+        })?;
+        self.tombstone_forget(&path);
         Ok(())
     }
 
@@ -1304,14 +1349,11 @@ impl WriteOverlay {
             if (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
                 self.register_write_fd(fd, path);
             }
-            let (folder, name) = Self::split(path);
-            {
-                let db = self.db.lock().expect("overlay db");
-                let _ = db.execute(
-                    r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                    params![folder, name],
-                );
-            }
+            // Same queue as unlink and rename: a direct UPDATE while older
+            // rows are unsaved would be undone when those rows replay.
+            self.persist_files_op(PendingFilesOp::ClearDeleted {
+                path: normpath(path),
+            })?;
             self.tombstone_forget(path);
             Ok(fd)
         }
@@ -1485,15 +1527,17 @@ impl WriteOverlay {
     /// `rename(2)` over `to`, then one SQLite transaction that marks `to` present
     /// and tombstones `from` only when the base has `from`. The in-memory
     /// tombstone set is updated after that transaction (`to` out, `from` in only
-    /// if the base has `from`). Lock order is `db` then tombstones.
+    /// if the base has `from`). Lock order is `pending_rows`, then `db`, then
+    /// tombstones.
     ///
     /// The transaction is tried [`RENAME_TX_ATTEMPTS`] times. If it still fails,
-    /// the rows are queued in `pending_rows` and this returns success: the host
-    /// rename cannot be undone, and this session's view is the completed rename.
-    /// The queue is replayed at the start of the next `files` write. Live,
-    /// interval, and on-exit commits refuse while it is still non-empty after a
-    /// replay attempt, so a plan cannot publish an archive `from` that the mount
-    /// already hides.
+    /// or if older rows are still queued after a replay attempt, this rename is
+    /// appended to `pending_rows` and this returns success: the host rename
+    /// cannot be undone, and writing it first would let the older replay undo
+    /// it. The queue is replayed at the start of the next `files` write, on
+    /// drop, and before a commit plan. Live, interval, and on-exit commits
+    /// refuse while it is still non-empty after a replay attempt, so a plan
+    /// cannot publish an archive member that the mount already hides.
     ///
     /// Reserved names are refused before the park open. The park open is a raw
     /// `open`, not [`Self::open_overlay_fd`] (`commit_gate` is not reentrant).
@@ -1563,13 +1607,9 @@ impl WriteOverlay {
         }
         fs::rename(&from_real, &to_real)?;
         let hides_from = self.current_base().exists(&from);
-        if let Err(e) = self.commit_rename_rows(&from, &to, &to_real, hides_from) {
-            log::error!(
-                "overlay rename {from} -> {to} replaced the host file but the tombstone \
-                 transaction failed: {e}; keeping the in-memory rename and queuing the rows \
-                 for replay"
-            );
-        }
+        // Host rename already happened. `persist_files_op` queues on failure
+        // and returns success so the client sees the completed rename.
+        self.commit_rename_rows(&from, &to, &to_real, hides_from)?;
         self.apply_rename_tombstone_memory(&from, &to, hides_from);
         Ok(parked)
     }
@@ -1606,10 +1646,9 @@ impl WriteOverlay {
 
     /// One transaction: `to` present, and `from` tombstoned iff `hides_from`.
     ///
-    /// Replays any older queued rows first, then tries this rename
-    /// [`RENAME_TX_ATTEMPTS`] times. The last failure appends this rename to
-    /// [`Self::pending_rows`] and returns that error. The caller still reports
-    /// success to the client.
+    /// Replays any older queued rows first. When those rows are still queued,
+    /// or when this rename's own attempts fail, the rename is appended and
+    /// this returns success. The host rename cannot be undone.
     fn commit_rename_rows(
         &self,
         from: &str,
@@ -1617,11 +1656,6 @@ impl WriteOverlay {
         to_real: &Path,
         hides_from: bool,
     ) -> Result<()> {
-        if let Err(e) = self.replay_pending_rows() {
-            log::warn!(
-                "overlay rename {from} -> {to} could not replay earlier tombstone rows: {e}"
-            );
-        }
         let mode = match fs::symlink_metadata(to_real) {
             Ok(meta) => metadata_mode(&meta),
             Err(e) => {
@@ -1632,52 +1666,88 @@ impl WriteOverlay {
                 ratarmount_core::S_IFREG | 0o644
             }
         };
-        let row = PendingRenameRows {
+        self.persist_files_op(PendingFilesOp::Rename {
             from: from.to_string(),
             to: to.to_string(),
             mode,
             hides_from,
+        })
+    }
+
+    /// Replay queued rows, then write `op` or append it.
+    ///
+    /// The host change has already happened. A failure here queues `op` and
+    /// returns success so the caller does not report an error for a change
+    /// that cannot be undone. Appending keeps order: a later direct write
+    /// would be undone when the older rows replay.
+    ///
+    /// Lock order: `pending_rows`, then `db`. Tombstones are updated by the
+    /// caller after this returns.
+    fn persist_files_op(&self, op: PendingFilesOp) -> Result<()> {
+        if let Err(e) = self.replay_pending_rows() {
+            log::warn!(
+                "overlay could not replay earlier files rows: {e}; queueing the next update behind them"
+            );
+        }
+        let attempts = if op.is_rename() {
+            RENAME_TX_ATTEMPTS
+        } else {
+            1
         };
+        let mut pending_op = Some(op);
         let mut last_err = None;
-        for attempt in 1..=RENAME_TX_ATTEMPTS {
+        for attempt in 1..=attempts {
             if attempt > 1 {
                 std::thread::sleep(RENAME_TX_BACKOFF);
             }
-            match self.try_commit_rename_once(&row) {
+            let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+            if !queued.is_empty() {
+                let op = pending_op.take().expect("files op");
+                log::error!(
+                    "overlay {op} appended behind {} unsaved files update(s); \
+                     writing it now would let a later replay undo it",
+                    queued.len()
+                );
+                queued.push(op);
+                return Ok(());
+            }
+            let op_ref = pending_op.as_ref().expect("files op");
+            let ctx = FilesWriteCtx {
+                db: &self.db,
+                #[cfg(test)]
+                fail: &self.rename_tx_fail_remaining,
+                #[cfg(test)]
+                before_tx: &self.rename_before_tx_hook,
+            };
+            match write_files_op_direct(&ctx, op_ref) {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!(
-                        "overlay rename {} -> {} tombstone transaction attempt \
-                         {attempt}/{RENAME_TX_ATTEMPTS} failed: {e}",
-                        row.from,
-                        row.to
+                        "overlay {op_ref} files update attempt {attempt}/{attempts} failed: {e}"
                     );
                     last_err = Some(e);
                 }
             }
         }
-        self.push_pending_row(row);
-        Err(last_err.expect("rename tx retry loop records an error"))
-    }
-
-    fn try_commit_rename_once(&self, row: &PendingRenameRows) -> Result<()> {
-        #[cfg(test)]
-        if let Some(Err(e)) = self.run_rename_before_tx_hook() {
-            return Err(e);
-        }
-        #[cfg(test)]
-        if let Some(e) = self.consume_rename_tx_failure() {
-            return Err(e);
-        }
-        let db = self.db.lock().expect("overlay db");
-        let tx = db.unchecked_transaction()?;
-        write_rename_rows_sql(&tx, row)?;
-        tx.commit()?;
+        let op = pending_op.take().expect("files op");
+        let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+        let why = last_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        log::error!(
+            "overlay {op} failed ({why}); queued it behind {} unsaved files update(s)",
+            queued.len()
+        );
+        queued.push(op);
         Ok(())
     }
 
-    /// Write queued rename rows, retrying a few times. Empty queue is success.
-    /// On failure the rows are put back in front of anything appended meanwhile.
+    /// Write queued rows, retrying a few times. Empty queue is success.
+    ///
+    /// Each attempt holds `pending_rows` across take, SQL, and restore
+    /// (lock order: queue, then `db`). On failure the batch is put back in
+    /// front of rows appended under that same lock.
     fn replay_pending_rows(&self) -> Result<()> {
         if self.pending_rows_is_empty() {
             return Ok(());
@@ -1691,7 +1761,7 @@ impl WriteOverlay {
                 Ok(()) => return Ok(()),
                 Err(e) => {
                     log::warn!(
-                        "overlay pending rename replay attempt {attempt}/{RENAME_TX_ATTEMPTS} \
+                        "overlay pending files replay attempt {attempt}/{RENAME_TX_ATTEMPTS} \
                          failed: {e}"
                     );
                     last_err = Some(e);
@@ -1702,50 +1772,34 @@ impl WriteOverlay {
     }
 
     fn try_replay_pending_once(&self) -> Result<()> {
-        let batch = {
-            let mut guard = self.pending_rows.lock().expect("overlay pending rows");
-            if guard.is_empty() {
-                return Ok(());
-            }
-            std::mem::take(&mut *guard)
-        };
+        let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+        if queued.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut *queued);
         #[cfg(test)]
-        if let Some(e) = self.consume_rename_tx_failure() {
-            self.restore_pending_rows(batch);
-            return Err(e);
+        {
+            let hook = self
+                .replay_hold_hook
+                .lock()
+                .expect("replay hold hook")
+                .take();
+            if let Some(mut hook) = hook {
+                if let Err(e) = hook() {
+                    restore_pending_front(&mut queued, batch);
+                    return Err(e);
+                }
+            }
+            if let Some(e) = consume_rename_tx_failure_flag(&self.rename_tx_fail_remaining) {
+                restore_pending_front(&mut queued, batch);
+                return Err(e);
+            }
         }
-        if let Err(e) = self.apply_pending_rows_sql(&batch) {
-            self.restore_pending_rows(batch);
+        if let Err(e) = apply_pending_ops_sql(&self.db, &batch) {
+            restore_pending_front(&mut queued, batch);
             return Err(e);
         }
         Ok(())
-    }
-
-    fn apply_pending_rows_sql(&self, rows: &[PendingRenameRows]) -> Result<()> {
-        let db = self.db.lock().expect("overlay db");
-        let tx = db.unchecked_transaction()?;
-        for row in rows {
-            write_rename_rows_sql(&tx, row)?;
-        }
-        tx.commit()?;
-        Ok(())
-    }
-
-    fn push_pending_row(&self, row: PendingRenameRows) {
-        self.pending_rows
-            .lock()
-            .expect("overlay pending rows")
-            .push(row);
-    }
-
-    fn restore_pending_rows(&self, mut batch: Vec<PendingRenameRows>) {
-        let mut guard = self.pending_rows.lock().expect("overlay pending rows");
-        if guard.is_empty() {
-            *guard = batch;
-            return;
-        }
-        batch.append(&mut *guard);
-        *guard = batch;
     }
 
     fn pending_rows_is_empty(&self) -> bool {
@@ -1755,10 +1809,57 @@ impl WriteOverlay {
             .is_empty()
     }
 
-    /// Replay queued rename rows, then refuse when any remain.
+    /// Paths an unsaved queue would hide that SQL does not already tombstone.
+    ///
+    /// After remount the in-memory queue is gone. Those archive members show
+    /// up again, and an offline `--commit-overlay` publishes them because it
+    /// reads SQL only.
+    fn pending_reappear_paths(&self) -> Vec<String> {
+        let ops = self
+            .pending_rows
+            .lock()
+            .expect("overlay pending rows")
+            .clone();
+        let mut hide: HashSet<String> = HashSet::new();
+        for op in &ops {
+            match op {
+                PendingFilesOp::Rename {
+                    from,
+                    to,
+                    hides_from,
+                    ..
+                } => {
+                    hide.remove(to);
+                    if *hides_from {
+                        hide.insert(from.clone());
+                    } else {
+                        hide.remove(from);
+                    }
+                }
+                PendingFilesOp::Deleted { path, hides_base } => {
+                    if *hides_base {
+                        hide.insert(path.clone());
+                    } else {
+                        hide.remove(path);
+                    }
+                }
+                PendingFilesOp::Present { path, .. } | PendingFilesOp::ClearDeleted { path } => {
+                    hide.remove(path);
+                }
+            }
+        }
+        let mut out: Vec<String> = hide
+            .into_iter()
+            .filter(|path| !matches!(self.files_deleted_flag(path), Ok(Some(1))))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Replay queued rows, then refuse when any remain.
     ///
     /// A commit plan reads `deleted = 1` from SQL. Publishing while the mount
-    /// already hides `from` would leave that archive member in place and, after
+    /// already hides a name would leave that archive member in place and, after
     /// the overlay reset, show it again.
     fn replay_pending_or_refuse_commit(&self) -> Result<()> {
         let replay_err = self.replay_pending_rows().err();
@@ -1768,20 +1869,56 @@ impl WriteOverlay {
                 None => Ok(()),
             };
         }
-        let n = self
-            .pending_rows
-            .lock()
-            .expect("overlay pending rows")
-            .len();
+        let n = self.pending_row_count_locked();
         let why = replay_err
             .map(|e| e.to_string())
             .unwrap_or_else(|| "replay left rows queued".to_string());
+        let paths = self.pending_reappear_paths();
+        let listed = if paths.is_empty() {
+            "unlinked archive members would reappear".to_string()
+        } else {
+            format!(
+                "unlinked archive members would reappear: {}",
+                paths.join(", ")
+            )
+        };
         Err(OverlayError::Msg(format!(
-            "write overlay {} has {n} rename tombstone update(s) that could not be saved ({why}); \
+            "write overlay {} has {n} files update(s) that could not be saved ({why}); \
              refusing to commit because the archive would not match the mount \
-             (unlinked archive members would reappear)",
+             ({listed}). An offline --commit-overlay will publish them",
             self.root.display()
         )))
+    }
+
+    fn pending_row_count_locked(&self) -> usize {
+        self.pending_rows
+            .lock()
+            .expect("overlay pending rows")
+            .len()
+    }
+
+    /// Final replay when the mount goes away. Rows that still cannot be saved
+    /// are logged with the archive paths that will show up again.
+    fn replay_pending_on_drop(&self) {
+        if self.pending_rows_is_empty() {
+            return;
+        }
+        if self.replay_pending_rows().is_ok() && self.pending_rows_is_empty() {
+            return;
+        }
+        let n = self.pending_row_count_locked();
+        let paths = self.pending_reappear_paths();
+        let listed = if paths.is_empty() {
+            "(none)".to_string()
+        } else {
+            paths.join(", ")
+        };
+        log::error!(
+            "overlay {}: {n} pending files update(s) were not saved on unmount; \
+             these paths will reappear on remount: {listed}. \
+             An offline --commit-overlay will publish them",
+            self.root.display()
+        );
     }
 
     fn plan_for_commit(
@@ -1819,21 +1956,10 @@ impl WriteOverlay {
         self.rename_tx_fail_remaining.store(n, Ordering::SeqCst);
     }
 
+    /// One-shot replay hook. Runs while `pending_rows` is held. Must not lock it.
     #[cfg(test)]
-    fn consume_rename_tx_failure(&self) -> Option<OverlayError> {
-        loop {
-            let cur = self.rename_tx_fail_remaining.load(Ordering::SeqCst);
-            if cur == 0 {
-                return None;
-            }
-            if self
-                .rename_tx_fail_remaining
-                .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
-                .is_ok()
-            {
-                return Some(OverlayError::Msg("injected rename tx failure".into()));
-            }
-        }
+    fn set_replay_hold_hook(&self, hook: Option<ReplayHoldHook>) {
+        *self.replay_hold_hook.lock().expect("replay hold hook") = hook;
     }
 
     #[cfg(test)]
@@ -1842,19 +1968,6 @@ impl WriteOverlay {
             .lock()
             .expect("overlay pending rows")
             .len()
-    }
-
-    /// Take the one-shot fault hook, drop its mutex guard, then call it.
-    /// The hook may call back into lookup or the database.
-    /// `None` when no hook is installed. The hook is not restored.
-    #[cfg(test)]
-    fn run_rename_before_tx_hook(&self) -> Option<Result<()>> {
-        let hook = self
-            .rename_before_tx_hook
-            .lock()
-            .expect("overlay rename hook")
-            .take();
-        hook.map(|mut hook| hook())
     }
 
     #[cfg(test)]
@@ -1868,7 +1981,6 @@ impl WriteOverlay {
     }
 
     /// `deleted` column for `path`: `Some(1)` tombstone, `Some(0)` present, `None` no row.
-    #[cfg(test)]
     fn files_deleted_flag(&self, path: &str) -> Result<Option<i64>> {
         let (folder, name) = Self::split(path);
         let db = self.db.lock().expect("overlay db");
@@ -1894,14 +2006,16 @@ impl WriteOverlay {
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
-        if format != CompressionFormat::Zstd {
-            ensure_gnu_tar()?;
-        }
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         if self.interval_disabled() {
             return Err(interval_disabled_err());
         }
+        // Refuse unsaved rows before looking for GNU tar, so on-exit names the
+        // paths that would reappear even when tar is not installed.
         let plan = self.plan_for_commit(None, &HashSet::new())?;
+        if format != CompressionFormat::Zstd {
+            ensure_gnu_tar()?;
+        }
         if plan.is_empty() {
             return Ok(false);
         }
@@ -2873,6 +2987,10 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         reset_overlay_dir(&self.root)?;
         {
+            // Queue then database. A later replay must not resurrect rows
+            // this reset just deleted.
+            let mut pending = self.pending_rows.lock().expect("overlay pending rows");
+            pending.clear();
             let db = self.db.lock().expect("overlay db");
             db.execute(r#"DELETE FROM "files""#, [])?;
         }
@@ -2885,6 +3003,12 @@ impl WriteOverlay {
         // symlink_metadata so a dangling overlay symlink is still visible.
         let meta = fs::symlink_metadata(&real).ok()?;
         Some(file_info_from_overlay_meta(path, &real, &meta))
+    }
+}
+
+impl Drop for WriteOverlay {
+    fn drop(&mut self) {
+        self.replay_pending_on_drop();
     }
 }
 
@@ -3827,10 +3951,11 @@ impl OverlayCommitPlan {
     }
 }
 
-/// Offline commit reads SQL only. In-memory [`PendingRenameRows`] belong to a
+/// Offline commit reads SQL only. In-memory [`PendingFilesOp`] rows belong to a
 /// live [`WriteOverlay`], which replays them in [`WriteOverlay::plan_for_commit`]
 /// before it builds a plan. This function has no overlay object, so it cannot
-/// see rows that never reached the database.
+/// see rows that never reached the database. An unsaved queue is logged on
+/// unmount: an offline `--commit-overlay` will publish those archive members.
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
     let db_path = write_overlay.join(HIDDEN_DB);
     let markers = overlay_markers(write_overlay)?;
@@ -4052,28 +4177,123 @@ fn tombstone_name(full: &str) -> &str {
     full.rsplit_once('/').map(|(_, name)| name).unwrap_or(full)
 }
 
-/// SQL for one completed rename: `to` present, `from` tombstoned iff `hides_from`.
-fn write_rename_rows_sql(conn: &Connection, row: &PendingRenameRows) -> Result<()> {
-    let (to_folder, to_name) = WriteOverlay::split(&row.to);
-    let (from_folder, from_name) = WriteOverlay::split(&row.from);
-    conn.execute(
-        r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
-        params![to_folder, to_name, row.mode as i64],
-    )?;
-    conn.execute(
-        r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-        params![to_folder, to_name],
-    )?;
-    if row.hides_from {
-        conn.execute(
-            r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
-            params![from_folder, from_name],
-        )?;
-    } else {
-        conn.execute(
-            r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
-            params![from_folder, from_name],
-        )?;
+/// Borrows of fields other than `pending_rows`, so a direct write can run
+/// while that queue is held (lock order: queue, then `db`).
+struct FilesWriteCtx<'a> {
+    db: &'a Mutex<Connection>,
+    #[cfg(test)]
+    fail: &'a AtomicU64,
+    #[cfg(test)]
+    before_tx: &'a Mutex<Option<RenameBeforeTxHook>>,
+}
+
+#[cfg(test)]
+fn consume_rename_tx_failure_flag(flag: &AtomicU64) -> Option<OverlayError> {
+    loop {
+        let cur = flag.load(Ordering::SeqCst);
+        if cur == 0 {
+            return None;
+        }
+        if flag
+            .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(OverlayError::Msg("injected rename tx failure".into()));
+        }
+    }
+}
+
+/// Direct `files` write. Rename attempts run the one-shot before-tx hook and
+/// the injected failure counter before SQL. The caller holds `pending_rows`.
+fn write_files_op_direct(ctx: &FilesWriteCtx<'_>, op: &PendingFilesOp) -> Result<()> {
+    // Drop the hook mutex before calling it. The hook may lock `db`.
+    // It must not lock `pending_rows`: the caller already holds that queue.
+    #[cfg(test)]
+    if op.is_rename() {
+        let hook = ctx.before_tx.lock().expect("overlay rename hook").take();
+        if let Some(mut hook) = hook {
+            hook()?;
+        }
+        if let Some(e) = consume_rename_tx_failure_flag(ctx.fail) {
+            return Err(e);
+        }
+    }
+    apply_pending_ops_sql(ctx.db, std::slice::from_ref(op))
+}
+
+fn apply_pending_ops_sql(db: &Mutex<Connection>, ops: &[PendingFilesOp]) -> Result<()> {
+    let db = db.lock().expect("overlay db");
+    let tx = db.unchecked_transaction()?;
+    for op in ops {
+        apply_files_op_sql(&tx, op)?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// SQL for one queued `files` update.
+fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
+    match op {
+        PendingFilesOp::Rename {
+            from,
+            to,
+            mode,
+            hides_from,
+        } => {
+            let (to_folder, to_name) = WriteOverlay::split(to);
+            let (from_folder, from_name) = WriteOverlay::split(from);
+            conn.execute(
+                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
+                params![to_folder, to_name, *mode as i64],
+            )?;
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![to_folder, to_name],
+            )?;
+            if *hides_from {
+                conn.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
+                    params![from_folder, from_name],
+                )?;
+            } else {
+                conn.execute(
+                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+                    params![from_folder, from_name],
+                )?;
+            }
+        }
+        PendingFilesOp::Deleted { path, hides_base } => {
+            let (folder, name) = WriteOverlay::split(path);
+            if *hides_base {
+                conn.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
+                    params![folder, name],
+                )?;
+            } else {
+                conn.execute(
+                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+                    params![folder, name],
+                )?;
+            }
+        }
+        PendingFilesOp::Present { path, mode } => {
+            let (folder, name) = WriteOverlay::split(path);
+            conn.execute(
+                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
+                params![folder, name, *mode as i64],
+            )?;
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            )?;
+        }
+        PendingFilesOp::ClearDeleted { path } => {
+            let (folder, name) = WriteOverlay::split(path);
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            )?;
+        }
     }
     Ok(())
 }
@@ -11537,9 +11757,10 @@ mod tests {
 
     /// Regression: a failed tombstone transaction after the host rename still
     /// returns success. When every retry fails, durable state matches the #88
-    /// crash table and the rows sit in `pending_rows`. Dropping the overlay
-    /// loses that queue (process crash). This session's tombstones match the
-    /// completed rename. Same-session replay is covered by the commit test.
+    /// crash table and the rows sit in `pending_rows`. Drop tries one last
+    /// replay; when that also fails, the queue is lost the same way a process
+    /// crash loses it. This session's tombstones match the completed rename.
+    /// Same-session replay is covered by the commit test.
     #[test]
     fn rename_tx_failure_matches_crash_table() {
         // Visible `to`, archive `from`: `from` reappears from the archive.
@@ -11550,7 +11771,9 @@ mod tests {
         put_overlay_bytes(&ov, "/dst", b"old-dest");
         let probe = Arc::downgrade(&ov);
         let host = overlay.clone();
-        // The one-shot hook fails only the first attempt. Keep failing the retries.
+        // The one-shot hook fails only the first attempt and does not consume a
+        // failure. Two retries consume 2. Drop's replay gets three more attempts;
+        // 8 leaves those failing so the queue is lost like a crash.
         ov.set_rename_tx_failures(8);
         ov.set_rename_before_tx_hook(Some(Box::new(move || {
             let probe = probe.upgrade().expect("overlay");
@@ -11597,6 +11820,7 @@ mod tests {
         put_overlay_bytes(&ov, "/src", b"new-src");
         let probe = Arc::downgrade(&ov);
         let host = overlay.clone();
+        // Same budget as the archive-from case: Drop's replay must also fail.
         ov.set_rename_tx_failures(8);
         ov.set_rename_before_tx_hook(Some(Box::new(move || {
             let probe = probe.upgrade().expect("overlay");
@@ -11628,6 +11852,7 @@ mod tests {
         put_overlay_bytes(&ov, "/src", b"replacement");
         let probe = Arc::downgrade(&ov);
         let host = overlay.clone();
+        // Same budget as the archive-from case: Drop's replay must also fail.
         ov.set_rename_tx_failures(8);
         ov.set_rename_before_tx_hook(Some(Box::new(move || {
             let probe = probe.upgrade().expect("overlay");
@@ -11863,6 +12088,353 @@ mod tests {
         assert!(after.lookup("/keep.txt", 0).is_some());
         let dst = ov.lookup("/dst.txt", 0).expect("dst visible after commit");
         assert_eq!(dst.size, payload.len() as u64);
+    }
+
+    /// Regression: archive `/a` and `/x`, rename `a`→`x` queued, then `x`→`y`
+    /// while replay still fails. The second rename must stay behind the first.
+    /// After the fault clears, remount must hide `/a` and `/x` and show `/y`
+    /// (#88). Replaying `a`→`x` after `x`→`y` would mark `/x` present again.
+    #[test]
+    fn rename_tx_pending_second_rename_keeps_intermediate_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        // First rename's direct attempts, then the second rename's replay.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("a->x returns success");
+        assert_eq!(ov.pending_row_count(), 1, "a->x queued");
+        assert_eq!(deleted_flag(&ov, "/a"), None, "sql has no a tombstone yet");
+        ov.rename("/x", "/y").expect("x->y returns success");
+        assert_eq!(ov.pending_row_count(), 2, "x->y appended behind a->x");
+        assert_eq!(deleted_flag(&ov, "/a"), None);
+        assert_eq!(
+            deleted_flag(&ov, "/x"),
+            None,
+            "x->y must not tombstone x while a->x is still queued"
+        );
+        assert_eq!(deleted_flag(&ov, "/y"), None);
+        assert!(ov.lookup("/a", 0).is_none(), "mount hides a");
+        assert!(ov.lookup("/x", 0).is_none(), "mount hides x");
+        assert!(is_overlay_fi(&ov.lookup("/y", 0).expect("y visible")));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+
+        ov.set_rename_tx_failures(0);
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1), "/x must stay deleted");
+        assert_eq!(deleted_flag(&ov, "/y"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none(), "remount must not show /a");
+        assert!(
+            ov.lookup("/x", 0).is_none(),
+            "remount must not show /x; a later a->x replay would resurrect it"
+        );
+        let y = ov.lookup("/y", 0).expect("/y present");
+        assert!(is_overlay_fi(&y));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+    }
+
+    /// Regression: replay holds `pending_rows` across take, the failure path,
+    /// and restore. A contending rename must not write `/x` while `a`→`x` is
+    /// off the queue (#88).
+    #[test]
+    fn rename_tx_pending_replay_holds_queue_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, &overlay).unwrap());
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/x").expect("a->x queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        ov.set_rename_tx_failures(0);
+
+        let in_replay = Arc::new(AtomicBool::new(false));
+        let t2_tried = Arc::new(AtomicBool::new(false));
+        let lock_was_held = Arc::new(AtomicBool::new(false));
+        let in_replay_hook = Arc::clone(&in_replay);
+        let t2_tried_hook = Arc::clone(&t2_tried);
+        ov.set_replay_hold_hook(Some(Box::new(move || {
+            in_replay_hook.store(true, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            while !t2_tried_hook.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    return Err(OverlayError::Msg(
+                        "replay hook timed out waiting for contender".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Fail this attempt so the batch is restored while the lock is held.
+            Err(OverlayError::Msg("injected replay hold failure".into()))
+        })));
+
+        let ov_t2 = Arc::clone(&ov);
+        let in_replay_t2 = Arc::clone(&in_replay);
+        let t2_tried_t2 = Arc::clone(&t2_tried);
+        let lock_was_held_t2 = Arc::clone(&lock_was_held);
+        let t2 = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !in_replay_t2.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    panic!("replay hook did not run");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            match ov_t2.pending_rows.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    lock_was_held_t2.store(false, Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    lock_was_held_t2.store(true, Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("pending queue poisoned");
+                }
+            }
+            t2_tried_t2.store(true, Ordering::SeqCst);
+            ov_t2.rename("/x", "/y").expect("contending rename");
+        });
+
+        ov.mkdir("/trigger", 0o755).expect("trigger replay");
+        t2.join().expect("contender");
+        assert!(
+            lock_was_held.load(Ordering::SeqCst),
+            "replay dropped the queue lock before apply/restore"
+        );
+        assert_eq!(ov.pending_row_count(), 0, "both renames reached sql");
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/y"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/x", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/y", 0).expect("y")));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+    }
+
+    /// Regression: an unlink tombstone write replays queued rows first (#88).
+    /// Skipping that replay would leave archive `/a` visible in SQL.
+    #[test]
+    fn rename_tx_pending_unlink_replays_before_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base =
+            Arc::new(MemBase::with(&[("/a", b"from-a"), ("/z", b"zzz")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        assert_eq!(deleted_flag(&ov, "/a"), None);
+        ov.set_rename_tx_failures(0);
+        ov.unlink("/z").expect("unlink replays, then tombstones z");
+        assert_eq!(ov.pending_row_count(), 0, "unlink drained the queue");
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/b"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/z"), Some(1));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/z", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/b", 0).expect("b")));
+        assert_eq!(fs::read(overlay.join("b")).unwrap(), b"from-a");
+    }
+
+    /// Regression: when replay fails, unlink queues behind the rename instead
+    /// of tombstoning `/x` in SQL. A later `a`→`x` replay would otherwise
+    /// mark `/x` present and the unlinked name would come back (#88).
+    #[test]
+    fn rename_tx_pending_unlink_queues_behind_failed_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("queued");
+        ov.unlink("/x").expect("unlink returns success");
+        assert_eq!(ov.pending_row_count(), 2, "unlink appended");
+        assert_eq!(
+            deleted_flag(&ov, "/x"),
+            None,
+            "unlink must not write the tombstone ahead of a->x"
+        );
+        assert!(ov.lookup("/x", 0).is_none(), "memory already hides x");
+        ov.set_rename_tx_failures(0);
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert_eq!(ov.pending_row_count(), 0);
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/x", 0).is_none());
+    }
+
+    /// Regression: a failed replay puts the batch back. The next present-mark
+    /// stays behind those rows, and a later successful replay still tombstones
+    /// `/a` (#88).
+    #[test]
+    fn rename_tx_failed_replay_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.mkdir("/c", 0o755)
+            .expect("present queues behind the failed replay");
+        assert_eq!(
+            ov.pending_row_count(),
+            2,
+            "failed replay must keep a->b and queue present /c"
+        );
+        assert_eq!(deleted_flag(&ov, "/a"), None, "a->b still unsaved");
+        assert_eq!(deleted_flag(&ov, "/c"), None, "present /c still unsaved");
+        ov.set_rename_tx_failures(0);
+        ov.mkdir("/d", 0o755)
+            .expect("later present replays the queue");
+        assert_eq!(ov.pending_row_count(), 0);
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/b"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/c"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/d"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none());
+    }
+
+    /// Regression: restoring a failed batch keeps those rows ahead of anything
+    /// already queued. Appending them would apply `x`→`y` before `a`→`x` and
+    /// resurrect `/x` (#88).
+    #[test]
+    fn restore_pending_front_keeps_older_rows_ahead() {
+        let older = vec![PendingFilesOp::Rename {
+            from: "/a".to_string(),
+            to: "/x".to_string(),
+            mode: ratarmount_core::S_IFREG | 0o644,
+            hides_from: true,
+        }];
+        let newer = PendingFilesOp::Rename {
+            from: "/x".to_string(),
+            to: "/y".to_string(),
+            mode: ratarmount_core::S_IFREG | 0o644,
+            hides_from: true,
+        };
+        let mut queued = vec![newer.clone()];
+        restore_pending_front(&mut queued, older.clone());
+        assert_eq!(
+            queued.first().map(|op| op.to_string()),
+            Some(older[0].to_string())
+        );
+        assert_eq!(queued, vec![older[0].clone(), newer]);
+
+        let mut empty = Vec::new();
+        restore_pending_front(&mut empty, older.clone());
+        assert_eq!(empty, older);
+    }
+
+    /// Regression: on-exit `commit_atomic` is the plan-builder call site that
+    /// does not refuse on its own. The plan must still refuse, name `/a` and
+    /// `/x`, and warn that an offline `--commit-overlay` would publish them
+    /// (#88). `commit_live` refuses before `plan_for_commit`, so it does not
+    /// cover deleting the check inside the plan builder.
+    #[test]
+    fn rename_tx_pending_on_exit_names_reappear_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = make_tiny_tar(dir.path(), &[("a", b"from-a"), ("x", b"orig-x")]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&tar, true), &overlay);
+        // a->x direct attempts, x->y replay, and commit_atomic's replay.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 3);
+        ov.rename("/a", "/x").expect("a->x queued");
+        ov.rename("/x", "/y").expect("x->y queued");
+        assert_eq!(ov.pending_row_count(), 2);
+        assert_eq!(deleted_flag(&ov, "/x"), None);
+        let err = ov
+            .commit_atomic(&tar)
+            .expect_err("on-exit commit must refuse while rows are queued");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to commit")
+                && msg.contains("reappear")
+                && msg.contains("/a")
+                && msg.contains("/x")
+                && msg.contains("offline --commit-overlay"),
+            "{msg}"
+        );
+        assert_eq!(ov.pending_row_count(), 2, "refusal must keep the queue");
+        let archive = open_uncompressed_tar_base(&tar, true);
+        assert!(
+            archive.lookup("/a", 0).is_some(),
+            "refused commit must leave /a in the archive"
+        );
+        assert!(
+            archive.lookup("/x", 0).is_some(),
+            "refused commit must leave /x in the archive"
+        );
+        assert!(
+            archive.lookup("/y", 0).is_none(),
+            "refused commit must not publish /y"
+        );
+    }
+
+    struct DropCaptureLog;
+
+    static DROP_CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    impl log::Log for DropCaptureLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Error
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            if let Ok(mut lines) = DROP_CAPTURED_LOGS.lock() {
+                lines.push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_drop_capture_log() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&DropCaptureLog).expect("install overlay drop log capture");
+            log::set_max_level(log::LevelFilter::Error);
+        });
+    }
+
+    /// Regression: drop replays once more, then logs the archive paths that
+    /// will reappear and warns that an offline `--commit-overlay` publishes
+    /// them (#88).
+    #[test]
+    fn rename_tx_pending_drop_logs_reappear_paths() {
+        install_drop_capture_log();
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        // Direct attempts plus Drop's three replay attempts.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        let root = overlay.display().to_string();
+        drop(ov);
+        let lines = DROP_CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let hit = lines.iter().any(|line| {
+            line.contains(&root)
+                && line.contains("/a")
+                && line.contains("will reappear")
+                && line.contains("offline --commit-overlay")
+        });
+        assert!(hit, "drop log missing reappear paths for {root}: {lines:?}");
     }
 
     /// Regression: mode 000 must not block rename or unlink (#88). Linux parks
