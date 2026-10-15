@@ -19,8 +19,9 @@ use std::sync::{mpsc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// One mount at a time: parallel test threads mounting several FUSE
-/// filesystems at once aborted a mount (`ECONNABORTED`) on the dev box.
+/// One mount at a time, so kernel cases do not contend with each other.
+/// (The `ECONNABORTED` exit seen at unmount was a daemon bug, fixed in
+/// `fuse_session_result`; this lock only keeps the cases independent.)
 static MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
