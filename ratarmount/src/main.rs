@@ -1675,14 +1675,20 @@ fn attach_export_stops(
     }
 }
 
-fn spawn_sftp_stdio_thread(source: Arc<dyn MountSource>, opts: ratarmount_sftp::SftpOptions) {
+fn spawn_sftp_stdio_thread(
+    source: Arc<dyn MountSource>,
+    opts: ratarmount_sftp::SftpOptions,
+) -> thread::JoinHandle<()> {
     thread::spawn(move || {
         if let Err(e) = ratarmount_sftp::serve_stdio(source, opts) {
             eprintln!("error starting SFTP stdio server: {e}");
         }
-    });
+    })
 }
 
+/// Bind failures call [`std::process::exit`] before any client is served.
+/// `pending_rows` is still empty then, so skipping [`WriteOverlay`]'s drop
+/// loses no queued update. Post-serve exits go through [`finish_overlay_serve`].
 fn spawn_export_threads(
     source: &Arc<dyn MountSource>,
     nfs_opts: Option<ratarmount_nfs::NfsOptions>,
@@ -1802,7 +1808,9 @@ fn spawn_export_threads(
     handles
 }
 
-fn probe_export_binds(nfs_opts: &Option<ratarmount_nfs::NfsOptions>, plan: &ExportPlan) {
+/// `false` when a bind fails. The caller drops the overlay before exiting.
+/// [`std::process::exit`] here would skip that drop.
+fn probe_export_binds(nfs_opts: &Option<ratarmount_nfs::NfsOptions>, plan: &ExportPlan) -> bool {
     let mut addrs = Vec::new();
     if let Some(o) = nfs_opts {
         addrs.push(("NFS", o.bind));
@@ -1825,9 +1833,10 @@ fn probe_export_binds(nfs_opts: &Option<ratarmount_nfs::NfsOptions>, plan: &Expo
     for (name, bind) in addrs {
         if let Err(e) = std::net::TcpListener::bind(bind) {
             eprintln!("error: cannot bind {name} on {bind}: {e}");
-            std::process::exit(1);
+            return false;
         }
     }
+    true
 }
 
 fn join_export_handles(handles: ExportHandles) {
@@ -1837,6 +1846,58 @@ fn join_export_handles(handles: ExportHandles) {
     for h in handles.others {
         let _ = h.join();
     }
+}
+
+/// Spawn the interval thread only in the process that serves the mount.
+///
+/// A thread started before `fork` is not copied into the child, but its
+/// [`Arc`] strong count is. The child then never drops [`WriteOverlay`], and
+/// the parent exits and kills the thread. Returns the handle so unmount can
+/// join it before the overlay drops.
+fn spawn_interval_if(
+    overlay: &Option<Arc<WriteOverlay>>,
+    live_archive: &Option<PathBuf>,
+    commit_interval: Option<Duration>,
+    stop: Option<ratarmount_nfs::NfsStop>,
+    open_opts: &OpenOptions,
+) -> Option<thread::JoinHandle<()>> {
+    match (overlay, live_archive, commit_interval) {
+        (Some(ov), Some(archive), Some(dur)) => Some(overlay_commit::spawn_interval_commits(
+            Arc::clone(ov),
+            archive.clone(),
+            dur,
+            stop,
+            open_opts.clone(),
+        )),
+        _ => None,
+    }
+}
+
+/// Replay queued overlay rows, then drop the overlay, before `process::exit`
+/// or a foreground return.
+///
+/// `std::process::exit` skips destructors, so [`WriteOverlay::drop`] would
+/// not run and a failed `files` update would stay unsaved. The interval
+/// thread is joined first: it holds an [`Arc`] and only returns after
+/// [`overlay_commit::request_shutdown`]. `commit` (on-exit persist) runs
+/// while this process still holds the overlay.
+///
+/// The forked parent must not call this. The child owns the SQLite
+/// connection; dropping here would replay into that connection. The parent's
+/// `process::exit` skips Drop on purpose.
+fn finish_overlay_serve(
+    overlay: Option<Arc<WriteOverlay>>,
+    source: Option<Arc<dyn MountSource>>,
+    interval: Option<thread::JoinHandle<()>>,
+    commit: impl FnOnce(Option<&WriteOverlay>),
+) {
+    overlay_commit::request_shutdown();
+    if let Some(handle) = interval {
+        let _ = handle.join();
+    }
+    commit(overlay.as_deref());
+    drop(source);
+    drop(overlay);
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1871,33 +1932,31 @@ fn run_exports(
     overlay_commit::spawn_signal_export_stops(callbacks);
     attach_export_stops(&mut nfs_opts, &mut plan, &nfs_stop, &export_stop);
     let sftp_stdio = plan.sftp_stdio.take();
-
-    if let (Some(ov), Some(archive), Some(dur)) =
-        (overlay_arc.clone(), live_archive.clone(), commit_interval)
-    {
-        overlay_commit::spawn_interval_commits(
+    let commit_exit = |ov: Option<&WriteOverlay>| {
+        overlay_commit::maybe_commit_on_exit(
             ov,
-            archive,
-            dur,
-            Some(nfs_stop.clone()),
-            open_opts.clone(),
+            live_archive.as_deref(),
+            commit_on_exit,
+            &open_opts,
         );
-    }
+    };
 
     match fuse_mp {
         None => {
+            let interval = spawn_interval_if(
+                &overlay_arc,
+                &live_archive,
+                commit_interval,
+                Some(nfs_stop.clone()),
+                &open_opts,
+            );
             let handles = spawn_export_threads(&source, nfs_opts, plan);
             if let Some(opts) = sftp_stdio {
                 let serve_err = ratarmount_sftp::serve_stdio(Arc::clone(&source), opts);
                 nfs_stop.request_stop();
                 export_stop.request_stop();
                 join_export_handles(handles);
-                overlay_commit::maybe_commit_on_exit(
-                    overlay_arc.as_deref(),
-                    live_archive.as_deref(),
-                    commit_on_exit,
-                    &open_opts,
-                );
+                finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
                 if let Err(e) = serve_err {
                     eprintln!("error starting SFTP stdio server: {e}");
                     std::process::exit(1);
@@ -1913,21 +1972,26 @@ fn run_exports(
             nfs_stop.request_stop();
             export_stop.request_stop();
             join_export_handles(handles);
-            overlay_commit::maybe_commit_on_exit(
-                overlay_arc.as_deref(),
-                live_archive.as_deref(),
-                commit_on_exit,
-                &open_opts,
-            );
+            finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
         }
         Some(mp) => {
             if live_archive.is_some() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             if foreground {
-                if let Some(opts) = sftp_stdio {
-                    spawn_sftp_stdio_thread(Arc::clone(&source), opts);
-                }
+                let interval = spawn_interval_if(
+                    &overlay_arc,
+                    &live_archive,
+                    commit_interval,
+                    Some(nfs_stop.clone()),
+                    &open_opts,
+                );
+                // Joined after unmount. `serve_stdio` runs until stdin closes,
+                // so this FUSE unmount waits for that client before the overlay
+                // drops. Dropping the handle would detach the thread and its
+                // `Arc` would outlive the overlay.
+                let sftp_thread =
+                    sftp_stdio.map(|opts| spawn_sftp_stdio_thread(Arc::clone(&source), opts));
                 eprintln!("FUSE at {}", mp.display());
                 let handles = spawn_export_threads(&source, nfs_opts, plan);
                 let mount_err = mount_blocking(
@@ -1942,12 +2006,10 @@ fn run_exports(
                 nfs_stop.request_stop();
                 export_stop.request_stop();
                 join_export_handles(handles);
-                overlay_commit::maybe_commit_on_exit(
-                    overlay_arc.as_deref(),
-                    live_archive.as_deref(),
-                    commit_on_exit,
-                    &open_opts,
-                );
+                if let Some(handle) = sftp_thread {
+                    let _ = handle.join();
+                }
+                finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
                 if let Err(e) = mount_err {
                     eprintln!("error mounting at {}: {e}", mp.display());
                     std::process::exit(1);
@@ -1956,9 +2018,16 @@ fn run_exports(
             }
 
             drop(sftp_stdio);
-            probe_export_binds(&nfs_opts, &plan);
+            if !probe_export_binds(&nfs_opts, &plan) {
+                finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
+                std::process::exit(1);
+            }
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
+                    // The child owns the overlay database. Dropping it here
+                    // would replay pending rows into the child's connection.
+                    // process::exit skips Drop on purpose. The interval thread
+                    // starts in the child, not in this process.
                     if !wait_until_mounted(&mp, Duration::from_secs(30)) {
                         eprintln!(
                             "error: timed out waiting for mount at {} (child pid {child})",
@@ -1977,7 +2046,14 @@ fn run_exports(
                     if live_archive.is_some() {
                         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
                     }
-                    let _handles = spawn_export_threads(&source, nfs_opts, plan);
+                    let interval = spawn_interval_if(
+                        &overlay_arc,
+                        &live_archive,
+                        commit_interval,
+                        Some(nfs_stop.clone()),
+                        &open_opts,
+                    );
+                    let handles = spawn_export_threads(&source, nfs_opts, plan);
                     let mount_err = mount_blocking(
                         source,
                         &mp,
@@ -1989,12 +2065,8 @@ fn run_exports(
                     );
                     nfs_stop.request_stop();
                     export_stop.request_stop();
-                    overlay_commit::maybe_commit_on_exit(
-                        overlay_arc.as_deref(),
-                        live_archive.as_deref(),
-                        commit_on_exit,
-                        &open_opts,
-                    );
+                    join_export_handles(handles);
+                    finish_overlay_serve(overlay_arc, None, interval, commit_exit);
                     if let Err(e) = mount_err {
                         let _ = std::fs::write(
                             "/tmp/ratarmount-rs-fuse-error.log",
@@ -2006,6 +2078,7 @@ fn run_exports(
                 }
                 Err(e) => {
                     eprintln!("error: fork failed: {e}");
+                    finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
                     std::process::exit(1);
                 }
             }
@@ -2065,19 +2138,23 @@ fn run_nfs_only(
     let stop = ratarmount_nfs::NfsStop::new();
     opts.stop = Some(stop.clone());
     overlay_commit::spawn_signal_nfs_stop(stop.clone());
-    if let (Some(ov), Some(archive), Some(dur)) =
-        (overlay.clone(), live_archive.clone(), commit_interval)
-    {
-        overlay_commit::spawn_interval_commits(ov, archive, dur, Some(stop), open_opts.clone());
-    }
-    eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
-    let serve_err = serve_nfs_blocking(source, opts);
-    overlay_commit::maybe_commit_on_exit(
-        overlay.as_deref(),
-        live_archive.as_deref(),
-        commit_on_exit,
+    let interval = spawn_interval_if(
+        &overlay,
+        &live_archive,
+        commit_interval,
+        Some(stop),
         &open_opts,
     );
+    eprintln!("{}", nfs_ready_line(&opts, opts.bind.port()));
+    let serve_err = serve_nfs_blocking(source, opts);
+    finish_overlay_serve(overlay, None, interval, |ov| {
+        overlay_commit::maybe_commit_on_exit(
+            ov,
+            live_archive.as_deref(),
+            commit_on_exit,
+            &open_opts,
+        );
+    });
     if let Err(e) = serve_err {
         eprintln!("error starting NFS server: {e}");
         std::process::exit(1);
@@ -2100,6 +2177,14 @@ fn run_fuse_and_nfs(
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
 ) {
+    let commit_exit = |ov: Option<&WriteOverlay>| {
+        overlay_commit::maybe_commit_on_exit(
+            ov,
+            live_archive.as_deref(),
+            commit_on_exit,
+            &open_opts,
+        );
+    };
     if foreground {
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
@@ -2107,22 +2192,19 @@ fn run_fuse_and_nfs(
         if live_archive.is_some() {
             overlay_commit::spawn_signal_fuse_unmount(mp.clone());
         }
-        if let (Some(ov), Some(archive), Some(dur)) =
-            (overlay_arc.clone(), live_archive.clone(), commit_interval)
-        {
-            overlay_commit::spawn_interval_commits(
-                ov,
-                archive,
-                dur,
-                Some(stop.clone()),
-                open_opts.clone(),
-            );
-        }
+        let interval = spawn_interval_if(
+            &overlay_arc,
+            &live_archive,
+            commit_interval,
+            Some(stop.clone()),
+            &open_opts,
+        );
         let ready = nfs_opts.clone();
         let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("error starting NFS server: {e}");
+                finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
                 std::process::exit(1);
             }
         };
@@ -2139,12 +2221,7 @@ fn run_fuse_and_nfs(
         );
         stop.request_stop();
         let _ = handle.join();
-        overlay_commit::maybe_commit_on_exit(
-            overlay_arc.as_deref(),
-            live_archive.as_deref(),
-            commit_on_exit,
-            &open_opts,
-        );
+        finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
@@ -2153,12 +2230,17 @@ fn run_fuse_and_nfs(
     }
 
     // Daemonize: probe NFS bind in the parent so a dead port is not silent.
+    // No client has been served. Drop the overlay before exit anyway.
     if let Err(e) = std::net::TcpListener::bind(nfs_opts.bind) {
         eprintln!("error: cannot bind NFS on {}: {e}", nfs_opts.bind);
+        finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
         std::process::exit(1);
     }
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
+            // The child owns the overlay database. Dropping it here would
+            // replay pending rows into the child's connection. process::exit
+            // skips Drop on purpose. The interval thread starts in the child.
             if !wait_until_mounted(&mp, Duration::from_secs(30)) {
                 eprintln!(
                     "error: timed out waiting for mount at {} (child pid {child})",
@@ -2180,24 +2262,24 @@ fn run_fuse_and_nfs(
             if live_archive.is_some() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
-            if let (Some(ov), Some(archive), Some(dur)) =
-                (overlay_arc.clone(), live_archive.clone(), commit_interval)
-            {
-                overlay_commit::spawn_interval_commits(
-                    ov,
-                    archive,
-                    dur,
-                    Some(stop.clone()),
-                    open_opts.clone(),
-                );
-            }
-            if let Err(e) = spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
-                let _ = std::fs::write(
-                    "/tmp/ratarmount-rs-nfs-error.log",
-                    format!("NFS bind error: {e}\n"),
-                );
-                std::process::exit(1);
-            }
+            let interval = spawn_interval_if(
+                &overlay_arc,
+                &live_archive,
+                commit_interval,
+                Some(stop.clone()),
+                &open_opts,
+            );
+            let handle = match spawn_nfs_for_opts(Arc::clone(&source), nfs_opts) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = std::fs::write(
+                        "/tmp/ratarmount-rs-nfs-error.log",
+                        format!("NFS bind error: {e}\n"),
+                    );
+                    finish_overlay_serve(overlay_arc, Some(source), interval, |_| {});
+                    std::process::exit(1);
+                }
+            };
             let mount_err = mount_blocking(
                 source,
                 &mp,
@@ -2208,12 +2290,8 @@ fn run_fuse_and_nfs(
                 readahead,
             );
             stop.request_stop();
-            overlay_commit::maybe_commit_on_exit(
-                overlay_arc.as_deref(),
-                live_archive.as_deref(),
-                commit_on_exit,
-                &open_opts,
-            );
+            let _ = handle.join();
+            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
@@ -2225,6 +2303,7 @@ fn run_fuse_and_nfs(
         }
         Err(e) => {
             eprintln!("error: fork failed: {e}");
+            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
             std::process::exit(1);
         }
     }
@@ -2248,14 +2327,24 @@ fn run_fuse_only(
     if live_archive.is_some() {
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
     }
+    let commit_exit = |ov: Option<&WriteOverlay>| {
+        overlay_commit::maybe_commit_on_exit(
+            ov,
+            live_archive.as_deref(),
+            commit_on_exit,
+            &open_opts,
+        );
+    };
     if foreground {
-        // NFS and the forked daemon child already spawn this. `-f` must too,
-        // or `--commit-overlay-interval` waits until process exit.
-        if let (Some(ov), Some(archive), Some(dur)) =
-            (overlay_arc.clone(), live_archive.clone(), commit_interval)
-        {
-            overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
-        }
+        // The interval thread holds an Arc. Join it before the overlay drops,
+        // or process exit kills it and the final replay never runs.
+        let interval = spawn_interval_if(
+            &overlay_arc,
+            &live_archive,
+            commit_interval,
+            None,
+            &open_opts,
+        );
         let mount_err = mount_blocking(
             source,
             &mp,
@@ -2265,12 +2354,7 @@ fn run_fuse_only(
             fuse_opts,
             readahead,
         );
-        overlay_commit::maybe_commit_on_exit(
-            overlay_arc.as_deref(),
-            live_archive.as_deref(),
-            commit_on_exit,
-            &open_opts,
-        );
+        finish_overlay_serve(overlay_arc, None, interval, commit_exit);
         if let Err(e) = mount_err {
             eprintln!("error mounting at {}: {e}", mp.display());
             std::process::exit(1);
@@ -2280,6 +2364,9 @@ fn run_fuse_only(
 
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
+            // The child owns the overlay database. Dropping it here would
+            // replay pending rows into the child's connection. process::exit
+            // skips Drop on purpose. The interval thread starts in the child.
             if !wait_until_mounted(&mp, Duration::from_secs(30)) {
                 eprintln!(
                     "error: timed out waiting for mount at {} (child pid {child})",
@@ -2298,11 +2385,13 @@ fn run_fuse_only(
             if live_archive.is_some() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
-            if let (Some(ov), Some(archive), Some(dur)) =
-                (overlay_arc.clone(), live_archive.clone(), commit_interval)
-            {
-                overlay_commit::spawn_interval_commits(ov, archive, dur, None, open_opts.clone());
-            }
+            let interval = spawn_interval_if(
+                &overlay_arc,
+                &live_archive,
+                commit_interval,
+                None,
+                &open_opts,
+            );
             let mount_err = mount_blocking(
                 source,
                 &mp,
@@ -2312,12 +2401,7 @@ fn run_fuse_only(
                 fuse_opts,
                 readahead,
             );
-            overlay_commit::maybe_commit_on_exit(
-                overlay_arc.as_deref(),
-                live_archive.as_deref(),
-                commit_on_exit,
-                &open_opts,
-            );
+            finish_overlay_serve(overlay_arc, None, interval, commit_exit);
             if let Err(e) = mount_err {
                 let _ = std::fs::write(
                     "/tmp/ratarmount-rs-fuse-error.log",
@@ -2329,6 +2413,7 @@ fn run_fuse_only(
         }
         Err(e) => {
             eprintln!("error: fork failed: {e}");
+            finish_overlay_serve(overlay_arc, Some(source), None, |_| {});
             std::process::exit(1);
         }
     }
@@ -4909,5 +4994,109 @@ mod repack_seekable_cli_tests {
         }
         exe.push(format!("ratarmount{}", std::env::consts::EXE_SUFFIX));
         exe.is_file().then_some(exe)
+    }
+}
+
+#[cfg(test)]
+mod overlay_unmount_drop_tests {
+    use super::finish_overlay_serve;
+    use ratarmount_compositing::WriteOverlay;
+    use ratarmount_core::{FileInfo, ListResult, MountSource, OpenOptions};
+    use std::sync::Arc;
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    struct EmptyBase;
+
+    impl MountSource for EmptyBase {
+        fn list(&self, _: &str) -> Option<ListResult> {
+            Some(ListResult::Names(Vec::new()))
+        }
+
+        fn lookup(&self, _: &str, _: i32) -> Option<FileInfo> {
+            None
+        }
+
+        fn open(
+            &self,
+            _: &FileInfo,
+            _: i32,
+        ) -> std::io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Err(std::io::Error::new(std::io::ErrorKind::NotFound, "empty"))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    struct ResetTerm;
+
+    impl Drop for ResetTerm {
+        fn drop(&mut self) {
+            crate::overlay_commit::set_term_flag_for_test(false);
+        }
+    }
+
+    /// Regression: unmount drops the overlay even when a background thread
+    /// still holds an Arc. `process::exit` would skip that drop (#88).
+    #[test]
+    fn finish_overlay_serve_drops_before_exit() {
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        let weak = Arc::downgrade(&ov);
+        let held = Arc::clone(&ov);
+        let interval = thread::spawn(move || {
+            let start = Instant::now();
+            while !crate::overlay_commit::term_requested() {
+                assert!(
+                    start.elapsed() < Duration::from_secs(5),
+                    "shutdown was not requested"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+            drop(held);
+        });
+        let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
+        finish_overlay_serve(Some(ov), Some(source), Some(interval), |_| {});
+        assert!(
+            weak.upgrade().is_none(),
+            "overlay Arc still alive after finish"
+        );
+    }
+
+    /// Regression: the control search callback must not keep the overlay alive
+    /// after the mount drops its strong refs (#88).
+    #[test]
+    fn live_search_callback_does_not_pin_overlay() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        let weak = Arc::downgrade(&ov);
+        let cb = crate::find::live_search_callback(
+            Arc::clone(&ov) as Arc<dyn MountSource>,
+            Some(Arc::clone(&ov)),
+            dir.path().join("archive.tar"),
+            OpenOptions::default(),
+        );
+        let mounted = cb("*");
+        assert!(
+            !mounted.contains("not mounted"),
+            "search while mounted: {mounted}"
+        );
+        drop(ov);
+        assert!(weak.upgrade().is_none(), "callback pinned the overlay");
+        let gone = cb("*");
+        assert!(
+            gone.contains("archive is not mounted"),
+            "search after drop: {gone}"
+        );
     }
 }
