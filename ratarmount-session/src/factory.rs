@@ -4523,6 +4523,83 @@ mod tests {
     use std::io::{Read, Seek, SeekFrom};
     use std::process::Command;
 
+    /// Regression: #102, a factory `eprintln!` (`could not load index;
+    /// rebuilding`) panicked (exit 101) once stdout/stderr had no reader.
+    /// The rebuild then prints the tar offset-dictionary lines.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn factory_prints_survive_dead_stdout() {
+        use std::os::fd::AsRawFd;
+        const CHILD_ENV: &str = "RATARMOUNT_SESSION_QUIET_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let tar_path = dir.path().join("t.tar");
+            {
+                let mut f = std::fs::File::create(&tar_path).unwrap();
+                ratarmount_formats_tar::write_ustar_members(
+                    &mut f,
+                    &[ratarmount_formats_tar::UstarMember {
+                        path: "hello.txt",
+                        payload: ratarmount_formats_tar::UstarPayload::File {
+                            bytes: b"hello world\n",
+                        },
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                    }],
+                )
+                .unwrap();
+                ratarmount_formats_tar::write_tar_eof(&mut f).unwrap();
+            }
+            let idx = dir.path().join("bad.index.sqlite");
+            std::fs::write(&idx, b"not a sqlite database").unwrap();
+            let (r1, w1) = std::io::pipe().unwrap();
+            let (r2, w2) = std::io::pipe().unwrap();
+            drop((r1, r2));
+            let ok =
+                unsafe { libc::dup2(w1.as_raw_fd(), 1) == 1 && libc::dup2(w2.as_raw_fd(), 2) == 2 };
+            if !ok {
+                drop(dir);
+                std::process::exit(3);
+            }
+            drop((w1, w2));
+            let mut mat = None;
+            let code = match open_tar(
+                &tar_path,
+                &tar_path,
+                Some(&idx),
+                &OpenOptions::default(),
+                false,
+                &mut mat,
+            ) {
+                Ok(_) => 0,
+                Err(_) => 4,
+            };
+            drop(dir);
+            std::process::exit(code);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_ENV, "1")
+            .args([
+                "factory::tests::factory_prints_survive_dead_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "child stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "child must have run the test"
+        );
+    }
+
     /// Plain 1-file TAR for B-119 index-minimum-file-count regression tests.
     fn make_tiny_plain_tar(dir: &Path) -> PathBuf {
         let data = dir.join("data-plain");

@@ -3463,6 +3463,7 @@ dependencies = [
 name = "ratarmount-session"
 version = "0.1.34"
 dependencies = [
+ "libc",
  "log",
  "ratarmount-compositing",
  "ratarmount-compress",

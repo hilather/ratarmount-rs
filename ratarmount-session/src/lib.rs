@@ -13,6 +13,9 @@
 //!
 //! Contract: types, [`Error`] (no `Busy`), [`Session`] (no [`Clone`]; share via
 //! [`std::sync::Arc`]). See `docs/session-api.md`.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 mod error;
 mod extract;

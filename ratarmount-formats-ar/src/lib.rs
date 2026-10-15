@@ -3,6 +3,9 @@
 //! Path-based open and [`ArMountSource::open_from_reader`] (shared `Read + Seek`)
 //! both stencil member ranges for random access — nested AutoMount without temp spool
 //! once the factory sniffs `!<arch>\n`.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

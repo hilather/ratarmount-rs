@@ -117,3 +117,4 @@ ratarmount-formats-xar = { workspace = true, optional = true }
 [dev-dependencies]
 url = "2"
 rusqlite.workspace = true
+libc.workspace = true

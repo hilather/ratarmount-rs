@@ -22,6 +22,9 @@
 //! (or member) into RAM. Encrypted folders need a password before `open`.
 //! Store-in-store and solid-in-store nested fixtures both avoid writing the
 //! outer member to a temp file when AutoMount uses the reader path.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 mod decode;
 mod parse;

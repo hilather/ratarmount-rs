@@ -14,6 +14,9 @@
 //! itself gains a generated directory version (Python recursive index parity) so
 //! `list`/`lookup` work without AutoMount. Size gate: when recursion is disabled,
 //! nested members larger than [`NESTED_FLATTEN_MAX_BYTES`] are only side-listed.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -3126,6 +3129,82 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
     use std::process::Command;
+
+    /// Regression: #102, `Creating offset dictionary` panicked (exit 101) when
+    /// stdout was a pipe with no reader (`ratarmount -f -c` after startup).
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn create_index_survives_dead_stdout() {
+        use std::os::fd::AsRawFd;
+        const CHILD_ENV: &str = "RATARMOUNT_TAR_QUIET_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            let dir = tempfile::tempdir().unwrap();
+            let tar_path = dir.path().join("t.tar");
+            {
+                let mut f = std::fs::File::create(&tar_path).unwrap();
+                write_ustar_members(
+                    &mut f,
+                    &[UstarMember {
+                        path: "hello.txt",
+                        payload: UstarPayload::File {
+                            bytes: b"hello world\n",
+                        },
+                        mode: 0o644,
+                        uid: 0,
+                        gid: 0,
+                        mtime: 0,
+                    }],
+                )
+                .unwrap();
+                write_tar_eof(&mut f).unwrap();
+            }
+            // Live stdio so far (libtest printed its banner). Now widow both.
+            let (r1, w1) = std::io::pipe().unwrap();
+            let (r2, w2) = std::io::pipe().unwrap();
+            drop((r1, r2));
+            let ok =
+                unsafe { libc::dup2(w1.as_raw_fd(), 1) == 1 && libc::dup2(w2.as_raw_fd(), 2) == 2 };
+            if !ok {
+                drop(dir);
+                std::process::exit(3);
+            }
+            drop((w1, w2));
+            let mut mat = None;
+            let code = match SqliteIndexedTar::create_index(
+                &tar_path,
+                &tar_path,
+                None,
+                &OpenOptions::default(),
+                "0.1.0",
+                &mut mat,
+            ) {
+                Ok(_) => 0,
+                Err(_) => 4,
+            };
+            // `exit` skips destructors; remove the temp dir first.
+            drop(dir);
+            std::process::exit(code);
+        }
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .env(CHILD_ENV, "1")
+            .args([
+                "tests::create_index_survives_dead_stdout",
+                "--exact",
+                "--nocapture",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "child stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("running 1 test"),
+            "child must have run the test"
+        );
+    }
 
     #[test]
     fn multi_version_count_updated_file() {

@@ -1,5 +1,7 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
+mod quiet_print;
+
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::{self, Read, Seek};

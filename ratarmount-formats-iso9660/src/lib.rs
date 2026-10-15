@@ -6,6 +6,9 @@
 //! seekable stream: [`Iso9660MountSource::open_from_reader`] indexes from any
 //! `Read + Seek` and retains a mutex-shared handle for extent stencil opens.
 //! Large images are never loaded fully into RAM.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::collections::HashSet;
 use std::fs::File;
