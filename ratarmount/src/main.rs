@@ -1686,33 +1686,82 @@ fn spawn_sftp_stdio_thread(
     })
 }
 
-/// Bind failures call [`std::process::exit`] before any client is served.
-/// `pending_rows` is still empty then, so skipping [`WriteOverlay`]'s drop
-/// loses no queued update. Post-serve exits go through [`finish_overlay_serve`].
+/// Stop flags for listeners that have already bound. Clones of the flags the
+/// server threads poll, so [`abandon_started_exports`] can join them.
+struct StartedExportStops {
+    nfs: Option<ratarmount_nfs::NfsStop>,
+    export: Option<ratarmount_http::ExportStop>,
+}
+
+/// Stop and join listeners that already bound so they drop their `Arc`s
+/// before [`WriteOverlay`] does. A listener with no stop flag is detached;
+/// the caller still exits, which ends that thread.
+fn abandon_started_exports(handles: ExportHandles, stops: &StartedExportStops) {
+    let can_stop_nfs = handles.nfs.is_none() || stops.nfs.is_some();
+    let can_stop_export = handles.others.is_empty() || stops.export.is_some();
+    if let Some(stop) = &stops.nfs {
+        stop.request_stop();
+    }
+    if let Some(stop) = &stops.export {
+        stop.request_stop();
+    }
+    if can_stop_nfs && can_stop_export {
+        join_export_handles(handles);
+    }
+}
+
+fn remember_export_stop(stops: &mut StartedExportStops, stop: Option<ratarmount_http::ExportStop>) {
+    if stops.export.is_none() && stop.is_some() {
+        stops.export = stop;
+    }
+}
+
+/// Same text as the historical `eprintln` before `process::exit(1)`.
+fn fail_export_bind(
+    handles: ExportHandles,
+    stops: &StartedExportStops,
+    proto: &str,
+    err: impl std::fmt::Display,
+) -> String {
+    abandon_started_exports(handles, stops);
+    format!("error starting {proto} server: {err}")
+}
+
+/// Bind every requested export.
+///
+/// On failure, listeners that already bound are stopped and joined, and the
+/// error string is the `error starting … server:` line. The caller prints it
+/// and exits through [`exit_on_export_bind_failure`] so the overlay drops.
+/// `std::process::exit` here would skip that drop: the interval thread is
+/// already running and holds an [`Arc`].
 fn spawn_export_threads(
     source: &Arc<dyn MountSource>,
     nfs_opts: Option<ratarmount_nfs::NfsOptions>,
     plan: ExportPlan,
-) -> ExportHandles {
+) -> Result<ExportHandles, String> {
     let mut handles = ExportHandles {
         nfs: None,
         others: Vec::new(),
     };
+    let mut stops = StartedExportStops {
+        nfs: None,
+        export: None,
+    };
     if let Some(opts) = nfs_opts {
+        let stop = opts.stop.clone();
         let ready = opts.clone();
         match spawn_nfs_for_opts(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!("{}", nfs_ready_line(&ready, h.port));
+                stops.nfs = stop;
                 handles.nfs = Some(h);
             }
-            Err(e) => {
-                eprintln!("error starting NFS server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "NFS", e)),
         }
     }
     if let Some(opts) = plan.http {
         let bind = opts.bind;
+        let stop = opts.stop.clone();
         match ratarmount_http::spawn_http_thread(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!(
@@ -1722,16 +1771,15 @@ fn spawn_export_threads(
                     bind.ip(),
                     h.port
                 );
+                remember_export_stop(&mut stops, stop);
                 handles.others.push(h);
             }
-            Err(e) => {
-                eprintln!("error starting HTTP server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "HTTP", e)),
         }
     }
     if let Some(opts) = plan.webdav {
         let bind = opts.bind;
+        let stop = opts.stop.clone();
         match ratarmount_http::spawn_webdav_thread(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!(
@@ -1739,17 +1787,16 @@ fn spawn_export_threads(
                     bind.ip(),
                     h.port
                 );
+                remember_export_stop(&mut stops, stop);
                 handles.others.push(h);
             }
-            Err(e) => {
-                eprintln!("error starting WebDAV server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "WebDAV", e)),
         }
     }
     if let Some(opts) = plan.smb {
         let bind = opts.bind;
         let share = opts.share_name.clone();
+        let stop = opts.stop.clone();
         match ratarmount_smb::spawn_smb_thread(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!(
@@ -1759,16 +1806,15 @@ fn spawn_export_threads(
                     bind.ip(),
                     h.port
                 );
+                remember_export_stop(&mut stops, stop);
                 handles.others.push(h);
             }
-            Err(e) => {
-                eprintln!("error starting SMB server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "SMB", e)),
         }
     }
     if let Some(opts) = plan.ninep {
         let bind = opts.bind;
+        let stop = opts.stop.clone();
         match ratarmount_9p::spawn_ninep_thread(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!(
@@ -1778,16 +1824,15 @@ fn spawn_export_threads(
                     h.port,
                     bind.ip()
                 );
+                remember_export_stop(&mut stops, stop);
                 handles.others.push(h);
             }
-            Err(e) => {
-                eprintln!("error starting 9P server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "9P", e)),
         }
     }
     if let Some(opts) = plan.sftp {
         let bind = opts.bind;
+        let stop = opts.stop.clone();
         match ratarmount_sftp::spawn_sftp_thread(Arc::clone(source), opts) {
             Ok(h) => {
                 eprintln!(
@@ -1797,15 +1842,66 @@ fn spawn_export_threads(
                     h.port,
                     bind.ip()
                 );
+                remember_export_stop(&mut stops, stop);
                 handles.others.push(h);
             }
-            Err(e) => {
-                eprintln!("error starting SFTP server: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => return Err(fail_export_bind(handles, &stops, "SFTP", e)),
         }
     }
-    handles
+    Ok(handles)
+}
+
+/// Print `message` (unchanged bind-failure text), drop the overlay, then exit.
+///
+/// `exit` is [`exit_with_code`] in production. Tests pass a hook that panics
+/// so the process stays up and the drop can be observed. The exit code is 1.
+/// The hook must not return; `!` is not stable in `FnOnce` bounds.
+fn exit_on_export_bind_failure(
+    message: &str,
+    overlay: Option<Arc<WriteOverlay>>,
+    source: Option<Arc<dyn MountSource>>,
+    interval: Option<thread::JoinHandle<()>>,
+    exit: impl FnOnce(i32, &str),
+) -> ! {
+    eprintln!("{message}");
+    finish_overlay_serve(overlay, source, interval, |_| {});
+    exit(1, message);
+    unreachable!("bind-failure exit hook returned");
+}
+
+fn exit_with_code(code: i32, _message: &str) {
+    std::process::exit(code);
+}
+
+/// Exports that bound, plus the overlay state the caller still owns.
+struct BoundExports {
+    handles: ExportHandles,
+    source: Arc<dyn MountSource>,
+    overlay: Option<Arc<WriteOverlay>>,
+    interval: Option<thread::JoinHandle<()>>,
+}
+
+/// Bind exports. A bind failure drops the overlay (final pending-row replay)
+/// and exits 1 with the same message as a direct `process::exit`.
+fn spawn_export_threads_or_exit(
+    source: Arc<dyn MountSource>,
+    nfs_opts: Option<ratarmount_nfs::NfsOptions>,
+    plan: ExportPlan,
+    overlay: Option<Arc<WriteOverlay>>,
+    interval: Option<thread::JoinHandle<()>>,
+    exit: impl FnOnce(i32, &str),
+) -> BoundExports {
+    match spawn_export_threads(&source, nfs_opts, plan) {
+        Ok(handles) => BoundExports {
+            handles,
+            source,
+            overlay,
+            interval,
+        },
+        Err(message) => {
+            exit_on_export_bind_failure(&message, overlay, Some(source), interval, exit);
+        }
+    }
 }
 
 /// `false` when a bind fails. The caller drops the overlay before exiting.
@@ -1950,7 +2046,19 @@ fn run_exports(
                 Some(nfs_stop.clone()),
                 &open_opts,
             );
-            let handles = spawn_export_threads(&source, nfs_opts, plan);
+            let BoundExports {
+                handles,
+                source,
+                overlay: overlay_arc,
+                interval,
+            } = spawn_export_threads_or_exit(
+                source,
+                nfs_opts,
+                plan,
+                overlay_arc,
+                interval,
+                exit_with_code,
+            );
             if let Some(opts) = sftp_stdio {
                 let serve_err = ratarmount_sftp::serve_stdio(Arc::clone(&source), opts);
                 nfs_stop.request_stop();
@@ -1986,14 +2094,28 @@ fn run_exports(
                     Some(nfs_stop.clone()),
                     &open_opts,
                 );
+                eprintln!("FUSE at {}", mp.display());
+                let BoundExports {
+                    handles,
+                    source,
+                    overlay: overlay_arc,
+                    interval,
+                } = spawn_export_threads_or_exit(
+                    source,
+                    nfs_opts,
+                    plan,
+                    overlay_arc,
+                    interval,
+                    exit_with_code,
+                );
                 // Joined after unmount. `serve_stdio` runs until stdin closes,
                 // so this FUSE unmount waits for that client before the overlay
-                // drops. Dropping the handle would detach the thread and its
-                // `Arc` would outlive the overlay.
+                // drops. Started only after binds succeed: a bind failure exits
+                // through `finish_overlay_serve`, and this thread would hold an
+                // `Arc` until stdin closed. Dropping the handle would detach it
+                // and that `Arc` would outlive the overlay.
                 let sftp_thread =
                     sftp_stdio.map(|opts| spawn_sftp_stdio_thread(Arc::clone(&source), opts));
-                eprintln!("FUSE at {}", mp.display());
-                let handles = spawn_export_threads(&source, nfs_opts, plan);
                 let mount_err = mount_blocking(
                     Arc::clone(&source),
                     &mp,
@@ -2053,7 +2175,19 @@ fn run_exports(
                         Some(nfs_stop.clone()),
                         &open_opts,
                     );
-                    let handles = spawn_export_threads(&source, nfs_opts, plan);
+                    let BoundExports {
+                        handles,
+                        source,
+                        overlay: overlay_arc,
+                        interval,
+                    } = spawn_export_threads_or_exit(
+                        source,
+                        nfs_opts,
+                        plan,
+                        overlay_arc,
+                        interval,
+                        exit_with_code,
+                    );
                     let mount_err = mount_blocking(
                         source,
                         &mp,
@@ -4999,12 +5133,44 @@ mod repack_seekable_cli_tests {
 
 #[cfg(test)]
 mod overlay_unmount_drop_tests {
-    use super::finish_overlay_serve;
+    use super::{finish_overlay_serve, spawn_export_threads_or_exit, ExportPlan};
     use ratarmount_compositing::WriteOverlay;
     use ratarmount_core::{FileInfo, ListResult, MountSource, OpenOptions};
-    use std::sync::Arc;
+    use std::net::{SocketAddr, TcpListener};
+    use std::panic::AssertUnwindSafe;
+    use std::sync::{Arc, Mutex, MutexGuard};
     use std::thread;
     use std::time::{Duration, Instant};
+
+    fn lock_term_flag() -> MutexGuard<'static, ()> {
+        crate::overlay_commit::term_flag_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// `body` runs on another thread. The test fails when that thread is still
+    /// inside `finish_overlay_serve`'s interval join at `deadline` (the live
+    /// interval thread did not exit). On that timeout the term flag is set so
+    /// the interval thread can leave, and this waits for it before returning
+    /// the panic.
+    fn assert_finishes_within(deadline: Duration, body: impl FnOnce() + Send + 'static) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let result = std::panic::catch_unwind(AssertUnwindSafe(body));
+            let _ = tx.send(result);
+        });
+        match rx.recv_timeout(deadline) {
+            Ok(Ok(())) => {}
+            Ok(Err(payload)) => std::panic::resume_unwind(payload),
+            Err(_) => {
+                crate::overlay_commit::set_term_flag_for_test(true);
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                panic!(
+                    "did not return within {deadline:?}; live interval thread still running (request_shutdown missing?)"
+                );
+            }
+        }
+    }
 
     struct EmptyBase;
 
@@ -5042,6 +5208,7 @@ mod overlay_unmount_drop_tests {
     /// still holds an Arc. `process::exit` would skip that drop (#88).
     #[test]
     fn finish_overlay_serve_drops_before_exit() {
+        let _guard = lock_term_flag();
         let _reset = ResetTerm;
         crate::overlay_commit::set_term_flag_for_test(false);
         let dir = tempfile::tempdir().unwrap();
@@ -5068,6 +5235,157 @@ mod overlay_unmount_drop_tests {
             weak.upgrade().is_none(),
             "overlay Arc still alive after finish"
         );
+    }
+
+    fn live_interval_thread(
+        ov: &Arc<WriteOverlay>,
+        archive: std::path::PathBuf,
+    ) -> thread::JoinHandle<()> {
+        let interval = crate::overlay_commit::spawn_interval_commits(
+            Arc::clone(ov),
+            archive,
+            Duration::from_secs(3600),
+            None,
+            OpenOptions::default(),
+        );
+        assert_eq!(
+            interval.thread().name(),
+            Some("ratarmount-overlay-commit"),
+            "expected the production interval-commit thread"
+        );
+        // Past the first flag check. A thread that already saw shutdown would
+        // have returned; one still in the poll sleep must not be finished.
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            !interval.is_finished(),
+            "interval thread exited before finish_overlay_serve"
+        );
+        interval
+    }
+
+    /// Regression: `finish_overlay_serve` must `request_shutdown` or the real
+    /// interval-commit thread never leaves its poll loop and the join hangs.
+    /// A stand-in thread that checks the flag itself does not catch that:
+    /// its panic is swallowed by `let _ = handle.join()`.
+    #[test]
+    fn finish_overlay_serve_joins_live_interval_thread() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        let weak = Arc::downgrade(&ov);
+        let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
+        let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
+        let deadline = Duration::from_secs(2);
+        let started = Instant::now();
+        assert_finishes_within(deadline, move || {
+            finish_overlay_serve(Some(ov), Some(source), Some(interval), |_| {});
+        });
+        assert!(
+            started.elapsed() < deadline,
+            "finish_overlay_serve took too long; interval thread did not exit promptly"
+        );
+        assert!(
+            weak.upgrade().is_none(),
+            "overlay Arc still alive after the interval thread was joined"
+        );
+    }
+
+    /// Regression: a bind failure after another listener is up must stop that
+    /// listener, join the live interval thread, and drop the overlay (final
+    /// pending-row replay) instead of `process::exit` skipping `Drop`.
+    /// Exit code stays 1 and the stderr line stays `error starting … server:`.
+    #[test]
+    fn export_bind_failure_drops_overlay() {
+        let _guard = lock_term_flag();
+        let _reset = ResetTerm;
+        crate::overlay_commit::set_term_flag_for_test(false);
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(EmptyBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        let weak = Arc::downgrade(&ov);
+        let interval = live_interval_thread(&ov, dir.path().join("archive.tar"));
+        let source: Arc<dyn MountSource> = Arc::clone(&ov) as Arc<dyn MountSource>;
+
+        // Hold this port so WebDAV's bind fails after HTTP has already bound.
+        let held = TcpListener::bind("127.0.0.1:0").unwrap();
+        let occupied = held.local_addr().unwrap();
+        let export_stop = ratarmount_http::ExportStop::new();
+        let plan = ExportPlan {
+            http: Some(ratarmount_http::HttpOptions {
+                bind: SocketAddr::from(([127, 0, 0, 1], 0)),
+                stop: Some(export_stop.clone()),
+                overlay: Some(Arc::clone(&ov)),
+                ..ratarmount_http::HttpOptions::default()
+            }),
+            webdav: Some(ratarmount_http::WebDavOptions {
+                bind: occupied,
+                stop: Some(export_stop),
+                overlay: Some(Arc::clone(&ov)),
+                ..ratarmount_http::WebDavOptions::default()
+            }),
+            smb: None,
+            ninep: None,
+            sftp: None,
+            sftp_stdio: None,
+        };
+
+        let seen = Arc::new(Mutex::new(None));
+        let seen_hook = Arc::clone(&seen);
+        let deadline = Duration::from_secs(2);
+        let started = Instant::now();
+        let (tx, rx) = std::sync::mpsc::channel();
+        thread::spawn(move || {
+            let panicked = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                spawn_export_threads_or_exit(
+                    source,
+                    None,
+                    plan,
+                    Some(ov),
+                    Some(interval),
+                    move |code, msg| {
+                        *seen_hook.lock().unwrap_or_else(|e| e.into_inner()) =
+                            Some((code, msg.to_string()));
+                        panic!("export bind failure exit");
+                    },
+                );
+            }));
+            let _ = tx.send(panicked.is_err());
+        });
+        let hook_panicked = match rx.recv_timeout(deadline) {
+            Ok(panicked) => panicked,
+            Err(_) => {
+                crate::overlay_commit::set_term_flag_for_test(true);
+                let _ = rx.recv_timeout(Duration::from_secs(2));
+                panic!(
+                    "export bind failure did not return within {deadline:?}; interval or listener thread still running"
+                );
+            }
+        };
+        assert!(hook_panicked, "bind failure returned instead of exiting");
+        assert!(
+            started.elapsed() < deadline,
+            "bind-failure cleanup took too long"
+        );
+        let (code, msg) = seen
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .expect("exit hook did not run");
+        assert_eq!(code, 1, "{msg}");
+        assert!(msg.starts_with("error starting WebDAV server:"), "{msg}");
+        assert!(msg.contains("in use"), "bind error text changed: {msg}");
+        assert!(
+            weak.upgrade().is_none(),
+            "overlay Arc still alive after bind-failure cleanup (listener or interval thread still holds it)"
+        );
+        drop(held);
     }
 
     /// Regression: the control search callback must not keep the overlay alive

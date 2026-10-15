@@ -80,3 +80,7 @@ ratarmount-compress.workspace = true
 ratarmount-core.workspace = true
 ratarmount-formats-tar.workspace = true
 ratarmount-index.workspace = true
+
+[[test]]
+name = "fuse_rename_over"
+path = "../ratarmount-fuse/tests/fuse_rename_over.rs"

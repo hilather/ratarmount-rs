@@ -215,6 +215,14 @@ impl Parked {
     pub fn fd(&self) -> Option<&std::os::unix::io::OwnedFd> {
         self.fd.as_ref()
     }
+
+    /// Split the snapshot into the [`FileInfo`] and the parked descriptor.
+    ///
+    /// FUSE stores both on the detached inode. Dropping the owned descriptor closes it.
+    #[cfg(unix)]
+    pub fn into_parts(self) -> (FileInfo, Option<std::os::unix::io::OwnedFd>) {
+        (self.last_fi, self.fd)
+    }
 }
 
 impl std::fmt::Debug for Parked {
@@ -11633,8 +11641,10 @@ mod tests {
             .rename_parked("/swap", "/final")
             .expect("overlay rename")
             .expect("overlay-backed target is parked");
-        assert!(parked.fd().is_some(), "regular file park keeps an fd");
-        drop(parked);
+        let (fi, fd) = parked.into_parts();
+        assert!(fd.is_some(), "regular file park keeps an fd");
+        assert_eq!(fi.size, b"old-dest".len() as u64);
+        drop(fd);
         assert_eq!(fs::read(overlay.join("final")).unwrap(), b"new-src");
         assert!(ov.lookup("/swap", 0).is_none());
         assert!(!ov.is_deleted("/swap"));

@@ -4,6 +4,12 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 description = "FUSE layer for ratarmount-rs (fuser low-level)"
+# `tests/fuse_rename_over.rs` is a `ratarmount` integration test (it needs
+# `CARGO_BIN_EXE_ratarmount`). Cargo discovers that only as a package autotest,
+# so disable discovery here. The binary crate lists the file as `[[test]]`.
+autotests = false
+
+[lib]
 
 [dependencies]
 ratarmount-core.workspace = true

@@ -2,8 +2,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -13,8 +14,8 @@ use fuser::{
     FUSE_ROOT_ID,
 };
 use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
-use log::debug;
-use ratarmount_compositing::WriteOverlay;
+use log::{debug, warn};
+use ratarmount_compositing::{Parked, WriteOverlay};
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
 
@@ -309,6 +310,10 @@ enum OpenBackend {
         /// overlay commit bumps the generation and shifts archive offsets, so a
         /// smaller value means this handle must re-lookup and reopen.
         opened_generation: u64,
+        /// Opened from a detached archive inode, or marked at detach because this
+        /// fh already referred to the name being replaced or unlinked.
+        /// [`RatarmountFs::refresh_source_handle_if_stale`] leaves it alone.
+        detached: bool,
     },
     /// Empty file — no underlying open.
     Empty,
@@ -316,17 +321,66 @@ enum OpenBackend {
     OverlayFd(i32),
 }
 
+/// Host fd parked for a detached inode. Drop closes it and, in tests, counts
+/// that close. The count is the oracle for "the parked fd was released": a raw
+/// `F_GETFD` on the old number can succeed after the kernel reuses it.
+struct ParkedFd {
+    fd: OwnedFd,
+    #[cfg(test)]
+    drops: Option<Arc<AtomicUsize>>,
+}
+
+impl Drop for ParkedFd {
+    fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(counter) = self.drops.take() {
+            counter.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+}
+
+impl AsRawFd for ParkedFd {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.fd.as_raw_fd()
+    }
+}
+
+/// Old file a nodeid keeps answering with after rename-over or unlink (#88).
+///
+/// `path` is `"\0stale-{ino}"` on the inode entry. This snapshot is the name
+/// and attributes from before that rewrite.
+struct Detached {
+    /// Parked host inode. `Some` for an overlay regular file whose park open
+    /// succeeded (`O_PATH` on Linux, `O_RDONLY|O_NONBLOCK` elsewhere).
+    /// `None` for an archive-only target and for a metadata-only park
+    /// (symlink, or any park-open error other than `EMFILE`/`ENFILE`).
+    fd: Option<ParkedFd>,
+    /// Snapshot taken before the name moved or was removed.
+    /// `None` only when neither the park nor a pre-call lookup produced one.
+    last_fi: Option<FileInfo>,
+    /// Name before detach. Archive `OpenBackend::Source::path` uses this,
+    /// not `"\0stale-{ino}"`.
+    path: String,
+}
+
 struct InodeEntry {
     path: String,
     /// Fat FileInfo cache. Immutable mounts, the root, and archive members
     /// the write overlay has not shadowed. Overlay-backed children store
     /// [`InodeAttrCookie`] instead and re-lookup.
+    /// Stays `None` for the life of a detached inode.
     file_info: Option<FileInfo>,
     /// Compact getattr scalars on overlay-backed child inodes. Not served as
     /// getattr/open truth — those paths re-lookup. Cleared by the generation
     /// sweep. Never `Some` together with `file_info` on a child overlay inode.
     #[allow(dead_code)] // density store; production must not reconstruct FileInfo
     cookie: Option<InodeAttrCookie>,
+    /// Kernel lookup count. Root starts at 1. Every other inode starts at 0.
+    /// Never reset when the inode is detached.
+    nlookup: u64,
+    /// `Some` only while this nodeid is detached (`path` is `"\0stale-{ino}"`
+    /// and `path_to_ino` has no entry for it).
+    detached: Option<Detached>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -414,9 +468,12 @@ fn is_absent(err: &std::io::Error) -> bool {
 }
 
 fn is_connection_gone(err: &std::io::Error) -> bool {
+    // `ECONNABORTED` is the same end of session as `ENODEV`: the kernel
+    // returns it when the connection is aborted, including a normal unmount
+    // that interleaves with a `/dev/fuse` read or a notify write.
     matches!(
         err.raw_os_error(),
-        Some(libc::ENODEV | libc::ENOTCONN | libc::EBADF)
+        Some(libc::ENODEV | libc::ENOTCONN | libc::EBADF | libc::ECONNABORTED)
     )
 }
 
@@ -518,6 +575,10 @@ pub struct RatarmountFs {
     /// kernel may still hold a 60s attr, so [`Self::drop_stable_attr`] decides
     /// from this set. Never pre-seeded from the inode cache. A leaf lock.
     attr_advertised: Mutex<HashSet<u64>>,
+    /// Test hook: cloned into each [`ParkedFd`] so a drop of the detached
+    /// entry increments it. Production builds leave this unset.
+    #[cfg(test)]
+    park_fd_drops: Mutex<Option<Arc<AtomicUsize>>>,
 }
 
 impl RatarmountFs {
@@ -542,6 +603,8 @@ impl RatarmountFs {
                 path: "/".into(),
                 file_info: Some(ratarmount_core::create_root_file_info()),
                 cookie: None,
+                nlookup: 1,
+                detached: None,
             },
         );
         path_to_ino.insert("/".into(), FUSE_ROOT_ID);
@@ -561,6 +624,8 @@ impl RatarmountFs {
             pending_inval: Mutex::new(Vec::new()),
             entry_advertised: Mutex::new(HashSet::new()),
             attr_advertised: Mutex::new(HashSet::new()),
+            #[cfg(test)]
+            park_fd_drops: Mutex::new(None),
         }
     }
 
@@ -589,6 +654,8 @@ impl RatarmountFs {
                 path: path.to_string(),
                 file_info,
                 cookie,
+                nlookup: 0,
+                detached: None,
             },
         );
         ino
@@ -614,6 +681,12 @@ impl RatarmountFs {
     }
 
     fn write_inode_cache(&self, ent: &mut InodeEntry, ino: u64, fi: FileInfo) {
+        // A detached nodeid keeps `file_info` empty for the rest of its life.
+        // Repopulating it would let the 60s stable-attr cache apply and re-arm
+        // `attr_advertised` (#84 / #92).
+        if ent.detached.is_some() {
+            return;
+        }
         let (file_info, cookie) = self.inode_cache_from_fi(ino, Some(fi));
         ent.file_info = file_info;
         ent.cookie = cookie;
@@ -693,7 +766,7 @@ impl RatarmountFs {
     fn test_open_ro(&self, path: &str) -> Result<u64, i32> {
         let ino = self.ino_for_path(path);
         let fi = self.file_info_for_open(ino, path).ok_or(ENOENT)?;
-        self.open_source_backend(path.to_string(), fi)
+        self.open_source_backend(path.to_string(), fi, false)
     }
 
     #[cfg(test)]
@@ -759,6 +832,10 @@ impl RatarmountFs {
             // Inode and directory caches are ours. `entry_advertised` and
             // `attr_advertised` track kernel dentries and attrs and must
             // survive this sweep.
+            //
+            // `detached` and `nlookup` stay too. Clearing the snapshot would
+            // make the next getattr of a nodeid the kernel still holds return
+            // ENOENT (#88).
             for ent in self.inodes.lock().unwrap().values_mut() {
                 ent.file_info = None;
                 ent.cookie = None;
@@ -767,7 +844,7 @@ impl RatarmountFs {
         }
     }
 
-    fn open_source_backend(&self, path: String, fi: FileInfo) -> Result<u64, i32> {
+    fn open_source_backend(&self, path: String, fi: FileInfo, detached: bool) -> Result<u64, i32> {
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let gen = self.source.content_generation();
         if fi.size == 0 {
@@ -785,6 +862,7 @@ impl RatarmountFs {
                     readahead: ReadaheadState::default(),
                 })),
                 opened_generation: gen,
+                detached,
             },
         );
         Ok(fh)
@@ -792,6 +870,9 @@ impl RatarmountFs {
 
     /// Re-lookup and reopen an archive-backed fh after `content_generation` advances.
     /// Overlay fds stay put (POSIX unlinked-inode). Missing fh is left for `read`.
+    ///
+    /// A detached fh keeps the reader it opened. Re-resolving by path would
+    /// serve the file that now owns the name, or ENOENT on a tombstone.
     fn refresh_source_handle_if_stale(&self, fh: u64) -> Result<(), i32> {
         self.sweep_if_generation_advanced();
         let gen = self.source.content_generation();
@@ -801,8 +882,9 @@ impl RatarmountFs {
                 Some(OpenBackend::Source {
                     path,
                     opened_generation,
+                    detached,
                     ..
-                }) if *opened_generation < gen => path.clone(),
+                }) if !*detached && *opened_generation < gen => path.clone(),
                 _ => return Ok(()),
             }
         };
@@ -821,6 +903,7 @@ impl RatarmountFs {
                     readahead: ReadaheadState::default(),
                 })),
                 opened_generation: gen,
+                detached: false,
             }
         };
         let mut handles = self.handles.lock().unwrap();
@@ -945,6 +1028,7 @@ impl RatarmountFs {
             .unwrap()
             .insert(fh, OpenBackend::OverlayFd(fd));
         let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        self.bump_nlookup(ino);
         Ok((ttl, Self::file_attr(ino, &fi), fh))
     }
 
@@ -976,6 +1060,7 @@ impl RatarmountFs {
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         self.invalidate_dir_cache(&parent_path);
         let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
+        self.bump_nlookup(ino);
         Ok((ttl, Self::file_attr(ino, &fi)))
     }
 
@@ -985,18 +1070,31 @@ impl RatarmountFs {
         let parent_path = self.path_for_ino(parent).ok_or(ENOENT)?;
         let name = name.to_string_lossy();
         let ov = self.overlay.as_ref().ok_or(EROFS)?;
-        let r = if dir {
-            ov.rmdir(&path)
-        } else {
-            // FUSE-only (#88). Other frontends call `unlink` and never open the file.
-            ov.unlink_parked(&path).map(|_| ())
-        };
-        r.map_err(|e| {
-            debug!("{}: {e}", if dir { "rmdir" } else { "unlink" });
+        if dir {
+            // Directories are not parked. A held directory fd can still
+            // GETATTR ENOENT after rmdir.
+            ov.rmdir(&path).map_err(|e| {
+                debug!("rmdir: {e}");
+                overlay_errno(&e)
+            })?;
+            self.invalidate_dir_cache(&parent_path);
+            self.note_dir_changed(parent, &name);
+            return Ok(());
+        }
+        // Snapshot before unlink: afterwards the name is a tombstone.
+        let ino = self.existing_ino(&path);
+        let snap = ino.and_then(|ino| self.snapshot_file_info(ino, &path));
+        // FUSE-only (#88). Other frontends call `unlink` and never open the file.
+        let parked = ov.unlink_parked(&path).map_err(|e| {
+            debug!("unlink: {e}");
             overlay_errno(&e)
         })?;
         self.invalidate_dir_cache(&parent_path);
+        // While path_to_ino still maps the name, so a 60s member still gets
+        // its Entry + Inode from attr_advertised.
         self.note_dir_changed(parent, &name);
+        self.detach_unlinked(&path, ino, parked, snap);
+        self.mark_source_handles_detached(&path);
         Ok(())
     }
 
@@ -1031,10 +1129,16 @@ impl RatarmountFs {
                 Err(ENOENT)
             };
         }
+        // Snapshot the destination while the name still resolves to the old
+        // file. After the host rename, lookup(to) is the incoming file, and
+        // drop_stable_attr below clears a fat archive FileInfo.
+        let src_ino = self.existing_ino(&from);
+        let replaced = self.existing_ino(&to).filter(|ino| Some(*ino) != src_ino);
+        let snap = replaced.and_then(|ino| self.snapshot_file_info(ino, &to));
         // FUSE-only (#88). Other frontends call `rename` and never open the target.
-        // The snapshot is released with this call; the open still runs first.
-        match ov.rename_parked(&from, &to) {
-            Ok(_parked) => {}
+        // The park open runs inside rename_parked, before rename(2).
+        let parked = match ov.rename_parked(&from, &to) {
+            Ok(parked) => parked,
             Err(ratarmount_compositing::OverlayError::Io(e)) => {
                 debug!("rename {from} -> {to}: {e}");
                 return Err(io_to_errno(&e));
@@ -1043,7 +1147,7 @@ impl RatarmountFs {
                 debug!("rename {from} -> {to}: {e}");
                 return Err(EIO);
             }
-        }
+        };
         // Kernel cache: queue the old name, both children and both parents
         // before the rebind, while path_to_ino still maps `from` to the
         // source and `to` to a replaced target (afterwards neither does).
@@ -1077,7 +1181,10 @@ impl RatarmountFs {
         if newparent != parent {
             self.drop_stable_attr(newparent);
         }
-        self.rebind_after_rename(&from, &to);
+        self.rebind_after_rename(&from, &to, parked, snap);
+        // Handles only, after both inode maps are released.
+        self.mark_source_handles_detached(&from);
+        self.mark_source_handles_detached(&to);
         self.invalidate_dir_cache(&parent_path);
         self.invalidate_dir_cache(&newparent_path);
         Ok(())
@@ -1110,30 +1217,169 @@ impl RatarmountFs {
     /// FORGET yet); it must not resolve to the file now at `to`.
     /// Clears only the userspace cache; `attr_advertised` keeps the kernel
     /// record so a later `drop_stable_attr` still invalidates.
-    fn rebind_after_rename(&self, from: &str, to: &str) {
-        // Lock order matches ino_for_path_with_fi: path_to_ino, then inodes.
-        let mut p2i = self.path_to_ino.lock().unwrap();
-        let mut inodes = self.inodes.lock().unwrap();
-        let src = p2i.get(from).copied();
-        if let Some(old_dest) = p2i.get(to).copied() {
-            if Some(old_dest) != src {
-                p2i.remove(to);
-                if let Some(ent) = inodes.get_mut(&old_dest) {
-                    ent.path = format!("\0stale-{old_dest}");
+    ///
+    /// One `path_to_ino`-then-`inodes` section. The parked fd moves onto the
+    /// map here; dropping `Parked` earlier would close it first.
+    fn rebind_after_rename(
+        &self,
+        from: &str,
+        to: &str,
+        mut parked: Option<Parked>,
+        mut snap: Option<FileInfo>,
+    ) {
+        // Clone the test counter before either map lock. `build_detached` is
+        // a free function and must not borrow `self` under `inodes`.
+        let mut drops = self.park_drop_counter();
+        let doomed = {
+            // Lock order matches ino_for_path_with_fi: path_to_ino, then inodes.
+            let mut p2i = self.path_to_ino.lock().unwrap();
+            let mut inodes = self.inodes.lock().unwrap();
+            let src = p2i.get(from).copied();
+            let mut doomed = None;
+            if let Some(old_dest) = p2i.get(to).copied() {
+                if Some(old_dest) != src {
+                    p2i.remove(to);
+                    let pre_path = inodes
+                        .get(&old_dest)
+                        .map(|e| e.path.clone())
+                        .unwrap_or_else(|| to.to_string());
+                    let detached = build_detached(
+                        old_dest,
+                        pre_path,
+                        parked.take(),
+                        snap.take(),
+                        drops.take(),
+                    );
+                    doomed = install_detached(&mut inodes, old_dest, detached);
+                }
+            }
+            if let Some(src) = src {
+                p2i.remove(from);
+                if let Some(ent) = inodes.get_mut(&src) {
+                    ent.path = to.to_string();
                     ent.file_info = None;
                     ent.cookie = None;
                 }
+                p2i.insert(to.to_string(), src);
+            }
+            doomed
+        };
+        // Close a parked fd the kernel does not reference, outside the locks.
+        drop(doomed);
+        drop(parked);
+        drop(snap);
+        drop(drops);
+    }
+
+    /// Unlink twin of [`Self::rebind_after_rename`]'s detach half.
+    ///
+    /// A name the kernel never looked up has no inode. Its parked fd is closed
+    /// after both maps are released, same as a replaced inode with `nlookup` 0.
+    fn detach_unlinked(
+        &self,
+        path: &str,
+        ino: Option<u64>,
+        mut parked: Option<Parked>,
+        mut snap: Option<FileInfo>,
+    ) {
+        let mut drops = self.park_drop_counter();
+        let doomed = {
+            let mut p2i = self.path_to_ino.lock().unwrap();
+            let mut inodes = self.inodes.lock().unwrap();
+            if let Some(ino) = ino {
+                p2i.remove(path);
+                let pre_path = inodes
+                    .get(&ino)
+                    .map(|e| e.path.clone())
+                    .unwrap_or_else(|| path.to_string());
+                let detached =
+                    build_detached(ino, pre_path, parked.take(), snap.take(), drops.take());
+                install_detached(&mut inodes, ino, detached)
+            } else {
+                None
+            }
+        };
+        // Close a parked fd the kernel does not reference, outside the locks.
+        drop(doomed);
+        drop(parked);
+        drop(snap);
+        drop(drops);
+    }
+
+    /// Archive readers opened on `path` before this rename or unlink keep
+    /// those bytes across a later live commit.
+    fn mark_source_handles_detached(&self, path: &str) {
+        let mut handles = self.handles.lock().unwrap();
+        for backend in handles.values_mut() {
+            if let OpenBackend::Source {
+                path: stored,
+                detached,
+                ..
+            } = backend
+            {
+                if stored == path {
+                    *detached = true;
+                }
             }
         }
-        if let Some(src) = src {
-            p2i.remove(from);
-            if let Some(ent) = inodes.get_mut(&src) {
-                ent.path = to.to_string();
-                ent.file_info = None;
-                ent.cookie = None;
-            }
-            p2i.insert(to.to_string(), src);
+    }
+
+    /// Stable archive `FileInfo` if the fat cache still has it, otherwise a
+    /// lookup while the name still points at the old file.
+    fn snapshot_file_info(&self, ino: u64, path: &str) -> Option<FileInfo> {
+        if let Some(fi) = self.cached_stable_fi(ino) {
+            return Some(fi);
         }
+        self.source.lookup(path, 0)
+    }
+
+    /// Cloned into each [`ParkedFd`] so tests observe the close. Production
+    /// always returns `None`. Taken before the inode-map locks.
+    fn park_drop_counter(&self) -> Option<Arc<AtomicUsize>> {
+        #[cfg(test)]
+        {
+            self.park_fd_drops.lock().unwrap().clone()
+        }
+        #[cfg(not(test))]
+        {
+            let _ = self;
+            None
+        }
+    }
+
+    fn bump_nlookup(&self, ino: u64) {
+        if let Some(ent) = self.inodes.lock().unwrap().get_mut(&ino) {
+            ent.nlookup = ent.nlookup.saturating_add(1);
+        }
+    }
+
+    /// Subtract `n` kernel references. A detached inode is removed only at 0,
+    /// and its parked fd is closed after `inodes` is released. A still-linked
+    /// inode stays so the next lookup reuses the nodeid. Root is never removed.
+    fn forget_nlookup(&self, ino: u64, n: u64) {
+        let removed = {
+            let mut inodes = self.inodes.lock().unwrap();
+            let (left, is_detached) = {
+                let Some(ent) = inodes.get_mut(&ino) else {
+                    return;
+                };
+                if n > ent.nlookup {
+                    warn!(
+                        "forget ino={ino} nlookup={n} exceeds stored {}",
+                        ent.nlookup
+                    );
+                }
+                ent.nlookup = ent.nlookup.saturating_sub(n);
+                (ent.nlookup, ent.detached.is_some())
+            };
+            if ino != FUSE_ROOT_ID && left == 0 && is_detached {
+                inodes.remove(&ino)
+            } else {
+                None
+            }
+        };
+        // Parked fd closes here, outside `inodes`.
+        drop(removed);
     }
 
     /// Kernel attr/entry TTL for this `FileInfo`.
@@ -1227,13 +1473,59 @@ impl RatarmountFs {
         ttl
     }
 
-    /// FUSE `getattr` body: TTL and attr to reply, `None` for ENOENT.
-    fn getattr_reply(&self, ino: u64) -> Option<(Duration, FileAttr)> {
-        // Stable archive members return the fat cache. Overlay-backed inodes
-        // re-lookup so create (size 0) → write → stat/ls sees the real size.
-        let fi = self.file_info_for_ino(ino)?;
-        let ttl = self.reply_attr_ttl(ino, &fi);
-        Some((ttl, Self::file_attr(ino, &fi)))
+    /// FUSE `getattr` body. `Err(ENOENT)` when the inode is unknown.
+    /// `Err(EIO)` when `fstat` of a parked fd fails.
+    ///
+    /// A detached inode replies with TTL 0 and `nlink` 0 and does not re-arm
+    /// `attr_advertised`.
+    fn getattr_reply(&self, ino: u64) -> Result<(Duration, FileAttr), i32> {
+        enum View {
+            Fd(libc::c_int),
+            Meta(FileInfo),
+            Missing,
+            Live,
+        }
+        // Copy the raw fd under `inodes` and stat after the release.
+        let view = {
+            let inodes = self.inodes.lock().unwrap();
+            match inodes.get(&ino).and_then(|e| e.detached.as_ref()) {
+                Some(det) => {
+                    if let Some(fd) = &det.fd {
+                        View::Fd(fd.as_raw_fd())
+                    } else if let Some(fi) = det.last_fi.clone() {
+                        View::Meta(fi)
+                    } else {
+                        View::Missing
+                    }
+                }
+                None => View::Live,
+            }
+        };
+        match view {
+            View::Fd(fd) => {
+                let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+                // Session::run is one thread, so FORGET cannot close `fd`
+                // between the copy and this fstat. Do not dup: the read path
+                // sends a GETATTR per read.
+                if unsafe { libc::fstat(fd, &mut st) } != 0 {
+                    return Err(EIO);
+                }
+                Ok((Duration::ZERO, file_attr_from_stat(ino, &st)))
+            }
+            View::Meta(fi) => Ok((Duration::ZERO, Self::file_attr_nlink(ino, &fi, 0))),
+            View::Missing => {
+                debug!("getattr detached ino={ino} has no metadata");
+                Err(ENOENT)
+            }
+            View::Live => {
+                // Stable archive members return the fat cache. Overlay-backed
+                // inodes re-lookup so create (size 0) → write → stat/ls sees
+                // the real size.
+                let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+                let ttl = self.reply_attr_ttl(ino, &fi);
+                Ok((ttl, Self::file_attr(ino, &fi)))
+            }
+        }
     }
 
     fn queue_kernel(&self, item: KernelInval) {
@@ -1297,6 +1589,7 @@ impl RatarmountFs {
         let fi = self.lookup_file_info(&path)?;
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         let ttl = self.reply_entry_ttl(parent, name.as_ref(), ino, &fi);
+        self.bump_nlookup(ino);
         Some((ino, Self::file_attr(ino, &fi), ttl))
     }
 
@@ -1337,6 +1630,13 @@ impl RatarmountFs {
     }
 
     fn file_attr(ino: u64, fi: &FileInfo) -> FileAttr {
+        Self::file_attr_nlink(ino, fi, 1)
+    }
+
+    /// `nlink` is 0 only for a detached (replaced or unlinked) nodeid. The
+    /// moved source inode stays at 1; publishing 0 there makes a held fd read
+    /// as `(deleted)`.
+    fn file_attr_nlink(ino: u64, fi: &FileInfo, nlink: u32) -> FileAttr {
         let kind = mode_to_kind(fi.mode);
         let perm = (fi.mode & 0o7777) as u16;
         let mtime = unix_float_to_system_time(fi.mtime);
@@ -1350,7 +1650,7 @@ impl RatarmountFs {
             crtime: mtime,
             kind,
             perm,
-            nlink: 1,
+            nlink,
             uid: fi.uid,
             gid: fi.gid,
             rdev: 0,
@@ -1370,6 +1670,13 @@ impl RatarmountFs {
     /// is not getattr truth). Overlay lookup miss → `None`.
     fn file_info_for_ino(&self, ino: u64) -> Option<FileInfo> {
         self.sweep_if_generation_advanced();
+        {
+            let inodes = self.inodes.lock().unwrap();
+            if let Some(det) = inodes.get(&ino).and_then(|e| e.detached.as_ref()) {
+                // Do not store_fi and do not lookup `"\0stale-…"`.
+                return det.last_fi.clone();
+            }
+        }
         let path = self.path_for_ino(ino)?;
         if path == "/" {
             let fi = ratarmount_core::create_root_file_info();
@@ -1399,6 +1706,9 @@ impl RatarmountFs {
     /// Never chooses [`OpenBackend::Empty`] from a cached size 0 when the
     /// overlay has a host file. Overlay getattr/open still re-lookup.
     fn open_inode(&self, ino: u64, flags: i32) -> Result<(u64, u32), i32> {
+        if self.inode_is_detached(ino) {
+            return self.open_detached(ino, flags);
+        }
         let path = self.path_for_ino(ino).ok_or(ENOENT)?;
         let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
         // Writes always go to the overlay; reads of files that exist in the overlay
@@ -1440,8 +1750,164 @@ impl RatarmountFs {
         }
 
         let fi = self.file_info_for_open(ino, &path).ok_or(ENOENT)?;
-        let fh = self.open_source_backend(path, fi)?;
+        let fh = self.open_source_backend(path, fi, false)?;
         Ok((fh, fuser::consts::FOPEN_KEEP_CACHE))
+    }
+
+    fn inode_is_detached(&self, ino: u64) -> bool {
+        self.inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .is_some_and(|e| e.detached.is_some())
+    }
+
+    /// Read-only reopen of a parked inode, or a detached archive reader.
+    /// A new write open is `EACCES`. Does not call `open_overlay_fd` (that
+    /// takes `commit_gate`, which is not reentrant with park).
+    fn open_detached(&self, ino: u64, flags: i32) -> Result<(u64, u32), i32> {
+        let write = (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0;
+        if write {
+            return Err(EACCES);
+        }
+        enum Kind {
+            Fd(libc::c_int),
+            Archive { path: String, fi: FileInfo },
+            Meta,
+            Missing,
+        }
+        let kind = {
+            let inodes = self.inodes.lock().unwrap();
+            let Some(det) = inodes.get(&ino).and_then(|e| e.detached.as_ref()) else {
+                return Err(ENOENT);
+            };
+            if let Some(fd) = &det.fd {
+                Kind::Fd(fd.as_raw_fd())
+            } else if let Some(fi) = det.last_fi.clone() {
+                if is_detached_archive_file(&fi) {
+                    Kind::Archive {
+                        path: det.path.clone(),
+                        fi,
+                    }
+                } else {
+                    Kind::Meta
+                }
+            } else {
+                Kind::Missing
+            }
+        };
+        match kind {
+            Kind::Fd(raw) => {
+                let fd = reopen_parked_readonly(raw)?;
+                let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
+                self.handles
+                    .lock()
+                    .unwrap()
+                    .insert(fh, OpenBackend::OverlayFd(fd));
+                Ok((fh, 0))
+            }
+            Kind::Archive { path, fi } => {
+                let fh = self.open_source_backend(path, fi, true)?;
+                Ok((fh, fuser::consts::FOPEN_KEEP_CACHE))
+            }
+            Kind::Meta => Err(EACCES),
+            Kind::Missing => {
+                debug!("open detached ino={ino} has no metadata");
+                Err(ENOENT)
+            }
+        }
+    }
+
+    /// Body of `setattr`. Non-detached behavior is path `truncate`. A detached
+    /// inode refuses an fh-less setattr; a write fh `ftruncate`s that fd.
+    fn setattr_entry(
+        &self,
+        ino: u64,
+        size: Option<u64>,
+        fh: Option<u64>,
+    ) -> Result<(Duration, FileAttr), i32> {
+        if self.inode_is_detached(ino) {
+            return self.setattr_detached(ino, size, fh);
+        }
+        let path = self.path_for_ino(ino).ok_or(ENOENT)?;
+        if let Some(sz) = size {
+            let ov = self.overlay.as_ref().ok_or(EROFS)?;
+            ov.truncate(&path, sz).map_err(|e| {
+                debug!("truncate: {e}");
+                overlay_errno(&e)
+            })?;
+            self.drop_stable_attr(ino);
+        } else if !self.writable() {
+            return Err(ENOSYS);
+        }
+        let fi = self
+            .file_info_for_ino(ino)
+            .or_else(|| self.source.lookup(&path, 0))
+            .unwrap_or_else(ratarmount_core::create_root_file_info);
+        let ttl = self.reply_attr_ttl(ino, &fi);
+        Ok((ttl, Self::file_attr(ino, &fi)))
+    }
+
+    fn setattr_detached(
+        &self,
+        ino: u64,
+        size: Option<u64>,
+        fh: Option<u64>,
+    ) -> Result<(Duration, FileAttr), i32> {
+        let Some(fh) = fh else {
+            return Err(EACCES);
+        };
+        let fd = {
+            let handles = self.handles.lock().unwrap();
+            match handles.get(&fh) {
+                Some(OpenBackend::OverlayFd(fd)) => *fd,
+                _ => return Err(EACCES),
+            }
+        };
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(EIO);
+        }
+        // O_NOFOLLOW / O_LARGEFILE sit outside O_ACCMODE. Raw equality with
+        // O_RDWR would reject a write fd opened by `open_overlay_fd`.
+        let acc = flags & libc::O_ACCMODE;
+        if acc != libc::O_WRONLY && acc != libc::O_RDWR {
+            return Err(EACCES);
+        }
+        if let Some(sz) = size {
+            if unsafe { libc::ftruncate(fd, sz as libc::off_t) } != 0 {
+                return Err(io_to_errno(&std::io::Error::last_os_error()));
+            }
+        }
+        let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe { libc::fstat(fd, &mut st) } != 0 {
+            return Err(EIO);
+        }
+        Ok((Duration::ZERO, file_attr_from_stat(ino, &st)))
+    }
+
+    /// `GETXATTR` body. `Ok(None)` is ENODATA / ENOATTR.
+    fn xattr_value(&self, ino: u64, key: &str) -> Result<Option<Vec<u8>>, i32> {
+        let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        Ok(self.source.get_xattr(&fi, key))
+    }
+
+    /// `LISTXATTR` body.
+    fn xattr_list(&self, ino: u64) -> Result<Vec<String>, i32> {
+        let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        Ok(self.source.list_xattr(&fi))
+    }
+
+    #[cfg(test)]
+    fn nlookup_of(&self, ino: u64) -> Option<u64> {
+        self.inodes.lock().unwrap().get(&ino).map(|e| e.nlookup)
+    }
+
+    /// Install the parked-fd close counter before the rename or unlink that
+    /// captures it onto [`Detached`].
+    #[cfg(test)]
+    fn track_parked_fd_drops(&self, counter: Arc<AtomicUsize>) {
+        *self.park_fd_drops.lock().unwrap() = Some(counter);
     }
 
     #[cfg(test)]
@@ -1521,7 +1987,229 @@ fn join_path(parent: &str, name: &str) -> String {
     }
 }
 
+/// Archive regular file whose reader is opened from `last_fi` (not a parked fd).
+fn is_detached_archive_file(fi: &FileInfo) -> bool {
+    file_info_attr_stable(fi) && (fi.mode & ratarmount_core::S_IFMT) == ratarmount_core::S_IFREG
+}
+
+/// `nlink` is forced to 0. Do not publish `st_nlink`.
+fn file_attr_from_stat(ino: u64, st: &libc::stat) -> FileAttr {
+    // `mode_t` is `u32` on Linux and `u16` on macOS.
+    #[cfg(target_os = "macos")]
+    let mode = u32::from(st.st_mode);
+    #[cfg(not(target_os = "macos"))]
+    let mode = st.st_mode;
+    let size = u64::try_from(st.st_size).unwrap_or(0);
+    let mtime = unix_float_to_system_time(st.st_mtime as f64);
+    FileAttr {
+        ino,
+        size,
+        blocks: size.div_ceil(512),
+        atime: mtime,
+        mtime,
+        ctime: mtime,
+        crtime: mtime,
+        kind: mode_to_kind(mode),
+        perm: (mode & 0o7777) as u16,
+        nlink: 0,
+        uid: st.st_uid,
+        gid: st.st_gid,
+        rdev: 0,
+        blksize: BLKSIZE,
+        flags: 0,
+    }
+}
+
+/// Build the snapshot stored on a detached inode.
+///
+/// `pre_path` is the name before `InodeEntry.path` becomes `"\0stale-{ino}"`.
+/// Archive `OpenBackend::Source::path` uses it. `drops` is moved onto the
+/// parked fd when one exists (test close counter).
+fn build_detached(
+    ino: u64,
+    pre_path: String,
+    parked: Option<Parked>,
+    snap: Option<FileInfo>,
+    drops: Option<Arc<AtomicUsize>>,
+) -> Detached {
+    let (last_fi, raw_fd) = match parked {
+        Some(parked) => {
+            let (fi, fd) = parked.into_parts();
+            (Some(fi), fd)
+        }
+        None => (snap, None),
+    };
+    if last_fi.is_none() {
+        debug!("detach ino={ino} without FileInfo; getattr/open will return ENOENT");
+    }
+    #[cfg(not(test))]
+    let _ = &drops;
+    let fd = raw_fd.map(|owned| ParkedFd {
+        fd: owned,
+        #[cfg(test)]
+        drops,
+    });
+    Detached {
+        fd,
+        last_fi,
+        path: pre_path,
+    }
+}
+
+/// Store `detached` and, when the kernel holds no lookup reference, take the
+/// entry out so the caller can drop the parked fd outside `inodes`.
+fn install_detached(
+    inodes: &mut HashMap<u64, InodeEntry>,
+    ino: u64,
+    detached: Detached,
+) -> Option<InodeEntry> {
+    let nlookup = {
+        let ent = inodes.get_mut(&ino)?;
+        ent.path = format!("\0stale-{ino}");
+        ent.file_info = None;
+        ent.cookie = None;
+        ent.detached = Some(detached);
+        ent.nlookup
+    };
+    if nlookup == 0 {
+        inodes.remove(&ino)
+    } else {
+        None
+    }
+}
+
+/// Reopen a parked descriptor read-only. Linux uses `/proc/self/fd` (the proc
+/// entry is a symlink, so no `O_NOFOLLOW` and no `O_PATH`). Other unix dups
+/// the already-readable fd.
+fn reopen_parked_readonly(raw: libc::c_int) -> Result<libc::c_int, i32> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = std::ffi::CString::new(format!("/proc/self/fd/{raw}")).map_err(|_| EIO)?;
+        // O_CLOEXEC so a later exec does not inherit the orphan.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            Err(io_to_errno(&std::io::Error::last_os_error()))
+        } else {
+            Ok(fd)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let fd = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 0) };
+        if fd < 0 {
+            Err(io_to_errno(&std::io::Error::last_os_error()))
+        } else {
+            Ok(fd)
+        }
+    }
+}
+
+/// macOS `OPEN_MAX`. `libc` does not export that constant on apple.
+#[cfg(target_os = "macos")]
+const MACOS_OPEN_MAX: libc::rlim_t = 10_240;
+
+/// Cap a macOS `RLIMIT_NOFILE` hard limit that may be `RLIM_INFINITY`.
+///
+/// Pure so the cap is tested on Linux. `open_max` is 10240 on macOS.
+#[cfg(any(test, target_os = "macos"))]
+fn nofile_soft_target(
+    hard: libc::rlim_t,
+    sysctl_maxfilesperproc: Option<libc::rlim_t>,
+    open_max: libc::rlim_t,
+) -> libc::rlim_t {
+    let mut cap = open_max;
+    if let Some(sys) = sysctl_maxfilesperproc {
+        cap = cap.min(sys);
+    }
+    if hard != libc::RLIM_INFINITY {
+        cap = cap.min(hard);
+    }
+    cap
+}
+
+fn nofile_target(hard: libc::rlim_t) -> libc::rlim_t {
+    #[cfg(target_os = "macos")]
+    {
+        nofile_soft_target(hard, macos_maxfilesperproc(), MACOS_OPEN_MAX)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Linux hard limits for NOFILE are finite. Do not cap by OPEN_MAX.
+        hard
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_maxfilesperproc() -> Option<libc::rlim_t> {
+    let mut val: i32 = 0;
+    let mut len = std::mem::size_of::<i32>();
+    let name = std::ffi::CString::new("kern.maxfilesperproc").unwrap();
+    let rc = unsafe {
+        libc::sysctlbyname(
+            name.as_ptr(),
+            &mut val as *mut i32 as *mut libc::c_void,
+            &mut len,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    if rc != 0 {
+        warn!(
+            "sysctl kern.maxfilesperproc failed: {}",
+            std::io::Error::last_os_error()
+        );
+        None
+    } else {
+        Some(val as libc::rlim_t)
+    }
+}
+
+/// Raise the soft `RLIMIT_NOFILE` up to the platform target. Failure is logged.
+/// The mount continues: a later park then fails closed with `EMFILE`.
+fn raise_nofile_soft_to_hard() {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+        warn!(
+            "getrlimit(RLIMIT_NOFILE) failed: {}",
+            std::io::Error::last_os_error()
+        );
+        return;
+    }
+    let target = nofile_target(lim.rlim_max);
+    if lim.rlim_cur >= target {
+        return;
+    }
+    let raised = libc::rlimit {
+        rlim_cur: target,
+        rlim_max: lim.rlim_max,
+    };
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &raised) } != 0 {
+        warn!(
+            "setrlimit(RLIMIT_NOFILE) soft {} -> {target} (hard {}) failed: {}",
+            lim.rlim_cur,
+            lim.rlim_max,
+            std::io::Error::last_os_error()
+        );
+    }
+}
+
 impl Filesystem for RatarmountFs {
+    fn init(
+        &mut self,
+        _req: &Request<'_>,
+        _config: &mut fuser::KernelConfig,
+    ) -> Result<(), libc::c_int> {
+        raise_nofile_soft_to_hard();
+        Ok(())
+    }
+
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
+        self.forget_nlookup(ino, nlookup);
+    }
+
     fn lookup(&mut self, _req: &Request<'_>, parent: u64, name: &OsStr, reply: ReplyEntry) {
         match self.lookup_entry(parent, name) {
             Some((_, attr, ttl)) => reply.entry(&ttl, &attr, 0),
@@ -1531,8 +2219,8 @@ impl Filesystem for RatarmountFs {
 
     fn getattr(&mut self, _req: &Request<'_>, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         match self.getattr_reply(ino) {
-            Some((ttl, attr)) => reply.attr(&ttl, &attr),
-            None => reply.error(ENOENT),
+            Ok((ttl, attr)) => reply.attr(&ttl, &attr),
+            Err(errno) => reply.error(errno),
         }
     }
 
@@ -1640,6 +2328,8 @@ impl Filesystem for RatarmountFs {
                 userdata: vec![],
             };
             let cino = self.ino_for_path(&child);
+            // Amendment 8: this ABI does not count readdirplus as a lookup.
+            // `ino_for_path` leaves the child at nlookup 0. Do not bump here.
             full.push((cino, name, Self::file_attr(cino, &fi)));
         }
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
@@ -1812,39 +2502,20 @@ impl Filesystem for RatarmountFs {
         _atime: Option<fuser::TimeOrNow>,
         _mtime: Option<fuser::TimeOrNow>,
         _ctime: Option<SystemTime>,
-        _fh: Option<u64>,
+        fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let Some(path) = self.path_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        if let Some(sz) = size {
-            let Some(ov) = &self.overlay else {
-                reply.error(EROFS);
-                return;
-            };
-            if let Err(e) = ov.truncate(&path, sz) {
-                debug!("truncate: {e}");
-                reply.error(overlay_errno(&e));
-                return;
+        match self.setattr_entry(ino, size, fh) {
+            Ok((ttl, attr)) => {
+                reply.attr(&ttl, &attr);
+                self.flush_kernel_invals();
             }
-            self.drop_stable_attr(ino);
-        } else if !self.writable() {
-            reply.error(ENOSYS);
-            return;
+            Err(errno) => reply.error(errno),
         }
-        let fi = self
-            .file_info_for_ino(ino)
-            .or_else(|| self.source.lookup(&path, 0))
-            .unwrap_or_else(ratarmount_core::create_root_file_info);
-        let ttl = self.reply_attr_ttl(ino, &fi);
-        reply.attr(&ttl, &Self::file_attr(ino, &fi));
-        self.flush_kernel_invals();
     }
 
     fn release(
@@ -1886,14 +2557,11 @@ impl Filesystem for RatarmountFs {
         size: u32,
         reply: ReplyXattr,
     ) {
-        let Some(fi) = self.file_info_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
         let key = name.to_string_lossy();
-        match self.source.get_xattr(&fi, &key) {
-            Some(value) => reply_xattr_bytes(size, &value, reply),
-            None => {
+        match self.xattr_value(ino, key.as_ref()) {
+            Ok(Some(value)) => reply_xattr_bytes(size, &value, reply),
+            Err(errno) => reply.error(errno),
+            Ok(None) => {
                 // Linux: ENODATA; macOS/BSD: ENOATTR (same numeric value on many systems).
                 #[cfg(target_os = "linux")]
                 reply.error(libc::ENODATA);
@@ -1904,13 +2572,13 @@ impl Filesystem for RatarmountFs {
     }
 
     fn listxattr(&mut self, _req: &Request<'_>, ino: u64, size: u32, reply: ReplyXattr) {
-        let Some(fi) = self.file_info_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let keys = self.source.list_xattr(&fi);
-        let bytes = encode_xattr_list(&keys);
-        reply_xattr_bytes(size, &bytes, reply);
+        match self.xattr_list(ino) {
+            Ok(keys) => {
+                let bytes = encode_xattr_list(&keys);
+                reply_xattr_bytes(size, &bytes, reply);
+            }
+            Err(errno) => reply.error(errno),
+        }
     }
 }
 
@@ -1950,6 +2618,22 @@ fn mount_option_from_str(s: &str) -> MountOption {
     }
 }
 
+/// `Session::run` outcome after the mount has been established.
+///
+/// fuser 0.15 turns `ENODEV` into `Ok` and returns every other `read` errno.
+/// Upstream fuser treats `ECONNABORTED` as the same clean end of session
+/// (cberner/fuser#212). The kernel returns it when the connection is aborted,
+/// including a normal unmount that wins the race in `fuse_dev_do_read` after
+/// a request is dequeued and before it is copied (`!fpq->connected` yields
+/// `-ECONNABORTED` even when `abort_with_err` is false). Hundreds of in-flight
+/// `FORGET`s make that window likely. Other errnos stay failures.
+fn fuse_session_result(res: std::io::Result<()>) -> std::io::Result<()> {
+    match res {
+        Err(err) if err.raw_os_error() == Some(libc::ECONNABORTED) => Ok(()),
+        other => other,
+    }
+}
+
 /// Mount `source` at `mountpoint` (blocking).
 ///
 /// `extra_fuse_opts` is the `-o` / `--fuse` string (comma-separated).
@@ -1982,6 +2666,8 @@ pub fn mount_blocking(
         options.push(opt);
     }
     let _ = foreground;
+    // Idempotent with `Filesystem::init`. In place before `Session::new`.
+    raise_nofile_soft_to_hard();
     let fs = RatarmountFs::with_readahead(source, overlay, readahead);
     // `mount2` does not hand back `Session::notifier`. The notifier thread
     // must exist before `run` so a shadowed archive member can drop a 60s
@@ -1996,13 +2682,13 @@ pub fn mount_blocking(
     // up, hence the explicit unmount. A notify parked on a directory
     // `i_rwsem` returns once the holder drops that lock; the holder was
     // waiting on a reply the session thread sent before `run` returned.
-    // After unmount a further write fails with `ENODEV` (thread exits), and
-    // the dropped sender ends `recv`.
+    // After unmount a further write fails with `ENODEV` or `ECONNABORTED`
+    // (thread exits), and the dropped sender ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
     let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
     let (tx, notifier_thread) = spawn_notifier(session.notifier());
     kernel_notify.install(tx);
-    let res = session.run();
+    let res = fuse_session_result(session.run());
     kernel_notify.clear();
     session.unmount();
     let _ = notifier_thread.join();
@@ -2859,14 +3545,23 @@ mod tests {
     /// Regression: FUSE rename returned ENOSYS (#86). Overwrite keeps the
     /// source inode and detaches the replaced destination inode so a kernel
     /// reference to it cannot resolve to the new file at `to`.
+    ///
+    /// A looked-up destination (nlookup >= 1) keeps the old size. A destination
+    /// that only plain readdir created (nlookup 0) is dropped at detach.
     #[test]
     fn rename_paths_rebinds_source_inode_and_detaches_replaced_destination() {
         let (_dir, ov, fs) = overlay_fs_for_rename();
         overlay_write_new(&ov, "/src", b"source-body");
         overlay_write_new(&ov, "/dst", b"dest");
-        let src_ino = fs.ino_for_path("/src");
-        let dst_ino = fs.ino_for_path("/dst");
+        let (src_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("src"))
+            .expect("lookup src");
+        let (dst_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("dst"))
+            .expect("lookup dst");
         assert_ne!(src_ino, dst_ino);
+        assert!(fs.nlookup_of(src_ino).unwrap() >= 1);
+        assert!(fs.nlookup_of(dst_ino).unwrap() >= 1);
         fs.list_mode_cached("/").expect("prime dir cache");
 
         fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
@@ -2875,11 +3570,19 @@ mod tests {
         assert_eq!(fs.path_for_ino(src_ino).as_deref(), Some("/dst"));
         assert_eq!(fs.path_to_ino.lock().unwrap().get("/dst"), Some(&src_ino));
         assert!(!fs.path_to_ino.lock().unwrap().contains_key("/src"));
-        assert_ne!(fs.path_for_ino(dst_ino).as_deref(), Some("/dst"));
-        assert!(
-            fs.file_info_for_ino(dst_ino).is_none(),
-            "replaced destination inode must not resolve to the renamed file"
+        assert_eq!(
+            fs.path_for_ino(dst_ino).as_deref(),
+            Some(format!("\0stale-{dst_ino}").as_str())
         );
+        assert!(
+            fs.cached_fi(dst_ino).is_none(),
+            "detached inode keeps file_info empty"
+        );
+        let old = fs
+            .file_info_for_ino(dst_ino)
+            .expect("replaced destination still answers with the old file");
+        assert_eq!(old.size, b"dest".len() as u64);
+        assert_ne!(old.size, b"source-body".len() as u64);
         assert_eq!(
             fs.file_info_for_ino(src_ino).expect("renamed").size,
             b"source-body".len() as u64
@@ -2903,6 +3606,16 @@ mod tests {
             .expect("plain rename");
         assert!(ov.lookup("/final", 0).is_some());
         assert!(ov.lookup("/tmp", 0).is_none());
+
+        // nlookup 0 (ino_for_path only, no lookup) is dropped at detach.
+        overlay_write_new(&ov, "/zero-src", b"zs");
+        overlay_write_new(&ov, "/zero-dst", b"zd");
+        let zero_dst = fs.ino_for_path("/zero-dst");
+        assert_eq!(fs.nlookup_of(zero_dst), Some(0));
+        fs.rename_paths(FUSE_ROOT_ID, "zero-src", FUSE_ROOT_ID, "zero-dst", 0)
+            .expect("rename over unreferenced destination");
+        assert!(fs.path_for_ino(zero_dst).is_none());
+        assert!(fs.file_info_for_ino(zero_dst).is_none());
     }
 
     /// Regression (#86): rename errnos. renameat2 flags are refused (EINVAL),
@@ -2982,6 +3695,22 @@ mod tests {
             libc::ENOSPC
         );
         assert_eq!(io_to_errno(&io::Error::other("generic")), EIO);
+    }
+
+    /// Regression: unmount with many in-flight FORGETs returns ECONNABORTED
+    /// (os error 103) from fuser 0.15 `Session::run`. That is a clean session
+    /// end, same as ENODEV. A real I/O error still fails the mount.
+    #[test]
+    fn fuse_session_result_treats_econnaborted_as_clean_unmount() {
+        let aborted = io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert!(
+            fuse_session_result(Err(aborted)).is_ok(),
+            "ECONNABORTED must not fail the mount"
+        );
+        assert!(fuse_session_result(Ok(())).is_ok());
+        let io_err = io::Error::from_raw_os_error(libc::EIO);
+        let mapped = fuse_session_result(Err(io_err)).expect_err("EIO stays an error");
+        assert_eq!(mapped.raw_os_error(), Some(libc::EIO));
     }
 
     /// Regression: dir_cache 30s TTL must not hide overlay creates from readdir.
@@ -4142,12 +4871,17 @@ mod tests {
         drop(thread);
     }
 
-    /// Regression: ENODEV, ENOTCONN, and EBADF mean the FUSE connection is gone.
-    /// The notifier exits on the first of those, without delivering the rest of
-    /// the batch, while the sender is still alive.
+    /// Regression: ENODEV, ENOTCONN, EBADF, and ECONNABORTED mean the FUSE
+    /// connection is gone. The notifier exits on the first of those, without
+    /// delivering the rest of the batch, while the sender is still alive.
     #[test]
     fn notifier_exits_on_enodev() {
-        for code in [libc::ENODEV, libc::ENOTCONN, libc::EBADF] {
+        for code in [
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::EBADF,
+            libc::ECONNABORTED,
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let (done_tx, done_rx) = mpsc::channel();
 
@@ -4958,5 +5692,690 @@ mod tests {
             fs.entry_advertised.lock().unwrap().is_empty(),
             "readdirplus must not advertise entries while its TTL is zero"
         );
+    }
+
+    fn overlay_fd_of(fs: &RatarmountFs, fh: u64) -> i32 {
+        match fs.handles.lock().unwrap().get(&fh) {
+            Some(OpenBackend::OverlayFd(fd)) => *fd,
+            _ => panic!("fh {fh} is not an overlay fd"),
+        }
+    }
+
+    fn pwrite_all(fd: i32, data: &[u8]) {
+        let n = unsafe { libc::pwrite(fd, data.as_ptr().cast(), data.len(), 0) };
+        assert_eq!(
+            n,
+            data.len() as isize,
+            "pwrite: {}",
+            std::io::Error::last_os_error()
+        );
+    }
+
+    /// Archive bytes owned by the `Cursor` at `open` time, copied out of
+    /// `FileInfo` userdata (`bytes:…`). A later map edit is visible only to a
+    /// refresh that calls `open` again.
+    struct ByteMembers {
+        files: Mutex<BTreeMap<String, Vec<u8>>>,
+        gen: Arc<AtomicU64>,
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl MountSource for ByteMembers {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            let files = self.files.lock().unwrap();
+            let m = files
+                .iter()
+                .map(|(name, body)| (name.clone(), byte_fi(body)))
+                .collect();
+            Some(ListResult::Infos(m))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            let name = path.strip_prefix('/')?;
+            let files = self.files.lock().unwrap();
+            files.get(name).map(|body| byte_fi(body))
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            let body = fi
+                .userdata
+                .iter()
+                .find_map(|u| match u {
+                    UserData::Other(s) => s
+                        .strip_prefix("bytes:")
+                        .map(|rest| rest.as_bytes().to_vec()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            Ok(Box::new(io::Cursor::new(body)))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+
+        fn content_generation(&self) -> u64 {
+            self.gen.load(Ordering::SeqCst)
+        }
+    }
+
+    fn byte_fi(body: &[u8]) -> FileInfo {
+        FileInfo {
+            size: body.len() as u64,
+            mtime: 1.0,
+            mode: S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Other(format!(
+                "bytes:{}",
+                String::from_utf8_lossy(body)
+            ))],
+        }
+    }
+
+    fn byte_members_fs(
+        entries: &[(&str, &str)],
+    ) -> (tempfile::TempDir, RatarmountFs, Arc<ByteMembers>) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut files = BTreeMap::new();
+        for (name, body) in entries {
+            files.insert((*name).to_string(), body.as_bytes().to_vec());
+        }
+        let bytes = Arc::new(ByteMembers {
+            files: Mutex::new(files),
+            gen: Arc::new(AtomicU64::new(0)),
+            opens: Arc::new(AtomicUsize::new(0)),
+        });
+        let base = Arc::clone(&bytes) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
+        (dir, fs, bytes)
+    }
+
+    struct XattrMembers {
+        files: BTreeMap<String, FileInfo>,
+    }
+
+    impl MountSource for XattrMembers {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            Some(ListResult::Infos(self.files.clone()))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                return Some(ratarmount_core::create_root_file_info());
+            }
+            self.files.get(path.trim_start_matches('/')).cloned()
+        }
+
+        fn open(&self, fi: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(vec![0u8; fi.size as usize])))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+
+        fn get_xattr(&self, fi: &FileInfo, key: &str) -> Option<Vec<u8>> {
+            if key != "user.demo" {
+                return None;
+            }
+            fi.userdata.iter().find_map(|u| match u {
+                UserData::Other(s) => s.strip_prefix("xattr:").map(|v| v.as_bytes().to_vec()),
+                _ => None,
+            })
+        }
+
+        fn list_xattr(&self, fi: &FileInfo) -> Vec<String> {
+            if self.get_xattr(fi, "user.demo").is_some() {
+                vec!["user.demo".into()]
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    fn xattr_fi(mode: u32, linkname: &str, value: &str, size: u64) -> FileInfo {
+        FileInfo {
+            size,
+            mtime: 1.0,
+            mode,
+            linkname: linkname.into(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![UserData::Other(format!("xattr:{value}"))],
+        }
+    }
+
+    fn xattr_members_fs(files: BTreeMap<String, FileInfo>) -> (tempfile::TempDir, RatarmountFs) {
+        use ratarmount_compositing::WriteOverlay;
+
+        let dir = tempfile::tempdir().unwrap();
+        let base = Arc::new(XattrMembers { files }) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, dir.path()).expect("overlay"));
+        let fs = RatarmountFs::new(Arc::clone(&ov) as Arc<dyn MountSource>, Some(ov));
+        (dir, fs)
+    }
+
+    /// Regression (#88): rename-over of an overlay file made the old nodeid
+    /// GETATTR/OPEN ENOENT (`"\0stale-…"`). It keeps the old bytes, nlink 0,
+    /// TTL 0. A new write open is EACCES.
+    #[test]
+    fn detached_overlay_rename_getattr_open_read_old_bytes() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/dst", b"old-dest");
+        overlay_write_new(&ov, "/src", b"new-src");
+        let (src_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("src"))
+            .expect("src");
+        let (dst_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("dst"))
+            .expect("dst");
+        assert!(fs.nlookup_of(dst_ino).unwrap() >= 1);
+
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .expect("rename over");
+
+        assert_eq!(
+            fs.path_for_ino(dst_ino).as_deref(),
+            Some(format!("\0stale-{dst_ino}").as_str())
+        );
+        assert!(fs.cached_fi(dst_ino).is_none());
+        let (ttl, attr) = fs.getattr_reply(dst_ino).expect("detached getattr");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        assert_eq!(attr.size, b"old-dest".len() as u64);
+        let (fh, flags) = fs
+            .open_inode(dst_ino, libc::O_RDONLY)
+            .expect("reopen parked");
+        assert_eq!(flags, 0);
+        assert_eq!(fs.test_read(fh, 0, 32).unwrap(), b"old-dest");
+        assert_eq!(fs.open_inode(dst_ino, libc::O_RDWR).unwrap_err(), EACCES);
+        assert_eq!(fs.open_inode(dst_ino, libc::O_WRONLY).unwrap_err(), EACCES);
+        assert_eq!(fs.path_for_ino(src_ino).as_deref(), Some("/dst"));
+        let (src_ttl, src_attr) = fs.getattr_reply(src_ino).expect("moved source");
+        assert_eq!(src_attr.size, b"new-src".len() as u64);
+        assert_eq!(src_attr.nlink, 1);
+        assert!(src_ttl.is_zero(), "copied-up source is overlay-backed");
+        assert_eq!(fs.xattr_value(dst_ino, "user.demo").unwrap(), None);
+    }
+
+    /// Regression (#88): unlink of an overlay file the kernel still holds
+    /// kept answering ENOENT. The old id still reads the old body.
+    #[test]
+    fn detached_overlay_unlink_keeps_attrs_and_bytes() {
+        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/gone", b"keep-me");
+        let (ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("gone"))
+            .expect("lookup");
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("gone"), false)
+            .expect("unlink");
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("gone")).is_none());
+        let (ttl, attr) = fs.getattr_reply(ino).expect("detached getattr");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        let (fh, _) = fs.open_inode(ino, libc::O_RDONLY).expect("reopen");
+        assert_eq!(fs.test_read(fh, 0, 32).unwrap(), b"keep-me");
+    }
+
+    /// Regression (#88): a reader opened on an archive member before
+    /// rename-over, and one opened on the detached id, must keep the old
+    /// payload after `content_generation` advances. A still-linked member
+    /// still refreshes.
+    #[test]
+    fn detached_archive_rename_open_skips_refresh() {
+        let (_dir, fs, bytes) = byte_members_fs(&[
+            ("final", "OLD-FINAL"),
+            ("src", "NEW-SRC"),
+            ("keep", "KEEP-BEFORE"),
+        ]);
+        let (final_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("final"))
+            .expect("final");
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src"))
+            .expect("src");
+        let (fh_before, _) = fs
+            .open_inode(final_ino, libc::O_RDONLY)
+            .expect("open final before rename");
+        assert!(matches!(
+            fs.handles.lock().unwrap().get(&fh_before),
+            Some(OpenBackend::Source { .. })
+        ));
+
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "final", 0)
+            .expect("rename over archive member");
+        let live = fs.source.lookup("/final", 0).expect("name is the copy-up");
+        assert!(
+            live.userdata
+                .iter()
+                .any(|u| matches!(u, UserData::Other(s) if s.starts_with("overlay:"))),
+            "post-rename lookup of /final is the overlay file"
+        );
+
+        let (fh_detached, flags) = fs
+            .open_inode(final_ino, libc::O_RDONLY)
+            .expect("open detached archive id");
+        assert_eq!(flags, fuser::consts::FOPEN_KEEP_CACHE);
+        let (keep_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("keep"))
+            .expect("keep");
+        let (fh_keep, _) = fs
+            .open_inode(keep_ino, libc::O_RDONLY)
+            .expect("open still-linked member");
+        let opens_before = bytes.opens.load(Ordering::SeqCst);
+
+        bytes
+            .files
+            .lock()
+            .unwrap()
+            .insert("keep".into(), b"KEEP-AFTER".to_vec());
+        bytes.gen.fetch_add(1, Ordering::SeqCst);
+
+        assert_eq!(
+            fs.test_read(fh_before, 0, 32).unwrap(),
+            b"OLD-FINAL",
+            "fh opened before rename must not follow the new file"
+        );
+        assert_eq!(fs.test_read(fh_detached, 0, 32).unwrap(), b"OLD-FINAL");
+        assert_eq!(
+            bytes.opens.load(Ordering::SeqCst),
+            opens_before,
+            "detached reads must not reopen"
+        );
+        assert_eq!(fs.test_read(fh_keep, 0, 32).unwrap(), b"KEEP-AFTER");
+        assert!(
+            bytes.opens.load(Ordering::SeqCst) > opens_before,
+            "still-linked member refreshes"
+        );
+        assert!(fs.cached_fi(final_ino).is_none());
+        let (ttl, attr) = fs.getattr_reply(final_ino).expect("getattr after bump");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        assert_eq!(attr.size, b"OLD-FINAL".len() as u64);
+    }
+
+    /// Regression (#88): unlink of a looked-up archive member keeps the old
+    /// bytes across a generation bump. The name is gone.
+    #[test]
+    fn detached_archive_unlink_keeps_bytes_across_generation() {
+        let (_dir, mut fs, bytes) = byte_members_fs(&[("gone", "ARCHIVE-BODY")]);
+        let (ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("gone"))
+            .expect("lookup");
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("gone"), false)
+            .expect("unlink");
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("gone")).is_none());
+        let (fh, _) = fs.open_inode(ino, libc::O_RDONLY).expect("open detached");
+        let opens = bytes.opens.load(Ordering::SeqCst);
+        bytes
+            .files
+            .lock()
+            .unwrap()
+            .insert("gone".into(), b"REPLACED".to_vec());
+        bytes.gen.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(fs.test_read(fh, 0, 32).unwrap(), b"ARCHIVE-BODY");
+        assert_eq!(bytes.opens.load(Ordering::SeqCst), opens);
+    }
+
+    /// Regression (#88): detached GETXATTR and readlink use the pre-rename
+    /// FileInfo, not lookup of the name after the replace.
+    #[test]
+    fn detached_archive_xattr_and_readlink_use_last_fi() {
+        let mut files = BTreeMap::new();
+        files.insert("reg".into(), xattr_fi(S_IFREG | 0o644, "", "old-reg", 4));
+        files.insert(
+            "lnk".into(),
+            xattr_fi(S_IFLNK | 0o777, "old-target", "old-link", 0),
+        );
+        files.insert("newreg".into(), xattr_fi(S_IFREG | 0o644, "", "new-reg", 4));
+        files.insert(
+            "newlnk".into(),
+            xattr_fi(S_IFREG | 0o644, "", "new-link", 4),
+        );
+        let (_dir, fs) = xattr_members_fs(files);
+        let (reg, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("reg"))
+            .expect("reg");
+        let (lnk, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("lnk"))
+            .expect("lnk");
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("newreg")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("newlnk")).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "newreg", FUSE_ROOT_ID, "reg", 0)
+            .unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "newlnk", FUSE_ROOT_ID, "lnk", 0)
+            .unwrap();
+
+        assert_eq!(
+            fs.xattr_value(reg, "user.demo").unwrap().as_deref(),
+            Some(b"old-reg".as_slice())
+        );
+        assert_eq!(fs.xattr_list(reg).unwrap(), vec!["user.demo".to_string()]);
+        let live = fs.source.lookup("/reg", 0).expect("replaced name");
+        assert!(fs.source.get_xattr(&live, "user.demo").is_none());
+        assert_eq!(
+            fs.xattr_value(lnk, "user.demo").unwrap().as_deref(),
+            Some(b"old-link".as_slice())
+        );
+        assert_eq!(fs.readlink_target(lnk).as_deref(), Some("old-target"));
+        assert_eq!(fs.open_inode(lnk, libc::O_RDONLY).unwrap_err(), EACCES);
+    }
+
+    /// Regression (#88): a symlink park has no fd. Readlink and getattr use
+    /// the snapshot; open is EACCES.
+    #[test]
+    fn detached_symlink_metadata_only_open_eacces() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        ov.create_symlink("/link", "old-target").expect("symlink");
+        overlay_write_new(&ov, "/src", b"file");
+        let (link_ino, _, _) = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("link"))
+            .expect("link");
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "link", 0)
+            .expect("file over symlink");
+        assert!(fs
+            .inodes
+            .lock()
+            .unwrap()
+            .get(&link_ino)
+            .is_some_and(|e| { e.detached.as_ref().is_some_and(|d| d.fd.is_none()) }));
+        assert_eq!(fs.readlink_target(link_ino).as_deref(), Some("old-target"));
+        let (ttl, attr) = fs.getattr_reply(link_ino).expect("getattr");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        assert_eq!(attr.kind, FileType::Symlink);
+        assert_eq!(fs.open_inode(link_ino, libc::O_RDONLY).unwrap_err(), EACCES);
+    }
+
+    /// Regression (#88): the parked fd closes only when FORGET brings nlookup
+    /// to 0. The close is counted on `ParkedFd` drop (an fd number can be
+    /// reused, so `F_GETFD` is not an oracle).
+    #[test]
+    fn forget_closes_parked_fd_only_at_zero() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/dst", b"old-dest");
+        overlay_write_new(&ov, "/src", b"new-src");
+        let counter = Arc::new(AtomicUsize::new(0));
+        fs.track_parked_fd_drops(Arc::clone(&counter));
+        let (dst, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        assert_eq!(fs.nlookup_of(dst), Some(2));
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .unwrap();
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        assert!(fs.path_for_ino(dst).is_some());
+
+        fs.forget_nlookup(dst, 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "partial forget keeps the fd"
+        );
+        assert!(fs.path_for_ino(dst).is_some());
+
+        fs.forget_nlookup(dst, 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(fs.path_for_ino(dst).is_none());
+
+        fs.forget_nlookup(dst, 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+    }
+
+    /// Regression (#88): FORGET of a still-linked file down to 0 keeps the
+    /// inode. The next lookup reuses it.
+    #[test]
+    fn forget_partial_keeps_still_linked_inode() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/p", b"p");
+        let (ino, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("p")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("p")).unwrap();
+        assert_eq!(fs.nlookup_of(ino), Some(2));
+        fs.forget_nlookup(ino, 1);
+        assert_eq!(fs.nlookup_of(ino), Some(1));
+        assert_eq!(fs.path_for_ino(ino).as_deref(), Some("/p"));
+        assert_eq!(fs.path_to_ino.lock().unwrap().get("/p"), Some(&ino));
+
+        fs.forget_nlookup(ino, 1);
+        assert_eq!(fs.nlookup_of(ino), Some(0));
+        assert_eq!(fs.path_for_ino(ino).as_deref(), Some("/p"));
+        assert_eq!(fs.path_to_ino.lock().unwrap().get("/p"), Some(&ino));
+
+        let (again, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("p")).unwrap();
+        assert_eq!(again, ino);
+        assert_eq!(fs.nlookup_of(ino), Some(1));
+    }
+
+    /// Regression (#88): create after unlink allocates a new nodeid. The
+    /// detached id still getattrs until its own FORGET.
+    #[test]
+    fn create_after_unlink_allocates_new_nodeid() {
+        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/a", b"old-a");
+        let (old, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("a")).unwrap();
+        let n = fs.nlookup_of(old).unwrap();
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("a"), false)
+            .unwrap();
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("a")).is_none());
+        let (_ttl, attr, _fh) = fs
+            .create_entry(FUSE_ROOT_ID, OsStr::new("a"), 0o644)
+            .expect("create");
+        assert_ne!(attr.ino, old);
+        let (got, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("a")).unwrap();
+        assert_eq!(got, attr.ino);
+        assert!(fs.getattr_reply(old).is_ok());
+        fs.forget_nlookup(old, n);
+        assert!(fs.getattr_reply(old).is_err());
+    }
+
+    /// Regression (#88): fh-less SETATTR on a detached id is EACCES and does
+    /// not change the orphan. A write fh opened before the rename truncates
+    /// that fd. The name keeps the new file's length.
+    #[test]
+    fn setattr_detached_without_fh_is_eacces_with_write_fh_truncates() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/dst", b"old-dest");
+        overlay_write_new(&ov, "/src", b"abcd");
+        let (dst, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        let (write_fh, _) = fs.open_inode(dst, libc::O_RDWR).expect("write fh");
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .unwrap();
+
+        assert_eq!(fs.setattr_entry(dst, Some(2), None).unwrap_err(), EACCES);
+        let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+        let wfd = overlay_fd_of(&fs, write_fh);
+        assert_eq!(unsafe { libc::fstat(wfd, &mut st) }, 0);
+        assert_eq!(st.st_size, b"old-dest".len() as i64);
+
+        let (ttl, attr) = fs
+            .setattr_entry(dst, Some(3), Some(write_fh))
+            .expect("ftruncate write fh");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        assert_eq!(attr.size, 3);
+        assert_eq!(fs.test_read(write_fh, 0, 8).unwrap().len(), 3);
+
+        let live = fs.source.lookup("/dst", 0).expect("new file");
+        assert_eq!(live.size, b"abcd".len() as u64);
+
+        let (ro_fh, _) = fs.open_inode(dst, libc::O_RDONLY).expect("reopen");
+        assert_eq!(
+            fs.setattr_entry(dst, Some(1), Some(ro_fh)).unwrap_err(),
+            EACCES
+        );
+    }
+
+    /// Regression (#88): a write fh opened before rename-over keeps pwrite
+    /// on the orphan. lookup of the name sees the incoming file.
+    #[test]
+    fn pre_rename_writer_keeps_writing_orphan() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/dst", b"old-dest");
+        overlay_write_new(&ov, "/src", b"new");
+        let (dst, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        let (fh, _) = fs.open_inode(dst, libc::O_RDWR).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .unwrap();
+        pwrite_all(overlay_fd_of(&fs, fh), b"ORPHAN!\n");
+        assert_eq!(fs.test_read(fh, 0, 16).unwrap(), b"ORPHAN!\n");
+        let live = fs.source.lookup("/dst", 0).expect("incoming");
+        assert_eq!(live.size, b"new".len() as u64);
+        let (now, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        assert_ne!(now, dst);
+        let (fh_live, _) = fs.open_inode(now, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.test_read(fh_live, 0, 8).unwrap(), b"new");
+    }
+
+    /// Regression (#88): root starts at nlookup 1 and is never removed.
+    /// Plain readdir / readdirplus (`ino_for_path`) leaves a child at 0
+    /// (amendment 8: this ABI does not bump on readdirplus). A lookup bumps
+    /// that child; FORGET then brings it back to 0 and keeps the entry.
+    #[test]
+    fn nlookup_root_starts_at_one_and_readdirplus_does_not_bump_children() {
+        let (_dir, ov, fs) = overlay_fs_for_rename();
+        assert_eq!(fs.nlookup_of(FUSE_ROOT_ID), Some(1));
+        fs.forget_nlookup(FUSE_ROOT_ID, 1);
+        assert_eq!(fs.nlookup_of(FUSE_ROOT_ID), Some(0));
+        assert_eq!(fs.path_for_ino(FUSE_ROOT_ID).as_deref(), Some("/"));
+
+        overlay_write_new(&ov, "/c", b"c");
+        let child = fs.ino_for_path("/c");
+        assert_eq!(fs.nlookup_of(child), Some(0));
+
+        let (id, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("c")).unwrap();
+        assert_eq!(id, child);
+        assert_eq!(fs.nlookup_of(child), Some(1));
+        fs.forget_nlookup(child, 1);
+        assert_eq!(fs.nlookup_of(child), Some(0));
+        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/c"));
+        assert_eq!(fs.path_to_ino.lock().unwrap().get("/c"), Some(&child));
+    }
+
+    /// Regression (#88): macOS must not set a soft NOFILE of RLIM_INFINITY.
+    /// The cap is min(finite hard, kern.maxfilesperproc, OPEN_MAX).
+    #[test]
+    fn nofile_soft_target_caps_infinite_hard_limit() {
+        assert_eq!(
+            nofile_soft_target(libc::RLIM_INFINITY, Some(10_240), 10_240),
+            10_240
+        );
+        assert_eq!(nofile_soft_target(512, Some(10_240), 10_240), 512);
+        assert_eq!(
+            nofile_soft_target(libc::RLIM_INFINITY, None, 10_240),
+            10_240
+        );
+        let mut before = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut before) },
+            0
+        );
+        raise_nofile_soft_to_hard();
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) },
+            0
+        );
+        assert!(
+            after.rlim_cur >= before.rlim_cur,
+            "soft {} -> {} must not decrease",
+            before.rlim_cur,
+            after.rlim_cur
+        );
+    }
+
+    /// Regression (#88 on #92 / #91): rename-over still queues the old name
+    /// and both children, with no Entry for the destination, and getattr of
+    /// the replaced id now succeeds with TTL 0.
+    #[test]
+    fn rename_over_still_queues_destination_inode_not_destination_name() {
+        let (_dir, fs) = readable_members_fs(&["m", "t"]);
+        let rec = attach_recording(&fs);
+        fs.getattr_reply(FUSE_ROOT_ID).expect("getattr root");
+        let (child_m, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("m")).unwrap();
+        let (child_t, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("t")).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "m", FUSE_ROOT_ID, "t", 0)
+            .unwrap();
+        assert_eq!(
+            flush_recorded(&fs, &rec.rx),
+            vec![
+                KernelInval::Entry {
+                    parent: FUSE_ROOT_ID,
+                    name: "m".into(),
+                },
+                KernelInval::Inode(child_m),
+                KernelInval::Inode(child_t),
+                KernelInval::Inode(FUSE_ROOT_ID),
+            ]
+        );
+        let (ttl, attr) = fs.getattr_reply(child_t).expect("detached getattr");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        assert_eq!(attr.size, 4);
+        stop_recording(&fs, rec);
+    }
+
+    /// Regression (#88): mode 000 still renames and unlinks. Linux park is
+    /// O_PATH, so getattr fstats. The read-only proc reopen checks mode.
+    /// Root bypasses that EACCES.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mode_000_rename_and_unlink_detach_with_fd() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (_dir, ov, mut fs) = overlay_fs_for_rename();
+        overlay_write_new(&ov, "/locked", b"secret");
+        overlay_write_new(&ov, "/src", b"incoming");
+        std::fs::set_permissions(
+            ov.root().join("locked"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod");
+        let (locked, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("locked")).unwrap();
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("src")).unwrap();
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "locked", 0)
+            .expect("rename over mode 000");
+        let (ttl, attr) = fs.getattr_reply(locked).expect("fstat O_PATH");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+        let open = fs.open_inode(locked, libc::O_RDONLY);
+        if unsafe { libc::geteuid() } == 0 {
+            assert!(open.is_ok(), "root bypasses mode 000 on reopen");
+        } else {
+            assert_eq!(open.unwrap_err(), EACCES);
+        }
+
+        overlay_write_new(&ov, "/gone", b"g");
+        std::fs::set_permissions(
+            ov.root().join("gone"),
+            std::fs::Permissions::from_mode(0o000),
+        )
+        .expect("chmod gone");
+        let (gone, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("gone")).unwrap();
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("gone"), false)
+            .expect("unlink mode 000");
+        assert!(fs.getattr_reply(gone).is_ok());
     }
 }
