@@ -2,6 +2,9 @@
 //!
 //! Parses `OggS` pages, demultiplexes by stream serial, and exposes each logical
 //! stream as a virtual file via multi-region [`StenciledFile`] (raw Ogg pages).
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::collections::HashMap;
 use std::fs::File;

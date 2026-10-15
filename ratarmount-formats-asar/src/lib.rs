@@ -8,6 +8,9 @@
 //! [`AsarMountSource::open_from_reader`] indexes any seekable stream without a
 //! host path, so nested ASAR can open without a `/tmp` spool when the parent
 //! member body is seekable.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};

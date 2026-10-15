@@ -2,6 +2,9 @@
 //!
 //! Scans HTML for `data:` URLs (base64 or plain), decodes them, and exposes each
 //! payload as a virtual file. Matches Python `HTMLMountSource` best-effort.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::collections::HashMap;
 use std::fs::File;

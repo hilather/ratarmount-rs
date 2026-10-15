@@ -26,6 +26,9 @@
 //! FlateDecode inflation and PNG reassembly are done here with `flate2` + `png`.
 //!
 //! Text extraction is out of scope.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;

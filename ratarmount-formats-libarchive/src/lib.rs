@@ -13,6 +13,9 @@
 //! Python keeps pure random-access for lrzip on this backend only (no custom CLI
 //! materialize). Single-stream `.lrz` files use a second open with the **raw** format
 //! handler after archive formats fail to bid (same as Python's two-phase open).
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 mod ffi;
 

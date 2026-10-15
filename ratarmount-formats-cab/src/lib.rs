@@ -33,6 +33,9 @@
 //! - [`TCOMP_TYPE_*`] constants — raw CAB `typeCompress` values (low nibble)
 //!
 //! Do **not** claim no-tmp nested LZX while this residual stands.
+// #102: shadow std print macros so a closed pipe does not panic (exit 101).
+#[macro_use]
+extern crate ratarmount_core;
 
 use std::collections::HashMap;
 use std::fs::File;
