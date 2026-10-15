@@ -41,6 +41,9 @@ fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
 /// Password / permission failures must not collapse to generic EIO — that is what
 /// users see as "Input/output error" when opening encrypted nested 7z without
 /// `--password`.
+///
+/// Kinds without a dedicated arm keep `raw_os_error` when the error has one, so
+/// `EMFILE` and `ENFILE` stay distinct. A kind-only error with no raw code is `EIO`.
 fn io_to_errno(err: &std::io::Error) -> i32 {
     match err.kind() {
         ErrorKind::NotFound => ENOENT,
@@ -49,7 +52,7 @@ fn io_to_errno(err: &std::io::Error) -> i32 {
         ErrorKind::AlreadyExists => EEXIST,
         ErrorKind::InvalidInput => EINVAL,
         ErrorKind::Unsupported => ENOSYS,
-        _ => EIO,
+        _ => err.raw_os_error().unwrap_or(EIO),
     }
 }
 
@@ -985,7 +988,8 @@ impl RatarmountFs {
         let r = if dir {
             ov.rmdir(&path)
         } else {
-            ov.unlink(&path)
+            // FUSE-only (#88). Other frontends call `unlink` and never open the file.
+            ov.unlink_parked(&path).map(|_| ())
         };
         r.map_err(|e| {
             debug!("{}: {e}", if dir { "rmdir" } else { "unlink" });
@@ -1027,8 +1031,10 @@ impl RatarmountFs {
                 Err(ENOENT)
             };
         }
-        match ov.rename(&from, &to) {
-            Ok(()) => {}
+        // FUSE-only (#88). Other frontends call `rename` and never open the target.
+        // The snapshot is released with this call; the open still runs first.
+        match ov.rename_parked(&from, &to) {
+            Ok(_parked) => {}
             Err(ratarmount_compositing::OverlayError::Io(e)) => {
                 debug!("rename {from} -> {to}: {e}");
                 return Err(io_to_errno(&e));
@@ -2957,6 +2963,25 @@ mod tests {
             io_to_errno(&std::io::Error::new(ErrorKind::AlreadyExists, "x")),
             EEXIST
         );
+    }
+
+    /// Regression: raw EMFILE and ENFILE reach FUSE unchanged (#88).
+    /// A kind-only error with no raw code stays EIO.
+    #[test]
+    fn io_to_errno_maps_raw_emfile_and_enfile() {
+        assert_eq!(
+            io_to_errno(&io::Error::from_raw_os_error(libc::EMFILE)),
+            libc::EMFILE
+        );
+        assert_eq!(
+            io_to_errno(&io::Error::from_raw_os_error(libc::ENFILE)),
+            libc::ENFILE
+        );
+        assert_eq!(
+            io_to_errno(&io::Error::from_raw_os_error(libc::ENOSPC)),
+            libc::ENOSPC
+        );
+        assert_eq!(io_to_errno(&io::Error::other("generic")), EIO);
     }
 
     /// Regression: dir_cache 30s TTL must not hide overlay creates from readdir.

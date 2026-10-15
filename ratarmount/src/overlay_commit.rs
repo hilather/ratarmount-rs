@@ -79,6 +79,15 @@ pub fn term_requested() -> bool {
     GOT_TERM.load(Ordering::SeqCst)
 }
 
+/// Ask interval commit and signal watchers to stop.
+///
+/// The mount path calls this before joining the interval thread and dropping
+/// [`WriteOverlay`]. `std::process::exit` skips that drop, so the flag has to
+/// be set while destructors still run.
+pub fn request_shutdown() {
+    GOT_TERM.store(true, Ordering::SeqCst);
+}
+
 pub fn spawn_signal_nfs_stop(stop: NfsStop) {
     thread::Builder::new()
         .name("ratarmount-nfs-signal".into())
@@ -130,7 +139,7 @@ pub fn spawn_interval_commits(
     interval: Duration,
     stop: Option<NfsStop>,
     opts: OpenOptions,
-) {
+) -> thread::JoinHandle<()> {
     // Poll at least once a second so a file enters the archive ~`interval`
     // after its last host mtime, not up to 2× interval later. The settle
     // threshold is still `interval` (only idle files are persisted).
@@ -181,7 +190,7 @@ pub fn spawn_interval_commits(
                 Err(e) => log::error!("interval overlay commit failed: {e}"),
             }
         })
-        .expect("interval commit thread");
+        .expect("interval commit thread")
 }
 
 pub fn apply_live_commit(

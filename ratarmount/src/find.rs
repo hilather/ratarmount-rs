@@ -8,7 +8,7 @@
 use std::io::{self, Write};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use ratarmount_compositing::{live_search_tsv, WriteOverlay};
 use ratarmount_core::{CheapSearchHit, MountSource, OpenOptions};
@@ -96,13 +96,25 @@ pub fn tsv_search_callback(
 
 /// One SearchFn for control file ≡ socket. Closes over the pre-Control source
 /// plus optional overlay (steps in [`live_search_tsv`]).
+///
+/// The callback stores [`Weak`] handles. The control thread is detached and,
+/// on a daemon mount, started before `fork`. A strong [`Arc`] would be copied
+/// into the child even though that thread is not, so [`WriteOverlay`]'s last
+/// owner would never drop and the final `pending_rows` replay would not run.
+/// After unmount, upgrade fails and search reports that the archive is gone.
 pub fn live_search_callback(
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     archive: PathBuf,
     open_opts: OpenOptions,
 ) -> Arc<dyn Fn(&str) -> String + Send + Sync> {
+    let source = Arc::downgrade(&source);
+    let overlay = overlay.as_ref().map(Arc::downgrade);
     Arc::new(move |pattern: &str| {
+        let Some(source) = source.upgrade() else {
+            return "error: archive is not mounted\n".to_string();
+        };
+        let overlay: Option<Arc<WriteOverlay>> = overlay.as_ref().and_then(Weak::upgrade);
         live_search_tsv(source.as_ref(), overlay.as_deref(), pattern, |pat| {
             search_existing_sidecar(
                 archive.as_path(),

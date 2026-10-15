@@ -7,7 +7,7 @@ use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, PoisonError, RwLock};
 use std::time::{Duration, Instant, SystemTime};
 
 use bzip2::write::BzEncoder;
@@ -154,6 +154,82 @@ pub enum OverlayError {
 }
 
 pub type Result<T> = std::result::Result<T, OverlayError>;
+
+/// `cfg(test)` hook invoked once after `rename(2)` and before the tombstone
+/// transaction. Taken on the first attempt and not restored. `Err` fails that
+/// attempt only; later attempts still run.
+///
+/// Runs while [`WriteOverlay`]'s pending-row queue is held. Must not lock that
+/// queue (lookup and the database are fine).
+#[cfg(test)]
+type RenameBeforeTxHook = Box<dyn FnMut() -> Result<()> + Send>;
+
+/// `cfg(test)` hook invoked once during a pending-row replay, after the batch
+/// is taken and before SQL, while the pending-row queue is held.
+///
+/// Must not lock that queue. `Err` fails that attempt; the batch is restored
+/// in front of anything appended under the same lock.
+#[cfg(test)]
+type ReplayHoldHook = Box<dyn FnMut() -> Result<()> + Send>;
+
+/// `cfg(test)` hook invoked once at the start of a direct-write retry wait,
+/// while `pending_rows` is held, before the backoff sleep.
+///
+/// Must not lock that queue. The contender samples the lock from another
+/// thread and only then continues; waiting for that contender's own
+/// `files` write deadlocks, because this hook still holds the queue.
+#[cfg(test)]
+type DirectRetryWaitHook = Box<dyn FnMut() + Send>;
+
+/// `cfg(test)` hook consulted when a parked open is about to run.
+///
+/// `Err` becomes the open result (`EMFILE` / `ENFILE`). `Ok(())` continues
+/// with the real `open`. Plain [`WriteOverlay::rename`] / [`WriteOverlay::unlink`]
+/// never call it.
+#[cfg(test)]
+type ParkOpenHook = Box<dyn FnMut() -> io::Result<()> + Send>;
+
+/// Host inode snapshotted before [`WriteOverlay::rename_parked`] or
+/// [`WriteOverlay::unlink_parked`] replaces or removes it (#88).
+///
+/// `fd` is set when the park open succeeded. On Linux that open is
+/// `O_PATH|O_NOFOLLOW|O_CLOEXEC` (mode `000` does not block it). Elsewhere it
+/// is `O_RDONLY|O_NONBLOCK|O_NOFOLLOW|O_CLOEXEC`. Symlinks are not opened. Any
+/// other open error leaves `fd` empty and keeps [`FileInfo`], including `linkname`.
+pub struct Parked {
+    #[cfg(unix)]
+    fd: Option<std::os::unix::io::OwnedFd>,
+    last_fi: FileInfo,
+}
+
+impl Parked {
+    /// Attributes of the parked inode, taken before the name moved or was removed.
+    pub fn file_info(&self) -> &FileInfo {
+        &self.last_fi
+    }
+
+    /// Parked descriptor, when the open succeeded.
+    ///
+    /// `fstat` on this fd is the old inode (Linux `O_PATH` included).
+    #[cfg(unix)]
+    pub fn fd(&self) -> Option<&std::os::unix::io::OwnedFd> {
+        self.fd.as_ref()
+    }
+}
+
+impl std::fmt::Debug for Parked {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut d = f.debug_struct("Parked");
+        #[cfg(unix)]
+        d.field("has_fd", &self.fd.is_some());
+        #[cfg(not(unix))]
+        d.field("has_fd", &false);
+        d.field("mode", &self.last_fi.mode)
+            .field("size", &self.last_fi.size)
+            .field("linkname", &self.last_fi.linkname)
+            .finish()
+    }
+}
 
 /// Live overlay persist job (V-4). Interval and on-exit only.
 ///
@@ -313,6 +389,83 @@ struct IndexPointerPlan {
     json: String,
 }
 
+/// Attempts for the post-rename tombstone transaction, and the same budget
+/// when those rows are replayed. Transient lock or disk errors usually clear
+/// on a retry. A database that is still failing keeps the rows in memory and
+/// live commit refuses until they land.
+const RENAME_TX_ATTEMPTS: u32 = 3;
+const RENAME_TX_BACKOFF: Duration = Duration::from_millis(5);
+
+/// One `files` change whose host effect already happened.
+///
+/// Lock order when these rows are applied: `pending_rows`, then `db`, then
+/// `tombstones`. Replay holds `pending_rows` across take, SQL, and restore.
+/// A direct writer holds it across every attempt, the backoff, and the push
+/// onto the queue. Releasing it during that wait lets a newer writer commit
+/// first; this retry then undoes that writer and an archive member reappears.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum PendingFilesOp {
+    /// Host rename finished: `to` present, `from` tombstoned iff `hides_from`.
+    Rename {
+        from: String,
+        to: String,
+        mode: u32,
+        hides_from: bool,
+    },
+    /// Host unlink or rmdir finished.
+    Deleted { path: String, hides_base: bool },
+    /// Host create finished (file, directory, or symlink).
+    Present { path: String, mode: u32 },
+    /// Open cleared `deleted` without inserting a row.
+    ClearDeleted { path: String },
+}
+
+impl PendingFilesOp {
+    fn is_rename(&self) -> bool {
+        matches!(self, Self::Rename { .. })
+    }
+}
+
+impl std::fmt::Display for PendingFilesOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Rename { from, to, .. } => write!(f, "rename {from} -> {to}"),
+            Self::Deleted { path, .. } => write!(f, "delete {path}"),
+            Self::Present { path, .. } => write!(f, "present {path}"),
+            Self::ClearDeleted { path } => write!(f, "clear tombstone {path}"),
+        }
+    }
+}
+
+/// Put `batch` back in front of `queued`. `batch` is the older snapshot.
+fn restore_pending_front(queued: &mut Vec<PendingFilesOp>, mut batch: Vec<PendingFilesOp>) {
+    if queued.is_empty() {
+        *queued = batch;
+        return;
+    }
+    batch.append(queued);
+    *queued = batch;
+}
+
+/// `Strict` panics if the mutex was poisoned. `Recover` is for [`Drop`],
+/// which must finish the last replay without aborting the process.
+#[derive(Clone, Copy)]
+enum LockPoison {
+    Strict,
+    Recover,
+}
+
+fn lock_mutex<'a, T>(
+    mutex: &'a Mutex<T>,
+    poison: LockPoison,
+    what: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match poison {
+        LockPoison::Recover => mutex.lock().unwrap_or_else(PoisonError::into_inner),
+        LockPoison::Strict => mutex.lock().expect(what),
+    }
+}
+
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
     base: Arc<dyn MountSource>,
@@ -325,6 +478,15 @@ pub struct WriteOverlay {
     /// `is_deleted` checks this set. The `files` table remains the durable
     /// copy; every insert or clear of a tombstone updates both.
     tombstones: Mutex<HashSet<String>>,
+    /// `files` rows saved after the host change when the transaction still
+    /// failed. Replayed at the start of the next `files` write, on drop, and
+    /// before a commit plan is built. Live, interval, and on-exit commits
+    /// refuse while this is non-empty after a replay attempt.
+    ///
+    /// Lock order: this queue, then [`Self::db`], then [`Self::tombstones`].
+    /// Held across take / apply / restore, and across a direct write's
+    /// attempts, backoff, and the push onto the queue. See [`PendingFilesOp`].
+    pending_rows: Mutex<Vec<PendingFilesOp>>,
     /// Writers take a read lock; live commit takes the write lock.
     commit_gate: RwLock<()>,
     /// Set when persist succeeded but reopen failed (K11). Further interval
@@ -366,6 +528,33 @@ pub struct WriteOverlay {
     /// Set for the duration of remote on-exit so the interval thread cannot start
     /// another PUT while on-exit is waiting.
     interval_suppressed: AtomicBool,
+    /// Test-only: after the host rename, before one tombstone attempt (#88).
+    /// `Err` fails that attempt. Later attempts still run. The rename returns
+    /// success either way, and the in-memory tombstones match the completed
+    /// rename. One-shot: taken on the first attempt and not restored.
+    #[cfg(test)]
+    rename_before_tx_hook: Mutex<Option<RenameBeforeTxHook>>,
+    /// Test-only: fail the next N `files` writes inside
+    /// [`apply_pending_ops_sql`], including direct retries and pending-row
+    /// replays. `0` means the fault is off. The one-shot before-tx hook does
+    /// not consume a count.
+    #[cfg(test)]
+    rename_tx_fail_remaining: AtomicU64,
+    /// Test-only: one-shot hook inside replay, while `pending_rows` is held.
+    #[cfg(test)]
+    replay_hold_hook: Mutex<Option<ReplayHoldHook>>,
+    /// Test-only: one-shot hook while a direct writer waits to retry, still
+    /// holding `pending_rows`.
+    #[cfg(test)]
+    direct_retry_wait_hook: Mutex<Option<DirectRetryWaitHook>>,
+    /// Test-only: injected park-open result. Stays installed until replaced.
+    /// Plain `rename` / `unlink` never consult it.
+    #[cfg(test)]
+    park_open_hook: Mutex<Option<ParkOpenHook>>,
+    /// Times a parked open was attempted (injected or real). Plain rename and
+    /// unlink leave this at 0.
+    #[cfg(test)]
+    park_open_count: AtomicU64,
 }
 
 impl OverlayError {
@@ -439,7 +628,7 @@ impl WriteOverlay {
                 )
             )));
         }
-        let conn = Connection::open(&db_path)?;
+        let mut conn = Connection::open(&db_path)?;
         let had_files = conn
             .query_row(
                 "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'files'",
@@ -518,7 +707,7 @@ impl WriteOverlay {
             .and_then(|_| conn.execute_batch(SCHEMA))
             .and_then(|_| tombstone_set_from_conn(&conn))
             .map_err(OverlayError::from);
-        let tombstones = match opened {
+        let mut tombstones = match opened {
             Ok(t) => t,
             Err(e) => {
                 // A folder that never opened successfully must not stay marked
@@ -532,6 +721,18 @@ impl WriteOverlay {
                 return Err(e);
             }
         };
+        // #88: a crash between host rename/create and the tombstone clear leaves
+        // the new bytes under a deleted=1 name. Clear those rows. A tombstone
+        // with no host file stays. Do not delete the host file.
+        if let Err(e) = clear_tombstones_with_host_files(&mut conn, &root, &mut tombstones) {
+            if created_marker && !had_files {
+                let _ = fs::remove_file(&marker_path);
+            }
+            if !had_files {
+                undo_new_db(conn);
+            }
+            return Err(e);
+        }
         // Once the current marker is in place the legacy one is redundant;
         // removing it keeps a reset to one file (also cleans folders that an
         // earlier build migrated but left both names in).
@@ -567,6 +768,7 @@ impl WriteOverlay {
             root,
             db: Mutex::new(conn),
             tombstones: Mutex::new(tombstones),
+            pending_rows: Mutex::new(Vec::new()),
             commit_gate: RwLock::new(()),
             interval_disabled: AtomicBool::new(false),
             commit_generation: std::sync::atomic::AtomicU64::new(0),
@@ -584,6 +786,18 @@ impl WriteOverlay {
             spool: Mutex::new(None),
             persist_count: AtomicU64::new(0),
             interval_suppressed: AtomicBool::new(false),
+            #[cfg(test)]
+            rename_before_tx_hook: Mutex::new(None),
+            #[cfg(test)]
+            rename_tx_fail_remaining: AtomicU64::new(0),
+            #[cfg(test)]
+            replay_hold_hook: Mutex::new(None),
+            #[cfg(test)]
+            direct_retry_wait_hook: Mutex::new(None),
+            #[cfg(test)]
+            park_open_hook: Mutex::new(None),
+            #[cfg(test)]
+            park_open_count: AtomicU64::new(0),
         })
     }
 
@@ -797,44 +1011,29 @@ impl WriteOverlay {
     }
 
     fn mark_deleted(&self, path: &str) -> Result<()> {
-        let (folder, name) = Self::split(path);
         let hides_base = self.current_base().exists(path);
-        {
-            let db = self.db.lock().expect("overlay db");
-            if hides_base {
-                db.execute(
-                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
-                    params![folder, name],
-                )?;
-            } else {
-                db.execute(
-                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
-                    params![folder, name],
-                )?;
-            }
-        }
+        let path = normpath(path);
+        // The host entry is already gone. Queue instead of returning an error
+        // when older rows are still unsaved or this write fails.
+        self.persist_files_op(PendingFilesOp::Deleted {
+            path: path.clone(),
+            hides_base,
+        })?;
         if hides_base {
-            self.tombstone_remember(path);
+            self.tombstone_remember(&path);
         } else {
-            self.tombstone_forget(path);
+            self.tombstone_forget(&path);
         }
         Ok(())
     }
 
     fn mark_present(&self, path: &str, mode: u32) -> Result<()> {
-        let (folder, name) = Self::split(path);
-        {
-            let db = self.db.lock().expect("overlay db");
-            db.execute(
-                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
-                params![folder, name, mode as i64],
-            )?;
-            db.execute(
-                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                params![folder, name],
-            )?;
-        }
-        self.tombstone_forget(path);
+        let path = normpath(path);
+        self.persist_files_op(PendingFilesOp::Present {
+            path: path.clone(),
+            mode,
+        })?;
+        self.tombstone_forget(&path);
         Ok(())
     }
 
@@ -1178,14 +1377,11 @@ impl WriteOverlay {
             if (flags & (libc::O_WRONLY | libc::O_RDWR)) != 0 {
                 self.register_write_fd(fd, path);
             }
-            let (folder, name) = Self::split(path);
-            {
-                let db = self.db.lock().expect("overlay db");
-                let _ = db.execute(
-                    r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
-                    params![folder, name],
-                );
-            }
+            // Same queue as unlink and rename: a direct UPDATE while older
+            // rows are unsaved would be undone when those rows replay.
+            self.persist_files_op(PendingFilesOp::ClearDeleted {
+                path: normpath(path),
+            })?;
             self.tombstone_forget(path);
             Ok(fd)
         }
@@ -1209,16 +1405,31 @@ impl WriteOverlay {
         Ok(())
     }
 
+    /// Remove `path` from the overlay. Does not open the host inode.
+    ///
+    /// 9P, SFTP, SMB, NFS, and export-core use this. FUSE uses [`Self::unlink_parked`].
     pub fn unlink(&self, path: &str) -> Result<()> {
+        self.unlink_inner(path, false).map(|_| ())
+    }
+
+    /// FUSE-only unlink. Parks the host inode when one exists, then removes `path` (#88).
+    ///
+    /// Other frontends call [`Self::unlink`], which never opens the old file.
+    /// Reserved names are refused before the park open. `EMFILE` / `ENFILE`
+    /// from that open fails the unlink with nothing removed. The park open is
+    /// a raw `open`, not [`Self::open_overlay_fd`]: this method already holds
+    /// `commit_gate`'s read lock, and `RwLock` is not reentrant.
+    pub fn unlink_parked(&self, path: &str) -> Result<Option<Parked>> {
+        self.unlink_inner(path, true)
+    }
+
+    fn unlink_inner(&self, path: &str, park: bool) -> Result<Option<Parked>> {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
-        self.unlink_inner(path)
-    }
-
-    fn unlink_inner(&self, path: &str) -> Result<()> {
-        let real = self.realpath(path);
+        let path = normpath(path);
+        let real = self.realpath(&path);
         // unlink of a symlink removes the link itself (safe); refuse only when the
         // joined path is not under the overlay root by construction.
         if !path_is_under(&self.root, &real) {
@@ -1227,12 +1438,17 @@ impl WriteOverlay {
                 "overlay unlink path escapes overlay root",
             )));
         }
+        let parked = if park {
+            self.park_host(&path, &real)?
+        } else {
+            None
+        };
         // remove_file unlinks symlinks without following them.
         if fs::symlink_metadata(&real).is_ok() {
             fs::remove_file(&real)?;
         }
-        self.mark_deleted(path)?;
-        Ok(())
+        self.mark_deleted(&path)?;
+        Ok(parked)
     }
 
     pub fn rmdir(&self, path: &str) -> Result<()> {
@@ -1323,8 +1539,46 @@ impl WriteOverlay {
         Ok(())
     }
 
-    /// Rename within the overlay (COW archive members first).
+    /// Rename `from` onto `to` inside the overlay. Does not open either inode.
+    ///
+    /// 9P, SFTP, SMB, NFS, and export-core use this. FUSE uses [`Self::rename_parked`].
     pub fn rename(&self, from: &str, to: &str) -> Result<()> {
+        self.rename_inner(from, to, false).map(|_| ())
+    }
+
+    /// FUSE-only rename of `from` onto `to` in one `rename(2)` (#88).
+    ///
+    /// Parks `to`'s host inode when it exists, then renames directly over `to`.
+    /// Other frontends call [`Self::rename`], which never opens the old file.
+    ///
+    /// For a non-directory: COW `from`, reject a directory `to`, park `to`,
+    /// `rename(2)` over `to`, then one SQLite transaction that marks `to` present
+    /// and tombstones `from` only when the base has `from`. The in-memory
+    /// tombstone set is updated after that transaction (`to` out, `from` in only
+    /// if the base has `from`). Lock order is `pending_rows`, then `db`, then
+    /// tombstones.
+    ///
+    /// The transaction is tried [`RENAME_TX_ATTEMPTS`] times. The queue lock is
+    /// held across those attempts, the backoff, and the push that records a
+    /// failure. Releasing it during the backoff lets another writer commit a
+    /// later rename that this retry then undoes. If it still fails, or if older
+    /// rows are still queued after a replay attempt, this rename is appended to
+    /// `pending_rows` and this returns success: the host rename cannot be
+    /// undone, and writing it first would let the older replay undo it. The
+    /// queue is replayed at the start of the next `files` write, on drop, and
+    /// before a commit plan. Live, interval, and on-exit commits refuse while
+    /// it is still non-empty after a replay attempt, so a plan cannot publish
+    /// an archive member that the mount already hides.
+    ///
+    /// Reserved names are refused before the park open. The park open is a raw
+    /// `open`, not [`Self::open_overlay_fd`] (`commit_gate` is not reentrant).
+    /// `EMFILE` / `ENFILE` fails the rename before `to` is modified (the source
+    /// copy-up may already exist).
+    pub fn rename_parked(&self, from: &str, to: &str) -> Result<Option<Parked>> {
+        self.rename_inner(from, to, true)
+    }
+
+    fn rename_inner(&self, from: &str, to: &str, park: bool) -> Result<Option<Parked>> {
         for p in [from, to] {
             if is_overlay_internal_path(p) {
                 return Err(internal_name_refused(p));
@@ -1352,7 +1606,7 @@ impl WriteOverlay {
             )));
         }
         // COW the source before touching the destination: if the copy fails
-        // (read error, ENOSPC), the destination must not already be unlinked.
+        // (read error, ENOSPC), the destination must stay as it was.
         self.ensure_modifiable(&from)?;
         let from_real = self.realpath(&from);
         let to_real = self.realpath(&to);
@@ -1364,27 +1618,455 @@ impl WriteOverlay {
                 format!("rename source missing: {from}"),
             )));
         }
-        if self.lookup(&to, 0).is_some() {
-            let dest_real = self.realpath(&to);
-            let dest_is_dir = fs::symlink_metadata(&dest_real)
-                .map(|m| m.file_type().is_dir())
-                .unwrap_or_else(|_| self.current_base().is_dir(&to));
-            if dest_is_dir {
-                return Err(OverlayError::Io(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "rename destination is a directory",
-                )));
-            }
-            self.unlink_inner(&to)?;
+        if fs::symlink_metadata(&to_real).is_ok_and(|m| m.file_type().is_dir())
+            || self
+                .lookup(&to, 0)
+                .is_some_and(|fi| ratarmount_core::is_dir_mode(fi.mode))
+        {
+            return Err(OverlayError::Io(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "rename destination is a directory",
+            )));
         }
+        let parked = if park {
+            self.park_host(&to, &to_real)?
+        } else {
+            None
+        };
         if let Some(parent) = to_real.parent() {
             fs::create_dir_all(parent)?;
         }
         fs::rename(&from_real, &to_real)?;
-        self.mark_deleted(&from)?;
-        let mode = metadata_mode(&fs::symlink_metadata(&to_real)?);
-        self.mark_present(&to, mode)?;
+        let hides_from = self.current_base().exists(&from);
+        // Host rename already happened. `persist_files_op` queues on failure
+        // and returns success so the client sees the completed rename.
+        self.commit_rename_rows(&from, &to, &to_real, hides_from)?;
+        self.apply_rename_tombstone_memory(&from, &to, hides_from);
+        Ok(parked)
+    }
+
+    /// Snapshot `host` when it exists, before `rename(2)` or `remove_file`.
+    ///
+    /// Does not take `commit_gate` and does not call [`Self::open_overlay_fd`].
+    fn park_host(&self, mount_path: &str, host: &Path) -> Result<Option<Parked>> {
+        let meta = match fs::symlink_metadata(host) {
+            Ok(meta) => meta,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(OverlayError::Io(e)),
+        };
+        if meta.file_type().is_dir() {
+            return Ok(None);
+        }
+        let last_fi = file_info_from_overlay_meta(mount_path, host, &meta);
+        if meta.file_type().is_symlink() {
+            return Ok(Some(parked_meta(last_fi)));
+        }
+        #[cfg(unix)]
+        {
+            match try_park_open(self, host) {
+                Ok(fd) => Ok(Some(parked_fd(last_fi, fd))),
+                Err(e) if is_fd_exhaustion(&e) => Err(OverlayError::Io(e)),
+                Err(_) => Ok(Some(parked_meta(last_fi))),
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Some(parked_meta(last_fi)))
+        }
+    }
+
+    /// One transaction: `to` present, and `from` tombstoned iff `hides_from`.
+    ///
+    /// Replays any older queued rows first. When those rows are still queued,
+    /// or when this rename's own attempts fail, the rename is appended and
+    /// this returns success. The host rename cannot be undone.
+    fn commit_rename_rows(
+        &self,
+        from: &str,
+        to: &str,
+        to_real: &Path,
+        hides_from: bool,
+    ) -> Result<()> {
+        let mode = match fs::symlink_metadata(to_real) {
+            Ok(meta) => metadata_mode(&meta),
+            Err(e) => {
+                log::error!(
+                    "overlay rename could not stat {} after the host rename: {e}",
+                    to_real.display()
+                );
+                ratarmount_core::S_IFREG | 0o644
+            }
+        };
+        self.persist_files_op(PendingFilesOp::Rename {
+            from: from.to_string(),
+            to: to.to_string(),
+            mode,
+            hides_from,
+        })
+    }
+
+    /// Replay queued rows, then write `op` or append it.
+    ///
+    /// The host change has already happened. A failure here queues `op` and
+    /// returns success so the caller does not report an error for a change
+    /// that cannot be undone. Appending keeps order: a later direct write
+    /// would be undone when the older rows replay.
+    ///
+    /// Lock order: `pending_rows`, then `db`. Tombstones are updated by the
+    /// caller after this returns. The queue guard stays held across every
+    /// direct attempt, the backoff sleep, and the final push. Dropping it to
+    /// sleep lets another writer see an empty queue and commit a later rename
+    /// that this retry then marks present again.
+    fn persist_files_op(&self, op: PendingFilesOp) -> Result<()> {
+        if let Err(e) = self.replay_pending_rows() {
+            log::warn!(
+                "overlay could not replay earlier files rows: {e}; queueing the next update behind them"
+            );
+        }
+        let attempts = if op.is_rename() {
+            RENAME_TX_ATTEMPTS
+        } else {
+            1
+        };
+        let mut pending_op = Some(op);
+        let mut last_err = None;
+        let mut queued = self.pending_rows.lock().expect("overlay pending rows");
+        for attempt in 1..=attempts {
+            if !queued.is_empty() {
+                let op = pending_op.take().expect("files op");
+                log::error!(
+                    "overlay {op} appended behind {} unsaved files update(s); \
+                     writing it now would let a later replay undo it",
+                    queued.len()
+                );
+                queued.push(op);
+                return Ok(());
+            }
+            if attempt > 1 {
+                // Still holding `pending_rows`. The sleep is the window another
+                // writer used to slip a later rename in ahead of this retry.
+                #[cfg(test)]
+                {
+                    let hook = self
+                        .direct_retry_wait_hook
+                        .lock()
+                        .expect("direct retry wait hook")
+                        .take();
+                    if let Some(mut hook) = hook {
+                        hook();
+                    }
+                }
+                std::thread::sleep(RENAME_TX_BACKOFF);
+            }
+            let op_ref = pending_op.as_ref().expect("files op");
+            let ctx = FilesWriteCtx {
+                db: &self.db,
+                #[cfg(test)]
+                fail: &self.rename_tx_fail_remaining,
+                #[cfg(test)]
+                before_tx: &self.rename_before_tx_hook,
+            };
+            match write_files_op_direct(&ctx, op_ref) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "overlay {op_ref} files update attempt {attempt}/{attempts} failed: {e}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        let op = pending_op.take().expect("files op");
+        let why = last_err
+            .as_ref()
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        log::error!(
+            "overlay {op} failed ({why}); queued it behind {} unsaved files update(s)",
+            queued.len()
+        );
+        queued.push(op);
         Ok(())
+    }
+
+    /// Write queued rows, retrying a few times. Empty queue is success.
+    fn replay_pending_rows(&self) -> Result<()> {
+        self.replay_pending_rows_with(LockPoison::Strict)
+    }
+
+    /// Each attempt holds `pending_rows` across take, SQL, and restore
+    /// (lock order: queue, then `db`). The backoff between attempts is
+    /// outside that lock. A failed attempt restores the batch before
+    /// releasing the lock, so the queue stays non-empty and another writer
+    /// cannot commit directly. On failure the batch is put back in front of
+    /// rows appended under that same lock.
+    fn replay_pending_rows_with(&self, poison: LockPoison) -> Result<()> {
+        if self.pending_rows_is_empty_with(poison) {
+            return Ok(());
+        }
+        let mut last_err = None;
+        for attempt in 1..=RENAME_TX_ATTEMPTS {
+            if attempt > 1 {
+                std::thread::sleep(RENAME_TX_BACKOFF);
+            }
+            match self.try_replay_pending_once_with(poison) {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    log::warn!(
+                        "overlay pending files replay attempt {attempt}/{RENAME_TX_ATTEMPTS} \
+                         failed: {e}"
+                    );
+                    last_err = Some(e);
+                }
+            }
+        }
+        Err(last_err.expect("pending replay loop records an error"))
+    }
+
+    fn try_replay_pending_once_with(&self, poison: LockPoison) -> Result<()> {
+        let mut queued = lock_mutex(&self.pending_rows, poison, "overlay pending rows");
+        if queued.is_empty() {
+            return Ok(());
+        }
+        let batch = std::mem::take(&mut *queued);
+        #[cfg(test)]
+        {
+            let hook = lock_mutex(&self.replay_hold_hook, poison, "replay hold hook").take();
+            if let Some(mut hook) = hook {
+                if let Err(e) = hook() {
+                    restore_pending_front(&mut queued, batch);
+                    return Err(e);
+                }
+            }
+        }
+        // A failure here is the real restore path. The injected fault is raised
+        // inside `apply_pending_ops_sql` after the first statement, so the
+        // transaction rolls back and this `Err` arm puts the batch back.
+        // Dropping `batch` on this error loses the rows.
+        if let Err(e) = apply_pending_ops_sql(
+            &self.db,
+            &batch,
+            poison,
+            #[cfg(test)]
+            Some(&self.rename_tx_fail_remaining),
+        ) {
+            restore_pending_front(&mut queued, batch);
+            return Err(e);
+        }
+        Ok(())
+    }
+
+    fn pending_rows_is_empty(&self) -> bool {
+        self.pending_rows_is_empty_with(LockPoison::Strict)
+    }
+
+    fn pending_rows_is_empty_with(&self, poison: LockPoison) -> bool {
+        lock_mutex(&self.pending_rows, poison, "overlay pending rows").is_empty()
+    }
+
+    /// Paths an unsaved queue would hide that SQL does not already tombstone.
+    ///
+    /// After remount the in-memory queue is gone. Those archive members show
+    /// up again, and an offline `--commit-overlay` publishes them because it
+    /// reads SQL only.
+    fn pending_reappear_paths(&self) -> Vec<String> {
+        self.pending_reappear_paths_with(LockPoison::Strict)
+    }
+
+    fn pending_reappear_paths_with(&self, poison: LockPoison) -> Vec<String> {
+        let ops = lock_mutex(&self.pending_rows, poison, "overlay pending rows").clone();
+        let mut hide: HashSet<String> = HashSet::new();
+        for op in &ops {
+            match op {
+                PendingFilesOp::Rename {
+                    from,
+                    to,
+                    hides_from,
+                    ..
+                } => {
+                    hide.remove(to);
+                    if *hides_from {
+                        hide.insert(from.clone());
+                    } else {
+                        hide.remove(from);
+                    }
+                }
+                PendingFilesOp::Deleted { path, hides_base } => {
+                    if *hides_base {
+                        hide.insert(path.clone());
+                    } else {
+                        hide.remove(path);
+                    }
+                }
+                PendingFilesOp::Present { path, .. } | PendingFilesOp::ClearDeleted { path } => {
+                    hide.remove(path);
+                }
+            }
+        }
+        let mut out: Vec<String> = hide
+            .into_iter()
+            .filter(|path| !matches!(self.files_deleted_flag_with(path, poison), Ok(Some(1))))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// Replay queued rows, then refuse when any remain.
+    ///
+    /// A commit plan reads `deleted = 1` from SQL. Publishing while the mount
+    /// already hides a name would leave that archive member in place and, after
+    /// the overlay reset, show it again.
+    fn replay_pending_or_refuse_commit(&self) -> Result<()> {
+        let replay_err = self.replay_pending_rows().err();
+        if self.pending_rows_is_empty() {
+            return match replay_err {
+                Some(e) => Err(e),
+                None => Ok(()),
+            };
+        }
+        let n = self.pending_row_count_locked_with(LockPoison::Strict);
+        let why = replay_err
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "replay left rows queued".to_string());
+        let paths = self.pending_reappear_paths();
+        let listed = if paths.is_empty() {
+            "unlinked archive members would reappear".to_string()
+        } else {
+            format!(
+                "unlinked archive members would reappear: {}",
+                paths.join(", ")
+            )
+        };
+        Err(OverlayError::Msg(format!(
+            "write overlay {} has {n} files update(s) that could not be saved ({why}); \
+             refusing to commit because the archive would not match the mount \
+             ({listed}). An offline --commit-overlay will publish them",
+            self.root.display()
+        )))
+    }
+
+    fn pending_row_count_locked_with(&self, poison: LockPoison) -> usize {
+        lock_mutex(&self.pending_rows, poison, "overlay pending rows").len()
+    }
+
+    /// Final replay when the mount goes away. Rows that still cannot be saved
+    /// are logged with the archive paths that will show up again.
+    ///
+    /// A poisoned `pending_rows` or `db` lock must not panic: this runs from
+    /// [`Drop`], and a panic while unwinding aborts the process. The guard is
+    /// recovered with [`PoisonError::into_inner`]. `std::process::exit` skips
+    /// this replay; the mount path drops the overlay before it exits.
+    fn replay_pending_on_drop(&self) {
+        let poison = LockPoison::Recover;
+        if self.pending_rows_is_empty_with(poison) {
+            return;
+        }
+        if self.replay_pending_rows_with(poison).is_ok() && self.pending_rows_is_empty_with(poison)
+        {
+            return;
+        }
+        let n = self.pending_row_count_locked_with(poison);
+        let paths = self.pending_reappear_paths_with(poison);
+        let listed = if paths.is_empty() {
+            "(none)".to_string()
+        } else {
+            paths.join(", ")
+        };
+        log::error!(
+            "overlay {}: {n} pending files update(s) were not saved on unmount; \
+             these paths will reappear on remount: {listed}. \
+             An offline --commit-overlay will publish them",
+            self.root.display()
+        );
+    }
+
+    fn plan_for_commit(
+        &self,
+        idle_cutoff: Option<SystemTime>,
+        busy_inodes: &HashSet<(u64, u64)>,
+    ) -> Result<OverlayCommitPlan> {
+        self.replay_pending_or_refuse_commit()?;
+        let db = self.db.lock().expect("overlay db");
+        collect_overlay_commit_plan_from_conn(&self.root, Some(&db), idle_cutoff, busy_inodes)
+    }
+
+    /// `to` leaves the tombstone set; `from` enters it only when the base has `from`.
+    fn apply_rename_tombstone_memory(&self, from: &str, to: &str, hides_from: bool) {
+        let mut set = self.tombstones.lock().expect("overlay tombstones");
+        set.remove(&normpath(to));
+        if hides_from {
+            set.insert(normpath(from));
+        } else {
+            set.remove(&normpath(from));
+        }
+    }
+
+    #[cfg(test)]
+    fn set_rename_before_tx_hook(&self, hook: Option<RenameBeforeTxHook>) {
+        *self
+            .rename_before_tx_hook
+            .lock()
+            .expect("overlay rename hook") = hook;
+    }
+
+    /// Fail the next `n` `files` writes (direct attempts and replays). `0` clears it.
+    #[cfg(test)]
+    fn set_rename_tx_failures(&self, n: u64) {
+        self.rename_tx_fail_remaining.store(n, Ordering::SeqCst);
+    }
+
+    /// One-shot replay hook. Runs while `pending_rows` is held. Must not lock it.
+    #[cfg(test)]
+    fn set_replay_hold_hook(&self, hook: Option<ReplayHoldHook>) {
+        *self.replay_hold_hook.lock().expect("replay hold hook") = hook;
+    }
+
+    /// One-shot hook at the start of a direct-write retry wait. Runs while
+    /// `pending_rows` is held. Must not lock it, and must not wait for another
+    /// thread's `files` write.
+    #[cfg(test)]
+    fn set_direct_retry_wait_hook(&self, hook: Option<DirectRetryWaitHook>) {
+        *self
+            .direct_retry_wait_hook
+            .lock()
+            .expect("direct retry wait hook") = hook;
+    }
+
+    #[cfg(test)]
+    fn pending_row_count(&self) -> usize {
+        self.pending_rows
+            .lock()
+            .expect("overlay pending rows")
+            .len()
+    }
+
+    #[cfg(test)]
+    fn set_park_open_hook(&self, hook: Option<ParkOpenHook>) {
+        *self.park_open_hook.lock().expect("park open hook") = hook;
+    }
+
+    #[cfg(test)]
+    fn park_open_count(&self) -> u64 {
+        self.park_open_count.load(Ordering::SeqCst)
+    }
+
+    /// `deleted` column for `path`: `Some(1)` tombstone, `Some(0)` present, `None` no row.
+    #[cfg(test)]
+    fn files_deleted_flag(&self, path: &str) -> Result<Option<i64>> {
+        self.files_deleted_flag_with(path, LockPoison::Strict)
+    }
+
+    fn files_deleted_flag_with(&self, path: &str, poison: LockPoison) -> Result<Option<i64>> {
+        let (folder, name) = Self::split(path);
+        let db = lock_mutex(&self.db, poison, "overlay db");
+        let flag = db
+            .query_row(
+                r#"SELECT deleted FROM "files" WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(flag)
     }
 
     /// True when `archive` can be live-committed (uncompressed TAR or `.tar.zst`).
@@ -1399,17 +2081,16 @@ impl WriteOverlay {
         }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
-        if format != CompressionFormat::Zstd {
-            ensure_gnu_tar()?;
-        }
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         if self.interval_disabled() {
             return Err(interval_disabled_err());
         }
-        let plan = {
-            let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), None, &HashSet::new())?
-        };
+        // Refuse unsaved rows before looking for GNU tar, so on-exit names the
+        // paths that would reappear even when tar is not installed.
+        let plan = self.plan_for_commit(None, &HashSet::new())?;
+        if format != CompressionFormat::Zstd {
+            ensure_gnu_tar()?;
+        }
         if plan.is_empty() {
             return Ok(false);
         }
@@ -1457,13 +2138,11 @@ impl WriteOverlay {
             let cutoff = SystemTime::now()
                 .checked_sub(idle_for)
                 .unwrap_or(SystemTime::UNIX_EPOCH);
+            self.replay_pending_or_refuse_commit()?;
             let Some(busy) = self.write_open_inodes() else {
                 return Ok(false);
             };
-            let plan = {
-                let db = self.db.lock().expect("overlay db");
-                collect_overlay_commit_plan_from_conn(&self.root, Some(&db), Some(cutoff), &busy)?
-            };
+            let plan = self.plan_for_commit(Some(cutoff), &busy)?;
             if plan.is_empty() {
                 return Ok(false);
             }
@@ -1908,6 +2587,7 @@ impl WriteOverlay {
                 .checked_sub(d)
                 .unwrap_or(SystemTime::UNIX_EPOCH)
         });
+        self.replay_pending_or_refuse_commit()?;
         let busy = if cutoff.is_some() {
             match self.write_open_inodes() {
                 Some(b) => b,
@@ -1916,10 +2596,7 @@ impl WriteOverlay {
         } else {
             HashSet::new()
         };
-        let plan = {
-            let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff, &busy)?
-        };
+        let plan = self.plan_for_commit(cutoff, &busy)?;
         if plan.is_empty() {
             return Ok(None);
         }
@@ -2044,6 +2721,7 @@ impl WriteOverlay {
                 .checked_sub(d)
                 .unwrap_or(SystemTime::UNIX_EPOCH)
         });
+        self.replay_pending_or_refuse_commit()?;
         let busy = if cutoff.is_some() {
             match self.write_open_inodes() {
                 Some(b) => b,
@@ -2052,10 +2730,7 @@ impl WriteOverlay {
         } else {
             HashSet::new()
         };
-        let plan = {
-            let db = self.db.lock().expect("overlay db");
-            collect_overlay_commit_plan_from_conn(&self.root, Some(&db), cutoff, &busy)?
-        };
+        let plan = self.plan_for_commit(cutoff, &busy)?;
         if plan.is_empty() {
             return Ok(false);
         }
@@ -2387,6 +3062,10 @@ impl WriteOverlay {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
         reset_overlay_dir(&self.root)?;
         {
+            // Queue then database. A later replay must not resurrect rows
+            // this reset just deleted.
+            let mut pending = self.pending_rows.lock().expect("overlay pending rows");
+            pending.clear();
             let db = self.db.lock().expect("overlay db");
             db.execute(r#"DELETE FROM "files""#, [])?;
         }
@@ -2398,22 +3077,50 @@ impl WriteOverlay {
         let real = self.realpath(path);
         // symlink_metadata so a dangling overlay symlink is still visible.
         let meta = fs::symlink_metadata(&real).ok()?;
-        let linkname = if meta.file_type().is_symlink() {
-            fs::read_link(&real)
-                .map(|p| p.to_string_lossy().into_owned())
-                .unwrap_or_default()
-        } else {
-            String::new()
-        };
-        Some(FileInfo {
-            size: meta.len(),
-            mtime: metadata_mtime_secs(&meta) as f64,
-            mode: metadata_mode(&meta),
-            linkname,
-            uid: metadata_uid(&meta),
-            gid: metadata_gid(&meta),
-            userdata: vec![UserData::Other(format!("overlay:{path}"))],
-        })
+        Some(file_info_from_overlay_meta(path, &real, &meta))
+    }
+}
+
+impl Drop for WriteOverlay {
+    fn drop(&mut self) {
+        // Recover poisoned locks. A panic here aborts the process.
+        // `std::process::exit` skips this; callers drop the overlay first.
+        self.replay_pending_on_drop();
+    }
+}
+
+fn file_info_from_overlay_meta(path: &str, host: &Path, meta: &fs::Metadata) -> FileInfo {
+    let linkname = if meta.file_type().is_symlink() {
+        fs::read_link(host)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
+    FileInfo {
+        size: meta.len(),
+        mtime: metadata_mtime_secs(meta) as f64,
+        mode: metadata_mode(meta),
+        linkname,
+        uid: metadata_uid(meta),
+        gid: metadata_gid(meta),
+        userdata: vec![UserData::Other(format!("overlay:{path}"))],
+    }
+}
+
+fn parked_meta(last_fi: FileInfo) -> Parked {
+    Parked {
+        #[cfg(unix)]
+        fd: None,
+        last_fi,
+    }
+}
+
+#[cfg(unix)]
+fn parked_fd(last_fi: FileInfo, fd: std::os::unix::io::OwnedFd) -> Parked {
+    Parked {
+        fd: Some(fd),
+        last_fi,
     }
 }
 
@@ -3100,6 +3807,67 @@ fn collect_ustar_pending_at(
     Ok(out)
 }
 
+fn is_fd_exhaustion(err: &io::Error) -> bool {
+    #[cfg(unix)]
+    {
+        matches!(err.raw_os_error(), Some(libc::EMFILE | libc::ENFILE))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = err;
+        false
+    }
+}
+
+/// Park open. Not [`WriteOverlay::open_overlay_fd`]: callers already hold
+/// `commit_gate`, and that helper would take the lock again.
+#[cfg(unix)]
+fn open_park_fd(host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
+    use std::os::unix::io::{FromRawFd, OwnedFd};
+    let c = c_path(host)?;
+    // Safety: `c` is NUL-terminated. Flags never include `O_CREAT`.
+    let fd = unsafe { libc::open(c.as_ptr(), park_open_flags(), 0) };
+    if fd < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        // Safety: `fd` is a new descriptor owned by this process.
+        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+#[cfg(unix)]
+fn park_open_flags() -> i32 {
+    #[cfg(target_os = "linux")]
+    {
+        libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+    }
+}
+
+/// Park open used by [`WriteOverlay::park_host`].
+///
+/// The `cfg(test)` hook and counter live here so a plain rename or unlink,
+/// which never calls [`WriteOverlay::park_host`], cannot bump either.
+#[cfg(unix)]
+fn try_park_open(overlay: &WriteOverlay, host: &Path) -> io::Result<std::os::unix::io::OwnedFd> {
+    #[cfg(test)]
+    {
+        overlay.park_open_count.fetch_add(1, Ordering::SeqCst);
+        let mut guard = overlay.park_open_hook.lock().expect("park open hook");
+        if let Some(hook) = guard.as_mut() {
+            hook()?;
+        }
+    }
+    #[cfg(not(test))]
+    {
+        let _ = overlay;
+    }
+    open_park_fd(host)
+}
+
 #[cfg(unix)]
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
     use std::os::unix::ffi::OsStrExt;
@@ -3260,6 +4028,11 @@ impl OverlayCommitPlan {
     }
 }
 
+/// Offline commit reads SQL only. In-memory [`PendingFilesOp`] rows belong to a
+/// live [`WriteOverlay`], which replays them in [`WriteOverlay::plan_for_commit`]
+/// before it builds a plan. This function has no overlay object, so it cannot
+/// see rows that never reached the database. An unsaved queue is logged on
+/// unmount: an offline `--commit-overlay` will publish those archive members.
 fn collect_overlay_commit_plan(write_overlay: &Path) -> Result<OverlayCommitPlan> {
     let db_path = write_overlay.join(HIDDEN_DB);
     let markers = overlay_markers(write_overlay)?;
@@ -3479,6 +4252,209 @@ fn tombstone_parent(full: &str) -> &str {
 
 fn tombstone_name(full: &str) -> &str {
     full.rsplit_once('/').map(|(_, name)| name).unwrap_or(full)
+}
+
+/// Borrows of fields other than `pending_rows`, so a direct write can run
+/// while that queue is held (lock order: queue, then `db`).
+struct FilesWriteCtx<'a> {
+    db: &'a Mutex<Connection>,
+    #[cfg(test)]
+    fail: &'a AtomicU64,
+    #[cfg(test)]
+    before_tx: &'a Mutex<Option<RenameBeforeTxHook>>,
+}
+
+#[cfg(test)]
+fn consume_rename_tx_failure_flag(flag: &AtomicU64) -> Option<OverlayError> {
+    loop {
+        let cur = flag.load(Ordering::SeqCst);
+        if cur == 0 {
+            return None;
+        }
+        if flag
+            .compare_exchange(cur, cur - 1, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            return Some(OverlayError::Msg("injected rename tx failure".into()));
+        }
+    }
+}
+
+/// Direct `files` write. Rename attempts run the one-shot before-tx hook
+/// before SQL. The injected failure counter lives in [`apply_pending_ops_sql`]
+/// so a failed replay restores through that function's error. The caller
+/// holds `pending_rows`.
+fn write_files_op_direct(ctx: &FilesWriteCtx<'_>, op: &PendingFilesOp) -> Result<()> {
+    // Drop the hook mutex before calling it. The hook may lock `db`.
+    // It must not lock `pending_rows`: the caller already holds that queue.
+    #[cfg(test)]
+    if op.is_rename() {
+        let hook = ctx.before_tx.lock().expect("overlay rename hook").take();
+        if let Some(mut hook) = hook {
+            hook()?;
+        }
+    }
+    apply_pending_ops_sql(
+        ctx.db,
+        std::slice::from_ref(op),
+        LockPoison::Strict,
+        #[cfg(test)]
+        Some(ctx.fail),
+    )
+}
+
+fn apply_pending_ops_sql(
+    db: &Mutex<Connection>,
+    ops: &[PendingFilesOp],
+    poison: LockPoison,
+    #[cfg(test)] fail: Option<&AtomicU64>,
+) -> Result<()> {
+    let db = lock_mutex(db, poison, "overlay db");
+    let tx = db.unchecked_transaction()?;
+    #[cfg(test)]
+    let mut injected = false;
+    for op in ops {
+        apply_files_op_sql(&tx, op)?;
+        // After the first statement, before commit. Returning here rolls the
+        // transaction back. Callers that replay a batch restore it on this
+        // error; dropping the batch loses those rows.
+        #[cfg(test)]
+        if !injected {
+            injected = true;
+            if let Some(flag) = fail {
+                if let Some(e) = consume_rename_tx_failure_flag(flag) {
+                    return Err(e);
+                }
+            }
+        }
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+/// SQL for one queued `files` update.
+fn apply_files_op_sql(conn: &Connection, op: &PendingFilesOp) -> Result<()> {
+    match op {
+        PendingFilesOp::Rename {
+            from,
+            to,
+            mode,
+            hides_from,
+        } => {
+            let (to_folder, to_name) = WriteOverlay::split(to);
+            let (from_folder, from_name) = WriteOverlay::split(from);
+            conn.execute(
+                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
+                params![to_folder, to_name, *mode as i64],
+            )?;
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![to_folder, to_name],
+            )?;
+            if *hides_from {
+                conn.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
+                    params![from_folder, from_name],
+                )?;
+            } else {
+                conn.execute(
+                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+                    params![from_folder, from_name],
+                )?;
+            }
+        }
+        PendingFilesOp::Deleted { path, hides_base } => {
+            let (folder, name) = WriteOverlay::split(path);
+            if *hides_base {
+                conn.execute(
+                    r#"INSERT OR REPLACE INTO "files" (path,name,deleted) VALUES (?1,?2,1)"#,
+                    params![folder, name],
+                )?;
+            } else {
+                conn.execute(
+                    r#"DELETE FROM "files" WHERE path = ?1 AND name = ?2"#,
+                    params![folder, name],
+                )?;
+            }
+        }
+        PendingFilesOp::Present { path, mode } => {
+            let (folder, name) = WriteOverlay::split(path);
+            conn.execute(
+                r#"INSERT OR IGNORE INTO "files" (path,name,mode,deleted) VALUES (?1,?2,?3,0)"#,
+                params![folder, name, *mode as i64],
+            )?;
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            )?;
+        }
+        PendingFilesOp::ClearDeleted { path } => {
+            let (folder, name) = WriteOverlay::split(path);
+            conn.execute(
+                r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+                params![folder, name],
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Clear tombstones whose name already has a host file or symlink (#88).
+///
+/// One transaction, then the in-memory set. A tombstone with no host file
+/// stays. A host directory does not count: see [`tombstone_has_host_file`].
+/// This does not delete the host file. The duplicate-only crash row
+/// (an archive member with neither a tombstone nor a host file) is left alone.
+fn clear_tombstones_with_host_files(
+    conn: &mut Connection,
+    root: &Path,
+    tombstones: &mut HashSet<String>,
+) -> Result<()> {
+    let shadowed: Vec<String> = tombstones
+        .iter()
+        .filter(|path| tombstone_has_host_file(root, path))
+        .cloned()
+        .collect();
+    if shadowed.is_empty() {
+        return Ok(());
+    }
+    let tx = conn.transaction()?;
+    for path in &shadowed {
+        let (folder, name) = WriteOverlay::split(path);
+        tx.execute(
+            r#"UPDATE "files" SET deleted = 0 WHERE path = ?1 AND name = ?2"#,
+            params![folder, name],
+        )?;
+    }
+    tx.commit()?;
+    for path in &shadowed {
+        tombstones.remove(path);
+    }
+    log::warn!(
+        "overlay {}: cleared {} tombstone(s) that had a host file under the same name",
+        root.display(),
+        shadowed.len()
+    );
+    Ok(())
+}
+
+/// True when `mount_path` has a non-directory host entry (regular file or symlink).
+///
+/// A host directory does not count. `ensure_parent` and nested creates call
+/// `create_dir_all` for parent folders while a directory tombstone stays set.
+/// Treating that directory as "the name was replaced" would clear the tombstone
+/// and resurrect the archive directory and its children. The crash window this
+/// cleanup repairs is a file or symlink written under a still-deleted name
+/// (host rename or create committed the bytes, then lost the `deleted = 0` update).
+fn tombstone_has_host_file(root: &Path, mount_path: &str) -> bool {
+    if is_overlay_internal_path(mount_path) {
+        return false;
+    }
+    let host = overlay_host_path(root, mount_path);
+    match fs::symlink_metadata(&host) {
+        Ok(meta) => !meta.file_type().is_dir(),
+        Err(_) => false,
+    }
 }
 
 /// Load every `deleted = 1` row. Any SQL error (prepare, step, or a row that
@@ -7299,8 +8275,8 @@ mod tests {
         assert_eq!(fi.size, 2);
     }
 
-    /// Regression: rename must not delete the destination when the source
-    /// COW fails — copy the source first, unlink the destination last.
+    /// Regression: rename must not modify the destination when the source
+    /// COW fails — copy the source first.
     #[test]
     fn rename_keeps_destination_when_source_cow_fails() {
         struct FailOpenBase;
@@ -10511,6 +11487,1600 @@ mod tests {
         );
         assert!(overlay.join("new.txt").is_file());
         let _ = worker.join().expect("interval thread");
+    }
+
+    /// In-memory archive: each path has a body the COW path can read.
+    struct MemBase {
+        files: BTreeMap<String, FileInfo>,
+        bodies: BTreeMap<String, Vec<u8>>,
+    }
+
+    impl MemBase {
+        fn with(entries: &[(&str, &[u8])]) -> Self {
+            let mut files = BTreeMap::new();
+            let mut bodies = BTreeMap::new();
+            for (path, body) in entries {
+                bodies.insert((*path).to_string(), body.to_vec());
+                files.insert((*path).to_string(), mem_file_info(path, body.len() as u64));
+            }
+            Self { files, bodies }
+        }
+
+        fn with_dir(path: &str) -> Self {
+            let mut files = BTreeMap::new();
+            files.insert(
+                path.to_string(),
+                FileInfo {
+                    size: 0,
+                    mtime: 0.0,
+                    mode: ratarmount_core::S_IFDIR | 0o755,
+                    linkname: String::new(),
+                    uid: 0,
+                    gid: 0,
+                    userdata: vec![],
+                },
+            );
+            Self {
+                files,
+                bodies: BTreeMap::new(),
+            }
+        }
+    }
+
+    fn mem_file_info(path: &str, size: u64) -> FileInfo {
+        FileInfo {
+            size,
+            mtime: 0.0,
+            mode: ratarmount_core::S_IFREG | 0o644,
+            linkname: String::new(),
+            uid: 0,
+            gid: 0,
+            userdata: vec![
+                UserData::Tar(ratarmount_core::SQLiteIndexedTarUserData {
+                    offset: 0,
+                    offsetheader: Some(0),
+                    istar: true,
+                    issparse: false,
+                    isgenerated: false,
+                    recursiondepth: 0,
+                }),
+                UserData::Other(format!("mem:{path}")),
+            ],
+        }
+    }
+
+    impl MountSource for MemBase {
+        fn list(&self, path: &str) -> Option<ListResult> {
+            if path != "/" {
+                return None;
+            }
+            let mut map = BTreeMap::new();
+            for (path, fi) in &self.files {
+                let name = path.trim_start_matches('/');
+                if !name.is_empty() && !name.contains('/') {
+                    map.insert(name.to_string(), fi.clone());
+                }
+            }
+            Some(ListResult::Infos(map))
+        }
+
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            if path == "/" {
+                Some(create_root_file_info())
+            } else {
+                self.files.get(path).cloned()
+            }
+        }
+
+        fn open(
+            &self,
+            file_info: &FileInfo,
+            _: i32,
+        ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            let path = file_info.userdata.iter().rev().find_map(|u| match u {
+                UserData::Other(s) => s.strip_prefix("mem:"),
+                _ => None,
+            });
+            let Some(path) = path else {
+                return Err(io::Error::new(io::ErrorKind::NotFound, "mem base"));
+            };
+            let body = self.bodies.get(path).cloned().unwrap_or_default();
+            Ok(Box::new(std::io::Cursor::new(body)))
+        }
+
+        fn is_immutable(&self) -> bool {
+            true
+        }
+    }
+
+    fn put_overlay_bytes(ov: &WriteOverlay, path: &str, bytes: &[u8]) {
+        let fd = ov.create_file(path, 0o644).unwrap();
+        let n = unsafe { libc::write(fd, bytes.as_ptr() as *const _, bytes.len()) };
+        assert_eq!(n as usize, bytes.len(), "write {path}");
+        unsafe { libc::close(fd) };
+    }
+
+    fn is_overlay_fi(fi: &FileInfo) -> bool {
+        matches!(fi.userdata.last(), Some(UserData::Other(s)) if s.starts_with("overlay:"))
+    }
+
+    fn deleted_flag(ov: &WriteOverlay, path: &str) -> Option<i64> {
+        ov.files_deleted_flag(path).expect("files row")
+    }
+
+    fn host_ino(path: &Path) -> u64 {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(path).unwrap().ino()
+    }
+
+    fn fd_ino(fd: &impl std::os::unix::io::AsRawFd) -> u64 {
+        let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
+        let rc = unsafe { libc::fstat(fd.as_raw_fd(), &mut st) };
+        assert_eq!(rc, 0, "fstat: {}", io::Error::last_os_error());
+        st.st_ino as u64
+    }
+
+    /// Regression: rename-over must not unlink first (#88). Overlay-backed,
+    /// archive-only, and tombstoned targets each end on the new bytes.
+    #[test]
+    fn rename_over_overlay_archive_and_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/final", b"old-dest");
+        put_overlay_bytes(&ov, "/swap", b"new-src");
+        let parked = ov
+            .rename_parked("/swap", "/final")
+            .expect("overlay rename")
+            .expect("overlay-backed target is parked");
+        assert!(parked.fd().is_some(), "regular file park keeps an fd");
+        drop(parked);
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"new-src");
+        assert!(ov.lookup("/swap", 0).is_none());
+        assert!(!ov.is_deleted("/swap"));
+        assert!(!ov.is_deleted("/final"));
+        let fi = ov.lookup("/final", 0).expect("final");
+        assert!(is_overlay_fi(&fi));
+        assert_eq!(deleted_flag(&ov, "/final"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/swap"), None);
+        ov.mkdir("/dir", 0o755).unwrap();
+        put_overlay_bytes(&ov, "/file", b"keep");
+        let err = ov.rename("/file", "/dir").expect_err("directory target");
+        match err {
+            OverlayError::Io(e) => {
+                assert_eq!(e.kind(), io::ErrorKind::AlreadyExists, "{e}");
+            }
+            other => panic!("expected Io, got {other}"),
+        }
+        assert_eq!(fs::read(overlay.join("file")).unwrap(), b"keep");
+        assert!(ratarmount_core::is_dir_mode(
+            ov.lookup("/dir", 0).expect("dir").mode
+        ));
+
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[
+            ("/src", b"archive-src"),
+            ("/final", b"archive-final"),
+        ])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        assert!(!is_overlay_fi(&ov.lookup("/final", 0).unwrap()));
+        let parked = ov.rename_parked("/src", "/final").expect("archive rename");
+        assert!(parked.is_none(), "archive-only target has no host inode");
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"archive-src");
+        assert!(is_overlay_fi(&ov.lookup("/final", 0).unwrap()));
+        assert!(
+            ov.lookup("/src", 0).is_none(),
+            "archive source is tombstoned"
+        );
+        assert!(ov.is_deleted("/src"));
+        assert!(!ov.is_deleted("/final"));
+        assert_eq!(deleted_flag(&ov, "/src"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/final"), Some(0));
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert!(
+            ov.is_deleted("/src"),
+            "persisted tombstone hides the archive source"
+        );
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"archive-src");
+        assert!(is_overlay_fi(&ov.lookup("/final", 0).unwrap()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.unlink("/final").unwrap();
+        assert!(ov.lookup("/final", 0).is_none());
+        assert!(ov.is_deleted("/final"));
+        assert!(!overlay.join("final").exists());
+        put_overlay_bytes(&ov, "/swap", b"replacement");
+        let parked = ov
+            .rename_parked("/swap", "/final")
+            .expect("rename over tombstone");
+        assert!(parked.is_none(), "tombstoned target has no host inode yet");
+        assert!(!ov.is_deleted("/final"));
+        assert!(is_overlay_fi(&ov.lookup("/final", 0).expect("visible")));
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"replacement");
+        assert_eq!(deleted_flag(&ov, "/final"), Some(0));
+        assert!(ov.lookup("/swap", 0).is_none());
+    }
+
+    /// Lookup oracles must fail instead of spinning when the in-memory rename
+    /// update disappears. `thread::scope` joins every child, so a parent assert
+    /// that never sets `stop` would hang the child until the job is killed.
+    const LOOKUP_ORACLE_DEADLINE: Duration = Duration::from_secs(10);
+
+    struct StopLookupOnDrop<'a>(&'a AtomicBool);
+
+    impl Drop for StopLookupOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn assert_lookup_oracle_deadline(deadline: Instant, waiting_for: &str) {
+        assert!(
+            Instant::now() < deadline,
+            "lookup loop exceeded 10s waiting for {waiting_for}; a missing in-memory rename update must fail the test, not hang"
+        );
+    }
+
+    /// Regression: a visible rename-over target never resolves as missing (#88).
+    #[test]
+    fn rename_visible_lookup_never_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/final", b"seed");
+        let nones = AtomicU64::new(0);
+        let samples = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        let some_to_none = std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let deadline = Instant::now() + LOOKUP_ORACLE_DEADLINE;
+                let mut prev = true;
+                let mut flips = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    assert_lookup_oracle_deadline(deadline, "the rename loop to stop");
+                    let some = ov.lookup("/final", 0).is_some();
+                    samples.fetch_add(1, Ordering::SeqCst);
+                    if !some {
+                        nones.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if prev && !some {
+                        flips += 1;
+                    }
+                    prev = some;
+                }
+                flips
+            });
+            // Drop sets `stop` before `handle` joins, including when an assert
+            // panics. Declared after `handle` so it runs first.
+            let _stop_on_unwind = StopLookupOnDrop(&stop);
+            let start = Instant::now();
+            while samples.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "lookup loop did not start"
+                );
+                std::thread::yield_now();
+            }
+            for i in 0..80 {
+                put_overlay_bytes(&ov, "/swap", format!("n{i:04}").as_bytes());
+                ov.rename("/swap", "/final").expect("rename");
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().expect("lookup thread")
+        });
+        assert!(samples.load(Ordering::SeqCst) > 0);
+        assert_eq!(
+            nones.load(Ordering::SeqCst),
+            0,
+            "visible target was None in {} lookups",
+            samples.load(Ordering::SeqCst)
+        );
+        assert_eq!(some_to_none, 0);
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"n0079");
+        assert!(ov.lookup("/swap", 0).is_none());
+    }
+
+    /// Regression: a tombstoned target stays missing until the rename commits,
+    /// then becomes visible once (#88).
+    #[test]
+    fn rename_tombstone_lookup_none_to_some_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(
+            Arc::new(MemBase::with(&[("/final", b"archived")])) as Arc<dyn MountSource>,
+            &overlay,
+        )
+        .unwrap();
+        ov.unlink("/final").unwrap();
+        assert!(ov.lookup("/final", 0).is_none());
+        let seen_none = AtomicBool::new(false);
+        let none_to_some = AtomicU64::new(0);
+        let some_to_none = AtomicU64::new(0);
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let handle = scope.spawn(|| {
+                let deadline = Instant::now() + LOOKUP_ORACLE_DEADLINE;
+                let mut prev = false;
+                let mut saw_none = false;
+                while !stop.load(Ordering::SeqCst) {
+                    assert_lookup_oracle_deadline(deadline, "stop after None->Some");
+                    let some = ov.lookup("/final", 0).is_some();
+                    if !some {
+                        saw_none = true;
+                        seen_none.store(true, Ordering::SeqCst);
+                    }
+                    if !prev && some && saw_none {
+                        none_to_some.fetch_add(1, Ordering::SeqCst);
+                    }
+                    if prev && !some {
+                        some_to_none.fetch_add(1, Ordering::SeqCst);
+                    }
+                    prev = some;
+                    std::thread::yield_now();
+                }
+            });
+            // Drop sets `stop` before `handle` joins, including when an assert
+            // panics. Declared after `handle` so it runs first.
+            let _stop_on_unwind = StopLookupOnDrop(&stop);
+            let start = Instant::now();
+            while !seen_none.load(Ordering::SeqCst) {
+                assert!(
+                    start.elapsed() < Duration::from_secs(2),
+                    "lookup loop did not observe the tombstone"
+                );
+                std::thread::yield_now();
+            }
+            put_overlay_bytes(&ov, "/swap", b"replacement");
+            ov.rename("/swap", "/final").unwrap();
+            let start = Instant::now();
+            while none_to_some.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    start.elapsed() < LOOKUP_ORACLE_DEADLINE,
+                    "lookup loop exceeded 10s waiting for None->Some; a missing in-memory rename update must fail the test, not hang (some_to_none={})",
+                    some_to_none.load(Ordering::SeqCst)
+                );
+                std::thread::yield_now();
+            }
+            stop.store(true, Ordering::SeqCst);
+            handle.join().expect("lookup thread");
+        });
+        assert_eq!(none_to_some.load(Ordering::SeqCst), 1);
+        assert_eq!(some_to_none.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(overlay.join("final")).unwrap(), b"replacement");
+    }
+
+    /// Regression: a failed tombstone transaction after the host rename still
+    /// returns success. When every retry fails, durable state matches the #88
+    /// crash table and the rows sit in `pending_rows`. Drop tries one last
+    /// replay; when that also fails, the queue is lost the same way a process
+    /// crash loses it. This session's tombstones match the completed rename.
+    /// Same-session replay is covered by the commit test.
+    #[test]
+    fn rename_tx_failure_matches_crash_table() {
+        // Visible `to`, archive `from`: `from` reappears from the archive.
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        put_overlay_bytes(&ov, "/dst", b"old-dest");
+        let probe = Arc::downgrade(&ov);
+        let host = overlay.clone();
+        // The one-shot hook fails only the first attempt and does not consume a
+        // failure. Two retries consume 2. Drop's replay gets three more attempts;
+        // 8 leaves those failing so the queue is lost like a crash.
+        ov.set_rename_tx_failures(8);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            let probe = probe.upgrade().expect("overlay");
+            assert_eq!(fs::read(host.join("dst")).unwrap(), b"archive-src");
+            assert!(!host.join("src").exists());
+            let src = probe.lookup("/src", 0).expect("archive from reappears");
+            assert!(
+                !is_overlay_fi(&src),
+                "crash window serves the archive member"
+            );
+            assert!(is_overlay_fi(&probe.lookup("/dst", 0).unwrap()));
+            assert_eq!(deleted_flag(&probe, "/src"), None);
+            assert_eq!(deleted_flag(&probe, "/dst"), Some(0));
+            Err(OverlayError::Msg("injected rename tx failure".into()))
+        })));
+        ov.rename_parked("/src", "/dst")
+            .expect("tx failure still returns success");
+        assert!(ov.pending_row_count() >= 1, "queued the failed rename");
+        assert!(ov.is_deleted("/src"), "in-memory tombstone applied");
+        assert!(ov.lookup("/src", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
+        assert_eq!(
+            deleted_flag(&ov, "/src"),
+            None,
+            "db still has no from tombstone"
+        );
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        let src = ov
+            .lookup("/src", 0)
+            .expect("duplicate archive member accepted");
+        assert!(!is_overlay_fi(&src));
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
+        assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
+
+        // Overlay-only `from`: lookup is None and a stale deleted=0 row remains.
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        put_overlay_bytes(&ov, "/dst", b"old-dest");
+        put_overlay_bytes(&ov, "/src", b"new-src");
+        let probe = Arc::downgrade(&ov);
+        let host = overlay.clone();
+        // Same budget as the archive-from case: Drop's replay must also fail.
+        ov.set_rename_tx_failures(8);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            let probe = probe.upgrade().expect("overlay");
+            assert_eq!(fs::read(host.join("dst")).unwrap(), b"new-src");
+            assert!(!host.join("src").exists());
+            assert!(probe.lookup("/src", 0).is_none());
+            assert!(is_overlay_fi(&probe.lookup("/dst", 0).unwrap()));
+            assert_eq!(deleted_flag(&probe, "/src"), Some(0));
+            Err(OverlayError::Msg("injected rename tx failure".into()))
+        })));
+        ov.rename("/src", "/dst").expect("success");
+        assert!(ov.pending_row_count() >= 1, "queued the failed rename");
+        assert!(!ov.is_deleted("/src"));
+        assert!(ov.lookup("/src", 0).is_none());
+        assert_eq!(deleted_flag(&ov, "/src"), Some(0), "stale present row kept");
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
+        drop(ov);
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        assert!(ov.lookup("/src", 0).is_none());
+        assert_eq!(deleted_flag(&ov, "/src"), Some(0));
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
+
+        // Tombstoned `to`: hidden until open recovery, which must keep the bytes.
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/dst", b"archived")])) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        ov.unlink("/dst").unwrap();
+        put_overlay_bytes(&ov, "/src", b"replacement");
+        let probe = Arc::downgrade(&ov);
+        let host = overlay.clone();
+        // Same budget as the archive-from case: Drop's replay must also fail.
+        ov.set_rename_tx_failures(8);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            let probe = probe.upgrade().expect("overlay");
+            assert_eq!(fs::read(host.join("dst")).unwrap(), b"replacement");
+            assert!(probe.lookup("/dst", 0).is_none(), "still tombstoned");
+            assert!(probe.is_deleted("/dst"));
+            assert_eq!(deleted_flag(&probe, "/dst"), Some(1));
+            Err(OverlayError::Msg("injected rename tx failure".into()))
+        })));
+        ov.rename("/src", "/dst").expect("success");
+        assert!(ov.pending_row_count() >= 1, "queued the failed rename");
+        assert!(!ov.is_deleted("/dst"), "in-memory clear");
+        assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
+        assert_eq!(deleted_flag(&ov, "/dst"), Some(1), "db row still deleted");
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert!(!ov.is_deleted("/dst"), "open clears the tombstone");
+        assert_eq!(deleted_flag(&ov, "/dst"), Some(0));
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"replacement");
+        assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
+    }
+
+    /// Regression: opening the overlay clears a tombstone that has a host file
+    /// and leaves a tombstone with no host file (#88). Recovery does not
+    /// delete the host file.
+    #[test]
+    fn clear_tombstone_with_host_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[
+            ("/keep.txt", b"archived-keep"),
+            ("/other.txt", b"archived-other"),
+        ])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        ov.unlink("/keep.txt").unwrap();
+        ov.unlink("/other.txt").unwrap();
+        assert!(ov.is_deleted("/keep.txt"));
+        assert!(ov.is_deleted("/other.txt"));
+        fs::write(overlay.join("keep.txt"), b"hidden-but-committed").unwrap();
+        drop(ov);
+
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        assert!(!ov.is_deleted("/keep.txt"));
+        assert!(is_overlay_fi(&ov.lookup("/keep.txt", 0).expect("visible")));
+        assert_eq!(
+            fs::read(overlay.join("keep.txt")).unwrap(),
+            b"hidden-but-committed"
+        );
+        assert_eq!(deleted_flag(&ov, "/keep.txt"), Some(0));
+        assert!(ov.is_deleted("/other.txt"));
+        assert!(ov.lookup("/other.txt", 0).is_none());
+        assert_eq!(deleted_flag(&ov, "/other.txt"), Some(1));
+        assert!(overlay.join(HIDDEN_DB).is_file());
+        assert!(overlay.join(OVERLAY_MARKER).is_file());
+        drop(ov);
+
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert!(!ov.is_deleted("/keep.txt"), "clear was persisted");
+        assert!(ov.is_deleted("/other.txt"));
+        assert_eq!(
+            fs::read(overlay.join("keep.txt")).unwrap(),
+            b"hidden-but-committed"
+        );
+    }
+
+    /// Regression: a host directory with the same name as a tombstone does not
+    /// clear that tombstone on open (#88).
+    ///
+    /// Parent directories are created for nested overlay files (`ensure_parent`
+    /// / `create_dir_all`) while a directory tombstone stays set. That directory
+    /// is not evidence the archive directory was replaced. Clearing it would
+    /// resurrect the archive directory and its children. Only a non-directory
+    /// host entry (file or symlink) is the crash window that should become visible.
+    #[test]
+    fn clear_tombstone_keeps_host_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with_dir("/sub")) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        ov.rmdir("/sub").expect("tombstone the archive directory");
+        assert!(ov.is_deleted("/sub"));
+        assert_eq!(deleted_flag(&ov, "/sub"), Some(1));
+        assert!(!overlay.join("sub").exists());
+        fs::create_dir(overlay.join("sub")).unwrap();
+        drop(ov);
+
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert!(
+            overlay.join("sub").is_dir(),
+            "open must not delete the host directory"
+        );
+        assert!(
+            ov.is_deleted("/sub"),
+            "a host directory must not clear the tombstone"
+        );
+        assert_eq!(deleted_flag(&ov, "/sub"), Some(1));
+        assert!(ov.lookup("/sub", 0).is_none());
+    }
+
+    /// Regression: one injected tombstone failure is retried and the rename
+    /// commits. The caller sees success and nothing is queued (#88).
+    #[test]
+    fn rename_tx_retry_transient() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(1);
+        ov.rename_parked("/src", "/dst")
+            .expect("a single transient failure is retried");
+        assert_eq!(ov.pending_row_count(), 0, "retry committed; nothing queued");
+        assert_eq!(deleted_flag(&ov, "/src"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/dst"), Some(0));
+        assert!(ov.is_deleted("/src"));
+        assert!(ov.lookup("/src", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/dst", 0).unwrap()));
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"archive-src");
+    }
+
+    /// Regression: queued rename rows are written at the start of the next
+    /// `files` update (`mark_present`), not only at commit time (#88).
+    #[test]
+    fn rename_tx_pending_replays_on_next_db_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/src", b"archive-src")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/src", "/dst").expect("rename returns success");
+        assert_eq!(ov.pending_row_count(), 1);
+        assert_eq!(deleted_flag(&ov, "/src"), None, "sql missed the tombstone");
+        assert!(ov.is_deleted("/src"), "memory already hides from");
+        ov.set_rename_tx_failures(0);
+        put_overlay_bytes(&ov, "/other", b"trigger-replay");
+        assert_eq!(
+            ov.pending_row_count(),
+            0,
+            "mark_present replayed the queued rename"
+        );
+        assert_eq!(deleted_flag(&ov, "/src"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/dst"), Some(0));
+        assert!(ov.is_deleted("/src"));
+        assert!(ov.lookup("/src", 0).is_none());
+        assert_eq!(fs::read(overlay.join("other")).unwrap(), b"trigger-replay");
+    }
+
+    /// Regression: a persistent tombstone-tx failure must not let `commit_live`
+    /// publish an archive `from` that the mount already hides (#88).
+    ///
+    /// While the fault is installed, commit refuses (the plan would omit the
+    /// `from` delete, then the overlay reset would show `from` again). After
+    /// the fault is cleared, the next commit replays the queued rows and
+    /// deletes `from` from the archive.
+    #[test]
+    fn rename_tx_pending_commit_refuses_then_replays() {
+        let dir = tempfile::tempdir().unwrap();
+        let payload = b"pending-src-payload\n";
+        let tar = make_tiny_tar(dir.path(), &[("src.txt", payload), ("keep.txt", b"keep\n")]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&tar, true), &overlay);
+        // Rename retries plus the commit's replay retries.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/src.txt", "/dst.txt")
+            .expect("rename returns success");
+        assert!(ov.pending_row_count() >= 1);
+        assert!(ov.is_deleted("/src.txt"));
+        assert!(
+            ov.lookup("/src.txt", 0).is_none(),
+            "mount hides archive from"
+        );
+        assert_eq!(
+            deleted_flag(&ov, "/src.txt"),
+            None,
+            "sql has no from tombstone yet"
+        );
+        assert_eq!(fs::read(overlay.join("dst.txt")).unwrap(), payload);
+
+        match ov.commit_live(&tar, |p| Ok(open_uncompressed_tar_base(p, true))) {
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("refusing to commit") && msg.contains("reappear"),
+                    "{msg}"
+                );
+            }
+            Ok(published) => {
+                panic!("commit published while rename rows were pending: {published}")
+            }
+        }
+        assert!(
+            ov.lookup("/src.txt", 0).is_none(),
+            "refused commit must keep from hidden"
+        );
+        assert!(ov.is_deleted("/src.txt"));
+        assert!(
+            ov.pending_row_count() >= 1,
+            "rows stay queued after the refusal"
+        );
+        let mid = open_uncompressed_tar_base(&tar, true);
+        assert!(
+            mid.lookup("/src.txt", 0).is_some(),
+            "refused commit must leave the archive member in place"
+        );
+        assert!(
+            mid.lookup("/dst.txt", 0).is_none(),
+            "refused commit must not append dst"
+        );
+
+        ov.set_rename_tx_failures(0);
+        match ov.commit_live(&tar, |p| Ok(open_uncompressed_tar_base(p, true))) {
+            Ok(true) => {}
+            Err(e) if soft_skip_gnu_tar_commit(&e) => {
+                eprintln!("skip: {e}");
+                return;
+            }
+            other => panic!("replay commit: {other:?}"),
+        }
+        assert_eq!(ov.pending_row_count(), 0, "replay drained the queue");
+        let after = open_uncompressed_tar_base(&tar, true);
+        assert!(
+            after.lookup("/src.txt", 0).is_none(),
+            "replayed tombstone deleted archive from; it must not stay as a duplicate"
+        );
+        assert_eq!(read_member(after.as_ref(), "/dst.txt"), payload);
+        assert!(
+            ov.lookup("/src.txt", 0).is_none(),
+            "mount must not show a duplicate from"
+        );
+        assert!(after.lookup("/keep.txt", 0).is_some());
+        let dst = ov.lookup("/dst.txt", 0).expect("dst visible after commit");
+        assert_eq!(dst.size, payload.len() as u64);
+    }
+
+    /// Regression: archive `/a` and `/x`, rename `a`→`x` queued, then `x`→`y`
+    /// while replay still fails. The second rename must stay behind the first.
+    /// After the fault clears, remount must hide `/a` and `/x` and show `/y`
+    /// (#88). Replaying `a`→`x` after `x`→`y` would mark `/x` present again.
+    #[test]
+    fn rename_tx_pending_second_rename_keeps_intermediate_hidden() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        // First rename's direct attempts, then the second rename's replay.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("a->x returns success");
+        assert_eq!(ov.pending_row_count(), 1, "a->x queued");
+        assert_eq!(deleted_flag(&ov, "/a"), None, "sql has no a tombstone yet");
+        ov.rename("/x", "/y").expect("x->y returns success");
+        assert_eq!(ov.pending_row_count(), 2, "x->y appended behind a->x");
+        assert_eq!(deleted_flag(&ov, "/a"), None);
+        assert_eq!(
+            deleted_flag(&ov, "/x"),
+            None,
+            "x->y must not tombstone x while a->x is still queued"
+        );
+        assert_eq!(deleted_flag(&ov, "/y"), None);
+        assert!(ov.lookup("/a", 0).is_none(), "mount hides a");
+        assert!(ov.lookup("/x", 0).is_none(), "mount hides x");
+        assert!(is_overlay_fi(&ov.lookup("/y", 0).expect("y visible")));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+
+        ov.set_rename_tx_failures(0);
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1), "/x must stay deleted");
+        assert_eq!(deleted_flag(&ov, "/y"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none(), "remount must not show /a");
+        assert!(
+            ov.lookup("/x", 0).is_none(),
+            "remount must not show /x; a later a->x replay would resurrect it"
+        );
+        let y = ov.lookup("/y", 0).expect("/y present");
+        assert!(is_overlay_fi(&y));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+    }
+
+    /// Regression: replay holds `pending_rows` across take, the failure path,
+    /// and restore. A contending rename must not write `/x` while `a`→`x` is
+    /// off the queue (#88).
+    #[test]
+    fn rename_tx_pending_replay_holds_queue_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(base, &overlay).unwrap());
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/x").expect("a->x queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        ov.set_rename_tx_failures(0);
+
+        let in_replay = Arc::new(AtomicBool::new(false));
+        let t2_tried = Arc::new(AtomicBool::new(false));
+        let lock_was_held = Arc::new(AtomicBool::new(false));
+        let in_replay_hook = Arc::clone(&in_replay);
+        let t2_tried_hook = Arc::clone(&t2_tried);
+        ov.set_replay_hold_hook(Some(Box::new(move || {
+            in_replay_hook.store(true, Ordering::SeqCst);
+            let start = std::time::Instant::now();
+            while !t2_tried_hook.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    return Err(OverlayError::Msg(
+                        "replay hook timed out waiting for contender".into(),
+                    ));
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            // Fail this attempt so the batch is restored while the lock is held.
+            Err(OverlayError::Msg("injected replay hold failure".into()))
+        })));
+
+        let ov_t2 = Arc::clone(&ov);
+        let in_replay_t2 = Arc::clone(&in_replay);
+        let t2_tried_t2 = Arc::clone(&t2_tried);
+        let lock_was_held_t2 = Arc::clone(&lock_was_held);
+        let t2 = std::thread::spawn(move || {
+            let start = std::time::Instant::now();
+            while !in_replay_t2.load(Ordering::SeqCst) {
+                if start.elapsed() > Duration::from_secs(5) {
+                    panic!("replay hook did not run");
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            match ov_t2.pending_rows.try_lock() {
+                Ok(guard) => {
+                    drop(guard);
+                    lock_was_held_t2.store(false, Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    lock_was_held_t2.store(true, Ordering::SeqCst);
+                }
+                Err(std::sync::TryLockError::Poisoned(_)) => {
+                    panic!("pending queue poisoned");
+                }
+            }
+            t2_tried_t2.store(true, Ordering::SeqCst);
+            ov_t2.rename("/x", "/y").expect("contending rename");
+        });
+
+        ov.mkdir("/trigger", 0o755).expect("trigger replay");
+        t2.join().expect("contender");
+        assert!(
+            lock_was_held.load(Ordering::SeqCst),
+            "replay dropped the queue lock before apply/restore"
+        );
+        assert_eq!(ov.pending_row_count(), 0, "both renames reached sql");
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/y"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/x", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/y", 0).expect("y")));
+        assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+    }
+
+    /// Regression: an unlink tombstone write replays queued rows first (#88).
+    /// Skipping that replay would leave archive `/a` visible in SQL.
+    #[test]
+    fn rename_tx_pending_unlink_replays_before_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base =
+            Arc::new(MemBase::with(&[("/a", b"from-a"), ("/z", b"zzz")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        assert_eq!(deleted_flag(&ov, "/a"), None);
+        ov.set_rename_tx_failures(0);
+        ov.unlink("/z").expect("unlink replays, then tombstones z");
+        assert_eq!(ov.pending_row_count(), 0, "unlink drained the queue");
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/b"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/z"), Some(1));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/z", 0).is_none());
+        assert!(is_overlay_fi(&ov.lookup("/b", 0).expect("b")));
+        assert_eq!(fs::read(overlay.join("b")).unwrap(), b"from-a");
+    }
+
+    /// Regression: when replay fails, unlink queues behind the rename instead
+    /// of tombstoning `/x` in SQL. A later `a`→`x` replay would otherwise
+    /// mark `/x` present and the unlinked name would come back (#88).
+    #[test]
+    fn rename_tx_pending_unlink_queues_behind_failed_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(Arc::clone(&base), &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("queued");
+        ov.unlink("/x").expect("unlink returns success");
+        assert_eq!(ov.pending_row_count(), 2, "unlink appended");
+        assert_eq!(
+            deleted_flag(&ov, "/x"),
+            None,
+            "unlink must not write the tombstone ahead of a->x"
+        );
+        assert!(ov.lookup("/x", 0).is_none(), "memory already hides x");
+        ov.set_rename_tx_failures(0);
+        drop(ov);
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert_eq!(ov.pending_row_count(), 0);
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/x"), Some(1));
+        assert!(ov.lookup("/a", 0).is_none());
+        assert!(ov.lookup("/x", 0).is_none());
+    }
+
+    /// Regression: a failed replay puts the batch back. The next present-mark
+    /// stays behind those rows, and a later successful replay still tombstones
+    /// `/a` (#88).
+    ///
+    /// The fault is raised inside `apply_pending_ops_sql` after the first
+    /// statement. The transaction rolls back, and
+    /// `try_replay_pending_once_with` restores the batch on that error.
+    /// Removing that restore drops `a`→`b` and this test's pending count is
+    /// no longer 2.
+    #[test]
+    fn rename_tx_failed_replay_keeps_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.mkdir("/c", 0o755)
+            .expect("present queues behind the failed replay");
+        assert_eq!(
+            ov.pending_row_count(),
+            2,
+            "failed replay must keep a->b and queue present /c"
+        );
+        assert_eq!(deleted_flag(&ov, "/a"), None, "a->b still unsaved");
+        assert_eq!(deleted_flag(&ov, "/c"), None, "present /c still unsaved");
+        ov.set_rename_tx_failures(0);
+        ov.mkdir("/d", 0o755)
+            .expect("later present replays the queue");
+        assert_eq!(ov.pending_row_count(), 0);
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1));
+        assert_eq!(deleted_flag(&ov, "/b"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/c"), Some(0));
+        assert_eq!(deleted_flag(&ov, "/d"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none());
+    }
+
+    /// Regression: restoring a failed batch keeps those rows ahead of anything
+    /// already queued. Appending them would apply `x`→`y` before `a`→`x` and
+    /// resurrect `/x` (#88).
+    #[test]
+    fn restore_pending_front_keeps_older_rows_ahead() {
+        let older = vec![PendingFilesOp::Rename {
+            from: "/a".to_string(),
+            to: "/x".to_string(),
+            mode: ratarmount_core::S_IFREG | 0o644,
+            hides_from: true,
+        }];
+        let newer = PendingFilesOp::Rename {
+            from: "/x".to_string(),
+            to: "/y".to_string(),
+            mode: ratarmount_core::S_IFREG | 0o644,
+            hides_from: true,
+        };
+        let mut queued = vec![newer.clone()];
+        restore_pending_front(&mut queued, older.clone());
+        assert_eq!(
+            queued.first().map(|op| op.to_string()),
+            Some(older[0].to_string())
+        );
+        assert_eq!(queued, vec![older[0].clone(), newer]);
+
+        let mut empty = Vec::new();
+        restore_pending_front(&mut empty, older.clone());
+        assert_eq!(empty, older);
+    }
+
+    /// Regression: on-exit `commit_atomic` is the plan-builder call site that
+    /// does not refuse on its own. The plan must still refuse, name `/a` and
+    /// `/x`, and warn that an offline `--commit-overlay` would publish them
+    /// (#88). `commit_live` refuses before `plan_for_commit`, so it does not
+    /// cover deleting the check inside the plan builder.
+    #[test]
+    fn rename_tx_pending_on_exit_names_reappear_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let tar = make_tiny_tar(dir.path(), &[("a", b"from-a"), ("x", b"orig-x")]);
+        let overlay = dir.path().join("ov");
+        let ov = overlay_with_base(open_uncompressed_tar_base(&tar, true), &overlay);
+        // a->x direct attempts, x->y replay, and commit_atomic's replay.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 3);
+        ov.rename("/a", "/x").expect("a->x queued");
+        ov.rename("/x", "/y").expect("x->y queued");
+        assert_eq!(ov.pending_row_count(), 2);
+        assert_eq!(deleted_flag(&ov, "/x"), None);
+        let err = ov
+            .commit_atomic(&tar)
+            .expect_err("on-exit commit must refuse while rows are queued");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("refusing to commit")
+                && msg.contains("reappear")
+                && msg.contains("/a")
+                && msg.contains("/x")
+                && msg.contains("offline --commit-overlay"),
+            "{msg}"
+        );
+        assert_eq!(ov.pending_row_count(), 2, "refusal must keep the queue");
+        let archive = open_uncompressed_tar_base(&tar, true);
+        assert!(
+            archive.lookup("/a", 0).is_some(),
+            "refused commit must leave /a in the archive"
+        );
+        assert!(
+            archive.lookup("/x", 0).is_some(),
+            "refused commit must leave /x in the archive"
+        );
+        assert!(
+            archive.lookup("/y", 0).is_none(),
+            "refused commit must not publish /y"
+        );
+    }
+
+    struct DropCaptureLog;
+
+    static DROP_CAPTURED_LOGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    impl log::Log for DropCaptureLog {
+        fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+            metadata.level() <= log::Level::Error
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            if !self.enabled(record.metadata()) {
+                return;
+            }
+            if let Ok(mut lines) = DROP_CAPTURED_LOGS.lock() {
+                lines.push(record.args().to_string());
+            }
+        }
+
+        fn flush(&self) {}
+    }
+
+    fn install_drop_capture_log() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            log::set_logger(&DropCaptureLog).expect("install overlay drop log capture");
+            log::set_max_level(log::LevelFilter::Error);
+        });
+    }
+
+    /// Regression: drop replays once more, then logs the archive paths that
+    /// will reappear and warns that an offline `--commit-overlay` publishes
+    /// them (#88).
+    #[test]
+    fn rename_tx_pending_drop_logs_reappear_paths() {
+        install_drop_capture_log();
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+            as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        // Direct attempts plus Drop's three replay attempts.
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS) * 2);
+        ov.rename("/a", "/x").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        let root = overlay.display().to_string();
+        drop(ov);
+        let lines = DROP_CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let hit = lines.iter().any(|line| {
+            line.contains(&root)
+                && line.contains("/a")
+                && line.contains("will reappear")
+                && line.contains("offline --commit-overlay")
+        });
+        assert!(hit, "drop log missing reappear paths for {root}: {lines:?}");
+    }
+
+    fn drop_log_reappear_list(root: &str) -> String {
+        let lines = DROP_CAPTURED_LOGS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let line = lines
+            .iter()
+            .rev()
+            .find(|line| {
+                line.contains(root) && line.contains("these paths will reappear on remount:")
+            })
+            .unwrap_or_else(|| panic!("drop log missing for {root}: {lines:?}"));
+        line.split_once("these paths will reappear on remount: ")
+            .and_then(|(_, rest)| rest.split_once('.'))
+            .map(|(paths, _)| paths.to_string())
+            .unwrap_or_else(|| panic!("could not parse drop log: {line}"))
+    }
+
+    /// Regression: a direct writer's retry holds `pending_rows` across the
+    /// backoff. Thread B (`x`→`y`) runs in that window. If the lock is free,
+    /// B tombstones `/x` and A's retry then marks `/x` present (#88).
+    #[test]
+    fn rename_tx_retry_window_second_thread_cannot_resurrect_x() {
+        for trial in 0..20 {
+            let dir = tempfile::tempdir().unwrap();
+            let overlay = dir.path().join("ov");
+            let base = Arc::new(MemBase::with(&[("/a", b"from-a"), ("/x", b"orig-x")]))
+                as Arc<dyn MountSource>;
+            let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+            let entered = Arc::new(AtomicBool::new(false));
+            let sampled = Arc::new(AtomicBool::new(false));
+            let lock_was_held = Arc::new(AtomicBool::new(false));
+            ov.set_rename_before_tx_hook(Some(Box::new(|| {
+                Err(OverlayError::Msg(
+                    "injected first attempt, before the retry wait".into(),
+                ))
+            })));
+            let entered_hook = Arc::clone(&entered);
+            let sampled_hook = Arc::clone(&sampled);
+            ov.set_direct_retry_wait_hook(Some(Box::new(move || {
+                entered_hook.store(true, Ordering::SeqCst);
+                let start = Instant::now();
+                while !sampled_hook.load(Ordering::SeqCst) {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "trial {trial}: contender did not sample the retry window"
+                    );
+                    std::thread::yield_now();
+                }
+            })));
+            let ov_b = Arc::clone(&ov);
+            let entered_b = Arc::clone(&entered);
+            let sampled_b = Arc::clone(&sampled);
+            let lock_b = Arc::clone(&lock_was_held);
+            let contender = std::thread::spawn(move || {
+                let start = Instant::now();
+                while !entered_b.load(Ordering::SeqCst) {
+                    assert!(
+                        start.elapsed() < Duration::from_secs(5),
+                        "trial {trial}: retry window did not open"
+                    );
+                    std::thread::yield_now();
+                }
+                match ov_b.pending_rows.try_lock() {
+                    Ok(guard) => {
+                        drop(guard);
+                        lock_b.store(false, Ordering::SeqCst);
+                    }
+                    Err(std::sync::TryLockError::WouldBlock) => {
+                        lock_b.store(true, Ordering::SeqCst);
+                    }
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        panic!("trial {trial}: pending queue poisoned");
+                    }
+                }
+                sampled_b.store(true, Ordering::SeqCst);
+                ov_b.rename("/x", "/y").expect("x->y");
+            });
+            ov.rename("/a", "/x").expect("a->x");
+            contender.join().expect("contender");
+            assert!(
+                lock_was_held.load(Ordering::SeqCst),
+                "trial {trial}: queue lock was free during the retry wait"
+            );
+            assert_eq!(
+                ov.pending_row_count(),
+                0,
+                "trial {trial}: both renames committed"
+            );
+            assert_eq!(deleted_flag(&ov, "/a"), Some(1), "trial {trial}");
+            assert_eq!(
+                deleted_flag(&ov, "/x"),
+                Some(1),
+                "trial {trial}: /x resurrected before reopen"
+            );
+            assert_eq!(deleted_flag(&ov, "/y"), Some(0), "trial {trial}");
+            drop(ov);
+            let ov = WriteOverlay::new(base, &overlay).unwrap();
+            assert_eq!(deleted_flag(&ov, "/a"), Some(1), "trial {trial}");
+            assert_eq!(
+                deleted_flag(&ov, "/x"),
+                Some(1),
+                "trial {trial}: /x resurrected on reopen"
+            );
+            assert_eq!(deleted_flag(&ov, "/y"), Some(0), "trial {trial}");
+            assert!(
+                ov.lookup("/x", 0).is_none(),
+                "trial {trial}: remount shows /x"
+            );
+            let y = ov.lookup("/y", 0).expect("trial {trial}: /y");
+            assert!(is_overlay_fi(&y), "trial {trial}");
+            assert_eq!(fs::read(overlay.join("y")).unwrap(), b"from-a");
+        }
+    }
+
+    /// Regression: `Drop` recovers a poisoned `pending_rows` or `db` lock and
+    /// still replays. `expect` on those locks aborts the process (#88).
+    #[test]
+    fn drop_recovers_poisoned_pending_and_db_locks() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"from-a")])) as Arc<dyn MountSource>;
+        let ov = Arc::new(WriteOverlay::new(Arc::clone(&base), &overlay).unwrap());
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        ov.set_rename_tx_failures(0);
+        {
+            let ov_poison = Arc::clone(&ov);
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = ov_poison.pending_rows.lock().expect("pending");
+                panic!("poison pending rows");
+            }));
+            assert!(poisoned.is_err(), "pending poison panic was swallowed");
+        }
+        {
+            let ov_poison = Arc::clone(&ov);
+            let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = ov_poison.db.lock().expect("db");
+                panic!("poison db");
+            }));
+            assert!(poisoned.is_err(), "db poison panic was swallowed");
+        }
+        assert!(
+            ov.pending_rows.lock().is_err(),
+            "pending lock must stay poisoned"
+        );
+        assert!(ov.db.lock().is_err(), "db lock must stay poisoned");
+        let ov = Arc::try_unwrap(ov).unwrap_or_else(|_| panic!("only the test holds the overlay"));
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(ov)));
+        assert!(dropped.is_ok(), "drop panicked on a poisoned overlay lock");
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        assert_eq!(deleted_flag(&ov, "/a"), Some(1), "drop replay must land");
+        assert_eq!(deleted_flag(&ov, "/b"), Some(0));
+        assert!(ov.lookup("/a", 0).is_none());
+    }
+
+    /// Regression: resetting the overlay clears `pending_rows`. A later `files`
+    /// write must not replay rows the reset just wiped (#88).
+    #[test]
+    fn reset_overlay_contents_clears_pending_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[("/a", b"archive-a")])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.set_rename_tx_failures(u64::from(RENAME_TX_ATTEMPTS));
+        ov.rename("/a", "/b").expect("queued");
+        assert_eq!(ov.pending_row_count(), 1);
+        // Clear the fault first. A leftover queue whose replay still fails
+        // would leave `/a` without a SQL tombstone, and the lookup below would
+        // pass even if the queue survived the reset.
+        ov.set_rename_tx_failures(0);
+        ov.reset_overlay_contents().expect("reset");
+        assert_eq!(
+            ov.pending_row_count(),
+            0,
+            "reset must drop queued files updates"
+        );
+        ov.mkdir("/c", 0o755).expect("later write");
+        assert_eq!(
+            ov.pending_row_count(),
+            0,
+            "later write must not replay wiped rows"
+        );
+        assert_eq!(
+            deleted_flag(&ov, "/a"),
+            None,
+            "queued a->b must not be rewritten after reset"
+        );
+        assert!(ov.lookup("/a", 0).is_some(), "archive /a stays visible");
+    }
+
+    /// Regression: the drop log lists only names that are still hidden. A later
+    /// rename that re-exposes an earlier hidden name must not be listed (#88).
+    /// Keeping `hide.remove(to)` out of the fold lists `/reexposed` as well.
+    #[test]
+    fn rename_tx_pending_drop_log_omits_reexposed_name() {
+        install_drop_capture_log();
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[
+            ("/still-hidden", b"stay"),
+            ("/reexposed", b"old"),
+        ])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/fresh", b"new-bytes");
+        ov.set_rename_tx_failures(20);
+        ov.unlink("/still-hidden").expect("queue still-hidden");
+        ov.unlink("/reexposed").expect("queue reexposed behind it");
+        ov.rename("/fresh", "/reexposed")
+            .expect("re-expose /reexposed");
+        assert_eq!(
+            ov.pending_reappear_paths(),
+            vec!["/still-hidden".to_string()],
+            "fold must drop the re-exposed name"
+        );
+        let root = overlay.display().to_string();
+        drop(ov);
+        assert_eq!(
+            drop_log_reappear_list(&root),
+            "/still-hidden",
+            "drop log must not list /reexposed"
+        );
+    }
+
+    /// Regression: a path SQL already tombstones is not logged as reappearing.
+    /// Dropping the `deleted = 1` filter lists `/already` (#88).
+    #[test]
+    fn rename_tx_pending_drop_log_omits_sql_tombstone() {
+        install_drop_capture_log();
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let base = Arc::new(MemBase::with(&[
+            ("/already", b"gone"),
+            ("/still-hidden", b"stay"),
+        ])) as Arc<dyn MountSource>;
+        let ov = WriteOverlay::new(base, &overlay).unwrap();
+        ov.unlink("/already").expect("sql tombstone");
+        assert_eq!(deleted_flag(&ov, "/already"), Some(1));
+        ov.set_rename_tx_failures(20);
+        ov.unlink("/still-hidden").expect("queue still-hidden");
+        ov.unlink("/already")
+            .expect("queue a path sql already hides");
+        assert_eq!(
+            ov.pending_reappear_paths(),
+            vec!["/still-hidden".to_string()],
+            "sql tombstone must be filtered out"
+        );
+        let root = overlay.display().to_string();
+        drop(ov);
+        assert_eq!(drop_log_reappear_list(&root), "/still-hidden");
+    }
+
+    /// Regression: mode 000 must not block rename or unlink (#88). Linux parks
+    /// with `O_PATH`; elsewhere a refused open is metadata-only.
+    #[test]
+    fn park_mode000_rename_and_unlink() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old-mode");
+        fs::set_permissions(overlay.join("dst"), fs::Permissions::from_mode(0o000)).unwrap();
+        let old_ino = host_ino(&overlay.join("dst"));
+        put_overlay_bytes(&ov, "/src", b"kept");
+        let parked = ov
+            .rename_parked("/src", "/dst")
+            .expect("mode 000 rename")
+            .expect("parked");
+        match parked.fd() {
+            Some(fd) => assert_eq!(fd_ino(fd), old_ino),
+            None => assert_eq!(parked.file_info().size, b"old-mode".len() as u64),
+        }
+        #[cfg(target_os = "linux")]
+        assert!(parked.fd().is_some(), "Linux O_PATH parks a mode-000 file");
+        drop(parked);
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"kept");
+        assert!(ov.lookup("/src", 0).is_none());
+
+        put_overlay_bytes(&ov, "/locked", b"secret");
+        fs::set_permissions(overlay.join("locked"), fs::Permissions::from_mode(0o000)).unwrap();
+        let old_ino = host_ino(&overlay.join("locked"));
+        let parked = ov.unlink_parked("/locked").expect("mode 000 unlink");
+        let parked = parked.expect("host file was parked");
+        match parked.fd() {
+            Some(fd) => assert_eq!(fd_ino(fd), old_ino),
+            None => assert_eq!(parked.file_info().size, b"secret".len() as u64),
+        }
+        #[cfg(target_os = "linux")]
+        assert!(
+            parked.fd().is_some(),
+            "Linux O_PATH parks a mode-000 unlink"
+        );
+        drop(parked);
+        assert!(!overlay.join("locked").exists());
+        assert!(ov.lookup("/locked", 0).is_none());
+    }
+
+    /// Regression: the parked fd is the pre-rename inode (#88).
+    #[test]
+    fn park_fstat_old_inode() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old-inode");
+        put_overlay_bytes(&ov, "/src", b"new-inode");
+        let old_ino = host_ino(&overlay.join("dst"));
+        let src_ino = host_ino(&overlay.join("src"));
+        assert_ne!(old_ino, src_ino);
+        let parked = ov.rename_parked("/src", "/dst").unwrap().expect("parked");
+        let fd = parked.fd().expect("park open");
+        assert_eq!(fd_ino(fd), old_ino);
+        assert_eq!(host_ino(&overlay.join("dst")), src_ino);
+        assert_ne!(host_ino(&overlay.join("dst")), old_ino);
+    }
+
+    /// Regression: a symlink target is snapshotted, not opened (#88).
+    #[test]
+    fn park_symlink_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        ov.create_symlink("/link", "old-target").unwrap();
+        put_overlay_bytes(&ov, "/src", b"file");
+        let parked = ov
+            .rename_parked("/src", "/link")
+            .unwrap()
+            .expect("symlink parked");
+        assert!(parked.fd().is_none(), "symlinks are not opened");
+        assert_eq!(parked.file_info().linkname, "old-target");
+        assert!(ratarmount_core::is_lnk_mode(parked.file_info().mode));
+        let now = ov.lookup("/link", 0).unwrap();
+        assert!(!ratarmount_core::is_lnk_mode(now.mode));
+        assert!(now.linkname.is_empty());
+        assert_eq!(fs::read(overlay.join("link")).unwrap(), b"file");
+        assert!(ov.lookup("/src", 0).is_none());
+    }
+
+    /// Regression: plain rename and unlink never open the target (#88).
+    /// An installed EMFILE park hook must not run, and the park-open counter stays 0.
+    #[test]
+    fn plain_rename_and_unlink_do_not_park() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old-dst");
+        put_overlay_bytes(&ov, "/src", b"new-src");
+        let hook_calls = Arc::new(AtomicU64::new(0));
+        let hook_calls2 = Arc::clone(&hook_calls);
+        ov.set_park_open_hook(Some(Box::new(move || {
+            hook_calls2.fetch_add(1, Ordering::SeqCst);
+            Err(io::Error::from_raw_os_error(libc::EMFILE))
+        })));
+        ov.rename("/src", "/dst")
+            .expect("plain rename over a target");
+        assert_eq!(ov.park_open_count(), 0);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
+        assert!(!overlay.join("src").exists());
+        assert!(ov.lookup("/src", 0).is_none());
+
+        put_overlay_bytes(&ov, "/gone", b"bye");
+        ov.unlink("/gone").expect("plain unlink of a target");
+        assert_eq!(ov.park_open_count(), 0);
+        assert_eq!(hook_calls.load(Ordering::SeqCst), 0);
+        assert!(!overlay.join("gone").exists());
+        assert!(ov.lookup("/gone", 0).is_none());
+    }
+
+    /// Regression: park open EMFILE/ENFILE fails rename with `to` unchanged
+    /// and fails unlink with nothing removed (#88).
+    #[test]
+    fn park_open_emfile_leaves_names_unchanged() {
+        for code in [libc::EMFILE, libc::ENFILE] {
+            let dir = tempfile::tempdir().unwrap();
+            let overlay = dir.path().join("ov");
+            let ov =
+                WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+            put_overlay_bytes(&ov, "/dst", b"keep-dst");
+            put_overlay_bytes(&ov, "/src", b"keep-src");
+            ov.set_park_open_hook(Some(Box::new(move || {
+                Err(io::Error::from_raw_os_error(code))
+            })));
+            let err = ov
+                .rename_parked("/src", "/dst")
+                .expect_err("park open must fail the rename");
+            let OverlayError::Io(err) = err else {
+                panic!("expected Io, got {err}");
+            };
+            assert_eq!(err.raw_os_error(), Some(code), "errno {code}");
+            assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"keep-dst");
+            assert_eq!(fs::read(overlay.join("src")).unwrap(), b"keep-src");
+            assert!(ov.lookup("/dst", 0).is_some());
+            assert!(ov.lookup("/src", 0).is_some());
+            assert!(!ov.is_deleted("/dst"));
+            assert_eq!(ov.park_open_count(), 1, "errno {code}");
+
+            put_overlay_bytes(&ov, "/victim", b"stay");
+            let err = ov
+                .unlink_parked("/victim")
+                .expect_err("park open must fail the unlink");
+            let OverlayError::Io(err) = err else {
+                panic!("expected Io, got {err}");
+            };
+            assert_eq!(err.raw_os_error(), Some(code), "errno {code}");
+            assert_eq!(fs::read(overlay.join("victim")).unwrap(), b"stay");
+            assert!(ov.lookup("/victim", 0).is_some());
+            assert!(!ov.is_deleted("/victim"));
+            assert_eq!(deleted_flag(&ov, "/victim"), Some(0));
+            assert_eq!(ov.park_open_count(), 2, "errno {code}");
+        }
+    }
+
+    /// Regression: the before-tx hook fires once and is not restored (#88).
+    /// A single `Err` fails only that attempt; the retry commits the rename.
+    #[test]
+    fn rename_before_tx_hook_is_one_shot() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old");
+        put_overlay_bytes(&ov, "/src", b"new");
+        let calls = Arc::new(AtomicU64::new(0));
+        let calls2 = Arc::clone(&calls);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            calls2.fetch_add(1, Ordering::SeqCst);
+            Err(OverlayError::Msg("injected rename tx failure".into()))
+        })));
+        ov.rename("/src", "/dst")
+            .expect("tx failure still returns success");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            deleted_flag(&ov, "/src"),
+            None,
+            "retry committed the overlay-only delete"
+        );
+        assert_eq!(ov.pending_row_count(), 0, "retry did not queue the rename");
+
+        put_overlay_bytes(&ov, "/src2", b"second");
+        put_overlay_bytes(&ov, "/dst2", b"old2");
+        ov.rename("/src2", "/dst2").expect("second rename");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "hook was not restored");
+        assert_eq!(deleted_flag(&ov, "/src2"), None, "second tx committed");
+        assert_eq!(fs::read(overlay.join("dst2")).unwrap(), b"second");
+    }
+
+    /// Regression: non-Linux park opens add O_NONBLOCK so a FIFO cannot block (#88).
+    ///
+    /// `#[cfg]` rather than `cfg!`: macOS libc has no `O_PATH`, so that name
+    /// must not be compiled off Linux.
+    #[cfg(unix)]
+    #[test]
+    fn park_open_flags_set_nonblock_off_linux() {
+        let flags = park_open_flags();
+        assert_ne!(flags & libc::O_NOFOLLOW, 0);
+        assert_ne!(flags & libc::O_CLOEXEC, 0);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(flags, libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC);
+            assert_eq!(flags & libc::O_NONBLOCK, 0);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            assert_eq!(
+                flags,
+                libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC
+            );
+        }
+    }
+
+    /// Regression: park-open EACCES is metadata-only (#88).
+    /// `rename_parked` and `unlink_parked` still change the names; `fd` is
+    /// `None` and `last_fi` keeps the pre-change attributes.
+    #[test]
+    fn park_open_eacces_is_metadata_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap();
+        put_overlay_bytes(&ov, "/dst", b"old-dst");
+        put_overlay_bytes(&ov, "/src", b"new-src");
+        let dst_before = ov.lookup("/dst", 0).expect("dst metadata");
+        ov.set_park_open_hook(Some(Box::new(|| {
+            Err(io::Error::from_raw_os_error(libc::EACCES))
+        })));
+        let parked = ov
+            .rename_parked("/src", "/dst")
+            .expect("EACCES park open still renames")
+            .expect("destination parked");
+        assert!(parked.fd().is_none(), "metadata-only park");
+        assert_eq!(parked.file_info().size, dst_before.size);
+        assert_eq!(parked.file_info().mode, dst_before.mode);
+        assert_eq!(parked.file_info().linkname, dst_before.linkname);
+        assert_eq!(parked.file_info().size, b"old-dst".len() as u64);
+        drop(parked);
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new-src");
+        assert!(!overlay.join("src").exists());
+        assert!(ov.lookup("/src", 0).is_none());
+        assert!(ov.lookup("/dst", 0).is_some());
+        assert_eq!(ov.park_open_count(), 1);
+
+        put_overlay_bytes(&ov, "/victim", b"stay-bytes");
+        let victim_before = ov.lookup("/victim", 0).expect("victim metadata");
+        let parked = ov
+            .unlink_parked("/victim")
+            .expect("EACCES park open still unlinks")
+            .expect("victim parked");
+        assert!(parked.fd().is_none(), "metadata-only park");
+        assert_eq!(parked.file_info().size, victim_before.size);
+        assert_eq!(parked.file_info().mode, victim_before.mode);
+        assert_eq!(parked.file_info().linkname, victim_before.linkname);
+        assert_eq!(parked.file_info().size, b"stay-bytes".len() as u64);
+        drop(parked);
+        assert!(!overlay.join("victim").exists());
+        assert!(ov.lookup("/victim", 0).is_none());
+        assert_eq!(ov.park_open_count(), 2);
+    }
+
+    /// Regression: the before-tx hook runs after its mutex guard is dropped (#88).
+    #[test]
+    fn rename_before_tx_hook_runs_after_mutex_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let overlay = dir.path().join("ov");
+        let ov = Arc::new(
+            WriteOverlay::new(Arc::new(NullBase) as Arc<dyn MountSource>, &overlay).unwrap(),
+        );
+        put_overlay_bytes(&ov, "/dst", b"old");
+        put_overlay_bytes(&ov, "/src", b"new");
+        let probe = Arc::downgrade(&ov);
+        ov.set_rename_before_tx_hook(Some(Box::new(move || {
+            let probe = probe.upgrade().expect("overlay");
+            assert!(
+                probe.rename_before_tx_hook.try_lock().is_ok(),
+                "hook ran while its mutex was still held"
+            );
+            Ok(())
+        })));
+        ov.rename("/src", "/dst").expect("rename");
+        assert_eq!(fs::read(overlay.join("dst")).unwrap(), b"new");
+        assert!(!overlay.join("src").exists());
     }
 
     fn overlay_entry_names(dir: &Path) -> Vec<String> {
