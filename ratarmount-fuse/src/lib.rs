@@ -468,9 +468,12 @@ fn is_absent(err: &std::io::Error) -> bool {
 }
 
 fn is_connection_gone(err: &std::io::Error) -> bool {
+    // `ECONNABORTED` is the same end of session as `ENODEV`: the kernel
+    // returns it when the connection is aborted, including a normal unmount
+    // that interleaves with a `/dev/fuse` read or a notify write.
     matches!(
         err.raw_os_error(),
-        Some(libc::ENODEV | libc::ENOTCONN | libc::EBADF)
+        Some(libc::ENODEV | libc::ENOTCONN | libc::EBADF | libc::ECONNABORTED)
     )
 }
 
@@ -2615,6 +2618,22 @@ fn mount_option_from_str(s: &str) -> MountOption {
     }
 }
 
+/// `Session::run` outcome after the mount has been established.
+///
+/// fuser 0.15 turns `ENODEV` into `Ok` and returns every other `read` errno.
+/// Upstream fuser treats `ECONNABORTED` as the same clean end of session
+/// (cberner/fuser#212). The kernel returns it when the connection is aborted,
+/// including a normal unmount that wins the race in `fuse_dev_do_read` after
+/// a request is dequeued and before it is copied (`!fpq->connected` yields
+/// `-ECONNABORTED` even when `abort_with_err` is false). Hundreds of in-flight
+/// `FORGET`s make that window likely. Other errnos stay failures.
+fn fuse_session_result(res: std::io::Result<()>) -> std::io::Result<()> {
+    match res {
+        Err(err) if err.raw_os_error() == Some(libc::ECONNABORTED) => Ok(()),
+        other => other,
+    }
+}
+
 /// Mount `source` at `mountpoint` (blocking).
 ///
 /// `extra_fuse_opts` is the `-o` / `--fuse` string (comma-separated).
@@ -2663,13 +2682,13 @@ pub fn mount_blocking(
     // up, hence the explicit unmount. A notify parked on a directory
     // `i_rwsem` returns once the holder drops that lock; the holder was
     // waiting on a reply the session thread sent before `run` returned.
-    // After unmount a further write fails with `ENODEV` (thread exits), and
-    // the dropped sender ends `recv`.
+    // After unmount a further write fails with `ENODEV` or `ECONNABORTED`
+    // (thread exits), and the dropped sender ends `recv`.
     let kernel_notify = Arc::clone(&fs.kernel_notify);
     let mut session = fuser::Session::new(fs, mountpoint.as_ref(), &options)?;
     let (tx, notifier_thread) = spawn_notifier(session.notifier());
     kernel_notify.install(tx);
-    let res = session.run();
+    let res = fuse_session_result(session.run());
     kernel_notify.clear();
     session.unmount();
     let _ = notifier_thread.join();
@@ -3676,6 +3695,22 @@ mod tests {
             libc::ENOSPC
         );
         assert_eq!(io_to_errno(&io::Error::other("generic")), EIO);
+    }
+
+    /// Regression: unmount with many in-flight FORGETs returns ECONNABORTED
+    /// (os error 103) from fuser 0.15 `Session::run`. That is a clean session
+    /// end, same as ENODEV. A real I/O error still fails the mount.
+    #[test]
+    fn fuse_session_result_treats_econnaborted_as_clean_unmount() {
+        let aborted = io::Error::from_raw_os_error(libc::ECONNABORTED);
+        assert!(
+            fuse_session_result(Err(aborted)).is_ok(),
+            "ECONNABORTED must not fail the mount"
+        );
+        assert!(fuse_session_result(Ok(())).is_ok());
+        let io_err = io::Error::from_raw_os_error(libc::EIO);
+        let mapped = fuse_session_result(Err(io_err)).expect_err("EIO stays an error");
+        assert_eq!(mapped.raw_os_error(), Some(libc::EIO));
     }
 
     /// Regression: dir_cache 30s TTL must not hide overlay creates from readdir.
@@ -4836,12 +4871,17 @@ mod tests {
         drop(thread);
     }
 
-    /// Regression: ENODEV, ENOTCONN, and EBADF mean the FUSE connection is gone.
-    /// The notifier exits on the first of those, without delivering the rest of
-    /// the batch, while the sender is still alive.
+    /// Regression: ENODEV, ENOTCONN, EBADF, and ECONNABORTED mean the FUSE
+    /// connection is gone. The notifier exits on the first of those, without
+    /// delivering the rest of the batch, while the sender is still alive.
     #[test]
     fn notifier_exits_on_enodev() {
-        for code in [libc::ENODEV, libc::ENOTCONN, libc::EBADF] {
+        for code in [
+            libc::ENODEV,
+            libc::ENOTCONN,
+            libc::EBADF,
+            libc::ECONNABORTED,
+        ] {
             let calls = Arc::new(AtomicUsize::new(0));
             let (done_tx, done_rx) = mpsc::channel();
 

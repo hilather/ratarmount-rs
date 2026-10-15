@@ -15,9 +15,13 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, AtomicUsize, Ordering};
-use std::sync::mpsc;
+use std::sync::{mpsc, Mutex, PoisonError};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// One mount at a time: parallel test threads mounting several FUSE
+/// filesystems at once aborted a mount (`ECONNABORTED`) on the dev box.
+static MOUNT_LOCK: Mutex<()> = Mutex::new(());
 
 const MOUNT_DEADLINE: Duration = Duration::from_secs(10);
 const UNMOUNT_DEADLINE: Duration = Duration::from_secs(10);
@@ -502,6 +506,8 @@ fn mount_and_run(
         eprintln!("{msg}");
         return;
     }
+    // A panicking case poisons the lock; later cases still run serially.
+    let _serial = MOUNT_LOCK.lock().unwrap_or_else(PoisonError::into_inner);
     let tmp = tempfile::Builder::new()
         .prefix(prefix)
         .tempdir()
