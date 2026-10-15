@@ -1269,14 +1269,17 @@ impl RatarmountFs {
     }
 
     /// Unlink twin of [`Self::rebind_after_rename`]'s detach half.
+    ///
+    /// A name the kernel never looked up has no inode. Its parked fd is closed
+    /// after both maps are released, same as a replaced inode with `nlookup` 0.
     fn detach_unlinked(
         &self,
         path: &str,
         ino: Option<u64>,
-        parked: Option<Parked>,
-        snap: Option<FileInfo>,
+        mut parked: Option<Parked>,
+        mut snap: Option<FileInfo>,
     ) {
-        let drops = self.park_drop_counter();
+        let mut drops = self.park_drop_counter();
         let doomed = {
             let mut p2i = self.path_to_ino.lock().unwrap();
             let mut inodes = self.inodes.lock().unwrap();
@@ -1286,16 +1289,18 @@ impl RatarmountFs {
                     .get(&ino)
                     .map(|e| e.path.clone())
                     .unwrap_or_else(|| path.to_string());
-                let detached = build_detached(ino, pre_path, parked, snap, drops);
+                let detached =
+                    build_detached(ino, pre_path, parked.take(), snap.take(), drops.take());
                 install_detached(&mut inodes, ino, detached)
             } else {
-                drop(parked);
-                drop(snap);
-                drop(drops);
                 None
             }
         };
+        // Close a parked fd the kernel does not reference, outside the locks.
         drop(doomed);
+        drop(parked);
+        drop(snap);
+        drop(drops);
     }
 
     /// Archive readers opened on `path` before this rename or unlink keep
@@ -6200,10 +6205,10 @@ mod tests {
 
     /// Regression (#88): root starts at nlookup 1 and is never removed.
     /// Plain readdir / readdirplus (`ino_for_path`) leaves a child at 0
-    /// (amendment 8: this ABI does not bump on readdirplus). FORGET of that
-    /// still-linked child keeps the entry.
+    /// (amendment 8: this ABI does not bump on readdirplus). A lookup bumps
+    /// that child; FORGET then brings it back to 0 and keeps the entry.
     #[test]
-    fn nlookup_root_starts_at_one_and_readdirplus_bumps_children() {
+    fn nlookup_root_starts_at_one_and_readdirplus_does_not_bump_children() {
         let (_dir, ov, fs) = overlay_fs_for_rename();
         assert_eq!(fs.nlookup_of(FUSE_ROOT_ID), Some(1));
         fs.forget_nlookup(FUSE_ROOT_ID, 1);
@@ -6213,14 +6218,14 @@ mod tests {
         overlay_write_new(&ov, "/c", b"c");
         let child = fs.ino_for_path("/c");
         assert_eq!(fs.nlookup_of(child), Some(0));
-        fs.forget_nlookup(child, 1);
-        assert_eq!(fs.nlookup_of(child), Some(0));
-        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/c"));
-        assert_eq!(fs.ino_for_path("/c"), child);
 
         let (id, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("c")).unwrap();
         assert_eq!(id, child);
         assert_eq!(fs.nlookup_of(child), Some(1));
+        fs.forget_nlookup(child, 1);
+        assert_eq!(fs.nlookup_of(child), Some(0));
+        assert_eq!(fs.path_for_ino(child).as_deref(), Some("/c"));
+        assert_eq!(fs.path_to_ino.lock().unwrap().get("/c"), Some(&child));
     }
 
     /// Regression (#88): macOS must not set a soft NOFILE of RLIM_INFINITY.

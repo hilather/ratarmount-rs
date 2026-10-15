@@ -239,7 +239,7 @@ fn fuse_rename_over_prerename_writer_discarded_at_commit() {
                 "committed archive still has note"
             );
             for ent in walk(&extract) {
-                let body = fs::read(&ent).unwrap_or_default();
+                let body = fs::read(&ent).unwrap_or_else(|e| panic!("read {}: {e}", ent.display()));
                 assert!(
                     !body.windows(b"ORPHAN".len()).any(|w| w == b"ORPHAN"),
                     "{} contains ORPHAN",
@@ -322,17 +322,20 @@ fn run_poll(d: &Path, writers: usize, cycles: usize, label: &str) -> PollReport 
         let handle = scope.spawn(|| {
             while !stop.load(Ordering::Relaxed) {
                 attempts.fetch_add(1, Ordering::Relaxed);
-                let fd = unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                let fd = note_errno(&open_enoent, &other, &first_other, true, || {
+                    let rc =
+                        unsafe { libc::open(c_path.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
+                    rc as isize
+                });
                 if fd < 0 {
-                    note_errno(&open_enoent, &other, &first_other, true);
                     continue;
                 }
                 let mut buf = [0u8; 64];
-                let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-                unsafe { libc::close(fd) };
-                if n < 0 {
-                    note_errno(&read_enoent, &other, &first_other, false);
-                }
+                // Errors are counted inside `note_errno`. A short read is not ENOENT.
+                let _n = note_errno(&read_enoent, &other, &first_other, false, || unsafe {
+                    libc::read(fd as libc::c_int, buf.as_mut_ptr().cast(), buf.len())
+                });
+                unsafe { libc::close(fd as libc::c_int) };
             }
         });
 
@@ -351,12 +354,10 @@ fn run_poll(d: &Path, writers: usize, cycles: usize, label: &str) -> PollReport 
     });
 
     let leftovers = fs::read_dir(d)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|ent| ent.file_name().to_string_lossy().starts_with(".tmp-"))
-                .count()
-        })
-        .unwrap_or(0);
+        .unwrap_or_else(|e| panic!("read_dir {}: {e}", d.display()))
+        .map(|ent| ent.unwrap_or_else(|e| panic!("read_dir {}: {e}", d.display())))
+        .filter(|ent| ent.file_name().to_string_lossy().starts_with(".tmp-"))
+        .count();
     let attempts = attempts.load(Ordering::Relaxed);
     let elapsed = poller;
     let secs = elapsed.as_secs_f64().max(1e-9);
@@ -387,18 +388,44 @@ fn run_poll(d: &Path, writers: usize, cycles: usize, label: &str) -> PollReport 
     report
 }
 
-fn note_errno(enoent: &AtomicU64, other: &AtomicU64, first_other: &AtomicI32, open: bool) {
-    let raw = io::Error::last_os_error().raw_os_error().unwrap_or(0);
-    if raw == libc::ENOENT {
-        enoent.fetch_add(1, Ordering::Relaxed);
-    } else {
-        other.fetch_add(1, Ordering::Relaxed);
-        let _ = first_other.compare_exchange(0, raw, Ordering::Relaxed, Ordering::Relaxed);
-        if open {
-            eprintln!("fuse_rename_over poll open errno {raw}");
-        } else {
-            eprintln!("fuse_rename_over poll read errno {raw}");
+/// Extra attempts after `EINTR` on one `open` or `read`. A further `EINTR`
+/// is recorded in `other` (fail-closed). `ENOENT` and every other errno are
+/// recorded on the first failure and are not retried.
+const EINTR_RETRIES: u32 = 16;
+
+/// Run `op` until it succeeds. `EINTR` is retried up to [`EINTR_RETRIES`]
+/// times and is not counted. Any other failure, including `EINTR` past that
+/// bound, updates `enoent` or `other` and returns the negative result.
+fn note_errno(
+    enoent: &AtomicU64,
+    other: &AtomicU64,
+    first_other: &AtomicI32,
+    open: bool,
+    mut op: impl FnMut() -> isize,
+) -> isize {
+    let mut attempt = 0u32;
+    loop {
+        let rc = op();
+        if rc >= 0 {
+            return rc;
         }
+        let raw = io::Error::last_os_error().raw_os_error().unwrap_or(0);
+        if raw == libc::EINTR && attempt < EINTR_RETRIES {
+            attempt += 1;
+            continue;
+        }
+        if raw == libc::ENOENT {
+            enoent.fetch_add(1, Ordering::Relaxed);
+        } else {
+            other.fetch_add(1, Ordering::Relaxed);
+            let _ = first_other.compare_exchange(0, raw, Ordering::Relaxed, Ordering::Relaxed);
+            if open {
+                eprintln!("fuse_rename_over poll open errno {raw}");
+            } else {
+                eprintln!("fuse_rename_over poll read errno {raw}");
+            }
+        }
+        return rc;
     }
 }
 
@@ -451,10 +478,9 @@ fn skip_no_gnu_tar() -> bool {
 
 fn walk(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    let Ok(rd) = fs::read_dir(dir) else {
-        return out;
-    };
-    for ent in rd.flatten() {
+    let rd = fs::read_dir(dir).unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
+    for ent in rd {
+        let ent = ent.unwrap_or_else(|e| panic!("read_dir {}: {e}", dir.display()));
         let path = ent.path();
         if path.is_dir() {
             out.extend(walk(&path));
