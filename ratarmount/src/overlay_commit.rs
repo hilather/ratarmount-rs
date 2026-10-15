@@ -1151,6 +1151,13 @@ pub(crate) fn set_term_flag_for_test(v: bool) {
     GOT_TERM.store(v, Ordering::SeqCst);
 }
 
+/// Serializes tests that flip [`GOT_TERM`]. The flag is process-global.
+#[cfg(test)]
+pub(crate) fn term_flag_test_lock() -> &'static std::sync::Mutex<()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    &LOCK
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1178,6 +1185,9 @@ mod tests {
 
     #[test]
     fn fuse_unmount_watcher_runs_after_term_flag() {
+        let _guard = super::term_flag_test_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let mp = dir.path().join("mnt");
         std::fs::create_dir_all(&mp).unwrap();
