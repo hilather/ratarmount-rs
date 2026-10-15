@@ -14,7 +14,7 @@ use fuser::{
     FUSE_ROOT_ID,
 };
 use libc::{EACCES, EEXIST, EINVAL, EIO, EISDIR, ENOENT, ENOSYS, EROFS};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use ratarmount_compositing::{Parked, WriteOverlay};
 use ratarmount_core::{CheapDirent, FileInfo, InodeAttrCookie, MountSource};
 use std::io::ErrorKind;
@@ -772,6 +772,75 @@ impl RatarmountFs {
     #[cfg(test)]
     fn test_read(&self, fh: u64, offset: i64, size: u32) -> Result<Vec<u8>, i32> {
         self.read_handle(fh, offset, size)
+    }
+
+    /// Body of [`Filesystem::readdirplus`].
+    ///
+    /// `add` is `ReplyDirectoryPlus::add`: `true` means the reply buffer is
+    /// full. Child inodes come from [`Self::ino_for_path`] and stay at
+    /// nlookup 0. This ABI does not count readdirplus as a lookup.
+    ///
+    /// The trait method only forwards this into a `ReplyDirectoryPlus`.
+    /// Unit tests call it directly: fuser 0.15 does not let another crate
+    /// build `Request` or `ReplySender`.
+    fn readdirplus_fill(
+        &self,
+        ino: u64,
+        offset: i64,
+        mut add: impl FnMut(u64, i64, &str, &Duration, &FileAttr) -> bool,
+    ) -> Result<(), i32> {
+        let path = self.path_for_ino(ino).ok_or(ENOENT)?;
+        let entries = self.list_mode_cached(&path).ok_or(ENOENT)?;
+        let self_fi = self
+            .cached_fi(ino)
+            .or_else(|| self.source.lookup(&path, 0))
+            .unwrap_or_else(ratarmount_core::create_root_file_info);
+        let mut full: Vec<(u64, String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
+        full.push((ino, ".".into(), Self::file_attr(ino, &self_fi)));
+        let parent_ino = if path == "/" {
+            ino
+        } else {
+            path.rsplit_once('/')
+                .map(|(p, _)| {
+                    let pp = if p.is_empty() { "/" } else { p };
+                    self.ino_for_path(pp)
+                })
+                .unwrap_or(FUSE_ROOT_ID)
+        };
+        full.push((
+            parent_ino,
+            "..".into(),
+            Self::file_attr(parent_ino, &self_fi),
+        ));
+        for (name, mode, size) in entries {
+            let child = join_path(&path, &name);
+            let fi = FileInfo {
+                size,
+                mtime: self_fi.mtime,
+                mode,
+                linkname: String::new(),
+                uid: self_fi.uid,
+                gid: self_fi.gid,
+                userdata: vec![],
+            };
+            let cino = self.ino_for_path(&child);
+            // Amendment 8: this ABI does not count readdirplus as a lookup.
+            // `ino_for_path` leaves the child at nlookup 0. Do not bump here.
+            full.push((cino, name, Self::file_attr(cino, &fi)));
+        }
+        for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
+            let entry_ttl = self.readdirplus_entry_ttl(&attr);
+            if add(cino, (i + 1) as i64, &name, &entry_ttl, &attr) {
+                break;
+            }
+            // Buffered with this TTL for entry and attr (zero with an overlay
+            // today, so nothing is recorded). If it ever becomes non-zero
+            // under an overlay, `(parent, name)` must go into
+            // `entry_advertised` in the same change (see
+            // `readdirplus_entry_ttl`).
+            self.note_attr_advertised(cino, entry_ttl);
+        }
+        Ok(())
     }
 
     /// Kernel TTL for one `readdirplus` dirent attr.
@@ -2287,64 +2356,13 @@ impl Filesystem for RatarmountFs {
     ) {
         // Cheap list_mode only — do not call MountSource::list (fat FileInfo map).
         // Full attrs (size/mtime/uid) are filled at getattr/lookup/open.
-        let Some(path) = self.path_for_ino(ino) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let Some(entries) = self.list_mode_cached(&path) else {
-            reply.error(ENOENT);
-            return;
-        };
-        let self_fi = self
-            .cached_fi(ino)
-            .or_else(|| self.source.lookup(&path, 0))
-            .unwrap_or_else(ratarmount_core::create_root_file_info);
-        let mut full: Vec<(u64, String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
-        full.push((ino, ".".into(), Self::file_attr(ino, &self_fi)));
-        let parent_ino = if path == "/" {
-            ino
-        } else {
-            path.rsplit_once('/')
-                .map(|(p, _)| {
-                    let pp = if p.is_empty() { "/" } else { p };
-                    self.ino_for_path(pp)
-                })
-                .unwrap_or(FUSE_ROOT_ID)
-        };
-        full.push((
-            parent_ino,
-            "..".into(),
-            Self::file_attr(parent_ino, &self_fi),
-        ));
-        for (name, mode, size) in entries {
-            let child = join_path(&path, &name);
-            let fi = FileInfo {
-                size,
-                mtime: self_fi.mtime,
-                mode,
-                linkname: String::new(),
-                uid: self_fi.uid,
-                gid: self_fi.gid,
-                userdata: vec![],
-            };
-            let cino = self.ino_for_path(&child);
-            // Amendment 8: this ABI does not count readdirplus as a lookup.
-            // `ino_for_path` leaves the child at nlookup 0. Do not bump here.
-            full.push((cino, name, Self::file_attr(cino, &fi)));
+        // nlookup is not bumped; see [`RatarmountFs::readdirplus_fill`].
+        match self.readdirplus_fill(ino, offset, |cino, off, name, ttl, attr| {
+            reply.add(cino, off, name, ttl, attr, 0)
+        }) {
+            Ok(()) => reply.ok(),
+            Err(errno) => reply.error(errno),
         }
-        for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
-            let entry_ttl = self.readdirplus_entry_ttl(&attr);
-            if reply.add(cino, (i + 1) as i64, name, &entry_ttl, &attr, 0) {
-                break;
-            }
-            // Buffered with this TTL for entry and attr (zero with an overlay
-            // today, so nothing is recorded). If it ever becomes non-zero
-            // under an overlay, `(parent, name)` must go into
-            // `entry_advertised` in the same change (see
-            // `readdirplus_entry_ttl`).
-            self.note_attr_advertised(cino, entry_ttl);
-        }
-        reply.ok();
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
@@ -2629,7 +2647,12 @@ fn mount_option_from_str(s: &str) -> MountOption {
 /// `FORGET`s make that window likely. Other errnos stay failures.
 fn fuse_session_result(res: std::io::Result<()>) -> std::io::Result<()> {
     match res {
-        Err(err) if err.raw_os_error() == Some(libc::ECONNABORTED) => Ok(()),
+        Err(err) if err.raw_os_error() == Some(libc::ECONNABORTED) => {
+            info!(
+                "FUSE session read returned ECONNABORTED at unmount; treating it as a clean exit"
+            );
+            Ok(())
+        }
         other => other,
     }
 }
@@ -2774,6 +2797,7 @@ mod tests {
     };
     use std::collections::BTreeMap;
     use std::io::{self, Seek};
+    use std::process::Command;
     use std::sync::atomic::AtomicUsize;
     use std::sync::mpsc;
     use std::thread;
@@ -6243,21 +6267,129 @@ mod tests {
         assert_eq!(fs.test_read(fh_live, 0, 8).unwrap(), b"new");
     }
 
+    /// Regression (#88): `create_entry` hands the kernel one reference.
+    /// Unlink while that count is still positive keeps the inode, the parked
+    /// fd, and `last_fi`. FORGET drops them only when nlookup reaches 0.
+    #[test]
+    fn create_entry_nlookup_is_one_and_unlinked_file_stays_until_forget() {
+        let (_dir, _ov, mut fs) = overlay_fs_for_rename();
+        let counter = Arc::new(AtomicUsize::new(0));
+        fs.track_parked_fd_drops(Arc::clone(&counter));
+        let (_ttl, attr, _fh) = fs
+            .create_entry(FUSE_ROOT_ID, OsStr::new("new"), 0o644)
+            .expect("create");
+        let ino = attr.ino;
+        assert_eq!(fs.nlookup_of(ino), Some(1), "create replies one lookup");
+        fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("new")).unwrap();
+        assert_eq!(fs.nlookup_of(ino), Some(2));
+
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("new"), false)
+            .expect("unlink");
+        assert!(fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("new")).is_none());
+        assert!(fs.path_to_ino.lock().unwrap().get("/new").is_none());
+        assert_detached_held(&fs, ino, 2);
+        assert_eq!(counter.load(Ordering::SeqCst), 0, "parked fd still open");
+
+        fs.forget_nlookup(ino, 1);
+        assert_detached_held(&fs, ino, 1);
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            0,
+            "partial forget keeps the fd"
+        );
+
+        fs.forget_nlookup(ino, 1);
+        assert!(fs.nlookup_of(ino).is_none(), "forget to 0 drops the inode");
+        assert_eq!(counter.load(Ordering::SeqCst), 1, "parked fd closed at 0");
+        assert!(fs.getattr_reply(ino).is_err());
+    }
+
+    /// Regression (#88): a created file replaced while nlookup > 0 keeps its
+    /// inode, parked fd, and `last_fi` until FORGET brings the count to 0.
+    #[test]
+    fn create_entry_nlookup_replaced_file_stays_until_forget() {
+        let (_dir, _ov, mut fs) = overlay_fs_for_rename();
+        let counter = Arc::new(AtomicUsize::new(0));
+        fs.track_parked_fd_drops(Arc::clone(&counter));
+        let (_ttl, attr, _fh) = fs
+            .create_entry(FUSE_ROOT_ID, OsStr::new("dst"), 0o644)
+            .expect("create dst");
+        let dst = attr.ino;
+        assert_eq!(fs.nlookup_of(dst), Some(1));
+        fs.create_entry(FUSE_ROOT_ID, OsStr::new("src"), 0o644)
+            .expect("create src");
+        fs.rename_paths(FUSE_ROOT_ID, "src", FUSE_ROOT_ID, "dst", 0)
+            .expect("rename over created file");
+
+        let (now, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("dst")).unwrap();
+        assert_ne!(now, dst, "the name is the incoming file");
+        assert_detached_held(&fs, dst, 1);
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+
+        fs.forget_nlookup(dst, 1);
+        assert!(fs.nlookup_of(dst).is_none());
+        assert_eq!(counter.load(Ordering::SeqCst), 1);
+        assert!(fs.getattr_reply(dst).is_err());
+        // create bumped once; the lookup above bumped again.
+        assert_eq!(fs.nlookup_of(now), Some(2));
+    }
+
+    /// Inode entry, parked fd, and `last_fi` are still stored at `nlookup`.
+    fn assert_detached_held(fs: &RatarmountFs, ino: u64, nlookup: u64) {
+        let inodes = fs.inodes.lock().unwrap();
+        let ent = inodes.get(&ino).expect("inode entry stays");
+        assert_eq!(ent.nlookup, nlookup);
+        assert_eq!(ent.path, format!("\0stale-{ino}"));
+        let det = ent.detached.as_ref().expect("detached snapshot");
+        assert!(det.fd.is_some(), "parked fd stays");
+        assert!(det.last_fi.is_some(), "last_fi stays");
+        drop(inodes);
+        let (ttl, attr) = fs.getattr_reply(ino).expect("detached getattr");
+        assert!(ttl.is_zero());
+        assert_eq!(attr.nlink, 0);
+    }
+
     /// Regression (#88): root starts at nlookup 1 and is never removed.
-    /// Plain readdir / readdirplus (`ino_for_path`) leaves a child at 0
-    /// (amendment 8: this ABI does not bump on readdirplus). A lookup bumps
-    /// that child; FORGET then brings it back to 0 and keeps the entry.
+    /// `readdirplus_fill` (the body of `Filesystem::readdirplus`) leaves each
+    /// child at 0 and does not bump root. A lookup bumps that child; FORGET
+    /// then brings it back to 0 and keeps the entry.
     #[test]
     fn nlookup_root_starts_at_one_and_readdirplus_does_not_bump_children() {
         let (_dir, ov, fs) = overlay_fs_for_rename();
         assert_eq!(fs.nlookup_of(FUSE_ROOT_ID), Some(1));
+        overlay_write_new(&ov, "/c", b"c");
+        assert!(
+            fs.path_to_ino.lock().unwrap().get("/c").is_none(),
+            "readdirplus must be what allocates the child"
+        );
+
+        let mut listed: Vec<(u64, String)> = Vec::new();
+        fs.readdirplus_fill(FUSE_ROOT_ID, 0, |cino, _off, name, _ttl, _attr| {
+            listed.push((cino, name.to_string()));
+            false
+        })
+        .expect("readdirplus");
+        let child = listed
+            .iter()
+            .find(|(_, name)| name == "c")
+            .map(|(ino, _)| *ino)
+            .expect("readdirplus omitted c");
+        assert_eq!(child, fs.ino_for_path("/c"));
+        for (cino, name) in &listed {
+            if name == "." || name == ".." {
+                continue;
+            }
+            assert_eq!(fs.nlookup_of(*cino), Some(0), "readdirplus bumped {name}");
+        }
+        assert_eq!(
+            fs.nlookup_of(FUSE_ROOT_ID),
+            Some(1),
+            "readdirplus must not bump root via . or .."
+        );
+
         fs.forget_nlookup(FUSE_ROOT_ID, 1);
         assert_eq!(fs.nlookup_of(FUSE_ROOT_ID), Some(0));
         assert_eq!(fs.path_for_ino(FUSE_ROOT_ID).as_deref(), Some("/"));
-
-        overlay_write_new(&ov, "/c", b"c");
-        let child = fs.ino_for_path("/c");
-        assert_eq!(fs.nlookup_of(child), Some(0));
 
         let (id, _, _) = fs.lookup_entry(FUSE_ROOT_ID, OsStr::new("c")).unwrap();
         assert_eq!(id, child);
@@ -6270,6 +6402,8 @@ mod tests {
 
     /// Regression (#88): macOS must not set a soft NOFILE of RLIM_INFINITY.
     /// The cap is min(finite hard, kern.maxfilesperproc, OPEN_MAX).
+    ///
+    /// Sysctl and OPEN_MAX differ below so ignoring either one fails.
     #[test]
     fn nofile_soft_target_caps_infinite_hard_limit() {
         assert_eq!(
@@ -6280,6 +6414,26 @@ mod tests {
         assert_eq!(
             nofile_soft_target(libc::RLIM_INFINITY, None, 10_240),
             10_240
+        );
+        assert_eq!(
+            nofile_soft_target(libc::RLIM_INFINITY, Some(100), 10_240),
+            100,
+            "sysctl below OPEN_MAX"
+        );
+        assert_eq!(
+            nofile_soft_target(libc::RLIM_INFINITY, Some(50_000), 10_240),
+            10_240,
+            "OPEN_MAX below sysctl"
+        );
+        assert_eq!(
+            nofile_soft_target(50, Some(100), 10_240),
+            50,
+            "finite hard below sysctl and OPEN_MAX"
+        );
+        assert_eq!(
+            nofile_soft_target(libc::RLIM_INFINITY, None, 8_192),
+            8_192,
+            "missing sysctl uses OPEN_MAX"
         );
         let mut before = libc::rlimit {
             rlim_cur: 0,
@@ -6304,6 +6458,121 @@ mod tests {
             before.rlim_cur,
             after.rlim_cur
         );
+    }
+
+    /// Regression (#88): `Filesystem::init` and `mount_blocking` call
+    /// [`raise_nofile_soft_to_hard`]. After a lowered soft limit, that raise
+    /// sets soft == hard on Linux.
+    ///
+    /// The probe runs in a re-exec'd child. `RLIMIT_NOFILE` is process-wide,
+    /// and a raw `fork` from the multithreaded test harness can deadlock.
+    /// The parent never calls `setrlimit`.
+    #[test]
+    fn nofile_soft_raise_to_hard_after_lower() {
+        if std::env::var_os("RATARMOUNT_FUSE_NOFILE_PROBE").is_some() {
+            nofile_probe_lower_and_raise();
+            return;
+        }
+        let exe = std::env::current_exe().expect("current_exe");
+        let thread = std::thread::current();
+        let name = thread
+            .name()
+            .unwrap_or("tests::nofile_soft_raise_to_hard_after_lower");
+        let out = Command::new(exe)
+            .arg(name)
+            .arg("--exact")
+            .arg("--test-threads")
+            .arg("1")
+            .env("RATARMOUNT_FUSE_NOFILE_PROBE", "1")
+            .env_remove("XDG_DATA_HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("XDG_CACHE_HOME")
+            .env_remove("XDG_STATE_HOME")
+            .output()
+            .expect("spawn nofile probe");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "nofile probe status {}\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            out.status
+        );
+    }
+
+    /// Lower soft `RLIMIT_NOFILE`, then run the init/startup raise.
+    fn nofile_probe_lower_and_raise() {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) },
+            0,
+            "getrlimit: {}",
+            std::io::Error::last_os_error()
+        );
+        let hard = lim.rlim_max;
+        let target = nofile_target(hard);
+        let floor = nofile_open_fd_floor();
+        assert!(
+            floor < target,
+            "cannot lower soft below target {target} (open-fd floor {floor}, hard {hard})"
+        );
+        let lowered = libc::rlimit {
+            rlim_cur: floor,
+            rlim_max: hard,
+        };
+        assert_eq!(
+            unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lowered) },
+            0,
+            "setrlimit soft {floor}: {}",
+            std::io::Error::last_os_error()
+        );
+        let mut mid = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut mid) }, 0);
+        assert!(
+            mid.rlim_cur < target,
+            "soft {} was not lowered below target {target}",
+            mid.rlim_cur
+        );
+        // Same function `Filesystem::init` and `mount_blocking` call.
+        raise_nofile_soft_to_hard();
+        let mut after = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        assert_eq!(
+            unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut after) },
+            0
+        );
+        assert_eq!(after.rlim_max, hard, "hard limit unchanged");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(
+            after.rlim_cur, hard,
+            "startup raise sets soft == hard (got {})",
+            after.rlim_cur
+        );
+        #[cfg(target_os = "macos")]
+        assert_eq!(
+            after.rlim_cur,
+            nofile_target(hard),
+            "startup raise sets the macOS cap"
+        );
+    }
+
+    fn nofile_open_fd_floor() -> libc::rlim_t {
+        let dir = if cfg!(target_os = "linux") {
+            "/proc/self/fd"
+        } else {
+            "/dev/fd"
+        };
+        let n = std::fs::read_dir(dir)
+            .map(|rd| rd.filter(|e| e.is_ok()).count())
+            .unwrap_or(32);
+        (n as libc::rlim_t).saturating_add(16)
     }
 
     /// Regression (#88 on #92 / #91): rename-over still queues the old name

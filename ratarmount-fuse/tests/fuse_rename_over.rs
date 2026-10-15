@@ -186,7 +186,10 @@ fn fuse_rename_over_held_archive_member_survives_live_commit() {
             fs::rename(d.join("other"), d.join("final")).expect("rename other onto final");
             thread::sleep(NOTIFY_SETTLE);
             fs::write(d.join("tick.bin"), b"tick\n").expect("tick");
-            wait_tar_lists(tar, "tick.bin");
+            if let Err(line) = wait_tar_lists_or_lseek(tar, "tick.bin") {
+                eprintln!("skip: {line}");
+                return;
+            }
             held.seek(SeekFrom::Start(0)).expect("seek held");
             let mut buf = String::new();
             held.read_to_string(&mut buf)
@@ -448,6 +451,47 @@ fn writer_loop(dir: &Path, id: usize, cycles: usize, errors: &AtomicUsize) {
             return;
         }
     }
+}
+
+/// Same strings as `soft_skip_gnu_tar_commit` in the compositing lib tests.
+/// Debian tar 1.35 prints `lseek: Value too large for defined data type`.
+fn gnu_tar_lseek_overflow(text: &str) -> bool {
+    text.contains("lseek") || text.contains("Value too large for defined data type")
+}
+
+fn lseek_overflow_line(log_path: &Path) -> Option<String> {
+    let text = fs::read_to_string(log_path).unwrap_or_default();
+    if !gnu_tar_lseek_overflow(&text) {
+        return None;
+    }
+    text.lines()
+        .find(|line| gnu_tar_lseek_overflow(line))
+        .map(str::to_string)
+        .or(Some(text))
+}
+
+/// `Ok` when `name` shows up in `tar -tf`. `Err` is the daemon-log line for
+/// the GNU tar lseek EOVERFLOW bug, which the caller skips.
+fn wait_tar_lists_or_lseek(tar: &Path, name: &str) -> Result<(), String> {
+    let log_path = tar.parent().unwrap_or(tar).join("daemon.log");
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        if tar_list(tar).contains(name) {
+            return Ok(());
+        }
+        if let Some(line) = lseek_overflow_line(&log_path) {
+            return Err(line);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+    if let Some(line) = lseek_overflow_line(&log_path) {
+        return Err(line);
+    }
+    panic!(
+        "interval did not commit {name} within 5s\n{}\n{}",
+        tar_list(tar),
+        tail(&log_path)
+    );
 }
 
 fn wait_tar_lists(tar: &Path, name: &str) {
