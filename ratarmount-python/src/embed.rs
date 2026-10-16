@@ -130,13 +130,12 @@ impl From<DirEnt> for Entry {
 
 #[pyclass(frozen, module = "ratarmount_rs._native")]
 struct Archive {
-    // Backends can share a seek position between member readers. Keep each
-    // complete Session operation atomic, including consuming RangeReader.
-    session: Mutex<Option<Arc<Mutex<Session>>>>,
+    // Only lifecycle changes are locked. I/O retains its own Session reference.
+    session: Mutex<Option<Arc<Session>>>,
 }
 
 impl Archive {
-    fn session(&self) -> PyResult<Arc<Mutex<Session>>> {
+    fn session(&self) -> PyResult<Arc<Session>> {
         self.session
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -165,7 +164,6 @@ impl Archive {
     fn ls(&self, py: Python<'_>, path: String) -> PyResult<Vec<Entry>> {
         let session = self.session()?;
         py.detach(move || {
-            let session = session.lock().unwrap_or_else(|e| e.into_inner());
             let info = session.lookup(&path)?.ok_or(Error::NotFound)?;
             if !info.is_dir {
                 return Err(Error::UnsupportedFormat("ls requires a directory".into()));
@@ -187,12 +185,9 @@ impl Archive {
     /// Look up complete metadata for one entry.
     fn stat(&self, py: Python<'_>, path: String) -> PyResult<Entry> {
         let session = self.session()?;
-        py.detach(move || {
-            let session = session.lock().unwrap_or_else(|e| e.into_inner());
-            session.lookup(&path)?.ok_or(Error::NotFound)
-        })
-        .map(Entry::from)
-        .map_err(to_py)
+        py.detach(move || session.lookup(&path)?.ok_or(Error::NotFound))
+            .map(Entry::from)
+            .map_err(to_py)
     }
 
     /// Read a bounded range as bytes. -1 reads through EOF; zero reads nothing.
@@ -208,7 +203,6 @@ impl Archive {
         }
         let session = self.session()?;
         let bytes = py.detach(move || -> PyResult<Vec<u8>> {
-            let session = session.lock().unwrap_or_else(|e| e.into_inner());
             let info = session
                 .lookup(&path)
                 .map_err(to_py)?
@@ -242,10 +236,7 @@ impl Archive {
     fn extent(&self, py: Python<'_>, path: String) -> PyResult<(PathBuf, u64, u64)> {
         let session = self.session()?;
         let extent = py
-            .detach(move || {
-                let session = session.lock().unwrap_or_else(|e| e.into_inner());
-                session.member_extent(&path)
-            })
+            .detach(move || session.member_extent(&path))
             .map_err(to_py)?;
         extent.map(|e| (e.file, e.offset, e.len)).ok_or_else(|| {
             NotMappable::new_err(
@@ -261,10 +252,7 @@ impl Archive {
             OffsetCursor::AfterOffset { offsetheader, path }
         });
         let page = py
-            .detach(move || {
-                let session = session.lock().unwrap_or_else(|e| e.into_inner());
-                session.iter_by_offset_page(cursor, 1024)
-            })
+            .detach(move || session.iter_by_offset_page(cursor, 1024))
             .map_err(to_py)?;
         let next = match page.next {
             Some(OffsetCursor::AfterOffset { offsetheader, path }) => Some((offsetheader, path)),
@@ -292,7 +280,6 @@ impl Archive {
         };
         let session = self.session()?;
         py.detach(move || {
-            let session = session.lock().unwrap_or_else(|e| e.into_inner());
             session.extract_to(
                 ExtractRequest {
                     members,
@@ -350,7 +337,7 @@ fn open(
         })
         .map_err(to_py)?;
     Ok(Archive {
-        session: Mutex::new(Some(Arc::new(Mutex::new(session)))),
+        session: Mutex::new(Some(Arc::new(session))),
     })
 }
 

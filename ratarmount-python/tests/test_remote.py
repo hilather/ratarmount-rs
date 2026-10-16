@@ -80,3 +80,17 @@ def test_regression_http_url_open_and_read_release_gil(archive_url):
         with pytest.raises(ratar.NotMappable):
             archive.mmap("a/first.txt")
     assert any(method == "GET" and header for method, header in requests)
+
+
+def test_regression_fsspec_native_http_target_uses_rust_ranges(archive_url):
+    """Regression: a native target needs no Python HTTP download or spool."""
+    fsspec = pytest.importorskip("fsspec", reason="skip: fsspec is optional")
+    url, payloads, requests = archive_url
+    fs = fsspec.filesystem("ratar", fo=url, skip_instance_cache=True)
+    try:
+        assert fs.cat_file("z-last-name.bin", start=7000, end=19000) == payloads["z-last-name.bin"][7000:19000]
+        with fs.open("a/first.txt", "rb") as member:
+            assert member.read() == payloads["a/first.txt"]
+    finally:
+        fs.close()
+    assert any(method == "GET" and header for method, header in requests)

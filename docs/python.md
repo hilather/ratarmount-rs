@@ -11,9 +11,10 @@ Type information ships as `__init__.pyi` and `py.typed`.
 From the workspace root, with Rust 1.90+ and `uv` installed:
 
 ```bash
+export UV_CACHE_DIR="/tmp/ratarmount-uv-cache"
 uv venv --python python3 ratarmount-python/.venv
-uv pip install --python ratarmount-python/.venv/bin/python maturin pytest
-VIRTUAL_ENV="$PWD/ratarmount-python/.venv" \
+uv pip install --python ratarmount-python/.venv/bin/python maturin pytest fsspec zstandard patchelf
+PATH="$PWD/ratarmount-python/.venv/bin:$PATH" VIRTUAL_ENV="$PWD/ratarmount-python/.venv" \
   ratarmount-python/.venv/bin/maturin develop -m ratarmount-python/Cargo.toml
 ratarmount-python/.venv/bin/pytest ratarmount-python/tests
 ```
@@ -23,8 +24,13 @@ For a wheel, run `ratarmount-python/.venv/bin/maturin build
 build environment if it is not already available; maturin uses it to bundle
 linked shared libraries (`uv pip install --python
 ratarmount-python/.venv/bin/python patchelf`). The version comes from the Rust
-workspace. PyPI publication and a multi-platform wheel CI matrix are later
-work (AI-PY2); `pip install ratarmount-rs` is not yet the installation path.
+workspace. The Python wheels workflow builds abi3 wheels for manylinux_2_28
+x86_64/aarch64 and macOS 14+ arm64, plus an sdist, and tests installed wheels in
+fresh venvs on Linux x86_64 and macOS arm64. Linux wheels require glibc 2.28+;
+linked libraries such as libarchive are bundled by maturin on Linux and
+delocate on macOS. No FUSE is needed.
+The workflow uploads build artifacts only; PyPI publishing is not enabled, so
+`pip install ratarmount-rs` is not yet the installation path.
 The Python crate is outside the workspace's default build members and no
 other crate depends on it. Its default features do not compile PyO3.
 
@@ -150,12 +156,11 @@ extraction. Session performs safe temporary-file publication, not Python
 An Archive can be shared by Python threads. All blocking native Session
 operations, including open, reads, listing, lookup, paging, extraction,
 extent inspection and final Session destruction, release the GIL. The
-wrapper serializes each binary stream's position updates. Complete Session
-operations on one Archive are also serialized, including consumption of a
-ranged reader: backing streams may share a seek position even though Session
-is Send + Sync. Waiting for this lock releases the GIL too. Separate Archive
-instances can work concurrently. `read()` allocates the requested bytes; prefer bounded reads or a
-binary stream for large members, and mmap for eligible zero-copy access.
+wrapper serializes each binary stream's position updates. Session I/O on a
+shared Archive runs concurrently using independent member readers; no
+per-Archive operation lock is held. A small lifecycle lock protects the Session
+reference during close. `read()` allocates the requested bytes; prefer bounded
+reads or a binary stream for large members, and mmap for eligible zero-copy access.
 
 `close()` is idempotent. Context exit closes even on exceptions. After close,
 new archive operations and member stream operations raise `ValueError`;
@@ -172,5 +177,188 @@ formats, corrupt indexes, cancellation, write-permission and other engine
 errors raise `RatarmountError` with the engine detail. Standard Python I/O
 and mmap errors retain their usual types.
 
-fsspec integration, dataset helpers and wheel CI belong to AI-PY2. The
-Python `.mount()` API belongs to AI-PY3 and is not provided here.
+The Python `.mount()` API belongs to AI-PY3 and is not provided here.
+
+## fsspec
+
+Install `fsspec` alongside the built wheel (or use its `[fsspec]` extra).
+The distribution registers protocol `ratar` through the `fsspec.specs` entry
+point; no call to `register_implementation` is needed. URLs follow
+[fsspec's archive chaining](https://filesystem-spec.readthedocs.io/en/latest/features.html#url-chaining):
+
+```python
+import fsspec
+
+fs = fsspec.filesystem("ratar", fo="/data/shard.tar.zst")
+print(fs.ls("/", detail=True))
+print(fs.glob("samples/*.json"))
+print(fs.cat_file("samples/0001.json", start=10, end=100))
+
+with fsspec.open("ratar://samples/0001.json::file:///data/shard.tar.zst", "rb") as f:
+    f.seek(10)
+    print(f.read(90))
+
+# The bare chain selects the filesystem root, which is a directory.
+fs, root = fsspec.core.url_to_fs("ratar::file:///data/shard.tar.zst")
+print(fs.ls(root))
+```
+
+Member paths are relative to the archive root. `ratar://archive.tar::member`
+is not supported. `ratar::file:///path/a.tar.zst` and
+`ratar::hf://datasets/org/name/shards/a.tar.zst` select an archive filesystem;
+include a member (or a glob) in the first component to open files.
+Calling `fsspec.open` on a bare chain raises `IsADirectoryError` on opening.
+
+The constructor accepts `fo`, `target_protocol`, `target_options`, and the
+Archive options `password`, `index`, `recursive`, `parallelization`. For example,
+`fsspec.filesystem("ratar", fo="bucket/a.tar", target_protocol="s3")`.
+Local targets and native remote URLs (HTTP(S), S3, GS, AZ, HF, and the other
+Session schemes) go directly to Rust. The HF backend must be available in the
+installed native build; this adapter does not implement HF transport itself.
+Chained URLs may require the target protocol's Python plugin for fsspec to
+parse the chain; using `fo` directly avoids that parser requirement.
+Credentials follow Session's environment/configuration. `target_options` that
+require translation raise `NotImplementedError` because Python credentials/options cannot currently be
+translated to Session. HF defaults injected by `datasets` (`token=None` and
+an endpoint equal to the native default or `HF_ENDPOINT`) are accepted; explicit
+Python tokens or different endpoints are rejected. Set native credentials
+through the environment instead. Other fsspec targets (such as
+`memory://`) and file objects also raise `NotImplementedError`; there is no
+Python download or temporary spool fallback.
+
+The adapter supports `ls(detail=...)`, `info`, seekable binary/text `open`,
+`cat_file` ranges (including negative slice bounds), and default `find`/`glob`.
+Missing members raise `FileNotFoundError`; writes are rejected. Fsspec's
+instance cache reuses an opened Archive for the same constructor arguments
+within a process/thread. Use `skip_instance_cache=True` for an independent
+instance. Close the filesystem when finished, and call
+`RatarmountFileSystem.clear_instance_cache()` before recreating a closed cached
+instance. Treat the backing archive as unchanged during an instance's lifetime.
+
+```python
+import pandas as pd
+import pyarrow.parquet as pq
+
+frame = pd.read_csv("ratar://data.csv::file:///data/tables.tar.zst", compression=None)
+records = pd.read_json("ratar://data.jsonl::file:///data/tables.tar.zst", lines=True, compression=None)
+with fsspec.open("ratar://data.parquet::file:///data/tables.tar.zst", "rb") as f:
+    table = pq.read_table(f)
+```
+
+These consumers are covered by optional integration tests. PyArrow and pandas
+are optional and are not imported by `ratarmount_rs`. Explicit `compression=None`
+prevents older pandas from inferring compression from the outer archive suffix.
+
+### Hugging Face datasets
+
+The `datasets` WebDataset builder needs raw TAR shard streams. If an outer
+archive contains TAR shards, select those members:
+
+```python
+from datasets import load_dataset
+
+# Tested with a local ZIP containing two TAR shards.
+rows = load_dataset(
+    "webdataset",
+    data_files="ratar://*.tar::/data/shards.zip",
+    streaming=True,
+    split="train",
+)
+
+# Equivalent Hub form; untested against the live Hub, requires the HF backend.
+rows = load_dataset(
+    "webdataset",
+    data_files="ratar://*.tar::hf://datasets/org/name/shards.zip",
+    streaming=True,
+    split="train",
+)
+```
+
+For `datasets` older than version 5 (including versions available on Python
+3.9), glob expansion loses chained targets. Supply `fo` via storage options:
+
+```python
+rows = load_dataset(
+    "webdataset", data_files="ratar://*.tar",
+    storage_options={"ratar": {"fo": "/data/shards.zip"}},
+    streaming=True, split="train",
+)
+```
+
+Both forms are covered by the installed-wheel tests on Python 3.9 and 3.12.
+Use a plain absolute local target in the chained example: `datasets` 5.1 normalizes
+`file:///` hops incorrectly when constructing its streaming iterator.
+
+The proposed `datasets.load_dataset("webdataset", data_files="ratar::hf://...")`
+form selects a directory, so it cannot supply the raw TAR stream the builder
+requires. Small nested TARs inside an outer TAR are flattened into directories by
+Session, even without recursive mode; use a ZIP container when selecting raw
+TAR shard members. For samples directly inside a Hub TAR shard, use its native
+`hf://` URL with `datasets`, or the sample iterator below to read through Rust.
+
+## PyTorch datasets
+
+PyTorch is optional: install it separately, or request the wheel's `[torch]`
+extra. Importing `ratarmount_rs` does not import torch.
+
+```python
+from torch.utils.data import DataLoader
+from ratarmount_rs.torch import RatarDataset, RatarIterableDataset
+
+dataset = RatarDataset("shard.tar.zst", pattern="samples/*", extensions=["jpg", "json"])
+path, data = dataset[0]
+text = RatarDataset("shard.tar", extensions="txt", decode=bytes.decode)
+
+stream = RatarIterableDataset(["shard-0.tar.zst", "shard-1.tar.zst"], shuffle=True, seed=42)
+loader = DataLoader(stream, batch_size=None, num_workers=2, multiprocessing_context="spawn")
+for path, data in loader:
+    consume(path, data)
+```
+
+Both return `(path, bytes)` or `(path, decode(bytes))`. Paths start with `/`;
+`pattern` matches without that leading slash using shell-style `fnmatch`;
+`extensions` is a string or sequence, with or without dots, and is case
+sensitive. Map datasets build their filtered path list on first `len`/indexing.
+Iterable datasets use `Archive.iter(order="archive")` without collecting the
+catalog. Pass `archive_options={"parallelization": 4}` to either constructor.
+
+Archives open lazily in each worker and are excluded from pickles. The map
+path list can be pickled; decode callables must also be pickleable. Prefer
+spawned workers for native libraries, and guard DataLoader startup with
+`if __name__ == "__main__":` in scripts. Iterable workers split shards; when
+there are fewer shards than workers, they divide the member sequence instead
+(each worker scans the catalogs, but only reads its assigned payloads).
+A fixed shuffle seed gives every worker the same shard order. Call `close()`
+on a map dataset when finished; iterable completion/closing releases its archive.
+Torch tests use fake base classes in default CI, with a real spawned DataLoader
+test when torch is installed.
+
+## WebDataset samples
+
+```python
+from ratarmount_rs.webdataset import samples, shuffle_shards, split_by_worker
+
+for sample in samples(["shard-0.tar.zst", "shard-1.tar.zst"], shuffle=True, seed=42):
+    print(sample["__key__"], sample["jpg"], sample["json"])
+
+# Optional webdataset integration: use a fresh iterator factory for each epoch.
+import webdataset as wds
+pipeline = wds.DataPipeline(lambda: samples(["shard.tar.zst"]))
+```
+
+`samples` does not require torch or webdataset. It emits raw dictionaries with
+`__key__`, `__url__`, and byte fields grouped by consecutive keys in archive
+order. Following [WebDataset tariterators](https://github.com/webdataset/webdataset/blob/main/src/webdataset/tariterators.py),
+it splits the basename at its first dot: `dir/001.JPG` becomes key `dir/001`
+and field `jpg`; `001.txt.gz` has field `txt.gz`. Extensionless and metadata
+files are ignored; duplicate suffixes in a sample raise `ValueError`. Shard
+boundaries always flush a sample. Session exposes newest versions of duplicate
+member paths; overwritten TAR history is not emitted, unlike a raw tar stream.
+
+`shuffle_shards(paths, seed)` returns a shuffled copy. `split_by_worker(paths,
+worker_id, num_workers)` returns round-robin shards; without explicit IDs it
+uses torch's worker info when available. `samples` applies worker splitting by
+default; use `split_workers=False` to disable it or supply explicit IDs. Workers
+with no assigned shards yield nothing. This iterator does not partition by
+distributed rank; split a shard list by rank before passing it to workers.
+Use `archive_options` to pass options to `ratarmount_rs.open`.
