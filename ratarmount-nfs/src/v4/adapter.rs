@@ -1,5 +1,6 @@
 //! `embednfs::FileSystem` on `MountSource`, with optional write overlay.
 
+use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -30,6 +31,7 @@ pub const READER_IDLE_TTL: Duration = Duration::from_secs(90);
 
 /// Userspace NFSv4.1 view of a factory-built [`MountSource`].
 pub struct RatarmountNfs4 {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -39,6 +41,12 @@ pub struct RatarmountNfs4 {
 }
 
 impl RatarmountNfs4 {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, None)
     }
@@ -50,6 +58,7 @@ impl RatarmountNfs4 {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
@@ -106,9 +115,9 @@ impl RatarmountNfs4 {
             size: fi.size,
             space_used: fi.size,
             link_count: if is_dir_mode(fi.mode) { 2 } else { 1 },
-            mode: fi.mode & 0o7777,
-            uid: fi.uid,
-            gid: fi.gid,
+            mode: self.attribute_mapping.mode(fi.mode) & 0o7777,
+            uid: self.attribute_mapping.uid(fi.uid),
+            gid: self.attribute_mapping.gid(fi.gid),
             atime: t,
             mtime: t,
             ctime: t,
@@ -1502,5 +1511,34 @@ mod tests {
         assert_eq!(got, all);
         let lim = nfs.limits();
         assert_eq!(lim.max_write, 1_048_576);
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+
+    /// Regression: NFS attributes must report mapped owners and mode for every Unix type.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(directory.path()).unwrap());
+        let plain = RatarmountNfs4::new(source.clone(), 0);
+        let mapped = RatarmountNfs4::new(source, 0).with_attribute_mapping(
+            AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+        );
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = ratarmount_core::create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = mapped.attrs(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.mode), (12345, 23456, 0o750));
+            let attr = plain.attrs(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.mode), (42, 43, 0o777));
+        }
+        let attr = mapped.getattr_sync(1).unwrap();
+        assert_eq!((attr.uid, attr.gid), (12345, 23456));
     }
 }

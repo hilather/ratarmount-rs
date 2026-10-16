@@ -61,6 +61,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE).\n\
                   Patch: ratarmount diff --base SOURCE OVERLAY [--git] (no FUSE)."
 )]
+#[command(group(clap::ArgGroup::new("overlay_target").args(["write_overlay", "overlay_tmpfs", "sandbox"]).multiple(true)))]
 struct Args {
     /// Unmount the given mountpoint(s)
     #[arg(short = 'u', long = "unmount", action = ArgAction::SetTrue)]
@@ -427,16 +428,28 @@ struct Args {
     #[arg(short = 'w', long = "write-overlay")]
     write_overlay: Option<PathBuf>,
 
+    /// Container-friendly ownership, allow_other/noatime, and a throwaway RAM overlay.
+    #[arg(long)]
+    sandbox: bool,
+
+    /// Private RAM write overlay; optional logical byte cap (use --overlay-tmpfs=2G).
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "", conflicts_with_all = ["write_overlay", "commit_overlay"])]
+    overlay_tmpfs: Option<String>,
+
+    /// Explicitly allow a temporary overlay to commit changes into the base archive.
+    #[arg(long, requires = "overlay_tmpfs")]
+    overlay_tmpfs_allow_commit: bool,
+
     /// Protect root-relative paths (repeatable, comma-separated; quote globs).
-    #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    #[arg(long, value_delimiter = ',', action = ArgAction::Append, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_readonly: Vec<String>,
 
     /// Maximum logical overlay bytes, including COW (bytes or binary K/M/G/T).
-    #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    #[arg(long, value_parser = ratarmount_compositing::parse_overlay_size, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota: Option<u64>,
 
     /// Maximum overlay regular files and symlinks, including COW copies.
-    #[arg(long, requires = "write_overlay", conflicts_with = "commit_overlay")]
+    #[arg(long, requires = "overlay_target", conflicts_with = "commit_overlay")]
     overlay_quota_files: Option<u64>,
 
     #[arg(skip)]
@@ -457,8 +470,8 @@ struct Args {
     yes: bool,
 
     /// On SIGINT/SIGTERM or NFS/FUSE return, commit `-w` into an uncompressed TAR
-    /// or `.tar.zst`. Rejects `:temp:` and gzip/bzip2/xz TAR / ZIP (no silent full rewrite).
-    /// Same create-if-missing as `-w` (still requires durable `-w`).
+    /// or `.tar.zst`. RAM overlays require --overlay-tmpfs-allow-commit.
+    /// Rejects disk-backed `:temp:` and gzip/bzip2/xz TAR / ZIP (no silent full rewrite).
     #[arg(long = "commit-overlay-on-exit", action = ArgAction::SetTrue)]
     commit_overlay_on_exit: bool,
 
@@ -466,7 +479,7 @@ struct Args {
     /// uncompressed TAR or `.tar.zst` while serving (`2s`/`15m`/`1h`).
     /// `0` (default) is off. Recently written files stay in the overlay until
     /// they settle; on-exit still flushes everything. In-process; promptless.
-    /// Requires durable `-w`. Same create-if-missing as `-w`.
+    /// Requires durable `-w` or --overlay-tmpfs-allow-commit for a RAM overlay.
     #[arg(
         long = "commit-overlay-interval",
         value_name = "DURATION",
@@ -600,6 +613,8 @@ where
         (stripped, false, false, false)
     };
     let mut args = Args::try_parse_from(stripped)?;
+    expand_sandbox(&mut args, caller_ids())
+        .map_err(|message| clap::Error::raw(clap::error::ErrorKind::ValueValidation, message))?;
     if !args.overlay_readonly.is_empty() {
         ratarmount_compositing::ReadOnlyGlobs::new(&args.overlay_readonly).map_err(|e| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
@@ -614,6 +629,128 @@ where
         args.no_mount = true;
     }
     Ok(args)
+}
+
+fn caller_ids() -> (u32, u32) {
+    let uid = std::env::var("SUDO_UID")
+        .ok()
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getuid() });
+    let gid = std::env::var("SUDO_GID")
+        .ok()
+        .and_then(|id| id.parse().ok())
+        .unwrap_or_else(|| unsafe { libc::getgid() });
+    (uid, gid)
+}
+
+fn expand_sandbox(args: &mut Args, (uid, gid): (u32, u32)) -> Result<(), String> {
+    let mapping = ratarmount_core::AttributeMapping::parse(&args.fuse)?;
+    if args.sandbox {
+        let mut defaults = vec!["allow_other".to_owned(), "noatime".to_owned()];
+        if mapping.uid.is_none() {
+            defaults.push(format!("uid={uid}"));
+        }
+        if mapping.gid.is_none() {
+            defaults.push(format!("gid={gid}"));
+        }
+        defaults.push(args.fuse.clone());
+        args.fuse = defaults.join(",");
+        if args.write_overlay.is_none() && args.overlay_tmpfs.is_none() {
+            args.overlay_tmpfs = Some(String::new());
+        }
+    }
+    if let Some(size) = &args.overlay_tmpfs {
+        if !size.is_empty() {
+            let cap = ratarmount_compositing::parse_overlay_size(size)?;
+            args.overlay_quota = Some(args.overlay_quota.map_or(cap, |quota| quota.min(cap)));
+        }
+        if (args.commit_overlay_on_exit
+            || overlay_commit::parse_interval(&args.commit_overlay_interval)?.is_some())
+            && !args.overlay_tmpfs_allow_commit
+        {
+            return Err("--overlay-tmpfs is throwaway: committing requires --overlay-tmpfs-allow-commit explicitly".into());
+        }
+        args.write_overlay = Some(PathBuf::from(":temp:"));
+    }
+    Ok(())
+}
+
+// process::exit skips local destructors. Register cleanup once, and relinquish
+// the parent's inherited directory after fork; only the serving child removes it.
+static TEMP_OVERLAY: std::sync::Mutex<Option<tempfile::TempDir>> = std::sync::Mutex::new(None);
+
+extern "C" fn cleanup_temp_overlay() {
+    if let Ok(mut overlay) = TEMP_OVERLAY.lock() {
+        overlay.take();
+    }
+}
+
+fn relinquish_temp_overlay() {
+    if let Some(overlay) = TEMP_OVERLAY.lock().unwrap().take() {
+        let _ = overlay.keep();
+    }
+}
+
+fn has_temp_overlay() -> bool {
+    TEMP_OVERLAY.lock().unwrap().is_some()
+}
+
+fn register_temp_overlay(overlay: tempfile::TempDir) {
+    static REGISTER: std::sync::Once = std::sync::Once::new();
+    REGISTER.call_once(|| unsafe {
+        libc::atexit(cleanup_temp_overlay);
+    });
+    *TEMP_OVERLAY.lock().unwrap() = Some(overlay);
+}
+
+fn create_tmpfs_overlay() -> std::io::Result<tempfile::TempDir> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "--overlay-tmpfs is supported only on Linux; use -w :temp: for a disk-backed temporary overlay"))
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let runtime = std::env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from);
+        create_tmpfs_overlay_in(Path::new("/dev/shm"), runtime.as_deref())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn create_tmpfs_overlay_in(
+    shm: &Path,
+    runtime: Option<&Path>,
+) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    let mut last_error = None;
+    for parent in std::iter::once(shm).chain(runtime) {
+        // XDG_RUNTIME_DIR is normally tmpfs, but refuse a disk-backed override.
+        let path = std::ffi::CString::new(parent.as_os_str().as_bytes())?;
+        let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statfs(path.as_ptr(), &mut stat) } != 0 {
+            last_error = Some(std::io::Error::last_os_error());
+            continue;
+        }
+        if stat.f_type != libc::TMPFS_MAGIC {
+            last_error = Some(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                format!("{} is not tmpfs", parent.display()),
+            ));
+            continue;
+        }
+        match tempfile::Builder::new()
+            .prefix("ratarmount-write-overlay.")
+            .permissions(std::fs::Permissions::from_mode(0o700))
+            .tempdir_in(parent)
+        {
+            Ok(directory) => return Ok(directory),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(std::io::Error::other(format!(
+        "cannot create RAM overlay on /dev/shm or $XDG_RUNTIME_DIR: {}",
+        last_error.unwrap()
+    )))
 }
 
 /// `--fts`, boolean `--hashes`, and `--offset-order` are find-argv only
@@ -878,6 +1015,25 @@ fn main() {
 
     let write_style = resolve_color_style(args.color, args.no_color);
     init_logger(args.debug, args.log_file.as_deref(), write_style);
+    if args.sandbox {
+        log::info!(
+            "sandbox: -o {} overlay={} quota={:?} passthrough={:?}",
+            args.fuse,
+            if args.overlay_tmpfs.is_some() {
+                "tmpfs".into()
+            } else {
+                args.write_overlay
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_default()
+            },
+            args.overlay_quota,
+            args.passthrough
+        );
+    }
+    if args.overlay_tmpfs.is_some() && args.overlay_quota.is_none() {
+        eprintln!("warning: --overlay-tmpfs has no size cap; RAM usage is unbounded (set --overlay-tmpfs=SIZE or --overlay-quota)");
+    }
 
     if args.repack_seekable {
         match run_repack_seekable_cli(&args) {
@@ -964,6 +1120,12 @@ fn main() {
     }
 
     let (inputs, mountpoint) = split_inputs_mountpoint(&args.paths, args.no_mount);
+    if mountpoint.is_some() && !args.no_mount && !args.unmount {
+        if let Err(error) = ratarmount_fuse::validate_allow_other(&args.fuse) {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
+    }
 
     if args.write_overlay.is_some() && inputs.len() == 1 {
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
@@ -1243,7 +1405,6 @@ fn main() {
         }
     }
 
-    let mut _temp_overlay: Option<tempfile::TempDir> = None;
     let mut overlay_arc: Option<Arc<WriteOverlay>> = None;
     let mut overlay_quota: Option<Arc<ratarmount_compositing::OverlayQuota>> = None;
 
@@ -1252,11 +1413,18 @@ fn main() {
 
     if let Some(w) = &args.write_overlay {
         let overlay_path = if w.as_os_str() == ":temp:" {
-            let td =
-                tempfile::TempDir::with_prefix("ratarmount-write-overlay.").expect("temp overlay");
+            let td = if args.overlay_tmpfs.is_some() {
+                create_tmpfs_overlay()
+            } else {
+                tempfile::TempDir::with_prefix("ratarmount-write-overlay.")
+            }
+            .unwrap_or_else(|error| {
+                eprintln!("error creating temporary overlay: {error}");
+                std::process::exit(1)
+            });
             let p = td.path().to_path_buf();
             eprintln!("Created temporary overlay directory: {}", p.display());
-            _temp_overlay = Some(td);
+            register_temp_overlay(td);
             p
         } else {
             w.clone()
@@ -1313,7 +1481,14 @@ fn main() {
         }
     };
     let live_commit_archive = if args.commit_overlay_on_exit || commit_interval.is_some() {
-        match overlay_commit::validate_live_commit_args(args.write_overlay.as_deref(), &inputs) {
+        match overlay_commit::validate_live_commit_args(
+            if args.overlay_tmpfs_allow_commit {
+                overlay_arc.as_ref().map(|overlay| overlay.root())
+            } else {
+                args.write_overlay.as_deref()
+            },
+            &inputs,
+        ) {
             Ok(p) => Some(p),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -1323,7 +1498,7 @@ fn main() {
     } else {
         None
     };
-    if args.commit_overlay_on_exit || commit_interval.is_some() {
+    if args.commit_overlay_on_exit || commit_interval.is_some() || has_temp_overlay() {
         overlay_commit::install_term_signal_flag();
     }
     if let (Some(ov), Some(archive)) = (overlay_arc.as_ref(), live_commit_archive.as_ref()) {
@@ -1513,6 +1688,8 @@ fn main() {
             );
         }
         let nfs_opts = ratarmount_nfs::NfsOptions {
+            attribute_mapping: ratarmount_core::AttributeMapping::parse(&args.fuse)
+                .expect("validated attribute mapping"),
             bind,
             export_name: args.nfs_export_name.clone(),
             readahead_bytes: readahead,
@@ -1755,6 +1932,8 @@ fn parse_export_plan(
         let bind = parse_bind_or_exit(&args.ninep_bind, ratarmount_9p::parse_ninep_bind);
         warn_export_non_loopback("9P", bind);
         plan.ninep = Some(ratarmount_9p::NinepOptions {
+            attribute_mapping: ratarmount_core::AttributeMapping::parse(&args.fuse)
+                .expect("validated attribute mapping"),
             bind,
             stop: None,
             overlay: overlay.clone(),
@@ -1766,6 +1945,8 @@ fn parse_export_plan(
         let bind = parse_bind_or_exit(&args.sftp_bind, ratarmount_sftp::parse_sftp_bind);
         warn_export_non_loopback("SFTP", bind);
         plan.sftp = Some(ratarmount_sftp::SftpOptions {
+            attribute_mapping: ratarmount_core::AttributeMapping::parse(&args.fuse)
+                .expect("validated attribute mapping"),
             bind,
             stop: None,
             overlay,
@@ -1777,6 +1958,8 @@ fn parse_export_plan(
     } else if args.sftp_subsystem {
         // bind / authorized_keys / host_key are ignored by serve_stdio.
         plan.sftp_stdio = Some(ratarmount_sftp::SftpOptions {
+            attribute_mapping: ratarmount_core::AttributeMapping::parse(&args.fuse)
+                .expect("validated attribute mapping"),
             bind: ratarmount_sftp::DEFAULT_SFTP_BIND,
             stop: None,
             overlay,
@@ -2139,6 +2322,7 @@ fn finish_overlay_serve(
     commit(overlay.as_deref());
     drop(source);
     drop(overlay);
+    cleanup_temp_overlay();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2229,7 +2413,7 @@ fn run_exports(
             finish_overlay_serve(overlay_arc, Some(source), interval, commit_exit);
         }
         Some(mp) => {
-            if live_archive.is_some() {
+            if live_archive.is_some() || has_temp_overlay() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             if foreground {
@@ -2293,6 +2477,7 @@ fn run_exports(
             }
             match unsafe { fork() } {
                 Ok(ForkResult::Parent { child }) => {
+                    relinquish_temp_overlay();
                     // The child owns the overlay database. Dropping it here
                     // would replay pending rows into the child's connection.
                     // process::exit skips Drop on purpose. The interval thread
@@ -2312,7 +2497,7 @@ fn run_exports(
                     if !has_log_file {
                         let _ = redirect_stdio_to_null();
                     }
-                    if live_archive.is_some() {
+                    if live_archive.is_some() || has_temp_overlay() {
                         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
                     }
                     let interval = spawn_interval_if(
@@ -2472,7 +2657,7 @@ fn run_fuse_and_nfs(
         let stop = ratarmount_nfs::NfsStop::new();
         nfs_opts.stop = Some(stop.clone());
         overlay_commit::spawn_signal_nfs_stop(stop.clone());
-        if live_archive.is_some() {
+        if live_archive.is_some() || has_temp_overlay() {
             overlay_commit::spawn_signal_fuse_unmount(mp.clone());
         }
         let interval = spawn_interval_if(
@@ -2522,6 +2707,7 @@ fn run_fuse_and_nfs(
     }
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
+            relinquish_temp_overlay();
             // The child owns the overlay database. Dropping it here would
             // replay pending rows into the child's connection. process::exit
             // skips Drop on purpose. The interval thread starts in the child.
@@ -2543,7 +2729,7 @@ fn run_fuse_and_nfs(
             let stop = ratarmount_nfs::NfsStop::new();
             nfs_opts.stop = Some(stop.clone());
             overlay_commit::spawn_signal_nfs_stop(stop.clone());
-            if live_archive.is_some() {
+            if live_archive.is_some() || has_temp_overlay() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             let interval = spawn_interval_if(
@@ -2610,7 +2796,7 @@ fn run_fuse_only(
     commit_interval: Option<Duration>,
     open_opts: OpenOptions,
 ) {
-    if live_archive.is_some() {
+    if foreground && (live_archive.is_some() || has_temp_overlay()) {
         overlay_commit::spawn_signal_fuse_unmount(mp.clone());
     }
     let commit_exit = |ov: Option<&WriteOverlay>| {
@@ -2651,6 +2837,7 @@ fn run_fuse_only(
 
     match unsafe { fork() } {
         Ok(ForkResult::Parent { child }) => {
+            relinquish_temp_overlay();
             // The child owns the overlay database. Dropping it here would
             // replay pending rows into the child's connection. process::exit
             // skips Drop on purpose. The interval thread starts in the child.
@@ -2669,7 +2856,7 @@ fn run_fuse_only(
             if !has_log_file {
                 let _ = redirect_stdio_to_null();
             }
-            if live_archive.is_some() {
+            if live_archive.is_some() || has_temp_overlay() {
                 overlay_commit::spawn_signal_fuse_unmount(mp.clone());
             }
             let interval = spawn_interval_if(
@@ -5859,5 +6046,191 @@ mod sandbox_cli_tests {
             control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
             "pong\n"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_preset_tests {
+    use super::*;
+
+    /// Regression: sandbox defaults must respect explicit overlay, ownership and passthrough settings.
+    #[test]
+    fn regression_sandbox_expansion_preserves_explicit_options() {
+        let mut args =
+            Args::try_parse_from(["ratarmount", "--sandbox", "source.tar", "mnt"]).unwrap();
+        expand_sandbox(&mut args, (1001, 1002)).unwrap();
+        assert_eq!(args.overlay_tmpfs.as_deref(), Some(""));
+        assert_eq!(args.write_overlay.as_deref(), Some(Path::new(":temp:")));
+        assert_eq!(args.passthrough, PassthroughMode::Auto);
+        let mapping = ratarmount_core::AttributeMapping::parse(&args.fuse).unwrap();
+        assert_eq!((mapping.uid, mapping.gid), (Some(1001), Some(1002)));
+        assert!(args.fuse.contains("allow_other,noatime"));
+        let mut args = Args::try_parse_from([
+            "ratarmount",
+            "--sandbox",
+            "-w",
+            "persistent",
+            "-o",
+            "uid=12345,gid=23456,umask=027",
+            "--passthrough",
+            "off",
+            "source.tar",
+            "mnt",
+        ])
+        .unwrap();
+        expand_sandbox(&mut args, (1, 2)).unwrap();
+        assert!(args.overlay_tmpfs.is_none());
+        assert_eq!(args.write_overlay.as_deref(), Some(Path::new("persistent")));
+        let mapping = ratarmount_core::AttributeMapping::parse(&args.fuse).unwrap();
+        assert_eq!(
+            (mapping.uid, mapping.gid, mapping.umask),
+            (Some(12345), Some(23456), 0o027)
+        );
+        assert_eq!(args.passthrough, PassthroughMode::Off);
+    }
+
+    /// Regression: optional tmpfs size must not consume archive/mountpoint or weaken an explicit quota.
+    #[test]
+    fn regression_overlay_tmpfs_clap_caps_and_conflicts() {
+        for (flag, quota) in [
+            ("--overlay-tmpfs", None),
+            ("--overlay-tmpfs=2G", Some(2 << 30)),
+        ] {
+            let args = parse_args_from(["ratarmount", flag, "source.tar", "mnt"]).unwrap();
+            assert_eq!(
+                args.paths,
+                [PathBuf::from("source.tar"), PathBuf::from("mnt")]
+            );
+            assert_eq!(args.overlay_quota, quota);
+        }
+        let args = parse_args_from([
+            "ratarmount",
+            "--sandbox",
+            "--overlay-quota",
+            "1M",
+            "source.tar",
+        ])
+        .unwrap();
+        assert_eq!(args.overlay_quota, Some(1 << 20));
+        let args = parse_args_from([
+            "ratarmount",
+            "--overlay-tmpfs=2G",
+            "--overlay-quota",
+            "1M",
+            "source.tar",
+        ])
+        .unwrap();
+        assert_eq!(args.overlay_quota, Some(1 << 20));
+        for tail in [
+            vec!["-w", "persistent"],
+            vec!["--commit-overlay"],
+            vec!["--commit-overlay-on-exit"],
+            vec!["--commit-overlay-interval", "2s"],
+        ] {
+            assert!(
+                parse_args_from(["ratarmount", "--overlay-tmpfs"].into_iter().chain(tail)).is_err()
+            );
+        }
+        assert!(parse_args_from(["ratarmount", "--overlay-tmpfs=bad"]).is_err());
+        assert!(parse_args_from(["ratarmount", "-o", "uid=bad"]).is_err());
+        assert!(parse_args_from([
+            "ratarmount",
+            "--overlay-tmpfs",
+            "--overlay-tmpfs-allow-commit",
+            "--commit-overlay-on-exit",
+            "source.tar",
+            "mnt"
+        ])
+        .is_ok());
+    }
+
+    /// Regression: the daemon parent must relinquish cleanup while the serving child retains it.
+    #[test]
+    fn regression_temp_overlay_daemon_parent_preserves_child_directory() {
+        let directory = tempfile::tempdir().unwrap();
+        let marker = directory.path().join("child-owned");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "sandbox_preset_tests::temp_overlay_daemon_cleanup_child",
+                "--nocapture",
+            ])
+            .env("RATARMOUNT_SB3_CLEANUP_TEST", &marker)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(&marker).unwrap(),
+            "child retained overlay"
+        );
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn temp_overlay_daemon_cleanup_child() {
+        let Some(marker) = std::env::var_os("RATARMOUNT_SB3_CLEANUP_TEST").map(PathBuf::from)
+        else {
+            return;
+        };
+        let directory = tempfile::tempdir_in(marker.parent().unwrap()).unwrap();
+        let path = directory.path().to_path_buf();
+        register_temp_overlay(directory);
+        match unsafe { fork() }.unwrap() {
+            ForkResult::Parent { child } => {
+                relinquish_temp_overlay();
+                let status = nix::sys::wait::waitpid(child, None).unwrap();
+                assert_eq!(status, nix::sys::wait::WaitStatus::Exited(child, 0));
+                assert!(!path.exists());
+            }
+            ForkResult::Child => {
+                std::thread::sleep(Duration::from_millis(100));
+                assert!(path.exists(), "parent removed child's overlay");
+                std::fs::write(marker, "child retained overlay").unwrap();
+                // The atexit handler must run even though Rust locals don't drop.
+                std::process::exit(0);
+            }
+        }
+    }
+
+    /// Regression: RAM overlays must be private, actually on tmpfs, and removed on drop.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_overlay_tmpfs_private_directory_removed_on_drop() {
+        use std::os::unix::fs::PermissionsExt;
+        let runtime = tempfile::tempdir().unwrap();
+        let directory = match create_tmpfs_overlay_in(Path::new("/dev/shm"), None) {
+            Ok(directory) => directory,
+            Err(error) => {
+                eprintln!("skip: direct /dev/shm creation is unavailable ({error}); checking runtime tmpfs fallback");
+                match create_tmpfs_overlay_in(
+                    Path::new("/nonexistent-ratarmount-shm"),
+                    Some(runtime.path()),
+                ) {
+                    Ok(directory) => directory,
+                    Err(error) => {
+                        eprintln!("skip: no writable tmpfs: {error}");
+                        return;
+                    }
+                }
+            }
+        };
+        let path = directory.path().to_path_buf();
+        let parent = path.parent().unwrap().to_path_buf();
+        assert!(path.starts_with("/dev/shm") || path.starts_with(runtime.path()));
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        drop(directory);
+        assert!(!path.exists());
+        let fallback =
+            create_tmpfs_overlay_in(Path::new("/nonexistent-ratarmount-shm"), Some(&parent))
+                .unwrap();
+        assert!(fallback.path().starts_with(parent));
+        assert!(create_tmpfs_overlay_in(Path::new("/proc"), None).is_err());
     }
 }

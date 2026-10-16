@@ -324,12 +324,12 @@ fn map_err(e: i32) -> StatusReply {
     code.into()
 }
 
-fn attrs_from_fi(fi: &FileInfo) -> FileAttributes {
+fn attrs_from_fi(fi: &FileInfo, mapping: ratarmount_core::AttributeMapping) -> FileAttributes {
     let mut a = FileAttributes {
         size: Some(fi.size),
-        uid: Some(fi.uid),
-        gid: Some(fi.gid),
-        permissions: Some(sftp_permissions(fi)),
+        uid: Some(mapping.uid(fi.uid)),
+        gid: Some(mapping.gid(fi.gid)),
+        permissions: Some(mapping.mode(sftp_permissions(fi))),
         atime: Some(unix_mtime_u32(fi.mtime)),
         mtime: Some(unix_mtime_u32(fi.mtime)),
         ..FileAttributes::default()
@@ -381,7 +381,7 @@ impl Handler for SftpSession {
         let fi = self.fs.file_info_at(&path).map_err(map_err)?;
         Ok(Attrs {
             id,
-            attrs: attrs_from_fi(&fi),
+            attrs: attrs_from_fi(&fi, self.fs.attribute_mapping()),
         })
     }
 
@@ -397,7 +397,7 @@ impl Handler for SftpSession {
         };
         Ok(Attrs {
             id,
-            attrs: attrs_from_fi(&fi),
+            attrs: attrs_from_fi(&fi, self.fs.attribute_mapping()),
         })
     }
 
@@ -429,7 +429,7 @@ impl Handler for SftpSession {
         let ents = self.fs.readdir(&path).map_err(map_err)?;
         let files = ents
             .into_iter()
-            .map(|(name, fi)| File::new(name, attrs_from_fi(&fi)))
+            .map(|(name, fi)| File::new(name, attrs_from_fi(&fi, self.fs.attribute_mapping())))
             .collect();
         Ok(Name { id, files })
     }
@@ -655,6 +655,32 @@ mod policy_status_tests {
                 reply.error_message.as_deref(),
                 Some(io::Error::from_raw_os_error(errno).to_string().as_str())
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+    use ratarmount_core::AttributeMapping;
+
+    /// Regression: SFTP STAT/FSTAT/READDIR must report the same mapped Unix attributes.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = ratarmount_core::create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = attrs_from_fi(
+                &fi,
+                AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+            );
+            assert_eq!((attr.uid, attr.gid), (Some(12345), Some(23456)));
+            assert_eq!(attr.permissions.unwrap() & 0o777, 0o750);
+            let attr = attrs_from_fi(&fi, AttributeMapping::default());
+            assert_eq!((attr.uid, attr.gid), (Some(42), Some(43)));
+            assert_eq!(attr.permissions.unwrap() & 0o777, 0o777);
         }
     }
 }

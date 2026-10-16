@@ -55,6 +55,7 @@ fn nfs4_from_opts(source: Arc<dyn MountSource>, opts: &NfsOptions) -> Ratarmount
         usize::try_from(opts.readahead_bytes).unwrap_or(usize::MAX),
         opts.overlay.clone(),
     )
+    .with_attribute_mapping(opts.attribute_mapping)
 }
 
 /// Drop idle `ArchiveRead` slots ~once per second (lease approximation).

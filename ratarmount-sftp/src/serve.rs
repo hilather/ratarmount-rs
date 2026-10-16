@@ -29,6 +29,7 @@ pub const DEFAULT_SFTP_BIND: SocketAddr =
 /// Listen / export options for [`serve_blocking`] / [`spawn_sftp_thread`].
 #[derive(Clone)]
 pub struct SftpOptions {
+    pub attribute_mapping: ratarmount_core::AttributeMapping,
     pub bind: SocketAddr,
     pub stop: Option<ExportStop>,
     /// When set, OPEN-write / MKDIR / REMOVE / RENAME / SETSTAT-size go here.
@@ -44,6 +45,7 @@ pub struct SftpOptions {
 impl Default for SftpOptions {
     fn default() -> Self {
         Self {
+            attribute_mapping: Default::default(),
             bind: default_export_bind(DEFAULT_SFTP_PORT),
             stop: None,
             overlay: None,
@@ -58,6 +60,7 @@ impl Default for SftpOptions {
 impl std::fmt::Debug for SftpOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SftpOptions")
+            .field("attribute_mapping", &self.attribute_mapping)
             .field("bind", &self.bind)
             .field("stop", &self.stop.as_ref().map(|_| "ExportStop"))
             .field("overlay", &self.overlay.is_some())
@@ -93,12 +96,15 @@ pub(crate) fn fs_from_opts(
     source: Arc<dyn MountSource>,
     opts: &SftpOptions,
 ) -> Arc<RatarmountSftp> {
-    Arc::new(RatarmountSftp::with_overlay(
-        source,
-        opts.readahead_bytes,
-        opts.reader_slots,
-        opts.overlay.clone(),
-    ))
+    Arc::new(
+        RatarmountSftp::with_overlay(
+            source,
+            opts.readahead_bytes,
+            opts.reader_slots,
+            opts.overlay.clone(),
+        )
+        .with_attribute_mapping(opts.attribute_mapping),
+    )
 }
 
 pub(crate) fn resolved_authorized_keys(

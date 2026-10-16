@@ -8,7 +8,8 @@ ratarmount -w attempt-overlay --overlay-readonly 't/**,tests/**' \
   --overlay-quota 2G --overlay-quota-files 100000 source.tar mnt/
 ```
 
-These options require `-w` / `--write-overlay` and conflict with the offline
+These options require an overlay from `-w` / `--write-overlay`,
+`--overlay-tmpfs`, or `--sandbox`, and conflict with the offline
 `--commit-overlay` command, which does not install mount policies. They apply through the shared
 overlay to FUSE, NFS, 9P, SFTP, SMB and WebDAV. Reads and read-only opens remain
 available. The base archive is unchanged by ordinary overlay writes.
@@ -162,3 +163,75 @@ Exit status is **0** for no changes, **1** for changes, and **2** for an error
 (including missing/corrupt/locked databases or a missing `--base`). Redirecting
 stdout preserves a clean patch; source-opening progress goes to stderr. Harnesses
 should accept both 0 and 1 as successful comparisons.
+
+## Ownership and container mounts
+
+`-o uid=12345,gid=23456,umask=027` overrides reported Unix ownership and
+masks permission bits with `mode & ~umask`, including directories and symlinks.
+The options apply to FUSE, NFS v3/v4, 9P and SFTP attributes, including overlay
+files. Omit an option to retain its original value. IDs are decimal; umask is
+octal (`000` through `777`). Stored ownership, creation credentials, chmod and
+chown behavior remain unchanged. SMB and WebDAV expose no Unix uid/gid fields.
+This mapping can avoid Git's “dubious ownership” check when a container uses a
+different user; see [Git mounts](git-mounts.md).
+
+`--sandbox` expands to `-o allow_other,noatime`, caller uid/gid (using
+`SUDO_UID` / `SUDO_GID` when present), and a RAM overlay unless `-w` supplies
+an explicit overlay. Explicit `-o uid=...,gid=...` overrides the caller IDs.
+Passthrough retains its `auto` default; an explicit `--passthrough` is honored.
+The effective options, overlay, quota and passthrough mode are logged at info
+level (`-d 2`). This preset configures filesystem access; container process and
+network isolation still come from the container runtime.
+
+For a non-root FUSE mount with `allow_other`, `/etc/fuse.conf` must contain
+this exact uncommented line:
+
+```text
+user_allow_other
+```
+
+Ratarmount checks this before mounting and explains the required line if it is
+missing. `allow_other` lets other local users access the mount; choose the
+reported permissions and mountpoint access accordingly.
+
+For example, for a host caller with uid/gid 1000, run the mount in one
+terminal, then bind it into a container (adjust IDs for your host and container
+user namespace):
+
+```sh
+mkdir -p mnt
+ratarmount -f --sandbox --overlay-tmpfs=2G \
+  -o uid=1000,gid=1000,umask=077 source.tar mnt/
+# In another terminal (the image must contain the tools you want):
+podman run --rm --userns=keep-id --user 1000:1000 -v "$PWD/mnt:/workspace:rw" \
+  -w /workspace docker.io/library/debian:stable-slim sh
+# Docker: omit --userns=keep-id; retain --user, -v and -w.
+```
+
+## Throwaway RAM overlays
+
+`--overlay-tmpfs[=SIZE]` creates a private mode-0700 directory on Linux
+`/dev/shm`. If unavailable, it tries `$XDG_RUNTIME_DIR`, verifying that the
+selected filesystem is tmpfs. It fails if neither offers RAM storage. macOS
+and other platforms reject this option with a clear error; `-w :temp:` remains
+the disk-backed alternative. It conflicts with explicit `-w` and offline
+`--commit-overlay`.
+
+Use `--overlay-tmpfs=2G` (with `=`) so the optional size cannot consume the
+archive argument. SIZE uses the same units and shared logical-content quota
+as `--overlay-quota`; when both are supplied, the smaller cap wins. All
+frontends enforce the cap. It does not reserve RAM or limit SQLite metadata,
+filesystem overhead, or other processes using the shared tmpfs. Without a
+size or an explicit quota, RAM use has no application cap and startup warns.
+
+The directory is removed on unmount, normal exit, SIGINT and SIGTERM, after
+serving and overlay shutdown. A daemon parent leaves cleanup to its serving
+child. SIGKILL and machine failure cannot run cleanup; remove abandoned
+`ratarmount-write-overlay.*` directories from the RAM filesystem after checking
+that no mount still uses them.
+
+Changes are discarded by default. `--commit-overlay-on-exit` or
+`--commit-overlay-interval` requires the explicit additional
+`--overlay-tmpfs-allow-commit` flag with `--overlay-tmpfs`; this deliberately
+allows changes to reach the base archive and retains the existing supported
+live-commit archive formats. Temporary overlay data is removed after commit.

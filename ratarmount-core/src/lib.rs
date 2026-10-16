@@ -1,6 +1,8 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
+mod attribute_mapping;
 mod quiet_print;
+pub use attribute_mapping::AttributeMapping;
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;

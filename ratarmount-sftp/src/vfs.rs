@@ -1,5 +1,6 @@
 //! `MountSource` adapter for SFTP v3 (inode table + reader LRU + overlay).
 
+use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
@@ -41,6 +42,7 @@ pub enum SftpHandle {
 
 /// Userspace SFTP view of a factory-built [`MountSource`].
 pub struct RatarmountSftp {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -49,6 +51,16 @@ pub struct RatarmountSftp {
 }
 
 impl RatarmountSftp {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
+    pub fn attribute_mapping(&self) -> AttributeMapping {
+        self.attribute_mapping
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize, reader_slots: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, reader_slots, None)
     }
@@ -61,6 +73,7 @@ impl RatarmountSftp {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
