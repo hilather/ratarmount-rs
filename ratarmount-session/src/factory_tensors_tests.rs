@@ -1,5 +1,7 @@
 use super::*;
-use crate::{IndexPolicy, OpenRequest, ReadRequest, Recreate, Session, SourceSpec};
+use crate::{
+    IndexPolicy, OpenRequest, ParallelizationSpec, ReadRequest, Recreate, Session, SourceSpec,
+};
 use ratarmount_formats_tar::{write_tar_eof, write_ustar_members, UstarMember, UstarPayload};
 use std::io::{Cursor, Read};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -51,6 +53,7 @@ fn open_session(path: &Path, recursive: bool) -> Result<Session, crate::Error> {
         recursive,
         recursion_depth: Some(1),
         recreate: Recreate::IfInvalid,
+        parallelization: ParallelizationSpec::default(),
     })
 }
 
