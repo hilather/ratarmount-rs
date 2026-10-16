@@ -11,6 +11,17 @@ use secrecy::ExposeSecret;
 
 use crate::{apply_http_auth, HttpAuthOptions, HttpLocation, HTTP_RANGE_CHUNK, USER_AGENT};
 
+pub(crate) fn redacted_url(raw: &str) -> String {
+    let Ok(mut url) = url::Url::parse(raw) else {
+        return "[invalid URL]".into();
+    };
+    let _ = url.set_username("");
+    let _ = url.set_password(None);
+    url.set_query(None);
+    url.set_fragment(None);
+    url.to_string()
+}
+
 pub(crate) fn agent() -> &'static ureq::Agent {
     static AGENT: OnceLock<ureq::Agent> = OnceLock::new();
     AGENT.get_or_init(|| {
@@ -106,7 +117,17 @@ impl HttpRequest {
             let resp = match body {
                 Some(bytes) => req.send_bytes(bytes),
                 None => req.call(),
-            }?;
+            }
+            .map_err(|e| match e {
+                // Other protocol backends also display these errors directly. Drop
+                // the transport's URL-bearing source chain before it can be logged.
+                ureq::Error::Transport(err) => ureq::Error::from(io::Error::other(format!(
+                    "HTTP {:?} for {}",
+                    err.kind(),
+                    redacted_url(&self.url)
+                ))),
+                status => status,
+            })?;
             let status = resp.status();
             let redirect = matches!(status, 301..=303)
                 || (matches!(status, 307 | 308)
@@ -170,6 +191,7 @@ pub(crate) struct HttpRangeSource {
     pub(crate) location: HttpLocation,
     pub(crate) options: HttpAuthOptions,
     target: Mutex<Option<Target>>,
+    hub_repo: Option<String>,
 }
 
 #[allow(clippy::result_large_err)]
@@ -179,7 +201,13 @@ impl HttpRangeSource {
             location,
             options,
             target: Mutex::new(None),
+            hub_repo: None,
         }
+    }
+
+    pub(crate) fn with_hub_repo(mut self, repo: String) -> Self {
+        self.hub_repo = Some(repo);
+        self
     }
 
     pub(crate) fn url(&self) -> &str {
@@ -301,7 +329,12 @@ impl HttpRangeSource {
         let timeout = cancelled.map(|_| Duration::from_secs(60));
         let resp = self
             .request_with_timeout("GET", Some((start, end)), timeout)
-            .map_err(|e| io::Error::other(crate::map_ureq_http_error(e, self.url())))?;
+            .map_err(|e| {
+                io::Error::other(match &self.hub_repo {
+                    Some(repo) => crate::hf::map_http_error(repo, e),
+                    None => crate::map_ureq_http_error(e, self.url()),
+                })
+            })?;
         let status = resp.status();
         if status == 206 {
             validate_content_range(&resp, start, end, Some(size))?;

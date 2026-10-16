@@ -1444,9 +1444,11 @@ mod tests {
         let env = SmbEnv::acquire(&[
             "HF_ENDPOINT",
             "HF_TOKEN",
+            "HUGGING_FACE_HUB_TOKEN",
             "HF_TOKEN_PATH",
             "HF_HOME",
             "HF_HUB_OFFLINE",
+            "TRANSFORMERS_OFFLINE",
             "RATARMOUNT_HF_TREE_CACHE",
         ]);
         env.set("HF_ENDPOINT", format!("http://{}", http.addr));
@@ -2327,7 +2329,7 @@ mod tests {
                     let msg = b"not found";
                     let _ = write!(
                         stream,
-                        "HTTP/1.1 404 Not Found\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        "HTTP/1.1 404 Not Found\r\nX-Error-Code: EntryNotFound\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                         msg.len()
                     );
                     if !is_head {

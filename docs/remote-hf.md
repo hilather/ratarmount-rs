@@ -50,13 +50,19 @@ new commits while it is open.
 
 Token lookup order is:
 
-1. Nonempty `HF_TOKEN`.
+1. `HF_TOKEN`, then legacy `HUGGING_FACE_HUB_TOKEN` when `HF_TOKEN` is unset or empty.
 2. The file named by `HF_TOKEN_PATH`.
 3. `$HF_HOME/token`.
-4. `~/.cache/huggingface/token`.
+4. `$XDG_CACHE_HOME/huggingface/token`, or `~/.cache/huggingface/token` when
+   `XDG_CACHE_HOME` is unset.
 
 The selected token file overrides later locations, even if missing. Leading and
-trailing whitespace is removed. Tokens are kept out of URLs and logs. Bearer
+trailing whitespace and embedded CR/LF are removed. A whitespace-only environment
+token falls back to the token file. `HF_HOME` and `HF_TOKEN_PATH` expand `~`,
+`$VAR` and `${VAR}`, matching upstream
+[constants.py](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/constants.py)
+and [_auth.py](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/utils/_auth.py).
+Tokens are kept out of URLs and logs. Bearer
 credentials go only to the configured Hub endpoint; redirects to the CDN drop
 authentication, including when a signed URL expires and is resolved again.
 Unrelated `RATARMOUNT_HTTP_*` Basic-auth and cookie settings do not apply to Hub
@@ -67,15 +73,26 @@ gated repositories may additionally require accepting their access terms.
 or drop-in Hub API; HTTP(S) endpoints with a base path are supported. The backend
 uses `/api/{models|datasets|spaces}/{repo}/revision/{revision}`, the recursive
 tree API, and the usual commit-pinned `/resolve/` URLs. Mirrors must implement
-those APIs. No `hf-hub`, reqwest, or asynchronous runtime is needed.
+those APIs. A plain-HTTP endpoint sends the token in cleartext; an authenticated
+mount logs this warning once per process. Use HTTPS for remote endpoints.
+No `hf-hub`, reqwest, or asynchronous runtime is needed.
 
 ## Listings, indexes, and rate limits
 
-Listings use `recursive=true&expand=true`, follow `Link: ...; rel="next"`, and
+Listings use `recursive=true` without `expand`, follow `Link: ...; rel="next"`, and
 publish the cache only after the entire listing has succeeded. Pagination cycles,
 links leaving the endpoint, malformed entries, and excessive listings fail
-closed. Limits are 10,000 pages, one million entries, and 256 MiB of JSON.
+closed. Limits are one million entries, 256 MiB of JSON, and 1,000,001 pages
+(the page guard also permits mirrors returning one entry per page).
 Git blob IDs, LFS metadata, and `xetHash` fields are retained in the persisted JSON.
+
+Verified against the public Hub on **2026-10-16**, without `expand`:
+`HuggingFaceFW/fineweb-edu` at `87f09149ef4734204d70ed1d046ddc9ca3f2b8f9`
+returned **1,000 entries** on its first page with a next-page Link. File entries
+retained `path`, `type`, `size`, `oid`, `lfs.{oid,size,pointerSize}` and `xetHash`
+(883 entries had `xetHash`). The smaller Xet fixture below returned 35 entries,
+14 with `xetHash`. Expanded commit/security metadata is unnecessary for mounting
+and reduces the Hub's page size to about 50.
 
 Complete listings are cached in memory and at
 `$XDG_CACHE_HOME/ratarmount/hf-tree-v1/` (default `~/.cache/ratarmount/hf-tree-v1/`),
@@ -84,12 +101,20 @@ directory. Keys include endpoint, repository type, repository ID, commit, and
 subdirectory. Remounting the same directory snapshot still resolves the revision once but
 makes **zero tree requests**. An unwritable cache only disables persistence.
 The listing cache currently has no automatic eviction; removing it is safe when
-mounts are closed. It contains filenames/metadata, not tokens or file contents.
+mounts are closed. Budget up to 256 MiB of JSON per cached snapshot/subdirectory,
+plus a small identity envelope; multiple commits or overlapping subdirectories
+consume separate files and can grow disk usage without bound. It contains
+filenames/metadata, not tokens or file contents.
 
 [Hub API requests are rate limited](https://huggingface.co/docs/hub/api).
 Large cold listings can require many pages; warm listing reuse avoids repeating
-that traffic. HTTP 429 fails clearly rather than publishing a partial listing;
-there is no automatic rate-limit retry loop in this backend.
+that traffic. Revision and tree API requests retry HTTP 429 at most three times,
+honoring `Retry-After` seconds or HTTP dates with a five-second maximum wait per
+retry (one second if absent/invalid). Exhaustion fails without caching a partial
+listing. Data reads and index-sidecar downloads do not use this retry loop.
+`X-Error-Code` distinguishes missing repositories, revisions, entries and gated
+access. A 401 without that header reports “not found or private.” Only an
+`EntryNotFound` tree response triggers the file-open path.
 
 For single archives, `.index.ptr`, `.index.<id>.sqlite`, and `.index.sqlite`
 siblings (including the existing compressed-index suffixes) are requested through
@@ -101,14 +126,28 @@ rebuilds skip remote index discovery.
 ## Range reads and Xet verification
 
 Files use the shared pooled HTTP agent, redirect-target caching, expired-target
-re-resolution, and bounded parallel sequential reads. Available final-response `X-Repo-Commit`,
+re-resolution, and bounded parallel sequential reads. The probe and source are
+shared per commit/path for the mount lifetime, including concurrent opens; a new
+handle does not repeat `/resolve/`. Available final-response `X-Repo-Commit`,
 `X-Linked-Etag`, `X-Linked-Size`, and `ETag` headers are recorded in debug logs;
-a conflicting `X-Repo-Commit` is rejected. A one-byte GET verifies
+a conflicting final-response `X-Repo-Commit` is rejected. This check normally
+applies only to non-redirected responses: intermediate redirect headers are not
+retained or checked, and CDNs generally omit this header. Pinning uses the SHA in
+the resolve URL. Transport errors omit URL query strings and userinfo.
+The CLI suppresses ureq's raw request debug traces, even with
+`RUST_LOG=ureq::unit=trace`. Applications embedding `ratarmount-remote` must likewise
+keep the `ureq::unit` log target at WARN or below in verbosity: those third-party
+traces include unredacted signed URLs and bypass the library's diagnostics.
+A one-byte GET verifies
 Range support rather than relying on CDN HEAD headers. If the server returns
 200 and ignores Range, its response is read sequentially once into the existing
-HTTP reader's memory buffer. This fallback can use memory proportional to file
-size. Unsupported archive formats may additionally use the existing temporary
-file materialization path.
+HTTP reader's shared memory buffer, **up to 64 MiB per file**. Larger responses
+are refused with a clear error, including responses without Content-Length;
+refusal is remembered until unmount. Use a Range-capable endpoint or download
+such a file locally. Repeated opens share the buffer rather than downloading or
+copying it again. Buffers remain alive for the mount lifetime, so opening many
+non-Range files adds their memory use. Unsupported archive formats may additionally
+use the existing temporary file materialization path.
 
 Live check on **2026-10-16**:
 
@@ -138,7 +177,8 @@ Normal CI only uses in-process mock servers.
 ## Offline and write-back limits
 
 `HF_HUB_OFFLINE=1` (also `true`, `yes`, or `on`) refuses `hf://` mounts before any
-network access. Listing caches alone cannot supply the file data. Shared Hub
+network access. Legacy `TRANSFORMERS_OFFLINE` is used when `HF_HUB_OFFLINE` is
+unset or empty; an explicit `HF_HUB_OFFLINE=0` overrides it. Listing caches alone cannot supply the file data. Shared Hub
 blob-cache reuse and `hf-cache://` offline mounts belong to AI-HF3 and are not
 implemented here. Do not treat this listing cache as an offline snapshot.
 

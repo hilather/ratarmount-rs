@@ -2614,6 +2614,7 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
     let mut builder =
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level.as_str()));
     builder.filter_level(level);
+    configure_http_logging(&mut builder);
     builder.write_style(write_style);
     if let Some(path) = log_file {
         match std::fs::OpenOptions::new()
@@ -2631,6 +2632,37 @@ fn init_logger(debug: u8, log_file: Option<&Path>, write_style: env_logger::Writ
         }
     }
     let _ = builder.try_init();
+}
+
+fn configure_http_logging(builder: &mut env_logger::Builder) {
+    // ureq's request/prelude debug logs contain raw signed URLs. Override even
+    // an explicit RUST_LOG=ureq::unit=trace; our HTTP diagnostics redact them.
+    builder.filter_module("ureq::unit", log::LevelFilter::Warn);
+}
+
+/// Regression: verbose HTTP request traces exposed presigned CDN URL queries.
+#[test]
+fn regression_http_debug_logging_hides_signed_request_urls() {
+    let mut builder = env_logger::Builder::new();
+    builder.parse_filters("debug,ureq::unit=trace");
+    configure_http_logging(&mut builder);
+    let logger = builder.build();
+    for level in [log::Level::Debug, log::Level::Trace] {
+        let record = log::Record::builder()
+            .target("ureq::unit")
+            .level(level)
+            .args(format_args!(
+                "GET https://cdn.example/data?Signature=secret"
+            ))
+            .build();
+        assert!(!logger.matches(&record));
+    }
+    let record = log::Record::builder()
+        .target("ratarmount_remote::http_pool")
+        .level(log::Level::Debug)
+        .args(format_args!("safe HTTP diagnostic"))
+        .build();
+    assert!(logger.matches(&record));
 }
 
 /// Adapter so env_logger can write through a Mutex-guarded File.

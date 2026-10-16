@@ -252,6 +252,7 @@ fn regression_hf_three_page_tree_cached_on_remount_and_cdn_has_no_token() {
         }
         if req.path.contains("/tree/") {
             assert!(req.path.contains(SHA));
+            assert!(!req.path.contains("expand"));
             let page = if req.path.contains("cursor=2") {
                 2
             } else if req.path.contains("cursor=1") {
@@ -262,7 +263,7 @@ fn regression_hf_three_page_tree_cached_on_remount_and_cdn_has_no_token() {
             let body = match page {
                 0 => json!([{"type":"directory","path":"train"}]),
                 1 => {
-                    json!([{"type":"file","path":"train/a.parquet","size":data.len(),"oid":"gitblob","lfs":{"oid":"sha256"},"xetHash":"xet"}])
+                    json!([{"type":"file","path":"train/a.parquet","size":data.len(),"oid":"gitblob","lfs":{"oid":"sha256","size":data.len()},"xetHash":"xet"}])
                 }
                 _ => json!([{"type":"file","path":"config.json","size":2}]),
             };
@@ -270,10 +271,7 @@ fn regression_hf_three_page_tree_cached_on_remount_and_cdn_has_no_token() {
             return if page < 2 {
                 response.header(
                     "Link",
-                    format!(
-                        "<?recursive=true&expand=true&cursor={}>; rel=\"next\"",
-                        page + 1
-                    ),
+                    format!("<?recursive=true&cursor={}>; rel=\"next\"", page + 1),
                 )
             } else {
                 response
@@ -292,7 +290,19 @@ fn regression_hf_three_page_tree_cached_on_remount_and_cdn_has_no_token() {
     let folder = repo.folder().unwrap().unwrap();
     assert_eq!(folder.list_dirents("/").unwrap().len(), 2);
     let fi = folder.lookup("/train/a.parquet", 0).unwrap();
-    assert_eq!(folder.read(&fi, data.len(), 0).unwrap(), data);
+    thread::scope(|scope| {
+        let opens: Vec<_> = (0..10)
+            .map(|_| scope.spawn(|| assert_eq!(folder.read(&fi, data.len(), 0).unwrap(), data)))
+            .collect();
+        for open in opens {
+            open.join().unwrap();
+        }
+    });
+    assert_eq!(
+        hub.count("/resolve/"),
+        1,
+        "ten opens share one resolve and probe"
+    );
     let root = folder.lookup("/", 0).unwrap();
     assert_eq!(
         folder.get_xattr(&root, "user.hf.commit").unwrap(),
@@ -465,9 +475,10 @@ fn regression_hf_ignored_range_buffers_once_and_empty_file_opens() {
     });
     let repo =
         HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), config(&hub, None)).unwrap();
-    let mut file = repo.open_file("file").unwrap();
+    let file = repo.open_file("file").unwrap();
     assert!(!file.uses_ranges());
     for _ in 0..3 {
+        let mut file = repo.open_file("file").unwrap();
         let mut s = String::new();
         file.seek(SeekFrom::Start(0)).unwrap();
         file.read_to_string(&mut s).unwrap();
@@ -577,6 +588,7 @@ fn regression_hf_subdirectory_tree_does_not_expose_outside_entries() {
         Config::from_values(|key| (key == "HF_ENDPOINT").then(|| "http://127.0.0.1:1".into()))
             .unwrap();
     let repo = HfRepo {
+        files: Arc::default(),
         location: parse_hf_url("hf://datasets/org/data/train").unwrap(),
         commit: SHA.into(),
         config,
@@ -653,5 +665,324 @@ fn regression_hf_compositing_tags_are_not_remote_paths() {
     assert_eq!(
         source.get_xattr(&synthetic_root, "user.hf.commit").unwrap(),
         SHA.as_bytes()
+    );
+}
+
+/// Regression: Hub token paths ignored XDG, tilde expansion and legacy variables.
+#[test]
+fn regression_hf_environment_matches_huggingface_hub_precedence() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (path, token) in [
+        (".cache/huggingface/token", "default"),
+        ("xdg/huggingface/token", "xdg"),
+        ("custom/token", "home"),
+        ("explicit", "path"),
+    ] {
+        let path = tmp.path().join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, token).unwrap();
+    }
+    let mut env = BTreeMap::from([("HOME", tmp.path().to_string_lossy().into_owned())]);
+    let token = |env: &BTreeMap<&str, String>| {
+        Config::from_values(|k| env.get(k).cloned())
+            .unwrap()
+            .token
+            .map(|s| s.expose_secret().clone())
+    };
+    assert_eq!(token(&env).as_deref(), Some("default"));
+    env.insert("XDG_CACHE_HOME", "~/xdg".into());
+    assert_eq!(token(&env).as_deref(), Some("xdg"));
+    env.insert("HF_HOME", "~/custom".into());
+    assert_eq!(token(&env).as_deref(), Some("home"));
+    env.insert("HF_HOME", "${HOME}/custom".into());
+    assert_eq!(token(&env).as_deref(), Some("home"));
+    env.insert("HF_TOKEN_PATH", "~/explicit".into());
+    assert_eq!(token(&env).as_deref(), Some("path"));
+    env.insert("HF_TOKEN_PATH", "$HOME/explicit".into());
+    assert_eq!(token(&env).as_deref(), Some("path"));
+    env.insert("HUGGING_FACE_HUB_TOKEN", " legacy\r\ntoken ".into());
+    assert_eq!(token(&env).as_deref(), Some("legacytoken"));
+    env.insert("HF_TOKEN", "env".into());
+    assert_eq!(token(&env).as_deref(), Some("env"));
+    env.insert("HF_TOKEN", "".into());
+    assert_eq!(token(&env).as_deref(), Some("legacytoken"));
+    env.insert("HF_TOKEN", " \r\n".into());
+    assert_eq!(token(&env).as_deref(), Some("path"));
+    env.insert("HF_TOKEN_PATH", "~/missing".into());
+    assert!(
+        token(&env).is_none(),
+        "selected file overrides other locations"
+    );
+    assert_eq!(
+        expand_env_path("$UNKNOWN/${MISSING}/$", &|_| None),
+        "$UNKNOWN/${MISSING}/$"
+    );
+
+    for (hub, legacy, expected) in [
+        (None, Some("1"), true),
+        (Some(""), Some("YES"), true),
+        (Some("0"), Some("1"), false),
+        (Some("false"), Some("ON"), false),
+        (Some("True"), Some("0"), true),
+        (None, Some("0"), false),
+        (None, None, false),
+    ] {
+        env.remove("HF_HUB_OFFLINE");
+        env.remove("TRANSFORMERS_OFFLINE");
+        if let Some(s) = hub {
+            env.insert("HF_HUB_OFFLINE", s.into());
+        }
+        if let Some(s) = legacy {
+            env.insert("TRANSFORMERS_OFFLINE", s.into());
+        }
+        let config = Config::from_values(|k| env.get(k).cloned()).unwrap();
+        assert_eq!(config.offline, expected);
+        assert_eq!(config.online().is_err(), expected);
+    }
+}
+
+/// Regression: an ignored Range could buffer an arbitrary file and redownload on open.
+#[test]
+fn regression_hf_ignored_range_large_file_refused_once() {
+    let hub = Server::new(|req| {
+        if req.path.contains("/revision/") {
+            Response::new(200, json!({"sha":SHA}).to_string())
+        } else {
+            Response::new(200, vec![0; MAX_BUFFER_BYTES as usize + 1])
+        }
+    });
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), config(&hub, None)).unwrap();
+    for _ in 0..3 {
+        let err = repo.open_file("large").err().unwrap().to_string();
+        assert!(
+            err.contains("ignores Range") && err.contains("64 MiB"),
+            "{err}"
+        );
+    }
+    assert_eq!(hub.count("/resolve/"), 1);
+    // A missing/dishonest Content-Length must not bypass the streaming limit.
+    let mut reader = io::repeat(0);
+    assert!(bounded_body(&mut reader, 64).unwrap().is_none());
+    assert_eq!(bounded_body(&b"abc"[..], 3).unwrap().unwrap(), b"abc");
+}
+
+/// Regression: generic 404 strings classified missing repos/revisions as files.
+#[test]
+fn regression_hf_error_codes_distinguish_files_revisions_and_repos() {
+    for (status, code, expected) in [
+        (401, None, "not found or private"),
+        (404, Some("RepoNotFound"), "repository not found or private"),
+        (403, Some("GatedRepo"), "gated repository"),
+        (404, Some("RevisionNotFound"), "revision not found"),
+        (404, Some("EntryNotFound"), "entry not found"),
+        (404, None, "Hub request failed"),
+    ] {
+        let hub = Server::new(move |req| {
+            if req.path.contains("/revision/") {
+                return Response::new(200, json!({"sha":SHA}).to_string());
+            }
+            let response = Response::new(status, "");
+            match code {
+                Some(code) => response.header("X-Error-Code", code),
+                None => response,
+            }
+        });
+        let repo = HfRepo::with_config(
+            parse_hf_url("hf://org/model/file").unwrap(),
+            config(&hub, None),
+        )
+        .unwrap();
+        let result = repo.tree();
+        if code == Some("EntryNotFound") {
+            assert!(result.unwrap().is_none());
+        } else {
+            let err = result.unwrap_err().to_string();
+            assert!(err.contains(expected) && err.contains("org/model"), "{err}");
+        }
+        let err = repo.open_file("file").err().unwrap().to_string();
+        assert!(err.contains(expected), "{err}");
+    }
+}
+
+/// Regression: 429 failed immediately or retries were applied to file reads.
+#[test]
+fn regression_hf_api_retry_after_bounded_and_data_not_retried() {
+    let revisions = Arc::new(AtomicUsize::new(0));
+    let trees = Arc::new(AtomicUsize::new(0));
+    let rev = revisions.clone();
+    let tree = trees.clone();
+    let hub = Server::new(move |req| {
+        if req.path.contains("/revision/") && rev.fetch_add(1, Ordering::Relaxed) == 3 {
+            return Response::new(200, json!({"sha":SHA}).to_string());
+        }
+        if req.path.contains("/tree/") && tree.fetch_add(1, Ordering::Relaxed) == 1 {
+            return Response::new(200, "[]");
+        }
+        Response::new(429, "").header("Retry-After", "0")
+    });
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), config(&hub, None)).unwrap();
+    assert!(repo.tree().unwrap().is_some());
+    assert_eq!(revisions.load(Ordering::Relaxed), 4);
+    assert_eq!(trees.load(Ordering::Relaxed), 2);
+    assert!(repo
+        .open_file("file")
+        .err()
+        .unwrap()
+        .to_string()
+        .contains("429"));
+    assert_eq!(hub.count("/resolve/"), 1);
+    assert!(repo.fetch_bytes(&repo.resolve_url("sidecar"), 64).is_err());
+    assert_eq!(hub.count("/sidecar"), 1);
+    let hub = Server::new(|_| Response::new(429, "").header("Retry-After", "0"));
+    assert!(
+        HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), config(&hub, None)).is_err()
+    );
+    assert_eq!(hub.count("/revision/"), 4);
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(784111777);
+    for (header, expected) in [
+        (Some("0"), 0),
+        (Some("2"), 2),
+        (Some("999999"), 5),
+        (None, 1),
+        (Some("invalid"), 1),
+        (Some("Sun, 06 Nov 1994 08:49:40 GMT"), 3),
+        (Some("Sun, 06 Nov 1994 08:49:30 GMT"), 0),
+    ] {
+        assert_eq!(retry_after(header, now), Duration::from_secs(expected));
+    }
+}
+
+/// Regression: an error after a successful probe suggested generic HTTP credentials.
+#[test]
+fn regression_hf_range_read_unauthorized_mentions_hf_token() {
+    let probes = Arc::new(AtomicUsize::new(0));
+    let count = probes.clone();
+    let hub = Server::new(move |req| {
+        if req.path.contains("/revision/") {
+            return Response::new(200, json!({"sha":SHA}).to_string());
+        }
+        if count.fetch_add(1, Ordering::Relaxed) == 0 {
+            range_response(&req, b"abc")
+        } else {
+            Response::new(401, "")
+        }
+    });
+    let repo =
+        HfRepo::with_config(parse_hf_url("hf://org/model").unwrap(), config(&hub, None)).unwrap();
+    let mut file = repo.open_file("file").unwrap();
+    let err = file.read(&mut [0; 1]).unwrap_err().to_string();
+    assert!(
+        err.contains("HF_TOKEN") && err.contains("not found or private"),
+        "{err}"
+    );
+    assert!(!err.contains("RATARMOUNT_HTTP"), "{err}");
+}
+
+/// Regression: ureq transport Display exposed cached CDN signatures in read errors.
+#[test]
+fn regression_http_cached_redirect_transport_error_redacts_signature() {
+    let cdn = Server::new(|req| range_response(&req, b"abc"));
+    let target = format!("{}/data?Signature=secret-signature", cdn.url);
+    let hub = Server::new(move |_| Response::new(302, "").header("Location", target.clone()));
+    let source = http_pool::HttpRangeSource::new(
+        HttpLocation {
+            url: hub.url.clone(),
+            auth: None,
+            cookie: None,
+        },
+        HttpAuthOptions::default(),
+    );
+    let mut file = HttpRangeFile::from_source(Arc::new(source), 3, None);
+    file.read_exact(&mut [0; 1]).unwrap();
+    drop(cdn);
+    let err = file.read(&mut [0; 1]).unwrap_err().to_string();
+    assert!(
+        !err.contains("Signature") && !err.contains("secret-signature"),
+        "{err}"
+    );
+    // Callers that log the shared request's error directly must also be safe.
+    let err = file
+        .source
+        .request("GET", Some((0, 0)))
+        .unwrap_err()
+        .to_string();
+    assert!(
+        !err.contains("Signature") && !err.contains("secret-signature"),
+        "{err}"
+    );
+    assert_eq!(hub.count(""), 1, "error must come from the cached target");
+    let url = "https://user:password@cdn.example/data?Signature=secret-signature#token";
+    assert_eq!(http_pool::redacted_url(url), "https://cdn.example/data");
+    let response = ureq::Response::new(401, "Unauthorized", "").unwrap();
+    let err = crate::map_ureq_http_error(ureq::Error::Status(401, response), url).to_string();
+    for secret in ["password", "secret-signature", "#token"] {
+        assert!(!err.contains(secret), "{err}");
+    }
+}
+
+/// Regression: authenticated plain-HTTP endpoints silently sent tokens in cleartext.
+#[test]
+fn regression_hf_plain_http_token_warning_once() {
+    let server = Server::new(|_| Response::new(200, ""));
+    let mut config = config(&server, None);
+    let once = Once::new();
+    config.token = None;
+    assert!(!warn_plain_http(&config, &once));
+    config.token = Some(SecretString::new("secret".into()));
+    config.endpoint.set_scheme("https").unwrap();
+    assert!(!warn_plain_http(&config, &once));
+    config.endpoint.set_scheme("http").unwrap();
+    assert!(warn_plain_http(&config, &once));
+    assert!(!warn_plain_http(&config, &once));
+}
+
+#[test]
+#[ignore = "public Hub network; also requires RATARMOUNT_TEST_HF_LIVE=1"]
+fn hf_live_unexpanded_tree_page_retains_file_metadata() {
+    if std::env::var("RATARMOUNT_TEST_HF_LIVE").as_deref() != Ok("1") {
+        eprintln!("skip: set RATARMOUNT_TEST_HF_LIVE=1");
+        return;
+    }
+    let config = Config::from_env().unwrap();
+    if config.offline {
+        eprintln!("skip: HF_HUB_OFFLINE is enabled");
+        return;
+    }
+    let repo = HfRepo::with_config(
+        parse_hf_url("hf://datasets/HuggingFaceFW/fineweb-edu").unwrap(),
+        config,
+    )
+    .unwrap();
+    let url = format!(
+        "{}?recursive=true",
+        repo.api_url(&format!("tree/{}", repo.commit))
+    );
+    let response = repo.get_api(&url).unwrap();
+    assert!(next_link(&response.all("Link").join(","), &url)
+        .unwrap()
+        .is_some());
+    let body = read_json(response.into_reader()).unwrap();
+    let items = body.as_array().unwrap();
+    assert!(
+        items.len() > 50,
+        "unexpanded tree unexpectedly uses expanded-size pages"
+    );
+    let mut xet_count = 0;
+    for file in items.iter().filter(|e| e["type"] == "file") {
+        assert!(file["path"].is_string() && file["size"].is_u64());
+        if !file["lfs"].is_null() {
+            assert!(file["lfs"]["oid"].is_string() && file["lfs"]["size"].is_u64());
+        }
+        if file["xetHash"].is_string() {
+            xet_count += 1;
+        }
+    }
+    assert!(xet_count > 0);
+    eprintln!(
+        "HF live unexpanded tree: commit={} entries={} xetHash entries={xet_count}",
+        repo.commit,
+        items.len()
     );
 }

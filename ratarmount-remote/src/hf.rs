@@ -3,8 +3,8 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{self, Read, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex, Once};
+use std::time::{Duration, SystemTime};
 
 use ratarmount_core::{ArchiveRead, CheapDirent, FileInfo, ListResult, MountSource, UserData};
 use secrecy::{ExposeSecret, SecretString};
@@ -17,14 +17,134 @@ use crate::{
     RemoteFolderMountSource, RemoteListing, Result, USER_AGENT,
 };
 
-const MAX_PAGES: usize = 10_000;
+const MAX_ENTRIES: usize = 1_000_000;
+// Even mirrors returning one entry per page can reach the entry limit.
+const MAX_PAGES: usize = MAX_ENTRIES + 1;
+const MAX_BUFFER_BYTES: u64 = 64 * 1024 * 1024;
+const MAX_API_RETRIES: usize = 3;
 const MAX_JSON_BYTES: u64 = 256 * 1024 * 1024;
 const TOKEN_HELP: &str =
-    "set HF_TOKEN, HF_TOKEN_PATH, HF_HOME/token, or ~/.cache/huggingface/token";
+    "set HF_TOKEN (or HUGGING_FACE_HUB_TOKEN), HF_TOKEN_PATH, HF_HOME/token, or $XDG_CACHE_HOME/huggingface/token (default ~/.cache/huggingface/token)";
 
 fn error(message: impl Into<String>) -> RemoteError {
     RemoteError::Hf(message.into())
 }
+
+pub(crate) fn map_http_error(repo: &str, err: ureq::Error) -> RemoteError {
+    let ureq::Error::Status(status, response) = err else {
+        return error(format!("Hub request failed for {repo}"));
+    };
+    let code = response.header("X-Error-Code").map(str::to_owned);
+    let detail = match code.as_deref() {
+        Some("RepoNotFound") => "repository not found or private",
+        Some("GatedRepo") => "gated repository; request access or accept its terms",
+        Some("RevisionNotFound") => "revision not found",
+        Some("EntryNotFound") => "entry not found",
+        _ if status == 401 => "repository not found or private",
+        _ if status == 403 => "access forbidden; check repository access and gated terms",
+        _ if status == 429 => "Hub rate limit exceeded",
+        _ => "Hub request failed",
+    };
+    let hint = if matches!(status, 401 | 403)
+        || matches!(code.as_deref(), Some("RepoNotFound" | "GatedRepo"))
+    {
+        format!("; {TOKEN_HELP}")
+    } else {
+        String::new()
+    };
+    RemoteError::HfStatus {
+        status,
+        code,
+        message: format!("HTTP {status} for Hub repo {repo}: {detail}{hint}"),
+    }
+}
+
+fn retry_after(value: Option<&str>, now: SystemTime) -> Duration {
+    let seconds = value
+        .and_then(|s| s.parse::<u64>().ok())
+        .or_else(|| {
+            let date = chrono::DateTime::parse_from_rfc2822(value?).ok()?;
+            let now = now.duration_since(SystemTime::UNIX_EPOCH).ok()?.as_secs();
+            Some((date.timestamp().max(0) as u64).saturating_sub(now))
+        })
+        .unwrap_or(1);
+    Duration::from_secs(seconds.min(5))
+}
+
+fn clean_token(value: String) -> Option<String> {
+    let value = value.replace(['\r', '\n'], "").trim().to_string();
+    (!value.is_empty()).then_some(value)
+}
+
+// Python expanduser followed by expandvars, with unknown variables left intact.
+fn expand_env_path(path: &str, env: &impl Fn(&str) -> Option<String>) -> String {
+    let path = if path == "~" || path.starts_with("~/") {
+        env("HOME")
+            .map(|home| format!("{home}{}", &path[1..]))
+            .unwrap_or_else(|| path.into())
+    } else {
+        path.into()
+    };
+    let mut out = String::new();
+    let mut rest = path.as_str();
+    while let Some(start) = rest.find('$') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let variable = if let Some(braced) = after.strip_prefix('{') {
+            braced.find('}').map(|end| (&braced[..end], end + 2))
+        } else {
+            let len = after
+                .bytes()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == b'_')
+                .count();
+            (len > 0).then_some((&after[..len], len))
+        };
+        if let Some((name, len)) = variable {
+            if let Some(value) = env(name) {
+                out.push_str(&value);
+            } else {
+                out.push_str(&rest[start..start + 1 + len]);
+            }
+            rest = &after[len..];
+        } else {
+            out.push('$');
+            rest = after;
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+static HTTP_TOKEN_WARNING: Once = Once::new();
+
+fn warn_plain_http(config: &Config, once: &Once) -> bool {
+    let mut warned = false;
+    if config.endpoint.scheme() == "http" && config.token.is_some() {
+        once.call_once(|| {
+            log::warn!("HF_ENDPOINT uses plain HTTP: the Hub token will be sent in cleartext; use HTTPS for remote endpoints");
+            warned = true;
+        });
+    }
+    warned
+}
+
+enum CachedFile {
+    Ready {
+        source: Arc<http_pool::HttpRangeSource>,
+        size: u64,
+        buffered: Option<Arc<[u8]>>,
+    },
+    TooLarge,
+}
+
+fn bounded_body(mut reader: impl Read, cap: u64) -> io::Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    reader.by_ref().take(cap).read_to_end(&mut bytes)?;
+    // Keep the overflow byte on the stack instead of growing a full buffer.
+    Ok((reader.read(&mut [0; 1])? == 0).then_some(bytes))
+}
+
+type FileCache = Arc<Mutex<BTreeMap<String, Arc<Mutex<Option<CachedFile>>>>>>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HfLocation {
@@ -182,16 +302,23 @@ impl Config {
                 "HF_ENDPOINT must be an HTTP(S) URL without credentials, query or fragment",
             ));
         }
-        let token = env("HF_TOKEN").filter(|s| !s.trim().is_empty());
+        // Match huggingface_hub: select the first nonempty raw environment value,
+        // then clean it; a whitespace-only HF_TOKEN does not select the legacy token.
+        let token = env("HF_TOKEN")
+            .filter(|s| !s.is_empty())
+            .or_else(|| env("HUGGING_FACE_HUB_TOKEN"))
+            .and_then(clean_token);
         let token = if token.is_some() {
             token
         } else {
-            let path = env("HF_TOKEN_PATH")
-                .map(PathBuf::from)
-                .or_else(|| env("HF_HOME").map(|p| PathBuf::from(p).join("token")))
-                .or_else(|| env("HOME").map(|p| PathBuf::from(p).join(".cache/huggingface/token")));
-            match path.map(std::fs::read_to_string).transpose() {
-                Ok(value) => value,
+            let home = env("HF_HOME").unwrap_or_else(|| {
+                let cache = env("XDG_CACHE_HOME").unwrap_or_else(|| "~/.cache".into());
+                format!("{cache}/huggingface")
+            });
+            let home = expand_env_path(&home, &env);
+            let path = env("HF_TOKEN_PATH").unwrap_or_else(|| format!("{home}/token"));
+            match std::fs::read_to_string(expand_env_path(&path, &env)) {
+                Ok(value) => clean_token(value),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => None,
                 Err(e) => {
                     return Err(error(format!(
@@ -200,8 +327,6 @@ impl Config {
                 }
             }
         }
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
         .map(SecretString::new);
         let cache = env("RATARMOUNT_HF_TREE_CACHE")
             .map(PathBuf::from)
@@ -211,9 +336,12 @@ impl Config {
                     .or_else(|| env("HOME").map(|p| PathBuf::from(p).join(".cache")))
                     .map(|p| p.join("ratarmount/hf-tree-v1"))
             });
-        let offline = env("HF_HUB_OFFLINE").is_some_and(|s| {
-            matches!(s.to_ascii_uppercase().as_str(), "1" | "TRUE" | "YES" | "ON")
-        });
+        let offline = env("HF_HUB_OFFLINE")
+            .filter(|s| !s.is_empty())
+            .or_else(|| env("TRANSFORMERS_OFFLINE"))
+            .is_some_and(|s| {
+                matches!(s.to_ascii_uppercase().as_str(), "1" | "TRUE" | "YES" | "ON")
+            });
         Ok(Self {
             endpoint,
             token,
@@ -237,6 +365,7 @@ pub struct HfRepo {
     pub location: HfLocation,
     pub commit: String,
     config: Config,
+    files: FileCache,
 }
 
 impl HfRepo {
@@ -250,9 +379,10 @@ impl HfRepo {
             location,
             config,
             commit: String::new(),
+            files: Arc::default(),
         };
         let url = repo.api_url(&format!("revision/{}", encode(&repo.location.revision)));
-        let response = repo.get(&url)?;
+        let response = repo.get_api(&url)?;
         let value = read_json(response.into_reader())?;
         let sha = value["sha"]
             .as_str()
@@ -295,11 +425,15 @@ impl HfRepo {
         )
     }
 
-    fn auth_error(&self, status: u16) -> RemoteError {
-        error(format!("HTTP {status} for Hub repo {} (private/gated access may require accepting its terms); {TOKEN_HELP}", self.location.repo))
+    fn get_api(&self, url: &str) -> Result<ureq::Response> {
+        self.get_with_retries(url, MAX_API_RETRIES)
     }
 
     fn get(&self, url: &str) -> Result<ureq::Response> {
+        self.get_with_retries(url, 0)
+    }
+
+    fn get_with_retries(&self, url: &str, retries: usize) -> Result<ureq::Response> {
         self.config.online()?;
         let parsed = Url::parse(url).map_err(|_| error("invalid Hub API URL"))?;
         if parsed.origin() != self.config.endpoint.origin()
@@ -309,23 +443,27 @@ impl HfRepo {
         {
             return Err(error("Hub pagination/sidecar URL escapes HF_ENDPOINT"));
         }
-        let mut req = http_pool::get(url)
-            .set("User-Agent", USER_AGENT)
-            .timeout(Duration::from_secs(60));
-        if let Some(token) = &self.config.token {
-            req = req.set(
-                "Authorization",
-                &format!("Bearer {}", token.expose_secret()),
-            );
-        }
-        req.call().map_err(|e| match e {
-            ureq::Error::Status(code @ (401 | 403), _) => self.auth_error(code),
-            ureq::Error::Status(code, _) => {
-                error(format!("HTTP {code} for Hub repo {}", self.location.repo))
+        warn_plain_http(&self.config, &HTTP_TOKEN_WARNING);
+        for attempt in 0..=retries {
+            let mut req = http_pool::get(url)
+                .set("User-Agent", USER_AGENT)
+                .timeout(Duration::from_secs(60));
+            if let Some(token) = &self.config.token {
+                req = req.set(
+                    "Authorization",
+                    &format!("Bearer {}", token.expose_secret()),
+                );
             }
-            // Do not print redirects containing signed URLs or token-bearing transport errors.
-            _ => error(format!("Hub request failed for {}", self.location.repo)),
-        })
+            match req.call() {
+                Err(ureq::Error::Status(429, response)) if attempt < retries => {
+                    let wait = retry_after(response.header("Retry-After"), SystemTime::now());
+                    drop(response);
+                    std::thread::sleep(wait);
+                }
+                result => return result.map_err(|e| map_http_error(&self.location.repo, e)),
+            }
+        }
+        unreachable!("last attempt returns its result")
     }
 
     /// Authenticated sidecar download; the pooled transport strips auth on redirects.
@@ -352,39 +490,63 @@ impl HfRepo {
         Ok(tmp)
     }
 
-    /// Use AI-0b's pooled source directly so unrelated HTTP Basic/cookie env is not applied.
+    /// Reuse AI-0b's source, including its expiring redirect target, across opens.
     pub fn open_file(&self, path: &str) -> Result<HttpRangeFile> {
         self.config.online()?;
         if !valid_path(path) {
             return Err(error("expected a file path in Hub repository"));
         }
-        let url = self.resolve_url(path);
-        let source = Arc::new(http_pool::HttpRangeSource::new(
-            HttpLocation {
-                url,
-                auth: None,
-                cookie: None,
-            },
-            HttpAuthOptions {
-                bearer_token: self.config.token.clone(),
-            },
-        ));
-        // Probe with a GET: some Hub/CDN HEAD responses omit Accept-Ranges.
+        let slot = self
+            .files
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(path.into())
+            .or_default()
+            .clone();
+        // Only initialization of this file is serialized, not other shards or reads.
+        let mut file = slot.lock().unwrap_or_else(|e| e.into_inner());
+        if file.is_none() {
+            *file = Some(self.probe_file(path)?);
+        }
+        match file.as_ref().unwrap() {
+            CachedFile::Ready { source, size, buffered } => {
+                Ok(HttpRangeFile::from_source(source.clone(), *size, buffered.clone()))
+            }
+            CachedFile::TooLarge => Err(error(format!(
+                "Hub file {}/{} ignores Range and exceeds the 64 MiB buffer limit; use an endpoint with Range support or download it locally",
+                self.location.repo, path
+            ))),
+        }
+    }
+
+    fn probe_file(&self, path: &str) -> Result<CachedFile> {
+        let source = Arc::new(
+            http_pool::HttpRangeSource::new(
+                HttpLocation {
+                    url: self.resolve_url(path),
+                    auth: None,
+                    cookie: None,
+                },
+                HttpAuthOptions {
+                    bearer_token: self.config.token.clone(),
+                },
+            )
+            .with_hub_repo(self.location.repo.clone()),
+        );
+        // Some Hub/CDN HEAD responses omit Accept-Ranges.
         let response = match source.request("GET", Some((0, 0))) {
             Err(ureq::Error::Status(416, response))
                 if response.header("Content-Range") == Some("bytes */0") =>
             {
-                return Ok(HttpRangeFile::from_source(source, 0, Some(Vec::new())));
+                return Ok(CachedFile::Ready {
+                    source,
+                    size: 0,
+                    buffered: Some(Arc::from([])),
+                });
             }
             result => result,
         }
-        .map_err(|e| match e {
-            ureq::Error::Status(code @ (401 | 403), _) => self.auth_error(code),
-            _ => error(format!(
-                "cannot open Hub file {}/{}",
-                self.location.repo, path
-            )),
-        })?;
+        .map_err(|e| map_http_error(&self.location.repo, e))?;
         for header in ["X-Repo-Commit", "X-Linked-Etag", "X-Linked-Size", "ETag"] {
             if let Some(value) = response.header(header) {
                 log::debug!("hf: {}/{} {header}={value}", self.location.repo, path);
@@ -404,20 +566,27 @@ impl HfRepo {
             if bytes.len() != 1 {
                 return Err(error("invalid Hub range probe body"));
             }
-            Ok(HttpRangeFile::from_source(source, size, None))
-        } else if response.status() == 200 {
-            // Range ignored: spool once, using the existing HTTP buffered fallback.
-            let mut bytes = Vec::new();
-            response.into_reader().read_to_end(&mut bytes)?;
-            log::info!(
-                "hf: Range unavailable for {path}; buffered {} bytes sequentially",
-                bytes.len()
-            );
-            Ok(HttpRangeFile::from_source(
+            Ok(CachedFile::Ready {
                 source,
-                bytes.len() as u64,
-                Some(bytes),
-            ))
+                size,
+                buffered: None,
+            })
+        } else if response.status() == 200 {
+            if response
+                .header("Content-Length")
+                .and_then(|s| s.parse::<u64>().ok())
+                .is_some_and(|size| size > MAX_BUFFER_BYTES)
+            {
+                return Ok(CachedFile::TooLarge);
+            }
+            match bounded_body(response.into_reader(), MAX_BUFFER_BYTES)? {
+                Some(bytes) => Ok(CachedFile::Ready {
+                    source,
+                    size: bytes.len() as u64,
+                    buffered: Some(bytes.into()),
+                }),
+                None => Ok(CachedFile::TooLarge),
+            }
         } else {
             Err(error("unexpected Hub range response"))
         }
@@ -443,7 +612,7 @@ impl HfRepo {
             .map(|p| p.join(format!("{key}.json")))
     }
 
-    /// `None` means the path names a file (the tree API returned 404).
+    /// `None` means the tree API returned EntryNotFound; try opening it as a file.
     fn tree(&self) -> Result<Option<Value>> {
         self.config.online()?;
         let identity = self.cache_identity();
@@ -462,7 +631,7 @@ impl HfRepo {
             format!("/{}", encode_path(&self.location.path))
         };
         let mut url = format!(
-            "{}?recursive=true&expand=true",
+            "{}?recursive=true",
             self.api_url(&format!("tree/{}{suffix}", self.commit))
         );
         let mut visited = BTreeSet::new();
@@ -472,11 +641,12 @@ impl HfRepo {
             if !visited.insert(url.clone()) {
                 return Err(error("Hub tree pagination cycle"));
             }
-            let response = match self.get(&url) {
-                Err(RemoteError::Hf(s))
-                    if page == 0
-                        && !self.location.path.is_empty()
-                        && s.starts_with("HTTP 404 ") =>
+            let response = match self.get_api(&url) {
+                Err(RemoteError::HfStatus {
+                    status: 404, code, ..
+                }) if page == 0
+                    && !self.location.path.is_empty()
+                    && code.as_deref() == Some("EntryNotFound") =>
                 {
                     return Ok(None)
                 }
@@ -492,7 +662,7 @@ impl HfRepo {
                 .as_array()
                 .ok_or_else(|| error("Hub tree response is not an array"))?;
             all.extend(items.iter().cloned());
-            if all.len() > 1_000_000 {
+            if all.len() > MAX_ENTRIES {
                 return Err(error("Hub tree exceeds one million entries"));
             }
             if let Some(next) = next {

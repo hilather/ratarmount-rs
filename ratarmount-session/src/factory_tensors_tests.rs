@@ -52,7 +52,6 @@ fn open_session(path: &Path, recursive: bool) -> Result<Session, crate::Error> {
         password: None,
         recursive,
         recursion_depth: Some(1),
-        parallelization: Default::default(),
         recreate: Recreate::IfInvalid,
         parallelization: ParallelizationSpec::default(),
     })
