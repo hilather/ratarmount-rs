@@ -2764,7 +2764,7 @@ fn commit_overlay_live_append_fuse_inode_and_readers() {
 #[test]
 fn commit_overlay_append_recovery_before_mount_open() {
     use std::io::{Read, Write};
-    for zstd in [false, true] {
+    for (zstd, writable) in [(false, false), (true, false), (false, true), (true, true)] {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
         let mut plain = Vec::new();
@@ -2807,12 +2807,12 @@ fn commit_overlay_append_recovery_before_mount_open() {
             .is_err()
         );
         assert_eq!(fs::metadata(&archive).unwrap().len(), 0);
-        let out = Command::new(bin())
-            .args(["--no-mount", "--index-file", ":memory:", "-w"])
-            .arg(dir.path().join("ov"))
-            .arg(&archive)
-            .output()
-            .unwrap();
+        let mut command = Command::new(bin());
+        command.args(["--no-mount", "--index-file", ":memory:"]);
+        if writable {
+            command.arg("-w").arg(dir.path().join("ov"));
+        }
+        let out = command.arg(&archive).output().unwrap();
         assert!(
             out.status.success(),
             "{}",
@@ -2825,5 +2825,67 @@ fn commit_overlay_append_recovery_before_mount_open() {
             .unwrap();
         assert_eq!(got, bytes);
         assert!(!ratarmount_compress::commit_journal::journal_path(&archive).exists());
+    }
+}
+
+/// Regression: offline append must print the members it will commit.
+#[cfg(unix)]
+#[test]
+fn commit_overlay_append_prints_plan() {
+    for zstd in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+        let mut plain = Vec::new();
+        ratarmount_formats_tar::write_ustar_members(
+            &mut plain,
+            &[ratarmount_formats_tar::UstarMember {
+                path: "old",
+                payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"old" },
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                mtime: 0,
+            }],
+        )
+        .unwrap();
+        ratarmount_formats_tar::write_tar_eof(&mut plain).unwrap();
+        if zstd {
+            // A seek table is required to take the append path.
+            let frame = ratarmount_compress::encode_zstd_frame(&plain, 3).unwrap();
+            let mut bytes = frame.clone();
+            bytes.extend_from_slice(&ratarmount_compress::build_seek_table_skippable(&[(
+                frame.len() as u32,
+                plain.len() as u32,
+            )]));
+            fs::write(&archive, bytes).unwrap();
+        } else {
+            fs::write(&archive, plain).unwrap();
+        }
+        let overlay = dir.path().join("ov");
+        fs::create_dir(&overlay).unwrap();
+        fs::write(overlay.join("new-member"), b"new").unwrap();
+        let output = Command::new(bin())
+            .args([
+                "--commit-overlay",
+                "--commit-overlay-mode",
+                "append",
+                "--yes",
+                "-w",
+            ])
+            .arg(&overlay)
+            .arg(&archive)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let plan = String::from_utf8_lossy(&output.stdout);
+        assert!(plan.contains("new-member"), "missing append plan: {plan}");
+        assert!(
+            !plan.contains("bytes copied"),
+            "append claimed a prefix copy: {plan}"
+        );
     }
 }

@@ -1,5 +1,6 @@
 //! Microsoft VHDX (fixed and sparse, no parent). Differencing / encrypted residual.
 
+use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 
 use crate::disk::{DiskMap, VirtualDisk};
@@ -54,7 +55,7 @@ fn guid_file_params() -> [u8; 16] {
         0xCAA1_6737,
         0xFA36,
         0x4D43,
-        [0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44, 0xE7, 0x6F],
+        [0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44, 0xE7, 0x6B],
     )
 }
 
@@ -72,11 +73,10 @@ fn guid_logical_sector() -> [u8; 16] {
         0x8141_BF1D,
         0xA96F,
         0x4709,
-        [0x99, 0x07, 0x94, 0xC8, 0x1A, 0xDE, 0x76, 0x1B],
+        [0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA, 0xAB, 0x5F],
     )
 }
 
-#[cfg(test)]
 fn guid_physical_sector() -> [u8; 16] {
     guid(
         0xCDA3_48C7,
@@ -92,6 +92,15 @@ fn guid_parent_locator() -> [u8; 16] {
         0xB30B,
         0x454D,
         [0xAB, 0xF7, 0xD3, 0xD8, 0x48, 0x34, 0xAB, 0x0C],
+    )
+}
+
+fn guid_disk_id() -> [u8; 16] {
+    guid(
+        0xBECA_12AB,
+        0xB2E6,
+        0x4523,
+        [0x93, 0xEF, 0xC3, 0x09, 0xE0, 0x00, 0xC7, 0x46],
     )
 }
 
@@ -243,8 +252,17 @@ fn parse_metadata<R: Read + Seek>(reader: &mut R, off: u64, len: u32) -> Result<
             "VHDX metadata region length {len} is < 64 KiB"
         )));
     }
-    let read_len = (len as usize).min(1024 * 1024);
-    let mut raw = vec![0u8; read_len];
+    let region_end = off
+        .checked_add(u64::from(len))
+        .ok_or_else(|| VhdError::Msg("VHDX metadata region offset overflow".into()))?;
+    if region_end > reader.seek(SeekFrom::End(0))? {
+        return Err(VhdError::Msg(
+            "VHDX metadata region is outside the file".into(),
+        ));
+    }
+    // Only the table has a fixed size. Items may be unaligned and anywhere
+    // after it, including beyond the first MiB (MS-VHDX 2.6 / 2.6.1.2).
+    let mut raw = vec![0u8; 64 * 1024];
     reader.seek(SeekFrom::Start(off))?;
     reader.read_exact(&mut raw)?;
     if raw.len() < 32 || raw[0..8] != *META_SIG {
@@ -260,6 +278,8 @@ fn parse_metadata<R: Read + Seek>(reader: &mut R, off: u64, len: u32) -> Result<
     let mut virt_size = None;
     let mut logical_sector = None;
     let mut saw_parent = false;
+    let mut item_ids = HashSet::new();
+    let mut ranges = Vec::with_capacity(count);
     for i in 0..count {
         let e = 32 + i * 32;
         if e + 32 > raw.len() {
@@ -267,32 +287,61 @@ fn parse_metadata<R: Read + Seek>(reader: &mut R, off: u64, len: u32) -> Result<
         }
         let mut id = [0u8; 16];
         id.copy_from_slice(&raw[e..e + 16]);
-        let item_off = le_u32(&raw, e + 16) as usize;
-        let item_len = le_u32(&raw, e + 20) as usize;
-        // Spec: Offset MUST be ≥ 64 KiB and a multiple of 64 KiB.
-        #[allow(clippy::manual_is_multiple_of)]
-        if item_off < 64 * 1024 || item_off % (64 * 1024) != 0 {
+        let item_off = le_u32(&raw, e + 16);
+        let item_len = le_u32(&raw, e + 20);
+        let flags = le_u32(&raw, e + 24);
+        let is_user = flags & 1 != 0;
+        if !item_ids.insert((id, is_user)) {
+            return Err(VhdError::Msg("VHDX duplicate metadata item".into()));
+        }
+        if item_len > MIB as u32 {
+            return Err(VhdError::Msg("VHDX metadata item exceeds 1 MiB".into()));
+        }
+        // Empty items use Offset=Length=0. Nonempty items must not overlap
+        // the table or run past the declared region; there is no alignment rule.
+        if (item_len == 0 && item_off != 0) || (item_len != 0 && item_off < 64 * 1024) {
             return Err(VhdError::Msg(format!(
-                "VHDX metadata item offset {item_off} is not 64 KiB-aligned"
+                "VHDX metadata item offset {item_off} is invalid for length {item_len}"
             )));
         }
         match item_off.checked_add(item_len) {
-            Some(end) if end <= raw.len() => {}
+            Some(end) if end <= len => {
+                if item_len != 0 {
+                    ranges.push((item_off, end));
+                }
+            }
             _ => {
                 return Err(VhdError::Msg(
-                    "VHDX metadata item is outside the region buffer".into(),
+                    "VHDX metadata item is outside the region".into(),
                 ))
             }
         }
-        let item = &raw[item_off..item_off + item_len];
+        let known = !is_user
+            && (id == guid_file_params()
+                || id == guid_virt_size()
+                || id == guid_logical_sector()
+                || id == guid_physical_sector()
+                || id == guid_disk_id()
+                || id == guid_parent_locator());
+        if !known && flags & 4 != 0 {
+            return Err(VhdError::Msg(format!(
+                "VHDX required metadata item is unknown: {id:02x?}"
+            )));
+        }
+        if !known {
+            continue;
+        }
+        let mut item = vec![0u8; item_len as usize];
+        reader.seek(SeekFrom::Start(off + u64::from(item_off)))?;
+        reader.read_exact(&mut item)?;
         if id == guid_file_params() {
             if item.len() < 8 {
                 return Err(VhdError::Msg(
                     "VHDX File Parameters item is truncated".into(),
                 ));
             }
-            let block_size = le_u32(item, 0);
-            let flags = le_u32(item, 4);
+            let block_size = le_u32(&item, 0);
+            let flags = le_u32(&item, 4);
             file_params = Some(FileParams {
                 block_size,
                 has_parent: flags & 2 != 0,
@@ -303,23 +352,28 @@ fn parse_metadata<R: Read + Seek>(reader: &mut R, off: u64, len: u32) -> Result<
                     "VHDX Virtual Disk Size item is truncated".into(),
                 ));
             }
-            virt_size = Some(le_u64(item, 0));
+            virt_size = Some(le_u64(&item, 0));
         } else if id == guid_logical_sector() {
             if item.len() < 4 {
                 return Err(VhdError::Msg(
                     "VHDX Logical Sector Size item is truncated".into(),
                 ));
             }
-            logical_sector = Some(le_u32(item, 0));
+            logical_sector = Some(le_u32(&item, 0));
         } else if id == guid_parent_locator() {
             saw_parent = true;
         }
+    }
+    ranges.sort_unstable();
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(VhdError::Msg("VHDX metadata items overlap".into()));
     }
     let file_params = file_params
         .ok_or_else(|| VhdError::Msg("VHDX metadata is missing File Parameters".into()))?;
     let virt_size = virt_size
         .ok_or_else(|| VhdError::Msg("VHDX metadata is missing Virtual Disk Size".into()))?;
-    let logical_sector = logical_sector.unwrap_or(512);
+    let logical_sector = logical_sector
+        .ok_or_else(|| VhdError::Msg("VHDX metadata is missing Logical Sector Size".into()))?;
     if file_params.has_parent || saw_parent {
         return Err(VhdError::Msg(
             "differencing VHDX is residual (no parent chain)".into(),
@@ -555,42 +609,220 @@ fn write_metadata_region(img: &mut [u8], off: usize, virt_size: u64, block_size:
     img[off..off + 8].copy_from_slice(META_SIG);
     img[off + 10..off + 12].copy_from_slice(&5u16.to_le_bytes());
 
-    // Each item Offset MUST be a multiple of 64 KiB (MS-VHDX).
+    // qemu-img 11 packs items consecutively after the 64 KiB metadata table.
+    let mut item_rel = ITEMS;
     let mut put_item = |id: [u8; 16], data: &[u8], flags: u32, entry: usize| {
         let e = off + 32 + entry * 32;
-        let item_rel = ITEMS * (entry + 1);
         img[e..e + 16].copy_from_slice(&id);
         img[e + 16..e + 20].copy_from_slice(&(item_rel as u32).to_le_bytes());
         img[e + 20..e + 24].copy_from_slice(&(data.len() as u32).to_le_bytes());
-        img[e + 28..e + 32].copy_from_slice(&flags.to_le_bytes());
+        img[e + 24..e + 28].copy_from_slice(&flags.to_le_bytes());
         img[off + item_rel..off + item_rel + data.len()].copy_from_slice(data);
+        item_rel += data.len();
     };
 
     // flags: IsVirtualDisk (bit 1) | IsRequired (bit 2) = 6; File Parameters is required only (4)
     let mut fp = [0u8; 8];
     fp[0..4].copy_from_slice(&block_size.to_le_bytes());
     fp[4..8].copy_from_slice(&1u32.to_le_bytes()); // LeaveBlockAllocated
-    put_item(guid_file_params(), &fp, 4, 0);
+                                                   // Literal GUIDs keep the fixture independent of the parser's identifiers.
+    put_item(
+        [
+            0x37, 0x67, 0xA1, 0xCA, 0x36, 0xFA, 0x43, 0x4D, 0xB3, 0xB6, 0x33, 0xF0, 0xAA, 0x44,
+            0xE7, 0x6B,
+        ],
+        &fp,
+        4,
+        0,
+    );
     put_item(guid_virt_size(), &virt_size.to_le_bytes(), 6, 1);
-    put_item(guid_logical_sector(), &512u32.to_le_bytes(), 6, 2);
-    put_item(guid_physical_sector(), &512u32.to_le_bytes(), 6, 3);
-    put_item(guid_disk_id(), &[0xABu8; 16], 6, 4);
-}
-
-#[cfg(test)]
-fn guid_disk_id() -> [u8; 16] {
-    guid(
-        0xBECA_12AB,
-        0xB2E6,
-        0x4523,
-        [0x93, 0xEF, 0xC3, 0x09, 0xE0, 0x00, 0xC7, 0x46],
-    )
+    put_item(guid_disk_id(), &[0xABu8; 16], 6, 2);
+    // Literal on-disk GUID from MS-VHDX 2.6.2 / qemu-img, independent of the parser.
+    put_item(
+        [
+            0x1D, 0xBF, 0x41, 0x81, 0x6F, 0xA9, 0x09, 0x47, 0xBA, 0x47, 0xF2, 0x33, 0xA8, 0xFA,
+            0xAB, 0x5F,
+        ],
+        &512u32.to_le_bytes(),
+        6,
+        3,
+    );
+    put_item(guid_physical_sector(), &512u32.to_le_bytes(), 6, 4);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    /// Regression: qemu-img 11 fixed VHDX fails on its packed metadata offsets.
+    #[test]
+    fn regression_qemu11_vhdx_packed_metadata() {
+        let img = encode_fixed_vhdx(b"qemu11 payload", MIB).unwrap();
+        let meta = MIB as usize;
+        for (entry, offset) in [0x10000, 0x10008, 0x10010, 0x10020, 0x10024]
+            .into_iter()
+            .enumerate()
+        {
+            assert_eq!(le_u32(&img, meta + 32 + entry * 32 + 16), offset);
+        }
+        let (mut disk, kind) = open_vhdx(Cursor::new(img)).expect("qemu11 packed metadata");
+        assert_eq!(kind, VhdKind::Vhdx);
+        let mut got = [0u8; 14];
+        disk.read_exact(&mut got).unwrap();
+        assert_eq!(&got, b"qemu11 payload");
+    }
+
+    /// Regression: the qemu/MS-VHDX logical-sector GUID must not default to 512.
+    #[test]
+    fn regression_qemu11_vhdx_logical_sector_guid() {
+        let mut img = encode_fixed_vhdx(&[], MIB).unwrap();
+        let sector = MIB as usize + 0x10020;
+        img[sector..sector + 4].copy_from_slice(&4096u32.to_le_bytes());
+        let meta = parse_metadata(&mut Cursor::new(img), MIB, MIB as u32).unwrap();
+        assert_eq!(meta.logical_sector, 4096);
+    }
+
+    fn metadata_image() -> Vec<u8> {
+        let mut img = vec![0u8; MIB as usize];
+        write_metadata_region(&mut img, 0, MIB, MIB as u32);
+        img
+    }
+
+    /// Regression: valid unaligned, unordered items beyond 1 MiB must open.
+    #[test]
+    fn regression_vhdx_metadata_unaligned_unordered_beyond_first_mib() {
+        let mut img = metadata_image();
+        img.resize(2 * MIB as usize, 0);
+        for (i, relative) in [47, 31, 1, 19, 25].into_iter().enumerate() {
+            let e = 32 + i * 32;
+            let old = le_u32(&img, e + 16) as usize;
+            let len = le_u32(&img, e + 20) as usize;
+            let new = MIB as usize + relative;
+            img.copy_within(old..old + len, new);
+            img[e + 16..e + 20].copy_from_slice(&(new as u32).to_le_bytes());
+        }
+        // The table itself is unsorted too.
+        for i in 0..32 {
+            img.swap(32 + i, 32 + 4 * 32 + i);
+        }
+        let meta = parse_metadata(&mut Cursor::new(img), 0, 2 * MIB as u32).unwrap();
+        assert_eq!(meta.virt_size, MIB);
+        assert_eq!(meta.file_params.block_size, MIB as u32);
+        assert_eq!(meta.logical_sector, 512);
+    }
+
+    /// Regression: relaxing item alignment must retain metadata bounds checks.
+    #[test]
+    fn regression_vhdx_metadata_invalid_ranges_rejected() {
+        for (offset, len, expected) in [
+            (65535, 8, "offset"),
+            (MIB as u32 - 4, 8, "outside the region"),
+            (u32::MAX - 3, 8, "outside the region"),
+            (65536, MIB as u32 + 1, "exceeds 1 MiB"),
+            (0, 8, "offset"),
+            (65536, 0, "offset"),
+        ] {
+            let mut img = metadata_image();
+            img[48..52].copy_from_slice(&offset.to_le_bytes());
+            img[52..56].copy_from_slice(&len.to_le_bytes());
+            let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+                .err()
+                .expect("invalid metadata range must fail");
+            assert!(err.to_string().contains(expected), "unexpected: {err}");
+        }
+        let mut img = metadata_image();
+        img.pop();
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("truncated region must fail");
+        assert!(err.to_string().contains("outside the file"), "{err}");
+    }
+
+    /// Regression: packed metadata must not allow overlapping or duplicate items.
+    #[test]
+    fn regression_vhdx_metadata_overlap_and_duplicate_rejected() {
+        let mut img = metadata_image();
+        // Disk ID is not used to interpret guest bytes, but its span still counts.
+        let disk_id = 32 + 2 * 32;
+        img[disk_id + 16..disk_id + 20].copy_from_slice(&65536u32.to_le_bytes());
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("overlapping item must fail");
+        assert!(err.to_string().contains("overlap"), "{err}");
+
+        let mut img = metadata_image();
+        img.copy_within(32..48, disk_id);
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("duplicate item must fail");
+        assert!(err.to_string().contains("duplicate"), "{err}");
+    }
+
+    /// Regression: unknown required metadata fails; optional empty items are valid.
+    #[test]
+    fn regression_vhdx_metadata_unknown_required_and_empty_optional() {
+        let mut img = metadata_image();
+        let e = 32 + 5 * 32;
+        img[10..12].copy_from_slice(&6u16.to_le_bytes());
+        img[e..e + 16].fill(0x77);
+        // Offset=Length=0 is valid for this unknown optional item.
+        parse_metadata(&mut Cursor::new(&img), 0, MIB as u32).unwrap();
+        img[e + 24..e + 28].copy_from_slice(&4u32.to_le_bytes());
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("unknown required item must fail");
+        assert!(err.to_string().contains("required metadata"), "{err}");
+    }
+
+    /// Regression: missing/truncated core metadata cannot silently use defaults.
+    #[test]
+    fn regression_vhdx_metadata_missing_and_truncated_items_rejected() {
+        for (entry, len) in [(0, 0u32), (1, 4), (3, 2)] {
+            let mut img = metadata_image();
+            let e = 32 + entry * 32;
+            img[e + 20..e + 24].copy_from_slice(&len.to_le_bytes());
+            if len == 0 {
+                img[e + 16..e + 20].fill(0);
+            }
+            let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+                .err()
+                .expect("truncated core item must fail");
+            assert!(err.to_string().contains("truncated"), "{err}");
+        }
+        let mut img = metadata_image();
+        let e = 32 + 3 * 32;
+        img[e..e + 16].fill(0x77);
+        img[e + 24..e + 28].fill(0);
+        let err = parse_metadata(&mut Cursor::new(img), 0, MIB as u32)
+            .err()
+            .expect("missing Logical Sector Size must fail");
+        assert!(
+            err.to_string().contains("missing Logical Sector Size"),
+            "{err}"
+        );
+    }
+
+    /// Regression: even an all-zero log cannot bypass the non-zero LogGuid refusal.
+    #[test]
+    fn regression_vhdx_nonzero_log_guid_with_empty_log_rejected() {
+        let mut img = encode_fixed_vhdx(b"payload", MIB).unwrap();
+        let log_offset = img.len();
+        img.resize(log_offset + MIB as usize, 0);
+        write_header(&mut img, HEADER2_OFF as usize, 2, [0xAA; 16]);
+        for off in [HEADER1_OFF as usize, HEADER2_OFF as usize] {
+            let header = &mut img[off..off + HEADER_LEN];
+            header[68..72].copy_from_slice(&(MIB as u32).to_le_bytes());
+            header[72..80].copy_from_slice(&(log_offset as u64).to_le_bytes());
+            header[4..8].fill(0);
+            let sum = crc32c(header);
+            header[4..8].copy_from_slice(&sum.to_le_bytes());
+        }
+        let err = open_vhdx(Cursor::new(img))
+            .err()
+            .expect("non-zero LogGuid with empty log must fail closed");
+        assert!(err.to_string().contains("log replay"), "{err}");
+    }
 
     #[test]
     fn crc32c_known_vector() {

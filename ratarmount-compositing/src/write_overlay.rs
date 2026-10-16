@@ -68,7 +68,7 @@ fn is_overlay_internal_name(name: &str) -> bool {
 /// SQLite sidecars, either marker name). Hidden and immutable through the
 /// mount at every depth, including anything beneath such a name, so a
 /// full-path frontend (SMB, SFTP) cannot `create_dir_all` one into being.
-fn is_overlay_internal_path(path: &str) -> bool {
+pub(crate) fn is_overlay_internal_path(path: &str) -> bool {
     path.split('/').any(is_overlay_internal_name)
 }
 
@@ -3271,7 +3271,10 @@ impl WriteOverlay {
         reopen: impl FnOnce(&Path) -> Result<Arc<dyn MountSource>>,
     ) -> Result<bool> {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
-        ratarmount_compress::commit_journal::recover(archive)?;
+        if let Err(e) = ratarmount_compress::commit_journal::recover(archive) {
+            self.refuse_base_after_commit_failure();
+            return Err(e.into());
+        }
         live_commit_is_supported(archive)?;
         let format = detect_live_commit_format(archive)?;
         if format != CompressionFormat::Zstd && self.commit_mode == CommitMode::Copy {
@@ -3334,7 +3337,12 @@ impl WriteOverlay {
                 Ok(true)
             }
             Err(e) => {
-                self.interval_disabled.store(true, Ordering::SeqCst);
+                if self.commit_mode == CommitMode::Copy {
+                    // Copy/rename leaves the old source's inode intact.
+                    self.interval_disabled.store(true, Ordering::SeqCst);
+                } else {
+                    self.refuse_base_after_commit_failure();
+                }
                 Err(OverlayError::Msg(format!(
                     "persist succeeded; reopen failed (remount required): {e}"
                 )))
@@ -3464,6 +3472,24 @@ impl WriteOverlay {
         Ok(window)
     }
 
+    fn refuse_base_after_commit_failure(&self) {
+        self.interval_disabled.store(true, Ordering::SeqCst);
+        *self.replacement.write().expect("overlay replacement") =
+            Some(Arc::new(FailedCommitSource));
+        self.commit_generation.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn recover_failed_append(&self, archive: &Path, error: &dyn std::fmt::Display) -> Result<()> {
+        if let Err(recovery) = ratarmount_compress::commit_journal::recover(archive) {
+            self.refuse_base_after_commit_failure();
+            return Err(OverlayError::Msg(format!(
+                "{error}; {recovery}; remount required"
+            )));
+        }
+        log::warn!("commit: append failed: {error}; retrying on the next interval or using copy in auto mode");
+        Ok(())
+    }
+
     /// Last-N zstd frame rewrite. Never calls GNU tar (K3).
     ///
     /// Returns [`SpliceStats`] from this splice. `prefix_compressed_bytes` is
@@ -3517,8 +3543,13 @@ impl WriteOverlay {
             match splice_zstd_last_frames_append(archive, from_idx, transform) {
                 Ok(stats) => stats,
                 Err(e) => {
-                    self.interval_disabled.store(true, Ordering::SeqCst);
-                    return Err(OverlayError::Msg(e.to_string()));
+                    self.recover_failed_append(archive, &e)?;
+                    if self.commit_mode == CommitMode::Auto {
+                        splice_zstd_last_frames_replace(archive, from_idx, transform)
+                            .map_err(|e| OverlayError::Msg(e.to_string()))?
+                    } else {
+                        return Err(OverlayError::Msg(e.to_string()));
+                    }
                 }
             }
         } else {
@@ -3570,8 +3601,10 @@ impl WriteOverlay {
                 Ok(Some(window)) => return Ok(window),
                 Ok(None) => {}
                 Err(e) => {
-                    self.interval_disabled.store(true, Ordering::SeqCst);
-                    return Err(e);
+                    self.recover_failed_append(archive, &e)?;
+                    if self.commit_mode != CommitMode::Auto {
+                        return Err(e);
+                    }
                 }
             }
         }
@@ -4563,6 +4596,45 @@ fn overlay_fd_unsupported() -> OverlayError {
     ))
 }
 
+// A successful in-place persist invalidates the old source even if reopen fails.
+struct FailedCommitSource;
+impl MountSource for FailedCommitSource {
+    fn is_immutable(&self) -> bool {
+        false
+    }
+    fn list(&self, _: &str) -> Option<ListResult> {
+        None
+    }
+    fn lookup(&self, _: &str, _: i32) -> Option<FileInfo> {
+        None
+    }
+    fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+        Err(io::Error::other(
+            "archive unavailable after commit failure; remount required",
+        ))
+    }
+}
+
+// Validate before mutation, while tarstats still describes the old archive.
+// Stamping a stale prefix index with fresh tarstats would bless wrong offsets.
+fn invalidate_stale_commit_sidecar(archive: &Path, opts: &OpenOptions) -> Result<()> {
+    let Some(path) = sidecar_path_for_patch(archive, opts) else {
+        return Ok(());
+    };
+    let valid = SqliteIndex::open_read_only(&path).is_ok_and(|idx| {
+        idx.tarstats().is_ok_and(|stats| stats.is_some())
+            && idx.check_tarstats_matches_archive(archive).is_ok()
+    });
+    if !valid {
+        fs::remove_file(&path)?;
+        log::info!(
+            "commit: removed stale sidecar {} before mutation",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn uncompressed_append_offset(
     archive: &Path,
     plan: &OverlayCommitPlan,
@@ -4574,6 +4646,11 @@ fn uncompressed_append_offset(
     Ok(ratarmount_formats_tar::tar_append_offset(
         &mut file, &touched, encoding,
     )?)
+}
+
+#[cfg(test)]
+thread_local! {
+    static APPEND_PREPARE_TOUCH: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 fn append_uncompressed_tar_plan(
@@ -4596,6 +4673,12 @@ fn append_uncompressed_tar_plan(
     let mut tail = tempfile::NamedTempFile::new_in(parent)?;
     ratarmount_formats_tar::write_ustar_members(tail.as_file_mut(), &members)?;
     ratarmount_formats_tar::write_tar_eof(tail.as_file_mut())?;
+    #[cfg(test)]
+    if APPEND_PREPARE_TOUCH.replace(false) {
+        File::options().write(true).open(archive)?.set_times(
+            fs::FileTimes::new().set_modified(original.modified()? + Duration::from_secs(2)),
+        )?;
+    }
     ratarmount_compress::commit_journal::replace_suffix_if_unchanged(
         archive,
         offset,
@@ -5499,25 +5582,51 @@ fn commit_overlay_tar(
         if plan.is_empty() {
             return Ok(false);
         }
-        if uncompressed_append_offset(tar_file, &plan, &opts.encoding)?.is_some() {
-            if !confirm_commit(opts)? {
-                return Ok(false);
+        let patch_opts = OpenOptions {
+            encoding: opts.encoding.clone(),
+            index_folders: vec![PathBuf::new()],
+            ..OpenOptions::default()
+        };
+        let mut canceled = false;
+        let attempt = (|| -> Result<Option<IndexPatchWindow>> {
+            if uncompressed_append_offset(tar_file, &plan, &opts.encoding)?.is_none() {
+                return Ok(None);
             }
+            if opts.debug >= 1 {
+                println!(
+                    "Append {} new members to '{}' in place (journaled tail replacement).",
+                    plan.append_entries.len(),
+                    tar_file.display()
+                );
+                for (path, _) in &plan.append_entries {
+                    println!("    add {path}");
+                }
+            }
+            if !confirm_commit(opts)? {
+                canceled = true;
+                return Ok(None);
+            }
+            invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
             let window =
-                append_uncompressed_tar_plan(tar_file, write_overlay, &plan, &opts.encoding)?
-                    .ok_or_else(|| {
-                        OverlayError::Msg("archive changed while preparing append".into())
-                    })?;
-            patch_sidecar_if_present(
-                tar_file,
-                &window,
-                &OpenOptions {
-                    encoding: opts.encoding.clone(),
-                    index_folders: vec![PathBuf::new()],
-                    ..OpenOptions::default()
-                },
-            )?;
-            return Ok(true);
+                append_uncompressed_tar_plan(tar_file, write_overlay, &plan, &opts.encoding)?;
+            Ok(window)
+        })();
+        if canceled {
+            return Ok(false);
+        }
+        match attempt {
+            Ok(Some(window)) => {
+                patch_sidecar_if_present(tar_file, &window, &patch_opts)?;
+                return Ok(true);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                ratarmount_compress::commit_journal::recover(tar_file)?;
+                if opts.mode != CommitMode::Auto {
+                    return Err(e);
+                }
+                log::warn!("commit: append failed: {e}; falling back to copy");
+            }
         }
     }
     ensure_gnu_tar()?;
@@ -5721,9 +5830,13 @@ fn commit_overlay_tar_zst(
     if opts.debug >= 1 {
         println!(
             "To commit the overlay folder to '{}', ratarmount will splice zstd frames \
-             (prefix copy + rewrite from the affected frame; no GNU tar).",
-            tar_file.display()
+             (rewrite from the affected frame, requested persistence mode {:?}; no GNU tar).",
+            tar_file.display(),
+            opts.mode
         );
+        for (path, _) in &plan.append_entries {
+            println!("    add/replace {path}");
+        }
         println!();
         println!("Committing is an experimental feature!");
     }
@@ -5794,8 +5907,23 @@ fn commit_overlay_tar_zst(
         };
         rewrite_tar_suffix(&mut suffix, stream_offset, &rewrite, &mut out).map(|_| ())
     };
+    let patch_opts = OpenOptions {
+        encoding: opts.encoding.clone(),
+        ignore_zeros: true,
+        write_index: false,
+        index_folders: vec![PathBuf::new()],
+        ..OpenOptions::default()
+    };
+    invalidate_stale_commit_sidecar(tar_file, &patch_opts)?;
     if append {
-        splice_zstd_last_frames_append(tar_file, from_idx, transform)
+        match splice_zstd_last_frames_append(tar_file, from_idx, transform) {
+            Err(e) if opts.mode == CommitMode::Auto => {
+                ratarmount_compress::commit_journal::recover(tar_file)?;
+                log::warn!("commit: append failed: {e}; falling back to copy");
+                splice_zstd_last_frames_replace(tar_file, from_idx, transform)
+            }
+            result => result,
+        }
     } else {
         splice_zstd_last_frames_replace(tar_file, from_idx, transform)
     }
@@ -5807,19 +5935,12 @@ fn commit_overlay_tar_zst(
         offsets_shifted: false,
     };
     // Sibling only: do not create a sidecar; do not hunt XDG (K3 / offline).
-    let patch_opts = OpenOptions {
-        encoding: opts.encoding.clone(),
-        ignore_zeros: true,
-        write_index: false,
-        index_folders: vec![PathBuf::new()],
-        ..OpenOptions::default()
-    };
     patch_sidecar_if_present(tar_file, &window, &patch_opts)?;
 
     if opts.debug >= 1 {
         let prefix = map.frames[from_idx].compressed_offset;
         println!(
-            "Committed .tar.zst ({} frames, from_idx={from_idx}, prefix {prefix} bytes copied).",
+            "Committed .tar.zst ({} frames, from_idx={from_idx}, prefix {prefix} bytes preserved).",
             map.frames.len()
         );
         println!(
@@ -7385,6 +7506,225 @@ mod tests {
         assert_eq!(body, "hello gzip commit\n");
     }
 
+    /// Regression: offline append must not bless a stale prefix index with fresh tarstats.
+    #[test]
+    fn commit_overlay_append_invalidates_stale_sidecar() {
+        for zstd in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+            append_fixture(&archive, zstd);
+            let sidecar = append_index(&archive, zstd);
+            if zstd {
+                write_split_tar_zst(
+                    &archive,
+                    &[ustar_file("prefix", b"changed")],
+                    &[ustar_file("last", b"last")],
+                    true,
+                );
+            } else {
+                fs::write(
+                    &archive,
+                    pack_tar(&[
+                        ustar_file("prefix", b"changed"),
+                        ustar_file("last", b"last"),
+                    ]),
+                )
+                .unwrap();
+            }
+            let root = dir.path().join("ov");
+            fs::create_dir(&root).unwrap();
+            fs::write(root.join("new"), b"new contents").unwrap();
+            assert!(commit_overlay(
+                &root,
+                &archive,
+                &CommitOverlayOptions {
+                    mode: CommitMode::Append,
+                    ..yes_commit_opts()
+                }
+            )
+            .unwrap());
+            assert!(
+                !sidecar.exists(),
+                "stale index must be invalidated before patching"
+            );
+            let base = if zstd {
+                open_tar_zst_base(&archive, false)
+            } else {
+                open_uncompressed_tar_base(&archive, false)
+            };
+            assert_eq!(read_member(base.as_ref(), "/prefix"), b"changed");
+            assert_eq!(read_member(base.as_ref(), "/last"), b"last");
+            assert_eq!(read_member(base.as_ref(), "/new"), b"new contents");
+        }
+    }
+
+    /// Regression: successful append followed by reopen failure must refuse stale reads.
+    #[test]
+    fn live_commit_append_reopen_failure_refuses_base_reads() {
+        for zstd in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
+            append_fixture(&archive, zstd);
+            let base = if zstd {
+                open_tar_zst_base(&archive, false)
+            } else {
+                open_uncompressed_tar_base(&archive, false)
+            };
+            let old = base.lookup("/last", 0).unwrap();
+            let mut ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+            ov.set_commit_mode(CommitMode::Append);
+            fs::write(ov.root().join("new"), b"new").unwrap();
+            assert!(ov
+                .commit_live(&archive, |_| Err(OverlayError::Msg("reopen failed".into())))
+                .is_err());
+            assert!(ov.interval_disabled());
+            assert!(ov.content_generation() > 0);
+            assert!(ov.open(&old, 0).is_err());
+            assert!(ov.root().join("new").exists());
+        }
+    }
+
+    /// Regression: recovery of a failed append keeps the old live index readable.
+    #[cfg(unix)]
+    #[test]
+    fn live_commit_append_failure_recovers_before_next_tick() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        let (_, last) = append_fixture(&archive, false);
+        let base = open_uncompressed_tar_base(&archive, false);
+        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let offset = fs::metadata(&archive).unwrap().len() - 1024;
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"partial new member").unwrap();
+        assert!(
+            ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                &archive,
+                offset,
+                &mut suffix,
+                &mut |step| {
+                    if step == "archive write" {
+                        Err(io::Error::from_raw_os_error(libc::ENOSPC))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .is_err()
+        );
+        ov.recover_failed_append(&archive, &"ENOSPC").unwrap();
+        assert!(!ov.interval_disabled());
+        assert_eq!(read_member(&ov, "/last"), last);
+    }
+
+    /// Regression: failed rollback must refuse base reads instead of serving torn bytes.
+    #[cfg(unix)]
+    #[test]
+    fn live_commit_append_recovery_failure_refuses_base_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        append_fixture(&archive, false);
+        let base = open_uncompressed_tar_base(&archive, false);
+        let old = base.lookup("/last", 0).unwrap();
+        let ov = WriteOverlay::new(base, dir.path().join("ov")).unwrap();
+        let mut suffix = tempfile::tempfile().unwrap();
+        suffix.write_all(b"new").unwrap();
+        assert!(
+            ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                &archive,
+                512,
+                &mut suffix,
+                &mut |step| {
+                    if step == "archive truncate" {
+                        Err(io::Error::other("crash"))
+                    } else {
+                        Ok(())
+                    }
+                },
+            )
+            .is_err()
+        );
+        File::options()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(b"unrelated bytes")
+            .unwrap();
+        assert!(ov
+            .commit_live(&archive, |_| panic!("must refuse recovery"))
+            .is_err());
+        assert!(ov.interval_disabled());
+        assert!(ov.open(&old, 0).is_err());
+    }
+
+    /// Regression: a touch during suffix staging must retry, or fall back to copy in auto.
+    #[cfg(unix)]
+    #[test]
+    fn live_commit_append_stale_preparation_retries_and_auto_copies() {
+        use std::os::unix::fs::MetadataExt;
+        for mode in [CommitMode::Append, CommitMode::Auto] {
+            if mode == CommitMode::Auto && ensure_gnu_tar().is_err() {
+                eprintln!("skip: GNU tar unavailable for auto copy fallback");
+                continue;
+            }
+            let dir = tempfile::tempdir().unwrap();
+            let archive = dir.path().join("a.tar");
+            append_fixture(&archive, false);
+            let before = fs::metadata(&archive).unwrap().ino();
+            let mut ov = WriteOverlay::new(
+                open_uncompressed_tar_base(&archive, false),
+                dir.path().join("ov"),
+            )
+            .unwrap();
+            ov.set_commit_mode(mode);
+            fs::write(ov.root().join("new"), b"new").unwrap();
+            APPEND_PREPARE_TOUCH.set(true);
+            let result = ov.commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)));
+            assert!(!ov.interval_disabled());
+            if mode == CommitMode::Append {
+                assert!(result.is_err());
+                assert!(ov
+                    .commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)))
+                    .unwrap());
+                assert_eq!(before, fs::metadata(&archive).unwrap().ino());
+            } else {
+                assert!(result.unwrap());
+                assert_ne!(before, fs::metadata(&archive).unwrap().ino());
+            }
+            assert_eq!(read_member(&ov, "/new"), b"new");
+        }
+    }
+
+    /// Regression: trailing garbage rejected during append preparation must not disable ticks.
+    #[test]
+    fn live_commit_append_checksum_error_keeps_interval_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("a.tar");
+        append_fixture(&archive, false);
+        let good = fs::read(&archive).unwrap();
+        let mut ov = WriteOverlay::new(
+            open_uncompressed_tar_base(&archive, false),
+            dir.path().join("ov"),
+        )
+        .unwrap();
+        ov.set_commit_mode(CommitMode::Append);
+        fs::write(ov.root().join("new"), b"new").unwrap();
+        File::options()
+            .append(true)
+            .open(&archive)
+            .unwrap()
+            .write_all(&[0x37; 512])
+            .unwrap();
+        assert!(ov
+            .commit_live(&archive, |_| panic!("invalid append must not reopen"))
+            .is_err());
+        assert!(!ov.interval_disabled());
+        fs::write(&archive, good).unwrap();
+        assert!(ov
+            .commit_live(&archive, |p| Ok(open_uncompressed_tar_base(p, false)))
+            .unwrap());
+        assert_eq!(read_member(&ov, "/new"), b"new");
+    }
+
     fn append_fixture(path: &Path, zstd: bool) -> (Vec<u8>, Vec<u8>) {
         let mut seed = 42u32;
         let prefix: Vec<_> = (0..2 * 1024 * 1024)
@@ -7669,7 +8009,7 @@ mod tests {
     fn commit_overlay_append_crash_listing_hashes_and_sidecar() {
         use ratarmount_compress::commit_journal::{recover, replace_suffix_with_hook};
         for zstd in [false, true] {
-            for stop in 1..=12 {
+            for stop in 1..=19 {
                 let dir = tempfile::tempdir().unwrap();
                 let archive = dir.path().join(if zstd { "a.tar.zst" } else { "a.tar" });
                 let (prefix, last) = append_fixture(&archive, zstd);
@@ -11027,6 +11367,7 @@ mod tests {
             "overlay must be kept after reopen failure"
         );
         assert!(ov.interval_disabled());
+        assert_eq!(read_member(&ov, "/seed.txt"), seed);
 
         let second = ov
             .commit_live(&archive, |_| {

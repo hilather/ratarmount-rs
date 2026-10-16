@@ -263,8 +263,16 @@ reads overlapping the commit on this mount, can observe an incomplete suffix.
 Use `copy` for snapshot-like reader isolation. Successful live commits reopen
 the source and refresh its generation as before. The journal
 `<archive>.ratarmount-commit-journal` is fsynced before mutation and recovered
-before the next write-mount open or commit. Keep it with its archive after a
-crash. See the [crash protocol](tasks/tar-zst-live-commit-design.md#crash-protocol).
+before every archive open (including read-only CLI and `Session::open`) or
+commit. The archive inode carries a journal-locator xattr so aliases also find
+pending recovery. Recovery refuses mismatching content or insufficient write
+access with the journal path and resolution instructions. Keep the journal with
+its archive after a crash. Append requires writable user xattrs; `auto` falls
+back to copy if unavailable. Recoverable live append errors roll back immediately
+and remain eligible for the next interval. A failed recovery/reopen requires
+remount and refuses base reads. For old/new suffix sizes O/N, staging plus the
+journal can occupy O + 2N + 100 bytes, including leftovers after process death.
+See the [crash protocol](tasks/tar-zst-live-commit-design.md#crash-protocol).
 
 **Not supported (live v1):**
 

@@ -9,6 +9,7 @@ mod control;
 mod empty_archive;
 mod folder;
 mod oci_whiteout;
+mod overlay_policy;
 mod path_intern;
 mod payload;
 mod prefix;
@@ -35,6 +36,10 @@ pub use empty_archive::{
 };
 pub use folder::FolderMountSource;
 pub use oci_whiteout::OciImageMountSource;
+pub use overlay_policy::{
+    parse_overlay_size, CompositeOverlayPolicy, OverlayQuota, OverlayStats, OverlayUsage,
+    QuotaUsage, ReadOnlyGlobs,
+};
 pub use payload::{maybe_wrap_payload_cache, PayloadCacheLayer};
 pub use prefix::PrefixMountSource;
 pub use transform::TransformMountSource;

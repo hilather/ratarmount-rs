@@ -136,6 +136,11 @@ impl Session {
         let remote_archive =
             matches!(&req.source, SourceSpec::Url(_)) || looks_like_url_archive(&archive_path);
 
+        if !remote_archive {
+            ratarmount_compress::commit_journal::recover(&archive_path)
+                .map_err(|e| Error::Internal(e.to_string()))?;
+        }
+
         let (loc, mut temp_guard, index_in_memory, index_file_path) = if req.index
             == IndexPolicy::Sibling
             && matches!(req.recreate, Recreate::Never)
@@ -745,6 +750,56 @@ mod tests {
             recreate: Recreate::IfInvalid,
         })
         .expect("Session::open")
+    }
+
+    /// Regression: read-only Session/factory opens must repair a torn archive before probing.
+    #[cfg(unix)]
+    #[test]
+    fn append_journal_readonly_session_and_factory_recover() {
+        for factory in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("archive.tar");
+            write_tar(&path, &[member_file("old", b"old contents")]);
+            let old = std::fs::read(&path).unwrap();
+            let alias = dir.path().join("alias.tar");
+            std::fs::hard_link(&path, &alias).unwrap();
+            let mut tail = tempfile::tempfile().unwrap();
+            tail.write_all(b"new").unwrap();
+            assert!(
+                ratarmount_compress::commit_journal::replace_suffix_with_hook(
+                    &path,
+                    0,
+                    &mut tail,
+                    &mut |step| {
+                        if step == "archive truncate" {
+                            Err(std::io::Error::other("crash"))
+                        } else {
+                            Ok(())
+                        }
+                    },
+                )
+                .is_err()
+            );
+            if factory {
+                let source = crate::factory::open_path(
+                    &alias,
+                    &OpenOptions {
+                        index_in_memory: true,
+                        ..OpenOptions::default()
+                    },
+                    false,
+                )
+                .unwrap();
+                assert!(source.lookup("/old", 0).is_some());
+            } else {
+                let mut req = never_req(alias, dir.path().join("index.sqlite"));
+                req.index = IndexPolicy::Memory;
+                req.recreate = Recreate::IfInvalid;
+                let session = Session::open(req).unwrap();
+                assert!(session.lookup("/old").unwrap().is_some());
+            }
+            assert_eq!(std::fs::read(&path).unwrap(), old);
+        }
     }
 
     /// Regression: Session requests must reach OpenOptions instead of silently using one thread.

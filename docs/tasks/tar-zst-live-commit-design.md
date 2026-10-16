@@ -1143,51 +1143,72 @@ its new frame and rebuilt seek table use the existing splice encoder.
 
 ### Crash protocol
 
-The archive and its journal must be on a local filesystem with durable file and
-directory fsync and atomic directory operations. Journal and staged suffix are
-sibling files. An exclusive advisory archive lock serializes journal recovery
-and mutation. The prepared suffix also carries a metadata snapshot; a changed
-archive is refused before journal publication. Concurrent independent copy/rename
-writers or writers ignoring the lock remain unsupported.
+Append requires a local filesystem with durable file/directory fsync and atomic
+extended-attribute updates (Linux/macOS). The canonical archive path determines
+`<archive>.ratarmount-commit-journal`. The inode's
+`user.ratarmount.commit-journal` xattr holds its locator, state, and CRC, so
+hard-link and bind-mount aliases discover it too. If the recorded location is
+inaccessible through another mount namespace, opening fails with that path and
+recovery instructions. Filesystems without writable user xattrs cannot append;
+`auto` falls back to copy. Concurrent independent copy/rename writers or
+writers ignoring the advisory inode lock remain unsupported.
 
-1. Prepare the entire replacement suffix before changing the archive.
-2. Write a private temporary journal containing a versioned fixed header
-   (archive device/inode, original length, cut offset, original mtime) followed
-   by the original tail bytes. Stream the tail; do not allocate the archive in
-   memory. Fsync the journal, publish it without overwriting an existing journal
-   as `<archive>.ratarmount-commit-journal`, and fsync its parent directory.
-3. Truncate the archive at the cut, write the staged suffix, and fsync the
-   archive. No prefix bytes are rewritten.
-4. Unlink the journal and fsync the parent directory. This is the commit point.
-   There is deliberately **no mutable completion flag** that could tear.
-5. Run the existing F-2 sidecar patch, reopen/swap the mounted source, advance
-   the generation, and clean up the committed overlay entries as before.
+1. Stage the replacement suffix. Under the inode lock, check that the archive
+   still matches the metadata snapshot from preparation.
+2. Write and fsync an immutable temporary journal: version, device/inode hints,
+   original/new lengths, cut, original mtime, SHA-256 of the first and last
+   64 KiB of the preserved prefix, old tail, new tail, and a CRC over the whole
+   record. Both tails are streamed, so memory use is bounded. Keeping the new
+   bytes allows exact comparison even after a short write in the middle of a
+   block. Prefix sampling avoids rereading a 200 GB prefix; it does not detect
+   an unrelated edit wholly outside the two sampled prefix regions.
+3. Atomically set and fsync the inode locator in **preparing** state. Publish
+   the journal without replacing another journal, then fsync its directory.
+   Atomically set and fsync the locator in **active** state before mutation.
+4. Truncate to the cut and fsync, then write the suffix and fsync the archive.
+5. Atomically set and fsync the locator in **complete** state: this is the
+   commit point. Atomic xattr replacement exposes either the old or new state;
+   a CRC rejects corrupt locators. There is no mutable journal completion byte.
+   Remove the journal, fsync its directory, remove the locator, and fsync the
+   archive. A cleanup failure after completion must not retry the append.
+6. Patch the existing F-2 sidecar, reopen/swap the mounted source, advance its
+   generation, and clean up committed overlay entries. Offline commits validate
+   the sidecar against the archive **before** mutation; stale/missing-tarstats
+   indexes are removed instead of patching stale prefix offsets.
 
-Recovery runs before CLI write-mount archive opening and before every commit,
-regardless of the selected mode. Library callers must call
-`ratarmount_compress::commit_journal::recover` **before constructing the base
-MountSource** (the generic `WriteOverlay::new` receives an already-open source,
-not an archive path). Any published journal means rollback: validate the
-archive device/inode and complete header/tail length, restore the tail and
-original file length/mtime, fsync the archive, then unlink the journal and fsync
-the directory. Repeating an interrupted rollback is safe. An identity mismatch
-fails closed and preserves both files for inspection.
+Every CLI/local factory open and `Session::open` checks recovery before probing
+archive bytes or trusting an index, including read-only opens. Recovery needs
+write access; otherwise opening refuses with the journal path and instructions.
+Direct users of format-crate constructors must still call
+`ratarmount_compress::commit_journal::recover` before constructing their source.
 
-Before journal publication a crash leaves the old archive. From publication
-through archive fsync it rolls back to the old archive. A crash during journal
-unlink/directory fsync can leave the journal present or absent: present restores
-the old archive; absent leaves the fully fsynced new archive. Thus each boundary
-recovers to exactly old or new bytes. Unpublished staging files may remain after
-a process crash; they are not interpreted as journals. Injected failures cover
-journal writes/publication/fsync, truncation, each suffix write chunk, archive
-fsync, unlink, and directory fsync, with full archive listing and content hashes.
+Preparing without a published journal means no mutation occurred. An active
+locator without its journal refuses recovery. With a journal, validate its CRC,
+lengths and prefix fingerprint, then compare the current suffix byte-for-byte
+with a prefix of the recorded new tail or old tail (an interrupted rollback).
+An external replacement or reused inode with different bytes is refused; the
+error names the journal and explains restoring the matching backup or verifying
+the replacement before removing the journal and locator. Device/inode changes
+alone do not block recovery. A complete locator keeps the new archive, verifying
+its full expected length and tail when the journal remains.
 
-The pre-commit sidecar remains valid after rollback because original bytes and
-mtime are restored. After a normal success F-2 patches exactly the old suffix
-window; warm open uses that sidecar without full parsing. A crash **after** the
-commit point but before sidecar patching leaves an old sidecar, which normal
-archive fingerprint validation rejects/rebuilds. Recovery does not claim to
-make archive and SQLite publication one transaction.
+Before completion, rollback truncates and fsyncs the cut **before** writing the
+old tail. Thus a second crash leaves a prefix of the old tail rather than mixed
+old/new bytes. After restoring the old tail/length and mtime, fsync, mark the
+locator preparing, and remove/fsync the journal and locator. EPERM restoring
+mtime is tolerated for non-owner writers: normal tarstats validation rebuilds
+an index whose mtime no longer matches. Other failures retain the journal.
+Ordinary append errors run recovery immediately while the live commit gate is
+held. If recovery fails, or persistence succeeds but reopen fails, the mount
+refuses base reads and disables intervals until remount. Harmless preparation
+errors keep intervals enabled: `append` logs and retries next tick; `auto`
+tries copy for that commit. Fault tests cover every persistence boundary,
+partial writes, repeated rollback, aliases, external changes and corrupt CRCs.
+
+The journal format is `RMCJ0002`. Earlier experimental `RMCJ0001` journals lack
+content fingerprints and are refused: recover them with the matching older
+binary before upgrading, or restore a matching backup. Do not discard an
+unrecovered journal merely to make the new opener proceed.
 
 ### Cost and readers
 
@@ -1202,6 +1223,18 @@ other mounts, hard links, and processes can observe a temporarily truncated or
 partially written suffix. Even readers on this mount can overlap that write;
 after a successful commit its normal reopen/generation refresh serves the new
 bytes. Choose copy when readers require a consistent snapshot throughout a
-commit. Append errors disable further live ticks; remount performs recovery.
-This is why **copy remains the default**. Append does not add cross-process
-reader exclusion or change the existing overlay retention after on-exit/crash.
+commit. Recoverable errors roll back before returning; failures that leave the
+base unavailable require remount. This is why **copy remains the default**.
+Append does not add cross-process reader exclusion or change the existing overlay retention after on-exit/crash.
+
+Per append, let O be the old suffix length and N the new suffix length. The
+staged suffix uses N bytes and the journal uses O + N + 100 bytes; worst-case
+additional temporary/journal storage is O + 2N + 100 bytes, plus filesystem
+metadata and the archive's growth. A single-frame zstd suffix can be the entire
+archive. Process death can leave that journal and the N-byte staging temporary;
+death before publication can instead leave the O + N + 100-byte private journal
+temporary. Repeated crashes can accumulate these private `.tmp*` files; after
+successful recovery they may be removed once no commit owns them. Never delete
+a published journal or its inode locator merely to free space. Copy fallback
+can leave a whole-archive temporary and requires space for a full replacement
+when reflinks are unavailable.
