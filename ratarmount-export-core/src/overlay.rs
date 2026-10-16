@@ -10,6 +10,9 @@ use ratarmount_compositing::{OverlayError, WriteOverlay};
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_errno(err: &io::Error) -> i32 {
     match err.kind() {
+        ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+        ErrorKind::QuotaExceeded => libc::EDQUOT,
+        ErrorKind::StorageFull => libc::ENOSPC,
         ErrorKind::NotFound => libc::ENOENT,
         ErrorKind::PermissionDenied => libc::EACCES,
         ErrorKind::IsADirectory => libc::EISDIR,
@@ -50,11 +53,114 @@ pub fn overlay_truncate(overlay: &WriteOverlay, path: &str, size: u64) -> io::Re
 
 #[cfg(test)]
 mod tests {
+    /// Regression: adding policy errors must not change historical errno mapping.
+    #[test]
+    fn regression_io_to_errno_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, libc::EACCES),
+            (libc::EACCES, libc::EACCES),
+            (libc::EOPNOTSUPP, libc::ENOSYS),
+            (libc::ENOTSUP, libc::ENOSYS),
+            (libc::ENOTEMPTY, libc::EIO),
+            (libc::ENOTDIR, libc::EIO),
+            (libc::ELOOP, libc::EIO),
+            (libc::EXDEV, libc::EIO),
+            (libc::EBUSY, libc::EIO),
+            (libc::EMFILE, libc::EIO),
+            (libc::ENFILE, libc::EIO),
+            (libc::EROFS, libc::EROFS),
+            (libc::EDQUOT, libc::EDQUOT),
+            (libc::ENOSPC, libc::ENOSPC),
+        ] {
+            assert_eq!(
+                io_to_errno(&std::io::Error::from_raw_os_error(raw)),
+                expected,
+                "raw {raw}"
+            );
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
     use std::sync::Arc;
 
     use ratarmount_core::{FileInfo, ListResult, MountSource};
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: policy errors survive overlay conversion and errno mapping.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        assert_eq!(
+            io_to_errno(&overlay_create_file(&ov, "/locked/new", 0o644).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_truncate(&ov, "/locked/file", 3).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_mkdir(&ov, "/locked/newdir", 0o755).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_unlink(&ov, "/locked/file").unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_rename(&ov, "/outside", "/locked/file").unwrap_err()),
+            libc::EROFS
+        );
+        for (kind, raw) in [
+            (ErrorKind::ReadOnlyFilesystem, libc::EROFS),
+            (ErrorKind::QuotaExceeded, libc::EDQUOT),
+            (ErrorKind::StorageFull, libc::ENOSPC),
+        ] {
+            assert_eq!(io_to_errno(&io::Error::new(kind, "policy")), raw);
+            assert_eq!(io_to_errno(&io::Error::from_raw_os_error(raw)), raw);
+        }
+    }
 
     struct EmptyFs;
     impl MountSource for EmptyFs {

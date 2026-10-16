@@ -1,6 +1,6 @@
 //! `MountSource` adapter for SMB2 (inode table + reader LRU + overlay).
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -293,10 +293,8 @@ impl RatarmountSmb {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| errno_to_nt(io_to_errno(&overlay_to_io(e))))?;
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let wrote = file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| file.write_all(data));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
         wrote.map_err(|e| errno_to_nt(io_to_errno(&e)))?;
         self.bump(id);
@@ -313,6 +311,8 @@ pub fn errno_to_nt(e: i32) -> u32 {
         x if x == libc::EISDIR => smb2::STATUS_FILE_IS_A_DIRECTORY,
         x if x == libc::ENOTDIR => smb2::STATUS_NOT_A_DIRECTORY,
         x if x == libc::EROFS => smb2::STATUS_MEDIA_WRITE_PROTECTED,
+        x if x == libc::ENOSPC => 0xC000_007F, // STATUS_DISK_FULL
+        x if x == libc::EDQUOT => 0xC000_0044, // STATUS_QUOTA_EXCEEDED
         x if x == libc::EINVAL => smb2::STATUS_INVALID_PARAMETER,
         x if x == libc::ENOSYS => smb2::STATUS_NOT_SUPPORTED,
         x if x == libc::ENOTEMPTY => smb2::STATUS_DIRECTORY_NOT_EMPTY,
@@ -352,10 +352,94 @@ fn check_leaf(path: &str) -> Result<(), u32> {
 
 #[cfg(test)]
 mod tests {
+    /// Regression: unsupported raw OS errors must remain STATUS_NOT_SUPPORTED.
+    #[test]
+    fn regression_smb_preserves_legacy_raw_errors() {
+        for (raw, expected) in [
+            (libc::EPERM, smb2::STATUS_ACCESS_DENIED),
+            (libc::EOPNOTSUPP, smb2::STATUS_NOT_SUPPORTED),
+            (libc::ENOTEMPTY, smb2::STATUS_ACCESS_DENIED),
+            (libc::ENOTDIR, smb2::STATUS_ACCESS_DENIED),
+            (libc::EXDEV, smb2::STATUS_ACCESS_DENIED),
+            (libc::EBUSY, smb2::STATUS_ACCESS_DENIED),
+            (libc::EMFILE, smb2::STATUS_ACCESS_DENIED),
+        ] {
+            let errno =
+                ratarmount_export_core::io_to_errno(&std::io::Error::from_raw_os_error(raw));
+            assert_eq!(errno_to_nt(errno), expected);
+        }
+    }
+
     use super::*;
     use std::io::Cursor;
 
     use ratarmount_core::ListResult;
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: SMB policy failures are write-protected/quota NTSTATUS.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let fs = RatarmountSmb::with_overlay(ov.clone(), 0, 8, Some(ov));
+        let file = fs.inodes.id_for_path("/locked/file");
+        let empty = fs.inodes.id_for_path("/locked/empty");
+        let outside = fs.inodes.id_for_path("/outside");
+        let quota = fs.inodes.id_for_path("/quota");
+        let ro = smb2::STATUS_MEDIA_WRITE_PROTECTED;
+        assert_eq!(fs.write(file, 0, b"x").unwrap_err(), ro);
+        assert_eq!(fs.create_file("/locked/new", 0o644).unwrap_err(), ro);
+        assert_eq!(fs.truncate(file, 3).unwrap_err(), ro);
+        assert_eq!(fs.rename(file, "/moved").unwrap_err(), ro);
+        assert_eq!(fs.rename(outside, "/locked/file").unwrap_err(), ro);
+        assert_eq!(fs.unlink(file).unwrap_err(), ro);
+        assert_eq!(fs.mkdir("/locked/newdir", 0o755).unwrap_err(), ro);
+        assert_eq!(fs.unlink(empty).unwrap_err(), ro);
+        assert_eq!(fs.write(quota, 0, b"abc").unwrap_err(), 0xC000_0044);
+        assert_eq!(errno_to_nt(libc::ENOSPC), 0xC000_007F);
+        assert_eq!(fs.write(quota, 0, b"ab").unwrap(), 2);
+        assert_eq!(fs.read(quota, 0, 8).unwrap(), b"ab");
+    }
 
     struct EmptyFs;
     impl MountSource for EmptyFs {
