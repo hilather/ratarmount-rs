@@ -1,4 +1,4 @@
-"""Read indexed archives without mounting a filesystem.
+"""Read indexed archives, supervise CLI mounts and publish indexes.
 
 All blocking native operations release the GIL. An Archive may be shared by
 threads and perform Session I/O concurrently. Closing prevents new operations
@@ -18,10 +18,13 @@ from typing import BinaryIO, Iterable, Iterator, Literal, Optional, Union, cast
 
 from . import _native
 from ._native import BadPassword, Entry, MemberNotFound, NotMappable, RatarmountError, split_url
+from ._process import Mount, _is_url, mount
+from ._publish import ArchiveIndex, PublishedIndex, publish_index
 
 __all__ = [
     "Archive", "Entry", "open", "split_url", "RatarmountError",
     "MemberNotFound", "BadPassword", "NotMappable",
+    "Mount", "mount", "PublishedIndex", "publish_index",
 ]
 
 Path = Union[str, os.PathLike[str]]
@@ -39,8 +42,23 @@ class Archive:
     stat() requests complete metadata.
     """
 
-    def __init__(self, native: _native.Archive) -> None:
+    def __init__(self, native: _native.Archive, source=None, process_options=None) -> None:
         self._native = native
+        self._source = source
+        self._process_options = process_options or {}
+
+    @property
+    def index(self) -> ArchiveIndex:
+        """Publish a validated index with archive.index.publish(destination)."""
+        self._check_open()
+        return ArchiveIndex(self)
+
+    def mount(self, mountpoint: Path, **opts) -> Mount:
+        """Supervise a separate CLI mount using this Archive's source/options."""
+        self._check_open()
+        if self._source is None:
+            raise ValueError("mount requires an Archive created by ratarmount_rs.open")
+        return mount(self._source, mountpoint, **(self._process_options | opts))
 
     @property
     def closed(self) -> bool:
@@ -155,6 +173,7 @@ class Archive:
         Existing mmap views remain valid while their backing file is unchanged.
         """
         self._native.close()
+        self._process_options.pop("password", None)
 
     def __enter__(self) -> Archive:
         self._check_open()
@@ -255,8 +274,11 @@ def open(
     parallelization = operator.index(parallelization)
     if parallelization < 0 or parallelization > 2**32 - 1:
         raise ValueError("parallelization must be between 0 and 2**32-1")
+    source = split_url(_path(path_or_url))
+    if not _is_url(source) and not source.lower().startswith("restic:"):
+        source = os.path.abspath(source)
     return Archive(_native.open(
-        _path(path_or_url), password=password,
+        source, password=password,
         index=None if index is None else _path(index),
         recursive=recursive, parallelization=parallelization,
-    ))
+    ), source, {"password": password, "recursive": recursive, "parallelization": parallelization})

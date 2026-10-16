@@ -28,7 +28,7 @@ workspace. The Python wheels workflow builds abi3 wheels for manylinux_2_28
 x86_64/aarch64 and macOS 14+ arm64, plus an sdist, and tests installed wheels in
 fresh venvs on Linux x86_64 and macOS arm64. Linux wheels require glibc 2.28+;
 linked libraries such as libarchive are bundled by maturin on Linux and
-delocate on macOS. No FUSE is needed.
+delocate on macOS. Library reads need no FUSE; optional mounting uses a separate CLI.
 The workflow uploads build artifacts only; PyPI publishing is not enabled, so
 `pip install ratarmount-rs` is not yet the installation path.
 The Python crate is outside the workspace's default build members and no
@@ -177,7 +177,114 @@ formats, corrupt indexes, cancellation, write-permission and other engine
 errors raise `RatarmountError` with the engine detail. Standard Python I/O
 and mmap errors retain their usual types.
 
-The Python `.mount()` API belongs to AI-PY3 and is not provided here.
+## Mount from Python
+
+```python
+with ratarmount_rs.mount(
+    ["base.tar.zst", "extra.tar"], "mnt", write_overlay="changes",
+    readonly_globs=[".git/**", "tests/**"], quota="2G", uid=1000, gid=1000,
+) as mounted:
+    print(mounted.path, mounted.alive)
+    # Ordinary filesystem access through mnt/.
+
+with ratarmount_rs.open("shard.tar", recursive=True) as archive:
+    with archive.mount("mnt", overlay_tmpfs="512M", passthrough="off"):
+        train_from_directory("mnt")
+```
+
+`mount(source_or_sources, mountpoint, *, write_overlay=None,
+overlay_tmpfs=False, recursive=False, options="", passthrough="auto",
+readonly_globs=None, quota=None, uid=None, gid=None, foreground=False,
+detach=False, timeout=30, password=None, parallelization=1)` requires Linux or
+macOS and a separately installed FUSE-enabled **ratarmount CLI**. It finds
+`ratarmount` on PATH, or uses the executable selected by `RATARMOUNT_BIN`.
+The wheel does not link ratarmount-fuse or libfuse: subprocess supervision
+keeps FUSE dependencies out of wheel repair and lets ordinary library reads
+work without a host FUSE installation. No extension `fuse` feature is needed.
+Other platforms raise `NotImplementedError`; a missing executable raises
+`FileNotFoundError`. FUSE/CLI startup failures raise `RatarmountError`.
+
+The child always receives `--foreground` so Python owns its lifetime;
+`foreground` is accepted for CLI compatibility and does not block the Python
+call. The call waits for the OS to report a live mount, up to `timeout`
+seconds, before returning `Mount`. Timeout raises `TimeoutError` and reaps
+the child. `.path` is an absolute string; `.alive` checks both the child and
+mountpoint; `.wait(timeout=None)` waits for child exit and returns its status
+without unmounting. `.unmount()` invokes the CLI's platform-specific unmount
+path, waits for shutdown, and is idempotent after success. Unmount failures
+raise an error and can be retried.
+
+Context exit unmounts explicitly. Garbage collection and normal interpreter
+exit also unmount, unless `detach=True`. Detached handles can still be
+explicitly unmounted or used as context managers. Cleanup cannot run after a
+forced process termination. Keep the mount handle alive while using the
+filesystem. Closing an Archive does not close a mount created from it:
+`Archive.mount` opens the source independently through the CLI, inheriting
+password, recursive and parallelization settings unless overridden. Relative
+archive paths are anchored when `open()` is called.
+
+`options` is the comma-separated FUSE `-o` string; `uid`/`gid` append ownership
+options. `write_overlay` and `overlay_tmpfs` are mutually exclusive.
+`overlay_tmpfs=True` uses the CLI default cap, or pass a size such as `"512M"`.
+`readonly_globs` (a string or iterable) and `quota` require an overlay. The
+CLI validates sizes, policies and host capabilities. Unknown keyword options
+raise `TypeError`; there is no arbitrary argv passthrough.
+
+Credentials follow the CLI's inherited environment and configuration (for
+example `HF_TOKEN` or the cloud SDK environment). Passwords use a private
+mode-0600 temporary file, never argv. Password strings containing newline,
+CR or NUL are rejected because the CLI reads newline-separated passwords.
+Credential-bearing URLs, query strings (including signed URLs), fragments,
+and credential-like FUSE options are rejected by these subprocess APIs.
+CLI diagnostics are kept private; exceptions report the operation and exit
+status without echoing credentials. Archive wrappers retain an explicitly
+provided password for these operations until `close()`.
+
+## Publish indexes
+
+```python
+with ratarmount_rs.open("shard.tar") as archive:
+    published = archive.index.publish()  # shard.tar.index.ptr + immutable blob
+    published = archive.index.publish("published/shard.tar.index.sqlite")
+    print(published.index_id, published.urls)
+
+    # The remote archive must already exist and match the local archive bytes.
+    published = archive.index.publish(
+        "hf://datasets/org/data/shard.tar", revision="main", create_pr=True,
+    )
+    print(published.commit, published.pull_request_url)
+```
+
+`Archive.index.publish(destination=None, *, revision=None, create_pr=False)`
+and `ratarmount_rs.publish_index(archive, ...)` use `ratarmount --publish-index`
+or `--publish-index-to`. They require the separate CLI on every platform;
+publication itself does not mount FUSE. The CLI builds and validates a private
+disk index from the source with the Archive's recursive/password/parallelization
+options; the Archive's active index is left alone. This can repeat an archive
+scan. Publication uses the CLI's existing validation, atomic local publication,
+blob-before-pointer object-store uploads and HF commit implementation.
+
+With no destination, a local archive gets `archive.index.sqlite`,
+`archive.index.ptr` and `archive.index.<index_id>.sqlite`. An explicit local
+destination names the SQLite file: a `.index.sqlite` suffix is replaced for
+pointer/blob names; otherwise `.index.ptr` and `.index.<id>.sqlite` are appended
+to that exact destination. Remote `hf://`, `s3://`, `gs://` and `az://`
+destinations name the **existing archive**, with sibling pointer/blob names.
+`revision` and `create_pr` are HF-only. Credentials use the same environment
+and configuration as the CLI and native remote backend; no Python token
+parameter is accepted.
+
+The frozen `PublishedIndex` result contains `index_id`, `pointer_url`,
+`blob_url`, `urls` (pointer and blob), `commit` and `pull_request_url` (optional).
+Local locations are absolute paths; cloud locations use their native scheme.
+For HF, native readback uses the commit reported by the CLI, including PR
+commits, and returns HTTP resolve URLs pinned to that commit. Remote readback
+uses the existing Rust authentication and range readers, with the GIL released.
+If publication succeeds but pointer readback fails, `RatarmountError` explicitly
+reports that distinction; the upload may already be visible. Object-store
+readback observes the current pointer, so serialize concurrent publications
+to the same archive when correlating results. Keep source bytes unchanged
+during publication, just as during native reads/mapping.
 
 ## fsspec
 
