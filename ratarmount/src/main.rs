@@ -34,6 +34,7 @@ use ratarmount_session::factory;
 #[macro_use]
 mod quiet_print;
 
+mod corpus;
 mod diff;
 mod export_index;
 mod find;
@@ -61,6 +62,7 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
                   Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
+                  Corpus: ratarmount corpus LIST-FILE MOUNTPOINT [--corpus-cache-size N].\n\
                   Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE).\n\
                   Patch: ratarmount diff --base SOURCE OVERLAY [--git] (no FUSE).\n\
                   Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv.\n\
@@ -382,9 +384,20 @@ struct Args {
     /// Subdirectory of the selected Git tree to mount
     #[arg(long, value_name = "SUBDIR")]
     git_prefix: Option<String>,
-    /// Expose a minimal .git with one parentless commit (requires Git mode and one input)
+    /// Expose a minimal .git with one parentless commit (requires exactly one Git source)
     #[arg(long)]
     git_synthetic_head: bool,
+
+    /// Mount a source at an absolute path before unioning (repeatable; after positional inputs)
+    #[arg(long = "bind", value_name = "/MOUNTPATH=SOURCE")]
+    source_binds: Vec<ratarmount_compositing::SourceBind>,
+
+    /// Maximum idle repositories retained by a corpus mount
+    #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u32).range(1..))]
+    corpus_cache_size: u32,
+
+    #[arg(skip)]
+    corpus_list: Option<PathBuf>,
 
     /// Newline-separated password file for encrypted archives
     #[arg(long = "password-file")]
@@ -646,6 +659,30 @@ where
         )?;
         let mut args = Args::try_parse_from(&raw[..1])?;
         args.overlay_stats = Some(stats);
+        return Ok(args);
+    }
+    if raw.get(1).is_some_and(|s| s == "corpus") {
+        let argv = std::iter::once(raw[0].clone()).chain(raw.iter().skip(2).cloned());
+        let mut args = Args::try_parse_from(argv)?;
+        if args.paths.len() != 2
+            || args.no_mount
+            || args.write_overlay.is_some()
+            || !args.source_binds.is_empty()
+            || args.git
+            || args.git_ref.is_some()
+            || args.git_prefix.is_some()
+            || args.git_synthetic_head
+            || args.unmount
+            || args.commit_overlay
+            || args.repack_seekable
+            || args.publish_index
+            || args.publish_index_to.is_some()
+        {
+            return Err(clap::Error::raw(clap::error::ErrorKind::ArgumentConflict,
+                "corpus requires LIST-FILE MOUNTPOINT; it is read-only and cannot combine with --no-mount, --bind or Git selectors"));
+        }
+        args.corpus_list = Some(args.paths[0].clone());
+        args.lazy = true;
         return Ok(args);
     }
     let find = raw.get(1).is_some_and(|s| s == "find");
@@ -1188,7 +1225,7 @@ fn main() {
         }
     }
 
-    if args.paths.is_empty() {
+    if args.paths.is_empty() && args.source_binds.is_empty() {
         eprintln!("usage: ratarmount [options] <archive|folder|URL>... [mountpoint]");
         eprintln!("       ratarmount -u <mountpoint>");
         eprintln!(
@@ -1203,7 +1240,15 @@ fn main() {
         std::process::exit(2);
     }
 
-    let (inputs, mountpoint) = split_inputs_mountpoint(&args.paths, args.no_mount);
+    let (source_paths, mountpoint) = split_bound_inputs_mountpoint(&args);
+    // Metadata labels also include bound sources; factory gets positional paths
+    // separately so every explicit bind is opened exactly once.
+    let mut inputs = source_paths.clone();
+    inputs.extend(
+        args.source_binds
+            .iter()
+            .map(|bind| PathBuf::from(&bind.source)),
+    );
     let publishing = args.publish_index || args.publish_index_to.is_some();
     if let Err(e) = publish_index::validate_publish_options(
         publishing,
@@ -1232,7 +1277,7 @@ fn main() {
             }
         }
     }
-    if args.write_overlay.is_some() && inputs.len() == 1 {
+    if args.write_overlay.is_some() && inputs.len() == 1 && args.source_binds.is_empty() {
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
             &inputs[0],
             overlay_commit::CreateMissingContext::Mount,
@@ -1375,8 +1420,25 @@ fn main() {
 
     let file_versions = !args.no_file_versions;
 
-    let mut bundle = match factory::build_mount_source_ex(
-        &inputs,
+    let mut bindings = factory::SourceBindings {
+        binds: args.source_binds.clone(),
+        ..Default::default()
+    };
+    if let Some(list) = &args.corpus_list {
+        match corpus::open(list, args.corpus_cache_size as usize) {
+            Ok(source) => bindings.sources.push(source),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+    let mut bundle = match factory::build_mount_source_with_bindings(
+        if args.corpus_list.is_some() {
+            &[]
+        } else {
+            &source_paths
+        },
         &mut open_opts,
         args.recreate_index && !args.no_recreate_index,
         factory::CompositingOptions {
@@ -1413,6 +1475,7 @@ fn main() {
             },
             parallel_nested_threads: args.parallel_nested,
         },
+        bindings,
     ) {
         Ok(b) => b,
         Err(e) => {
@@ -3509,6 +3572,22 @@ fn redirect_stdio_to_null() -> std::io::Result<()> {
         libc::dup2(fd, 2);
     }
     Ok(())
+}
+
+fn split_bound_inputs_mountpoint(args: &Args) -> (Vec<PathBuf>, Option<PathBuf>) {
+    // With binds and one local positional, use that positional as the explicit
+    // mountpoint. Export-only commands keep their positional source as before.
+    if !args.source_binds.is_empty()
+        && args.paths.len() == 1
+        && !args.no_mount
+        && !any_export(args)
+        && !ratarmount_remote::is_remote_url(&args.paths[0].to_string_lossy())
+        && !args.paths[0].is_file()
+    {
+        (Vec::new(), Some(args.paths[0].clone()))
+    } else {
+        split_inputs_mountpoint(&args.paths, args.no_mount)
+    }
 }
 
 fn split_inputs_mountpoint(paths: &[PathBuf], no_mount: bool) -> (Vec<PathBuf>, Option<PathBuf>) {
@@ -6408,5 +6487,108 @@ mod sandbox_preset_tests {
                 .unwrap();
         assert!(fallback.path().starts_with(parent));
         assert!(create_tmpfs_overlay_in(Path::new("/proc"), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod corpus_cli_tests {
+    use super::*;
+
+    /// Regression: --bind consumed the mountpoint or split URL query equals signs.
+    #[test]
+    fn regression_bind_flag_preserves_positionals() {
+        let args = parse_args_from([
+            "ratarmount",
+            "image.tar",
+            "--bind",
+            "/repo=repo.git@abc",
+            "--bind",
+            "/data=https://host/file?x=y",
+            "mnt",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.paths,
+            [PathBuf::from("image.tar"), PathBuf::from("mnt")]
+        );
+        assert_eq!(args.source_binds.len(), 2);
+        assert_eq!(args.source_binds[1].source, "https://host/file?x=y");
+        assert!(parse_args_from(["ratarmount", "--bind", "/../escape=repo", "mnt"]).is_err());
+        let bound = parse_args_from([
+            "ratarmount",
+            "--bind",
+            "/repo=repo.git@abc",
+            "mnt",
+            "--git-synthetic-head",
+        ])
+        .unwrap();
+        assert!(bound.git_synthetic_head);
+        assert_eq!(bound.paths, [PathBuf::from("mnt")]);
+        assert_eq!(
+            split_bound_inputs_mountpoint(&bound),
+            (vec![], Some(PathBuf::from("mnt")))
+        );
+        for flag in ["--ninep", "--nfs"] {
+            let export = parse_args_from([
+                "ratarmount",
+                "serve",
+                flag,
+                "--bind",
+                "/repo=repo.git@abc",
+                "docker://ubuntu:24.04",
+            ])
+            .unwrap();
+            assert_eq!(
+                split_bound_inputs_mountpoint(&export),
+                (vec![PathBuf::from("docker://ubuntu:24.04")], None)
+            );
+        }
+    }
+
+    /// Regression: the corpus verb must only match argv[1] and retain both of its positionals.
+    #[test]
+    fn regression_corpus_verb_does_not_steal_positionals() {
+        let args = parse_args_from([
+            "ratarmount",
+            "corpus",
+            "list.txt",
+            "mnt",
+            "--corpus-cache-size",
+            "8",
+            "-f",
+        ])
+        .unwrap();
+        assert_eq!(args.corpus_list, Some(PathBuf::from("list.txt")));
+        assert_eq!(
+            args.paths,
+            [PathBuf::from("list.txt"), PathBuf::from("mnt")]
+        );
+        assert_eq!(args.corpus_cache_size, 8);
+        assert!(args.lazy, "corpus recursion must preserve lazy opening");
+        let ordinary = parse_args_from(["ratarmount", "--no-mount", "corpus"]).unwrap();
+        assert!(ordinary.corpus_list.is_none());
+        assert_eq!(ordinary.paths, [PathBuf::from("corpus")]);
+        for argv in [
+            vec!["ratarmount", "corpus", "list.txt"],
+            vec!["ratarmount", "corpus", "list.txt", "mnt", "-w", "overlay"],
+            vec![
+                "ratarmount",
+                "corpus",
+                "list.txt",
+                "mnt",
+                "--git-ref",
+                "HEAD",
+            ],
+            vec![
+                "ratarmount",
+                "corpus",
+                "list.txt",
+                "mnt",
+                "--corpus-cache-size",
+                "0",
+            ],
+        ] {
+            assert!(parse_args_from(argv).is_err());
+        }
     }
 }

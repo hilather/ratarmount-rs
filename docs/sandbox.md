@@ -235,3 +235,42 @@ Changes are discarded by default. `--commit-overlay-on-exit` or
 `--overlay-tmpfs-allow-commit` flag with `--overlay-tmpfs`; this deliberately
 allows changes to reach the base archive and retains the existing supported
 live-commit archive formats. Temporary overlay data is removed after commit.
+
+## Image + repository rootfs
+
+`--bind /MOUNTPATH=SOURCE` mounts one input inside the tree before unioning:
+
+```sh
+ratarmount docker://ubuntu:24.04 \
+  --bind /repo=/srv/repos/project.git@0123456789abcdef0123456789abcdef01234567 \
+  --git-synthetic-head -w attempt-overlay mnt
+```
+
+Sources accept the same local paths, archives, Git revisions and URLs as
+positional inputs. Mount paths must be absolute within the mount, with no `.`
+or `..` components; `/` is allowed. The first `=` separates the path from the
+source, so URL query parameters containing `=` remain intact. Positional inputs
+come first at `/`; repeated binds follow in flag order, even when flags are
+interspersed with positionals. Supply an explicit mountpoint when using only
+binds, or use `serve` for an export-only tree. With binds, a lone local
+positional that is not an existing file is interpreted as the mountpoint;
+supply both source and mountpoint when adding a positional directory/repo.
+Export flags keep a lone positional as the source.
+
+Directories merge; later sources win for conflicting files. The existing union
+policy favors real directories over conflicting symlinks/files. OCI whiteouts
+are evaluated within the image's own layers and cannot delete a separately
+bound repository. Image content already under `/repo` remains visible unless
+replaced by repository entries. Use an image with an empty `/repo` when a clean
+Git worktree is required.
+
+Explicit binds retain their requested paths under `--disable-union-mount`;
+that option gives only positional inputs inferred basename prefixes. Global
+`-p` still wraps the completed union. `--git-synthetic-head` requires exactly
+one Git source and exposes `.git` under its bind path. Git selectors apply to
+that Git source alongside non-Git image/archive inputs; multiple Git sources
+remain an error in synthetic mode. A write overlay wraps the complete union.
+
+See the [rootfs recipe](recipes/sandbox-rootfs.md) for bubblewrap,
+systemd-nspawn, and microVM exports. This assembles filesystem content; the
+sandbox runtime supplies process isolation.
