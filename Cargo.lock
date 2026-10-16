@@ -2968,6 +2968,7 @@ dependencies = [
  "ratarmount-sftp",
  "ratarmount-smb",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "url",
 ]
@@ -3552,6 +3553,7 @@ dependencies = [
 name = "ratarmount-remote"
 version = "0.1.34"
 dependencies = [
+ "base64",
  "chrono",
  "hex",
  "hmac 0.12.1",

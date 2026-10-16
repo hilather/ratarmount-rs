@@ -173,7 +173,7 @@ fn decode(s: &str) -> Result<String> {
     String::from_utf8(out).map_err(|_| error("hf URL is not UTF-8"))
 }
 
-fn encode(s: &str) -> String {
+pub(crate) fn encode(s: &str) -> String {
     let mut out = String::new();
     for b in s.bytes() {
         if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
@@ -186,7 +186,7 @@ fn encode(s: &str) -> String {
     out
 }
 
-fn encode_path(s: &str) -> String {
+pub(crate) fn encode_path(s: &str) -> String {
     s.split('/').map(encode).collect::<Vec<_>>().join("/")
 }
 
@@ -359,6 +359,23 @@ impl Config {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn commit_test_repo(endpoint: &str, token: Option<&str>) -> HfRepo {
+    let config = Config::from_values(|key| match key {
+        "HF_ENDPOINT" => Some(endpoint.into()),
+        "HF_TOKEN" => token.map(str::to_owned),
+        "HF_TOKEN_PATH" => Some("/nonexistent/ratarmount-hf-commit-token".into()),
+        _ => None,
+    })
+    .unwrap();
+    HfRepo {
+        location: parse_hf_url("hf://datasets/org/data/a.tar").unwrap(),
+        commit: "a".repeat(40),
+        config,
+        files: Arc::default(),
+    }
+}
+
 /// A revision resolved exactly once. Clones and all file/sidecar requests retain this SHA.
 #[derive(Clone)]
 pub struct HfRepo {
@@ -401,13 +418,92 @@ impl HfRepo {
         Ok(repo)
     }
 
-    fn api_url(&self, suffix: &str) -> String {
+    pub(crate) fn api_url(&self, suffix: &str) -> String {
         format!(
             "{}api/{}/{}/{suffix}",
             self.config.endpoint,
             self.location.kind,
             encode_path(&self.location.repo)
         )
+    }
+
+    /// Only Hub-origin requests may use the token selected by the read backend.
+    pub(crate) fn write_request(&self, method: &str, url: &str) -> Result<http_pool::HttpRequest> {
+        self.config.online()?;
+        let token = self.config.token.as_ref().ok_or_else(|| {
+            error(format!(
+                "publishing requires a Hub token with write scope; {TOKEN_HELP}"
+            ))
+        })?;
+        let parsed = Url::parse(url).map_err(|_| error("invalid Hub write URL"))?;
+        if parsed.origin() != self.config.endpoint.origin()
+            || !parsed.path().starts_with(self.config.endpoint.path())
+            || !parsed.username().is_empty()
+            || parsed.password().is_some()
+        {
+            return Err(error("Hub write URL escapes HF_ENDPOINT"));
+        }
+        warn_plain_http(&self.config, &HTTP_TOKEN_WARNING);
+        Ok(http_pool::request(method, url)
+            .set("User-Agent", USER_AGENT)
+            .set(
+                "Authorization",
+                &format!("Bearer {}", token.expose_secret()),
+            )
+            .timeout(Duration::from_secs(300)))
+    }
+
+    pub(crate) fn lfs_batch_url(&self) -> String {
+        let prefix = if self.location.kind == "models" {
+            String::new()
+        } else {
+            format!("{}/", self.location.kind)
+        };
+        format!(
+            "{}{prefix}{}.git/info/lfs/objects/batch",
+            self.config.endpoint,
+            encode_path(&self.location.repo)
+        )
+    }
+
+    /// Require the normal Hub token before preparing a publication (no network request).
+    pub fn require_publish_token(&self) -> Result<()> {
+        self.write_request("POST", &self.api_url("commit/main"))
+            .map(|_| ())
+    }
+
+    /// Choose the archive branch when it is a branch, otherwise `main`.
+    pub fn publish_branch(&self, explicit: Option<&str>) -> Result<String> {
+        if let Some(branch) = explicit {
+            if !valid_path(branch) {
+                return Err(error("invalid --publish-revision branch"));
+            }
+            return Ok(branch.into());
+        }
+        if self.location.revision == "main" {
+            return Ok("main".into());
+        }
+        let refs = read_json(self.get_api(&self.api_url("refs"))?.into_reader())?;
+        let branch = refs["branches"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|b| b["name"].as_str() == Some(&self.location.revision))
+        });
+        Ok(if branch {
+            self.location.revision.clone()
+        } else {
+            "main".into()
+        })
+    }
+
+    /// Resolve another revision using the same endpoint and credentials.
+    pub fn at_revision(&self, revision: &str) -> Result<Self> {
+        if !valid_path(revision) {
+            return Err(error("invalid Hub revision"));
+        }
+        let mut location = self.location.clone();
+        location.revision = revision.into();
+        Self::with_config(location, self.config.clone())
     }
 
     pub fn resolve_url(&self, path: &str) -> String {

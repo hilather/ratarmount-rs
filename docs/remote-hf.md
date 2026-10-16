@@ -123,6 +123,61 @@ validation apply, and private sidecars use the same Hub token. No branch-relativ
 or CDN-relative sibling URLs are guessed. Explicit in-memory indexes and forced
 rebuilds skip remote index discovery.
 
+## Publishing indexes
+
+Dataset authors can build and publish a reusable index with:
+
+```sh
+ratarmount --publish-index 'hf://datasets/org/name@main/shards/00001.tar.zst'
+```
+
+A token with repository **write scope** is required, using the same token lookup
+and `HF_ENDPOINT` as reads. Without a mountpoint the command exits after
+publication. Local publication retains its existing copy, pointer, and keep-last-2
+snapshot behavior. Remote `--publish-index-to URL` names the destination archive;
+its bytes must match the source archive. `s3://`, `gs://`, and `az://` destinations
+use the existing backend credentials and refuse anonymous writes.
+
+The publisher builds/validates the sidecar through the mount factory, copies it
+into a temporary publication snapshot, and stores tarstats of the remote archive.
+The immutable blob is `{archive}.index.<sha256>.sqlite`; the pointer is
+`{archive}.index.ptr`. Its `index_id` equals the blob SHA-256. For Hub sources the
+pointer also records `archive_hf_commit` and `archive_hf_resolve_url`; the SQLite
+metadata retains the original pinned archive identity.
+
+On object stores the blob PUT completes before the pointer PUT; failures leave
+at most an orphan blob. On the Hub **both files go into one atomic commit** after
+LFS upload, so no pointer can precede its blob. Upload negotiation uses preupload,
+LFS batch, basic or multipart PUT, optional verification, then NDJSON commit,
+following the upstream [commit implementation](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/_commit_api.py)
+and [LFS implementation](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/lfs.py).
+The Hub Bearer token goes only to the Hub endpoint; LFS storage requests use only
+headers supplied in the batch action. Native Xet uploads are unsupported. If a
+Hub requires Xet and refuses the LFS path, publication fails with an explicit
+message. Existing Xet-backed read support is unaffected.
+
+`--publish-revision BRANCH` selects an existing destination branch (default: the
+archive revision if it is a branch, otherwise `main`); `--create-pr` adds
+`?create_pr=1` to preupload and commit. The destination archive is fingerprinted
+and `parentCommit` rejects concurrent branch changes. Readers must use the
+**new commit** or updated branch: an earlier pinned commit cannot see sidecars
+added later. Failed commits are not retried automatically because a lost response
+may hide a successful commit or PR. Remote snapshots are not automatically
+pruned. Publication currently refuses blobs above 64 MiB, matching the existing
+S3 sibling publisher and bounding in-memory Hub commit encoding; the reader can
+accept larger sidecars without retaining them in its metadata cache.
+
+See the [dataset-author recipe](recipes/publish-hf-index.md) for a complete
+“run once, every downloader gets a zero-scan mount” workflow. Fingerprint checks
+still read archive byte ranges even when no indexing scan is needed.
+
+The ignored write test additionally requires explicit approval and both a test
+repository and an environment token; it leaves test artifacts in that repository:
+
+```sh
+RATARMOUNT_TEST_HF_REPO=your-name/test-repo HF_TOKEN=hf_... cargo test -p ratarmount --bin ratarmount regression_publish_index_hf_live -- --ignored --nocapture
+```
+
 ## Range reads and Xet verification
 
 Files use the shared pooled HTTP agent, redirect-target caching, expired-target
@@ -183,6 +238,6 @@ blob-cache reuse and `hf-cache://` offline mounts belong to AI-HF3 and are not
 implemented here. Do not treat this listing cache as an offline snapshot.
 
 Hub reads are read-only. `--commit-overlay` and live overlay commit report that
-`hf://` is not supported for commit. Hub publication and write-back are separate
-roadmap tasks. Full-file LFS hash verification is performed by the live test;
+`hf://` is not supported for commit. Index publication is supported as described above; archive write-back remains a
+separate roadmap task. Full-file LFS hash verification is performed by the live test;
 ordinary partial reads validate HTTP byte ranges, not the entire LFS object hash.

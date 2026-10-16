@@ -4124,6 +4124,28 @@ where
     match kind {
         "tar" => {
             eprintln!("{transport} TAR: {input} ({range_len} bytes, live Range)");
+            if !recreate && !o.clear_index_cache {
+                if let Some(path) = ip.filter(|p| p.is_file()) {
+                    match SqliteIndexedTar::open_with_existing_index_from_reader(
+                        range,
+                        &label,
+                        path,
+                        o.clone(),
+                    ) {
+                        Ok(src) => return Ok(Some((label, Arc::new(src)))),
+                        Err(e) => {
+                            if refuse_index_rebuild(&o) {
+                                return Err(format!("corrupt or mismatched index: {e}"));
+                            }
+                            eprintln!("info: could not load remote TAR index ({e}); rebuilding");
+                            range = reopen()?;
+                        }
+                    }
+                }
+            }
+            if refuse_index_rebuild(&o) {
+                return Err("corrupt or mismatched index: no usable sidecar".into());
+            }
             let src = SqliteIndexedTar::open_from_reader(range, &label, ip, &o, VERSION)
                 .map_err(|e| e.to_string())?;
             Ok(Some((label, Arc::new(src))))

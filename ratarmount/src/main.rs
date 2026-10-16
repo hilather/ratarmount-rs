@@ -280,15 +280,23 @@ struct Args {
     #[arg(long = "index-folders")]
     index_folders: Option<String>,
 
-    /// Copy the on-disk SQLite sidecar next to the archive after a successful open.
-    /// Boolean (`SetTrue`); does not steal the archive path.
+    /// Publish the validated SQLite index next to the archive (local, hf, s3, gs, az).
+    /// With no mountpoint, exit after publication.
     #[arg(long = "publish-index", action = ArgAction::SetTrue)]
     publish_index: bool,
 
     /// Copy the on-disk SQLite sidecar to PATH. Required value (`num_args = 1`);
-    /// do not use `num_args = 0..=1` (that steals the archive). No S3 PUT in v1.
-    #[arg(long = "publish-index-to", value_name = "PATH", num_args = 1)]
+    /// do not use `num_args = 0..=1` (that steals the archive). A remote URL names the archive.
+    #[arg(long = "publish-index-to", value_name = "PATH_OR_URL", num_args = 1)]
     publish_index_to: Option<PathBuf>,
+
+    /// Hub branch for index publication (archive branch, otherwise main).
+    #[arg(long = "publish-revision", value_name = "BRANCH", num_args = 1)]
+    publish_revision: Option<String>,
+
+    /// Publish the Hub index as a pull request instead of updating the branch.
+    #[arg(long = "create-pr", action = ArgAction::SetTrue)]
+    create_pr: bool,
 
     /// Also check archive mtime against the index (stricter reuse)
     #[arg(long = "verify-mtime", action = ArgAction::SetTrue)]
@@ -930,6 +938,17 @@ fn main() {
     }
 
     let (inputs, mountpoint) = split_inputs_mountpoint(&args.paths, args.no_mount);
+    let publishing = args.publish_index || args.publish_index_to.is_some();
+    if let Err(e) = publish_index::validate_publish_options(
+        publishing,
+        &inputs,
+        args.publish_index_to.as_deref(),
+        args.publish_revision.as_deref(),
+        args.create_pr,
+    ) {
+        eprintln!("error: {e}");
+        std::process::exit(2);
+    }
 
     if args.write_overlay.is_some() && inputs.len() == 1 {
         if let Err(e) = overlay_commit::maybe_create_missing_write_base(
@@ -1190,12 +1209,16 @@ fn main() {
     if args.publish_index || args.publish_index_to.is_some() {
         match index_sidecar.as_deref() {
             Some(src) => {
-                if let Err(e) = publish_index::publish_index(publish_index::PublishIndexOpts {
-                    archive: &inputs[0],
-                    sidecar: src,
-                    dest: args.publish_index_to.as_deref(),
-                    no_recreate_index: args.no_recreate_index,
-                }) {
+                if let Err(e) = publish_index::publish_validated_index(
+                    publish_index::PublishIndexOpts {
+                        archive: &inputs[0],
+                        sidecar: src,
+                        dest: args.publish_index_to.as_deref(),
+                        no_recreate_index: args.no_recreate_index,
+                    },
+                    args.publish_revision.as_deref(),
+                    args.create_pr,
+                ) {
                     eprintln!("error: {e}");
                     std::process::exit(1);
                 }
@@ -1207,6 +1230,10 @@ fn main() {
                 std::process::exit(2);
             }
         }
+    }
+
+    if publishing && mountpoint.is_none() {
+        return;
     }
 
     let mut _temp_overlay: Option<tempfile::TempDir> = None;
@@ -3741,6 +3768,38 @@ mod export_cli_tests {
         assert!(a.publish_index);
         assert!(a.publish_index_to.is_none());
         assert_eq!(archive_paths(&a), vec![PathBuf::from("a.tar")]);
+    }
+
+    /// Regression: Hub publish flags must preserve URL and mountpoint operands.
+    #[test]
+    fn publish_index_hf_revision_and_create_pr_preserve_operands() {
+        let args = Args::try_parse_from([
+            "ratarmount",
+            "--publish-index",
+            "--publish-revision",
+            "feature/new",
+            "--create-pr",
+            "hf://datasets/org/data/a.tar",
+        ])
+        .unwrap();
+        assert!(args.publish_index && args.create_pr);
+        assert_eq!(args.publish_revision.as_deref(), Some("feature/new"));
+        assert_eq!(
+            args.paths,
+            vec![PathBuf::from("hf://datasets/org/data/a.tar")]
+        );
+        let args = Args::try_parse_from([
+            "ratarmount",
+            "--publish-index-to",
+            "s3://bucket/a.tar",
+            "a.tar",
+        ])
+        .unwrap();
+        assert_eq!(
+            args.publish_index_to.as_deref(),
+            Some(std::path::Path::new("s3://bucket/a.tar"))
+        );
+        assert_eq!(args.paths, vec![PathBuf::from("a.tar")]);
     }
 
     /// Regression: `--publish-index-to PATH` is `num_args = 1` (not `0..=1`).
