@@ -778,6 +778,21 @@ impl MountSource for UnionMountSource {
             .fold(0u64, |acc, s| acc.saturating_add(s.content_generation()))
     }
 
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if let Some(si) = self.source_from_info(file_info) {
+            if let Some(src) = self.sources.get(si) {
+                let mut fi = file_info.clone();
+                if let Some(UserData::Other(s)) = fi.userdata.last() {
+                    if s.starts_with("union:") {
+                        fi.userdata.pop();
+                    }
+                }
+                return src.backing_extent(&fi);
+            }
+        }
+        None
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if let Some(si) = self.source_from_info(file_info) {
             if let Some(src) = self.sources.get(si) {

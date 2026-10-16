@@ -237,6 +237,26 @@ impl MountSource for FolderMountSource {
         Ok(Box::new(File::open(real)?))
     }
 
+    fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if fi.mode & S_IFMT != ratarmount_core::S_IFREG || !fi.linkname.is_empty() {
+            return None;
+        }
+        let path = fi.userdata.iter().rev().find_map(|u| match u {
+            UserData::Other(s) if s.starts_with('/') => Some(s.as_str()),
+            _ => None,
+        })?;
+        let file = File::open(self.realpath(path)).ok()?;
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() {
+            return None;
+        }
+        Some(ratarmount_core::BackingExtent {
+            file,
+            offset: 0,
+            len: meta.len(),
+        })
+    }
+
     fn is_immutable(&self) -> bool {
         false
     }
@@ -246,6 +266,49 @@ impl MountSource for FolderMountSource {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    /// Regression: folder backing extents cover the whole regular file through wrappers.
+    #[test]
+    fn backing_extent_folder_whole_file_and_wrappers() {
+        use crate::{AutoMountLayer, FileVersionLayer, PrefixMountSource, UnionMountSource};
+        use std::io::Read;
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("file"), b"payload").unwrap();
+        std::os::unix::fs::symlink("file", dir.path().join("link")).unwrap();
+        let folder: Arc<dyn MountSource> = Arc::new(FolderMountSource::new(dir.path()).unwrap());
+        for path in ["/", "/link"] {
+            assert!(folder
+                .backing_extent(&folder.lookup(path, 0).unwrap())
+                .is_none());
+        }
+        let other_dir = tempfile::tempdir().unwrap();
+        fs::write(other_dir.path().join("file"), b"wrong source").unwrap();
+        let other = Arc::new(FolderMountSource::new(other_dir.path()).unwrap());
+        let union: Arc<dyn MountSource> = Arc::new(UnionMountSource::new(vec![other, folder]));
+        let version: Arc<dyn MountSource> = Arc::new(FileVersionLayer::new(union));
+        let prefix: Arc<dyn MountSource> = Arc::new(PrefixMountSource::new("data", version));
+        let automount = Arc::new(AutoMountLayer::new(
+            prefix,
+            1,
+            Arc::new(|_| panic!("no nested archive")),
+        ));
+        let cache =
+            ratarmount_index::PayloadCache::with_dir(dir.path().join("cache"), Some(1024), 1024);
+        let source = crate::PayloadCacheLayer::new(automount, cache);
+        for (path, expected) in [
+            ("/data/file", b"payload".as_slice()),
+            ("/data/file.versions/1", b"wrong source".as_slice()),
+        ] {
+            let fi = source.lookup(path, 0).unwrap();
+            let mut extent = source.backing_extent(&fi).unwrap();
+            assert_eq!(extent.offset, 0);
+            assert_eq!(extent.len, expected.len() as u64, "{path}");
+            let mut bytes = Vec::new();
+            extent.file.read_to_end(&mut bytes).unwrap();
+            assert_eq!(bytes, expected, "{path}");
+        }
+    }
 
     /// Regression: `dir1 dir2` readdir built `FileInfo` / called fat `list()`.
     /// Default `list_dirents` zeros sizes; matching `symlink_metadata` proves

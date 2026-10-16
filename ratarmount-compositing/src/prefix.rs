@@ -155,6 +155,10 @@ impl MountSource for PrefixMountSource {
         self.inner.content_generation()
     }
 
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        self.inner.backing_extent(file_info)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         self.inner.member_seek_is_cheap(file_info)
     }

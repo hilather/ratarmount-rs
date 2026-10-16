@@ -1254,6 +1254,20 @@ impl MountSource for AutoMountLayer {
         self.root.content_generation()
     }
 
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        if let Some(key) = Self::automount_key(file_info) {
+            if key == "/" {
+                return self.root.backing_extent(file_info);
+            }
+            let mounted = self.mounted.lock().expect("automount mutex");
+            if let Some(m) = mounted.get(key) {
+                return m.source.backing_extent(file_info);
+            }
+            return None;
+        }
+        self.root.backing_extent(file_info)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         if let Some(key) = Self::automount_key(file_info) {
             if key == "/" {
@@ -1534,6 +1548,27 @@ mod tests {
         fn member_seek_is_cheap(&self, _: &FileInfo) -> bool {
             false
         }
+    }
+
+    /// Regression: a nested backing extent must come from its tagged source.
+    #[test]
+    fn backing_extent_automount_selects_nested_source() {
+        use std::io::Read;
+        let root_dir = tempfile::tempdir().unwrap();
+        let nested_dir = tempfile::tempdir().unwrap();
+        fs::write(root_dir.path().join("nested.tar"), b"fake archive").unwrap();
+        fs::write(root_dir.path().join("file"), b"root").unwrap();
+        fs::write(nested_dir.path().join("file"), b"nested").unwrap();
+        let root: Arc<dyn MountSource> =
+            Arc::new(crate::FolderMountSource::new(root_dir.path()).unwrap());
+        let nested: Arc<dyn MountSource> =
+            Arc::new(crate::FolderMountSource::new(nested_dir.path()).unwrap());
+        let layer = AutoMountLayer::new(root, 1, Arc::new(move |_| Ok(nested.clone())));
+        let fi = layer.lookup("/nested.tar/file", 0).unwrap();
+        let mut extent = layer.backing_extent(&fi).unwrap();
+        let mut bytes = Vec::new();
+        extent.file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"nested");
     }
 
     /// Regression: NFS pin of solid 7z must see through AutoMount + nested source.

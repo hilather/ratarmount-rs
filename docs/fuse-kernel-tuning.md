@@ -175,3 +175,89 @@ These are **illustrative** of what the harness is designed to surface; re-run lo
 - Mount options parity: [`docs/mount-options-parity.md`](mount-options-parity.md) (`--readahead`, `-o`)  
 - Gzip G3 polish / spacing: [`docs/gzip-binding-decision.md`](gzip-binding-decision.md), [`docs/tasks/g3-polish-batch.md`](tasks/g3-polish-batch.md)  
 - General benches: [`benchmarks/README.md`](../benchmarks/README.md)
+
+## Linux FUSE passthrough
+
+`--passthrough auto|on|off` defaults to `auto`. On Linux 6.9 or later,
+ratarmount negotiates `FUSE_PASSTHROUGH` only when the kernel advertises it
+(ABI 7.40 or later), with a maximum stacking depth of 1. `auto` silently keeps
+daemon I/O when unavailable; `on` rejects an unsupported mount with a clear
+error; `off` keeps the existing read and page-cache behavior. macOS uses daemon
+I/O (`on` reports unsupported).
+
+Use `-d 2` to see the single mount-level `FUSE I/O mode:` log line. A negotiated
+mount can still serve individual files through the daemon. `-d 3` also logs
+successful backing registrations and per-open fallback errors. Current Linux
+requires `CAP_SYS_ADMIN` to register backing descriptors; a kernel advertising
+the capability does not guarantee that registration will succeed. Registration
+errors, including permission and filesystem stacking errors, fall back to daemon
+reads even with `on`. See the [kernel passthrough documentation](https://docs.kernel.org/filesystems/fuse/fuse-passthrough.html).
+
+| Source | Eligibility |
+|--------|-------------|
+| Plain files in a folder mount | Read-only regular files; their fd covers the whole file |
+| Stored members of a local, uncompressed TAR | Regular, contiguous, non-sparse, non-generated, top-level members; reflink preparation or explicitly allowed copying |
+| Compressed TAR, sparse members, reader-backed/nested archives | Daemon reads |
+| Overlay files on an explicitly read-only mount (`-w overlay -o ro`) | Read-only whole-file fds, including when an overlay policy is installed |
+| Writable overlay mounts | Daemon I/O for all opens, preserving write policy, quota accounting, and live-commit behavior |
+| Future completed caches | `MountSource::backing_extent` can supply an open whole-file extent; partial caches must return `None` |
+
+The kernel backing-file interface has **no offset**. Passing a TAR archive fd
+would expose its header as the first member byte. Instead, ratarmount prepares
+a private per-member file with byte zero at the member's first byte. It tries
+`FICLONERANGE` only when both the source offset and member length align to the
+filesystem block size. Reflinks require a supporting filesystem (such as btrfs
+or XFS with reflink enabled) and source and cache on the same filesystem.
+Ordinary TAR's 512-byte layout often fails the alignment check.
+
+Prepared files use a private `0700` directory under `$XDG_CACHE_HOME` (or
+`$HOME/.cache`), with `O_TMPFILE` where supported and an immediately unlinked
+file otherwise. Their fds last until the last concurrent open is released;
+they do not form a persistent member cache. Place the cache on the archive's
+filesystem for reflinks. Failure to create a cache or clone a member keeps
+daemon reads unless copying is explicitly allowed:
+
+```bash
+# Clone eligible aligned members, otherwise read through the daemon:
+ratarmount --passthrough auto stored.tar /mnt
+
+# Permit copying individual members up to 64 MiB, including unaligned members:
+ratarmount --passthrough on --passthrough-copy --passthrough-copy-max 64M stored.tar /mnt
+
+# Compare the original daemon path:
+ratarmount --passthrough off stored.tar /mnt
+```
+
+Copying requires **both** `--passthrough-copy` and a positive
+`--passthrough-copy-max`; the default cap is `0` (off). The cap is per member,
+not a total mount budget. A copy completes before the open reply, so it can
+increase first-open latency and disk usage. Clone/copy failures always fall
+back; the member is never partially published.
+
+All concurrent opens of an inode reuse one registration. If its first open
+falls back, subsequent opens keep daemon I/O until its last release. Linux
+rejects mixing cached daemon opens with passthrough opens on the same inode,
+and rejects `FOPEN_KEEP_CACHE` on passthrough replies. Daemon replies retain
+their existing flags; passthrough uses the backing file's page cache.
+
+This kernel restriction also explains the conservative overlay rule: allowing
+a read-only passthrough open on a writable overlay inode would prevent a later
+policy-enforcing daemon writer from opening that inode. Writable overlay
+mounts therefore retain daemon I/O, even without a policy. Read-only overlay
+passthrough assumes the overlay is not concurrently committed or mutated by
+another frontend. Use `--passthrough off` if sharing it with writable exports.
+
+Kernel regression checks (outside the Codex sandbox):
+
+```bash
+cargo test -p ratarmount --test fuse_passthrough
+# Require actual backing registration, on a host with the necessary privilege:
+RATARMOUNT_TEST_REQUIRE_PASSTHROUGH=1 cargo test -p ratarmount --test fuse_passthrough
+```
+
+The ordinary integration test checks bytes and the negotiated mode; it permits
+per-open registration fallback. The opt-in environment variable additionally
+requires actual registrations for the folder and copied TAR cases. Unit tests
+exercise negotiation and registration failure over a socket without `/dev/fuse`,
+copy limits, alignment, tmpfs fallback, and reflinks on btrfs/XFS. Set
+`RATARMOUNT_TEST_REFLINK_DIR` to choose the filesystem for the real clone test.

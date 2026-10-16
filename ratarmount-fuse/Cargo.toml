@@ -14,12 +14,10 @@ autotests = false
 [dependencies]
 ratarmount-core.workspace = true
 ratarmount-compositing.workspace = true
-# ABI support is negotiated at runtime, including 7.40 for future passthrough.
+# ABI support is negotiated at runtime, including 7.40 for optional passthrough.
 # Keep the libfuse mounting backend used by 0.15 (no longer a default feature).
 fuser = { version = "0.18.0", features = ["libfuse"] }
 libc.workspace = true
 log.workspace = true
 thiserror.workspace = true
-
-[dev-dependencies]
 tempfile.workspace = true

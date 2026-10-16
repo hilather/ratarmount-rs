@@ -874,6 +874,31 @@ impl MountSource for SqliteIndexedTar {
         )))
     }
 
+    fn backing_extent(&self, fi: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        let ContentBackend::File { file, _keep: None } = &self.backend else {
+            return None;
+        };
+        if self.archive_path != self.data_path
+            || fi.mode & ratarmount_core::S_IFMT != ratarmount_core::S_IFREG
+            || !fi.linkname.is_empty()
+        {
+            return None;
+        }
+        let ud = tar_userdata(fi)?;
+        if ud.issparse || ud.isgenerated || ud.recursiondepth != 0 || ud.offsetheader.is_none() {
+            return None;
+        }
+        let meta = file.metadata().ok()?;
+        if !meta.is_file() || ud.offset.checked_add(fi.size)? > meta.len() {
+            return None;
+        }
+        Some(ratarmount_core::BackingExtent {
+            file: file.try_clone().ok()?,
+            offset: ud.offset,
+            len: fi.size,
+        })
+    }
+
     fn is_immutable(&self) -> bool {
         true
     }
@@ -3129,6 +3154,83 @@ mod tests {
     use super::*;
     use std::io::{Read, Seek, Write};
     use std::process::Command;
+
+    /// Regression: passthrough must expose member bytes, never a TAR header or stale path.
+    #[test]
+    fn backing_extent_stored_member_pins_file_and_rejects_noncontiguous_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("plain.tar");
+        std::fs::write(&path, synthetic_ustar("member", b"payload")).unwrap();
+        let source = SqliteIndexedTar::create_index(
+            &path,
+            &path,
+            None,
+            &OpenOptions::default(),
+            "test",
+            &mut None,
+        )
+        .unwrap();
+        let fi = source.lookup("/member", 0).unwrap();
+        let mut extent = source.backing_extent(&fi).unwrap();
+        assert_eq!(extent.offset, 512);
+        assert_eq!(extent.len, 7);
+        std::fs::rename(&path, dir.path().join("old.tar")).unwrap();
+        std::fs::write(&path, b"replacement").unwrap();
+        extent.file.seek(SeekFrom::Start(extent.offset)).unwrap();
+        let mut bytes = [0; 7];
+        extent.file.read_exact(&mut bytes).unwrap();
+        assert_eq!(&bytes, b"payload");
+        for kind in 0..7 {
+            let mut bad = fi.clone();
+            let UserData::Tar(ud) = &mut bad.userdata[0] else {
+                panic!("TAR row");
+            };
+            match kind {
+                0 => ud.issparse = true,
+                1 => ud.isgenerated = true,
+                2 => ud.recursiondepth = 1,
+                3 => ud.offsetheader = None,
+                4 => ud.offset = u64::MAX,
+                5 => bad.linkname = "target".into(),
+                _ => bad.mode = ratarmount_core::S_IFDIR | 0o755,
+            }
+            assert!(source.backing_extent(&bad).is_none(), "kind={kind}");
+        }
+    }
+
+    /// Regression: compressed and materialized TAR bodies must not masquerade as stored bytes.
+    #[test]
+    fn backing_extent_compressed_tar_returns_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compressed.tar.zst");
+        let bytes = synthetic_ustar("member", b"payload");
+        std::fs::write(
+            &path,
+            ratarmount_compress::encode_zstd_frame(&bytes, 1).unwrap(),
+        )
+        .unwrap();
+        let body = ratarmount_compress::open_seekable_zstd_with_threads(&path, 1).unwrap();
+        let source =
+            SqliteIndexedTar::create_index_body(&path, body, None, &OpenOptions::default(), "test")
+                .unwrap();
+        assert!(source
+            .backing_extent(&source.lookup("/member", 0).unwrap())
+            .is_none());
+        let plain = dir.path().join("materialized.tar");
+        std::fs::write(&plain, bytes).unwrap();
+        let source = SqliteIndexedTar::create_index(
+            &path,
+            &plain,
+            None,
+            &OpenOptions::default(),
+            "test",
+            &mut None,
+        )
+        .unwrap();
+        assert!(source
+            .backing_extent(&source.lookup("/member", 0).unwrap())
+            .is_none());
+    }
 
     /// Regression: #102, `Creating offset dictionary` panicked (exit 101) when
     /// stdout was a pipe with no reader (`ratarmount -f -c` after startup).

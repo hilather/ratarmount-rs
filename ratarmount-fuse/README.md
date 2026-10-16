@@ -29,7 +29,16 @@ and [`fs/fuse/fuse_i.h`](https://github.com/torvalds/linux/blob/master/fs/fuse/f
 The higher ABI itself is intentional; wire negotiation and malformed-request
 handling cannot be identical to the old 7.12 session.
 
-## Passthrough handoff (AI-PT)
+## Passthrough (AI-PT)
+
+`--passthrough auto|on|off` and opt-in bounded member copying are implemented.
+See [FUSE kernel tuning](../docs/fuse-kernel-tuning.md#linux-fuse-passthrough)
+for eligibility, cache placement, privilege requirements, and integration checks.
+Writable overlay mounts keep daemon I/O so a later writer can use the overlay
+policy funnel. Explicitly read-only overlay mounts can pass whole-file fds.
+Passthrough replies omit `FOPEN_KEEP_CACHE` (the kernel rejects that combination);
+daemon replies retain their existing flags. Registration failure fixes that
+inode's mode to daemon I/O until its last release, avoiding mixed-mode EIO.
 
 On Linux, `Filesystem::init` receives `&mut fuser::KernelConfig`. Check
 `kernel_abi()` (at least `fuser::Version(7, 40)`) and

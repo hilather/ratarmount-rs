@@ -612,6 +612,19 @@ pub trait ArchiveRead: Read + Seek + Send {}
 
 impl<T: Read + Seek + Send> ArchiveRead for T {}
 
+/// Contiguous, uncompressed bytes in an open host file.
+///
+/// The descriptor pins the file even if its pathname is replaced. A whole-file
+/// extent (`offset == 0`, `len == file.metadata().len()`) can back kernel I/O
+/// directly, including completed cache files. A subrange needs a separate file
+/// starting at byte zero before it can be used for FUSE passthrough.
+#[derive(Debug)]
+pub struct BackingExtent {
+    pub file: std::fs::File,
+    pub offset: u64,
+    pub len: u64,
+}
+
 /// Generic mount point API (sync, FUSE-friendly). Paths use a leading `/`.
 pub trait MountSource: Send + Sync {
     fn list(&self, path: &str) -> Option<ListResult>;
@@ -677,6 +690,13 @@ pub trait MountSource: Send + Sync {
     }
 
     fn open(&self, file_info: &FileInfo, buffering: i32) -> io::Result<Box<dyn ArchiveRead>>;
+
+    /// Optional backing for regular file bytes. Compressed, sparse, generated,
+    /// or otherwise transformed content must return `None`. Errors discovering
+    /// an extent also return `None`; callers retain the ordinary read path.
+    fn backing_extent(&self, _fi: &FileInfo) -> Option<BackingExtent> {
+        None
+    }
 
     /// When false, the body from [`Self::open`] is a progressive/compressed
     /// stream: mid/tail seeks fully decompress the member. Default is cheap
@@ -932,7 +952,8 @@ mod tests {
         );
     }
 
-    /// Regression: default list_dirents derives from list_mode with size=0.
+    /// Regression: default list_dirents derives from list_mode with size=0;
+    /// backends without an extent implementation must not opt into passthrough.
     #[test]
     fn regression_default_list_dirents_size_zero() {
         struct Dummy;
@@ -970,6 +991,7 @@ mod tests {
                 true
             }
         }
+        assert!(Dummy.backing_extent(&create_root_file_info()).is_none());
         let dents = Dummy.list_dirents("/").expect("dirents");
         assert_eq!(dents.len(), 1);
         assert_eq!(dents[0].name, "a");

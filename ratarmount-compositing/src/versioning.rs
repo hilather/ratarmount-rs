@@ -213,6 +213,19 @@ impl MountSource for FileVersionLayer {
         self.inner.content_generation()
     }
 
+    fn backing_extent(&self, file_info: &FileInfo) -> Option<ratarmount_core::BackingExtent> {
+        let mut fi = file_info.clone();
+        if let Some(UserData::Other(s)) = fi.userdata.last() {
+            if s == TAG_FOLDER {
+                return None;
+            }
+            if s == TAG_FILE {
+                fi.userdata.pop();
+            }
+        }
+        self.inner.backing_extent(&fi)
+    }
+
     fn member_seek_is_cheap(&self, file_info: &FileInfo) -> bool {
         let mut fi = file_info.clone();
         if let Some(UserData::Other(s)) = fi.userdata.last() {
