@@ -45,6 +45,8 @@ mod webdav;
 // --- inbound protocol modules (worktree PRs: one `mod` + `pub use` pair only) ---
 mod hf;
 pub use hf::{open_hf_range, parse_hf_url, HfLocation, HfMountSource, HfRepo};
+mod hf_commit;
+pub use hf_commit::{HfCommitFile, HfCommitResult};
 mod folder;
 pub use folder::{try_open_remote_folder, RemoteDirent, RemoteFolderMountSource, RemoteListing};
 mod ftp;
@@ -109,7 +111,7 @@ pub use dropbox::{
 pub(crate) use gcs::fetch_gcs_bytes_capped;
 pub use index_sibling::{
     fetch_index_sibling_bytes_capped, fetch_index_sibling_to_temp, is_object_store_archive_url,
-    put_s3_index_siblings, S3IndexSiblingPut,
+    put_object_store_index_siblings, put_s3_index_siblings, S3IndexSiblingPut,
 };
 pub(crate) use s3::fetch_s3_bytes_capped;
 pub use s3::{

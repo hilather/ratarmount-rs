@@ -2,8 +2,8 @@
 //!
 //! Pointer `{url}.index.ptr` and immutable `{url}.index.{id}.sqlite` are extra
 //! candidates. GET is `fetch_*`; S3 PUT is [`put_s3_index_siblings`].
-//! GCS live commit PUTs through `put_gcs_object` (one object, caller-ordered).
-//! Azure stays GET-only. The well-known `{url}.index.sqlite` key is not written.
+//! CLI publication also supports GCS and Azure. The well-known
+//! `{url}.index.sqlite` key is not written.
 
 use std::fs::File;
 use std::io::Read;
@@ -146,6 +146,89 @@ pub fn put_s3_index_siblings(
         Some(INDEX_POINTER_CONTENT_TYPE),
     )?;
     Ok(S3IndexSiblingPut::Uploaded)
+}
+
+/// Publish an immutable blob before its pointer, using the backend's existing
+/// credential chain. Anonymous writes are refused by each PUT implementation.
+/// Failure leaves at most an orphan blob; no remote snapshots are pruned.
+pub fn put_object_store_index_siblings(
+    archive_url: &str,
+    index_id: &str,
+    pointer_bytes: &[u8],
+    blob_path: &Path,
+) -> Result<()> {
+    let id = canonical_index_id(index_id)?;
+    let len = std::fs::metadata(blob_path)?.len();
+    if len > META_SIDECAR_WHOLE_MAX {
+        return Err(RemoteError::Url(format!(
+            "index blob exceeds publication limit ({META_SIDECAR_WHOLE_MAX} bytes)"
+        )));
+    }
+    match remote_url_scheme(archive_url).as_deref() {
+        Some("s3") => {
+            let outcome = put_s3_index_siblings(
+                &crate::parse_s3_url(archive_url)?,
+                &id,
+                pointer_bytes,
+                blob_path,
+            )?;
+            if let S3IndexSiblingPut::Skipped { blob_len, limit } = outcome {
+                return Err(RemoteError::Url(format!(
+                    "index blob grew to {blob_len} bytes, above publication limit ({limit})"
+                )));
+            }
+        }
+        Some("gs") => {
+            let loc = crate::parse_gcs_url(archive_url)?;
+            let (blob, ptr) = index_sibling_object_keys(&loc.object, &id);
+            crate::put_gcs_file(
+                &crate::GcsLocation {
+                    bucket: loc.bucket.clone(),
+                    object: blob,
+                },
+                blob_path,
+                OCI_INDEX_ARTIFACT_TYPE,
+            )?;
+            crate::put_gcs_object(
+                &crate::GcsLocation {
+                    bucket: loc.bucket,
+                    object: ptr,
+                },
+                pointer_bytes,
+                INDEX_POINTER_CONTENT_TYPE,
+            )?;
+        }
+        Some("az" | "azure") => {
+            let loc = crate::parse_azure_url(archive_url)?;
+            let (blob, ptr) = index_sibling_object_keys(&loc.blob, &id);
+            let generation = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64;
+            crate::put_azure_blocks(
+                &crate::AzureLocation {
+                    container: loc.container.clone(),
+                    blob,
+                },
+                blob_path,
+                OCI_INDEX_ARTIFACT_TYPE,
+                generation,
+                None,
+            )?;
+            crate::put_azure_bytes(
+                &crate::AzureLocation {
+                    container: loc.container,
+                    blob: ptr,
+                },
+                pointer_bytes,
+                INDEX_POINTER_CONTENT_TYPE,
+                generation,
+                None,
+            )?;
+        }
+        _ => return Err(RemoteError::UnsupportedScheme(archive_url.into())),
+    }
+    Ok(())
 }
 
 /// True for `s3://` / `gs://` / `az://` / `azure://` archive URLs.
@@ -489,5 +572,21 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("exceeds"), "{err}");
+    }
+    /// Regression: CLI publication must refuse an oversize blob before issuing any PUT.
+    #[test]
+    fn regression_publish_object_store_oversize_refused_before_put() {
+        let blob = tempfile::NamedTempFile::new().unwrap();
+        blob.as_file().set_len(META_SIDECAR_WHOLE_MAX + 1).unwrap();
+        for url in [
+            "s3://bucket/a.tar",
+            "gs://bucket/a.tar",
+            "az://bucket/a.tar",
+        ] {
+            let err = put_object_store_index_siblings(url, &"a".repeat(64), b"{}", blob.path())
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("publication limit"), "{err}");
+        }
     }
 }
