@@ -55,9 +55,12 @@ examples for chained paths; `datasets` requires raw TAR shard streams.
 ## Memory budget and cache limits
 
 The documented `RATARMOUNT_PAYLOAD_CACHE_BYTES` setting limits persistent
-payload and range-cache disk use; it is not a process RSS limit. This checkout
-does not expose a global `--memory-budget` control. Plan reader concurrency,
-codec buffers, host page cache, and model memory independently. vLLM loads all
+payload and range-cache disk use; it is not a process RSS limit.
+`--memory-budget SIZE` caps ratarmount's own RAM pools (decode-ahead, HTTP
+prefetch, FUSE readahead, codec chunk caches, SQLite caches) and degrades them
+to synchronous paths instead of failing reads; see
+[memory-budget.md](../memory-budget.md). It does not limit the kernel page
+cache; pair it with `--direct-io` for one-pass training reads. vLLM loads all
 weights into host/device memory at startup, even when the source mount fetches
 those bytes lazily.
 
