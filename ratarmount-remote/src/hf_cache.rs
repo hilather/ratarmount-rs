@@ -2115,13 +2115,17 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (cache, location, _, _) = fixture(dir.path(), "file", b"original", true);
         let snapshots = cache.repo_dir(&location).join("snapshots");
-        fs::write(
-            snapshots
-                .join(COMMIT)
-                .join(std::ffi::OsString::from_vec(vec![0xff])),
-            b"skip me",
-        )
-        .unwrap();
+        if cfg!(target_os = "macos") {
+            eprintln!("skip: macOS filesystems reject non-UTF-8 file names; HOME and short-commit checks still run");
+        } else {
+            fs::write(
+                snapshots
+                    .join(COMMIT)
+                    .join(std::ffi::OsString::from_vec(vec![0xff])),
+                b"skip me",
+            )
+            .unwrap();
+        }
         let mounted =
             HfCacheMountSource::with_cache("hf-cache://datasets/org/data@0123456", cache.clone())
                 .unwrap();

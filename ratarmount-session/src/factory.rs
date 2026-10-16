@@ -9225,7 +9225,8 @@ mod source_bind_tests {
             .any(|d| d.name.starts_with(".wh.")));
     }
 
-    /// Regression: synthetic HEAD rejected an image plus one bound repository.
+    /// Regression: synthetic HEAD rejected an image plus one bound repository;
+    /// macOS /var temp aliases must not trip the cache's no-follow protection.
     #[cfg(all(feature = "git", unix))]
     #[test]
     fn regression_source_bind_synthetic_head_appears_under_repo() {
@@ -9234,7 +9235,7 @@ mod source_bind_tests {
             let cache = tempfile::tempdir().unwrap();
             let output = std::process::Command::new(std::env::current_exe().unwrap())
                 .args(["factory::source_bind_tests::regression_source_bind_synthetic_head_appears_under_repo", "--exact", "--nocapture"])
-                .env(CHILD, "1").env("XDG_CACHE_HOME", cache.path())
+                .env(CHILD, "1").env("XDG_CACHE_HOME", cache.path().canonicalize().unwrap())
                 .env_remove("RATARMOUNT_FORCE_GIT").output().unwrap();
             assert!(
                 output.status.success(),

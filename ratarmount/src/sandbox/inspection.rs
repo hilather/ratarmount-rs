@@ -36,7 +36,22 @@ pub fn socket_path(attempt: &Attempt) -> PathBuf {
         .join("inspect.sock")
 }
 
+pub(super) fn validate_socket_path(path: &Path) -> io::Result<()> {
+    // SAFETY: all-zero sockaddr_un is valid; only the path array length is used.
+    let address: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    let limit = address.sun_path.len();
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= limit || bytes.contains(&0) {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, format!(
+            "Unix socket path must contain no NUL and be shorter than {limit} bytes (got {}): {}; choose a shorter --socket or --state-dir path",
+            bytes.len(), path.display()
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) fn start(path: &Path, overlay: &Arc<WriteOverlay>) -> io::Result<Inspector> {
+    validate_socket_path(path)?;
     let parent = fs::symlink_metadata(
         path.parent()
             .ok_or_else(|| io::Error::other("socket needs a parent"))?,

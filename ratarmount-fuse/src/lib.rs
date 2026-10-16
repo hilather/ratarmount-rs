@@ -56,6 +56,14 @@ fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
 /// Unmapped raw OS errors pass through, including `EMFILE` and `ENFILE`.
 /// Unknown kind-only errors map to `EIO`.
 fn io_to_errno(err: &std::io::Error) -> i32 {
+    // Rust does not classify both Darwin unsupported-operation errnos as Unsupported.
+    // A predicate also handles platforms where these constants are aliases.
+    if err
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP)
+    {
+        return ENOSYS;
+    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => libc::EROFS,
         ErrorKind::QuotaExceeded => libc::EDQUOT,
@@ -3574,7 +3582,7 @@ mod tests {
             bytes[512..1024]
         );
     }
-    /// Regression: adding policy errors must not change historical errno mapping.
+    /// Regression: policy errors and Darwin ENOTSUP must preserve historical errno mapping.
     #[test]
     fn regression_io_to_errno_preserves_legacy_raw_errors() {
         for (raw, expected) in [

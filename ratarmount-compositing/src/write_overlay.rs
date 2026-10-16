@@ -4875,7 +4875,10 @@ fn persist_provenance_plan(
 ) -> Result<IndexPatchWindow> {
     live_commit_is_supported(archive)?;
     let base = provenance_base(archive, encoding)?;
-    let mut pending = collect_ustar_pending_at(root, &plan.append_entries)?;
+    // Offline commits do not pass through WriteOverlay::new's canonical root.
+    // macOS /var (and other symlinked parents) must compare in the same form.
+    let root = root.canonicalize()?;
+    let mut pending = collect_ustar_pending_at(&root, &plan.append_entries)?;
     let mut spools = Vec::new();
     for path in plan.xattrs.keys() {
         if pending.iter().any(|p| &p.path == path) {
@@ -11875,6 +11878,65 @@ mod tests {
                 base.get_xattr(&fi, "user.teacher"),
                 Some(b"teacher".to_vec())
             );
+        }
+    }
+
+    /// Regression: offline manifest commits rejected overlays below symlinked parents (/var on macOS).
+    #[cfg(unix)]
+    #[test]
+    fn regression_provenance_manifest_symlinked_overlay_parent() {
+        for compressed in [false, true] {
+            for mode in [CommitMode::Copy, CommitMode::Append] {
+                for xattrs in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let real = dir.path().join("real");
+                    fs::create_dir(&real).unwrap();
+                    let alias = dir.path().join("alias");
+                    std::os::unix::fs::symlink(&real, &alias).unwrap();
+                    let archive = dir.path().join(if compressed {
+                        "base.tar.zst"
+                    } else {
+                        "base.tar"
+                    });
+                    append_fixture(&archive, compressed);
+                    let root = alias.join("ov");
+                    let ov = WriteOverlay::new(
+                        Arc::new(provenance_base(&archive, "utf-8").unwrap()),
+                        &root,
+                    )
+                    .unwrap();
+                    assert_eq!(ov.root, real.join("ov").canonicalize().unwrap());
+                    put_overlay_bytes(&ov, "/new", b"new payload");
+                    if xattrs {
+                        ov.set_xattr("/new", "user.teacher", b"teacher", 0).unwrap();
+                    }
+                    drop(ov);
+                    assert!(commit_overlay(
+                        &root,
+                        &archive,
+                        &CommitOverlayOptions {
+                            yes: true,
+                            mode,
+                            manifest_hashes: Some("new".into()),
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap());
+                    let base = provenance_base(&archive, "utf-8").unwrap();
+                    let fi = base.lookup("/new", 0).unwrap();
+                    assert_eq!(base.read(&fi, 100, 0).unwrap(), b"new payload");
+                    assert_eq!(
+                        base.get_xattr(&fi, "user.teacher"),
+                        xattrs.then(|| b"teacher".to_vec())
+                    );
+                    let manifest =
+                        fs::read_to_string(format!("{}.manifest.jsonl", archive.display()))
+                            .unwrap();
+                    assert!(manifest.contains(
+                        &ratarmount_index::sha256_hex_stream(&mut &b"new payload"[..]).unwrap()
+                    ));
+                }
+            }
         }
     }
 

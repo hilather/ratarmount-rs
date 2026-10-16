@@ -9,6 +9,14 @@ use ratarmount_compositing::{OverlayError, WriteOverlay};
 /// Password / permission failures must not collapse to generic EIO — that is
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_errno(err: &io::Error) -> i32 {
+    // Rust does not classify both Darwin unsupported-operation errnos as Unsupported.
+    // A predicate also handles platforms where these constants are aliases.
+    if err
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::ENOTSUP || raw == libc::EOPNOTSUPP)
+    {
+        return libc::ENOSYS;
+    }
     match err.kind() {
         ErrorKind::ReadOnlyFilesystem => libc::EROFS,
         ErrorKind::QuotaExceeded => libc::EDQUOT,
@@ -53,7 +61,7 @@ pub fn overlay_truncate(overlay: &WriteOverlay, path: &str, size: u64) -> io::Re
 
 #[cfg(test)]
 mod tests {
-    /// Regression: adding policy errors must not change historical errno mapping.
+    /// Regression: policy errors and Darwin ENOTSUP must preserve historical errno mapping.
     #[test]
     fn regression_io_to_errno_preserves_legacy_raw_errors() {
         for (raw, expected) in [
