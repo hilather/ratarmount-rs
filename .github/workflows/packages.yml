@@ -268,10 +268,10 @@ jobs:
                 return 0
               fi
               if (( attempt >= max )); then
-                echo "apt-get install failed after ${max} attempts" >&2
+                echo "package install failed after ${max} attempts" >&2
                 return 1
               fi
-              echo "apt-get install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
+              echo "package install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
               sleep $(( attempt * 3 ))
               attempt=$(( attempt + 1 ))
             done
@@ -292,17 +292,17 @@ jobs:
                 return 0
               fi
               if (( attempt >= max )); then
-                echo "apt-get install failed after ${max} attempts" >&2
+                echo "package install failed after ${max} attempts" >&2
                 return 1
               fi
-              echo "apt-get install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
+              echo "package install failed (attempt ${attempt}/${max}); refreshing indexes…" >&2
               sleep $(( attempt * 3 ))
               attempt=$(( attempt + 1 ))
             done
           }
           apt_get_install \
             build-essential pkg-config curl ca-certificates git \
-            libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
+            make perl libfuse3-dev fuse3 libarchive-dev zlib1g-dev libssl-dev
 
       - name: Install Rust
         run: |
@@ -327,7 +327,6 @@ jobs:
           TARBALL_ONLY: "1"
           DISTRO_LABEL: ${{ matrix.distro_label }}
           OUT_DIR: dist
-          OPENSSL_NO_VENDOR: "1"
         run: |
           export PATH="$HOME/.cargo/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin:$PATH"
           test -n "${VERSION:-}"
@@ -336,6 +335,9 @@ jobs:
           # Record glibc requirement for consumers
           ldd --version | head -1 | tee dist/glibc-version.txt || true
           file target/release/ratarmount | tee dist/file-info.txt || true
+
+      - name: Check portable binary shared-library dependencies
+        run: bash packaging/test-portable-deps.sh target/release/ratarmount
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
