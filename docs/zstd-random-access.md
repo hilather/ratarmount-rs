@@ -265,3 +265,99 @@ decoded/encoded suffix above 256 MiB.
 | [parity-todo.md](https://github.com/hilather/ratarmount-rs/blob/main/docs/parity-todo.md) | Codec parity checklist |
 | `ratarmount-compress/src/zstd_seek.rs` | Implementation + unit tests |
 | Upstream [#196](https://github.com/mxmlnkn/ratarmount/issues/196) | Multi-frame / chunked zstd examples |
+
+## Sequential decode-ahead
+
+Mapped multi-frame and seek-table readers can decode upcoming frames concurrently.
+The CLI defaults `--parallelization` to `min(available CPUs, 4)`; `-P 1` keeps
+serial decoding. Library openers and Session's default `ParallelizationSpec`
+remain at one thread. Explicit `0` still means all available CPUs.
+
+After 128 KiB of uninterrupted forward progress, each reader schedules upcoming
+frames on a shared process-wide pool. The pool grows to the largest requested
+thread count; readers queue at most `min(threads, 16)` frames. Results are consumed
+in frame order. A position-changing seek drops queued results immediately,
+without waiting for running decodes. A speculative error is retried synchronously
+when that frame is actually requested; later corrupt frames cannot fail an
+earlier read. Random reads retain the single-frame cache path.
+
+`--readahead BYTES` also sets the speculative decoded-byte budget for local zstd
+openers (64 MiB maximum). When omitted, zstd uses 16 MiB, independently of the
+FUSE read window. Explicit `--readahead 0` disables decode-ahead. Equal-size frames
+therefore occupy at most `min(threads, 16, budget / frame_size)` slots. A frame
+larger than the budget is decoded synchronously: the byte limit takes precedence
+over a minimum speculative slot. Variable-size frames reserve their individual
+uncompressed lengths before submission. Cancelled running jobs retain their
+reservation until they finish. The current synchronous frame, decoder working
+memory and FUSE's separate read window are additional memory costs; this is not
+a process-wide RSS limit. Input is streamed, without a full compressed-frame copy. Consumed frame buffers
+are handed back to workers for reuse when they fit the next reservation, avoiding
+per-frame allocation/zero-fill and cross-thread frees on the steady-state path.
+
+Path-backed reads use Linux `POSIX_FADV_SEQUENTIAL` during decode-ahead.
+Before dispatch, a bounded contiguous `POSIX_FADV_WILLNEED` hint queues backing
+reads in frame order, avoiding dependence on worker scheduling for disk readahead. With
+`--direct-io`, successfully decoded compressed ranges also receive
+`POSIX_FADV_DONTNEED`. Advice is best effort and may retain partial pages. Reader
+backends such as HTTP and nested archive streams have no local descriptor to
+advise. Single-frame full-decode fallback does not use this pool or these hints.
+The CLI's explicit byte budget and direct-I/O advice currently reach top-level
+local zstd openers; nested/remote zstd retains its thread setting and the library
+16 MiB window. No temporary spool is added by decode-ahead.
+
+Run `SIZE_MIB=256 THREADS=4 benchmarks/ai/zstd-decode-ahead.sh` for a smaller
+smoke run (default member size: 1 GiB). The CSV compares:
+
+- Session reads of the same member with 128 KiB buffers, at `-P 1` and `-P N`;
+- `zstd -d` of the entire TAR to `/dev/null` (its byte count includes TAR framing);
+- fresh FUSE mounts with direct I/O **off and on**, each at `-P 1` and `-P N`,
+  using both `cat` and `dd bs=1M` to distinguish caller request-size limits.
+
+Mount/index time is excluded. CPU percent is the daemon's CPU for FUSE, the
+Session process's CPU for library reads, and the zstd child's CPU for the CLI
+(100% = one CPU). `CACHE=cold` (default) advises eviction of only the compressed
+fixture before each run; `CACHE=warm` reads it into cache first. Eviction is
+best effort, and does not produce cold disk reads on tmpfs. Every FUSE row uses
+a new mount, so it never measures a hot FUSE member re-read. Use
+`WORK_DIR=$PWD/target/ai-perf-data` to keep the fixture/logs on the archive's
+filesystem and reuse them between runs. By default the scratch fixture lives below the workspace
+`target/` directory, avoiding the common tmpfs `/tmp` default. Check
+`findmnt -T "$WORK_DIR"` before drawing disk conclusions: a custom directory
+or workspace can still be RAM-backed.
+`NO_FUSE=1` runs the baselines without a mount; missing `/dev/fuse` also skips
+only FUSE. `SKIP_BUILD=1` reuses existing release binaries. `READAHEAD=1M`
+overrides the harness's 16 MiB FUSE/codec window. Missing `zstd` skips its CLI
+row with a message; Session still runs.
+
+At log level `-d 2`, each mapped reader emits `zstd-read-summary` on close:
+`prefetched` counts submitted frames, `ready` counts results available when
+requested, `waited` counts results that required waiting, and `synchronous`
+counts foreground decodes (including error retries). `reused` counts consumed
+buffers passed back to workers. `wait_ns` measures time
+blocked on worker results. A submitted frame may be cancelled without being
+consumed. `prefetched > 0` proves the decode-ahead path engaged; the counters do
+not infer it from the configured thread count. The benchmark excludes startup
+reader logs and includes these counters in its CSV. Library users can take a
+difference of `zstd_decode_stats()` after dropping their readers; these aggregate
+completed readers across the process, including any concurrent workloads.
+FUSE also logs actual request counts, the largest request, and request-handler
+wall time at unmount. Neither a larger request limit nor decode-ahead guarantees
+NVMe saturation: inspect ready/wait counters and compare the Session baseline
+before attributing a slow FUSE read to decompression.
+
+A local diagnostic run (2026-10-16, i7-8750H, Linux 7.2.5, Btrfs fixture,
+release build) used a 256 MiB member in 257 one-MiB-or-smaller frames, with
+128 KiB Session reads. Medians of 15 randomized serial/parallel pairs were:
+
+| Backing cache | `-P 1` MB/s / CPU% | `-P 4` MB/s / CPU% | Parallel ready / waited frames |
+|---|---:|---:|---:|
+| Warm | 4771 / 99.5 | 5946 / 324.3 | 254 / 2 |
+| Per-file eviction advice | 2422 / 74.5 | 2735 / 191.5 | 207 / 49 |
+
+Every parallel read submitted 256 frames, reused 251 consumed buffers, and
+decoded one frame synchronously. Warm worker wait time was a median 2.1 ms;
+after eviction advice it was 59.2 ms. These are library measurements, not FUSE
+or raw-NVMe measurements. Other builds were active on the host; earlier short
+samples sometimes favored serial. Neither these medians nor a ready-frame
+counter guarantees every parallel run will outperform serial. The host FUSE
+matrix remains necessary to measure the request-size change.

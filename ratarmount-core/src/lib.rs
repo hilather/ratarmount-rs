@@ -508,6 +508,10 @@ pub struct OpenOptions {
     pub gnu_incremental: Option<bool>,
     /// Decompression parallelization matrix (Python `-P backend:n` / integer default).
     pub parallelization: ParallelizationSpec,
+    /// Speculative decoded zstd bytes per reader; zero disables decode-ahead.
+    pub zstd_readahead_bytes: u64,
+    /// Drop consumed local archive pages where the backend supports advice.
+    pub direct_io: bool,
     /// Character encoding for TAR (and similar) member names (`-e` / `--encoding`).
     pub encoding: String,
     pub gzip_seek_point_spacing: u64,
@@ -549,6 +553,8 @@ impl Default for OpenOptions {
             ignore_zeros: false,
             gnu_incremental: None,
             parallelization: ParallelizationSpec::default(),
+            zstd_readahead_bytes: 16 * 1024 * 1024,
+            direct_io: false,
             encoding: "utf-8".into(),
             gzip_seek_point_spacing: 16 * 1024 * 1024,
             passwords: Vec::new(),
