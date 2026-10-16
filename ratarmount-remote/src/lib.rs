@@ -85,7 +85,9 @@ use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use http_pool::{HttpRangeSource, Prefetch};
+pub use http_pool::HttpRangeSource;
+use http_pool::Prefetch;
+pub use ratarmount_index::ContentToken;
 use secrecy::SecretString;
 
 use log::debug;
@@ -770,6 +772,9 @@ fn probe_range_size(source: &HttpRangeSource) -> Result<Option<HttpProbe>> {
     if status == 206 {
         // Prefer Content-Range total (Content-Length on 206 is only the partial length).
         let total = http_pool::validate_content_range(&resp, 0, 0, None)?;
+        if let Some(size) = total {
+            source.observe_identity(&resp, size);
+        }
         // Consume the probe body so the connection returns to the shared pool.
         let mut byte = [0];
         let mut reader = resp.into_reader();
@@ -1109,6 +1114,18 @@ impl HttpRangeFile {
             cookie: None,
         });
         Self::from_source(Arc::new(HttpRangeSource::new(loc, options)), size, None)
+    }
+
+    /// Attach an identity verified by a backend, such as a resolved Hub commit.
+    pub fn with_content_token(mut self, token: ContentToken) -> Self {
+        self.prefetch = None;
+        self.source.set_content_token(token);
+        self
+    }
+
+    /// A contiguous local file once every remote chunk has been cached.
+    pub fn complete_file(&self) -> Option<PathBuf> {
+        self.source.complete_file(self.size)
     }
 
     /// Origin URL, with userinfo removed.

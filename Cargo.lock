@@ -3560,6 +3560,7 @@ dependencies = [
  "md-5",
  "md4",
  "ratarmount-core",
+ "ratarmount-index",
  "secrecy",
  "serde_json",
  "sha1 0.10.7",

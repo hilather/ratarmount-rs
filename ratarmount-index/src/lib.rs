@@ -20,6 +20,7 @@ mod meta_cache;
 mod nested;
 mod patch;
 mod payload_cache;
+mod range_cache;
 mod search;
 
 pub use dirent_order::{cmp_offset_then_name, DirentOrder, VisibleMember};
@@ -56,6 +57,7 @@ pub use payload_cache::{
     PAYLOAD_CACHE_BYTES_ENV, PAYLOAD_CACHE_DIR_ENV, PAYLOAD_CACHE_MEMBER_MAX_DEFAULT,
     PAYLOAD_CACHE_MEMBER_MAX_ENV,
 };
+pub use range_cache::{ContentToken, RangeCache, RANGE_CACHE_CHUNK_DEFAULT};
 pub use search::{locate_pattern_matches, FindAfter, SearchHit, SearchQuery, DEFAULT_SEARCH_LIMIT};
 
 use std::collections::BTreeMap;

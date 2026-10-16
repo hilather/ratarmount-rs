@@ -64,13 +64,15 @@ up to the reader's configured maximum, as chunks are consumed. Each chunk is
 **4 MiB**, and results are delivered in byte order. Both running workers and
 completed, unconsumed chunks count against the process-wide cap, shared by all
 open files. Cancelled workers retain their slots until they exit. At capacity,
-new prefetch is skipped and the foreground reads directly into the caller's
-buffer, without another chunk allocation. Payload storage is reserved only
+new prefetch is skipped and the foreground reads on the calling thread.
+Uncached, unverified sources read directly into the caller's buffer; verified
+cache misses fetch an aligned chunk for reuse. Payload storage is reserved only
 after the first body bytes arrive. The payload cap excludes caller-owned
 buffers, transport buffers and thread stacks.
 
-A random read uses one request capped at 4 MiB; callers continue filling after
-a short read. Seeking to a different position or dropping the reader cancels
+A random read is capped at 4 MiB; callers continue filling after a short read.
+With a verified cache identity, misses fetch aligned 4 MiB chunks (a read
+straddling a boundary may need two requests). Seeking to a different position or dropping the reader cancels
 and detaches background work immediately, without waiting for network progress.
 Cancellation is checked while skipping an ignored-Range 200 prefix as well as
 while receiving chunk data. Background requests have a **60-second overall
@@ -79,7 +81,7 @@ origin refresh is a separate attempt with the same deadline. This deadline
 applies only to prefetch, so slow IPFS gateways and foreground/full downloads
 retain their existing timeout behavior. A failed prefetch is discarded, and
 the next read at that offset retries synchronously. This is an in-memory
-window, not a persistent range cache.
+window; the persistent disk cache below is shared with foreground reads.
 
 Rust callers can pass `HttpAuthOptions { bearer_token: Some(SecretString::new(token)) }`
 to `HttpRangeFile::open_with_auth`, `HttpRangeFile::range_backed_with_auth`, or
@@ -308,3 +310,64 @@ ratarmount -f ipfs://bafyhash/path.tar mnt/
 # RATARMOUNT_TEST_SSH_URL=ssh://user@host//path/a.tar ./test-harness/run-phase10-remote.sh
 # RATARMOUNT_TEST_OCI_URL=oci://ghcr.io/org/img:tag
 ```
+### Persistent remote range cache (AI-RC)
+
+HTTP range readers and their prefetch workers store verified bytes under
+`platform_cache_root()/range-v1/`. The root follows the same platform rules as
+`payload-v1/`: Linux XDG, macOS `~/Library/Caches/ratarmount/`, and Windows
+`%LOCALAPPDATA%/ratarmount/`. Put the cache on local NVMe/scratch by setting
+`XDG_CACHE_HOME` or choosing a dedicated parent with the override below.
+
+| Env | Behavior |
+|-----|----------|
+| `RATARMOUNT_PAYLOAD_CACHE_BYTES` | **Shared** disk body budget for `payload-v1/` and `range-v1/`, default **4 GiB**. **0** disables both reads and writes. Invalid/empty values use the default. Metadata sidecars remain under the separate `RATARMOUNT_META_CACHE_BYTES` cap. |
+| `RATARMOUNT_PAYLOAD_CACHE_DIR` | Existing exact payload directory override. Remote ranges use its **sibling `range-v1/`**; for example `/nvme/ratarmount/payload-v1` selects `/nvme/ratarmount/range-v1`. Use a dedicated parent directory. |
+| `RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX` | Whole decompressed member limit, default **64 MiB**; it does not limit remote file sizes or range chunks. |
+
+Chunks are aligned **4 MiB** windows, with a shorter final chunk. Keys include
+an immutable content token, file size, chunk size and chunk number. Plain HTTP
+uses a **strong ETag scoped to the origin resource URL plus size**, captured
+from HEAD or a validated ranged response. The URL alone, weak ETags and missing
+ETags never enable caching. A reopened reader still probes metadata (normally
+HEAD); once its token is known, rereading cached bytes issues **zero GETs**.
+A changed ETag selects new data. Responses with a changed ETag, invalid
+`Content-Range`, a short body or extra body bytes are rejected; ignored-Range
+200 responses and ranges without the expected ETag are never persisted.
+
+Backends with verified metadata can use
+`HttpRangeFile::with_content_token(ContentToken)` or
+`HttpRangeSource::with_content_token(ContentToken)`. Tokens support SHA-256,
+resolved Hub commit + endpoint/repo/path, strong ETag + resource/size, and
+object-store version/generation + resource/size. Supplying a token asserts that
+the backend has verified its binding to the remote bytes; revision names and
+untrusted URL parameters are insufficient. The Hub backend can attach a pinned
+commit/path or `X-Linked-Etag` SHA-256 without changing the HTTP reader.
+Object-store readers have a token API available; their own transports are not
+wired to this HTTP hook.
+
+`RangeCache::get` / `put` expose chunks. Once every chunk is present and the
+whole file fits the cap, chunks are assembled into one contiguous `.complete`
+file and removed, counting the stored bytes once. Single-chunk files are
+assembled immediately. SHA-256 tokens check the whole digest before publishing
+that completed file. `RangeCache::complete_file` and
+`HttpRangeFile::complete_file` return its path for passthrough/Hub-cache callers;
+open it promptly because later eviction may unlink it. Files larger than the
+cap retain only their recently used chunks and cannot become complete.
+
+LRU eviction spans both stores. In-process accounting uses an ordered LRU and
+reconciles disk changes at most once per **60 seconds**, on installation.
+There is no interprocess lock: concurrent processes can temporarily exceed the
+cap and have approximate cross-process recency until reconciliation. Range hits update
+in-process recency immediately and persist header timestamps at most once
+per five seconds to avoid an fsync for every small page read. Eviction
+unlinks immutable files; already open Unix readers keep their bytes. On
+platforms that refuse to unlink an open file, that eviction may fail and the
+cache remains best effort. The cap counts published body bytes; headers,
+active temporary files and transient completion copies use additional space.
+
+Directories are private (0700 on Unix). Cache roots/fanout directories and
+entries reject symlinks; Unix file opens also use `O_NOFOLLOW`. Data and headers
+use unique temporary files, sync, then atomic rename, as in payload-v1.
+Temporary files are ignored by readers and reclaimed after **one hour** during
+reconciliation; truncated chunks/completed files are misses. Cache hits are
+read on the calling thread and do not take HTTP prefetch worker permits.

@@ -259,11 +259,13 @@ Publish: `--publish-index` copies the sidecar next to the archive; `--publish-in
 
 ### G-3 — Content-addressed member cache — `partial`
 
-Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodies** by sha256 across mounts (`payload-v1/{hh}/{sha256}`). Nested Debian sources, OCI layers, and unioned backup tars share identical members. Default-on when `user.hash.sha256` exists; do not hash on cold `open`. Skip `:memory:` indexes, overlay writes, members > 64 MiB (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`), and `RATARMOUNT_PAYLOAD_CACHE_BYTES=0`. LRU cap default 4 GiB.
+Hash members (`--hashes sha256` on TAR/ZIP/7z). Cache decompressed **member bodies** by sha256 across mounts (`payload-v1/{hh}/{sha256}`). Nested Debian sources, OCI layers, and unioned backup tars share identical members. Default-on when `user.hash.sha256` exists; do not hash on cold `open`. Skip `:memory:` indexes, overlay writes, members > 64 MiB (`RATARMOUNT_PAYLOAD_CACHE_MEMBER_MAX`), and `RATARMOUNT_PAYLOAD_CACHE_BYTES=0`. LRU cap default 4 GiB, shared with the remote range cache (`range-v1/`); `=0` disables both.
 
 `payload-v1/` is a **sibling** of `local-index-v1/` under [`platform_cache_root()`](https://github.com/hilather/ratarmount-rs/blob/main/ratarmount-index/src/local_cache.rs) (macOS `~/Library/Caches/ratarmount/`, Linux XDG, Windows `%LOCALAPPDATA%\ratarmount\`). Distinct from V-3 (`$XDG_CACHE_HOME/ratarmount/meta-v3/`), which caches whole **sidecar downloads** (SQLite blobs ≤ 64 MiB) and is **not** migrated to Library/Caches.
 
-**Residual:** remote range/chunk caching (needed for lazy remote model loading); CDC / nydus-like chunking of members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`).
+**Remote ranges (AI-RC):** HTTP foreground/prefetch reads now cache aligned 4 MiB chunks under `range-v1/`, keyed by verified content tokens. A strong resource-scoped ETag plus size enables plain HTTP caching; backends can supply a pinned Hub commit/path or SHA-256. LRU eviction spans both body caches, with periodic reconciliation rather than a directory scan on every install. Completed files are stored contiguously for passthrough/Hub-cache consumers. See [remote cache configuration](../phase10-remote.md#persistent-remote-range-cache-ai-rc).
+
+**Residual:** CDC / nydus-like chunking of decompressed members larger than 64 MiB (would need a chunk table; do not put it in SQLite `files`); object-store transports need separate wiring to the shared range cache.
 
 ### G-4 — Snapshot browser — `partial` (restic done; borg / kopia / ZFS residual)
 

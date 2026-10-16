@@ -4,19 +4,19 @@
 //! [`platform_cache_root()`]`/payload-v1/{hh}/{sha256}` plus `{sha256}.hdr`.
 //! Never writes `meta-v3/` or nests under `local-index-v1/`.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use log::debug;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::range_cache::{ensure_private_dir, open_regular, temporary, timestamp, SharedBudget};
 use crate::HASH_STREAM_CHUNK;
 
-/// Env cap for the LRU directory. `0` disables writes. Default [`PAYLOAD_CACHE_BYTES_DEFAULT`].
+/// Shared payload-v1 + range-v1 byte cap. `0` disables both. Default [`PAYLOAD_CACHE_BYTES_DEFAULT`].
 pub const PAYLOAD_CACHE_BYTES_ENV: &str = "RATARMOUNT_PAYLOAD_CACHE_BYTES";
 
 /// Override directory (highest priority; skips platform / XDG roots).
@@ -44,17 +44,12 @@ pub struct PayloadCache {
     /// `None` disables lookup and store (`RATARMOUNT_PAYLOAD_CACHE_BYTES=0`).
     budget: Option<u64>,
     member_max: u64,
+    shared_budget: SharedBudget,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PayloadHeader {
     schema: String,
-    len: u64,
-    last_hit: u64,
-}
-
-struct CacheEntry {
-    key: String,
     len: u64,
     last_hit: u64,
 }
@@ -69,6 +64,7 @@ impl PayloadCache {
         }
         let budget = cache_budget()?;
         Some(Self {
+            shared_budget: SharedBudget::for_payload(&payload_v1_dir()),
             dir: payload_v1_dir(),
             budget: Some(budget),
             member_max: member_max_from_env(),
@@ -78,8 +74,9 @@ impl PayloadCache {
     /// Test/helper constructor. `budget = None` disables store.
     pub fn with_dir(dir: PathBuf, budget: Option<u64>, member_max: u64) -> Self {
         Self {
+            shared_budget: SharedBudget::for_payload(&dir),
             dir,
-            budget,
+            budget: budget.filter(|n| *n > 0),
             member_max,
         }
     }
@@ -109,7 +106,18 @@ impl PayloadCache {
             Ok(h) if h.schema == PAYLOAD_SCHEMA => h,
             _ => return None,
         };
-        let meta = match fs::metadata(&blob) {
+        if fs::symlink_metadata(&self.dir)
+            .ok()?
+            .file_type()
+            .is_symlink()
+            || fs::symlink_metadata(self.fanout_dir(&key))
+                .ok()?
+                .file_type()
+                .is_symlink()
+        {
+            return None;
+        }
+        let meta = match open_regular(&blob).and_then(|f| f.metadata()) {
             Ok(m) if m.is_file() => m,
             _ => return None,
         };
@@ -152,7 +160,6 @@ impl PayloadCache {
             }
         }
         self.ensure_fanout(&key)?;
-        self.evict_until(budget.saturating_sub(expected_len), Some(&key))?;
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
         let tmp = self
             .fanout_dir(&key)
@@ -175,7 +182,7 @@ impl PayloadCache {
         if let Ok(f) = File::open(&tmp) {
             let _ = f.sync_all();
         }
-        let now = unix_now();
+        let now = timestamp();
         let hdr = PayloadHeader {
             schema: PAYLOAD_SCHEMA.to_string(),
             len: expected_len,
@@ -192,6 +199,8 @@ impl PayloadCache {
             self.invalidate_key(&key);
             return Err(e);
         }
+        self.shared_budget
+            .install(&dest, expected_len, budget, &[])?;
         debug!(
             "payload-v1 store {key} -> {} ({expected_len} bytes)",
             dest.display()
@@ -226,48 +235,40 @@ impl PayloadCache {
         self.dir.join(&key[..2])
     }
 
-    fn ensure_dir(path: &Path) -> io::Result<()> {
-        fs::create_dir_all(path)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o700));
-        }
-        Ok(())
-    }
-
     fn ensure_fanout(&self, key: &str) -> io::Result<()> {
-        Self::ensure_dir(&self.dir)?;
-        Self::ensure_dir(&self.fanout_dir(key))
+        ensure_private_dir(&self.dir)?;
+        ensure_private_dir(&self.fanout_dir(key))
     }
 
     fn read_header(&self, key: &str) -> io::Result<PayloadHeader> {
-        let bytes = fs::read(self.hdr_path(key))?;
+        let mut bytes = Vec::new();
+        open_regular(&self.hdr_path(key))?
+            .take(8192)
+            .read_to_end(&mut bytes)?;
         serde_json::from_slice(&bytes).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
     fn write_header(&self, key: &str, hdr: &PayloadHeader) -> io::Result<()> {
         self.ensure_fanout(key)?;
-        let part = self.fanout_dir(key).join(format!("{key}.hdr.part"));
+        let mut part = temporary(&self.fanout_dir(key))?;
         let json =
             serde_json::to_vec(hdr).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        {
-            let mut f = File::create(&part)?;
-            f.write_all(&json)?;
-            f.sync_all()?;
-        }
-        fs::rename(part, self.hdr_path(key))?;
+        part.write_all(&json)?;
+        part.as_file().sync_all()?;
+        part.persist(self.hdr_path(key)).map_err(|e| e.error)?;
         Ok(())
     }
 
     fn touch(&self, key: &str, hdr: &PayloadHeader) {
         let mut next = hdr.clone();
-        next.last_hit = unix_now().max(hdr.last_hit.saturating_add(1));
+        next.last_hit = timestamp().max(hdr.last_hit.saturating_add(1));
+        self.shared_budget
+            .touch(&self.blob_path(key), hdr.len, next.last_hit);
         let _ = self.write_header(key, &next);
     }
 
     fn invalidate_key(&self, key: &str) {
-        let _ = fs::remove_file(self.blob_path(key));
+        self.shared_budget.remove(&self.blob_path(key));
         let _ = fs::remove_file(self.hdr_path(key));
         let fan = self.fanout_dir(key);
         if let Ok(iter) = fs::read_dir(&fan) {
@@ -279,82 +280,6 @@ impl PayloadCache {
                 }
             }
         }
-    }
-
-    fn evict_until(&self, max_used: u64, keep: Option<&str>) -> io::Result<()> {
-        let mut entries = self.list_entries()?;
-        let mut used: u64 = entries.iter().map(|e| e.len).sum();
-        if used <= max_used {
-            return Ok(());
-        }
-        entries.sort_by_key(|e| e.last_hit);
-        let mut remaining = entries.len();
-        for e in entries {
-            if used <= max_used {
-                break;
-            }
-            if keep == Some(e.key.as_str()) {
-                continue;
-            }
-            if remaining <= 1 {
-                break;
-            }
-            debug!(
-                "payload-v1 evict {} ({} bytes, last_hit {})",
-                e.key, e.len, e.last_hit
-            );
-            self.invalidate_key(&e.key);
-            used = used.saturating_sub(e.len);
-            remaining = remaining.saturating_sub(1);
-        }
-        Ok(())
-    }
-
-    fn list_entries(&self) -> io::Result<Vec<CacheEntry>> {
-        let mut out = Vec::new();
-        let iter = match fs::read_dir(&self.dir) {
-            Ok(i) => i,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(out),
-            Err(e) => return Err(e),
-        };
-        for fan in iter {
-            let fan = fan?;
-            let fan_name = fan.file_name();
-            let fan_name = match fan_name.to_str() {
-                Some(s) if is_fanout_name(s) => s,
-                _ => continue,
-            };
-            let _ = fan_name;
-            let sub = match fs::read_dir(fan.path()) {
-                Ok(s) => s,
-                Err(_) => continue,
-            };
-            for ent in sub {
-                let ent = ent?;
-                let name = ent.file_name();
-                let name = match name.to_str() {
-                    Some(s) => s,
-                    None => continue,
-                };
-                let Some(key) = normalize_sha256(name) else {
-                    continue;
-                };
-                let path = ent.path();
-                let len = match fs::metadata(&path) {
-                    Ok(m) if m.is_file() => m.len(),
-                    _ => continue,
-                };
-                if len == 0 {
-                    continue;
-                }
-                let last_hit = match self.read_header(&key) {
-                    Ok(h) if h.schema == PAYLOAD_SCHEMA => h.last_hit,
-                    _ => file_mtime_unix(&path),
-                };
-                out.push(CacheEntry { key, len, last_hit });
-            }
-        }
-        Ok(out)
     }
 }
 
@@ -390,7 +315,7 @@ pub fn is_payload_cache_path(path: &Path) -> bool {
 }
 
 fn copy_hash_to_tmp<R: Read>(tmp: &Path, reader: &mut R, expected_len: u64) -> io::Result<String> {
-    let mut f = File::create(tmp)?;
+    let mut f = OpenOptions::new().write(true).create_new(true).open(tmp)?;
     let mut hasher = Sha256::new();
     let mut buf = [0u8; HASH_STREAM_CHUNK];
     let mut written = 0u64;
@@ -427,27 +352,7 @@ fn normalize_sha256(s: &str) -> Option<String> {
     }
 }
 
-fn is_fanout_name(name: &str) -> bool {
-    name.len() == 2 && name.bytes().all(|b| b.is_ascii_hexdigit())
-}
-
-fn unix_now() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-fn file_mtime_unix(path: &Path) -> u64 {
-    fs::metadata(path)
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-fn cache_budget() -> Option<u64> {
+pub(crate) fn cache_budget() -> Option<u64> {
     match std::env::var(PAYLOAD_CACHE_BYTES_ENV) {
         Ok(s) => {
             let s = s.trim();
@@ -506,6 +411,9 @@ mod tests {
         let mut hdr: PayloadHeader =
             serde_json::from_slice(&fs::read(cache.hdr_path(sha)).unwrap()).unwrap();
         hdr.last_hit = ts;
+        cache
+            .shared_budget
+            .touch(&cache.blob_path(sha), hdr.len, ts);
         fs::write(cache.hdr_path(sha), serde_json::to_vec(&hdr).unwrap()).unwrap();
     }
 
