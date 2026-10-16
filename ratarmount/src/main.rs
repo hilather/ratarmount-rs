@@ -41,6 +41,7 @@ mod overlay_commit;
 mod overlay_stats;
 mod publish_index;
 mod shard;
+mod snapshot;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -62,7 +63,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
                   Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE).\n\
                   Patch: ratarmount diff --base SOURCE OVERLAY [--git] (no FUSE).\n\
-                  Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv."
+                  Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv.\n\
+                  Snapshots: ratarmount snapshot add DIR --repo REPO [--init]; ratarmount snapshot list --repo REPO."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -554,6 +556,9 @@ struct Args {
     shard: Option<shard::ShardArgs>,
 
     #[arg(skip)]
+    snapshot: Option<snapshot::SnapshotArgs>,
+
+    #[arg(skip)]
     export_index: Option<export_index::ExportArgs>,
 
     /// Find-argv `--fts` (FTS5 MATCH). Not a global mount flag.
@@ -589,6 +594,15 @@ where
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    if raw.get(1).is_some_and(|s| s == "snapshot") {
+        let snapshot = snapshot::SnapshotArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount snapshot"))
+                .chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.snapshot = Some(snapshot);
+        return Ok(args);
+    }
     if raw.get(1).is_some_and(|s| s == "diff") {
         let diff = diff::DiffArgs::try_parse_from(
             std::iter::once(OsString::from("ratarmount diff")).chain(raw.iter().skip(2).cloned()),
@@ -871,6 +885,15 @@ fn main() {
     neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
 
+    if let Some(snapshot) = &args.snapshot {
+        match snapshot::run(snapshot, &mut std::io::stdout().lock()) {
+            Ok(code) => std::process::exit(code),
+            Err(error) => {
+                eprintln!("snapshot: {error}");
+                std::process::exit(1);
+            }
+        }
+    }
     if let Some(diff) = &args.diff {
         std::process::exit(diff::run(diff));
     }
