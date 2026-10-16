@@ -1,6 +1,7 @@
 //! Core types and the `MountSource` trait (mirrors Python `ratarmountcore.mountsource`).
 
 mod attribute_mapping;
+pub mod budget;
 mod quiet_print;
 pub use attribute_mapping::AttributeMapping;
 

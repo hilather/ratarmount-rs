@@ -1076,7 +1076,9 @@ pub struct HttpRangeFile {
     size: u64,
     pos: u64,
     /// Optional fully buffered body if ranges unavailable.
-    buffered: Option<Arc<[u8]>>,
+    buffered: Option<Arc<Vec<u8>>>,
+    memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+    disk: Option<Arc<std::sync::Mutex<std::fs::File>>>,
     last_read_end: Option<u64>,
     sequential_bytes: u64,
     last_read_size: usize,
@@ -1120,21 +1122,39 @@ impl HttpRangeFile {
         if !(200..300).contains(&resp.status()) {
             return Err(http_status_err(resp.status(), source.url()));
         }
+        if ratarmount_core::budget::MemoryBudget::global().enabled() {
+            let _pool = ratarmount_core::budget::MemoryPool::global(
+                "http-fallback",
+                64 * 1024 * 1024,
+                ratarmount_core::budget::Priority::Cache,
+            );
+            let mut file = tempfile::tempfile()?;
+            let size = io::copy(&mut resp.into_reader(), &mut file)?;
+            let mut reader = Self::from_source(source, size, None);
+            reader.disk = Some(Arc::new(std::sync::Mutex::new(file)));
+            return Ok(reader);
+        }
         let mut buf = Vec::new();
         resp.into_reader().read_to_end(&mut buf)?;
         Ok(Self::from_source(
             source,
             buf.len() as u64,
-            Some(buf.into()),
+            Some(Arc::new(buf)),
         ))
     }
 
-    fn from_source(source: Arc<HttpRangeSource>, size: u64, buffered: Option<Arc<[u8]>>) -> Self {
+    fn from_source(
+        source: Arc<HttpRangeSource>,
+        size: u64,
+        buffered: Option<Arc<Vec<u8>>>,
+    ) -> Self {
         Self {
             source,
             size,
             pos: 0,
             buffered,
+            memory: None,
+            disk: None,
             last_read_end: None,
             sequential_bytes: 0,
             last_read_size: 0,
@@ -1195,7 +1215,7 @@ impl HttpRangeFile {
 
     /// True when reads issue live Range GETs (not a fully buffered body).
     pub fn uses_ranges(&self) -> bool {
-        self.buffered.is_none()
+        self.buffered.is_none() && self.disk.is_none()
     }
 }
 
@@ -1331,7 +1351,13 @@ impl Read for HttpRangeFile {
         if self.pos >= self.size || buf.is_empty() {
             return Ok(0);
         }
-        let n = if let Some(data) = &self.buffered {
+        let n = if let Some(file) = &self.disk {
+            let mut file = file
+                .lock()
+                .map_err(|_| io::Error::other("HF spool mutex poisoned"))?;
+            file.seek(SeekFrom::Start(self.pos))?;
+            file.read(buf)?
+        } else if let Some(data) = &self.buffered {
             let start = self.pos as usize;
             let n = buf.len().min(data.len() - start);
             buf[..n].copy_from_slice(&data[start..start + n]);
@@ -1420,6 +1446,30 @@ pub fn materialize_input(input: &str) -> Result<RemoteLocal> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_http_ignored_range_spills() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        http_range_file_fallback_buffer();
+        let snapshot = ratarmount_core::budget::MemoryBudget::global().snapshot();
+        assert_eq!(snapshot.reserved, 0);
+        assert!(snapshot
+            .pools
+            .iter()
+            .any(|pool| pool.name == "http-fallback"));
+    }
     use super::*;
     use std::io::{BufRead, BufReader};
     use std::net::TcpListener;

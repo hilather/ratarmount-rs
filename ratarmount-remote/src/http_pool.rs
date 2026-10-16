@@ -780,6 +780,8 @@ fn prefetch_budget() -> Arc<PrefetchBudget> {
 struct FetchedChunk {
     data: Vec<u8>,
     _permit: PrefetchPermit,
+    _memory: ratarmount_core::budget::Reservation,
+    _pressure: Option<ratarmount_core::budget::PressureHook>,
 }
 
 struct PendingRange {
@@ -842,9 +844,25 @@ impl Prefetch {
                 self.next = end + 1;
                 continue;
             }
+            let pool = ratarmount_core::budget::MemoryPool::global(
+                "http-prefetch",
+                256 * 1024 * 1024,
+                ratarmount_core::budget::Priority::Speculative,
+            );
+            let Some(memory) = pool.reserve(end - start + 1) else {
+                break;
+            };
             let Some(permit) = self.budget.try_acquire() else {
                 break;
             };
+            let weak = Arc::downgrade(&self.cancelled);
+            let pressure = pool.enabled().then(|| {
+                pool.on_pressure(move || {
+                    if let Some(cancelled) = weak.upgrade() {
+                        cancelled.store(true, Ordering::Release);
+                    }
+                })
+            });
             let source = Arc::clone(&self.source);
             let size = self.size;
             let cancelled = Arc::clone(&self.cancelled);
@@ -855,6 +873,8 @@ impl Prefetch {
                     Ok(FetchedChunk {
                         data,
                         _permit: permit,
+                        _memory: memory,
+                        _pressure: pressure,
                     })
                 })?;
             self.pending.push_back(PendingRange {
@@ -870,6 +890,10 @@ impl Prefetch {
     // None means capacity is occupied elsewhere; the caller can read synchronously.
     pub(crate) fn read(&mut self, pos: u64, buf: &mut [u8]) -> io::Result<Option<usize>> {
         self.position = pos;
+        if self.cancelled.load(Ordering::Acquire) {
+            self.pending.clear();
+            return Ok(None);
+        }
         if self.pending.front().is_none_or(|range| pos < range.start) {
             if let Some(n) = self.source.read_cached_into(pos, self.size, buf) {
                 self.position = pos + n as u64;
@@ -894,11 +918,13 @@ impl Prefetch {
         }
         if let Some(worker) = front.worker.take() {
             // Move the original io::Error out, preserving its source and raw errno.
-            front.data = Some(
-                worker
-                    .join()
-                    .map_err(|_| io::Error::other("HTTP range worker panicked"))??,
-            );
+            let result = worker
+                .join()
+                .map_err(|_| io::Error::other("HTTP range worker panicked"))?;
+            if self.cancelled.load(Ordering::Acquire) {
+                return Ok(None);
+            }
+            front.data = Some(result?);
         }
         let data = &front.data.as_ref().unwrap().data;
         let offset = (pos - front.start) as usize;

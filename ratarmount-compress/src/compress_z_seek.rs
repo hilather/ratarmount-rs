@@ -40,7 +40,7 @@ pub fn open_seekable_compress_z_with_threads(
     }
     let plain = lzw_z::decompress_slice(&raw).map_err(|e| CompressError::Msg(e.to_string()))?;
     if plain.len() as u64 <= DEFAULT_MEMORY_CAP {
-        Ok(DecodedBody::from_bytes(path, "compress-z", plain) as Arc<dyn SeekableBody>)
+        Ok(DecodedBody::from_bytes(path, "compress-z", plain)? as Arc<dyn SeekableBody>)
     } else {
         // Spill large bodies via from_decoder path.
         let cursor = std::io::Cursor::new(plain);

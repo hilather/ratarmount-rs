@@ -1461,7 +1461,10 @@ pub struct Lzma2RandomAccessDecoder {
     chunk_size: usize,
     max_cached_chunks: usize,
     /// Window index → decoded unpacked bytes for that window.
-    window_cache: HashMap<usize, Vec<u8>>,
+    window_cache: Arc<std::sync::Mutex<HashMap<usize, Vec<u8>>>>,
+    memory: Arc<std::sync::Mutex<Option<ratarmount_core::budget::Reservation>>>,
+    _memory_hook: Option<ratarmount_core::budget::PressureHook>,
+    memory_pool: ratarmount_core::budget::MemoryPool,
     /// LRU order: oldest window index at the front.
     window_lru: Vec<usize>,
     live: Option<LiveLzma2Cursor>,
@@ -1539,6 +1542,25 @@ impl Lzma2RandomAccessDecoder {
         let chunks = index_lzma2_chunks_from_pack(pack.as_ref())?;
         let unpack_size = folder.get_unpack_size();
         let allow_independent_resume = !content.iter().any(coder_is_bcj_or_delta);
+        let memory_pool = ratarmount_core::budget::MemoryPool::global(
+            "sevenzip-chunks",
+            (DEFAULT_CHUNK_SIZE * DEFAULT_MAX_CACHED_CHUNKS) as u64,
+            ratarmount_core::budget::Priority::Cache,
+        );
+        let window_cache = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let memory = Arc::new(std::sync::Mutex::new(None));
+        let weak_cache = Arc::downgrade(&window_cache);
+        let weak_memory = Arc::downgrade(&memory);
+        let memory_hook = memory_pool.enabled().then(|| {
+            memory_pool.on_pressure(move || {
+                if let (Some(cache), Some(memory)) = (weak_cache.upgrade(), weak_memory.upgrade()) {
+                    if let (Ok(mut cache), Ok(mut memory)) = (cache.try_lock(), memory.try_lock()) {
+                        cache.clear();
+                        memory.take();
+                    }
+                }
+            })
+        });
         Ok(Self {
             pack,
             coders: content.to_vec(),
@@ -1551,7 +1573,10 @@ impl Lzma2RandomAccessDecoder {
             cache_full: unpack_size <= SMALL_FOLDER_FULL_CACHE,
             chunk_size: chunk_size.max(4096),
             max_cached_chunks: max_cached_chunks.max(1),
-            window_cache: HashMap::new(),
+            window_cache,
+            memory,
+            _memory_hook: memory_hook,
+            memory_pool,
             window_lru: Vec::new(),
             live: None,
             prefix_from_zero: Vec::new(),
@@ -1568,7 +1593,7 @@ impl Lzma2RandomAccessDecoder {
     /// After a header-at-end decode that walks from unpacked 0, the next earlier
     /// member read hits this prefix instead of restarting the decompressor.
     pub fn set_retain_from_zero(&mut self, retain: bool) {
-        self.retain_from_zero = retain;
+        self.retain_from_zero = retain && !self.memory_pool.enabled();
     }
 
     #[allow(dead_code)] // shipped decode-pass counters (tests + diagnostics)
@@ -1862,7 +1887,7 @@ impl Lzma2RandomAccessDecoder {
         self.window_lru.push(index);
         while self.window_lru.len() > self.max_cached_chunks {
             let old = self.window_lru.remove(0);
-            self.window_cache.remove(&old);
+            self.window_cache.lock().unwrap().remove(&old);
         }
     }
 
@@ -1870,33 +1895,43 @@ impl Lzma2RandomAccessDecoder {
         if data.is_empty() {
             return;
         }
-        self.window_cache.insert(index, data);
+        {
+            let mut cache = self.window_cache.lock().unwrap();
+            if self.memory_pool.enabled() && self.memory.lock().unwrap().is_none() {
+                return;
+            }
+            if !cache.contains_key(&index) && cache.len() >= self.max_cached_chunks {
+                if let Some(old) = self.window_lru.first() {
+                    cache.remove(old);
+                }
+            }
+            cache.insert(index, data);
+        }
         self.touch_window(index);
     }
 
     fn assemble_from_windows(&mut self, start: usize, end: usize) -> Result<Vec<u8>> {
+        let cache = self.window_cache.lock().unwrap();
         let mut out = Vec::with_capacity(end.saturating_sub(start));
         let mut offset = start;
         while offset < end {
             let index = offset / self.chunk_size;
-            if !self.window_cache.contains_key(&index) {
-                return Err(SevenZipError::Msg(format!(
-                    "LZMA2 window {index} missing after ensure (offset={offset})"
-                )));
-            }
-            self.touch_window(index);
-            let win = self.window_cache.get(&index).unwrap();
-            let chunk_start = index * self.chunk_size;
-            let local = offset - chunk_start;
+            let Some(win) = cache.get(&index) else {
+                // Pressure can reclaim windows between ensure and assembly.
+                drop(cache);
+                return self.live_decode_span(start, end);
+            };
+            let local = offset - index * self.chunk_size;
             if local >= win.len() {
-                return Err(SevenZipError::Msg(format!(
-                    "Invalid window slice at {index}: local={local} len={}",
-                    win.len()
-                )));
+                return Err(SevenZipError::Msg("Invalid cached window slice".into()));
             }
             let take = (end - offset).min(win.len() - local);
             out.extend_from_slice(&win[local..local + take]);
             offset += take;
+        }
+        drop(cache);
+        for index in start / self.chunk_size..=(end - 1) / self.chunk_size {
+            self.touch_window(index);
         }
         Ok(out)
     }
@@ -1908,14 +1943,14 @@ impl Lzma2RandomAccessDecoder {
         }
         let first = start / self.chunk_size;
         let last = (end - 1) / self.chunk_size;
-        if (first..=last).all(|i| self.window_cache.contains_key(&i)) {
+        if (first..=last).all(|i| self.window_cache.lock().unwrap().contains_key(&i)) {
             for i in first..=last {
                 self.touch_window(i);
             }
             return Ok(());
         }
         let need_from = (first..=last)
-            .find(|i| !self.window_cache.contains_key(i))
+            .find(|i| !self.window_cache.lock().unwrap().contains_key(i))
             .map(|i| i * self.chunk_size)
             .unwrap_or(start)
             .min(start);
@@ -1927,13 +1962,11 @@ impl Lzma2RandomAccessDecoder {
             if win_start >= self.unpack_size as usize {
                 break;
             }
-            if !self.window_cache.contains_key(&i) && win_start >= need_from {
+            if !self.window_cache.lock().unwrap().contains_key(&i) && win_start >= need_from {
                 let off = win_start - need_from;
                 let win_end = (win_start + self.chunk_size).min(need_from + span.len());
                 if off < span.len() && win_end > win_start {
-                    self.window_cache
-                        .insert(i, span[off..off + (win_end - win_start)].to_vec());
-                    self.touch_window(i);
+                    self.store_window(i, span[off..off + (win_end - win_start)].to_vec());
                 }
             }
         }
@@ -1952,7 +1985,7 @@ impl Lzma2RandomAccessDecoder {
             if win_start >= span_start && win_end <= span_end && win_end > win_start {
                 let off = win_start - span_start;
                 let slice = &data[off..off + (win_end - win_start)];
-                if !self.window_cache.contains_key(&i) {
+                if !self.window_cache.lock().unwrap().contains_key(&i) {
                     self.store_window(i, slice.to_vec());
                 } else {
                     self.touch_window(i);
@@ -1969,6 +2002,22 @@ impl Lzma2RandomAccessDecoder {
             .saturating_add(length)
             .min(self.unpack_size as usize);
         let s = start as usize;
+
+        if self.memory_pool.enabled() {
+            self.cache_full = false;
+            self.retain_from_zero = false;
+            if self.memory.lock().unwrap().is_none() {
+                self.max_cached_chunks = self
+                    .max_cached_chunks
+                    .min((self.memory_pool.cap() / self.chunk_size as u64) as usize);
+                let bytes = (self.max_cached_chunks * self.chunk_size) as u64;
+                let memory = self.memory_pool.reserve(bytes);
+                *self.memory.lock().unwrap() = memory;
+            }
+            if self.memory.lock().unwrap().is_none() || self.max_cached_chunks == 0 {
+                return self.live_decode_span(s, end);
+            }
+        }
 
         // Prefer full cache when already populated or folder is small.
         if self.full.is_some() || self.cache_full {
@@ -1997,7 +2046,7 @@ impl Lzma2RandomAccessDecoder {
             return Ok(span[..take].to_vec());
         }
         self.ensure_windows(s, end)?;
-        if (first..=last).all(|i| self.window_cache.contains_key(&i)) {
+        if (first..=last).all(|i| self.window_cache.lock().unwrap().contains_key(&i)) {
             return self.assemble_from_windows(s, end);
         }
         // Partial windows (unaligned first read): decode the exact range.
@@ -2010,7 +2059,7 @@ impl Lzma2RandomAccessDecoder {
 
     #[allow(dead_code)] // used by unit tests / diagnostics
     pub fn cached_window_count(&self) -> usize {
-        self.window_cache.len()
+        self.window_cache.lock().unwrap().len()
     }
 
     #[allow(dead_code)]
@@ -2244,6 +2293,84 @@ mod hex {
 
 #[cfg(test)]
 mod lzma2_random_tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_sevenzip_pressure_reclaims_windows() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(131072).unwrap();
+
+        let bytes = vec![73; 32768];
+        let mut packed = vec![1, 0x7f, 0xff];
+        packed.extend_from_slice(&bytes);
+        packed.push(0);
+        let folder = lzma2_folder(bytes.len() as u64, Some(vec![0]));
+        let mut decoder =
+            Lzma2RandomAccessDecoder::with_chunk_size(&folder, packed, 4096, 4).unwrap();
+        assert_eq!(decoder.read_range(0, 512).unwrap(), bytes[..512]);
+        assert!(decoder.cached_window_count() > 0);
+        let held = decoder.memory_pool.reserve(16384).unwrap();
+        assert_eq!(decoder.cached_window_count(), 0);
+        assert_eq!(decoder.read_range(4096, 512).unwrap(), bytes[4096..4608]);
+        drop(held);
+        assert_eq!(decoder.read_range(0, 512).unwrap(), bytes[..512]);
+        assert!(decoder.cached_window_count() > 0);
+        assert!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .high_water
+                <= 16384
+        );
+    }
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_sevenzip_degrades() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        // A raw LZMA2 uncompressed chunk (no external compressor required).
+        let bytes = vec![61; 8192];
+        let mut packed = vec![1, 0x1f, 0xff];
+        packed.extend_from_slice(&bytes);
+        packed.push(0);
+        let folder = lzma2_folder(bytes.len() as u64, Some(vec![0]));
+        let mut decoder = Lzma2RandomAccessDecoder::new(&folder, packed, 64).unwrap();
+        decoder.set_retain_from_zero(true);
+        for offset in [0, 4096, 512, 7000] {
+            assert_eq!(
+                decoder.read_range(offset, 512).unwrap(),
+                bytes[offset as usize..offset as usize + 512]
+            );
+        }
+        assert_eq!(decoder.cached_window_count(), 0);
+        assert!(decoder.full.is_none());
+        assert!(decoder.prefix_from_zero.is_empty());
+        assert!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .high_water
+                <= 64
+        );
+    }
     use super::*;
     use crate::parse::{Coder, Folder, METHOD_AES, METHOD_BCJ, METHOD_BCJ2, METHOD_LZMA2};
     use std::io::{Read, Seek};

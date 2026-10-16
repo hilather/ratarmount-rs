@@ -38,7 +38,7 @@ pub fn open_seekable_lzma_with_threads(
     lzma_rs::lzma_decompress(&mut input, &mut output)
         .map_err(|e| CompressError::Msg(format!("failed to decompress .lzma: {e}")))?;
     if output.len() as u64 <= DEFAULT_MEMORY_CAP {
-        Ok(DecodedBody::from_bytes(path, "lzma", output) as Arc<dyn SeekableBody>)
+        Ok(DecodedBody::from_bytes(path, "lzma", output)? as Arc<dyn SeekableBody>)
     } else {
         let body = DecodedBody::from_decoder(
             path,

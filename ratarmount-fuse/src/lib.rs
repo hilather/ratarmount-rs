@@ -144,13 +144,14 @@ pub fn clamp_readahead(bytes: u64) -> u64 {
 }
 
 /// Per-open window of decoded/source bytes retained for sequential FUSE reads.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 struct ReadAheadWindow {
     /// Absolute file offset of `data[0]`.
     start: u64,
     data: Vec<u8>,
     /// Last fill was short ⇒ true EOF at `start + data.len()`.
     hit_eof: bool,
+    _memory: Option<ratarmount_core::budget::Reservation>,
 }
 
 impl ReadAheadWindow {
@@ -204,9 +205,10 @@ impl ReadAheadWindow {
 /// request size so scattered I/O does not storm the decompressor with
 /// multi‑MiB fills. Sequential continuation after a fill skips a redundant
 /// `Seek` when the underlying cursor is already at the requested offset.
-#[derive(Clone, Debug, Default)]
+#[derive(Default)]
 struct ReadaheadState {
-    window: Option<ReadAheadWindow>,
+    window: Arc<Mutex<Option<ReadAheadWindow>>>,
+    memory_hook: Option<ratarmount_core::budget::PressureHook>,
     /// Known absolute position of the underlying reader after last seek/fill.
     cursor: Option<u64>,
     /// End offset of the last FUSE response (`offset + returned len`).
@@ -215,21 +217,21 @@ struct ReadaheadState {
 
 impl ReadaheadState {
     fn clear(&mut self) {
-        self.window = None;
+        *self.window.lock().unwrap() = None;
         self.cursor = None;
         self.last_end = None;
     }
 
     /// True when a miss should pull a full readahead window (not exact size).
     fn is_sequential_miss(&self, offset: u64) -> bool {
-        if self.window.is_none() && self.last_end.is_none() {
+        if self.window.lock().unwrap().is_none() && self.last_end.is_none() {
             // First fill on this open: prime a large window (typical `cat`).
             return true;
         }
         if self.last_end == Some(offset) {
             return true;
         }
-        if let Some(w) = self.window.as_ref() {
+        if let Some(w) = self.window.lock().unwrap().as_ref() {
             if offset == w.end_offset() {
                 return true;
             }
@@ -264,7 +266,8 @@ fn readahead_fill(
         return Ok(Vec::new());
     }
 
-    if let Some(w) = state.window.as_ref() {
+    let window = state.window.lock().unwrap();
+    if let Some(w) = window.as_ref() {
         if let Some(out) = w.try_serve(offset, size) {
             state.last_end = Some(offset.saturating_add(out.len() as u64));
             return Ok(out);
@@ -276,6 +279,7 @@ fn readahead_fill(
         if state.last_end == Some(offset) && offset >= w.start && offset < end {
             let mut out = w.data[(offset - w.start) as usize..].to_vec();
             state.last_end = Some(end);
+            drop(window);
             out.extend(readahead_fill(
                 reader,
                 state,
@@ -287,6 +291,7 @@ fn readahead_fill(
         }
     }
 
+    drop(window);
     let sequential = state.is_sequential_miss(offset);
     let want = if sequential {
         size.max(readahead_bytes)
@@ -302,6 +307,27 @@ fn readahead_fill(
         state.cursor = Some(offset);
     }
 
+    let pool = ratarmount_core::budget::MemoryPool::global(
+        "fuse-readahead",
+        MAX_READAHEAD_BYTES,
+        ratarmount_core::budget::Priority::Speculative,
+    );
+    if pool.enabled() {
+        *state.window.lock().unwrap() = None;
+    }
+    if pool.enabled() && state.memory_hook.is_none() {
+        let weak = Arc::downgrade(&state.window);
+        state.memory_hook = Some(pool.on_pressure(move || {
+            if let Some(window) = weak.upgrade() {
+                if let Ok(mut window) = window.try_lock() {
+                    *window = None;
+                }
+            }
+        }));
+    }
+    let Some(memory) = pool.reserve(want as u64) else {
+        return readahead_fill(reader, state, 0, offset, size);
+    };
     let mut data = vec![0u8; want];
     let n = fill_read_for_fuse(reader, &mut data)?;
     data.truncate(n);
@@ -310,7 +336,8 @@ fn readahead_fill(
     let out_len = n.min(size);
     let out = data[..out_len].to_vec();
     state.last_end = Some(offset.saturating_add(out_len as u64));
-    state.window = Some(ReadAheadWindow {
+    *state.window.lock().unwrap() = Some(ReadAheadWindow {
+        _memory: Some(memory),
         start: offset,
         data,
         hit_eof,
@@ -3497,6 +3524,56 @@ fn _pb() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_readahead_degrades() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(32768).unwrap();
+
+        let bytes = vec![37; 8192];
+        let mut reader = std::io::Cursor::new(bytes.clone());
+        let mut state = ReadaheadState::default();
+        for offset in (0..8192).step_by(512) {
+            assert_eq!(
+                readahead_fill(&mut reader, &mut state, 8192, offset as u64, 512).unwrap(),
+                bytes[offset..offset + 512]
+            );
+            assert!(state.window.lock().unwrap().is_none());
+        }
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+        assert_eq!(
+            readahead_fill(&mut reader, &mut state, 2048, 0, 512).unwrap(),
+            bytes[..512]
+        );
+        assert!(state.window.lock().unwrap().is_some());
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "fuse-readahead",
+            MAX_READAHEAD_BYTES,
+            ratarmount_core::budget::Priority::Speculative,
+        );
+        let held = pool.reserve(4096).unwrap();
+        assert!(state.window.lock().unwrap().is_none());
+        drop(held);
+        assert_eq!(
+            readahead_fill(&mut reader, &mut state, 2048, 512, 512).unwrap(),
+            bytes[512..1024]
+        );
+    }
     /// Regression: adding policy errors must not change historical errno mapping.
     #[test]
     fn regression_io_to_errno_preserves_legacy_raw_errors() {
@@ -5448,7 +5525,7 @@ mod tests {
         let got = readahead_fill(&mut spy, &mut state, 0, 100, 64).expect("read");
         assert_eq!(got, payload[100..164]);
         assert!(
-            state.window.is_none(),
+            state.window.lock().unwrap().is_none(),
             "readahead 0 must not retain a window"
         );
         assert_eq!(spy.pos, 164);
@@ -5493,7 +5570,7 @@ mod tests {
         let mut spy = SpyReader::new(payload.clone());
         let mut state = ReadaheadState::default();
         let _ = readahead_fill(&mut spy, &mut state, 1000, 0, 100).expect("prime");
-        assert!(!state.window.as_ref().unwrap().hit_eof);
+        assert!(!state.window.lock().unwrap().as_ref().unwrap().hit_eof);
         let seeks = spy.seeks;
         let got = readahead_fill(&mut spy, &mut state, 1000, 900, 200).expect("straddle");
         assert_eq!(got, payload[900..1100]);

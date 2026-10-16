@@ -337,6 +337,10 @@ struct Args {
     #[arg(long = "readahead", default_value = "0", value_name = "BYTES")]
     readahead: String,
 
+    /// Process-wide optional buffer/cache budget (e.g. 512M); excludes kernel pages.
+    #[arg(long, value_name = "SIZE", value_parser = parse_byte_size)]
+    memory_budget: Option<u64>,
+
     /// Bypass FUSE's page cache for source members; overlay files keep normal caching.
     /// Disables passthrough and advises eviction of consumed local zstd/TAR pages.
     #[arg(long)]
@@ -1085,6 +1089,11 @@ fn main() {
     // mount exists, so point dead stdio at /dev/null first.
     neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+
+    if let Some(limit) = args.memory_budget {
+        ratarmount_core::budget::MemoryBudget::install(limit)
+            .expect("budget initialized before sources");
+    }
 
     if let Some(snapshot) = &args.snapshot {
         match snapshot::run(snapshot, &mut std::io::stdout().lock()) {
@@ -2539,6 +2548,12 @@ fn finish_overlay_serve(
     drop(source);
     drop(overlay);
     cleanup_temp_overlay();
+    log::debug!(
+        "{}",
+        ratarmount_core::budget::MemoryBudget::global()
+            .status_text()
+            .replace('\n', "; ")
+    );
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3378,7 +3393,11 @@ fn control_reply_with_quota(
 fn control_reply(cmd: &str, mp: &Path, stop: &AtomicBool, on_search: Option<&SearchFn>) -> String {
     match cmd {
         "ping" => "pong\n".to_string(),
-        "status" => format!("mounted {}\n", mp.display()),
+        "status" => format!(
+            "mounted {}\n{}",
+            mp.display(),
+            ratarmount_core::budget::MemoryBudget::global().status_text()
+        ),
         "unmount" | "quit" | "exit" => {
             let _ = unmount(mp);
             stop.store(true, Ordering::Relaxed);
@@ -6406,7 +6425,8 @@ mod sandbox_cli_tests {
         let stop = AtomicBool::new(false);
         let reply =
             control_reply_with_quota("status", Path::new("/mnt"), &stop, None, Some(&quota));
-        assert_eq!(reply, "mounted /mnt\noverlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n");
+        assert!(reply.starts_with("mounted /mnt\nmemory_budget unlimited\n"));
+        assert!(reply.ends_with("overlay_bytes 0\noverlay_quota_bytes 1024\noverlay_files 0\noverlay_quota_files unlimited\n"));
         assert_eq!(
             control_reply_with_quota("ping", Path::new("/mnt"), &stop, None, Some(&quota)),
             "pong\n"
@@ -6700,5 +6720,27 @@ mod corpus_cli_tests {
         ] {
             assert!(parse_args_from(argv).is_err());
         }
+    }
+}
+
+#[cfg(test)]
+mod memory_budget_tests {
+    use super::*;
+
+    /// Regression: SIZE parsing must not consume the archive or mountpoint.
+    #[test]
+    fn regression_memory_budget_flag_and_status() {
+        let args =
+            parse_args_from(["ratarmount", "--memory-budget", "64M", "a.tar", "mnt"]).unwrap();
+        assert_eq!(args.memory_budget, Some(64 * 1024 * 1024));
+        assert!(parse_args_from(["ratarmount", "--memory-budget", "invalid", "a.tar"]).is_err());
+        let _pool = ratarmount_core::budget::MemoryPool::global(
+            "socket-test",
+            1,
+            ratarmount_core::budget::Priority::Cache,
+        );
+        let reply = control_reply("status", Path::new("mnt"), &AtomicBool::new(false), None);
+        assert!(reply.contains("memory_budget unlimited"));
+        assert!(reply.contains("memory_pool socket-test"));
     }
 }

@@ -132,3 +132,10 @@ Clap: short `-g`, long `--gzip-seek-point-spacing`, visible alias `--gs`. Value 
 | Random-heavy FUSE | **1–4** — less decode-from-checkpoint work per seek; **higher open time and RSS** (more cloned inflate states) |
 
 Applies to default **G3** seekable gzip (`.gz` / `.tar.gz`) and is also the soft spacing hint for opt-in rapidgzip when preferred. Does not invent thruput; denser spacing is a latency/open-cost tradeoff. G3 polish A–E (decoded-window LRU, RGZI warm, auto readahead, hard GZIDX window apply, GZIDX export) is tracked in [`tasks/g3-polish-batch.md`](tasks/g3-polish-batch.md) and the [G3 polish](gzip-binding-decision.md#g3-polish) subsection of the binding decision.
+
+### Process-wide memory budget (Rust extension)
+
+`--memory-budget SIZE` limits reservations for optional buffers, decode windows,
+and caches across all open sources. The default preserves existing caps. See
+[memory-budget.md](memory-budget.md) for pool shares, fallback paths, control
+status fields, and exclusions from this retained-buffer budget.
