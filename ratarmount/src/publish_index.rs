@@ -355,7 +355,7 @@ fn atomic_copy(src: &Path, dest: &Path) -> io::Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::fs;
 
@@ -523,12 +523,12 @@ mod tests {
         assert_eq!(fs::read(&dest).unwrap(), b"old");
     }
     static PUBLISH_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    struct PublishEnv {
+    pub(crate) struct PublishEnv {
         saved: Vec<(String, Option<std::ffi::OsString>)>,
         _lock: std::sync::MutexGuard<'static, ()>,
     }
     impl PublishEnv {
-        fn new(values: &[(&str, &str)]) -> Self {
+        pub(crate) fn new(values: &[(&str, &str)]) -> Self {
             let lock = PUBLISH_ENV.lock().unwrap_or_else(|e| e.into_inner());
             let mut updates = std::collections::BTreeMap::new();
             for key in [
@@ -585,19 +585,32 @@ mod tests {
         }
     }
     #[derive(Default)]
-    struct PublishState {
-        objects: std::collections::BTreeMap<String, Vec<u8>>,
-        requests: Vec<(String, String, Vec<u8>)>,
+    pub(crate) struct PublishState {
+        pub(crate) objects: std::collections::BTreeMap<String, Vec<u8>>,
+        pub(crate) requests: Vec<(String, String, Vec<u8>)>,
         commit: bool,
+        pub(crate) conflict_on_commit: bool,
+        pub(crate) fail_commit_response: bool,
+        pub(crate) head: String,
+        pr_head: String,
+        generation: usize,
+        snapshots: std::collections::BTreeMap<String, std::collections::BTreeMap<String, Vec<u8>>>,
+        lfs: std::collections::BTreeMap<String, Vec<u8>>,
     }
-    struct PublishServer {
-        url: String,
-        state: std::sync::Arc<std::sync::Mutex<PublishState>>,
+    pub(crate) struct PublishServer {
+        pub(crate) url: String,
+        pub(crate) state: std::sync::Arc<std::sync::Mutex<PublishState>>,
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
         join: Option<std::thread::JoinHandle<()>>,
     }
     impl PublishServer {
         fn new(archive: Vec<u8>, fail_blob: bool, fail_pointer: bool) -> Self {
+            Self::with_live(archive, fail_blob, fail_pointer, false)
+        }
+        pub(crate) fn live(archive: Vec<u8>) -> Self {
+            Self::with_live(archive, false, false, true)
+        }
+        fn with_live(archive: Vec<u8>, fail_blob: bool, fail_pointer: bool, live: bool) -> Self {
             use std::io::{BufRead, BufReader};
             use std::sync::{
                 atomic::{AtomicBool, Ordering},
@@ -607,6 +620,19 @@ mod tests {
             listener.set_nonblocking(true).unwrap();
             let url = format!("http://{}", listener.local_addr().unwrap());
             let state = Arc::new(Mutex::new(PublishState::default()));
+            if live {
+                let mut state = state.lock().unwrap();
+                state.head = "a".repeat(40);
+                let name = if archive.starts_with(&[0x28, 0xb5, 0x2f, 0xfd]) {
+                    "a.tar.zst"
+                } else {
+                    "a.tar"
+                };
+                state.objects.insert(name.into(), archive.clone());
+                let objects = state.objects.clone();
+                state.snapshots.insert("a".repeat(40), objects);
+            }
+            let upload_url = url.clone();
             let shared = state.clone();
             let stop = Arc::new(AtomicBool::new(false));
             let stopped = stop.clone();
@@ -654,7 +680,23 @@ mod tests {
                     let mut status = 200;
                     let mut extra = Vec::<(String, String)>::new();
                     let mut response = if path.contains("/revision/") {
-                        serde_json::json!({"sha":if state.commit {"b".repeat(40)} else {"a".repeat(40)}}).to_string().into_bytes()
+                        let revision = path.rsplit('/').next().unwrap();
+                        let sha = if live {
+                            if revision.len() == 40 {
+                                revision.to_string()
+                            } else if revision.starts_with("refs%2Fpr%2F") {
+                                state.pr_head.clone()
+                            } else {
+                                state.head.clone()
+                            }
+                        } else if state.commit {
+                            "b".repeat(40)
+                        } else {
+                            "a".repeat(40)
+                        };
+                        serde_json::json!({"sha":sha}).to_string().into_bytes()
+                    } else if path.ends_with("/refs") {
+                        serde_json::json!({"branches":[{"name":"main"},{"name":"dev"}],"tags":[{"name":"v1"}]}).to_string().into_bytes()
                     } else if path.contains("/tree/") {
                         status = 404;
                         extra.push(("X-Error-Code".into(), "EntryNotFound".into()));
@@ -662,6 +704,61 @@ mod tests {
                     } else if path.contains("/preupload/") {
                         let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
                         serde_json::json!({"files":v["files"].as_array().unwrap().iter().map(|f|serde_json::json!({"path":f["path"],"uploadMode":"regular","shouldIgnore":false})).collect::<Vec<_>>()}).to_string().into_bytes()
+                    } else if live && path.ends_with("/info/lfs/objects/batch") {
+                        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+                        let object = &v["objects"][0];
+                        serde_json::json!({"transfer":"basic","objects":[{"oid":object["oid"],"size":object["size"],"actions":{"upload":{"href":format!("{upload_url}/lfs/{}",object["oid"].as_str().unwrap())}}}]}).to_string().into_bytes()
+                    } else if live && path.starts_with("/lfs/") && method == "PUT" {
+                        assert!(
+                            !headers.contains_key("authorization"),
+                            "Hub token leaked to storage"
+                        );
+                        state
+                            .lfs
+                            .insert(path.trim_start_matches("/lfs/").into(), body.clone());
+                        vec![]
+                    } else if live && path.contains("/commit/") {
+                        let ops: Vec<serde_json::Value> = std::str::from_utf8(&body)
+                            .unwrap()
+                            .lines()
+                            .map(|l| serde_json::from_str(l).unwrap())
+                            .collect();
+                        let pr = path.contains("create_pr=1");
+                        let on_pr = path.contains("refs%2Fpr%2F");
+                        if state.conflict_on_commit {
+                            state.head = "f".repeat(40);
+                        }
+                        let parent = if on_pr { &state.pr_head } else { &state.head };
+                        // A new PR forks the specified parent; writes to an existing ref require its head.
+                        if !pr && ops[0]["value"]["parentCommit"].as_str() != Some(parent) {
+                            status = 409;
+                            b"conflict: hf-test must never appear in logs".to_vec()
+                        } else {
+                            assert_eq!(ops.len(), 4, "archive, index and pointer must be atomic");
+                            let mut next = state.objects.clone();
+                            for op in &ops[1..] {
+                                let v = &op["value"];
+                                let bytes = if op["key"] == "lfsFile" {
+                                    state.lfs[v["oid"].as_str().unwrap()].clone()
+                                } else {
+                                    decode_base64(v["content"].as_str().unwrap())
+                                };
+                                next.insert(v["path"].as_str().unwrap().into(), bytes);
+                            }
+                            state.generation += 1;
+                            let commit = format!("{:x}", state.generation + 10).repeat(40);
+                            state.snapshots.insert(commit.clone(), next.clone());
+                            state.objects = next;
+                            if pr || on_pr {
+                                state.pr_head = commit.clone();
+                            } else {
+                                state.head = commit.clone();
+                            }
+                            if state.fail_commit_response {
+                                status = 500;
+                            }
+                            serde_json::json!({"commitOid":commit,"pullRequestUrl":if pr {Some(format!("{upload_url}/datasets/org/data/discussions/7"))} else {None}}).to_string().into_bytes()
+                        }
                     } else if path.contains("/commit/") {
                         // Publish both names only after parsing the complete commit payload.
                         let mut next = state.objects.clone();
@@ -693,6 +790,20 @@ mod tests {
                             state.objects.insert(path.clone(), body);
                         }
                         vec![]
+                    } else if live && path.contains("/resolve/") {
+                        let (commit, key) = path
+                            .split("/resolve/")
+                            .nth(1)
+                            .unwrap()
+                            .split_once('/')
+                            .unwrap();
+                        match state.snapshots.get(commit).and_then(|s| s.get(key)) {
+                            Some(bytes) => bytes.clone(),
+                            None => {
+                                status = 404;
+                                vec![]
+                            }
+                        }
                     } else if path.ends_with("a.tar") || path.ends_with("a.tar.zst") {
                         archive.clone()
                     } else {
@@ -775,7 +886,7 @@ mod tests {
         }
         out
     }
-    fn publish_tar() -> Vec<u8> {
+    pub(crate) fn publish_tar() -> Vec<u8> {
         let mut tar = vec![0u8; 2048];
         tar[..9].copy_from_slice(b"hello.txt");
         tar[100..108].copy_from_slice(b"0000644\0");
@@ -792,7 +903,7 @@ mod tests {
         tar[512..515].copy_from_slice(b"hi\n");
         tar
     }
-    fn build_publish_index(
+    pub(crate) fn build_publish_index(
         url: &str,
         path: &Path,
         scan: std::sync::Arc<std::sync::atomic::AtomicUsize>,

@@ -307,7 +307,7 @@ struct Args {
     #[arg(long = "publish-revision", value_name = "BRANCH", num_args = 1)]
     publish_revision: Option<String>,
 
-    /// Publish the Hub index as a pull request instead of updating the branch.
+    /// Publish the Hub index or live overlay changes as a pull request.
     #[arg(long = "create-pr", action = ArgAction::SetTrue)]
     create_pr: bool,
 
@@ -1331,12 +1331,19 @@ fn main() {
             .map(|bind| PathBuf::from(&bind.source)),
     );
     let publishing = args.publish_index || args.publish_index_to.is_some();
+    let live_hf_pr = !publishing
+        && overlay_commit::live_hf_create_pr(
+            &inputs,
+            &args.commit_overlay_interval,
+            args.commit_overlay_on_exit,
+            args.create_pr,
+        );
     if let Err(e) = publish_index::validate_publish_options(
         publishing,
         &inputs,
         args.publish_index_to.as_deref(),
         args.publish_revision.as_deref(),
-        args.create_pr,
+        args.create_pr && !live_hf_pr,
     ) {
         eprintln!("error: {e}");
         std::process::exit(2);
@@ -1820,7 +1827,15 @@ fn main() {
         overlay_commit::install_term_signal_flag();
     }
     if let (Some(ov), Some(archive)) = (overlay_arc.as_ref(), live_commit_archive.as_ref()) {
-        overlay_commit::install_object_store_live_commit(ov, archive, &open_opts);
+        if let Err(error) = overlay_commit::install_object_store_live_commit(
+            ov,
+            archive,
+            &open_opts,
+            args.create_pr,
+        ) {
+            eprintln!("error: {error}");
+            std::process::exit(2);
+        }
     }
 
     if args.no_mount {
@@ -4420,6 +4435,43 @@ mod export_cli_tests {
             Some(std::path::Path::new("s3://bucket/a.tar"))
         );
         assert_eq!(args.paths, vec![PathBuf::from("a.tar")]);
+    }
+
+    /// Regression: --create-pr must be accepted for live Hub overlays without stealing either operand.
+    #[test]
+    fn regression_hf_live_create_pr_cli_preserves_archive_and_mountpoint() {
+        let args = Args::try_parse_from([
+            "ratarmount",
+            "-w",
+            "overlay",
+            "--commit-overlay-interval",
+            "1s",
+            "--create-pr",
+            "hf://datasets/org/data@main/a.tar.zst",
+            "mnt",
+        ])
+        .unwrap();
+        let (inputs, mountpoint) = super::split_bound_inputs_mountpoint(&args);
+        assert_eq!(mountpoint, Some(PathBuf::from("mnt")));
+        assert_eq!(
+            inputs,
+            vec![PathBuf::from("hf://datasets/org/data@main/a.tar.zst")]
+        );
+        let live_pr = crate::overlay_commit::live_hf_create_pr(
+            &inputs,
+            &args.commit_overlay_interval,
+            args.commit_overlay_on_exit,
+            args.create_pr,
+        );
+        assert!(live_pr);
+        crate::publish_index::validate_publish_options(
+            false,
+            &inputs,
+            None,
+            None,
+            args.create_pr && !live_pr,
+        )
+        .unwrap();
     }
 
     /// Regression: `--publish-index-to PATH` is `num_args = 1` (not `0..=1`).

@@ -1,6 +1,8 @@
 //! Blocking Hub commits using preupload and Git LFS basic/multipart transfers.
 //! Blob and pointer operations share one atomic commit; failed uploads never publish names.
 
+use std::io::{Cursor, Read, Seek, SeekFrom};
+use std::path::Path;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
@@ -16,6 +18,46 @@ const MAX_RESPONSE: u64 = 4 * 1024 * 1024;
 pub struct HfCommitFile<'a> {
     pub path: &'a str,
     pub content: &'a [u8],
+}
+
+trait UploadReader: Read + Seek {}
+impl<T: Read + Seek> UploadReader for T {}
+
+struct UploadFile<'a> {
+    path: &'a str,
+    reader: Box<dyn UploadReader + 'a>,
+    len: u64,
+    id: String,
+    sample: String,
+    force_lfs: bool,
+}
+
+impl<'a> UploadFile<'a> {
+    fn new(path: &'a str, mut reader: Box<dyn UploadReader + 'a>, force_lfs: bool) -> Result<Self> {
+        let mut sample = Vec::new();
+        reader.by_ref().take(512).read_to_end(&mut sample)?;
+        reader.seek(SeekFrom::Start(0))?;
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        let mut len = 0;
+        loop {
+            let count = reader.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            digest.update(&buffer[..count]);
+            len += count as u64;
+        }
+        reader.seek(SeekFrom::Start(0))?;
+        Ok(Self {
+            path,
+            reader,
+            len,
+            id: hex::encode(digest.finalize()),
+            sample: STANDARD.encode(sample),
+            force_lfs,
+        })
+    }
 }
 
 #[derive(Debug)]
@@ -38,7 +80,6 @@ fn write_error(repo: &str, stage: &str, err: ureq::Error) -> RemoteError {
 }
 
 fn read_json(response: ureq::Response) -> Result<Value> {
-    use std::io::Read;
     let mut bytes = Vec::new();
     response
         .into_reader()
@@ -69,8 +110,66 @@ impl HfRepo {
         create_pr: bool,
         parent_commit: Option<&str>,
     ) -> Result<HfCommitResult> {
-        // Require credentials before revision lookup or any upload.
         self.require_publish_token()?;
+        let mut uploads = files
+            .iter()
+            .map(|f| UploadFile::new(f.path, Box::new(Cursor::new(f.content)), false))
+            .collect::<Result<Vec<_>>>()?;
+        self.commit_uploads(&mut uploads, revision, create_pr, parent_commit)
+    }
+
+    /// Stream an archive through LFS and publish its index siblings in the same commit.
+    /// Archive memory use is bounded for both basic and multipart uploads.
+    pub fn commit_archive(
+        &self,
+        archive: &Path,
+        siblings: &[HfCommitFile<'_>],
+        revision: &str,
+        create_pr: bool,
+        parent_commit: &str,
+    ) -> Result<HfCommitResult> {
+        self.require_publish_token()?;
+        let mut files = vec![UploadFile::new(
+            &self.location.path,
+            Box::new(std::fs::File::open(archive)?),
+            true,
+        )?];
+        for file in siblings {
+            files.push(UploadFile::new(
+                file.path,
+                Box::new(Cursor::new(file.content)),
+                false,
+            )?);
+        }
+        self.commit_uploads(&mut files, Some(revision), create_pr, Some(parent_commit))
+    }
+
+    /// Live write-back must target the mounted branch; tags and SHAs never fall back to main.
+    pub fn live_commit_branch(&self) -> Result<String> {
+        self.require_publish_token()?;
+        let revision = &self.location.revision;
+        let refs: Value =
+            serde_json::from_slice(&self.fetch_bytes(&self.api_url("refs"), MAX_RESPONSE)?)
+                .map_err(|_| error("invalid Hub refs response"))?;
+        if !refs["branches"].as_array().is_some_and(|branches| {
+            branches
+                .iter()
+                .any(|b| b["name"].as_str() == Some(revision))
+        }) {
+            return Err(error(
+                "hf:// live commit requires a branch revision, not a commit SHA or tag",
+            ));
+        }
+        Ok(revision.clone())
+    }
+
+    fn commit_uploads(
+        &self,
+        files: &mut [UploadFile<'_>],
+        revision: Option<&str>,
+        create_pr: bool,
+        parent_commit: Option<&str>,
+    ) -> Result<HfCommitResult> {
         if files.is_empty() || files.iter().any(|f| !valid_path(f.path)) {
             return Err(error("Hub commit requires files with safe relative paths"));
         }
@@ -81,13 +180,8 @@ impl HfRepo {
         let revision = self.publish_branch(revision)?;
         let suffix = if create_pr { "?create_pr=1" } else { "" };
         let encoded_revision = encode(&revision);
-        let ids: Vec<String> = files
-            .iter()
-            .map(|f| hex::encode(Sha256::digest(f.content)))
-            .collect();
-        let payload = json!({"files": files.iter().zip(&ids).map(|(f, id)| json!({
-            "path": f.path, "sample": STANDARD.encode(&f.content[..f.content.len().min(512)]),
-            "size": f.content.len(), "sha": id
+        let payload = json!({"files": files.iter().map(|f| json!({
+            "path": f.path, "sample": f.sample, "size": f.len, "sha": f.id
         })).collect::<Vec<_>>()});
         let response = self
             .write_request(
@@ -102,12 +196,17 @@ impl HfRepo {
             .as_array()
             .ok_or_else(|| error("Hub preupload response has no files"))?;
         let mut operations = Vec::new();
-        let mut header = json!({"summary": "Publish ratarmount archive index", "description": format!("Archive snapshot {} (index fingerprints validate archive bytes).", self.commit)});
+        let summary = if files.iter().any(|f| f.force_lfs) {
+            "Publish ratarmount archive and index"
+        } else {
+            "Publish ratarmount archive index"
+        };
+        let mut header = json!({"summary": summary, "description": format!("Archive snapshot {} (index fingerprints validate archive bytes).", self.commit)});
         if let Some(parent) = parent_commit {
             header["parentCommit"] = json!(parent);
         }
         operations.push(json!({"key": "header", "value": header}));
-        for (file, id) in files.iter().zip(&ids) {
+        for file in files {
             let matching: Vec<_> = modes
                 .iter()
                 .filter(|m| m["path"].as_str() == Some(file.path))
@@ -117,16 +216,24 @@ impl HfRepo {
             }
             let mode = matching[0];
             if mode["shouldIgnore"].as_bool() == Some(true) {
-                return Err(error("Hub gitignore excludes a published index file"));
+                return Err(error("Hub gitignore excludes a published file"));
             }
             match mode["uploadMode"].as_str() {
-                Some("regular") => operations.push(json!({"key": "file", "value": {
-                    "path": file.path, "content": STANDARD.encode(file.content), "encoding": "base64"
-                }})),
-                Some("lfs") => {
-                    self.upload_lfs(file.content, id, &revision)?;
+                Some("regular") if !file.force_lfs => {
+                    if file.len > 64 * 1024 * 1024 {
+                        return Err(error("regular Hub commit file exceeds 64 MiB; configure LFS"));
+                    }
+                    let mut bytes = Vec::new();
+                    file.reader.by_ref().take(file.len + 1).read_to_end(&mut bytes)?;
+                    if bytes.len() as u64 != file.len { return Err(error("Hub upload file changed size")); }
+                    operations.push(json!({"key": "file", "value": {
+                        "path": file.path, "content": STANDARD.encode(bytes), "encoding": "base64"
+                    }}));
+                }
+                Some("lfs" | "regular") => {
+                    self.upload_lfs(file.reader.as_mut(), file.len, &file.id, &revision)?;
                     operations.push(json!({"key": "lfsFile", "value": {
-                        "path": file.path, "algo": "sha256", "oid": id, "size": file.content.len()
+                        "path": file.path, "algo": "sha256", "oid": file.id, "size": file.len
                     }}));
                 }
                 _ => return Err(error("unsupported Hub upload mode (Xet-only uploads are unsupported; LFS basic/multipart required)")),
@@ -152,13 +259,19 @@ impl HfRepo {
                 error("Hub commit response has no valid commitOid; commit may have succeeded")
             })?;
         Ok(HfCommitResult {
-            commit: commit.into(),
+            commit: commit.to_ascii_lowercase(),
             pull_request_url: value["pullRequestUrl"].as_str().map(str::to_owned),
         })
     }
 
-    fn upload_lfs(&self, bytes: &[u8], id: &str, revision: &str) -> Result<()> {
-        let payload = json!({"operation": "upload", "transfers": ["basic", "multipart"], "hash_algo": "sha256", "ref": {"name": revision}, "objects": [{"oid": id, "size": bytes.len()}]});
+    fn upload_lfs(
+        &self,
+        reader: &mut dyn UploadReader,
+        len: u64,
+        id: &str,
+        revision: &str,
+    ) -> Result<()> {
+        let payload = json!({"operation": "upload", "transfers": ["basic", "multipart"], "hash_algo": "sha256", "ref": {"name": revision}, "objects": [{"oid": id, "size": len}]});
         let response = self
             .write_request("POST", &self.lfs_batch_url())?
             .set("Accept", LFS_JSON)
@@ -179,7 +292,7 @@ impl HfRepo {
             .ok_or_else(|| error("LFS batch has no objects"))?;
         if objects.len() != 1
             || objects[0]["oid"].as_str() != Some(id)
-            || objects[0]["size"].as_u64() != Some(bytes.len() as u64)
+            || objects[0]["size"].as_u64() != Some(len)
         {
             return Err(error("LFS batch returned a different object"));
         }
@@ -195,30 +308,32 @@ impl HfRepo {
         if let Some(chunk) = upload.get("header").and_then(|h| h.get("chunk_size")) {
             let chunk = chunk
                 .as_str()
-                .and_then(|s| s.parse::<usize>().ok())
-                .or_else(|| chunk.as_u64().and_then(|n| usize::try_from(n).ok()))
+                .and_then(|s| s.parse::<u64>().ok())
+                .or(chunk.as_u64())
                 .filter(|n| *n > 0)
                 .ok_or_else(|| error("invalid LFS multipart chunk size"))?;
             let headers = upload["header"]
                 .as_object()
                 .ok_or_else(|| error("invalid LFS multipart headers"))?;
-            let count = bytes.len().div_ceil(chunk);
+            let count = len.div_ceil(chunk);
             if headers
                 .keys()
                 .filter(|k| k.bytes().all(|b| b.is_ascii_digit()))
-                .count()
+                .count() as u64
                 != count
             {
                 return Err(error("LFS multipart response has wrong part count"));
             }
             let mut parts = Vec::new();
-            for (n, part) in bytes.chunks(chunk).enumerate() {
+            for n in 0..count {
+                let part_len = chunk.min(len - n * chunk);
                 let href = headers
                     .get(&(n + 1).to_string())
                     .and_then(Value::as_str)
                     .ok_or_else(|| error("LFS multipart response missing part URL"))?;
                 let response = action_request("PUT", href, None)?
-                    .send_bytes(part)
+                    .set("Content-Length", &part_len.to_string())
+                    .send_reader((&mut *reader).take(part_len))
                     .map_err(|e| write_error(&self.location.repo, "LFS part", e))?;
                 let etag = response
                     .header("ETag")
@@ -241,7 +356,8 @@ impl HfRepo {
                 .map_err(|e| write_error(&self.location.repo, "LFS completion", e))?;
         } else {
             action_request("PUT", href(upload)?, upload.get("header"))?
-                .send_bytes(bytes)
+                .set("Content-Length", &len.to_string())
+                .send_reader((&mut *reader).take(len))
                 .map_err(|e| write_error(&self.location.repo, "LFS upload", e))?;
         }
         if let Some(verify) = actions.get("verify").filter(|v| !v.is_null()) {
@@ -262,7 +378,7 @@ impl HfRepo {
                 action_request("POST", url, verify.get("header"))?
             };
             req.set("Content-Type", LFS_JSON)
-                .send_string(&json!({"oid": id, "size": bytes.len()}).to_string())
+                .send_string(&json!({"oid": id, "size": len}).to_string())
                 .map_err(|e| write_error(&self.location.repo, "LFS verify", e))?;
         }
         Ok(())
@@ -425,6 +541,132 @@ mod tests {
         json!({"files": body["files"].as_array().unwrap().iter().map(|f| json!({"path": f["path"], "uploadMode": if lfs && !f["path"].as_str().unwrap().ends_with(".ptr") { "lfs" } else { "regular" }, "shouldIgnore": false})).collect::<Vec<_>>()})
     }
 
+    /// Regression: archive upload slurped the entire spool, or published siblings separately.
+    #[test]
+    fn regression_hf_archive_streams_lfs_with_atomic_siblings() {
+        let archive = vec![b'a'; 2 * 1024 * 1024 + 17];
+        let uploaded = Arc::new(Mutex::new(Vec::new()));
+        let storage_bytes = uploaded.clone();
+        let storage = Server::spawn(move |request| {
+            assert!(!request.headers.contains_key("authorization"));
+            *storage_bytes.lock().unwrap() = request.body;
+            response(json!({}))
+        });
+        let href = storage.url.clone();
+        let commits = Arc::new(Mutex::new(Vec::new()));
+        let commit_bytes = commits.clone();
+        let hub = Server::spawn(move |request| {
+            if request.path.contains("preupload") {
+                let value: Value = serde_json::from_slice(&request.body).unwrap();
+                assert_eq!(value["files"].as_array().unwrap().len(), 3);
+                assert_eq!(value["files"][0]["size"], 2 * 1024 * 1024 + 17);
+                assert_eq!(
+                    STANDARD
+                        .decode(value["files"][0]["sample"].as_str().unwrap())
+                        .unwrap(),
+                    vec![b'a'; 512]
+                );
+                // Small archives may negotiate regular; write-back explicitly uses LFS.
+                response(modes(&request, false))
+            } else if request.path.ends_with("batch") {
+                let value: Value = serde_json::from_slice(&request.body).unwrap();
+                response(
+                    json!({"transfer":"basic","objects":[{"oid":value["objects"][0]["oid"],"size":value["objects"][0]["size"],"actions":{"upload":{"href":format!("{href}/archive")}}}]}),
+                )
+            } else {
+                assert!(request.path.contains("/commit/"));
+                *commit_bytes.lock().unwrap() = request.body;
+                response(json!({"commitOid":"B".repeat(40)}))
+            }
+        });
+        let repo = crate::hf::commit_test_repo(&hub.url, Some("hub-secret"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), &archive).unwrap();
+        let result = repo
+            .commit_archive(
+                file.path(),
+                &[
+                    HfCommitFile {
+                        path: "a.tar.index.sqlite",
+                        content: b"index",
+                    },
+                    HfCommitFile {
+                        path: "a.tar.index.ptr",
+                        content: b"ptr",
+                    },
+                ],
+                "main",
+                false,
+                &repo.commit,
+            )
+            .unwrap();
+        assert_eq!(
+            result.commit,
+            "b".repeat(40),
+            "commit identity must match the reader's normalization"
+        );
+        assert_eq!(*uploaded.lock().unwrap(), archive);
+        let ops: Vec<Value> = std::str::from_utf8(&commits.lock().unwrap())
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(ops.len(), 4);
+        assert_eq!(ops[0]["value"]["parentCommit"], repo.commit);
+        assert_eq!(ops[1]["key"], "lfsFile");
+        assert_eq!(ops[1]["value"]["oid"], hex::encode(Sha256::digest(archive)));
+        assert_eq!(ops[2]["value"]["path"], "a.tar.index.sqlite");
+        assert_eq!(ops[3]["value"]["path"], "a.tar.index.ptr");
+    }
+
+    /// Regression: a streamed storage PUT must not be replayed or forward credentials through redirects.
+    #[test]
+    fn regression_hf_archive_upload_redirect_is_not_replayed() {
+        let followed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = followed.clone();
+        let target = Server::spawn(move |_| {
+            count.fetch_add(1, Ordering::Relaxed);
+            response(json!({}))
+        });
+        let target_url = target.url.clone();
+        let storage = Server::spawn(move |request| {
+            assert!(!request.headers.contains_key("authorization"));
+            (
+                302,
+                vec![(
+                    "Location".into(),
+                    format!("{target_url}/upload?secret=storage-secret"),
+                )],
+                vec![],
+            )
+        });
+        let storage_url = storage.url.clone();
+        let hub = Server::spawn(move |request| {
+            if request.path.contains("preupload") {
+                response(modes(&request, false))
+            } else {
+                assert!(
+                    request.path.ends_with("batch"),
+                    "failed upload must not commit"
+                );
+                let value: Value = serde_json::from_slice(&request.body).unwrap();
+                response(
+                    json!({"objects":[{"oid":value["objects"][0]["oid"],"size":value["objects"][0]["size"],"actions":{"upload":{"href":format!("{storage_url}/upload")}}}]}),
+                )
+            }
+        });
+        let repo = crate::hf::commit_test_repo(&hub.url, Some("hub-secret"));
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), b"archive").unwrap();
+        let err = repo
+            .commit_archive(file.path(), &[], "main", false, &repo.commit)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("LFS upload request failed"), "{err}");
+        assert!(!err.contains("secret"));
+        assert_eq!(followed.load(Ordering::Relaxed), 0);
+    }
+
     /// Regression: Hub token leaked to LFS storage, or pointer was committed before the upload/verify.
     #[test]
     fn regression_hf_publish_basic_blob_before_atomic_pointer_and_no_token_leak() {
@@ -575,6 +817,22 @@ mod tests {
     #[test]
     fn regression_hf_publish_requires_write_scope() {
         let repo = crate::hf::commit_test_repo("http://127.0.0.1:1", None);
+        assert!(repo
+            .live_commit_branch()
+            .unwrap_err()
+            .to_string()
+            .contains("token with write scope"));
+        assert!(repo
+            .commit_archive(
+                Path::new("/nonexistent/archive.tar.zst"),
+                &[],
+                "main",
+                false,
+                &repo.commit
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("token with write scope"));
         let file = HfCommitFile {
             path: "a.index.ptr",
             content: b"ptr",
