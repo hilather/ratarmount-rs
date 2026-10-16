@@ -34,6 +34,12 @@ shared libraries: libssl.so.1.1". `packaging/test-portable-deps.sh BINARY`
 lists the binary's direct `NEEDED` libraries and fails on any `libssl` or
 `libcrypto`; the Packages workflow runs it before upload.
 
+Vendoring freezes OpenSSL inside the portable tarball. That tarball receives
+OpenSSL fixes only when maintainers rebuild and re-release it. After an
+OpenSSL security advisory, rebuild and re-release the portable tarball.
+Users get those fixes by upgrading to the new tarball. Updating distro
+OpenSSL packages does not change an already-shipped portable tarball.
+
 **Triggers**
 
 | Event | Result |
