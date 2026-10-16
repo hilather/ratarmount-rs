@@ -33,7 +33,8 @@ CORE_TOML="$ROOT/ratarmount-core/Cargo.toml"
 INDEX_TOML="$ROOT/ratarmount-index/Cargo.toml"
 # Origin / docs / crates.io metadata. Do not inherit mxmlnkn/ratarmount-rs (404).
 WANT_REPO='https://github.com/hilather/ratarmount-rs'
-WANT_MSRV='1.74'
+# Keep in sync with the workspace rust-version (checked by test-msrv-ci.sh).
+WANT_MSRV='1.90'
 
 check_l0_manifest() {
     local name="$1"
