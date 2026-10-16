@@ -79,6 +79,33 @@ fn fuse_sandbox_readonly_and_quota() {
     );
 }
 
+/// Regression: uid/gid/umask mapping must reach stat(2) for archive and overlay files.
+#[test]
+fn fuse_sandbox_mapped_owners() {
+    with_mount_options(
+        "rrs-sandbox-owner-",
+        |directory, _| {
+            use std::os::unix::fs::MetadataExt;
+            let root = directory.parent().unwrap();
+            for path in [
+                root.to_path_buf(),
+                directory.to_path_buf(),
+                directory.join("a1"),
+            ] {
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((metadata.uid(), metadata.gid()), (12345, 23456));
+                assert_eq!(metadata.mode() & 0o027, 0);
+            }
+            let created = root.join("mapped-new");
+            fs::write(&created, "payload").unwrap();
+            let metadata = fs::metadata(created).unwrap();
+            assert_eq!((metadata.uid(), metadata.gid()), (12345, 23456));
+            assert_eq!(metadata.mode() & 0o027, 0);
+        },
+        &["-o", "uid=12345,gid=23456,umask=027"],
+    );
+}
+
 fn with_mount_options(prefix: &str, cases: fn(&Path, &Path), options: &[&str]) {
     if let Some(msg) = skip_reason() {
         eprintln!("{msg}");

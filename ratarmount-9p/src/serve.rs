@@ -33,6 +33,7 @@ pub const DEFAULT_NINEP_BIND: SocketAddr = SocketAddr::V4(std::net::SocketAddrV4
 /// Listen / export options for [`serve_blocking`] / [`spawn_ninep_thread`].
 #[derive(Clone)]
 pub struct NinepOptions {
+    pub attribute_mapping: ratarmount_core::AttributeMapping,
     pub bind: SocketAddr,
     pub stop: Option<ExportStop>,
     /// When set, `Tlcreate`/`Twrite`/`Tmkdir`/`Tunlinkat`/`Trenameat`/`Tsymlink`
@@ -45,6 +46,7 @@ pub struct NinepOptions {
 impl Default for NinepOptions {
     fn default() -> Self {
         Self {
+            attribute_mapping: Default::default(),
             bind: default_export_bind(DEFAULT_NINEP_PORT),
             stop: None,
             overlay: None,
@@ -57,6 +59,7 @@ impl Default for NinepOptions {
 impl std::fmt::Debug for NinepOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NinepOptions")
+            .field("attribute_mapping", &self.attribute_mapping)
             .field("bind", &self.bind)
             .field("stop", &self.stop.as_ref().map(|_| "ExportStop"))
             .field("overlay", &self.overlay.is_some())
@@ -80,12 +83,15 @@ fn access_label(opts: &NinepOptions) -> &'static str {
 }
 
 fn fs_from_opts(source: Arc<dyn MountSource>, opts: &NinepOptions) -> Arc<Ratarmount9p> {
-    Arc::new(Ratarmount9p::with_overlay(
-        source,
-        opts.readahead_bytes,
-        opts.reader_slots,
-        opts.overlay.clone(),
-    ))
+    Arc::new(
+        Ratarmount9p::with_overlay(
+            source,
+            opts.readahead_bytes,
+            opts.reader_slots,
+            opts.overlay.clone(),
+        )
+        .with_attribute_mapping(opts.attribute_mapping),
+    )
 }
 
 /// Bind + accept until [`ExportStop`] (200 ms poll).

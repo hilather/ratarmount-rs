@@ -1,5 +1,6 @@
 //! `NFSFileSystem` on `MountSource`, with optional write overlay.
 
+use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
@@ -19,6 +20,7 @@ use crate::reader::{fill_from_state, ReaderLru, DEFAULT_READER_SLOTS};
 
 /// Userspace NFSv3 view of a factory-built [`MountSource`].
 pub struct RatarmountNfs {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -27,6 +29,12 @@ pub struct RatarmountNfs {
 }
 
 impl RatarmountNfs {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, None)
     }
@@ -38,6 +46,7 @@ impl RatarmountNfs {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
@@ -80,14 +89,14 @@ impl RatarmountNfs {
         Ok(fi)
     }
 
-    fn fattr(id: fileid3, fi: &FileInfo) -> fattr3 {
+    fn fattr(&self, id: fileid3, fi: &FileInfo) -> fattr3 {
         let t = unix_float_to_nfs_time(fi.mtime);
         fattr3 {
             ftype: mode_to_ftype(fi.mode),
-            mode: fi.mode & 0o7777,
+            mode: self.attribute_mapping.mode(fi.mode) & 0o7777,
             nlink: 1,
-            uid: fi.uid,
-            gid: fi.gid,
+            uid: self.attribute_mapping.uid(fi.uid),
+            gid: self.attribute_mapping.gid(fi.gid),
             size: fi.size,
             used: fi.size,
             rdev: specdata3::default(),
@@ -124,7 +133,7 @@ impl RatarmountNfs {
 
     pub fn getattr_sync(&self, id: fileid3) -> Result<fattr3, nfsstat3> {
         let fi = self.file_info_for_id(id)?;
-        Ok(Self::fattr(id, &fi))
+        Ok(self.fattr(id, &fi))
     }
 
     pub fn readdir_sync(
@@ -210,7 +219,7 @@ impl RatarmountNfs {
                 entries.push(DirEntry {
                     fileid: dirid,
                     name: encode_filename("."),
-                    attr: Self::fattr(dirid, &dir_fi),
+                    attr: self.fattr(dirid, &dir_fi),
                 });
                 continue;
             }
@@ -218,7 +227,7 @@ impl RatarmountNfs {
                 entries.push(DirEntry {
                     fileid: parent_id,
                     name: encode_filename(".."),
-                    attr: Self::fattr(parent_id, &parent_fi),
+                    attr: self.fattr(parent_id, &parent_fi),
                 });
                 continue;
             }
@@ -252,7 +261,7 @@ impl RatarmountNfs {
             entries.push(DirEntry {
                 fileid: *id,
                 name: encode_filename(name),
-                attr: Self::fattr(*id, &fi),
+                attr: self.fattr(*id, &fi),
             });
         }
         Ok(ReadDirResult { entries, end })
@@ -1774,5 +1783,34 @@ mod tests {
             assert_eq!(a, body[..100]);
             assert_eq!(b, body[50..150]);
         });
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+
+    /// Regression: NFS attributes must report mapped owners and mode for every Unix type.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(directory.path()).unwrap());
+        let plain = RatarmountNfs::new(source.clone(), 0);
+        let mapped = RatarmountNfs::new(source, 0).with_attribute_mapping(
+            AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+        );
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = ratarmount_core::create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = mapped.fattr(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.mode), (12345, 23456, 0o750));
+            let attr = plain.fattr(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.mode), (42, 43, 0o777));
+        }
+        let attr = mapped.getattr_sync(1).unwrap();
+        assert_eq!((attr.uid, attr.gid), (12345, 23456));
     }
 }

@@ -1,5 +1,6 @@
 //! `MountSource` adapter for 9P2000.L (inode table + reader LRU + overlay).
 
+use ratarmount_core::AttributeMapping;
 use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
@@ -21,6 +22,7 @@ const MAX_NAME_LEN: usize = 255;
 
 /// Userspace 9P2000.L view of a factory-built [`MountSource`].
 pub struct Ratarmount9p {
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     inodes: Arc<InodeTable>,
@@ -29,6 +31,12 @@ pub struct Ratarmount9p {
 }
 
 impl Ratarmount9p {
+    /// Map protocol attributes only; source and overlay metadata stay unchanged.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
     pub fn new(source: Arc<dyn MountSource>, readahead_bytes: usize, reader_slots: usize) -> Self {
         Self::with_overlay(source, readahead_bytes, reader_slots, None)
     }
@@ -41,6 +49,7 @@ impl Ratarmount9p {
     ) -> Self {
         let overlay_set = overlay.is_some();
         Self {
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             inodes: Arc::new(InodeTable::with_overlay(overlay_set)),
@@ -130,7 +139,7 @@ impl Ratarmount9p {
 
     pub fn getattr(&self, id: u64) -> Result<Attr, i32> {
         let fi = self.file_info(id)?;
-        Ok(attr_from(id, &fi))
+        Ok(attr_from(id, &fi, self.attribute_mapping))
     }
 
     pub fn read(&self, id: u64, offset: u64, count: u32) -> Result<Vec<u8>, i32> {
@@ -451,14 +460,14 @@ fn unix_time(t: f64) -> (u64, u64) {
     (secs as u64, (t.fract() * 1e9) as u64)
 }
 
-fn attr_from(id: u64, fi: &FileInfo) -> Attr {
+fn attr_from(id: u64, fi: &FileInfo, mapping: AttributeMapping) -> Attr {
     let (sec, nsec) = unix_time(fi.mtime);
     let nlink = if is_dir_mode(fi.mode) { 2 } else { 1 };
     Attr {
         qid: qid_from(id, fi),
-        mode: fi.mode,
-        uid: fi.uid,
-        gid: fi.gid,
+        mode: mapping.mode(fi.mode),
+        uid: mapping.uid(fi.uid),
+        gid: mapping.gid(fi.gid),
         nlink,
         rdev: 0,
         size: fi.size,
@@ -710,5 +719,39 @@ mod tests {
             fs.inodes.cached_lookup_fi(id).is_none(),
             "overlay child must not keep a fat FileInfo"
         );
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+
+    /// Regression: 9P Rgetattr must map owners without masking the file type.
+    #[test]
+    fn regression_mapped_attrs_include_unset() {
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = attr_from(
+                7,
+                &fi,
+                AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+            );
+            assert_eq!(
+                (attr.uid, attr.gid, attr.mode),
+                (12345, 23456, mode & !0o027)
+            );
+            let attr = attr_from(7, &fi, AttributeMapping::default());
+            assert_eq!((attr.uid, attr.gid, attr.mode), (42, 43, mode));
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let source =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(directory.path()).unwrap());
+        let fs = Ratarmount9p::new(source, 0, 8)
+            .with_attribute_mapping(AttributeMapping::parse("uid=12345,gid=23456").unwrap());
+        let attr = fs.getattr(root_id()).unwrap();
+        assert_eq!((attr.uid, attr.gid), (12345, 23456));
     }
 }

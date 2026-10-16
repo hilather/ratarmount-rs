@@ -130,6 +130,8 @@ fn sftp_batch(
 ) -> Option<(bool, String)> {
     let sftp = which("sftp")?;
     let mut cmd = Command::new(sftp);
+    // Regression: host SSH config permissions and includes must not affect loopback tests.
+    cmd.args(["-F", "/dev/null"]);
     cmd.arg("-P")
         .arg(port.to_string())
         .arg("-o")

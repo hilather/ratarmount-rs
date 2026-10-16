@@ -5,6 +5,7 @@ mod fuser_tests;
 
 mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
+use ratarmount_core::AttributeMapping;
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -566,6 +567,7 @@ pub struct RatarmountFs {
     #[cfg(target_os = "linux")]
     backing_opens: Mutex<passthrough::OpenBackings<passthrough::linux::RegisteredBacking>>,
 
+    attribute_mapping: AttributeMapping,
     source: Arc<dyn MountSource>,
     overlay: Option<Arc<WriteOverlay>>,
     /// Per-handle sequential readahead size in bytes (`0` = disabled).
@@ -649,6 +651,7 @@ impl RatarmountFs {
             passthrough_readonly_mount: overlay.is_none(),
             #[cfg(target_os = "linux")]
             backing_opens: Mutex::new(passthrough::OpenBackings::default()),
+            attribute_mapping: AttributeMapping::default(),
             source,
             overlay,
             readahead_bytes,
@@ -666,6 +669,23 @@ impl RatarmountFs {
             #[cfg(test)]
             park_fd_drops: Mutex::new(None),
         }
+    }
+
+    /// Override reported ownership and mask permissions without changing stored metadata.
+    pub fn with_attribute_mapping(mut self, mapping: AttributeMapping) -> Self {
+        self.attribute_mapping = mapping;
+        self
+    }
+
+    fn mapped_attr(&self, mut attr: FileAttr) -> FileAttr {
+        attr.uid = self.attribute_mapping.uid(attr.uid);
+        attr.gid = self.attribute_mapping.gid(attr.gid);
+        attr.perm = self.attribute_mapping.mode(u32::from(attr.perm)) as u16;
+        attr
+    }
+
+    fn mapped_file_attr(&self, ino: u64, fi: &FileInfo) -> FileAttr {
+        self.mapped_attr(Self::file_attr(ino, fi))
     }
 
     /// Set passthrough negotiation and optional per-member copying.
@@ -935,7 +955,7 @@ impl RatarmountFs {
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
         let mut full: Vec<(u64, String, FileAttr)> = Vec::with_capacity(entries.len() + 2);
-        full.push((ino, ".".into(), Self::file_attr(ino, &self_fi)));
+        full.push((ino, ".".into(), self.mapped_file_attr(ino, &self_fi)));
         let parent_ino = if path == "/" {
             ino
         } else {
@@ -949,7 +969,7 @@ impl RatarmountFs {
         full.push((
             parent_ino,
             "..".into(),
-            Self::file_attr(parent_ino, &self_fi),
+            self.mapped_file_attr(parent_ino, &self_fi),
         ));
         for (name, mode, size) in entries {
             let child = join_path(&path, &name);
@@ -965,7 +985,7 @@ impl RatarmountFs {
             let cino = self.ino_for_path(&child);
             // Amendment 8: this ABI does not count readdirplus as a lookup.
             // `ino_for_path` leaves the child at nlookup 0. Do not bump here.
-            full.push((cino, name, Self::file_attr(cino, &fi)));
+            full.push((cino, name, self.mapped_file_attr(cino, &fi)));
         }
         for (i, (cino, name, attr)) in full.into_iter().enumerate().skip(offset as usize) {
             let entry_ttl = self.readdirplus_entry_ttl(&attr);
@@ -1237,7 +1257,7 @@ impl RatarmountFs {
             .insert(fh, OpenBackend::OverlayFd(fd));
         let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
         self.bump_nlookup(ino);
-        Ok((ttl, Self::file_attr(ino, &fi), fh))
+        Ok((ttl, self.mapped_file_attr(ino, &fi), fh))
     }
 
     /// Body of `mkdir`, replying-free so it can be unit-tested.
@@ -1269,7 +1289,7 @@ impl RatarmountFs {
         self.invalidate_dir_cache(&parent_path);
         let ttl = self.reply_entry_ttl(parent, &name, ino, &fi);
         self.bump_nlookup(ino);
-        Ok((ttl, Self::file_attr(ino, &fi)))
+        Ok((ttl, self.mapped_file_attr(ino, &fi)))
     }
 
     /// Body of `unlink` / `rmdir`, replying-free so it can be unit-tested.
@@ -1725,9 +1745,15 @@ impl RatarmountFs {
                 if unsafe { libc::fstat(fd, &mut st) } != 0 {
                     return Err(EIO);
                 }
-                Ok((Duration::ZERO, file_attr_from_stat(ino, &st)))
+                Ok((
+                    Duration::ZERO,
+                    self.mapped_attr(file_attr_from_stat(ino, &st)),
+                ))
             }
-            View::Meta(fi) => Ok((Duration::ZERO, Self::file_attr_nlink(ino, &fi, 0))),
+            View::Meta(fi) => Ok((
+                Duration::ZERO,
+                self.mapped_attr(Self::file_attr_nlink(ino, &fi, 0)),
+            )),
             View::Missing => {
                 debug!("getattr detached ino={ino} has no metadata");
                 Err(ENOENT)
@@ -1738,7 +1764,7 @@ impl RatarmountFs {
                 // the real size.
                 let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
                 let ttl = self.reply_attr_ttl(ino, &fi);
-                Ok((ttl, Self::file_attr(ino, &fi)))
+                Ok((ttl, self.mapped_file_attr(ino, &fi)))
             }
         }
     }
@@ -1805,7 +1831,7 @@ impl RatarmountFs {
         let ino = self.ino_for_path_with_fi(&path, Some(fi.clone()));
         let ttl = self.reply_entry_ttl(parent, name.as_ref(), ino, &fi);
         self.bump_nlookup(ino);
-        Some((ino, Self::file_attr(ino, &fi), ttl))
+        Some((ino, self.mapped_file_attr(ino, &fi), ttl))
     }
 
     /// Invalidate one directory entry the kernel may have cached, then drop
@@ -2121,7 +2147,7 @@ impl RatarmountFs {
             .or_else(|| self.source.lookup(&path, 0))
             .unwrap_or_else(ratarmount_core::create_root_file_info);
         let ttl = self.reply_attr_ttl(ino, &fi);
-        Ok((ttl, Self::file_attr(ino, &fi)))
+        Ok((ttl, self.mapped_file_attr(ino, &fi)))
     }
 
     fn setattr_detached(
@@ -2153,7 +2179,10 @@ impl RatarmountFs {
             if unsafe { libc::fstat(fd, &mut st) } != 0 {
                 return Err(EIO);
             }
-            Ok((Duration::ZERO, file_attr_from_stat(ino, &st)))
+            Ok((
+                Duration::ZERO,
+                self.mapped_attr(file_attr_from_stat(ino, &st)),
+            ))
         })
     }
 
@@ -2852,15 +2881,59 @@ impl Filesystem for RatarmountFs {
 
 /// Parse a Python-style `-o` / `--fuse` comma-separated option string into `MountOption`s.
 ///
-/// Unknown tokens become `MountOption::CUSTOM` (passed through to libfuse/kernel).
+/// Ownership and umask options are consumed by [`AttributeMapping`].
+/// Other unknown tokens become `MountOption::CUSTOM` (passed through to libfuse/kernel).
 /// `allow_root` and `allow_other` are also CUSTOM here; [`mount_blocking`]
 /// extracts them into the session ACL before mounting.
 pub fn parse_fuse_options(s: &str) -> Vec<MountOption> {
     s.split(',')
         .map(str::trim)
-        .filter(|t| !t.is_empty())
+        .filter(|t| {
+            !t.is_empty()
+                && !["uid=", "gid=", "umask="]
+                    .iter()
+                    .any(|key| t.starts_with(key))
+        })
         .map(mount_option_from_str)
         .collect()
+}
+
+/// Whether fuse.conf explicitly permits non-root allow_other mounts.
+pub fn fuse_conf_allows_other(contents: &str) -> bool {
+    contents
+        .lines()
+        .any(|line| line.split('#').next().unwrap_or_default().trim() == "user_allow_other")
+}
+
+/// Validate before opening /dev/fuse so fusermount's diagnostic is actionable.
+pub fn validate_allow_other(options: &str) -> std::io::Result<()> {
+    validate_allow_other_with(
+        options,
+        unsafe { libc::geteuid() },
+        Path::new("/etc/fuse.conf"),
+    )
+}
+
+fn validate_allow_other_with(options: &str, uid: u32, config: &Path) -> std::io::Result<()> {
+    if uid == 0
+        || !options
+            .split(',')
+            .map(str::trim)
+            .any(|option| option == "allow_other")
+    {
+        return Ok(());
+    }
+    let allowed = match std::fs::read_to_string(config) {
+        Ok(contents) => fuse_conf_allows_other(&contents),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => return Err(std::io::Error::new(error.kind(), format!("cannot read {}: {error}; allow_other requires the line user_allow_other in /etc/fuse.conf", config.display()))),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+            "allow_other requested by a non-root user: add the uncommented line user_allow_other to /etc/fuse.conf"))
+    }
 }
 
 fn mount_option_from_str(s: &str) -> MountOption {
@@ -3019,12 +3092,16 @@ pub fn mount_blocking_with_passthrough(
     readahead: u64,
     passthrough: PassthroughOptions,
 ) -> std::io::Result<()> {
+    let mapping = AttributeMapping::parse(extra_fuse_opts)
+        .map_err(|message| std::io::Error::new(std::io::ErrorKind::InvalidInput, message))?;
+    validate_allow_other(extra_fuse_opts)?;
     let config = mount_config(writable, extra_fuse_opts);
     let _ = foreground;
     // Idempotent with `Filesystem::init`. In place before `Session::new`.
     raise_nofile_soft_to_hard();
-    let mut fs =
-        RatarmountFs::with_readahead(source, overlay, readahead).with_passthrough(passthrough);
+    let mut fs = RatarmountFs::with_readahead(source, overlay, readahead)
+        .with_passthrough(passthrough)
+        .with_attribute_mapping(mapping);
     fs.passthrough_readonly_mount = config.mount_options.contains(&MountOption::RO);
     // `mount` does not hand back `Session::notifier`. The notifier thread
     // must exist before `run` so a shadowed archive member can drop a 60s
@@ -7317,5 +7394,102 @@ mod tests {
         fs.remove_entry(FUSE_ROOT_ID, OsStr::new("gone"), false)
             .expect("unlink mode 000");
         assert!(fs.getattr_reply(gone).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod sandbox_attr_tests {
+    use super::*;
+
+    /// Regression: containers must see mapped owners on regular, directory and symlink attrs.
+    #[test]
+    fn regression_mapped_attrs_include_detached_and_unset() {
+        let source =
+            Arc::new(ratarmount_compositing::FolderMountSource::new(std::env::temp_dir()).unwrap());
+        let plain = RatarmountFs::new(source.clone(), None);
+        let mapped = RatarmountFs::new(source, None).with_attribute_mapping(
+            AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+        );
+        for mode in [0o100777, 0o040777, 0o120777] {
+            let mut fi = ratarmount_core::create_root_file_info();
+            fi.mode = mode;
+            fi.uid = 42;
+            fi.gid = 43;
+            let attr = mapped.mapped_file_attr(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.perm), (12345, 23456, 0o750));
+            let attr = plain.mapped_file_attr(7, &fi);
+            assert_eq!((attr.uid, attr.gid, attr.perm), (42, 43, 0o777));
+            let detached = mapped.mapped_attr(RatarmountFs::file_attr_nlink(7, &fi, 0));
+            assert_eq!(
+                (detached.uid, detached.gid, detached.perm, detached.nlink),
+                (12345, 23456, 0o750, 0)
+            );
+        }
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        stat.st_uid = 42;
+        stat.st_gid = 43;
+        stat.st_mode = 0o100777;
+        let attr = mapped.mapped_attr(file_attr_from_stat(7, &stat));
+        assert_eq!((attr.uid, attr.gid, attr.perm), (12345, 23456, 0o750));
+        assert!(parse_fuse_options("uid=12345,gid=23456,umask=027,noatime")
+            .iter()
+            .all(|option| *option == MountOption::NoAtime));
+    }
+
+    /// Regression: mapped create replies must not store the container's uid/gid in the overlay.
+    #[test]
+    fn regression_mapped_create_keeps_real_overlay_owner() {
+        use std::os::unix::fs::MetadataExt;
+        let base = tempfile::tempdir().unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let source = Arc::new(ratarmount_compositing::FolderMountSource::new(base.path()).unwrap());
+        let overlay = Arc::new(WriteOverlay::new(source, directory.path()).unwrap());
+        let fs = RatarmountFs::new(overlay.clone(), Some(overlay.clone())).with_attribute_mapping(
+            AttributeMapping::parse("uid=12345,gid=23456,umask=027").unwrap(),
+        );
+        let (_, attr, _) = fs
+            .create_entry(FUSE_ROOT_ID, OsStr::new("created"), 0o666)
+            .unwrap();
+        let metadata = std::fs::metadata(directory.path().join("created")).unwrap();
+        assert_eq!((attr.uid, attr.gid), (12345, 23456));
+        assert_eq!(
+            (metadata.uid(), metadata.gid()),
+            (unsafe { libc::geteuid() }, unsafe { libc::getegid() })
+        );
+        assert_eq!(u32::from(attr.perm), metadata.mode() & 0o7777 & !0o027);
+        let raw = overlay.lookup("/created", 0).unwrap();
+        assert_eq!((raw.uid, raw.gid), (metadata.uid(), metadata.gid()));
+    }
+
+    /// Regression: allow_other must explain the fuse.conf line before fusermount fails.
+    #[test]
+    fn regression_allow_other_commented_whitespace_and_missing_config() {
+        for contents in [
+            "# user_allow_other",
+            "  #user_allow_other",
+            "",
+            "user_allow_other=no",
+            "user_allow_other extra",
+        ] {
+            assert!(!fuse_conf_allows_other(contents), "{contents}");
+        }
+        for contents in [
+            "user_allow_other",
+            "  user_allow_other \t",
+            "# comment\n\tuser_allow_other # permitted\n",
+        ] {
+            assert!(fuse_conf_allows_other(contents), "{contents}");
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("fuse.conf");
+        let error = validate_allow_other_with("allow_other", 1000, &path).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error
+            .to_string()
+            .contains("uncommented line user_allow_other to /etc/fuse.conf"));
+        assert!(validate_allow_other_with("allow_other", 0, &path).is_ok());
+        assert!(validate_allow_other_with("noatime", 1000, &path).is_ok());
+        std::fs::write(&path, "# user_allow_other\n user_allow_other # enable\n").unwrap();
+        assert!(validate_allow_other_with("allow_other", 1000, &path).is_ok());
     }
 }

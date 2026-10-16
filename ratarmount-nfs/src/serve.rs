@@ -86,6 +86,7 @@ impl Default for NfsStop {
 /// Listen / export options for [`serve_blocking`] / [`spawn_nfs_thread`].
 #[derive(Clone)]
 pub struct NfsOptions {
+    pub attribute_mapping: ratarmount_core::AttributeMapping,
     pub bind: SocketAddr,
     pub export_name: Option<String>,
     pub readahead_bytes: u64,
@@ -100,6 +101,7 @@ pub struct NfsOptions {
 impl Default for NfsOptions {
     fn default() -> Self {
         Self {
+            attribute_mapping: Default::default(),
             bind: crate::DEFAULT_NFS_BIND,
             export_name: None,
             readahead_bytes: 0,
@@ -114,6 +116,7 @@ impl Default for NfsOptions {
 impl std::fmt::Debug for NfsOptions {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("NfsOptions")
+            .field("attribute_mapping", &self.attribute_mapping)
             .field("bind", &self.bind)
             .field("export_name", &self.export_name)
             .field("readahead_bytes", &self.readahead_bytes)
@@ -199,6 +202,7 @@ fn nfs_from_opts(source: Arc<dyn MountSource>, opts: &NfsOptions) -> RatarmountN
         usize::try_from(opts.readahead_bytes).unwrap_or(usize::MAX),
         opts.overlay.clone(),
     )
+    .with_attribute_mapping(opts.attribute_mapping)
 }
 
 /// Bind + serve on the current tokio Runtime.
