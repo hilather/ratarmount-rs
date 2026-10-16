@@ -69,7 +69,7 @@ pub fn open_seekable_zlib_with_threads(
         .read_to_end(&mut plain)
         .map_err(|e| CompressError::Msg(format!("zlib inflate failed: {e}")))?;
     if plain.len() as u64 <= DEFAULT_MEMORY_CAP {
-        Ok(DecodedBody::from_bytes(path, "zlib", plain) as Arc<dyn SeekableBody>)
+        Ok(DecodedBody::from_bytes(path, "zlib", plain)? as Arc<dyn SeekableBody>)
     } else {
         let cursor = std::io::Cursor::new(plain);
         let body = DecodedBody::from_decoder(path, "zlib", cursor, DEFAULT_MEMORY_CAP)?;

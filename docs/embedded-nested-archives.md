@@ -14,9 +14,9 @@ This is the user-facing guide. Implementation / remaining work lives in [`tasks/
 
 | Question | Answer |
 |----------|--------|
-| **Does `.tar` inside a ZIP use `/tmp`?** | **No**, when AutoMount uses the nested *reader* path (default with `-r`). Outer ZIP `open()` yields a seekable member stream; nested TAR uses a **compact-only** in-process file table (no SQLite `files` store). |
+| **Does `.tar` inside a ZIP use `/tmp`?** | **No** for stored members. Deflate members use RAM up to the 64 MiB cache cap when budget permits; larger/refused members spill to a temporary file. Nested TAR still uses the reader path and a **compact-only** file table. |
 | **Does `.tar.gz` inside a 7z use `/tmp`?** | **No** for the nested body (gzip seek + TAR compact index from the member stream). Same for ZIP / TAR / 7z outers that can open the member as `Read+Seek`. |
-| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies — **not** full payload spool. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without spool. |
+| **When *is* `/tmp` used?** | Nested fallback when stream open fails/unsupported; residual path-only top-level backends (classic SquashFS lzma/`unsquashfs`, lrzip CLI, CAB LZX, encrypted SQLAR, …). **Plain** `.gz`/`.bz2`/`.zst`/… single-file mounts use seekable bodies; restart maps avoid full payload spool, while full-decode fallbacks may spill. `--memory-budget` can also spill decoded bodies/zstd frames, and ZIP Deflate members above 64 MiB always spill. Nested SquashFS (gzip/zstd/xz/…) uses `open_from_reader` without spool. |
 | **Is “no `/tmp`” the same as free I/O?** | No. Store/stencil is cheap; deflate/gzip still decompress; solid 7z can be expensive. |
 | **Large recursive trees (`-r` on huge `.deb`s)?** | Prefer **`-l` / `--lazy`** (and optional **`--recursion-depth`**). Eager `-r` can use multi‑GB RAM and minutes; not a correctness bug ([#179](https://github.com/mxmlnkn/ratarmount/issues/179)). |
 
@@ -125,15 +125,15 @@ RUST_LOG=debug,ratarmount=debug,ratarmount_compositing=debug ratarmount -r -d 2 
 
 ## Nested reader: formats that open **without** `/tmp`
 
-These are recognized from the **member byte stream** by `open_nested_reader_fn` (factory):
+These parsers accept the **member byte stream** via `open_nested_reader_fn` (factory), without requiring a host pathname. Parent ZIP Deflate members and decoded codec bodies can still spill according to the [memory-budget limits](memory-budget.md).
 
 | Nested member | Detection | How it is mounted | Nested member random read |
 |---------------|-----------|-------------------|---------------------------|
 | **Uncompressed TAR** | ustar magic or `.tar` name | `SqliteIndexedTar::open_from_reader` | **Yes** — stencil on stream offsets |
-| **ZIP** | `PK` magic | `ZipMountSource::open_from_reader` | Store: true random; deflate: inflate whole member then seek in RAM |
+| **ZIP** | `PK` magic | `ZipMountSource::open_from_reader` | Store: true random; deflate: inflate whole member then seek in RAM (≤64 MiB, budget permitting) or a temporary file |
 | **7z** | 7z signature | `SevenZipMountSource::open_from_reader` | Store: true random; pure LZMA2 / AES+LZMA2 / native BCJ/Delta+LZMA2 large solids: progressive; BCJ2 / multi-pack / Deflate / BZip2 solid: full-folder residual |
 | **`.tar.gz` / `.tgz`** | gzip magic + TAR body/name | Seekable gzip + `create_index_gzip` | **Yes** — gzip checkpoints + TAR stencil |
-| **Plain `.gz` / `.zst` / `.bz2` / `.xz` (non-TAR)** | compress magic | Seekable body + `SingleFileMountSource::from_seekable_body` (or nested archive if payload is ZIP/7z/…) | **Yes** — no nested member spool |
+| **Plain `.gz` / `.zst` / `.bz2` / `.xz` (non-TAR)** | compress magic | Seekable body + `SingleFileMountSource::from_seekable_body` (or nested archive if payload is ZIP/7z/…) | **Yes** — seekable maps, or decoded-body RAM/temp according to the limits |
 | **`.tar.zst`** | zstd magic + TAR | Seekable zstd + TAR body | Yes (frame/map dependent) |
 | **`.tar.bz2`** | `BZh` + TAR | Seekable bzip2 + TAR | Yes (block map) |
 | **`.tar.xz`** | xz magic + TAR | Seekable xz + TAR | Index map (multi-block / multi-stream preferred); large single-block spills |
@@ -180,9 +180,9 @@ the fallback described above.
 | Outer (parent) | Nested member | Uses `/tmp` for nested body? | Notes |
 |----------------|---------------|------------------------------|--------|
 | **ZIP (store)** | `.tar` | **No** | Parent: byte region; nested: TAR from_reader |
-| **ZIP (deflate)** | `.tar` | **No** | Parent inflates member into RAM (`Cursor`); nested TAR from that buffer — **no disk spool** |
-| **ZIP** | `.tar.gz` | **No** | Parent open + nested gzip→tar |
-| **ZIP** | `.zip` / `.7z` | **No** | Nested magic open |
+| **ZIP (deflate)** | `.tar` | **Conditional** | RAM up to 64 MiB when budget permits; otherwise decoded member spills to disk. Nested TAR still uses `from_reader`. |
+| **ZIP** | `.tar.gz` | **Conditional** | Stored parent: no spool; Deflate parent follows the RAM/temporary-file limits above, then nested gzip→tar. |
+| **ZIP** | `.zip` / `.7z` | **Conditional** | Nested magic open; outer Deflate member follows the RAM/temporary-file limits above. |
 | **TAR** (plain) | `.tar` | **No** (often no AutoMount) | Flattened nested TAR paths in outer index when small / `-r`; else reader path |
 | **TAR** | `.tar.gz` / `.zip` / `.7z` | **No** | Stencil outer member + nested reader |
 | **`.tar.gz` / `.tgz`** | `.tar` / `.zip` / `.7z` / `.tar.gz` | **No** | Outer is seekable gzip; member open is stencil over gzip |
@@ -203,11 +203,11 @@ outer.zip
 
 ```bash
 ratarmount -r outer.zip mnt/
-cat mnt/inner.tar/hi.txt   # no copy of inner.tar to /tmp
+cat mnt/inner.tar/hi.txt   # stored members avoid /tmp; Deflate follows the limits below
 ```
 
 - **Store** ZIP member: nested TAR reads stencil into the ZIP file (best).
-- **Deflate** ZIP member: `inner.tar` is inflated once into memory, then TAR is indexed/read from that buffer — still **not** written under `/tmp`.
+- **Deflate** ZIP member: `inner.tar` is inflated into the shared RAM cache up to 64 MiB when the budget permits. Otherwise it is streamed to a temporary file. TAR indexes and reads either seekable body directly.
 
 Same for `outer.zip` → `inner.tar.gz`.
 
@@ -244,7 +244,7 @@ Temp files are held for the life of that nested mount and removed when the neste
 |-----------|----------------------------------------|
 | TAR stencil / ZIP store / 7z store | ~disk `pread` (best) |
 | gzip / zstd / bzip2 seek + TAR | Jump to checkpoint/frame + local decompress |
-| ZIP deflate member (as nested *or* as parent open of nested TAR) | Inflate whole member once (cached); then free seeks in RAM |
+| ZIP deflate member (as nested *or* as parent open of nested TAR) | Inflate whole member (shared cache when ≤64 MiB and budget permits; otherwise temporary file); then cheap seeks |
 | 7z pure LZMA2 / AES+LZMA2 (solid or large non-solid) | Live sequential cursor (linear `cat`); random reads resume at independent LZMA2 reset chunks. Window LRU helps locality. Non-solid folders retain the 0..N prefix after a header-at-end walk |
 | 7z native BCJ/Delta+LZMA2 (large solid) | Sequential-from-0 + LRU; **no** dict-reset resume (BCJ IP is decoder-relative) |
 | 7z BCJ2 / multi-pack / Deflate / BZip2 solid | Full-folder decompress residual |
@@ -268,7 +268,7 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 
 | Symptom | Likely cause |
 |---------|----------------|
-| Nested works but `/tmp/…` appears | Fallback path; check `RUST_LOG` for unsupported magic |
+| Nested works but `/tmp/…` appears | Unsupported-reader fallback, oversized ZIP Deflate member, or memory-budget spill; check `RUST_LOG` and control status |
 | List OK, read fails with EACCES | Encrypted 7z metadata-only; need password (inner password for nested encrypted 7z) |
 | Nested `.tar.gz` slow cold open | Building gzip seek checkpoints on the member stream (once per nested mount) |
 | Nested inside solid 7z slow | Solid prefix cost — re-pack outer non-solid if possible |
@@ -305,4 +305,13 @@ Uncompressed **TAR-in-TAR** may never hit AutoMount:
 | Nested CAB LZX / classic SquashFS LZMA / RAR | usually **tmp** | depends on path open |
 | Solid multi-GB 7z outer | no tmp | often costly |
 
-\* Inner ZIP deflate / solid 7z have the usual decompress costs. **xz residual:** open/size is cheap with a Stream Index (footer-first range reads); any byte access still decompresses the covering **block**. Prefer `xz --block-size=…` / pixz for multi‑GiB random access. Default single-block maps stay seekable only when the unit is ≤ the ~256 MiB RAM cap; larger single-block falls through to full decode + temp spill (same cap as other codecs). Nested temp files are still avoided when the reader path succeeds.
+\* Inner ZIP deflate / solid 7z have the usual decompress costs. **xz residual:** open/size is cheap with a Stream Index (footer-first range reads); any byte access still decompresses the covering **block**. Prefer `xz --block-size=…` / pixz for multi‑GiB random access. Default single-block maps stay seekable only when the unit is ≤ the ~256 MiB RAM cap; larger single-block falls through to full decode + temp spill (same cap as other codecs). The nested parser avoids an additional spool when its reader path succeeds; parent/codecs remain subject to their RAM caps and `--memory-budget`.
+
+### Optional memory-budget spill
+
+With `--memory-budget SIZE`, decoded seekable bodies, zstd frames, Deflate ZIP
+members, and HF responses that ignore Range can spill to temporary files when
+RAM reservations are refused. This also applies to nested readers. The normal
+no-flag matrix above is unchanged except that Deflate ZIP members larger than
+the 64 MiB inflate-cache byte cap now use a temporary file. See
+[memory-budget.md](memory-budget.md) for the exact scope and pool limits.

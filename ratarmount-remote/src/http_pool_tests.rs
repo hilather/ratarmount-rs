@@ -1564,3 +1564,33 @@ fn regression_http_range_cache_explicit_strong_etag_mismatch_bypasses() {
     assert!(file.source.token(16).is_none());
     assert!(file.complete_file().is_none());
 }
+
+/// Regression: a tiny memory budget must degrade without corrupting reads.
+#[test]
+fn regression_memory_budget_http_prefetch_degrades() {
+    let name = std::thread::current().name().unwrap().to_string();
+    if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("RATARMOUNT_BUDGET_TEST", &name)
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+    let size = 2 * 1024 * 1024;
+    let server = Server::spawn(move |req| Response::ranged(&req, size));
+    let mut reader = HttpRangeFile::open(&server.url).unwrap();
+    reader.parallel = 8;
+    let mut bytes = Vec::new();
+    reader.read_to_end(&mut bytes).unwrap();
+    assert_eq!(bytes, pattern(0, size as usize));
+    assert_eq!(
+        ratarmount_core::budget::MemoryBudget::global()
+            .snapshot()
+            .reserved,
+        0
+    );
+}

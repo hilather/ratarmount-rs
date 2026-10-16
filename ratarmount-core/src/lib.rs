@@ -2,6 +2,7 @@
 
 mod atomic_update;
 mod attribute_mapping;
+pub mod budget;
 mod quiet_print;
 pub use atomic_update::{try_update_u64, try_update_usize};
 pub use attribute_mapping::AttributeMapping;

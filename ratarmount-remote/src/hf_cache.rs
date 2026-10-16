@@ -815,6 +815,82 @@ pub(crate) struct HubCacheFile {
     state: Arc<(Mutex<PublishState>, Condvar)>,
 }
 
+/// Publication owns the same bytes/reservation or disk spool as live readers.
+enum BufferedBody {
+    Memory {
+        bytes: Arc<Vec<u8>>,
+        _memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+    },
+    Disk {
+        file: Arc<Mutex<File>>,
+        size: u64,
+    },
+}
+
+// Windows seek_read changes the shared cursor. Lock only each read, restoring
+// that cursor before releasing it; publication writes never hold the reader lock.
+#[cfg(any(not(unix), test))]
+struct SpoolReader<'a> {
+    file: &'a Mutex<File>,
+    pos: u64,
+    size: u64,
+}
+
+#[cfg(any(not(unix), test))]
+impl Read for SpoolReader<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let len = (buf.len() as u64).min(self.size.saturating_sub(self.pos)) as usize;
+        if len == 0 {
+            return Ok(0);
+        }
+        let mut file = self.file.lock().unwrap_or_else(|e| e.into_inner());
+        let saved = file.stream_position()?;
+        file.seek(SeekFrom::Start(self.pos))?;
+        let result = file.read(&mut buf[..len]);
+        let restored = file.seek(SeekFrom::Start(saved));
+        let count = result?;
+        restored?;
+        self.pos += count as u64;
+        Ok(count)
+    }
+}
+
+impl BufferedBody {
+    fn size(&self) -> u64 {
+        match self {
+            Self::Memory { bytes, .. } => bytes.len() as u64,
+            Self::Disk { size, .. } => *size,
+        }
+    }
+
+    fn write_to(&self, writer: &mut impl Write) -> io::Result<()> {
+        match self {
+            Self::Memory { bytes, .. } => writer.write_all(bytes),
+            Self::Disk { file, size } => {
+                #[cfg(unix)]
+                let mut reader = {
+                    let file = file.lock().unwrap_or_else(|e| e.into_inner()).try_clone()?;
+                    LocalReader {
+                        file: Arc::new(file),
+                        size: *size,
+                        pos: 0,
+                    }
+                };
+                #[cfg(not(unix))]
+                let mut reader = SpoolReader {
+                    file,
+                    size: *size,
+                    pos: 0,
+                };
+                if io::copy(&mut reader, writer)? != *size {
+                    return Err(io::ErrorKind::UnexpectedEof.into());
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
 impl HubCacheFile {
     pub(crate) fn new(
         cache: HubCache,
@@ -869,7 +945,7 @@ impl HubCacheFile {
         &self,
         ranges: Option<RangeCache>,
         token: ContentToken,
-        buffered: Option<Arc<[u8]>>,
+        buffered: Option<BufferedBody>,
     ) {
         let mut state = self.state.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.busy || state.retry_at.is_some_and(|t| t > Instant::now()) || self.etag.is_none() {
@@ -891,7 +967,7 @@ impl HubCacheFile {
                     let blobs = bridge.cache.repo_dir(&bridge.location).join("blobs");
                     directories(&bridge.cache.root, &blobs, true)?;
                     let mut tmp = temporary(&blobs)?;
-                    tmp.write_all(&bytes)?;
+                    bytes.write_to(&mut tmp)?;
                     let path = tmp.path().to_path_buf();
                     #[cfg(test)]
                     bridge.cache.stats.spools.lock().unwrap().push(path.clone());
@@ -935,16 +1011,31 @@ impl HubCacheFile {
         }
     }
 
-    pub(crate) fn buffered(&self, bytes: Arc<[u8]>) {
+    pub(crate) fn buffered(
+        &self,
+        bytes: Arc<Vec<u8>>,
+        memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+    ) {
+        self.publish_body(BufferedBody::Memory {
+            bytes,
+            _memory: memory,
+        });
+    }
+
+    pub(crate) fn spooled(&self, file: Arc<Mutex<File>>, size: u64) {
+        self.publish_body(BufferedBody::Disk { file, size });
+    }
+
+    fn publish_body(&self, body: BufferedBody) {
         let token = ContentToken::HfCommitPath {
             endpoint: "buffered".into(),
             repo_kind: self.location.kind.clone(),
             repo: self.location.repo.clone(),
             commit: self.commit.clone(),
             path: self.path.clone(),
-            size: bytes.len() as u64,
+            size: body.size(),
         };
-        self.schedule(None, token, Some(bytes));
+        self.schedule(None, token, Some(body));
     }
 
     pub(crate) fn observed(&self, ranges: &RangeCache, token: &ContentToken, chunk: u64) {
@@ -2064,7 +2155,7 @@ mod tests {
         let started = Arc::new(std::sync::Barrier::new(2));
         let resume = Arc::new(std::sync::Barrier::new(2));
         *cache.stats.before_install.lock().unwrap() = Some((started.clone(), resume.clone()));
-        bridge.buffered(Arc::from(b"buffered".as_slice()));
+        bridge.buffered(Arc::new(b"buffered".to_vec()), None);
         started.wait();
         let paths = cache.stats.spools.lock().unwrap().clone();
         let in_cache = paths.len() == 1
@@ -2075,6 +2166,74 @@ mod tests {
         assert!(in_cache);
         assert!(bridge.local().is_some());
         assert!(!paths[0].exists());
+    }
+
+    /// Regression: background publication outlived the reader's memory reservation.
+    #[test]
+    fn regression_hf_cache_publication_holds_memory_reservation() {
+        use ratarmount_core::budget::{MemoryBudget, Priority};
+
+        let budget = MemoryBudget::new(Some(64));
+        let pool = budget.register("hf-fallback", 0, 64, Priority::Cache);
+        let memory = Arc::new(pool.reserve(8).unwrap());
+        let body = BufferedBody::Memory {
+            bytes: Arc::new(b"buffered".to_vec()),
+            _memory: Some(memory.clone()),
+        };
+        drop(memory);
+        assert_eq!(budget.snapshot().reserved, 8);
+        assert!(pool.reserve(1).is_none());
+        let mut bytes = Vec::new();
+        body.write_to(&mut bytes).unwrap();
+        assert_eq!(bytes, b"buffered");
+        drop(body);
+        assert_eq!(budget.snapshot().reserved, 0);
+    }
+
+    /// Regression: disk publication held the reader lock and changed its cursor.
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn regression_hf_cache_spooled_publication_preserves_reader_cursor() {
+        struct Writer {
+            file: Arc<Mutex<File>>,
+            bytes: Vec<u8>,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+                let mut file = self
+                    .file
+                    .try_lock()
+                    .expect("publication must not lock reads");
+                assert_eq!(file.stream_position()?, 3);
+                self.bytes.write(bytes)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"spooled").unwrap();
+        file.seek(SeekFrom::Start(3)).unwrap();
+        let file = Arc::new(Mutex::new(file));
+        let body = BufferedBody::Disk {
+            file: file.clone(),
+            size: 7,
+        };
+        let mut writer = Writer {
+            file,
+            bytes: Vec::new(),
+        };
+        body.write_to(&mut writer).unwrap();
+        assert_eq!(writer.bytes, b"spooled");
+        let file = writer.file.clone();
+        let mut reader = SpoolReader {
+            file: &file,
+            pos: 0,
+            size: 7,
+        };
+        writer.bytes.clear();
+        io::copy(&mut reader, &mut writer).unwrap();
+        assert_eq!(writer.bytes, b"spooled");
     }
 
     /// Regression: an unwritable cache retried a failed publication on every read instead of backing off.

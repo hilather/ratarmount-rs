@@ -7504,7 +7504,8 @@ mod tests {
         assert_udf_fail_closed(&nested_err.to_string(), "open_nested_reader_fn");
 
         let body =
-            ratarmount_compress::DecodedBody::from_bytes(Path::new("mixed.iso"), "test", img);
+            ratarmount_compress::DecodedBody::from_bytes(Path::new("mixed.iso"), "test", img)
+                .unwrap();
         let seekable_err =
             try_open_formats_from_seekable_body(Path::new("mixed.iso"), body, None, &opts, true)
                 .err()

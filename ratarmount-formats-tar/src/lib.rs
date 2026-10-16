@@ -5235,7 +5235,8 @@ mod tests {
             Path::new("virtual.bin"),
             "test",
             payload.to_vec(),
-        );
+        )
+        .unwrap();
         let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
             .expect("from_seekable_body");
 
@@ -5298,7 +5299,8 @@ mod tests {
             Path::new("virtual.bin"),
             "test",
             payload.to_vec(),
-        );
+        )
+        .unwrap();
         let src = SingleFileMountSource::from_seekable_body("payload.bin".into(), body)
             .expect("from_seekable_body");
 

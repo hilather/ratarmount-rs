@@ -795,10 +795,10 @@ fn classify_zstd<R: Read + Seek>(reader: &mut R, threads: u32) -> Result<ZstdPla
 
 fn decode_full(path: &Path, threads: u32) -> Result<Arc<dyn SeekableBody>> {
     // Best-effort: multi-frame full materialization with parallel frame decode.
-    if threads > 1 {
+    if threads > 1 && !ratarmount_core::budget::MemoryBudget::global().enabled() {
         if let Ok(data) = try_parallel_frame_decode(path, threads) {
             if data.len() as u64 <= DEFAULT_MEMORY_CAP {
-                return Ok(DecodedBody::from_bytes(path, "zstd", data) as Arc<dyn SeekableBody>);
+                return Ok(DecodedBody::from_bytes(path, "zstd", data)? as Arc<dyn SeekableBody>);
             }
             let cursor = std::io::Cursor::new(data);
             let body = DecodedBody::from_decoder(path, "zstd", cursor, DEFAULT_MEMORY_CAP)?;
@@ -820,10 +820,10 @@ fn decode_full_from_reader<R>(
 where
     R: Read + Seek + Send + 'static,
 {
-    if threads > 1 {
+    if threads > 1 && !ratarmount_core::budget::MemoryBudget::global().enabled() {
         if let Ok(data) = try_parallel_frame_decode_from_reader(&mut reader, threads) {
             if data.len() as u64 <= DEFAULT_MEMORY_CAP {
-                return Ok(DecodedBody::from_bytes(path, "zstd", data) as Arc<dyn SeekableBody>);
+                return Ok(DecodedBody::from_bytes(path, "zstd", data)? as Arc<dyn SeekableBody>);
             }
             let cursor = std::io::Cursor::new(data);
             let body = DecodedBody::from_decoder(path, "zstd", cursor, DEFAULT_MEMORY_CAP)?;
@@ -1064,6 +1064,8 @@ impl Seek for CompressedHandle {
 
 #[derive(Debug)]
 struct Reservation {
+    _memory: ratarmount_core::budget::Reservation,
+    _pressure: Option<ratarmount_core::budget::PressureHook>,
     used: Arc<AtomicU64>,
     slots: Arc<AtomicU64>,
     bytes: u64,
@@ -1089,6 +1091,9 @@ struct ZstdFrameReader {
     pos: u64,
     frame_idx: Option<usize>,
     frame_data: Vec<u8>,
+    frame_reservation: Option<Reservation>,
+    frame_memory: Option<ratarmount_core::budget::Reservation>,
+    frame_spool: Option<File>,
     frame_start: u64,
     progress: u64,
     bytes_read: u64,
@@ -1187,6 +1192,9 @@ impl ZstdFrameReader {
             pos: 0,
             frame_idx: None,
             frame_data: Vec::new(),
+            frame_reservation: None,
+            frame_memory: None,
+            frame_spool: None,
             frame_start: 0,
             progress: 0,
             bytes_read: 0,
@@ -1215,6 +1223,20 @@ impl ZstdFrameReader {
     }
 
     fn reserve_frame(&self, bytes: u64, budget: u64) -> Option<Reservation> {
+        let pool = ratarmount_core::budget::MemoryPool::global(
+            "zstd-decode-ahead",
+            64 * 1024 * 1024,
+            ratarmount_core::budget::Priority::Speculative,
+        );
+        let memory = pool.reserve(bytes)?;
+        let weak = Arc::downgrade(&self.cancelled);
+        let pressure = pool.enabled().then(|| {
+            pool.on_pressure(move || {
+                if let Some(cancelled) = weak.upgrade() {
+                    cancelled.store(true, Ordering::Release);
+                }
+            })
+        });
         ratarmount_core::try_update_u64(
             &self.reserved_slots,
             Ordering::AcqRel,
@@ -1234,6 +1256,8 @@ impl ZstdFrameReader {
             return None;
         }
         Some(Reservation {
+            _memory: memory,
+            _pressure: pressure,
             used: Arc::clone(&self.reserved),
             slots: Arc::clone(&self.reserved_slots),
             bytes,
@@ -1267,6 +1291,10 @@ impl ZstdFrameReader {
     }
 
     fn prefetch(&mut self, mut reusable: Vec<u8>) {
+        if self.cancelled.load(Ordering::Acquire) {
+            self.cancel();
+            return;
+        }
         if self.options.threads <= 1
             || self.options.readahead_bytes == 0
             || self.progress < 128 * 1024
@@ -1358,12 +1386,20 @@ impl ZstdFrameReader {
     }
 
     fn ensure_frame(&mut self, target: u64) -> io::Result<()> {
+        if self.cancelled.load(Ordering::Acquire) {
+            self.cancel();
+        }
         if target >= self.size {
             return Ok(());
         }
+        let cached_len = if self.frame_spool.is_some() {
+            self.frame_idx.map_or(0, |index| self.frame_size(index))
+        } else {
+            self.frame_data.len() as u64
+        };
         if self.frame_idx.is_some()
             && target >= self.frame_start
-            && target < self.frame_start + self.frame_data.len() as u64
+            && target < self.frame_start + cached_len
         {
             return Ok(());
         }
@@ -1389,13 +1425,56 @@ impl ZstdFrameReader {
                 }
                 Err(mpsc::TryRecvError::Disconnected) => None,
             };
-            result.and_then(|(data, _reservation)| data.ok())
+            result.and_then(|(data, reservation)| data.ok().map(|data| (data, reservation)))
         } else {
             None
         };
         let mut reusable = std::mem::take(&mut self.frame_data);
+        if ratarmount_core::budget::MemoryBudget::global().enabled() {
+            reusable = Vec::new();
+            self.frame_reservation = None;
+            self.frame_memory = None;
+            self.frame_spool = None;
+            if prefetched.is_none() {
+                let pool = ratarmount_core::budget::MemoryPool::global(
+                    "zstd-frame",
+                    64 * 1024 * 1024,
+                    ratarmount_core::budget::Priority::Cache,
+                );
+                self.frame_memory = pool.reserve(self.frame_size(best));
+                if self.frame_memory.is_none() {
+                    let mut input = self.backend.open_compressed()?;
+                    let info = &self.frames[best];
+                    input.seek(SeekFrom::Start(info.compressed_offset))?;
+                    let decoder = zstd::stream::read::Decoder::new(
+                        input.take(info.compressed_size.unwrap_or(u64::MAX)),
+                    )?
+                    .single_frame();
+                    let mut spool = tempfile::tempfile()?;
+                    let expected = self.frame_size(best);
+                    let size = io::copy(&mut decoder.take(expected.saturating_add(1)), &mut spool)?;
+                    if size != expected {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "zstd frame size differs from frame map",
+                        ));
+                    }
+                    self.frame_spool = Some(spool);
+                    self.frame_idx = Some(best);
+                    self.frame_start = info.uncompressed_offset;
+                    self.stats.synchronous += 1;
+                    self.prefetch(Vec::new());
+                    return Ok(());
+                }
+            }
+        }
         self.frame_data = match prefetched {
-            Some(data) => data,
+            Some((data, reservation)) => {
+                if ratarmount_core::budget::MemoryBudget::global().enabled() {
+                    self.frame_reservation = Some(reservation);
+                }
+                data
+            }
             None => {
                 self.stats.synchronous += 1;
                 let start = std::time::Instant::now();
@@ -1449,8 +1528,16 @@ impl Read for ZstdFrameReader {
         }
         self.ensure_frame(self.pos)?;
         let into = (self.pos - self.frame_start) as usize;
-        let n = (self.frame_data.len() - into).min(buf.len());
-        buf[..n].copy_from_slice(&self.frame_data[into..into + n]);
+        let remaining = self
+            .frame_size(self.frame_idx.unwrap())
+            .saturating_sub(into as u64);
+        let n = remaining.min(buf.len() as u64) as usize;
+        if let Some(spool) = &mut self.frame_spool {
+            spool.seek(SeekFrom::Start(into as u64))?;
+            spool.read_exact(&mut buf[..n])?;
+        } else {
+            buf[..n].copy_from_slice(&self.frame_data[into..into + n]);
+        }
         self.pos += n as u64;
         self.progress = self.progress.saturating_add(n as u64);
         self.bytes_read += n as u64;
@@ -1715,6 +1802,75 @@ pub fn build_seek_table_skippable(frames: &[(u32, u32)]) -> Vec<u8> {
 
 #[cfg(test)]
 mod tests {
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_zstd_tracks_active_and_prefetched_frames() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(8388608).unwrap();
+
+        let (_dir, mut reader, expected) = ahead_fixture(4, 512 * 1024);
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert!(reader.stats.prefetched > 0);
+        let snapshot = ratarmount_core::budget::MemoryBudget::global().snapshot();
+        assert!(snapshot.high_water > 0 && snapshot.high_water <= 8388608);
+        assert!(snapshot.pools.iter().all(|p| p.high_water <= p.cap));
+    }
+
+    /// Regression: a tiny memory budget must degrade without corrupting reads.
+    #[test]
+    fn regression_memory_budget_zstd_ahead_degrades() {
+        let name = std::thread::current().name().unwrap().to_string();
+        if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+            assert!(std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", &name, "--nocapture"])
+                .env("RATARMOUNT_BUDGET_TEST", &name)
+                .status()
+                .unwrap()
+                .success());
+            return;
+        }
+        ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+        let (_dir, mut reader, expected) = ahead_fixture(4, 512 * 1024);
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(reader.stats.prefetched, 0);
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+        let path = _dir.path().join("single.zst");
+        std::fs::write(&path, encode_frame(&expected)).unwrap();
+        let body = open_seekable_zstd_with_threads(&path, 4).unwrap();
+        let mut actual = Vec::new();
+        body.open_reader()
+            .unwrap()
+            .read_to_end(&mut actual)
+            .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            ratarmount_core::budget::MemoryBudget::global()
+                .snapshot()
+                .reserved,
+            0
+        );
+        regression_decode_ahead_error_at_requested_offset_and_retry();
+    }
     use super::*;
     use std::io::{Cursor, Write};
 
@@ -2024,15 +2180,9 @@ mod tests {
         }
         reader.cancel();
         let (tx, result) = mpsc::channel();
-        reader.reserved.store(1, Ordering::Release);
-        reader.reserved_slots.store(1, Ordering::Release);
         tx.send((
             Err(io::Error::other("transient prefetch error")),
-            Reservation {
-                used: reader.reserved.clone(),
-                slots: reader.reserved_slots.clone(),
-                bytes: 1,
-            },
+            reader.reserve_frame(1, 512 * 1024).unwrap(),
         ))
         .unwrap();
         reader.pending.push_back(PendingFrame { index: 1, result });
@@ -2053,6 +2203,10 @@ mod tests {
         assert_eq!(got, data[256 * 1024..384 * 1024]);
         assert!(reader.read(&mut got).is_err());
         assert_eq!(reader.pos, 384 * 1024);
+        // A failed replacement must not advertise the now-empty previous frame.
+        reader.seek(SeekFrom::Start(256 * 1024)).unwrap();
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, data[256 * 1024..384 * 1024]);
     }
 
     #[test]

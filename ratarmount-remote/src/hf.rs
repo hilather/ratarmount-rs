@@ -132,7 +132,9 @@ enum CachedFile {
     Ready {
         source: Arc<http_pool::HttpRangeSource>,
         size: u64,
-        buffered: Option<Arc<[u8]>>,
+        buffered: Option<Arc<Vec<u8>>>,
+        memory: Option<Arc<ratarmount_core::budget::Reservation>>,
+        disk: Option<Arc<Mutex<std::fs::File>>>,
     },
     TooLarge,
 }
@@ -630,9 +632,17 @@ impl HfRepo {
             *file = Some(self.probe_file(path)?);
         }
         match file.as_ref().unwrap() {
-            CachedFile::Ready { source, size, buffered } => {
-                if let Some(bytes) = buffered { source.store_buffered(bytes.clone()); }
-                Ok(HttpRangeFile::from_source(source.clone(), *size, buffered.clone()))
+            CachedFile::Ready { source, size, buffered, memory, disk } => {
+                if let Some(bytes) = buffered {
+                    source.store_buffered(bytes.clone(), memory.clone());
+                }
+                if let Some(disk) = disk {
+                    source.store_spooled(disk.clone(), *size);
+                }
+                let mut reader = HttpRangeFile::from_source(source.clone(), *size, buffered.clone());
+                reader.memory = memory.clone();
+                reader.disk = disk.clone();
+                Ok(reader)
             }
             CachedFile::TooLarge => Err(error(format!(
                 "Hub file {}/{} ignores Range and exceeds the 64 MiB buffer limit; use an endpoint with Range support or download it locally",
@@ -689,6 +699,8 @@ impl HfRepo {
                 source,
                 size,
                 buffered: None,
+                memory: None,
+                disk: None,
             });
         }
         let mut source = match cached {
@@ -702,11 +714,13 @@ impl HfRepo {
             {
                 let source = Arc::new(source);
                 self.attach_content_token(&source, path, 0);
-                source.store_buffered(Arc::from([]));
+                source.store_buffered(Arc::new(Vec::new()), None);
                 return Ok(CachedFile::Ready {
                     source,
                     size: 0,
-                    buffered: Some(Arc::from([])),
+                    buffered: Some(Arc::new(Vec::new())),
+                    memory: None,
+                    disk: None,
                 });
             }
             result => result,
@@ -764,6 +778,8 @@ impl HfRepo {
                 source,
                 size,
                 buffered: None,
+                memory: None,
+                disk: None,
             })
         } else if response.status() == 200 {
             if response
@@ -773,15 +789,43 @@ impl HfRepo {
             {
                 return Ok(CachedFile::TooLarge);
             }
+            let pool = ratarmount_core::budget::MemoryPool::global(
+                "hf-fallback",
+                MAX_BUFFER_BYTES,
+                ratarmount_core::budget::Priority::Cache,
+            );
+            let memory = pool.reserve(MAX_BUFFER_BYTES).map(Arc::new);
+            if memory.is_none() {
+                let mut file = tempfile::tempfile()?;
+                let size = io::copy(
+                    &mut response.into_reader().take(MAX_BUFFER_BYTES + 1),
+                    &mut file,
+                )?;
+                if size > MAX_BUFFER_BYTES {
+                    return Ok(CachedFile::TooLarge);
+                }
+                self.attach_content_token(&source, path, size);
+                let disk = Arc::new(Mutex::new(file));
+                source.store_spooled(disk.clone(), size);
+                return Ok(CachedFile::Ready {
+                    source,
+                    size,
+                    buffered: None,
+                    memory: None,
+                    disk: Some(disk),
+                });
+            }
             match bounded_body(response.into_reader(), MAX_BUFFER_BYTES)? {
                 Some(bytes) => {
                     self.attach_content_token(&source, path, bytes.len() as u64);
-                    let bytes: Arc<[u8]> = bytes.into();
-                    source.store_buffered(bytes.clone());
+                    let bytes = Arc::new(bytes);
+                    source.store_buffered(bytes.clone(), memory.clone());
                     Ok(CachedFile::Ready {
                         source,
                         size: bytes.len() as u64,
                         buffered: Some(bytes),
+                        memory,
+                        disk: None,
                     })
                 }
                 None => Ok(CachedFile::TooLarge),

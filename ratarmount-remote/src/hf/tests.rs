@@ -1109,6 +1109,28 @@ fn regression_hf_range_cache_tree_lfs_oid_verifies_complete_file() {
     );
 }
 
+/// Regression: a tiny memory budget must degrade without corrupting reads.
+#[test]
+fn regression_memory_budget_hf_spills_ignored_range() {
+    let name = std::thread::current().name().unwrap().to_string();
+    if std::env::var("RATARMOUNT_BUDGET_TEST").ok().as_deref() != Some(&name) {
+        assert!(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &name, "--nocapture"])
+            .env("RATARMOUNT_BUDGET_TEST", &name)
+            .status()
+            .unwrap()
+            .success());
+        return;
+    }
+    ratarmount_core::budget::MemoryBudget::install(64).unwrap();
+
+    regression_hf_ignored_range_buffers_once_and_empty_file_opens();
+    regression_hf_cache_buffered_and_empty_files_shared();
+    let snapshot = ratarmount_core::budget::MemoryBudget::global().snapshot();
+    assert_eq!(snapshot.reserved, 0);
+    assert!(snapshot.pools.iter().any(|p| p.name == "hf-fallback"));
+}
+
 fn shared_cache_config(server: &Server, root: &std::path::Path) -> Config {
     let mut config = config(server, None);
     config.hub_cache = Some(crate::hf_cache::HubCache::from_values(&|key| {

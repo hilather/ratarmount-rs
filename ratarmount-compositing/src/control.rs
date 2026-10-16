@@ -261,6 +261,7 @@ impl ControlFolderMountSource {
             None => s.push_str("mounted\n"),
         }
         s.push_str(&format!("pid {}\n", std::process::id()));
+        s.push_str(&ratarmount_core::budget::MemoryBudget::global().status_text());
         if let Some(callback) = &self.on_status {
             s.push_str(&callback());
         }
@@ -725,6 +726,7 @@ mod tests {
         }
     }
 
+    /// Regression: virtual status includes global memory pools and accounting.
     #[test]
     fn status_and_pid_readable() {
         let dir = tempfile::tempdir().unwrap();
@@ -736,7 +738,14 @@ mod tests {
             ControlFolderOptions::enabled().with_label("/mnt/test"),
         );
 
+        let _pool = ratarmount_core::budget::MemoryPool::global(
+            "status-test",
+            1,
+            ratarmount_core::budget::Priority::Cache,
+        );
         let status = read_all(&ms, &format!("{CONTROL_DIR_PATH}/status"));
+        assert!(status.contains("memory_budget unlimited"));
+        assert!(status.contains("memory_pool status-test"));
         assert!(status.contains("mounted /mnt/test"), "{status}");
         assert!(
             status.contains(&format!("pid {}", std::process::id())),
