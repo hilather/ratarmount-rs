@@ -33,10 +33,12 @@ use ratarmount_session::factory;
 #[macro_use]
 mod quiet_print;
 
+mod export_index;
 mod find;
 mod overlay_commit;
 mod overlay_stats;
 mod publish_index;
+mod shard;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -56,7 +58,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
                   Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
-                  Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE)."
+                  Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE).\n\
+                  Datasets: ratarmount shard INPUT -o OUTPUT; ratarmount export-index ARCHIVE --format parquet|jsonl|csv."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -512,6 +515,12 @@ struct Args {
     #[arg(skip)]
     find: bool,
 
+    #[arg(skip)]
+    shard: Option<shard::ShardArgs>,
+
+    #[arg(skip)]
+    export_index: Option<export_index::ExportArgs>,
+
     /// Find-argv `--fts` (FTS5 MATCH). Not a global mount flag.
     #[arg(skip)]
     find_fts: bool,
@@ -545,6 +554,21 @@ where
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    if raw
+        .get(1)
+        .is_some_and(|s| s == "shard" || s == "export-index")
+    {
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        let verb = raw[1].to_string_lossy();
+        let argv = std::iter::once(OsString::from(format!("ratarmount {verb}")))
+            .chain(raw.iter().skip(2).cloned());
+        if verb == "shard" {
+            args.shard = Some(shard::ShardArgs::try_parse_from(argv)?);
+        } else {
+            args.export_index = Some(export_index::ExportArgs::try_parse_from(argv)?);
+        }
+        return Ok(args);
+    }
     if raw.get(1).is_some_and(|s| s == "overlay-stats") {
         let stats = overlay_stats::StatsArgs::try_parse_from(
             std::iter::once(OsString::from("ratarmount overlay-stats"))
@@ -803,6 +827,26 @@ fn main() {
     // mount exists, so point dead stdio at /dev/null first.
     neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+
+    if args.shard.is_some() || args.export_index.is_some() {
+        let result = export_index::cli_stdout()
+            .map_err(Into::into)
+            .and_then(|mut stdout| {
+                if let Some(shard) = &args.shard {
+                    shard::run(shard).map(|_| ())
+                } else {
+                    export_index::run(
+                        args.export_index.as_ref().expect("parsed export-index"),
+                        &mut stdout,
+                    )
+                }
+            });
+        if let Err(error) = result {
+            eprintln!("error: {error}");
+            std::process::exit(1);
+        }
+        return;
+    }
 
     if let Some(stats) = &args.overlay_stats {
         match overlay_stats::run(stats) {
