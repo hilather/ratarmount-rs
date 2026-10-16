@@ -43,10 +43,16 @@ fn overlay_errno(err: &ratarmount_compositing::OverlayError) -> i32 {
 /// users see as "Input/output error" when opening encrypted nested 7z without
 /// `--password`.
 ///
-/// Kinds without a dedicated arm keep `raw_os_error` when the error has one, so
-/// `EMFILE` and `ENFILE` stay distinct. A kind-only error with no raw code is `EIO`.
+/// Raw OS errors pass through unchanged, including `EMFILE` and `ENFILE`.
+/// Unknown kind-only errors map to `EIO`.
 fn io_to_errno(err: &std::io::Error) -> i32 {
+    if let Some(errno) = err.raw_os_error() {
+        return errno;
+    }
     match err.kind() {
+        ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+        ErrorKind::QuotaExceeded => libc::EDQUOT,
+        ErrorKind::StorageFull => libc::ENOSPC,
         ErrorKind::NotFound => ENOENT,
         ErrorKind::PermissionDenied => EACCES,
         ErrorKind::IsADirectory => EISDIR,
@@ -1887,6 +1893,31 @@ impl RatarmountFs {
         }
     }
 
+    fn mutation_path(&self, ino: u64) -> Result<String, i32> {
+        self.inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .map(|e| e.detached.as_ref().map_or(&e.path, |d| &d.path).clone())
+            .ok_or(ENOENT)
+    }
+
+    /// Body of WRITE, also exercised without a kernel mount in policy tests.
+    fn write_handle(&self, ino: u64, fh: u64, offset: i64, data: &[u8]) -> Result<usize, i32> {
+        use std::os::fd::FromRawFd;
+        let ov = self.overlay.as_ref().ok_or(EROFS)?;
+        let path = self.mutation_path(ino)?;
+        let handles = self.handles.lock().unwrap();
+        let fd = match handles.get(&fh) {
+            Some(OpenBackend::OverlayFd(fd)) => *fd,
+            _ => return Err(EIO),
+        };
+        // Borrow the handle while its table lock prevents release/close.
+        let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+        ov.write_at(&file, &path, offset.max(0) as u64, data)
+            .map_err(|e| io_to_errno(&e))
+    }
+
     /// Body of `setattr`. Non-detached behavior is path `truncate`. A detached
     /// inode refuses an fh-less setattr; a write fh `ftruncate`s that fd.
     fn setattr_entry(
@@ -1926,12 +1957,11 @@ impl RatarmountFs {
         let Some(fh) = fh else {
             return Err(EACCES);
         };
-        let fd = {
-            let handles = self.handles.lock().unwrap();
-            match handles.get(&fh) {
-                Some(OpenBackend::OverlayFd(fd)) => *fd,
-                _ => return Err(EACCES),
-            }
+        let path = self.mutation_path(ino)?;
+        let handles = self.handles.lock().unwrap();
+        let fd = match handles.get(&fh) {
+            Some(OpenBackend::OverlayFd(fd)) => *fd,
+            _ => return Err(EACCES),
         };
         let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
         if flags < 0 {
@@ -1944,9 +1974,11 @@ impl RatarmountFs {
             return Err(EACCES);
         }
         if let Some(sz) = size {
-            if unsafe { libc::ftruncate(fd, sz as libc::off_t) } != 0 {
-                return Err(io_to_errno(&std::io::Error::last_os_error()));
-            }
+            use std::os::fd::FromRawFd;
+            let ov = self.overlay.as_ref().ok_or(EROFS)?;
+            let file = std::mem::ManuallyDrop::new(unsafe { std::fs::File::from_raw_fd(fd) });
+            ov.truncate_file(&file, &path, sz)
+                .map_err(|e| io_to_errno(&e))?;
         }
         let mut st = unsafe { std::mem::zeroed::<libc::stat>() };
         if unsafe { libc::fstat(fd, &mut st) } != 0 {
@@ -2407,25 +2439,13 @@ impl Filesystem for RatarmountFs {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let fd = {
-            let g = self.handles.lock().unwrap();
-            match g.get(&fh) {
-                Some(OpenBackend::OverlayFd(fd)) => *fd,
-                _ => {
-                    reply.error(if self.writable() { EIO } else { EROFS });
-                    return;
-                }
+        match self.write_handle(ino, fh, offset, data) {
+            Err(e) => reply.error(e),
+            Ok(n) => {
+                self.drop_stable_attr(ino);
+                reply.written(n as u32);
+                self.flush_kernel_invals();
             }
-        };
-        let n = unsafe { libc::pwrite(fd, data.as_ptr() as *const _, data.len(), offset.max(0)) };
-        if n < 0 {
-            reply.error(EIO);
-        } else {
-            // First write of a previously cached archive member must drop the
-            // 60s kernel attr. Later overlay writes already have TTL 0.
-            self.drop_stable_attr(ino);
-            reply.written(n as u32);
-            self.flush_kernel_invals();
         }
     }
 
@@ -2802,6 +2822,139 @@ mod tests {
     use std::sync::mpsc;
     use std::thread;
     use std::time::Instant;
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: FUSE data writes and namespace mutations preserve policy errnos.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyBase), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let fd = {
+            // A pre-existing writable handle must still consult the policy.
+            use std::os::fd::IntoRawFd;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .open(td.path().join("locked/file"))
+                .unwrap()
+                .into_raw_fd()
+        };
+        let mut fs = RatarmountFs::new(ov.clone(), Some(ov));
+        let locked = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("locked"))
+            .unwrap()
+            .0;
+        let file = fs.lookup_entry(locked, OsStr::new("file")).unwrap().0;
+        let quota = fs
+            .lookup_entry(FUSE_ROOT_ID, OsStr::new("quota"))
+            .unwrap()
+            .0;
+        fs.handles
+            .lock()
+            .unwrap()
+            .insert(999, OpenBackend::OverlayFd(fd));
+        assert_eq!(
+            fs.write_handle(file, 999, 0, b"x").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.create_entry(locked, OsStr::new("new"), 0o644)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.setattr_entry(file, Some(3), None).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.rename_paths(locked, "file", FUSE_ROOT_ID, "moved", 0)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.rename_paths(FUSE_ROOT_ID, "outside", locked, "file", 0)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.remove_entry(locked, OsStr::new("file"), false)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.mkdir_entry(locked, OsStr::new("newdir"), 0o755)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.remove_entry(locked, OsStr::new("empty"), true)
+                .unwrap_err(),
+            libc::EROFS
+        );
+        let (fh, _) = fs.open_inode(quota, libc::O_RDWR).unwrap();
+        assert_eq!(
+            fs.write_handle(quota, fh, 0, b"abc").unwrap_err(),
+            libc::EDQUOT
+        );
+        assert_eq!(fs.write_handle(quota, fh, 0, b"ab").unwrap(), 2);
+        fs.remove_entry(FUSE_ROOT_ID, OsStr::new("quota"), false)
+            .unwrap();
+        assert_eq!(
+            fs.write_handle(quota, fh, 2, b"c").unwrap_err(),
+            libc::EDQUOT
+        );
+        assert_eq!(
+            fs.setattr_entry(quota, Some(3), Some(fh)).unwrap_err(),
+            libc::EDQUOT
+        );
+        assert_eq!(fs.read_handle(fh, 0, 8).unwrap(), b"ab");
+        for (kind, errno) in [
+            (ErrorKind::ReadOnlyFilesystem, libc::EROFS),
+            (ErrorKind::QuotaExceeded, libc::EDQUOT),
+            (ErrorKind::StorageFull, libc::ENOSPC),
+        ] {
+            assert_eq!(io_to_errno(&io::Error::new(kind, "policy")), errno);
+        }
+    }
 
     /// Minimal MountSource that only serves synthetic xattrs for unit tests.
     struct XattrSource {

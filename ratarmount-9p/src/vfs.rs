@@ -1,6 +1,6 @@
 //! `MountSource` adapter for 9P2000.L (inode table + reader LRU + overlay).
 
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io;
 use std::os::unix::io::FromRawFd;
 use std::sync::Arc;
 
@@ -370,10 +370,8 @@ impl Ratarmount9p {
         let fd = ov
             .open_overlay_fd(&path, flags)
             .map_err(|e| io_to_errno(&overlay_to_io(e)))?;
-        let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-        let wrote = file
-            .seek(SeekFrom::Start(offset))
-            .and_then(|_| file.write_all(data));
+        let file = unsafe { std::fs::File::from_raw_fd(fd) };
+        let wrote = ov.write_all_at(&file, &path, offset, data);
         ov.finish_owned_write_fd(file);
         wrote.map_err(|e| io_to_errno(&e))?;
         self.bump(id);
@@ -513,6 +511,87 @@ mod tests {
     use std::io::Cursor;
 
     use ratarmount_core::ListResult;
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: policy errors from every 9P mutator retain EROFS/EDQUOT.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let fs = Ratarmount9p::with_overlay(ov.clone(), 0, 8, Some(ov));
+        let locked = fs.inodes.id_for_path("/locked");
+        let file = fs.inodes.id_for_path("/locked/file");
+        let quota = fs.inodes.id_for_path("/quota");
+        assert_eq!(fs.write(file, 0, b"x").unwrap_err(), libc::EROFS);
+        assert_eq!(fs.lcreate(locked, "new", 0o644).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.setattr_size(file, SETATTR_SIZE, 3).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.renameat(locked, "file", ROOT_FILEID, "moved")
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.renameat(ROOT_FILEID, "outside", locked, "file")
+                .unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.unlinkat(locked, "file", 0).unwrap_err(), libc::EROFS);
+        assert_eq!(fs.mkdir(locked, "newdir", 0o755).unwrap_err(), libc::EROFS);
+        assert_eq!(
+            fs.unlinkat(locked, "empty", AT_REMOVEDIR).unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(
+            fs.symlink(locked, "link", "target").unwrap_err(),
+            libc::EROFS
+        );
+        assert_eq!(fs.write(quota, 0, b"abc").unwrap_err(), libc::EDQUOT);
+        assert_eq!(fs.write(quota, 0, b"ab").unwrap(), 2);
+        assert_eq!(fs.read(quota, 0, 8).unwrap(), b"ab");
+    }
 
     struct EmptyFs;
     impl MountSource for EmptyFs {

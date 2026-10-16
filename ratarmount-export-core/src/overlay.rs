@@ -9,7 +9,13 @@ use ratarmount_compositing::{OverlayError, WriteOverlay};
 /// Password / permission failures must not collapse to generic EIO — that is
 /// what users see when opening encrypted nested 7z without `--password`.
 pub fn io_to_errno(err: &io::Error) -> i32 {
+    if let Some(errno) = err.raw_os_error() {
+        return errno;
+    }
     match err.kind() {
+        ErrorKind::ReadOnlyFilesystem => libc::EROFS,
+        ErrorKind::QuotaExceeded => libc::EDQUOT,
+        ErrorKind::StorageFull => libc::ENOSPC,
         ErrorKind::NotFound => libc::ENOENT,
         ErrorKind::PermissionDenied => libc::EACCES,
         ErrorKind::IsADirectory => libc::EISDIR,
@@ -55,6 +61,85 @@ mod tests {
     use std::sync::Arc;
 
     use ratarmount_core::{FileInfo, ListResult, MountSource};
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: policy errors survive overlay conversion and errno mapping.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyFs), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        assert_eq!(
+            io_to_errno(&overlay_create_file(&ov, "/locked/new", 0o644).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_truncate(&ov, "/locked/file", 3).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_mkdir(&ov, "/locked/newdir", 0o755).unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_unlink(&ov, "/locked/file").unwrap_err()),
+            libc::EROFS
+        );
+        assert_eq!(
+            io_to_errno(&overlay_rename(&ov, "/outside", "/locked/file").unwrap_err()),
+            libc::EROFS
+        );
+        for (kind, raw) in [
+            (ErrorKind::ReadOnlyFilesystem, libc::EROFS),
+            (ErrorKind::QuotaExceeded, libc::EDQUOT),
+            (ErrorKind::StorageFull, libc::ENOSPC),
+        ] {
+            assert_eq!(io_to_errno(&io::Error::new(kind, "policy")), raw);
+            assert_eq!(io_to_errno(&io::Error::from_raw_os_error(raw)), raw);
+        }
+        for raw in [libc::EMFILE, libc::ENFILE, libc::EPERM, libc::EOPNOTSUPP] {
+            assert_eq!(io_to_errno(&io::Error::from_raw_os_error(raw)), raw);
+        }
+    }
 
     struct EmptyFs;
     impl MountSource for EmptyFs {

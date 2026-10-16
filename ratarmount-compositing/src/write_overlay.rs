@@ -474,8 +474,74 @@ fn lock_mutex<'a, T>(
     }
 }
 
+/// Mutation being authorized. Rename supplies both source and destination paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OverlayMutation {
+    CopyOnWrite,
+    Create,
+    OpenWrite,
+    Write,
+    Mkdir,
+    Unlink,
+    Rmdir,
+    Truncate,
+    Symlink,
+    Rename,
+    Reset,
+}
+
+/// Optional authorization and accounting for overlay content.
+///
+/// Paths are normalized mount paths. Callbacks must not call back into the
+/// overlay. Checks and accounting are serialized within this overlay.
+/// `check_write` authorizes the prospective extent (including sparse growth),
+/// with the current host file length, not the archive member's size. A truncate
+/// checks `(offset = new_size, len = 0)`. COW checks the full copy before creating
+/// a host file, then checks each write as well.
+///
+/// Accounting counts logical host file lengths, including symlinks and COW
+/// copies, but excludes directories and overlay bookkeeping. Removal releases
+/// the named file's charge; an unlinked open inode is not part of named usage.
+/// Initialize usage from the overlay folder before installing a policy on an
+/// existing overlay. External host writes are outside this interface.
+pub trait OverlayPolicy: Send + Sync {
+    fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()>;
+    fn check_write(&self, path: &str, offset: u64, len: u64, current_size: u64) -> io::Result<()>;
+    fn bytes_changed(&self, _path: &str, _added: u64, _removed: u64) {}
+    fn file_created(&self, _path: &str) {}
+    fn file_removed(&self, _path: &str) {}
+}
+
+// Snapshot around a host mutation, including failed/partial operations. This
+// guard is only constructed with a policy; the default path does no extra stat.
+struct PolicyAccounting<'a> {
+    overlay: &'a WriteOverlay,
+    path: String,
+    before: Option<u64>,
+}
+
+impl Drop for PolicyAccounting<'_> {
+    fn drop(&mut self) {
+        let after = self.overlay.policy_file_size(&self.path);
+        let policy = self.overlay.policy.as_ref().expect("policy accounting");
+        if self.before.is_none() && after.is_some() {
+            policy.file_created(&self.path);
+        }
+        let old = self.before.unwrap_or(0);
+        let new = after.unwrap_or(0);
+        if old != new {
+            policy.bytes_changed(&self.path, new.saturating_sub(old), old.saturating_sub(new));
+        }
+        if self.before.is_some() && after.is_none() {
+            policy.file_removed(&self.path);
+        }
+    }
+}
+
 /// Union of a read-only base with a writable overlay folder + deletion DB.
 pub struct WriteOverlay {
+    policy: Option<Arc<dyn OverlayPolicy>>,
+    policy_gate: Mutex<()>,
     base: Arc<dyn MountSource>,
     /// After a live TAR commit, the reopened archive.
     replacement: RwLock<Option<Arc<dyn MountSource>>>,
@@ -596,6 +662,185 @@ impl OverlayError {
 }
 
 impl WriteOverlay {
+    /// Install before sharing the overlay with frontends. `None` disables hooks.
+    pub fn set_policy(&mut self, policy: Option<Arc<dyn OverlayPolicy>>) {
+        self.policy = policy;
+    }
+
+    fn policy_lock(&self) -> Option<std::sync::MutexGuard<'_, ()>> {
+        self.policy
+            .as_ref()
+            .map(|_| self.policy_gate.lock().expect("overlay policy"))
+    }
+
+    fn check_mutation(&self, op: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+        if let Some(policy) = &self.policy {
+            let paths: Vec<String> = paths.iter().map(|p| normpath(p)).collect();
+            let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+            policy.check_mutation(op, &refs)?;
+        }
+        Ok(())
+    }
+
+    fn policy_file_size(&self, path: &str) -> Option<u64> {
+        fs::symlink_metadata(self.realpath(path))
+            .ok()
+            .filter(|m| !m.is_dir())
+            .map(|m| m.len())
+    }
+
+    fn account_path(&self, path: &str) -> Option<PolicyAccounting<'_>> {
+        self.policy.as_ref().map(|_| PolicyAccounting {
+            overlay: self,
+            path: normpath(path),
+            before: self.policy_file_size(path),
+        })
+    }
+
+    /// Write bytes through the policy to a borrowed overlay file (never closes it).
+    /// The file may refer to an inode detached by rename/unlink. Callers retain
+    /// ownership and the write-open pin until their normal release path.
+    #[cfg(unix)]
+    pub fn write_at(&self, file: &File, path: &str, offset: u64, buf: &[u8]) -> io::Result<usize> {
+        let _gate = self
+            .policy
+            .as_ref()
+            .map(|_| self.commit_gate.read().expect("overlay commit gate"));
+        let _policy = self.policy_lock();
+        self.write_at_inner(file, path, offset, buf)
+    }
+
+    #[cfg(unix)]
+    fn write_at_inner(
+        &self,
+        file: &File,
+        path: &str,
+        offset: u64,
+        buf: &[u8],
+    ) -> io::Result<usize> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        if is_overlay_internal_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "overlay internal path",
+            ));
+        }
+        self.check_mutation(OverlayMutation::Write, &[path])?;
+        let before = if let Some(policy) = &self.policy {
+            use std::os::fd::AsRawFd;
+            let meta = file.metadata()?;
+            let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+            if flags < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // Linux pwrite honors O_APPEND despite the positional offset.
+            let effective_offset = if cfg!(target_os = "linux") && flags & libc::O_APPEND != 0 {
+                meta.len()
+            } else {
+                offset
+            };
+            policy.check_write(
+                &normpath(path),
+                effective_offset,
+                buf.len() as u64,
+                meta.len(),
+            )?;
+            Some((meta, effective_offset))
+        } else {
+            None
+        };
+        let written = file.write_at(buf, offset)?;
+        if let (Some(policy), Some((before, effective_offset))) = (&self.policy, before) {
+            // An unlinked inode was already removed from named usage.
+            if before.nlink() != 0 {
+                let added = if written == 0 {
+                    0
+                } else {
+                    effective_offset
+                        .saturating_add(written as u64)
+                        .saturating_sub(before.len())
+                };
+                if added != 0 {
+                    policy.bytes_changed(&normpath(path), added, 0);
+                }
+            }
+        }
+        Ok(written)
+    }
+
+    /// Fill a positional write, preserving short-write and EINTR semantics.
+    #[cfg(unix)]
+    pub fn write_all_at(
+        &self,
+        file: &File,
+        path: &str,
+        mut offset: u64,
+        mut buf: &[u8],
+    ) -> io::Result<()> {
+        while !buf.is_empty() {
+            match self.write_at(file, path, offset, buf) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WriteZero,
+                        "overlay write returned zero",
+                    ))
+                }
+                Ok(n) => {
+                    offset = offset.checked_add(n as u64).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidInput, "overlay write offset overflow")
+                    })?;
+                    buf = &buf[n..];
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(())
+    }
+
+    /// Truncate an already-open inode, including a detached FUSE writer.
+    pub fn truncate_file(&self, file: &File, path: &str, size: u64) -> io::Result<()> {
+        let _gate = self
+            .policy
+            .as_ref()
+            .map(|_| self.commit_gate.read().expect("overlay commit gate"));
+        let _policy = self.policy_lock();
+        self.truncate_file_inner(file, path, size)
+    }
+
+    fn truncate_file_inner(&self, file: &File, path: &str, size: u64) -> io::Result<()> {
+        if is_overlay_internal_path(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "overlay internal path",
+            ));
+        }
+        self.check_mutation(OverlayMutation::Truncate, &[path])?;
+        let before = if let Some(policy) = &self.policy {
+            let meta = file.metadata()?;
+            policy.check_write(&normpath(path), size, 0, meta.len())?;
+            Some(meta)
+        } else {
+            None
+        };
+        file.set_len(size)?;
+        if let (Some(policy), Some(before)) = (&self.policy, before) {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                if before.nlink() == 0 {
+                    return Ok(());
+                }
+            }
+            policy.bytes_changed(
+                &normpath(path),
+                size.saturating_sub(before.len()),
+                before.len().saturating_sub(size),
+            );
+        }
+        Ok(())
+    }
+
     pub fn new(base: Arc<dyn MountSource>, overlay: impl AsRef<Path>) -> Result<Self> {
         let root = overlay.as_ref().to_path_buf();
         if root.exists() {
@@ -771,6 +1016,8 @@ impl WriteOverlay {
             }
         }
         Ok(Self {
+            policy: None,
+            policy_gate: Mutex::new(()),
             base,
             replacement: RwLock::new(None),
             root,
@@ -1060,10 +1307,18 @@ impl WriteOverlay {
 
     /// Copy base file into overlay (COW) if not already present.
     pub fn ensure_modifiable(&self, path: &str) -> Result<()> {
+        let _gate = self
+            .policy
+            .as_ref()
+            .map(|_| self.commit_gate.read().expect("overlay commit gate"));
+        let _policy = self.policy_lock();
+        self.ensure_modifiable_inner(path)
+    }
+
+    fn ensure_modifiable_inner(&self, path: &str) -> Result<()> {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
-        self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         // Use symlink_metadata so a planted escape symlink is not treated as "present".
@@ -1071,15 +1326,26 @@ impl WriteOverlay {
             // Existing entry must stay under root (final symlink already rejected).
             return Ok(());
         }
+        self.check_mutation(OverlayMutation::CopyOnWrite, &[path])?;
+        self.ensure_parent(path)?;
         let Some(fi) = self.current_base().lookup(path, 0) else {
             // New file: just ensure parent
             return Ok(());
         };
+        if let Some(policy) = &self.policy {
+            let size = match fi.mode & ratarmount_core::S_IFMT {
+                ratarmount_core::S_IFLNK => fi.linkname.len() as u64,
+                ratarmount_core::S_IFDIR => 0,
+                _ => fi.size,
+            };
+            policy.check_write(&normpath(path), 0, size, 0)?;
+        }
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFDIR {
             fs::create_dir_all(&real)?;
             return Ok(());
         }
         if fi.mode & ratarmount_core::S_IFMT == ratarmount_core::S_IFLNK {
+            let _account = self.account_path(path);
             // COW a symlink as a symlink: archive symlinks carry no content,
             // so copying the body would materialize an empty regular file and
             // a later commit would drop the link member entirely.
@@ -1092,8 +1358,31 @@ impl WriteOverlay {
         let mut src = self.current_base().open(&fi, 0)?;
         let mut opts = open_options_nofollow();
         opts.write(true).create_new(true);
-        let mut dst = opts.open(&real)?;
-        io::copy(&mut src, &mut dst)?;
+        let mut dst = {
+            let _account = self.account_path(path);
+            opts.open(&real)?
+        };
+        if let Some(policy) = &self.policy {
+            let mut buf = [0u8; 64 * 1024];
+            let mut offset = 0;
+            loop {
+                let n = match src.read(&mut buf) {
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                    other => other?,
+                };
+                if n == 0 {
+                    break;
+                }
+                self.check_mutation(OverlayMutation::Write, &[path])?;
+                policy.check_write(&normpath(path), offset, n as u64, offset)?;
+                // Account partial writes even when write_all returns an error.
+                let _account = self.account_path(path);
+                dst.write_all(&buf[..n])?;
+                offset += n as u64;
+            }
+        } else {
+            io::copy(&mut src, &mut dst)?;
+        }
         Ok(())
     }
 
@@ -1221,6 +1510,7 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
         let fd = self.create_file_inner(path, mode)?;
         self.register_write_fd(fd, path);
         Ok(fd)
@@ -1305,6 +1595,7 @@ impl WriteOverlay {
         if is_overlay_internal_path(path) {
             return Err(internal_name_refused(path));
         }
+        self.check_mutation(OverlayMutation::Create, &[path])?;
         #[cfg(not(unix))]
         {
             let _ = (self, path, mode);
@@ -1325,6 +1616,15 @@ impl WriteOverlay {
                 use std::os::unix::fs::OpenOptionsExt;
                 opts.mode(mode & 0o7777);
             }
+            if let Some(policy) = &self.policy {
+                policy.check_write(
+                    &normpath(path),
+                    0,
+                    0,
+                    self.policy_file_size(path).unwrap_or(0),
+                )?;
+            }
+            let _account = self.account_path(path);
             let f = opts.open(&real)?;
             let fd = {
                 use std::os::unix::io::IntoRawFd;
@@ -1347,7 +1647,11 @@ impl WriteOverlay {
         #[cfg(unix)]
         {
             let _gate = self.commit_gate.read().expect("overlay commit gate");
-            self.ensure_modifiable(path)?;
+            let _policy = self.policy_lock();
+            if flags & (libc::O_WRONLY | libc::O_RDWR | libc::O_CREAT | libc::O_TRUNC) != 0 {
+                self.check_mutation(OverlayMutation::OpenWrite, &[path])?;
+            }
+            self.ensure_modifiable_inner(path)?;
             let real = self.realpath(path);
             self.ensure_under_root(&real)?;
             // If still missing and write flags, create empty. `create_file_inner`
@@ -1367,11 +1671,25 @@ impl WriteOverlay {
                 )));
             }
             // Never follow host symlinks out of the overlay folder.
-            let flags = flags | libc::O_NOFOLLOW;
+            let mut flags = flags | libc::O_NOFOLLOW;
+            let policy_truncate = self.policy.is_some() && flags & libc::O_TRUNC != 0;
+            if policy_truncate {
+                flags &= !libc::O_TRUNC;
+            }
             let fd = unsafe { libc::open(c_path(&real)?.as_ptr(), flags, 0o644) };
             if fd < 0 {
                 return Err(OverlayError::Io(io::Error::last_os_error()));
             }
+            let fd = if policy_truncate {
+                use std::os::fd::{FromRawFd, IntoRawFd};
+                // Only truncate after open succeeds (O_EXCL must preserve the
+                // old contents). Ownership closes the fd if policy/set_len fails.
+                let file = unsafe { File::from_raw_fd(fd) };
+                self.truncate_file_inner(&file, path, 0)?;
+                file.into_raw_fd()
+            } else {
+                fd
+            };
             // Double-check the opened path still resolves under the overlay root.
             if let Ok(canon) = fs::canonicalize(&real) {
                 if !path_is_under(&self.root, &canon) {
@@ -1400,6 +1718,8 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Mkdir, &[path])?;
         self.ensure_parent(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
@@ -1436,6 +1756,8 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Unlink, &[path])?;
         let path = normpath(path);
         let real = self.realpath(&path);
         // unlink of a symlink removes the link itself (safe); refuse only when the
@@ -1451,6 +1773,7 @@ impl WriteOverlay {
         } else {
             None
         };
+        let _account = self.account_path(&path);
         // remove_file unlinks symlinks without following them.
         if fs::symlink_metadata(&real).is_ok() {
             fs::remove_file(&real)?;
@@ -1464,6 +1787,8 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Rmdir, &[path])?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         // POSIX: refuse non-directories and non-empty dirs in the union view.
@@ -1508,13 +1833,15 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
-        self.ensure_modifiable(path)?;
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Truncate, &[path])?;
+        self.ensure_modifiable_inner(path)?;
         let real = self.realpath(path);
         self.ensure_under_root(&real)?;
         let mut opts = open_options_nofollow();
         opts.write(true);
         let f = opts.open(&real)?;
-        f.set_len(size)?;
+        self.truncate_file_inner(&f, path, size)?;
         Ok(())
     }
 
@@ -1524,6 +1851,8 @@ impl WriteOverlay {
             return Err(internal_name_refused(path));
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Symlink, &[path])?;
         if target.is_empty() {
             return Err(OverlayError::Io(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1542,6 +1871,10 @@ impl WriteOverlay {
         if let Some(parent) = real.parent() {
             fs::create_dir_all(parent)?;
         }
+        if let Some(policy) = &self.policy {
+            policy.check_write(&normpath(path), 0, target.len() as u64, 0)?;
+        }
+        let _account = self.account_path(path);
         overlay_symlink(Path::new(target), &real)?;
         self.mark_present(path, ratarmount_core::S_IFLNK | 0o777)?;
         Ok(())
@@ -1593,6 +1926,8 @@ impl WriteOverlay {
             }
         }
         let _gate = self.commit_gate.read().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Rename, &[from, to])?;
         let from = normpath(from);
         let to = normpath(to);
         if from == "/" || to == "/" || from == to {
@@ -1615,7 +1950,7 @@ impl WriteOverlay {
         }
         // COW the source before touching the destination: if the copy fails
         // (read error, ENOSPC), the destination must stay as it was.
-        self.ensure_modifiable(&from)?;
+        self.ensure_modifiable_inner(&from)?;
         let from_real = self.realpath(&from);
         let to_real = self.realpath(&to);
         self.ensure_rename_confined(&from_real)?;
@@ -1644,7 +1979,11 @@ impl WriteOverlay {
         if let Some(parent) = to_real.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::rename(&from_real, &to_real)?;
+        {
+            let _from_account = self.account_path(&from);
+            let _to_account = self.account_path(&to);
+            fs::rename(&from_real, &to_real)?;
+        }
         let hides_from = self.current_base().exists(&from);
         // Host rename already happened. `persist_files_op` queues on failure
         // and returns success so the client sees the completed rename.
@@ -2753,6 +3092,7 @@ impl WriteOverlay {
                 let cleanup = if idle_for.is_some() {
                     self.forget_committed_overlay(&plan)
                 } else {
+                    let _account = self.account_reset()?;
                     let wiped = reset_overlay_dir(&self.root).and_then(|_| {
                         self.db
                             .lock()
@@ -2814,6 +3154,7 @@ impl WriteOverlay {
                 continue;
             }
             let host = self.realpath(rel);
+            let _account = self.account_path(rel);
             match fs::remove_file(&host) {
                 Ok(()) => {}
                 Err(e) if e.kind() == io::ErrorKind::NotFound => {}
@@ -3065,9 +3406,40 @@ impl WriteOverlay {
         Ok(window)
     }
 
+    fn account_reset(&self) -> Result<Vec<PolicyAccounting<'_>>> {
+        if self.policy.is_none() {
+            return Ok(Vec::new());
+        }
+        let mut accounts = Vec::new();
+        let mut dirs = vec![("/".to_string(), self.root.clone())];
+        while let Some((path, host)) = dirs.pop() {
+            for entry in fs::read_dir(host)? {
+                let entry = entry?;
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if is_overlay_internal_name(&name) {
+                    continue;
+                }
+                let child = join(&path, &name);
+                if entry.file_type()?.is_dir() {
+                    dirs.push((child.clone(), entry.path()));
+                }
+                if let Some(account) = self.account_path(&child) {
+                    accounts.push(account);
+                }
+            }
+        }
+        Ok(accounts)
+    }
+
     /// Remove overlay files (except the hidden DB) and clear deletion/present rows.
     pub fn reset_overlay_contents(&self) -> Result<()> {
         let _gate = self.commit_gate.write().expect("overlay commit gate");
+        let _policy = self.policy_lock();
+        self.check_mutation(OverlayMutation::Reset, &["/"])?;
+        let _account = self.account_reset()?;
+        for account in &_account {
+            self.check_mutation(OverlayMutation::Unlink, &[&account.path])?;
+        }
         reset_overlay_dir(&self.root)?;
         {
             // Queue then database. A later replay must not resurrect rows
@@ -5749,6 +6121,328 @@ mod tests {
     use std::process::Command as StdCommand;
     use zip::write::SimpleFileOptions;
     use zip::{CompressionMethod, ZipArchive, ZipWriter};
+
+    /// Regression: append-mode descriptors must charge growth even with offset zero.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn regression_overlay_policy_append_cannot_bypass_quota() {
+        use std::os::fd::FromRawFd;
+        let (_td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[])), 4);
+        let file = unsafe {
+            File::from_raw_fd(
+                ov.open_overlay_fd("/append", libc::O_WRONLY | libc::O_CREAT | libc::O_APPEND)
+                    .unwrap(),
+            )
+        };
+        ov.write_at(&file, "/append", 0, b"ab").unwrap();
+        ov.write_at(&file, "/append", 0, b"cd").unwrap();
+        assert_eq!(policy.usage(), (4, 1));
+        assert_eq!(
+            ov.write_at(&file, "/append", 0, b"e").unwrap_err().kind(),
+            io::ErrorKind::QuotaExceeded
+        );
+        assert_eq!(file.metadata().unwrap().len(), 4);
+        ov.finish_owned_write_fd(file);
+    }
+
+    /// Regression: a failed COW still charges bytes left by a partial copy.
+    #[test]
+    fn regression_overlay_policy_accounts_partial_cow_failure() {
+        struct PartialReader(io::Cursor<Vec<u8>>);
+        impl Read for PartialReader {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                if self.0.position() >= 3 {
+                    return Err(io::Error::other("injected read failure"));
+                }
+                self.0.read(buf)
+            }
+        }
+        impl Seek for PartialReader {
+            fn seek(&mut self, pos: SeekFrom) -> io::Result<u64> {
+                self.0.seek(pos)
+            }
+        }
+        struct PartialBase;
+        impl MountSource for PartialBase {
+            fn list(&self, _: &str) -> Option<ListResult> {
+                None
+            }
+            fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+                (path == "/partial").then(|| mem_file_info(path, 6))
+            }
+            fn open(
+                &self,
+                _: &FileInfo,
+                _: i32,
+            ) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+                Ok(Box::new(PartialReader(io::Cursor::new(b"abc".to_vec()))))
+            }
+            fn is_immutable(&self) -> bool {
+                true
+            }
+        }
+        let (td, ov, policy) = policy_overlay(Arc::new(PartialBase), 8);
+        assert!(ov.ensure_modifiable("/partial").is_err());
+        assert_eq!(fs::read(td.path().join("partial")).unwrap(), b"abc");
+        assert_eq!(policy.usage(), (3, 1));
+        ov.unlink("/partial").unwrap();
+        assert_eq!(policy.usage(), (0, 0));
+    }
+
+    /// Regression: read-only opens of an existing host file must not invoke a write policy.
+    #[cfg(unix)]
+    #[test]
+    fn regression_overlay_policy_read_open_still_allowed() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(MemBase::with(&[])), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        let file = policy_file(&ov, "/locked/file");
+        ov.write_at(&file, "/locked/file", 0, b"base").unwrap();
+        ov.finish_owned_write_fd(file);
+        ov.set_policy(Some(Arc::new(CountingPolicy::new(0))));
+        let fd = ov.open_overlay_fd("/locked/file", libc::O_RDONLY).unwrap();
+        ov.close_overlay_fd(fd);
+        assert!(
+            matches!(ov.reset_overlay_contents(), Err(OverlayError::Io(ref e)) if e.kind() == io::ErrorKind::ReadOnlyFilesystem)
+        );
+        assert_eq!(fs::read(td.path().join("locked/file")).unwrap(), b"base");
+    }
+
+    struct CountingPolicy {
+        limit: u64,
+        usage: Mutex<(u64, u64)>,
+    }
+
+    impl CountingPolicy {
+        fn new(limit: u64) -> Self {
+            Self {
+                limit,
+                usage: Mutex::new((0, 0)),
+            }
+        }
+        fn usage(&self) -> (u64, u64) {
+            *self.usage.lock().unwrap()
+        }
+    }
+
+    impl OverlayPolicy for CountingPolicy {
+        fn check_mutation(&self, _: OverlayMutation, paths: &[&str]) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(io::ErrorKind::ReadOnlyFilesystem, "locked"));
+            }
+            Ok(())
+        }
+        fn check_write(&self, _: &str, offset: u64, len: u64, current_size: u64) -> io::Result<()> {
+            let growth = offset.saturating_add(len).saturating_sub(current_size);
+            if self.usage().0.saturating_add(growth) > self.limit {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "quota"));
+            }
+            Ok(())
+        }
+        fn bytes_changed(&self, _: &str, added: u64, removed: u64) {
+            let mut usage = self.usage.lock().unwrap();
+            usage.0 = usage
+                .0
+                .checked_add(added)
+                .unwrap()
+                .checked_sub(removed)
+                .unwrap();
+        }
+        fn file_created(&self, _: &str) {
+            self.usage.lock().unwrap().1 += 1;
+        }
+        fn file_removed(&self, _: &str) {
+            self.usage.lock().unwrap().1 -= 1;
+        }
+    }
+
+    fn policy_overlay(
+        base: Arc<dyn MountSource>,
+        limit: u64,
+    ) -> (tempfile::TempDir, WriteOverlay, Arc<CountingPolicy>) {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(base, td.path()).unwrap();
+        let policy = Arc::new(CountingPolicy::new(limit));
+        ov.set_policy(Some(policy.clone()));
+        (td, ov, policy)
+    }
+
+    #[cfg(unix)]
+    fn policy_file(ov: &WriteOverlay, path: &str) -> File {
+        use std::os::fd::FromRawFd;
+        unsafe {
+            File::from_raw_fd(
+                ov.open_overlay_fd(path, libc::O_RDWR | libc::O_CREAT)
+                    .unwrap(),
+            )
+        }
+    }
+
+    /// Regression: readonly paths reject COW, both rename endpoints, and all mutations before side effects.
+    #[test]
+    fn regression_overlay_policy_denials_leave_names_unchanged() {
+        let (td, ov, policy) = policy_overlay(
+            Arc::new(MemBase::with(&[
+                ("/locked/file", b"base"),
+                ("/outside", b"source"),
+            ])),
+            64,
+        );
+        let results = [
+            ov.ensure_modifiable("/locked/file"),
+            ov.create_file("/locked/new", 0o644)
+                .map(|fd| ov.close_overlay_fd(fd)),
+            ov.mkdir("/locked/dir", 0o755),
+            ov.unlink("/locked/file"),
+            ov.unlink_parked("/locked/file").map(|_| ()),
+            ov.rmdir("/locked/empty"),
+            ov.truncate("/locked/file", 0),
+            ov.create_symlink("/locked/link", "target"),
+            ov.rename("/locked/file", "/moved"),
+            ov.rename("/outside", "/locked/file"),
+            ov.rename_parked("/outside", "/locked/file").map(|_| ()),
+        ];
+        for result in results {
+            assert!(
+                matches!(result, Err(OverlayError::Io(ref e)) if e.kind() == io::ErrorKind::ReadOnlyFilesystem)
+            );
+        }
+        assert!(!td.path().join("locked").exists());
+        assert!(!td.path().join("outside").exists());
+        assert_eq!(policy.usage(), (0, 0));
+        assert_eq!(ov.lookup("/locked/file", 0).unwrap().size, 4);
+    }
+
+    /// Regression: COW, sparse writes, overwrite, truncate, symlink and rename-over account actual host growth once.
+    #[cfg(unix)]
+    #[test]
+    fn regression_overlay_policy_accounts_cow_truncate_rename_and_reset() {
+        let (_td, ov, policy) =
+            policy_overlay(Arc::new(MemBase::with(&[("/base", b"abcdef")])), 64);
+        ov.ensure_modifiable("/base").unwrap();
+        ov.ensure_modifiable("/base").unwrap();
+        assert_eq!(policy.usage(), (6, 1));
+        let file = policy_file(&ov, "/base");
+        ov.write_at(&file, "/base", 8, b"xy").unwrap();
+        assert_eq!(policy.usage(), (10, 1));
+        ov.write_at(&file, "/base", 0, b"xy").unwrap();
+        assert_eq!(policy.usage(), (10, 1));
+        ov.truncate("/base", 3).unwrap();
+        assert_eq!(policy.usage(), (3, 1));
+        let fd = ov.create_file("/base", 0o644).unwrap();
+        ov.close_overlay_fd(fd);
+        assert_eq!(policy.usage(), (0, 1));
+        ov.create_symlink("/link", "foo").unwrap();
+        assert_eq!(policy.usage(), (3, 2));
+        ov.unlink("/link").unwrap();
+        assert_eq!(policy.usage(), (0, 1));
+        ov.write_at(&file, "/base", 0, b"abc").unwrap();
+        let dst = policy_file(&ov, "/dest");
+        ov.write_at(&dst, "/dest", 0, b"1234").unwrap();
+        assert_eq!(policy.usage(), (7, 2));
+        ov.rename("/base", "/dest").unwrap();
+        assert_eq!(policy.usage(), (3, 1));
+        // Detached fd changes are checked but do not recharge a removed name.
+        ov.write_at(&dst, "/dest", 8, b"orphan").unwrap();
+        ov.truncate_file(&dst, "/dest", 1).unwrap();
+        assert_eq!(policy.usage(), (3, 1));
+        ov.finish_owned_write_fd(file);
+        ov.finish_owned_write_fd(dst);
+        ov.create_symlink("/dangling", "/missing/target").unwrap();
+        ov.reset_overlay_contents().unwrap();
+        assert_eq!(policy.usage(), (0, 0));
+    }
+
+    /// Regression: quota refusal cannot leave a full COW copy or enlarge a truncated file.
+    #[cfg(unix)]
+    #[test]
+    fn regression_overlay_policy_quota_cow_and_truncate() {
+        let (td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[("/large", b"abcdef")])), 4);
+        assert!(
+            matches!(ov.ensure_modifiable("/large"), Err(OverlayError::Io(ref e)) if e.kind() == io::ErrorKind::QuotaExceeded)
+        );
+        assert!(!td.path().join("large").exists());
+        let file = policy_file(&ov, "/small");
+        ov.write_at(&file, "/small", 0, b"abcd").unwrap();
+        assert_eq!(
+            ov.write_at(&file, "/small", 4, b"x").unwrap_err().kind(),
+            io::ErrorKind::QuotaExceeded
+        );
+        assert!(
+            matches!(ov.truncate("/small", 5), Err(OverlayError::Io(ref e)) if e.kind() == io::ErrorKind::QuotaExceeded)
+        );
+        assert_eq!(file.metadata().unwrap().len(), 4);
+        let refused = ov.open_overlay_fd(
+            "/small",
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_TRUNC,
+        );
+        assert!(
+            matches!(refused, Err(OverlayError::Io(ref e)) if e.kind() == io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(file.metadata().unwrap().len(), 4);
+        assert_eq!(policy.usage(), (4, 1));
+        let fd = ov
+            .open_overlay_fd("/small", libc::O_RDWR | libc::O_TRUNC)
+            .unwrap();
+        ov.close_overlay_fd(fd);
+        assert_eq!(policy.usage(), (0, 1));
+        ov.finish_owned_write_fd(file);
+    }
+
+    /// Regression: concurrent checks cannot both spend the same quota allowance.
+    #[cfg(unix)]
+    #[test]
+    fn regression_overlay_policy_concurrent_writes_do_not_overspend() {
+        let (_td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[])), 8);
+        let ov = Arc::new(ov);
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let threads: Vec<_> = ["/a", "/b"]
+            .into_iter()
+            .map(|path| {
+                let ov = ov.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    let file = policy_file(&ov, path);
+                    barrier.wait();
+                    let result = ov.write_at(&file, path, 0, b"12345678");
+                    ov.finish_owned_write_fd(file);
+                    result
+                })
+            })
+            .collect();
+        let results: Vec<_> = threads.into_iter().map(|t| t.join().unwrap()).collect();
+        assert_eq!(results.iter().filter(|r| r.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .find_map(|r| r.as_ref().err())
+                .unwrap()
+                .kind(),
+            io::ErrorKind::QuotaExceeded
+        );
+        assert_eq!(policy.usage(), (8, 2));
+    }
+
+    /// Regression: commit cleanup must release quota for removed host files.
+    #[cfg(unix)]
+    #[test]
+    fn regression_overlay_policy_commit_cleanup_releases_usage() {
+        let (_td, ov, policy) = policy_overlay(Arc::new(MemBase::with(&[])), 8);
+        let file = policy_file(&ov, "/file");
+        ov.write_at(&file, "/file", 0, b"abcd").unwrap();
+        ov.finish_owned_write_fd(file);
+        let plan = OverlayCommitPlan {
+            deletions_nul: Vec::new(),
+            appends_nul: Vec::new(),
+            deleted_paths: HashSet::new(),
+            append_entries: vec![("file".into(), false)],
+        };
+        ov.forget_committed_overlay(&plan).unwrap();
+        assert_eq!(policy.usage(), (0, 0));
+    }
 
     fn write_zero_file(path: &Path, n: usize) {
         fs::write(path, vec![0u8; n]).unwrap();

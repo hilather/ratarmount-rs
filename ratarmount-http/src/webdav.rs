@@ -617,7 +617,7 @@ pub(crate) fn put_overlay(
         let mut remaining = content_len;
         if !leftover.is_empty() && remaining > 0 {
             let n = leftover.len().min(remaining as usize);
-            file.write_all(&leftover[..n])?;
+            overlay.write_all_at(&file, path, content_len - remaining, &leftover[..n])?;
             remaining -= n as u64;
         }
         let mut buf = vec![0u8; 64 * 1024];
@@ -630,7 +630,7 @@ pub(crate) fn put_overlay(
                     "short PUT body",
                 ));
             }
-            file.write_all(&buf[..n])?;
+            overlay.write_all_at(&file, path, content_len - remaining, &buf[..n])?;
             remaining -= n as u64;
         }
         file.flush()?;
@@ -680,7 +680,7 @@ pub(crate) fn copy_overlay_file(
             if n == 0 {
                 break;
             }
-            file.write_all(&buf[..n])?;
+            overlay.write_all_at(&file, dest, fi.size - remaining, &buf[..n])?;
             remaining -= n as u64;
         }
         file.flush()?;
@@ -712,7 +712,8 @@ pub(crate) fn move_overlay(overlay: &WriteOverlay, from: &str, to: &str) -> io::
 pub(crate) fn overlay_status(err: &io::Error) -> (u16, &'static str) {
     match err.kind() {
         io::ErrorKind::NotFound => (404, "Not Found"),
-        io::ErrorKind::PermissionDenied => (403, "Forbidden"),
+        io::ErrorKind::PermissionDenied | io::ErrorKind::ReadOnlyFilesystem => (403, "Forbidden"),
+        io::ErrorKind::QuotaExceeded | io::ErrorKind::StorageFull => (507, "Insufficient Storage"),
         io::ErrorKind::AlreadyExists => (405, "Method Not Allowed"),
         io::ErrorKind::InvalidInput => (400, "Bad Request"),
         io::ErrorKind::IsADirectory | io::ErrorKind::NotADirectory => (409, "Conflict"),
@@ -777,6 +778,111 @@ pub(crate) fn read_limited_body(
 mod tests {
     use super::*;
     use ratarmount_core::{create_root_file_info, S_IFDIR, S_IFREG};
+
+    use std::sync::Arc;
+    struct EmptyPolicyBase;
+    impl MountSource for EmptyPolicyBase {
+        fn is_immutable(&self) -> bool {
+            true
+        }
+        fn list(&self, _: &str) -> Option<ratarmount_core::ListResult> {
+            None
+        }
+        fn lookup(&self, path: &str, _: i32) -> Option<FileInfo> {
+            (path == "/").then(ratarmount_core::create_root_file_info)
+        }
+        fn open(&self, _: &FileInfo, _: i32) -> io::Result<Box<dyn ratarmount_core::ArchiveRead>> {
+            Ok(Box::new(io::Cursor::new(Vec::<u8>::new())))
+        }
+    }
+
+    struct TestPolicy;
+    impl ratarmount_compositing::OverlayPolicy for TestPolicy {
+        fn check_mutation(
+            &self,
+            _: ratarmount_compositing::OverlayMutation,
+            paths: &[&str],
+        ) -> io::Result<()> {
+            if paths
+                .iter()
+                .any(|p| *p == "/locked" || p.starts_with("/locked/"))
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::ReadOnlyFilesystem,
+                    "policy read-only path",
+                ));
+            }
+            Ok(())
+        }
+        fn check_write(
+            &self,
+            path: &str,
+            offset: u64,
+            len: u64,
+            current_size: u64,
+        ) -> io::Result<()> {
+            if path == "/quota" && offset.saturating_add(len) > current_size.max(2) {
+                return Err(io::Error::new(io::ErrorKind::QuotaExceeded, "policy quota"));
+            }
+            Ok(())
+        }
+    }
+
+    /// Regression: WebDAV PUT/COPY use the policy funnel and return 403/507.
+    #[test]
+    fn regression_overlay_policy_denials() {
+        let td = tempfile::tempdir().unwrap();
+        let mut ov = WriteOverlay::new(Arc::new(EmptyPolicyBase), td.path()).unwrap();
+        ov.mkdir("/locked", 0o755).unwrap();
+        ov.mkdir("/locked/empty", 0o755).unwrap();
+        for path in ["/locked/file", "/outside", "/quota"] {
+            let fd = ov.create_file(path, 0o644).unwrap();
+            ov.close_overlay_fd(fd);
+        }
+        ov.set_policy(Some(Arc::new(TestPolicy)));
+        let ov = Arc::new(ov);
+
+        let mut body = io::Cursor::new(b"abc".to_vec());
+        assert_eq!(
+            overlay_status(&put_overlay(&ov, "/locked/file", &mut body, &[], 3).unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&put_overlay(&ov, "/locked/new", &mut body, &[], 3).unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&mkcol_overlay(&ov, "/locked/newdir").unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&delete_overlay(&ov, "/locked/file").unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&delete_overlay(&ov, "/locked/empty").unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&move_overlay(&ov, "/outside", "/locked/file").unwrap_err()).0,
+            403
+        );
+        assert_eq!(
+            overlay_status(&put_overlay(&ov, "/quota", &mut body, &[], 3).unwrap_err()).0,
+            507
+        );
+        let mut body = io::Cursor::new(b"abc".to_vec());
+        put_overlay(&ov, "/outside", &mut body, &[], 3).unwrap();
+        assert_eq!(
+            overlay_status(&copy_overlay_file(&ov, ov.as_ref(), "/outside", "/quota").unwrap_err())
+                .0,
+            507
+        );
+        assert_eq!(
+            overlay_status(&io::Error::new(io::ErrorKind::StorageFull, "full")).0,
+            507
+        );
+    }
 
     fn file_fi(size: u64, mtime: f64) -> FileInfo {
         FileInfo {

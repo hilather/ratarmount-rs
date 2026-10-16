@@ -11,7 +11,13 @@ use embednfs::FsError;
 /// the VFS layer remaps that to [`FsError::Stale`]. Lookup name-miss is
 /// [`FsError::NotFound`] without going through `io::Error`.
 pub fn io_to_fserror(err: &std::io::Error) -> FsError {
+    if err.raw_os_error() == Some(libc::EPERM) {
+        return FsError::PermissionDenied;
+    }
     match err.kind() {
+        ErrorKind::ReadOnlyFilesystem => FsError::ReadOnly,
+        // embednfs has no DQUOT variant; NOSPC is its capacity-error response.
+        ErrorKind::QuotaExceeded | ErrorKind::StorageFull => FsError::NoSpace,
         ErrorKind::AlreadyExists => FsError::AlreadyExists,
         ErrorKind::NotFound => FsError::NotFound,
         ErrorKind::PermissionDenied => FsError::AccessDenied,
@@ -26,6 +32,39 @@ pub fn io_to_fserror(err: &std::io::Error) -> FsError {
 mod tests {
     use super::*;
     use std::io::{Error, ErrorKind};
+
+    /// Regression: both policy kinds and raw capacity errnos retain protocol status.
+    #[test]
+    fn regression_overlay_policy_errno_mapping() {
+        assert_eq!(
+            io_to_fserror(&Error::from_raw_os_error(libc::EPERM)),
+            FsError::PermissionDenied
+        );
+        assert_eq!(
+            io_to_fserror(&Error::new(ErrorKind::ReadOnlyFilesystem, "policy")),
+            FsError::ReadOnly
+        );
+        assert_eq!(
+            io_to_fserror(&Error::from_raw_os_error(libc::EROFS)),
+            FsError::ReadOnly
+        );
+        assert_eq!(
+            io_to_fserror(&Error::new(ErrorKind::QuotaExceeded, "policy")),
+            FsError::NoSpace
+        );
+        assert_eq!(
+            io_to_fserror(&Error::from_raw_os_error(libc::EDQUOT)),
+            FsError::NoSpace
+        );
+        assert_eq!(
+            io_to_fserror(&Error::new(ErrorKind::StorageFull, "policy")),
+            FsError::NoSpace
+        );
+        assert_eq!(
+            io_to_fserror(&Error::from_raw_os_error(libc::ENOSPC)),
+            FsError::NoSpace
+        );
+    }
 
     #[test]
     fn v4_io_to_fserror_maps_kinds() {
