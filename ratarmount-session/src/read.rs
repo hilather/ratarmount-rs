@@ -124,6 +124,54 @@ mod tests {
 
     fn assert_send<T: Send>(_: &T) {}
 
+    /// Regression: concurrent Session ranges from one TAR read sibling member bytes.
+    #[test]
+    fn regression_parallel_tar_read_ranges_keep_member_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let payloads: Vec<Vec<u8>> = (0..2)
+            .map(|member| {
+                (0..16384)
+                    .map(|offset| (offset % 127) as u8 + member * 128)
+                    .collect()
+            })
+            .collect();
+        let session = open_tar(
+            dir.path(),
+            "parallel.tar",
+            &[
+                member_file("a.bin", &payloads[0]),
+                member_file("b.bin", &payloads[1]),
+            ],
+        );
+        let barrier = std::sync::Barrier::new(2);
+        std::thread::scope(|scope| {
+            for (name, expected) in ["a.bin", "b.bin"].into_iter().zip(&payloads) {
+                let session = &session;
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    for iteration in 0..2048 {
+                        let offset = iteration * 37 % (expected.len() - 257);
+                        let mut reader = session
+                            .read_range(ReadRequest {
+                                path: format!("/{name}"),
+                                offset: offset as u64,
+                                max_len: 257,
+                            })
+                            .unwrap();
+                        let mut actual = Vec::new();
+                        reader.read_to_end(&mut actual).unwrap();
+                        assert_eq!(
+                            actual,
+                            &expected[offset..offset + 257],
+                            "{name}, iteration {iteration}, offset {offset}"
+                        );
+                    }
+                });
+            }
+        });
+    }
+
     /// Regression: 4 KiB from a 100 MiB member must not slurp the member.
     #[test]
     fn read_range_capped() {
