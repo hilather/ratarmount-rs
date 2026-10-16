@@ -167,6 +167,15 @@ Anything else (CAB **LZX**, classic SquashFS **LZMA**, pure-fail EXT4, RAR/libar
 
 Outer archive must expose a **seekable** `open()` for the nested file. Then the nested reader path above applies.
 
+File-backed TAR member readers keep independent logical positions and use
+positional I/O (`read_at` on Unix, `seek_read` on Windows) without a shared read
+lock. Multiple nested members can open and read concurrently with the default
+`--parallel-nested` setting; serializing nested opens is unnecessary. Regression
+tests repeatedly open four AR members from one TAR, check each member's distinct
+payload, and reject temp-spool fallback. Concurrent Session range reads also
+check distinct TAR member bytes. Unsupported formats and parser errors still
+use the fallback described above.
+
 | Outer (parent) | Nested member | Uses `/tmp` for nested body? | Notes |
 |----------------|---------------|------------------------------|--------|
 | **ZIP (store)** | `.tar` | **No** | Parent: byte region; nested: TAR from_reader |
