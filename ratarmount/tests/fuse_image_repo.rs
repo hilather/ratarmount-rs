@@ -36,6 +36,7 @@ impl Registry {
             &mut tar,
             &[
                 UstarMember {
+                    xattrs: &[],
                     path: "etc/os-release",
                     payload: UstarPayload::File {
                         bytes: b"test image\n",
@@ -47,6 +48,7 @@ impl Registry {
                     xattrs: &[],
                 },
                 UstarMember {
+                    xattrs: &[],
                     path: "repo/image-file",
                     payload: UstarPayload::File { bytes: b"base\n" },
                     mode: 0o644,
