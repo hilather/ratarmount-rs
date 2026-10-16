@@ -43,6 +43,7 @@ mod tests {
 
     fn member_file<'a>(path: &'a str, bytes: &'a [u8]) -> UstarMember<'a> {
         UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,
@@ -400,6 +401,7 @@ mod tests {
         write_ustar_members(&mut inner, &inner_members).unwrap();
         write_tar_eof(&mut inner).unwrap();
         let outer_members = [UstarMember {
+            xattrs: &[],
             path: "inner.tar",
             payload: UstarPayload::File {
                 bytes: inner.as_slice(),

@@ -468,6 +468,18 @@ struct Args {
     #[arg(long = "commit-overlay-mode", default_value = "copy", value_parser = ["copy", "append", "auto"])]
     commit_overlay_mode: String,
 
+    /// Write an atomic <archive>.manifest.jsonl after a successful TAR commit.
+    #[arg(long)]
+    commit_manifest: bool,
+
+    /// Manifest SHA-256 coverage: new/changed payloads (default), all, or none.
+    #[arg(long, default_value = "new", value_parser = ["all", "new", "none"])]
+    manifest_hashes: String,
+
+    /// Find-only xattr predicates (repeatable): NAME, NAME=VALUE, NAME!=VALUE.
+    #[arg(long = "xattr", action = ArgAction::Append)]
+    find_xattrs: Vec<String>,
+
     /// Skip interactive confirmation for `--commit-overlay` (type "commit" otherwise).
     #[arg(long = "yes", action = ArgAction::SetTrue)]
     yes: bool,
@@ -641,6 +653,15 @@ where
         ratarmount_compositing::ReadOnlyGlobs::new(&args.overlay_readonly).map_err(|e| {
             clap::Error::raw(clap::error::ErrorKind::ValueValidation, e.to_string())
         })?;
+    }
+    if !find && !args.find_xattrs.is_empty() {
+        return Err(clap::Error::raw(
+            clap::error::ErrorKind::ArgumentConflict,
+            "--xattr requires find",
+        ));
+    }
+    if find && !args.find_xattrs.is_empty() && args.paths.len() == 1 {
+        args.paths.insert(0, PathBuf::from("*"));
     }
     args.serve = serve;
     args.find = find;
@@ -995,6 +1016,7 @@ fn main() {
         }
         let opts = CommitOverlayOptions {
             mode: args.commit_overlay_mode.parse().expect("clap commit mode"),
+            manifest_hashes: args.commit_manifest.then(|| args.manifest_hashes.clone()),
             yes: args.yes,
             debug: args.debug,
             encoding: args.encoding.clone(),
@@ -1184,6 +1206,7 @@ fn main() {
             include_hashes,
             fill_hashes: &open_opts.hashes,
             offset_order: args.find_offset_order,
+            xattrs: &args.find_xattrs,
         };
         std::process::exit(find::run(archive, &pattern, &open_opts, &loc));
     }
@@ -1354,6 +1377,7 @@ fn main() {
         match WriteOverlay::new(Arc::clone(&bundle.source), &overlay_path) {
             Ok(mut ov) => {
                 ov.set_encoding(&args.encoding);
+                ov.set_manifest_hashes(args.commit_manifest.then(|| args.manifest_hashes.clone()));
                 ov.set_commit_mode(args.commit_overlay_mode.parse().expect("clap commit mode"));
                 if !args.overlay_readonly.is_empty()
                     || args.overlay_quota.is_some()
@@ -4316,6 +4340,44 @@ mod find_cli_tests {
     use std::sync::Arc;
 
     /// Regression: `find '*.fits' a.tar` does not steal the pattern or archive.
+    /// Regression: repeatable xattr filters must not steal the archive or path pattern.
+    #[test]
+    fn regression_provenance_find_cli_flags() {
+        let a = parse_args_from([
+            "ratarmount",
+            "find",
+            "--xattr",
+            "train_ok=false",
+            "--xattr",
+            "teacher",
+            "trace.tar",
+        ])
+        .unwrap();
+        assert_eq!(a.find_xattrs, ["train_ok=false", "teacher"]);
+        assert_eq!(
+            a.paths,
+            [
+                std::path::PathBuf::from("*"),
+                std::path::PathBuf::from("trace.tar")
+            ]
+        );
+        assert!(find_cli_error(&a).is_none());
+        assert!(parse_args_from(["ratarmount", "--xattr", "teacher", "trace.tar"]).is_err());
+        let a = parse_args_from([
+            "ratarmount",
+            "--commit-manifest",
+            "--manifest-hashes",
+            "all",
+            "--commit-overlay",
+            "-w",
+            "ov",
+            "trace.tar",
+        ])
+        .unwrap();
+        assert!(a.commit_manifest);
+        assert_eq!(a.manifest_hashes, "all");
+    }
+
     #[test]
     fn find_flag_does_not_steal_archive() {
         let a = parse_args_from(["ratarmount", "find", "*.fits", "a.tar"]).expect("parse");

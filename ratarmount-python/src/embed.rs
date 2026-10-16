@@ -426,6 +426,7 @@ mod tests {
         write_ustar_members(
             &mut file,
             &[UstarMember {
+                xattrs: &[],
                 path: "hello.txt",
                 payload: UstarPayload::File { bytes: b"abcdWXYZ" },
                 mode: 0o644,

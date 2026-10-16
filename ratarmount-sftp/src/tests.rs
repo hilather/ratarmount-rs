@@ -64,6 +64,7 @@ fn tar_source() -> Arc<dyn MountSource> {
     write_ustar_members(
         &mut buf,
         &[UstarMember {
+            xattrs: &[],
             path: "hello.txt",
             payload: UstarPayload::File {
                 bytes: b"hello sftp\n",

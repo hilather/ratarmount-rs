@@ -3367,6 +3367,7 @@ dependencies = [
  "ratarmount-index",
  "regex",
  "rusqlite",
+ "serde_json",
  "tempfile",
  "thiserror",
  "xz2",

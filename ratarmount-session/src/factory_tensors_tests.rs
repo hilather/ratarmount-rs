@@ -69,6 +69,7 @@ fn write_outer_tar(path: &Path, files: &[(&str, &[u8])]) {
     let members: Vec<_> = files
         .iter()
         .map(|&(path, bytes)| UstarMember {
+            xattrs: &[],
             path,
             payload: UstarPayload::File { bytes },
             mode: 0o644,

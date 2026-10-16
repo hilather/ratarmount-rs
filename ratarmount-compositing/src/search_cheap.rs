@@ -274,6 +274,7 @@ fn write_fits_tar(path: &std::path::Path, files: &[(&str, &[u8])]) {
     let members: Vec<UstarMember<'_>> = files
         .iter()
         .map(|(p, bytes)| UstarMember {
+            xattrs: &[],
             path: p,
             payload: UstarPayload::File { bytes },
             mode: 0o644,

@@ -1574,6 +1574,7 @@ mod tests {
         write_ustar_members(
             &mut frame0,
             &[UstarMember {
+                xattrs: &[],
                 path: "seed.txt",
                 payload: UstarPayload::File { bytes: seed },
                 mode: 0o644,
@@ -1589,6 +1590,7 @@ mod tests {
         write_ustar_members(
             &mut frame1,
             &[UstarMember {
+                xattrs: &[],
                 path: "more.txt",
                 payload: UstarPayload::File { bytes: more },
                 mode: 0o644,

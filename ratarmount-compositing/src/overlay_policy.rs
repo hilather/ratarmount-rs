@@ -554,6 +554,7 @@ mod tests {
         let members: Vec<_> = paths
             .iter()
             .map(|path| UstarMember {
+                xattrs: &[],
                 path,
                 payload: UstarPayload::File {
                     bytes: if *path == "empty" {

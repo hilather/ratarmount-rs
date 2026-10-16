@@ -1427,6 +1427,7 @@ mod tests {
         ratarmount_formats_tar::write_ustar_members(
             &mut tar,
             &[ratarmount_formats_tar::UstarMember {
+                xattrs: &[],
                 path: name,
                 payload: ratarmount_formats_tar::UstarPayload::File { bytes },
                 mode: 0o644,
@@ -2864,6 +2865,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let archive = dir.path().join("a.tar");
         let member = ratarmount_formats_tar::UstarMember {
+            xattrs: &[],
             path: "hello.txt",
             payload: ratarmount_formats_tar::UstarPayload::File { bytes: b"hi\n" },
             mode: 0o644,

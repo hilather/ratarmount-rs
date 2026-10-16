@@ -4685,6 +4685,7 @@ mod tests {
                 ratarmount_formats_tar::write_ustar_members(
                     &mut f,
                     &[ratarmount_formats_tar::UstarMember {
+                        xattrs: &[],
                         path: "hello.txt",
                         payload: ratarmount_formats_tar::UstarPayload::File {
                             bytes: b"hello world\n",
@@ -8635,6 +8636,7 @@ mod git_tests {
         write_ustar_members(
             &mut file,
             &[UstarMember {
+                xattrs: &[],
                 path: "before",
                 payload: UstarPayload::File { bytes: b"base" },
                 mode: 0o644,

@@ -6,7 +6,7 @@ mod fuser_tests;
 mod passthrough;
 pub use passthrough::{PassthroughMode, PassthroughOptions};
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
 use std::os::unix::io::{AsRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
@@ -374,6 +374,7 @@ struct Detached {
     /// Snapshot taken before the name moved or was removed.
     /// `None` only when neither the park nor a pre-call lookup produced one.
     last_fi: Option<FileInfo>,
+    xattrs: BTreeMap<String, Vec<u8>>,
     /// Name before detach. Archive `OpenBackend::Source::path` uses this,
     /// not `"\0stale-{ino}"`.
     path: String,
@@ -1292,6 +1293,7 @@ impl RatarmountFs {
         // Snapshot before unlink: afterwards the name is a tombstone.
         let ino = self.existing_ino(&path);
         let snap = ino.and_then(|ino| self.snapshot_file_info(ino, &path));
+        let xattrs = self.snapshot_xattrs(snap.as_ref());
         // FUSE-only (#88). Other frontends call `unlink` and never open the file.
         let parked = ov.unlink_parked(&path).map_err(|e| {
             debug!("unlink: {e}");
@@ -1301,7 +1303,7 @@ impl RatarmountFs {
         // While path_to_ino still maps the name, so a 60s member still gets
         // its Entry + Inode from attr_advertised.
         self.note_dir_changed(parent, &name);
-        self.detach_unlinked(&path, ino, parked, snap);
+        self.detach_unlinked(&path, ino, parked, snap, xattrs);
         self.mark_source_handles_detached(&path);
         Ok(())
     }
@@ -1343,6 +1345,7 @@ impl RatarmountFs {
         let src_ino = self.existing_ino(&from);
         let replaced = self.existing_ino(&to).filter(|ino| Some(*ino) != src_ino);
         let snap = replaced.and_then(|ino| self.snapshot_file_info(ino, &to));
+        let xattrs = self.snapshot_xattrs(snap.as_ref());
         // FUSE-only (#88). Other frontends call `rename` and never open the target.
         // The park open runs inside rename_parked, before rename(2).
         let parked = match ov.rename_parked(&from, &to) {
@@ -1389,7 +1392,7 @@ impl RatarmountFs {
         if newparent != parent {
             self.drop_stable_attr(newparent);
         }
-        self.rebind_after_rename(&from, &to, parked, snap);
+        self.rebind_after_rename(&from, &to, parked, snap, xattrs);
         // Handles only, after both inode maps are released.
         self.mark_source_handles_detached(&from);
         self.mark_source_handles_detached(&to);
@@ -1434,6 +1437,7 @@ impl RatarmountFs {
         to: &str,
         mut parked: Option<Parked>,
         mut snap: Option<FileInfo>,
+        mut xattrs: BTreeMap<String, Vec<u8>>,
     ) {
         // Clone the test counter before either map lock. `build_detached` is
         // a free function and must not borrow `self` under `inodes`.
@@ -1458,6 +1462,7 @@ impl RatarmountFs {
                         snap.take(),
                         drops.take(),
                         self.overlay.clone(),
+                        std::mem::take(&mut xattrs),
                     );
                     doomed = install_detached(&mut inodes, old_dest, detached);
                 }
@@ -1490,6 +1495,7 @@ impl RatarmountFs {
         ino: Option<u64>,
         mut parked: Option<Parked>,
         mut snap: Option<FileInfo>,
+        mut xattrs: BTreeMap<String, Vec<u8>>,
     ) {
         let mut drops = self.park_drop_counter();
         let doomed = {
@@ -1508,6 +1514,7 @@ impl RatarmountFs {
                     snap.take(),
                     drops.take(),
                     self.overlay.clone(),
+                    std::mem::take(&mut xattrs),
                 );
                 install_detached(&mut inodes, ino, detached)
             } else {
@@ -2157,15 +2164,56 @@ impl RatarmountFs {
         })
     }
 
+    fn snapshot_xattrs(&self, fi: Option<&FileInfo>) -> BTreeMap<String, Vec<u8>> {
+        fi.map(|fi| {
+            self.source
+                .list_xattr(fi)
+                .into_iter()
+                .filter_map(|name| self.source.get_xattr(fi, &name).map(|value| (name, value)))
+                .collect()
+        })
+        .unwrap_or_default()
+    }
+
     /// `GETXATTR` body. `Ok(None)` is ENODATA / ENOATTR.
     fn xattr_value(&self, ino: u64, key: &str) -> Result<Option<Vec<u8>>, i32> {
+        if let Some(detached) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .and_then(|entry| entry.detached.as_ref())
+        {
+            return Ok(detached.xattrs.get(key).cloned());
+        }
         let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        if let (Some(overlay), Some(path)) = (&self.overlay, self.path_for_ino(ino)) {
+            return overlay
+                .xattrs_for_path(&path)
+                .map(|mut attrs| attrs.remove(key))
+                .map_err(|e| overlay_errno(&e));
+        }
         Ok(self.source.get_xattr(&fi, key))
     }
 
     /// `LISTXATTR` body.
     fn xattr_list(&self, ino: u64) -> Result<Vec<String>, i32> {
+        if let Some(detached) = self
+            .inodes
+            .lock()
+            .unwrap()
+            .get(&ino)
+            .and_then(|entry| entry.detached.as_ref())
+        {
+            return Ok(detached.xattrs.keys().cloned().collect());
+        }
         let fi = self.file_info_for_ino(ino).ok_or(ENOENT)?;
+        if let (Some(overlay), Some(path)) = (&self.overlay, self.path_for_ino(ino)) {
+            return overlay
+                .xattrs_for_path(&path)
+                .map(|attrs| attrs.into_keys().collect())
+                .map_err(|e| overlay_errno(&e));
+        }
         Ok(self.source.list_xattr(&fi))
     }
 
@@ -2303,6 +2351,7 @@ fn build_detached(
     snap: Option<FileInfo>,
     drops: Option<Arc<AtomicUsize>>,
     overlay: Option<Arc<WriteOverlay>>,
+    xattrs: BTreeMap<String, Vec<u8>>,
 ) -> Detached {
     let (last_fi, raw_fd) = match parked {
         Some(parked) => {
@@ -2328,6 +2377,7 @@ fn build_detached(
         }
     });
     Detached {
+        xattrs,
         fd,
         last_fi,
         path: pre_path,
@@ -2822,6 +2872,65 @@ impl Filesystem for RatarmountFs {
             return;
         };
         reply.data(fi.linkname.as_bytes());
+    }
+
+    fn setxattr(
+        &self,
+        _req: &Request,
+        ino: INodeNo,
+        name: &OsStr,
+        value: &[u8],
+        flags: i32,
+        position: u32,
+        reply: ReplyEmpty,
+    ) {
+        let result = (|| {
+            if position != 0 {
+                return Err(EINVAL);
+            }
+            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+            let name = name.to_str().ok_or(EINVAL)?;
+            // macFUSE passes the native CREATE=2/REPLACE=4 bits; the storage API
+            // uses the Linux CREATE=1/REPLACE=2 encoding on every platform.
+            #[cfg(target_os = "macos")]
+            let flags = match flags {
+                0 => 0,
+                libc::XATTR_CREATE => 1,
+                libc::XATTR_REPLACE => 2,
+                _ => return Err(EINVAL),
+            };
+            overlay
+                .set_xattr(&path, name, value, flags)
+                .map_err(|e| match &e {
+                    ratarmount_compositing::OverlayError::Io(e) => {
+                        e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                    }
+                    _ => EIO,
+                })
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
+    }
+
+    fn removexattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, reply: ReplyEmpty) {
+        let result = (|| {
+            let overlay = self.overlay.as_ref().ok_or(EROFS)?;
+            let path = self.path_for_ino(ino.0).ok_or(EACCES)?;
+            let name = name.to_str().ok_or(EINVAL)?;
+            overlay.remove_xattr(&path, name).map_err(|e| match &e {
+                ratarmount_compositing::OverlayError::Io(e) => {
+                    e.raw_os_error().unwrap_or_else(|| io_to_errno(e))
+                }
+                _ => EIO,
+            })
+        })();
+        match result {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(Errno::from_i32(e)),
+        }
     }
 
     fn getxattr(&self, _req: &Request, ino: INodeNo, name: &OsStr, size: u32, reply: ReplyXattr) {
@@ -6761,7 +6870,10 @@ mod tests {
         );
         assert_eq!(fs.xattr_list(reg).unwrap(), vec!["user.demo".to_string()]);
         let live = fs.source.lookup("/reg", 0).expect("replaced name");
-        assert!(fs.source.get_xattr(&live, "user.demo").is_none());
+        assert_eq!(
+            fs.source.get_xattr(&live, "user.demo"),
+            Some(b"new-reg".to_vec())
+        );
         assert_eq!(
             fs.xattr_value(lnk, "user.demo").unwrap().as_deref(),
             Some(b"old-link".as_slice())
