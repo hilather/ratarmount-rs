@@ -34,6 +34,7 @@ use ratarmount_session::factory;
 #[macro_use]
 mod quiet_print;
 
+mod diff;
 mod find;
 mod overlay_commit;
 mod overlay_stats;
@@ -57,7 +58,8 @@ const VERSION: &str = env!("CARGO_PKG_VERSION");
                   Requires at least one of --nfs/--http/--webdav/--smb/--ninep/--sftp/--sftp-subsystem.\n\
                   Incompatible with --no-mount. Boolean flags remain the stable interface.\n\
                   Locate: ratarmount find [--fts] [--hashes] [--offset-order] PATTERN ARCHIVE (no FUSE).\n\
-                  Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE)."
+                  Statistics: ratarmount overlay-stats OVERLAY [--json] (no FUSE).\n\
+                  Patch: ratarmount diff --base SOURCE OVERLAY [--git] (no FUSE)."
 )]
 struct Args {
     /// Unmount the given mountpoint(s)
@@ -440,6 +442,9 @@ struct Args {
     #[arg(skip)]
     overlay_stats: Option<overlay_stats::StatsArgs>,
 
+    #[arg(skip)]
+    diff: Option<diff::DiffArgs>,
+
     /// Commit write-overlay changes into a TAR (uncompressed / gzip / bzip2 / xz via GNU tar,
     /// or `.tar.zst` via frame splice) or ZIP (full rebuild). Does not mount; requires
     /// `--write-overlay` and a single archive path.
@@ -562,6 +567,14 @@ where
     T: Into<OsString> + Clone,
 {
     let raw: Vec<OsString> = iter.into_iter().map(Into::into).collect();
+    if raw.get(1).is_some_and(|s| s == "diff") {
+        let diff = diff::DiffArgs::try_parse_from(
+            std::iter::once(OsString::from("ratarmount diff")).chain(raw.iter().skip(2).cloned()),
+        )?;
+        let mut args = Args::try_parse_from(&raw[..1])?;
+        args.diff = Some(diff);
+        return Ok(args);
+    }
     if raw.get(1).is_some_and(|s| s == "overlay-stats") {
         let stats = overlay_stats::StatsArgs::try_parse_from(
             std::iter::once(OsString::from("ratarmount overlay-stats"))
@@ -820,6 +833,10 @@ fn main() {
     // mount exists, so point dead stdio at /dev/null first.
     neutralize_dead_stdio();
     let args = parse_args_from(std::env::args_os()).unwrap_or_else(|e| e.exit());
+
+    if let Some(diff) = &args.diff {
+        std::process::exit(diff::run(diff));
+    }
 
     if let Some(stats) = &args.overlay_stats {
         match overlay_stats::run(stats) {
