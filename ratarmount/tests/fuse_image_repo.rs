@@ -44,6 +44,7 @@ impl Registry {
                     uid: 0,
                     gid: 0,
                     mtime: 0,
+                    xattrs: &[],
                 },
                 UstarMember {
                     path: "repo/image-file",
@@ -52,6 +53,7 @@ impl Registry {
                     uid: 0,
                     gid: 0,
                     mtime: 0,
+                    xattrs: &[],
                 },
             ],
         )

@@ -8891,6 +8891,7 @@ mod source_bind_tests {
                 uid: 0,
                 gid: 0,
                 mtime: 0,
+                xattrs: &[],
             })
             .collect();
         write_ustar_members(&mut std::fs::File::create(path).unwrap(), &members).unwrap();
